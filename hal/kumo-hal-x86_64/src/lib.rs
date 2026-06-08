@@ -46,6 +46,17 @@ pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadCont
     // x86_64 context switching lands with the x86 backend parity milestone.
 }
 
+pub fn monotonic_nanos() -> u64 {
+    // The x86_64 monotonic clock (TSC/HPET) lands with the x86_64 metal milestone.
+    0
+}
+
+pub fn console_read_byte() -> Option<u8> {
+    // No serial input wired on the x86_64 backend yet (CI/QEMU-only). The shared
+    // kernel can call this unconditionally.
+    None
+}
+
 pub fn early_console_write(_bytes: &[u8]) {
     // Kept as a later backend checkpoint; no x86 port I/O is wired in M0.
 }

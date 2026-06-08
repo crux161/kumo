@@ -12,18 +12,18 @@ compile_error!("select a HAL backend");
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
     pub use kumo_hal_aarch64::{
-        arch_name, early_console_write, halt, init_timer_interrupts, install_exception_vectors,
-        set_framebuffer, spin_once, switch_context, timer_irq_count, wait_for_timer_irqs,
-        ThreadContext, ARCH,
+        arch_name, console_read_byte, early_console_write, halt, init_timer_interrupts,
+        install_exception_vectors, monotonic_nanos, set_framebuffer, spin_once, switch_context,
+        timer_irq_count, wait_for_timer_irqs, ThreadContext, ARCH,
     };
 }
 
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        arch_name, early_console_write, halt, init_timer_interrupts, install_exception_vectors,
-        set_framebuffer, spin_once, switch_context, timer_irq_count, wait_for_timer_irqs,
-        ThreadContext, ARCH,
+        arch_name, console_read_byte, early_console_write, halt, init_timer_interrupts,
+        install_exception_vectors, monotonic_nanos, set_framebuffer, spin_once, switch_context,
+        timer_irq_count, wait_for_timer_irqs, ThreadContext, ARCH,
     };
 }
 

@@ -164,6 +164,7 @@ type EfiHandleProtocol = extern "efiapi" fn(
     interface: *mut *mut c_void,
 ) -> EfiStatus;
 type EfiExitBootServices = extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> EfiStatus;
+type EfiStall = extern "efiapi" fn(microseconds: usize) -> EfiStatus;
 type EfiLocateProtocol = extern "efiapi" fn(
     protocol: *const EfiGuid,
     registration: *mut c_void,
@@ -204,7 +205,7 @@ struct EfiBootServices {
     unload_image: *const c_void,
     exit_boot_services: EfiExitBootServices,
     get_next_monotonic_count: *const c_void,
-    stall: *const c_void,
+    stall: EfiStall,
     set_watchdog_timer: *const c_void,
     connect_controller: *const c_void,
     disconnect_controller: *const c_void,
@@ -524,6 +525,11 @@ unsafe fn boot_and_jump(
             return;
         }
     }
+
+    // Optional pre-handoff pause. Works on any board because it uses the firmware's
+    // own console input (the X13s USB keyboard included), and times out so automated
+    // boots are not blocked.
+    unsafe { prompt_pause(system_table, boot_services, con_out) };
 
     kprint!(
         con_out,
@@ -1037,6 +1043,49 @@ unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo) -> ! {
             in("x0") boot,
             options(noreturn),
         )
+    }
+}
+
+/// Offer a brief pre-handoff pause via the firmware console. Drains any stale key,
+/// then polls `ConIn` for ~3 seconds; if a key is pressed it holds until a second
+/// key, otherwise it continues so unattended/automated boots are not blocked.
+unsafe fn prompt_pause(
+    system_table: *mut EfiSystemTable,
+    boot_services: *mut EfiBootServices,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+) {
+    if system_table.is_null() {
+        return;
+    }
+    let con_in = unsafe { (*system_table).con_in };
+    if con_in.is_null() {
+        return;
+    }
+
+    // Discard buffered input so a stale key does not auto-pause.
+    unsafe { ((*con_in).reset)(con_in, false) };
+
+    kprint!(
+        con_out,
+        "\r\nPress a key within 3s to pause before handoff...\r\n"
+    );
+
+    let mut key = MaybeUninit::<EfiInputKey>::uninit();
+    let mut pressed = false;
+    for _ in 0..30 {
+        let status = unsafe { ((*con_in).read_key_stroke)(con_in, key.as_mut_ptr()) };
+        if status == EFI_SUCCESS {
+            pressed = true;
+            break;
+        }
+        unsafe { ((*boot_services).stall)(100_000) }; // 100 ms
+    }
+
+    if pressed {
+        kprint!(con_out, "Paused. Press any key to continue handoff.\r\n");
+        wait_for_key(system_table);
+    } else {
+        kprint!(con_out, "No key pressed; continuing.\r\n");
     }
 }
 

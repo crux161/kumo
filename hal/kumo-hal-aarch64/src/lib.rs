@@ -136,6 +136,7 @@ const UARTIBRD: usize = 0x24;
 const UARTFBRD: usize = 0x28;
 const UARTLCR_H: usize = 0x2c;
 const UARTCR: usize = 0x30;
+const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFF: u32 = 1 << 5;
 const UARTLCR_H_FEN: u32 = 1 << 4;
 const UARTLCR_H_WLEN_8: u32 = 3 << 5;
@@ -344,6 +345,21 @@ pub fn console_set_cursor(col: u32, row: u32) {
         FB_ROW.store(row, ORD);
     } else if UART_READY.load(ORD) {
         pl011_putc(b'\r');
+    }
+}
+
+/// Non-blocking read of one byte of console input. Only the PL011 path has an input
+/// device (QEMU serial); a framebuffer console (e.g. the X13s) has no keyboard yet,
+/// so this returns `None` there rather than touching a nonexistent UART.
+pub fn console_read_byte() -> Option<u8> {
+    if FB_PRESENT.load(ORD) || !UART_READY.load(ORD) {
+        return None;
+    }
+    let flags = unsafe { pl011_reg(UARTFR).read_volatile() };
+    if flags & UARTFR_RXFE != 0 {
+        None
+    } else {
+        Some((unsafe { pl011_reg(UARTDR).read_volatile() } & 0xff) as u8)
     }
 }
 
@@ -851,13 +867,50 @@ unsafe fn enable_irq() {
 #[cfg(not(target_os = "none"))]
 unsafe fn enable_irq() {}
 
+/// A hook the timer IRQ calls (after EOI) to drive preemptive scheduling. Stored as
+/// a raw `extern "C" fn()` address; 0 means "no preemption".
+static PREEMPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the preemption hook (the scheduler tick). It runs in IRQ context after the
+/// timer interrupt is acknowledged/EOI'd, and may context-switch via `switch_context`.
+pub fn set_preempt_hook(hook: extern "C" fn()) {
+    PREEMPT_HOOK.store(hook as usize, ORD);
+}
+
+/// Stop calling the preemption hook (back to plain timer ticks).
+pub fn clear_preempt_hook() {
+    PREEMPT_HOOK.store(0, ORD);
+}
+
 #[cfg(target_os = "none")]
-fn handle_irq(intid: u32) {
-    if intid == TIMER_IRQ_ID.load(ORD) {
+unsafe fn eoi(intid: u32) {
+    unsafe {
+        core::arch::asm!("msr icc_eoir1_el1, {0}", in(reg) intid as u64, options(nostack, nomem))
+    };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn eoi(_intid: u32) {}
+
+#[cfg(target_os = "none")]
+fn on_irq(intid: u32) {
+    let is_timer = intid == TIMER_IRQ_ID.load(ORD);
+    if is_timer {
         TIMER_IRQ_COUNT.fetch_add(1, ORD);
         let period = TIMER_PERIOD_TICKS.load(ORD);
         if period != 0 {
             unsafe { virtual_timer_program(period) };
+        }
+    }
+    // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
+    // leaves this IRQ active across threads.
+    unsafe { eoi(intid) };
+    if is_timer {
+        let hook = PREEMPT_HOOK.load(ORD);
+        if hook != 0 {
+            // SAFETY: only ever set from `set_preempt_hook` with a real `fn()`.
+            let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+            hook();
         }
     }
 }
@@ -946,8 +999,12 @@ mod traps {
         "  mrs x2, elr_el1",
         "  mrs x3, far_el1",
         "  b   kumo_exception_entry",
+        // IRQ entry: save the FULL interrupted state (x0-x30 + ELR + SPSR) on the
+        // current stack, so the timer handler may context-switch to another thread
+        // (which has its own such frame). EOI happens inside `on_irq`, before any
+        // switch. Frame is 272 bytes (16-aligned).
         "kumo_irq_common:",
-        "  sub sp, sp, #256",
+        "  sub sp, sp, #272",
         "  stp x0,  x1,  [sp, #0]",
         "  stp x2,  x3,  [sp, #16]",
         "  stp x4,  x5,  [sp, #32]",
@@ -964,14 +1021,17 @@ mod traps {
         "  stp x26, x27, [sp, #208]",
         "  stp x28, x29, [sp, #224]",
         "  str x30,      [sp, #240]",
+        "  mrs x0, elr_el1",
+        "  mrs x1, spsr_el1",
+        "  stp x0,  x1,  [sp, #248]",
         "  mrs x0, icc_iar1_el1",
-        "  mov x19, x0",
-        "  mov x20, #1020",
-        "  cmp x19, x20",
+        "  cmp x0, #1020",
         "  b.hs 1f",
         "  bl  kumo_irq_entry",
-        "  msr icc_eoir1_el1, x19",
         "1:",
+        "  ldp x0,  x1,  [sp, #248]",
+        "  msr elr_el1, x0",
+        "  msr spsr_el1, x1",
         "  ldp x0,  x1,  [sp, #0]",
         "  ldp x2,  x3,  [sp, #16]",
         "  ldp x4,  x5,  [sp, #32]",
@@ -988,7 +1048,7 @@ mod traps {
         "  ldp x26, x27, [sp, #208]",
         "  ldp x28, x29, [sp, #224]",
         "  ldr x30,      [sp, #240]",
-        "  add sp, sp, #256",
+        "  add sp, sp, #272",
         "  eret",
     );
 
@@ -1038,7 +1098,7 @@ mod traps {
 
     #[no_mangle]
     extern "C" fn kumo_irq_entry(intid: u64) {
-        super::handle_irq(intid as u32);
+        super::on_irq(intid as u32);
     }
 
     fn ec_name(ec: u32) -> &'static str {

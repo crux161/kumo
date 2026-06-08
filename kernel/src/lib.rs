@@ -4,8 +4,10 @@
 extern crate alloc;
 
 pub mod bootstrap;
+pub mod kdemo;
 pub mod mm;
 pub mod object;
+pub mod shell;
 pub mod task;
 
 use kumo_abi::{BootInfo, ABI_VERSION};
@@ -141,8 +143,77 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         }
     }
 
-    stage_a_console_banner();
-    kumo_hal::active::halt()
+    // M3 (opening): run more than one thread of control. A couple of kernel threads
+    // cooperatively yield through the HAL context switch — the first real use of the
+    // task substrate on the boot path. Preemptive, timer-driven scheduling is next.
+    let m3 = kdemo::run();
+    klog!(
+        "M3: cooperative ctx-switch OK; {} kthreads, {} switches, {} work units\n",
+        m3.threads,
+        m3.switches,
+        m3.work
+    );
+
+    if report.has_framebuffer {
+        // Framebuffer console (e.g. the X13s): no kernel keyboard yet, so idle here.
+        // The screen keeps the boot report; a pre-handoff pause lives in the loader.
+        stage_a_console_banner();
+        kumo_hal::active::halt()
+    } else {
+        // Serial console (QEMU PL011): an interactive command shell — KUMO's first
+        // interactive surface, and the ancestor of the userspace shell.
+        let env = shell::ShellEnv {
+            arch: report.arch,
+            abi_version: report.abi_version,
+            usable_frames: mm.usable_frames,
+            usable_bytes: report.usable_bytes,
+            total_bytes: report.total_bytes,
+            heap_kib: mm.heap_bytes >> 10,
+            uptime_ns: 0,
+        };
+        serial_shell(env)
+    }
+}
+
+/// Stage-A serial command shell over the PL011 console: line-edit input, dispatch
+/// each line to the (host-tested) `shell::run_command`, print its output, reprompt.
+fn serial_shell(mut env: shell::ShellEnv) -> ! {
+    use alloc::string::String;
+
+    const MAX_LINE: usize = 256;
+
+    // Snapshot of the task objects the M3 demo created, for the `ps` command.
+    let tasks = kdemo::tasks();
+
+    klog!("\nKUMO Ziwei Stage-A serial shell. Type 'help'.\n");
+    klog!("{}", shell::PROMPT);
+
+    let mut line = String::new();
+    loop {
+        match kumo_hal::active::console_read_byte() {
+            Some(b'\r') | Some(b'\n') => {
+                bootstrap::console::write(b"\r\n");
+                env.uptime_ns = kumo_hal::active::monotonic_nanos();
+                let mut out = bootstrap::console::Writer;
+                shell::run_command(&line, &env, &tasks, &mut out);
+                line.clear();
+                klog!("{}", shell::PROMPT);
+            }
+            Some(0x08) | Some(0x7f) => {
+                if line.pop().is_some() {
+                    bootstrap::console::write(b"\x08 \x08");
+                }
+            }
+            Some(byte @ 0x20..=0x7e) => {
+                if line.len() < MAX_LINE {
+                    line.push(byte as char);
+                    bootstrap::console::write(&[byte]);
+                }
+            }
+            Some(_) => {}
+            None => kumo_hal::active::spin_once(),
+        }
+    }
 }
 
 #[no_mangle]
