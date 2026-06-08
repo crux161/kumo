@@ -1,0 +1,17 @@
+[package]
+name = "niji-uefi"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-abi.workspace = true
+niji-loader = { path = "../niji-loader" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "niji-uefi"
+path = "src/main.rs"

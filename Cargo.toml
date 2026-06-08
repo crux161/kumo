@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "boot/niji-loader",
+    "boot/niji-uefi",
+    "hal/kumo-hal",
+    "hal/kumo-hal-aarch64",
+    "hal/kumo-hal-x86_64",
+    "imager",
+    "kernel",
+    "lib/kumo-abi",
+    "lib/kumo-ipc",
+    "tools/stage-a-smoke",
+    "userland/kumo-rt",
+    "userland/sora",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["KUMO contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+kumo-abi = { path = "lib/kumo-abi" }
+kumo-hal = { path = "hal/kumo-hal", default-features = false }
+kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
+kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }
+kumo-ipc = { path = "lib/kumo-ipc" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"

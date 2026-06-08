@@ -1,0 +1,6 @@
+# M0 pins to the installed local stable toolchain so host checks do not require
+# network access. Switch this to a dated nightly before enabling build-std image
+# builds for the no_std kernel and UEFI artifacts.
+[toolchain]
+channel = "stable"
+profile = "minimal"

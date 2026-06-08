@@ -1,0 +1,15 @@
+[package]
+name = "kumo-stage-a-smoke"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kernel = { path = "../../kernel" }
+kumo-abi.workspace = true
+niji-loader = { path = "../../boot/niji-loader" }
+
+[[bin]]
+name = "kumo-stage-a-smoke"
+path = "src/main.rs"

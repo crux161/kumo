@@ -1,0 +1,13 @@
+[package]
+name = "kumo-rt"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-abi.workspace = true
+kumo-ipc.workspace = true
+
+[lib]
+path = "src/lib.rs"

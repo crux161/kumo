@@ -1,0 +1,14 @@
+[package]
+name = "sora"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-abi.workspace = true
+kumo-ipc.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[lib]
+path = "src/lib.rs"

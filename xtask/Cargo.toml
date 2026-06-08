@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+imager = { path = "../imager" }
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

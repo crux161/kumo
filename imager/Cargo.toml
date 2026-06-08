@@ -1,0 +1,16 @@
+[package]
+name = "imager"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-abi.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kumo-imager"
+path = "src/main.rs"
