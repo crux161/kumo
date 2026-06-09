@@ -4,10 +4,14 @@
 extern crate alloc;
 
 pub mod bootstrap;
+pub mod ipc;
+pub mod ipcdemo;
 pub mod kdemo;
 pub mod mm;
 pub mod object;
+pub mod sched;
 pub mod shell;
+pub mod syscall;
 pub mod task;
 
 use kumo_abi::{BootInfo, ABI_VERSION};
@@ -117,6 +121,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         sum
     );
 
+    // Take ownership of the MMU: build KUMO's own identity page tables and switch off
+    // the firmware's. Everything below now runs under kernel-owned paging — the
+    // foundation for per-process address spaces and EL0/userspace.
+    match unsafe { mm::enable_paging(boot) } {
+        Some(p) => klog!(
+            "PAGING: kernel page tables active; {} MiB identity-mapped, {} tables  OK\n",
+            p.mapped_bytes >> 20,
+            p.tables
+        ),
+        None => klog!("PAGING: skipped (no usable memory map)\n"),
+    }
+
     match kumo_hal::active::init_timer_interrupts(boot.platform.dtb, 20) {
         Ok(timer) => {
             let start = kumo_hal::active::timer_irq_count();
@@ -154,6 +170,62 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         m3.work
     );
 
+    // M3: the scheduler substrate (DESIGN/003). Discipline A — the O(1) strict-priority
+    // class — replaces the old flat round-robin. A deterministic self-test proves the
+    // two-level bitmap selects in strict-priority/FIFO order, the idle floor always has
+    // a thread, and a more-urgent thread preempts a running one.
+    let sc = sched::smoke();
+    if sc.ordered && sc.idle_floor && sc.preemptions == 2 {
+        klog!(
+            "SCHED: O(1) strict-priority (Discipline A); {}-level bitmap, {} picks ordered, idle floor, {} preempts  OK\n",
+            sc.levels,
+            sc.picks,
+            sc.preemptions
+        );
+    } else {
+        klog!(
+            "SCHED: self-test FAILED; ordered={} idle_floor={} preempts={}\n",
+            sc.ordered,
+            sc.idle_floor,
+            sc.preemptions
+        );
+        kumo_hal::active::halt();
+    }
+    match ipc::smoke() {
+        Ok(ipc) => klog!(
+            "P4: IPC channel/call/port OK; {} channel pair, {} port, {} call, {} bytes, {} handles\n",
+            ipc.channels,
+            ipc.ports,
+            ipc.calls,
+            ipc.bytes,
+            ipc.handle_count
+        ),
+        Err(err) => {
+            klog!("P4: IPC smoke failed: {:?}\n", err);
+            kumo_hal::active::halt();
+        }
+    }
+
+    // P4: blocking IPC between two running kernel threads. The consumer parks on an
+    // empty channel and the producer wakes it — real scheduler-integrated block/wake,
+    // driven by the cooperative context switch.
+    let blk = ipcdemo::run();
+    if blk.delivered {
+        klog!(
+            "P4: blocking IPC OK; consumer parked {}x, producer woke it {}x, delivered {} bytes\n",
+            blk.consumer_blocks,
+            blk.wakes,
+            blk.received
+        );
+    } else {
+        klog!(
+            "P4: blocking IPC FAILED; parked {}x woke {}x received {} bytes\n",
+            blk.consumer_blocks,
+            blk.wakes,
+            blk.received
+        );
+    }
+
     if report.has_framebuffer {
         // Framebuffer console (e.g. the X13s): no kernel keyboard yet, so idle here.
         // The screen keeps the boot report; a pre-handoff pause lives in the loader.
@@ -170,6 +242,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             total_bytes: report.total_bytes,
             heap_kib: mm.heap_bytes >> 10,
             uptime_ns: 0,
+            preempt_ticks: 0,
+            preempt_switches: 0,
         };
         serial_shell(env)
     }
@@ -182,8 +256,7 @@ fn serial_shell(mut env: shell::ShellEnv) -> ! {
 
     const MAX_LINE: usize = 256;
 
-    // Snapshot of the task objects the M3 demo created, for the `ps` command.
-    let tasks = kdemo::tasks();
+    kdemo::install_preemption_probe();
 
     klog!("\nKUMO Ziwei Stage-A serial shell. Type 'help'.\n");
     klog!("{}", shell::PROMPT);
@@ -194,6 +267,10 @@ fn serial_shell(mut env: shell::ShellEnv) -> ! {
             Some(b'\r') | Some(b'\n') => {
                 bootstrap::console::write(b"\r\n");
                 env.uptime_ns = kumo_hal::active::monotonic_nanos();
+                let preempt = kdemo::preempt_stats();
+                env.preempt_ticks = preempt.ticks;
+                env.preempt_switches = preempt.switches;
+                let tasks = kdemo::tasks();
                 let mut out = bootstrap::console::Writer;
                 shell::run_command(&line, &env, &tasks, &mut out);
                 line.clear();

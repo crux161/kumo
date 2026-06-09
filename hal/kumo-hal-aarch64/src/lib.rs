@@ -404,6 +404,151 @@ pub fn monotonic_nanos() -> u64 {
     ((timer_ticks() as u128 * 1_000_000_000u128) / freq as u128) as u64
 }
 
+// ---- Kernel-owned MMU (identity map) --------------------------------
+//
+// On hand-off the kernel runs in the firmware's identity page tables. This builds
+// KUMO's own 4 KiB-granule, 48-bit identity map (RAM -> Normal-WB executable, MMIO ->
+// Device, framebuffer -> Normal-NC so the display DMA sees writes) and switches
+// `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1` to it with the MMU staying on. Because the new map
+// is identity, the instruction stream, stack, and page-table memory all keep their
+// addresses across the switch. 2 MiB blocks are enough to separate the framebuffer
+// from kernel RAM (they are megabytes apart). The eventual EL0/user mappings and a
+// reclaiming page-table allocator build on this.
+
+#[cfg(target_os = "none")]
+pub mod mmu {
+    const GB: u64 = 1 << 30;
+    const BLOCK_2M: u64 = 1 << 21;
+
+    // Descriptor bits.
+    const DESC_VALID: u64 = 1 << 0;
+    const DESC_TABLE: u64 = 1 << 1; // table (L0-L2) / page (L3) descriptor
+    const DESC_AF: u64 = 1 << 10; // access flag
+    const SH_INNER: u64 = 3 << 8;
+    const PXN: u64 = 1 << 53;
+    const UXN: u64 = 1 << 54;
+
+    // MAIR attribute indices.
+    const MAIR_WB: u64 = 0; // Normal write-back
+    const MAIR_DEVICE: u64 = 1; // Device-nGnRnE
+    const MAIR_NC: u64 = 2; // Normal non-cacheable
+    const MAIR_VALUE: u64 = 0xff | (0x00 << 8) | (0x44 << 16);
+
+    /// T0SZ for a 48-bit VA space.
+    const T0SZ: u64 = 16;
+
+    fn write_desc(table_phys: u64, index: usize, value: u64) {
+        unsafe { ((table_phys + (index as u64) * 8) as *mut u64).write_volatile(value) };
+    }
+
+    fn block_desc(pa: u64, mair_index: u64, no_execute: bool) -> u64 {
+        let mut desc = pa | DESC_VALID | DESC_AF | (mair_index << 2);
+        if no_execute {
+            desc |= PXN | UXN; // device / framebuffer: not executable, not shareable
+        } else {
+            desc |= SH_INNER; // normal RAM: inner shareable, executable
+        }
+        desc
+    }
+
+    fn parange() -> u64 {
+        let mmfr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nostack, nomem))
+        };
+        // IPS uses the same encoding as PARange; clamp to 48-bit (5) for a 4 KiB map.
+        (mmfr0 & 0xf).min(5)
+    }
+
+    /// Build an identity map of `[0, top)` and switch to it. `is_ram(pa)` reports
+    /// whether the 2 MiB block at `pa` is RAM; `[fb_phys, fb_phys+fb_len)` is mapped
+    /// Normal-NC. `alloc` yields zeroed, 4 KiB-aligned page-table frames. Returns
+    /// `(tables_used, mapped_bytes)`.
+    ///
+    /// # Safety
+    /// Must run at EL1 with the firmware identity map active; `[0, top)` must include
+    /// the executing code, stack, and the frames `alloc` returns.
+    pub unsafe fn enable_identity(
+        top: u64,
+        fb_phys: u64,
+        fb_len: u64,
+        is_ram: &dyn Fn(u64) -> bool,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<(usize, u64), ()> {
+        let l0 = alloc().ok_or(())?;
+        let l1 = alloc().ok_or(())?;
+        let mut tables = 2usize;
+        write_desc(l0, 0, l1 | DESC_VALID | DESC_TABLE);
+
+        let fb_end = fb_phys.saturating_add(fb_len);
+        let gb_count = top.div_ceil(GB);
+        let mut gi = 0u64;
+        while gi < gb_count {
+            let l2 = alloc().ok_or(())?;
+            tables += 1;
+            write_desc(l1, gi as usize, l2 | DESC_VALID | DESC_TABLE);
+
+            let mut bi = 0u64;
+            while bi < 512 {
+                let pa = gi * GB + bi * BLOCK_2M;
+                if pa >= top {
+                    break;
+                }
+                let desc = if fb_len != 0 && pa + BLOCK_2M > fb_phys && pa < fb_end {
+                    block_desc(pa, MAIR_NC, true)
+                } else if is_ram(pa) {
+                    block_desc(pa, MAIR_WB, false)
+                } else {
+                    block_desc(pa, MAIR_DEVICE, true)
+                };
+                write_desc(l2, bi as usize, desc);
+                bi += 1;
+            }
+            gi += 1;
+        }
+
+        let ips = parange();
+        // TG0=4KiB, SH0=inner, IRGN0/ORGN0=WBWA, T0SZ=48-bit, EPD1=1 (no TTBR1 walks).
+        let tcr: u64 =
+            T0SZ | (1 << 8) | (1 << 10) | (3 << 12) | (0 << 14) | (1 << 23) | (ips << 32);
+
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",                 // page-table writes visible to the walker
+                "msr mair_el1, {mair}",
+                "msr tcr_el1, {tcr}",
+                "msr ttbr0_el1, {ttbr}",
+                "isb",
+                "tlbi vmalle1",            // drop stale firmware TLB entries
+                "dsb ish",
+                "isb",
+                mair = in(reg) MAIR_VALUE,
+                tcr = in(reg) tcr,
+                ttbr = in(reg) l0,
+                options(nostack, preserves_flags),
+            );
+        }
+
+        Ok((tables, gb_count * GB))
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use mmu::enable_identity as enable_identity_mmu;
+
+/// Host stub: the freestanding kernel installs real page tables; on the host there is
+/// nothing to do.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn enable_identity_mmu(
+    _top: u64,
+    _fb_phys: u64,
+    _fb_len: u64,
+    _is_ram: &dyn Fn(u64) -> bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(usize, u64), ()> {
+    Ok((0, 0))
+}
+
 // ---- GICv3 + ARM virtual timer IRQs ---------------------------------
 
 const TIMER_VIRTUAL_PPI: u32 = 27;
@@ -890,6 +1035,7 @@ unsafe fn eoi(intid: u32) {
 }
 
 #[cfg(not(target_os = "none"))]
+#[allow(dead_code)]
 unsafe fn eoi(_intid: u32) {}
 
 #[cfg(target_os = "none")]

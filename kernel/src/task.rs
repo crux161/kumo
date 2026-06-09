@@ -183,113 +183,29 @@ impl Thread {
         }
     }
 
+    pub fn ready(&mut self) {
+        if !matches!(self.state, ThreadState::Terminated) {
+            self.state = ThreadState::Ready;
+        }
+    }
+
+    pub fn run(&mut self) {
+        if !matches!(self.state, ThreadState::Terminated) {
+            self.state = ThreadState::Running;
+        }
+    }
+
     pub fn terminate(&mut self) {
         self.state = ThreadState::Terminated;
         self.object.signal(Signals::TERMINATED);
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Scheduler {
-    current: Option<KoId>,
-    run_queue: Vec<KoId>,
-    quantum_ticks: u32,
-    ticks_in_quantum: u32,
-}
-
-impl Scheduler {
-    pub const fn new() -> Self {
-        Self {
-            current: None,
-            run_queue: Vec::new(),
-            quantum_ticks: 1,
-            ticks_in_quantum: 0,
-        }
-    }
-
-    pub const fn with_quantum(quantum_ticks: u32) -> Self {
-        Self {
-            current: None,
-            run_queue: Vec::new(),
-            quantum_ticks: if quantum_ticks == 0 { 1 } else { quantum_ticks },
-            ticks_in_quantum: 0,
-        }
-    }
-
-    pub fn enqueue(&mut self, thread: &mut Thread) {
-        if matches!(thread.state, ThreadState::Terminated) {
-            return;
-        }
-        thread.state = ThreadState::Ready;
-        let koid = thread.koid();
-        if !self.run_queue.iter().any(|queued| *queued == koid) {
-            self.run_queue.push(koid);
-        }
-    }
-
-    pub fn pick_next(&mut self) -> Option<KoId> {
-        if self.run_queue.is_empty() {
-            None
-        } else {
-            Some(self.run_queue.remove(0))
-        }
-    }
-
-    pub fn set_running(&mut self, thread: &mut Thread) {
-        thread.state = ThreadState::Running;
-        self.current = Some(thread.koid());
-        self.ticks_in_quantum = 0;
-    }
-
-    pub fn on_timer_tick(&mut self) -> ScheduleDecision {
-        self.ticks_in_quantum = self.ticks_in_quantum.saturating_add(1);
-        let Some(current) = self.current else {
-            return match self.pick_next() {
-                Some(next) => {
-                    self.current = Some(next);
-                    self.ticks_in_quantum = 0;
-                    ScheduleDecision::Switch {
-                        from: None,
-                        to: next,
-                    }
-                }
-                None => ScheduleDecision::Idle,
-            };
-        };
-
-        if self.ticks_in_quantum < self.quantum_ticks {
-            return ScheduleDecision::Continue(current);
-        }
-
-        self.ticks_in_quantum = 0;
-        match self.pick_next() {
-            Some(next) => {
-                self.run_queue.push(current);
-                self.current = Some(next);
-                ScheduleDecision::Switch {
-                    from: Some(current),
-                    to: next,
-                }
-            }
-            None => ScheduleDecision::Continue(current),
-        }
-    }
-
-    pub fn current(&self) -> Option<KoId> {
-        self.current
-    }
-
-    pub fn queued_count(&self) -> usize {
-        self.run_queue.len()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScheduleDecision {
-    Idle,
-    Continue(KoId),
-    Switch { from: Option<KoId>, to: KoId },
-}
+// The run-queue / scheduling policy used to live here as a flat round-robin
+// `Scheduler`. It has been replaced by the modular, strict-priority scheduler in
+// `crate::sched` (Discipline A — the O(1) bitmap; `DESIGN/003`). `task` now owns only
+// the schedulable objects (Job / Process / Thread / KernelStack); the dispatcher owns
+// the policy.
 
 fn align_up_usize(value: usize, align: usize) -> Option<usize> {
     let mask = align.checked_sub(1)?;
@@ -360,40 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_is_fifo_and_does_not_duplicate_ready_threads() {
-        let mut objects = ObjectManager::new();
-        let root = Job::root(&mut objects);
-        let process = Process::new(&mut objects, &root, test_vmar());
-        let mut a = Thread::new(
-            &mut objects,
-            &process,
-            test_entry_addr(),
-            1,
-            DEFAULT_KERNEL_STACK_SIZE,
-        )
-        .unwrap();
-        let mut b = Thread::new(
-            &mut objects,
-            &process,
-            test_entry_addr(),
-            2,
-            DEFAULT_KERNEL_STACK_SIZE,
-        )
-        .unwrap();
-        let mut scheduler = Scheduler::new();
-
-        scheduler.enqueue(&mut a);
-        scheduler.enqueue(&mut a);
-        scheduler.enqueue(&mut b);
-
-        assert_eq!(scheduler.queued_count(), 2);
-        assert_eq!(scheduler.pick_next(), Some(a.koid()));
-        assert_eq!(scheduler.pick_next(), Some(b.koid()));
-        assert_eq!(scheduler.pick_next(), None);
-    }
-
-    #[test]
-    fn terminated_threads_signal_and_stay_off_the_run_queue() {
+    fn terminated_threads_signal_and_drop_off_runnable() {
         let mut objects = ObjectManager::new();
         let root = Job::root(&mut objects);
         let process = Process::new(&mut objects, &root, test_vmar());
@@ -405,14 +288,11 @@ mod tests {
             DEFAULT_KERNEL_STACK_SIZE,
         )
         .unwrap();
-        let mut scheduler = Scheduler::new();
 
         thread.terminate();
-        scheduler.enqueue(&mut thread);
 
         assert_eq!(thread.state(), ThreadState::Terminated);
         assert!(thread.signals().contains(Signals::TERMINATED));
-        assert_eq!(scheduler.queued_count(), 0);
     }
 
     #[test]
@@ -422,46 +302,5 @@ mod tests {
             KernelStack::new(PAGE_SIZE as usize - 1),
             Err(TaskError::StackTooSmall)
         );
-    }
-
-    #[test]
-    fn timer_tick_decisions_rotate_on_quantum() {
-        let mut objects = ObjectManager::new();
-        let root = Job::root(&mut objects);
-        let process = Process::new(&mut objects, &root, test_vmar());
-        let mut a = Thread::new(
-            &mut objects,
-            &process,
-            test_entry_addr(),
-            1,
-            DEFAULT_KERNEL_STACK_SIZE,
-        )
-        .unwrap();
-        let mut b = Thread::new(
-            &mut objects,
-            &process,
-            test_entry_addr(),
-            2,
-            DEFAULT_KERNEL_STACK_SIZE,
-        )
-        .unwrap();
-        let mut scheduler = Scheduler::with_quantum(2);
-
-        scheduler.set_running(&mut a);
-        scheduler.enqueue(&mut b);
-
-        assert_eq!(
-            scheduler.on_timer_tick(),
-            ScheduleDecision::Continue(a.koid())
-        );
-        assert_eq!(
-            scheduler.on_timer_tick(),
-            ScheduleDecision::Switch {
-                from: Some(a.koid()),
-                to: b.koid()
-            }
-        );
-        assert_eq!(scheduler.current(), Some(b.koid()));
-        assert_eq!(scheduler.queued_count(), 1);
     }
 }

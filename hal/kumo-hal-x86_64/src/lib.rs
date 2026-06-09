@@ -46,6 +46,18 @@ pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadCont
     // x86_64 context switching lands with the x86 backend parity milestone.
 }
 
+/// Host/x86_64 stub: kernel-owned paging on x86_64 lands with the x86_64 metal
+/// milestone. The shared kernel can call this unconditionally.
+pub unsafe fn enable_identity_mmu(
+    _top: u64,
+    _fb_phys: u64,
+    _fb_len: u64,
+    _is_ram: &dyn Fn(u64) -> bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(usize, u64), ()> {
+    Ok((0, 0))
+}
+
 pub fn monotonic_nanos() -> u64 {
     // The x86_64 monotonic clock (TSC/HPET) lands with the x86_64 metal milestone.
     0
@@ -70,6 +82,15 @@ pub fn set_framebuffer(_base: u64, _len_bytes: u64, _width: u32, _height: u32, _
 pub fn install_exception_vectors() {
     // The x86_64 IDT (and its fault handlers) land with the x86_64 metal milestone.
     // Stubbed so the shared kernel can call it unconditionally.
+}
+
+pub fn set_preempt_hook(_hook: extern "C" fn()) {
+    // Timer-driven preemption is wired on the arm64 spine first. The x86_64 backend
+    // keeps this API symmetric for shared-kernel tests and the later parity milestone.
+}
+
+pub fn clear_preempt_hook() {
+    // See `set_preempt_hook`.
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

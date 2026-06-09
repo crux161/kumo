@@ -20,6 +20,8 @@ pub struct ShellEnv {
     pub total_bytes: u64,
     pub heap_kib: u64,
     pub uptime_ns: u64,
+    pub preempt_ticks: u64,
+    pub preempt_switches: u64,
 }
 
 /// One row of the `ps` table — a kernel object from the task substrate.
@@ -38,6 +40,7 @@ const HELP: &str = "commands:\r\n\
      ver             kernel identity\r\n\
      mem             memory accounting\r\n\
      ps              task/thread table\r\n\
+     ticks           timer scheduler ticks\r\n\
      uptime          time since boot\r\n\
      echo <text>     print text\r\n\
      clear           clear the screen\r\n";
@@ -82,6 +85,13 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
                 );
             }
         }
+        "ticks" => {
+            let _ = write!(
+                out,
+                "timer scheduler ticks={} switches={}\r\n",
+                env.preempt_ticks, env.preempt_switches
+            );
+        }
         "uptime" => {
             let secs = env.uptime_ns / 1_000_000_000;
             let millis = (env.uptime_ns % 1_000_000_000) / 1_000_000;
@@ -115,6 +125,8 @@ mod tests {
             total_bytes: 128 << 20,
             heap_kib: 1024,
             uptime_ns: 1_234_000_000,
+            preempt_ticks: 7,
+            preempt_switches: 3,
         }
     }
 
@@ -142,7 +154,9 @@ mod tests {
     #[test]
     fn help_lists_builtins() {
         let out = run("help");
-        for cmd in ["help", "ver", "mem", "ps", "uptime", "echo", "clear"] {
+        for cmd in [
+            "help", "ver", "mem", "ps", "ticks", "uptime", "echo", "clear",
+        ] {
             assert!(out.contains(cmd), "help missing '{cmd}'");
         }
     }
@@ -176,6 +190,13 @@ mod tests {
     #[test]
     fn uptime_formats_seconds_and_millis() {
         assert!(run("uptime").contains("1.234 s"));
+    }
+
+    #[test]
+    fn ticks_reports_scheduler_tick_counters() {
+        let out = run("ticks");
+        assert!(out.contains("ticks=7"));
+        assert!(out.contains("switches=3"));
     }
 
     #[test]

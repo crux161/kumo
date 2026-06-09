@@ -121,17 +121,21 @@ impl HandleTable {
     }
 
     pub fn close(&mut self, handle: Handle) -> Result<(), ObjectError> {
+        self.remove(handle).map(|_| ())
+    }
+
+    pub fn remove(&mut self, handle: Handle) -> Result<HandleEntry, ObjectError> {
         let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
         let slot = self.entries.get_mut(index).ok_or(ObjectError::BadHandle)?;
-        if slot.is_none() {
-            return Err(ObjectError::BadHandle);
-        }
-        *slot = None;
-        Ok(())
+        slot.take().ok_or(ObjectError::BadHandle)
     }
 
     pub fn live_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    pub fn insert_entry(&mut self, entry: HandleEntry) -> Result<Handle, ObjectError> {
+        self.insert_parts(entry.koid, entry.kind, entry.rights)
     }
 
     fn insert_parts(
@@ -240,6 +244,23 @@ mod tests {
         assert_eq!(handles.live_count(), 0);
         assert_eq!(handles.get(handle), Err(ObjectError::BadHandle));
         assert_eq!(handles.close(handle), Err(ObjectError::BadHandle));
+    }
+
+    #[test]
+    fn remove_returns_the_handle_entry_for_transfer() {
+        let mut objects = ObjectManager::new();
+        let channel = objects.create(ObjectKind::Channel);
+        let mut handles = HandleTable::new();
+        let handle = handles
+            .insert(channel, Rights::READ | Rights::TRANSFER)
+            .unwrap();
+
+        let entry = handles.remove(handle).unwrap();
+
+        assert_eq!(entry.koid, channel.koid());
+        assert_eq!(entry.kind, ObjectKind::Channel);
+        assert_eq!(entry.rights, Rights::READ | Rights::TRANSFER);
+        assert_eq!(handles.get(handle), Err(ObjectError::BadHandle));
     }
 
     #[test]

@@ -4,6 +4,82 @@ use kumo_hal::PageFlags;
 pub mod heap;
 
 pub const PAGE_SIZE: u64 = 4096;
+const BLOCK_2M: u64 = 1 << 21;
+const GIB: u64 = 1 << 30;
+
+/// What kernel paging brought up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PagingReport {
+    pub tables: usize,
+    pub mapped_bytes: u64,
+}
+
+fn is_ram_kind(kind: MemRegionKind) -> bool {
+    matches!(
+        kind,
+        MemRegionKind::Usable
+            | MemRegionKind::Bootloader
+            | MemRegionKind::Kernel
+            | MemRegionKind::Initrd
+            | MemRegionKind::Acpi
+    )
+}
+
+/// Build kernel-owned identity page tables and switch to them. RAM becomes
+/// Normal-WB (executable), unlisted/MMIO ranges become Device, and the framebuffer
+/// becomes Normal-NC so the display controller sees writes. The switch is transparent
+/// because the new map is identity (same addresses as the firmware map).
+///
+/// # Safety
+///
+/// Must run once at EL1 while the firmware identity map is active, before anything
+/// depends on a particular page table. `boot.mem_regions` must be the validated
+/// handoff slice and remain readable for the call.
+pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
+    let regions = unsafe { boot.mem_regions.as_slice() };
+    if regions.is_empty() {
+        return None;
+    }
+
+    let mut top = 0u64;
+    for region in regions {
+        top = top.max(region.range.end());
+    }
+    let (fb_phys, fb_len) = if boot.has_framebuffer() {
+        (boot.framebuffer.phys, boot.framebuffer.len)
+    } else {
+        (0, 0)
+    };
+    top = top.max(fb_phys.saturating_add(fb_len));
+    top = top.div_ceil(GIB).saturating_mul(GIB);
+    if top == 0 {
+        return None;
+    }
+
+    // Page-table frames come from usable RAM (which we then map Normal-WB). The boot
+    // frame allocator already excludes the kernel, initrd, and framebuffer.
+    let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
+    let mut frames = plan.frame_allocator();
+    let mut alloc = || -> Option<u64> {
+        let frame = frames.next_frame()?.start;
+        // SAFETY: usable RAM, identity-mapped now; zero it for a clean table.
+        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
+        Some(frame)
+    };
+    let is_ram = |pa: u64| {
+        regions.iter().any(|region| {
+            is_ram_kind(region.kind) && overlaps(pa, BLOCK_2M, region.range.start, region.range.len)
+        })
+    };
+
+    let (tables, mapped_bytes) =
+        unsafe { kumo_hal::active::enable_identity_mmu(top, fb_phys, fb_len, &is_ram, &mut alloc) }
+            .ok()?;
+    Some(PagingReport {
+        tables,
+        mapped_bytes,
+    })
+}
 
 /// What M1 memory bring-up found and proved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

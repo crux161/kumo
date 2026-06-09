@@ -7,10 +7,12 @@
 //! `kumo_context_switch` / trampoline path actually saves and restores kernel
 //! thread state on real silicon.
 //!
-//! Deliberately *cooperative*: preemptive, timer-driven scheduling (wiring
-//! `task::Scheduler::on_timer_tick` into the IRQ path) is the next slice. The switch
-//! itself only exists on the freestanding target; the scheduler *policy* is
-//! host-tested separately in `task::tests`.
+//! Deliberately *cooperative* for the `kthread_body` threads. The preemption probe
+//! below drives the real `sched::Dispatcher` (Discipline A, the O(1) strict-priority
+//! class) from the timer IRQ and rotates thread *state* in interrupt context; the
+//! remaining step — switching thread *bodies* from the IRQ (real preemptive
+//! multitasking) — is the next slice. The switch itself only exists on the
+//! freestanding target; the scheduler *policy* is host-tested in `sched::tests`.
 //!
 //! Soundness note: the demo state lives in a `static` and is reached reentrantly
 //! (the scheduler loop and a running thread's `kyield` both touch it). To stay
@@ -25,6 +27,7 @@ use kumo_hal::active::{switch_context, ThreadContext};
 
 use crate::mm::{Vmar, PAGE_SIZE};
 use crate::object::ObjectManager;
+use crate::sched::{ClassId, Decision, Dispatcher, Priority};
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const KTHREADS: usize = 2;
@@ -37,11 +40,19 @@ struct Demo {
     /// A thread that is created but never scheduled — the future idle thread. Kept so
     /// `ps` can show a task in a state other than `terminated`.
     idle: Thread,
+    /// Timer-driven scheduler smoke threads. These are deliberately not entered yet:
+    /// the hook proves IRQ -> scheduler wiring and strict-priority state rotation,
+    /// while full interrupt-context execution waits for the next slice.
+    preempt_threads: Vec<Thread>,
+    preempt_scheduler: Dispatcher,
     job_koid: u64,
     process_koid: u64,
     current: usize,
     switches: u64,
     work: u64,
+    preempt_ticks: u64,
+    preempt_switches: u64,
+    preempt_hook_installed: bool,
 }
 
 struct DemoCell(UnsafeCell<Option<Demo>>);
@@ -113,6 +124,12 @@ pub struct DemoReport {
     pub work: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreemptStats {
+    pub ticks: u64,
+    pub switches: u64,
+}
+
 fn state_str(state: ThreadState) -> &'static str {
     match state {
         ThreadState::New => "new",
@@ -127,6 +144,14 @@ fn state_str(state: ThreadState) -> &'static str {
 /// Must be called after `run`.
 pub fn tasks() -> Vec<crate::shell::TaskInfo> {
     use crate::shell::TaskInfo;
+    let hook_installed = {
+        let p = demo_ptr();
+        unsafe { (&*p).preempt_hook_installed }
+    };
+    if hook_installed {
+        kumo_hal::active::clear_preempt_hook();
+    }
+
     let p = demo_ptr();
     // SAFETY: read-only snapshot, after `run`, single-core.
     let d = unsafe { &*p };
@@ -158,7 +183,93 @@ pub fn tasks() -> Vec<crate::shell::TaskInfo> {
         state: state_str(d.idle.state()),
         label: "idle",
     });
+    let labels = ["preempt-a", "preempt-b"];
+    for (i, thread) in d.preempt_threads.iter().enumerate() {
+        out.push(TaskInfo {
+            koid: thread.koid().0,
+            kind: "thread",
+            state: state_str(thread.state()),
+            label: labels.get(i).copied().unwrap_or("preempt"),
+        });
+    }
+
+    if hook_installed {
+        kumo_hal::active::set_preempt_hook(preempt_tick);
+    }
     out
+}
+
+pub fn preempt_stats() -> PreemptStats {
+    let hook_installed = {
+        let p = demo_ptr();
+        unsafe { (&*p).preempt_hook_installed }
+    };
+    if hook_installed {
+        kumo_hal::active::clear_preempt_hook();
+    }
+
+    let p = demo_ptr();
+    let stats = unsafe {
+        let d = &*p;
+        PreemptStats {
+            ticks: d.preempt_ticks,
+            switches: d.preempt_switches,
+        }
+    };
+
+    if hook_installed {
+        kumo_hal::active::set_preempt_hook(preempt_tick);
+    }
+    stats
+}
+
+pub fn install_preemption_probe() {
+    let p = demo_ptr();
+    let should_install = unsafe {
+        let d = &mut *p;
+        if d.preempt_hook_installed {
+            false
+        } else {
+            d.preempt_hook_installed = true;
+            true
+        }
+    };
+    if should_install {
+        kumo_hal::active::set_preempt_hook(preempt_tick);
+    }
+}
+
+extern "C" fn preempt_tick() {
+    let p = demo_ptr();
+    unsafe {
+        let d = &mut *p;
+        d.preempt_ticks = d.preempt_ticks.saturating_add(1);
+        match d.preempt_scheduler.on_timer_tick() {
+            Decision::Idle | Decision::Continue(_) => {}
+            Decision::Switch { from, to } => {
+                d.preempt_switches = d.preempt_switches.saturating_add(1);
+                if let Some(from) = from {
+                    set_thread_state(&mut d.preempt_threads, from, ThreadState::Ready);
+                }
+                set_thread_state(&mut d.preempt_threads, to, ThreadState::Running);
+            }
+        }
+    }
+}
+
+fn set_thread_state(threads: &mut [Thread], koid: kumo_abi::KoId, state: ThreadState) {
+    for thread in threads {
+        if thread.koid() == koid {
+            match state {
+                ThreadState::Ready => thread.ready(),
+                ThreadState::Running => thread.run(),
+                ThreadState::Blocked => thread.block(),
+                ThreadState::Terminated => thread.terminate(),
+                ThreadState::New => {}
+            }
+            break;
+        }
+    }
 }
 
 /// Run the cooperative kernel-thread demo and report what happened.
@@ -187,6 +298,27 @@ pub fn run() -> DemoReport {
         DEFAULT_KERNEL_STACK_SIZE,
     )
     .expect("idle thread");
+    let mut preempt_threads = Vec::new();
+    let mut i = 0;
+    while i < KTHREADS {
+        let thread = Thread::new(
+            &mut objects,
+            &process,
+            entry,
+            0x100 + i,
+            DEFAULT_KERNEL_STACK_SIZE,
+        )
+        .expect("preempt thread");
+        preempt_threads.push(thread);
+        i += 1;
+    }
+    // Two equal-priority RT threads: with a 1-tick quantum they round-robin every
+    // timer tick under Discipline A (the O(1) strict-priority class).
+    preempt_threads[0].run();
+    preempt_threads[1].ready();
+    let mut preempt_scheduler = Dispatcher::new(1);
+    preempt_scheduler.set_running(preempt_threads[0].koid(), Priority::DEFAULT, ClassId::Rt);
+    preempt_scheduler.admit(preempt_threads[1].koid(), Priority::DEFAULT);
 
     // SAFETY: first writer; nothing else touches DEMO yet.
     unsafe {
@@ -194,11 +326,16 @@ pub fn run() -> DemoReport {
             main_ctx: ThreadContext::default(),
             threads,
             idle,
+            preempt_threads,
+            preempt_scheduler,
             job_koid: job.koid().0,
             process_koid: process.koid().0,
             current: 0,
             switches: 0,
             work: 0,
+            preempt_ticks: 0,
+            preempt_switches: 0,
+            preempt_hook_installed: false,
         });
     }
 
