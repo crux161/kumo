@@ -17,8 +17,9 @@
 //! urgent thread never preempts a running one.
 //!
 //! Donation (sched-2) and SMP `rebalance` (later) are SFI seams kept as no-ops here.
-//! This module is arch-neutral and fully host-tested; the IRQ-context body switch
-//! that makes preemption *real* is the next slice.
+//! This module is arch-neutral and fully host-tested. The freestanding arm64 path
+//! drives it from the timer IRQ, while cooperative demos and future syscalls enter
+//! through the same block / wake / yield / finish scheduling points.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -297,6 +298,20 @@ impl Dispatcher {
         self.rt.enqueue(t, prio);
     }
 
+    /// Remove a ready RT thread from its run queue. Used when a waiter is cancelled,
+    /// killed, or consumed by a bounded demo before it is picked again.
+    pub fn remove_ready_rt(&mut self, t: ThreadId, prio: Priority) -> bool {
+        self.rt.dequeue(t, prio)
+    }
+
+    /// Wake a blocked/new thread into the RT class and immediately reevaluate the
+    /// local CPU. A more-urgent wake preempts now; an equal/less-urgent wake waits
+    /// for a timer tick or explicit yield.
+    pub fn wake_rt(&mut self, t: ThreadId, prio: Priority) -> Decision {
+        self.rt.enqueue(t, prio);
+        self.reschedule_current()
+    }
+
     /// Mark a thread as the one currently on-CPU (e.g. the bootstrap thread), without
     /// going through a pick. Resets its quantum.
     pub fn set_running(&mut self, t: ThreadId, prio: Priority, class: ClassId) {
@@ -341,7 +356,57 @@ impl Dispatcher {
         Decision::Continue(cur.id)
     }
 
+    /// Reevaluate the current CPU without charging a timer tick. This is the
+    /// non-interrupt path used after wakeups and explicit reschedule requests.
+    pub fn reschedule_current(&mut self) -> Decision {
+        let Some(cur) = self.current else {
+            return self.dispatch_fresh();
+        };
+
+        if let Some(top) = self.rt.peek_top() {
+            if cur.class == ClassId::Idle || top < cur.prio {
+                return self.preempt_to_rt(cur);
+            }
+        }
+
+        Decision::Continue(cur.id)
+    }
+
+    /// Voluntarily give up the CPU. RT threads go to the tail of their priority FIFO
+    /// and the dispatcher selects the next eligible thread. Idle only yields if real
+    /// work is ready.
+    pub fn yield_current(&mut self) -> Decision {
+        let Some(cur) = self.current else {
+            return self.dispatch_fresh();
+        };
+
+        match cur.class {
+            ClassId::Rt => {
+                self.rt.enqueue(cur.id, cur.prio);
+                self.dispatch_after_removed(Some(cur.id))
+            }
+            ClassId::Idle => self.reschedule_current(),
+        }
+    }
+
+    /// The current thread blocked. It is no longer runnable and must not be
+    /// reinserted; choose a replacement, falling back to idle.
+    pub fn block_current(&mut self) -> Decision {
+        let from = self.current.take().map(|cur| cur.id);
+        self.ticks = 0;
+        self.dispatch_after_removed(from)
+    }
+
+    /// The current thread exited or otherwise left the scheduler forever.
+    pub fn finish_current(&mut self) -> Decision {
+        self.block_current()
+    }
+
     fn dispatch_fresh(&mut self) -> Decision {
+        self.dispatch_after_removed(None)
+    }
+
+    fn dispatch_after_removed(&mut self, from: Option<ThreadId>) -> Decision {
         if let Some(prio) = self.rt.peek_top() {
             let to = self.rt.pick_next().expect("rt non-empty");
             self.current = Some(Running {
@@ -350,7 +415,10 @@ impl Dispatcher {
                 class: ClassId::Rt,
             });
             self.ticks = 0;
-            return Decision::Switch { from: None, to };
+            if from == Some(to) {
+                return Decision::Continue(to);
+            }
+            return Decision::Switch { from, to };
         }
         if let Some(idle) = self.idle.pick_next() {
             self.current = Some(Running {
@@ -359,10 +427,10 @@ impl Dispatcher {
                 class: ClassId::Idle,
             });
             self.ticks = 0;
-            return Decision::Switch {
-                from: None,
-                to: idle,
-            };
+            if from == Some(idle) {
+                return Decision::Continue(idle);
+            }
+            return Decision::Switch { from, to: idle };
         }
         Decision::Idle
     }
@@ -609,6 +677,75 @@ mod tests {
             Decision::Switch {
                 from: Some(KoId(1)),
                 to: KoId(2)
+            }
+        );
+    }
+
+    #[test]
+    fn wake_more_urgent_thread_preempts_without_waiting_for_tick() {
+        let mut d = Dispatcher::new(10);
+        d.set_running(KoId(1), Priority(80), ClassId::Rt);
+        assert_eq!(
+            d.wake_rt(KoId(2), Priority(10)),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+        assert_eq!(d.current(), Some(KoId(2)));
+    }
+
+    #[test]
+    fn equal_priority_wake_waits_for_tick_or_yield() {
+        let mut d = Dispatcher::new(10);
+        d.set_running(KoId(1), Priority(50), ClassId::Rt);
+        assert_eq!(
+            d.wake_rt(KoId(2), Priority(50)),
+            Decision::Continue(KoId(1))
+        );
+        assert_eq!(
+            d.yield_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+    }
+
+    #[test]
+    fn block_current_selects_next_or_idle_floor() {
+        let mut d = Dispatcher::new(1);
+        d.set_idle(KoId(99));
+        d.set_running(KoId(1), Priority::DEFAULT, ClassId::Rt);
+        d.admit(KoId(2), Priority::DEFAULT);
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+        assert_eq!(
+            d.finish_current(),
+            Decision::Switch {
+                from: Some(KoId(2)),
+                to: KoId(99)
+            }
+        );
+    }
+
+    #[test]
+    fn removing_ready_thread_keeps_it_from_being_picked() {
+        let mut d = Dispatcher::new(1);
+        d.set_idle(KoId(99));
+        d.set_running(KoId(1), Priority::DEFAULT, ClassId::Rt);
+        d.admit(KoId(2), Priority::DEFAULT);
+        assert!(d.remove_ready_rt(KoId(2), Priority::DEFAULT));
+        assert_eq!(
+            d.finish_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(99)
             }
         );
     }

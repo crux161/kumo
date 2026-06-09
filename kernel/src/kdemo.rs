@@ -9,10 +9,9 @@
 //!
 //! Deliberately *cooperative* for the `kthread_body` threads. The preemption probe
 //! below drives the real `sched::Dispatcher` (Discipline A, the O(1) strict-priority
-//! class) from the timer IRQ and rotates thread *state* in interrupt context; the
-//! remaining step — switching thread *bodies* from the IRQ (real preemptive
-//! multitasking) — is the next slice. The switch itself only exists on the
-//! freestanding target; the scheduler *policy* is host-tested in `sched::tests`.
+//! class) from the timer IRQ and switches actual thread bodies in interrupt context.
+//! The switch itself only exists on the freestanding target; the scheduler *policy*
+//! is host-tested in `sched::tests`.
 //!
 //! Soundness note: the demo state lives in a `static` and is reached reentrantly
 //! (the scheduler loop and a running thread's `kyield` both touch it). To stay
@@ -32,6 +31,7 @@ use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const KTHREADS: usize = 2;
 const YIELDS_PER_THREAD: u32 = 3;
+const PREEMPT_MIN_SWITCHES: u64 = 4;
 
 struct Demo {
     /// The scheduler-loop context we return to whenever a thread yields or exits.
@@ -40,11 +40,13 @@ struct Demo {
     /// A thread that is created but never scheduled — the future idle thread. Kept so
     /// `ps` can show a task in a state other than `terminated`.
     idle: Thread,
-    /// Timer-driven scheduler smoke threads. These are deliberately not entered yet:
-    /// the hook proves IRQ -> scheduler wiring and strict-priority state rotation,
-    /// while full interrupt-context execution waits for the next slice.
+    /// Timer-driven scheduler smoke threads. They never call `kyield`; the timer IRQ
+    /// alone moves execution between their bodies.
     preempt_threads: Vec<Thread>,
+    /// The per-CPU scheduler front. Its idle thread is `idle`, whose saved context is
+    /// the Stage-A bootstrap execution context while this bounded demo is active.
     preempt_scheduler: Dispatcher,
+    preempt_work: [u64; KTHREADS],
     job_koid: u64,
     process_koid: u64,
     current: usize,
@@ -53,6 +55,7 @@ struct Demo {
     preempt_ticks: u64,
     preempt_switches: u64,
     preempt_hook_installed: bool,
+    preempt_done: bool,
 }
 
 struct DemoCell(UnsafeCell<Option<Demo>>);
@@ -124,10 +127,49 @@ pub struct DemoReport {
     pub work: u64,
 }
 
+pub struct PreemptReport {
+    pub threads: usize,
+    pub ticks: u64,
+    pub switches: u64,
+    pub work: [u64; KTHREADS],
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PreemptStats {
     pub ticks: u64,
     pub switches: u64,
+}
+
+extern "C" fn preempt_thread_body(arg: usize) {
+    let idx = arg;
+    loop {
+        let should_install_hook = {
+            let p = demo_ptr();
+            unsafe {
+                let d = &mut *p;
+                if d.preempt_hook_installed {
+                    false
+                } else {
+                    d.preempt_hook_installed = true;
+                    true
+                }
+            }
+        };
+        if should_install_hook {
+            kumo_hal::active::set_preempt_hook(preempt_tick);
+        }
+
+        {
+            let p = demo_ptr();
+            unsafe {
+                let d = &mut *p;
+                if idx < KTHREADS {
+                    d.preempt_work[idx] = d.preempt_work[idx].saturating_add(1);
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
 }
 
 fn state_str(state: ThreadState) -> &'static str {
@@ -227,7 +269,7 @@ pub fn install_preemption_probe() {
     let p = demo_ptr();
     let should_install = unsafe {
         let d = &mut *p;
-        if d.preempt_hook_installed {
+        if d.preempt_hook_installed || d.preempt_done {
             false
         } else {
             d.preempt_hook_installed = true;
@@ -241,33 +283,151 @@ pub fn install_preemption_probe() {
 
 extern "C" fn preempt_tick() {
     let p = demo_ptr();
-    unsafe {
+    let switch = unsafe {
         let d = &mut *p;
-        d.preempt_ticks = d.preempt_ticks.saturating_add(1);
-        match d.preempt_scheduler.on_timer_tick() {
-            Decision::Idle | Decision::Continue(_) => {}
-            Decision::Switch { from, to } => {
-                d.preempt_switches = d.preempt_switches.saturating_add(1);
-                if let Some(from) = from {
-                    set_thread_state(&mut d.preempt_threads, from, ThreadState::Ready);
+        if d.preempt_done {
+            None
+        } else {
+            d.preempt_ticks = d.preempt_ticks.saturating_add(1);
+            if d.preempt_switches >= PREEMPT_MIN_SWITCHES
+                && d.preempt_work.iter().all(|&work| work > 0)
+            {
+                kumo_hal::active::clear_preempt_hook();
+                d.preempt_hook_installed = false;
+                d.preempt_done = true;
+                let current = d.preempt_scheduler.current();
+                for thread in &mut d.preempt_threads {
+                    if Some(thread.koid()) != current {
+                        let _ = d
+                            .preempt_scheduler
+                            .remove_ready_rt(thread.koid(), Priority::DEFAULT);
+                    }
+                    thread.terminate();
                 }
-                set_thread_state(&mut d.preempt_threads, to, ThreadState::Running);
+                d.idle.run();
+                let decision = d.preempt_scheduler.finish_current();
+                preempt_switch_for_decision(d, decision, false)
+            } else {
+                let decision = d.preempt_scheduler.on_timer_tick();
+                preempt_switch_for_decision(d, decision, true)
             }
         }
+    };
+
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
     }
 }
 
-fn set_thread_state(threads: &mut [Thread], koid: kumo_abi::KoId, state: ThreadState) {
-    for thread in threads {
-        if thread.koid() == koid {
-            match state {
-                ThreadState::Ready => thread.ready(),
-                ThreadState::Running => thread.run(),
-                ThreadState::Blocked => thread.block(),
-                ThreadState::Terminated => thread.terminate(),
-                ThreadState::New => {}
-            }
-            break;
+#[derive(Clone, Copy)]
+enum PreemptSlot {
+    Idle,
+    Thread(usize),
+}
+
+fn preempt_slot(d: &Demo, koid: kumo_abi::KoId) -> Option<PreemptSlot> {
+    if d.idle.koid() == koid {
+        return Some(PreemptSlot::Idle);
+    }
+    d.preempt_threads
+        .iter()
+        .position(|thread| thread.koid() == koid)
+        .map(PreemptSlot::Thread)
+}
+
+fn set_preempt_slot_state(d: &mut Demo, slot: PreemptSlot, state: ThreadState) {
+    let thread = match slot {
+        PreemptSlot::Idle => &mut d.idle,
+        PreemptSlot::Thread(i) => &mut d.preempt_threads[i],
+    };
+    match state {
+        ThreadState::Ready => thread.ready(),
+        ThreadState::Running => thread.run(),
+        ThreadState::Blocked => thread.block(),
+        ThreadState::Terminated => thread.terminate(),
+        ThreadState::New => {}
+    }
+}
+
+fn preempt_context_mut(d: &mut Demo, slot: PreemptSlot) -> *mut ThreadContext {
+    match slot {
+        PreemptSlot::Idle => d.idle.context_mut() as *mut ThreadContext,
+        PreemptSlot::Thread(i) => d.preempt_threads[i].context_mut() as *mut ThreadContext,
+    }
+}
+
+fn preempt_context(d: &Demo, slot: PreemptSlot) -> *const ThreadContext {
+    match slot {
+        PreemptSlot::Idle => d.idle.context() as *const ThreadContext,
+        PreemptSlot::Thread(i) => d.preempt_threads[i].context() as *const ThreadContext,
+    }
+}
+
+fn preempt_switch_for_decision(
+    d: &mut Demo,
+    decision: Decision,
+    count_body_switch: bool,
+) -> Option<(*mut ThreadContext, *const ThreadContext)> {
+    let Decision::Switch {
+        from: Some(from),
+        to,
+    } = decision
+    else {
+        return None;
+    };
+    let from_slot = preempt_slot(d, from)?;
+    let to_slot = preempt_slot(d, to)?;
+
+    if !matches!(from_slot, PreemptSlot::Idle) {
+        set_preempt_slot_state(d, from_slot, ThreadState::Ready);
+    }
+    set_preempt_slot_state(d, to_slot, ThreadState::Running);
+    if count_body_switch
+        && matches!(from_slot, PreemptSlot::Thread(_))
+        && matches!(to_slot, PreemptSlot::Thread(_))
+    {
+        d.preempt_switches = d.preempt_switches.saturating_add(1);
+    }
+
+    let prev = preempt_context_mut(d, from_slot);
+    let next = preempt_context(d, to_slot);
+    Some((prev, next))
+}
+
+pub fn run_preemption() -> PreemptReport {
+    let p = demo_ptr();
+    let (ret, first): (*mut ThreadContext, *const ThreadContext) = unsafe {
+        let d = &mut *p;
+        if d.preempt_done {
+            return PreemptReport {
+                threads: d.preempt_threads.len(),
+                ticks: d.preempt_ticks,
+                switches: d.preempt_switches,
+                work: d.preempt_work,
+            };
+        }
+        let decision = d.preempt_scheduler.reschedule_current();
+        let Some((ret, first)) = preempt_switch_for_decision(d, decision, false) else {
+            return PreemptReport {
+                threads: d.preempt_threads.len(),
+                ticks: d.preempt_ticks,
+                switches: d.preempt_switches,
+                work: d.preempt_work,
+            };
+        };
+        (ret, first)
+    };
+
+    unsafe { switch_context(ret, first) };
+
+    let p = demo_ptr();
+    unsafe {
+        let d = &*p;
+        PreemptReport {
+            threads: d.preempt_threads.len(),
+            ticks: d.preempt_ticks,
+            switches: d.preempt_switches,
+            work: d.preempt_work,
         }
     }
 }
@@ -290,7 +450,7 @@ pub fn run() -> DemoReport {
     }
     // An extra thread we never schedule, so `ps` shows a live (New) task alongside the
     // terminated demo threads.
-    let idle = Thread::new(
+    let mut idle = Thread::new(
         &mut objects,
         &process,
         entry,
@@ -304,8 +464,8 @@ pub fn run() -> DemoReport {
         let thread = Thread::new(
             &mut objects,
             &process,
-            entry,
-            0x100 + i,
+            preempt_thread_body as extern "C" fn(usize) as usize,
+            i,
             DEFAULT_KERNEL_STACK_SIZE,
         )
         .expect("preempt thread");
@@ -313,11 +473,15 @@ pub fn run() -> DemoReport {
         i += 1;
     }
     // Two equal-priority RT threads: with a 1-tick quantum they round-robin every
-    // timer tick under Discipline A (the O(1) strict-priority class).
-    preempt_threads[0].run();
+    // timer tick under Discipline A (the O(1) strict-priority class). The idle
+    // thread is the explicit bootstrap context the demo returns to.
+    idle.ready();
+    preempt_threads[0].ready();
     preempt_threads[1].ready();
     let mut preempt_scheduler = Dispatcher::new(1);
-    preempt_scheduler.set_running(preempt_threads[0].koid(), Priority::DEFAULT, ClassId::Rt);
+    preempt_scheduler.set_idle(idle.koid());
+    preempt_scheduler.set_running(idle.koid(), Priority::LOWEST, ClassId::Idle);
+    preempt_scheduler.admit(preempt_threads[0].koid(), Priority::DEFAULT);
     preempt_scheduler.admit(preempt_threads[1].koid(), Priority::DEFAULT);
 
     // SAFETY: first writer; nothing else touches DEMO yet.
@@ -328,6 +492,7 @@ pub fn run() -> DemoReport {
             idle,
             preempt_threads,
             preempt_scheduler,
+            preempt_work: [0; KTHREADS],
             job_koid: job.koid().0,
             process_koid: process.koid().0,
             current: 0,
@@ -336,6 +501,7 @@ pub fn run() -> DemoReport {
             preempt_ticks: 0,
             preempt_switches: 0,
             preempt_hook_installed: false,
+            preempt_done: false,
         });
     }
 

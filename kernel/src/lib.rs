@@ -191,6 +191,17 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         );
         kumo_hal::active::halt();
     }
+
+    let preempt = kdemo::run_preemption();
+    klog!(
+        "SCHED: timer preemption OK; {} kthreads, {} IRQ ticks, {} body switches, work {}/{}\n",
+        preempt.threads,
+        preempt.ticks,
+        preempt.switches,
+        preempt.work[0],
+        preempt.work[1]
+    );
+
     match ipc::smoke() {
         Ok(ipc) => klog!(
             "P4: IPC channel/call/port OK; {} channel pair, {} port, {} call, {} bytes, {} handles\n",

@@ -96,6 +96,10 @@ core::arch::global_asm!(
     "  ret",
     ".global kumo_context_trampoline",
     "kumo_context_trampoline:",
+    // A thread first entered from an IRQ-context switch inherits the IRQ mask from
+    // exception entry. Drop it before jumping into the body so timer preemption keeps
+    // working on freshly-started threads.
+    "  msr daifclr, #2",
     "  mov x0, x20",
     "  blr x19",
     "1:",

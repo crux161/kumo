@@ -5,9 +5,9 @@
 //! (transitions to `Blocked` and parks off the run queue). The producer writes a
 //! message and **wakes** the consumer (back to `Ready`), after which the consumer
 //! resumes and receives the payload. This is the scheduler-integrated block/wake the
-//! syscall layer will reuse for `ChannelRead`/`PortWait`; here it is driven by the
-//! proven cooperative context switch rather than the (still-narrow) interrupt-context
-//! path, so it touches no new architecture assembly.
+//! syscall layer will reuse for `ChannelRead`/`PortWait`; here it enters through
+//! `sched::Dispatcher`'s production-shaped block/wake/finish points and then uses the
+//! proven context switch to move directly to the chosen thread.
 //!
 //! Soundness: same discipline as `kdemo` — the demo state lives in a `static`, and no
 //! Rust reference to it is ever held across a `switch_context`. Single core, and the
@@ -20,6 +20,7 @@ use kumo_hal::active::{switch_context, ThreadContext};
 use crate::ipc::{ChannelEnd, ChannelPair, IpcError, KernelMessage};
 use crate::mm::{Vmar, PAGE_SIZE};
 use crate::object::ObjectManager;
+use crate::sched::{Decision, Dispatcher, Priority};
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const CONSUMER: usize = 0;
@@ -30,8 +31,8 @@ struct Demo {
     /// Context to return to (the scheduler loop) when a thread yields, blocks, or exits.
     main_ctx: ThreadContext,
     threads: [Thread; 2],
+    scheduler: Dispatcher,
     channel: ChannelPair,
-    current: usize,
     switches: u64,
     consumer_blocks: u64,
     wakes: u64,
@@ -51,22 +52,74 @@ fn demo_ptr() -> *mut Demo {
     unsafe { (&mut *opt).as_mut().expect("ipcdemo not initialized") as *mut Demo }
 }
 
-/// Hand the CPU back to the scheduler loop. If `block` is set, the current thread
-/// parks (`Blocked`) and stays off the run queue until something `ready()`s it.
-fn yield_to_main(block: bool) {
+/// Park the current thread and switch directly to the dispatcher's chosen successor.
+fn block_current_thread() {
     let p = demo_ptr();
-    let (cur, main): (*mut ThreadContext, *const ThreadContext) = unsafe {
+    let switch = unsafe {
         let d = &mut *p;
-        d.switches += 1;
-        let i = d.current;
-        if block {
-            d.threads[i].block();
-        }
-        let cur = d.threads[i].context_mut() as *mut ThreadContext;
-        let main = &d.main_ctx as *const ThreadContext;
-        (cur, main)
+        let Some(cur) = d.scheduler.current() else {
+            return;
+        };
+        let Some(cur_idx) = thread_index(d, cur) else {
+            return;
+        };
+        d.threads[cur_idx].block();
+        let decision = d.scheduler.block_current();
+        switch_for_decision(d, decision).or_else(|| switch_thread_to_main(d, cur_idx))
     };
-    unsafe { switch_context(cur, main) };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+}
+
+fn maybe_switch_after_wake(decision: Decision) {
+    let p = demo_ptr();
+    let switch = unsafe {
+        let d = &mut *p;
+        switch_for_decision(d, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+}
+
+fn switch_for_decision(
+    d: &mut Demo,
+    decision: Decision,
+) -> Option<(*mut ThreadContext, *const ThreadContext)> {
+    match decision {
+        Decision::Switch { from, to } => {
+            let to_idx = thread_index(d, to)?;
+            let prev = if let Some(from) = from {
+                let from_idx = thread_index(d, from)?;
+                if matches!(d.threads[from_idx].state(), ThreadState::Running) {
+                    d.threads[from_idx].ready();
+                }
+                d.threads[from_idx].context_mut() as *mut ThreadContext
+            } else {
+                &mut d.main_ctx as *mut ThreadContext
+            };
+            d.threads[to_idx].run();
+            d.switches = d.switches.saturating_add(1);
+            let next = d.threads[to_idx].context() as *const ThreadContext;
+            Some((prev, next))
+        }
+        Decision::Idle | Decision::Continue(_) => None,
+    }
+}
+
+fn switch_thread_to_main(
+    d: &mut Demo,
+    index: usize,
+) -> Option<(*mut ThreadContext, *const ThreadContext)> {
+    d.switches = d.switches.saturating_add(1);
+    let cur = d.threads[index].context_mut() as *mut ThreadContext;
+    let main = &d.main_ctx as *const ThreadContext;
+    Some((cur, main))
+}
+
+fn thread_index(d: &Demo, koid: kumo_abi::KoId) -> Option<usize> {
+    d.threads.iter().position(|thread| thread.koid() == koid)
 }
 
 extern "C" fn consumer_body(_arg: usize) {
@@ -93,7 +146,7 @@ extern "C" fn consumer_body(_arg: usize) {
                         (*p).consumer_blocks += 1;
                     }
                 }
-                yield_to_main(true);
+                block_current_thread();
             }
             Err(_) => break,
         }
@@ -102,7 +155,7 @@ extern "C" fn consumer_body(_arg: usize) {
 }
 
 extern "C" fn producer_body(_arg: usize) {
-    {
+    let wake_decision = {
         let p = demo_ptr();
         // SAFETY: transient &mut, dropped before any switch.
         unsafe {
@@ -113,23 +166,32 @@ extern "C" fn producer_body(_arg: usize) {
             if matches!(d.threads[CONSUMER].state(), ThreadState::Blocked) {
                 d.threads[CONSUMER].ready();
                 d.wakes += 1;
+                let decision = d
+                    .scheduler
+                    .wake_rt(d.threads[CONSUMER].koid(), Priority::DEFAULT);
+                Some(decision)
+            } else {
+                None
             }
         }
+    };
+    if let Some(decision) = wake_decision {
+        maybe_switch_after_wake(decision);
     }
     thread_exit(PRODUCER)
 }
 
 fn thread_exit(index: usize) -> ! {
     let p = demo_ptr();
-    let (cur, main): (*mut ThreadContext, *const ThreadContext) = unsafe {
+    let switch = unsafe {
         let d = &mut *p;
         d.threads[index].terminate();
-        d.switches += 1;
-        let cur = d.threads[index].context_mut() as *mut ThreadContext;
-        let main = &d.main_ctx as *const ThreadContext;
-        (cur, main)
+        let decision = d.scheduler.finish_current();
+        switch_for_decision(d, decision).or_else(|| switch_thread_to_main(d, index))
     };
-    unsafe { switch_context(cur, main) };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
     loop {
         kumo_hal::active::spin_once();
     }
@@ -169,13 +231,17 @@ pub fn run() -> IpcDemoReport {
     )
     .expect("producer thread");
 
+    let mut scheduler = Dispatcher::new(1);
+    scheduler.admit(consumer.koid(), Priority::DEFAULT);
+    scheduler.admit(producer.koid(), Priority::DEFAULT);
+
     // SAFETY: first writer; nothing else touches DEMO yet.
     unsafe {
         *DEMO.0.get() = Some(Demo {
             main_ctx: ThreadContext::default(),
             threads: [consumer, producer],
+            scheduler,
             channel,
-            current: 0,
             switches: 0,
             consumer_blocks: 0,
             wakes: 0,
@@ -185,39 +251,16 @@ pub fn run() -> IpcDemoReport {
     }
 
     let p = demo_ptr();
-    // Round-robin over runnable threads (skip Blocked and Terminated). `last` starts
-    // at the end so the first pick is the consumer, which blocks on the empty channel;
-    // then the producer runs, writes, and wakes it; then the consumer receives.
-    let mut last = 1;
-    loop {
-        let pick = unsafe {
-            let d = &*p;
-            let mut chosen = None;
-            let mut k = 0;
-            while k < 2 {
-                let idx = (last + 1 + k) % 2;
-                let state = d.threads[idx].state();
-                if state != ThreadState::Terminated && state != ThreadState::Blocked {
-                    chosen = Some(idx);
-                    break;
-                }
-                k += 1;
-            }
-            chosen
-        };
-        let Some(idx) = pick else { break };
-        last = idx;
-
-        let (main, next): (*mut ThreadContext, *const ThreadContext) = unsafe {
-            let d = &mut *p;
-            d.current = idx;
-            d.switches += 1;
-            d.threads[idx].run();
-            let main = &mut d.main_ctx as *mut ThreadContext;
-            let next = d.threads[idx].context() as *const ThreadContext;
-            (main, next)
-        };
-        unsafe { switch_context(main, next) };
+    // Start on the first dispatcher pick (the consumer), then let block/wake/finish
+    // decisions switch directly between thread bodies until the last thread returns
+    // here through `main_ctx`.
+    let switch = unsafe {
+        let d = &mut *p;
+        let decision = d.scheduler.reschedule_current();
+        switch_for_decision(d, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
     }
 
     // SAFETY: both threads terminated; only this code touches DEMO now.
