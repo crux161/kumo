@@ -167,9 +167,14 @@ pub struct El0Report {
     pub exit_code: u64,
 }
 
-pub fn run_el0_smoke() -> El0Report {
+pub fn run_el0_smoke(
+    _base: u64,
+    _stack_top: u64,
+    _stack_size: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
     // Ring-3 entry + the IDT/syscall path land with the x86_64 metal milestone.
-    El0Report::default()
+    Err(UserImageError::Unsupported)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,18 +187,24 @@ pub struct UserLoadSegment<'a> {
     pub source: &'a [u8],
     pub virt_addr: u64,
     pub mem_size: u64,
+    pub writable: bool,
+    pub executable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserImage<'a> {
     pub entry: u64,
     pub stack_top: u64,
+    pub stack_size: u64,
     /// Bootstrap handle passed to the process at entry (Ring-3 entry lands later).
     pub bootstrap: u64,
     pub segments: &'a [UserLoadSegment<'a>],
 }
 
-pub fn run_el0_image(_image: UserImage<'_>) -> Result<El0Report, UserImageError> {
+pub fn run_el0_image(
+    _image: UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
     // Ring-3 image entry lands with the x86_64 metal milestone.
     Err(UserImageError::Unsupported)
 }

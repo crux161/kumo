@@ -82,8 +82,15 @@ pub fn stage_a(boot: &BootInfo) -> ! {
 
     // Boot banner in the idiom of the Jet Alone OS POST screen (Evangelion): green
     // phosphor, a RE-BOOT header, then a column of subsystem self-checks each ending in
-    // OK. The Japanese system lines await a CJK console font; the Latin POST stands in.
+    // OK. The Stage-A console now renders a curated CJK set (DESIGN/005), so the Japanese
+    // system header stands beside the Latin POST instead of waiting for a font.
     klog!("\nKUMO Hi-SYS Re-BOOT!\n");
+    // 雲 紫微 起動 / 記憶 検査 正常 = "KUMO Ziwei boot / memory check OK". A mixed
+    // ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
+    klog!("雲 紫微 起動    記憶 検査 正常\n");
+    // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
+    // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
+    klog!("简体中文  日本語漢字  ㄱㄴㄷㄹㅁ\n");
     klog!(
         "ZIWEI re-boot operating system, Ver 0.1.0  ({})\n",
         report.arch
@@ -274,17 +281,17 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // SyscallEngine), then ProcessExit; the kernel handles each via the SVC trap and
     // trampolines back. The "hello from EL0" line is userspace asking the kernel to act.
     let u = match initrd {
-        Some(initrd) => match usermode::run_sora(initrd) {
+        Some(initrd) => match usermode::run_sora(boot, initrd) {
             Ok(report) => report,
             Err(err) => {
                 klog!(
                     "SORA EL0          Check     {:?}; using payload fallback   --\n",
                     err
                 );
-                usermode::run()
+                usermode::run(boot)
             }
         },
-        None => usermode::run(),
+        None => usermode::run(boot),
     };
     if u.entered && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 && u.chan.1 != 0 {
         klog!(

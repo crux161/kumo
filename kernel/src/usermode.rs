@@ -17,12 +17,16 @@ use core::cell::UnsafeCell;
 
 use alloc::vec::Vec;
 
-use kumo_abi::{find_file, sys::Syscall, Handle, InitrdError, SORA_INIT_PATH};
+use kumo_abi::{find_file, sys::Syscall, BootInfo, Handle, InitrdError, SORA_INIT_PATH};
 use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment};
+use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
-use crate::bootstrap::user::{plan_elf_process, UserBootstrapError};
-use crate::mm::{Vmar, PAGE_SIZE};
+use crate::bootstrap::user::{
+    plan_elf_process, UserBootstrapError, USER_IMAGE_BASE, USER_ROOT_BASE, USER_ROOT_SIZE,
+    USER_STACK_SIZE, USER_STACK_TOP,
+};
+use crate::mm::{alloc_zeroed_frame, Vmar};
 use crate::syscall::{KernelCall, KernelCallResult, SyscallEngine};
 use crate::task::{Job, Process};
 
@@ -84,6 +88,21 @@ impl From<UserImageError> for UsermodeError {
     }
 }
 
+/// Validate an EL0-supplied pointer range before the kernel dereferences it. With
+/// per-process TTBR0 (P5-mmu-b), the user's VA is only mapped while its address space is
+/// active — but a malicious EL0 could pass a *kernel-half* VA to trick EL1 into reading
+/// through TTBR1. Require `[ptr, ptr+len)` to sit wholly inside the process's user VMAR
+/// (the low half); reject anything else. (Real `copy_from_user`/`copy_to_user` with a
+/// fault-fixup handler is future work; this is the structural bound check.)
+fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
+    let vmar = process.root_vmar();
+    let base = vmar.base();
+    match (base.checked_add(vmar.len()), ptr.checked_add(len)) {
+        (Some(vmar_end), Some(end)) => ptr >= base && end <= vmar_end,
+        _ => false,
+    }
+}
+
 /// The kernel's EL0 syscall handler (registered with the HAL). `regs` points at the
 /// saved x0..x30: x8 = syscall number, args in x0.., results written back to x0/x1.
 extern "C" fn svc_hook(regs: *mut u64) {
@@ -99,10 +118,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
     let demo = unsafe { &mut *demo_ptr() };
 
     if num == Syscall::DebugWrite as u64 {
-        let ptr = r[0] as *const u8;
+        let user_ptr = r[0];
         let len = (r[1] as usize).min(256);
-        // EL1 may read the EL0 window (AP=EL0-RW is also EL1-RW, identity-mapped).
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        if !user_range_ok(&demo.process, user_ptr, len as u64) {
+            r[0] = u64::MAX; // EFAULT-like: refuse to read outside the user VMAR
+            return;
+        }
+        // EL1 reads the user VA while the process TTBR0 is active (AP EL0-RW/RO is also
+        // EL1-readable); the range was just bounds-checked into the user half.
+        let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
         crate::bootstrap::console::write(bytes);
         demo.wrote += len;
         r[0] = len as u64;
@@ -121,10 +145,14 @@ extern "C" fn svc_hook(regs: *mut u64) {
     } else if num == Syscall::ChannelWrite as u64 {
         // x0 = handle, x1 = bytes ptr (user VA), x2 = len. Status returned in x0.
         let channel = Handle(r[0] as u32);
-        let ptr = r[1] as *const u8;
+        let user_ptr = r[1];
         let len = (r[2] as usize).min(256);
-        // SAFETY: the user buffer lives in the EL0 window, readable by EL1.
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        if !user_range_ok(&demo.process, user_ptr, len as u64) {
+            r[0] = (-1i32) as u32 as u64;
+            return;
+        }
+        // SAFETY: bounds-checked into the user VMAR, readable by EL1 under the process map.
+        let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
         let status = match Message::new(1, bytes, &[]) {
             Ok(message) => match demo.engine.dispatch(
                 &mut demo.process,
@@ -139,8 +167,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
     } else if num == Syscall::ChannelRead as u64 {
         // x0 = handle, x1 = dst buffer (user VA), x2 = capacity. Bytes read returned in x0.
         let channel = Handle(r[0] as u32);
-        let buf = r[1] as *mut u8;
+        let user_buf = r[1];
         let cap = (r[2] as usize).min(256);
+        if !user_range_ok(&demo.process, user_buf, cap as u64) {
+            r[0] = 0; // refuse to write outside the user VMAR -> 0 bytes
+            return;
+        }
         match demo
             .engine
             .dispatch(&mut demo.process, KernelCall::ChannelRead { channel })
@@ -148,8 +180,8 @@ extern "C" fn svc_hook(regs: *mut u64) {
             KernelCallResult::Message(message) => {
                 let bytes = message.bytes();
                 let n = bytes.len().min(cap);
-                // SAFETY: the dst buffer is in the EL0 window, writable by EL1.
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
+                // SAFETY: dst bounds-checked into the user VMAR (an RW page), writable by EL1.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n) };
                 r[0] = n as u64;
             }
             _ => r[0] = 0, // nothing pending / error -> 0 bytes
@@ -159,11 +191,13 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 }
 
-/// Run the EL0 syscall smoke and report what userspace did.
-pub fn run() -> UserReport {
+/// Run the EL0 syscall smoke and report what userspace did. `boot` supplies the frame
+/// allocator the per-process page tables are built from.
+pub fn run(boot: &BootInfo) -> UserReport {
     let mut engine = SyscallEngine::new();
     let job = Job::root(engine.objects_mut());
-    let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).expect("user vmar");
+    // Match the smoke's actual VAs so the SVC pointer-validation accepts its accesses.
+    let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).expect("user vmar");
     let process = Process::new(engine.objects_mut(), &job, vmar);
 
     // SAFETY: first writer; nothing else touches DEMO yet.
@@ -177,7 +211,15 @@ pub fn run() -> UserReport {
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
-    let report = kumo_hal::active::run_el0_smoke();
+    // SAFETY: runs before the TTBR0 switch, so frames are reachable via the identity map.
+    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
+    let report = kumo_hal::active::run_el0_smoke(
+        USER_IMAGE_BASE,
+        USER_STACK_TOP,
+        USER_STACK_SIZE,
+        &mut alloc,
+    )
+    .unwrap_or_default();
 
     // SAFETY: initialized above; single-threaded read after EL0 has exited.
     let demo = unsafe { &*demo_ptr() };
@@ -191,7 +233,7 @@ pub fn run() -> UserReport {
     }
 }
 
-pub fn run_sora(initrd: &[u8]) -> Result<UserReport, UsermodeError> {
+pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeError> {
     let sora = find_file(initrd, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
     let mut engine = SyscallEngine::new();
     let plan = plan_elf_process(engine.objects_mut(), sora.bytes)?;
@@ -211,6 +253,8 @@ pub fn run_sora(initrd: &[u8]) -> Result<UserReport, UsermodeError> {
             source: &sora.bytes[start..end],
             virt_addr: segment.virt_addr,
             mem_size: segment.mem_size,
+            writable: segment.flags.contains(PageFlags::WRITE),
+            executable: segment.flags.contains(PageFlags::EXECUTE),
         });
     }
 
@@ -258,12 +302,18 @@ pub fn run_sora(initrd: &[u8]) -> Result<UserReport, UsermodeError> {
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
-    let report = kumo_hal::active::run_el0_image(UserImage {
-        entry: plan.entry,
-        stack_top: plan.stack_top,
-        bootstrap: sora_end.0 as u64,
-        segments: &load_segments,
-    })?;
+    // SAFETY: runs before the TTBR0 switch, so frames are reachable via the identity map.
+    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
+    let report = kumo_hal::active::run_el0_image(
+        UserImage {
+            entry: plan.entry,
+            stack_top: plan.stack_top,
+            stack_size: USER_STACK_SIZE,
+            bootstrap: sora_end.0 as u64,
+            segments: &load_segments,
+        },
+        &mut alloc,
+    )?;
 
     // Read what Sora sent down the root channel during its run.
     let mut handshake = [0u8; 32];

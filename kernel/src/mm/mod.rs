@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range};
 use kumo_hal::PageFlags;
 
@@ -6,6 +8,39 @@ pub mod heap;
 pub const PAGE_SIZE: u64 = 4096;
 const BLOCK_2M: u64 = 1 << 21;
 const GIB: u64 = 1 << 30;
+
+/// Start of the next never-yet-allocated physical frame. A persistent watermark so a
+/// frame handed out for the kernel page tables (`enable_paging`) is never reissued when a
+/// per-process address space is built (`alloc_zeroed_frame`). 0 = nothing allocated yet.
+static FRAME_WATERMARK: AtomicU64 = AtomicU64::new(0);
+
+/// Hand out the next usable physical frame, zeroed, advancing [`FRAME_WATERMARK`] so the
+/// same frame is never returned twice across the whole boot (kernel tables *and* user
+/// address spaces draw from this one cursor). The frame is touched by physical address, so
+/// the caller must hold the kernel identity map active in TTBR0 — i.e. allocate *before*
+/// switching to a process page-table tree.
+///
+/// O(frames-scanned) per call (it re-derives the boot allocator and skips below the
+/// watermark); Stage-A only ever needs a few dozen frames, so the simplicity wins.
+///
+/// # Safety
+/// `boot.mem_regions` must be the validated handoff slice, readable for the call, and the
+/// returned frame must be mapped by the currently-active page tables.
+pub unsafe fn alloc_zeroed_frame(boot: &BootInfo) -> Option<u64> {
+    let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
+    let mut frames = plan.frame_allocator();
+    let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
+    loop {
+        let frame = frames.next_frame()?.start;
+        if frame < watermark {
+            continue;
+        }
+        FRAME_WATERMARK.store(frame.saturating_add(PAGE_SIZE), Ordering::Relaxed);
+        // SAFETY: usable RAM, mapped now; zero it for a clean table / BSS-clear page.
+        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
+        return Some(frame);
+    }
+}
 
 /// What kernel paging brought up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,16 +91,11 @@ pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
         return None;
     }
 
-    // Page-table frames come from usable RAM (which we then map Normal-WB). The boot
-    // frame allocator already excludes the kernel, initrd, and framebuffer.
-    let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
-    let mut frames = plan.frame_allocator();
-    let mut alloc = || -> Option<u64> {
-        let frame = frames.next_frame()?.start;
-        // SAFETY: usable RAM, identity-mapped now; zero it for a clean table.
-        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
-        Some(frame)
-    };
+    // Page-table frames come from usable RAM (which we then map Normal-WB) via the shared
+    // watermark allocator, so frames spent on kernel tables here are off-limits when a
+    // process address space is built later. The boot frame allocator already excludes the
+    // kernel, initrd, and framebuffer.
+    let mut alloc = || -> Option<u64> { unsafe { alloc_zeroed_frame(boot) } };
     let is_ram = |pa: u64| {
         regions.iter().any(|region| {
             is_ram_kind(region.kind) && overlaps(pa, BLOCK_2M, region.range.start, region.range.len)

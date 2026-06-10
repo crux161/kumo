@@ -3,6 +3,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+mod cjk_font;
+
 pub const ARCH: &str = "aarch64";
 
 pub fn arch_name() -> &'static str {
@@ -280,6 +282,134 @@ unsafe fn blit_glyph(
     }
 }
 
+// ---- CJK console glyphs (DESIGN/005) --------------------------------
+//
+// ASCII keeps the 8x16 PSF path; non-ASCII Unicode scalars look up a curated 16x16
+// double-width glyph (`cjk_font::CJK_GLYPHS`, binary-searchable). A codepoint absent from
+// the table renders as the tofu box below — never blank, never a panic.
+
+/// Missing-glyph "tofu": a hollow 16x16 box (the DESIGN/005 fail-safe — a CJK cell the
+/// font lacks still leaves a legible, distinct mark on a diagnostic line).
+const TOFU: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x3f, 0xfc, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04,
+    0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x3f, 0xfc, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The 16x16 bitmap (a 32-byte slice) for a Unicode scalar, or `None` if it is outside the
+/// embedded set. Binary search over `cjk_font::CJK_FONT`'s sorted fixed-size records.
+fn cjk_glyph(scalar: u32) -> Option<&'static [u8]> {
+    let cp = u16::try_from(scalar).ok()?;
+    let font = cjk_font::CJK_FONT;
+    let rec = cjk_font::RECORD;
+    let (mut lo, mut hi) = (0usize, cjk_font::GLYPH_COUNT);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let off = mid * rec;
+        let code = u16::from_le_bytes([font[off], font[off + 1]]);
+        if code == cp {
+            return Some(&font[off + 2..off + rec]);
+        } else if code < cp {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
+}
+
+/// Decode `bytes` (a valid-UTF-8 console fragment) into Unicode scalars, emitting each via
+/// `emit`. Malformed input degrades to `U+FFFD` (which renders as tofu) rather than
+/// faulting — a diagnostic console must never wedge on a stray byte. Pure, so host-tested.
+fn for_each_scalar(bytes: &[u8], mut emit: impl FnMut(u32)) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            emit(b as u32);
+            i += 1;
+            continue;
+        }
+        let (need, init) = if b >= 0xf0 {
+            (3usize, (b & 0x07) as u32)
+        } else if b >= 0xe0 {
+            (2, (b & 0x0f) as u32)
+        } else if b >= 0xc0 {
+            (1, (b & 0x1f) as u32)
+        } else {
+            (0, 0) // stray continuation byte
+        };
+        if need == 0 {
+            emit(0xfffd);
+            i += 1;
+            continue;
+        }
+        let mut cp = init;
+        let mut consumed = 0;
+        let mut ok = true;
+        while consumed < need {
+            let j = i + 1 + consumed;
+            if j >= bytes.len() || bytes[j] & 0xc0 != 0x80 {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (bytes[j] & 0x3f) as u32;
+            consumed += 1;
+        }
+        if ok {
+            emit(cp);
+            i += 1 + need;
+        } else {
+            emit(0xfffd);
+            i += 1 + consumed;
+        }
+    }
+}
+
+/// Blit a 16x16 double-width glyph (2 bytes/row, MSB = leftmost pixel) into a 32-bpp
+/// framebuffer. Bounds-checked against `len_px` like [`blit_glyph`].
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_wide_glyph(
+    base: *mut u32,
+    len_px: usize,
+    stride: usize,
+    x_px: usize,
+    y_px: usize,
+    rows: &[u8],
+    fg: u32,
+    bg: u32,
+) {
+    for ry in 0..GLYPH_H {
+        let bits = ((rows[ry * 2] as u16) << 8) | (rows[ry * 2 + 1] as u16);
+        let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
+        for rx in 0..16 {
+            let on = (bits >> (15 - rx)) & 1 != 0;
+            let idx = row_start.wrapping_add(rx);
+            if idx < len_px {
+                unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
+            }
+        }
+        // Flush the 16-pixel span to RAM for the scanout (see `fb_clean_line`); 16 px is
+        // two cache lines, so clean both ends.
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + 15;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
 /// Switch the Stage-A console to a linear framebuffer and clear it. Called from
 /// kmain when BootInfo carries a usable GOP framebuffer.
 pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, stride: u32) {
@@ -393,27 +523,30 @@ pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32
     }
 }
 
-fn fb_putc(byte: u8) {
+/// Render one Unicode scalar to the framebuffer. ASCII (and `\n`/`\r`) use the 8x16 PSF
+/// cell; any scalar >= `0x80` takes a curated 16x16 **double-width** CJK glyph (or the tofu
+/// box if absent), advancing the cursor by two cells.
+fn fb_putchar(scalar: u32) {
     let stride = FB_STRIDE.load(ORD) as usize;
     let cols = (FB_WIDTH.load(ORD) as usize / GLYPH_W).max(1);
     let rows = (FB_HEIGHT.load(ORD) as usize / GLYPH_H).max(1);
     let mut col = FB_COL.load(ORD) as usize;
     let mut row = FB_ROW.load(ORD) as usize;
+    let base = FB_BASE.load(ORD) as *mut u32;
+    let len_px = FB_LEN_PX.load(ORD);
 
-    match byte {
-        b'\n' => {
+    match scalar {
+        0x0a => {
             col = 0;
             row += 1;
         }
-        b'\r' => col = 0,
+        0x0d => col = 0,
         0x20..=0x7e => {
             if col >= cols {
                 col = 0;
                 row += 1;
             }
             if row < rows {
-                let base = FB_BASE.load(ORD) as *mut u32;
-                let len_px = FB_LEN_PX.load(ORD);
                 unsafe {
                     blit_glyph(
                         base,
@@ -421,7 +554,7 @@ fn fb_putc(byte: u8) {
                         stride,
                         col * GLYPH_W,
                         row * GLYPH_H,
-                        byte,
+                        scalar as u8,
                         FG,
                         BG,
                     )
@@ -429,7 +562,30 @@ fn fb_putc(byte: u8) {
                 col += 1;
             }
         }
-        _ => {}
+        c if c >= 0x80 => {
+            // A wide cell needs two columns; wrap first if it would not fit.
+            if col + 2 > cols {
+                col = 0;
+                row += 1;
+            }
+            if row < rows {
+                let glyph = cjk_glyph(c).unwrap_or(&TOFU[..]);
+                unsafe {
+                    blit_wide_glyph(
+                        base,
+                        len_px,
+                        stride,
+                        col * GLYPH_W,
+                        row * GLYPH_H,
+                        glyph,
+                        FG,
+                        BG,
+                    )
+                };
+                col += 2;
+            }
+        }
+        _ => {} // other C0 controls: ignore
     }
 
     // No scrolling yet: clamp at the bottom row (Stage-A output is a few lines).
@@ -443,12 +599,12 @@ fn fb_putc(byte: u8) {
 
 pub fn early_console_write(bytes: &[u8]) {
     if FB_PRESENT.load(ORD) {
-        for &byte in bytes {
-            fb_putc(byte);
-        }
+        // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
+        for_each_scalar(bytes, fb_putchar);
         return;
     }
 
+    // PL011 is a byte stream; pass the raw UTF-8 through and let the host terminal decode.
     if !UART_READY.swap(true, ORD) {
         pl011_init();
     }
@@ -748,7 +904,93 @@ pub mod mmu {
         Ok((tables, gb_count * GB))
     }
 
-    const AP_EL0: u64 = 1 << 6; // AP[1]=1 -> AP[2:1]=0b01: EL1 RW / EL0 RW
+    // Stage-1 AP[2:1] (descriptor bits [7:6]) access-permission encodings.
+    const AP_EL1RW_EL0RW: u64 = 1 << 6; // AP=0b01: EL1 RW / EL0 RW
+    const AP_EL1RO_EL0RO: u64 = (1 << 6) | (1 << 7); // AP=0b11: EL1 RO / EL0 RO
+
+    /// Build a 4 KiB **user** (TTBR0) page descriptor with true per-page W^X:
+    /// * `writable`  → EL0 RW, never executable (`UXN|PXN`) — data / stack.
+    /// * `executable` (read-only) → EL0 RO + executable (`UXN` clear), EL1 noexec — code.
+    /// * otherwise   → EL0 RO, never executable — read-only data.
+    /// Writable-and-executable is impossible by construction (W wins → non-exec), so no
+    /// page is ever both, with `SCTLR.WXN` left untouched.
+    pub fn user_page_desc(executable: bool, writable: bool) -> u64 {
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (MAIR_WB << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else if executable {
+            base | AP_EL1RO_EL0RO | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
+    /// Map one 4 KiB page `va -> pa` with `desc` into the page-table tree rooted at `root`,
+    /// allocating intermediate tables from `alloc`. `desc` should come from
+    /// [`user_page_desc`]; `alloc` must return zeroed frames.
+    ///
+    /// # Safety
+    /// `root` must be a live L0 table reachable by the active page tables; `alloc` frames
+    /// must be writable RAM mapped now.
+    pub unsafe fn map_user_page(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        map_page(root, va, pa, desc, alloc, tables)
+    }
+
+    /// Map a 2 MiB **kernel-only** (EL1) block `va -> pa` into `root` as Device (`device`)
+    /// or Normal-NC (framebuffer). Used to keep the active console MMIO reachable while a
+    /// process TTBR0 is installed (the kernel still prints via raw-physical access); EL0
+    /// can never touch it (no `AP_EL0`, `PXN|UXN`).
+    ///
+    /// # Safety
+    /// As [`map_user_page`].
+    pub unsafe fn map_kernel_device_block(
+        root: u64,
+        va: u64,
+        pa: u64,
+        device: bool,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let mair = if device { MAIR_DEVICE } else { MAIR_NC };
+        map_block(root, va, pa, block_desc(pa, mair, true), alloc, tables)
+    }
+
+    /// Read `TTBR0_EL1` (the active low-half root), so the kernel identity map can be
+    /// restored after a process address space has run.
+    pub fn read_ttbr0() -> u64 {
+        let value: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) value, options(nostack, nomem)) };
+        value
+    }
+
+    /// Switch `TTBR0_EL1` to `root` and flush the low-half TLB. TTBR1 (the kernel) is
+    /// untouched, so EL1 keeps executing across the swap. ASID 0 throughout; a full
+    /// `tlbi vmalle1` avoids stale aliasing between the kernel identity map and a process
+    /// tree.
+    ///
+    /// # Safety
+    /// `root` must be a valid L0 table for the intended address space.
+    pub unsafe fn set_ttbr0(root: u64) {
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "msr ttbr0_el1, {root}",
+                "isb",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                root = in(reg) root,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 
     /// Translate an address inside the high-linked kernel image to its physical backing.
     pub fn kernel_image_phys(va: u64) -> Option<u64> {
@@ -757,48 +999,6 @@ pub mod mmu {
         let len = KERNEL_IMAGE_LEN.load(Ordering::Relaxed);
         let offset = va.checked_sub(virt)?;
         (offset < len).then_some(phys + offset)
-    }
-
-    /// Re-map the live 2 MiB block containing identity VA `va` as **EL0-accessible**.
-    ///
-    /// # Safety
-    /// Runs at EL1 under the kernel's TTBR0 map; `va` must be 2 MiB-aligned RAM.
-    pub unsafe fn map_user_2m(va: u64) {
-        unsafe { map_user_2m_to(va, va) }
-    }
-
-    /// Map the 2 MiB block at virtual address `va` to physical address `pa` as
-    /// EL0-accessible Normal-WB, EL0 read/write/execute (`AP[1]=1`, `UXN=0`),
-    /// kernel-noexec (`PXN=1`). This is a Stage-A block-granularity user alias; real
-    /// per-page `Vmar` permissions come next.
-    ///
-    /// # Safety
-    /// Runs at EL1 under the kernel's TTBR0 map. `va` and `pa` must be 2 MiB-aligned RAM,
-    /// and the caller must ensure replacing the VA block does not hide live kernel data.
-    pub unsafe fn map_user_2m_to(va: u64, pa: u64) {
-        let ttbr0: u64;
-        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem)) };
-        let l0 = ttbr0 & ADDR_MASK;
-        let l1 = read_desc(l0, ((va >> 39) & 0x1ff) as usize) & ADDR_MASK;
-        let l2 = read_desc(l1, ((va >> 30) & 0x1ff) as usize) & ADDR_MASK;
-        let l2i = ((va >> 21) & 0x1ff) as usize;
-        let desc = (pa & ADDR_MASK & !(BLOCK_2M - 1))
-            | DESC_VALID
-            | DESC_AF
-            | (MAIR_WB << 2)
-            | SH_INNER
-            | AP_EL0
-            | PXN;
-        write_desc(l2, l2i, desc);
-        unsafe {
-            core::arch::asm!(
-                "dsb ish",
-                "tlbi vmalle1",
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags),
-            );
-        }
     }
 }
 
@@ -816,14 +1016,7 @@ pub use mmu::enable_kernel as enable_kernel_mmu;
 pub mod el0 {
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-    const USER_BLOCK_SIZE: u64 = 0x200000;
-
-    /// A 4 MiB arena that always contains at least one 2 MiB-aligned physical subrange
-    /// even after Nijigumo relocates the whole kernel to a non-2MiB-aligned address.
-    #[repr(C, align(0x200000))]
-    struct UserArena([u8; 0x400000]);
-    static mut USER_ARENA: UserArena = UserArena([0; 0x400000]);
-    static mut USER_STACK_ARENA: UserArena = UserArena([0; 0x400000]);
+    const PAGE_4K: u64 = 1 << 12;
 
     static SYSCALLS: AtomicU32 = AtomicU32::new(0);
 
@@ -849,22 +1042,31 @@ pub mod el0 {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum UserImageError {
         Empty,
-        ImageTooLarge,
-        SegmentOutsideImageBlock,
-        StackOutsideStackBlock,
+        BadSegment,
+        BadStack,
+        OutOfFrames,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct UserLoadSegment<'a> {
+        /// The `p_filesz` bytes of file content; the page builder copies these at
+        /// `virt_addr`'s page offset and zero-fills the rest of `mem_size` (BSS).
         pub source: &'a [u8],
         pub virt_addr: u64,
         pub mem_size: u64,
+        /// `PF_W` — maps the segment RW (EL0 read/write, never executable).
+        pub writable: bool,
+        /// `PF_X` — maps a non-writable segment RX (EL0 read/execute).
+        pub executable: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct UserImage<'a> {
         pub entry: u64,
         pub stack_top: u64,
+        /// Bytes of RW stack to map immediately below `stack_top` (page-aligned). One
+        /// unmapped guard page sits below that, so a stack overflow faults to the Tower.
+        pub stack_size: u64,
         /// Handed to the process in `x0` at entry (processargs-style): the bootstrap
         /// root-channel handle. 0 = none.
         pub bootstrap: u64,
@@ -1067,93 +1269,156 @@ pub mod el0 {
         unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack)) };
     }
 
-    fn block_base(value: u64) -> u64 {
-        value & !(USER_BLOCK_SIZE - 1)
+    fn align_down_4k(value: u64) -> u64 {
+        value & !(PAGE_4K - 1)
     }
 
-    fn block_align_up(value: u64) -> u64 {
-        (value + USER_BLOCK_SIZE - 1) & !(USER_BLOCK_SIZE - 1)
+    fn align_up_4k(value: u64) -> Option<u64> {
+        value
+            .checked_add(PAGE_4K - 1)
+            .map(|value| value & !(PAGE_4K - 1))
     }
 
-    unsafe fn clear_region(base: *mut u8, len: usize) {
-        unsafe { core::ptr::write_bytes(base, 0, len) };
+    /// Keep the active console MMIO reachable (EL1-only) while a process TTBR0 is
+    /// installed: the kernel still prints by raw-physical access (the framebuffer on real
+    /// hardware, the PL011 UART under QEMU), and TTBR1's higher half does not cover those
+    /// low identity addresses. This is the lone scaffold bridge of P5-mmu-b — it retires
+    /// when the console becomes a userspace driver (M5/P6). EL0 can never touch it.
+    unsafe fn map_console_window(
+        root: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), UserImageError> {
+        const BLOCK_2M: u64 = 1 << 21;
+        if super::FB_PRESENT.load(super::ORD) {
+            let base = super::FB_BASE.load(super::ORD) & !(BLOCK_2M - 1);
+            let span = (super::FB_LEN_PX.load(super::ORD) as u64) * 4;
+            let end = (super::FB_BASE.load(super::ORD) + span)
+                .checked_add(BLOCK_2M - 1)
+                .ok_or(UserImageError::OutOfFrames)?
+                & !(BLOCK_2M - 1);
+            let mut pa = base;
+            while pa < end {
+                unsafe { super::mmu::map_kernel_device_block(root, pa, pa, false, alloc, tables) }
+                    .map_err(|()| UserImageError::OutOfFrames)?;
+                pa += BLOCK_2M;
+            }
+        } else {
+            let base = (super::PL011_BASE as u64) & !(BLOCK_2M - 1);
+            unsafe { super::mmu::map_kernel_device_block(root, base, base, true, alloc, tables) }
+                .map_err(|()| UserImageError::OutOfFrames)?;
+        }
+        Ok(())
     }
 
-    fn stage_user_image(image: UserImage<'_>) -> Result<(u64, u64), UserImageError> {
+    /// Build a fresh per-process TTBR0 tree: each `PT_LOAD` segment as 4 KiB pages with
+    /// true per-page **W^X** (RX code / RW data, file bytes copied, the rest zeroed for
+    /// BSS), an RW stack below `stack_top` with one unmapped guard page beneath it, and the
+    /// EL1-only console window. Frames (`alloc`, returning zeroed RAM) are touched by
+    /// physical address, so this must run with the kernel identity map still active in
+    /// TTBR0 — i.e. before [`enter_user_image`] switches to the tree it returns. Returns
+    /// the L0 root physical address.
+    fn build_user_space(
+        image: &UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<u64, UserImageError> {
         if image.segments.is_empty() {
             return Err(UserImageError::Empty);
         }
 
-        let image_va = block_base(
-            image
-                .segments
-                .iter()
-                .map(|segment| segment.virt_addr)
-                .min()
-                .ok_or(UserImageError::Empty)?,
-        );
-        let stack_va = block_base(image.stack_top.saturating_sub(1));
-        let image_pa = block_align_up(
-            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_ARENA) as u64)
-                .ok_or(UserImageError::ImageTooLarge)?,
-        );
-        let stack_pa = block_align_up(
-            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_STACK_ARENA) as u64)
-                .ok_or(UserImageError::StackOutsideStackBlock)?,
-        );
-
-        unsafe {
-            clear_region(image_pa as *mut u8, USER_BLOCK_SIZE as usize);
-            clear_region(stack_pa as *mut u8, USER_BLOCK_SIZE as usize);
-        }
+        let mut tables = 0usize;
+        let root = alloc().ok_or(UserImageError::OutOfFrames)?; // zeroed L0 table
 
         for segment in image.segments {
-            let segment_end = segment
-                .virt_addr
-                .checked_add(segment.mem_size)
-                .ok_or(UserImageError::ImageTooLarge)?;
-            if segment.virt_addr < image_va || segment_end > image_va + USER_BLOCK_SIZE {
-                return Err(UserImageError::SegmentOutsideImageBlock);
+            if segment.writable && segment.executable {
+                return Err(UserImageError::BadSegment); // W^X: never both
             }
             if segment.source.len() as u64 > segment.mem_size {
-                return Err(UserImageError::ImageTooLarge);
+                return Err(UserImageError::BadSegment);
             }
-            let dst = (image_pa + (segment.virt_addr - image_va)) as *mut u8;
-            unsafe {
-                core::ptr::copy_nonoverlapping(segment.source.as_ptr(), dst, segment.source.len())
-            };
+            let seg_end = segment
+                .virt_addr
+                .checked_add(segment.mem_size)
+                .ok_or(UserImageError::BadSegment)?;
+            if segment.mem_size == 0 {
+                continue;
+            }
+            let src_lo = segment.virt_addr;
+            let src_hi = src_lo + segment.source.len() as u64;
+            let desc = super::mmu::user_page_desc(segment.executable, segment.writable);
+
+            let mut page = align_down_4k(segment.virt_addr);
+            let last = align_down_4k(seg_end - 1);
+            loop {
+                let frame = alloc().ok_or(UserImageError::OutOfFrames)?; // zeroed -> BSS
+                let copy_lo = core::cmp::max(page, src_lo);
+                let copy_hi = core::cmp::min(page + PAGE_4K, src_hi);
+                if copy_hi > copy_lo {
+                    let dst_off = copy_lo - page;
+                    let src_off = (copy_lo - src_lo) as usize;
+                    let len = (copy_hi - copy_lo) as usize;
+                    // SAFETY: `frame` is a zeroed RAM page mapped by the identity map; the
+                    // copied span lies inside `segment.source`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            segment.source.as_ptr().add(src_off),
+                            (frame + dst_off) as *mut u8,
+                            len,
+                        );
+                    }
+                }
+                unsafe { super::mmu::map_user_page(root, page, frame, desc, alloc, &mut tables) }
+                    .map_err(|()| UserImageError::OutOfFrames)?;
+                if segment.executable {
+                    // SAFETY: clean this code frame to PoC + drop the I-cache so EL0 fetches
+                    // the bytes we just wrote (the loader does the same for the kernel image).
+                    unsafe { flush_for_exec(frame, PAGE_4K as usize) };
+                }
+                if page == last {
+                    break;
+                }
+                page += PAGE_4K;
+            }
         }
 
-        if image.stack_top <= stack_va || image.stack_top > stack_va + USER_BLOCK_SIZE {
-            return Err(UserImageError::StackOutsideStackBlock);
+        // RW stack directly below `stack_top`; one unmapped guard page beneath it.
+        let stack_size = align_up_4k(image.stack_size).ok_or(UserImageError::BadStack)?;
+        if stack_size == 0 || stack_size > image.stack_top {
+            return Err(UserImageError::BadStack);
         }
-
-        unsafe {
-            super::mmu::map_user_2m_to(image_va, image_pa);
-            super::mmu::map_user_2m_to(stack_va, stack_pa);
-            flush_for_exec(image_pa, USER_BLOCK_SIZE as usize);
+        let stack_base = image.stack_top - stack_size;
+        let stack_desc = super::mmu::user_page_desc(false, true); // RW, never executable
+        let mut sp = stack_base;
+        while sp < image.stack_top {
+            let frame = alloc().ok_or(UserImageError::OutOfFrames)?;
+            unsafe { super::mmu::map_user_page(root, sp, frame, stack_desc, alloc, &mut tables) }
+                .map_err(|()| UserImageError::OutOfFrames)?;
+            sp += PAGE_4K;
         }
+        // [stack_base - PAGE_4K, stack_base): intentionally left unmapped (the guard page).
 
-        Ok((image_va, stack_va))
+        unsafe { map_console_window(root, alloc, &mut tables)? };
+
+        Ok(root)
     }
 
-    pub fn run_el0_image(image: UserImage<'_>) -> Result<El0Report, UserImageError> {
-        let (_image_va, _stack_va) = stage_user_image(image)?;
-
-        unsafe {
-            core::arch::asm!(
-                "mrs {t}, sctlr_el1",
-                "bic {t}, {t}, #0x80000",
-                "msr sctlr_el1, {t}",
-                "isb",
-                t = out(reg) _,
-                options(nostack, nomem),
-            );
-        }
+    /// Build the process address space, switch `TTBR0` to it, `eret` to EL0, and on return
+    /// (a `ProcessExit` syscall) restore the kernel identity map. TTBR1 — the kernel —
+    /// stays mapped throughout, so EL1 keeps executing across both swaps.
+    fn enter_user_image(
+        image: UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
+        let root = build_user_space(&image, alloc)?;
+        let kernel_ttbr0 = super::mmu::read_ttbr0();
 
         SYSCALLS.store(0, Ordering::Relaxed);
+        // SAFETY: `root` is a complete user tree; the kernel half (TTBR1) is untouched.
+        unsafe { super::mmu::set_ttbr0(root) };
         let exit_code =
             unsafe { kumo_enter_el0(image.entry, image.stack_top - 16, image.bootstrap) };
+        // SAFETY: restore the identity map the rest of Stage-A (and the console) expects.
+        unsafe { super::mmu::set_ttbr0(kernel_ttbr0) };
 
         Ok(El0Report {
             entered: true,
@@ -1163,51 +1428,42 @@ pub mod el0 {
         })
     }
 
-    /// Drop to EL0, run the payload, handle its syscalls, and return the outcome.
-    pub fn run_el0_smoke() -> El0Report {
-        const SMOKE_VA: u64 = 0x0040_0000;
-        let region_pa = block_align_up(
-            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_ARENA) as u64)
-                .expect("EL0 arena outside kernel image"),
-        );
+    /// Materialize `image` into a per-process address space and run it at EL0.
+    pub fn run_el0_image(
+        image: UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
+        enter_user_image(image, alloc)
+    }
 
-        // Make the window EL0-accessible (EL0 RWX, kernel-noexec).
-        unsafe { super::mmu::map_user_2m_to(SMOKE_VA, region_pa) };
-
-        // Clear SCTLR_EL1.WXN so the (writable) EL0 code page is executable even if the
-        // firmware enforced write-implies-XN. Per-page W^X (separate RX code / RW stack)
-        // arrives with the real Vmar; this is a no-op where WXN was already clear (QEMU).
-        unsafe {
-            core::arch::asm!(
-                "mrs {t}, sctlr_el1",
-                "bic {t}, {t}, #0x80000",
-                "msr sctlr_el1, {t}",
-                "isb",
-                t = out(reg) _,
-                options(nostack, nomem),
-            );
-        }
-
-        // Copy the payload to the window's base and make it coherent for EL0 fetch.
+    /// Run the embedded smoke payload (DebugWrite + ChannelCreate + ProcessExit) as a real
+    /// frame-backed RX process at `base`, with an RW stack below `stack_top`. The fallback
+    /// when there is no Sora image; exercises the same per-process page-table path.
+    pub fn run_el0_smoke(
+        base: u64,
+        stack_top: u64,
+        stack_size: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<El0Report, UserImageError> {
         let start = core::ptr::addr_of!(el0_payload_start) as usize;
         let end = core::ptr::addr_of!(el0_payload_end) as usize;
-        let len = end - start;
-        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, region_pa as *mut u8, len) };
-        unsafe { flush_for_exec(region_pa, len) };
-
-        SYSCALLS.store(0, Ordering::Relaxed);
-
-        // User stack at the top of the window (16-aligned), then drop to EL0. The exit
-        // syscall trampolines back here with the exit code.
-        let user_sp = SMOKE_VA + 0x200000 - 16;
-        let exit_code = unsafe { kumo_enter_el0(SMOKE_VA, user_sp, 0) };
-
-        El0Report {
-            entered: true,
-            syscalls: SYSCALLS.load(Ordering::Relaxed),
-            ping_echo: 0,
-            exit_code,
-        }
+        // SAFETY: the payload symbols bracket the embedded blob in our own .text section.
+        let payload = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+        let segment = UserLoadSegment {
+            source: payload,
+            virt_addr: base,
+            mem_size: payload.len() as u64,
+            writable: false,
+            executable: true,
+        };
+        let image = UserImage {
+            entry: base,
+            stack_top,
+            stack_size,
+            bootstrap: 0,
+            segments: core::slice::from_ref(&segment),
+        };
+        enter_user_image(image, alloc)
     }
 }
 
@@ -1240,6 +1496,8 @@ pub struct UserLoadSegment<'a> {
     pub source: &'a [u8],
     pub virt_addr: u64,
     pub mem_size: u64,
+    pub writable: bool,
+    pub executable: bool,
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1247,18 +1505,27 @@ pub struct UserLoadSegment<'a> {
 pub struct UserImage<'a> {
     pub entry: u64,
     pub stack_top: u64,
+    pub stack_size: u64,
     /// Bootstrap handle passed to the process in `x0` at entry (0 = none).
     pub bootstrap: u64,
     pub segments: &'a [UserLoadSegment<'a>],
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn run_el0_smoke() -> El0Report {
-    El0Report::default()
+pub fn run_el0_smoke(
+    _base: u64,
+    _stack_top: u64,
+    _stack_size: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
+    Err(UserImageError::Unsupported)
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn run_el0_image(_image: UserImage<'_>) -> Result<El0Report, UserImageError> {
+pub fn run_el0_image(
+    _image: UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<El0Report, UserImageError> {
     Err(UserImageError::Unsupported)
 }
 
@@ -2034,6 +2301,54 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "aarch64");
+    }
+
+    fn scalars<const N: usize>(bytes: &[u8]) -> ([u32; N], usize) {
+        let mut out = [0u32; N];
+        let mut n = 0;
+        for_each_scalar(bytes, |c| {
+            out[n] = c;
+            n += 1;
+        });
+        (out, n)
+    }
+
+    #[test]
+    fn decodes_ascii_and_multibyte_scalars() {
+        // "A紫雲" = U+0041, U+7D2B (3-byte), U+96F2 (3-byte).
+        let (out, n) = scalars::<8>("A紫雲".as_bytes());
+        assert_eq!(&out[..n], &[0x41, 0x7d2b, 0x96f2]);
+    }
+
+    #[test]
+    fn malformed_utf8_becomes_replacement_not_panic() {
+        // Stray continuation byte, then a truncated 3-byte lead, then a clean 'Z'.
+        let (out, n) = scalars::<8>(&[0x80, 0xe7, b'Z']);
+        assert_eq!(&out[..n], &[0xfffd, 0xfffd, b'Z' as u32]);
+    }
+
+    #[test]
+    fn cjk_font_records_are_sorted_and_looked_up() {
+        let font = cjk_font::CJK_FONT;
+        let rec = cjk_font::RECORD;
+        assert_eq!(font.len() % rec, 0);
+        assert_eq!(font.len() / rec, cjk_font::GLYPH_COUNT);
+        // Strictly ascending codepoints, so the binary search is valid.
+        let code = |i: usize| u16::from_le_bytes([font[i * rec], font[i * rec + 1]]);
+        assert!((1..cjk_font::GLYPH_COUNT).all(|i| code(i - 1) < code(i)));
+        // Broad set: common Han (一/的) and a Hangul jamo (ㄱ) are in; a precomposed Hangul
+        // syllable (가) and an astral codepoint are not (deferred to the BDF stage).
+        assert_eq!(cjk_glyph('一' as u32).map(<[u8]>::len), Some(32));
+        assert!(cjk_glyph('的' as u32).is_some());
+        assert!(cjk_glyph('ㄱ' as u32).is_some());
+        assert!(cjk_glyph('가' as u32).is_none());
+        assert!(cjk_glyph(0x1_0000).is_none());
+    }
+
+    #[test]
+    fn tofu_is_a_nonempty_box() {
+        // The fail-safe glyph must leave a visible mark (DESIGN/005), so it is never blank.
+        assert!(TOFU.iter().any(|&b| b != 0));
     }
 
     #[test]
