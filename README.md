@@ -1,5 +1,5 @@
-<div align="center" style="border: 4px solid #3498db; border-radius:12px;">
- <img src="resources/kumo_full-color.jpg" alt="KUMO Logo" width="400"/>
+<div align="center">
+ <img src="resources/kumo_full-color.jpg" style="border: 2px solid #3498db; border-radius:12px;" alt="KUMO Logo" width="400"/>
 
   # KUMO (雲)
   **A Serene, Capability-Based Microkernel in Rust**
