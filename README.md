@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center" style="border: 4px solid #3498db; border-radius:12px;">
  <img src="resources/kumo_full-color.jpg" alt="KUMO Logo" width="400"/>
 
   # KUMO (雲)
