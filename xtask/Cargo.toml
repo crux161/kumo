@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 imager = { path = "../imager" }
+kumo-abi.workspace = true
 
 [[bin]]
 name = "xtask"

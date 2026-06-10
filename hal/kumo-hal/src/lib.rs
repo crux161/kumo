@@ -12,20 +12,22 @@ compile_error!("select a HAL backend");
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
     pub use kumo_hal_aarch64::{
-        arch_name, clear_preempt_hook, console_read_byte, early_console_write, enable_identity_mmu,
-        halt, init_timer_interrupts, install_exception_vectors, monotonic_nanos, set_framebuffer,
-        set_preempt_hook, spin_once, switch_context, timer_irq_count, wait_for_timer_irqs,
-        ThreadContext, ARCH,
+        arch_name, clear_preempt_hook, console_read_byte, early_console_write, el0_exit,
+        enable_identity_mmu, fb_fill, fb_paint_band, halt, init_timer_interrupts,
+        install_exception_vectors, monotonic_nanos, run_el0_smoke, set_framebuffer,
+        set_preempt_hook, set_svc_hook, spin_once, switch_context, timer_irq_count,
+        wait_for_timer_irqs, El0Report, ThreadContext, ARCH,
     };
 }
 
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        arch_name, clear_preempt_hook, console_read_byte, early_console_write, enable_identity_mmu,
-        halt, init_timer_interrupts, install_exception_vectors, monotonic_nanos, set_framebuffer,
-        set_preempt_hook, spin_once, switch_context, timer_irq_count, wait_for_timer_irqs,
-        ThreadContext, ARCH,
+        arch_name, clear_preempt_hook, console_read_byte, early_console_write, el0_exit,
+        enable_identity_mmu, fb_fill, fb_paint_band, halt, init_timer_interrupts,
+        install_exception_vectors, monotonic_nanos, run_el0_smoke, set_framebuffer,
+        set_preempt_hook, set_svc_hook, spin_once, switch_context, timer_irq_count,
+        wait_for_timer_irqs, El0Report, ThreadContext, ARCH,
     };
 }
 

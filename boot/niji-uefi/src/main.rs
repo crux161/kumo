@@ -561,10 +561,10 @@ unsafe fn boot_and_jump(
         return;
     }
 
-    // Boot services are gone — no more UEFI console. The kernel's Stage-A console
-    // takes over. Make the freshly-copied kernel code visible to the I-cache, then
-    // branch to its entry with x0 = BootInfo*.
-    unsafe { jump_to_kernel(kernel.entry, boot_ptr) }
+    // Boot services are gone — no more UEFI console. The kernel's Stage-A console takes
+    // over. Make the freshly-copied kernel code coherent for instruction fetch (clean
+    // D-cache to PoC, invalidate I-cache), then branch to entry with x0 = BootInfo*.
+    unsafe { jump_to_kernel(kernel.entry, boot_ptr, kernel.phys.start, kernel.phys.len) }
 }
 
 /// Open the boot device's volume root (`LoadedImage -> SimpleFileSystem`).
@@ -742,10 +742,16 @@ unsafe fn load_kernel(
     // (`--emit-relocs`), so we rebase it to wherever we landed.
     let pages = ((image.load_span() + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE) as usize;
     let mut load_addr: u64 = 0;
+    // Allocate the kernel into EfiLoaderCode, not EfiLoaderData: strict UEFI (Qualcomm's
+    // SC8280XP firmware) maps loader *data* pages non-executable, so a `br` into the
+    // copied kernel faults on instruction fetch and never runs its first instruction —
+    // the X13s "red flash, no green" symptom. Lax firmware (the Pi's EDK2, QEMU/AAVMF)
+    // maps data executable and masks the bug. EfiLoaderCode is what GRUB and the Linux
+    // EFI stub use for loaded kernels.
     let status = unsafe {
         ((*boot_services).allocate_pages)(
             EFI_ALLOCATE_ANY_PAGES,
-            efi_memory_type::LOADER_DATA,
+            efi_memory_type::LOADER_CODE,
             pages,
             &mut load_addr,
         )
@@ -1031,8 +1037,24 @@ unsafe fn discover_framebuffer(
 
 /// Make the freshly-copied kernel visible to instruction fetch, then branch to its
 /// entry with `x0 = BootInfo*`. Never returns.
-unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo) -> ! {
+///
+/// The loader wrote the kernel's `.text` (and patched relocations) with ordinary
+/// stores, which sit **dirty in the D-cache**. Real ARM cores do not keep the I- and
+/// D-caches coherent, so before fetching that code we must clean each written line —
+/// to the Point of *Coherency* (`dc civac`), not just the PoU: on cores whose I-cache
+/// fills below the PoU (some DSU/big.LITTLE configs, incl. the SC8280XP) a clean-to-PoU
+/// leaves the code stale and the kernel never executes its first instruction. Then we
+/// invalidate the I-cache (`ic iallu`). It all appears to work on QEMU, whose caches are
+/// modelled coherently. `image_base..image_base+len` is the loaded image (`kernel.phys`).
+unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo, image_base: u64, image_len: u64) -> ! {
     unsafe {
+        let line = dcache_line_size();
+        let mut addr = image_base & !(line - 1);
+        let end = image_base.wrapping_add(image_len);
+        while addr < end {
+            core::arch::asm!("dc civac, {a}", a = in(reg) addr, options(nostack, preserves_flags));
+            addr = addr.wrapping_add(line);
+        }
         core::arch::asm!(
             "dsb sy",
             "ic  iallu",
@@ -1044,6 +1066,21 @@ unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo) -> ! {
             options(noreturn),
         )
     }
+}
+
+/// D-cache line size in bytes, from `CTR_EL0.DminLine` (log2 of the line size in
+/// 32-bit words). Used to stride `dc civac` over the loaded kernel image.
+unsafe fn dcache_line_size() -> u64 {
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {c}, ctr_el0",
+            c = out(reg) ctr,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    let dminline = (ctr >> 16) & 0xf;
+    4u64 << dminline
 }
 
 /// Offer a brief pre-handoff pause via the firmware console. Drains any stale key,

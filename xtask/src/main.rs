@@ -11,14 +11,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
+use kumo_abi::initrd::{
+    INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION,
+    SORA_INIT_PATH,
+};
 
 /// Staged kernel image + initrd locations on the ESP (must match the paths
 /// `niji-uefi` opens at runtime).
 const KERNEL_ESP_PATH: &str = "EFI/KUMO/kernel/kumo-kernel.elf";
 const INITRD_ESP_PATH: &str = "EFI/KUMO/initrd.img";
-/// Placeholder initrd payload until a real initrd builder exists. It is loaded and
-/// handed off for real; the kernel does not parse it yet.
-const INITRD_PLACEHOLDER: &[u8] = b"KUMO initrd placeholder\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Arch {
@@ -169,6 +170,9 @@ fn parse_hardware_target(value: &str) -> Result<HardwareTarget, String> {
         | "lenovo-thinkpad-x13s"
         | "sc8280xp-lenovo-thinkpad-x13s" => Ok(HardwareTarget::ThinkPadX13sGen1),
         "qemu" | "qemu-virt" | "qemu-virt-aarch64" => Ok(HardwareTarget::QemuVirtAarch64),
+        "rpi5" | "pi5" | "raspberry-pi-5" | "raspberrypi5" | "raspberry-pi5" => {
+            Ok(HardwareTarget::RaspberryPi5)
+        }
         "generic-x86_64" | "generic-uefi-x86_64" | "x86_64" => {
             Ok(HardwareTarget::GenericUefiX86_64)
         }
@@ -529,21 +533,84 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
         return Ok(None);
     }
 
+    let sora = build_sora_image(&workspace_root()?)?;
+    let initrd = build_initrd(&[(SORA_INIT_PATH, sora.as_slice())])?;
+
     let staged_path = out_dir
         .join(plan.hardware.to_string())
         .join(INITRD_ESP_PATH);
     if let Some(parent) = staged_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
-    fs::write(&staged_path, INITRD_PLACEHOLDER)
+    fs::write(&staged_path, &initrd)
         .map_err(|err| format!("write {}: {err}", staged_path.display()))?;
 
     Ok(Some(StagedSimpleAsset {
         esp_path: PathBuf::from(INITRD_ESP_PATH),
         staged_path,
-        byte_len: INITRD_PLACEHOLDER.len() as u64,
-        fingerprint: fnv1a64(INITRD_PLACEHOLDER),
+        byte_len: initrd.len() as u64,
+        fingerprint: fnv1a64(&initrd),
     }))
+}
+
+fn build_sora_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "sora",
+            "--bin",
+            "sora",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("sora");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as Sora ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_initrd(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    let table_bytes = files
+        .len()
+        .checked_mul(INITRD_ENTRY_LEN)
+        .ok_or_else(|| "initrd entry table too large".to_owned())?;
+    let data_offset = INITRD_HEADER_LEN
+        .checked_add(table_bytes)
+        .ok_or_else(|| "initrd header too large".to_owned())?;
+    let mut initrd = vec![0; data_offset];
+
+    initrd[..8].copy_from_slice(&INITRD_MAGIC);
+    initrd[8..12].copy_from_slice(&INITRD_VERSION.to_le_bytes());
+    initrd[12..16].copy_from_slice(&(files.len() as u32).to_le_bytes());
+
+    let mut cursor = data_offset;
+    for (index, (path, bytes)) in files.iter().enumerate() {
+        let path_bytes = path.as_bytes();
+        if path_bytes.is_empty() || path_bytes.len() >= INITRD_PATH_MAX {
+            return Err(format!("initrd path '{path}' does not fit"));
+        }
+
+        let entry = INITRD_HEADER_LEN + index * INITRD_ENTRY_LEN;
+        initrd[entry..entry + path_bytes.len()].copy_from_slice(path_bytes);
+        initrd[entry + INITRD_PATH_MAX..entry + INITRD_PATH_MAX + 8]
+            .copy_from_slice(&(cursor as u64).to_le_bytes());
+        initrd[entry + INITRD_PATH_MAX + 8..entry + INITRD_PATH_MAX + 16]
+            .copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+
+        initrd.extend_from_slice(bytes);
+        cursor = initrd.len();
+    }
+
+    Ok(initrd)
 }
 
 fn validate_aarch64_kernel_elf(bytes: &[u8]) -> Result<u64, String> {

@@ -179,7 +179,9 @@ fn pl011_putc(byte: u8) {
 const FONT: &[u8] = include_bytes!("../font8x16.psf");
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
-const FG: u32 = 0x00ff_ffff; // white — identical bytes in RGB and BGR
+// Jet Alone-style phosphor green on black. Green is the middle byte, so 0x0000_ff00 is
+// the same pixel in RGB888x and BGR888x — format-agnostic like white was.
+const FG: u32 = 0x0000_ff00; // phosphor green
 const BG: u32 = 0x0000_0000; // black
 
 static FB_PRESENT: AtomicBool = AtomicBool::new(false);
@@ -217,6 +219,20 @@ fn glyph_rows(ch: u8) -> &'static [u8] {
     }
 }
 
+/// Clean one cache line containing `addr` to the point of coherency. The display
+/// controller scans the framebuffer from RAM; until `mm::enable_paging` remaps the
+/// framebuffer as Normal-NC, CPU pixel writes can sit in the D-cache where the scanout
+/// never sees them (a blank screen on real hardware even though the kernel is running).
+/// No-op on the host; harmless on QEMU and on WC/Device buffers (a clean of a line
+/// that was never cached does nothing).
+#[cfg(target_os = "none")]
+#[inline]
+unsafe fn fb_clean_line(addr: usize) {
+    unsafe {
+        core::arch::asm!("dc cvac, {a}", a = in(reg) addr, options(nostack, preserves_flags))
+    };
+}
+
 /// Blit one glyph into a 32-bpp framebuffer. Bounds-checked against `len_px`, so a
 /// bad geometry truncates instead of scribbling past the buffer. Pure with respect
 /// to console state, which makes it host-testable against an in-memory buffer.
@@ -236,13 +252,31 @@ unsafe fn blit_glyph(
     let rows = glyph_rows(ch);
     for (ry, &bits) in rows.iter().enumerate() {
         let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
         for rx in 0..GLYPH_W {
             let on = (bits >> (7 - rx)) & 1 != 0;
-            let idx = py.wrapping_mul(stride).wrapping_add(x_px + rx);
+            let idx = row_start.wrapping_add(rx);
             if idx < len_px {
                 unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
             }
         }
+        // Flush this row's pixels to RAM so the display actually shows them (see
+        // `fb_clean_line`). The 8-pixel span is one cache line; clean both ends in case
+        // it straddles a line boundary.
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + GLYPH_W - 1;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
 }
 
@@ -263,14 +297,100 @@ pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, strid
     FB_COL.store(0, ORD);
     FB_ROW.store(0, ORD);
 
+    // Clear to the black phosphor backdrop, then flush to RAM so it shows on real
+    // hardware where the framebuffer may be write-back cached (see `fb_clean_line`).
     let ptr = base as *mut u32;
     let mut i = 0;
     while i < len_px {
         unsafe { ptr.add(i).write_volatile(BG) };
         i += 1;
     }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut j = 0;
+        while j < len_px {
+            fb_clean_line(ptr.add(j) as usize);
+            j += 16; // 64-byte cache line / 4-byte pixel
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
 
     FB_PRESENT.store(true, ORD);
+}
+
+/// Fill the whole linear framebuffer with `color` (little-endian BGRx u32) and flush it
+/// to RAM. Used as a bring-up backdrop and a "the kernel is executing and this
+/// framebuffer is visible" proof that persists until something repaints over it. Painted
+/// before any fallible work, so on a fresh board: a solid colour means entry +
+/// relocation + cache coherency + a live framebuffer all work; an unchanged screen (or a
+/// reset) means the kernel never got here (or these writes are not reaching the panel).
+pub fn fb_fill(phys: u64, len_bytes: u64, color: u32) {
+    if phys == 0 {
+        return;
+    }
+    let len_px = (len_bytes / 4) as usize;
+    let base = phys as *mut u32;
+    let mut i = 0;
+    while i < len_px {
+        unsafe { base.add(i).write_volatile(color) };
+        i += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut j = 0;
+        while j < len_px {
+            fb_clean_line(base.add(j) as usize);
+            j += 16; // 64-byte cache line / 4-byte pixel
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Bring-up "POST code on screen": paint a solid 24px band of `color` across the full
+/// width at row `y0`, **directly** into a linear BGRx framebuffer described by the raw
+/// `BootInfo` fields — bypassing all console/`FB_PRESENT` state — and flush it to RAM.
+/// Lets a boot milestone (or the exact point of an early hang) be seen on real hardware
+/// before, and independent of, the text console. `color` is a little-endian BGRx u32:
+/// blue = `0x0000_00ff`, green = `0x0000_ff00`, red = `0x00ff_0000`.
+pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32, color: u32) {
+    if phys == 0 || width == 0 {
+        return;
+    }
+    let stride = if stride == 0 { width } else { stride } as usize;
+    let width = width as usize;
+    let len_px = (len_bytes / 4) as usize;
+    let base = phys as *mut u32;
+    const BAND_H: usize = 24;
+
+    let mut ry = 0;
+    while ry < BAND_H {
+        let row = (y0 as usize + ry).wrapping_mul(stride);
+        let mut x = 0;
+        while x < width {
+            let idx = row + x;
+            if idx < len_px {
+                unsafe { base.add(idx).write_volatile(color) };
+            }
+            x += 1;
+        }
+        // Flush this row to RAM so the display scanout sees it (see `fb_clean_line`).
+        #[cfg(target_os = "none")]
+        {
+            let start = row.min(len_px);
+            let stop_px = (row + width).min(len_px);
+            let mut a = ((base as usize) + start * 4) & !63;
+            let stop = (base as usize) + stop_px * 4;
+            while a < stop {
+                unsafe { fb_clean_line(a) };
+                a += 64;
+            }
+        }
+        ry += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
 }
 
 fn fb_putc(byte: u8) {
@@ -535,10 +655,348 @@ pub mod mmu {
 
         Ok((tables, gb_count * GB))
     }
+
+    const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    const AP_EL0: u64 = 1 << 6; // AP[1]=1 -> AP[2:1]=0b01: EL1 RW / EL0 RW
+
+    fn read_desc(table_phys: u64, index: usize) -> u64 {
+        unsafe { ((table_phys + (index as u64) * 8) as *const u64).read_volatile() }
+    }
+
+    /// Re-map the live 2 MiB block containing identity VA `va` as **EL0-accessible**:
+    /// Normal-WB, EL0 read/write/execute (`AP[1]=1`, `UXN=0`), kernel-noexec (`PXN=1`,
+    /// W^X). The block must already be mapped (it is — `enable_identity` covers all RAM).
+    /// This is the minimal hook for a user window; per-page `Vmar` mappings come later.
+    ///
+    /// # Safety
+    /// Runs at EL1 under the kernel's TTBR0 map; `va` must be 2 MiB-aligned RAM.
+    pub unsafe fn map_user_2m(va: u64) {
+        let ttbr0: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem)) };
+        let l0 = ttbr0 & ADDR_MASK;
+        let l1 = read_desc(l0, ((va >> 39) & 0x1ff) as usize) & ADDR_MASK;
+        let l2 = read_desc(l1, ((va >> 30) & 0x1ff) as usize) & ADDR_MASK;
+        let l2i = ((va >> 21) & 0x1ff) as usize;
+        let pa = va & !(BLOCK_2M - 1);
+        let desc = pa | DESC_VALID | DESC_AF | (MAIR_WB << 2) | SH_INNER | AP_EL0 | PXN;
+        write_desc(l2, l2i, desc);
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
 pub use mmu::enable_identity as enable_identity_mmu;
+
+// ---- EL0 / userspace smoke -----------------------------------------------------------
+//
+// The first time KUMO drops below EL1. A tiny position-independent payload runs at EL0
+// in a dedicated, EL0-accessible 2 MiB window, issues `SVC #0` syscalls (a "ping" and an
+// "exit"), and the kernel handles them at EL1 and trampolines back. This proves the whole
+// privilege round-trip — user mapping, `eret` to EL0, the SVC trap, dispatch, and return
+// — the foundation the real syscall ABI (`SyscallEngine`) and Sora build on.
+#[cfg(target_os = "none")]
+pub mod el0 {
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// A 2 MiB, 2 MiB-aligned window — its own L2 block, re-mapped EL0-accessible at
+    /// runtime. Holds the user payload (low) and the user stack (high).
+    #[repr(C, align(0x200000))]
+    struct UserRegion([u8; 0x200000]);
+    static mut USER_REGION: UserRegion = UserRegion([0; 0x200000]);
+
+    static SYSCALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// The kernel's syscall handler, registered via [`set_svc_hook`]. It receives a
+    /// pointer to the 31 saved EL0 GP registers (x0..x30): the ABI is x8 = syscall
+    /// number, x0.. = args, results written back to x0/x1. 0 means "not installed".
+    static SVC_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Register the kernel's EL0 syscall handler (see [`SVC_HOOK`]).
+    pub fn set_svc_hook(hook: extern "C" fn(*mut u64)) {
+        SVC_HOOK.store(hook as usize, Ordering::Release);
+    }
+
+    /// Outcome of the EL0 round-trip, for the boot report.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct El0Report {
+        pub entered: bool,
+        pub syscalls: u32,
+        pub ping_echo: u64,
+        pub exit_code: u64,
+    }
+
+    /// Saved kernel callee-saved registers + SP, so the exit SVC can return to the boot
+    /// flow as if `kumo_enter_el0` had returned. Touched only from asm.
+    #[no_mangle]
+    #[used]
+    static mut KERNEL_RESUME: [u64; 16] = [0; 16];
+
+    extern "C" {
+        fn kumo_enter_el0(entry: u64, user_sp: u64) -> u64;
+        static el0_payload_start: u8;
+        static el0_payload_end: u8;
+    }
+
+    // The EL0 program (position-independent: register ops + svc + adr/relative branch).
+    // Uses the real syscall ABI (x8 = number, args in x0..): DebugWrite(29) a greeting,
+    // ChannelCreate(3), then ProcessExit(21). The string is embedded and addressed
+    // PC-relative, so it resolves to its user-VA after the blob is copied into the window.
+    core::arch::global_asm!(
+        ".section .text.el0_payload",
+        ".global el0_payload_start",
+        ".global el0_payload_end",
+        ".balign 4",
+        "el0_payload_start:",
+        "  adr  x0, 5f",  // x0 = &msg (user VA)
+        "  movz x1, #23", // x1 = msg len
+        "  movz x8, #29", // SYS DebugWrite
+        "  svc  #0",
+        "  movz x8, #3", // SYS ChannelCreate -> x0=h0, x1=h1
+        "  svc  #0",
+        "  movz x0, #0",  // exit code 0
+        "  movz x8, #21", // SYS ProcessExit (does not return to EL0)
+        "  svc  #0",
+        "1: b 1b",
+        "5: .ascii \"hello from EL0 via SVC\\n\"",
+        ".balign 4",
+        "el0_payload_end:",
+    );
+
+    // Save kernel callee-saved + SP, then `eret` to EL0 (entry=x0, user SP=x1).
+    core::arch::global_asm!(
+        ".global kumo_enter_el0",
+        ".balign 4",
+        "kumo_enter_el0:",
+        "  adrp x2, KERNEL_RESUME",
+        "  add  x2, x2, :lo12:KERNEL_RESUME",
+        "  stp  x19, x20, [x2, #0]",
+        "  stp  x21, x22, [x2, #16]",
+        "  stp  x23, x24, [x2, #32]",
+        "  stp  x25, x26, [x2, #48]",
+        "  stp  x27, x28, [x2, #64]",
+        "  stp  x29, x30, [x2, #80]",
+        "  mov  x3, sp",
+        "  str  x3, [x2, #96]",
+        "  msr  elr_el1, x0", // EL0 entry point
+        "  movz x4, #0x3c0",  // SPSR: EL0t, DAIF masked (no preemption during the smoke)
+        "  msr  spsr_el1, x4",
+        "  msr  sp_el0, x1", // EL0 stack
+        "  isb",
+        "  eret",
+    );
+
+    // Restore kernel callee-saved + SP and `ret` to `kumo_enter_el0`'s caller (x0 = code).
+    core::arch::global_asm!(
+        ".global kumo_resume_kernel",
+        ".balign 4",
+        "kumo_resume_kernel:",
+        "  adrp x2, KERNEL_RESUME",
+        "  add  x2, x2, :lo12:KERNEL_RESUME",
+        "  ldp  x19, x20, [x2, #0]",
+        "  ldp  x21, x22, [x2, #16]",
+        "  ldp  x23, x24, [x2, #32]",
+        "  ldp  x25, x26, [x2, #48]",
+        "  ldp  x27, x28, [x2, #64]",
+        "  ldp  x29, x30, [x2, #80]",
+        "  ldr  x3, [x2, #96]",
+        "  mov  sp, x3",
+        "  ret",
+    );
+
+    // Lower-EL synchronous handler: save the EL0 frame, and if the cause is SVC, dispatch
+    // it and `eret` back to EL0; otherwise fall through to the Tower (a real EL0 fault).
+    core::arch::global_asm!(
+        ".global kumo_svc_common",
+        ".balign 4",
+        "kumo_svc_common:",
+        "  sub  sp, sp, #288",
+        "  stp  x0,  x1,  [sp, #0]",
+        "  stp  x2,  x3,  [sp, #16]",
+        "  stp  x4,  x5,  [sp, #32]",
+        "  stp  x6,  x7,  [sp, #48]",
+        "  stp  x8,  x9,  [sp, #64]",
+        "  stp  x10, x11, [sp, #80]",
+        "  stp  x12, x13, [sp, #96]",
+        "  stp  x14, x15, [sp, #112]",
+        "  stp  x16, x17, [sp, #128]",
+        "  stp  x18, x19, [sp, #144]",
+        "  stp  x20, x21, [sp, #160]",
+        "  stp  x22, x23, [sp, #176]",
+        "  stp  x24, x25, [sp, #192]",
+        "  stp  x26, x27, [sp, #208]",
+        "  stp  x28, x29, [sp, #224]",
+        "  str  x30,      [sp, #240]",
+        "  mrs  x0, elr_el1",
+        "  mrs  x1, spsr_el1",
+        "  stp  x0,  x1,  [sp, #248]",
+        "  mrs  x0, sp_el0",
+        "  str  x0,      [sp, #264]",
+        "  mrs  x0, esr_el1", // EC = ESR[31:26]; 0x15 == SVC from AArch64
+        "  lsr  x1, x0, #26",
+        "  and  x1, x1, #0x3f",
+        "  cmp  x1, #0x15",
+        "  b.ne 8f",
+        "  mov  x0, sp", // dispatch(frame*)
+        "  bl   kumo_svc_dispatch",
+        "  ldp  x0,  x1,  [sp, #248]", // restore EL0 return state (x0/x1 scratch)
+        "  msr  elr_el1, x0",
+        "  msr  spsr_el1, x1",
+        "  ldr  x0,      [sp, #264]",
+        "  msr  sp_el0, x0",
+        "  ldp  x0,  x1,  [sp, #0]", // restore GPRs (x0 may carry the syscall result)
+        "  ldp  x2,  x3,  [sp, #16]",
+        "  ldp  x4,  x5,  [sp, #32]",
+        "  ldp  x6,  x7,  [sp, #48]",
+        "  ldp  x8,  x9,  [sp, #64]",
+        "  ldp  x10, x11, [sp, #80]",
+        "  ldp  x12, x13, [sp, #96]",
+        "  ldp  x14, x15, [sp, #112]",
+        "  ldp  x16, x17, [sp, #128]",
+        "  ldp  x18, x19, [sp, #144]",
+        "  ldp  x20, x21, [sp, #160]",
+        "  ldp  x22, x23, [sp, #176]",
+        "  ldp  x24, x25, [sp, #192]",
+        "  ldp  x26, x27, [sp, #208]",
+        "  ldp  x28, x29, [sp, #224]",
+        "  ldr  x30,      [sp, #240]",
+        "  add  sp, sp, #288",
+        "  eret",
+        "8:", // not SVC: a real lower-EL fault -> the Tower
+        "  mrs  x1, esr_el1",
+        "  mrs  x2, elr_el1",
+        "  mrs  x3, far_el1",
+        "  mov  x0, #8",
+        "  b    kumo_exception_entry",
+    );
+
+    /// The saved EL0 register frame `kumo_svc_common` hands to the dispatcher.
+    #[repr(C)]
+    struct SvcFrame {
+        x: [u64; 31], // x0..x30
+        elr: u64,
+        spsr: u64,
+        sp_el0: u64,
+    }
+
+    extern "C" {
+        fn kumo_resume_kernel(code: u64) -> !;
+    }
+
+    /// End the EL0 thread and return to `kumo_enter_el0`'s caller with `code` (the boot
+    /// flow). The kernel's syscall hook calls this for `ProcessExit`. Never returns.
+    pub fn el0_exit(code: u64) -> ! {
+        unsafe { kumo_resume_kernel(code) }
+    }
+
+    /// Dispatch one EL0 syscall (called from `kumo_svc_common`). Hands the saved x0..x30
+    /// register file to the kernel's registered hook (the real syscall ABI lives there);
+    /// with no hook installed it ends the thread so EL0 can never wedge the boot.
+    #[no_mangle]
+    extern "C" fn kumo_svc_dispatch(frame: *mut SvcFrame) {
+        SYSCALLS.fetch_add(1, Ordering::Relaxed);
+        let hook = SVC_HOOK.load(Ordering::Acquire);
+        if hook == 0 {
+            let f = unsafe { &mut *frame };
+            el0_exit(f.x[0]);
+        }
+        // SAFETY: SVC_HOOK only ever holds an `extern "C" fn(*mut u64)` set by
+        // `set_svc_hook`; `frame.x` is the 31-entry x0..x30 register file.
+        let hook: extern "C" fn(*mut u64) = unsafe { core::mem::transmute(hook) };
+        hook(frame as *mut u64);
+    }
+
+    /// Clean the written user code to PoC + invalidate the I-cache over it, so EL0 fetches
+    /// the real instructions (same handshake the loader does for the kernel image).
+    unsafe fn flush_for_exec(base: u64, len: usize) {
+        let mut a = base & !63;
+        let end = base + len as u64;
+        while a < end {
+            unsafe {
+                core::arch::asm!("dc civac, {a}", a = in(reg) a, options(nostack, preserves_flags))
+            };
+            a += 64;
+        }
+        unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack)) };
+    }
+
+    /// Drop to EL0, run the payload, handle its syscalls, and return the outcome.
+    pub fn run_el0_smoke() -> El0Report {
+        let region = core::ptr::addr_of_mut!(USER_REGION) as u64;
+
+        // Make the window EL0-accessible (EL0 RWX, kernel-noexec).
+        unsafe { super::mmu::map_user_2m(region) };
+
+        // Clear SCTLR_EL1.WXN so the (writable) EL0 code page is executable even if the
+        // firmware enforced write-implies-XN. Per-page W^X (separate RX code / RW stack)
+        // arrives with the real Vmar; this is a no-op where WXN was already clear (QEMU).
+        unsafe {
+            core::arch::asm!(
+                "mrs {t}, sctlr_el1",
+                "bic {t}, {t}, #0x80000",
+                "msr sctlr_el1, {t}",
+                "isb",
+                t = out(reg) _,
+                options(nostack, nomem),
+            );
+        }
+
+        // Copy the payload to the window's base and make it coherent for EL0 fetch.
+        let start = core::ptr::addr_of!(el0_payload_start) as usize;
+        let end = core::ptr::addr_of!(el0_payload_end) as usize;
+        let len = end - start;
+        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, region as *mut u8, len) };
+        unsafe { flush_for_exec(region, len) };
+
+        SYSCALLS.store(0, Ordering::Relaxed);
+
+        // User stack at the top of the window (16-aligned), then drop to EL0. The exit
+        // syscall trampolines back here with the exit code.
+        let user_sp = region + 0x200000 - 16;
+        let exit_code = unsafe { kumo_enter_el0(region, user_sp) };
+
+        El0Report {
+            entered: true,
+            syscalls: SYSCALLS.load(Ordering::Relaxed),
+            ping_echo: 0,
+            exit_code,
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub use el0::{el0_exit, run_el0_smoke, set_svc_hook, El0Report};
+
+/// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
+/// call this unconditionally.
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct El0Report {
+    pub entered: bool,
+    pub syscalls: u32,
+    pub ping_echo: u64,
+    pub exit_code: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn run_el0_smoke() -> El0Report {
+    El0Report::default()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn el0_exit(_code: u64) -> ! {
+    halt()
+}
 
 /// Host stub: the freestanding kernel installs real page tables; on the host there is
 /// nothing to do.
@@ -1126,6 +1584,12 @@ mod traps {
         "  mov x0, #\\idx",
         "  b   kumo_irq_common",
         ".endm",
+        // Lower-EL synchronous: SVC from EL0 (and EL0 faults). Must NOT clobber x0 (a
+        // syscall arg), so it branches straight to the SVC handler which checks the EC.
+        ".macro KVEC_SVC",
+        ".balign 0x80",
+        "  b   kumo_svc_common",
+        ".endm",
         "  KVEC_EXC 0",
         "  KVEC_IRQ 1",
         "  KVEC_EXC 2",
@@ -1134,7 +1598,7 @@ mod traps {
         "  KVEC_IRQ 5",
         "  KVEC_EXC 6",
         "  KVEC_EXC 7",
-        "  KVEC_EXC 8",
+        "  KVEC_SVC",
         "  KVEC_IRQ 9",
         "  KVEC_EXC 10",
         "  KVEC_EXC 11",
@@ -1144,6 +1608,7 @@ mod traps {
         "  KVEC_EXC 15",
         ".purgem KVEC_EXC",
         ".purgem KVEC_IRQ",
+        ".purgem KVEC_SVC",
         "kumo_exception_common:",
         "  mrs x1, esr_el1",
         "  mrs x2, elr_el1",

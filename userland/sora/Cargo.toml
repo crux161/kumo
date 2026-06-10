@@ -12,3 +12,7 @@ kumo-rt = { path = "../kumo-rt" }
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "sora"
+path = "src/main.rs"

@@ -33,6 +33,7 @@ impl fmt::Display for ImageArch {
 pub enum HardwareTarget {
     ThinkPadX13sGen1,
     QemuVirtAarch64,
+    RaspberryPi5,
     GenericUefiX86_64,
 }
 
@@ -77,6 +78,23 @@ impl HardwareTarget {
                 firmware_notes: &[
                     "test target, not physical hardware",
                     "run QEMU with gic-version=3",
+                ],
+            },
+            Self::RaspberryPi5 => HardwareProfile {
+                id: "raspberry-pi-5",
+                name: "Raspberry Pi 5",
+                arch: ImageArch::Aarch64,
+                soc: "Broadcom BCM2712 (Cortex-A76)",
+                firmware: "UEFI (EDK2 for Raspberry Pi)",
+                interrupt_controller: "GIC-400 (GICv2)",
+                early_console: "UEFI GOP/console first; PL011 on the 40-pin header",
+                dtb_source_path: None,
+                dtb_path: None,
+                dtb_compatibles: &[],
+                firmware_notes: &[
+                    "needs the EDK2 UEFI firmware (RPi5) on the boot media, not the stock Pi loader",
+                    "second aarch64 board for cross-checking the boot ladder vs the X13s",
+                    "full boot past the ladder needs GIC-400/GICv2 support (kernel is GICv3 today)",
                 ],
             },
             Self::GenericUefiX86_64 => HardwareProfile {
