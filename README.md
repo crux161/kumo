@@ -1,20 +1,4 @@
- GUIDANCE   kernel    targets     build.sh   PLAN.md      vars.fd
-
-crux  …/KUMO   main    v1.96.0  ♥ 23:20  cargo clean
-     Removed 0 files
-
-crux  …/KUMO   main    v1.96.0  ♥ 23:20  git status
-On branch main
-Your branch is up to date with 'origin/main'.
-
-nothing to commit, working tree clean
-
-crux  …/KUMO   main    v1.96.0  ♥ 23:20  nvim README
-
-crux  …/KUMO   main    v1.96.0  ♥ 23:21  nvim README.md
-
-crux  …/KUMO   main !   v1.96.0  ♥ 23:21  gsed -E 's/\[cite: [0-9]+\]//g' README.md
-  <img src="resources/kumo_full-color.jpg" alt="KUMO Logo" width="400"/>
+<img src="resources/kumo_full-color.jpg" alt="KUMO Logo" width="400"/>
 
   # KUMO (雲)
   **A Serene, Capability-Based Microkernel in Rust**
