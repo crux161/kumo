@@ -14,9 +14,6 @@ fn main() {
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         println!("cargo:rustc-link-arg-bins=-T{manifest_dir}/kumo-kernel.ld");
         println!("cargo:rustc-link-arg-bins=-no-pie");
-        // Retain relocation records so Nijigumo can rebase the (statically-linked)
-        // kernel to whatever physical address a given board actually has free.
-        println!("cargo:rustc-link-arg-bins=--emit-relocs");
         println!("cargo:rerun-if-changed=kumo-kernel.ld");
     }
 

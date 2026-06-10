@@ -16,3 +16,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "sora"
 path = "src/main.rs"
+# Freestanding (no_std/no_main, own panic handler): not host-testable, so keep it out of
+# `cargo test --workspace` (which would otherwise build a std test harness for the bin and
+# hit a duplicate `panic_impl` lang item). Sora is built for aarch64-unknown-none.
+test = false
+bench = false
+doctest = false

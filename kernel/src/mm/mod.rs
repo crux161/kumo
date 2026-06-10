@@ -25,10 +25,10 @@ fn is_ram_kind(kind: MemRegionKind) -> bool {
     )
 }
 
-/// Build kernel-owned identity page tables and switch to them. RAM becomes
-/// Normal-WB (executable), unlisted/MMIO ranges become Device, and the framebuffer
-/// becomes Normal-NC so the display controller sees writes. The switch is transparent
-/// because the new map is identity (same addresses as the firmware map).
+/// Build KUMO-owned split page tables and switch to them. TTBR0 retains the bootstrap
+/// identity map; TTBR1 owns the high-linked kernel and the permanent physical-memory
+/// window. RAM becomes Normal-WB, unlisted/MMIO ranges become Device, and the
+/// framebuffer becomes Normal-NC so the display controller sees writes.
 ///
 /// # Safety
 ///
@@ -72,9 +72,21 @@ pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
         })
     };
 
-    let (tables, mapped_bytes) =
-        unsafe { kumo_hal::active::enable_identity_mmu(top, fb_phys, fb_len, &is_ram, &mut alloc) }
-            .ok()?;
+    let kernel = boot.kernel_phys;
+    let kernel_virt = boot.kernel_virt;
+    let (tables, mapped_bytes) = unsafe {
+        kumo_hal::active::enable_kernel_mmu(
+            top,
+            kernel.start,
+            kernel_virt.start,
+            kernel.len,
+            fb_phys,
+            fb_len,
+            &is_ram,
+            &mut alloc,
+        )
+    }
+    .ok()?;
     Some(PagingReport {
         tables,
         mapped_bytes,

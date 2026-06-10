@@ -74,6 +74,7 @@ pub enum ElfError {
 pub struct UserProcessPlan {
     pub root_job: Job,
     pub process: Process,
+    pub load_segments: Vec<ElfSegment>,
     pub image_mappings: Vec<Mapping>,
     pub image_mapping: Mapping,
     pub stack_mapping: Mapping,
@@ -134,6 +135,13 @@ pub fn plan_initrd_process(
     Ok(UserProcessPlan {
         root_job,
         process,
+        load_segments: alloc::vec![ElfSegment {
+            file_offset: 0,
+            file_size: image.len,
+            virt_addr: USER_IMAGE_BASE,
+            mem_size: image.len,
+            flags: PageFlags::READ | PageFlags::EXECUTE | PageFlags::USER,
+        }],
         image_mappings: alloc::vec![image_mapping],
         image_mapping,
         stack_mapping,
@@ -178,6 +186,7 @@ pub fn plan_elf_process(
     Ok(UserProcessPlan {
         root_job,
         process,
+        load_segments: elf.segments,
         image_mappings,
         image_mapping,
         stack_mapping,

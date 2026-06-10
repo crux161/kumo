@@ -48,8 +48,11 @@ pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadCont
 
 /// Host/x86_64 stub: kernel-owned paging on x86_64 lands with the x86_64 metal
 /// milestone. The shared kernel can call this unconditionally.
-pub unsafe fn enable_identity_mmu(
+pub unsafe fn enable_kernel_mmu(
     _top: u64,
+    _kernel_phys: u64,
+    _kernel_virt: u64,
+    _kernel_len: u64,
     _fb_phys: u64,
     _fb_len: u64,
     _is_ram: &dyn Fn(u64) -> bool,
@@ -167,6 +170,32 @@ pub struct El0Report {
 pub fn run_el0_smoke() -> El0Report {
     // Ring-3 entry + the IDT/syscall path land with the x86_64 metal milestone.
     El0Report::default()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserImageError {
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserLoadSegment<'a> {
+    pub source: &'a [u8],
+    pub virt_addr: u64,
+    pub mem_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserImage<'a> {
+    pub entry: u64,
+    pub stack_top: u64,
+    /// Bootstrap handle passed to the process at entry (Ring-3 entry lands later).
+    pub bootstrap: u64,
+    pub segments: &'a [UserLoadSegment<'a>],
+}
+
+pub fn run_el0_image(_image: UserImage<'_>) -> Result<El0Report, UserImageError> {
+    // Ring-3 image entry lands with the x86_64 metal milestone.
+    Err(UserImageError::Unsupported)
 }
 
 pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}

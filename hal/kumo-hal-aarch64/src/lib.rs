@@ -528,21 +528,20 @@ pub fn monotonic_nanos() -> u64 {
     ((timer_ticks() as u128 * 1_000_000_000u128) / freq as u128) as u64
 }
 
-// ---- Kernel-owned MMU (identity map) --------------------------------
+// ---- Kernel-owned MMU ------------------------------------------------
 //
-// On hand-off the kernel runs in the firmware's identity page tables. This builds
-// KUMO's own 4 KiB-granule, 48-bit identity map (RAM -> Normal-WB executable, MMIO ->
-// Device, framebuffer -> Normal-NC so the display DMA sees writes) and switches
-// `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1` to it with the MMU staying on. Because the new map
-// is identity, the instruction stream, stack, and page-table memory all keep their
-// addresses across the switch. 2 MiB blocks are enough to separate the framebuffer
-// from kernel RAM (they are megabytes apart). The eventual EL0/user mappings and a
-// reclaiming page-table allocator build on this.
+// Nijigumo enters through a temporary TTBR1 map. This replaces it with KUMO-owned
+// tables: TTBR0 retains the Stage-A identity map until per-process address spaces land,
+// while TTBR1 permanently maps the high-linked kernel and a non-executable physmap.
 
 #[cfg(target_os = "none")]
 pub mod mmu {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     const GB: u64 = 1 << 30;
     const BLOCK_2M: u64 = 1 << 21;
+    const PAGE_4K: u64 = 1 << 12;
+    pub const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
 
     // Descriptor bits.
     const DESC_VALID: u64 = 1 << 0;
@@ -560,6 +559,12 @@ pub mod mmu {
 
     /// T0SZ for a 48-bit VA space.
     const T0SZ: u64 = 16;
+    /// T1SZ for a 48-bit upper VA space.
+    const T1SZ: u64 = 16;
+    const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+    static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+    static KERNEL_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
+    static KERNEL_IMAGE_LEN: AtomicU64 = AtomicU64::new(0);
 
     fn write_desc(table_phys: u64, index: usize, value: u64) {
         unsafe { ((table_phys + (index as u64) * 8) as *mut u64).write_volatile(value) };
@@ -575,6 +580,63 @@ pub mod mmu {
         desc
     }
 
+    fn page_desc(pa: u64, mair_index: u64, executable: bool) -> u64 {
+        let mut desc = pa | DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (mair_index << 2) | UXN;
+        if !executable {
+            desc |= PXN;
+        }
+        desc
+    }
+
+    fn read_desc(table_phys: u64, index: usize) -> u64 {
+        unsafe { ((table_phys + (index as u64) * 8) as *const u64).read_volatile() }
+    }
+
+    fn ensure_table(
+        parent: u64,
+        index: usize,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<u64, ()> {
+        let current = read_desc(parent, index);
+        if current & DESC_VALID != 0 {
+            return Ok(current & ADDR_MASK);
+        }
+        let child = alloc().ok_or(())?;
+        *tables += 1;
+        write_desc(parent, index, child | DESC_VALID | DESC_TABLE);
+        Ok(child)
+    }
+
+    fn map_page(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
+        let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
+        let l3 = ensure_table(l2, ((va >> 21) & 0x1ff) as usize, alloc, tables)?;
+        write_desc(l3, ((va >> 12) & 0x1ff) as usize, pa | desc);
+        Ok(())
+    }
+
+    fn map_block(
+        root: u64,
+        va: u64,
+        pa: u64,
+        desc: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        tables: &mut usize,
+    ) -> Result<(), ()> {
+        let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
+        let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
+        write_desc(l2, ((va >> 21) & 0x1ff) as usize, pa | desc);
+        Ok(())
+    }
+
     fn parange() -> u64 {
         let mmfr0: u64;
         unsafe {
@@ -584,34 +646,35 @@ pub mod mmu {
         (mmfr0 & 0xf).min(5)
     }
 
-    /// Build an identity map of `[0, top)` and switch to it. `is_ram(pa)` reports
-    /// whether the 2 MiB block at `pa` is RAM; `[fb_phys, fb_phys+fb_len)` is mapped
-    /// Normal-NC. `alloc` yields zeroed, 4 KiB-aligned page-table frames. Returns
-    /// `(tables_used, mapped_bytes)`.
+    /// Build the permanent Stage-A split map and switch to it. TTBR0 identity-maps
+    /// `[0, top)` for the current bootstrap code; TTBR1 maps the kernel image at its
+    /// linked virtual range and maps all physical addresses at [`PHYSMAP_BASE`].
     ///
     /// # Safety
     /// Must run at EL1 with the firmware identity map active; `[0, top)` must include
     /// the executing code, stack, and the frames `alloc` returns.
-    pub unsafe fn enable_identity(
+    pub unsafe fn enable_kernel(
         top: u64,
+        kernel_phys: u64,
+        kernel_virt: u64,
+        kernel_len: u64,
         fb_phys: u64,
         fb_len: u64,
         is_ram: &dyn Fn(u64) -> bool,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<(usize, u64), ()> {
-        let l0 = alloc().ok_or(())?;
-        let l1 = alloc().ok_or(())?;
+        KERNEL_PHYS_BASE.store(kernel_phys, Ordering::Relaxed);
+        KERNEL_VIRT_BASE.store(kernel_virt, Ordering::Relaxed);
+        KERNEL_IMAGE_LEN.store(kernel_len, Ordering::Relaxed);
+
+        let ttbr0 = alloc().ok_or(())?;
+        let ttbr1 = alloc().ok_or(())?;
         let mut tables = 2usize;
-        write_desc(l0, 0, l1 | DESC_VALID | DESC_TABLE);
 
         let fb_end = fb_phys.saturating_add(fb_len);
         let gb_count = top.div_ceil(GB);
         let mut gi = 0u64;
         while gi < gb_count {
-            let l2 = alloc().ok_or(())?;
-            tables += 1;
-            write_desc(l1, gi as usize, l2 | DESC_VALID | DESC_TABLE);
-
             let mut bi = 0u64;
             while bi < 512 {
                 let pa = gi * GB + bi * BLOCK_2M;
@@ -625,30 +688,59 @@ pub mod mmu {
                 } else {
                     block_desc(pa, MAIR_DEVICE, true)
                 };
-                write_desc(l2, bi as usize, desc);
+                map_block(ttbr0, pa, pa, desc, alloc, &mut tables)?;
+                map_block(
+                    ttbr1,
+                    PHYSMAP_BASE + pa,
+                    pa,
+                    desc | PXN | UXN,
+                    alloc,
+                    &mut tables,
+                )?;
                 bi += 1;
             }
             gi += 1;
         }
 
+        let kernel_pages = kernel_len.div_ceil(PAGE_4K);
+        let mut page = 0u64;
+        while page < kernel_pages {
+            let pa = kernel_phys + page * PAGE_4K;
+            let va = kernel_virt + page * PAGE_4K;
+            let desc = page_desc(0, MAIR_WB, true);
+            map_page(ttbr1, va, pa, desc, alloc, &mut tables)?;
+            page += 1;
+        }
+
         let ips = parange();
-        // TG0=4KiB, SH0=inner, IRGN0/ORGN0=WBWA, T0SZ=48-bit, EPD1=1 (no TTBR1 walks).
-        let tcr: u64 =
-            T0SZ | (1 << 8) | (1 << 10) | (3 << 12) | (0 << 14) | (1 << 23) | (ips << 32);
+        // Both halves use 4 KiB granules, inner-shareable WBWA walks, and 48-bit VAs.
+        let tcr: u64 = T0SZ
+            | (1 << 8)
+            | (1 << 10)
+            | (3 << 12)
+            | (0 << 14)
+            | (T1SZ << 16)
+            | (1 << 24)
+            | (1 << 26)
+            | (3 << 28)
+            | (2 << 30)
+            | (ips << 32);
 
         unsafe {
             core::arch::asm!(
                 "dsb ish",                 // page-table writes visible to the walker
                 "msr mair_el1, {mair}",
                 "msr tcr_el1, {tcr}",
-                "msr ttbr0_el1, {ttbr}",
+                "msr ttbr0_el1, {ttbr0}",
+                "msr ttbr1_el1, {ttbr1}",
                 "isb",
                 "tlbi vmalle1",            // drop stale firmware TLB entries
                 "dsb ish",
                 "isb",
                 mair = in(reg) MAIR_VALUE,
                 tcr = in(reg) tcr,
-                ttbr = in(reg) l0,
+                ttbr0 = in(reg) ttbr0,
+                ttbr1 = in(reg) ttbr1,
                 options(nostack, preserves_flags),
             );
         }
@@ -656,29 +748,47 @@ pub mod mmu {
         Ok((tables, gb_count * GB))
     }
 
-    const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
     const AP_EL0: u64 = 1 << 6; // AP[1]=1 -> AP[2:1]=0b01: EL1 RW / EL0 RW
 
-    fn read_desc(table_phys: u64, index: usize) -> u64 {
-        unsafe { ((table_phys + (index as u64) * 8) as *const u64).read_volatile() }
+    /// Translate an address inside the high-linked kernel image to its physical backing.
+    pub fn kernel_image_phys(va: u64) -> Option<u64> {
+        let virt = KERNEL_VIRT_BASE.load(Ordering::Relaxed);
+        let phys = KERNEL_PHYS_BASE.load(Ordering::Relaxed);
+        let len = KERNEL_IMAGE_LEN.load(Ordering::Relaxed);
+        let offset = va.checked_sub(virt)?;
+        (offset < len).then_some(phys + offset)
     }
 
-    /// Re-map the live 2 MiB block containing identity VA `va` as **EL0-accessible**:
-    /// Normal-WB, EL0 read/write/execute (`AP[1]=1`, `UXN=0`), kernel-noexec (`PXN=1`,
-    /// W^X). The block must already be mapped (it is — `enable_identity` covers all RAM).
-    /// This is the minimal hook for a user window; per-page `Vmar` mappings come later.
+    /// Re-map the live 2 MiB block containing identity VA `va` as **EL0-accessible**.
     ///
     /// # Safety
     /// Runs at EL1 under the kernel's TTBR0 map; `va` must be 2 MiB-aligned RAM.
     pub unsafe fn map_user_2m(va: u64) {
+        unsafe { map_user_2m_to(va, va) }
+    }
+
+    /// Map the 2 MiB block at virtual address `va` to physical address `pa` as
+    /// EL0-accessible Normal-WB, EL0 read/write/execute (`AP[1]=1`, `UXN=0`),
+    /// kernel-noexec (`PXN=1`). This is a Stage-A block-granularity user alias; real
+    /// per-page `Vmar` permissions come next.
+    ///
+    /// # Safety
+    /// Runs at EL1 under the kernel's TTBR0 map. `va` and `pa` must be 2 MiB-aligned RAM,
+    /// and the caller must ensure replacing the VA block does not hide live kernel data.
+    pub unsafe fn map_user_2m_to(va: u64, pa: u64) {
         let ttbr0: u64;
         unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem)) };
         let l0 = ttbr0 & ADDR_MASK;
         let l1 = read_desc(l0, ((va >> 39) & 0x1ff) as usize) & ADDR_MASK;
         let l2 = read_desc(l1, ((va >> 30) & 0x1ff) as usize) & ADDR_MASK;
         let l2i = ((va >> 21) & 0x1ff) as usize;
-        let pa = va & !(BLOCK_2M - 1);
-        let desc = pa | DESC_VALID | DESC_AF | (MAIR_WB << 2) | SH_INNER | AP_EL0 | PXN;
+        let desc = (pa & ADDR_MASK & !(BLOCK_2M - 1))
+            | DESC_VALID
+            | DESC_AF
+            | (MAIR_WB << 2)
+            | SH_INNER
+            | AP_EL0
+            | PXN;
         write_desc(l2, l2i, desc);
         unsafe {
             core::arch::asm!(
@@ -693,7 +803,7 @@ pub mod mmu {
 }
 
 #[cfg(target_os = "none")]
-pub use mmu::enable_identity as enable_identity_mmu;
+pub use mmu::enable_kernel as enable_kernel_mmu;
 
 // ---- EL0 / userspace smoke -----------------------------------------------------------
 //
@@ -706,11 +816,14 @@ pub use mmu::enable_identity as enable_identity_mmu;
 pub mod el0 {
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-    /// A 2 MiB, 2 MiB-aligned window — its own L2 block, re-mapped EL0-accessible at
-    /// runtime. Holds the user payload (low) and the user stack (high).
+    const USER_BLOCK_SIZE: u64 = 0x200000;
+
+    /// A 4 MiB arena that always contains at least one 2 MiB-aligned physical subrange
+    /// even after Nijigumo relocates the whole kernel to a non-2MiB-aligned address.
     #[repr(C, align(0x200000))]
-    struct UserRegion([u8; 0x200000]);
-    static mut USER_REGION: UserRegion = UserRegion([0; 0x200000]);
+    struct UserArena([u8; 0x400000]);
+    static mut USER_ARENA: UserArena = UserArena([0; 0x400000]);
+    static mut USER_STACK_ARENA: UserArena = UserArena([0; 0x400000]);
 
     static SYSCALLS: AtomicU32 = AtomicU32::new(0);
 
@@ -733,6 +846,31 @@ pub mod el0 {
         pub exit_code: u64,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum UserImageError {
+        Empty,
+        ImageTooLarge,
+        SegmentOutsideImageBlock,
+        StackOutsideStackBlock,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserLoadSegment<'a> {
+        pub source: &'a [u8],
+        pub virt_addr: u64,
+        pub mem_size: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserImage<'a> {
+        pub entry: u64,
+        pub stack_top: u64,
+        /// Handed to the process in `x0` at entry (processargs-style): the bootstrap
+        /// root-channel handle. 0 = none.
+        pub bootstrap: u64,
+        pub segments: &'a [UserLoadSegment<'a>],
+    }
+
     /// Saved kernel callee-saved registers + SP, so the exit SVC can return to the boot
     /// flow as if `kumo_enter_el0` had returned. Touched only from asm.
     #[no_mangle]
@@ -740,7 +878,7 @@ pub mod el0 {
     static mut KERNEL_RESUME: [u64; 16] = [0; 16];
 
     extern "C" {
-        fn kumo_enter_el0(entry: u64, user_sp: u64) -> u64;
+        fn kumo_enter_el0(entry: u64, user_sp: u64, arg0: u64) -> u64;
         static el0_payload_start: u8;
         static el0_payload_end: u8;
     }
@@ -774,7 +912,8 @@ pub mod el0 {
     core::arch::global_asm!(
         ".global kumo_enter_el0",
         ".balign 4",
-        "kumo_enter_el0:",
+        "kumo_enter_el0:", // x0=entry, x1=user_sp, x2=arg0 (-> EL0 x0, the bootstrap handle)
+        "  mov  x9, x2",   // stash arg0 before x2 is reused as the save base
         "  adrp x2, KERNEL_RESUME",
         "  add  x2, x2, :lo12:KERNEL_RESUME",
         "  stp  x19, x20, [x2, #0]",
@@ -789,6 +928,7 @@ pub mod el0 {
         "  movz x4, #0x3c0",  // SPSR: EL0t, DAIF masked (no preemption during the smoke)
         "  msr  spsr_el1, x4",
         "  msr  sp_el0, x1", // EL0 stack
+        "  mov  x0, x9",     // x0 at EL0 = the bootstrap handle (processargs-style)
         "  isb",
         "  eret",
     );
@@ -927,12 +1067,112 @@ pub mod el0 {
         unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack)) };
     }
 
+    fn block_base(value: u64) -> u64 {
+        value & !(USER_BLOCK_SIZE - 1)
+    }
+
+    fn block_align_up(value: u64) -> u64 {
+        (value + USER_BLOCK_SIZE - 1) & !(USER_BLOCK_SIZE - 1)
+    }
+
+    unsafe fn clear_region(base: *mut u8, len: usize) {
+        unsafe { core::ptr::write_bytes(base, 0, len) };
+    }
+
+    fn stage_user_image(image: UserImage<'_>) -> Result<(u64, u64), UserImageError> {
+        if image.segments.is_empty() {
+            return Err(UserImageError::Empty);
+        }
+
+        let image_va = block_base(
+            image
+                .segments
+                .iter()
+                .map(|segment| segment.virt_addr)
+                .min()
+                .ok_or(UserImageError::Empty)?,
+        );
+        let stack_va = block_base(image.stack_top.saturating_sub(1));
+        let image_pa = block_align_up(
+            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_ARENA) as u64)
+                .ok_or(UserImageError::ImageTooLarge)?,
+        );
+        let stack_pa = block_align_up(
+            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_STACK_ARENA) as u64)
+                .ok_or(UserImageError::StackOutsideStackBlock)?,
+        );
+
+        unsafe {
+            clear_region(image_pa as *mut u8, USER_BLOCK_SIZE as usize);
+            clear_region(stack_pa as *mut u8, USER_BLOCK_SIZE as usize);
+        }
+
+        for segment in image.segments {
+            let segment_end = segment
+                .virt_addr
+                .checked_add(segment.mem_size)
+                .ok_or(UserImageError::ImageTooLarge)?;
+            if segment.virt_addr < image_va || segment_end > image_va + USER_BLOCK_SIZE {
+                return Err(UserImageError::SegmentOutsideImageBlock);
+            }
+            if segment.source.len() as u64 > segment.mem_size {
+                return Err(UserImageError::ImageTooLarge);
+            }
+            let dst = (image_pa + (segment.virt_addr - image_va)) as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(segment.source.as_ptr(), dst, segment.source.len())
+            };
+        }
+
+        if image.stack_top <= stack_va || image.stack_top > stack_va + USER_BLOCK_SIZE {
+            return Err(UserImageError::StackOutsideStackBlock);
+        }
+
+        unsafe {
+            super::mmu::map_user_2m_to(image_va, image_pa);
+            super::mmu::map_user_2m_to(stack_va, stack_pa);
+            flush_for_exec(image_pa, USER_BLOCK_SIZE as usize);
+        }
+
+        Ok((image_va, stack_va))
+    }
+
+    pub fn run_el0_image(image: UserImage<'_>) -> Result<El0Report, UserImageError> {
+        let (_image_va, _stack_va) = stage_user_image(image)?;
+
+        unsafe {
+            core::arch::asm!(
+                "mrs {t}, sctlr_el1",
+                "bic {t}, {t}, #0x80000",
+                "msr sctlr_el1, {t}",
+                "isb",
+                t = out(reg) _,
+                options(nostack, nomem),
+            );
+        }
+
+        SYSCALLS.store(0, Ordering::Relaxed);
+        let exit_code =
+            unsafe { kumo_enter_el0(image.entry, image.stack_top - 16, image.bootstrap) };
+
+        Ok(El0Report {
+            entered: true,
+            syscalls: SYSCALLS.load(Ordering::Relaxed),
+            ping_echo: 0,
+            exit_code,
+        })
+    }
+
     /// Drop to EL0, run the payload, handle its syscalls, and return the outcome.
     pub fn run_el0_smoke() -> El0Report {
-        let region = core::ptr::addr_of_mut!(USER_REGION) as u64;
+        const SMOKE_VA: u64 = 0x0040_0000;
+        let region_pa = block_align_up(
+            super::mmu::kernel_image_phys(core::ptr::addr_of_mut!(USER_ARENA) as u64)
+                .expect("EL0 arena outside kernel image"),
+        );
 
         // Make the window EL0-accessible (EL0 RWX, kernel-noexec).
-        unsafe { super::mmu::map_user_2m(region) };
+        unsafe { super::mmu::map_user_2m_to(SMOKE_VA, region_pa) };
 
         // Clear SCTLR_EL1.WXN so the (writable) EL0 code page is executable even if the
         // firmware enforced write-implies-XN. Per-page W^X (separate RX code / RW stack)
@@ -952,15 +1192,15 @@ pub mod el0 {
         let start = core::ptr::addr_of!(el0_payload_start) as usize;
         let end = core::ptr::addr_of!(el0_payload_end) as usize;
         let len = end - start;
-        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, region as *mut u8, len) };
-        unsafe { flush_for_exec(region, len) };
+        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, region_pa as *mut u8, len) };
+        unsafe { flush_for_exec(region_pa, len) };
 
         SYSCALLS.store(0, Ordering::Relaxed);
 
         // User stack at the top of the window (16-aligned), then drop to EL0. The exit
         // syscall trampolines back here with the exit code.
-        let user_sp = region + 0x200000 - 16;
-        let exit_code = unsafe { kumo_enter_el0(region, user_sp) };
+        let user_sp = SMOKE_VA + 0x200000 - 16;
+        let exit_code = unsafe { kumo_enter_el0(SMOKE_VA, user_sp, 0) };
 
         El0Report {
             entered: true,
@@ -972,7 +1212,10 @@ pub mod el0 {
 }
 
 #[cfg(target_os = "none")]
-pub use el0::{el0_exit, run_el0_smoke, set_svc_hook, El0Report};
+pub use el0::{
+    el0_exit, run_el0_image, run_el0_smoke, set_svc_hook, El0Report, UserImage, UserImageError,
+    UserLoadSegment,
+};
 
 /// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
 /// call this unconditionally.
@@ -986,8 +1229,37 @@ pub struct El0Report {
 }
 
 #[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserImageError {
+    Unsupported,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserLoadSegment<'a> {
+    pub source: &'a [u8],
+    pub virt_addr: u64,
+    pub mem_size: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserImage<'a> {
+    pub entry: u64,
+    pub stack_top: u64,
+    /// Bootstrap handle passed to the process in `x0` at entry (0 = none).
+    pub bootstrap: u64,
+    pub segments: &'a [UserLoadSegment<'a>],
+}
+
+#[cfg(not(target_os = "none"))]
 pub fn run_el0_smoke() -> El0Report {
     El0Report::default()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn run_el0_image(_image: UserImage<'_>) -> Result<El0Report, UserImageError> {
+    Err(UserImageError::Unsupported)
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1001,8 +1273,11 @@ pub fn el0_exit(_code: u64) -> ! {
 /// Host stub: the freestanding kernel installs real page tables; on the host there is
 /// nothing to do.
 #[cfg(not(target_os = "none"))]
-pub unsafe fn enable_identity_mmu(
+pub unsafe fn enable_kernel_mmu(
     _top: u64,
+    _kernel_phys: u64,
+    _kernel_virt: u64,
+    _kernel_len: u64,
     _fb_phys: u64,
     _fb_len: u64,
     _is_ram: &dyn Fn(u64) -> bool,

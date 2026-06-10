@@ -1,14 +1,10 @@
 //! Minimal, allocation-free ELF64 loader support for the kernel image.
 //!
 //! Nijigumo needs exactly enough of ELF to place a static kernel at a board-chosen
-//! address: the entry point and the `PT_LOAD` segments (where in the file, where in
-//! memory, how much to copy, how much to zero), plus the absolute relocations to
-//! fix up after rebasing. The kernel is linked at a fixed base but built with
-//! `--emit-relocs`, so [`for_each_load_reloc`] surfaces the `SHT_RELA` entries that
-//! land inside the loaded image; the loader rebases the absolute ones and ignores
-//! the PC-relative ones. Symbols and debug info are not parsed. Everything is
-//! bounds-checked against the input slice so a malformed image yields an error
-//! instead of a wild read.
+//! address: the entry point and the `PT_LOAD` segments (where in the file, their
+//! physical-load offsets, their linked virtual addresses, how much to copy, and how
+//! much to zero). Symbols and debug info are not parsed. Everything is bounds-checked
+//! against the input slice so a malformed image yields an error instead of a wild read.
 
 /// `e_machine` value for AArch64.
 pub const EM_AARCH64: u16 = 0xB7;
@@ -50,6 +46,10 @@ pub struct Elf64Image {
     pub load_base: u64,
     /// Highest `p_paddr + p_memsz` across all `PT_LOAD` segments.
     pub load_end: u64,
+    /// Lowest `p_vaddr` across all `PT_LOAD` segments.
+    pub virt_base: u64,
+    /// Highest `p_vaddr + p_memsz` across all `PT_LOAD` segments.
+    pub virt_end: u64,
     segments: [LoadSegment; MAX_LOAD_SEGMENTS],
     segment_count: usize,
 }
@@ -62,6 +62,17 @@ impl Elf64Image {
     /// Total physical span the image occupies, in bytes.
     pub fn load_span(&self) -> u64 {
         self.load_end.saturating_sub(self.load_base)
+    }
+
+    /// Total virtual span occupied by the image.
+    pub fn virt_span(&self) -> u64 {
+        self.virt_end.saturating_sub(self.virt_base)
+    }
+
+    /// Translate a linked virtual address into its corresponding image offset.
+    pub fn virt_offset(&self, addr: u64) -> Option<u64> {
+        addr.checked_sub(self.virt_base)
+            .filter(|offset| *offset < self.virt_span())
     }
 }
 
@@ -118,6 +129,8 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<Elf64Image, ElfError> {
     let mut segment_count = 0usize;
     let mut load_base = u64::MAX;
     let mut load_end = 0u64;
+    let mut virt_base = u64::MAX;
+    let mut virt_end = 0u64;
 
     for index in 0..phnum {
         let base = phoff
@@ -168,6 +181,13 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<Elf64Image, ElfError> {
         if seg_end > load_end {
             load_end = seg_end;
         }
+        if virt_addr < virt_base {
+            virt_base = virt_addr;
+        }
+        let virt_seg_end = virt_addr.saturating_add(mem_size);
+        if virt_seg_end > virt_end {
+            virt_end = virt_seg_end;
+        }
     }
 
     if segment_count == 0 {
@@ -179,6 +199,8 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<Elf64Image, ElfError> {
         machine,
         load_base,
         load_end,
+        virt_base,
+        virt_end,
         segments,
         segment_count,
     })
@@ -302,7 +324,7 @@ mod tests {
         buf[6] = 1; // version
         put_u16(&mut buf, 16, ET_EXEC);
         put_u16(&mut buf, 18, EM_AARCH64);
-        put_u64(&mut buf, 24, 0x4800_0000); // e_entry
+        put_u64(&mut buf, 24, 0xffff_8000_4800_0000); // e_entry
         put_u64(&mut buf, 32, EHDR_LEN as u64); // e_phoff
         put_u16(&mut buf, 54, PHDR_LEN as u16); // e_phentsize
         put_u16(&mut buf, 56, 1); // e_phnum
@@ -310,7 +332,7 @@ mod tests {
         let ph = EHDR_LEN;
         put_u32(&mut buf, ph, PT_LOAD);
         put_u64(&mut buf, ph + 8, 0x1000); // p_offset
-        put_u64(&mut buf, ph + 16, 0x4800_0000); // p_vaddr
+        put_u64(&mut buf, ph + 16, 0xffff_8000_4800_0000); // p_vaddr
         put_u64(&mut buf, ph + 24, 0x4800_0000); // p_paddr
         put_u64(&mut buf, ph + 32, 0x20); // p_filesz (kept inside this buffer? no — see test)
         put_u64(&mut buf, ph + 40, 0x1_0000); // p_memsz
@@ -335,7 +357,7 @@ mod tests {
         bytes[..header.len()].copy_from_slice(&header);
 
         let image = parse_elf64(&bytes).unwrap();
-        assert_eq!(image.entry, 0x4800_0000);
+        assert_eq!(image.entry, 0xffff_8000_4800_0000);
         assert_eq!(image.machine, EM_AARCH64);
         assert_eq!(image.segments().len(), 1);
         let seg = image.segments()[0];
@@ -346,6 +368,10 @@ mod tests {
         assert_eq!(image.load_base, 0x4800_0000);
         assert_eq!(image.load_end, 0x4801_0000);
         assert_eq!(image.load_span(), 0x1_0000);
+        assert_eq!(image.virt_base, 0xffff_8000_4800_0000);
+        assert_eq!(image.virt_end, 0xffff_8000_4801_0000);
+        assert_eq!(image.virt_span(), 0x1_0000);
+        assert_eq!(image.virt_offset(image.entry), Some(0));
     }
 
     #[test]

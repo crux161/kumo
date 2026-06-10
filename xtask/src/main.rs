@@ -508,6 +508,12 @@ fn stage_kernel(
             source_path.display()
         )
     })?;
+    if entry < 0xffff_0000_0000_0000 {
+        return Err(format!(
+            "validate {} as higher-half kernel ELF: entry {entry:#x} is not in TTBR1",
+            source_path.display()
+        ));
+    }
 
     let staged_path = out_dir
         .join(plan.hardware.to_string())

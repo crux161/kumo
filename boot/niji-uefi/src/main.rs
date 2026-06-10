@@ -29,9 +29,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use kumo_abi::{BootInfo, Framebuffer, FramebufferFormat, MemRegion, Range, RawSlice};
-use niji_loader::elf::{
-    for_each_load_reloc, parse_elf64, EM_AARCH64, R_AARCH64_ABS32, R_AARCH64_ABS64,
-};
+use niji_loader::elf::{parse_elf64, EM_AARCH64};
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
     build_boot_info, efi_memory_type, efi_pixel_format, framebuffer_from_gop, is_fdt_magic,
@@ -403,8 +401,10 @@ unsafe fn con_out_of(system_table: *mut EfiSystemTable) -> *mut EfiSimpleTextOut
 }
 
 struct KernelLoad {
-    entry: u64,
+    entry_virt: u64,
     phys: Range,
+    virt: Range,
+    boot_ttbr1: u64,
 }
 
 /// Discover the platform, load the kernel + initrd + DTB, assemble & validate the
@@ -480,9 +480,7 @@ unsafe fn boot_and_jump(
         dtb: dtb_addr,
         framebuffer,
         kernel_phys: kernel.phys,
-        // Identity mapping for now: the kernel runs in the firmware's page tables
-        // after ExitBootServices. Higher-half remap is a later slice.
-        kernel_virt: kernel.phys,
+        kernel_virt: kernel.virt,
         initrd,
         ..UefiHandoffSeed::empty()
     };
@@ -504,7 +502,13 @@ unsafe fn boot_and_jump(
         discovery.usable_bytes >> 20,
         discovery.total_bytes >> 20
     );
-    kprint!(con_out, "kernel image : entry {:#x}\r\n", kernel.entry);
+    kprint!(
+        con_out,
+        "kernel image : phys {:#x}, virt {:#x}, entry {:#x}\r\n",
+        kernel.phys.start,
+        kernel.virt.start,
+        kernel.entry_virt
+    );
     kprint!(
         con_out,
         "initrd       : {}\r\n",
@@ -534,7 +538,7 @@ unsafe fn boot_and_jump(
     kprint!(
         con_out,
         "\r\nExiting boot services; jumping to Ziwei at {:#x}...\r\n",
-        kernel.entry
+        kernel.entry_virt
     );
 
     // ExitBootServices: refill mem_regions from the FINAL map, then exit on the key
@@ -564,7 +568,15 @@ unsafe fn boot_and_jump(
     // Boot services are gone — no more UEFI console. The kernel's Stage-A console takes
     // over. Make the freshly-copied kernel code coherent for instruction fetch (clean
     // D-cache to PoC, invalidate I-cache), then branch to entry with x0 = BootInfo*.
-    unsafe { jump_to_kernel(kernel.entry, boot_ptr, kernel.phys.start, kernel.phys.len) }
+    unsafe {
+        jump_to_kernel(
+            kernel.entry_virt,
+            kernel.boot_ttbr1,
+            boot_ptr,
+            kernel.phys.start,
+            kernel.phys.len,
+        )
+    }
 }
 
 /// Open the boot device's volume root (`LoadedImage -> SimpleFileSystem`).
@@ -698,8 +710,111 @@ unsafe fn load_dtb(
     }
 }
 
-/// Load the kernel ELF: read it, parse program headers, allocate its fixed load
-/// region, copy each `PT_LOAD` segment (zeroing BSS), and return its entry + span.
+const PT_DESC_VALID: u64 = 1 << 0;
+const PT_DESC_TABLE_OR_PAGE: u64 = 1 << 1;
+const PT_DESC_AF: u64 = 1 << 10;
+const PT_DESC_SH_INNER: u64 = 3 << 8;
+const PT_DESC_UXN: u64 = 1 << 54;
+const PT_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+const BOOT_MAIR_WB_INDEX: u64 = 7;
+
+struct BootPageTables {
+    next: u64,
+    end: u64,
+}
+
+impl BootPageTables {
+    unsafe fn alloc(&mut self) -> Option<u64> {
+        if self.next >= self.end {
+            return None;
+        }
+        let page = self.next;
+        self.next += EFI_PAGE_SIZE;
+        unsafe { ptr::write_bytes(page as *mut u8, 0, EFI_PAGE_SIZE as usize) };
+        Some(page)
+    }
+}
+
+unsafe fn table_desc(table: u64, index: usize) -> u64 {
+    unsafe { ((table + index as u64 * 8) as *const u64).read_volatile() }
+}
+
+unsafe fn write_table_desc(table: u64, index: usize, desc: u64) {
+    unsafe { ((table + index as u64 * 8) as *mut u64).write_volatile(desc) };
+}
+
+unsafe fn ensure_boot_table(tables: &mut BootPageTables, parent: u64, index: usize) -> Option<u64> {
+    let existing = unsafe { table_desc(parent, index) };
+    if existing & PT_DESC_VALID != 0 {
+        return Some(existing & PT_ADDR_MASK);
+    }
+    let child = unsafe { tables.alloc()? };
+    unsafe { write_table_desc(parent, index, child | PT_DESC_VALID | PT_DESC_TABLE_OR_PAGE) };
+    Some(child)
+}
+
+/// Construct the temporary TTBR1 tree used only for the first virtual jump into the
+/// high-linked kernel. The kernel replaces this tree with its permanent map during M1.
+unsafe fn build_boot_ttbr1(
+    boot_services: *mut EfiBootServices,
+    virt_base: u64,
+    phys_base: u64,
+    len: u64,
+) -> Option<u64> {
+    if len == 0 || virt_base & (EFI_PAGE_SIZE - 1) != 0 || phys_base & (EFI_PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+
+    let mapped_pages = len.div_ceil(EFI_PAGE_SIZE) as usize;
+    // One root plus L1/L2 slack and one L3 table per 2 MiB of image.
+    let table_pages = 4usize.saturating_add(mapped_pages.div_ceil(512));
+    let mut table_base = 0u64;
+    let status = unsafe {
+        ((*boot_services).allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            efi_memory_type::LOADER_DATA,
+            table_pages,
+            &mut table_base,
+        )
+    };
+    if status != EFI_SUCCESS {
+        return None;
+    }
+
+    unsafe {
+        ptr::write_bytes(
+            table_base as *mut u8,
+            0,
+            table_pages * EFI_PAGE_SIZE as usize,
+        )
+    };
+    let root = table_base;
+    let mut tables = BootPageTables {
+        next: table_base + EFI_PAGE_SIZE,
+        end: table_base + table_pages as u64 * EFI_PAGE_SIZE,
+    };
+
+    for page in 0..mapped_pages {
+        let va = virt_base + page as u64 * EFI_PAGE_SIZE;
+        let pa = phys_base + page as u64 * EFI_PAGE_SIZE;
+        let l1 = unsafe { ensure_boot_table(&mut tables, root, ((va >> 39) & 0x1ff) as usize)? };
+        let l2 = unsafe { ensure_boot_table(&mut tables, l1, ((va >> 30) & 0x1ff) as usize)? };
+        let l3 = unsafe { ensure_boot_table(&mut tables, l2, ((va >> 21) & 0x1ff) as usize)? };
+        let desc = pa
+            | PT_DESC_VALID
+            | PT_DESC_TABLE_OR_PAGE
+            | PT_DESC_AF
+            | PT_DESC_SH_INNER
+            | (BOOT_MAIR_WB_INDEX << 2)
+            | PT_DESC_UXN;
+        unsafe { write_table_desc(l3, ((va >> 12) & 0x1ff) as usize, desc) };
+    }
+
+    Some(root)
+}
+
+/// Load the high-linked kernel ELF into arbitrary physical pages, copy each `PT_LOAD`
+/// segment (zeroing BSS), and construct the temporary TTBR1 map used for entry.
 unsafe fn load_kernel(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
@@ -738,8 +853,8 @@ unsafe fn load_kernel(
 
     // Let the firmware pick a free physical region (boards differ wildly: QEMU virt
     // RAM is at 0x40000000, the X13s puts conventional memory up at 0xe0000000+).
-    // The kernel is statically linked at a fixed base but carries relocation records
-    // (`--emit-relocs`), so we rebase it to wherever we landed.
+    // Linked virtual addresses remain fixed; physical placement changes only the
+    // backing pages installed into the temporary TTBR1 map.
     let pages = ((image.load_span() + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE) as usize;
     let mut load_addr: u64 = 0;
     // Allocate the kernel into EfiLoaderCode, not EfiLoaderData: strict UEFI (Qualcomm's
@@ -767,11 +882,32 @@ unsafe fn load_kernel(
         return None;
     }
 
-    let delta = load_addr.wrapping_sub(image.load_base);
+    if image.load_span() != image.virt_span() {
+        kprint!(
+            con_out,
+            "kernel       : physical/virtual spans differ ({:#x}/{:#x})\r\n",
+            image.load_span(),
+            image.virt_span()
+        );
+        unsafe { ((*boot_services).free_pool)(buffer) };
+        return None;
+    }
+
+    let phys_delta = load_addr.wrapping_sub(image.load_base);
 
     for segment in image.segments() {
+        let phys_offset = segment.phys_addr.wrapping_sub(image.load_base);
+        let virt_offset = segment.virt_addr.wrapping_sub(image.virt_base);
+        if phys_offset != virt_offset {
+            kprint!(
+                con_out,
+                "kernel       : PT_LOAD physical/virtual layout mismatch\r\n"
+            );
+            unsafe { ((*boot_services).free_pool)(buffer) };
+            return None;
+        }
         let src = unsafe { (buffer as *const u8).add(segment.file_offset as usize) };
-        let dst = segment.phys_addr.wrapping_add(delta) as *mut u8;
+        let dst = segment.phys_addr.wrapping_add(phys_delta) as *mut u8;
         unsafe { ptr::copy_nonoverlapping(src, dst, segment.file_size as usize) };
         let zero = segment.mem_size.saturating_sub(segment.file_size) as usize;
         if zero > 0 {
@@ -779,41 +915,43 @@ unsafe fn load_kernel(
         }
     }
 
-    // Rebase absolute pointers in the loaded image by `delta`. PC-relative
-    // relocations move with the code and need no fixup.
-    let reloc_result =
-        for_each_load_reloc(bytes, image.load_base, image.load_end, |r_offset, ty| {
-            let loc = r_offset.wrapping_add(delta);
-            match ty {
-                R_AARCH64_ABS64 => unsafe {
-                    let p = loc as *mut u64;
-                    p.write_unaligned(p.read_unaligned().wrapping_add(delta));
-                },
-                R_AARCH64_ABS32 => unsafe {
-                    let p = loc as *mut u32;
-                    p.write_unaligned(p.read_unaligned().wrapping_add(delta as u32));
-                },
-                _ => {}
-            }
-        });
     unsafe { ((*boot_services).free_pool)(buffer) };
-    if let Err(err) = reloc_result {
-        kprint!(con_out, "kernel       : relocation failed ({:?})\r\n", err);
-        return None;
-    }
 
-    let entry = image.entry.wrapping_add(delta);
+    let entry_offset = match image.virt_offset(image.entry) {
+        Some(offset) => offset,
+        None => {
+            kprint!(
+                con_out,
+                "kernel       : entry lies outside PT_LOAD span\r\n"
+            );
+            return None;
+        }
+    };
+    let entry_phys = load_addr.wrapping_add(entry_offset);
+    let boot_ttbr1 = match unsafe {
+        build_boot_ttbr1(boot_services, image.virt_base, load_addr, image.virt_span())
+    } {
+        Some(root) => root,
+        None => {
+            kprint!(con_out, "kernel       : TTBR1 bootstrap map failed\r\n");
+            return None;
+        }
+    };
     kprint!(
         con_out,
-        "kernel       : {} @ {:#x}..{:#x} entry {:#x}\r\n",
+        "kernel       : {} phys {:#x}..{:#x} -> virt {:#x} entry {:#x} (trampoline {:#x})\r\n",
         KERNEL_ESP_PATH,
         load_addr,
         load_addr + image.load_span(),
-        entry
+        image.virt_base,
+        image.entry,
+        entry_phys
     );
     Some(KernelLoad {
-        entry,
+        entry_virt: image.entry,
         phys: Range::new(load_addr, image.load_span()),
+        virt: Range::new(image.virt_base, image.virt_span()),
+        boot_ttbr1,
     })
 }
 
@@ -1035,8 +1173,8 @@ unsafe fn discover_framebuffer(
     Some(fb)
 }
 
-/// Make the freshly-copied kernel visible to instruction fetch, then branch to its
-/// entry with `x0 = BootInfo*`. Never returns.
+/// Make the freshly-copied kernel visible to instruction fetch, enable its temporary
+/// TTBR1 map, then branch to the high virtual entry with `x0 = BootInfo*`. Never returns.
 ///
 /// The loader wrote the kernel's `.text` (and patched relocations) with ordinary
 /// stores, which sit **dirty in the D-cache**. Real ARM cores do not keep the I- and
@@ -1046,7 +1184,13 @@ unsafe fn discover_framebuffer(
 /// leaves the code stale and the kernel never executes its first instruction. Then we
 /// invalidate the I-cache (`ic iallu`). It all appears to work on QEMU, whose caches are
 /// modelled coherently. `image_base..image_base+len` is the loaded image (`kernel.phys`).
-unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo, image_base: u64, image_len: u64) -> ! {
+unsafe fn jump_to_kernel(
+    entry: u64,
+    boot_ttbr1: u64,
+    boot: *const BootInfo,
+    image_base: u64,
+    image_len: u64,
+) -> ! {
     unsafe {
         let line = dcache_line_size();
         let mut addr = image_base & !(line - 1);
@@ -1055,13 +1199,48 @@ unsafe fn jump_to_kernel(entry: u64, boot: *const BootInfo, image_base: u64, ima
             core::arch::asm!("dc civac, {a}", a = in(reg) addr, options(nostack, preserves_flags));
             addr = addr.wrapping_add(line);
         }
+
+        // Preserve the firmware's TTBR0 geometry while defining a 48-bit, 4 KiB TTBR1
+        // regime. MAIR slot 7 is reserved for this temporary Normal-WB mapping.
+        let mut mair: u64;
+        let mut tcr: u64;
+        core::arch::asm!(
+            "mrs {mair}, mair_el1",
+            "mrs {tcr}, tcr_el1",
+            mair = out(reg) mair,
+            tcr = out(reg) tcr,
+            options(nostack, nomem, preserves_flags),
+        );
+        mair = (mair & !(0xffu64 << 56)) | (0xffu64 << 56);
+        let t1_fields = (0x3fu64 << 16)
+            | (1u64 << 23)
+            | (0x3u64 << 24)
+            | (0x3u64 << 26)
+            | (0x3u64 << 28)
+            | (0x3u64 << 30);
+        tcr = (tcr & !t1_fields)
+            | (16u64 << 16) // T1SZ: 48-bit upper VA
+            | (1u64 << 24) // IRGN1: WBWA
+            | (1u64 << 26) // ORGN1: WBWA
+            | (3u64 << 28) // SH1: inner-shareable
+            | (2u64 << 30); // TG1: 4 KiB
+
         core::arch::asm!(
             "dsb sy",
             "ic  iallu",
             "dsb sy",
+            "msr mair_el1, {mair}",
+            "msr ttbr1_el1, {ttbr1}",
+            "msr tcr_el1, {tcr}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
             "isb",
             "br  {entry}",
             entry = in(reg) entry,
+            ttbr1 = in(reg) boot_ttbr1,
+            mair = in(reg) mair,
+            tcr = in(reg) tcr,
             in("x0") boot,
             options(noreturn),
         )

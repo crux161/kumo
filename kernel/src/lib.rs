@@ -243,7 +243,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         );
     }
 
-    if report.has_initrd {
+    let initrd = if report.has_initrd {
         // P5 bootstrap: prove the initrd now contains a named Sora image and that Ziwei
         // can turn it into the first userspace process/VMAR plan. This is still a plan,
         // not execution; the next page-table slice materializes these mappings.
@@ -264,13 +264,28 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             }
             Err(err) => klog!("SORA INITRD        Check     {:?}   --\n", err),
         }
-    }
+        Some(initrd)
+    } else {
+        None
+    };
 
     // P5 (opening): the first descent below EL1 making *real* syscalls. A tiny EL0
     // payload calls DebugWrite (prints the line below), ChannelCreate (through the real
     // SyscallEngine), then ProcessExit; the kernel handles each via the SVC trap and
     // trampolines back. The "hello from EL0" line is userspace asking the kernel to act.
-    let u = usermode::run();
+    let u = match initrd {
+        Some(initrd) => match usermode::run_sora(initrd) {
+            Ok(report) => report,
+            Err(err) => {
+                klog!(
+                    "SORA EL0          Check     {:?}; using payload fallback   --\n",
+                    err
+                );
+                usermode::run()
+            }
+        },
+        None => usermode::run(),
+    };
     if u.entered && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 && u.chan.1 != 0 {
         klog!(
             "USERLAND  EL0      Check     {} svc  wrote {}b  chan h{}/h{}   OK\n",
@@ -288,6 +303,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             u.chan.0,
             u.chan.1
         );
+    }
+
+    // P5: kernel <-> Sora IPC. Sora wrote a greeting down the bootstrap root channel
+    // (handle 1); the kernel held the peer end and read it back after Sora exited.
+    if u.handshake_len > 0 {
+        let msg = core::str::from_utf8(&u.handshake[..u.handshake_len]).unwrap_or("<binary>");
+        klog!(
+            "SORA HANDSHAKE     Check     root channel: {:?}   OK\n",
+            msg.trim_end()
+        );
+    } else if u.chan.0 != 0 {
+        klog!("SORA HANDSHAKE     Check     no message on root channel   --\n");
     }
 
     if report.has_framebuffer {

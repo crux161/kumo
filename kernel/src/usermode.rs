@@ -15,8 +15,13 @@
 
 use core::cell::UnsafeCell;
 
-use kumo_abi::sys::Syscall;
+use alloc::vec::Vec;
 
+use kumo_abi::{find_file, sys::Syscall, Handle, InitrdError, SORA_INIT_PATH};
+use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment};
+use kumo_ipc::Message;
+
+use crate::bootstrap::user::{plan_elf_process, UserBootstrapError};
 use crate::mm::{Vmar, PAGE_SIZE};
 use crate::syscall::{KernelCall, KernelCallResult, SyscallEngine};
 use crate::task::{Job, Process};
@@ -46,6 +51,37 @@ pub struct UserReport {
     pub wrote: usize,
     pub chan: (u32, u32),
     pub exit_code: u64,
+    /// Bytes the kernel read back from the root channel after the process exited.
+    pub handshake: [u8; 32],
+    pub handshake_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsermodeError {
+    Initrd(InitrdError),
+    MissingSora,
+    Bootstrap(UserBootstrapError),
+    Image(UserImageError),
+    BadSegmentRange,
+    ChannelSetup,
+}
+
+impl From<InitrdError> for UsermodeError {
+    fn from(error: InitrdError) -> Self {
+        Self::Initrd(error)
+    }
+}
+
+impl From<UserBootstrapError> for UsermodeError {
+    fn from(error: UserBootstrapError) -> Self {
+        Self::Bootstrap(error)
+    }
+}
+
+impl From<UserImageError> for UsermodeError {
+    fn from(error: UserImageError) -> Self {
+        Self::Image(error)
+    }
 }
 
 /// The kernel's EL0 syscall handler (registered with the HAL). `regs` points at the
@@ -82,6 +118,42 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::ChannelWrite as u64 {
+        // x0 = handle, x1 = bytes ptr (user VA), x2 = len. Status returned in x0.
+        let channel = Handle(r[0] as u32);
+        let ptr = r[1] as *const u8;
+        let len = (r[2] as usize).min(256);
+        // SAFETY: the user buffer lives in the EL0 window, readable by EL1.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        let status = match Message::new(1, bytes, &[]) {
+            Ok(message) => match demo.engine.dispatch(
+                &mut demo.process,
+                KernelCall::ChannelWrite { channel, message },
+            ) {
+                KernelCallResult::Status(s) => s,
+                _ => -1,
+            },
+            Err(_) => -1,
+        };
+        r[0] = status as u32 as u64;
+    } else if num == Syscall::ChannelRead as u64 {
+        // x0 = handle, x1 = dst buffer (user VA), x2 = capacity. Bytes read returned in x0.
+        let channel = Handle(r[0] as u32);
+        let buf = r[1] as *mut u8;
+        let cap = (r[2] as usize).min(256);
+        match demo
+            .engine
+            .dispatch(&mut demo.process, KernelCall::ChannelRead { channel })
+        {
+            KernelCallResult::Message(message) => {
+                let bytes = message.bytes();
+                let n = bytes.len().min(cap);
+                // SAFETY: the dst buffer is in the EL0 window, writable by EL1.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
+                r[0] = n as u64;
+            }
+            _ => r[0] = 0, // nothing pending / error -> 0 bytes
+        }
     } else {
         r[0] = u64::MAX; // ENOSYS
     }
@@ -115,5 +187,111 @@ pub fn run() -> UserReport {
         wrote: demo.wrote,
         chan: demo.chan,
         exit_code: report.exit_code,
+        ..Default::default()
     }
+}
+
+pub fn run_sora(initrd: &[u8]) -> Result<UserReport, UsermodeError> {
+    let sora = find_file(initrd, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
+    let mut engine = SyscallEngine::new();
+    let plan = plan_elf_process(engine.objects_mut(), sora.bytes)?;
+
+    let mut load_segments = Vec::new();
+    for segment in &plan.load_segments {
+        let start =
+            usize::try_from(segment.file_offset).map_err(|_| UsermodeError::BadSegmentRange)?;
+        let len = usize::try_from(segment.file_size).map_err(|_| UsermodeError::BadSegmentRange)?;
+        let end = start
+            .checked_add(len)
+            .ok_or(UsermodeError::BadSegmentRange)?;
+        if end > sora.bytes.len() {
+            return Err(UsermodeError::BadSegmentRange);
+        }
+        load_segments.push(UserLoadSegment {
+            source: &sora.bytes[start..end],
+            virt_addr: segment.virt_addr,
+            mem_size: segment.mem_size,
+        });
+    }
+
+    // SAFETY: first writer for this EL0 descent; SVC hook runs synchronously.
+    unsafe {
+        *DEMO.0.get() = Some(Demo {
+            engine,
+            process: plan.process,
+            wrote: 0,
+            chan: (0, 0),
+        });
+    }
+
+    // Provision the root channel *before* Sora runs. `first` = Sora's end (handed to it as
+    // the bootstrap handle in x0), `second` = the kernel's end (we read it after exit).
+    let (sora_end, kernel_end) = {
+        // SAFETY: DEMO just initialized; single-threaded.
+        let demo = unsafe { &mut *demo_ptr() };
+        match demo
+            .engine
+            .dispatch(&mut demo.process, KernelCall::ChannelCreate)
+        {
+            KernelCallResult::Handles { first, second } => {
+                demo.chan = (first.0, second.0);
+                (first, second)
+            }
+            _ => return Err(UsermodeError::ChannelSetup),
+        }
+    };
+
+    // Seed Sora's inbox with a kernel boot message: writing to our end (`kernel_end`)
+    // lands it in Sora's end. Sora `ChannelRead`s it, echoes it, and replies.
+    {
+        // SAFETY: DEMO initialized; single-threaded.
+        let demo = unsafe { &mut *demo_ptr() };
+        if let Ok(message) = Message::new(1, b"kernel->sora boot\n", &[]) {
+            let _ = demo.engine.dispatch(
+                &mut demo.process,
+                KernelCall::ChannelWrite {
+                    channel: kernel_end,
+                    message,
+                },
+            );
+        }
+    }
+
+    kumo_hal::active::set_svc_hook(svc_hook);
+    let report = kumo_hal::active::run_el0_image(UserImage {
+        entry: plan.entry,
+        stack_top: plan.stack_top,
+        bootstrap: sora_end.0 as u64,
+        segments: &load_segments,
+    })?;
+
+    // Read what Sora sent down the root channel during its run.
+    let mut handshake = [0u8; 32];
+    let mut handshake_len = 0;
+    {
+        // SAFETY: initialized above; single-threaded read after EL0 has exited.
+        let demo = unsafe { &mut *demo_ptr() };
+        if let KernelCallResult::Message(message) = demo.engine.dispatch(
+            &mut demo.process,
+            KernelCall::ChannelRead {
+                channel: kernel_end,
+            },
+        ) {
+            let bytes = message.bytes();
+            handshake_len = bytes.len().min(handshake.len());
+            handshake[..handshake_len].copy_from_slice(&bytes[..handshake_len]);
+        }
+    }
+
+    // SAFETY: initialized above; single-threaded read after EL0 has exited.
+    let demo = unsafe { &*demo_ptr() };
+    Ok(UserReport {
+        entered: report.entered,
+        syscalls: report.syscalls,
+        wrote: demo.wrote,
+        chan: demo.chan,
+        exit_code: report.exit_code,
+        handshake,
+        handshake_len,
+    })
 }
