@@ -65,6 +65,10 @@ struct SoraState {
     block_channel: usize,
     /// The kernel's endpoint for the block channel.
     block_kernel_end: ChannelEnd,
+    /// Index of the network [`ChannelPair`] (P9-c: loopback server).
+    net_channel: usize,
+    /// The kernel's endpoint for the network channel.
+    net_kernel_end: ChannelEnd,
     /// Bytes written by `DebugWrite` syscalls during this run.
     wrote: usize,
 }
@@ -92,6 +96,60 @@ fn child_ptr() -> *mut ChildState {
 fn sora_ptr() -> *mut SoraState {
     let opt: *mut Option<SoraState> = SORA.0.get();
     unsafe { (&mut *opt).as_mut().expect("sora state not initialized") as *mut SoraState }
+}
+
+/// P9-a: signal all interrupt objects bound to `irq`. Called from the timer IRQ
+/// handler via `set_interrupt_hook`. Wakes Sora if it's parked on InterruptWait.
+extern "C" fn signal_irq(irq: u32) {
+    let sora = unsafe { &mut *sora_ptr() };
+    sora.engine.signal_interrupt(irq);
+    // Wake Sora if parked — InterruptWait uses park_current_user().
+    if crate::user_thread::is_started()
+        && !crate::user_thread::is_done()
+        && crate::user_thread::is_parked()
+    {
+        crate::user_thread::wake_user();
+    }
+}
+
+/// P9-c: send `data` on the network channel, wake Sora (loopback server echoes it),
+/// and read the reply. Returns bytes copied into `buf`.
+pub fn net_loopback(data: &[u8], buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+    {
+        let sora = unsafe { &mut *sora_ptr() };
+        let Ok(message) = Message::new(4, data, &[]) else {
+            return 0;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return 0;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+            return 0;
+        };
+        if channel.write(sora.net_kernel_end, msg).is_err() {
+            return 0;
+        }
+    }
+    crate::user_thread::wake_user();
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+        return 0;
+    };
+    match channel.read(sora.net_kernel_end) {
+        Ok(reply) => {
+            let bytes = reply.bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            n
+        }
+        Err(_) => 0,
+    }
 }
 
 /// P8-l: run a child process synchronously via `kumo_enter_el0`. The child shares
@@ -247,6 +305,53 @@ extern "C" fn svc_hook(regs: *mut u64) {
         ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ResourceMintMmio as u64 {
+        let resource = Handle(r[0] as u32);
+        let phys_base = r[1];
+        let len = r[2];
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base,
+                len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::InterruptCreate as u64 {
+        let irq = r[0] as u32;
+        match sora
+            .engine
+            .dispatch(&mut sora.process, KernelCall::InterruptCreate { irq })
+        {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::InterruptWait as u64 {
+        let interrupt = Handle(r[0] as u32);
+        let should_wait = Errno::ShouldWait.status();
+        loop {
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::InterruptWait { interrupt })
+            {
+                KernelCallResult::Handle(count) => {
+                    r[0] = count.0 as u64;
+                    break;
+                }
+                KernelCallResult::Status(status)
+                    if status == should_wait && crate::user_thread::is_started() =>
+                {
+                    crate::user_thread::park_current_user();
+                }
+                _ => {
+                    r[0] = 0;
+                    break;
+                }
+            }
         }
     } else if num == Syscall::ProcessRun as u64 {
         let process_handle = Handle(r[0] as u32);
@@ -441,6 +546,8 @@ pub fn run(boot: &BootInfo) -> UserReport {
             console_kernel_end: ChannelEnd::Left,
             block_channel: 0,
             block_kernel_end: ChannelEnd::Left,
+            net_channel: 0,
+            net_kernel_end: ChannelEnd::Left,
             wrote: 0,
         });
     }
@@ -513,6 +620,17 @@ fn attempt_sora(
                 .map_err(|_| UsermodeError::ChannelSetup)?,
             Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
         )
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P9-b: root Resource — grants access to all physical MMIO (scaffold; Gouchen
+    // will mint per-device Resources later). Sora receives the handle in x5.
+    let root_resource_handle = engine
+        .root_resource_create(&mut process, 0, u64::MAX)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P9-c: network channel — loopback server. Kernel is the first client.
+    let (net_handle, net_channel_idx, net_kernel_end) = engine
+        .root_channel_create(&mut process)
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
     // P7-g: block channel — the kernel sends block-read requests, Sora serves them from
@@ -599,6 +717,8 @@ fn attempt_sora(
             x[2] = console_handle.0 as u64; // console channel handle
             x[3] = initrd_vmo_handle.0 as u64; // initrd VMO handle (P7-a)
             x[4] = block_handle.0 as u64; // block-server channel handle (P7-g)
+            x[5] = root_resource_handle.0 as u64; // root Resource handle (P9-b)
+            x[6] = net_handle.0 as u64; // network channel handle (P9-c)
             x
         },
         elr: recipe.entry,
@@ -620,6 +740,8 @@ fn attempt_sora(
             console_kernel_end,
             block_channel: block_channel_idx,
             block_kernel_end,
+            net_channel: net_channel_idx,
+            net_kernel_end,
             wrote: 0,
         });
     }
@@ -658,6 +780,8 @@ fn attempt_sora(
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
+    #[cfg(target_os = "none")]
+    kumo_hal::active::set_interrupt_hook(signal_irq);
     // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
     // a server — or exits (the legacy/fault path).
     unsafe { crate::user_thread::spawn_user(user_state, user_ttbr0) };

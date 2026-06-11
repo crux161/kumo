@@ -7,8 +7,8 @@ use core::panic::PanicInfo;
 
 use kumo_abi::Handle;
 use kumo_rt::{
-    channel_read, channel_write, debug_write, process_create, process_exit, process_run,
-    thread_create, thread_start, vmar_map, vmo_read,
+    channel_read, channel_write, debug_write, interrupt_create,
+    process_create, process_exit, process_run, thread_create, thread_start, vmar_map, vmo_read,
 };
 use kumoza::parse;
 
@@ -27,12 +27,14 @@ core::arch::global_asm!(
     "1: b 1b",
 );
 
-/// Bootstrap args (arrive in x0-x4, aarch64 calling convention):
+/// Bootstrap args (arrive in x0-x6, aarch64 calling convention):
 ///   x0: root-channel handle
 ///   x1: framebuffer virtual address (0 if no FB)
 ///   x2: console channel handle
 ///   x3: initrd VMO handle
 ///   x4: block-server channel handle (P7-g)
+///   x5: root Resource handle (P9-b)
+///   x6: network channel handle (P9-c loopback server)
 #[no_mangle]
 extern "C" fn sora_main(
     root_handle: u64,
@@ -40,11 +42,15 @@ extern "C" fn sora_main(
     console_handle: u64,
     initrd_vmo: u64,
     block_handle: u64,
+    resource_handle: u64,
+    net_handle: u64,
 ) -> ! {
     let root = Handle(root_handle as u32);
     let console = Handle(console_handle as u32);
     let initrd = Handle(initrd_vmo as u32);
     let block = Handle(block_handle as u32);
+    let _res = Handle(resource_handle as u32);
+    let _net = Handle(net_handle as u32);
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
@@ -236,17 +242,21 @@ extern "C" fn sora_main(
         // Use the bottom of Sora's mapped stack region (0x101F_0000..0x1020_0000).
         // Sora is in kernel mode during ProcessRun, so its EL0 stack is frozen.
         let child_sp = 0x0000_0000_101F_8000u64;
-        let run_ok = process_run(
-            child,
-            child_payload as *const () as usize as u64,
-            child_sp,
-        );
+        let run_ok = process_run(child, child_payload as *const () as usize as u64, child_sp);
         debug_write(b" run=".as_ptr(), 5);
         if run_ok == 0 {
             debug_write(b"ok\n".as_ptr(), 3);
         } else {
             debug_write(b"fail\n".as_ptr(), 5);
         }
+    }
+
+    // P9-a: create an Interrupt object bound to the timer IRQ (27). The handle
+    // proves interrupt infrastructure works. InterruptWait is not called here —
+    // it would park Sora before the serve loop, breaking channel dispatch.
+    let timer_irq = interrupt_create(27);
+    if timer_irq != u64::MAX {
+        debug_write(b"timer irq ok\n".as_ptr(), 13);
     }
 
     // P6-d/e + P7-g: the serve loop, forever, multiplexing two channels.
@@ -342,6 +352,11 @@ extern "C" fn sora_main(
                 channel_write(block, block_buf.as_ptr(), served);
             }
         }
+
+        // P9-c: network channel is created at boot but not drained here — the
+        // 2-channel serve loop (console, block) is the stable limit with the
+        // current park/wake mechanism. Net drain returns when Port/wait-many.
+
     }
 }
 

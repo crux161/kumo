@@ -67,6 +67,16 @@ pub fn debug_write(_ptr: *const u8, _len: usize) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+pub fn channel_create() -> u64 {
+    syscall(Syscall::ChannelCreate, 0, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_create() -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn channel_read(channel: Handle, buf: *mut u8, cap: usize) -> u64 {
     syscall(
         Syscall::ChannelRead,
@@ -199,6 +209,42 @@ pub fn process_run(process: Handle, entry: u64, sp: u64) -> u64 {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub fn process_run(_process: Handle, _entry: u64, _sp: u64) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn interrupt_create(irq: u32) -> u64 {
+    syscall(Syscall::InterruptCreate, irq as u64, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn interrupt_create(_irq: u32) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn interrupt_wait(interrupt: Handle) -> u64 {
+    syscall(Syscall::InterruptWait, interrupt.0 as u64, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn interrupt_wait(_interrupt: Handle) -> u64 {
+    0
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
+    syscall(
+        Syscall::ResourceMintMmio,
+        resource.0 as u64,
+        phys_base,
+        len,
+        0,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 {
     u64::MAX
 }
 

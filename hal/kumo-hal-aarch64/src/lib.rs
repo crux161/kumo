@@ -2267,11 +2267,18 @@ unsafe fn enable_irq() {}
 /// A hook the timer IRQ calls (after EOI) to drive preemptive scheduling. Stored as
 /// a raw `extern "C" fn()` address; 0 means "no preemption".
 static PREEMPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the preemption hook (the scheduler tick). It runs in IRQ context after the
 /// timer interrupt is acknowledged/EOI'd, and may context-switch via `switch_context`.
 pub fn set_preempt_hook(hook: extern "C" fn()) {
     PREEMPT_HOOK.store(hook as usize, ORD);
+}
+
+/// Install the interrupt-signal hook. Called from the timer IRQ handler (same context
+/// as the preempt hook) to deliver IRQs to kernel Interrupt objects (P9-a).
+pub fn set_interrupt_hook(hook: extern "C" fn(u32)) {
+    INTERRUPT_HOOK.store(hook as usize, ORD);
 }
 
 /// Stop calling the preemption hook (back to plain timer ticks).
@@ -2309,6 +2316,11 @@ fn on_irq(intid: u32) {
             // SAFETY: only ever set from `set_preempt_hook` with a real `fn()`.
             let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
             hook();
+        }
+        let irq_hook = INTERRUPT_HOOK.load(ORD);
+        if irq_hook != 0 {
+            let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+            irq_hook(intid);
         }
     }
 }

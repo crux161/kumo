@@ -74,6 +74,17 @@ pub enum KernelCall<'a> {
         entry: u64,
         sp: u64,
     },
+    InterruptCreate {
+        irq: u32,
+    },
+    InterruptWait {
+        interrupt: Handle,
+    },
+    ResourceMintMmio {
+        resource: Handle,
+        phys_base: u64,
+        len: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -86,6 +97,22 @@ pub enum KernelCallResult {
     PortPacket(PortPacket),
 }
 
+/// An interrupt binding: (irq_number, object_koid, fire_count).
+#[derive(Clone, Copy, Debug)]
+struct IrqBinding {
+    irq: u32,
+    koid: KoId,
+    count: u64,
+}
+
+/// A Resource grant: the holder may mint VMOs from this MMIO range.
+#[derive(Clone, Copy, Debug)]
+struct ResourceBinding {
+    koid: KoId,
+    phys_base: u64,
+    len: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SyscallEngine {
     objects: ObjectManager,
@@ -94,6 +121,8 @@ pub struct SyscallEngine {
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
+    interrupts: Vec<IrqBinding>,
+    resources: Vec<ResourceBinding>,
 }
 
 impl SyscallEngine {
@@ -105,6 +134,45 @@ impl SyscallEngine {
             processes: Vec::new(),
             threads: Vec::new(),
             boot_info: None,
+            interrupts: Vec::new(),
+            resources: Vec::new(),
+        }
+    }
+
+    /// Create a root Resource covering `[phys_base, phys_base + len)`. Returns a handle
+    /// for `caller`. This is the scaffold — Gouchen will mint per-device Resources later.
+    pub fn root_resource_create(
+        &mut self,
+        caller: &mut Process,
+        phys_base: u64,
+        len: u64,
+    ) -> Result<Handle, ObjectError> {
+        let object = self.objects.create(ObjectKind::Resource);
+        let handle = caller
+            .handles_mut()
+            .insert(object, Rights::READ | Rights::WRITE | Rights::DUPLICATE)?;
+        self.resources.push(ResourceBinding {
+            koid: object.koid(),
+            phys_base,
+            len,
+        });
+        Ok(handle)
+    }
+
+    /// Look up a Resource binding by koid.
+    fn resource_by_koid(&self, koid: KoId) -> Option<ResourceBinding> {
+        self.resources
+            .iter()
+            .find_map(|r| if r.koid == koid { Some(*r) } else { None })
+    }
+
+    /// Signal all interrupt objects bound to `irq`. Called from the IRQ handler.
+    /// Increments the fire count for each matching binding.
+    pub fn signal_interrupt(&mut self, irq: u32) {
+        for binding in &mut self.interrupts {
+            if binding.irq == irq {
+                binding.count = binding.count.saturating_add(1);
+            }
         }
     }
 
@@ -526,6 +594,87 @@ impl SyscallEngine {
                 {
                     let _ = (process_handle, entry, sp);
                     KernelCallResult::Status(Errno::NotSupported.status())
+                }
+            }
+            KernelCall::InterruptCreate { irq } => {
+                let object = self.objects.create(ObjectKind::Interrupt);
+                let handle = match process
+                    .handles_mut()
+                    .insert(object, Rights::READ | Rights::WAIT | Rights::DUPLICATE)
+                {
+                    Ok(h) => h,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                self.interrupts.push(IrqBinding {
+                    irq,
+                    koid: object.koid(),
+                    count: 0,
+                });
+                KernelCallResult::Handle(handle)
+            }
+            KernelCall::InterruptWait { interrupt } => {
+                let entry =
+                    match process
+                        .handles()
+                        .require(interrupt, ObjectKind::Interrupt, Rights::WAIT)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                // Find the binding and check fire count. If > 0, return the count.
+                // If 0, return ShouldWait — the caller parks and the IRQ handler
+                // will wake it.
+                for binding in &mut self.interrupts {
+                    if binding.koid == entry.koid {
+                        if binding.count > 0 {
+                            let n = binding.count;
+                            binding.count = 0;
+                            return KernelCallResult::Handle(Handle(n as u32));
+                        }
+                        return KernelCallResult::Status(Errno::ShouldWait.status());
+                    }
+                }
+                KernelCallResult::Status(Errno::BadHandle.status())
+            }
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base,
+                len,
+            } => {
+                let res_entry =
+                    match process
+                        .handles()
+                        .require(resource, ObjectKind::Resource, Rights::WRITE)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                let Some(res) = self.resource_by_koid(res_entry.koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                // Check the requested range is within the Resource grant.
+                let end = match phys_base.checked_add(len) {
+                    Some(e) => e,
+                    None => return KernelCallResult::Status(Errno::InvalidArgs.status()),
+                };
+                let res_end = match res.phys_base.checked_add(res.len) {
+                    Some(e) => e,
+                    None => return KernelCallResult::Status(Errno::InvalidArgs.status()),
+                };
+                if phys_base < res.phys_base || end > res_end {
+                    return KernelCallResult::Status(Errno::AccessDenied.status());
+                }
+                // Create a Physical VMO from the MMIO range.
+                match crate::mm::Vmo::from_physical_range(phys_base, len) {
+                    Ok(vmo) => match self.root_vmo_create(
+                        process,
+                        vmo,
+                        Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+                    ) {
+                        Ok(handle) => KernelCallResult::Handle(handle),
+                        Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+                    },
+                    Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),

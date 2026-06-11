@@ -420,6 +420,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     );
                 }
             }
+
         }
     }
 

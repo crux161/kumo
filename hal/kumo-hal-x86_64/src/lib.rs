@@ -270,6 +270,9 @@ pub fn clear_preempt_hook() {
     // See `set_preempt_hook`.
 }
 
+/// Stub: P9-a interrupt-signal hook — arm64 spine first.
+pub fn set_interrupt_hook(_hook: extern "C" fn(u32)) {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {
     pub counter_hz: u64,
