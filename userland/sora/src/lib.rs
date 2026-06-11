@@ -1,7 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use kumo_abi::{Errno, Status};
+use kumo_abi::{Errno, Handle, Status};
 use kumo_ipc::{Message, MessageError};
 
 pub const SORA_NAME: &str = "Sora";
@@ -38,7 +38,7 @@ impl kumo_rt::Server for Sora {
         SORA_NAME
     }
 
-    fn dispatch(&mut self, _message: Message<'_>) -> Status {
+    fn dispatch(&mut self, _channel: Handle, _message: &[u8]) -> Status {
         Errno::Ok.status()
     }
 }

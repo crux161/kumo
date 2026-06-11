@@ -31,6 +31,8 @@ pub enum Syscall {
     FutexWait = 27,
     FutexWake = 28,
     DebugWrite = 29,
+    AddressSpaceCreate = 30,
+    ProcessRun = 31,
 }
 
 pub type Status = i32;

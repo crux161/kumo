@@ -11,6 +11,7 @@ members = [
     "lib/kumo-ipc",
     "tools/stage-a-smoke",
     "userland/kumo-rt",
+    "userland/kumoza",
     "userland/sora",
     "xtask",
 ]

@@ -230,8 +230,17 @@ pub struct Mapping {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmoBacking {
+    /// Anonymous memory: fresh zeroed frames allocated on map.
+    Anonymous,
+    /// Physical memory: frames at a fixed physical address (MMIO, framebuffer).
+    Physical { phys_base: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmo {
     len: u64,
+    backing: VmoBacking,
 }
 
 impl Vmo {
@@ -239,9 +248,22 @@ impl Vmo {
         if len == 0 {
             return Err(MemoryError::Empty);
         }
-
         Ok(Self {
             len: align_up(len).ok_or(MemoryError::InvalidRange)?,
+            backing: VmoBacking::Anonymous,
+        })
+    }
+
+    pub fn from_physical_range(phys_base: u64, len: u64) -> Result<Self, MemoryError> {
+        if len == 0 {
+            return Err(MemoryError::Empty);
+        }
+        if !is_page_aligned(phys_base) {
+            return Err(MemoryError::Unaligned);
+        }
+        Ok(Self {
+            len: align_up(len).ok_or(MemoryError::InvalidRange)?,
+            backing: VmoBacking::Physical { phys_base },
         })
     }
 
@@ -251,6 +273,10 @@ impl Vmo {
 
     pub const fn frame_count(self) -> u64 {
         self.len / PAGE_SIZE
+    }
+
+    pub const fn backing(self) -> VmoBacking {
+        self.backing
     }
 }
 

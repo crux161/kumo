@@ -4,6 +4,7 @@ pub const INITRD_ENTRY_LEN: usize = 80;
 pub const INITRD_PATH_MAX: usize = 64;
 pub const INITRD_VERSION: u32 = 1;
 pub const SORA_INIT_PATH: &str = "bin/sora";
+pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitrdError {

@@ -16,6 +16,8 @@ use kumo_abi::initrd::{
     SORA_INIT_PATH,
 };
 
+const FAT32_IMG_PATH: &str = "bin/fat32.img";
+
 /// Staged kernel image + initrd locations on the ESP (must match the paths
 /// `niji-uefi` opens at runtime).
 const KERNEL_ESP_PATH: &str = "EFI/KUMO/kernel/kumo-kernel.elf";
@@ -534,13 +536,116 @@ fn stage_kernel(
     }))
 }
 
+/// Build a minimal FAT32 disk image with:
+///   sector 0:   BPB
+///   sector 1:   FSInfo (signatures only)
+///   sectors 2–31: reserved (zeroed)
+///   sectors 32–63: FAT #1
+///   sectors 64–95: FAT #2
+///   sector 96:  root directory (cluster 2) with a volume label + two test files
+///
+/// Layout constants (must be internally consistent):
+const FAT_SEC_SIZE: u16 = 512;
+const FAT_RESERVED: u16 = 32;
+const FAT_NUM_FATS: u8 = 2;
+const FAT_SPC: u8 = 1;
+const FAT_SPF: u32 = 32; // sectors per FAT
+const FAT_TOTAL_SECS: u32 = 4096;
+const ROOT_CLUSTER: u32 = 2;
+const DATA_START: u64 = FAT_RESERVED as u64 + (FAT_NUM_FATS as u64 * FAT_SPF as u64);
+
+fn build_fat32_image() -> Vec<u8> {
+    let total = FAT_TOTAL_SECS as usize * FAT_SEC_SIZE as usize;
+    let mut img = vec![0u8; total];
+
+    // ---- sector 0: BPB ----
+    let s = &mut img[..512];
+    s[0..3].copy_from_slice(&[0xEB, 0xFE, 0x90]);
+    s[3..11].copy_from_slice(b"MSDOS5.0");
+    s[0x0B..0x0D].copy_from_slice(&FAT_SEC_SIZE.to_le_bytes());
+    s[0x0D] = FAT_SPC;
+    s[0x0E..0x10].copy_from_slice(&FAT_RESERVED.to_le_bytes());
+    s[0x10] = FAT_NUM_FATS;
+    s[0x15] = 0xF8;
+    s[0x18..0x1A].copy_from_slice(&63u16.to_le_bytes());
+    s[0x1A..0x1C].copy_from_slice(&255u16.to_le_bytes());
+    s[0x20..0x24].copy_from_slice(&FAT_TOTAL_SECS.to_le_bytes());
+    s[0x24..0x28].copy_from_slice(&FAT_SPF.to_le_bytes());
+    s[0x2C..0x30].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
+    s[0x30..0x32].copy_from_slice(&1u16.to_le_bytes()); // FSInfo sector
+    s[0x32..0x34].copy_from_slice(&6u16.to_le_bytes()); // backup boot sector
+    s[0x40] = 0x80;
+    s[0x42] = 0x29;
+    s[0x43..0x47].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+    s[0x47..0x52].copy_from_slice(b"KUMO       ");
+    s[0x52..0x5A].copy_from_slice(b"FAT32   ");
+    s[0x1FE..0x200].copy_from_slice(&[0x55, 0xAA]);
+
+    // ---- sector 1: FSInfo (signatures only) ----
+    img[512..516].copy_from_slice(b"RRaA");
+    img[512 + 0x1E4..512 + 0x1E8].copy_from_slice(b"rrAa");
+
+    // ---- FAT #1 at sector 32 ----
+    let fat1_off = FAT_RESERVED as usize * FAT_SEC_SIZE as usize;
+    let fat_size = FAT_SPF as usize * FAT_SEC_SIZE as usize;
+    {
+        let fat1 = &mut img[fat1_off..fat1_off + fat_size];
+        fat1[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]);
+        fat1[4..8].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]);
+        fat1[8..12].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]); // cluster 2 = root dir = EOF
+        fat1[12..16].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]); // cluster 3 = HELLO.TXT = EOF
+    }
+
+    // ---- FAT #2 at sector 64 (copy of FAT #1) ----
+    let fat2_off = fat1_off + fat_size;
+    img.copy_within(fat1_off..fat1_off + fat_size, fat2_off);
+
+    // ---- cluster 3 (sector 97): HELLO.TXT payload ----
+    let cluster3_off =
+        (DATA_START as usize + (3 - 2) as usize * FAT_SPC as usize) * FAT_SEC_SIZE as usize;
+    img[cluster3_off..cluster3_off + 6].copy_from_slice(b"hello!");
+
+    // ---- root directory at cluster 2 (sector 96) ----
+    let root_off = DATA_START as usize * FAT_SEC_SIZE as usize;
+    {
+        let dir = &mut img[root_off..root_off + 512];
+
+        fn put_entry(
+            dir: &mut [u8],
+            off: usize,
+            name: &[u8; 11],
+            attr: u8,
+            cluster: u32,
+            size: u32,
+        ) {
+            let e = &mut dir[off..off + 32];
+            e[..11].copy_from_slice(name);
+            e[11] = attr;
+            e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+            e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+            e[28..32].copy_from_slice(&size.to_le_bytes());
+        }
+
+        put_entry(dir, 0, b"KUMO       ", 0x08, 0, 0);
+        put_entry(dir, 32, b"README  TXT", 0x20, 0, 128);
+        put_entry(dir, 64, b"HELLO   TXT", 0x20, 3, 6); // cluster 3, 6 bytes
+        dir[96] = 0x00;
+    }
+
+    img
+}
+
 fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleAsset>, String> {
     if plan.arch != ImageArch::Aarch64 {
         return Ok(None);
     }
 
     let sora = build_sora_image(&workspace_root()?)?;
-    let initrd = build_initrd(&[(SORA_INIT_PATH, sora.as_slice())])?;
+    let fat32_img = build_fat32_image();
+    let initrd = build_initrd(&[
+        (SORA_INIT_PATH, sora.as_slice()),
+        (FAT32_IMG_PATH, fat32_img.as_slice()),
+    ])?;
 
     let staged_path = out_dir
         .join(plan.hardware.to_string())

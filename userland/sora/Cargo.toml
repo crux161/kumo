@@ -9,6 +9,7 @@ version.workspace = true
 kumo-abi.workspace = true
 kumo-ipc.workspace = true
 kumo-rt = { path = "../kumo-rt" }
+kumoza = { path = "../kumoza" }
 
 [lib]
 path = "src/lib.rs"

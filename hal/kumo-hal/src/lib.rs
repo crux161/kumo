@@ -12,24 +12,26 @@ compile_error!("select a HAL backend");
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
     pub use kumo_hal_aarch64::{
-        arch_name, clear_preempt_hook, console_read_byte, early_console_write, el0_exit,
-        enable_kernel_mmu, fb_fill, fb_paint_band, halt, init_timer_interrupts,
-        install_exception_vectors, monotonic_nanos, run_el0_image, run_el0_smoke, set_framebuffer,
-        set_preempt_hook, set_svc_hook, spin_once, switch_context, timer_irq_count,
-        wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment,
-        ARCH,
+        arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
+        early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
+        init_timer_interrupts, install_exception_vectors, irq_unmask, monotonic_nanos, read_phys,
+        read_ttbr0, run_el0_image, run_el0_smoke, set_framebuffer, set_preempt_hook, set_svc_hook,
+        set_ttbr0, spin_once, switch_context, syscall_count, timer_irq_count, wait_for_timer_irqs,
+        El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping,
+        UserState, ARCH,
     };
 }
 
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        arch_name, clear_preempt_hook, console_read_byte, early_console_write, el0_exit,
-        enable_kernel_mmu, fb_fill, fb_paint_band, halt, init_timer_interrupts,
-        install_exception_vectors, monotonic_nanos, run_el0_image, run_el0_smoke, set_framebuffer,
-        set_preempt_hook, set_svc_hook, spin_once, switch_context, timer_irq_count,
-        wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment,
-        ARCH,
+        arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
+        early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
+        init_timer_interrupts, install_exception_vectors, irq_unmask, monotonic_nanos, read_phys,
+        read_ttbr0, run_el0_image, run_el0_smoke, set_framebuffer, set_preempt_hook, set_svc_hook,
+        set_ttbr0, spin_once, switch_context, syscall_count, timer_irq_count, wait_for_timer_irqs,
+        El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping,
+        UserState, ARCH,
     };
 }
 

@@ -10,7 +10,7 @@ pub use boot::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegion, MemRegionKind, PlatformTable, Range,
     RawSlice,
 };
-pub use initrd::{find_file, InitrdError, InitrdFile, SORA_INIT_PATH};
+pub use initrd::{find_file, InitrdError, InitrdFile, FAT32_IMG_PATH, SORA_INIT_PATH};
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
 pub use sys::{Errno, Status, Syscall};
 

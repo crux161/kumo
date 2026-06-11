@@ -143,6 +143,24 @@ impl IpcRegistry {
         }
     }
 
+    /// Create a root channel: one endpoint goes to `process` as a handle, the other
+    /// is retained by the kernel. Returns `(process_handle, channel_index, kernel_end)`.
+    /// The kernel reads/writes `kernel_end` via [`channel_pair_mut`](Self::channel_pair_mut).
+    pub fn root_channel_create(
+        &mut self,
+        objects: &mut ObjectManager,
+        process: &mut Process,
+    ) -> Result<(Handle, usize, ChannelEnd), IpcError> {
+        let channel = ChannelPair::new(objects);
+        let right = process.handles_mut().insert(
+            channel.object(ChannelEnd::Right),
+            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE,
+        )?;
+        let index = self.channels.len();
+        self.channels.push(channel);
+        Ok((right, index, ChannelEnd::Left))
+    }
+
     pub fn channel_create(
         &mut self,
         objects: &mut ObjectManager,
@@ -275,6 +293,13 @@ impl IpcRegistry {
             }
         }
         Err(IpcError::NotChannel)
+    }
+
+    /// Access a [`ChannelPair`] by its index in the registry (returned by
+    /// [`channel_create`](Self::channel_create)). Used by the kernel to read/write
+    /// its own channel endpoint directly, without going through a handle table.
+    pub fn channel_pair_mut(&mut self, index: usize) -> Option<&mut ChannelPair> {
+        self.channels.get_mut(index)
     }
 
     fn channel_mut_by_koid(&mut self, koid: KoId) -> Result<&mut ChannelPair, IpcError> {

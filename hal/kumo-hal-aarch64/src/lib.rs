@@ -120,6 +120,18 @@ pub unsafe fn switch_context(prev: *mut ThreadContext, next: *const ThreadContex
 #[cfg(not(target_os = "none"))]
 pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadContext) {}
 
+/// Unmask IRQs. A context resumed from a switch performed inside an exception handler
+/// (e.g. the boot flow resumed by a user thread's `ProcessExit` SVC) inherits that
+/// handler's masked DAIF — the same hazard `kumo_context_trampoline` clears for fresh
+/// kernel threads. Call this after such a resume so the timer keeps ticking.
+#[cfg(target_os = "none")]
+pub fn irq_unmask() {
+    unsafe { core::arch::asm!("msr daifclr, #0x2", "isb", options(nostack, nomem)) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn irq_unmask() {}
+
 // =====================================================================
 // Stage-A early console
 //
@@ -152,8 +164,36 @@ const UARTCR_RXE: u32 = 1 << 9;
 
 static UART_READY: AtomicBool = AtomicBool::new(false);
 
+/// Added to every console MMIO physical address before dereferencing. 0 during early
+/// boot (the identity/firmware map); [`console_use_physmap`] raises it to
+/// [`mmu::PHYSMAP_BASE`] so console access rides TTBR1 — mapped no matter which TTBR0
+/// (kernel identity or a user process tree) is active.
+static CONSOLE_VA_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Switch the Stage-A console (PL011 + framebuffer) to physmap addressing. Call once
+/// the kernel's split tables are live (`enable_kernel_mmu`): afterwards console output
+/// needs no identity/EL1 window in user page tables — the journal-052 scaffold bridge.
+#[cfg(target_os = "none")]
+pub fn console_use_physmap() {
+    CONSOLE_VA_OFFSET.store(mmu::PHYSMAP_BASE, ORD);
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn console_use_physmap() {}
+
+/// Read bytes from a physical address into `dest`. Only safe when the physmap is live
+/// (after `enable_kernel_mmu`) — the physical address is accessed at `PHYSMAP_BASE + phys`.
+#[cfg(target_os = "none")]
+pub fn read_phys(phys: u64, dest: &mut [u8]) {
+    let src = (mmu::PHYSMAP_BASE + phys) as *const u8;
+    unsafe { core::ptr::copy_nonoverlapping(src, dest.as_mut_ptr(), dest.len()) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
+
 fn pl011_reg(offset: usize) -> *mut u32 {
-    (PL011_BASE + offset) as *mut u32
+    (PL011_BASE as u64 + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
 }
 
 fn pl011_init() {
@@ -523,6 +563,36 @@ pub fn fb_paint_band(phys: u64, len_bytes: u64, width: u32, stride: u32, y0: u32
     }
 }
 
+/// Scroll the framebuffer text grid up by one glyph row: move every full glyph band up
+/// `GLYPH_H` pixel rows, clear the freed bottom band, and flush the moved region to RAM
+/// for the scanout. Replaces the old bottom-row clamp — the POST outgrew small displays
+/// (QEMU ramfb is 37 rows), where the tail lines overwrote each other.
+fn fb_scroll_up(base: *mut u32, len_px: usize, stride: usize, height_px: usize) {
+    let band = stride * GLYPH_H; // pixels per text row band
+    let visible_px = stride * ((height_px / GLYPH_H) * GLYPH_H);
+    if band == 0 || visible_px <= band || visible_px > len_px {
+        return;
+    }
+    let keep = visible_px - band;
+    // Forward overlapping copy (dst < src) — safe with `copy`.
+    unsafe { core::ptr::copy(base.add(band), base, keep) };
+    let mut i = keep;
+    while i < visible_px {
+        unsafe { base.add(i).write_volatile(BG) };
+        i += 1;
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        let mut a = (base as usize) & !63;
+        let end = base as usize + visible_px * 4;
+        while a < end {
+            fb_clean_line(a);
+            a += 64;
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
 /// Render one Unicode scalar to the framebuffer. ASCII (and `\n`/`\r`) use the 8x16 PSF
 /// cell; any scalar >= `0x80` takes a curated 16x16 **double-width** CJK glyph (or the tofu
 /// box if absent), advancing the cursor by two cells.
@@ -532,7 +602,9 @@ fn fb_putchar(scalar: u32) {
     let rows = (FB_HEIGHT.load(ORD) as usize / GLYPH_H).max(1);
     let mut col = FB_COL.load(ORD) as usize;
     let mut row = FB_ROW.load(ORD) as usize;
-    let base = FB_BASE.load(ORD) as *mut u32;
+    // Address pixels through the console VA offset (identity early, physmap once the
+    // split tables are live) so text rendering works under any active TTBR0.
+    let base = (FB_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD)) as *mut u32;
     let len_px = FB_LEN_PX.load(ORD);
 
     match scalar {
@@ -546,21 +618,23 @@ fn fb_putchar(scalar: u32) {
                 col = 0;
                 row += 1;
             }
-            if row < rows {
-                unsafe {
-                    blit_glyph(
-                        base,
-                        len_px,
-                        stride,
-                        col * GLYPH_W,
-                        row * GLYPH_H,
-                        scalar as u8,
-                        FG,
-                        BG,
-                    )
-                };
-                col += 1;
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
             }
+            unsafe {
+                blit_glyph(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    scalar as u8,
+                    FG,
+                    BG,
+                )
+            };
+            col += 1;
         }
         c if c >= 0x80 => {
             // A wide cell needs two columns; wrap first if it would not fit.
@@ -568,30 +642,33 @@ fn fb_putchar(scalar: u32) {
                 col = 0;
                 row += 1;
             }
-            if row < rows {
-                let glyph = cjk_glyph(c).unwrap_or(&TOFU[..]);
-                unsafe {
-                    blit_wide_glyph(
-                        base,
-                        len_px,
-                        stride,
-                        col * GLYPH_W,
-                        row * GLYPH_H,
-                        glyph,
-                        FG,
-                        BG,
-                    )
-                };
-                col += 2;
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
             }
+            let glyph = cjk_glyph(c).unwrap_or(&TOFU[..]);
+            unsafe {
+                blit_wide_glyph(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    glyph,
+                    FG,
+                    BG,
+                )
+            };
+            col += 2;
         }
         _ => {} // other C0 controls: ignore
     }
 
-    // No scrolling yet: clamp at the bottom row (Stage-A output is a few lines).
+    // A trailing newline at the bottom scrolls eagerly, leaving a blank last row for
+    // the next character (normal terminal behaviour).
     if row >= rows {
+        fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
         row = rows - 1;
-        col = 0;
     }
     FB_COL.store(col as u32, ORD);
     FB_ROW.store(row as u32, ORD);
@@ -943,23 +1020,33 @@ pub mod mmu {
         map_page(root, va, pa, desc, alloc, tables)
     }
 
-    /// Map a 2 MiB **kernel-only** (EL1) block `va -> pa` into `root` as Device (`device`)
-    /// or Normal-NC (framebuffer). Used to keep the active console MMIO reachable while a
-    /// process TTBR0 is installed (the kernel still prints via raw-physical access); EL0
-    /// can never touch it (no `AP_EL0`, `PXN|UXN`).
+    // (`map_kernel_device_block` — the EL1-only console-window mapper — is gone with the
+    // P5-mmu-b console bridge: the console rides the TTBR1 physmap now.)
+
+    /// Map a 2 MiB block `va -> pa` into `root` with **EL0 access** (RW if `writable`,
+    /// RO otherwise). `nc` means Normal-NC (for framebuffers); otherwise Device-nGnRnE
+    /// (for MMIO registers). EL0 can never execute (`UXN`), and the kernel does not
+    /// execute from device pages (`PXN`).
     ///
     /// # Safety
     /// As [`map_user_page`].
-    pub unsafe fn map_kernel_device_block(
+    pub unsafe fn map_user_device_block(
         root: u64,
         va: u64,
         pa: u64,
-        device: bool,
+        nc: bool,
+        writable: bool,
         alloc: &mut dyn FnMut() -> Option<u64>,
         tables: &mut usize,
     ) -> Result<(), ()> {
-        let mair = if device { MAIR_DEVICE } else { MAIR_NC };
-        map_block(root, va, pa, block_desc(pa, mair, true), alloc, tables)
+        let mair = if nc { MAIR_NC } else { MAIR_DEVICE };
+        let ap = if writable {
+            AP_EL1RW_EL0RW
+        } else {
+            AP_EL1RO_EL0RO
+        };
+        let desc = pa | DESC_VALID | DESC_AF | (mair << 2) | PXN | UXN | ap;
+        map_block(root, va, pa, desc, alloc, tables)
     }
 
     /// Read `TTBR0_EL1` (the active low-half root), so the kernel identity map can be
@@ -1004,6 +1091,8 @@ pub mod mmu {
 
 #[cfg(target_os = "none")]
 pub use mmu::enable_kernel as enable_kernel_mmu;
+#[cfg(target_os = "none")]
+pub use mmu::{read_ttbr0, set_ttbr0};
 
 // ---- EL0 / userspace smoke -----------------------------------------------------------
 //
@@ -1019,6 +1108,12 @@ pub mod el0 {
     const PAGE_4K: u64 = 1 << 12;
 
     static SYSCALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// Read the syscall counter (useful when the kernel drives EL0 entry via the
+    /// scheduler instead of the synchronous `run_el0_image` path).
+    pub fn syscall_count() -> u32 {
+        SYSCALLS.load(Ordering::Relaxed)
+    }
 
     /// The kernel's syscall handler, registered via [`set_svc_hook`]. It receives a
     /// pointer to the 31 saved EL0 GP registers (x0..x30): the ABI is x8 = syscall
@@ -1045,6 +1140,9 @@ pub mod el0 {
         BadSegment,
         BadStack,
         OutOfFrames,
+        ImageTooLarge,
+        SegmentOutsideImageBlock,
+        StackOutsideStackBlock,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1061,6 +1159,21 @@ pub mod el0 {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct UserMapping {
+        /// Physical base address of the mapping (need not be 2 MiB-aligned).
+        pub phys_base: u64,
+        /// The 2 MiB-aligned virtual **slot** the covering blocks are mapped at. The
+        /// usable VA for `phys_base` is `virt_addr + (phys_base & (2 MiB - 1))`.
+        pub virt_addr: u64,
+        /// Length in bytes.
+        pub len: u64,
+        /// Whether EL0 can write to this mapping.
+        pub writable: bool,
+        /// If true, map as Device-nGnRnE; otherwise Normal-NC (for framebuffers).
+        pub device: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct UserImage<'a> {
         pub entry: u64,
         pub stack_top: u64,
@@ -1071,6 +1184,9 @@ pub mod el0 {
         /// root-channel handle. 0 = none.
         pub bootstrap: u64,
         pub segments: &'a [UserLoadSegment<'a>],
+        /// Extra physical mappings (e.g. framebuffer, MMIO). Mapped as 2 MiB blocks
+        /// with EL0 access. Each mapping must be page-aligned.
+        pub extra_mappings: &'a [UserMapping],
     }
 
     /// Saved kernel callee-saved registers + SP, so the exit SVC can return to the boot
@@ -1084,6 +1200,72 @@ pub mod el0 {
         static el0_payload_start: u8;
         static el0_payload_end: u8;
     }
+
+    // ---- P5-sched: UserState + scheduler-driven EL0 entry ------------------------
+    //
+    // A user thread's ThreadContext stores x19_entry = &UserState and
+    // x30_lr = kumo_user_enter (not kumo_context_trampoline). When the scheduler
+    // first switches to the thread, kumo_context_switch restores callee-saved regs
+    // + sp and `ret`s to kumo_user_enter, which loads the full EL0 register file,
+    // switches TTBR0, and erets to EL0 with DAIF unmasked (so the timer preempts).
+
+    /// Saved EL0 execution context. Used for first entry (loaded by
+    /// `kumo_user_enter`) and for save/restore across scheduler-driven blocks.
+    #[repr(C)]
+    pub struct UserState {
+        /// x0..x30 at EL0 entry. x0 = bootstrap arg (channel handle) on first entry.
+        pub x: [u64; 31],
+        /// EL0 entry point (restored to ELR_EL1)
+        pub elr: u64,
+        /// Saved processor state (restored to SPSR_EL1): EL0t, DAIF setting
+        pub spsr: u64,
+        /// EL0 stack pointer (restored to SP_EL0)
+        pub sp_el0: u64,
+        /// Process page table root physical address (restored to TTBR0_EL1)
+        pub ttbr0: u64,
+    }
+
+    core::arch::global_asm!(
+        ".global kumo_user_enter",
+        ".balign 4",
+        "kumo_user_enter:",
+        // x19 = *const UserState (set by `user_entry_context` for user threads).
+        // Order matters: program every system register FIRST (through scratch regs that
+        // have not received their EL0 values yet), THEN load the GP file, with the base
+        // register (x9) loaded dead last. The previous version loaded the GP file first
+        // and then pulled elr/spsr/sp_el0/ttbr0 through x2/x3 — handing EL0 the TTBR0
+        // physical address in x2 instead of its third bootstrap argument.
+        "  mov  x9, x19",              // x9 = &UserState (base)
+        "  ldp  x10, x11, [x9, #248]", // elr, spsr
+        "  msr  elr_el1, x10",
+        "  msr  spsr_el1, x11",
+        "  ldr  x10, [x9, #264]", // sp_el0
+        "  msr  sp_el0, x10",
+        "  ldr  x10, [x9, #272]", // ttbr0 (process page tables)
+        "  msr  ttbr0_el1, x10",
+        "  isb",
+        "  tlbi vmalle1",
+        "  dsb  ish",
+        "  isb",
+        "  ldp  x0, x1, [x9, #0]", // EL0 register file (x9 last — it is the base)
+        "  ldp  x2, x3, [x9, #16]",
+        "  ldp  x4, x5, [x9, #32]",
+        "  ldp  x6, x7, [x9, #48]",
+        "  ldr  x8, [x9, #64]",
+        "  ldp  x10, x11, [x9, #80]",
+        "  ldp  x12, x13, [x9, #96]",
+        "  ldp  x14, x15, [x9, #112]",
+        "  ldp  x16, x17, [x9, #128]",
+        "  ldp  x18, x19, [x9, #144]",
+        "  ldp  x20, x21, [x9, #160]",
+        "  ldp  x22, x23, [x9, #176]",
+        "  ldp  x24, x25, [x9, #192]",
+        "  ldp  x26, x27, [x9, #208]",
+        "  ldp  x28, x29, [x9, #224]",
+        "  ldr  x30, [x9, #240]",
+        "  ldr  x9, [x9, #72]", // finally x9 itself
+        "  eret",
+    );
 
     // The EL0 program (position-independent: register ops + svc + adr/relative branch).
     // Uses the real syscall ABI (x8 = number, args in x0..): DebugWrite(29) a greeting,
@@ -1279,45 +1461,17 @@ pub mod el0 {
             .map(|value| value & !(PAGE_4K - 1))
     }
 
-    /// Keep the active console MMIO reachable (EL1-only) while a process TTBR0 is
-    /// installed: the kernel still prints by raw-physical access (the framebuffer on real
-    /// hardware, the PL011 UART under QEMU), and TTBR1's higher half does not cover those
-    /// low identity addresses. This is the lone scaffold bridge of P5-mmu-b — it retires
-    /// when the console becomes a userspace driver (M5/P6). EL0 can never touch it.
-    unsafe fn map_console_window(
-        root: u64,
-        alloc: &mut dyn FnMut() -> Option<u64>,
-        tables: &mut usize,
-    ) -> Result<(), UserImageError> {
-        const BLOCK_2M: u64 = 1 << 21;
-        if super::FB_PRESENT.load(super::ORD) {
-            let base = super::FB_BASE.load(super::ORD) & !(BLOCK_2M - 1);
-            let span = (super::FB_LEN_PX.load(super::ORD) as u64) * 4;
-            let end = (super::FB_BASE.load(super::ORD) + span)
-                .checked_add(BLOCK_2M - 1)
-                .ok_or(UserImageError::OutOfFrames)?
-                & !(BLOCK_2M - 1);
-            let mut pa = base;
-            while pa < end {
-                unsafe { super::mmu::map_kernel_device_block(root, pa, pa, false, alloc, tables) }
-                    .map_err(|()| UserImageError::OutOfFrames)?;
-                pa += BLOCK_2M;
-            }
-        } else {
-            let base = (super::PL011_BASE as u64) & !(BLOCK_2M - 1);
-            unsafe { super::mmu::map_kernel_device_block(root, base, base, true, alloc, tables) }
-                .map_err(|()| UserImageError::OutOfFrames)?;
-        }
-        Ok(())
-    }
+    // The P5-mmu-b "console window" (an EL1-only console mapping copied into every user
+    // tree) is gone: the console addresses MMIO through the TTBR1 physmap once the split
+    // tables are live (`console_use_physmap`), so user page tables carry user state only.
 
     /// Build a fresh per-process TTBR0 tree: each `PT_LOAD` segment as 4 KiB pages with
     /// true per-page **W^X** (RX code / RW data, file bytes copied, the rest zeroed for
-    /// BSS), an RW stack below `stack_top` with one unmapped guard page beneath it, and the
-    /// EL1-only console window. Frames (`alloc`, returning zeroed RAM) are touched by
-    /// physical address, so this must run with the kernel identity map still active in
-    /// TTBR0 — i.e. before [`enter_user_image`] switches to the tree it returns. Returns
-    /// the L0 root physical address.
+    /// BSS), an RW stack below `stack_top` with one unmapped guard page beneath it, and
+    /// any requested extra device mappings. Frames (`alloc`, returning zeroed RAM) are
+    /// touched by physical address, so this must run with the kernel identity map still
+    /// active in TTBR0 — i.e. before [`enter_user_image`] switches to the tree it
+    /// returns. Returns the L0 root physical address.
     fn build_user_space(
         image: &UserImage<'_>,
         alloc: &mut dyn FnMut() -> Option<u64>,
@@ -1397,7 +1551,43 @@ pub mod el0 {
         }
         // [stack_base - PAGE_4K, stack_base): intentionally left unmapped (the guard page).
 
-        unsafe { map_console_window(root, alloc, &mut tables)? };
+        // Extra physical mappings (e.g. framebuffer VMO for userspace console).
+        //
+        // `virt_addr` must be 2 MiB-aligned (the mapping *slot*); the physical range is
+        // covered with aligned va/pa block pairs starting at `phys_base & !mask`. The
+        // caller derives the usable VA as `virt_addr + (phys_base & mask)` — see
+        // `UserMapping`. (The previous offset arithmetic underflowed for a non-aligned
+        // `phys_base`, landing the mapping displaced — the journal-061 paint wart.)
+        const BLOCK_2M: u64 = 1 << 21;
+        for mapping in image.extra_mappings {
+            let block_mask = BLOCK_2M - 1;
+            if mapping.virt_addr & block_mask != 0 {
+                return Err(UserImageError::BadSegment);
+            }
+            let base = mapping.phys_base & !block_mask;
+            let end = mapping
+                .phys_base
+                .checked_add(mapping.len)
+                .and_then(|end| end.checked_add(block_mask))
+                .ok_or(UserImageError::ImageTooLarge)?
+                & !block_mask;
+            let mut offset = 0;
+            while base + offset < end {
+                unsafe {
+                    super::mmu::map_user_device_block(
+                        root,
+                        mapping.virt_addr + offset,
+                        base + offset,
+                        !mapping.device, // false = Normal-NC (fb), true = Device (MMIO)
+                        mapping.writable,
+                        alloc,
+                        &mut tables,
+                    )
+                }
+                .map_err(|()| UserImageError::OutOfFrames)?;
+                offset += BLOCK_2M;
+            }
+        }
 
         Ok(root)
     }
@@ -1436,6 +1626,17 @@ pub mod el0 {
         enter_user_image(image, alloc)
     }
 
+    /// Build a per-process TTBR0 tree and return its L0 root physical address. The caller
+    /// owns the tree and is responsible for switching to it and tearing it down. This is
+    /// the page-table half of `run_el0_image`; P5-sched uses it directly so it can enter
+    /// the user process via the scheduler instead of the synchronous detour.
+    pub fn build_user_tables(
+        image: &UserImage<'_>,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+    ) -> Result<u64, UserImageError> {
+        build_user_space(image, alloc)
+    }
+
     /// Run the embedded smoke payload (DebugWrite + ChannelCreate + ProcessExit) as a real
     /// frame-backed RX process at `base`, with an RW stack below `stack_top`. The fallback
     /// when there is no Sora image; exercises the same per-process page-table path.
@@ -1462,6 +1663,7 @@ pub mod el0 {
             stack_size,
             bootstrap: 0,
             segments: core::slice::from_ref(&segment),
+            extra_mappings: &[],
         };
         enter_user_image(image, alloc)
     }
@@ -1469,8 +1671,8 @@ pub mod el0 {
 
 #[cfg(target_os = "none")]
 pub use el0::{
-    el0_exit, run_el0_image, run_el0_smoke, set_svc_hook, El0Report, UserImage, UserImageError,
-    UserLoadSegment,
+    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_svc_hook, syscall_count,
+    El0Report, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState,
 };
 
 /// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
@@ -1509,6 +1711,7 @@ pub struct UserImage<'a> {
     /// Bootstrap handle passed to the process in `x0` at entry (0 = none).
     pub bootstrap: u64,
     pub segments: &'a [UserLoadSegment<'a>],
+    pub extra_mappings: &'a [UserMapping],
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1536,6 +1739,51 @@ pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 pub fn el0_exit(_code: u64) -> ! {
     halt()
 }
+
+// Host stubs for P5-sched types/functions.
+#[cfg(not(target_os = "none"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserState {
+    pub x: [u64; 31],
+    pub elr: u64,
+    pub spsr: u64,
+    pub sp_el0: u64,
+    pub ttbr0: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserMapping {
+    pub phys_base: u64,
+    pub virt_addr: u64,
+    pub len: u64,
+    pub writable: bool,
+    pub device: bool,
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn build_user_tables(
+    _image: &UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<u64, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn syscall_count() -> u32 {
+    0
+}
+
+/// Host stub: the freestanding kernel reads TTBR0; on the host there is no page table.
+#[cfg(not(target_os = "none"))]
+pub fn read_ttbr0() -> u64 {
+    0
+}
+
+/// Host stub: the freestanding kernel sets TTBR0; on the host this is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn set_ttbr0(_root: u64) {}
 
 /// Host stub: the freestanding kernel installs real page tables; on the host there is
 /// nothing to do.

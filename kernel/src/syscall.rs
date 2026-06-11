@@ -1,9 +1,13 @@
-use kumo_abi::{Errno, Handle, Rights, Status, Syscall};
+use alloc::vec::Vec;
+
+use kumo_abi::{Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall};
+use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
 use crate::ipc::{IpcError, IpcRegistry, KernelMessage, PortPacket};
+use crate::mm::{Mapping, Vmar, Vmo};
 use crate::object::{ObjectError, ObjectManager};
-use crate::task::Process;
+use crate::task::{Job, Process, Thread};
 
 #[derive(Clone, Copy, Debug)]
 pub enum KernelCall<'a> {
@@ -26,6 +30,50 @@ pub enum KernelCall<'a> {
     PortWait {
         port: Handle,
     },
+    VmoRead {
+        vmo: Handle,
+        offset: u64,
+        dest: *mut u8,
+        len: usize,
+    },
+    VmoWrite {
+        vmo: Handle,
+        offset: u64,
+        src: *const u8,
+        len: usize,
+    },
+    ProcessCreate {
+        parent_job: Job,
+        vmar_base: u64,
+        vmar_size: u64,
+    },
+    VmarMap {
+        process_handle: Handle,
+        vmo_handle: Handle,
+        vmo_offset: u64,
+        virt: u64,
+        len: u64,
+        flags: PageFlags,
+    },
+    ThreadCreate {
+        process_handle: Handle,
+    },
+    ThreadStart {
+        thread_handle: Handle,
+        entry: u64,
+        sp: u64,
+        arg: u64,
+    },
+    AddressSpaceCreate {
+        process_handle: Handle,
+        stack_virt: u64,
+        stack_size: u64,
+    },
+    ProcessRun {
+        process_handle: Handle,
+        entry: u64,
+        sp: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -42,6 +90,10 @@ pub enum KernelCallResult {
 pub struct SyscallEngine {
     objects: ObjectManager,
     ipc: IpcRegistry,
+    vmos: Vec<(KoId, Vmo)>,
+    processes: Vec<Process>,
+    threads: Vec<Thread>,
+    boot_info: Option<kumo_abi::BootInfo>,
 }
 
 impl SyscallEngine {
@@ -49,11 +101,123 @@ impl SyscallEngine {
         Self {
             objects: ObjectManager::new(),
             ipc: IpcRegistry::new(),
+            vmos: Vec::new(),
+            processes: Vec::new(),
+            threads: Vec::new(),
+            boot_info: None,
         }
+    }
+
+    pub fn set_boot_info(&mut self, boot: kumo_abi::BootInfo) {
+        self.boot_info = Some(boot);
     }
 
     pub fn objects_mut(&mut self) -> &mut ObjectManager {
         &mut self.objects
+    }
+
+    pub fn ipc_mut(&mut self) -> &mut IpcRegistry {
+        &mut self.ipc
+    }
+
+    /// Create a root channel: one endpoint for `process`, one retained by the kernel.
+    /// Convenience wrapper that avoids borrow conflicts between `objects` and `ipc`.
+    pub fn root_channel_create(
+        &mut self,
+        process: &mut Process,
+    ) -> Result<(Handle, usize, crate::ipc::ChannelEnd), crate::ipc::IpcError> {
+        self.ipc.root_channel_create(&mut self.objects, process)
+    }
+
+    /// Create a VMO handle for `process`. The VMO is stored in the engine keyed by koid,
+    /// so future syscalls (VmoOp) can resolve it.
+    pub fn root_vmo_create(
+        &mut self,
+        process: &mut Process,
+        vmo: Vmo,
+        rights: Rights,
+    ) -> Result<Handle, ObjectError> {
+        let object = self.objects.create(ObjectKind::Vmo);
+        let handle = process.handles_mut().insert(object, rights)?;
+        self.vmos.push((object.koid(), vmo));
+        Ok(handle)
+    }
+
+    /// Look up a VMO by koid. Returns `None` if the koid doesn't match a stored VMO.
+    pub fn vmo_by_koid(&self, koid: KoId) -> Option<Vmo> {
+        self.vmos
+            .iter()
+            .find_map(|(k, v)| if *k == koid { Some(*v) } else { None })
+    }
+
+    /// Look up a process by koid. Returns `None` if not found.
+    pub fn process_by_koid(&self, koid: KoId) -> Option<&Process> {
+        self.processes.iter().find(|p| p.koid() == koid)
+    }
+
+    /// Look up a process by koid (mutable).
+    pub fn process_by_koid_mut(&mut self, koid: KoId) -> Option<&mut Process> {
+        self.processes.iter_mut().find(|p| p.koid() == koid)
+    }
+
+    /// Look up a thread by koid (mutable).
+    pub fn thread_by_koid_mut(&mut self, koid: KoId) -> Option<&mut Thread> {
+        self.threads.iter_mut().find(|t| t.koid() == koid)
+    }
+
+    /// Create a thread in `target_process`. The thread starts with placeholder context;
+    /// [`ThreadStart`] sets the real entry point, stack, and argument.
+    pub fn thread_create(
+        &mut self,
+        caller: &mut Process,
+        target_koid: KoId,
+    ) -> Result<Handle, ObjectError> {
+        // Thread::new only uses process.koid(); extract it before the mutable borrow.
+        let proc_koid = {
+            let target = self
+                .process_by_koid(target_koid)
+                .ok_or(ObjectError::BadHandle)?;
+            target.koid()
+        };
+        // Create a minimal Process stub just for the koid. We need &Process for
+        // Thread::new's signature, but it only reads .koid(). Use a temporary that
+        // stores exactly the koid we extracted.
+        let temp_process = Process::from_parts(
+            proc_koid,
+            crate::mm::Vmar::new(0, crate::mm::PAGE_SIZE).unwrap(),
+        );
+        let thread = Thread::new(
+            &mut self.objects,
+            &temp_process,
+            0,
+            0,
+            crate::task::DEFAULT_KERNEL_STACK_SIZE,
+        )
+        .map_err(|_| ObjectError::TableFull)?;
+        let handle = caller.handles_mut().insert(
+            thread.object(),
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+        )?;
+        self.threads.push(thread);
+        Ok(handle)
+    }
+
+    /// Create a child process under `parent_job`. Returns a handle to the new
+    /// process inserted into `caller`'s handle table.
+    pub fn process_create(
+        &mut self,
+        caller: &mut Process,
+        parent_job: &Job,
+        vmar: Vmar,
+    ) -> Result<Handle, ObjectError> {
+        let job = Job::child(&mut self.objects, parent_job);
+        let child = Process::new(&mut self.objects, &job, vmar);
+        let handle = caller.handles_mut().insert(
+            child.object(),
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+        )?;
+        self.processes.push(child);
+        Ok(handle)
     }
 
     pub fn dispatch(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
@@ -96,6 +260,274 @@ impl SyscallEngine {
                 Ok(packet) => KernelCallResult::PortPacket(packet),
                 Err(error) => KernelCallResult::Status(errno_from_ipc(error).status()),
             },
+            KernelCall::VmoRead {
+                vmo,
+                offset,
+                dest,
+                len,
+            } => {
+                let status = match process
+                    .handles()
+                    .require(vmo, ObjectKind::Vmo, Rights::READ)
+                {
+                    Ok(entry) => match self.vmo_by_koid(entry.koid) {
+                        Some(vmo_obj) => {
+                            if offset.checked_add(len as u64).is_none()
+                                || offset.saturating_add(len as u64) > vmo_obj.len()
+                            {
+                                Errno::InvalidArgs.status()
+                            } else if let crate::mm::VmoBacking::Physical { phys_base } =
+                                vmo_obj.backing()
+                            {
+                                let dest_slice =
+                                    unsafe { core::slice::from_raw_parts_mut(dest, len) };
+                                kumo_hal::active::read_phys(phys_base + offset, dest_slice);
+                                Errno::Ok.status()
+                            } else {
+                                // Anonymous VMO: no allocated frames yet; read returns zeros
+                                Errno::NotSupported.status()
+                            }
+                        }
+                        None => Errno::BadHandle.status(),
+                    },
+                    Err(error) => errno_from_object(error).status(),
+                };
+                KernelCallResult::Status(status)
+            }
+            KernelCall::VmoWrite {
+                vmo: _,
+                offset: _,
+                src: _,
+                len: _,
+            } => KernelCallResult::Status(Errno::NotSupported.status()),
+            KernelCall::ProcessCreate {
+                parent_job,
+                vmar_base,
+                vmar_size,
+            } => match Vmar::new(vmar_base, vmar_size) {
+                Ok(vmar) => match self.process_create(process, &parent_job, vmar) {
+                    Ok(handle) => KernelCallResult::Handle(handle),
+                    Err(error) => KernelCallResult::Status(errno_from_object(error).status()),
+                },
+                Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
+            },
+            KernelCall::VmarMap {
+                process_handle,
+                vmo_handle,
+                vmo_offset,
+                virt,
+                len,
+                flags,
+            } => {
+                // Look up the target process koid and VMO before mutably borrowing self.
+                let proc_koid = match process.handles().require(
+                    process_handle,
+                    ObjectKind::Process,
+                    Rights::WRITE,
+                ) {
+                    Ok(entry) => entry.koid,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                let vmo = match process
+                    .handles()
+                    .require(vmo_handle, ObjectKind::Vmo, Rights::READ)
+                {
+                    Ok(entry) => self.vmo_by_koid(entry.koid),
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                let Some(vmo) = vmo else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                let Some(target) = self.process_by_koid_mut(proc_koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                let status = match target.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
+                    Ok(mapping) => {
+                        target.add_mapping(mapping, vmo);
+                        Errno::Ok.status()
+                    }
+                    Err(_) => Errno::InvalidArgs.status(),
+                };
+                KernelCallResult::Status(status)
+            }
+            KernelCall::ThreadCreate { process_handle } => {
+                let proc_koid = match process.handles().require(
+                    process_handle,
+                    ObjectKind::Process,
+                    Rights::WRITE,
+                ) {
+                    Ok(entry) => entry.koid,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                match self.thread_create(process, proc_koid) {
+                    Ok(handle) => KernelCallResult::Handle(handle),
+                    Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+                }
+            }
+            KernelCall::ThreadStart {
+                thread_handle,
+                entry,
+                sp,
+                arg,
+            } => {
+                let thread_koid = match process.handles().require(
+                    thread_handle,
+                    ObjectKind::Thread,
+                    Rights::WRITE,
+                ) {
+                    Ok(e) => e.koid,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                // Two-pass: first extract the process koid (mutable borrow), then
+                // look up the process's ttbr0 (immutable borrow).
+                let proc_koid = {
+                    let Some(thread) = self.thread_by_koid_mut(thread_koid) else {
+                        return KernelCallResult::Status(Errno::BadHandle.status());
+                    };
+                    thread.process()
+                };
+                let proc_ttbr0 = self.process_by_koid(proc_koid).and_then(|p| p.ttbr0);
+                let Some(thread) = self.thread_by_koid_mut(thread_koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                #[cfg(target_os = "none")]
+                if let Some(ttbr0) = proc_ttbr0 {
+                    // P8-k: user-mode thread. Build a UserState and create a context
+                    // that enters via kumo_user_enter.
+                    let mut user_state = kumo_hal::active::UserState {
+                        x: [0u64; 31],
+                        elr: entry,
+                        spsr: 0,
+                        sp_el0: sp,
+                        ttbr0,
+                    };
+                    user_state.x[0] = arg; // bootstrap arg
+                    let kernel_sp = thread.stack().top();
+                    extern "C" {
+                        fn kumo_user_enter();
+                    }
+                    let mut ctx = kumo_hal::active::ThreadContext::default();
+                    unsafe {
+                        let raw = &mut ctx as *mut kumo_hal::active::ThreadContext as *mut u64;
+                        *raw = &user_state as *const kumo_hal::active::UserState as *const ()
+                            as usize as u64; // x19_entry
+                        *raw.add(11) = kumo_user_enter as *const () as usize as u64; // x30_lr
+                        *raw.add(12) = kernel_sp as u64; // sp
+                        *raw.add(13) = 1; // user = true
+                    }
+                    thread.user_state = Some(user_state);
+                    *thread.context_mut() = ctx;
+                }
+                #[cfg(not(target_os = "none"))]
+                {
+                    // Kernel thread (backward-compatible scaffold).
+                    *thread.context_mut() = kumo_hal::active::ThreadContext::new(
+                        entry as usize,
+                        arg as usize,
+                        sp as usize,
+                        false,
+                    );
+                }
+                #[cfg(target_os = "none")]
+                if proc_ttbr0.is_none() {
+                    // Kernel thread fallback when no TTBR0 is set.
+                    *thread.context_mut() = kumo_hal::active::ThreadContext::new(
+                        entry as usize,
+                        arg as usize,
+                        sp as usize,
+                        false,
+                    );
+                }
+                thread.ready();
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::AddressSpaceCreate {
+                process_handle,
+                stack_virt,
+                stack_size,
+            } => {
+                let proc_koid = match process.handles().require(
+                    process_handle,
+                    ObjectKind::Process,
+                    Rights::WRITE,
+                ) {
+                    Ok(e) => e.koid,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                // Extract mappings and boot_info before mutably borrowing self.
+                let boot = self.boot_info;
+                let user_mappings: Vec<kumo_hal::active::UserMapping> = {
+                    let Some(target) = self.process_by_koid(proc_koid) else {
+                        return KernelCallResult::Status(Errno::BadHandle.status());
+                    };
+                    let mut um = Vec::new();
+                    for &(mapping, vmo) in target.mappings() {
+                        if let crate::mm::VmoBacking::Physical { phys_base } = vmo.backing() {
+                            let writable = mapping.flags.contains(PageFlags::WRITE);
+                            let device = mapping.flags.contains(PageFlags::DEVICE);
+                            const BLOCK_MASK: u64 = (1 << 21) - 1;
+                            let slot = mapping.virt & !BLOCK_MASK;
+                            um.push(kumo_hal::active::UserMapping {
+                                phys_base: phys_base + mapping.vmo_offset,
+                                virt_addr: slot,
+                                len: mapping.len,
+                                writable,
+                                device,
+                            });
+                        }
+                    }
+                    um
+                };
+                let image = kumo_hal::active::UserImage {
+                    entry: 0,
+                    stack_top: stack_virt,
+                    stack_size,
+                    bootstrap: 0,
+                    segments: &[],
+                    extra_mappings: &user_mappings,
+                };
+                let Some(ref boot) = boot else {
+                    return KernelCallResult::Status(Errno::Internal.status());
+                };
+                let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot) };
+                match kumo_hal::active::build_user_tables(&image, &mut alloc) {
+                    Ok(ttbr0) => {
+                        if let Some(target) = self.process_by_koid_mut(proc_koid) {
+                            target.ttbr0 = Some(ttbr0);
+                        }
+                        KernelCallResult::Handle(Handle(ttbr0 as u32))
+                    }
+                    Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
+                }
+            }
+            KernelCall::ProcessRun {
+                process_handle,
+                entry,
+                sp,
+            } => {
+                #[cfg(target_os = "none")]
+                {
+                    let proc_koid = match process.handles().require(
+                        process_handle,
+                        ObjectKind::Process,
+                        Rights::WRITE,
+                    ) {
+                        Ok(e) => e.koid,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                    let Some(target) = self.process_by_koid(proc_koid) else {
+                        return KernelCallResult::Status(Errno::BadHandle.status());
+                    };
+                    let status =
+                        crate::usermode::run_child(proc_koid, target.root_vmar(), entry, sp);
+                    KernelCallResult::Status(status)
+                }
+                #[cfg(not(target_os = "none"))]
+                {
+                    let _ = (process_handle, entry, sp);
+                    KernelCallResult::Status(Errno::NotSupported.status())
+                }
+            }
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }

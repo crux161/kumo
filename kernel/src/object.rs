@@ -18,6 +18,14 @@ pub struct KernelObject {
 }
 
 impl KernelObject {
+    pub const fn new(koid: KoId, kind: ObjectKind) -> Self {
+        Self {
+            koid,
+            kind,
+            signals: Signals::empty(),
+        }
+    }
+
     pub const fn koid(self) -> KoId {
         self.koid
     }

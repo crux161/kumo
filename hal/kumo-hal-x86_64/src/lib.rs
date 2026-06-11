@@ -167,6 +167,13 @@ pub struct El0Report {
     pub exit_code: u64,
 }
 
+pub fn build_user_tables(
+    _image: &UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<u64, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
 pub fn run_el0_smoke(
     _base: u64,
     _stack_top: u64,
@@ -180,6 +187,24 @@ pub fn run_el0_smoke(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserImageError {
     Unsupported,
+    Empty,
+    BadSegment,
+    BadStack,
+    OutOfFrames,
+    ImageTooLarge,
+    SegmentOutsideImageBlock,
+    StackOutsideStackBlock,
+}
+
+/// Saved EL0 execution context (stub — Ring-3 entry lands with the x86_64 metal milestone).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserState {
+    pub x: [u64; 31],
+    pub elr: u64,
+    pub spsr: u64,
+    pub sp_el0: u64,
+    pub ttbr0: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +217,15 @@ pub struct UserLoadSegment<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserMapping {
+    pub phys_base: u64,
+    pub virt_addr: u64,
+    pub len: u64,
+    pub writable: bool,
+    pub device: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserImage<'a> {
     pub entry: u64,
     pub stack_top: u64,
@@ -199,6 +233,9 @@ pub struct UserImage<'a> {
     /// Bootstrap handle passed to the process at entry (Ring-3 entry lands later).
     pub bootstrap: u64,
     pub segments: &'a [UserLoadSegment<'a>],
+    /// Extra physical mappings (framebuffer, MMIO). x86_64 stub — unused until
+    /// Ring-3 entry lands.
+    pub extra_mappings: &'a [UserMapping],
 }
 
 pub fn run_el0_image(
@@ -213,6 +250,10 @@ pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 
 pub fn el0_exit(_code: u64) -> ! {
     halt()
+}
+
+pub fn syscall_count() -> u32 {
+    0
 }
 
 pub fn install_exception_vectors() {
@@ -253,6 +294,25 @@ pub fn timer_irq_count() -> u64 {
 
 pub fn wait_for_timer_irqs(_start: u64, _needed: u64, _timeout_ns: u64) -> u64 {
     0
+}
+
+/// Stub: x86_64 ring-3 entry (and its IRQ-mask handling) lands with the metal milestone.
+pub fn irq_unmask() {}
+
+/// Stub: the x86_64 physmap console migration lands with its paging slice.
+pub fn console_use_physmap() {}
+
+/// Stub: physical memory read not yet wired for x86_64.
+pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
+
+pub fn read_ttbr0() -> u64 {
+    0 // x86_64 stub — paging lands with the x86_64 metal milestone.
+}
+
+/// # Safety
+/// Stub (no paging yet); unsafe to match the aarch64 backend's contract.
+pub unsafe fn set_ttbr0(_root: u64) {
+    // x86_64 stub.
 }
 
 pub fn halt() -> ! {

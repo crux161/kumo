@@ -13,6 +13,7 @@ pub mod sched;
 pub mod shell;
 pub mod syscall;
 pub mod task;
+pub mod user_thread;
 pub mod usermode;
 
 use kumo_abi::{BootInfo, ABI_VERSION};
@@ -139,11 +140,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // the firmware's. Everything below now runs under kernel-owned paging — the
     // foundation for per-process address spaces and EL0/userspace.
     match unsafe { mm::enable_paging(boot) } {
-        Some(p) => klog!(
-            "ROOTING TABLES     Check     {} MiB mapped  {} tables   OK\n",
-            p.mapped_bytes >> 20,
-            p.tables
-        ),
+        Some(p) => {
+            // The TTBR1 physmap is live: move console MMIO access onto it, so printing
+            // works under any TTBR0 (user trees no longer carry a console window).
+            kumo_hal::active::console_use_physmap();
+            klog!(
+                "ROOTING TABLES     Check     {} MiB mapped  {} tables   OK\n",
+                p.mapped_bytes >> 20,
+                p.tables
+            )
+        }
         None => klog!("ROOTING TABLES     Check     no usable memory map      --\n"),
     }
 
@@ -276,10 +282,11 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         None
     };
 
-    // P5 (opening): the first descent below EL1 making *real* syscalls. A tiny EL0
-    // payload calls DebugWrite (prints the line below), ChannelCreate (through the real
-    // SyscallEngine), then ProcessExit; the kernel handles each via the SVC trap and
-    // trampolines back. The "hello from EL0" line is userspace asking the kernel to act.
+    // P5/P6: Sora runs as a scheduler-driven EL0 thread in its own address space. It
+    // greets via DebugWrite, echoes the kernel's root-channel boot message, acks, then
+    // serves the console channel (P6-c: four kernel console lines echoed). The kernel
+    // holds the root/console peer endpoints directly, so only Sora's bootstrap handle
+    // (chan.0) is a process handle — there is no second handle to report.
     let u = match initrd {
         Some(initrd) => match usermode::run_sora(boot, initrd) {
             Ok(report) => report,
@@ -293,22 +300,21 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         },
         None => usermode::run(boot),
     };
-    if u.entered && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 && u.chan.1 != 0 {
+    if u.entered && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 {
         klog!(
-            "USERLAND  EL0      Check     {} svc  wrote {}b  chan h{}/h{}   OK\n",
+            "USERLAND  EL0      Check     {} svc  wrote {}b  boot h{}  {}   OK\n",
             u.syscalls,
             u.wrote,
             u.chan.0,
-            u.chan.1
+            if u.serving { "serving" } else { "exited" }
         );
     } else {
         klog!(
-            "USERLAND  EL0      Check     entered={} svc={} wrote={} chan {}/{}   FAIL\n",
+            "USERLAND  EL0      Check     entered={} svc={} wrote={} boot h{}   FAIL\n",
             u.entered,
             u.syscalls,
             u.wrote,
-            u.chan.0,
-            u.chan.1
+            u.chan.0
         );
     }
 
@@ -324,6 +330,99 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("SORA HANDSHAKE     Check     no message on root channel   --\n");
     }
 
+    // P6-e: with Sora serving, route the kernel console through it. The probe line is
+    // the first routed `klog!`; the syscall delta proves Sora actually round-tripped it
+    // (wake -> ChannelRead -> DebugWrite -> park). On a zero delta the route is torn
+    // back down so output never silently vanishes. Everything below — the remaining
+    // POST lines and the serial shell — rides the userspace console server.
+    if u.serving {
+        let svc_before = kumo_hal::active::syscall_count();
+        usermode::enable_console_route();
+        klog!("ZIWEI console     -> Sora console channel\n");
+        let probe_svcs = kumo_hal::active::syscall_count().saturating_sub(svc_before);
+        if probe_svcs > 0 {
+            klog!(
+                "CONSOLE ROUTE      Check     probe {} svc  via sora   OK\n",
+                probe_svcs
+            );
+        } else {
+            usermode::disable_console_route();
+            klog!("CONSOLE ROUTE      Check     probe 0 svc  direct fallback   FAIL\n");
+        }
+
+        // P7-g: the kernel as a *client* of the userspace block server. Two reads of
+        // the "disk" (the initrd) served by Sora over the block channel, verified by
+        // value: the KUMORD01 magic at offset 0, and the first entry's path at offset
+        // 16 — which is Sora's own image name.
+        let mut sector = [0u8; 64];
+        let magic_n = usermode::block_read_via_sora(0, 8, &mut sector);
+        let magic_ok = magic_n == 8 && &sector[..8] == b"KUMORD01";
+        let path_n = usermode::block_read_via_sora(16, 8, &mut sector);
+        let path_ok = path_n == 8 && &sector[..8] == b"bin/sora";
+        if magic_ok && path_ok {
+            klog!(
+                "BLOCK SERVE        Check     2 req  {}b  via sora   OK\n",
+                magic_n + path_n
+            );
+        } else {
+            klog!(
+                "BLOCK SERVE        Check     magic {}b ok={}  path {}b ok={}   FAIL\n",
+                magic_n,
+                magic_ok,
+                path_n,
+                path_ok
+            );
+        }
+
+        // P7-h: read the FAT32 disk image's sector 0 through the block server and verify
+        // the BPB signature — proving the userspace block path carries real filesystem data.
+        if let Some(initrd_bytes) = initrd {
+            if let Ok(Some(fat32_file)) =
+                kumo_abi::find_file(initrd_bytes, kumo_abi::FAT32_IMG_PATH)
+            {
+                let mut bpb = [0u8; 512];
+                let bpb_n = usermode::block_read_via_sora(fat32_file.offset, 512, &mut bpb);
+                let sig_ok = bpb_n >= 0x5A
+                    && &bpb[0x52..0x5A] == b"FAT32   "
+                    && &bpb[0..3] == [0xEB, 0xFE, 0x90];
+                if sig_ok {
+                    klog!("BLOCK FAT32        Check     sector 0 BPB  via sora   OK\n");
+                } else {
+                    klog!(
+                        "BLOCK FAT32        Check     sector 0 BPB  {}b sig-ok={}   FAIL\n",
+                        bpb_n,
+                        sig_ok
+                    );
+                }
+
+                // P7-j: read a named file through Sora's block channel — Sora resolves the
+                // path against the FAT32 root directory, walks the FAT chain, and returns the
+                // file contents. HELLO.TXT at cluster 3 holds "hello!" (6 bytes).
+                let mut content = [0u8; 32];
+                let content_n = usermode::file_read_via_sora(b"HELLO.TXT", &mut content);
+                let content_ok = content_n == 6 && &content[..6] == b"hello!";
+                // P7-k: ranged read — offset 1, length 4 should return "ello".
+                let mut ranged = [0u8; 8];
+                let ranged_n = usermode::file_read_via_sora_at(b"HELLO.TXT", 1, 4, &mut ranged);
+                let ranged_ok = ranged_n == 4 && &ranged[..4] == b"ello";
+                if content_ok && ranged_ok {
+                    klog!(
+                        "BLOCK FILE         Check     HELLO.TXT +{}b @1  via sora   OK\n",
+                        ranged_n
+                    );
+                } else {
+                    klog!(
+                        "BLOCK FILE         Check     HELLO {}b ok={}  ranged {}b ok={}   FAIL\n",
+                        content_n,
+                        content_ok,
+                        ranged_n,
+                        ranged_ok
+                    );
+                }
+            }
+        }
+    }
+
     if report.has_framebuffer {
         // Framebuffer console (e.g. the X13s): no kernel keyboard yet, so idle here.
         // The screen keeps the boot report; a pre-handoff pause lives in the loader.
@@ -332,9 +431,13 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("KUMO Ziwei Stage-A core only; awaiting userspace.  HALT.\n");
         kumo_hal::active::halt()
     } else {
-        // Serial console (QEMU PL011): an interactive command shell — KUMO's first
-        // interactive surface, and the ancestor of the userspace shell.
-        let env = shell::ShellEnv {
+        // P8-b: serial console (QEMU PL011) — forward keystrokes to Sora via the
+        // keyboard channel. Sora buffers keystrokes (minimal line editing: backspace),
+        // echoes via DebugWrite, and sends completed lines to the kernel via the root
+        // channel. The kernel runs shell::run_command on each line. This is scaffold
+        // under DESIGN/006 §b — the line-edit loop is IPC, not a TTY.
+        kdemo::install_preemption_probe();
+        let mut env = shell::ShellEnv {
             arch: report.arch,
             abi_version: report.abi_version,
             usable_frames: mm.usable_frames,
@@ -345,50 +448,25 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             preempt_ticks: 0,
             preempt_switches: 0,
         };
-        serial_shell(env)
-    }
-}
-
-/// Stage-A serial command shell over the PL011 console: line-edit input, dispatch
-/// each line to the (host-tested) `shell::run_command`, print its output, reprompt.
-fn serial_shell(mut env: shell::ShellEnv) -> ! {
-    use alloc::string::String;
-
-    const MAX_LINE: usize = 256;
-
-    kdemo::install_preemption_probe();
-
-    klog!("\nKUMO Ziwei Stage-A serial shell. Type 'help'.\n");
-    klog!("{}", shell::PROMPT);
-
-    let mut line = String::new();
-    loop {
-        match kumo_hal::active::console_read_byte() {
-            Some(b'\r') | Some(b'\n') => {
-                bootstrap::console::write(b"\r\n");
-                env.uptime_ns = kumo_hal::active::monotonic_nanos();
-                let preempt = kdemo::preempt_stats();
-                env.preempt_ticks = preempt.ticks;
-                env.preempt_switches = preempt.switches;
-                let tasks = kdemo::tasks();
-                let mut out = bootstrap::console::Writer;
-                shell::run_command(&line, &env, &tasks, &mut out);
-                line.clear();
+        klog!("\nKUMO Ziwei Stage-A serial shell. Type 'help'.\n");
+        klog!("{}", shell::PROMPT);
+        loop {
+            match kumo_hal::active::console_read_byte() {
+                Some(byte @ 0x08)
+                | Some(byte @ 0x7f)
+                | Some(byte @ b'\r')
+                | Some(byte @ b'\n')
+                | Some(byte @ 0x20..=0x7e) => {
+                    usermode::kbd_forward(byte);
+                }
+                Some(_) => {}
+                None => {}
+            }
+            // Check for a completed command line from Sora via the root channel.
+            let tasks = kdemo::tasks();
+            if usermode::poll_root_command(&tasks, &mut env) > 0 {
                 klog!("{}", shell::PROMPT);
             }
-            Some(0x08) | Some(0x7f) => {
-                if line.pop().is_some() {
-                    bootstrap::console::write(b"\x08 \x08");
-                }
-            }
-            Some(byte @ 0x20..=0x7e) => {
-                if line.len() < MAX_LINE {
-                    line.push(byte as char);
-                    bootstrap::console::write(&[byte]);
-                }
-            }
-            Some(_) => {}
-            None => kumo_hal::active::spin_once(),
         }
     }
 }
@@ -443,6 +521,9 @@ pub fn expected_abi_version() -> u32 {
 }
 
 fn tower_halt_ascii(reason: &str, error: Option<HandoffError>) -> ! {
+    // A fault path must never wake or switch threads: pin the console to the direct
+    // device path before printing anything.
+    usermode::disable_console_route();
     klog!("TOWER: ");
     klog!("{}", reason);
     if let Some(error) = error {

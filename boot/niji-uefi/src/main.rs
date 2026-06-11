@@ -658,6 +658,57 @@ unsafe fn read_esp_file(
     Some((buffer, read_size))
 }
 
+/// Like [`read_esp_file`], but the buffer comes from `AllocatePages` (`LoaderData`), so
+/// it is **page-aligned** — required for handoffs the kernel republishes as physical
+/// VMOs (the initrd). The pages stay allocated across `ExitBootServices`; the kernel's
+/// memory plan excludes the range from the frame allocator.
+unsafe fn read_esp_file_pages(
+    boot_services: *mut EfiBootServices,
+    root: *mut EfiFileProtocol,
+    path: &str,
+) -> Option<(*mut c_void, usize)> {
+    let path16 = ascii_to_utf16::<96>(path);
+    let mut file: *mut EfiFileProtocol = ptr::null_mut();
+    let status = unsafe { ((*root).open)(root, &mut file, path16.as_ptr(), EFI_FILE_MODE_READ, 0) };
+    if status != EFI_SUCCESS || file.is_null() {
+        return None;
+    }
+
+    let size = match unsafe { file_size_bytes(file) } {
+        Some(size) => size,
+        None => {
+            unsafe { ((*file).close)(file) };
+            return None;
+        }
+    };
+
+    let pages = size.div_ceil(EFI_PAGE_SIZE).max(1) as usize;
+    let mut base = 0u64;
+    let status = unsafe {
+        ((*boot_services).allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            efi_memory_type::LOADER_DATA,
+            pages,
+            &mut base,
+        )
+    };
+    if status != EFI_SUCCESS || base == 0 {
+        unsafe { ((*file).close)(file) };
+        return None;
+    }
+
+    let mut read_size = size as usize;
+    let status = unsafe { ((*file).read)(file, &mut read_size, base as *mut c_void) };
+    unsafe { ((*file).close)(file) };
+    if status != EFI_SUCCESS {
+        // `free_pages` is untyped in our minimal bindings; a failed read here means the
+        // boot is about to be declared degraded anyway, so the pages are left to the
+        // firmware (reclaimed at ExitBootServices accounting like any LoaderData).
+        return None;
+    }
+    Some((base as *mut c_void, read_size))
+}
+
 /// Read `EFI_FILE_INFO.FileSize` (at offset 8 of the structure).
 unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
     let mut info = [0u8; 512];
@@ -955,18 +1006,20 @@ unsafe fn load_kernel(
     })
 }
 
-/// Load an optional initrd from the ESP. The pool buffer (if any) is handed to the
-/// kernel via `BootInfo.initrd`. Absence is honest, not fatal.
+/// Load an optional initrd from the ESP into **page-aligned** memory. The kernel turns
+/// `BootInfo.initrd` into the first physical VMO (PLAN §8.4), and physical VMOs require
+/// a page-aligned base — a pool allocation's `+0x18` would be rejected. Absence is
+/// honest, not fatal.
 unsafe fn load_initrd(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
     con_out: *mut EfiSimpleTextOutputProtocol,
 ) -> (Range, *mut c_void) {
-    match unsafe { read_esp_file(boot_services, root, INITRD_ESP_PATH) } {
+    match unsafe { read_esp_file_pages(boot_services, root, INITRD_ESP_PATH) } {
         Some((buffer, len)) => {
             kprint!(
                 con_out,
-                "initrd       : {} @ {:#x} ({} bytes)\r\n",
+                "initrd       : {} @ {:#x} ({} bytes, page-aligned)\r\n",
                 INITRD_ESP_PATH,
                 buffer as u64,
                 len

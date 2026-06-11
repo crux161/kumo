@@ -1,51 +1,117 @@
-//! P5 (opening): EL0 syscalls routed through the real `SyscallEngine`.
+//! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
-//! Builds a demo `Process` + `SyscallEngine`, registers a HAL SVC hook, then drops to
-//! EL0 (via the HAL mechanism, journal 042) where a tiny payload issues *real* syscalls
-//! against the kernel-object ABI:
-//!   * `DebugWrite` — the kernel reads the user-supplied string out of the EL0 window and
-//!     prints it (user -> kernel memory + console), proving argument passing,
-//!   * `ChannelCreate` — dispatched through `SyscallEngine`, minting genuine handles on
-//!     the trap path (the first time the host-tested engine runs from a real syscall),
-//!   * `ProcessExit` — trampolines back to the boot flow.
+//! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
+//! (passed in x0), the other is held directly by the kernel via [`IpcRegistry`] —
+//! no handle table needed for the kernel side. Messages cross the process boundary:
+//! Sora's `ChannelWrite`/`ChannelRead` go through its process handle table; the kernel
+//! reads/writes the peer endpoint via direct [`ChannelPair`] access.
 //!
-//! Soundness: the demo state lives in a `static` reached only from the SVC hook, which
-//! runs single-threaded at EL1 with IRQs masked while EL0 is blocked in the trap — no
-//! re-entrancy, no concurrency.
+//! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
+//! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
 use core::cell::UnsafeCell;
 
 use alloc::vec::Vec;
 
-use kumo_abi::{find_file, sys::Syscall, BootInfo, Handle, InitrdError, SORA_INIT_PATH};
-use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment};
+use kumo_abi::{
+    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, Rights, Status,
+    SORA_INIT_PATH,
+};
+use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment, UserMapping, UserState};
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
 use crate::bootstrap::user::{
-    plan_elf_process, UserBootstrapError, USER_IMAGE_BASE, USER_ROOT_BASE, USER_ROOT_SIZE,
-    USER_STACK_SIZE, USER_STACK_TOP,
+    plan_elf_process, ElfSegment, UserBootstrapError, USER_IMAGE_BASE, USER_ROOT_BASE,
+    USER_ROOT_SIZE, USER_STACK_SIZE, USER_STACK_TOP,
 };
-use crate::mm::{alloc_zeroed_frame, Vmar};
+use crate::ipc::{ChannelEnd, IpcError, KernelMessage};
+use crate::mm::{alloc_zeroed_frame, Vmar, Vmo};
 use crate::syscall::{KernelCall, KernelCallResult, SyscallEngine};
 use crate::task::{Job, Process};
 
-struct Demo {
+/// Maximum restart attempts before giving up and reporting failure.
+const MAX_SORA_ATTEMPTS: u32 = 3;
+
+/// The kernel-held Sora recipe: the ELF image and its parsed layout, retained so the
+/// kernel can re-spawn Sora after a crash without re-reading the initrd.
+struct SoraRecipe {
+    /// Sora's raw ELF bytes (the file image from the initrd).
+    _elf_bytes: Vec<u8>,
+    /// ELF entry point.
+    entry: u64,
+    /// Initial stack pointer (SP_EL0).
+    stack_top: u64,
+    /// Loadable segments (file offset/size, VA, mem size, flags).
+    segments: Vec<ElfSegment>,
+}
+
+/// Live state for one Sora incarnation. The kernel holds the root channel's peer
+/// endpoint directly; Sora holds the other end as a handle in its process table.
+struct SoraState {
+    engine: SyscallEngine,
+    process: Process,
+    /// The root Job — child processes are created under this.
+    root_job: Job,
+    /// Index of the root [`ChannelPair`] in the IPC registry.
+    root_channel: usize,
+    /// The kernel's endpoint for the root channel (Left — Sora gets Right).
+    kernel_end: ChannelEnd,
+    /// Index of the console [`ChannelPair`] in the IPC registry.
+    console_channel: usize,
+    /// The kernel's endpoint for the console channel.
+    console_kernel_end: ChannelEnd,
+    /// Index of the block [`ChannelPair`] (P7-g: kernel-as-client block reads).
+    block_channel: usize,
+    /// The kernel's endpoint for the block channel.
+    block_kernel_end: ChannelEnd,
+    /// Bytes written by `DebugWrite` syscalls during this run.
+    wrote: usize,
+}
+
+struct SoraCell(UnsafeCell<Option<SoraState>>);
+unsafe impl Sync for SoraCell {}
+static SORA: SoraCell = SoraCell(UnsafeCell::new(None));
+
+/// Minimal state for a child process running synchronously via [`ProcessRun`].
+struct ChildState {
     engine: SyscallEngine,
     process: Process,
     wrote: usize,
-    chan: (u32, u32),
 }
 
-struct DemoCell(UnsafeCell<Option<Demo>>);
-// The EL0 smoke runs single-threaded with interrupts masked; never accessed concurrently.
-unsafe impl Sync for DemoCell {}
-static DEMO: DemoCell = DemoCell(UnsafeCell::new(None));
+struct ChildCell(UnsafeCell<Option<ChildState>>);
+unsafe impl Sync for ChildCell {}
+static CHILD: ChildCell = ChildCell(UnsafeCell::new(None));
 
-fn demo_ptr() -> *mut Demo {
-    let opt: *mut Option<Demo> = DEMO.0.get();
-    // SAFETY: `run` initializes DEMO before the hook can fire; single-threaded.
-    unsafe { (&mut *opt).as_mut().expect("usermode demo not initialized") as *mut Demo }
+fn child_ptr() -> *mut ChildState {
+    let opt: *mut Option<ChildState> = CHILD.0.get();
+    unsafe { (&mut *opt).as_mut().expect("child state not initialized") as *mut ChildState }
+}
+
+fn sora_ptr() -> *mut SoraState {
+    let opt: *mut Option<SoraState> = SORA.0.get();
+    unsafe { (&mut *opt).as_mut().expect("sora state not initialized") as *mut SoraState }
+}
+
+/// P8-l: run a child process synchronously via `kumo_enter_el0`. The child shares
+/// Sora's TTBR0 (same address space scaffold). Returns 0 on success.
+#[cfg(target_os = "none")]
+pub fn run_child(proc_koid: kumo_abi::KoId, root_vmar: Vmar, entry: u64, sp: u64) -> Status {
+    let child_proc = Process::from_parts(proc_koid, root_vmar);
+    unsafe {
+        *CHILD.0.get() = Some(ChildState {
+            engine: SyscallEngine::new(),
+            process: child_proc,
+            wrote: 0,
+        });
+    }
+    extern "C" {
+        fn kumo_enter_el0(entry: u64, user_sp: u64, arg0: u64) -> u64;
+    }
+    let _exit_code = unsafe { kumo_enter_el0(entry, sp, 0) };
+    unsafe { (&mut *CHILD.0.get()).take() };
+    Errno::Ok.status()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,6 +124,10 @@ pub struct UserReport {
     /// Bytes the kernel read back from the root channel after the process exited.
     pub handshake: [u8; 32],
     pub handshake_len: usize,
+    /// Number of Sora restart attempts (0 = first run succeeded).
+    pub attempts: u32,
+    /// True if Sora is alive and parked on its console channel (a live server).
+    pub serving: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +138,11 @@ pub enum UsermodeError {
     Image(UserImageError),
     BadSegmentRange,
     ChannelSetup,
+    /// Sora exited non-zero after all restart attempts were exhausted.
+    SoraExhausted {
+        exit_code: u64,
+        attempts: u32,
+    },
 }
 
 impl From<InitrdError> for UsermodeError {
@@ -88,12 +163,6 @@ impl From<UserImageError> for UsermodeError {
     }
 }
 
-/// Validate an EL0-supplied pointer range before the kernel dereferences it. With
-/// per-process TTBR0 (P5-mmu-b), the user's VA is only mapped while its address space is
-/// active — but a malicious EL0 could pass a *kernel-half* VA to trick EL1 into reading
-/// through TTBR1. Require `[ptr, ptr+len)` to sit wholly inside the process's user VMAR
-/// (the low half); reject anything else. (Real `copy_from_user`/`copy_to_user` with a
-/// fault-fixup handler is future work; this is the structural bound check.)
 fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
     let vmar = process.root_vmar();
     let base = vmar.base();
@@ -103,59 +172,198 @@ fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
     }
 }
 
-/// The kernel's EL0 syscall handler (registered with the HAL). `regs` points at the
-/// saved x0..x30: x8 = syscall number, args in x0.., results written back to x0/x1.
 extern "C" fn svc_hook(regs: *mut u64) {
-    // SAFETY: the HAL hands us a valid pointer to the 31 saved EL0 registers.
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
 
-    if num == Syscall::ProcessExit as u64 {
-        kumo_hal::active::el0_exit(r[0]); // restores the kernel context; never returns
+    // P8-l: if a child process is running synchronously, handle only DebugWrite
+    // and ProcessExit. Everything else returns error.
+    {
+        let child_opt: *mut Option<ChildState> = CHILD.0.get();
+        if unsafe { (&*child_opt).is_some() } {
+            if num == Syscall::ProcessExit as u64 {
+                unsafe { (&mut *CHILD.0.get()).take() };
+                kumo_hal::active::el0_exit(r[0]);
+            }
+            let child = unsafe { &mut *child_ptr() };
+            if num == Syscall::DebugWrite as u64 {
+                let user_ptr = r[0];
+                let len = (r[1] as usize).min(256);
+                if !user_range_ok(&child.process, user_ptr, len as u64) {
+                    r[0] = u64::MAX;
+                    return;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+                kumo_hal::active::early_console_write(bytes);
+                child.wrote += len;
+                r[0] = len as u64;
+            } else {
+                r[0] = u64::MAX;
+            }
+            return;
+        }
     }
 
-    // SAFETY: initialized in `run`; single-threaded, IRQs masked while EL0 is trapped.
-    let demo = unsafe { &mut *demo_ptr() };
+    if num == Syscall::ProcessExit as u64 {
+        if crate::user_thread::is_started() {
+            crate::user_thread::exit_current_user(r[0]);
+        }
+        kumo_hal::active::el0_exit(r[0]);
+    }
+
+    let sora = unsafe { &mut *sora_ptr() };
 
     if num == Syscall::DebugWrite as u64 {
         let user_ptr = r[0];
         let len = (r[1] as usize).min(256);
-        if !user_range_ok(&demo.process, user_ptr, len as u64) {
-            r[0] = u64::MAX; // EFAULT-like: refuse to read outside the user VMAR
+        if !user_range_ok(&sora.process, user_ptr, len as u64) {
+            r[0] = u64::MAX;
             return;
         }
-        // EL1 reads the user VA while the process TTBR0 is active (AP EL0-RW/RO is also
-        // EL1-readable); the range was just bounds-checked into the user half.
         let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-        crate::bootstrap::console::write(bytes);
-        demo.wrote += len;
+        // Render on the device directly (never through `bootstrap::console::write`):
+        // this is the console *server's own* output path — routing it back through the
+        // console channel would recurse into Sora forever (P6-e reentrancy guard).
+        kumo_hal::active::early_console_write(bytes);
+        sora.wrote += len;
         r[0] = len as u64;
+    } else if num == Syscall::VmoRead as u64 {
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = (r[3] as usize).min(256);
+        if !user_range_ok(&sora.process, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return;
+        }
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::VmoRead {
+                vmo,
+                offset,
+                dest: user_buf as *mut u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ProcessRun as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let entry = r[1];
+        let sp = r[2];
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::ProcessRun {
+                process_handle,
+                entry,
+                sp,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::AddressSpaceCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let stack_virt = r[1];
+        let stack_size = r[2];
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::AddressSpaceCreate {
+                process_handle,
+                stack_virt,
+                stack_size,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::ThreadCreate { process_handle },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadStart as u64 {
+        let thread_handle = Handle(r[0] as u32);
+        let entry = r[1];
+        let sp = r[2];
+        let arg = r[3];
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::ThreadStart {
+                thread_handle,
+                entry,
+                sp,
+                arg,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ProcessCreate as u64 {
+        let vmar_base = r[0];
+        let vmar_size = r[1];
+        let result = sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::ProcessCreate {
+                parent_job: sora.root_job,
+                vmar_base,
+                vmar_size,
+            },
+        );
+        match result {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmarMap as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let vmo_handle = Handle(r[1] as u32);
+        let vmo_offset = r[2];
+        let virt = r[3];
+        let len = r[4];
+        let flags_raw = r[5];
+        let flags = PageFlags(flags_raw);
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::VmarMap {
+                process_handle,
+                vmo_handle,
+                vmo_offset,
+                virt,
+                len,
+                flags,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::ChannelCreate as u64 {
-        match demo
+        match sora
             .engine
-            .dispatch(&mut demo.process, KernelCall::ChannelCreate)
+            .dispatch(&mut sora.process, KernelCall::ChannelCreate)
         {
             KernelCallResult::Handles { first, second } => {
-                demo.chan = (first.0, second.0);
                 r[0] = first.0 as u64;
                 r[1] = second.0 as u64;
             }
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::ChannelWrite as u64 {
-        // x0 = handle, x1 = bytes ptr (user VA), x2 = len. Status returned in x0.
         let channel = Handle(r[0] as u32);
         let user_ptr = r[1];
         let len = (r[2] as usize).min(256);
-        if !user_range_ok(&demo.process, user_ptr, len as u64) {
+        if !user_range_ok(&sora.process, user_ptr, len as u64) {
             r[0] = (-1i32) as u32 as u64;
             return;
         }
-        // SAFETY: bounds-checked into the user VMAR, readable by EL1 under the process map.
         let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
         let status = match Message::new(1, bytes, &[]) {
-            Ok(message) => match demo.engine.dispatch(
-                &mut demo.process,
+            Ok(message) => match sora.engine.dispatch(
+                &mut sora.process,
                 KernelCall::ChannelWrite { channel, message },
             ) {
                 KernelCallResult::Status(s) => s,
@@ -165,53 +373,79 @@ extern "C" fn svc_hook(regs: *mut u64) {
         };
         r[0] = status as u32 as u64;
     } else if num == Syscall::ChannelRead as u64 {
-        // x0 = handle, x1 = dst buffer (user VA), x2 = capacity. Bytes read returned in x0.
         let channel = Handle(r[0] as u32);
         let user_buf = r[1];
         let cap = (r[2] as usize).min(256);
-        if !user_range_ok(&demo.process, user_buf, cap as u64) {
-            r[0] = 0; // refuse to write outside the user VMAR -> 0 bytes
+        if !user_range_ok(&sora.process, user_buf, cap as u64) {
+            r[0] = 0;
             return;
         }
-        match demo
-            .engine
-            .dispatch(&mut demo.process, KernelCall::ChannelRead { channel })
-        {
-            KernelCallResult::Message(message) => {
-                let bytes = message.bytes();
-                let n = bytes.len().min(cap);
-                // SAFETY: dst bounds-checked into the user VMAR (an RW page), writable by EL1.
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n) };
-                r[0] = n as u64;
+        // Blocking read with multiplex-friendly wakes: an empty inbox parks the user
+        // thread **once** (the boot flow resumes); the next kernel-side wake retries
+        // this channel exactly once. If it is still empty the syscall returns 0 —
+        // "woken, but not for this channel" — so a server waiting on several channels
+        // can poll its others and come back. (P7-g: Sora serves console + block.)
+        let should_wait = kumo_abi::sys::Errno::ShouldWait.status();
+        let mut parked_once = false;
+        loop {
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::ChannelRead { channel })
+            {
+                KernelCallResult::Message(message) => {
+                    let bytes = message.bytes();
+                    let n = bytes.len().min(cap);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                    };
+                    r[0] = n as u64;
+                    break;
+                }
+                KernelCallResult::Status(status)
+                    if status == should_wait
+                        && !parked_once
+                        && crate::user_thread::is_started() =>
+                {
+                    parked_once = true;
+                    crate::user_thread::park_current_user();
+                }
+                _ => {
+                    r[0] = 0; // error, or woken for a different channel
+                    break;
+                }
             }
-            _ => r[0] = 0, // nothing pending / error -> 0 bytes
         }
     } else {
-        r[0] = u64::MAX; // ENOSYS
+        r[0] = u64::MAX;
     }
 }
 
-/// Run the EL0 syscall smoke and report what userspace did. `boot` supplies the frame
-/// allocator the per-process page tables are built from.
+/// Fallback (no Sora in the initrd): run the embedded EL0 smoke payload via the old
+/// synchronous path. The SVC hook reads the `SORA` static, so install a minimal state
+/// for it — there is no prior Sora to preserve on this path.
 pub fn run(boot: &BootInfo) -> UserReport {
     let mut engine = SyscallEngine::new();
     let job = Job::root(engine.objects_mut());
-    // Match the smoke's actual VAs so the SVC pointer-validation accepts its accesses.
     let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).expect("user vmar");
     let process = Process::new(engine.objects_mut(), &job, vmar);
 
-    // SAFETY: first writer; nothing else touches DEMO yet.
+    // SAFETY: single-threaded boot path; installed before any SVC can fire.
     unsafe {
-        *DEMO.0.get() = Some(Demo {
+        *SORA.0.get() = Some(SoraState {
             engine,
             process,
+            root_job: job,
+            root_channel: 0,
+            kernel_end: ChannelEnd::Left,
+            console_channel: 0,
+            console_kernel_end: ChannelEnd::Left,
+            block_channel: 0,
+            block_kernel_end: ChannelEnd::Left,
             wrote: 0,
-            chan: (0, 0),
         });
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
-    // SAFETY: runs before the TTBR0 switch, so frames are reachable via the identity map.
     let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
     let report = kumo_hal::active::run_el0_smoke(
         USER_IMAGE_BASE,
@@ -221,36 +455,97 @@ pub fn run(boot: &BootInfo) -> UserReport {
     )
     .unwrap_or_default();
 
-    // SAFETY: initialized above; single-threaded read after EL0 has exited.
-    let demo = unsafe { &*demo_ptr() };
+    let sora = unsafe { &*sora_ptr() };
     UserReport {
         entered: report.entered,
         syscalls: report.syscalls,
-        wrote: demo.wrote,
-        chan: demo.chan,
+        wrote: sora.wrote,
+        chan: (0, 0),
         exit_code: report.exit_code,
+        attempts: 0,
         ..Default::default()
     }
 }
 
-pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeError> {
-    let sora = find_file(initrd, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
-    let mut engine = SyscallEngine::new();
-    let plan = plan_elf_process(engine.objects_mut(), sora.bytes)?;
+/// Build a Sora recipe from the initrd. Called once; the recipe is reused across
+/// restart attempts.
+fn build_recipe(initrd: &[u8]) -> Result<SoraRecipe, UsermodeError> {
+    let sora_file = find_file(initrd, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
+    let elf_bytes = sora_file.bytes.to_vec();
+    let plan = plan_elf_process(&mut crate::object::ObjectManager::new(), &elf_bytes)?;
+    Ok(SoraRecipe {
+        _elf_bytes: elf_bytes,
+        entry: plan.entry,
+        stack_top: plan.stack_top,
+        segments: plan.load_segments,
+    })
+}
 
+/// One attempt: build page tables, create root channel, spawn Sora, wait for exit.
+/// Returns the handshake and exit code.
+fn attempt_sora(
+    boot: &BootInfo,
+    recipe: &SoraRecipe,
+    initrd_bytes: &[u8],
+) -> Result<(UserReport, u64), UsermodeError> {
+    let mut engine = SyscallEngine::new();
+    engine.set_boot_info(*boot);
+    let job = Job::root(engine.objects_mut());
+    let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).map_err(UserBootstrapError::from)?;
+    let mut process = Process::new(engine.objects_mut(), &job, vmar);
+
+    // Root channel (bootstrap): kernel gets Left, Sora gets Right.
+    let (sora_handle, root_channel, kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // Console channel: kernel sends console output to Sora. Kernel keeps Left,
+    // Sora gets Right as a second handle (passed in x2 at entry).
+    let (console_handle, console_channel_idx, console_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P7-a: hand the initrd to Sora as a VMO. Sora receives the handle in x3.
+    let initrd_vmo_handle = engine
+        .root_vmo_create(
+            &mut process,
+            Vmo::from_physical_range(boot.initrd.start, boot.initrd.len as u64)
+                .map_err(|_| UsermodeError::ChannelSetup)?,
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P7-g: block channel — the kernel sends block-read requests, Sora serves them from
+    // the initrd VMO. Kernel keeps Left; Sora gets Right as a handle (passed in x4).
+    let (block_handle, block_channel_idx, block_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // Seed Sora's root inbox.
+    if let Ok(message) = Message::new(1, b"kernel->sora boot\n", &[]) {
+        let msg = KernelMessage::from_borrowed(message).map_err(|_| UsermodeError::ChannelSetup)?;
+        let channel = engine
+            .ipc_mut()
+            .channel_pair_mut(root_channel)
+            .ok_or(UsermodeError::ChannelSetup)?;
+        let _ = channel.write(kernel_end, msg);
+    }
+
+    // Build load segments from the recipe.
     let mut load_segments = Vec::new();
-    for segment in &plan.load_segments {
+    let sora_file = find_file(initrd_bytes, SORA_INIT_PATH)?.ok_or(UsermodeError::MissingSora)?;
+    for segment in &recipe.segments {
         let start =
             usize::try_from(segment.file_offset).map_err(|_| UsermodeError::BadSegmentRange)?;
         let len = usize::try_from(segment.file_size).map_err(|_| UsermodeError::BadSegmentRange)?;
         let end = start
             .checked_add(len)
             .ok_or(UsermodeError::BadSegmentRange)?;
-        if end > sora.bytes.len() {
+        if end > sora_file.bytes.len() {
             return Err(UsermodeError::BadSegmentRange);
         }
         load_segments.push(UserLoadSegment {
-            source: &sora.bytes[start..end],
+            source: &sora_file.bytes[start..end],
             virt_addr: segment.virt_addr,
             mem_size: segment.mem_size,
             writable: segment.flags.contains(PageFlags::WRITE),
@@ -258,90 +553,453 @@ pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeEr
         });
     }
 
-    // SAFETY: first writer for this EL0 descent; SVC hook runs synchronously.
+    // Build page tables. If the boot handoff has a framebuffer, map it into Sora's
+    // address space so it can paint pixels directly (the first driver capability).
+    // `fb_slot` is the 2 MiB-aligned mapping slot; the VA handed to Sora carries the
+    // framebuffer's offset within its first 2 MiB block, so Sora's writes land at the
+    // real scanout base regardless of GOP alignment (the journal-061 paint wart).
+    let fb_mapping: UserMapping;
+    let fb_va: u64;
+    let extra_mappings: &[_];
+    if boot.has_framebuffer() {
+        const BLOCK_MASK: u64 = (1 << 21) - 1;
+        let fb_slot = USER_STACK_TOP + 0x0200_0000; // 32 MiB above user stack (2M-aligned)
+        fb_va = fb_slot + (boot.framebuffer.phys & BLOCK_MASK);
+        fb_mapping = UserMapping {
+            phys_base: boot.framebuffer.phys,
+            virt_addr: fb_slot,
+            len: boot.framebuffer.len,
+            writable: true,
+            device: false, // Normal-NC for framebuffer
+        };
+        extra_mappings = core::slice::from_ref(&fb_mapping);
+    } else {
+        fb_va = 0;
+        extra_mappings = &[];
+    }
+
+    let image = UserImage {
+        entry: recipe.entry,
+        stack_top: recipe.stack_top,
+        stack_size: USER_STACK_SIZE,
+        bootstrap: sora_handle.0 as u64,
+        segments: &load_segments,
+        extra_mappings,
+    };
+    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
+    let user_ttbr0 =
+        kumo_hal::active::build_user_tables(&image, &mut alloc).map_err(UsermodeError::Image)?;
+
+    let kernel_ttbr0 = kumo_hal::active::read_ttbr0();
+    let user_state = UserState {
+        x: {
+            let mut x = [0u64; 31];
+            x[0] = sora_handle.0 as u64; // bootstrap handle (root channel)
+            x[1] = fb_va; // framebuffer virtual address (0 if none)
+            x[2] = console_handle.0 as u64; // console channel handle
+            x[3] = initrd_vmo_handle.0 as u64; // initrd VMO handle (P7-a)
+            x[4] = block_handle.0 as u64; // block-server channel handle (P7-g)
+            x
+        },
+        elr: recipe.entry,
+        spsr: 0,
+        sp_el0: recipe.stack_top - 16,
+        ttbr0: user_ttbr0,
+    };
+
+    // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
+    // restart loop — the hook never needs it.)
     unsafe {
-        *DEMO.0.get() = Some(Demo {
+        *SORA.0.get() = Some(SoraState {
             engine,
-            process: plan.process,
+            process,
+            root_job: job,
+            root_channel,
+            kernel_end,
+            console_channel: console_channel_idx,
+            console_kernel_end,
+            block_channel: block_channel_idx,
+            block_kernel_end,
             wrote: 0,
-            chan: (0, 0),
         });
     }
 
-    // Provision the root channel *before* Sora runs. `first` = Sora's end (handed to it as
-    // the bootstrap handle in x0), `second` = the kernel's end (we read it after exit).
-    let (sora_end, kernel_end) = {
-        // SAFETY: DEMO just initialized; single-threaded.
-        let demo = unsafe { &mut *demo_ptr() };
-        match demo
-            .engine
-            .dispatch(&mut demo.process, KernelCall::ChannelCreate)
-        {
-            KernelCallResult::Handles { first, second } => {
-                demo.chan = (first.0, second.0);
-                (first, second)
-            }
-            _ => return Err(UsermodeError::ChannelSetup),
-        }
-    };
+    // Scheduler harness.
+    crate::user_thread::init(
+        unsafe { &mut *sora_ptr() }.engine.objects_mut(),
+        kernel_ttbr0,
+    )
+    .map_err(|_| UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
 
-    // Seed Sora's inbox with a kernel boot message: writing to our end (`kernel_end`)
-    // lands it in Sora's end. Sora `ChannelRead`s it, echoes it, and replies.
+    let boot_ctx = kumo_hal::active::ThreadContext::default();
+    unsafe { crate::user_thread::pin_boot_context(&boot_ctx) };
+
+    // P6-c: write several console messages from the kernel to Sora's console channel.
+    // Sora's read loop will echo each one via DebugWrite.
     {
-        // SAFETY: DEMO initialized; single-threaded.
-        let demo = unsafe { &mut *demo_ptr() };
-        if let Ok(message) = Message::new(1, b"kernel->sora boot\n", &[]) {
-            let _ = demo.engine.dispatch(
-                &mut demo.process,
-                KernelCall::ChannelWrite {
-                    channel: kernel_end,
-                    message,
-                },
-            );
+        let sora = unsafe { &mut *sora_ptr() };
+        let messages: &[&[u8]] = &[
+            b"P6: console line 1\n",
+            b"P6: console line 2\n",
+            b"P6: console line 3\n",
+            b"P6: console line 4\n",
+        ];
+        for msg_bytes in messages {
+            if let Ok(message) = Message::new(1, msg_bytes, &[]) {
+                if let Ok(msg) = KernelMessage::from_borrowed(message) {
+                    if let Some(channel) =
+                        sora.engine.ipc_mut().channel_pair_mut(sora.console_channel)
+                    {
+                        let _ = channel.write(sora.console_kernel_end, msg);
+                    }
+                }
+            }
         }
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
-    // SAFETY: runs before the TTBR0 switch, so frames are reachable via the identity map.
-    let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
-    let report = kumo_hal::active::run_el0_image(
-        UserImage {
-            entry: plan.entry,
-            stack_top: plan.stack_top,
-            stack_size: USER_STACK_SIZE,
-            bootstrap: sora_end.0 as u64,
-            segments: &load_segments,
-        },
-        &mut alloc,
-    )?;
+    // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
+    // a server — or exits (the legacy/fault path).
+    unsafe { crate::user_thread::spawn_user(user_state, user_ttbr0) };
 
-    // Read what Sora sent down the root channel during its run.
+    // P6-d: prove the park/wake cycle live — with Sora parked, push two more console
+    // lines; each write wakes Sora, it echoes and parks again before we continue.
+    console_to_sora(b"P6: live console A\n");
+    console_to_sora(b"P6: live console B\n");
+
+    // Read Sora's reply from the root channel (kernel side).
     let mut handshake = [0u8; 32];
     let mut handshake_len = 0;
+    let serving = !crate::user_thread::is_done() && crate::user_thread::is_parked();
+    let exit_code = if crate::user_thread::is_done() {
+        crate::user_thread::exit_code()
+    } else {
+        0
+    };
+    let wrote;
     {
-        // SAFETY: initialized above; single-threaded read after EL0 has exited.
-        let demo = unsafe { &mut *demo_ptr() };
-        if let KernelCallResult::Message(message) = demo.engine.dispatch(
-            &mut demo.process,
-            KernelCall::ChannelRead {
-                channel: kernel_end,
-            },
-        ) {
-            let bytes = message.bytes();
-            handshake_len = bytes.len().min(handshake.len());
-            handshake[..handshake_len].copy_from_slice(&bytes[..handshake_len]);
+        let sora = unsafe { &mut *sora_ptr() };
+        wrote = sora.wrote;
+        if let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) {
+            match channel.read(sora.kernel_end) {
+                Ok(message) => {
+                    let bytes = message.bytes();
+                    handshake_len = bytes.len().min(handshake.len());
+                    handshake[..handshake_len].copy_from_slice(&bytes[..handshake_len]);
+                }
+                Err(IpcError::ShouldWait) => {} // Sora didn't reply
+                Err(_) => {}
+            }
         }
     }
 
-    // SAFETY: initialized above; single-threaded read after EL0 has exited.
-    let demo = unsafe { &*demo_ptr() };
-    Ok(UserReport {
-        entered: report.entered,
-        syscalls: report.syscalls,
-        wrote: demo.wrote,
-        chan: demo.chan,
-        exit_code: report.exit_code,
-        handshake,
-        handshake_len,
-    })
+    Ok((
+        UserReport {
+            entered: true,
+            syscalls: kumo_hal::active::syscall_count(),
+            wrote,
+            chan: (sora_handle.0, 0),
+            exit_code,
+            handshake,
+            handshake_len,
+            attempts: 0,
+            serving,
+        },
+        exit_code,
+    ))
+}
+
+/// P6-e: when true, `bootstrap::console::write` offers each fragment to the live Sora
+/// server before falling back to the direct device path. Enabled by `stage_a` once the
+/// probe proves Sora is serving; cleared forever by the Tower (a panic must never wake
+/// or switch threads).
+static CONSOLE_ROUTE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_console_route() {
+    CONSOLE_ROUTE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub fn disable_console_route() {
+    CONSOLE_ROUTE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Largest routed fragment: must fit Sora's 256-byte read buffer with margin.
+const ROUTE_CHUNK: usize = 192;
+
+/// Deliver one console message to Sora and wake it to drain. Returns false if the
+/// channel write failed (the caller falls back to the direct path).
+fn deliver_to_sora(bytes: &[u8]) -> bool {
+    let sora = unsafe { &mut *sora_ptr() };
+    let Ok(message) = Message::new(1, bytes, &[]) else {
+        return false;
+    };
+    let Ok(msg) = KernelMessage::from_borrowed(message) else {
+        return false;
+    };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.console_channel) else {
+        return false;
+    };
+    if channel.write(sora.console_kernel_end, msg).is_err() {
+        return false;
+    }
+    crate::user_thread::wake_user();
+    true
+}
+
+/// Send one console message to the live Sora server (the P6-c live-wake demo path).
+pub fn console_to_sora(bytes: &[u8]) {
+    if !crate::user_thread::is_started() {
+        return;
+    }
+    let _ = deliver_to_sora(bytes);
+}
+
+/// P7-g: read `len` bytes at `offset` of the "disk" (the initrd) **through the
+/// userspace block server**. The kernel is the client here: it writes a 16-byte
+/// request (`offset: u64 LE, len: u64 LE`) to the block channel, wakes Sora — which
+/// `VmoRead`s the initrd and writes the data back — and reads the reply once Sora has
+/// re-parked. Returns the bytes copied into `buf` (0 = server down / refused).
+pub fn block_read_via_sora(offset: u64, len: usize, buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    let mut request = [0u8; 16];
+    request[..8].copy_from_slice(&offset.to_le_bytes());
+    request[8..].copy_from_slice(&(len as u64).to_le_bytes());
+
+    {
+        let sora = unsafe { &mut *sora_ptr() };
+        let Ok(message) = Message::new(2, &request, &[]) else {
+            return 0;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return 0;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        if channel.write(sora.block_kernel_end, msg).is_err() {
+            return 0;
+        }
+    }
+
+    // Run Sora until it parks again; single-core and synchronous, so by the time this
+    // returns the reply (if any) is sitting in our endpoint's inbox.
+    crate::user_thread::wake_user();
+
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+        return 0;
+    };
+    match channel.read(sora.block_kernel_end) {
+        Ok(reply) => {
+            let bytes = reply.bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            n
+        }
+        Err(_) => 0,
+    }
+}
+
+/// P7-k: read a byte range from a named file via Sora's block channel. Sends
+/// [0x01][file_off:u64 LE][len:u64 LE][path…] as the request; Sora resolves the path,
+/// seeks to `file_off`, and returns up to `len` bytes. Returns bytes copied into `buf`.
+pub fn file_read_via_sora_at(path: &[u8], file_off: u64, len: usize, buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    let mut req = [0u8; 32];
+    req[0] = 0x01;
+    req[1..9].copy_from_slice(&file_off.to_le_bytes());
+    req[9..17].copy_from_slice(&(len as u64).to_le_bytes());
+    let path_len = path.len().min(req.len() - 17);
+    req[17..17 + path_len].copy_from_slice(&path[..path_len]);
+
+    {
+        let sora = unsafe { &mut *sora_ptr() };
+        let Ok(message) = Message::new(2, &req[..17 + path_len], &[]) else {
+            return 0;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return 0;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        if channel.write(sora.block_kernel_end, msg).is_err() {
+            return 0;
+        }
+    }
+
+    crate::user_thread::wake_user();
+
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+        return 0;
+    };
+    match channel.read(sora.block_kernel_end) {
+        Ok(reply) => {
+            let bytes = reply.bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            n
+        }
+        Err(_) => 0,
+    }
+}
+
+/// P7-j: read a named file from the FAT32 filesystem via Sora's block channel. Sends
+/// the path bytes as the request; Sora recognises non-16-byte requests as path-based
+/// reads and returns the file contents (up to 512 bytes). Returns bytes copied into `buf`.
+pub fn file_read_via_sora(path: &[u8], buf: &mut [u8]) -> usize {
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return 0;
+    }
+
+    {
+        let sora = unsafe { &mut *sora_ptr() };
+        let Ok(message) = Message::new(2, path, &[]) else {
+            return 0;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return 0;
+        };
+        let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+            return 0;
+        };
+        if channel.write(sora.block_kernel_end, msg).is_err() {
+            return 0;
+        }
+    }
+
+    crate::user_thread::wake_user();
+
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
+        return 0;
+    };
+    match channel.read(sora.block_kernel_end) {
+        Ok(reply) => {
+            let bytes = reply.bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            n
+        }
+        Err(_) => 0,
+    }
+}
+
+/// P8-a/b: forward a single keystroke byte to Sora via the console channel. Sora
+/// treats single-byte console messages as keystrokes (echo + line-buffer) and
+/// multi-byte messages as klog! output (echo only). Returns true if sent.
+pub fn kbd_forward(byte: u8) -> bool {
+    console_to_sora(&[byte]);
+    true
+}
+
+/// P8-b: check the root channel for a completed command line from Sora. If one is
+/// waiting, run it through the kernel shell and return the byte count. Returns 0 if
+/// no line is available. The caller should emit the prompt after the command output.
+pub fn poll_root_command(
+    tasks: &[crate::shell::TaskInfo],
+    env: &mut crate::shell::ShellEnv,
+) -> usize {
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) else {
+        return 0;
+    };
+    let Ok(message) = channel.read(sora.kernel_end) else {
+        return 0;
+    };
+    let bytes = message.bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let line = core::str::from_utf8(bytes).unwrap_or("");
+    env.uptime_ns = kumo_hal::active::monotonic_nanos();
+    let preempt = crate::kdemo::preempt_stats();
+    env.preempt_ticks = preempt.ticks;
+    env.preempt_switches = preempt.switches;
+    let mut out = crate::bootstrap::console::Writer;
+    crate::shell::run_command(line, env, tasks, &mut out);
+    line.len()
+}
+
+/// Offer a console fragment to the live Sora server. Returns true if Sora rendered it
+/// (the caller must not also write it directly). Refuses — returning false for the
+/// direct fallback — unless routing is enabled AND Sora is alive and **parked**: the
+/// parked check is both the liveness test and the reentrancy guard, since any console
+/// write issued while Sora itself is running (its own `DebugWrite`, an SVC handler, a
+/// fault path) must take the direct path rather than wake the thread we are inside of.
+pub fn try_console_route(bytes: &[u8]) -> bool {
+    if !CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return false;
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + ROUTE_CHUNK).min(bytes.len());
+        if !deliver_to_sora(&bytes[offset..end]) {
+            // Render the undelivered remainder directly ourselves — never hand it back
+            // to the caller, which would double-print the chunks already delivered.
+            kumo_hal::active::early_console_write(&bytes[offset..]);
+            break;
+        }
+        offset = end;
+    }
+    true
+}
+
+/// Run Sora with supervised restart: if Sora exits non-zero or crashes, re-spawn up to
+/// [`MAX_SORA_ATTEMPTS`] times. Returns the last successful report, or an error if all
+/// attempts are exhausted.
+pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeError> {
+    let recipe = build_recipe(initrd)?;
+    let mut last_report = None;
+
+    for attempt in 0..MAX_SORA_ATTEMPTS {
+        match attempt_sora(boot, &recipe, initrd) {
+            Ok((report, 0)) => {
+                // Clean exit.
+                let mut report = report;
+                report.attempts = attempt;
+                return Ok(report);
+            }
+            Ok((report, exit_code)) => {
+                // Non-zero exit — may retry.
+                last_report = Some((report, exit_code));
+            }
+            Err(err) => {
+                // Bootstrap error (e.g. out of frames) — not retryable.
+                return Err(err);
+            }
+        }
+    }
+
+    // All attempts exhausted.
+    if let Some((_report, exit_code)) = last_report {
+        Err(UsermodeError::SoraExhausted {
+            exit_code,
+            attempts: MAX_SORA_ATTEMPTS,
+        })
+    } else {
+        Err(UsermodeError::ChannelSetup)
+    }
 }

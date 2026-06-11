@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
-use kumo_hal::active::ThreadContext;
+use kumo_hal::active::{ThreadContext, UserState};
 
-use crate::mm::{Vmar, PAGE_SIZE};
+use crate::mm::{Mapping, Vmar, PAGE_SIZE};
 use crate::object::{HandleTable, KernelObject, ObjectManager};
 
 pub const DEFAULT_KERNEL_STACK_SIZE: usize = 16 * 1024;
@@ -50,6 +50,8 @@ pub struct Process {
     job: KoId,
     root_vmar: Vmar,
     handles: HandleTable,
+    mappings: Vec<(Mapping, crate::mm::Vmo)>,
+    pub ttbr0: Option<u64>,
 }
 
 impl Process {
@@ -59,11 +61,40 @@ impl Process {
             job: job.koid(),
             root_vmar,
             handles: HandleTable::new(),
+            mappings: Vec::new(),
+            ttbr0: None,
+        }
+    }
+
+    /// Build a Process from raw parts (scaffold for borrow-splitting in syscall
+    /// dispatch — lets Thread::new receive a &Process when the real one is behind
+    /// a mutable borrow). The returned Process has no handle table and a fake
+    /// KernelObject; it exists only to satisfy Thread::new's signature.
+    pub fn from_parts(koid: KoId, root_vmar: Vmar) -> Self {
+        Self {
+            object: crate::object::KernelObject::new(koid, kumo_abi::ObjectKind::Process),
+            job: KoId(0),
+            root_vmar,
+            handles: HandleTable::new(),
+            mappings: Vec::new(),
+            ttbr0: None,
         }
     }
 
     pub const fn koid(&self) -> KoId {
         self.object.koid()
+    }
+
+    pub const fn object(&self) -> KernelObject {
+        self.object
+    }
+
+    pub fn add_mapping(&mut self, mapping: Mapping, vmo: crate::mm::Vmo) {
+        self.mappings.push((mapping, vmo));
+    }
+
+    pub fn mappings(&self) -> &[(Mapping, crate::mm::Vmo)] {
+        &self.mappings
     }
 
     pub const fn job(&self) -> KoId {
@@ -121,13 +152,42 @@ pub enum ThreadState {
     Terminated,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Thread {
     object: KernelObject,
     process: KoId,
     state: ThreadState,
     stack: KernelStack,
     context: ThreadContext,
+    pub user_state: Option<UserState>,
+}
+
+impl Clone for Thread {
+    fn clone(&self) -> Self {
+        Self {
+            object: self.object,
+            process: self.process,
+            state: self.state,
+            stack: self.stack.clone(),
+            context: self.context,
+            user_state: None, // UserState isn't Clone; drop on clone
+        }
+    }
+}
+
+impl core::fmt::Debug for Thread {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Thread")
+            .field("object", &self.object)
+            .field("process", &self.process)
+            .field("state", &self.state)
+            .field("stack", &self.stack)
+            .field("context", &self.context)
+            .field(
+                "user_state",
+                &self.user_state.as_ref().map(|_| "<UserState>"),
+            )
+            .finish()
+    }
 }
 
 impl Thread {
@@ -146,11 +206,16 @@ impl Thread {
             state: ThreadState::New,
             stack,
             context,
+            user_state: None,
         })
     }
 
     pub const fn koid(&self) -> KoId {
         self.object.koid()
+    }
+
+    pub const fn object(&self) -> KernelObject {
+        self.object
     }
 
     pub const fn process(&self) -> KoId {
