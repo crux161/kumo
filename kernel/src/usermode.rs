@@ -48,29 +48,33 @@ struct SoraRecipe {
 
 /// Live state for one Sora incarnation. The kernel holds the root channel's peer
 /// endpoint directly; Sora holds the other end as a handle in its process table.
-struct SoraState {
-    engine: SyscallEngine,
-    process: Process,
+pub(crate) struct SoraState {
+    pub engine: SyscallEngine,
+    pub process: Process,
     /// The root Job — child processes are created under this.
-    root_job: Job,
+    pub root_job: Job,
     /// Index of the root [`ChannelPair`] in the IPC registry.
-    root_channel: usize,
+    pub root_channel: usize,
     /// The kernel's endpoint for the root channel (Left — Sora gets Right).
-    kernel_end: ChannelEnd,
+    pub kernel_end: ChannelEnd,
     /// Index of the console [`ChannelPair`] in the IPC registry.
-    console_channel: usize,
+    pub console_channel: usize,
     /// The kernel's endpoint for the console channel.
-    console_kernel_end: ChannelEnd,
+    pub console_kernel_end: ChannelEnd,
     /// Index of the block [`ChannelPair`] (P7-g: kernel-as-client block reads).
-    block_channel: usize,
+    pub block_channel: usize,
     /// The kernel's endpoint for the block channel.
-    block_kernel_end: ChannelEnd,
+    pub block_kernel_end: ChannelEnd,
     /// Index of the network [`ChannelPair`] (P9-c: loopback server).
-    net_channel: usize,
+    pub net_channel: usize,
     /// The kernel's endpoint for the network channel.
-    net_kernel_end: ChannelEnd,
+    pub net_kernel_end: ChannelEnd,
+    /// Index of the keyboard [`ChannelPair`] (P8-a restoration).
+    pub keyboard_channel: usize,
+    /// The kernel's endpoint for the keyboard channel.
+    pub keyboard_kernel_end: ChannelEnd,
     /// Bytes written by `DebugWrite` syscalls during this run.
-    wrote: usize,
+    pub wrote: usize,
 }
 
 struct SoraCell(UnsafeCell<Option<SoraState>>);
@@ -98,6 +102,10 @@ fn sora_ptr() -> *mut SoraState {
     unsafe { (&mut *opt).as_mut().expect("sora state not initialized") as *mut SoraState }
 }
 
+pub fn sora_ptr_mut() -> *mut SoraState {
+    sora_ptr()
+}
+
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora if it's parked on InterruptWait.
 extern "C" fn signal_irq(irq: u32) {
@@ -109,6 +117,19 @@ extern "C" fn signal_irq(irq: u32) {
         && crate::user_thread::is_parked()
     {
         crate::user_thread::wake_user();
+    }
+}
+
+/// P9-e: check the net channel for a handle transferred by Sora. Returns true if
+/// a handle was received.
+pub fn net_check_transfer() -> bool {
+    let sora = unsafe { &mut *sora_ptr() };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
+        return false;
+    };
+    match channel.read(sora.net_kernel_end) {
+        Ok(message) => !message.handles().is_empty(),
+        Err(_) => false,
     }
 }
 
@@ -155,7 +176,16 @@ pub fn net_loopback(data: &[u8], buf: &mut [u8]) -> usize {
 /// P8-l: run a child process synchronously via `kumo_enter_el0`. The child shares
 /// Sora's TTBR0 (same address space scaffold). Returns 0 on success.
 #[cfg(target_os = "none")]
-pub fn run_child(proc_koid: kumo_abi::KoId, root_vmar: Vmar, entry: u64, sp: u64) -> Status {
+pub fn run_child(
+    proc_koid: kumo_abi::KoId,
+    root_vmar: Vmar,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+) -> Status {
+    // Look up the real process to get its TTBR0 (if AddressSpaceCreate was called).
+    let sora = unsafe { &mut *sora_ptr() };
+    let child_ttbr0 = sora.engine.process_by_koid(proc_koid).and_then(|p| p.ttbr0);
     let child_proc = Process::from_parts(proc_koid, root_vmar);
     unsafe {
         *CHILD.0.get() = Some(ChildState {
@@ -164,10 +194,22 @@ pub fn run_child(proc_koid: kumo_abi::KoId, root_vmar: Vmar, entry: u64, sp: u64
             wrote: 0,
         });
     }
+    // Swap to child TTBR0 if separate address space was built.
+    let sora_ttbr0 = if child_ttbr0.is_some() {
+        let ttbr0 = kumo_hal::active::read_ttbr0();
+        unsafe { kumo_hal::active::set_ttbr0(child_ttbr0.unwrap()) };
+        Some(ttbr0)
+    } else {
+        None
+    };
     extern "C" {
         fn kumo_enter_el0(entry: u64, user_sp: u64, arg0: u64) -> u64;
     }
-    let _exit_code = unsafe { kumo_enter_el0(entry, sp, 0) };
+    let _exit_code = unsafe { kumo_enter_el0(entry, sp, arg) };
+    // Restore Sora's TTBR0.
+    if let Some(ttbr0) = sora_ttbr0 {
+        unsafe { kumo_hal::active::set_ttbr0(ttbr0) };
+    }
     unsafe { (&mut *CHILD.0.get()).take() };
     Errno::Ok.status()
 }
@@ -285,6 +327,27 @@ extern "C" fn svc_hook(regs: *mut u64) {
         kumo_hal::active::early_console_write(bytes);
         sora.wrote += len;
         r[0] = len as u64;
+    } else if num == Syscall::VmoWrite as u64 {
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = (r[3] as usize).min(256);
+        if !user_range_ok(&sora.process, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return;
+        }
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::VmoWrite {
+                vmo,
+                offset,
+                src: user_buf as *const u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::VmoRead as u64 {
         let vmo = Handle(r[0] as u32);
         let offset = r[1];
@@ -302,6 +365,25 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 dest: user_buf as *mut u8,
                 len,
             },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::HandleKoid as u64 {
+        let handle = Handle(r[0] as u32);
+        match sora
+            .engine
+            .dispatch(&mut sora.process, KernelCall::HandleKoid { handle })
+        {
+            KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortBindChannel as u64 {
+        let port = Handle(r[0] as u32);
+        let channel = Handle(r[1] as u32);
+        match sora.engine.dispatch(
+            &mut sora.process,
+            KernelCall::PortBindChannel { port, channel },
         ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
@@ -330,6 +412,29 @@ extern "C" fn svc_hook(regs: *mut u64) {
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::PortWait as u64 {
+        let port = Handle(r[0] as u32);
+        let should_wait = Errno::ShouldWait.status();
+        loop {
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::PortWait { port })
+            {
+                KernelCallResult::PortPacket(packet) => {
+                    r[0] = packet.source.0 as u64;
+                    break;
+                }
+                KernelCallResult::Status(status)
+                    if status == should_wait && crate::user_thread::is_started() =>
+                {
+                    crate::user_thread::park_current_user();
+                }
+                _ => {
+                    r[0] = 0;
+                    break;
+                }
+            }
+        }
     } else if num == Syscall::InterruptWait as u64 {
         let interrupt = Handle(r[0] as u32);
         let should_wait = Errno::ShouldWait.status();
@@ -357,12 +462,14 @@ extern "C" fn svc_hook(regs: *mut u64) {
         let process_handle = Handle(r[0] as u32);
         let entry = r[1];
         let sp = r[2];
+        let arg = r[3];
         match sora.engine.dispatch(
             &mut sora.process,
             KernelCall::ProcessRun {
                 process_handle,
                 entry,
                 sp,
+                arg,
             },
         ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
@@ -466,7 +573,13 @@ extern "C" fn svc_hook(regs: *mut u64) {
             return;
         }
         let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-        let status = match Message::new(1, bytes, &[]) {
+        // P9-e: r[3] is an optional handle to transfer alongside the message.
+        let transfer_handle = if r[3] != 0 {
+            &[Handle(r[3] as u32)]
+        } else {
+            &[][..]
+        };
+        let status = match Message::new(1, bytes, transfer_handle) {
             Ok(message) => match sora.engine.dispatch(
                 &mut sora.process,
                 KernelCall::ChannelWrite { channel, message },
@@ -548,6 +661,8 @@ pub fn run(boot: &BootInfo) -> UserReport {
             block_kernel_end: ChannelEnd::Left,
             net_channel: 0,
             net_kernel_end: ChannelEnd::Left,
+            keyboard_channel: 0,
+            keyboard_kernel_end: ChannelEnd::Left,
             wrote: 0,
         });
     }
@@ -630,6 +745,11 @@ fn attempt_sora(
 
     // P9-c: network channel — loopback server. Kernel is the first client.
     let (net_handle, net_channel_idx, net_kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // P8-a restoration: keyboard channel — kernel forwards keystrokes to Sora.
+    let (kbd_handle, kbd_channel_idx, kbd_kernel_end) = engine
         .root_channel_create(&mut process)
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
@@ -719,6 +839,7 @@ fn attempt_sora(
             x[4] = block_handle.0 as u64; // block-server channel handle (P7-g)
             x[5] = root_resource_handle.0 as u64; // root Resource handle (P9-b)
             x[6] = net_handle.0 as u64; // network channel handle (P9-c)
+            x[7] = kbd_handle.0 as u64; // keyboard channel handle (P8-a)
             x
         },
         elr: recipe.entry,
@@ -742,6 +863,8 @@ fn attempt_sora(
             block_kernel_end,
             net_channel: net_channel_idx,
             net_kernel_end,
+            keyboard_channel: kbd_channel_idx,
+            keyboard_kernel_end: kbd_kernel_end,
             wrote: 0,
         });
     }
@@ -1026,10 +1149,36 @@ pub fn file_read_via_sora(path: &[u8], buf: &mut [u8]) -> usize {
 }
 
 /// P8-a/b: forward a single keystroke byte to Sora via the console channel. Sora
-/// treats single-byte console messages as keystrokes (echo + line-buffer) and
-/// multi-byte messages as klog! output (echo only). Returns true if sent.
+/// P8-a restoration: forward a keystroke to Sora via the dedicated keyboard channel.
+/// Returns true if sent.
 pub fn kbd_forward(byte: u8) -> bool {
-    console_to_sora(&[byte]);
+    if !crate::user_thread::is_started()
+        || crate::user_thread::is_done()
+        || !crate::user_thread::is_parked()
+    {
+        return false;
+    }
+    {
+        let sora = unsafe { &mut *sora_ptr() };
+        let payload = [byte];
+        let Ok(message) = Message::new(5, &payload, &[]) else {
+            return false;
+        };
+        let Ok(msg) = KernelMessage::from_borrowed(message) else {
+            return false;
+        };
+        let Some(channel) = sora
+            .engine
+            .ipc_mut()
+            .channel_pair_mut(sora.keyboard_channel)
+        else {
+            return false;
+        };
+        if channel.write(sora.keyboard_kernel_end, msg).is_err() {
+            return false;
+        }
+    }
+    crate::user_thread::wake_user();
     true
 }
 

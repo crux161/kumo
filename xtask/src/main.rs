@@ -315,9 +315,10 @@ fn stage_uefi_bootloader(
     out_dir: &Path,
     plan: &ImagePlan,
 ) -> Result<Option<StagedBootloader>, String> {
-    if plan.arch != ImageArch::Aarch64 {
-        return Ok(None);
-    }
+    let (target, src_name) = match plan.arch {
+        ImageArch::Aarch64 => ("aarch64-unknown-uefi", "niji-uefi.efi"),
+        ImageArch::X86_64 => ("x86_64-unknown-uefi", "niji-uefi.efi"),
+    };
 
     run_cargo(
         root,
@@ -328,17 +329,24 @@ fn stage_uefi_bootloader(
             "--bin",
             "niji-uefi",
             "--target",
-            "aarch64-unknown-uefi",
+            target,
         ],
     )?;
 
     let source_path = root
-        .join("target/aarch64-unknown-uefi/debug")
-        .join("niji-uefi.efi");
+        .join("target")
+        .join(target)
+        .join("debug")
+        .join(src_name);
     let bytes =
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
-    validate_aarch64_efi_application(&bytes)
-        .map_err(|err| format!("validate {} as AA64 EFI app: {err}", source_path.display()))?;
+    // Validate EFI application for the matching arch.
+    match plan.arch {
+        ImageArch::Aarch64 => validate_aarch64_efi_application(&bytes)
+            .map_err(|err| format!("validate {source_path:?} as AA64 EFI app: {err}"))?,
+        ImageArch::X86_64 => validate_x86_64_efi_application(&bytes)
+            .map_err(|err| format!("validate {source_path:?} as x64 EFI app: {err}"))?,
+    }
 
     let staged_path = out_dir
         .join(plan.hardware.to_string())
@@ -481,9 +489,10 @@ fn stage_kernel(
     out_dir: &Path,
     plan: &ImagePlan,
 ) -> Result<Option<StagedKernel>, String> {
-    if plan.arch != ImageArch::Aarch64 {
-        return Ok(None);
-    }
+    let (target, features, bin_name) = match plan.arch {
+        ImageArch::Aarch64 => ("aarch64-unknown-none", "arch_aarch64", "kumo-kernel"),
+        ImageArch::X86_64 => ("x86_64-unknown-none", "arch_x86_64", "kumo-kernel"),
+    };
 
     run_cargo(
         root,
@@ -492,25 +501,31 @@ fn stage_kernel(
             "-p",
             "kernel",
             "--bin",
-            "kumo-kernel",
+            bin_name,
             "--target",
-            "aarch64-unknown-none",
+            target,
             "--release",
+            "--no-default-features",
+            "--features",
+            features,
         ],
     )?;
 
     let source_path = root
-        .join("target/aarch64-unknown-none/release")
-        .join("kumo-kernel");
+        .join("target")
+        .join(target)
+        .join("release")
+        .join(bin_name);
     let bytes =
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
-    let entry = validate_aarch64_kernel_elf(&bytes).map_err(|err| {
-        format!(
-            "validate {} as aarch64 kernel ELF: {err}",
-            source_path.display()
-        )
-    })?;
-    if entry < 0xffff_0000_0000_0000 {
+    let entry = match plan.arch {
+        ImageArch::Aarch64 => validate_aarch64_kernel_elf(&bytes)
+            .map_err(|err| format!("validate {} as kernel ELF: {err}", source_path.display()))?,
+        ImageArch::X86_64 => validate_x86_64_kernel_elf(&bytes)
+            .map_err(|err| format!("validate {} as kernel ELF: {err}", source_path.display()))?,
+    };
+    // Higher-half check only applies to aarch64 TTBR1.
+    if plan.arch == ImageArch::Aarch64 && entry < 0xffff_0000_0000_0000 {
         return Err(format!(
             "validate {} as higher-half kernel ELF: entry {entry:#x} is not in TTBR1",
             source_path.display()
@@ -636,16 +651,22 @@ fn build_fat32_image() -> Vec<u8> {
 }
 
 fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleAsset>, String> {
-    if plan.arch != ImageArch::Aarch64 {
-        return Ok(None);
-    }
-
-    let sora = build_sora_image(&workspace_root()?)?;
-    let fat32_img = build_fat32_image();
-    let initrd = build_initrd(&[
-        (SORA_INIT_PATH, sora.as_slice()),
-        (FAT32_IMG_PATH, fat32_img.as_slice()),
-    ])?;
+    let initrd = match plan.arch {
+        ImageArch::Aarch64 => {
+            let sora = build_sora_image(&workspace_root()?)?;
+            let fat32_img = build_fat32_image();
+            build_initrd(&[
+                (SORA_INIT_PATH, sora.as_slice()),
+                (FAT32_IMG_PATH, fat32_img.as_slice()),
+            ])?
+        }
+        ImageArch::X86_64 => {
+            // P10: empty initrd placeholder — Sora is aarch64-only. The kernel
+            // boots without userspace; Nijigumo still needs a valid initrd image
+            // to pass via BootInfo.
+            build_initrd(&[])?
+        }
+    };
 
     let staged_path = out_dir
         .join(plan.hardware.to_string())
@@ -724,6 +745,30 @@ fn build_initrd(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     Ok(initrd)
 }
 
+fn validate_x86_64_kernel_elf(bytes: &[u8]) -> Result<u64, String> {
+    const ET_EXEC: u16 = 2;
+    const EM_X86_64: u16 = 0x3E;
+
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        return Err("missing ELF magic".to_owned());
+    }
+    if bytes[4] != 2 {
+        return Err("not ELFCLASS64".to_owned());
+    }
+    if bytes[5] != 1 {
+        return Err("not little-endian".to_owned());
+    }
+    let e_type = read_le_u16(bytes, 16)?;
+    if e_type != ET_EXEC {
+        return Err(format!("e_type is {e_type}, expected EXEC (2)"));
+    }
+    let e_machine = read_le_u16(bytes, 18)?;
+    if e_machine != EM_X86_64 {
+        return Err(format!("e_machine is 0x{e_machine:04x}, expected x86_64"));
+    }
+    read_le_u64(bytes, 24)
+}
+
 fn validate_aarch64_kernel_elf(bytes: &[u8]) -> Result<u64, String> {
     const ET_EXEC: u16 = 2;
     const EM_AARCH64: u16 = 0xB7;
@@ -794,6 +839,43 @@ fn validate_aarch64_efi_application(bytes: &[u8]) -> Result<(), String> {
         ));
     }
 
+    Ok(())
+}
+
+fn validate_x86_64_efi_application(bytes: &[u8]) -> Result<(), String> {
+    const AMD64_MACHINE: u16 = 0x8664;
+    const PE32_PLUS: u16 = 0x20b;
+    const EFI_APPLICATION_SUBSYSTEM: u16 = 10;
+
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return Err("missing DOS MZ header".to_owned());
+    }
+    let pe_offset = read_le_u32(bytes, 0x3c)? as usize;
+    let sig_end = pe_offset.checked_add(4).ok_or("invalid PE offset")?;
+    if sig_end > bytes.len() || &bytes[pe_offset..sig_end] != b"PE\0\0" {
+        return Err("missing PE signature".to_owned());
+    }
+    let machine = read_le_u16(bytes, pe_offset + 4)?;
+    if machine != AMD64_MACHINE {
+        return Err(format!("PE machine 0x{machine:04x}, expected 0x8664"));
+    }
+    let opt_hdr_size = read_le_u16(bytes, pe_offset + 20)? as usize;
+    let opt_hdr = pe_offset.checked_add(24).ok_or("invalid PE optional-hdr")?;
+    if opt_hdr_size < 70 {
+        return Err(format!("PE optional header too small ({opt_hdr_size})"));
+    }
+    let magic = read_le_u16(bytes, opt_hdr)?;
+    if magic != PE32_PLUS {
+        return Err(format!(
+            "PE optional-header magic 0x{magic:04x}, expected PE32+"
+        ));
+    }
+    let subsystem = read_le_u16(bytes, opt_hdr + 68)?;
+    if subsystem != EFI_APPLICATION_SUBSYSTEM {
+        return Err(format!(
+            "PE subsystem {subsystem}, expected EFI application"
+        ));
+    }
     Ok(())
 }
 

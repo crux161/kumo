@@ -16,8 +16,11 @@ pub mod task;
 pub mod user_thread;
 pub mod usermode;
 
-use kumo_abi::{BootInfo, ABI_VERSION};
+use kumo_abi::{BootInfo, ObjectKind, Rights, Signals, ABI_VERSION};
+use kumo_ipc::Message;
 use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
+
+use crate::syscall::{KernelCall, KernelCallResult};
 
 pub const STAGE_A_BANNER: &str = "KUMO Ziwei Stage-A core only; halting";
 
@@ -421,6 +424,104 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 }
             }
 
+            // P9-e: verify Sora transferred a handle via the net channel.
+            if usermode::net_check_transfer() {
+                klog!("HANDLE XFER        Check     net channel  via sora   OK\n");
+            } else {
+                klog!("HANDLE XFER        Check     net channel no handle   FAIL\n");
+            }
+
+            // Port/wait-many: kernel-level test via dispatch() which avoids
+            // borrow conflicts between objects and ipc.
+            {
+                let s = unsafe { &mut *usermode::sora_ptr_mut() };
+                // Create port via dispatch
+                let port_h = match s.engine.dispatch(&mut s.process, KernelCall::PortCreate) {
+                    KernelCallResult::Handle(h) => Some(h),
+                    _ => {
+                        klog!("PORT BIND          Check     port create  via eng   FAIL\n");
+                        None
+                    }
+                };
+                // Create channel via dispatch
+                let ch_pair = if port_h.is_some() {
+                    match s.engine.dispatch(&mut s.process, KernelCall::ChannelCreate) {
+                        KernelCallResult::Handles { first, second } => Some((first, second)),
+                        _ => {
+                            klog!("PORT BIND          Check     channel create  via eng   FAIL\n");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let (Some(port_h), Some((h0, _h1))) = (port_h, ch_pair) {
+                    // Bind port to channel
+                    s.engine.dispatch(
+                        &mut s.process,
+                        KernelCall::PortBindChannel {
+                            port: port_h,
+                            channel: h0,
+                        },
+                    );
+                    // Write to channel → should signal port
+                    let msg = Message::new(1, b"x", &[]).unwrap();
+                    s.engine.dispatch(
+                        &mut s.process,
+                        KernelCall::ChannelWrite {
+                            channel: h0,
+                            message: msg,
+                        },
+                    );
+                    // Check port
+                    match s
+                        .engine
+                        .dispatch(&mut s.process, KernelCall::PortWait { port: port_h })
+                    {
+                        KernelCallResult::PortPacket(pkt)
+                            if pkt.signals.contains(Signals::READABLE) =>
+                        {
+                            klog!("PORT BIND          Check     channel signal  via eng   OK\n");
+                        }
+                        KernelCallResult::PortPacket(pkt) => {
+                            klog!(
+                                "PORT BIND          Check     sig={:?} (expect READABLE)   FAIL\n",
+                                pkt.signals
+                            );
+                        }
+                        _ => {
+                            klog!("PORT BIND          Check     port empty   FAIL\n");
+                        }
+                    }
+                }
+
+                // Net loopback: send "ping" on the net channel, Sora echoes it.
+                let mut lb_buf = [0u8; 8];
+                let lb_n = usermode::net_loopback(b"ping", &mut lb_buf);
+                let lb_ok = lb_n == 4 && &lb_buf[..4] == b"ping";
+                // Multi-connection: send "conn" to create a new connection channel.
+                let mut cn_buf = [0u8; 8];
+                let cn_n = usermode::net_loopback(b"conn", &mut cn_buf);
+                let cn_ok = cn_n >= 1 && cn_buf[0] != b'e';
+                // P9-f: named pipe — two "pipe:test" requests return paired channel ends.
+                let mut p1_buf = [0u8; 8];
+                let p1_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
+                let p2_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
+                let pipe_ok = p1_n >= 1 && p1_buf[0] != b'e' && p2_n >= 1 && p1_buf[0] != b'e';
+                if lb_ok && cn_ok && pipe_ok {
+                    klog!("NET LOOPBACK       Check     ping +conn +pipe  via sora   OK\n");
+                } else {
+                    klog!(
+                        "NET LOOPBACK       Check     lb={}/{} cn={}/{} pipe={}/{}   FAIL\n",
+                        lb_n,
+                        lb_ok,
+                        cn_n,
+                        cn_ok,
+                        p2_n,
+                        pipe_ok
+                    );
+                }
+            }
         }
     }
 

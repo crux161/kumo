@@ -1237,6 +1237,7 @@ unsafe fn discover_framebuffer(
 /// leaves the code stale and the kernel never executes its first instruction. Then we
 /// invalidate the I-cache (`ic iallu`). It all appears to work on QEMU, whose caches are
 /// modelled coherently. `image_base..image_base+len` is the loaded image (`kernel.phys`).
+#[cfg(target_arch = "aarch64")]
 unsafe fn jump_to_kernel(
     entry: u64,
     boot_ttbr1: u64,
@@ -1300,8 +1301,29 @@ unsafe fn jump_to_kernel(
     }
 }
 
+/// P10: x86_64 kernel handoff — exit UEFI boot services, preserve the firmware
+/// identity map, and jump to the kernel entry with BootInfo in RDI.
+#[cfg(target_arch = "x86_64")]
+unsafe fn jump_to_kernel(
+    entry: u64,
+    _boot_ttbr1: u64,
+    boot: *const BootInfo,
+    _image_base: u64,
+    _image_len: u64,
+) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "jmp {entry}",
+            entry = in(reg) entry,
+            in("rdi") boot,
+            options(noreturn),
+        )
+    }
+}
+
 /// D-cache line size in bytes, from `CTR_EL0.DminLine` (log2 of the line size in
 /// 32-bit words). Used to stride `dc civac` over the loaded kernel image.
+#[cfg(target_arch = "aarch64")]
 unsafe fn dcache_line_size() -> u64 {
     let ctr: u64;
     unsafe {

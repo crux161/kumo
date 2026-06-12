@@ -73,6 +73,7 @@ pub enum KernelCall<'a> {
         process_handle: Handle,
         entry: u64,
         sp: u64,
+        arg: u64,
     },
     InterruptCreate {
         irq: u32,
@@ -84,6 +85,13 @@ pub enum KernelCall<'a> {
         resource: Handle,
         phys_base: u64,
         len: u64,
+    },
+    PortBindChannel {
+        port: Handle,
+        channel: Handle,
+    },
+    HandleKoid {
+        handle: Handle,
     },
     Unsupported(Syscall),
 }
@@ -123,6 +131,7 @@ pub struct SyscallEngine {
     boot_info: Option<kumo_abi::BootInfo>,
     interrupts: Vec<IrqBinding>,
     resources: Vec<ResourceBinding>,
+    port_bindings: Vec<(KoId, KoId)>,
 }
 
 impl SyscallEngine {
@@ -136,6 +145,7 @@ impl SyscallEngine {
             boot_info: None,
             interrupts: Vec::new(),
             resources: Vec::new(),
+            port_bindings: Vec::new(),
         }
     }
 
@@ -172,6 +182,27 @@ impl SyscallEngine {
         for binding in &mut self.interrupts {
             if binding.irq == irq {
                 binding.count = binding.count.saturating_add(1);
+            }
+        }
+    }
+
+    /// Bind a channel to a port. When a message arrives on the channel, the port
+    /// is signalled with `Signals::READABLE` and the channel's koid as source.
+    pub fn port_bind_channel(&mut self, port_koid: KoId, channel_koid: KoId) {
+        self.port_bindings.push((port_koid, channel_koid));
+    }
+
+    /// Signal all ports bound to `channel_koid` (called after a channel write).
+    pub fn signal_channel_ports(&mut self, channel_koid: KoId) {
+        for &(port_koid, ch_koid) in &self.port_bindings {
+            if ch_koid == channel_koid {
+                // Queue a signal on the port. We need access to the IpcRegistry.
+                // The signal is queued via the IPC layer.
+                self.ipc.port_queue_signal_by_koid(
+                    port_koid,
+                    channel_koid,
+                    kumo_abi::Signals::READABLE,
+                );
             }
         }
     }
@@ -310,8 +341,14 @@ impl SyscallEngine {
                 }
             }
             KernelCall::ChannelWrite { channel, message } => {
+                let ch_koid = process.handles().get(channel).map(|e| e.koid).ok();
                 let status = match self.ipc.channel_write(process, channel, message) {
-                    Ok(()) => Errno::Ok.status(),
+                    Ok(()) => {
+                        if let Some(koid) = ch_koid {
+                            self.signal_channel_ports(koid);
+                        }
+                        Errno::Ok.status()
+                    }
                     Err(error) => errno_from_ipc(error).status(),
                 };
                 KernelCallResult::Status(status)
@@ -363,11 +400,45 @@ impl SyscallEngine {
                 KernelCallResult::Status(status)
             }
             KernelCall::VmoWrite {
-                vmo: _,
-                offset: _,
-                src: _,
-                len: _,
-            } => KernelCallResult::Status(Errno::NotSupported.status()),
+                vmo,
+                offset,
+                src,
+                len,
+            } => {
+                let status = match process
+                    .handles()
+                    .require(vmo, ObjectKind::Vmo, Rights::WRITE)
+                {
+                    Ok(entry) => match self.vmo_by_koid(entry.koid) {
+                        Some(vmo_obj) => {
+                            if offset.checked_add(len as u64).is_none()
+                                || offset.saturating_add(len as u64) > vmo_obj.len()
+                            {
+                                Errno::InvalidArgs.status()
+                            } else if let crate::mm::VmoBacking::Physical { phys_base } =
+                                vmo_obj.backing()
+                            {
+                                // Write through the physmap to the physical address.
+                                let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        src_slice.as_ptr(),
+                                        (0xffff_9000_0000_0000u64 + phys_base + offset) as *mut u8,
+                                        len,
+                                    );
+                                }
+                                Errno::Ok.status()
+                            } else {
+                                // Anonymous VMO: no allocated frames yet.
+                                Errno::NotSupported.status()
+                            }
+                        }
+                        None => Errno::BadHandle.status(),
+                    },
+                    Err(error) => errno_from_object(error).status(),
+                };
+                KernelCallResult::Status(status)
+            }
             KernelCall::ProcessCreate {
                 parent_job,
                 vmar_base,
@@ -572,6 +643,7 @@ impl SyscallEngine {
                 process_handle,
                 entry,
                 sp,
+                arg,
             } => {
                 #[cfg(target_os = "none")]
                 {
@@ -587,12 +659,12 @@ impl SyscallEngine {
                         return KernelCallResult::Status(Errno::BadHandle.status());
                     };
                     let status =
-                        crate::usermode::run_child(proc_koid, target.root_vmar(), entry, sp);
+                        crate::usermode::run_child(proc_koid, target.root_vmar(), entry, sp, arg);
                     KernelCallResult::Status(status)
                 }
                 #[cfg(not(target_os = "none"))]
                 {
-                    let _ = (process_handle, entry, sp);
+                    let _ = (process_handle, entry, sp, arg);
                     KernelCallResult::Status(Errno::NotSupported.status())
                 }
             }
@@ -677,6 +749,30 @@ impl SyscallEngine {
                     Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
+            KernelCall::PortBindChannel { port, channel } => {
+                let port_koid =
+                    match process
+                        .handles()
+                        .require(port, ObjectKind::Port, Rights::WAIT)
+                    {
+                        Ok(e) => e.koid,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                let ch_koid =
+                    match process
+                        .handles()
+                        .require(channel, ObjectKind::Channel, Rights::READ)
+                    {
+                        Ok(e) => e.koid,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                self.port_bind_channel(port_koid, ch_koid);
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::HandleKoid { handle } => match process.handles().get(handle) {
+                Ok(entry) => KernelCallResult::Handle(Handle(entry.koid.0 as u32)),
+                Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+            },
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }

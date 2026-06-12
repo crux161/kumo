@@ -33,6 +33,8 @@ pub enum Syscall {
     DebugWrite = 29,
     AddressSpaceCreate = 30,
     ProcessRun = 31,
+    PortBindChannel = 32,
+    HandleKoid = 33,
 }
 
 pub type Status = i32;

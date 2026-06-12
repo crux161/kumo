@@ -76,6 +76,58 @@ pub fn channel_create() -> u64 {
     u64::MAX
 }
 
+/// Create a channel pair, returning both handles. `pair.0` = first, `pair.1` = second.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_create_pair() -> (u64, u64) {
+    let h0: u64;
+    let h1: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x8, {num}",
+            "svc #0",
+            num = in(reg) Syscall::ChannelCreate as u64,
+            out("x0") h0,
+            out("x1") h1,
+            options(nostack),
+        );
+    }
+    (h0, h1)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_create_pair() -> (u64, u64) {
+    (u64::MAX, u64::MAX)
+}
+
+/// Write a message with an optional handle transfer. Pass `handle` = Handle(0) for
+/// no transfer; any non-zero handle is removed from the sender's table and arrives
+/// at the receiver.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_write_with_handle(
+    channel: Handle,
+    ptr: *const u8,
+    len: usize,
+    handle: Handle,
+) -> Status {
+    syscall(
+        Syscall::ChannelWrite,
+        channel.0 as u64,
+        ptr as u64,
+        len as u64,
+        handle.0 as u64,
+    ) as Status
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_write_with_handle(
+    _channel: Handle,
+    _ptr: *const u8,
+    _len: usize,
+    _handle: Handle,
+) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn channel_read(channel: Handle, buf: *mut u8, cap: usize) -> u64 {
     syscall(
@@ -106,6 +158,22 @@ pub fn channel_write(channel: Handle, ptr: *const u8, len: usize) -> Status {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn channel_write(_channel: Handle, _ptr: *const u8, _len: usize) -> Status {
     kumo_abi::Errno::NotSupported.status()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn vmo_write(vmo: Handle, offset: u64, buf: *const u8, len: usize) -> u64 {
+    syscall(
+        Syscall::VmoWrite,
+        vmo.0 as u64,
+        offset,
+        buf as u64,
+        len as u64,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmo_write(_vmo: Handle, _offset: u64, _buf: *const u8, _len: usize) -> u64 {
+    0
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -203,12 +271,12 @@ pub fn address_space_create(_process: Handle, _stack_virt: u64, _stack_size: u64
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn process_run(process: Handle, entry: u64, sp: u64) -> u64 {
-    syscall(Syscall::ProcessRun, process.0 as u64, entry, sp, 0)
+pub fn process_run(process: Handle, entry: u64, sp: u64, arg: u64) -> u64 {
+    syscall(Syscall::ProcessRun, process.0 as u64, entry, sp, arg)
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-pub fn process_run(_process: Handle, _entry: u64, _sp: u64) -> u64 {
+pub fn process_run(_process: Handle, _entry: u64, _sp: u64, _arg: u64) -> u64 {
     u64::MAX
 }
 
@@ -220,6 +288,16 @@ pub fn interrupt_create(irq: u32) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn interrupt_create(_irq: u32) -> u64 {
     u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn port_wait(port: Handle) -> u64 {
+    syscall(Syscall::PortWait, port.0 as u64, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn port_wait(_port: Handle) -> u64 {
+    0
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -245,6 +323,42 @@ pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn port_create() -> u64 {
+    syscall(Syscall::PortCreate, 0, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn port_create() -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn handle_koid(handle: Handle) -> u64 {
+    syscall(Syscall::HandleKoid, handle.0 as u64, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn handle_koid(_handle: Handle) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn port_bind_channel(port: Handle, channel: Handle) -> u64 {
+    syscall(
+        Syscall::PortBindChannel,
+        port.0 as u64,
+        channel.0 as u64,
+        0,
+        0,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn port_bind_channel(_port: Handle, _channel: Handle) -> u64 {
     u64::MAX
 }
 

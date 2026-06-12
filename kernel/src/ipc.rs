@@ -215,6 +215,14 @@ impl IpcRegistry {
         Ok(())
     }
 
+    /// Signal a port directly by koid (no process handle lookup). Used by
+    /// port-channel bindings when a message arrives on a bound channel.
+    pub fn port_queue_signal_by_koid(&mut self, port_koid: KoId, source: KoId, signals: Signals) {
+        if let Ok(port) = self.port_mut_by_koid(port_koid) {
+            port.queue_signal(source, signals);
+        }
+    }
+
     pub fn channel_write(
         &mut self,
         process: &mut Process,
