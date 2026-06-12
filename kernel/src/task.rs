@@ -50,7 +50,7 @@ pub struct Process {
     job: KoId,
     root_vmar: Vmar,
     handles: HandleTable,
-    mappings: Vec<(Mapping, crate::mm::Vmo)>,
+    mappings: Vec<(Mapping, KoId)>,
     pub ttbr0: Option<u64>,
 }
 
@@ -89,11 +89,11 @@ impl Process {
         self.object
     }
 
-    pub fn add_mapping(&mut self, mapping: Mapping, vmo: crate::mm::Vmo) {
-        self.mappings.push((mapping, vmo));
+    pub fn add_mapping(&mut self, mapping: Mapping, vmo_koid: KoId) {
+        self.mappings.push((mapping, vmo_koid));
     }
 
-    pub fn mappings(&self) -> &[(Mapping, crate::mm::Vmo)] {
+    pub fn mappings(&self) -> &[(Mapping, KoId)] {
         &self.mappings
     }
 

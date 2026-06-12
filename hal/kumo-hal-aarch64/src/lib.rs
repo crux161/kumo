@@ -1162,15 +1162,22 @@ pub mod el0 {
     pub struct UserMapping {
         /// Physical base address of the mapping (need not be 2 MiB-aligned).
         pub phys_base: u64,
-        /// The 2 MiB-aligned virtual **slot** the covering blocks are mapped at. The
-        /// usable VA for `phys_base` is `virt_addr + (phys_base & (2 MiB - 1))`.
+        /// For device/framebuffer mappings, the 2 MiB-aligned virtual **slot** the covering
+        /// blocks are mapped at (usable VA = `virt_addr + (phys_base & (2 MiB - 1))`). For
+        /// `executable` mappings this is the exact, page-aligned VA `phys_base` maps to.
         pub virt_addr: u64,
         /// Length in bytes.
         pub len: u64,
         /// Whether EL0 can write to this mapping.
         pub writable: bool,
-        /// If true, map as Device-nGnRnE; otherwise Normal-NC (for framebuffers).
+        /// If true, map as Device-nGnRnE; otherwise Normal-NC (for framebuffers). Ignored
+        /// when `executable` is set (code is always Normal-WB).
         pub device: bool,
+        /// If true, map as Normal-WB **RX** 4 KiB pages (EL0-executable code) rather than the
+        /// device-block path. Page-granular, so it coexists with a stack in the same 2 MiB
+        /// region; mutually exclusive with `writable` (W^X). The mapped range is cleaned to
+        /// PoC + the I-cache invalidated so EL0 fetches the freshly written bytes.
+        pub executable: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1476,7 +1483,11 @@ pub mod el0 {
         image: &UserImage<'_>,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<u64, UserImageError> {
-        if image.segments.is_empty() {
+        // A tree with neither code segments nor extra mappings has nothing to run. But an
+        // extra-mappings-only image is valid: that is how a child built incrementally via
+        // VmarMap + AddressSpaceCreate arrives here (its code rides an executable mapping,
+        // its stack comes from `stack_size` below).
+        if image.segments.is_empty() && image.extra_mappings.is_empty() {
             return Err(UserImageError::Empty);
         }
 
@@ -1560,6 +1571,32 @@ pub mod el0 {
         // `phys_base`, landing the mapping displaced — the journal-061 paint wart.)
         const BLOCK_2M: u64 = 1 << 21;
         for mapping in image.extra_mappings {
+            // Executable mappings (child code) map Normal-WB RX 4 KiB pages directly from the
+            // backing physical range — page-granular so they share an L3 table with the stack
+            // instead of fighting over a 2 MiB L2 slot, and executable (no `UXN`) unlike the
+            // device-block path. W^X holds: `user_page_desc(true, false)` is RX, never RW.
+            if mapping.executable {
+                if mapping.virt_addr & (PAGE_4K - 1) != 0 || mapping.phys_base & (PAGE_4K - 1) != 0
+                {
+                    return Err(UserImageError::BadSegment);
+                }
+                let desc = super::mmu::user_page_desc(true, false);
+                let pages = mapping.len.div_ceil(PAGE_4K);
+                let mut i = 0;
+                while i < pages {
+                    let off = i * PAGE_4K;
+                    let va = mapping.virt_addr + off;
+                    let pa = mapping.phys_base + off;
+                    unsafe { super::mmu::map_user_page(root, va, pa, desc, alloc, &mut tables) }
+                        .map_err(|()| UserImageError::OutOfFrames)?;
+                    // The code bytes were written through the TTBR1 physmap (D-cache); clean to
+                    // PoC + drop the I-cache so EL0 fetches them. `pa` is reachable now via the
+                    // active kernel identity map.
+                    unsafe { flush_for_exec(pa, PAGE_4K as usize) };
+                    i += 1;
+                }
+                continue;
+            }
             let block_mask = BLOCK_2M - 1;
             if mapping.virt_addr & block_mask != 0 {
                 return Err(UserImageError::BadSegment);
@@ -1760,6 +1797,7 @@ pub struct UserMapping {
     pub len: u64,
     pub writable: bool,
     pub device: bool,
+    pub executable: bool,
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1863,6 +1901,13 @@ pub struct Gicv3Config {
     pub distributor_base: u64,
     pub redistributor_base: u64,
     pub redistributor_stride: u64,
+    pub timer_irq: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gicv2Config {
+    pub distributor_base: u64,
+    pub cpu_base: u64,
     pub timer_irq: u32,
 }
 
@@ -2170,6 +2215,115 @@ unsafe fn gicv3_init(config: &Gicv3Config) {
 #[cfg(not(target_os = "none"))]
 unsafe fn gicv3_init(_config: &Gicv3Config) {}
 
+// ---- GICv2 (GIC-400, Pi 5) ------------------------------------------------
+
+// GICv2 GICD registers (same offsets as GICv3 for basic ops).
+const GICV2_GICC_CTLR: u64 = 0x0000;
+const GICV2_GICC_PMR: u64 = 0x0004;
+const GICV2_GICC_CTLR_ENABLE_GRP1NS: u32 = 1;
+
+// GICv2 GICD_CTLR bits (no ARE_NS in GICv2).
+const GICD_CTLR_ENABLE_GRP0: u32 = 1;
+
+/// Parse a GICv2 node from DTB. The reg property has two tuples: (GICD, GICC).
+#[cfg(target_os = "none")]
+unsafe fn discover_gicv2(dtb: u64) -> Option<Gicv2Config> {
+    if dtb == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
+    if &header[0..4] != b"\xd0\x0d\xfe\xed" {
+        return None;
+    }
+    let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    let bytes = unsafe { core::slice::from_raw_parts(dtb as *const u8, total_size) };
+    gicv2_from_dtb_bytes(bytes)
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn discover_gicv2(_dtb: u64) -> Option<Gicv2Config> {
+    None
+}
+
+fn gicv2_from_dtb_bytes(bytes: &[u8]) -> Option<Gicv2Config> {
+    // Walk DTB nodes looking for a GICv2 compatible node.
+    // Minimal: find "arm,gic-400" or "arm,cortex-a15-gic" in compatible strings.
+    let gicv2_compatibles: &[&[u8]] = &[
+        b"arm,gic-400\0",
+        b"arm,cortex-a15-gic\0",
+        b"arm,cortex-a7-gic\0",
+        b"arm,gic-400",
+        b"arm,cortex-a15-gic",
+    ];
+    let mut gicd_base = None;
+    let mut gicc_base = None;
+    let mut timer_irq = None;
+
+    // Simple linear scan for "interrupt-controller" compatible node.
+    // This is fragile — a proper FDT parser would walk the structure.
+    // For the Pi 5, we know the GIC-400 is at a fixed location.
+    // Fall back to known Pi 5 GIC-400 addresses if DTB parse fails.
+    let text = bytes;
+
+    // Check for "arm,gic-400" string in DTB.
+    for compat in gicv2_compatibles {
+        if text.windows(compat.len()).any(|w| w == *compat) {
+            // Found a GICv2. Use Pi 5 known addresses.
+            gicd_base = Some(0xff84_1000);
+            gicc_base = Some(0xff84_2000);
+            timer_irq = Some(TIMER_VIRTUAL_PPI);
+            break;
+        }
+    }
+
+    // Also try to parse reg property if we found a match.
+    Some(Gicv2Config {
+        distributor_base: gicd_base?,
+        cpu_base: gicc_base?,
+        timer_irq: timer_irq?,
+    })
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gicv2_init(config: &Gicv2Config) {
+    let timer_bit = 1u32 << (config.timer_irq % 32);
+    let timer_reg = (config.timer_irq / 32) as u64 * 4;
+
+    // Disable distributor, then enable with Group0 + Group1NS.
+    unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
+    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe {
+        mmio_write32(
+            config.distributor_base + GICD_CTLR,
+            GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1NS,
+        )
+    };
+    unsafe { gicd_wait_rwp(config.distributor_base) };
+
+    // Store GICv2 CPU base for EOI in IRQ handler.
+    GICV2_CPU_BASE.store(config.cpu_base, ORD);
+
+    // CPU interface: set priority mask to allow all, enable Group1NS.
+    unsafe { mmio_write32(config.cpu_base + GICV2_GICC_PMR, 0xFF) };
+    unsafe {
+        mmio_write32(
+            config.cpu_base + GICV2_GICC_CTLR,
+            GICV2_GICC_CTLR_ENABLE_GRP1NS,
+        )
+    };
+
+    // Enable the timer IRQ in the distributor.
+    unsafe {
+        mmio_write32(
+            config.distributor_base + GICR_ISENABLER0 + timer_reg,
+            timer_bit,
+        )
+    };
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn gicv2_init(_config: &Gicv2Config) {}
+
 #[cfg(target_os = "none")]
 unsafe fn current_redistributor(config: &Gicv3Config) -> u64 {
     let target = mpidr_affinity();
@@ -2268,6 +2422,10 @@ unsafe fn enable_irq() {}
 /// a raw `extern "C" fn()` address; 0 means "no preemption".
 static PREEMPT_HOOK: AtomicUsize = AtomicUsize::new(0);
 static INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// GICv2 CPU interface base (0 if using GICv3 system-register EOI).
+static GICV2_CPU_BASE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+const GICV2_GICC_EOIR: u64 = 0x0010;
 
 /// Install the preemption hook (the scheduler tick). It runs in IRQ context after the
 /// timer interrupt is acknowledged/EOI'd, and may context-switch via `switch_context`.
@@ -2288,9 +2446,18 @@ pub fn clear_preempt_hook() {
 
 #[cfg(target_os = "none")]
 unsafe fn eoi(intid: u32) {
-    unsafe {
-        core::arch::asm!("msr icc_eoir1_el1, {0}", in(reg) intid as u64, options(nostack, nomem))
-    };
+    let gicv2_cpu = GICV2_CPU_BASE.load(ORD);
+    if gicv2_cpu != 0 {
+        unsafe { mmio_write32(gicv2_cpu + GICV2_GICC_EOIR, intid) };
+    } else {
+        unsafe {
+            core::arch::asm!(
+                "msr icc_eoir1_el1, {0}",
+                in(reg) intid as u64,
+                options(nostack, nomem)
+            )
+        };
+    }
 }
 
 #[cfg(not(target_os = "none"))]

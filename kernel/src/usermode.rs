@@ -348,6 +348,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::VmoCreate as u64 {
+        let size = r[0];
+        match sora
+            .engine
+            .dispatch(&mut sora.process, KernelCall::VmoCreate { size })
+        {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::VmoRead as u64 {
         let vmo = Handle(r[0] as u32);
         let offset = r[1];
@@ -733,7 +742,10 @@ fn attempt_sora(
             &mut process,
             Vmo::from_physical_range(boot.initrd.start, boot.initrd.len as u64)
                 .map_err(|_| UsermodeError::ChannelSetup)?,
-            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+            // WRITE lets Sora stage child code into the initrd VMO (VmoWrite) before mapping
+            // it RX into a child address space — the P10 process-model demo. A scratch
+            // anonymous VMO would avoid mutating the initrd, but that path is deferred.
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
@@ -809,6 +821,7 @@ fn attempt_sora(
             len: boot.framebuffer.len,
             writable: true,
             device: false, // Normal-NC for framebuffer
+            executable: false,
         };
         extra_mappings = core::slice::from_ref(&fb_mapping);
     } else {

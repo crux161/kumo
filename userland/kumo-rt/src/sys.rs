@@ -177,6 +177,16 @@ pub fn vmo_write(_vmo: Handle, _offset: u64, _buf: *const u8, _len: usize) -> u6
 }
 
 #[cfg(target_arch = "aarch64")]
+pub fn vmo_create(size: u64) -> u64 {
+    syscall(Syscall::VmoCreate, size, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmo_create(_size: u64) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn vmo_read(vmo: Handle, offset: u64, buf: *mut u8, len: usize) -> u64 {
     syscall(
         Syscall::VmoRead,

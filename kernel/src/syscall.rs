@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use kumo_abi::{Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall};
+use kumo_abi::{BootInfo, Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall};
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
@@ -93,6 +93,9 @@ pub enum KernelCall<'a> {
     HandleKoid {
         handle: Handle,
     },
+    VmoCreate {
+        size: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -121,11 +124,58 @@ struct ResourceBinding {
     len: u64,
 }
 
+/// Stored VMO with optional pre-allocated frames for anonymous backing.
+#[derive(Clone, Debug)]
+struct VmoEntry {
+    koid: KoId,
+    vmo: Vmo,
+    #[allow(dead_code)]
+    frames: Vec<Option<u64>>,
+}
+
+const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
+
+fn phys_ptr_mut(phys: u64) -> *mut u8 {
+    (PHYSMAP_BASE + phys) as *mut u8
+}
+
+fn alloc_anonymous_frame(boot: &BootInfo) -> Result<u64, Errno> {
+    #[cfg(target_os = "none")]
+    {
+        let saved_ttbr0 = kumo_hal::active::read_ttbr0();
+        unsafe { kumo_hal::active::set_ttbr0(crate::user_thread::kernel_ttbr0()) };
+        let frame = unsafe { crate::mm::alloc_zeroed_frame(boot) };
+        unsafe { kumo_hal::active::set_ttbr0(saved_ttbr0) };
+        frame.ok_or(Errno::NoMemory)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    {
+        unsafe { crate::mm::alloc_zeroed_frame(boot) }.ok_or(Errno::NoMemory)
+    }
+}
+
+fn ensure_anonymous_frame(
+    entry: &mut VmoEntry,
+    page_index: usize,
+    boot: &BootInfo,
+) -> Result<u64, Errno> {
+    if entry.frames.len() <= page_index {
+        entry.frames.resize(page_index + 1, None);
+    }
+    if let Some(frame) = entry.frames[page_index] {
+        return Ok(frame);
+    }
+    let frame = alloc_anonymous_frame(boot)?;
+    entry.frames[page_index] = Some(frame);
+    Ok(frame)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SyscallEngine {
     objects: ObjectManager,
     ipc: IpcRegistry,
-    vmos: Vec<(KoId, Vmo)>,
+    vmos: Vec<VmoEntry>,
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
@@ -238,15 +288,31 @@ impl SyscallEngine {
     ) -> Result<Handle, ObjectError> {
         let object = self.objects.create(ObjectKind::Vmo);
         let handle = process.handles_mut().insert(object, rights)?;
-        self.vmos.push((object.koid(), vmo));
+        self.vmos.push(VmoEntry {
+            koid: object.koid(),
+            vmo,
+            frames: Vec::new(),
+        });
         Ok(handle)
     }
 
-    /// Look up a VMO by koid. Returns `None` if the koid doesn't match a stored VMO.
+    /// Look up a VMO by koid. Returns `None` if not found.
     pub fn vmo_by_koid(&self, koid: KoId) -> Option<Vmo> {
-        self.vmos
-            .iter()
-            .find_map(|(k, v)| if *k == koid { Some(*v) } else { None })
+        self.vmos.iter().find_map(|entry| {
+            if entry.koid == koid {
+                Some(entry.vmo)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn vmo_entry_by_koid(&self, koid: KoId) -> Option<&VmoEntry> {
+        self.vmos.iter().find(|entry| entry.koid == koid)
+    }
+
+    fn vmo_entry_by_koid_mut(&mut self, koid: KoId) -> Option<&mut VmoEntry> {
+        self.vmos.iter_mut().find(|entry| entry.koid == koid)
     }
 
     /// Look up a process by koid. Returns `None` if not found.
@@ -375,22 +441,43 @@ impl SyscallEngine {
                     .handles()
                     .require(vmo, ObjectKind::Vmo, Rights::READ)
                 {
-                    Ok(entry) => match self.vmo_by_koid(entry.koid) {
-                        Some(vmo_obj) => {
+                    Ok(handle_entry) => match self.vmo_entry_by_koid(handle_entry.koid) {
+                        Some(vmo_entry) => {
                             if offset.checked_add(len as u64).is_none()
-                                || offset.saturating_add(len as u64) > vmo_obj.len()
+                                || offset.saturating_add(len as u64) > vmo_entry.vmo.len()
                             {
                                 Errno::InvalidArgs.status()
-                            } else if let crate::mm::VmoBacking::Physical { phys_base } =
-                                vmo_obj.backing()
-                            {
+                            } else {
                                 let dest_slice =
                                     unsafe { core::slice::from_raw_parts_mut(dest, len) };
-                                kumo_hal::active::read_phys(phys_base + offset, dest_slice);
-                                Errno::Ok.status()
-                            } else {
-                                // Anonymous VMO: no allocated frames yet; read returns zeros
-                                Errno::NotSupported.status()
+                                match vmo_entry.vmo.backing() {
+                                    crate::mm::VmoBacking::Physical { phys_base } => {
+                                        kumo_hal::active::read_phys(phys_base + offset, dest_slice);
+                                        Errno::Ok.status()
+                                    }
+                                    crate::mm::VmoBacking::Anonymous => {
+                                        let mut copied = 0usize;
+                                        while copied < len {
+                                            let pos = offset + copied as u64;
+                                            let page_index = (pos / crate::mm::PAGE_SIZE) as usize;
+                                            let page_off = (pos % crate::mm::PAGE_SIZE) as usize;
+                                            let chunk = (len - copied)
+                                                .min(crate::mm::PAGE_SIZE as usize - page_off);
+                                            if let Some(Some(frame)) =
+                                                vmo_entry.frames.get(page_index)
+                                            {
+                                                kumo_hal::active::read_phys(
+                                                    frame + page_off as u64,
+                                                    &mut dest_slice[copied..copied + chunk],
+                                                );
+                                            } else {
+                                                dest_slice[copied..copied + chunk].fill(0);
+                                            }
+                                            copied += chunk;
+                                        }
+                                        Errno::Ok.status()
+                                    }
+                                }
                             }
                         }
                         None => Errno::BadHandle.status(),
@@ -409,32 +496,68 @@ impl SyscallEngine {
                     .handles()
                     .require(vmo, ObjectKind::Vmo, Rights::WRITE)
                 {
-                    Ok(entry) => match self.vmo_by_koid(entry.koid) {
-                        Some(vmo_obj) => {
-                            if offset.checked_add(len as u64).is_none()
-                                || offset.saturating_add(len as u64) > vmo_obj.len()
-                            {
-                                Errno::InvalidArgs.status()
-                            } else if let crate::mm::VmoBacking::Physical { phys_base } =
-                                vmo_obj.backing()
-                            {
-                                // Write through the physmap to the physical address.
-                                let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(
-                                        src_slice.as_ptr(),
-                                        (0xffff_9000_0000_0000u64 + phys_base + offset) as *mut u8,
-                                        len,
-                                    );
+                    Ok(handle_entry) => {
+                        let Some(vmo_entry) = self.vmo_entry_by_koid(handle_entry.koid) else {
+                            return KernelCallResult::Status(Errno::BadHandle.status());
+                        };
+                        if offset.checked_add(len as u64).is_none()
+                            || offset.saturating_add(len as u64) > vmo_entry.vmo.len()
+                        {
+                            Errno::InvalidArgs.status()
+                        } else {
+                            let backing = vmo_entry.vmo.backing();
+                            let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
+                            match backing {
+                                crate::mm::VmoBacking::Physical { phys_base } => {
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            src_slice.as_ptr(),
+                                            phys_ptr_mut(phys_base + offset),
+                                            len,
+                                        );
+                                    }
+                                    Errno::Ok.status()
                                 }
-                                Errno::Ok.status()
-                            } else {
-                                // Anonymous VMO: no allocated frames yet.
-                                Errno::NotSupported.status()
+                                crate::mm::VmoBacking::Anonymous => {
+                                    let Some(boot) = self.boot_info else {
+                                        return KernelCallResult::Status(Errno::Internal.status());
+                                    };
+                                    let Some(vmo_entry) =
+                                        self.vmo_entry_by_koid_mut(handle_entry.koid)
+                                    else {
+                                        return KernelCallResult::Status(Errno::BadHandle.status());
+                                    };
+                                    let mut copied = 0usize;
+                                    let mut status = Errno::Ok.status();
+                                    while copied < len {
+                                        let pos = offset + copied as u64;
+                                        let page_index = (pos / crate::mm::PAGE_SIZE) as usize;
+                                        let page_off = (pos % crate::mm::PAGE_SIZE) as usize;
+                                        let chunk = (len - copied)
+                                            .min(crate::mm::PAGE_SIZE as usize - page_off);
+                                        let frame = match ensure_anonymous_frame(
+                                            vmo_entry, page_index, &boot,
+                                        ) {
+                                            Ok(frame) => frame,
+                                            Err(errno) => {
+                                                status = errno.status();
+                                                break;
+                                            }
+                                        };
+                                        unsafe {
+                                            core::ptr::copy_nonoverlapping(
+                                                src_slice[copied..copied + chunk].as_ptr(),
+                                                phys_ptr_mut(frame + page_off as u64),
+                                                chunk,
+                                            );
+                                        }
+                                        copied += chunk;
+                                    }
+                                    status
+                                }
                             }
                         }
-                        None => Errno::BadHandle.status(),
-                    },
+                    }
                     Err(error) => errno_from_object(error).status(),
                 };
                 KernelCallResult::Status(status)
@@ -467,13 +590,14 @@ impl SyscallEngine {
                     Ok(entry) => entry.koid,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
-                let vmo = match process
-                    .handles()
-                    .require(vmo_handle, ObjectKind::Vmo, Rights::READ)
-                {
-                    Ok(entry) => self.vmo_by_koid(entry.koid),
-                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
-                };
+                let (vmo_koid, vmo) =
+                    match process
+                        .handles()
+                        .require(vmo_handle, ObjectKind::Vmo, Rights::READ)
+                    {
+                        Ok(entry) => (entry.koid, self.vmo_by_koid(entry.koid)),
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
                 let Some(vmo) = vmo else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
@@ -482,7 +606,7 @@ impl SyscallEngine {
                 };
                 let status = match target.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
                     Ok(mapping) => {
-                        target.add_mapping(mapping, vmo);
+                        target.add_mapping(mapping, vmo_koid);
                         Errno::Ok.status()
                     }
                     Err(_) => Errno::InvalidArgs.status(),
@@ -595,28 +719,76 @@ impl SyscallEngine {
                 };
                 // Extract mappings and boot_info before mutably borrowing self.
                 let boot = self.boot_info;
-                let user_mappings: Vec<kumo_hal::active::UserMapping> = {
+                let Some(ref boot_ref) = boot else {
+                    return KernelCallResult::Status(Errno::Internal.status());
+                };
+                let process_mappings: Vec<(Mapping, KoId)> = {
                     let Some(target) = self.process_by_koid(proc_koid) else {
                         return KernelCallResult::Status(Errno::BadHandle.status());
                     };
-                    let mut um = Vec::new();
-                    for &(mapping, vmo) in target.mappings() {
-                        if let crate::mm::VmoBacking::Physical { phys_base } = vmo.backing() {
-                            let writable = mapping.flags.contains(PageFlags::WRITE);
-                            let device = mapping.flags.contains(PageFlags::DEVICE);
-                            const BLOCK_MASK: u64 = (1 << 21) - 1;
-                            let slot = mapping.virt & !BLOCK_MASK;
-                            um.push(kumo_hal::active::UserMapping {
+                    target.mappings().to_vec()
+                };
+                let mut user_mappings = Vec::new();
+                for (mapping, vmo_koid) in process_mappings {
+                    let executable = mapping.flags.contains(PageFlags::EXECUTE);
+                    // W^X: an executable mapping is RX, never writable.
+                    let writable = mapping.flags.contains(PageFlags::WRITE) && !executable;
+                    let device = mapping.flags.contains(PageFlags::DEVICE);
+                    let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
+                        return KernelCallResult::Status(Errno::BadHandle.status());
+                    };
+                    match vmo_entry.vmo.backing() {
+                        crate::mm::VmoBacking::Physical { phys_base } => {
+                            // Executable code maps at its exact page-aligned VA (4 KiB pages);
+                            // device/framebuffer mappings ride a 2 MiB-aligned block slot.
+                            let virt_addr = if executable {
+                                mapping.virt
+                            } else {
+                                const BLOCK_MASK: u64 = (1 << 21) - 1;
+                                mapping.virt & !BLOCK_MASK
+                            };
+                            user_mappings.push(kumo_hal::active::UserMapping {
                                 phys_base: phys_base + mapping.vmo_offset,
-                                virt_addr: slot,
+                                virt_addr,
                                 len: mapping.len,
                                 writable,
                                 device,
+                                executable,
                             });
                         }
+                        crate::mm::VmoBacking::Anonymous => {
+                            if !executable || mapping.len % crate::mm::PAGE_SIZE != 0 {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
+                            let pages = mapping.len / crate::mm::PAGE_SIZE;
+                            let mut page = 0;
+                            while page < pages {
+                                let off = page * crate::mm::PAGE_SIZE;
+                                let vmo_page =
+                                    ((mapping.vmo_offset + off) / crate::mm::PAGE_SIZE) as usize;
+                                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                                    return KernelCallResult::Status(Errno::BadHandle.status());
+                                };
+                                let phys_base =
+                                    match ensure_anonymous_frame(vmo_entry, vmo_page, boot_ref) {
+                                        Ok(frame) => frame,
+                                        Err(errno) => {
+                                            return KernelCallResult::Status(errno.status());
+                                        }
+                                    };
+                                user_mappings.push(kumo_hal::active::UserMapping {
+                                    phys_base,
+                                    virt_addr: mapping.virt + off,
+                                    len: crate::mm::PAGE_SIZE,
+                                    writable: false,
+                                    device: false,
+                                    executable: true,
+                                });
+                                page += 1;
+                            }
+                        }
                     }
-                    um
-                };
+                }
                 let image = kumo_hal::active::UserImage {
                     entry: 0,
                     stack_top: stack_virt,
@@ -625,11 +797,23 @@ impl SyscallEngine {
                     segments: &[],
                     extra_mappings: &user_mappings,
                 };
-                let Some(ref boot) = boot else {
-                    return KernelCallResult::Status(Errno::Internal.status());
+                let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot_ref) };
+                // `build_user_tables` writes page-table frames and flushes code pages by raw
+                // physical address, which assume the kernel identity map. But this syscall runs
+                // on the user thread with the caller's (Sora's) tree live in TTBR0. Switch to the
+                // kernel identity map for the build, then restore the caller's tree so the
+                // eventual `eret` returns to EL0 correctly.
+                #[cfg(target_os = "none")]
+                let result = {
+                    let saved_ttbr0 = kumo_hal::active::read_ttbr0();
+                    unsafe { kumo_hal::active::set_ttbr0(crate::user_thread::kernel_ttbr0()) };
+                    let r = kumo_hal::active::build_user_tables(&image, &mut alloc);
+                    unsafe { kumo_hal::active::set_ttbr0(saved_ttbr0) };
+                    r
                 };
-                let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot) };
-                match kumo_hal::active::build_user_tables(&image, &mut alloc) {
+                #[cfg(not(target_os = "none"))]
+                let result = kumo_hal::active::build_user_tables(&image, &mut alloc);
+                match result {
                     Ok(ttbr0) => {
                         if let Some(target) = self.process_by_koid_mut(proc_koid) {
                             target.ttbr0 = Some(ttbr0);
@@ -772,6 +956,17 @@ impl SyscallEngine {
             KernelCall::HandleKoid { handle } => match process.handles().get(handle) {
                 Ok(entry) => KernelCallResult::Handle(Handle(entry.koid.0 as u32)),
                 Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+            },
+            KernelCall::VmoCreate { size } => match crate::mm::Vmo::new(size) {
+                Ok(vmo) => match self.root_vmo_create(
+                    process,
+                    vmo,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(handle) => KernelCallResult::Handle(handle),
+                    Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+                },
+                Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }

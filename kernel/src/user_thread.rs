@@ -79,6 +79,14 @@ pub fn is_started() -> bool {
     unsafe { (&*opt).is_some() }
 }
 
+/// The kernel identity-map TTBR0 captured at launch. A syscall handler running on the
+/// user thread (TTBR0 = the process tree) switches to this before building page tables by
+/// physical address, then restores the process tree. Valid once `init` has run.
+pub fn kernel_ttbr0() -> u64 {
+    let p = sched_ptr();
+    unsafe { (&*p).kernel_ttbr0 }
+}
+
 fn sched_ptr() -> *mut UserSched {
     let opt: *mut Option<UserSched> = USER_SCHED.0.get();
     unsafe {

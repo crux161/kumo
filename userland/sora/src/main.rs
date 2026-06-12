@@ -10,7 +10,7 @@ use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind_channel,
     port_create, port_wait, process_create, process_exit, process_run, thread_create, thread_start,
-    vmar_map, vmo_read, vmo_write,
+    vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 
@@ -18,6 +18,10 @@ mod heap;
 
 #[global_allocator]
 static ALLOC: heap::BumpAlloc = heap::BumpAlloc;
+
+fn log(msg: &[u8]) {
+    debug_write(msg.as_ptr(), msg.len());
+}
 
 // Tiny asm trampoline: `_start` (the ELF entry point) just calls `sora_main`.
 // Bootstrap registers (x0-x3) are passed through per the aarch64 calling convention.
@@ -203,7 +207,7 @@ extern "C" fn sora_main(
             0x1000,                // 4 KiB
             1,                     // READ flag
         );
-        debug_write(b"child process h".as_ptr(), 16);
+        debug_write(b"child process h".as_ptr(), 15);
         let mut h = child_h;
         let mut hex = [0u8; 16];
         let mut hi = 16;
@@ -236,7 +240,7 @@ extern "C" fn sora_main(
                 debug_write(b"fail\n".as_ptr(), 5);
             }
         } else {
-            debug_write(b" thread=fail\n".as_ptr(), 12);
+            debug_write(b" thread=fail\n".as_ptr(), 13);
         }
         // P9-h: create a channel pair, pass one end to the child as bootstrap arg,
         // then read what the child wrote to the other end. Proves cross-process
@@ -290,59 +294,94 @@ extern "C" fn sora_main(
         channel_write_with_handle(net, b"h".as_ptr(), 1, h0);
     }
 
-    // P10-a (process model): VmoWrite demo + child separate address space.
-    // Write a child asm payload to the initrd VMO at offset 0x1000, map it
-    // executable into the child, build page tables, and run with the child's
-    // own TTBR0. Proves separate address spaces work.
+    // P10-b (process model): anonymous VMO + child separate address space.
+    // Write a child asm payload to a fresh VMO, map it executable into the child,
+    // build page tables, and run with the child's own TTBR0. Proves child code no
+    // longer mutates the shared initrd VMO.
     //
-    // Payload (8 aarch64 instructions, 32 bytes at offset 0x1100):
+    // Payload (8 aarch64 instructions, 32 bytes at offset 0x1100), verified with llvm-mc:
     //   movz x0, #0x1000, lsl #16  → x0 = 0x1000_0000
-    //   add  x0, x0, #0x1000       → x0 = 0x1000_1000 (string at initrd+0x1000)
-    //   movz x1, #21               → len = 21
+    //   movk x0, #0x1000           → x0 = 0x1000_1000 (string at child VA+0x1000)
+    //   movz x1, #20               → len = 20
     //   movz x8, #29               → DebugWrite
     //   svc  #0
     //   movz x0, #0                → exit code 0
     //   movz x8, #21               → ProcessExit
     //   svc  #0
-    // String at 0x1000: "hello from child as\n" (21 bytes)
+    // String at VMO offset 0x1000: "hello from child as\n" (20 bytes).
     {
+        // The two `movz x8` words carry the syscall numbers; an earlier draft transposed
+        // their nibbles (0x..3a28 = #465, 0x..2a28 = #337), so both SVCs ran with garbage
+        // x8 and the child fell off the end of the payload. `movk` replaces an `add` whose
+        // #0x1000 immediate didn't fit in the imm12 field.
         let code: [u32; 8] = [
-            0xd2a01000, // movz x0, #0x1000, lsl #16
-            0x91040000, // add x0, x0, #0x1000
-            0xd28002a1, // movz x1, #21
-            0xd2803a28, // movz x8, #29
+            0xd2a20000, // movz x0, #0x1000, lsl #16  -> 0x1000_0000
+            0xf2820000, // movk x0, #0x1000           -> 0x1000_1000
+            0xd2800281, // movz x1, #20
+            0xd28003a8, // movz x8, #29  (DebugWrite)
             0xd4000001, // svc #0
             0xd2800000, // movz x0, #0
-            0xd2802a28, // movz x8, #21
+            0xd28002a8, // movz x8, #21  (ProcessExit)
             0xd4000001, // svc #0
         ];
         let mut code_bytes = [0u8; 32];
         for (i, w) in code.iter().enumerate() {
             code_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
         }
-        // Write string + code to initrd VMO.
-        vmo_write(initrd, 0x1000, b"hello from child as\n".as_ptr(), 21);
-        vmo_write(initrd, 0x1100, code_bytes.as_ptr(), 32);
-        // Map initrd into child at 0x10000000 with RWX (flags=7) for code+stack.
-        let child_as = Handle(child_h as u32);
-        vmar_map(child_as, initrd, 0, 0x10000000, 0x200000, 7); // 2 MiB, RWX
-                                                                // Build page tables.
-        address_space_create(child_as, 0x10010000, 0x4000); // 16 KiB stack
-                                                            // Run child with its own TTBR0.
-        let run_as = process_run(child_as, 0x10001100, 0x1000FFF0, 0);
-        debug_write(b" child as run=".as_ptr(), 13);
-        if run_as == 0 {
-            debug_write(b"ok\n".as_ptr(), 3);
+        let child_vmo_h = vmo_create(0x2000);
+        if child_vmo_h == u64::MAX {
+            log(b" child as=nop (vmo create fail)\n");
         } else {
-            debug_write(b"fail\n".as_ptr(), 5);
+            let child_vmo = Handle(child_vmo_h as u32);
+            let string_ok =
+                vmo_write(child_vmo, 0x1000, b"hello from child as\n".as_ptr(), 20) == 0;
+            let code_ok = vmo_write(child_vmo, 0x1100, code_bytes.as_ptr(), 32) == 0;
+            if !string_ok {
+                log(b" child as=nop (string write fail)\n");
+            } else if !code_ok {
+                log(b" child as=nop (code write fail)\n");
+            } else {
+                // A *fresh* child: its VMAR carries only the executable code mapping below, so
+                // AddressSpaceCreate builds a clean tree. (Reusing the P8/P9 child would inherit
+                // its READ-only initrd mapping at the same VA, which loses the L2 slot to a UXN
+                // 2 MiB block and faults the code fetch.)
+                let child_as_h = process_create(0x0000_0000_0000_0000, 0x0000_0000_2000_0000);
+                if child_as_h != u64::MAX {
+                    let child_as = Handle(child_as_h as u32);
+                    // Map the 2 pages holding the string (0x1000) and code (0x1100) at child VA
+                    // 0x10000000 as RX (READ|EXECUTE = 5): W^X-clean and page-granular, so the
+                    // code's L3 entries share a table with the stack below instead of colliding on
+                    // a 2 MiB block.
+                    if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) != 0 {
+                        log(b" child as=nop (map fail)\n");
+                    } else if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
+                        log(b" child as=nop (addr space fail)\n");
+                    } else {
+                        let run_as = process_run(child_as, 0x10001100, 0x1000FFF0, 0);
+                        log(b" child as run=");
+                        if run_as == 0 {
+                            log(b"ok\n");
+                        } else {
+                            log(b"fail\n");
+                        }
+                    }
+                } else {
+                    log(b" child as=nop (process create fail)\n");
+                }
+            }
         }
     }
 
-    // P10-a: VmoWrite demo — write to the initrd VMO, read back.
-    if vmo_write(initrd, 8, b"VMO_OK\n".as_ptr(), 6) == 0 {
+    // P10-b: VmoWrite/VmoRead demo on anonymous backing.
+    let scratch_h = vmo_create(0x1000);
+    if scratch_h != u64::MAX {
+        let scratch = Handle(scratch_h as u32);
         let mut vbuf = [0u8; 8];
-        if vmo_read(initrd, 8, vbuf.as_mut_ptr(), 6) == 0 && &vbuf[..6] == b"VMO_OK" {
-            debug_write(b"vmo write ok\n".as_ptr(), 12);
+        if vmo_write(scratch, 8, b"VMO_OK\n".as_ptr(), 6) == 0
+            && vmo_read(scratch, 8, vbuf.as_mut_ptr(), 6) == 0
+            && &vbuf[..6] == b"VMO_OK"
+        {
+            log(b"anon vmo write ok\n");
         }
     }
 

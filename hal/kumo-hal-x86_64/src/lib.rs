@@ -326,6 +326,7 @@ pub struct UserMapping {
     pub len: u64,
     pub writable: bool,
     pub device: bool,
+    pub executable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
