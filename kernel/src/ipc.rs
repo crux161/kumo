@@ -303,6 +303,18 @@ impl IpcRegistry {
         Err(IpcError::NotChannel)
     }
 
+    pub fn peer_koid_for(&self, koid: KoId) -> Result<KoId, IpcError> {
+        for channel in &self.channels {
+            if channel.object(ChannelEnd::Left).koid() == koid {
+                return Ok(channel.object(ChannelEnd::Right).koid());
+            }
+            if channel.object(ChannelEnd::Right).koid() == koid {
+                return Ok(channel.object(ChannelEnd::Left).koid());
+            }
+        }
+        Err(IpcError::NotChannel)
+    }
+
     /// Access a [`ChannelPair`] by its index in the registry (returned by
     /// [`channel_create`](Self::channel_create)). Used by the kernel to read/write
     /// its own channel endpoint directly, without going through a handle table.

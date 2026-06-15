@@ -352,8 +352,6 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             usermode::disable_console_route();
             klog!("CONSOLE ROUTE      Check     probe 0 svc  direct fallback   FAIL\n");
         }
-        klog!("HEAPDBG after console-route used={}\n", crate::mm::heap::used());
-
         // P7-g: the kernel as a *client* of the userspace block server. Two reads of
         // the "disk" (the initrd) served by Sora over the block channel, verified by
         // value: the KUMORD01 magic at offset 0, and the first entry's path at offset
@@ -425,7 +423,6 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 }
             }
 
-            klog!("HEAPDBG after block used={}\n", crate::mm::heap::used());
             // P9-e: verify Sora transferred a handle via the net channel.
             if usermode::net_check_transfer() {
                 klog!("HANDLE XFER        Check     net channel  via sora   OK\n");
@@ -457,16 +454,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 } else {
                     None
                 };
-                if let (Some(port_h), Some((h0, _h1))) = (port_h, ch_pair) {
+                if let (Some(port_h), Some((h0, h1))) = (port_h, ch_pair) {
                     // Bind port to channel
                     s.engine.dispatch(
                         &mut s.process,
                         KernelCall::PortBindChannel {
                             port: port_h,
-                            channel: h0,
+                            channel: h1,
                         },
                     );
-                    // Write to channel → should signal port
+                    // Write to h0 delivers to h1, which should signal the bound port.
                     let msg = Message::new(1, b"x", &[]).unwrap();
                     s.engine.dispatch(
                         &mut s.process,
@@ -497,18 +494,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     }
                 }
 
-                klog!("HEAPDBG before net used={}\n", crate::mm::heap::used());
                 // Net loopback: send "ping" on the net channel, Sora echoes it.
                 let mut lb_buf = [0u8; 8];
                 let lb_n = usermode::net_loopback(b"ping", &mut lb_buf);
                 let lb_ok = lb_n == 4 && &lb_buf[..4] == b"ping";
-                klog!("HEAPDBG after ping used={}\n", crate::mm::heap::used());
-                // Multi-connection: send "conn" to create a new connection channel.
+                // Multi-connection control token. Real capability transfer waits for
+                // child/channel syscalls; the POST checks that Sora's net route responds.
                 let mut cn_buf = [0u8; 8];
                 let cn_n = usermode::net_loopback(b"conn", &mut cn_buf);
-                klog!("HEAPDBG after conn used={}\n", crate::mm::heap::used());
                 let cn_ok = cn_n >= 1 && cn_buf[0] != b'e';
-                // P9-f: named pipe — two "pipe:test" requests return paired channel ends.
+                // P9-f: named pipe control token; two requests must get non-error acks.
                 let mut p1_buf = [0u8; 8];
                 let p1_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
                 let p2_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);

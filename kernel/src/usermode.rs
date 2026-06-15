@@ -828,9 +828,21 @@ fn attempt_sora(
 
     // Koids of Sora's own channel ends — the koids Sora binds to its serve-loop port.
     // Resolved from the handle table before `process` is moved into `SoraState`.
-    let console_koid = process.handles().get(console_handle).map(|e| e.koid).unwrap_or(KoId(0));
-    let block_koid = process.handles().get(block_handle).map(|e| e.koid).unwrap_or(KoId(0));
-    let net_koid = process.handles().get(net_handle).map(|e| e.koid).unwrap_or(KoId(0));
+    let console_koid = process
+        .handles()
+        .get(console_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+    let block_koid = process
+        .handles()
+        .get(block_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
+    let net_koid = process
+        .handles()
+        .get(net_handle)
+        .map(|e| e.koid)
+        .unwrap_or(KoId(0));
 
     // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
     // restart loop — the hook never needs it.)

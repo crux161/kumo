@@ -7,10 +7,10 @@ use core::panic::PanicInfo;
 
 use kumo_abi::Handle;
 use kumo_rt::{
-    address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
-    channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind_channel,
-    port_create, port_wait, process_create, process_exit, process_run, thread_create, thread_start,
-    vmar_map, vmo_create, vmo_read, vmo_write,
+    address_space_create, channel_create, channel_read, channel_write, channel_write_with_handle,
+    debug_write, handle_koid, interrupt_create, port_bind_channel, port_create, port_wait,
+    process_create, process_exit, process_run, thread_create, thread_start, vmar_map, vmo_create,
+    vmo_read, vmo_write,
 };
 use kumoza::parse;
 
@@ -387,12 +387,6 @@ extern "C" fn sora_main(
         let mut block_buf = [0u8; 512];
         let mut line_buf = [0u8; 256];
         let mut line_pos = 0usize;
-        let mut conn_handles = [Handle(0); 4];
-        let mut conn_koids = [Handle(0); 4];
-        let mut conn_peers = [Handle(0); 4]; // P9-g: peer handle for pipes
-        let mut conn_names = [[0u8; 32]; 4];
-        let mut conn_name_lens = [0usize; 4];
-        let mut conn_count = 0usize;
         loop {
             let source = Handle(port_wait(port) as u32);
             // console handler — output only (klog! → DebugWrite)
@@ -436,154 +430,17 @@ extern "C" fn sora_main(
                     channel_write(block, block_buf.as_ptr(), served);
                 }
             }
-            // net handler — loopback echo + multi-connection "conn" requests
+            // net handler — loopback echo + lightweight control acks.
             if source == net_k {
                 let n = channel_read(net, serve_buf.as_mut_ptr(), 256) as usize;
-                if n > 5 && &serve_buf[..5] == b"pipe:" && conn_count + 1 < conn_handles.len() {
-                    // P9-f: named pipe. Two "pipe:NAME" requests return paired channel
-                    // ends. The first request stores the name; the second request finds
-                    // the match and returns the complementary handle.
-                    let name = &serve_buf[5..n];
-                    let mut matched = false;
-                    // Check if this name already has a pending pipe.
-                    for i in 0..conn_count {
-                        if conn_name_lens[i] == name.len() && &conn_names[i][..name.len()] == name {
-                            // Match found: create a new channel pair, give one end to
-                            // the existing holder, return the other to the caller.
-                            let (h0, h1) = channel_create_pair();
-                            if h0 != u64::MAX && h1 != u64::MAX {
-                                let r0 = Handle(h0 as u32);
-                                let _r1 = Handle(h1 as u32);
-                                let lk = handle_koid(r0);
-                                if lk != u64::MAX {
-                                    port_bind_channel(port, r0);
-                                    conn_handles[conn_count] = r0;
-                                    conn_koids[conn_count] = Handle(lk as u32);
-                                    conn_peers[conn_count] = conn_handles[i];
-                                    conn_peers[i] = r0;
-                                    conn_count += 1;
-                                    // Send r0 to the EXISTING holder via their channel.
-                                    let mut dbuf = [0u8; 8];
-                                    let mut dv = r0.0 as u64;
-                                    let mut di = 8;
-                                    loop {
-                                        di -= 1;
-                                        dbuf[di] = b'0' + (dv % 10) as u8;
-                                        dv /= 10;
-                                        if dv == 0 {
-                                            break;
-                                        }
-                                    }
-                                    channel_write(conn_handles[i], dbuf[di..].as_ptr(), 8 - di);
-                                }
-                            }
-                            // Return r1 (remote end of new pair) to the caller.
-                            let mut rb = [0u8; 8];
-                            let mut rv = if h1 != u64::MAX { h1 as u64 } else { 0 };
-                            let mut ri = 8;
-                            if rv == 0 {
-                                rb[0] = b'0';
-                                ri = 7;
-                            } else {
-                                loop {
-                                    ri -= 1;
-                                    rb[ri] = b'0' + (rv % 10) as u8;
-                                    rv /= 10;
-                                    if rv == 0 {
-                                        break;
-                                    }
-                                }
-                            }
-                            channel_write(net, rb[ri..].as_ptr(), 8 - ri);
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if !matched {
-                        // First request: create a channel pair, store the local end
-                        // as a pending pipe with this name.
-                        let (h0, h1) = channel_create_pair();
-                        if h0 != u64::MAX && h1 != u64::MAX {
-                            let local = Handle(h0 as u32);
-                            let lk = handle_koid(local);
-                            if lk != u64::MAX {
-                                port_bind_channel(port, local);
-                                conn_handles[conn_count] = local;
-                                conn_koids[conn_count] = Handle(lk as u32);
-                                // Store the name for matching.
-                                if name.len() <= 32 {
-                                    let mut nbuf = [0u8; 32];
-                                    nbuf[..name.len()].copy_from_slice(name);
-                                    conn_names[conn_count] = nbuf;
-                                    conn_name_lens[conn_count] = name.len();
-                                }
-                                conn_count += 1;
-                            }
-                        }
-                        // Return remote handle to caller.
-                        let mut rb = [0u8; 8];
-                        let mut rv = if h1 != u64::MAX { h1 as u64 } else { 0 };
-                        let mut ri = 8;
-                        if rv == 0 {
-                            rb[0] = b'0';
-                            ri = 7;
-                        } else {
-                            loop {
-                                ri -= 1;
-                                rb[ri] = b'0' + (rv % 10) as u8;
-                                rv /= 10;
-                                if rv == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        channel_write(net, rb[ri..].as_ptr(), 8 - ri);
-                    }
-                } else if n == 4 && &serve_buf[..4] == b"conn" && conn_count < conn_handles.len() {
-                    let (h0, h1) = channel_create_pair();
-                    if h0 != u64::MAX && h1 != u64::MAX {
-                        let local = Handle(h0 as u32);
-                        let remote = Handle(h1 as u32);
-                        let lk = handle_koid(local);
-                        if lk != u64::MAX {
-                            port_bind_channel(port, local);
-                            conn_handles[conn_count] = local;
-                            conn_koids[conn_count] = Handle(lk as u32);
-                            conn_count += 1;
-                            let mut dbuf = [0u8; 8];
-                            let mut dv = remote.0 as u64;
-                            let mut di = 8;
-                            loop {
-                                di -= 1;
-                                dbuf[di] = b'0' + (dv % 10) as u8;
-                                dv /= 10;
-                                if dv == 0 {
-                                    break;
-                                }
-                            }
-                            channel_write(net, dbuf[di..].as_ptr(), 8 - di);
-                        } else {
-                            channel_write(net, b"err".as_ptr(), 3);
-                        }
-                    } else {
-                        channel_write(net, b"err".as_ptr(), 3);
-                    }
+                if n == 4 && &serve_buf[..4] == b"conn" {
+                    // The kernel POST cannot receive Sora-process handles as capabilities yet.
+                    // Return a protocol token instead of allocating ephemeral local channels.
+                    channel_write(net, b"conn".as_ptr(), 4);
+                } else if n > 5 && &serve_buf[..5] == b"pipe:" {
+                    channel_write(net, b"pipe".as_ptr(), 4);
                 } else if n > 0 {
                     channel_write(net, serve_buf.as_ptr(), n);
-                }
-            }
-            // connection handlers — forward to peer if paired, else echo
-            for i in 0..conn_count {
-                if source == conn_koids[i] {
-                    let n = channel_read(conn_handles[i], serve_buf.as_mut_ptr(), 256) as usize;
-                    if n > 0 {
-                        let dest = if conn_peers[i].0 != 0 {
-                            conn_peers[i]
-                        } else {
-                            conn_handles[i]
-                        };
-                        channel_write(dest, serve_buf.as_ptr(), n);
-                    }
                 }
             }
             // keyboard handler — input only (keystrokes → line buffer)

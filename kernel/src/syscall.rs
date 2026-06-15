@@ -236,8 +236,8 @@ impl SyscallEngine {
         }
     }
 
-    /// Bind a channel to a port. When a message arrives on the channel, the port
-    /// is signalled with `Signals::READABLE` and the channel's koid as source.
+    /// Bind a channel endpoint to a port. When a message arrives at that endpoint,
+    /// the port is signalled with `Signals::READABLE` and the endpoint koid as source.
     pub fn port_bind_channel(&mut self, port_koid: KoId, channel_koid: KoId) {
         self.port_bindings.push((port_koid, channel_koid));
     }
@@ -407,10 +407,14 @@ impl SyscallEngine {
                 }
             }
             KernelCall::ChannelWrite { channel, message } => {
-                let ch_koid = process.handles().get(channel).map(|e| e.koid).ok();
+                let signal_koid = process
+                    .handles()
+                    .get(channel)
+                    .ok()
+                    .and_then(|e| self.ipc.peer_koid_for(e.koid).ok());
                 let status = match self.ipc.channel_write(process, channel, message) {
                     Ok(()) => {
-                        if let Some(koid) = ch_koid {
+                        if let Some(koid) = signal_koid {
                             self.signal_channel_ports(koid);
                         }
                         Errno::Ok.status()
@@ -1159,6 +1163,55 @@ mod tests {
         };
         assert_eq!(message.header.ordinal, 4);
         assert_eq!(message.bytes(), b"hello");
+    }
+
+    #[test]
+    fn channel_write_signals_peer_endpoint_port() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let peer_port = create_port(&mut engine, &mut process);
+        let writer_port = create_port(&mut engine, &mut process);
+        let (left, right) = create_channel(&mut engine, &mut process);
+
+        let bind = engine.dispatch(
+            &mut process,
+            KernelCall::PortBindChannel {
+                port: peer_port,
+                channel: right,
+            },
+        );
+        assert_eq!(bind, KernelCallResult::Status(Errno::Ok.status()));
+
+        let bind_writer = engine.dispatch(
+            &mut process,
+            KernelCall::PortBindChannel {
+                port: writer_port,
+                channel: left,
+            },
+        );
+        assert_eq!(bind_writer, KernelCallResult::Status(Errno::Ok.status()));
+
+        let write = engine.dispatch(
+            &mut process,
+            KernelCall::ChannelWrite {
+                channel: left,
+                message: Message::new(4, b"x", &[]).unwrap(),
+            },
+        );
+        assert_eq!(write, KernelCallResult::Status(Errno::Ok.status()));
+
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port: writer_port }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+
+        let result = engine.dispatch(&mut process, KernelCall::PortWait { port: peer_port });
+        let KernelCallResult::PortPacket(packet) = result else {
+            panic!("expected peer endpoint port packet");
+        };
+        let right_koid = process.handles().get(right).unwrap().koid;
+        assert_eq!(packet.source, right_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::READABLE));
     }
 
     #[test]
