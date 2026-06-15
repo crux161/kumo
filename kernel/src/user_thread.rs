@@ -10,6 +10,7 @@
 
 use core::cell::UnsafeCell;
 
+use kumo_abi::{Errno, KoId, Status};
 use kumo_hal::active::{switch_context, ThreadContext, UserState};
 
 use crate::mm::PAGE_SIZE;
@@ -18,6 +19,7 @@ use crate::sched::{ClassId, Decision, Dispatcher, Priority};
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
+const CHILD_PRIORITY: Priority = Priority(63);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserSchedError {
@@ -41,6 +43,20 @@ pub struct UserSched {
     pub user_ttbr0: u64,
     /// The user thread.
     pub user_thread: Thread,
+    /// True until the first switch into Sora's `kumo_user_enter` trampoline.
+    pub user_fresh: bool,
+    /// A scheduler-hosted child spawned by Sora's `ProcessRun` demo.
+    pub child_thread: Option<Thread>,
+    /// True until the first switch into the child's `kumo_user_enter` trampoline.
+    pub child_fresh: bool,
+    /// The child process's TTBR0 tree.
+    pub child_ttbr0: u64,
+    /// The child process koid.
+    pub child_process: Option<KoId>,
+    /// The child exit code.
+    pub child_exit_code: u64,
+    /// True once the child thread has terminated.
+    pub child_done: bool,
     /// Whether the user thread has been started (admitted to the scheduler).
     pub started: bool,
     /// Accumulated context-switch count.
@@ -96,6 +112,15 @@ fn sched_ptr() -> *mut UserSched {
     }
 }
 
+fn set_active_ttbr0(root: u64) {
+    #[cfg(target_os = "none")]
+    unsafe {
+        kumo_hal::active::set_ttbr0(root)
+    };
+    #[cfg(not(target_os = "none"))]
+    kumo_hal::active::set_ttbr0(root);
+}
+
 /// Create a `ThreadContext` for the first entry of a user thread. `x19_entry` points at
 /// the `UserState`; `x30_lr` is `kumo_user_enter` (not `kumo_context_trampoline`).
 fn user_entry_context(user_state: *const UserState, kernel_sp: usize) -> ThreadContext {
@@ -134,14 +159,20 @@ pub unsafe fn pin_boot_context(ctx: &ThreadContext) {
 
 /// Initialise the scheduler-driven user-thread harness. `boot` provides the frame
 /// allocator; `objects` provides the kernel object store.
-pub fn init(objects: &mut ObjectManager, kernel_ttbr0: u64) -> Result<(), UserSchedError> {
+pub fn init(
+    objects: &mut ObjectManager,
+    user_proc_koid: KoId,
+    user_root_vmar: crate::mm::Vmar,
+    kernel_ttbr0: u64,
+) -> Result<(), UserSchedError> {
     let job = Job::root(objects);
     let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).expect("kernel vmar");
-    let process = Process::new(objects, &job, vmar);
+    let idle_process = Process::new(objects, &job, vmar);
+    let user_process = Process::from_parts(user_proc_koid, user_root_vmar);
 
     let idle = Thread::new(
         objects,
-        &process,
+        &idle_process,
         idle_body as extern "C" fn(usize) as usize,
         0,
         DEFAULT_KERNEL_STACK_SIZE,
@@ -162,12 +193,19 @@ pub fn init(objects: &mut ObjectManager, kernel_ttbr0: u64) -> Result<(), UserSc
             user_ttbr0: 0,
             user_thread: Thread::new(
                 objects,
-                &process,
+                &user_process,
                 0, // placeholder; overridden in spawn_user
                 0,
                 DEFAULT_KERNEL_STACK_SIZE,
             )
             .map_err(|_| UserSchedError::OutOfFrames)?,
+            user_fresh: true,
+            child_thread: None,
+            child_fresh: false,
+            child_ttbr0: 0,
+            child_process: None,
+            child_exit_code: 0,
+            child_done: false,
             started: false,
             switches: 0,
             exit_code: 0,
@@ -175,6 +213,100 @@ pub fn init(objects: &mut ObjectManager, kernel_ttbr0: u64) -> Result<(), UserSc
         });
     }
     Ok(())
+}
+
+/// The process koid for the EL0 thread currently represented by the dispatcher, if any.
+pub fn current_process_koid() -> Option<KoId> {
+    let p = sched_ptr();
+    unsafe {
+        let s = &*p;
+        let current = s.dispatcher.current()?;
+        if current == s.user_thread.koid() {
+            Some(s.user_thread.process())
+        } else if let Some(child) = &s.child_thread {
+            if current == child.koid() {
+                Some(child.process())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Run a child process as a real scheduler participant. Returns after the child exits
+/// and Sora's `ProcessRun` syscall context is resumed.
+pub fn run_child(
+    objects: &mut ObjectManager,
+    proc_koid: KoId,
+    root_vmar: crate::mm::Vmar,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+) -> Status {
+    let temp_process = Process::from_parts(proc_koid, root_vmar);
+    let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
+        Ok(thread) => thread,
+        Err(_) => return Errno::NoMemory.status(),
+    };
+
+    let p = sched_ptr();
+    let next_ctx = unsafe {
+        let s = &mut *p;
+        if s.child_thread.is_some() && !s.child_done {
+            return Errno::ShouldWait.status();
+        }
+
+        s.child_thread = Some(new_child);
+        s.child_fresh = true;
+        s.child_ttbr0 = ttbr0;
+        s.child_process = Some(proc_koid);
+        s.child_exit_code = 0;
+        s.child_done = false;
+
+        let child = s.child_thread.as_mut().expect("child just installed");
+        child.user_state = Some(UserState {
+            x: {
+                let mut x = [0u64; 31];
+                x[0] = arg;
+                x
+            },
+            elr: entry,
+            spsr: 0,
+            sp_el0: sp,
+            ttbr0,
+        });
+        let state_ptr = child.user_state.as_ref().expect("child user state") as *const UserState;
+        let kernel_sp = child.stack().top();
+        *child.context_mut() = user_entry_context(state_ptr, kernel_sp);
+        child.ready();
+
+        s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
+        let decision = s.dispatcher.reschedule_current();
+        dispatch_context(s, decision)
+    };
+
+    if let Some((prev, next)) = next_ctx {
+        unsafe { switch_context(prev, next) };
+    }
+
+    let exit_code = unsafe {
+        let s = &mut *p;
+        let code = s.child_exit_code;
+        s.child_thread = None;
+        s.child_fresh = false;
+        s.child_ttbr0 = 0;
+        s.child_process = None;
+        s.child_done = false;
+        code
+    };
+    if exit_code == 0 {
+        Errno::Ok.status()
+    } else {
+        Errno::Internal.status()
+    }
 }
 
 /// Spawn a user thread: build its `UserState` from the ELF image, admit it to the
@@ -190,8 +322,14 @@ pub unsafe fn spawn_user(user_state: UserState, user_ttbr0: u64) {
         let s = &mut *p;
         s.user_ttbr0 = user_ttbr0;
         // Build a Thread for the user. Reuse the one allocated in `init`.
+        s.user_thread.user_state = Some(user_state);
+        let state_ptr = s
+            .user_thread
+            .user_state
+            .as_ref()
+            .expect("user state just installed") as *const UserState;
         let kernel_sp = s.user_thread.stack().top();
-        let ctx = user_entry_context(&user_state as *const UserState, kernel_sp);
+        let ctx = user_entry_context(state_ptr, kernel_sp);
 
         // Overwrite the thread's kernel context.
         *s.user_thread.context_mut() = ctx;
@@ -219,7 +357,7 @@ pub unsafe fn spawn_user(user_state: UserState, user_ttbr0: u64) {
 /// unmask IRQs (the trampoline hazard `kumo_context_trampoline` documents).
 fn boot_flow_resumed(p: *mut UserSched) {
     let kernel_ttbr0 = unsafe { (&*p).kernel_ttbr0 };
-    unsafe { kumo_hal::active::set_ttbr0(kernel_ttbr0) };
+    set_active_ttbr0(kernel_ttbr0);
     kumo_hal::active::irq_unmask();
 }
 
@@ -257,10 +395,6 @@ pub fn wake_user() {
         dispatch_context(s, decision)
     };
     if let Some((prev, next)) = switch {
-        // The user thread resumes inside its saved SVC context and will `eret` to EL0:
-        // its process page tables must be active again.
-        let user_ttbr0 = unsafe { (&*p).user_ttbr0 };
-        unsafe { kumo_hal::active::set_ttbr0(user_ttbr0) };
         unsafe { switch_context(prev, next) };
         boot_flow_resumed(p);
     }
@@ -273,9 +407,26 @@ pub fn exit_current_user(exit_code: u64) -> ! {
     let p = sched_ptr();
     let switch = unsafe {
         let s = &mut *p;
-        s.exit_code = exit_code;
-        s.user_thread.terminate();
-        s.done = true;
+        match s.dispatcher.current() {
+            Some(current) if current == s.user_thread.koid() => {
+                s.exit_code = exit_code;
+                s.user_thread.terminate();
+                s.done = true;
+            }
+            Some(current)
+                if s.child_thread
+                    .as_ref()
+                    .map(|child| child.koid() == current)
+                    .unwrap_or(false) =>
+            {
+                s.child_exit_code = exit_code;
+                s.child_done = true;
+                if let Some(child) = s.child_thread.as_mut() {
+                    child.terminate();
+                }
+            }
+            _ => {}
+        }
         let decision = s.dispatcher.finish_current();
         dispatch_context(s, decision)
     };
@@ -316,6 +467,15 @@ fn dispatch_context(
                         s.user_thread.ready();
                     }
                     s.user_thread.context_mut() as *mut ThreadContext
+                } else if let Some(child) = s.child_thread.as_mut() {
+                    if from_id == child.koid() {
+                        if matches!(child.state(), ThreadState::Running) {
+                            child.ready();
+                        }
+                        child.context_mut() as *mut ThreadContext
+                    } else {
+                        &mut s.boot_ctx as *mut ThreadContext
+                    }
                 } else {
                     // idle (or unknown) = the boot flow's save slot.
                     &mut s.boot_ctx as *mut ThreadContext
@@ -325,12 +485,34 @@ fn dispatch_context(
             };
             let next = if to == s.user_thread.koid() {
                 s.user_thread.run();
+                if s.user_fresh {
+                    s.user_fresh = false;
+                } else {
+                    set_active_ttbr0(s.user_ttbr0);
+                }
                 s.user_thread.context() as *const ThreadContext
+            } else if let Some(child) = s.child_thread.as_mut() {
+                if to == child.koid() {
+                    child.run();
+                    if s.child_fresh {
+                        s.child_fresh = false;
+                    } else {
+                        set_active_ttbr0(s.child_ttbr0);
+                    }
+                    child.context() as *const ThreadContext
+                } else {
+                    if to == s.idle.koid() {
+                        s.idle.run(); // dispatcher bookkeeping only; idle_body never executes
+                    }
+                    set_active_ttbr0(s.kernel_ttbr0);
+                    &s.boot_ctx as *const ThreadContext
+                }
             } else {
                 // idle (or unknown) = resume the suspended boot flow.
                 if to == s.idle.koid() {
                     s.idle.run(); // dispatcher bookkeeping only; idle_body never executes
                 }
+                set_active_ttbr0(s.kernel_ttbr0);
                 &s.boot_ctx as *const ThreadContext
             };
             Some((prev, next))

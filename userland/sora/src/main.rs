@@ -242,40 +242,14 @@ extern "C" fn sora_main(
         } else {
             debug_write(b" thread=fail\n".as_ptr(), 13);
         }
-        // P9-h: create a channel pair, pass one end to the child as bootstrap arg,
-        // then read what the child wrote to the other end. Proves cross-process
-        // data flow through channels.
-        let (h0, h1) = channel_create_pair();
-        let child_sp = 0x0000_0000_101F_8000u64;
-        let run_ok = if h0 != u64::MAX && h1 != u64::MAX {
-            let child_pipe = h1; // goes to child (in x0)
-            let sora_pipe = Handle(h0 as u32); // Sora keeps this end
-            extern "C" {
-                fn child_payload(pipe: u64) -> !;
-            }
-            let ok = process_run(
-                child,
-                child_payload as *const () as usize as u64,
-                child_sp,
-                child_pipe,
-            );
-            // After child exits, read what it wrote to our pipe end.
-            let mut pipe_buf = [0u8; 32];
-            let pn = channel_read(sora_pipe, pipe_buf.as_mut_ptr(), 32) as usize;
-            if pn > 0 {
-                debug_write(b"pipe from child: ".as_ptr(), 17);
-                debug_write(pipe_buf.as_ptr(), pn);
-            }
-            ok
-        } else {
-            u64::MAX
-        };
-        debug_write(b" run=".as_ptr(), 5);
-        if run_ok == 0 {
-            debug_write(b"ok\n".as_ptr(), 3);
-        } else {
-            debug_write(b"fail\n".as_ptr(), 5);
-        }
+        // P9-h (retired): a cross-process pipe was demonstrated here by `process_run`ing
+        // `child_payload` in Sora's *shared* address space. P10 replaced that fiction with
+        // real per-process address spaces, and `ProcessRun` now requires one (built via
+        // AddressSpaceCreate) and runs the child as a scheduled thread on its own TTBR0 —
+        // so a shared-AS "child" is no longer valid. The P10 child-AS demo below is the
+        // successor; cross-process IPC from a real child returns once a child process may
+        // issue channel syscalls (today the SVC hook limits non-Sora processes to
+        // DebugWrite).
     }
 
     // P9-a: create an Interrupt object bound to the timer IRQ (27). The handle
@@ -430,7 +404,13 @@ extern "C" fn sora_main(
             }
             if source == blk_koid {
                 let n = channel_read(block, serve_buf.as_mut_ptr(), 256) as usize;
-                if n == 16 {
+                if n == 0 {
+                    // Spurious wake: our own reply re-signalled this port (the engine signals
+                    // the writer's bound port on every ChannelWrite). The request was already
+                    // consumed, so the inbox is empty — do NOT reply, or each empty read writes
+                    // another reply that re-signals again, spinning the serve loop until the
+                    // kernel heap is exhausted.
+                } else if n == 16 {
                     let offset = u64::from_le_bytes(serve_buf[..8].try_into().unwrap());
                     let len = u64::from_le_bytes(serve_buf[8..16].try_into().unwrap());
                     let len = (len as usize).min(block_buf.len());
@@ -817,21 +797,6 @@ fn serve_file_read_at(
 /// P7-j simple path read: entire file from offset 0 (backward compatible).
 fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
     serve_file_read_at(initrd, path, 0, out.len() as u64, out)
-}
-
-/// P8-l: child process payload. Receives a bootstrap handle in x0 (P9-h: pipe
-/// handle for data-flow test). Writes a message to it and exits.
-#[no_mangle]
-extern "C" fn child_payload(pipe_handle: u64) -> ! {
-    debug_write(b"child hello\n".as_ptr(), 12);
-    if pipe_handle != 0 {
-        channel_write(
-            Handle(pipe_handle as u32),
-            b"child pipe test\n".as_ptr(),
-            16,
-        );
-    }
-    process_exit(0);
 }
 
 #[panic_handler]

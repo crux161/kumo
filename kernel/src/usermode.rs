@@ -14,8 +14,7 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use kumo_abi::{
-    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, Rights, Status,
-    SORA_INIT_PATH,
+    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, Rights, SORA_INIT_PATH,
 };
 use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment, UserMapping, UserState};
 use kumo_hal::PageFlags;
@@ -73,6 +72,13 @@ pub(crate) struct SoraState {
     pub keyboard_channel: usize,
     /// The kernel's endpoint for the keyboard channel.
     pub keyboard_kernel_end: ChannelEnd,
+    /// Koids of Sora's *own* ends of the console/block/net channels — the koids Sora binds
+    /// to its serve-loop `Port`. A kernel-side write to one of these channels signals the
+    /// matching port (`signal_channel_ports`) so Sora's `PortWait` wakes; the engine's
+    /// `ChannelWrite` does this for user writes, but the kernel writes pairs directly.
+    pub console_koid: KoId,
+    pub block_koid: KoId,
+    pub net_koid: KoId,
     /// Bytes written by `DebugWrite` syscalls during this run.
     pub wrote: usize,
 }
@@ -80,22 +86,6 @@ pub(crate) struct SoraState {
 struct SoraCell(UnsafeCell<Option<SoraState>>);
 unsafe impl Sync for SoraCell {}
 static SORA: SoraCell = SoraCell(UnsafeCell::new(None));
-
-/// Minimal state for a child process running synchronously via [`ProcessRun`].
-struct ChildState {
-    engine: SyscallEngine,
-    process: Process,
-    wrote: usize,
-}
-
-struct ChildCell(UnsafeCell<Option<ChildState>>);
-unsafe impl Sync for ChildCell {}
-static CHILD: ChildCell = ChildCell(UnsafeCell::new(None));
-
-fn child_ptr() -> *mut ChildState {
-    let opt: *mut Option<ChildState> = CHILD.0.get();
-    unsafe { (&mut *opt).as_mut().expect("child state not initialized") as *mut ChildState }
-}
 
 fn sora_ptr() -> *mut SoraState {
     let opt: *mut Option<SoraState> = SORA.0.get();
@@ -157,7 +147,7 @@ pub fn net_loopback(data: &[u8], buf: &mut [u8]) -> usize {
             return 0;
         }
     }
-    crate::user_thread::wake_user();
+    signal_and_wake(unsafe { &*sora_ptr() }.net_koid);
     let sora = unsafe { &mut *sora_ptr() };
     let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.net_channel) else {
         return 0;
@@ -171,47 +161,6 @@ pub fn net_loopback(data: &[u8], buf: &mut [u8]) -> usize {
         }
         Err(_) => 0,
     }
-}
-
-/// P8-l: run a child process synchronously via `kumo_enter_el0`. The child shares
-/// Sora's TTBR0 (same address space scaffold). Returns 0 on success.
-#[cfg(target_os = "none")]
-pub fn run_child(
-    proc_koid: kumo_abi::KoId,
-    root_vmar: Vmar,
-    entry: u64,
-    sp: u64,
-    arg: u64,
-) -> Status {
-    // Look up the real process to get its TTBR0 (if AddressSpaceCreate was called).
-    let sora = unsafe { &mut *sora_ptr() };
-    let child_ttbr0 = sora.engine.process_by_koid(proc_koid).and_then(|p| p.ttbr0);
-    let child_proc = Process::from_parts(proc_koid, root_vmar);
-    unsafe {
-        *CHILD.0.get() = Some(ChildState {
-            engine: SyscallEngine::new(),
-            process: child_proc,
-            wrote: 0,
-        });
-    }
-    // Swap to child TTBR0 if separate address space was built.
-    let sora_ttbr0 = if child_ttbr0.is_some() {
-        let ttbr0 = kumo_hal::active::read_ttbr0();
-        unsafe { kumo_hal::active::set_ttbr0(child_ttbr0.unwrap()) };
-        Some(ttbr0)
-    } else {
-        None
-    };
-    extern "C" {
-        fn kumo_enter_el0(entry: u64, user_sp: u64, arg0: u64) -> u64;
-    }
-    let _exit_code = unsafe { kumo_enter_el0(entry, sp, arg) };
-    // Restore Sora's TTBR0.
-    if let Some(ttbr0) = sora_ttbr0 {
-        unsafe { kumo_hal::active::set_ttbr0(ttbr0) };
-    }
-    unsafe { (&mut *CHILD.0.get()).take() };
-    Errno::Ok.status()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -276,34 +225,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
 
-    // P8-l: if a child process is running synchronously, handle only DebugWrite
-    // and ProcessExit. Everything else returns error.
-    {
-        let child_opt: *mut Option<ChildState> = CHILD.0.get();
-        if unsafe { (&*child_opt).is_some() } {
-            if num == Syscall::ProcessExit as u64 {
-                unsafe { (&mut *CHILD.0.get()).take() };
-                kumo_hal::active::el0_exit(r[0]);
-            }
-            let child = unsafe { &mut *child_ptr() };
-            if num == Syscall::DebugWrite as u64 {
-                let user_ptr = r[0];
-                let len = (r[1] as usize).min(256);
-                if !user_range_ok(&child.process, user_ptr, len as u64) {
-                    r[0] = u64::MAX;
-                    return;
-                }
-                let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-                kumo_hal::active::early_console_write(bytes);
-                child.wrote += len;
-                r[0] = len as u64;
-            } else {
-                r[0] = u64::MAX;
-            }
-            return;
-        }
-    }
-
     if num == Syscall::ProcessExit as u64 {
         if crate::user_thread::is_started() {
             crate::user_thread::exit_current_user(r[0]);
@@ -312,6 +233,29 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 
     let sora = unsafe { &mut *sora_ptr() };
+
+    if let Some(current_process) = crate::user_thread::current_process_koid() {
+        if current_process != sora.process.koid() {
+            if num == Syscall::DebugWrite as u64 {
+                let user_ptr = r[0];
+                let len = (r[1] as usize).min(256);
+                let Some(child_process) = sora.engine.process_by_koid(current_process) else {
+                    r[0] = u64::MAX;
+                    return;
+                };
+                if !user_range_ok(child_process, user_ptr, len as u64) {
+                    r[0] = u64::MAX;
+                    return;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+                kumo_hal::active::early_console_write(bytes);
+                r[0] = len as u64;
+            } else {
+                r[0] = u64::MAX;
+            }
+            return;
+        }
+    }
 
     if num == Syscall::DebugWrite as u64 {
         let user_ptr = r[0];
@@ -385,6 +329,14 @@ extern "C" fn svc_hook(regs: *mut u64) {
             .dispatch(&mut sora.process, KernelCall::HandleKoid { handle })
         {
             KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortCreate as u64 {
+        match sora
+            .engine
+            .dispatch(&mut sora.process, KernelCall::PortCreate)
+        {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::PortBindChannel as u64 {
@@ -672,6 +624,9 @@ pub fn run(boot: &BootInfo) -> UserReport {
             net_kernel_end: ChannelEnd::Left,
             keyboard_channel: 0,
             keyboard_kernel_end: ChannelEnd::Left,
+            console_koid: KoId(0),
+            block_koid: KoId(0),
+            net_koid: KoId(0),
             wrote: 0,
         });
     }
@@ -861,6 +816,22 @@ fn attempt_sora(
         ttbr0: user_ttbr0,
     };
 
+    // Scheduler harness. Bind Sora's thread to Sora's real process koid so syscall
+    // dispatch can distinguish Sora from scheduled child processes.
+    crate::user_thread::init(
+        engine.objects_mut(),
+        process.koid(),
+        process.root_vmar(),
+        kernel_ttbr0,
+    )
+    .map_err(|_| UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
+
+    // Koids of Sora's own channel ends — the koids Sora binds to its serve-loop port.
+    // Resolved from the handle table before `process` is moved into `SoraState`.
+    let console_koid = process.handles().get(console_handle).map(|e| e.koid).unwrap_or(KoId(0));
+    let block_koid = process.handles().get(block_handle).map(|e| e.koid).unwrap_or(KoId(0));
+    let net_koid = process.handles().get(net_handle).map(|e| e.koid).unwrap_or(KoId(0));
+
     // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
     // restart loop — the hook never needs it.)
     unsafe {
@@ -878,16 +849,12 @@ fn attempt_sora(
             net_kernel_end,
             keyboard_channel: kbd_channel_idx,
             keyboard_kernel_end: kbd_kernel_end,
+            console_koid,
+            block_koid,
+            net_koid,
             wrote: 0,
         });
     }
-
-    // Scheduler harness.
-    crate::user_thread::init(
-        unsafe { &mut *sora_ptr() }.engine.objects_mut(),
-        kernel_ttbr0,
-    )
-    .map_err(|_| UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
 
     let boot_ctx = kumo_hal::active::ThreadContext::default();
     unsafe { crate::user_thread::pin_boot_context(&boot_ctx) };
@@ -986,6 +953,17 @@ pub fn disable_console_route() {
 /// Largest routed fragment: must fit Sora's 256-byte read buffer with margin.
 const ROUTE_CHUNK: usize = 192;
 
+/// Queue a port packet for the Sora-bound channel `channel_koid` (so its serve-loop
+/// `PortWait` returns that source), then run Sora until it parks again. The kernel writes
+/// to channel pairs directly rather than via the engine's `ChannelWrite`, so nothing has
+/// signalled the bound port — this does what `ChannelWrite`'s `signal_channel_ports` would.
+fn signal_and_wake(channel_koid: KoId) {
+    unsafe { &mut *sora_ptr() }
+        .engine
+        .signal_channel_ports(channel_koid);
+    crate::user_thread::wake_user();
+}
+
 /// Deliver one console message to Sora and wake it to drain. Returns false if the
 /// channel write failed (the caller falls back to the direct path).
 fn deliver_to_sora(bytes: &[u8]) -> bool {
@@ -1002,7 +980,8 @@ fn deliver_to_sora(bytes: &[u8]) -> bool {
     if channel.write(sora.console_kernel_end, msg).is_err() {
         return false;
     }
-    crate::user_thread::wake_user();
+    let koid = sora.console_koid;
+    signal_and_wake(koid);
     true
 }
 
@@ -1049,7 +1028,7 @@ pub fn block_read_via_sora(offset: u64, len: usize, buf: &mut [u8]) -> usize {
 
     // Run Sora until it parks again; single-core and synchronous, so by the time this
     // returns the reply (if any) is sitting in our endpoint's inbox.
-    crate::user_thread::wake_user();
+    signal_and_wake(unsafe { &*sora_ptr() }.block_koid);
 
     let sora = unsafe { &mut *sora_ptr() };
     let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
@@ -1100,7 +1079,7 @@ pub fn file_read_via_sora_at(path: &[u8], file_off: u64, len: usize, buf: &mut [
         }
     }
 
-    crate::user_thread::wake_user();
+    signal_and_wake(unsafe { &*sora_ptr() }.block_koid);
 
     let sora = unsafe { &mut *sora_ptr() };
     let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {
@@ -1144,7 +1123,7 @@ pub fn file_read_via_sora(path: &[u8], buf: &mut [u8]) -> usize {
         }
     }
 
-    crate::user_thread::wake_user();
+    signal_and_wake(unsafe { &*sora_ptr() }.block_koid);
 
     let sora = unsafe { &mut *sora_ptr() };
     let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.block_channel) else {

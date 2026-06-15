@@ -10,8 +10,14 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Size of the Stage-A bump heap (lives in the kernel image's BSS).
-pub const HEAP_SIZE: usize = 1024 * 1024;
+/// Size of the Stage-A bump heap (lives in the kernel image's BSS — NOBITS, so it costs
+/// memory but not image bytes). Sized for the whole Stage-A POST: every kernel-side IPC
+/// message (`KernelMessage::from_borrowed` → `Vec`), the console-route klogs once Sora is
+/// serving, and the P10 process-model demos all allocate here and **never free** (`dealloc`
+/// is a no-op). 1 MiB was exhausted partway through the userspace serve checks once the
+/// serve/console-route paths actually round-tripped; the headroom here carries the boot to
+/// the shell. The real fix remains the reclaiming allocator described above.
+pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct Bump {
     next: AtomicUsize,
@@ -73,6 +79,11 @@ mod global {
     #[global_allocator]
     static ALLOC: Bump = Bump::new();
 
+    /// Bytes handed out so far by the global bump allocator (diagnostic only).
+    pub fn used() -> usize {
+        ALLOC.used()
+    }
+
     unsafe impl GlobalAlloc for Bump {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             match self.reserve(layout.size(), layout.align(), HEAP_SIZE) {
@@ -85,6 +96,16 @@ mod global {
             // Bump allocator: reclamation arrives with the real heap.
         }
     }
+}
+
+/// Bytes handed out by the global bump allocator so far (diagnostic). 0 on host.
+#[cfg(target_os = "none")]
+pub fn used() -> usize {
+    global::used()
+}
+#[cfg(not(target_os = "none"))]
+pub fn used() -> usize {
+    0
 }
 
 #[cfg(test)]

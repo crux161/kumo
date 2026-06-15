@@ -16,7 +16,7 @@ pub mod task;
 pub mod user_thread;
 pub mod usermode;
 
-use kumo_abi::{BootInfo, ObjectKind, Rights, Signals, ABI_VERSION};
+use kumo_abi::{BootInfo, Signals, ABI_VERSION};
 use kumo_ipc::Message;
 use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
 
@@ -352,6 +352,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             usermode::disable_console_route();
             klog!("CONSOLE ROUTE      Check     probe 0 svc  direct fallback   FAIL\n");
         }
+        klog!("HEAPDBG after console-route used={}\n", crate::mm::heap::used());
 
         // P7-g: the kernel as a *client* of the userspace block server. Two reads of
         // the "disk" (the initrd) served by Sora over the block channel, verified by
@@ -424,6 +425,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 }
             }
 
+            klog!("HEAPDBG after block used={}\n", crate::mm::heap::used());
             // P9-e: verify Sora transferred a handle via the net channel.
             if usermode::net_check_transfer() {
                 klog!("HANDLE XFER        Check     net channel  via sora   OK\n");
@@ -495,13 +497,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     }
                 }
 
+                klog!("HEAPDBG before net used={}\n", crate::mm::heap::used());
                 // Net loopback: send "ping" on the net channel, Sora echoes it.
                 let mut lb_buf = [0u8; 8];
                 let lb_n = usermode::net_loopback(b"ping", &mut lb_buf);
                 let lb_ok = lb_n == 4 && &lb_buf[..4] == b"ping";
+                klog!("HEAPDBG after ping used={}\n", crate::mm::heap::used());
                 // Multi-connection: send "conn" to create a new connection channel.
                 let mut cn_buf = [0u8; 8];
                 let cn_n = usermode::net_loopback(b"conn", &mut cn_buf);
+                klog!("HEAPDBG after conn used={}\n", crate::mm::heap::used());
                 let cn_ok = cn_n >= 1 && cn_buf[0] != b'e';
                 // P9-f: named pipe — two "pipe:test" requests return paired channel ends.
                 let mut p1_buf = [0u8; 8];

@@ -842,8 +842,19 @@ impl SyscallEngine {
                     let Some(target) = self.process_by_koid(proc_koid) else {
                         return KernelCallResult::Status(Errno::BadHandle.status());
                     };
-                    let status =
-                        crate::usermode::run_child(proc_koid, target.root_vmar(), entry, sp, arg);
+                    let Some(ttbr0) = target.ttbr0 else {
+                        return KernelCallResult::Status(Errno::InvalidArgs.status());
+                    };
+                    let root_vmar = target.root_vmar();
+                    let status = crate::user_thread::run_child(
+                        &mut self.objects,
+                        proc_koid,
+                        root_vmar,
+                        ttbr0,
+                        entry,
+                        sp,
+                        arg,
+                    );
                     KernelCallResult::Status(status)
                 }
                 #[cfg(not(target_os = "none"))]
