@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 kumo-abi.workspace = true
 kumo-ipc.workspace = true
+linked_list_allocator = "0.10.6"
 
 [lib]
 path = "src/lib.rs"

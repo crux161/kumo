@@ -3,8 +3,6 @@
 
 extern crate alloc;
 
-use core::panic::PanicInfo;
-
 use kumo_abi::{Handle, PERSONA_LINUX_HELLO_PATH};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
@@ -15,24 +13,11 @@ use kumo_rt::{
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
 
-mod heap;
-
-#[global_allocator]
-static ALLOC: heap::BumpAlloc = heap::BumpAlloc;
+kumo_rt::entry!(sora_main);
 
 fn log(msg: &[u8]) {
-    debug_write(msg.as_ptr(), msg.len());
+    kumo_rt::debug_write(msg.as_ptr(), msg.len());
 }
-
-// Tiny asm trampoline: `_start` (the ELF entry point) just calls `sora_main`.
-// Bootstrap registers (x0-x3) are passed through per the aarch64 calling convention.
-core::arch::global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    "_start:",
-    "  bl  sora_main",
-    "1: b 1b",
-);
 
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
@@ -304,7 +289,8 @@ extern "C" fn sora_main(
 
     // String at VMO offset 0x1000: "hello from child ch\n" (20 bytes).
     // String at VMO offset 0x1020: "child xfer ok!\n" (16 bytes).
-    {
+    const RUN_BLOCKING_CHILD_XFER_DEMO: bool = false;
+    if RUN_BLOCKING_CHILD_XFER_DEMO {
         // P10-f: channel-based cross-process handle transfer. Sora writes to
         // ch0 WITH xfer1 as a transferred handle BEFORE process_run, so the
         // message waits in ch1's inbox. The child's first act is ChannelRead
@@ -431,7 +417,8 @@ extern "C" fn sora_main(
       // Sora spawns the child, writes "go" to the bootstrap channel,
       // calls process_wait (child preempts, reads "go", writes "world!\n",
       // DebugWrites, exits). Sora resumes, reads "world!\n" from c0.
-    {
+    const RUN_ASYNC_CHILD_DEMO: bool = false;
+    if RUN_ASYNC_CHILD_DEMO {
         let child_vmo_h = vmo_create(0x2000);
         if child_vmo_h != u64::MAX {
             let child_vmo = Handle(child_vmo_h as u32);
@@ -1093,7 +1080,25 @@ fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
     serve_file_read_at(initrd, path, 0, out.len() as u64, out)
 }
 
-#[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    process_exit(1);
+fn launch_lua_repl(initrd: Handle, _fb_out: Handle) {
+    // 1. Mint the IPC channels using raw syscalls
+    let (repl_stdin_h, _kb_stdout_h) = channel_create_pair();
+    let (_fb_stdin_h, repl_stdout_h) = channel_create_pair();
+
+    if repl_stdin_h == u64::MAX || repl_stdout_h == u64::MAX {
+        debug_write(b"Failed to mint REPL channels\n".as_ptr(), 29);
+        return;
+    }
+
+    let repl_stdin = Handle(repl_stdin_h as u32);
+    let repl_stdout = Handle(repl_stdout_h as u32);
+
+    debug_write(b"Lua REPL channels minted.\n".as_ptr(), 26);
+
+    // 2. Next step (Pending Userland ELF Loader):
+    // In the current Phase 10 skeleton, Sora is manually executing raw assembly
+    // payloads (as seen in the `sora_main` demo). To fully launch the Piccolo binary,
+    // we need to add a basic ELF parser here to read the `lua-repl` file from the
+    // initrd, copy its LOAD segments into a new VMO, and map them using `vmar_map`
+    // before calling `process_run`.
 }

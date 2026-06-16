@@ -158,11 +158,21 @@ pub fn plan_elf_process(
     let root_job = Job::root(objects);
     let root_vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE)?;
     let process = Process::new(objects, &root_job, root_vmar);
-    let image_vmo = Vmo::new(image.len() as u64)?;
-
+    let max_vmo_offset = elf
+        .segments
+        .iter()
+        .map(|seg| {
+            let page_delta = seg.virt_addr % crate::mm::PAGE_SIZE;
+            crate::mm::align_down(seg.file_offset)
+                + crate::mm::align_up(page_delta.saturating_add(seg.mem_size)).unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    let vmo_size = core::cmp::max(image.len() as u64, max_vmo_offset);
+    let image_vmo = Vmo::new(vmo_size)?;
     let mut image_mappings = Vec::new();
     for segment in &elf.segments {
-        let page_delta = segment.virt_addr % PAGE_SIZE;
+        let page_delta = segment.virt_addr % crate::mm::PAGE_SIZE;
         let virt = align_down(segment.virt_addr);
         let vmo_offset = align_down(segment.file_offset);
         let len = align_up(page_delta.saturating_add(segment.mem_size))

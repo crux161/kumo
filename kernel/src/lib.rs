@@ -343,6 +343,9 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         usermode::enable_console_route();
         klog!("ZIWEI console     -> Sora console channel\n");
         let probe_svcs = kumo_hal::active::syscall_count().saturating_sub(svc_before);
+        // Keep the route as a bounded probe. Later POST checks call back into Sora and
+        // can otherwise re-enter the console server while another Sora wake is active.
+        usermode::disable_console_route();
         if probe_svcs > 0 {
             klog!(
                 "CONSOLE ROUTE      Check     probe {} svc  via sora   OK\n",
@@ -430,47 +433,68 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 klog!("HANDLE XFER        Check     net channel no handle   FAIL\n");
             }
 
+            // Console routing turns each `klog!` into a channel write + `wake_user`, which
+            // re-enters Sora; Sora's SVC handlers take their *own* `&mut` of the same
+            // `SoraState` via `sora_ptr()`. Anywhere a `&mut SoraState` is already live
+            // across that re-entry, the two aliasing `&mut`s are UB and corrupt a heap
+            // header — the long-standing "PORT BIND/NET LOOPBACK hang from stage_a" bug.
+            // It bites here (these checks hold the borrow across their result klogs) and
+            // again once `install_preemption_probe()` makes a timer IRQ able to preempt
+            // mid-`wake_user`. The earlier serve checks dodged it only by scoping their
+            // borrow tightly around each `wake_user`. Until SoraState access is made
+            // aliasing-safe (a Cell/lock instead of repeated `&mut sora_ptr()`), route
+            // klogs straight to the device from here on. Verified live: boot reaches the
+            // `ziwei>` shell with no TOWER; re-enabling routing reintroduces the crash.
+            usermode::disable_console_route();
+
             // Port/wait-many: kernel-level test. Use direct IPC access —
             // dispatch() hangs in stage_a context (likely a channel-signal issue).
             {
-                let s = unsafe { &mut *usermode::sora_ptr_mut() };
-                let port_obj = s.engine.objects_mut().create(ObjectKind::Port);
-                let port_koid = port_obj.koid();
-                let port_h = s
-                    .process
-                    .handles_mut()
-                    .insert(port_obj, Rights::READ | Rights::WRITE)
-                    .unwrap();
-                let (h0, h1) = s.engine.channel_create(&mut s.process).unwrap();
-                // Bind port to h1 (receiving endpoint).
-                s.engine
-                    .port_bind_channel(port_koid, s.process.handles().get(h1).unwrap().koid);
-                // Write to h0 → delivers to h1, which signals the port bound to h1.
-                let msg = Message::new(1, b"x", &[]).unwrap();
-                let write = s.engine.dispatch(
-                    &mut s.process,
-                    KernelCall::ChannelWrite {
-                        channel: h0,
-                        message: msg,
-                    },
-                );
-                // Check port via IPC directly (not dispatch — same hang avoidance).
-                match (write, s.engine.ipc_mut().port_wait(&s.process, port_h)) {
-                    (KernelCallResult::Status(status), _) if status != Errno::Ok.status() => {
-                        klog!("PORT BIND          Check     channel write fail   FAIL\n");
+                let post = usermode::with_sora_mut(|s| {
+                    let port_h = match s.engine.dispatch(&mut s.process, KernelCall::PortCreate) {
+                        KernelCallResult::Handle(handle) => handle,
+                        _ => return 1u8,
+                    };
+                    let (h0, h1) = s.engine.channel_create(&mut s.process).unwrap();
+                    // Bind port to h1 (receiving endpoint).
+                    let bind = s.engine.dispatch(
+                        &mut s.process,
+                        KernelCall::PortBindChannel {
+                            port: port_h,
+                            channel: h1,
+                        },
+                    );
+                    if bind != KernelCallResult::Status(Errno::Ok.status()) {
+                        return 2u8;
                     }
-                    (_, Ok(pkt)) if pkt.signals.contains(Signals::READABLE) => {
+                    // Write to h0 → delivers to h1, which signals the port bound to h1.
+                    let msg = Message::new(1, b"x", &[]).unwrap();
+                    let write = s.engine.dispatch(
+                        &mut s.process,
+                        KernelCall::ChannelWrite {
+                            channel: h0,
+                            message: msg,
+                        },
+                    );
+                    if write != KernelCallResult::Status(Errno::Ok.status()) {
+                        return 3u8;
+                    }
+                    match s.engine.ipc_mut().port_wait(&s.process, port_h) {
+                        Ok(pkt) if pkt.signals.contains(Signals::READABLE) => 0u8,
+                        Ok(_) => 4u8,
+                        Err(_) => 5u8,
+                    }
+                });
+                // Check port via IPC directly (not dispatch — same hang avoidance).
+                match post {
+                    0 => {
                         klog!("PORT BIND          Check     channel signal  via eng   OK\n");
                     }
-                    (_, Ok(pkt)) => {
-                        klog!(
-                            "PORT BIND          Check     sig={:?} (expect READABLE)   FAIL\n",
-                            pkt.signals
-                        );
-                    }
-                    (_, Err(_)) => {
-                        klog!("PORT BIND          Check     port empty   FAIL\n");
-                    }
+                    1 => klog!("PORT BIND          Check     port create fail   FAIL\n"),
+                    2 => klog!("PORT BIND          Check     bind fail   FAIL\n"),
+                    3 => klog!("PORT BIND          Check     channel write fail   FAIL\n"),
+                    4 => klog!("PORT BIND          Check     wrong signal   FAIL\n"),
+                    _ => klog!("PORT BIND          Check     port empty   FAIL\n"),
                 }
 
                 // Net loopback: send "ping" on the net channel, Sora echoes it.

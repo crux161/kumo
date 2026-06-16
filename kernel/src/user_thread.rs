@@ -278,7 +278,21 @@ pub fn run_child(
         Ok(thread) => thread,
         Err(_) => return Errno::NoMemory.status(),
     };
+    run_prepared_child(new_child, proc_koid, root_vmar, ttbr0, entry, sp, arg, arg2)
+}
 
+/// Run a child thread that has already been allocated. This keeps object-manager and
+/// Sora-state borrows out of the context-switch window, so child SVCs can re-enter Sora.
+pub fn run_prepared_child(
+    new_child: Thread,
+    proc_koid: KoId,
+    _root_vmar: crate::mm::Vmar,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    arg2: u64,
+) -> Status {
     let p = sched_ptr();
     let next_ctx = unsafe {
         let s = &mut *p;

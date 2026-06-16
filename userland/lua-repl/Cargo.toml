@@ -1,0 +1,12 @@
+[package]
+name = "lua-repl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kumo-abi = { path = "../../lib/kumo-abi" }
+kumo-rt = { path = "../kumo-rt" }
+
+# Piccolo is a pure-Rust, no_std-friendly Lua 5.4 engine.
+# We disable default features to ensure it doesn't try to link std.
+piccolo = { version = "0.3", default-features = false, features = ["core"] }

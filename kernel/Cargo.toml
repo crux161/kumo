@@ -15,6 +15,7 @@ arch_x86_64 = ["kumo-hal/arch_x86_64"]
 kumo-abi.workspace = true
 kumo-hal = { workspace = true, default-features = false }
 kumo-ipc.workspace = true
+linked_list_allocator = "0.10.6"
 niji-loader = { path = "../boot/niji-loader" }
 
 [lib]
