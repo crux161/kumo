@@ -15,10 +15,10 @@ pub mod active {
         arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
         early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
         init_timer_interrupts, install_exception_vectors, irq_unmask, monotonic_nanos, read_phys,
-        read_ttbr0, run_el0_image, run_el0_smoke, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_ttbr0, spin_once, switch_context, syscall_count,
-        timer_irq_count, wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError,
-        UserLoadSegment, UserMapping, UserState, ARCH,
+        read_user_aspace_root, run_el0_image, run_el0_smoke, set_framebuffer, set_interrupt_hook,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
+        syscall_count, timer_irq_count, wait_for_timer_irqs, El0Report, ThreadContext, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 
@@ -28,10 +28,10 @@ pub mod active {
         arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
         early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
         init_timer_interrupts, install_exception_vectors, irq_unmask, monotonic_nanos, read_phys,
-        read_ttbr0, run_el0_image, run_el0_smoke, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_ttbr0, spin_once, switch_context, syscall_count,
-        timer_irq_count, wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError,
-        UserLoadSegment, UserMapping, UserState, ARCH,
+        read_user_aspace_root, run_el0_image, run_el0_smoke, set_framebuffer, set_interrupt_hook,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
+        syscall_count, timer_irq_count, wait_for_timer_irqs, El0Report, ThreadContext, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 

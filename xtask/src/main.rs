@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION,
-    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH,
+    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -118,6 +118,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "run" => run_smoke(&root, args.arch),
+        "preflight" => preflight(&root),
         "help" => {
             print_help();
             Ok(())
@@ -654,10 +655,12 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
     let initrd = match plan.arch {
         ImageArch::Aarch64 => {
             let sora = build_sora_image(&workspace_root()?)?;
+            let svc_health = build_svc_health_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
+                (SVC_HEALTH_PATH, svc_health.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
             ])?
@@ -709,6 +712,35 @@ fn build_sora_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as Sora ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_svc_health_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "svc-health",
+            "--bin",
+            "svc-health",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("svc-health");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as svc-health ELF: {err}",
+            source_path.display()
+        )
+    })?;
     Ok(bytes)
 }
 
@@ -1023,6 +1055,27 @@ fn run_smoke(root: &Path, arch: Arch) -> Result<(), String> {
     );
     println!("UEFI/AAVMF boot is still deferred until Nijigumo has a real UEFI entry.");
     Ok(())
+}
+
+/// Run the mechanical guardrail tripwires (GUIDANCE/006 §5): fmt, the VEIL-identifier
+/// grep, and the kernel register-leak ratchet. Delegates to `scripts/preflight.sh` so the
+/// same checks run identically from the shell and from CI. Pass `--full` through env
+/// (`KUMO_PREFLIGHT_FULL=1 cargo xtask preflight`) to also build both backends + smoke.
+fn preflight(root: &Path) -> Result<(), String> {
+    let script = root.join("scripts/preflight.sh");
+    let mut cmd = Command::new("sh");
+    cmd.arg(&script).current_dir(root);
+    if env::var_os("KUMO_PREFLIGHT_FULL").is_some() {
+        cmd.arg("--full");
+    }
+    let status = cmd
+        .status()
+        .map_err(|err| format!("spawn {}: {err}", script.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("preflight tripwire failed with {status}"))
+    }
 }
 
 fn run_cargo(root: &Path, args: &[&str]) -> Result<(), String> {
@@ -1469,7 +1522,8 @@ Expected serial transcript is in:\n\
 
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|image|product|run> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
     );
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
+    println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
 }

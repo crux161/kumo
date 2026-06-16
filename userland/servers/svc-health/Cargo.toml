@@ -1,0 +1,24 @@
+[package]
+name = "svc-health"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../../kumo-rt" }
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[[bin]]
+name = "svc-health"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

@@ -13,6 +13,7 @@ members = [
     "userland/kumo-rt",
     "userland/kumoza",
     "userland/persona-linux",
+    "userland/servers/svc-health",
     "userland/sora",
     "xtask",
 ]

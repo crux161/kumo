@@ -147,10 +147,10 @@ fn phys_ptr_mut(phys: u64) -> *mut u8 {
 fn alloc_anonymous_frame(boot: &BootInfo) -> Result<u64, Errno> {
     #[cfg(target_os = "none")]
     {
-        let saved_ttbr0 = kumo_hal::active::read_ttbr0();
-        unsafe { kumo_hal::active::set_ttbr0(crate::user_thread::kernel_ttbr0()) };
+        let saved_ttbr0 = kumo_hal::active::read_user_aspace_root();
+        unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
         let frame = unsafe { crate::mm::alloc_zeroed_frame(boot) };
-        unsafe { kumo_hal::active::set_ttbr0(saved_ttbr0) };
+        unsafe { kumo_hal::active::set_user_aspace_root(saved_ttbr0) };
         frame.ok_or(Errno::NoMemory)
     }
 
@@ -258,6 +258,8 @@ impl SyscallEngine {
                     channel_koid,
                     kumo_abi::Signals::READABLE,
                 );
+                #[cfg(target_os = "none")]
+                crate::user_thread::wake_child_waiting_on_port(port_koid);
             }
         }
     }
@@ -361,9 +363,11 @@ impl SyscallEngine {
         // Create a minimal Process stub just for the koid. We need &Process for
         // Thread::new's signature, but it only reads .koid(). Use a temporary that
         // stores exactly the koid we extracted.
+        // A syscall handler must never panic on behalf of userspace; surface an error
+        // instead of unwrapping (the temp Vmar only exists to carry proc_koid).
         let temp_process = Process::from_parts(
             proc_koid,
-            crate::mm::Vmar::new(0, crate::mm::PAGE_SIZE).unwrap(),
+            crate::mm::Vmar::new(0, crate::mm::PAGE_SIZE).map_err(|_| ObjectError::TableFull)?,
         );
         let thread = Thread::new(
             &mut self.objects,
@@ -442,6 +446,8 @@ impl SyscallEngine {
                     Ok(()) => {
                         if let Some(koid) = signal_koid {
                             self.signal_channel_ports(koid);
+                            #[cfg(target_os = "none")]
+                            crate::user_thread::wake_child_waiting_on_channel(koid);
                         }
                         Errno::Ok.status()
                     }
@@ -835,10 +841,12 @@ impl SyscallEngine {
                 // eventual `eret` returns to EL0 correctly.
                 #[cfg(target_os = "none")]
                 let result = {
-                    let saved_ttbr0 = kumo_hal::active::read_ttbr0();
-                    unsafe { kumo_hal::active::set_ttbr0(crate::user_thread::kernel_ttbr0()) };
+                    let saved_ttbr0 = kumo_hal::active::read_user_aspace_root();
+                    unsafe {
+                        kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0())
+                    };
                     let r = kumo_hal::active::build_user_tables(&image, &mut alloc);
-                    unsafe { kumo_hal::active::set_ttbr0(saved_ttbr0) };
+                    unsafe { kumo_hal::active::set_user_aspace_root(saved_ttbr0) };
                     r
                 };
                 #[cfg(not(target_os = "none"))]

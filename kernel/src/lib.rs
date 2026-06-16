@@ -568,8 +568,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 None => {}
             }
             // Check for a completed command line from Sora via the root channel.
-            let tasks = kdemo::tasks();
-            if usermode::poll_root_command(&tasks, &mut env) > 0 {
+            if usermode::poll_root_command(&mut env) > 0 {
                 klog!("{}", shell::PROMPT);
             }
         }

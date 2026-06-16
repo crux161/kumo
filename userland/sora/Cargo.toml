@@ -12,6 +12,7 @@ kumo-rt = { path = "../kumo-rt" }
 kumoza = { path = "../kumoza" }
 linked_list_allocator = "0.10.6"
 persona-linux = { path = "../persona-linux" }
+svc-health = { path = "../servers/svc-health" }
 
 [lib]
 path = "src/lib.rs"

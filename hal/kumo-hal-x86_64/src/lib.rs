@@ -432,6 +432,18 @@ pub unsafe fn set_ttbr0(_root: u64) {
     // x86_64 stub.
 }
 
+/// Arch-neutral name the kernel uses to switch the user address-space root. This backend
+/// will program `cr3` once x86 paging lands (x86 metal milestone).
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+pub unsafe fn set_user_aspace_root(_root: u64) {}
+
+/// Arch-neutral name the kernel uses to read the current user address-space root (x86 stub).
+pub fn read_user_aspace_root() -> u64 {
+    0
+}
+
 pub fn halt() -> ! {
     loop {
         #[cfg(target_os = "none")]

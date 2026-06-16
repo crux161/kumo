@@ -1094,6 +1094,20 @@ pub use mmu::enable_kernel as enable_kernel_mmu;
 #[cfg(target_os = "none")]
 pub use mmu::{read_ttbr0, set_ttbr0};
 
+/// Arch-neutral name the kernel uses to switch the user address-space root. This backend
+/// programs `TTBR0_EL1`. Inherently unsafe: `root` must be a valid table for the space.
+#[cfg(target_os = "none")]
+pub unsafe fn set_user_aspace_root(root: u64) {
+    unsafe { mmu::set_ttbr0(root) }
+}
+
+/// Arch-neutral name the kernel uses to read the current user address-space root
+/// (this backend: `TTBR0_EL1`).
+#[cfg(target_os = "none")]
+pub fn read_user_aspace_root() -> u64 {
+    mmu::read_ttbr0()
+}
+
 // ---- EL0 / userspace smoke -----------------------------------------------------------
 //
 // The first time KUMO drops below EL1. A tiny position-independent payload runs at EL0
@@ -1864,6 +1878,19 @@ pub fn read_ttbr0() -> u64 {
 /// Host stub: the freestanding kernel sets TTBR0; on the host this is a no-op.
 #[cfg(not(target_os = "none"))]
 pub fn set_ttbr0(_root: u64) {}
+
+/// Host stub: arch-neutral user-address-space-root switch (no-op on the host).
+///
+/// # Safety
+/// No-op; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn set_user_aspace_root(_root: u64) {}
+
+/// Host stub: arch-neutral user-address-space-root read (no page tables on the host).
+#[cfg(not(target_os = "none"))]
+pub fn read_user_aspace_root() -> u64 {
+    0
+}
 
 /// Host stub: the freestanding kernel installs real page tables; on the host there is
 /// nothing to do.

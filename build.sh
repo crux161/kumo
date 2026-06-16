@@ -1,74 +1,92 @@
 #!/bin/sh
+# build.sh — crux's quick deploy loop.
+#
+#   ./build.sh            # FAST: build the ThinkPad X13s image, open its product dir (drag EFI/ -> USB)
+#   ./build.sh all        # build X13s + Raspberry Pi 5 + x86_64 (the old full sweep)
+#   KUMO_ESP=/Volumes/ESP ./build.sh   # also copy the EFI tree straight onto a mounted ESP/USB
+#
+# After `./build.sh`, the X13s image dir opens in Finder; drag its EFI/ folder onto the USB key's
+# EFI System Partition, then boot the ThinkPad. (No need to append `open build` anymore.)
 set -eu
 
+MODE="${1:-x13s}"
 ESP="${KUMO_ESP:-}"
 
-echo "==> building KUMO images (aarch64 thinkpad-x13s-gen1, aarch64 pi5 + x86_64 generic-uefi-x86_64)"
+X13S_DIR="build/images/thinkpad-x13s-gen1"
 
-# ---- aarch64 / ThinkPad X13s ----
-echo "==> [1/3] Building aarch64 (ThinkPad X13s)..."
-cargo xtask image --arch aarch64 --hardware thinkpad-x13s-gen1
+build_x13s() {
+    echo "==> Building aarch64 (ThinkPad X13s Gen 1)..."
+    cargo xtask image --arch aarch64 --hardware thinkpad-x13s-gen1
+}
 
-AARCH64_DIR="build/images/thinkpad-x13s-gen1"
-AARCH64_KERNEL="${AARCH64_DIR}/EFI/KUMO/kernel/kumo-kernel.elf"
-AARCH64_INITRD="${AARCH64_DIR}/EFI/KUMO/initrd.img"
-AARCH64_PLAN="${AARCH64_DIR}/kumo-image-plan-thinkpad-x13s-gen1.txt"
-
-# ---- aarch64 / Raspberry Pi 5 ----
-echo "==> [2/3] Building aarch64 (Raspberry Pi 5)..."
-if [ -x "scripts/mk-pi5-img.sh" ]; then
-    ./scripts/mk-pi5-img.sh
-else
-    # Fallback to xtask if the script isn't executable or present
-    cargo xtask image --arch aarch64 --hardware bcm2712-rpi5
-fi
-
-# ---- x86_64 / generic UEFI ----
-echo "==> [3/3] Building x86_64 (Generic UEFI)..."
-cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
-
-X86_64_DIR="build/images/generic-uefi-x86_64"
-X86_64_KERNEL="${X86_64_DIR}/EFI/KUMO/kernel/kumo-kernel.elf"
-X86_64_INITRD="${X86_64_DIR}/EFI/KUMO/initrd.img"
-X86_64_PLAN="${X86_64_DIR}/kumo-image-plan-generic-uefi-x86_64.txt"
-
-echo ""
-echo "==> aarch64 (ThinkPad X13s) build products:"
-if [ -f "$AARCH64_KERNEL" ]; then
-    ls -la "$AARCH64_KERNEL" "$AARCH64_INITRD" 2>/dev/null || echo "    (some files missing)"
-    if [ -f "$AARCH64_PLAN" ]; then
-        echo "    kernel fingerprint: $(grep kernel_fingerprint "$AARCH64_PLAN" || echo unknown)"
-        echo "    initrd fingerprint: $(grep initrd_fingerprint "$AARCH64_PLAN" || echo unknown)"
+build_pi5() {
+    echo "==> Building aarch64 (Raspberry Pi 5)..."
+    if [ -x "scripts/mk-pi5-img.sh" ]; then
+        ./scripts/mk-pi5-img.sh
+    else
+        cargo xtask image --arch aarch64 --hardware bcm2712-rpi5
     fi
-fi
+}
 
-echo ""
-echo "==> x86_64 (generic UEFI) build products:"
-if [ -f "$X86_64_KERNEL" ]; then
-    ls -la "$X86_64_KERNEL" "$X86_64_INITRD" 2>/dev/null || echo "    (some files missing)"
-    if [ -f "$X86_64_PLAN" ]; then
-        echo "    kernel fingerprint: $(grep kernel_fingerprint "$X86_64_PLAN" || echo unknown)"
-        echo "    initrd fingerprint: $(grep initrd_fingerprint "$X86_64_PLAN" || echo unknown)"
+build_x86() {
+    echo "==> Building x86_64 (Generic UEFI)..."
+    cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
+}
+
+report() {
+    dir="$1"; name="$2"
+    kernel="${dir}/EFI/KUMO/kernel/kumo-kernel.elf"
+    initrd="${dir}/EFI/KUMO/initrd.img"
+    plan="${dir}/kumo-image-plan-${name}.txt"
+    echo ""
+    echo "==> ${name} build products:"
+    if [ -f "$kernel" ]; then
+        ls -la "$kernel" "$initrd" 2>/dev/null || echo "    (some files missing)"
+        if [ -f "$plan" ]; then
+            echo "    kernel fingerprint: $(grep kernel_fingerprint "$plan" 2>/dev/null || echo unknown)"
+            echo "    initrd fingerprint: $(grep initrd_fingerprint "$plan" 2>/dev/null || echo unknown)"
+        fi
+    else
+        echo "    not staged: $kernel"
     fi
-else
-    echo "    x86_64 kernel not staged (Sora/initrd aarch64-only; image pipeline WIP)"
-    ls "$X86_64_DIR" 2>/dev/null || echo "    (no x86_64 image dir)"
-fi
+}
 
-# ---- deploy to ESP ----
+case "$MODE" in
+    x13s)
+        echo "==> Quick build: ThinkPad X13s only (use './build.sh all' for Pi5 + x86_64)"
+        build_x13s
+        report "$X13S_DIR" "thinkpad-x13s-gen1"
+        OPEN_DIR="$X13S_DIR"
+        ;;
+    all)
+        echo "==> Full sweep: X13s + Pi5 + x86_64"
+        build_x13s
+        build_pi5
+        build_x86
+        report "$X13S_DIR" "thinkpad-x13s-gen1"
+        report "build/images/generic-uefi-x86_64" "generic-uefi-x86_64"
+        OPEN_DIR="build/images"
+        ;;
+    *)
+        echo "usage: ./build.sh [x13s|all]   (default: x13s)" >&2
+        exit 2
+        ;;
+esac
+
+# ---- deploy to a mounted ESP/USB if KUMO_ESP is set ----
 if [ -n "$ESP" ]; then
     if ! mountpoint -q "$ESP" 2>/dev/null && [ ! -d "$ESP/EFI" ]; then
-        echo "Warning: $ESP does not look like a mounted EFI partition."
+        echo "Warning: $ESP does not look like a mounted EFI partition; skipping deploy."
     else
-        echo "==> Deploying to ESP at $ESP"
-        cp -r "$AARCH64_DIR/EFI/"* "$ESP/EFI/"
+        echo "==> Deploying X13s EFI tree to ESP at $ESP"
+        cp -r "$X13S_DIR/EFI/"* "$ESP/EFI/"
         sync
         echo "    Deploy complete."
     fi
 fi
 
-# ---- Open output directory ----
+# ---- open the product dir so the EFI/ folder is ready to drag onto the USB key ----
 if command -v open >/dev/null 2>&1; then
-    echo "==> Opening build/images..."
-    open build/images
+    echo "==> Opening ${OPEN_DIR}..."
+    open "$OPEN_DIR"
 fi

@@ -3,15 +3,16 @@
 
 extern crate alloc;
 
-use kumo_abi::{Handle, PERSONA_LINUX_HELLO_PATH};
+use kumo_abi::{Errno, Handle, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind_channel,
-    port_create, port_wait, process_create, process_exit, process_run, process_wait, thread_create,
-    thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
+    port_create, port_wait, process_create, process_run, process_wait, thread_create, thread_start,
+    vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
+use svc_health::{Request as HealthRequest, Response as HealthResponse};
 
 kumo_rt::entry!(sora_main);
 
@@ -567,6 +568,14 @@ extern "C" fn sora_main(
         log(b"M10 elf: run fail\n");
     }
 
+    // Stage-C seed: spawn the first real server as its own process, with exactly one
+    // request channel. Sora keeps the peer and verifies Ping plus Status replies.
+    if run_svc_health_smoke(initrd) {
+        log(b"svc-health: serve ok\n");
+    } else {
+        log(b"svc-health: serve fail\n");
+    }
+
     // P10-b: VmoWrite/VmoRead demo on anonymous backing.
     let scratch_h = vmo_create(0x1000);
     if scratch_h != u64::MAX {
@@ -938,6 +947,234 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
     }
 
     process_run(child_as, elf.entry, 0x1000FFF0, 0, 0, 0) == 0
+}
+
+fn run_svc_health_smoke(initrd: Handle) -> bool {
+    match run_initrd_elf_with_channel(initrd, SVC_HEALTH_PATH.as_bytes()) {
+        Some((child_as, entry, stack_top, server_chan, client_chan)) => {
+            if process_run(child_as, entry, stack_top, server_chan.0 as u64, 0, 1) != 0 {
+                log(b"svc-health: run fail\n");
+                return false;
+            }
+            if !child_parked(process_wait()) {
+                log(b"svc-health: initial park fail\n");
+                return false;
+            }
+
+            let ping = HealthRequest::Ping.encode();
+            if channel_write(client_chan, ping.as_ptr(), ping.len()) != 0 {
+                log(b"svc-health: ping write fail\n");
+                return false;
+            }
+            if !child_parked(process_wait()) {
+                log(b"svc-health: ping pump fail\n");
+                return false;
+            }
+
+            let mut reply = [0u8; 32];
+            let n = channel_read(client_chan, reply.as_mut_ptr(), reply.len()) as usize;
+            if HealthResponse::decode(&reply[..n]) != Some(HealthResponse::Pong) {
+                return false;
+            }
+
+            let status = HealthRequest::Status.encode();
+            if channel_write(client_chan, status.as_ptr(), status.len()) != 0 {
+                log(b"svc-health: status write fail\n");
+                return false;
+            }
+            if !child_parked(process_wait()) {
+                log(b"svc-health: status pump fail\n");
+                return false;
+            }
+            let n = channel_read(client_chan, reply.as_mut_ptr(), reply.len()) as usize;
+            HealthResponse::decode(&reply[..n])
+                == Some(HealthResponse::Status {
+                    uptime_ticks: 0,
+                    served: 2,
+                })
+        }
+        None => false,
+    }
+}
+
+fn child_parked(status: u64) -> bool {
+    status == Errno::ShouldWait.status() as u32 as u64
+}
+
+fn run_initrd_elf_with_channel(
+    initrd: Handle,
+    path: &[u8],
+) -> Option<(Handle, u64, u64, Handle, Handle)> {
+    const PAGE_SIZE: u64 = 4096;
+    const MAX_SEGMENTS: usize = 8;
+    const STACK_TOP: u64 = 0x10010000;
+    const STACK_SIZE: u64 = 0x4000;
+
+    fn align_down(value: u64) -> u64 {
+        value & !(PAGE_SIZE - 1)
+    }
+
+    fn align_up(value: u64) -> Option<u64> {
+        value
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+    }
+
+    fn page_flags(elf_flags: u32) -> u64 {
+        let mut flags = 0u64;
+        if elf_flags & linux_elf::PF_R != 0 {
+            flags |= 1;
+        }
+        if elf_flags & linux_elf::PF_W != 0 {
+            flags |= 2;
+        }
+        if elf_flags & linux_elf::PF_X != 0 {
+            flags |= 4;
+        }
+        flags
+    }
+
+    let (elf_off, elf_len) = match find_initrd_file(initrd, path) {
+        Some(file) => file,
+        None => {
+            log(b"svc-health: missing\n");
+            return None;
+        }
+    };
+
+    let mut header = [0u8; linux_elf::ELF_HEADER_LEN];
+    if vmo_read(initrd, elf_off, header.as_mut_ptr(), header.len()) != 0 {
+        log(b"svc-health: hdr read fail\n");
+        return None;
+    }
+    let elf = match linux_elf::parse_header(&header) {
+        Ok(elf) => elf,
+        Err(_) => {
+            log(b"svc-health: bad hdr\n");
+            return None;
+        }
+    };
+
+    let ph_table_len = (elf.phnum as u64).saturating_mul(elf.phentsize as u64);
+    if elf.phoff.saturating_add(ph_table_len) > elf_len || elf.phnum as usize > MAX_SEGMENTS {
+        log(b"svc-health: ph range fail\n");
+        return None;
+    }
+
+    let empty = PersonaLoadSegment {
+        file_offset: 0,
+        file_size: 0,
+        virt_addr: 0,
+        mem_size: 0,
+        flags: 0,
+    };
+    let mut segments = [empty; MAX_SEGMENTS];
+    let mut segment_count = 0usize;
+    let mut vmo_len = 0u64;
+
+    for index in 0..elf.phnum as usize {
+        let ph_off = elf_off + elf.phoff + (index as u64) * (elf.phentsize as u64);
+        let mut ph_buf = [0u8; linux_elf::ELF_PHDR_LEN];
+        if vmo_read(initrd, ph_off, ph_buf.as_mut_ptr(), ph_buf.len()) != 0 {
+            log(b"svc-health: ph read fail\n");
+            return None;
+        }
+        let ph = match linux_elf::parse_program_header(&ph_buf) {
+            Ok(ph) => ph,
+            Err(_) => {
+                log(b"svc-health: bad ph\n");
+                return None;
+            }
+        };
+        if ph.kind != linux_elf::PT_LOAD {
+            continue;
+        }
+        if segment_count >= MAX_SEGMENTS
+            || ph.file_offset.saturating_add(ph.file_size) > elf_len
+            || ph.file_offset.saturating_add(ph.mem_size) < ph.file_offset
+        {
+            log(b"svc-health: segment range fail\n");
+            return None;
+        }
+        vmo_len = vmo_len.max(ph.file_offset.saturating_add(ph.mem_size));
+        segments[segment_count] = PersonaLoadSegment {
+            file_offset: ph.file_offset,
+            file_size: ph.file_size,
+            virt_addr: ph.virt_addr,
+            mem_size: ph.mem_size,
+            flags: page_flags(ph.flags),
+        };
+        segment_count += 1;
+    }
+
+    if segment_count == 0 {
+        log(b"svc-health: no load\n");
+        return None;
+    }
+
+    let child_vmo_h = vmo_create(align_up(vmo_len)?);
+    if child_vmo_h == u64::MAX {
+        log(b"svc-health: vmo fail\n");
+        return None;
+    }
+    let child_vmo = Handle(child_vmo_h as u32);
+
+    let mut chunk = [0u8; 256];
+    for segment in segments.iter().take(segment_count) {
+        let mut copied = 0u64;
+        while copied < segment.file_size {
+            let n = ((segment.file_size - copied) as usize).min(chunk.len());
+            if vmo_read(
+                initrd,
+                elf_off + segment.file_offset + copied,
+                chunk.as_mut_ptr(),
+                n,
+            ) != 0
+                || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
+            {
+                log(b"svc-health: copy fail\n");
+                return None;
+            }
+            copied += n as u64;
+        }
+    }
+
+    let child_as_h = process_create(0, 0x2000_0000);
+    if child_as_h == u64::MAX {
+        log(b"svc-health: process fail\n");
+        return None;
+    }
+    let child_as = Handle(child_as_h as u32);
+
+    for segment in segments.iter().take(segment_count) {
+        let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
+        let virt = align_down(segment.virt_addr);
+        let vmo_offset = align_down(segment.file_offset);
+        let len = align_up(page_delta.saturating_add(segment.mem_size))?;
+        if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
+            log(b"svc-health: map fail\n");
+            return None;
+        }
+    }
+
+    if address_space_create(child_as, STACK_TOP, STACK_SIZE) == u64::MAX {
+        log(b"svc-health: as fail\n");
+        return None;
+    }
+
+    let (client, server) = channel_create_pair();
+    if client == u64::MAX || server == u64::MAX {
+        log(b"svc-health: channel fail\n");
+        return None;
+    }
+
+    Some((
+        child_as,
+        elf.entry,
+        STACK_TOP - 0x10,
+        Handle(server as u32),
+        Handle(client as u32),
+    ))
 }
 
 /// Resolve a file path against the FAT32 root directory and return up to `req_len` bytes

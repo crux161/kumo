@@ -448,6 +448,110 @@ fn wait_sora_port_without_borrow(port: Handle) -> u64 {
     }
 }
 
+enum ChildReadOutcome {
+    Message { len: u64, handle: u64 },
+    ShouldWait(KoId),
+    Done,
+}
+
+enum ChildPortWaitOutcome {
+    Packet(KoId),
+    ShouldWait(KoId),
+    Done,
+}
+
+fn read_child_channel_without_borrow(
+    process_koid: KoId,
+    channel: Handle,
+    user_buf: u64,
+    cap: usize,
+) -> (u64, u64) {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildReadOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            if !user_range_ok(child, user_buf, cap as u64) {
+                return ChildReadOutcome::Done;
+            }
+            let wait_koid = match child.handles().get(channel) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildReadOutcome::Done,
+            };
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::ChannelRead { channel })
+            {
+                KernelCallResult::Message(message) => {
+                    let bytes = message.bytes();
+                    let n = bytes.len().min(cap);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                    };
+                    let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
+                    ChildReadOutcome::Message {
+                        len: n as u64,
+                        handle,
+                    }
+                }
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildReadOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildReadOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildReadOutcome::Message { len, handle } => return (len, handle),
+            ChildReadOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_channel(wait_koid);
+            }
+            ChildReadOutcome::Done => return (0, 0),
+        }
+    }
+}
+
+fn wait_child_port_without_borrow(process_koid: KoId, port: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildPortWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = match child.handles().get(port) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildPortWaitOutcome::Done,
+            };
+
+            match sora.engine.dispatch(child, KernelCall::PortWait { port }) {
+                KernelCallResult::PortPacket(packet) => ChildPortWaitOutcome::Packet(packet.source),
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildPortWaitOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildPortWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildPortWaitOutcome::Packet(source) => return source.0 as u64,
+            ChildPortWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_port(wait_koid);
+            }
+            ChildPortWaitOutcome::Done => return 0,
+        }
+    }
+}
+
 extern "C" fn svc_hook(regs: *mut u64) {
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
@@ -478,10 +582,38 @@ extern "C" fn svc_hook(regs: *mut u64) {
         return;
     }
 
+    if num == Syscall::ProcessWait as u64 {
+        r[0] = crate::user_thread::process_wait() as u32 as u64;
+        return;
+    }
+
     if num == Syscall::PortWait as u64 {
         let port = Handle(r[0] as u32);
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                r[0] = wait_child_port_without_borrow(cp_koid, port);
+                return;
+            }
+        }
         r[0] = wait_sora_port_without_borrow(port);
         return;
+    }
+
+    if num == Syscall::ChannelRead as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let channel = Handle(r[0] as u32);
+                let user_buf = r[1];
+                let cap = (r[2] as usize).min(256);
+                let (n, handle) =
+                    read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
+                r[0] = n;
+                r[1] = handle;
+                return;
+            }
+        }
     }
 
     with_sora_mut(|sora| {
@@ -514,41 +646,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     kumo_hal::active::early_console_write(bytes);
                     r[0] = len as u64;
                 } else if num == Syscall::ChannelRead as u64 {
-                    let channel = Handle(r[0] as u32);
-                    let user_buf = r[1];
-                    let cap = (r[2] as usize).min(256);
-                    if !user_range_ok(child, user_buf, cap as u64) {
-                        r[0] = 0;
-                        return;
-                    }
-                    // P10-e: dispatch against the child's own process so transfers
-                    // install into its handle table. The bootstrap handle was
-                    // duplicated there by run_child.
-                    match sora
-                        .engine
-                        .dispatch(child, KernelCall::ChannelRead { channel })
-                    {
-                        KernelCallResult::Message(message) => {
-                            let bytes = message.bytes();
-                            let n = bytes.len().min(cap);
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    user_buf as *mut u8,
-                                    n,
-                                )
-                            };
-                            let handles = message.handles();
-                            r[0] = n as u64;
-                            r[1] = handles.first().map(|h| h.0 as u64).unwrap_or(0);
-                        }
-                        KernelCallResult::Status(status)
-                            if status == Errno::ShouldWait.status() =>
-                        {
-                            r[0] = 0;
-                        }
-                        _ => r[0] = 0,
-                    }
+                    r[0] = 0;
                 } else if num == Syscall::ChannelWrite as u64 {
                     let channel = Handle(r[0] as u32);
                     let user_ptr = r[1];
@@ -570,6 +668,22 @@ extern "C" fn svc_hook(regs: *mut u64) {
                             }
                         }
                         Err(_) => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::PortCreate as u64 {
+                    match sora.engine.dispatch(child, KernelCall::PortCreate) {
+                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::PortBindChannel as u64 {
+                    let port = Handle(r[0] as u32);
+                    let channel = Handle(r[1] as u32);
+                    match sora
+                        .engine
+                        .dispatch(child, KernelCall::PortBindChannel { port, channel })
+                    {
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
                     }
                 } else {
                     r[0] = u64::MAX;
@@ -1089,7 +1203,7 @@ fn attempt_sora(
     let user_ttbr0 =
         kumo_hal::active::build_user_tables(&image, &mut alloc).map_err(UsermodeError::Image)?;
 
-    let kernel_ttbr0 = kumo_hal::active::read_ttbr0();
+    let kernel_ttbr0 = kumo_hal::active::read_user_aspace_root();
     let user_state = UserState {
         x: {
             let mut x = [0u64; 31];
@@ -1490,10 +1604,7 @@ pub fn kbd_forward(byte: u8) -> bool {
 /// P8-b: check the root channel for a completed command line from Sora. If one is
 /// waiting, run it through the kernel shell and return the byte count. Returns 0 if
 /// no line is available. The caller should emit the prompt after the command output.
-pub fn poll_root_command(
-    tasks: &[crate::shell::TaskInfo],
-    env: &mut crate::shell::ShellEnv,
-) -> usize {
+pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
     let line = with_sora_mut(|sora| {
         let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) else {
             return None;
@@ -1515,8 +1626,9 @@ pub fn poll_root_command(
     let preempt = crate::kdemo::preempt_stats();
     env.preempt_ticks = preempt.ticks;
     env.preempt_switches = preempt.switches;
+    let tasks = crate::kdemo::tasks();
     let mut out = crate::bootstrap::console::Writer;
-    crate::shell::run_command(&line, env, tasks, &mut out);
+    crate::shell::run_command(&line, env, &tasks, &mut out);
     line.len()
 }
 

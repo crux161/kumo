@@ -408,17 +408,22 @@ impl Dispatcher {
 
     fn dispatch_after_removed(&mut self, from: Option<ThreadId>) -> Decision {
         if let Some(prio) = self.rt.peek_top() {
-            let to = self.rt.pick_next().expect("rt non-empty");
-            self.current = Some(Running {
-                id: to,
-                prio,
-                class: ClassId::Rt,
-            });
-            self.ticks = 0;
-            if from == Some(to) {
-                return Decision::Continue(to);
+            // Invariant: peek_top() == Some implies pick_next() == Some. If that ever
+            // breaks, fall through to the idle floor rather than panic — the scheduler
+            // is the §5.6 fixed point and must never bring the kernel down (DESIGN/003).
+            if let Some(to) = self.rt.pick_next() {
+                self.current = Some(Running {
+                    id: to,
+                    prio,
+                    class: ClassId::Rt,
+                });
+                self.ticks = 0;
+                if from == Some(to) {
+                    return Decision::Continue(to);
+                }
+                return Decision::Switch { from, to };
             }
-            return Decision::Switch { from, to };
+            debug_assert!(false, "rt peek_top/pick_next disagree");
         }
         if let Some(idle) = self.idle.pick_next() {
             self.current = Some(Running {
@@ -440,8 +445,16 @@ impl Dispatcher {
         if cur.class == ClassId::Rt {
             self.rt.enqueue(cur.id, cur.prio);
         }
-        let prio = self.rt.peek_top().expect("rt non-empty");
-        let to = self.rt.pick_next().expect("rt non-empty");
+        // A preempt only fires when an RT thread is ready, so rt is non-empty here.
+        // If that invariant is ever violated, keep the current thread running rather
+        // than panic — the scheduler must never fault (DESIGN/003).
+        let prio = self.rt.peek_top();
+        let to = self.rt.pick_next();
+        let (Some(prio), Some(to)) = (prio, to) else {
+            debug_assert!(false, "preempt_to_rt with empty rt");
+            self.current = Some(cur);
+            return Decision::Continue(cur.id);
+        };
         self.current = Some(Running {
             id: to,
             prio,
@@ -456,7 +469,13 @@ impl Dispatcher {
 
     fn rotate_same_level(&mut self, cur: Running) -> Decision {
         self.rt.enqueue(cur.id, cur.prio);
-        let to = self.rt.pick_next().expect("rt non-empty");
+        // We just enqueued cur.id, so pick_next() is guaranteed Some; guard anyway so a
+        // future invariant break degrades to "keep running" instead of a kernel panic.
+        let Some(to) = self.rt.pick_next() else {
+            debug_assert!(false, "rotate_same_level: rt empty after enqueue");
+            self.current = Some(cur);
+            return Decision::Continue(cur.id);
+        };
         self.current = Some(Running {
             id: to,
             prio: cur.prio,
