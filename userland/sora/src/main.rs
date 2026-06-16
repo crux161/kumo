@@ -5,14 +5,15 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
-use kumo_abi::Handle;
+use kumo_abi::{Handle, PERSONA_LINUX_HELLO_PATH};
 use kumo_rt::{
-    address_space_create, channel_create, channel_read, channel_write, channel_write_with_handle,
-    debug_write, handle_koid, interrupt_create, port_bind_channel, port_create, port_wait,
-    process_create, process_exit, process_run, thread_create, thread_start, vmar_map, vmo_create,
-    vmo_read, vmo_write,
+    address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
+    channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind_channel,
+    port_create, port_wait, process_create, process_exit, process_run, process_wait, thread_create,
+    thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
+use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
 
 mod heap;
 
@@ -282,23 +283,65 @@ extern "C" fn sora_main(
     //   movz x0, #0                → exit code 0
     //   movz x8, #21               → ProcessExit
     //   svc  #0
-    // String at VMO offset 0x1000: "hello from child as\n" (20 bytes).
+    // P10-f: verify ChannelWrite + handle transfer across a channel pair.
+    // The channel_create_pair asm used `in(reg)` which could alias x8 with
+    // the output register, causing ChannelCreate to execute as VmoCreate
+    // (handle-is-Vmo). Fixed by switching to explicit `in("x8")`.
     {
-        // The two `movz x8` words carry the syscall numbers; an earlier draft transposed
-        // their nibbles (0x..3a28 = #465, 0x..2a28 = #337), so both SVCs ran with garbage
-        // x8 and the child fell off the end of the payload. `movk` replaces an `add` whose
-        // #0x1000 immediate didn't fit in the imm12 field.
-        let code: [u32; 8] = [
-            0xd2a20000, // movz x0, #0x1000, lsl #16  -> 0x1000_0000
-            0xf2820000, // movk x0, #0x1000           -> 0x1000_1000
-            0xd2800281, // movz x1, #20
-            0xd28003a8, // movz x8, #29  (DebugWrite)
+        let (a0, a1) = channel_create_pair();
+        let (b0, b1) = channel_create_pair();
+        if a0 != u64::MAX && a1 != u64::MAX && b0 != u64::MAX && b1 != u64::MAX {
+            let st = channel_write(Handle(a0 as u32), b"T".as_ptr(), 1);
+            let st2 =
+                channel_write_with_handle(Handle(a0 as u32), b"x".as_ptr(), 1, Handle(b1 as u32));
+            if st == 0 && st2 == 0 {
+                log(b"P10-f: ch-write+transfer ok\n");
+            } else {
+                log(b"P10-f: ch-write fail\n");
+            }
+        }
+    }
+
+    // String at VMO offset 0x1000: "hello from child ch\n" (20 bytes).
+    // String at VMO offset 0x1020: "child xfer ok!\n" (16 bytes).
+    {
+        // P10-f: channel-based cross-process handle transfer. Sora writes to
+        // ch0 WITH xfer1 as a transferred handle BEFORE process_run, so the
+        // message waits in ch1's inbox. The child's first act is ChannelRead
+        // on ch1, which installs xfer1 in its own handle table. The child
+        // then writes to xfer1 and exits. Sora reads from xfer0 to verify.
+        //
+        // Payload (22 aarch64 instructions, 88 bytes at VMO offset 0x1100),
+        // verified with llvm-mc -triple=aarch64 --show-encoding:
+        let code: [u32; 22] = [
+            0xaa0003f3, // mov x19, x0              (save bootstrap handle)
+            // ChannelRead(x19, buf=0x1000FE00, cap=32) — buf on RW stack
+            0xaa1303e0, // mov x0, x19              (channel = bootstrap)
+            0xd2a20001, // movz x1, #0x1000, lsl #16
+            0xf29fc001, // movk x1, #0xFE00          (buf = 0x1000FE00)
+            0xd2800402, // movz x2, #32              (cap = 32)
+            0xd28000a8, // movz x8, #5               (ChannelRead)
             0xd4000001, // svc #0
+            0xaa0103f4, // mov x20, x1               (save transferred handle)
+            // ChannelWrite(x20, string_xfer, 16)
+            0xaa1403e0, // mov x0, x20              (channel = received)
+            0xd2a20001, // movz x1, #0x1000, lsl #16
+            0xf2820401, // movk x1, #0x1020          (ptr = 0x10001020)
+            0xd2800202, // movz x2, #16              (len = 16)
+            0xd2800088, // movz x8, #4               (ChannelWrite)
+            0xd4000001, // svc #0
+            // DebugWrite(string_hello, 20)
+            0xd2a20000, // movz x0, #0x1000, lsl #16
+            0xf2820000, // movk x0, #0x1000          (ptr = 0x10001000)
+            0xd2800281, // movz x1, #20              (len = 20)
+            0xd28003a8, // movz x8, #29              (DebugWrite)
+            0xd4000001, // svc #0
+            // ProcessExit(0)
             0xd2800000, // movz x0, #0
-            0xd28002a8, // movz x8, #21  (ProcessExit)
+            0xd28002a8, // movz x8, #21              (ProcessExit)
             0xd4000001, // svc #0
         ];
-        let mut code_bytes = [0u8; 32];
+        let mut code_bytes = [0u8; 88];
         for (i, w) in code.iter().enumerate() {
             code_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
         }
@@ -307,31 +350,71 @@ extern "C" fn sora_main(
             log(b" child as=nop (vmo create fail)\n");
         } else {
             let child_vmo = Handle(child_vmo_h as u32);
-            let string_ok =
-                vmo_write(child_vmo, 0x1000, b"hello from child as\n".as_ptr(), 20) == 0;
-            let code_ok = vmo_write(child_vmo, 0x1100, code_bytes.as_ptr(), 32) == 0;
-            if !string_ok {
+            let s1 = vmo_write(child_vmo, 0x1000, b"hello from child ch\n".as_ptr(), 20) == 0;
+            let s2 = vmo_write(child_vmo, 0x1020, b"child xfer ok!\n".as_ptr(), 16) == 0;
+            let c_ok = vmo_write(child_vmo, 0x1100, code_bytes.as_ptr(), 88) == 0;
+            if !s1 || !s2 {
                 log(b" child as=nop (string write fail)\n");
-            } else if !code_ok {
+            } else if !c_ok {
                 log(b" child as=nop (code write fail)\n");
             } else {
-                // A *fresh* child: its VMAR carries only the executable code mapping below, so
-                // AddressSpaceCreate builds a clean tree. (Reusing the P8/P9 child would inherit
-                // its READ-only initrd mapping at the same VA, which loses the L2 slot to a UXN
-                // 2 MiB block and faults the code fetch.)
                 let child_as_h = process_create(0x0000_0000_0000_0000, 0x0000_0000_2000_0000);
                 if child_as_h != u64::MAX {
                     let child_as = Handle(child_as_h as u32);
-                    // Map the 2 pages holding the string (0x1000) and code (0x1100) at child VA
-                    // 0x10000000 as RX (READ|EXECUTE = 5): W^X-clean and page-granular, so the
-                    // code's L3 entries share a table with the stack below instead of colliding on
-                    // a 2 MiB block.
+                    // Map the 3 pages holding strings (0x1000, 0x1020) and code
+                    // (0x1100) at child VA 0x10000000 as RX (READ|EXECUTE = 5).
                     if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) != 0 {
                         log(b" child as=nop (map fail)\n");
                     } else if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
                         log(b" child as=nop (addr space fail)\n");
                     } else {
-                        let run_as = process_run(child_as, 0x10001100, 0x1000FFF0, 0);
+                        // P10-f: channel-based handle transfer. Create two pairs.
+                        // Sora writes to ch0 with xfer1 as transfer BEFORE
+                        // process_run; the child reads from ch1 (passed as the
+                        // bootstrap arg) and receives xfer1 via install_transfers.
+                        let (ch0, ch1) = channel_create_pair();
+                        let (xfer0, xfer1) = channel_create_pair();
+                        let run_as = if ch0 != u64::MAX
+                            && ch1 != u64::MAX
+                            && xfer0 != u64::MAX
+                            && xfer1 != u64::MAX
+                        {
+                            // Queue the handle transfer before the child starts.
+                            let xfer_st = channel_write_with_handle(
+                                Handle(ch0 as u32),
+                                b"x".as_ptr(),
+                                1,
+                                Handle(xfer1 as u32),
+                            );
+                            let ok = process_run(child_as, 0x10001100, 0x1000FFF0, ch1, 0, 0);
+                            // Read from xfer0: the child wrote to xfer1.
+                            let mut xfer_buf = [0u8; 32];
+                            let xn = channel_read(Handle(xfer0 as u32), xfer_buf.as_mut_ptr(), 32)
+                                as usize;
+                            if xn > 0 {
+                                log(b"child xfer: ");
+                                debug_write(xfer_buf.as_ptr(), xn);
+                            } else {
+                                log(b"child xfer: (none) st=");
+                                let mut hx = [0u8; 4];
+                                let mut v = xfer_st as u64;
+                                let mut i = 4;
+                                loop {
+                                    i -= 1;
+                                    let d = (v & 0xF) as u8;
+                                    hx[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                                    v >>= 4;
+                                    if v == 0 && i <= 1 {
+                                        break;
+                                    }
+                                }
+                                debug_write(hx[i..].as_ptr(), 4 - i);
+                                debug_write(b"\n".as_ptr(), 1);
+                            }
+                            ok
+                        } else {
+                            u64::MAX
+                        };
                         log(b" child as run=");
                         if run_as == 0 {
                             log(b"ok\n");
@@ -344,6 +427,157 @@ extern "C" fn sora_main(
                 }
             }
         }
+    } // P10-g: async child demo — non-blocking ProcessRun (flags=1).
+      // Sora spawns the child, writes "go" to the bootstrap channel,
+      // calls process_wait (child preempts, reads "go", writes "world!\n",
+      // DebugWrites, exits). Sora resumes, reads "world!\n" from c0.
+    {
+        let child_vmo_h = vmo_create(0x2000);
+        if child_vmo_h != u64::MAX {
+            let child_vmo = Handle(child_vmo_h as u32);
+            // Code: save handle + ChannelRead + ChannelWrite + DebugWrite + ProcessExit
+            // String at 0x1000: "async child ok\n" (15 bytes)
+            // String at 0x1020: "world!\n" (6 bytes)
+            let code: [u32; 21] = [
+                0xaa0003f3, // mov x19, x0              (save bootstrap handle)
+                // ChannelRead(x19, buf=0x1000FE00, cap=32)
+                0xaa1303e0, // mov x0, x19
+                0xd2a20001, // movz x1, #0x1000, lsl #16
+                0xf29fc001, // movk x1, #0xFE00
+                0xd2800402, // movz x2, #32
+                0xd28000a8, // movz x8, #5               (ChannelRead)
+                0xd4000001, // svc #0
+                // ChannelWrite(x19, reply, 6)
+                0xaa1303e0, // mov x0, x19
+                0xd2a20001, // movz x1, #0x1000, lsl #16
+                0xf2820401, // movk x1, #0x1020
+                0xd28000c2, // movz x2, #6
+                0xd2800088, // movz x8, #4               (ChannelWrite)
+                0xd4000001, // svc #0
+                // DebugWrite(string, 15)
+                0xd2a20000, // movz x0, #0x1000, lsl #16
+                0xf2820000, // movk x0, #0x1000
+                0xd28001e1, // movz x1, #15
+                0xd28003a8, // movz x8, #29              (DebugWrite)
+                0xd4000001, // svc #0
+                // ProcessExit(0)
+                0xd2800000, // movz x0, #0
+                0xd28002a8, // movz x8, #21              (ProcessExit)
+                0xd4000001, // svc #0
+            ];
+            let mut cb = [0u8; 84];
+            for (i, w) in code.iter().enumerate() {
+                cb[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let s1 = vmo_write(child_vmo, 0x1000, b"async child ok\n".as_ptr(), 15) == 0;
+            let s2 = vmo_write(child_vmo, 0x1020, b"world!\n".as_ptr(), 6) == 0;
+            let c_ok = vmo_write(child_vmo, 0x1100, cb.as_ptr(), 84) == 0;
+            if s1 && s2 && c_ok {
+                let child_as_h = process_create(0, 0x2000_0000);
+                if child_as_h != u64::MAX {
+                    let child_as = Handle(child_as_h as u32);
+                    if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) == 0
+                        && address_space_create(child_as, 0x10010000, 0x4000) != u64::MAX
+                    {
+                        let (c0, c1) = channel_create_pair();
+                        if c0 != u64::MAX && c1 != u64::MAX {
+                            // flags=1 → async
+                            let st = process_run(child_as, 0x10001100, 0x1000FFF0, c1, 0, 1);
+                            if st == 0 {
+                                channel_write(Handle(c0 as u32), b"go".as_ptr(), 2);
+                                process_wait();
+                                let mut rbuf = [0u8; 16];
+                                let rn =
+                                    channel_read(Handle(c0 as u32), rbuf.as_mut_ptr(), 16) as usize;
+                                if rn > 0 {
+                                    log(b"async reply: ");
+                                    debug_write(rbuf.as_ptr(), rn);
+                                }
+                                log(b"async run=ok\n");
+                            } else {
+                                log(b"async run=fail\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // M10-a: first `persona-linux` smoke. This is not a native KUMO child: the
+    // payload uses ARM64 Linux syscall numbers (`write` = 64, `exit_group` = 94).
+    // The temporary Stage-A bridge in the kernel translates those numbers only for
+    // non-Sora children until the userspace persona runner owns the trap path.
+    {
+        let _ = linux_arm64::WRITE;
+        let _ = linux_arm64::EXIT_GROUP;
+        let linux_msg = b"M10 linux hello\n";
+        let child_vmo_h = vmo_create(0x2000);
+        if child_vmo_h == u64::MAX {
+            log(b"M10 linux: vmo fail\n");
+        } else if linux_msg.len() != 16 {
+            log(b"M10 linux: len fail\n");
+        } else {
+            let child_vmo = Handle(child_vmo_h as u32);
+            // Payload (9 aarch64 instructions, 36 bytes at VMO offset 0x1100),
+            // verified with `llvm-mc -triple=aarch64 --show-encoding`:
+            //   movz x0, #1                → fd = stdout
+            //   movz x1, #0x1000, lsl #16 → x1 = 0x1000_0000
+            //   movk x1, #0x1000          → buf = 0x1000_1000
+            //   movz x2, #16              → len
+            //   movz x8, #64              → Linux arm64 write
+            //   svc  #0
+            //   movz x0, #0               → status
+            //   movz x8, #94              → Linux arm64 exit_group
+            //   svc  #0
+            let code: [u32; 9] = [
+                0xd2800020, // movz x0, #1
+                0xd2a20001, // movz x1, #0x1000, lsl #16
+                0xf2820001, // movk x1, #0x1000
+                0xd2800202, // movz x2, #16
+                0xd2800808, // movz x8, #64
+                0xd4000001, // svc #0
+                0xd2800000, // movz x0, #0
+                0xd2800bc8, // movz x8, #94
+                0xd4000001, // svc #0
+            ];
+            let mut cb = [0u8; 36];
+            for (i, w) in code.iter().enumerate() {
+                cb[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let msg_ok = vmo_write(child_vmo, 0x1000, linux_msg.as_ptr(), linux_msg.len()) == 0;
+            let code_ok = vmo_write(child_vmo, 0x1100, cb.as_ptr(), cb.len()) == 0;
+            if !msg_ok || !code_ok {
+                log(b"M10 linux: write fail\n");
+            } else {
+                let child_as_h = process_create(0, 0x2000_0000);
+                if child_as_h == u64::MAX {
+                    log(b"M10 linux: process fail\n");
+                } else {
+                    let child_as = Handle(child_as_h as u32);
+                    if vmar_map(child_as, child_vmo, 0, 0x10000000, 0x2000, 5) != 0 {
+                        log(b"M10 linux: map fail\n");
+                    } else if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
+                        log(b"M10 linux: as fail\n");
+                    } else {
+                        let st = process_run(child_as, 0x10001100, 0x1000FFF0, 0, 0, 0);
+                        if st == 0 {
+                            log(b"M10 linux: run ok\n");
+                        } else {
+                            log(b"M10 linux: run fail\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // M10-b: load the same hello path as an initrd-resident ARM64 Linux ELF.
+    // This is the first step from handmade payload toward "one static ELF".
+    if run_persona_linux_elf(initrd) {
+        log(b"M10 elf: run ok\n");
+    } else {
+        log(b"M10 elf: run fail\n");
     }
 
     // P10-b: VmoWrite/VmoRead demo on anonymous backing.
@@ -514,6 +748,209 @@ fn path_to_8_3(path: &[u8]) -> Option<[u8; 11]> {
     name[..base.len()].copy_from_slice(base);
     name[8..8 + ext.len()].copy_from_slice(ext);
     Some(name)
+}
+
+#[derive(Clone, Copy)]
+struct PersonaLoadSegment {
+    file_offset: u64,
+    file_size: u64,
+    virt_addr: u64,
+    mem_size: u64,
+    flags: u64,
+}
+
+fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {
+    let mut header = [0u8; 16];
+    if vmo_read(initrd, 0, header.as_mut_ptr(), 16) != 0 {
+        return None;
+    }
+    let entry_count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let mut entry = [0u8; 80];
+    for i in 0..entry_count {
+        let off = 16u64 + (i as u64) * 80;
+        if vmo_read(initrd, off, entry.as_mut_ptr(), 80) != 0 {
+            return None;
+        }
+        let plen = entry[..64].iter().position(|b| *b == 0).unwrap_or(64);
+        if plen == target.len() && entry[..plen] == target[..] {
+            let file_off = u64::from_le_bytes(entry[64..72].try_into().unwrap());
+            let file_len = u64::from_le_bytes(entry[72..80].try_into().unwrap());
+            return Some((file_off, file_len));
+        }
+    }
+    None
+}
+
+fn run_persona_linux_elf(initrd: Handle) -> bool {
+    const PAGE_SIZE: u64 = 4096;
+    const MAX_SEGMENTS: usize = 8;
+
+    fn align_down(value: u64) -> u64 {
+        value & !(PAGE_SIZE - 1)
+    }
+
+    fn align_up(value: u64) -> Option<u64> {
+        value
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+    }
+
+    fn page_flags(elf_flags: u32) -> u64 {
+        let mut flags = 0u64;
+        if elf_flags & linux_elf::PF_R != 0 {
+            flags |= 1;
+        }
+        if elf_flags & linux_elf::PF_W != 0 {
+            flags |= 2;
+        }
+        if elf_flags & linux_elf::PF_X != 0 {
+            flags |= 4;
+        }
+        flags
+    }
+
+    let (elf_off, elf_len) = match find_initrd_file(initrd, PERSONA_LINUX_HELLO_PATH.as_bytes()) {
+        Some(file) => file,
+        None => {
+            log(b"M10 elf: missing\n");
+            return false;
+        }
+    };
+
+    let mut header = [0u8; linux_elf::ELF_HEADER_LEN];
+    if vmo_read(initrd, elf_off, header.as_mut_ptr(), header.len()) != 0 {
+        log(b"M10 elf: hdr read fail\n");
+        return false;
+    }
+    let elf = match linux_elf::parse_header(&header) {
+        Ok(elf) => elf,
+        Err(_) => {
+            log(b"M10 elf: bad hdr\n");
+            return false;
+        }
+    };
+
+    let ph_table_len = (elf.phnum as u64).saturating_mul(elf.phentsize as u64);
+    if elf.phoff.saturating_add(ph_table_len) > elf_len || elf.phnum as usize > MAX_SEGMENTS {
+        log(b"M10 elf: ph range fail\n");
+        return false;
+    }
+
+    let empty = PersonaLoadSegment {
+        file_offset: 0,
+        file_size: 0,
+        virt_addr: 0,
+        mem_size: 0,
+        flags: 0,
+    };
+    let mut segments = [empty; MAX_SEGMENTS];
+    let mut segment_count = 0usize;
+    let mut vmo_len = 0u64;
+
+    for index in 0..elf.phnum as usize {
+        let ph_off = elf_off + elf.phoff + (index as u64) * (elf.phentsize as u64);
+        let mut ph_buf = [0u8; linux_elf::ELF_PHDR_LEN];
+        if vmo_read(initrd, ph_off, ph_buf.as_mut_ptr(), ph_buf.len()) != 0 {
+            log(b"M10 elf: ph read fail\n");
+            return false;
+        }
+        let ph = match linux_elf::parse_program_header(&ph_buf) {
+            Ok(ph) => ph,
+            Err(_) => {
+                log(b"M10 elf: bad ph\n");
+                return false;
+            }
+        };
+        if ph.kind != linux_elf::PT_LOAD {
+            continue;
+        }
+        if segment_count >= MAX_SEGMENTS
+            || ph.file_offset.saturating_add(ph.file_size) > elf_len
+            || ph.file_offset.saturating_add(ph.mem_size) < ph.file_offset
+        {
+            log(b"M10 elf: segment range fail\n");
+            return false;
+        }
+        vmo_len = vmo_len.max(ph.file_offset.saturating_add(ph.mem_size));
+        segments[segment_count] = PersonaLoadSegment {
+            file_offset: ph.file_offset,
+            file_size: ph.file_size,
+            virt_addr: ph.virt_addr,
+            mem_size: ph.mem_size,
+            flags: page_flags(ph.flags),
+        };
+        segment_count += 1;
+    }
+
+    if segment_count == 0 {
+        log(b"M10 elf: no load\n");
+        return false;
+    }
+    let vmo_len = match align_up(vmo_len) {
+        Some(len) if len > 0 => len,
+        _ => {
+            log(b"M10 elf: size fail\n");
+            return false;
+        }
+    };
+
+    let child_vmo_h = vmo_create(vmo_len);
+    if child_vmo_h == u64::MAX {
+        log(b"M10 elf: vmo fail\n");
+        return false;
+    }
+    let child_vmo = Handle(child_vmo_h as u32);
+
+    let mut chunk = [0u8; 256];
+    for segment in segments.iter().take(segment_count) {
+        let mut copied = 0u64;
+        while copied < segment.file_size {
+            let n = ((segment.file_size - copied) as usize).min(chunk.len());
+            if vmo_read(
+                initrd,
+                elf_off + segment.file_offset + copied,
+                chunk.as_mut_ptr(),
+                n,
+            ) != 0
+                || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
+            {
+                log(b"M10 elf: copy fail\n");
+                return false;
+            }
+            copied += n as u64;
+        }
+    }
+
+    let child_as_h = process_create(0, 0x2000_0000);
+    if child_as_h == u64::MAX {
+        log(b"M10 elf: process fail\n");
+        return false;
+    }
+    let child_as = Handle(child_as_h as u32);
+
+    for segment in segments.iter().take(segment_count) {
+        let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
+        let virt = align_down(segment.virt_addr);
+        let vmo_offset = align_down(segment.file_offset);
+        let len = match align_up(page_delta.saturating_add(segment.mem_size)) {
+            Some(len) => len,
+            None => {
+                log(b"M10 elf: map len fail\n");
+                return false;
+            }
+        };
+        if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
+            log(b"M10 elf: map fail\n");
+            return false;
+        }
+    }
+
+    if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
+        log(b"M10 elf: as fail\n");
+        return false;
+    }
+
+    process_run(child_as, elf.entry, 0x1000FFF0, 0, 0, 0) == 0
 }
 
 /// Resolve a file path against the FAT32 root directory and return up to `req_len` bytes

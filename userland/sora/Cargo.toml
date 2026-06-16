@@ -10,6 +10,7 @@ kumo-abi.workspace = true
 kumo-ipc.workspace = true
 kumo-rt = { path = "../kumo-rt" }
 kumoza = { path = "../kumoza" }
+persona-linux = { path = "../persona-linux" }
 
 [lib]
 path = "src/lib.rs"

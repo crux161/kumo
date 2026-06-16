@@ -221,6 +221,108 @@ fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
     }
 }
 
+const LINUX_ARM64_READ: u64 = 63;
+const LINUX_ARM64_OPENAT: u64 = 56;
+const LINUX_ARM64_CLOSE: u64 = 57;
+const LINUX_ARM64_WRITE: u64 = 64;
+const LINUX_ARM64_WRITEV: u64 = 66;
+const LINUX_ARM64_NEWFSTATAT: u64 = 79;
+const LINUX_ARM64_EXIT: u64 = 93;
+const LINUX_ARM64_EXIT_GROUP: u64 = 94;
+const LINUX_ARM64_MUNMAP: u64 = 215;
+const LINUX_ARM64_BRK: u64 = 214;
+const LINUX_ARM64_MMAP: u64 = 222;
+const LINUX_ARM64_STDOUT: u64 = 1;
+const LINUX_ARM64_STDERR: u64 = 2;
+
+/// Temporary Stage-A M10 bridge for the first `persona-linux` smoke.
+///
+/// The real design keeps the Linux personality in userspace. Until the upcall
+/// path exists, non-Sora child SVCs that use ARM64 Linux syscall numbers are
+/// translated here narrowly enough to run a static hello payload.
+fn handle_linux_persona_syscall(process: &Process, regs: &mut [u64]) -> bool {
+    match regs[8] {
+        LINUX_ARM64_WRITE => {
+            let fd = regs[0];
+            let user_ptr = regs[1];
+            let len = (regs[2] as usize).min(256);
+            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            if !user_range_ok(process, user_ptr, len as u64) {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+            kumo_hal::active::early_console_write(bytes);
+            regs[0] = len as u64;
+            true
+        }
+        LINUX_ARM64_WRITEV => {
+            let fd = regs[0];
+            let iov = regs[1];
+            let iovcnt = (regs[2] as usize).min(8);
+            if fd != LINUX_ARM64_STDOUT && fd != LINUX_ARM64_STDERR {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let bytes_len = (iovcnt as u64).saturating_mul(16);
+            if !user_range_ok(process, iov, bytes_len) {
+                regs[0] = (-1i64) as u64;
+                return true;
+            }
+            let mut total = 0u64;
+            for index in 0..iovcnt {
+                let base = iov + (index as u64) * 16;
+                let ptr = unsafe { core::ptr::read_unaligned(base as *const u64) };
+                let len = unsafe { core::ptr::read_unaligned((base + 8) as *const u64) };
+                let len = (len as usize).min(256);
+                if !user_range_ok(process, ptr, len as u64) {
+                    regs[0] = (-1i64) as u64;
+                    return true;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                kumo_hal::active::early_console_write(bytes);
+                total = total.saturating_add(len as u64);
+            }
+            regs[0] = total;
+            true
+        }
+        LINUX_ARM64_READ => {
+            // The first MVP payload has no stdin. Return EOF for fd 0 and EBADF-ish
+            // for anything else; enough for simple static startup probes.
+            regs[0] = if regs[0] == 0 { 0 } else { (-1i64) as u64 };
+            true
+        }
+        LINUX_ARM64_CLOSE | LINUX_ARM64_MUNMAP => {
+            regs[0] = 0;
+            true
+        }
+        LINUX_ARM64_OPENAT | LINUX_ARM64_NEWFSTATAT => {
+            regs[0] = (-1i64) as u64;
+            true
+        }
+        LINUX_ARM64_BRK => {
+            // No heap growth yet. A zero query returns the fixed bootstrap break; any
+            // request is left unchanged so minimalist static binaries can continue.
+            regs[0] = 0x1001_0000;
+            true
+        }
+        LINUX_ARM64_MMAP => {
+            regs[0] = (-1i64) as u64;
+            true
+        }
+        LINUX_ARM64_EXIT | LINUX_ARM64_EXIT_GROUP => {
+            if crate::user_thread::is_started() {
+                crate::user_thread::exit_current_user(regs[0]);
+            }
+            kumo_hal::active::el0_exit(regs[0])
+        }
+        _ => false,
+    }
+}
+
 extern "C" fn svc_hook(regs: *mut u64) {
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
@@ -234,22 +336,86 @@ extern "C" fn svc_hook(regs: *mut u64) {
 
     let sora = unsafe { &mut *sora_ptr() };
 
-    if let Some(current_process) = crate::user_thread::current_process_koid() {
-        if current_process != sora.process.koid() {
+    if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+        if cp_koid != sora.process.koid() {
+            // P10-d scaffold: child syscalls use Sora's handle table for
+            // channel ops (the child's handles were created by Sora and
+            // haven't been transferred yet). Real capability-scoped routing
+            // uses the child's own table once handle transfer is implemented.
+            let child_ptr = sora
+                .engine
+                .process_by_koid_mut(cp_koid)
+                .map(|p| p as *mut Process);
+            let Some(child_ptr) = child_ptr else {
+                r[0] = u64::MAX;
+                return;
+            };
+            let child = unsafe { &mut *child_ptr };
+            if handle_linux_persona_syscall(child, r) {
+                return;
+            }
             if num == Syscall::DebugWrite as u64 {
                 let user_ptr = r[0];
                 let len = (r[1] as usize).min(256);
-                let Some(child_process) = sora.engine.process_by_koid(current_process) else {
-                    r[0] = u64::MAX;
-                    return;
-                };
-                if !user_range_ok(child_process, user_ptr, len as u64) {
+                if !user_range_ok(child, user_ptr, len as u64) {
                     r[0] = u64::MAX;
                     return;
                 }
                 let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
                 kumo_hal::active::early_console_write(bytes);
                 r[0] = len as u64;
+            } else if num == Syscall::ChannelRead as u64 {
+                let channel = Handle(r[0] as u32);
+                let user_buf = r[1];
+                let cap = (r[2] as usize).min(256);
+                if !user_range_ok(child, user_buf, cap as u64) {
+                    r[0] = 0;
+                    return;
+                }
+                // P10-e: dispatch against the child's own process so transfers
+                // install into its handle table. The bootstrap handle was
+                // duplicated there by run_child.
+                match sora
+                    .engine
+                    .dispatch(child, KernelCall::ChannelRead { channel })
+                {
+                    KernelCallResult::Message(message) => {
+                        let bytes = message.bytes();
+                        let n = bytes.len().min(cap);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                        };
+                        let handles = message.handles();
+                        r[0] = n as u64;
+                        r[1] = handles.first().map(|h| h.0 as u64).unwrap_or(0);
+                    }
+                    KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                        r[0] = 0;
+                    }
+                    _ => r[0] = 0,
+                }
+            } else if num == Syscall::ChannelWrite as u64 {
+                let channel = Handle(r[0] as u32);
+                let user_ptr = r[1];
+                let len = (r[2] as usize).min(256);
+                if !user_range_ok(child, user_ptr, len as u64) {
+                    r[0] = u64::MAX;
+                    return;
+                }
+                let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+                match Message::new(1, bytes, &[]) {
+                    Ok(message) => {
+                        // P10-e: use child's own process.
+                        match sora
+                            .engine
+                            .dispatch(child, KernelCall::ChannelWrite { channel, message })
+                        {
+                            KernelCallResult::Status(s) => r[0] = s as u32 as u64,
+                            _ => r[0] = u64::MAX,
+                        }
+                    }
+                    Err(_) => r[0] = u64::MAX,
+                }
             } else {
                 r[0] = u64::MAX;
             }
@@ -424,6 +590,8 @@ extern "C" fn svc_hook(regs: *mut u64) {
         let entry = r[1];
         let sp = r[2];
         let arg = r[3];
+        let arg2 = r[4];
+        let flags = r[5];
         match sora.engine.dispatch(
             &mut sora.process,
             KernelCall::ProcessRun {
@@ -431,8 +599,18 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 entry,
                 sp,
                 arg,
+                arg2,
+                flags,
             },
         ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ProcessWait as u64 {
+        match sora
+            .engine
+            .dispatch(&mut sora.process, KernelCall::ProcessWait)
+        {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
@@ -577,7 +755,9 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     unsafe {
                         core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
                     };
+                    let handles = message.handles();
                     r[0] = n as u64;
+                    r[1] = handles.first().map(|h| h.0 as u64).unwrap_or(0);
                     break;
                 }
                 KernelCallResult::Status(status)

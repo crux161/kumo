@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION,
-    SORA_INIT_PATH,
+    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -655,9 +655,11 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
         ImageArch::Aarch64 => {
             let sora = build_sora_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
+            let persona_linux_hello = build_persona_linux_hello_elf();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
+                (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
             ])?
         }
         ImageArch::X86_64 => {
@@ -708,6 +710,84 @@ fn build_sora_image(root: &Path) -> Result<Vec<u8>, String> {
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as Sora ELF: {err}", source_path.display()))?;
     Ok(bytes)
+}
+
+fn build_persona_linux_hello_elf() -> Vec<u8> {
+    const ELF_HEADER_LEN: usize = 64;
+    const ELF_PHDR_LEN: usize = 56;
+    const ET_EXEC: u16 = 2;
+    const EM_AARCH64: u16 = 0xb7;
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1 << 0;
+    const PF_R: u32 = 1 << 2;
+    const ENTRY: u64 = 0x1000_1000;
+    const DATA: u64 = 0x1000_2000;
+    const CODE_OFFSET: usize = 0x1000;
+    const DATA_OFFSET: usize = 0x2000;
+
+    fn put_u16(buf: &mut [u8], offset: usize, value: u16) {
+        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
+        buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut elf = vec![0u8; 0x3000];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // little-endian
+    elf[6] = 1; // current version
+    put_u16(&mut elf, 16, ET_EXEC);
+    put_u16(&mut elf, 18, EM_AARCH64);
+    put_u32(&mut elf, 20, 1);
+    put_u64(&mut elf, 24, ENTRY);
+    put_u64(&mut elf, 32, ELF_HEADER_LEN as u64);
+    put_u16(&mut elf, 52, ELF_HEADER_LEN as u16);
+    put_u16(&mut elf, 54, ELF_PHDR_LEN as u16);
+    put_u16(&mut elf, 56, 2);
+
+    let code_ph = ELF_HEADER_LEN;
+    put_u32(&mut elf, code_ph, PT_LOAD);
+    put_u32(&mut elf, code_ph + 4, PF_R | PF_X);
+    put_u64(&mut elf, code_ph + 8, CODE_OFFSET as u64);
+    put_u64(&mut elf, code_ph + 16, ENTRY);
+    put_u64(&mut elf, code_ph + 24, ENTRY);
+    put_u64(&mut elf, code_ph + 32, 36);
+    put_u64(&mut elf, code_ph + 40, 36);
+    put_u64(&mut elf, code_ph + 48, 0x1000);
+
+    let data_ph = ELF_HEADER_LEN + ELF_PHDR_LEN;
+    let msg = b"M10 elf linux hi\n";
+    put_u32(&mut elf, data_ph, PT_LOAD);
+    put_u32(&mut elf, data_ph + 4, PF_R);
+    put_u64(&mut elf, data_ph + 8, DATA_OFFSET as u64);
+    put_u64(&mut elf, data_ph + 16, DATA);
+    put_u64(&mut elf, data_ph + 24, DATA);
+    put_u64(&mut elf, data_ph + 32, msg.len() as u64);
+    put_u64(&mut elf, data_ph + 40, msg.len() as u64);
+    put_u64(&mut elf, data_ph + 48, 0x1000);
+
+    // Payload verified with `llvm-mc -triple=aarch64 --show-encoding`.
+    let code: [u32; 9] = [
+        0xd2800020, // movz x0, #1
+        0xd2a20001, // movz x1, #0x1000, lsl #16
+        0xf2840001, // movk x1, #0x2000
+        0xd2800222, // movz x2, #17
+        0xd2800808, // movz x8, #64
+        0xd4000001, // svc #0
+        0xd2800000, // movz x0, #0
+        0xd2800bc8, // movz x8, #94
+        0xd4000001, // svc #0
+    ];
+    for (index, word) in code.iter().enumerate() {
+        elf[CODE_OFFSET + index * 4..CODE_OFFSET + (index + 1) * 4]
+            .copy_from_slice(&word.to_le_bytes());
+    }
+    elf[DATA_OFFSET..DATA_OFFSET + msg.len()].copy_from_slice(msg);
+    elf
 }
 
 fn build_initrd(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {

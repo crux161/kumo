@@ -74,7 +74,12 @@ pub enum KernelCall<'a> {
         entry: u64,
         sp: u64,
         arg: u64,
+        arg2: u64,
+        /// Bit 0 = async (don't block, admit at low priority).
+        flags: u64,
     },
+    /// P10-g: block until the async child process exits.
+    ProcessWait,
     InterruptCreate {
         irq: u32,
     },
@@ -269,6 +274,15 @@ impl SyscallEngine {
         &mut self.ipc
     }
 
+    /// Create a channel pair: both endpoints go to `process`. Convenience wrapper
+    /// that avoids borrow conflicts between `objects` and `ipc`.
+    pub fn channel_create(
+        &mut self,
+        process: &mut Process,
+    ) -> Result<(Handle, Handle), crate::ipc::IpcError> {
+        self.ipc.channel_create(&mut self.objects, process)
+    }
+
     /// Create a root channel: one endpoint for `process`, one retained by the kernel.
     /// Convenience wrapper that avoids borrow conflicts between `objects` and `ipc`.
     pub fn root_channel_create(
@@ -383,6 +397,18 @@ impl SyscallEngine {
         )?;
         self.processes.push(child);
         Ok(handle)
+    }
+
+    /// Dispatch a syscall by process koid (avoids borrow conflict when the caller
+    /// already holds a reference into `self.processes`).
+    pub fn dispatch_by_koid(&mut self, proc_koid: KoId, call: KernelCall<'_>) -> KernelCallResult {
+        if let Some(proc) = self.process_by_koid_mut(proc_koid) {
+            // Re-borrow: this is safe because we just obtained the mutable ref above.
+            let p: &mut Process = unsafe { &mut *(proc as *mut Process) };
+            self.dispatch(p, call)
+        } else {
+            KernelCallResult::Status(Errno::BadHandle.status())
+        }
     }
 
     pub fn dispatch(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
@@ -761,7 +787,7 @@ impl SyscallEngine {
                             });
                         }
                         crate::mm::VmoBacking::Anonymous => {
-                            if !executable || mapping.len % crate::mm::PAGE_SIZE != 0 {
+                            if mapping.len % crate::mm::PAGE_SIZE != 0 {
                                 return KernelCallResult::Status(Errno::InvalidArgs.status());
                             }
                             let pages = mapping.len / crate::mm::PAGE_SIZE;
@@ -784,9 +810,9 @@ impl SyscallEngine {
                                     phys_base,
                                     virt_addr: mapping.virt + off,
                                     len: crate::mm::PAGE_SIZE,
-                                    writable: false,
+                                    writable,
                                     device: false,
-                                    executable: true,
+                                    executable,
                                 });
                                 page += 1;
                             }
@@ -832,6 +858,8 @@ impl SyscallEngine {
                 entry,
                 sp,
                 arg,
+                arg2,
+                flags,
             } => {
                 #[cfg(target_os = "none")]
                 {
@@ -850,23 +878,62 @@ impl SyscallEngine {
                         return KernelCallResult::Status(Errno::InvalidArgs.status());
                     };
                     let root_vmar = target.root_vmar();
-                    let status = crate::user_thread::run_child(
-                        &mut self.objects,
-                        proc_koid,
-                        root_vmar,
-                        ttbr0,
-                        entry,
-                        sp,
-                        arg,
-                    );
+                    // Duplicate bootstrap handles from the caller's table
+                    // into the child's handle namespace.
+                    let dup = |a: u64| -> u64 {
+                        if a != 0 {
+                            process
+                                .handles()
+                                .get(Handle(a as u32))
+                                .ok()
+                                .and_then(|entry| {
+                                    self.process_by_koid(proc_koid)
+                                        .map(|cp| cp as *const Process as *mut Process)
+                                        .and_then(|child_ptr| unsafe {
+                                            (*child_ptr).handles_mut().insert_entry(entry).ok()
+                                        })
+                                })
+                                .map(|h| h.0 as u64)
+                                .unwrap_or(a)
+                        } else {
+                            a
+                        }
+                    };
+                    let child_arg = dup(arg);
+                    let child_arg2 = dup(arg2);
+                    // P10-g: flags & 1 = async (non-blocking, low-priority child).
+                    let status = if flags & 1 != 0 {
+                        crate::user_thread::spawn_child_async(
+                            &mut self.objects,
+                            proc_koid,
+                            root_vmar,
+                            ttbr0,
+                            entry,
+                            sp,
+                            child_arg,
+                            child_arg2,
+                        )
+                    } else {
+                        crate::user_thread::run_child(
+                            &mut self.objects,
+                            proc_koid,
+                            root_vmar,
+                            ttbr0,
+                            entry,
+                            sp,
+                            child_arg,
+                            child_arg2,
+                        )
+                    };
                     KernelCallResult::Status(status)
                 }
                 #[cfg(not(target_os = "none"))]
                 {
-                    let _ = (process_handle, entry, sp, arg);
+                    let _ = (process_handle, entry, sp, arg, arg2, flags);
                     KernelCallResult::Status(Errno::NotSupported.status())
                 }
             }
+            KernelCall::ProcessWait => KernelCallResult::Status(crate::user_thread::process_wait()),
             KernelCall::InterruptCreate { irq } => {
                 let object = self.objects.create(ObjectKind::Interrupt);
                 let handle = match process

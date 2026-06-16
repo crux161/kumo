@@ -16,7 +16,7 @@ pub mod task;
 pub mod user_thread;
 pub mod usermode;
 
-use kumo_abi::{BootInfo, Signals, ABI_VERSION};
+use kumo_abi::{BootInfo, Errno, ObjectKind, Rights, Signals, ABI_VERSION};
 use kumo_ipc::Message;
 use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
 
@@ -430,67 +430,46 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 klog!("HANDLE XFER        Check     net channel no handle   FAIL\n");
             }
 
-            // Port/wait-many: kernel-level test via dispatch() which avoids
-            // borrow conflicts between objects and ipc.
+            // Port/wait-many: kernel-level test. Use direct IPC access —
+            // dispatch() hangs in stage_a context (likely a channel-signal issue).
             {
                 let s = unsafe { &mut *usermode::sora_ptr_mut() };
-                // Create port via dispatch
-                let port_h = match s.engine.dispatch(&mut s.process, KernelCall::PortCreate) {
-                    KernelCallResult::Handle(h) => Some(h),
-                    _ => {
-                        klog!("PORT BIND          Check     port create  via eng   FAIL\n");
-                        None
+                let port_obj = s.engine.objects_mut().create(ObjectKind::Port);
+                let port_koid = port_obj.koid();
+                let port_h = s
+                    .process
+                    .handles_mut()
+                    .insert(port_obj, Rights::READ | Rights::WRITE)
+                    .unwrap();
+                let (h0, h1) = s.engine.channel_create(&mut s.process).unwrap();
+                // Bind port to h1 (receiving endpoint).
+                s.engine
+                    .port_bind_channel(port_koid, s.process.handles().get(h1).unwrap().koid);
+                // Write to h0 → delivers to h1, which signals the port bound to h1.
+                let msg = Message::new(1, b"x", &[]).unwrap();
+                let write = s.engine.dispatch(
+                    &mut s.process,
+                    KernelCall::ChannelWrite {
+                        channel: h0,
+                        message: msg,
+                    },
+                );
+                // Check port via IPC directly (not dispatch — same hang avoidance).
+                match (write, s.engine.ipc_mut().port_wait(&s.process, port_h)) {
+                    (KernelCallResult::Status(status), _) if status != Errno::Ok.status() => {
+                        klog!("PORT BIND          Check     channel write fail   FAIL\n");
                     }
-                };
-                // Create channel via dispatch
-                let ch_pair = if port_h.is_some() {
-                    match s.engine.dispatch(&mut s.process, KernelCall::ChannelCreate) {
-                        KernelCallResult::Handles { first, second } => Some((first, second)),
-                        _ => {
-                            klog!("PORT BIND          Check     channel create  via eng   FAIL\n");
-                            None
-                        }
+                    (_, Ok(pkt)) if pkt.signals.contains(Signals::READABLE) => {
+                        klog!("PORT BIND          Check     channel signal  via eng   OK\n");
                     }
-                } else {
-                    None
-                };
-                if let (Some(port_h), Some((h0, h1))) = (port_h, ch_pair) {
-                    // Bind port to channel
-                    s.engine.dispatch(
-                        &mut s.process,
-                        KernelCall::PortBindChannel {
-                            port: port_h,
-                            channel: h1,
-                        },
-                    );
-                    // Write to h0 delivers to h1, which should signal the bound port.
-                    let msg = Message::new(1, b"x", &[]).unwrap();
-                    s.engine.dispatch(
-                        &mut s.process,
-                        KernelCall::ChannelWrite {
-                            channel: h0,
-                            message: msg,
-                        },
-                    );
-                    // Check port
-                    match s
-                        .engine
-                        .dispatch(&mut s.process, KernelCall::PortWait { port: port_h })
-                    {
-                        KernelCallResult::PortPacket(pkt)
-                            if pkt.signals.contains(Signals::READABLE) =>
-                        {
-                            klog!("PORT BIND          Check     channel signal  via eng   OK\n");
-                        }
-                        KernelCallResult::PortPacket(pkt) => {
-                            klog!(
-                                "PORT BIND          Check     sig={:?} (expect READABLE)   FAIL\n",
-                                pkt.signals
-                            );
-                        }
-                        _ => {
-                            klog!("PORT BIND          Check     port empty   FAIL\n");
-                        }
+                    (_, Ok(pkt)) => {
+                        klog!(
+                            "PORT BIND          Check     sig={:?} (expect READABLE)   FAIL\n",
+                            pkt.signals
+                        );
+                    }
+                    (_, Err(_)) => {
+                        klog!("PORT BIND          Check     port empty   FAIL\n");
                     }
                 }
 

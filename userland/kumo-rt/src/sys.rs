@@ -19,6 +19,12 @@ fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
             in("x2") x2,
             in("x3") x3,
             lateout("x0") ret,
+            // The kernel's syscall path uses NEON (memcpy/memset in VmoWrite, frame
+            // zeroing, etc.) and does NOT save/restore the caller's FP/SIMD state across
+            // the trap. Without this the compiler may keep a live v-register (e.g. a
+            // vectorized buffer copy) across the `svc` and read back garbage. `clobber_abi`
+            // marks the C caller-saved set (incl. v0-v7/v16-v31) as clobbered.
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -45,6 +51,8 @@ fn syscall6(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) 
             in("x4") x4,
             in("x5") x5,
             lateout("x0") ret,
+            // See `syscall`: the kernel clobbers FP/SIMD across the trap.
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -83,11 +91,12 @@ pub fn channel_create_pair() -> (u64, u64) {
     let h1: u64;
     unsafe {
         core::arch::asm!(
-            "mov x8, {num}",
             "svc #0",
-            num = in(reg) Syscall::ChannelCreate as u64,
-            out("x0") h0,
-            out("x1") h1,
+            in("x8") Syscall::ChannelCreate as u64,
+            lateout("x0") h0,
+            lateout("x1") h1,
+            // See `syscall`: the kernel clobbers FP/SIMD across the trap.
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -281,12 +290,38 @@ pub fn address_space_create(_process: Handle, _stack_virt: u64, _stack_size: u64
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn process_run(process: Handle, entry: u64, sp: u64, arg: u64) -> u64 {
-    syscall(Syscall::ProcessRun, process.0 as u64, entry, sp, arg)
+pub fn process_run(process: Handle, entry: u64, sp: u64, arg: u64, arg2: u64, flags: u64) -> u64 {
+    syscall6(
+        Syscall::ProcessRun,
+        process.0 as u64,
+        entry,
+        sp,
+        arg,
+        arg2,
+        flags,
+    )
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-pub fn process_run(_process: Handle, _entry: u64, _sp: u64, _arg: u64) -> u64 {
+pub fn process_run(
+    _process: Handle,
+    _entry: u64,
+    _sp: u64,
+    _arg: u64,
+    _arg2: u64,
+    _flags: u64,
+) -> u64 {
+    u64::MAX
+}
+
+/// P10-g: block until the async child process exits.
+#[cfg(target_arch = "aarch64")]
+pub fn process_wait() -> u64 {
+    syscall(Syscall::ProcessWait, 0, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn process_wait() -> u64 {
     u64::MAX
 }
 

@@ -10,6 +10,8 @@
 
 use core::cell::UnsafeCell;
 
+use kumo_abi::Handle;
+
 use kumo_abi::{Errno, KoId, Status};
 use kumo_hal::active::{switch_context, ThreadContext, UserState};
 
@@ -20,6 +22,9 @@ use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
 const CHILD_PRIORITY: Priority = Priority(63);
+/// P10-g: async child preempts Sora via reschedule_current in process_wait.
+/// Same priority as the blocking child — more urgent than Sora (64).
+const CHILD_ASYNC_PRIORITY: Priority = Priority(63);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserSchedError {
@@ -57,6 +62,12 @@ pub struct UserSched {
     pub child_exit_code: u64,
     /// True once the child thread has terminated.
     pub child_done: bool,
+    /// P10-g: async child (spawned without blocking the caller).
+    pub async_child: Option<Thread>,
+    /// The async child's process koid.
+    pub async_child_process: Option<KoId>,
+    /// True once the async child has terminated.
+    pub async_child_done: bool,
     /// Whether the user thread has been started (admitted to the scheduler).
     pub started: bool,
     /// Accumulated context-switch count.
@@ -206,6 +217,9 @@ pub fn init(
             child_process: None,
             child_exit_code: 0,
             child_done: false,
+            async_child: None,
+            async_child_process: None,
+            async_child_done: false,
             started: false,
             switches: 0,
             exit_code: 0,
@@ -226,6 +240,18 @@ pub fn current_process_koid() -> Option<KoId> {
         } else if let Some(child) = &s.child_thread {
             if current == child.koid() {
                 Some(child.process())
+            } else if let Some(ac) = &s.async_child {
+                if current == ac.koid() {
+                    Some(ac.process())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if let Some(ac) = &s.async_child {
+            if current == ac.koid() {
+                Some(ac.process())
             } else {
                 None
             }
@@ -245,6 +271,7 @@ pub fn run_child(
     entry: u64,
     sp: u64,
     arg: u64,
+    arg2: u64,
 ) -> Status {
     let temp_process = Process::from_parts(proc_koid, root_vmar);
     let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
@@ -271,6 +298,7 @@ pub fn run_child(
             x: {
                 let mut x = [0u64; 31];
                 x[0] = arg;
+                x[1] = arg2;
                 x
             },
             elr: entry,
@@ -307,6 +335,96 @@ pub fn run_child(
     } else {
         Errno::Internal.status()
     }
+}
+
+/// P10-g: spawn a child asynchronously using the proven child_thread slot.
+/// The child is admitted at CHILD_PRIORITY (63, more urgent than Sora at 64)
+/// but does NOT preempt immediately. Returns immediately.
+pub fn spawn_child_async(
+    objects: &mut ObjectManager,
+    proc_koid: KoId,
+    root_vmar: crate::mm::Vmar,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    arg2: u64,
+) -> Status {
+    let temp_process = Process::from_parts(proc_koid, root_vmar);
+    let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
+        Ok(thread) => thread,
+        Err(_) => return Errno::NoMemory.status(),
+    };
+
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        if s.child_thread.is_some() && !s.child_done {
+            return Errno::ShouldWait.status();
+        }
+
+        s.child_thread = Some(new_child);
+        s.child_fresh = true;
+        s.child_ttbr0 = ttbr0;
+        s.child_process = Some(proc_koid);
+        s.child_exit_code = 0;
+        s.child_done = false;
+
+        let child = s.child_thread.as_mut().expect("child just installed");
+        child.user_state = Some(UserState {
+            x: {
+                let mut x = [0u64; 31];
+                x[0] = arg;
+                x[1] = arg2;
+                x
+            },
+            elr: entry,
+            spsr: 0,
+            sp_el0: sp,
+            ttbr0,
+        });
+        let state_ptr = child.user_state.as_ref().expect("child user state") as *const UserState;
+        let kernel_sp = child.stack().top();
+        *child.context_mut() = user_entry_context(state_ptr, kernel_sp);
+        child.ready();
+
+        // Admit at CHILD_PRIORITY (63) but do NOT reschedule — Sora continues.
+        s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
+    }
+    Errno::Ok.status()
+}
+
+/// P10-g: block until the async child (stored in child_thread) terminates.
+/// Uses the proven run_child reschedule pattern.
+pub fn process_wait() -> Status {
+    let p = sched_ptr();
+    let has_child = unsafe {
+        let s = &*p;
+        s.child_thread.is_some() && !s.child_done
+    };
+    if !has_child {
+        return Errno::Ok.status();
+    }
+    let switch = unsafe {
+        let s = &mut *p;
+        let decision = s.dispatcher.reschedule_current();
+        dispatch_context(s, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+    // After child exits, clean up.
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        let _code = s.child_exit_code;
+        s.child_thread = None;
+        s.child_fresh = false;
+        s.child_ttbr0 = 0;
+        s.child_process = None;
+        s.child_done = false;
+    }
+    Errno::Ok.status()
 }
 
 /// Spawn a user thread: build its `UserState` from the ELF image, admit it to the
@@ -425,6 +543,22 @@ pub fn exit_current_user(exit_code: u64) -> ! {
                     child.terminate();
                 }
             }
+            Some(current)
+                if s.async_child
+                    .as_ref()
+                    .map(|child| child.koid() == current)
+                    .unwrap_or(false) =>
+            {
+                s.async_child_done = true;
+                if let Some(child) = s.async_child.as_mut() {
+                    child.terminate();
+                }
+                // Re-admit Sora if she's blocked (on ProcessWait or ChannelRead).
+                if matches!(s.user_thread.state(), crate::task::ThreadState::Blocked) {
+                    s.user_thread.ready();
+                    s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+                }
+            }
             _ => {}
         }
         let decision = s.dispatcher.finish_current();
@@ -473,6 +607,24 @@ fn dispatch_context(
                             child.ready();
                         }
                         child.context_mut() as *mut ThreadContext
+                    } else if let Some(ac) = s.async_child.as_mut() {
+                        if from_id == ac.koid() {
+                            if matches!(ac.state(), ThreadState::Running) {
+                                ac.ready();
+                            }
+                            ac.context_mut() as *mut ThreadContext
+                        } else {
+                            &mut s.boot_ctx as *mut ThreadContext
+                        }
+                    } else {
+                        &mut s.boot_ctx as *mut ThreadContext
+                    }
+                } else if let Some(ac) = s.async_child.as_mut() {
+                    if from_id == ac.koid() {
+                        if matches!(ac.state(), ThreadState::Running) {
+                            ac.ready();
+                        }
+                        ac.context_mut() as *mut ThreadContext
                     } else {
                         &mut s.boot_ctx as *mut ThreadContext
                     }
@@ -500,9 +652,33 @@ fn dispatch_context(
                         set_active_ttbr0(s.child_ttbr0);
                     }
                     child.context() as *const ThreadContext
+                } else if let Some(ac) = s.async_child.as_mut() {
+                    if to == ac.koid() {
+                        ac.run();
+                        // P10-g: async child is always fresh on first dispatch.
+                        // Its TTBR0 is embedded in its UserState.
+                        ac.context() as *const ThreadContext
+                    } else {
+                        if to == s.idle.koid() {
+                            s.idle.run();
+                        }
+                        set_active_ttbr0(s.kernel_ttbr0);
+                        &s.boot_ctx as *const ThreadContext
+                    }
                 } else {
                     if to == s.idle.koid() {
-                        s.idle.run(); // dispatcher bookkeeping only; idle_body never executes
+                        s.idle.run();
+                    }
+                    set_active_ttbr0(s.kernel_ttbr0);
+                    &s.boot_ctx as *const ThreadContext
+                }
+            } else if let Some(ac) = s.async_child.as_mut() {
+                if to == ac.koid() {
+                    ac.run();
+                    ac.context() as *const ThreadContext
+                } else {
+                    if to == s.idle.koid() {
+                        s.idle.run();
                     }
                     set_active_ttbr0(s.kernel_ttbr0);
                     &s.boot_ctx as *const ThreadContext

@@ -1344,11 +1344,13 @@ pub mod el0 {
 
     // Lower-EL synchronous handler: save the EL0 frame, and if the cause is SVC, dispatch
     // it and `eret` back to EL0; otherwise fall through to the Tower (a real EL0 fault).
+    // The syscall boundary is transparent to EL0 FP/SIMD: Rust kernel code may use NEON
+    // during the dispatch, so save q0-q31 plus FPCR/FPSR before calling into Rust.
     core::arch::global_asm!(
         ".global kumo_svc_common",
         ".balign 4",
         "kumo_svc_common:",
-        "  sub  sp, sp, #288",
+        "  sub  sp, sp, #800",
         "  stp  x0,  x1,  [sp, #0]",
         "  stp  x2,  x3,  [sp, #16]",
         "  stp  x4,  x5,  [sp, #32]",
@@ -1370,6 +1372,25 @@ pub mod el0 {
         "  stp  x0,  x1,  [sp, #248]",
         "  mrs  x0, sp_el0",
         "  str  x0,      [sp, #264]",
+        "  mrs  x0, fpsr",
+        "  mrs  x1, fpcr",
+        "  stp  x0,  x1,  [sp, #272]",
+        "  stp  q0,  q1,  [sp, #288]",
+        "  stp  q2,  q3,  [sp, #320]",
+        "  stp  q4,  q5,  [sp, #352]",
+        "  stp  q6,  q7,  [sp, #384]",
+        "  stp  q8,  q9,  [sp, #416]",
+        "  stp  q10, q11, [sp, #448]",
+        "  stp  q12, q13, [sp, #480]",
+        "  stp  q14, q15, [sp, #512]",
+        "  stp  q16, q17, [sp, #544]",
+        "  stp  q18, q19, [sp, #576]",
+        "  stp  q20, q21, [sp, #608]",
+        "  stp  q22, q23, [sp, #640]",
+        "  stp  q24, q25, [sp, #672]",
+        "  stp  q26, q27, [sp, #704]",
+        "  stp  q28, q29, [sp, #736]",
+        "  stp  q30, q31, [sp, #768]",
         "  mrs  x0, esr_el1", // EC = ESR[31:26]; 0x15 == SVC from AArch64
         "  lsr  x1, x0, #26",
         "  and  x1, x1, #0x3f",
@@ -1382,6 +1403,25 @@ pub mod el0 {
         "  msr  spsr_el1, x1",
         "  ldr  x0,      [sp, #264]",
         "  msr  sp_el0, x0",
+        "  ldp  x0,  x1,  [sp, #272]",
+        "  msr  fpsr, x0",
+        "  msr  fpcr, x1",
+        "  ldp  q0,  q1,  [sp, #288]",
+        "  ldp  q2,  q3,  [sp, #320]",
+        "  ldp  q4,  q5,  [sp, #352]",
+        "  ldp  q6,  q7,  [sp, #384]",
+        "  ldp  q8,  q9,  [sp, #416]",
+        "  ldp  q10, q11, [sp, #448]",
+        "  ldp  q12, q13, [sp, #480]",
+        "  ldp  q14, q15, [sp, #512]",
+        "  ldp  q16, q17, [sp, #544]",
+        "  ldp  q18, q19, [sp, #576]",
+        "  ldp  q20, q21, [sp, #608]",
+        "  ldp  q22, q23, [sp, #640]",
+        "  ldp  q24, q25, [sp, #672]",
+        "  ldp  q26, q27, [sp, #704]",
+        "  ldp  q28, q29, [sp, #736]",
+        "  ldp  q30, q31, [sp, #768]",
         "  ldp  x0,  x1,  [sp, #0]", // restore GPRs (x0 may carry the syscall result)
         "  ldp  x2,  x3,  [sp, #16]",
         "  ldp  x4,  x5,  [sp, #32]",
@@ -1398,7 +1438,7 @@ pub mod el0 {
         "  ldp  x26, x27, [sp, #208]",
         "  ldp  x28, x29, [sp, #224]",
         "  ldr  x30,      [sp, #240]",
-        "  add  sp, sp, #288",
+        "  add  sp, sp, #800",
         "  eret",
         "8:", // not SVC: a real lower-EL fault -> the Tower
         "  mrs  x1, esr_el1",
@@ -1571,16 +1611,16 @@ pub mod el0 {
         // `phys_base`, landing the mapping displaced — the journal-061 paint wart.)
         const BLOCK_2M: u64 = 1 << 21;
         for mapping in image.extra_mappings {
-            // Executable mappings (child code) map Normal-WB RX 4 KiB pages directly from the
-            // backing physical range — page-granular so they share an L3 table with the stack
-            // instead of fighting over a 2 MiB L2 slot, and executable (no `UXN`) unlike the
-            // device-block path. W^X holds: `user_page_desc(true, false)` is RX, never RW.
-            if mapping.executable {
+            // Normal anonymous mappings (child code/data) map as 4 KiB pages directly from
+            // the backing physical range — page-granular so code, rodata, data, and stack can
+            // share an L3 table without fighting over a 2 MiB L2 slot. W^X holds in
+            // `user_page_desc`: writable pages are never executable.
+            if !mapping.device {
                 if mapping.virt_addr & (PAGE_4K - 1) != 0 || mapping.phys_base & (PAGE_4K - 1) != 0
                 {
                     return Err(UserImageError::BadSegment);
                 }
-                let desc = super::mmu::user_page_desc(true, false);
+                let desc = super::mmu::user_page_desc(mapping.executable, mapping.writable);
                 let pages = mapping.len.div_ceil(PAGE_4K);
                 let mut i = 0;
                 while i < pages {
@@ -1589,10 +1629,12 @@ pub mod el0 {
                     let pa = mapping.phys_base + off;
                     unsafe { super::mmu::map_user_page(root, va, pa, desc, alloc, &mut tables) }
                         .map_err(|()| UserImageError::OutOfFrames)?;
-                    // The code bytes were written through the TTBR1 physmap (D-cache); clean to
-                    // PoC + drop the I-cache so EL0 fetches them. `pa` is reachable now via the
-                    // active kernel identity map.
-                    unsafe { flush_for_exec(pa, PAGE_4K as usize) };
+                    if mapping.executable {
+                        // The code bytes were written through the TTBR1 physmap (D-cache);
+                        // clean to PoC + drop the I-cache so EL0 fetches them. `pa` is
+                        // reachable now via the active kernel identity map.
+                        unsafe { flush_for_exec(pa, PAGE_4K as usize) };
+                    }
                     i += 1;
                 }
                 continue;
