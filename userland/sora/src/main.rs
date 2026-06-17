@@ -4,9 +4,10 @@
 extern crate alloc;
 
 use kumo_abi::{
-    BootInfo, Errno, Handle, Rights, VmarFlags, DRV_BLK_PATH, DRV_FB_PATH,
+    BootInfo, Errno, Handle, Rights, VmarFlags, DRV_BLK_PATH, DRV_FB_PATH, FAT32_IMG_PATH,
     PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
 };
+use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_duplicate, handle_koid, interrupt_create,
@@ -21,6 +22,71 @@ kumo_rt::entry!(sora_main);
 
 fn log(msg: &[u8]) {
     kumo_rt::debug_write(msg.as_ptr(), msg.len());
+}
+
+/// Locate a file in the initrd by path, returning its `(offset, len)`. Sora
+/// holds the initrd as a VMO handle (not a mapped slice), so it walks the entry
+/// table with `vmo_read` rather than `kumo_abi::initrd::find_file`.
+fn initrd_find(initrd: Handle, want: &[u8]) -> Option<(u64, u64)> {
+    let mut hdr = [0u8; 16];
+    if vmo_read(initrd, 0, hdr.as_mut_ptr(), 16) != 0 || &hdr[..8] != b"KUMORD01" {
+        return None;
+    }
+    let entry_count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as u64;
+    let mut name = [0u8; 64];
+    let mut tail = [0u8; 16]; // offset(8) + len(8)
+    for i in 0..entry_count {
+        let base = 16 + i * 80;
+        if vmo_read(initrd, base, name.as_mut_ptr(), 64) != 0
+            || vmo_read(initrd, base + 64, tail.as_mut_ptr(), 16) != 0
+        {
+            return None;
+        }
+        let nlen = name.iter().position(|&b| b == 0).unwrap_or(64);
+        if &name[..nlen] == want {
+            let off = u64::from_le_bytes(tail[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+            return Some((off, len));
+        }
+    }
+    None
+}
+
+/// A [`SectorReader`] serving 512-byte sectors from a region of the initrd VMO
+/// (the FAT32 image lives as a file inside the initrd). This is the interim
+/// block source until `drv-blk` serves the same image over IPC.
+struct InitrdSectors {
+    vmo: Handle,
+    base: u64,
+    len: u64,
+}
+
+/// The kernel's `VmoRead` syscall copies at most this many bytes per call
+/// (`usermode.rs`), so a 512-byte sector must be read in chunks.
+const VMO_READ_MAX: usize = 256;
+
+impl SectorReader for InitrdSectors {
+    fn read_sector(&mut self, lba: u32, buf: &mut [u8; kumo_fatfs::SECTOR_SIZE]) -> bool {
+        let off = lba as u64 * kumo_fatfs::SECTOR_SIZE as u64;
+        if off + kumo_fatfs::SECTOR_SIZE as u64 > self.len {
+            return false;
+        }
+        let mut done = 0usize;
+        while done < kumo_fatfs::SECTOR_SIZE {
+            let chunk = (kumo_fatfs::SECTOR_SIZE - done).min(VMO_READ_MAX);
+            if vmo_read(
+                self.vmo,
+                self.base + off + done as u64,
+                buf[done..].as_mut_ptr(),
+                chunk,
+            ) != 0
+            {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    }
 }
 
 const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
@@ -345,6 +411,36 @@ extern "C" fn sora_main(
                 }
             }
         }
+    }
+
+    // Live proof that kumo-fatfs reads the real bin/fat32.img shipped in the
+    // initrd: mount it, resolve HELLO.TXT, read its bytes, and log them. The
+    // image is read straight from the initrd VMO (the interim block source until
+    // drv-blk serves it over IPC). This exercises the whole kumo-fatfs read
+    // engine against reality. Verified by the local UEFI/AAVMF smoke (xtask
+    // qemu-smoke boots only the raw Stage-A stub, not the kernel/sora); see
+    // JOURNAL/165 for the "fatfs: HELLO.TXT = hello!" serial capture.
+    if let Some((base, len)) = initrd_find(initrd, FAT32_IMG_PATH.as_bytes()) {
+        let mut disk = InitrdSectors {
+            vmo: initrd,
+            base,
+            len,
+        };
+        match FatVolume::mount(&mut disk) {
+            Ok(vol) => match vol.find_in_root(&mut disk, b"HELLO   TXT") {
+                Some(entry) => {
+                    let mut data = [0u8; 16];
+                    let n = vol.read_file(&mut disk, &entry, &mut data);
+                    log(b"fatfs: HELLO.TXT = ");
+                    debug_write(data.as_ptr(), n);
+                    log(b"\n");
+                }
+                None => log(b"fatfs: HELLO.TXT missing\n"),
+            },
+            Err(_) => log(b"fatfs: mount failed\n"),
+        }
+    } else {
+        log(b"fatfs: image not found\n");
     }
 
     // J159: spawn drv-fb when a framebuffer is present.

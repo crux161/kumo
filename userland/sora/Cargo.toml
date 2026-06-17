@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 kumo-abi.workspace = true
+kumo-fatfs = { path = "../../lib/kumo-fatfs" }
 kumo-ipc.workspace = true
 kumo-rt = { path = "../kumo-rt" }
 kumoza = { path = "../kumoza" }

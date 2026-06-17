@@ -10,14 +10,17 @@
 //! geometry and directory entries a `fatfs` server (`userland/servers/houtu/`)
 //! will later expose over the vfs protocol (`PLAN §12`).
 //!
-//! Scope of this slice (the smallest provable unit, `GUIDANCE/006 §6`):
+//! What this library does (grown one provable slice at a time, `GUIDANCE/006 §6`):
 //!   * parse + validate the BPB (boot sector) of a FAT32 volume,
 //!   * derive the on-disk geometry (FAT region, data region, cluster→sector),
-//!   * decode a 32-byte short (8.3) directory entry.
+//!   * decode a 32-byte short (8.3) directory entry,
+//!   * decode a FAT-table entry and follow a file's cluster chain to its end,
+//!   * mount a volume and read a file by 8.3 name through a [`SectorReader`].
 //!
-//! It performs no I/O and holds no state — the caller supplies the bytes. That
-//! keeps the whole crate host-testable (no `drv-blk`/runtime dependency) and
-//! lets the future server compose it over any block source.
+//! It owns no device and performs no I/O itself — every read goes through a
+//! [`SectorReader`] the caller supplies (over `drv-blk` in the server, over a
+//! byte source in tests). That keeps the whole crate host-testable with no
+//! runtime dependency, and allocation-free so it runs in any `no_std` server.
 
 /// FAT logical sector size. KUMO only targets 512-byte-sector volumes (the
 /// historical MBR/GPT sector and `drv-blk`'s `BLOCK_SIZE`).
@@ -50,6 +53,8 @@ pub enum FatError {
     /// A geometry field that must be non-zero (sector size, sectors/cluster,
     /// FAT count, sectors/FAT) was zero, or the root cluster was below 2.
     BadGeometry,
+    /// The backing [`SectorReader`] failed to return the boot sector.
+    ReadFailed,
 }
 
 /// The parsed BIOS Parameter Block of a FAT32 volume — just the fields KUMO
@@ -204,6 +209,198 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
         first_cluster,
         size: u32_le(raw, 0x1C),
     })
+}
+
+/// FAT32 entries are 32-bit but only the low 28 bits are meaningful; the top 4
+/// bits are reserved and must be ignored when interpreting a link.
+pub const FAT32_ENTRY_MASK: u32 = 0x0FFF_FFFF;
+/// Sentinel for a cluster marked bad/unusable.
+pub const FAT32_BAD: u32 = 0x0FFF_FFF7;
+/// Any value at or above this marks the end of a cluster chain.
+pub const FAT32_EOF_MIN: u32 = 0x0FFF_FFF8;
+
+/// A decoded FAT-table entry (the link that follows one cluster).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatEntry {
+    /// Unallocated (value 0).
+    Free,
+    /// Points to the next cluster in the chain.
+    Next(u32),
+    /// Cluster marked bad.
+    Bad,
+    /// End of chain (>= [`FAT32_EOF_MIN`]); also covers the reserved clusters 0/1.
+    End,
+}
+
+/// Decode the FAT entry for `cluster` from an in-memory FAT region `fat` (the
+/// bytes of the first FAT, i.e. starting at [`Bpb::fat_start_sector`]). Returns
+/// `None` if the entry would fall outside `fat`.
+pub fn fat_entry(fat: &[u8], cluster: u32) -> Option<FatEntry> {
+    let off = cluster as usize * 4;
+    if off + 4 > fat.len() {
+        return None;
+    }
+    let raw = u32_le(fat, off) & FAT32_ENTRY_MASK;
+    Some(match raw {
+        0 => FatEntry::Free,
+        FAT32_BAD => FatEntry::Bad,
+        v if v >= FAT32_EOF_MIN => FatEntry::End,
+        v => FatEntry::Next(v),
+    })
+}
+
+/// Walks a file's cluster chain, reading links from an in-memory FAT region.
+///
+/// Yields each cluster of the chain in order, starting at `start`, and stops
+/// after the cluster whose FAT entry is `End`/`Bad`/`Free` or out of range. A
+/// `start` below 2 (the reserved clusters, used to denote an empty file) yields
+/// nothing. The iterator allocates nothing, so it works in any `no_std` server.
+pub struct ClusterChain<'a> {
+    fat: &'a [u8],
+    next: Option<u32>,
+}
+
+impl<'a> ClusterChain<'a> {
+    /// Begin a chain walk at `start`, following links in `fat`.
+    pub fn new(fat: &'a [u8], start: u32) -> Self {
+        let next = if start < 2 { None } else { Some(start) };
+        Self { fat, next }
+    }
+}
+
+impl Iterator for ClusterChain<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let cluster = self.next?;
+        // Look up what follows this cluster; anything that is not another data
+        // cluster terminates the chain after we have yielded the current one.
+        self.next = match fat_entry(self.fat, cluster) {
+            Some(FatEntry::Next(n)) => Some(n),
+            _ => None,
+        };
+        Some(cluster)
+    }
+}
+
+/// FAT32 entries per [`SECTOR_SIZE`] sector (512 / 4).
+const FAT_ENTRIES_PER_SECTOR: u32 = (SECTOR_SIZE / 4) as u32;
+
+/// A source of 512-byte logical sectors — the one capability `kumo-fatfs` needs
+/// from the outside world. The `fatfs` server implements this over `drv-blk`'s
+/// block protocol; tests implement it over an in-memory image.
+pub trait SectorReader {
+    /// Read the sector at logical block address `lba` into `buf`. Returns
+    /// `false` on failure (the read engine then stops, returning what it has).
+    fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool;
+}
+
+/// A mounted FAT32 volume: the parsed geometry plus read helpers that drive a
+/// [`SectorReader`]. Holds no buffers — each call reads one sector at a time, so
+/// a large FAT never has to be resident.
+pub struct FatVolume {
+    bpb: Bpb,
+}
+
+impl FatVolume {
+    /// Mount a volume by reading and parsing the boot sector (LBA 0).
+    pub fn mount<R: SectorReader>(reader: &mut R) -> Result<FatVolume, FatError> {
+        let mut buf = [0u8; SECTOR_SIZE];
+        if !reader.read_sector(0, &mut buf) {
+            return Err(FatError::ReadFailed);
+        }
+        Ok(FatVolume {
+            bpb: Bpb::parse(&buf)?,
+        })
+    }
+
+    /// The parsed BIOS Parameter Block.
+    pub const fn bpb(&self) -> &Bpb {
+        &self.bpb
+    }
+
+    /// Follow the FAT link out of `cluster` by reading only the one FAT sector
+    /// that holds its entry.
+    fn next_link<R: SectorReader>(&self, reader: &mut R, cluster: u32) -> Option<FatEntry> {
+        let fat_sector = self.bpb.fat_start_sector() + cluster / FAT_ENTRIES_PER_SECTOR;
+        let index = cluster % FAT_ENTRIES_PER_SECTOR;
+        let mut buf = [0u8; SECTOR_SIZE];
+        if !reader.read_sector(fat_sector, &mut buf) {
+            return None;
+        }
+        fat_entry(&buf, index)
+    }
+
+    /// Find a file or subdirectory by raw 8.3 name (space-padded, e.g.
+    /// `b"HELLO   TXT"`) in the root directory. Walks the root's cluster chain
+    /// sector by sector; returns the first matching [`DirEntry`].
+    pub fn find_in_root<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        name: &[u8; 11],
+    ) -> Option<DirEntry> {
+        let spc = self.bpb.sectors_per_cluster as u32;
+        let mut cluster = self.bpb.root_cluster;
+        let mut buf = [0u8; SECTOR_SIZE];
+        loop {
+            let first = self.bpb.cluster_to_sector(cluster);
+            for s in 0..spc {
+                if !reader.read_sector(first + s, &mut buf) {
+                    return None;
+                }
+                let mut off = 0;
+                while off + DIR_ENTRY_SIZE <= SECTOR_SIZE {
+                    match parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]) {
+                        DirSlot::End => return None,
+                        DirSlot::File(e) if &e.name == name => return Some(e),
+                        _ => {}
+                    }
+                    off += DIR_ENTRY_SIZE;
+                }
+            }
+            match self.next_link(reader, cluster) {
+                Some(FatEntry::Next(n)) => cluster = n,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Read `entry`'s data into `out`, following its cluster chain. Copies at
+    /// most `min(entry.size, out.len())` bytes and returns how many were written
+    /// (which may be short if a sector read fails or the chain ends early).
+    pub fn read_file<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        entry: &DirEntry,
+        out: &mut [u8],
+    ) -> usize {
+        let limit = (entry.size as usize).min(out.len());
+        if limit == 0 || entry.first_cluster < 2 {
+            return 0;
+        }
+        let spc = self.bpb.sectors_per_cluster as u32;
+        let mut cluster = entry.first_cluster;
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut written = 0usize;
+        loop {
+            let first = self.bpb.cluster_to_sector(cluster);
+            for s in 0..spc {
+                if written >= limit {
+                    return written;
+                }
+                if !reader.read_sector(first + s, &mut buf) {
+                    return written;
+                }
+                let take = (limit - written).min(SECTOR_SIZE);
+                out[written..written + take].copy_from_slice(&buf[..take]);
+                written += take;
+            }
+            match self.next_link(reader, cluster) {
+                Some(FatEntry::Next(n)) => cluster = n,
+                _ => return written,
+            }
+        }
+    }
 }
 
 #[inline]
@@ -373,5 +570,173 @@ mod tests {
             DirSlot::File(d) => assert_eq!(d.first_cluster, 0x0001_2345),
             other => panic!("expected File, got {other:?}"),
         }
+    }
+
+    /// Build a small FAT region from a list of 32-bit entries (LE), as on disk.
+    fn fat_with(entries: &[u32]) -> [u8; 64] {
+        let mut fat = [0u8; 64];
+        for (i, &e) in entries.iter().enumerate() {
+            fat[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
+        }
+        fat
+    }
+
+    #[test]
+    fn fixture_fat_entries_are_end_of_chain() {
+        // xtask's fixture marks entries 0..=3 with EOF/reserved values.
+        let fat = fat_with(&[0x0FFF_FFF8, 0x0FFF_FFFF, 0x0FFF_FFFF, 0x0FFF_FFFF]);
+        assert_eq!(fat_entry(&fat, 0), Some(FatEntry::End)); // reserved/media
+        assert_eq!(fat_entry(&fat, 2), Some(FatEntry::End)); // root dir, single cluster
+        assert_eq!(fat_entry(&fat, 3), Some(FatEntry::End)); // HELLO.TXT, single cluster
+    }
+
+    #[test]
+    fn classifies_free_bad_and_next_entries() {
+        // entry 5 = free, 6 = bad, 7 = link to 4. Top 4 bits are reserved noise.
+        let fat = fat_with(&[0, 0, 0, 0, 0, 0x0000_0000, 0x0FFF_FFF7, 0xF000_0004]);
+        assert_eq!(fat_entry(&fat, 5), Some(FatEntry::Free));
+        assert_eq!(fat_entry(&fat, 6), Some(FatEntry::Bad));
+        assert_eq!(fat_entry(&fat, 7), Some(FatEntry::Next(4)));
+    }
+
+    #[test]
+    fn fat_entry_out_of_range_is_none() {
+        let fat = fat_with(&[0x0FFF_FFFF, 0x0FFF_FFFF]);
+        assert_eq!(fat_entry(&fat, 1000), None);
+    }
+
+    #[test]
+    fn single_cluster_chain_yields_one_cluster() {
+        // HELLO.TXT: starts at cluster 3, whose FAT entry is EOF.
+        let fat = fat_with(&[0x0FFF_FFF8, 0x0FFF_FFFF, 0x0FFF_FFFF, 0x0FFF_FFFF]);
+        let mut chain = ClusterChain::new(&fat, 3);
+        assert_eq!(chain.next(), Some(3));
+        assert_eq!(chain.next(), None);
+    }
+
+    #[test]
+    fn follows_multi_cluster_chain_to_end() {
+        // 2 -> 3 -> 4 -> EOF.
+        let fat = fat_with(&[0x0FFF_FFF8, 0x0FFF_FFFF, 3, 4, 0x0FFF_FFFF]);
+        let mut chain = ClusterChain::new(&fat, 2);
+        assert_eq!(chain.next(), Some(2));
+        assert_eq!(chain.next(), Some(3));
+        assert_eq!(chain.next(), Some(4));
+        assert_eq!(chain.next(), None);
+    }
+
+    #[test]
+    fn empty_file_start_cluster_yields_nothing() {
+        // first_cluster 0 (and the reserved cluster 1) denote a file with no data.
+        let fat = fat_with(&[0x0FFF_FFF8, 0x0FFF_FFFF, 0x0FFF_FFFF]);
+        assert_eq!(ClusterChain::new(&fat, 0).next(), None);
+        assert_eq!(ClusterChain::new(&fat, 1).next(), None);
+    }
+
+    /// A `SectorReader` over xtask's fixture image. Sectors 0/32/96/97 mirror the
+    /// real `build_fat32_image()` (BPB, FAT, root dir, HELLO.TXT). A synthetic
+    /// `BIG.BIN` (cluster 4 -> 5, 600 bytes) is added — the real fixture has no
+    /// multi-cluster file — to exercise the chain-spanning read loop.
+    struct FixtureDisk;
+    impl SectorReader for FixtureDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            *buf = [0u8; SECTOR_SIZE];
+            match lba {
+                0 => *buf = fixture_boot_sector(),
+                32 => {
+                    // FAT: 0/1 reserved, 2/3 single-cluster EOF, 4 -> 5, 5 EOF.
+                    let entries = [
+                        0x0FFF_FFF8u32,
+                        0x0FFF_FFFF,
+                        0x0FFF_FFFF,
+                        0x0FFF_FFFF,
+                        5,
+                        0x0FFF_FFFF,
+                    ];
+                    for (i, e) in entries.iter().enumerate() {
+                        buf[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
+                    }
+                }
+                96 => {
+                    buf[0..32].copy_from_slice(&dir_entry(b"KUMO       ", attr::VOLUME_ID, 0, 0));
+                    buf[32..64].copy_from_slice(&dir_entry(b"README  TXT", attr::ARCHIVE, 0, 128));
+                    buf[64..96].copy_from_slice(&dir_entry(b"HELLO   TXT", attr::ARCHIVE, 3, 6));
+                    buf[96..128].copy_from_slice(&dir_entry(b"BIG     BIN", attr::ARCHIVE, 4, 600));
+                    // offset 128 stays 0x00 -> end of directory.
+                }
+                97 => buf[..6].copy_from_slice(b"hello!"),
+                98 => *buf = [0xAA; SECTOR_SIZE], // BIG.BIN cluster 4
+                99 => *buf = [0xBB; SECTOR_SIZE], // BIG.BIN cluster 5
+                _ => {}
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn mount_reads_fixture_bpb() {
+        let vol = FatVolume::mount(&mut FixtureDisk).expect("mount");
+        assert_eq!(vol.bpb().root_cluster, 2);
+        assert_eq!(vol.bpb().data_start_sector(), 96);
+    }
+
+    #[test]
+    fn reads_hello_txt_end_to_end() {
+        // The real-fixture proof: resolve HELLO.TXT and read its bytes.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol
+            .find_in_root(&mut FixtureDisk, b"HELLO   TXT")
+            .expect("HELLO.TXT present");
+        assert_eq!(entry.first_cluster, 3);
+        assert_eq!(entry.size, 6);
+
+        let mut out = [0u8; 16];
+        let n = vol.read_file(&mut FixtureDisk, &entry, &mut out);
+        assert_eq!(n, 6);
+        assert_eq!(&out[..6], b"hello!");
+    }
+
+    #[test]
+    fn reads_multi_cluster_file() {
+        // BIG.BIN spans clusters 4 -> 5; 600 bytes = a full sector + 88 bytes.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol.find_in_root(&mut FixtureDisk, b"BIG     BIN").unwrap();
+        assert_eq!(entry.size, 600);
+
+        let mut out = [0u8; 700];
+        let n = vol.read_file(&mut FixtureDisk, &entry, &mut out);
+        assert_eq!(n, 600);
+        assert!(out[..512].iter().all(|&b| b == 0xAA));
+        assert!(out[512..600].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn missing_file_returns_none() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        assert_eq!(vol.find_in_root(&mut FixtureDisk, b"NOPE    TXT"), None);
+    }
+
+    #[test]
+    fn empty_file_reads_zero_bytes() {
+        // README.TXT has size 128 but first_cluster 0 (no data) in the fixture.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol.find_in_root(&mut FixtureDisk, b"README  TXT").unwrap();
+        assert_eq!(entry.first_cluster, 0);
+        let mut out = [0u8; 16];
+        assert_eq!(vol.read_file(&mut FixtureDisk, &entry, &mut out), 0);
+    }
+
+    #[test]
+    fn mount_propagates_read_failure() {
+        struct DeadDisk;
+        impl SectorReader for DeadDisk {
+            fn read_sector(&mut self, _lba: u32, _buf: &mut [u8; SECTOR_SIZE]) -> bool {
+                false
+            }
+        }
+        assert!(matches!(
+            FatVolume::mount(&mut DeadDisk),
+            Err(FatError::ReadFailed)
+        ));
     }
 }
