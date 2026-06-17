@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use drv_blk::{BlockDevice, CMD_READ, CMD_WRITE, STATUS_BAD_LBA, STATUS_OK};
+use drv_blk::{BlockDevice, Request, CMD_READ, CMD_WRITE, STATUS_BAD_LBA, STATUS_OK};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_rt::{channel_read, channel_read_with_handle, channel_write, debug_write, vmar_map};
 
@@ -67,14 +67,14 @@ extern "C" fn main(
     let mut buf = [0u8; 4096]; // response buffer
     loop {
         let n = channel_read(ch, req.as_mut_ptr(), req.len()) as usize;
-        if n < REQ_LEN {
-            continue;
-        }
-        let cmd = req[0];
-        let lba = u64::from_le_bytes(req[1..9].try_into().unwrap());
-        let count = u16::from_le_bytes(req[9..11].try_into().unwrap()) as u64;
+        let request = match Request::decode(&req[..n]) {
+            Some(r) => r,
+            None => continue, // empty/partial frame (e.g. a spurious wake)
+        };
+        let lba = request.lba;
+        let count = request.count as u64;
 
-        match cmd {
+        match request.cmd {
             CMD_READ => {
                 if !dev.check_bounds(lba, count) {
                     buf[0] = STATUS_BAD_LBA;
