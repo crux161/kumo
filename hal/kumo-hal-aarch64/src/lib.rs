@@ -1049,6 +1049,30 @@ pub mod mmu {
         map_block(root, va, pa, desc, alloc, tables)
     }
 
+    /// Build a 4 KiB **Device-nGnRnE** page descriptor for EL0 (MMIO registers).
+    /// Follows [`user_page_desc`]'s shape but uses `MAIR_DEVICE` and omits `SH_INNER`
+    /// (device memory has no shareability domain). Use with [`map_user_page`].
+    pub fn user_device_page_desc(writable: bool) -> u64 {
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_DEVICE << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
+    /// Build a 4 KiB **Normal-NC** page descriptor for EL0 (framebuffer scanout, bootinfo).
+    /// Follows [`user_page_desc`]'s shape but uses `MAIR_NC` instead of `MAIR_WB`.
+    /// Use with [`map_user_page`].
+    pub fn user_nc_page_desc(writable: bool) -> u64 {
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (MAIR_NC << 2);
+        if writable {
+            base | AP_EL1RW_EL0RW | UXN | PXN
+        } else {
+            base | AP_EL1RO_EL0RO | UXN | PXN
+        }
+    }
+
     /// Read `TTBR0_EL1` (the active low-half root), so the kernel identity map can be
     /// restored after a process address space has run.
     pub fn read_ttbr0() -> u64 {
@@ -1092,7 +1116,64 @@ pub mod mmu {
 #[cfg(target_os = "none")]
 pub use mmu::enable_kernel as enable_kernel_mmu;
 #[cfg(target_os = "none")]
+pub use mmu::{
+    map_user_device_block, map_user_page, user_device_page_desc, user_nc_page_desc, user_page_desc,
+};
+#[cfg(target_os = "none")]
 pub use mmu::{read_ttbr0, set_ttbr0};
+
+// ---- Host stubs for mmu items (kernel tests run on host) ----
+
+/// Host stub: build a 4 KiB user page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_page_desc(_executable: bool, _writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: build a 4 KiB Device-nGnRnE page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_device_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: build a 4 KiB Normal-NC page descriptor.
+#[cfg(not(target_os = "none"))]
+pub fn user_nc_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Host stub: map one 4 KiB user page.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn map_user_page(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _desc: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Host stub: map a 2 MiB device block.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn map_user_device_block(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _nc: bool,
+    _writable: bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
 
 /// Arch-neutral name the kernel uses to switch the user address-space root. This backend
 /// programs `TTBR0_EL1`. Inherently unsafe: `root` must be a valid table for the space.

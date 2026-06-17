@@ -1,4 +1,4 @@
-use kumo_abi::{Handle, Status, Syscall};
+use kumo_abi::{Handle, Rights, Status, Syscall};
 
 /// Execute a raw syscall: `x8` = number, `x0`-`x3` = args, returns `x0`.
 ///
@@ -108,6 +108,24 @@ pub fn channel_create_pair() -> (u64, u64) {
     (u64::MAX, u64::MAX)
 }
 
+/// Duplicate a handle with a subset of its original rights.
+/// The new handle shares the same kernel object.
+#[cfg(target_arch = "aarch64")]
+pub fn handle_duplicate(handle: Handle, rights: Rights) -> u64 {
+    syscall(
+        Syscall::HandleDuplicate,
+        handle.0 as u64,
+        rights.0 as u64,
+        0,
+        0,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn handle_duplicate(_handle: Handle, _rights: Rights) -> u64 {
+    0
+}
+
 /// Write a message with an optional handle transfer. Pass `handle` = Handle(0) for
 /// no transfer; any non-zero handle is removed from the sender's table and arrives
 /// at the receiver.
@@ -151,6 +169,34 @@ pub fn channel_read(channel: Handle, buf: *mut u8, cap: usize) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn channel_read(_channel: Handle, _buf: *mut u8, _cap: usize) -> u64 {
     0
+}
+
+/// Read from a channel, returning both the byte count and an attached handle.
+/// When the peer called `channel_write_with_handle`, the handle travels with
+/// the message and is returned here in the second element of the tuple.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (usize, u64) {
+    let ret: u64;
+    let handle: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ChannelRead as u64,
+            in("x0") channel.0 as u64,
+            in("x1") buf as u64,
+            in("x2") cap as u64,
+            lateout("x0") ret,
+            lateout("x1") handle,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (ret as usize, handle)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_read_with_handle(_channel: Handle, _buf: *mut u8, _cap: usize) -> (usize, u64) {
+    (0, 0)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -221,6 +267,8 @@ pub fn process_create(_vmar_base: u64, _vmar_size: u64) -> u64 {
     u64::MAX
 }
 
+/// Map a VMO into a process's address space (syscall `VmarMap`).
+/// `flags` are [`kumo_abi::VmarFlags`] bits OR'd together.
 #[cfg(target_arch = "aarch64")]
 pub fn vmar_map(
     process: Handle,

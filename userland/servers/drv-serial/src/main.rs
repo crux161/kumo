@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use kumo_abi::Handle;
+use kumo_abi::{Handle, VmarFlags};
 use kumo_rt::{
     channel_write, debug_write, interrupt_create, interrupt_wait, resource_mint_mmio, vmar_map,
 };
@@ -48,7 +48,14 @@ extern "C" fn main(
 
     // 2. Map the VMO into our address space
     let map_virt = 0x0000_0000_1000_0000; // arbitrary unmapped region
-    let map_status = vmar_map(Handle(0), vmo, 0, map_virt, UART_SIZE, 3); // READ|WRITE
+    let map_status = vmar_map(
+        Handle(0),
+        vmo,
+        0,
+        map_virt,
+        UART_SIZE,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE).0,
+    );
     if map_status != 0 {
         debug_write(b"drv-serial: map failed\n".as_ptr(), 23);
         kumo_rt::process_exit(1);

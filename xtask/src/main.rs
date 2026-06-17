@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    DRV_SERIAL_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX,
-    INITRD_VERSION, PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
+    DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC,
+    INITRD_PATH_MAX, INITRD_VERSION, PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -657,12 +657,16 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let sora = build_sora_image(&workspace_root()?)?;
             let svc_health = build_svc_health_image(&workspace_root()?)?;
             let drv_serial = build_drv_serial_image(&workspace_root()?)?;
+            let drv_fb = build_drv_fb_image(&workspace_root()?)?;
+            let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
                 (DRV_SERIAL_PATH, drv_serial.as_slice()),
+                (DRV_FB_PATH, drv_fb.as_slice()),
+                (DRV_BLK_PATH, drv_blk.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
             ])?
@@ -772,6 +776,56 @@ fn build_drv_serial_image(root: &Path) -> Result<Vec<u8>, String> {
             source_path.display()
         )
     })?;
+    Ok(bytes)
+}
+
+fn build_drv_fb_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "drv-fb",
+            "--bin",
+            "drv-fb",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("drv-fb");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as drv-fb ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_drv_blk_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "drv-blk",
+            "--bin",
+            "drv-blk",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("drv-blk");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as drv-blk ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 
@@ -1365,6 +1419,19 @@ fn run_qemu_serial_smoke(files: &Arm64QemuBootFiles) -> Result<(), String> {
             &[b"[NIJIGUMO] HANDOFF COMPLETE", b"READY\n"],
             Duration::from_secs(3),
         )?;
+
+        // Fail the smoke if Sora faulted at runtime. The kernel masks
+        // `SoraExhausted` by falling back to the EL0 payload, so `READY`
+        // alone is false confidence (FORECAST/001 §5.1).
+        let transcript_str = String::from_utf8_lossy(&transcript);
+        if transcript_str.contains("*** EL0 FAULT")
+            || transcript_str.contains("SoraExhausted")
+            || transcript_str.contains("payload fallback")
+        {
+            return Err(format!(
+                "Sora EL0 fault detected in smoke transcript:\n{transcript_str}"
+            ));
+        }
 
         stdin
             .write_all(b"HELLO\r")

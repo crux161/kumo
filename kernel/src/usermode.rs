@@ -1299,6 +1299,26 @@ fn attempt_sora(
         )
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
+    // J159: BootInfo VMO — a one-page snapshot of the kernel's BootInfo struct
+    // so sora (and drv-fb) can read framebuffer geometry without the kernel
+    // having to pass every field in registers. Allocated as a dedicated frame
+    // and backed by a physical-range VMO (identity-mapped, J153 invariant).
+    let bootinfo_vmo_handle = {
+        let bootinfo_frame = unsafe { crate::mm::alloc_zeroed_frame(boot) }
+            .ok_or(UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
+        // Write BootInfo into the identity-mapped frame (J153: identity, not physmap).
+        unsafe { (bootinfo_frame as *mut BootInfo).write(*boot) };
+        let bootinfo_vmo = Vmo::from_physical_range(bootinfo_frame, crate::mm::PAGE_SIZE)
+            .map_err(|_| UsermodeError::ChannelSetup)?;
+        engine
+            .root_vmo_create(
+                &mut process,
+                bootinfo_vmo,
+                Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(|_| UsermodeError::ChannelSetup)?
+    };
+
     // P9-b: root Resource — grants access to all physical MMIO and every IRQ line
     // (scaffold; Gouchen will mint per-device Resources later). Sora receives the
     // handle in x5 and narrows it before handing grants to drivers.
@@ -1391,6 +1411,9 @@ fn attempt_sora(
     let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
     let user_ttbr0 =
         kumo_hal::active::build_user_tables(&image, &mut alloc).map_err(UsermodeError::Image)?;
+    // Store sora's ttbr0 on its Process so the VmarMap live-tree gate
+    // (process.ttbr0 == Some(root)) triggers when sora self-maps at runtime.
+    process.ttbr0 = Some(user_ttbr0);
 
     let kernel_ttbr0 = kumo_hal::active::read_user_aspace_root();
     let user_state = UserState {
@@ -1404,6 +1427,7 @@ fn attempt_sora(
             x[5] = root_resource_handle.0 as u64; // root Resource handle (P9-b)
             x[6] = net_handle.0 as u64; // network channel handle (P9-c)
             x[7] = kbd_handle.0 as u64; // keyboard channel handle (P8-a)
+            x[8] = bootinfo_vmo_handle.0 as u64; // BootInfo VMO handle (J159)
             x
         },
         elr: recipe.entry,

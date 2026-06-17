@@ -65,3 +65,35 @@ impl Errno {
         matches!(self, Self::Ok)
     }
 }
+
+/// Page flags for `vmar_map`. Bit-identical to `kumo_hal::PageFlags` (the
+/// arch-neutral HAL owns the canonical definition; these constants let
+/// userspace programs construct map flags without depending on the HAL).
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmarFlags(pub u64);
+
+impl VmarFlags {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    /// EL0-accessible page.
+    pub const USER: Self = Self(1 << 3);
+    /// Map as Device-nGnRnE memory (MMIO registers), not Normal cacheable.
+    pub const DEVICE: Self = Self(1 << 4);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn contains(self, needed: Self) -> bool {
+        self.0 & needed.0 == needed.0
+    }
+}
+
+impl core::ops::BitOr for VmarFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}

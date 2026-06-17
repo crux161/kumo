@@ -1,0 +1,23 @@
+[package]
+name = "drv-fb"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "drv_fb"
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[[bin]]
+name = "drv-fb"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+# Gated to aarch64 (the image target) so `cargo test -p drv-fb` exercises the pure
+# rendering lib without dragging in the runtime — the svc-health pattern.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-rt = { path = "../../kumo-rt" }
+kumo-abi = { path = "../../../lib/kumo-abi" }

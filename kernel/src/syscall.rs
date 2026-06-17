@@ -463,6 +463,95 @@ impl SyscallEngine {
         self.vmos.iter_mut().find(|entry| entry.koid == koid)
     }
 
+    /// Write a single mapping into an already-live page table tree.
+    /// Called from [`VmarMap`] when the target process's TTBR0 is populated.
+    /// Mirrors [`AddressSpaceCreate`] but operates on one mapping at a time,
+    /// using 4 KiB pages (not 2 MiB blocks) to avoid clobbering adjacent VAs
+    /// that share a 2 MiB region (stack, data, other mappings).
+    ///
+    /// The caller must switch TTBR0 to the kernel identity map before calling
+    /// (so page-table frame writes land by physical address), and restore the
+    /// user tree afterward (the `AddressSpaceCreate` pattern at lines ~993-999).
+    fn apply_to_live_tree(
+        &mut self,
+        ttbr0: u64,
+        mapping: Mapping,
+        vmo_koid: KoId,
+    ) -> Result<(), Errno> {
+        let boot = self.boot_info;
+        let Some(ref boot_ref) = boot else {
+            return Err(Errno::Internal);
+        };
+        let executable = mapping.flags.contains(PageFlags::EXECUTE);
+        // W^X: writable wins → non-executable (matches user_page_desc).
+        let writable = mapping.flags.contains(PageFlags::WRITE) && !executable;
+        let device = mapping.flags.contains(PageFlags::DEVICE);
+
+        let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
+            return Err(Errno::BadHandle);
+        };
+
+        // Choose the page descriptor based on VMO backing + flags.
+        // Physical non-DEVICE uses Normal-NC: correct for framebuffers and
+        // harmless for bootinfo (read-once, no cache-line sharing hazard).
+        let desc: u64;
+        let needs_frame_alloc: bool;
+        match vmo_entry.vmo.backing() {
+            crate::mm::VmoBacking::Physical { .. } => {
+                desc = if device {
+                    kumo_hal::active::user_device_page_desc(writable)
+                } else {
+                    kumo_hal::active::user_nc_page_desc(writable)
+                };
+                needs_frame_alloc = false;
+            }
+            crate::mm::VmoBacking::Anonymous => {
+                desc = kumo_hal::active::user_page_desc(executable, writable);
+                needs_frame_alloc = true;
+            }
+        }
+
+        if mapping.len % crate::mm::PAGE_SIZE != 0 {
+            return Err(Errno::InvalidArgs);
+        }
+        let pages = mapping.len / crate::mm::PAGE_SIZE;
+        let phys_base = match vmo_entry.vmo.backing() {
+            crate::mm::VmoBacking::Physical { phys_base } => phys_base,
+            crate::mm::VmoBacking::Anonymous => 0,
+        };
+
+        let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot_ref) };
+        let mut tables: usize = 0;
+        let mut page: u64 = 0;
+        while page < pages {
+            let off = page * crate::mm::PAGE_SIZE;
+            let va = mapping.virt + off;
+            let pa = if needs_frame_alloc {
+                let vmo_page = ((mapping.vmo_offset + off) / crate::mm::PAGE_SIZE) as usize;
+                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                    return Err(Errno::BadHandle);
+                };
+                match ensure_anonymous_frame(vmo_entry, vmo_page, boot_ref) {
+                    Ok(frame) => frame,
+                    Err(errno) => return Err(errno),
+                }
+            } else {
+                phys_base + mapping.vmo_offset + off
+            };
+
+            // SAFETY: caller switched TTBR0 to kernel identity map; `root` (ttbr0)
+            // is the user tree root, and all intermediate table frames come from
+            // `alloc` which returns identity-mapped RAM (J153 invariant).
+            unsafe {
+                kumo_hal::active::map_user_page(ttbr0, va, pa, desc, &mut alloc, &mut tables)
+            }
+            .map_err(|_| Errno::NoMemory)?;
+
+            page += 1;
+        }
+        Ok(())
+    }
+
     /// Look up a process by koid. Returns `None` if not found.
     pub fn process_by_koid(&self, koid: KoId) -> Option<&Process> {
         self.processes.iter().find(|p| p.koid() == koid)
@@ -768,9 +857,35 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
                 if process_handle == kumo_abi::INVALID_HANDLE {
+                    // Self-map: map into the calling process's own VMAR.
                     let status = match process.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
                         Ok(mapping) => {
                             process.add_mapping(mapping, vmo_koid);
+                            // If this process is already running, eagerly write the
+                            // mapping into the live page tables so the next access
+                            // doesn't fault (FORECAST/001 — VmarMap was record-only).
+                            if let Some(ttbr0) = process.ttbr0 {
+                                #[cfg(target_os = "none")]
+                                {
+                                    let saved = kumo_hal::active::read_user_aspace_root();
+                                    unsafe {
+                                        kumo_hal::active::set_user_aspace_root(
+                                            crate::user_thread::kernel_ttbr0(),
+                                        )
+                                    };
+                                    let result = self.apply_to_live_tree(ttbr0, mapping, vmo_koid);
+                                    unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+                                    if let Err(e) = result {
+                                        return KernelCallResult::Status(e.status());
+                                    }
+                                }
+                                #[cfg(not(target_os = "none"))]
+                                {
+                                    // Host tests: exercise the logic but skip
+                                    // hardware table writes (stub HAL fns).
+                                    let _ = self.apply_to_live_tree(ttbr0, mapping, vmo_koid);
+                                }
+                            }
                             Errno::Ok.status()
                         }
                         Err(_) => Errno::InvalidArgs.status(),
@@ -778,7 +893,9 @@ impl SyscallEngine {
                     return KernelCallResult::Status(status);
                 }
 
-                // Look up the target process koid after resolving the VMO.
+                // Target-child: map into a different process's VMAR.
+                // Scope the target borrow tightly so we can re-borrow `self`
+                // for the live-tree write (target borrows `self.processes`).
                 let proc_koid = match process.handles().require(
                     process_handle,
                     ObjectKind::Process,
@@ -787,16 +904,42 @@ impl SyscallEngine {
                     Ok(entry) => entry.koid,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
-                let Some(target) = self.process_by_koid_mut(proc_koid) else {
-                    return KernelCallResult::Status(Errno::BadHandle.status());
-                };
-                let status = match target.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
-                    Ok(mapping) => {
-                        target.add_mapping(mapping, vmo_koid);
-                        Errno::Ok.status()
+                let (status, live_write) = {
+                    let Some(target) = self.process_by_koid_mut(proc_koid) else {
+                        return KernelCallResult::Status(Errno::BadHandle.status());
+                    };
+                    match target.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
+                        Ok(mapping) => {
+                            target.add_mapping(mapping, vmo_koid);
+                            let ttbr0 = target.ttbr0;
+                            (
+                                Errno::Ok.status(),
+                                ttbr0.map(|root| (root, mapping, vmo_koid)),
+                            )
+                        }
+                        Err(_) => (Errno::InvalidArgs.status(), None),
                     }
-                    Err(_) => Errno::InvalidArgs.status(),
-                };
+                }; // target borrow ends here
+                if let Some((ttbr0, mapping, vmo_koid)) = live_write {
+                    #[cfg(target_os = "none")]
+                    {
+                        let saved = kumo_hal::active::read_user_aspace_root();
+                        unsafe {
+                            kumo_hal::active::set_user_aspace_root(
+                                crate::user_thread::kernel_ttbr0(),
+                            )
+                        };
+                        let result = self.apply_to_live_tree(ttbr0, mapping, vmo_koid);
+                        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+                        if let Err(e) = result {
+                            return KernelCallResult::Status(e.status());
+                        }
+                    }
+                    #[cfg(not(target_os = "none"))]
+                    {
+                        let _ = self.apply_to_live_tree(ttbr0, mapping, vmo_koid);
+                    }
+                }
                 KernelCallResult::Status(status)
             }
             KernelCall::ThreadCreate { process_handle } => {

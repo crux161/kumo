@@ -426,6 +426,54 @@ pub fn console_use_physmap() {}
 /// Stub: physical memory read not yet wired for x86_64.
 pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
 
+// ---- mmu stubs (x86 paging lands with the x86 metal milestone) ----
+
+/// Stub: build a 4 KiB user page descriptor (aarch64 TTBR0 format).
+pub fn user_page_desc(_executable: bool, _writable: bool) -> u64 {
+    0
+}
+
+/// Stub: build a 4 KiB Device-nGnRnE page descriptor.
+pub fn user_device_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Stub: build a 4 KiB Normal-NC page descriptor.
+pub fn user_nc_page_desc(_writable: bool) -> u64 {
+    0
+}
+
+/// Stub: map one 4 KiB user page.
+///
+/// # Safety
+/// Stub; `unsafe` to match the aarch64 backend's contract.
+pub unsafe fn map_user_page(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _desc: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Stub: map a 2 MiB device block.
+///
+/// # Safety
+/// Stub; `unsafe` to match the aarch64 backend's contract.
+pub unsafe fn map_user_device_block(
+    _root: u64,
+    _va: u64,
+    _pa: u64,
+    _nc: bool,
+    _writable: bool,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+    _tables: &mut usize,
+) -> Result<(), ()> {
+    Ok(())
+}
+
 pub fn read_ttbr0() -> u64 {
     0 // x86_64 stub — paging lands with the x86_64 metal milestone.
 }

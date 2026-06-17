@@ -3,12 +3,15 @@
 
 extern crate alloc;
 
-use kumo_abi::{Errno, Handle, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH};
+use kumo_abi::{
+    BootInfo, Errno, Handle, Rights, VmarFlags, DRV_BLK_PATH, DRV_FB_PATH,
+    PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
+};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
-    channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind, port_create,
-    port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
-    thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
+    channel_write_with_handle, debug_write, handle_duplicate, handle_koid, interrupt_create,
+    port_bind, port_create, port_wait, process_create, process_run, process_wait,
+    resource_create_child, thread_create, thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -37,7 +40,7 @@ const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
 #[no_mangle]
 extern "C" fn sora_main(
     root_handle: u64,
-    _fb_va: u64,
+    fb_va: u64,
     console_handle: u64,
     initrd_vmo: u64,
     block_handle: u64,
@@ -52,6 +55,16 @@ extern "C" fn sora_main(
     let res = Handle(resource_handle as u32);
     let net = Handle(net_handle as u32);
     let kbd = Handle(kbd_handle as u32);
+
+    // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8).
+    let bootinfo_vmo: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, x8",
+            out(reg) bootinfo_vmo,
+            options(nostack, nomem)
+        );
+    }
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
@@ -275,6 +288,108 @@ extern "C" fn sora_main(
         log(b"drv-serial: run ok\n");
     } else {
         log(b"drv-serial: run fail\n");
+    }
+
+    // J160/J161: spawn drv-blk — the ramdisk block driver (M6/P7).
+    // Duplicate the initrd VMO with read-only rights, compute the total
+    // initrd size from the file table, and pass both (size + handle) to
+    // drv-blk over a bootstrap channel.
+    {
+        let blk_vmo_h = handle_duplicate(initrd, Rights::READ);
+        if blk_vmo_h != 0 && blk_vmo_h != u64::MAX {
+            // Compute the total initrd data size from the header + entry table.
+            let mut initrd_size: u64 = 0;
+            let mut hdr = [0u8; 16];
+            if vmo_read(initrd, 0, hdr.as_mut_ptr(), 16) == 0 {
+                let entry_count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as u64;
+                let mut entry = [0u8; 80];
+                for i in 0..entry_count {
+                    let off = 16u64 + i * 80;
+                    if vmo_read(initrd, off, entry.as_mut_ptr(), 80) != 0 {
+                        break;
+                    }
+                    let file_off = u64::from_le_bytes(entry[64..72].try_into().unwrap());
+                    let file_len = u64::from_le_bytes(entry[72..80].try_into().unwrap());
+                    let end = file_off.saturating_add(file_len);
+                    if end > initrd_size {
+                        initrd_size = end;
+                    }
+                }
+                // Add header + table overhead. The data region starts after
+                // header(16) + table(entry_count * 80).
+                initrd_size = initrd_size
+                    .saturating_add(16)
+                    .saturating_add(entry_count.saturating_mul(80));
+            }
+            let (server_chan, client_chan) = channel_create_pair();
+            if server_chan != u64::MAX && client_chan != u64::MAX {
+                // Send the size as 8 LE bytes alongside the VMO handle.
+                let size_bytes = initrd_size.to_le_bytes();
+                channel_write_with_handle(
+                    Handle(server_chan as u32),
+                    size_bytes.as_ptr(),
+                    size_bytes.len(),
+                    Handle(blk_vmo_h as u32),
+                );
+                if run_elf(
+                    initrd,
+                    kumo_abi::DRV_BLK_PATH.as_bytes(),
+                    0,           // arg (x0) = unused
+                    client_chan, // arg2 (x1) = bootstrap channel
+                    1,           // async
+                    b"drv-blk",
+                ) {
+                    log(b"drv-blk: run ok\n");
+                } else {
+                    log(b"drv-blk: run fail\n");
+                }
+            }
+        }
+    }
+
+    // J159: spawn drv-fb when a framebuffer is present.
+    // Map the BootInfo VMO (populated by the kernel), read framebuffer geometry,
+    // create a narrowed child Resource for the framebuffer MMIO range, and hand
+    // fb_res, the console channel, and the bootinfo VMO to drv-fb over a
+    // bootstrap channel pair. drv-fb reads these and paints the text console.
+    if fb_va != 0 && bootinfo_vmo != 0 {
+        let bi_vmo = Handle(bootinfo_vmo as u32);
+        let bi_va = 0x0000_0000_3000_0000;
+        if vmar_map(Handle(0), bi_vmo, 0, bi_va, 4096, (VmarFlags::READ).0) == 0 {
+            let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
+            if bootinfo.has_framebuffer() {
+                let fb = bootinfo.framebuffer;
+                let fb_res_h = resource_create_child(res, fb.phys, fb.len, 0, 0);
+                if fb_res_h != u64::MAX {
+                    let (server_chan, client_chan) = channel_create_pair();
+                    if server_chan != u64::MAX && client_chan != u64::MAX {
+                        let srv = Handle(server_chan as u32);
+                        // Write the three handles drv-fb expects.
+                        channel_write_with_handle(srv, b"F".as_ptr(), 1, Handle(fb_res_h as u32));
+                        channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
+                        channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
+                        if run_elf(
+                            initrd,
+                            kumo_abi::DRV_FB_PATH.as_bytes(),
+                            0,           // arg (x0) = unused
+                            client_chan, // arg2 (x1) = bootstrap channel
+                            1,           // async
+                            b"drv-fb",
+                        ) {
+                            log(b"drv-fb: run ok\n");
+                        } else {
+                            log(b"drv-fb: run fail\n");
+                        }
+                    } else {
+                        log(b"drv-fb: channel fail\n");
+                    }
+                } else {
+                    log(b"drv-fb: resource fail\n");
+                }
+            }
+        } else {
+            log(b"drv-fb: bootinfo map fail\n");
+        }
     }
 
     // P9-e: handle transfer test. Create a channel pair, transfer one handle
