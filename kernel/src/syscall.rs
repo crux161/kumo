@@ -81,6 +81,7 @@ pub enum KernelCall<'a> {
     /// P10-g: block until the async child process exits.
     ProcessWait,
     InterruptCreate {
+        resource: Handle,
         irq: u32,
     },
     InterruptWait {
@@ -90,6 +91,13 @@ pub enum KernelCall<'a> {
         resource: Handle,
         phys_base: u64,
         len: u64,
+    },
+    ResourceCreateChild {
+        parent: Handle,
+        phys_base: u64,
+        len: u64,
+        irq_base: u32,
+        irq_count: u32,
     },
     PortBind {
         port: Handle,
@@ -121,12 +129,43 @@ struct IrqBinding {
     count: u64,
 }
 
-/// A Resource grant: the holder may mint VMOs from this MMIO range.
+/// A Resource grant: the holder may mint VMOs from this MMIO range and create
+/// Interrupt objects for IRQs in `[irq_base, irq_base + irq_count)`.
 #[derive(Clone, Copy, Debug)]
 struct ResourceBinding {
     koid: KoId,
     phys_base: u64,
     len: u64,
+    irq_base: u32,
+    irq_count: u32,
+}
+
+fn resource_contains(parent: ResourceBinding, phys_base: u64, len: u64) -> bool {
+    let Some(end) = phys_base.checked_add(len) else {
+        return false;
+    };
+    let Some(parent_end) = parent.phys_base.checked_add(parent.len) else {
+        return false;
+    };
+    phys_base >= parent.phys_base && end <= parent_end
+}
+
+/// True when `[irq_base, irq_base + irq_count)` is wholly inside the parent's IRQ
+/// window. Widened in `u64` so `irq_count == u32::MAX` (the root grant) cannot wrap.
+fn resource_contains_irq_window(parent: ResourceBinding, irq_base: u32, irq_count: u32) -> bool {
+    let start = irq_base as u64;
+    let end = start + irq_count as u64;
+    let parent_start = parent.irq_base as u64;
+    let parent_end = parent_start + parent.irq_count as u64;
+    start >= parent_start && end <= parent_end
+}
+
+/// True when the single IRQ `irq` falls within the resource's IRQ window.
+fn resource_contains_irq(parent: ResourceBinding, irq: u32) -> bool {
+    let irq = irq as u64;
+    let parent_start = parent.irq_base as u64;
+    let parent_end = parent_start + parent.irq_count as u64;
+    irq >= parent_start && irq < parent_end
 }
 
 /// Stored VMO with optional pre-allocated frames for anonymous backing.
@@ -204,22 +243,72 @@ impl SyscallEngine {
         }
     }
 
-    /// Create a root Resource covering `[phys_base, phys_base + len)`. Returns a handle
-    /// for `caller`. This is the scaffold — Gouchen will mint per-device Resources later.
+    /// Create a root Resource covering MMIO `[phys_base, phys_base + len)` and the IRQ
+    /// window `[irq_base, irq_base + irq_count)`. Returns a handle for `caller`. Sora
+    /// narrows this into per-device Resources before spawning drivers.
     pub fn root_resource_create(
         &mut self,
         caller: &mut Process,
         phys_base: u64,
         len: u64,
+        irq_base: u32,
+        irq_count: u32,
     ) -> Result<Handle, ObjectError> {
         let object = self.objects.create(ObjectKind::Resource);
-        let handle = caller
-            .handles_mut()
-            .insert(object, Rights::READ | Rights::WRITE | Rights::DUPLICATE)?;
+        let handle = caller.handles_mut().insert(
+            object,
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER | Rights::MANAGE,
+        )?;
         self.resources.push(ResourceBinding {
             koid: object.koid(),
             phys_base,
             len,
+            irq_base,
+            irq_count,
+        });
+        Ok(handle)
+    }
+
+    fn resource_create_child(
+        &mut self,
+        caller: &mut Process,
+        parent: Handle,
+        phys_base: u64,
+        len: u64,
+        irq_base: u32,
+        irq_count: u32,
+    ) -> Result<Handle, Errno> {
+        if len == 0 {
+            return Err(Errno::InvalidArgs);
+        }
+        let parent_entry = caller
+            .handles()
+            .require(parent, ObjectKind::Resource, Rights::MANAGE)
+            .map_err(errno_from_object)?;
+        let parent = self
+            .resource_by_koid(parent_entry.koid)
+            .ok_or(Errno::BadHandle)?;
+        if !resource_contains(parent, phys_base, len) {
+            return Err(Errno::AccessDenied);
+        }
+        if !resource_contains_irq_window(parent, irq_base, irq_count) {
+            return Err(Errno::AccessDenied);
+        }
+
+        let object = self.objects.create(ObjectKind::Resource);
+        let handle = caller
+            .handles_mut()
+            .insert(
+                object,
+                Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(errno_from_object)?;
+        self.resources.push(ResourceBinding {
+            koid: object.koid(),
+            phys_base,
+            len,
+            irq_base,
+            irq_count,
         });
         Ok(handle)
     }
@@ -231,15 +320,59 @@ impl SyscallEngine {
             .find_map(|r| if r.koid == koid { Some(*r) } else { None })
     }
 
+    /// Reclaim the IRQ binding for `koid`. Called at process teardown so a dead or
+    /// restarted driver does not leak a stale binding (DESIGN/002 §3: drivers are
+    /// soft-state — the kernel reclaims their bindings; the new instance re-binds).
+    /// Returns true if a binding was removed.
+    pub fn release_interrupt(&mut self, koid: KoId) -> bool {
+        let before = self.interrupts.len();
+        self.interrupts.retain(|binding| binding.koid != koid);
+        self.interrupts.len() != before
+    }
+
+    /// Reclaim the Resource grant for `koid` at process teardown, so a restarted
+    /// driver's re-carved grant does not accumulate orphaned bindings. Returns true
+    /// if a binding was removed.
+    pub fn release_resource(&mut self, koid: KoId) -> bool {
+        let before = self.resources.len();
+        self.resources.retain(|binding| binding.koid != koid);
+        self.resources.len() != before
+    }
+
+    /// Drop every port binding touching `koid`, whether it is the watching port or the
+    /// watched object. Called at teardown for each handle a dying process releases: once
+    /// either endpoint is gone the binding can never fire again, so leaving it would leak
+    /// and let a future koid reuse alias a stale watch. Returns true if any were removed.
+    pub fn release_port_bindings(&mut self, koid: KoId) -> bool {
+        let before = self.port_bindings.len();
+        self.port_bindings
+            .retain(|&(port_koid, object_koid)| port_koid != koid && object_koid != koid);
+        self.port_bindings.len() != before
+    }
+
     /// Signal all interrupt objects bound to `irq`. Called from the IRQ handler.
-    /// Increments the fire count for each matching binding.
+    /// Increments the fire count for each matching binding (the `InterruptWait`
+    /// drain path) **and** signals any `Port` the interrupt is bound to with
+    /// `Signals::IRQ` — so a driver may `port_wait` on {IRQ-fired OR
+    /// channel-readable} in one thread, which console-out (Stage C) needs to
+    /// serve input and output from a single loop. Channel-readable already feeds
+    /// ports (`ChannelWrite` → `signal_ports(READABLE)`); this closes the
+    /// symmetric gap for interrupts (J145 §1).
     pub fn signal_interrupt(&mut self, irq: u32) {
-        for binding in &mut self.interrupts {
-            if binding.irq == irq {
-                binding.count = binding.count.saturating_add(1);
+        // Indexed walk, not `for binding in &mut self.interrupts`: `signal_ports`
+        // re-borrows `self` (port_bindings + ipc), so no borrow of `self.interrupts`
+        // may be live across it (GUIDANCE/006 §2.1). signal_ports touches neither
+        // `interrupts` nor its length, so the index stays valid.
+        let mut i = 0;
+        while i < self.interrupts.len() {
+            if self.interrupts[i].irq == irq {
+                self.interrupts[i].count = self.interrupts[i].count.saturating_add(1);
+                let koid = self.interrupts[i].koid;
                 #[cfg(target_os = "none")]
-                crate::user_thread::wake_child_waiting_on_interrupt(binding.koid);
+                crate::user_thread::wake_child_waiting_on_interrupt(koid);
+                self.signal_ports(koid, kumo_abi::Signals::IRQ);
             }
+            i += 1;
         }
     }
 
@@ -623,15 +756,6 @@ impl SyscallEngine {
                 len,
                 flags,
             } => {
-                // Look up the target process koid and VMO before mutably borrowing self.
-                let proc_koid = match process.handles().require(
-                    process_handle,
-                    ObjectKind::Process,
-                    Rights::WRITE,
-                ) {
-                    Ok(entry) => entry.koid,
-                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
-                };
                 let (vmo_koid, vmo) =
                     match process
                         .handles()
@@ -642,6 +766,26 @@ impl SyscallEngine {
                     };
                 let Some(vmo) = vmo else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                if process_handle == kumo_abi::INVALID_HANDLE {
+                    let status = match process.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
+                        Ok(mapping) => {
+                            process.add_mapping(mapping, vmo_koid);
+                            Errno::Ok.status()
+                        }
+                        Err(_) => Errno::InvalidArgs.status(),
+                    };
+                    return KernelCallResult::Status(status);
+                }
+
+                // Look up the target process koid after resolving the VMO.
+                let proc_koid = match process.handles().require(
+                    process_handle,
+                    ObjectKind::Process,
+                    Rights::WRITE,
+                ) {
+                    Ok(entry) => entry.koid,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
                 let Some(target) = self.process_by_koid_mut(proc_koid) else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
@@ -948,7 +1092,24 @@ impl SyscallEngine {
                 }
             }
             KernelCall::ProcessWait => KernelCallResult::Status(crate::user_thread::process_wait()),
-            KernelCall::InterruptCreate { irq } => {
+            KernelCall::InterruptCreate { resource, irq } => {
+                // IRQ authority flows through a Resource grant, range-checked like MMIO
+                // (no ambient authority — PLAN §5.1). A driver may only bind an IRQ its
+                // narrowed device Resource covers.
+                let res_entry =
+                    match process
+                        .handles()
+                        .require(resource, ObjectKind::Resource, Rights::WRITE)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                let Some(res) = self.resource_by_koid(res_entry.koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                if !resource_contains_irq(res, irq) {
+                    return KernelCallResult::Status(Errno::AccessDenied.status());
+                }
                 let object = self.objects.create(ObjectKind::Interrupt);
                 let handle = match process
                     .handles_mut()
@@ -1004,16 +1165,10 @@ impl SyscallEngine {
                 let Some(res) = self.resource_by_koid(res_entry.koid) else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
-                // Check the requested range is within the Resource grant.
-                let end = match phys_base.checked_add(len) {
-                    Some(e) => e,
-                    None => return KernelCallResult::Status(Errno::InvalidArgs.status()),
-                };
-                let res_end = match res.phys_base.checked_add(res.len) {
-                    Some(e) => e,
-                    None => return KernelCallResult::Status(Errno::InvalidArgs.status()),
-                };
-                if phys_base < res.phys_base || end > res_end {
+                if len == 0 {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                if !resource_contains(res, phys_base, len) {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
                 // Create a Physical VMO from the MMIO range.
@@ -1029,6 +1184,18 @@ impl SyscallEngine {
                     Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
+            KernelCall::ResourceCreateChild {
+                parent,
+                phys_base,
+                len,
+                irq_base,
+                irq_count,
+            } => match self
+                .resource_create_child(process, parent, phys_base, len, irq_base, irq_count)
+            {
+                Ok(handle) => KernelCallResult::Handle(handle),
+                Err(errno) => KernelCallResult::Status(errno.status()),
+            },
             KernelCall::PortBind { port, object } => {
                 let port_koid =
                     match process
@@ -1225,6 +1392,262 @@ mod tests {
     }
 
     #[test]
+    fn resource_child_must_stay_inside_parent_range() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x1000, 0x1000, 0, u32::MAX)
+            .unwrap();
+
+        let child = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x1800,
+                len: 0x100,
+                irq_base: 0,
+                irq_count: u32::MAX,
+            },
+        );
+        let KernelCallResult::Handle(child) = child else {
+            panic!("expected child Resource handle, got {child:?}");
+        };
+        assert!(process
+            .handles()
+            .require(child, ObjectKind::Resource, Rights::WRITE)
+            .is_ok());
+        assert_eq!(
+            process
+                .handles()
+                .require(child, ObjectKind::Resource, Rights::MANAGE),
+            Err(ObjectError::AccessDenied)
+        );
+
+        let outside = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x1f00,
+                len: 0x200,
+                irq_base: 0,
+                irq_count: u32::MAX,
+            },
+        );
+        assert_eq!(
+            outside,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn mmio_minting_is_limited_to_resource_range() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x9000_0000, 0x1000, 0, u32::MAX)
+            .unwrap();
+        let child = match engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x9000_0000,
+                len: 0x1000,
+                irq_base: 0,
+                irq_count: u32::MAX,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected child Resource handle, got {other:?}"),
+        };
+
+        let inside = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceMintMmio {
+                resource: child,
+                phys_base: 0x9000_0000,
+                len: 0x1000,
+            },
+        );
+        assert!(matches!(inside, KernelCallResult::Handle(_)));
+
+        let outside = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceMintMmio {
+                resource: child,
+                phys_base: 0x9000_1000,
+                len: 0x1000,
+            },
+        );
+        assert_eq!(
+            outside,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn interrupt_create_is_limited_to_resource_irq_window() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 0, u32::MAX)
+            .unwrap();
+        // Carve a PL011-shaped device grant: one MMIO page plus exactly IRQ 33.
+        let device = match engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x0900_0000,
+                len: 0x1000,
+                irq_base: 33,
+                irq_count: 1,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected child Resource handle, got {other:?}"),
+        };
+
+        // The granted IRQ binds.
+        let inside = engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate {
+                resource: device,
+                irq: 33,
+            },
+        );
+        assert!(matches!(inside, KernelCallResult::Handle(_)));
+
+        // A neighbouring IRQ the grant does not cover is denied — no ambient authority.
+        let outside = engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate {
+                resource: device,
+                irq: 34,
+            },
+        );
+        assert_eq!(
+            outside,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn resource_child_irq_window_must_stay_inside_parent() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        // Parent grants only IRQs [32, 40).
+        let root = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 32, 8)
+            .unwrap();
+
+        // A child IRQ window reaching past the parent's is rejected.
+        let outside = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x0900_0000,
+                len: 0x1000,
+                irq_base: 39,
+                irq_count: 4,
+            },
+        );
+        assert_eq!(
+            outside,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+
+        // A child IRQ window inside the parent's is granted.
+        let inside = engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x0900_0000,
+                len: 0x1000,
+                irq_base: 33,
+                irq_count: 1,
+            },
+        );
+        assert!(matches!(inside, KernelCallResult::Handle(_)));
+    }
+
+    #[test]
+    fn teardown_reclaims_interrupt_and_resource_bindings() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 33, 1)
+            .unwrap();
+        let irq = match engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate { resource, irq: 33 },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected interrupt handle, got {other:?}"),
+        };
+        assert_eq!(engine.interrupts.len(), 1);
+        assert_eq!(engine.resources.len(), 1);
+
+        // The object koids the dying process's handles carry (as teardown drains them).
+        let irq_koid = process.handles().get(irq).unwrap().koid;
+        let resource_koid = process.handles().get(resource).unwrap().koid;
+
+        // Teardown reclaims both bindings so a restarted driver re-binds cleanly.
+        assert!(engine.release_interrupt(irq_koid));
+        assert!(engine.release_resource(resource_koid));
+        assert_eq!(engine.interrupts.len(), 0);
+        assert_eq!(engine.resources.len(), 0);
+
+        // Idempotent: a second reclamation finds nothing left to remove.
+        assert!(!engine.release_interrupt(irq_koid));
+        assert!(!engine.release_resource(resource_koid));
+    }
+
+    #[test]
+    fn teardown_reclaims_port_bindings_on_either_endpoint() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let port = create_port(&mut engine, &mut process);
+        let (left, right) = create_channel(&mut engine, &mut process);
+
+        // Watch one endpoint via the port.
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(engine.port_bindings.len(), 1);
+
+        let port_koid = process.handles().get(port).unwrap().koid;
+        let right_koid = process.handles().get(right).unwrap().koid;
+        let left_koid = process.handles().get(left).unwrap().koid;
+
+        // Reclaiming by the watched object's koid drops the binding (it can never fire).
+        assert!(engine.release_port_bindings(right_koid));
+        assert_eq!(engine.port_bindings.len(), 0);
+        // A handle the binding never named leaves nothing to remove.
+        assert!(!engine.release_port_bindings(left_koid));
+
+        // Re-bind, then prove reclamation also fires when the *port* side dies.
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(engine.port_bindings.len(), 1);
+        assert!(engine.release_port_bindings(port_koid));
+        assert_eq!(engine.port_bindings.len(), 0);
+    }
+
+    #[test]
     fn dispatches_channel_create_write_and_read() {
         let mut engine = SyscallEngine::new();
         let mut process = test_process(&mut engine);
@@ -1294,6 +1717,62 @@ mod tests {
         let right_koid = process.handles().get(right).unwrap().koid;
         assert_eq!(packet.source, right_koid);
         assert!(packet.signals.contains(kumo_abi::Signals::READABLE));
+    }
+
+    #[test]
+    fn signal_interrupt_wakes_port_bound_to_interrupt() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        // A device Resource covering exactly IRQ 33, then an Interrupt bound to it.
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 33, 1)
+            .unwrap();
+        let irq = match engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate { resource, irq: 33 },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected interrupt handle, got {other:?}"),
+        };
+        let irq_koid = process.handles().get(irq).unwrap().koid;
+
+        // Watch the Interrupt via a Port — the wait_many shape console-out needs.
+        let watched = create_port(&mut engine, &mut process);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: watched,
+                    object: irq,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        // An unrelated port, bound to nothing, must stay silent.
+        let bystander = create_port(&mut engine, &mut process);
+
+        // The IRQ fires.
+        engine.signal_interrupt(33);
+
+        // The watching port wakes with an IRQ packet sourced from the interrupt koid.
+        let result = engine.dispatch(&mut process, KernelCall::PortWait { port: watched });
+        let KernelCallResult::PortPacket(packet) = result else {
+            panic!("expected an IRQ port packet, got {result:?}");
+        };
+        assert_eq!(packet.source, irq_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::IRQ));
+
+        // The unbound port saw nothing.
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port: bystander }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+
+        // The legacy InterruptWait drain path still sees the same fire (count incremented).
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+            KernelCallResult::Handle(Handle(1))
+        );
     }
 
     #[test]

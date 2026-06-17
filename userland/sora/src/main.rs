@@ -7,8 +7,8 @@ use kumo_abi::{Errno, Handle, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind, port_create,
-    port_wait, process_create, process_run, process_wait, thread_create, thread_start, vmar_map,
-    vmo_create, vmo_read, vmo_write,
+    port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
+    thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -19,6 +19,11 @@ kumo_rt::entry!(sora_main);
 fn log(msg: &[u8]) {
     kumo_rt::debug_write(msg.as_ptr(), msg.len());
 }
+
+const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
+const QEMU_PL011_MMIO_SIZE: u64 = 0x1000;
+const QEMU_PL011_IRQ: u32 = 33; // SPI 1 = 33 on QEMU ARM virt
+const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
 
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
@@ -44,7 +49,7 @@ extern "C" fn sora_main(
     let console = Handle(console_handle as u32);
     let initrd = Handle(initrd_vmo as u32);
     let block = Handle(block_handle as u32);
-    let _res = Handle(resource_handle as u32);
+    let res = Handle(resource_handle as u32);
     let net = Handle(net_handle as u32);
     let kbd = Handle(kbd_handle as u32);
 
@@ -242,16 +247,27 @@ extern "C" fn sora_main(
     // P9-a: create an Interrupt object bound to the timer IRQ (27). The handle
     // proves interrupt infrastructure works. InterruptWait is not called here —
     // it would park Sora before the serve loop, breaking channel dispatch.
-    let timer_irq = interrupt_create(27);
+    // IRQ authority is gated by `res` (the root Resource covers every IRQ line).
+    let timer_irq = interrupt_create(res, TIMER_IRQ);
     if timer_irq != u64::MAX {
         debug_write(b"timer irq ok\n".as_ptr(), 13);
     }
 
-    // Spawn drv-serial
-    if run_elf(
+    // Spawn drv-serial with only the PL011 device grant — its MMIO page and its
+    // single IRQ line — not Sora's root Resource.
+    let serial_res_h = resource_create_child(
+        res,
+        QEMU_PL011_MMIO_BASE,
+        QEMU_PL011_MMIO_SIZE,
+        QEMU_PL011_IRQ,
+        1,
+    );
+    if serial_res_h == u64::MAX {
+        log(b"drv-serial: resource fail\n");
+    } else if run_elf(
         initrd,
         kumo_abi::DRV_SERIAL_PATH.as_bytes(),
-        resource_handle,
+        serial_res_h,
         console_handle,
         1, // async
         b"drv-serial",

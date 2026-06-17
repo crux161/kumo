@@ -460,6 +460,12 @@ enum ChildPortWaitOutcome {
     Done,
 }
 
+enum ChildInterruptWaitOutcome {
+    Fired(u64),
+    ShouldWait(KoId),
+    Done,
+}
+
 fn read_child_channel_without_borrow(
     process_koid: KoId,
     channel: Handle,
@@ -552,6 +558,44 @@ fn wait_child_port_without_borrow(process_koid: KoId, port: Handle) -> u64 {
     }
 }
 
+fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildInterruptWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = match child.handles().get(interrupt) {
+                Ok(entry) => entry.koid,
+                Err(_) => return ChildInterruptWaitOutcome::Done,
+            };
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::InterruptWait { interrupt })
+            {
+                KernelCallResult::Handle(count) => ChildInterruptWaitOutcome::Fired(count.0 as u64),
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    ChildInterruptWaitOutcome::ShouldWait(wait_koid)
+                }
+                _ => ChildInterruptWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildInterruptWaitOutcome::Fired(count) => return count,
+            ChildInterruptWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_interrupt(wait_koid);
+            }
+            ChildInterruptWaitOutcome::Done => return 0,
+        }
+    }
+}
+
 /// Tears down the current process before it exits: closes all handles (firing PEER_CLOSED
 /// on any channels) and signals TERMINATED on its process object so the supervisor wakes up.
 fn teardown_current_process_and_signal() {
@@ -566,12 +610,27 @@ fn teardown_current_process_and_signal() {
             proc.handles_mut().drain()
         };
         for entry in handles {
-            if entry.kind == kumo_abi::ObjectKind::Channel {
-                if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
-                    sora.engine
-                        .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+            match entry.kind {
+                kumo_abi::ObjectKind::Channel => {
+                    if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
+                        sora.engine
+                            .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                    }
                 }
+                // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
+                // reclaim its IRQ bindings and Resource grants so a restarted instance
+                // re-binds cleanly instead of stacking orphaned entries in the engine.
+                kumo_abi::ObjectKind::Interrupt => {
+                    sora.engine.release_interrupt(entry.koid);
+                }
+                kumo_abi::ObjectKind::Resource => {
+                    sora.engine.release_resource(entry.koid);
+                }
+                _ => {}
             }
+            // Any object this process owned may have been a port or a watched object;
+            // drop port bindings on either side so a dead watch never lingers.
+            sora.engine.release_port_bindings(entry.koid);
         }
         let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
             return;
@@ -666,6 +725,17 @@ extern "C" fn svc_hook(regs: *mut u64) {
         }
     }
 
+    if num == Syscall::InterruptWait as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let interrupt = Handle(r[0] as u32);
+                r[0] = wait_child_interrupt_without_borrow(cp_koid, interrupt);
+                return;
+            }
+        }
+    }
+
     with_sora_mut(|sora| {
         if let Some(cp_koid) = crate::user_thread::current_process_koid() {
             if cp_koid != sora.process.koid() {
@@ -733,6 +803,52 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         .dispatch(child, KernelCall::PortBind { port, object })
                     {
                         KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::VmarMap as u64 {
+                    let process_handle = Handle(r[0] as u32);
+                    let vmo_handle = Handle(r[1] as u32);
+                    let vmo_offset = r[2];
+                    let virt = r[3];
+                    let len = r[4];
+                    let flags = PageFlags(r[5]);
+                    match sora.engine.dispatch(
+                        child,
+                        KernelCall::VmarMap {
+                            process_handle,
+                            vmo_handle,
+                            vmo_offset,
+                            virt,
+                            len,
+                            flags,
+                        },
+                    ) {
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::ResourceMintMmio as u64 {
+                    let resource = Handle(r[0] as u32);
+                    let phys_base = r[1];
+                    let len = r[2];
+                    match sora.engine.dispatch(
+                        child,
+                        KernelCall::ResourceMintMmio {
+                            resource,
+                            phys_base,
+                            len,
+                        },
+                    ) {
+                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
+                } else if num == Syscall::InterruptCreate as u64 {
+                    let resource = Handle(r[0] as u32);
+                    let irq = r[1] as u32;
+                    match sora
+                        .engine
+                        .dispatch(child, KernelCall::InterruptCreate { resource, irq })
+                    {
+                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                         _ => r[0] = u64::MAX,
                     }
                 } else {
@@ -849,12 +965,33 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
             }
+        } else if num == Syscall::ResourceCreateChild as u64 {
+            let parent = Handle(r[0] as u32);
+            let phys_base = r[1];
+            let len = r[2];
+            // The IRQ window is packed into the fourth argument: (base << 32) | count.
+            let irq_base = (r[3] >> 32) as u32;
+            let irq_count = r[3] as u32;
+            match sora.engine.dispatch(
+                &mut sora.process,
+                KernelCall::ResourceCreateChild {
+                    parent,
+                    phys_base,
+                    len,
+                    irq_base,
+                    irq_count,
+                },
+            ) {
+                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                _ => r[0] = u64::MAX,
+            }
         } else if num == Syscall::InterruptCreate as u64 {
-            let irq = r[0] as u32;
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::InterruptCreate { irq })
-            {
+            let resource = Handle(r[0] as u32);
+            let irq = r[1] as u32;
+            match sora.engine.dispatch(
+                &mut sora.process,
+                KernelCall::InterruptCreate { resource, irq },
+            ) {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
             }
@@ -1162,10 +1299,11 @@ fn attempt_sora(
         )
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
-    // P9-b: root Resource — grants access to all physical MMIO (scaffold; Gouchen
-    // will mint per-device Resources later). Sora receives the handle in x5.
+    // P9-b: root Resource — grants access to all physical MMIO and every IRQ line
+    // (scaffold; Gouchen will mint per-device Resources later). Sora receives the
+    // handle in x5 and narrows it before handing grants to drivers.
     let root_resource_handle = engine
-        .root_resource_create(&mut process, 0, u64::MAX)
+        .root_resource_create(&mut process, 0, u64::MAX, 0, u32::MAX)
         .map_err(|_| UsermodeError::ChannelSetup)?;
 
     // P9-c: network channel — loopback server. Kernel is the first client.

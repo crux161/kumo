@@ -5,8 +5,7 @@ extern crate alloc;
 
 use kumo_abi::Handle;
 use kumo_rt::{
-    channel_write, debug_write, sys_interrupt_create, sys_interrupt_wait, sys_resource_mint_mmio,
-    vmar_map,
+    channel_write, debug_write, interrupt_create, interrupt_wait, resource_mint_mmio, vmar_map,
 };
 
 kumo_rt::entry!(main);
@@ -40,7 +39,7 @@ extern "C" fn main(
     let console = Handle(console_channel as u32);
 
     // 1. Mint MMIO VMO
-    let vmo_h = sys_resource_mint_mmio(res, UART_BASE, UART_SIZE);
+    let vmo_h = resource_mint_mmio(res, UART_BASE, UART_SIZE);
     if vmo_h == u64::MAX {
         debug_write(b"drv-serial: vmo mint failed\n".as_ptr(), 28);
         kumo_rt::process_exit(1);
@@ -55,8 +54,9 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
-    // 3. Create the Interrupt object
-    let irq_h = sys_interrupt_create(UART_IRQ);
+    // 3. Create the Interrupt object — gated by the same device Resource that
+    //    authorized the MMIO mint above (its grant covers exactly this IRQ line).
+    let irq_h = interrupt_create(res, UART_IRQ);
     if irq_h == u64::MAX {
         debug_write(b"drv-serial: irq failed\n".as_ptr(), 23);
         kumo_rt::process_exit(1);
@@ -76,7 +76,7 @@ extern "C" fn main(
     // Main loop: wait for interrupt, read UART, write to console channel
     loop {
         // Wait for IRQ
-        sys_interrupt_wait(irq);
+        interrupt_wait(irq);
 
         // Acknowledge interrupt (clear RXIC)
         unsafe {

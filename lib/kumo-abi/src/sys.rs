@@ -36,6 +36,7 @@ pub enum Syscall {
     PortBind = 32,
     HandleKoid = 33,
     ProcessWait = 34,
+    ResourceCreateChild = 35,
 }
 
 pub type Status = i32;

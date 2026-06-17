@@ -326,12 +326,18 @@ pub fn process_wait() -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn interrupt_create(irq: u32) -> u64 {
-    syscall(Syscall::InterruptCreate, irq as u64, 0, 0, 0)
+pub fn interrupt_create(resource: Handle, irq: u32) -> u64 {
+    syscall(
+        Syscall::InterruptCreate,
+        resource.0 as u64,
+        irq as u64,
+        0,
+        0,
+    )
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-pub fn interrupt_create(_irq: u32) -> u64 {
+pub fn interrupt_create(_resource: Handle, _irq: u32) -> u64 {
     u64::MAX
 }
 
@@ -371,6 +377,38 @@ pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 
     u64::MAX
 }
 
+/// Carve a child Resource bounded to MMIO `[phys_base, phys_base + len)` and the IRQ
+/// window `[irq_base, irq_base + irq_count)`. The IRQ window is packed into one argument
+/// as `(irq_base << 32) | irq_count` so the call fits the four-register syscall ABI.
+#[cfg(target_arch = "aarch64")]
+pub fn resource_create_child(
+    parent: Handle,
+    phys_base: u64,
+    len: u64,
+    irq_base: u32,
+    irq_count: u32,
+) -> u64 {
+    let irq_window = ((irq_base as u64) << 32) | (irq_count as u64);
+    syscall(
+        Syscall::ResourceCreateChild,
+        parent.0 as u64,
+        phys_base,
+        len,
+        irq_window,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn resource_create_child(
+    _parent: Handle,
+    _phys_base: u64,
+    _len: u64,
+    _irq_base: u32,
+    _irq_count: u32,
+) -> u64 {
+    u64::MAX
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn port_create() -> u64 {
     syscall(Syscall::PortCreate, 0, 0, 0, 0)
@@ -389,24 +427,6 @@ pub fn handle_koid(handle: Handle) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn handle_koid(_handle: Handle) -> u64 {
     0
-}
-
-pub fn sys_interrupt_create(irq: u32) -> u64 {
-    syscall(Syscall::InterruptCreate, irq as u64, 0, 0, 0)
-}
-
-pub fn sys_interrupt_wait(interrupt: Handle) -> u64 {
-    syscall(Syscall::InterruptWait, interrupt.0 as u64, 0, 0, 0)
-}
-
-pub fn sys_resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
-    syscall(
-        Syscall::ResourceMintMmio,
-        resource.0 as u64,
-        phys_base,
-        len,
-        0,
-    )
 }
 
 #[cfg(target_arch = "aarch64")]
