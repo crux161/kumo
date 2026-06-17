@@ -4,6 +4,7 @@
 extern crate alloc;
 
 pub mod bootstrap;
+pub mod cap;
 pub mod ipc;
 pub mod ipcdemo;
 pub mod kdemo;
@@ -459,9 +460,9 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     // Bind port to h1 (receiving endpoint).
                     let bind = s.engine.dispatch(
                         &mut s.process,
-                        KernelCall::PortBindChannel {
+                        KernelCall::PortBind {
                             port: port_h,
-                            channel: h1,
+                            object: h1,
                         },
                     );
                     if bind != KernelCallResult::Status(Errno::Ok.status()) {

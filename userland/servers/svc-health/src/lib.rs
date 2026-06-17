@@ -37,6 +37,8 @@ use alloc::vec::Vec;
 mod op {
     pub const PING: u8 = 0x01;
     pub const STATUS: u8 = 0x02;
+    pub const SHUTDOWN: u8 = 0x03;
+    pub const CRASH: u8 = 0x04;
     pub const PONG: u8 = 0x81;
     pub const STATUS_OK: u8 = 0x82;
     pub const ERROR: u8 = 0xEE;
@@ -49,6 +51,12 @@ pub enum Request {
     Ping,
     /// Ask for the server's running counters; expects [`Response::Status`].
     Status,
+    /// Graceful stop: the serve loop exits (no reply) and the server process terminates,
+    /// so its supervisor observes the termination (DESIGN/002 §1). Intercepted in
+    /// [`serve_once`] before the reply path.
+    Shutdown,
+    /// Explicit crash: executes an undefined instruction to trigger an EL0 fault.
+    Crash,
 }
 
 impl Request {
@@ -58,6 +66,8 @@ impl Request {
         match raw.first().copied()? {
             op::PING => Some(Request::Ping),
             op::STATUS => Some(Request::Status),
+            op::SHUTDOWN => Some(Request::Shutdown),
+            op::CRASH => Some(Request::Crash),
             _ => None,
         }
     }
@@ -67,6 +77,8 @@ impl Request {
         let code = match self {
             Request::Ping => op::PING,
             Request::Status => op::STATUS,
+            Request::Shutdown => op::SHUTDOWN,
+            Request::Crash => op::CRASH,
         };
         alloc::vec![code]
     }
@@ -142,15 +154,23 @@ impl Health {
         self.uptime_ticks = self.uptime_ticks.saturating_add(ticks);
     }
 
-    /// Handle one typed request, advancing the served counter.
+    /// Handle one typed request, advancing the served counter for replied requests.
     pub fn handle(&mut self, req: Request) -> Response {
-        self.served = self.served.saturating_add(1);
         match req {
-            Request::Ping => Response::Pong,
-            Request::Status => Response::Status {
-                uptime_ticks: self.uptime_ticks,
-                served: self.served,
-            },
+            Request::Ping => {
+                self.served = self.served.saturating_add(1);
+                Response::Pong
+            }
+            Request::Status => {
+                self.served = self.served.saturating_add(1);
+                Response::Status {
+                    uptime_ticks: self.uptime_ticks,
+                    served: self.served,
+                }
+            }
+            // A control request with no reply; `serve_once` intercepts it before this path,
+            // so this arm only keeps a direct `handle`/`dispatch` call total.
+            Request::Shutdown | Request::Crash => Response::Error,
         }
     }
 
@@ -176,10 +196,26 @@ pub trait Transport {
     fn send(&mut self, frame: &[u8]);
 }
 
-/// Handle exactly one request/reply exchange. Returns `false` when the transport closed.
+/// Handle exactly one request/reply exchange. Returns `false` — ending the serve loop —
+/// when the transport closes **or** a [`Request::Shutdown`] arrives (a graceful stop that
+/// sends no reply; the server process then exits, DESIGN/002 §1).
 pub fn serve_once<T: Transport>(t: &mut T, state: &mut Health, buf: &mut [u8]) -> bool {
     match t.recv(buf) {
         Some(n) => {
+            if Request::decode(&buf[..n]) == Some(Request::Shutdown) {
+                return false;
+            }
+            if Request::decode(&buf[..n]) == Some(Request::Crash) {
+                // Execute an undefined instruction to trigger an EL0 fault.
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("udf #0");
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                unsafe {
+                    core::ptr::read_volatile(0xDEAD_0000 as *const u32);
+                }
+            }
             let reply = state.dispatch(&buf[..n]);
             t.send(&reply);
             true
@@ -247,6 +283,49 @@ mod tests {
                 served: 2,
             })
         );
+    }
+
+    #[test]
+    fn request_opcodes_round_trip() {
+        for req in [Request::Ping, Request::Status, Request::Shutdown] {
+            assert_eq!(Request::decode(&req.encode()), Some(req));
+        }
+    }
+
+    #[test]
+    fn shutdown_ends_serve_loop_without_replying() {
+        use alloc::collections::VecDeque;
+        use alloc::vec::Vec;
+
+        struct Mock {
+            incoming: VecDeque<Vec<u8>>,
+            sent: Vec<Vec<u8>>,
+        }
+        impl Transport for Mock {
+            fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+                let frame = self.incoming.pop_front()?;
+                buf[..frame.len()].copy_from_slice(&frame);
+                Some(frame.len())
+            }
+            fn send(&mut self, frame: &[u8]) {
+                self.sent.push(frame.to_vec());
+            }
+        }
+
+        // Ping is served; then Shutdown stops the loop. The Status queued *after* Shutdown
+        // must never be served — the loop exits on Shutdown, not on transport drain.
+        let mut m = Mock {
+            incoming: VecDeque::from([
+                Request::Ping.encode(),
+                Request::Shutdown.encode(),
+                Request::Status.encode(),
+            ]),
+            sent: Vec::new(),
+        };
+        serve(&mut m);
+
+        assert_eq!(m.sent.len(), 1, "only Ping replies; Shutdown sends nothing");
+        assert_eq!(Response::decode(&m.sent[0]), Some(Response::Pong));
     }
 
     #[test]

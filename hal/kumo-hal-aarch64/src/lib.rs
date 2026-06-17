@@ -1139,6 +1139,18 @@ pub mod el0 {
         SVC_HOOK.store(hook as usize, Ordering::Release);
     }
 
+    /// The kernel's EL0-fault handler, registered via [`set_fault_hook`]. Called when a
+    /// lower-EL (EL0) thread takes a non-SVC synchronous exception — a *user* fault (bad
+    /// access, illegal instruction). It receives `(esr, elr, far)` and must NOT return: it
+    /// terminates the faulting thread and switches away, so one process's crash never halts
+    /// the kernel (DESIGN/002). 0 means "not installed" → fall back to the Tower halt.
+    static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Register the kernel's EL0-fault handler (see [`FAULT_HOOK`]).
+    pub fn set_fault_hook(hook: extern "C" fn(u64, u64, u64) -> !) {
+        FAULT_HOOK.store(hook as usize, Ordering::Release);
+    }
+
     /// Outcome of the EL0 round-trip, for the boot report.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct El0Report {
@@ -1454,7 +1466,14 @@ pub mod el0 {
         "  ldr  x30,      [sp, #240]",
         "  add  sp, sp, #800",
         "  eret",
-        "8:", // not SVC: a real lower-EL fault -> the Tower
+        "8:", // not SVC: an EL0 fault. Try the kernel's fault hook (contain it to this
+        // process); it terminates the thread and never returns. Only if no hook is
+        // installed does the fault fall through to the Tower (a full halt).
+        "  mrs  x0, esr_el1",
+        "  mrs  x1, elr_el1",
+        "  mrs  x2, far_el1",
+        "  bl   kumo_el0_fault",
+        // Unhandled (no hook): the Tower.
         "  mrs  x1, esr_el1",
         "  mrs  x2, elr_el1",
         "  mrs  x3, far_el1",
@@ -1496,6 +1515,22 @@ pub mod el0 {
         // `set_svc_hook`; `frame.x` is the 31-entry x0..x30 register file.
         let hook: extern "C" fn(*mut u64) = unsafe { core::mem::transmute(hook) };
         hook(frame as *mut u64);
+    }
+
+    /// Called from `kumo_svc_common` when a lower-EL (EL0) thread takes a non-SVC sync
+    /// exception — a user fault. If the kernel registered a [`FAULT_HOOK`], hand off to it
+    /// (it terminates the faulting thread and never returns); otherwise return so the
+    /// vector falls through to the Tower (an *unhandled* fault still halts, as before).
+    #[no_mangle]
+    extern "C" fn kumo_el0_fault(esr: u64, elr: u64, far: u64) {
+        let hook = FAULT_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: FAULT_HOOK only ever holds an `extern "C" fn(u64,u64,u64) -> !` set by
+            // `set_fault_hook`.
+            let hook: extern "C" fn(u64, u64, u64) -> ! = unsafe { core::mem::transmute(hook) };
+            hook(esr, elr, far);
+        }
+        // No hook installed: return to the vector, which branches to the Tower.
     }
 
     /// Clean the written user code to PoC + invalidate the I-cache over it, so EL0 fetches
@@ -1764,8 +1799,8 @@ pub mod el0 {
 
 #[cfg(target_os = "none")]
 pub use el0::{
-    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_svc_hook, syscall_count,
-    El0Report, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState,
+    build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_fault_hook, set_svc_hook,
+    syscall_count, El0Report, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState,
 };
 
 /// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
@@ -1827,6 +1862,9 @@ pub fn run_el0_image(
 
 #[cfg(not(target_os = "none"))]
 pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64) -> !) {}
 
 #[cfg(not(target_os = "none"))]
 pub fn el0_exit(_code: u64) -> ! {

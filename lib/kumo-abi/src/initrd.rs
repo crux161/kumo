@@ -5,6 +5,7 @@ pub const INITRD_PATH_MAX: usize = 64;
 pub const INITRD_VERSION: u32 = 1;
 pub const SORA_INIT_PATH: &str = "bin/sora";
 pub const SVC_HEALTH_PATH: &str = "bin/svc-health";
+pub const DRV_SERIAL_PATH: &str = "bin/drv-serial";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 

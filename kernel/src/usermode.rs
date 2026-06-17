@@ -552,12 +552,61 @@ fn wait_child_port_without_borrow(process_koid: KoId, port: Handle) -> u64 {
     }
 }
 
+/// Tears down the current process before it exits: closes all handles (firing PEER_CLOSED
+/// on any channels) and signals TERMINATED on its process object so the supervisor wakes up.
+fn teardown_current_process_and_signal() {
+    let Some(koid) = crate::user_thread::current_process_koid() else {
+        return;
+    };
+    with_sora_mut(|sora| {
+        let handles = {
+            let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
+                return;
+            };
+            proc.handles_mut().drain()
+        };
+        for entry in handles {
+            if entry.kind == kumo_abi::ObjectKind::Channel {
+                if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
+                    sora.engine
+                        .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                }
+            }
+        }
+        let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
+            return;
+        };
+        proc.signal(kumo_abi::Signals::TERMINATED);
+        sora.engine
+            .signal_ports(koid, kumo_abi::Signals::TERMINATED);
+    });
+}
+
+/// Exit code stamped on a thread the kernel terminated for faulting (vs. a clean
+/// `ProcessExit`). Cosmetic for resident children (the supervisor detects death by the reap).
+const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
+
+/// HAL fault hook (registered via `set_fault_hook`): an EL0 thread took a non-SVC sync
+/// exception — a *user* fault (bad access / illegal instruction). Contain it: terminate just
+/// that thread and switch to the scheduler, so one server's crash never halts the kernel
+/// (DESIGN/002, §5.6). Never returns to the faulting context.
+extern "C" fn fault_hook(_esr: u64, _elr: u64, _far: u64) -> ! {
+    kumo_hal::active::early_console_write(b"KUMO: EL0 fault contained; process terminated\n");
+    if crate::user_thread::is_started() {
+        teardown_current_process_and_signal();
+        crate::user_thread::exit_current_user(EL0_FAULT_EXIT_CODE);
+    }
+    // No scheduler harness yet (early boot): fall back to the synchronous EL0 exit path.
+    kumo_hal::active::el0_exit(EL0_FAULT_EXIT_CODE);
+}
+
 extern "C" fn svc_hook(regs: *mut u64) {
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
 
     if num == Syscall::ProcessExit as u64 {
         if crate::user_thread::is_started() {
+            teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
         }
         kumo_hal::active::el0_exit(r[0]);
@@ -565,6 +614,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
 
     if num == LINUX_ARM64_EXIT || num == LINUX_ARM64_EXIT_GROUP {
         if crate::user_thread::is_started() {
+            teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
         }
         kumo_hal::active::el0_exit(r[0]);
@@ -675,12 +725,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                         _ => r[0] = u64::MAX,
                     }
-                } else if num == Syscall::PortBindChannel as u64 {
+                } else if num == Syscall::PortBind as u64 {
                     let port = Handle(r[0] as u32);
-                    let channel = Handle(r[1] as u32);
+                    let object = Handle(r[1] as u32);
                     match sora
                         .engine
-                        .dispatch(child, KernelCall::PortBindChannel { port, channel })
+                        .dispatch(child, KernelCall::PortBind { port, object })
                     {
                         KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                         _ => r[0] = u64::MAX,
@@ -774,13 +824,13 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
             }
-        } else if num == Syscall::PortBindChannel as u64 {
+        } else if num == Syscall::PortBind as u64 {
             let port = Handle(r[0] as u32);
-            let channel = Handle(r[1] as u32);
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::PortBindChannel { port, channel },
-            ) {
+            let object = Handle(r[1] as u32);
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::PortBind { port, object })
+            {
                 KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                 _ => r[0] = u64::MAX,
             }
@@ -1039,6 +1089,7 @@ pub fn run(boot: &BootInfo) -> UserReport {
     }
 
     kumo_hal::active::set_svc_hook(svc_hook);
+    kumo_hal::active::set_fault_hook(fault_hook);
     let mut alloc = || unsafe { alloc_zeroed_frame(boot) };
     let report = kumo_hal::active::run_el0_smoke(
         USER_IMAGE_BASE,
@@ -1307,6 +1358,7 @@ fn attempt_sora(
     });
 
     kumo_hal::active::set_svc_hook(svc_hook);
+    kumo_hal::active::set_fault_hook(fault_hook);
     #[cfg(target_os = "none")]
     kumo_hal::active::set_interrupt_hook(signal_irq);
     // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
@@ -1382,7 +1434,8 @@ const ROUTE_CHUNK: usize = 192;
 /// signalled the bound port — this does what `ChannelWrite`'s `signal_channel_ports` would.
 fn signal_and_wake(channel_koid: KoId) {
     with_sora_mut(|sora| {
-        sora.engine.signal_channel_ports(channel_koid);
+        sora.engine
+            .signal_ports(channel_koid, kumo_abi::Signals::READABLE);
     });
     crate::user_thread::wake_user();
 }

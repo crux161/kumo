@@ -14,7 +14,7 @@ use crate::object::ObjectManager;
 use crate::task::{Job, Process};
 
 pub const USER_ROOT_BASE: u64 = 0x0000_0000_0020_0000;
-pub const USER_ROOT_SIZE: u64 = 0x0000_0000_1000_0000;
+pub const USER_ROOT_SIZE: u64 = 0x0000_0000_8000_0000;
 pub const USER_IMAGE_BASE: u64 = USER_ROOT_BASE;
 pub const USER_STACK_SIZE: u64 = PAGE_SIZE * 16;
 pub const USER_STACK_TOP: u64 = USER_ROOT_BASE + USER_ROOT_SIZE;

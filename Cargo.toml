@@ -13,6 +13,7 @@ members = [
     "userland/kumo-rt",
     "userland/kumoza",
     "userland/persona-linux",
+    "userland/servers/drv-serial",
     "userland/servers/svc-health",
     "userland/sora",
     "xtask",
@@ -35,4 +36,7 @@ kumo-ipc = { path = "lib/kumo-ipc" }
 [profile.release]
 codegen-units = 1
 lto = "fat"
+panic = "abort"
+
+[profile.dev]
 panic = "abort"

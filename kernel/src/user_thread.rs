@@ -20,6 +20,10 @@ use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
 const CHILD_PRIORITY: Priority = Priority(63);
+/// Upper bound on simultaneously-resident children. Two is the smallest that proves
+/// independent per-thread waits across distinct child koids (Journal 134); raise it when a
+/// real case needs more (`GUIDANCE/006 §6`: do not build the infinitely-extensible version).
+const MAX_RESIDENT_CHILDREN: usize = 2;
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
 /// Same priority as the blocking child — more urgent than Sora (64).
 const CHILD_ASYNC_PRIORITY: Priority = Priority(63);
@@ -36,6 +40,7 @@ pub enum UserSchedError {
 enum WaitTarget {
     Channel(KoId),
     Port(KoId),
+    Interrupt(KoId),
 }
 
 /// One parked thread and the typed object it blocked on.
@@ -89,13 +94,24 @@ impl WaitQueue {
     fn remove_thread(&mut self, thread: KoId) {
         self.entries.retain(|e| e.thread != thread);
     }
+}
 
-    /// Drop every entry. Used when a child generation is (re)installed or torn down; with
-    /// the single-child scaffold the queue only holds that child, so this matches the old
-    /// `child_wait = None` reset exactly.
-    fn clear(&mut self) {
-        self.entries.clear();
-    }
+/// A scheduler-hosted resident child and all the per-child state the harness tracks for it.
+/// One element of the `children` collection (Journal 134): because every field is per child,
+/// two residents keep independent `ttbr0`/`fresh`/`done` state and never clobber each other.
+struct ResidentChild {
+    /// The child's scheduler thread.
+    thread: Thread,
+    /// True until the first switch into the child's `kumo_user_enter` trampoline.
+    fresh: bool,
+    /// The child process's TTBR0 tree, restored on every resume after the first.
+    ttbr0: u64,
+    /// The child process koid.
+    process: KoId,
+    /// The child exit code (valid once `done`).
+    exit_code: u64,
+    /// True once the child thread has terminated.
+    done: bool,
 }
 
 /// The scheduler-integrated user-thread harness. Owns the dispatcher, the boot-flow
@@ -114,20 +130,11 @@ pub struct UserSched {
     pub user_thread: Thread,
     /// True until the first switch into Sora's `kumo_user_enter` trampoline.
     pub user_fresh: bool,
-    /// A scheduler-hosted child spawned by Sora's `ProcessRun` demo.
-    pub child_thread: Option<Thread>,
-    /// True until the first switch into the child's `kumo_user_enter` trampoline.
-    pub child_fresh: bool,
-    /// The child process's TTBR0 tree.
-    pub child_ttbr0: u64,
-    /// The child process koid.
-    pub child_process: Option<KoId>,
+    /// The resident children spawned by Sora's `ProcessRun` demos, each with its own
+    /// per-child state. Bounded by `MAX_RESIDENT_CHILDREN`; looked up by thread koid.
+    children: alloc::vec::Vec<ResidentChild>,
     /// Threads parked on a typed wait target, keyed by thread and object koid.
     wait_queue: WaitQueue,
-    /// The child exit code.
-    pub child_exit_code: u64,
-    /// True once the child thread has terminated.
-    pub child_done: bool,
     /// Whether the user thread has been started (admitted to the scheduler).
     pub started: bool,
     /// Accumulated context-switch count.
@@ -268,13 +275,8 @@ pub fn init(
             )
             .map_err(|_| UserSchedError::OutOfFrames)?,
             user_fresh: true,
-            child_thread: None,
-            child_fresh: false,
-            child_ttbr0: 0,
-            child_process: None,
+            children: alloc::vec::Vec::new(),
             wait_queue: WaitQueue::new(),
-            child_exit_code: 0,
-            child_done: false,
             started: false,
             switches: 0,
             exit_code: 0,
@@ -292,14 +294,73 @@ pub fn current_process_koid() -> Option<KoId> {
         let current = s.dispatcher.current()?;
         if current == s.user_thread.koid() {
             Some(s.user_thread.process())
-        } else if let Some(child) = &s.child_thread {
-            if current == child.koid() {
-                Some(child.process())
-            } else {
-                None
-            }
         } else {
-            None
+            s.children
+                .iter()
+                .find(|c| c.thread.koid() == current)
+                .map(|c| c.process)
+        }
+    }
+}
+
+/// Install a fresh resident child into the harness: build its `ResidentChild` record, its
+/// `UserState` from the supplied entry/stack/args, and its first-entry kernel context, then
+/// mark it ready. The caller admits it to the dispatcher at the priority it chooses
+/// (`run_prepared_child` reschedules immediately; `spawn_child_async` does not).
+/// Returns the koid of the installed child, which the caller admits to the dispatcher. No
+/// wait-queue reset: a fresh child has a fresh koid, so it owns no stale entry, and a sibling
+/// resident's entry must survive — only `reap_done` drops entries, and only by exact koid.
+#[allow(clippy::too_many_arguments)]
+fn install_child(
+    s: &mut UserSched,
+    new_child: Thread,
+    proc_koid: KoId,
+    ttbr0: u64,
+    entry: u64,
+    sp: u64,
+    arg: u64,
+    arg2: u64,
+) -> KoId {
+    let mut child = ResidentChild {
+        thread: new_child,
+        fresh: true,
+        ttbr0,
+        process: proc_koid,
+        exit_code: 0,
+        done: false,
+    };
+    child.thread.user_state = Some(UserState {
+        x: {
+            let mut x = [0u64; 31];
+            x[0] = arg;
+            x[1] = arg2;
+            x
+        },
+        elr: entry,
+        spsr: 0,
+        sp_el0: sp,
+        ttbr0,
+    });
+    let state_ptr = child.thread.user_state.as_ref().expect("child user state") as *const UserState;
+    let kernel_sp = child.thread.stack().top();
+    *child.thread.context_mut() = user_entry_context(state_ptr, kernel_sp);
+    child.thread.ready();
+    let koid = child.thread.koid();
+    s.children.push(child);
+    koid
+}
+
+/// Remove resident children that have terminated, dropping any stale wait entry. Called at
+/// the `ProcessWait` / sync-run boundaries, where Sora has observed the exit.
+fn reap_done(s: &mut UserSched) {
+    let mut i = 0;
+    while i < s.children.len() {
+        if s.children[i].done {
+            let koid = s.children[i].thread.koid();
+            s.wait_queue.remove_thread(koid);
+            s.children.remove(i);
+        } else {
+            i += 1;
         }
     }
 }
@@ -337,41 +398,17 @@ pub fn run_prepared_child(
     arg2: u64,
 ) -> Status {
     let p = sched_ptr();
-    let next_ctx = unsafe {
+    let (koid, next_ctx) = unsafe {
         let s = &mut *p;
-        if s.child_thread.is_some() && !s.child_done {
+        reap_done(s);
+        if s.children.len() >= MAX_RESIDENT_CHILDREN {
             return Errno::ShouldWait.status();
         }
 
-        s.child_thread = Some(new_child);
-        s.child_fresh = true;
-        s.child_ttbr0 = ttbr0;
-        s.child_process = Some(proc_koid);
-        s.wait_queue.clear();
-        s.child_exit_code = 0;
-        s.child_done = false;
-
-        let child = s.child_thread.as_mut().expect("child just installed");
-        child.user_state = Some(UserState {
-            x: {
-                let mut x = [0u64; 31];
-                x[0] = arg;
-                x[1] = arg2;
-                x
-            },
-            elr: entry,
-            spsr: 0,
-            sp_el0: sp,
-            ttbr0,
-        });
-        let state_ptr = child.user_state.as_ref().expect("child user state") as *const UserState;
-        let kernel_sp = child.stack().top();
-        *child.context_mut() = user_entry_context(state_ptr, kernel_sp);
-        child.ready();
-
-        s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
+        let koid = install_child(s, new_child, proc_koid, ttbr0, entry, sp, arg, arg2);
+        s.dispatcher.admit(koid, CHILD_PRIORITY);
         let decision = s.dispatcher.reschedule_current();
-        dispatch_context(s, decision)
+        (koid, dispatch_context(s, decision))
     };
 
     if let Some((prev, next)) = next_ctx {
@@ -380,13 +417,12 @@ pub fn run_prepared_child(
 
     let exit_code = unsafe {
         let s = &mut *p;
-        let code = s.child_exit_code;
-        s.child_thread = None;
-        s.child_fresh = false;
-        s.child_ttbr0 = 0;
-        s.child_process = None;
-        s.wait_queue.clear();
-        s.child_done = false;
+        let code = s
+            .children
+            .iter()
+            .find(|c| c.thread.koid() == koid)
+            .map_or(0, |c| c.exit_code);
+        reap_done(s);
         code
     };
     if exit_code == 0 {
@@ -396,7 +432,7 @@ pub fn run_prepared_child(
     }
 }
 
-/// P10-g: spawn a child asynchronously using the proven child_thread slot.
+/// P10-g: spawn a child asynchronously using the proven resident-child slot.
 /// The child is admitted at CHILD_ASYNC_PRIORITY (63, more urgent than Sora at 64)
 /// but does NOT preempt immediately. Returns immediately.
 pub fn spawn_child_async(
@@ -418,51 +454,33 @@ pub fn spawn_child_async(
     let p = sched_ptr();
     unsafe {
         let s = &mut *p;
-        if s.child_thread.is_some() && !s.child_done {
+        reap_done(s);
+        if s.children.len() >= MAX_RESIDENT_CHILDREN {
             return Errno::ShouldWait.status();
         }
 
-        s.child_thread = Some(new_child);
-        s.child_fresh = true;
-        s.child_ttbr0 = ttbr0;
-        s.child_process = Some(proc_koid);
-        s.wait_queue.clear();
-        s.child_exit_code = 0;
-        s.child_done = false;
-
-        let child = s.child_thread.as_mut().expect("child just installed");
-        child.user_state = Some(UserState {
-            x: {
-                let mut x = [0u64; 31];
-                x[0] = arg;
-                x[1] = arg2;
-                x
-            },
-            elr: entry,
-            spsr: 0,
-            sp_el0: sp,
-            ttbr0,
-        });
-        let state_ptr = child.user_state.as_ref().expect("child user state") as *const UserState;
-        let kernel_sp = child.stack().top();
-        *child.context_mut() = user_entry_context(state_ptr, kernel_sp);
-        child.ready();
-
+        let koid = install_child(s, new_child, proc_koid, ttbr0, entry, sp, arg, arg2);
         // Admit at CHILD_ASYNC_PRIORITY (63) but do NOT reschedule — Sora continues.
-        s.dispatcher.admit(child.koid(), CHILD_ASYNC_PRIORITY);
+        s.dispatcher.admit(koid, CHILD_ASYNC_PRIORITY);
     }
     Errno::Ok.status()
 }
 
-/// P10-g: block until the async child (stored in child_thread) terminates.
-/// Uses the proven run_child reschedule pattern.
+/// P10-g: pump the resident children. Reschedules so every runnable child runs until it
+/// blocks or exits, then returns: `ShouldWait` while any child is still resident (blocked),
+/// `Ok` once all have exited. A single pump drains all woken children because each one's
+/// park hands the CPU to the next runnable child before control returns to Sora.
 pub fn process_wait() -> Status {
     let p = sched_ptr();
-    let has_child = unsafe {
+    let has_live = unsafe {
         let s = &*p;
-        s.child_thread.is_some() && !s.child_done
+        s.children.iter().any(|c| !c.done)
     };
-    if !has_child {
+    if !has_live {
+        unsafe {
+            let s = &mut *p;
+            reap_done(s);
+        }
         return Errno::Ok.status();
     }
     let switch = unsafe {
@@ -473,22 +491,18 @@ pub fn process_wait() -> Status {
     if let Some((prev, next)) = switch {
         unsafe { switch_context(prev, next) };
     }
-    // After child exits, clean up. If it merely blocked, leave it resident so a
-    // later channel write can wake it and another ProcessWait can pump it.
+    // Reap children that exited during the pump; resident (still-blocked) children stay so a
+    // later channel write can wake one and another ProcessWait can pump it.
     let p = sched_ptr();
     unsafe {
         let s = &mut *p;
-        if !s.child_done {
-            return Errno::ShouldWait.status();
+        reap_done(s);
+        if s.children.is_empty() {
+            Errno::Ok.status()
+        } else {
+            Errno::ShouldWait.status()
         }
-        s.child_thread = None;
-        s.child_fresh = false;
-        s.child_ttbr0 = 0;
-        s.child_process = None;
-        s.wait_queue.clear();
-        s.child_done = false;
     }
-    Errno::Ok.status()
 }
 
 /// Spawn a user thread: build its `UserState` from the ELF image, admit it to the
@@ -569,9 +583,13 @@ pub fn park_current_child_on_channel(channel_koid: KoId) {
 }
 
 /// Park the current child thread on an empty port. This is the non-Sora mirror of
-/// Sora's PortWait parking path, still scoped to the single child slot.
+/// Sora's PortWait parking path; each resident child parks on its own object.
 pub fn park_current_child_on_port(port_koid: KoId) {
     park_current_child_on(WaitTarget::Port(port_koid));
+}
+
+pub fn park_current_child_on_interrupt(interrupt_koid: KoId) {
+    park_current_child_on(WaitTarget::Interrupt(interrupt_koid));
 }
 
 fn park_current_child_on(target: WaitTarget) {
@@ -581,12 +599,15 @@ fn park_current_child_on(target: WaitTarget) {
         let Some(current) = s.dispatcher.current() else {
             return;
         };
-        let Some(child) = s.child_thread.as_mut() else {
+        // Park whichever resident child is the one currently running.
+        let Some(child) = s
+            .children
+            .iter_mut()
+            .find(|c| c.thread.koid() == current)
+            .map(|c| &mut c.thread)
+        else {
             return;
         };
-        if current != child.koid() {
-            return;
-        }
         let child_koid = child.koid();
         child.block();
         s.wait_queue.park(child_koid, target);
@@ -610,6 +631,10 @@ pub fn wake_child_waiting_on_port(port_koid: KoId) {
     wake_child_waiting_on(WaitTarget::Port(port_koid));
 }
 
+pub fn wake_child_waiting_on_interrupt(interrupt_koid: KoId) {
+    wake_child_waiting_on(WaitTarget::Interrupt(interrupt_koid));
+}
+
 fn wake_child_waiting_on(target: WaitTarget) {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -623,11 +648,17 @@ fn wake_child_waiting_on(target: WaitTarget) {
         let Some(waiter) = s.wait_queue.waiter_for(target) else {
             return;
         };
-        // This slice still hosts only the single resident child; the waiter must be it.
-        let Some(child) = s.child_thread.as_mut() else {
+        // The wait queue keys on object koid, so `waiter` is exactly the child parked on
+        // this object — wake that one, leaving any sibling resident on its own object asleep.
+        let Some(child) = s
+            .children
+            .iter_mut()
+            .find(|c| c.thread.koid() == waiter)
+            .map(|c| &mut c.thread)
+        else {
             return;
         };
-        if child.koid() != waiter || !matches!(child.state(), ThreadState::Blocked) {
+        if !matches!(child.state(), ThreadState::Blocked) {
             return;
         }
         s.wait_queue.remove_thread(waiter);
@@ -670,17 +701,12 @@ pub fn exit_current_user(exit_code: u64) -> ! {
                 s.user_thread.terminate();
                 s.done = true;
             }
-            Some(current)
-                if s.child_thread
-                    .as_ref()
-                    .map(|child| child.koid() == current)
-                    .unwrap_or(false) =>
-            {
-                s.child_exit_code = exit_code;
-                s.child_done = true;
+            Some(current) if s.children.iter().any(|c| c.thread.koid() == current) => {
                 s.wait_queue.remove_thread(current);
-                if let Some(child) = s.child_thread.as_mut() {
-                    child.terminate();
+                if let Some(child) = s.children.iter_mut().find(|c| c.thread.koid() == current) {
+                    child.exit_code = exit_code;
+                    child.done = true;
+                    child.thread.terminate();
                 }
             }
             _ => {}
@@ -725,15 +751,13 @@ fn dispatch_context(
                         s.user_thread.ready();
                     }
                     s.user_thread.context_mut() as *mut ThreadContext
-                } else if let Some(child) = s.child_thread.as_mut() {
-                    if from_id == child.koid() {
-                        if matches!(child.state(), ThreadState::Running) {
-                            child.ready();
-                        }
-                        child.context_mut() as *mut ThreadContext
-                    } else {
-                        &mut s.boot_ctx as *mut ThreadContext
+                } else if let Some(child) =
+                    s.children.iter_mut().find(|c| c.thread.koid() == from_id)
+                {
+                    if matches!(child.thread.state(), ThreadState::Running) {
+                        child.thread.ready();
                     }
+                    child.thread.context_mut() as *mut ThreadContext
                 } else {
                     // idle (or unknown) = the boot flow's save slot.
                     &mut s.boot_ctx as *mut ThreadContext
@@ -749,22 +773,14 @@ fn dispatch_context(
                     set_active_aspace_root(s.user_ttbr0);
                 }
                 s.user_thread.context() as *const ThreadContext
-            } else if let Some(child) = s.child_thread.as_mut() {
-                if to == child.koid() {
-                    child.run();
-                    if s.child_fresh {
-                        s.child_fresh = false;
-                    } else {
-                        set_active_aspace_root(s.child_ttbr0);
-                    }
-                    child.context() as *const ThreadContext
+            } else if let Some(child) = s.children.iter_mut().find(|c| c.thread.koid() == to) {
+                child.thread.run();
+                if child.fresh {
+                    child.fresh = false;
                 } else {
-                    if to == s.idle.koid() {
-                        s.idle.run();
-                    }
-                    set_active_aspace_root(s.kernel_ttbr0);
-                    &s.boot_ctx as *const ThreadContext
+                    set_active_aspace_root(child.ttbr0);
                 }
+                child.thread.context() as *const ThreadContext
             } else {
                 // idle (or unknown) = resume the suspended boot flow.
                 if to == s.idle.koid() {
@@ -819,13 +835,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_every_entry() {
+    fn two_threads_park_on_distinct_objects_and_wake_independently() {
+        // The multi-resident invariant (Journal 134): two parked threads are routed by
+        // object koid, so waking one by its object leaves the other untouched.
         let mut q = WaitQueue::new();
         q.park(KoId(7), WaitTarget::Port(KoId(42)));
-        q.park(KoId(8), WaitTarget::Channel(KoId(9)));
-        q.clear();
+        q.park(KoId(8), WaitTarget::Port(KoId(43)));
+        assert_eq!(q.waiter_for(WaitTarget::Port(KoId(42))), Some(KoId(7)));
+        assert_eq!(q.waiter_for(WaitTarget::Port(KoId(43))), Some(KoId(8)));
+        // Wake thread 7 (remove it); thread 8 stays parked on its own object.
+        q.remove_thread(KoId(7));
         assert_eq!(q.waiter_for(WaitTarget::Port(KoId(42))), None);
-        assert_eq!(q.waiter_for(WaitTarget::Channel(KoId(9))), None);
-        assert!(q.entries.is_empty());
+        assert_eq!(q.waiter_for(WaitTarget::Port(KoId(43))), Some(KoId(8)));
     }
 }

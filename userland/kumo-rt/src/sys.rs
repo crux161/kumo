@@ -388,22 +388,34 @@ pub fn handle_koid(handle: Handle) -> u64 {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub fn handle_koid(_handle: Handle) -> u64 {
-    u64::MAX
+    0
 }
 
-#[cfg(target_arch = "aarch64")]
-pub fn port_bind_channel(port: Handle, channel: Handle) -> u64 {
+pub fn sys_interrupt_create(irq: u32) -> u64 {
+    syscall(Syscall::InterruptCreate, irq as u64, 0, 0, 0)
+}
+
+pub fn sys_interrupt_wait(interrupt: Handle) -> u64 {
+    syscall(Syscall::InterruptWait, interrupt.0 as u64, 0, 0, 0)
+}
+
+pub fn sys_resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
     syscall(
-        Syscall::PortBindChannel,
-        port.0 as u64,
-        channel.0 as u64,
-        0,
+        Syscall::ResourceMintMmio,
+        resource.0 as u64,
+        phys_base,
+        len,
         0,
     )
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn port_bind(port: Handle, object: Handle) -> u64 {
+    syscall(Syscall::PortBind, port.0 as u64, object.0 as u64, 0, 0)
+}
+
 #[cfg(not(target_arch = "aarch64"))]
-pub fn port_bind_channel(_port: Handle, _channel: Handle) -> u64 {
+pub fn port_bind(_port: Handle, _object: Handle) -> u64 {
     u64::MAX
 }
 

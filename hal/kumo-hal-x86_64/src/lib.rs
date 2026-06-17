@@ -352,6 +352,10 @@ pub fn run_el0_image(
 
 pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 
+/// x86_64 EL0-fault containment is deferred with the rest of the x86 EL0 path; the IDT will
+/// route #PF/#UD/#GP from ring 3 to this hook once it lands (P10). Stubbed for parity.
+pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64) -> !) {}
+
 pub fn el0_exit(_code: u64) -> ! {
     halt()
 }

@@ -1,0 +1,18 @@
+[package]
+name = "drv-serial"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../../kumo-rt" }
+kumo-ipc.workspace = true
+
+[[bin]]
+name = "drv-serial"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

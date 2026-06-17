@@ -91,9 +91,9 @@ pub enum KernelCall<'a> {
         phys_base: u64,
         len: u64,
     },
-    PortBindChannel {
+    PortBind {
         port: Handle,
-        channel: Handle,
+        object: Handle,
     },
     HandleKoid {
         handle: Handle,
@@ -237,27 +237,26 @@ impl SyscallEngine {
         for binding in &mut self.interrupts {
             if binding.irq == irq {
                 binding.count = binding.count.saturating_add(1);
+                #[cfg(target_os = "none")]
+                crate::user_thread::wake_child_waiting_on_interrupt(binding.koid);
             }
         }
     }
 
-    /// Bind a channel endpoint to a port. When a message arrives at that endpoint,
-    /// the port is signalled with `Signals::READABLE` and the endpoint koid as source.
-    pub fn port_bind_channel(&mut self, port_koid: KoId, channel_koid: KoId) {
-        self.port_bindings.push((port_koid, channel_koid));
+    /// Bind an object to a port. When an event occurs on that object,
+    /// the port is signalled with the corresponding signals and the object koid as source.
+    pub fn port_bind(&mut self, port_koid: KoId, object_koid: KoId) {
+        self.port_bindings.push((port_koid, object_koid));
     }
 
-    /// Signal all ports bound to `channel_koid` (called after a channel write).
-    pub fn signal_channel_ports(&mut self, channel_koid: KoId) {
-        for &(port_koid, ch_koid) in &self.port_bindings {
-            if ch_koid == channel_koid {
+    /// Signal all ports bound to `object_koid`.
+    pub fn signal_ports(&mut self, object_koid: KoId, signals: kumo_abi::Signals) {
+        for &(port_koid, bound_koid) in &self.port_bindings {
+            if bound_koid == object_koid {
                 // Queue a signal on the port. We need access to the IpcRegistry.
                 // The signal is queued via the IPC layer.
-                self.ipc.port_queue_signal_by_koid(
-                    port_koid,
-                    channel_koid,
-                    kumo_abi::Signals::READABLE,
-                );
+                self.ipc
+                    .port_queue_signal_by_koid(port_koid, object_koid, signals);
                 #[cfg(target_os = "none")]
                 crate::user_thread::wake_child_waiting_on_port(port_koid);
             }
@@ -379,7 +378,7 @@ impl SyscallEngine {
         .map_err(|_| ObjectError::TableFull)?;
         let handle = caller.handles_mut().insert(
             thread.object(),
-            Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT,
         )?;
         self.threads.push(thread);
         Ok(handle)
@@ -397,7 +396,7 @@ impl SyscallEngine {
         let child = Process::new(&mut self.objects, &job, vmar);
         let handle = caller.handles_mut().insert(
             child.object(),
-            Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT,
         )?;
         self.processes.push(child);
         Ok(handle)
@@ -418,8 +417,15 @@ impl SyscallEngine {
     pub fn dispatch(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
         match call {
             KernelCall::HandleClose { handle } => {
-                let status = match process.handles_mut().close(handle) {
-                    Ok(()) => Errno::Ok.status(),
+                let status = match process.handles_mut().remove(handle) {
+                    Ok(entry) => {
+                        if entry.kind == ObjectKind::Channel {
+                            if let Ok(Some(peer_koid)) = self.ipc.close_by_koid(entry.koid) {
+                                self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                            }
+                        }
+                        Errno::Ok.status()
+                    }
                     Err(error) => errno_from_object(error).status(),
                 };
                 KernelCallResult::Status(status)
@@ -445,7 +451,7 @@ impl SyscallEngine {
                 let status = match self.ipc.channel_write(process, channel, message) {
                     Ok(()) => {
                         if let Some(koid) = signal_koid {
-                            self.signal_channel_ports(koid);
+                            self.signal_ports(koid, kumo_abi::Signals::READABLE);
                             #[cfg(target_os = "none")]
                             crate::user_thread::wake_child_waiting_on_channel(koid);
                         }
@@ -1023,7 +1029,7 @@ impl SyscallEngine {
                     Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
-            KernelCall::PortBindChannel { port, channel } => {
+            KernelCall::PortBind { port, object } => {
                 let port_koid =
                     match process
                         .handles()
@@ -1032,15 +1038,16 @@ impl SyscallEngine {
                         Ok(e) => e.koid,
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                     };
-                let ch_koid =
-                    match process
-                        .handles()
-                        .require(channel, ObjectKind::Channel, Rights::READ)
-                    {
-                        Ok(e) => e.koid,
-                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
-                    };
-                self.port_bind_channel(port_koid, ch_koid);
+                let obj_koid = match process.handles().get(object) {
+                    Ok(e) => {
+                        if !e.rights.contains(Rights::WAIT) {
+                            return KernelCallResult::Status(Errno::AccessDenied.status());
+                        }
+                        e.koid
+                    }
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                self.port_bind(port_koid, obj_koid);
                 KernelCallResult::Status(Errno::Ok.status())
             }
             KernelCall::HandleKoid { handle } => match process.handles().get(handle) {
@@ -1250,18 +1257,18 @@ mod tests {
 
         let bind = engine.dispatch(
             &mut process,
-            KernelCall::PortBindChannel {
+            KernelCall::PortBind {
                 port: peer_port,
-                channel: right,
+                object: right,
             },
         );
         assert_eq!(bind, KernelCallResult::Status(Errno::Ok.status()));
 
         let bind_writer = engine.dispatch(
             &mut process,
-            KernelCall::PortBindChannel {
+            KernelCall::PortBind {
                 port: writer_port,
-                channel: left,
+                object: left,
             },
         );
         assert_eq!(bind_writer, KernelCallResult::Status(Errno::Ok.status()));

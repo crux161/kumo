@@ -6,9 +6,9 @@ extern crate alloc;
 use kumo_abi::{Errno, Handle, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
-    channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind_channel,
-    port_create, port_wait, process_create, process_run, process_wait, thread_create, thread_start,
-    vmar_map, vmo_create, vmo_read, vmo_write,
+    channel_write_with_handle, debug_write, handle_koid, interrupt_create, port_bind, port_create,
+    port_wait, process_create, process_run, process_wait, thread_create, thread_start, vmar_map,
+    vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -245,6 +245,20 @@ extern "C" fn sora_main(
     let timer_irq = interrupt_create(27);
     if timer_irq != u64::MAX {
         debug_write(b"timer irq ok\n".as_ptr(), 13);
+    }
+
+    // Spawn drv-serial
+    if run_elf(
+        initrd,
+        kumo_abi::DRV_SERIAL_PATH.as_bytes(),
+        resource_handle,
+        console_handle,
+        1, // async
+        b"drv-serial",
+    ) {
+        log(b"drv-serial: run ok\n");
+    } else {
+        log(b"drv-serial: run fail\n");
     }
 
     // P9-e: handle transfer test. Create a channel pair, transfer one handle
@@ -562,18 +576,50 @@ extern "C" fn sora_main(
 
     // M10-b: load the same hello path as an initrd-resident ARM64 Linux ELF.
     // This is the first step from handmade payload toward "one static ELF".
-    if run_persona_linux_elf(initrd) {
-        log(b"M10 elf: run ok\n");
+    if run_elf(
+        initrd,
+        PERSONA_LINUX_HELLO_PATH.as_bytes(),
+        0,
+        0,
+        0,
+        b"M10 elf",
+    ) {
+        debug_write(b"M10-c Check ok\n".as_ptr(), 15);
     } else {
         log(b"M10 elf: run fail\n");
     }
 
-    // Stage-C seed: spawn the first real server as its own process, with exactly one
-    // request channel. Sora keeps the peer and verifies Ping plus Status replies.
-    if run_svc_health_smoke(initrd) {
+    // Stage-C: spawn TWO real servers as independent resident processes, each with its own
+    // request channel and port. Proves the kernel's per-thread wait queue routes each
+    // client's traffic to exactly the server that owns its port — no cross-wake (Journal 134).
+    if run_svc_health_pair_smoke(initrd) {
         log(b"svc-health: serve ok\n");
     } else {
         log(b"svc-health: serve fail\n");
+    }
+
+    // §5.6 supervised restart: a server is shut down and reaped, then Sora rebuilds it from
+    // its recipe; the fresh instance serves with reset state — the first restart (Journal 136).
+    if run_svc_health_restart_smoke(initrd) {
+        log(b"svc-health: restart ok\n");
+    } else {
+        log(b"svc-health: restart fail\n");
+    }
+
+    // §5.6 crash containment: a child that faults must be terminated by the kernel alone, not
+    // halt it. Spawn one at a bogus entry; the kernel contains the fault and Sora lives on.
+    if run_crash_containment_smoke(initrd) {
+        log(b"svc-health: crash contained\n");
+    } else {
+        log(b"svc-health: crash escaped\n");
+    }
+
+    // §5.6 crash restart: trigger an explicit crash on the server. The kernel contains it,
+    // tears it down, and fires PEER_CLOSED to our port wait, waking us to respawn it.
+    if run_crash_restart_smoke(initrd) {
+        log(b"svc-health: crash-restart ok\n");
+    } else {
+        log(b"svc-health: crash-restart fail\n");
     }
 
     // P10-b: VmoWrite/VmoRead demo on anonymous backing.
@@ -605,10 +651,10 @@ extern "C" fn sora_main(
         && kbd_koid != u64::MAX
     {
         let port = Handle(port_h as u32);
-        port_bind_channel(port, console);
-        port_bind_channel(port, block);
-        port_bind_channel(port, net);
-        port_bind_channel(port, kbd);
+        port_bind(port, console);
+        port_bind(port, block);
+        port_bind(port, net);
+        port_bind(port, kbd);
         let cons_koid = Handle(console_koid as u32);
         let blk_koid = Handle(block_koid as u32);
         let net_k = Handle(net_koid as u32);
@@ -617,6 +663,10 @@ extern "C" fn sora_main(
         let mut block_buf = [0u8; 512];
         let mut line_buf = [0u8; 256];
         let mut line_pos = 0usize;
+
+        // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
+        launch_lua_repl(initrd, kbd, console);
+
         loop {
             let source = Handle(port_wait(port) as u32);
             // console handler — output only (klog! → DebugWrite)
@@ -777,7 +827,7 @@ fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
-fn run_persona_linux_elf(initrd: Handle) -> bool {
+fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {
     const PAGE_SIZE: u64 = 4096;
     const MAX_SEGMENTS: usize = 8;
 
@@ -805,30 +855,34 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
         flags
     }
 
-    let (elf_off, elf_len) = match find_initrd_file(initrd, PERSONA_LINUX_HELLO_PATH.as_bytes()) {
+    let (elf_off, elf_len) = match find_initrd_file(initrd, path) {
         Some(file) => file,
         None => {
-            log(b"M10 elf: missing\n");
+            log(name);
+            log(b": missing\n");
             return false;
         }
     };
 
     let mut header = [0u8; linux_elf::ELF_HEADER_LEN];
     if vmo_read(initrd, elf_off, header.as_mut_ptr(), header.len()) != 0 {
-        log(b"M10 elf: hdr read fail\n");
+        log(name);
+        log(b": hdr read fail\n");
         return false;
     }
     let elf = match linux_elf::parse_header(&header) {
         Ok(elf) => elf,
         Err(_) => {
-            log(b"M10 elf: bad hdr\n");
+            log(name);
+            log(b": bad hdr\n");
             return false;
         }
     };
 
     let ph_table_len = (elf.phnum as u64).saturating_mul(elf.phentsize as u64);
     if elf.phoff.saturating_add(ph_table_len) > elf_len || elf.phnum as usize > MAX_SEGMENTS {
-        log(b"M10 elf: ph range fail\n");
+        log(name);
+        log(b": ph range fail\n");
         return false;
     }
 
@@ -847,13 +901,15 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
         let ph_off = elf_off + elf.phoff + (index as u64) * (elf.phentsize as u64);
         let mut ph_buf = [0u8; linux_elf::ELF_PHDR_LEN];
         if vmo_read(initrd, ph_off, ph_buf.as_mut_ptr(), ph_buf.len()) != 0 {
-            log(b"M10 elf: ph read fail\n");
+            log(name);
+            log(b": ph read fail\n");
             return false;
         }
         let ph = match linux_elf::parse_program_header(&ph_buf) {
             Ok(ph) => ph,
             Err(_) => {
-                log(b"M10 elf: bad ph\n");
+                log(name);
+                log(b": bad ph\n");
                 return false;
             }
         };
@@ -864,7 +920,8 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
             || ph.file_offset.saturating_add(ph.file_size) > elf_len
             || ph.file_offset.saturating_add(ph.mem_size) < ph.file_offset
         {
-            log(b"M10 elf: segment range fail\n");
+            log(name);
+            log(b": segment range fail\n");
             return false;
         }
         vmo_len = vmo_len.max(ph.file_offset.saturating_add(ph.mem_size));
@@ -879,20 +936,23 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
     }
 
     if segment_count == 0 {
-        log(b"M10 elf: no load\n");
+        log(name);
+        log(b": no load\n");
         return false;
     }
     let vmo_len = match align_up(vmo_len) {
         Some(len) if len > 0 => len,
         _ => {
-            log(b"M10 elf: size fail\n");
+            log(name);
+            log(b": size fail\n");
             return false;
         }
     };
 
     let child_vmo_h = vmo_create(vmo_len);
     if child_vmo_h == u64::MAX {
-        log(b"M10 elf: vmo fail\n");
+        log(name);
+        log(b": vmo fail\n");
         return false;
     }
     let child_vmo = Handle(child_vmo_h as u32);
@@ -910,7 +970,8 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
             ) != 0
                 || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
             {
-                log(b"M10 elf: copy fail\n");
+                log(name);
+                log(b": copy fail\n");
                 return false;
             }
             copied += n as u64;
@@ -919,7 +980,8 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
 
     let child_as_h = process_create(0, 0x2000_0000);
     if child_as_h == u64::MAX {
-        log(b"M10 elf: process fail\n");
+        log(name);
+        log(b": process fail\n");
         return false;
     }
     let child_as = Handle(child_as_h as u32);
@@ -931,74 +993,315 @@ fn run_persona_linux_elf(initrd: Handle) -> bool {
         let len = match align_up(page_delta.saturating_add(segment.mem_size)) {
             Some(len) => len,
             None => {
-                log(b"M10 elf: map len fail\n");
+                log(name);
+                log(b": map len fail\n");
                 return false;
             }
         };
         if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
-            log(b"M10 elf: map fail\n");
+            log(name);
+            log(b": map fail\n");
             return false;
         }
     }
 
     if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
-        log(b"M10 elf: as fail\n");
+        log(name);
+        log(b": as fail\n");
         return false;
     }
 
-    process_run(child_as, elf.entry, 0x1000FFF0, 0, 0, 0) == 0
+    process_run(child_as, elf.entry, 0x1000FFF0, arg, arg2, flags) == 0
 }
 
-fn run_svc_health_smoke(initrd: Handle) -> bool {
-    match run_initrd_elf_with_channel(initrd, SVC_HEALTH_PATH.as_bytes()) {
-        Some((child_as, entry, stack_top, server_chan, client_chan)) => {
-            if process_run(child_as, entry, stack_top, server_chan.0 as u64, 0, 1) != 0 {
-                log(b"svc-health: run fail\n");
-                return false;
-            }
-            if !child_parked(process_wait()) {
-                log(b"svc-health: initial park fail\n");
-                return false;
-            }
+/// Stage-C milestone (Journal 134): two `svc-health` servers run as **independent**
+/// resident processes at the same time. Each binds its own request channel to its own port
+/// and parks in `PortWait`; the kernel's per-thread wait queue routes each client write to
+/// exactly the server that owns that port, so the two never cross-wake. Independence is
+/// proved by each server's own `served` counter reaching 2 from its own Ping + Status —
+/// neither sees the other's traffic. (This subsumes the former single-resident smoke.)
+/// A server's **construction recipe** (DESIGN/002 §5.6): everything Sora needs to (re)build
+/// the server from scratch. For `svc-health` — a *stateless* recovery-class server — that is
+/// just where to find its ELF; a fresh instance gets a fresh address space and channel, and
+/// its advisory counters reset. Respawning after a crash/stop is simply calling
+/// [`spawn_from_recipe`] again.
+struct SvcRecipe {
+    initrd: Handle,
+    path: &'static str,
+}
 
-            let ping = HealthRequest::Ping.encode();
-            if channel_write(client_chan, ping.as_ptr(), ping.len()) != 0 {
-                log(b"svc-health: ping write fail\n");
-                return false;
-            }
-            if !child_parked(process_wait()) {
-                log(b"svc-health: ping pump fail\n");
-                return false;
-            }
-
-            let mut reply = [0u8; 32];
-            let n = channel_read(client_chan, reply.as_mut_ptr(), reply.len()) as usize;
-            if HealthResponse::decode(&reply[..n]) != Some(HealthResponse::Pong) {
-                return false;
-            }
-
-            let status = HealthRequest::Status.encode();
-            if channel_write(client_chan, status.as_ptr(), status.len()) != 0 {
-                log(b"svc-health: status write fail\n");
-                return false;
-            }
-            if !child_parked(process_wait()) {
-                log(b"svc-health: status pump fail\n");
-                return false;
-            }
-            let n = channel_read(client_chan, reply.as_mut_ptr(), reply.len()) as usize;
-            HealthResponse::decode(&reply[..n])
-                == Some(HealthResponse::Status {
-                    uptime_ticks: 0,
-                    served: 2,
-                })
-        }
-        None => false,
+/// Spawn one fresh server instance from its recipe: reload the ELF into a new address space,
+/// grant it a fresh request channel, and start it as a resident (async) process. Returns the
+/// client endpoint to talk to it. The caller pumps (`process_wait`) to let it reach `PortWait`.
+fn spawn_from_recipe(recipe: &SvcRecipe) -> Option<Handle> {
+    let (child_as, entry, stack_top, server_chan, client_chan) =
+        run_initrd_elf_with_channel(recipe.initrd, recipe.path.as_bytes())?;
+    if process_run(child_as, entry, stack_top, server_chan.0 as u64, 0, 1) != 0 {
+        return None;
     }
+    Some(client_chan)
+}
+
+fn run_svc_health_pair_smoke(initrd: Handle) -> bool {
+    let recipe = SvcRecipe {
+        initrd,
+        path: SVC_HEALTH_PATH,
+    };
+    // Spawn both as resident (async) servers; one pump drains both to their own PortWait.
+    let cli1 = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"svc-pair: run1 fail\n");
+            return false;
+        }
+    };
+    let cli2 = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"svc-pair: run2 fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"svc-pair: park fail\n");
+        return false;
+    }
+
+    // Ping each resident on its own channel: each must reply Pong while the other stays
+    // asleep (no cross-wake).
+    if request_reply(cli1, HealthRequest::Ping) != Some(HealthResponse::Pong) {
+        log(b"svc-pair: ping1 fail\n");
+        return false;
+    }
+    if request_reply(cli2, HealthRequest::Ping) != Some(HealthResponse::Pong) {
+        log(b"svc-pair: ping2 fail\n");
+        return false;
+    }
+
+    // Status each: served == 2 (its own Ping + Status) proves separate per-process state —
+    // neither counted the other's Ping.
+    let want = Some(HealthResponse::Status {
+        uptime_ticks: 0,
+        served: 2,
+    });
+    if request_reply(cli1, HealthRequest::Status) != want {
+        log(b"svc-pair: status1 fail\n");
+        return false;
+    }
+    if request_reply(cli2, HealthRequest::Status) != want {
+        log(b"svc-pair: status2 fail\n");
+        return false;
+    }
+
+    // Termination + detection (Journal 135): shut down resident #1. Its serve loop exits
+    // and it process-exits; the harness reaps it. Resident #2 must keep serving — proving
+    // an *independent lifecycle*, not just independent wakeups — so ProcessWait still
+    // reports a resident remaining.
+    if !child_parked(shutdown_resident(cli1)) {
+        log(b"svc-pair: shutdown1 fail\n");
+        return false;
+    }
+    if request_reply(cli2, HealthRequest::Ping) != Some(HealthResponse::Pong) {
+        log(b"svc-pair: survivor fail\n");
+        return false;
+    }
+    // Shut down the survivor too; now ProcessWait must report no resident left.
+    if !all_residents_gone(shutdown_resident(cli2)) {
+        log(b"svc-pair: shutdown2 fail\n");
+        return false;
+    }
+    true
+}
+
+/// First **supervised restart** (Journal 136, DESIGN/002): a server dies and Sora rebuilds
+/// it from its recipe. Instance A serves until its counter reaches 2, then is shut down and
+/// reaped. Sora respawns from the *same* recipe; the fresh instance B must serve, and its
+/// first `Status` reports `served: 1` — not 3 — proving it is a **new process with reset
+/// state** (the stateless recovery class), not a revived A.
+fn run_svc_health_restart_smoke(initrd: Handle) -> bool {
+    let recipe = SvcRecipe {
+        initrd,
+        path: SVC_HEALTH_PATH,
+    };
+
+    // Instance A: serve Ping + Status (counter climbs to 2), then "die" via Shutdown.
+    let a = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"svc-restart: a spawn fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"svc-restart: a park fail\n");
+        return false;
+    }
+    if request_reply(a, HealthRequest::Ping) != Some(HealthResponse::Pong) {
+        log(b"svc-restart: a ping fail\n");
+        return false;
+    }
+    if request_reply(a, HealthRequest::Status)
+        != Some(HealthResponse::Status {
+            uptime_ticks: 0,
+            served: 2,
+        })
+    {
+        log(b"svc-restart: a status fail\n");
+        return false;
+    }
+    if !all_residents_gone(shutdown_resident(a)) {
+        log(b"svc-restart: a shutdown fail\n");
+        return false;
+    }
+
+    // Supervised restart from the same recipe. Instance B is a fresh process: its first
+    // Status reports served:1 (not 3), proving reset state — the restart actually worked.
+    let b = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"svc-restart: respawn fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"svc-restart: b park fail\n");
+        return false;
+    }
+    if request_reply(b, HealthRequest::Status)
+        != Some(HealthResponse::Status {
+            uptime_ticks: 0,
+            served: 1,
+        })
+    {
+        log(b"svc-restart: b state fail\n");
+        return false;
+    }
+    if !all_residents_gone(shutdown_resident(b)) {
+        log(b"svc-restart: b shutdown fail\n");
+        return false;
+    }
+    true
+}
+
+/// §5.6 crash containment (Journal 137): a child that *faults* must be terminated by the
+/// kernel — never halt it. Spawn a child at a bogus (unmapped) entry so it instruction-aborts
+/// on its first fetch. If the kernel contains the fault and reaps the child, Sora keeps
+/// running and `ProcessWait` reports no resident remaining; before this slice the boot would
+/// have stopped at the Tower ("Ziwei seizes the wheel") and never reached this line.
+fn run_crash_containment_smoke(initrd: Handle) -> bool {
+    // Build a valid child address space + stack + channel, then run it at an unmapped entry.
+    let (child_as, _entry, stack_top, server_chan, _client) =
+        match run_initrd_elf_with_channel(initrd, SVC_HEALTH_PATH.as_bytes()) {
+            Some(t) => t,
+            None => return false,
+        };
+    const BOGUS_ENTRY: u64 = 0xDEAD_0000; // unmapped: instruction abort on first fetch
+    if process_run(child_as, BOGUS_ENTRY, stack_top, server_chan.0 as u64, 0, 1) != 0 {
+        log(b"svc-crash: run fail\n");
+        return false;
+    }
+    // The child faults immediately; the kernel contains it and reaps it. Reaching here at all
+    // proves the kernel survived; `Ok` proves the crashed child was reaped (no resident left).
+    all_residents_gone(process_wait())
+}
+
+/// Start a server from a recipe, bind its channel to a port, request a crash, and verify
+/// we wake up from the port wait with PEER_CLOSED, enabling true supervised restart.
+fn run_crash_restart_smoke(initrd: Handle) -> bool {
+    // 1. Spawn from recipe
+    let recipe = SvcRecipe {
+        initrd,
+        path: SVC_HEALTH_PATH,
+    };
+    let Some(mut server) = spawn_from_recipe(&recipe) else {
+        log(b"svc-crash-restart: spawn fail\n");
+        return false;
+    };
+    if request_reply(server, HealthRequest::Ping) != Some(HealthResponse::Pong) {
+        log(b"svc-crash-restart: ping 1 fail\n");
+        return false;
+    }
+
+    // 2. Bind the client channel to a port
+    let port = Handle(port_create() as u32);
+    if port.0 as u64 == u64::MAX {
+        return false;
+    }
+    if port_bind(port, server) != 0 {
+        return false;
+    }
+
+    // 3. Send a Crash request (no reply expected)
+    let bytes = HealthRequest::Crash.encode();
+    if channel_write(server, bytes.as_ptr(), bytes.len()) != 0 {
+        return false;
+    }
+
+    // 4. Wait on the port. We expect to be woken by the crash closing the channel.
+    let packet = port_wait(port);
+    if packet == 0 {
+        log(b"svc-crash-restart: port wait fail\n");
+        return false;
+    }
+    // The source should be the channel koid
+    let source_koid = packet >> 32;
+    let signals = (packet & 0xFFFFFFFF) as u32;
+    if signals != kumo_abi::Signals::PEER_CLOSED.bits() {
+        log(b"svc-crash-restart: missing PEER_CLOSED signal\n");
+        return false;
+    }
+
+    // 5. Respawn using the recipe
+    let Some(respawned) = spawn_from_recipe(&recipe) else {
+        log(b"svc-crash-restart: respawn fail\n");
+        return false;
+    };
+    server = respawned;
+
+    // 6. Verify it's a fresh instance
+    let want_status = Some(HealthResponse::Status {
+        uptime_ticks: 0,
+        served: 1, // just this status request
+    });
+    if request_reply(server, HealthRequest::Status) != want_status {
+        log(b"svc-crash-restart: fresh status fail\n");
+        return false;
+    }
+
+    // Shutdown the respawned instance so the smoke test cleans up
+    shutdown_resident(server) == Errno::Ok.status() as u64
+}
+
+/// Send one request to a resident server on `client`, pump the scheduler so that server
+/// wakes, serves, and re-parks, then read and decode its reply.
+fn request_reply(client: Handle, request: HealthRequest) -> Option<HealthResponse> {
+    let bytes = request.encode();
+    if channel_write(client, bytes.as_ptr(), bytes.len()) != 0 {
+        return None;
+    }
+    if !child_parked(process_wait()) {
+        return None;
+    }
+    let mut reply = [0u8; 32];
+    let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+    HealthResponse::decode(&reply[..n])
+}
+
+/// Send `Shutdown` to a resident on `client` and pump: the server's serve loop exits and it
+/// process-exits, so the harness reaps it. Returns the `ProcessWait` status — `ShouldWait`
+/// while another resident remains, `Ok` once none do.
+fn shutdown_resident(client: Handle) -> u64 {
+    let bytes = HealthRequest::Shutdown.encode();
+    let _ = channel_write(client, bytes.as_ptr(), bytes.len());
+    process_wait()
 }
 
 fn child_parked(status: u64) -> bool {
     status == Errno::ShouldWait.status() as u32 as u64
+}
+
+fn all_residents_gone(status: u64) -> bool {
+    status == Errno::Ok.status() as u32 as u64
 }
 
 fn run_initrd_elf_with_channel(
@@ -1317,25 +1620,20 @@ fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
     serve_file_read_at(initrd, path, 0, out.len() as u64, out)
 }
 
-fn launch_lua_repl(initrd: Handle, _fb_out: Handle) {
-    // 1. Mint the IPC channels using raw syscalls
-    let (repl_stdin_h, _kb_stdout_h) = channel_create_pair();
-    let (_fb_stdin_h, repl_stdout_h) = channel_create_pair();
+fn launch_lua_repl(initrd: Handle, kbd: Handle, console: Handle) {
+    debug_write(b"Launching Lua REPL...\n".as_ptr(), 22);
 
-    if repl_stdin_h == u64::MAX || repl_stdout_h == u64::MAX {
-        debug_write(b"Failed to mint REPL channels\n".as_ptr(), 29);
-        return;
+    // 2. Launch the ELF binary from the initrd, passing kbd as stdin and console as stdout
+    if run_elf(
+        initrd,
+        b"bin/lua-repl",
+        kbd.0 as u64,
+        console.0 as u64,
+        0, // synchronous run
+        b"lua-repl",
+    ) {
+        debug_write(b"Lua REPL exited normally.\n".as_ptr(), 26);
+    } else {
+        debug_write(b"Lua REPL failed to run.\n".as_ptr(), 24);
     }
-
-    let repl_stdin = Handle(repl_stdin_h as u32);
-    let repl_stdout = Handle(repl_stdout_h as u32);
-
-    debug_write(b"Lua REPL channels minted.\n".as_ptr(), 26);
-
-    // 2. Next step (Pending Userland ELF Loader):
-    // In the current Phase 10 skeleton, Sora is manually executing raw assembly
-    // payloads (as seen in the `sora_main` demo). To fully launch the Piccolo binary,
-    // we need to add a basic ELF parser here to read the `lua-repl` file from the
-    // initrd, copy its LOAD segments into a new VMO, and map them using `vmar_map`
-    // before calling `process_run`.
 }

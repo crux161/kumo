@@ -39,20 +39,30 @@ serve loop is identical; only the authority differs.
 
 The serve loop (`svc_health::serve` over a `Transport`) is host-tested end-to-end
 (`cargo test -p svc-health`'s `end_to_end_*`). The image path now also builds a freestanding
-`svc-health` binary into the initrd. Sora creates a process, grants it one request-channel
-handle via async `process_run`, and the child binds that channel to a child-owned `Port`.
-The server blocks in `PortWait`, then reads and serves `Ping` and `Status` in separate
-scheduling turns. Each write wakes the resident child through the port, and Sora accepts
-only `Pong` followed by `Status { served: 2 }`. The scheduler harness now records the
-resident child's wait in a small `WaitQueue` indexable by thread koid and object koid
-(replacing the single typed slot), so the eventual general per-thread wait queue has one
-shape and one set of operations to grow from — it just holds a single entry today.
+`svc-health` binary into the initrd. Sora spawns **two** `svc-health` servers as independent
+resident processes, each granted its own request channel via async `process_run` and binding
+it to its own `Port`. Both block in `PortWait`; the scheduler harness holds them in a
+bounded `children` collection and parks each in a `WaitQueue` keyed by object koid. Each
+client write wakes **only** the server that owns that port — never the other — and each
+server's own `served` counter independently reaches 2 from its own `Ping` + `Status`,
+proving separate per-process state (Journal 134).
 
-That proves a service running as its **own process**, not inside Sora — the first
-end-to-end Stage-C migration. Verify it with `./scripts/preflight.sh`.
+That proves two services running as their **own processes**, not inside Sora, woken
+independently — Stage-C migration past a single service. Sora then drives each to terminate
+with a `Shutdown` request: the serve loop exits, the process `process_exit`s, and the harness
+reaps it. Shutting down one resident leaves the other serving (independent lifecycle), and
+once both are down `ProcessWait` reports no resident remaining — the detection half of
+`DESIGN/002` supervised restart (Journal 135). Sora then performs the **first supervised
+restart** (Journal 136): it holds each server's construction recipe (`SvcRecipe` — for the
+stateless `svc-health`, just where to find its ELF), and after a server is shut down and
+reaped it respawns a fresh instance from that recipe and re-verifies it serves with reset
+state (`served: 1`, not continuing the dead instance's count). And a server that *faults* no
+longer halts the kernel: an EL0 fault is **contained** — the kernel terminates just that
+process and the supervisor lives on (Journal 137, `DESIGN/002 §5.6`). Verify with
+`./scripts/preflight.sh`.
 
 ## Next integration step
 
-Let the harness host more than one resident thread in the `WaitQueue` (real per-thread
-waits across distinct child koids), then let Sora supervise and reconnect to restarted
-services.
+Restart-on-crash: wire `TERMINATED`/`PEER_CLOSED` so a server that faults wakes Sora via
+`object_wait_many` (not just the reap poll), then respawn the crashed server from its recipe
+on that signal — followed by per-`Job` restart policy + backoff (`DESIGN/002 §5`).

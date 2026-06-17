@@ -38,7 +38,7 @@ extern "C" fn svc_health_main(request_channel: u64) -> ! {
         kumo_rt::process_exit(1);
     }
     let port = Handle(port_h as u32);
-    if kumo_rt::port_bind_channel(port, chan) != 0 {
+    if kumo_rt::port_bind(port, chan) != 0 {
         kumo_rt::process_exit(1);
     }
     serve(&mut ChannelTransport { chan, port });

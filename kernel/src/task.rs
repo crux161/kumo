@@ -112,6 +112,10 @@ impl Process {
     pub fn handles_mut(&mut self) -> &mut HandleTable {
         &mut self.handles
     }
+
+    pub fn signal(&mut self, signals: kumo_abi::Signals) {
+        self.object.signal(signals);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

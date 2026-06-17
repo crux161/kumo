@@ -142,6 +142,16 @@ impl HandleTable {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
+    pub fn drain(&mut self) -> Vec<HandleEntry> {
+        let mut removed = Vec::new();
+        for slot in &mut self.entries {
+            if let Some(entry) = slot.take() {
+                removed.push(entry);
+            }
+        }
+        removed
+    }
+
     pub fn insert_entry(&mut self, entry: HandleEntry) -> Result<Handle, ObjectError> {
         self.insert_parts(entry.koid, entry.kind, entry.rights)
     }

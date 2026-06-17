@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION,
-    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
+    DRV_SERIAL_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX,
+    INITRD_VERSION, PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -656,11 +656,13 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
         ImageArch::Aarch64 => {
             let sora = build_sora_image(&workspace_root()?)?;
             let svc_health = build_svc_health_image(&workspace_root()?)?;
+            let drv_serial = build_drv_serial_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
+                (DRV_SERIAL_PATH, drv_serial.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
             ])?
@@ -738,6 +740,35 @@ fn build_svc_health_image(root: &Path) -> Result<Vec<u8>, String> {
     validate_aarch64_kernel_elf(&bytes).map_err(|err| {
         format!(
             "validate {} as svc-health ELF: {err}",
+            source_path.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn build_drv_serial_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "drv-serial",
+            "--bin",
+            "drv-serial",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("drv-serial");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as drv-serial ELF: {err}",
             source_path.display()
         )
     })?;

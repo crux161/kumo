@@ -154,7 +154,7 @@ impl IpcRegistry {
         let channel = ChannelPair::new(objects);
         let right = process.handles_mut().insert(
             channel.object(ChannelEnd::Right),
-            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE,
+            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
         let index = self.channels.len();
         self.channels.push(channel);
@@ -169,11 +169,11 @@ impl IpcRegistry {
         let channel = ChannelPair::new(objects);
         let left = process.handles_mut().insert(
             channel.object(ChannelEnd::Left),
-            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE,
+            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
         let right = process.handles_mut().insert(
             channel.object(ChannelEnd::Right),
-            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE,
+            Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
         self.channels.push(channel);
         Ok((left, right))
@@ -340,6 +340,18 @@ impl IpcRegistry {
             }
         }
         Err(IpcError::BadHandle)
+    }
+
+    pub fn close_by_koid(&mut self, koid: KoId) -> Result<Option<KoId>, IpcError> {
+        let end = self.channel_end_for(koid)?;
+        let channel = self.channel_mut_by_koid(koid)?;
+        channel.close(end);
+        let peer_end = peer(end);
+        if channel.endpoint(peer_end).open {
+            Ok(Some(channel.object(peer_end).koid()))
+        } else {
+            Ok(None)
+        }
     }
 }
 

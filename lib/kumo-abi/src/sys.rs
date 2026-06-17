@@ -33,7 +33,7 @@ pub enum Syscall {
     DebugWrite = 29,
     AddressSpaceCreate = 30,
     ProcessRun = 31,
-    PortBindChannel = 32,
+    PortBind = 32,
     HandleKoid = 33,
     ProcessWait = 34,
 }
