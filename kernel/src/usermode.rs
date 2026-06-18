@@ -21,7 +21,7 @@ use kumo_abi::{
 };
 use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment, UserMapping, UserState};
 use kumo_hal::PageFlags;
-use kumo_ipc::Message;
+use kumo_ipc::{Message, MAX_INLINE_BYTES};
 
 use crate::bootstrap::user::{
     plan_elf_process, ElfSegment, UserBootstrapError, USER_IMAGE_BASE, USER_ROOT_BASE,
@@ -34,6 +34,14 @@ use crate::task::{Job, Process, Thread, DEFAULT_KERNEL_STACK_SIZE};
 
 /// Maximum restart attempts before giving up and reporting failure.
 const MAX_SORA_ATTEMPTS: u32 = 3;
+
+/// Cap on inline bytes copied across a `ChannelRead`/`ChannelWrite` syscall — for Sora and
+/// for resident children alike. It was 256, enough for the svc-health/console frames, but that
+/// truncated `drv-blk`'s 512-byte block reply (J173). Raised to the IPC inline ceiling
+/// (`kumo_ipc::MAX_INLINE_BYTES`) so a full sector returns in one reply. Backward-compatible:
+/// the effective length is `min(user_len, MAX_CHANNEL_BYTES)`, so callers asking for less are
+/// unchanged. (The kernel→Sora console *routing* path has its own smaller `ROUTE_CHUNK`.)
+const MAX_CHANNEL_BYTES: usize = MAX_INLINE_BYTES;
 
 /// The kernel-held Sora recipe: the ELF image and its parsed layout, retained so the
 /// kernel can re-spawn Sora after a crash without re-reading the initrd.
@@ -715,7 +723,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
             if cp_koid != sora_koid {
                 let channel = Handle(r[0] as u32);
                 let user_buf = r[1];
-                let cap = (r[2] as usize).min(256);
+                let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
                 let (n, handle) =
                     read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
                 r[0] = n;
@@ -770,7 +778,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 } else if num == Syscall::ChannelWrite as u64 {
                     let channel = Handle(r[0] as u32);
                     let user_ptr = r[1];
-                    let len = (r[2] as usize).min(256);
+                    let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
                     if !user_range_ok(child, user_ptr, len as u64) {
                         r[0] = u64::MAX;
                         return;
@@ -930,6 +938,20 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 .dispatch(&mut sora.process, KernelCall::HandleKoid { handle })
             {
                 KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
+                _ => r[0] = u64::MAX,
+            }
+        } else if num == Syscall::HandleDuplicate as u64 {
+            // Narrow-or-equal rights duplicate of a handle Sora already holds (e.g. the
+            // initrd VMO shared read-only with drv-blk). The engine enforces that rights
+            // can only narrow (no ambient authority, PLAN §5.1). Without this arm the
+            // syscall fell through to the u64::MAX default, so drv-blk never spawned (J166).
+            let handle = Handle(r[0] as u32);
+            let rights = Rights(r[1] as u32);
+            match sora.engine.dispatch(
+                &mut sora.process,
+                KernelCall::HandleDuplicate { handle, rights },
+            ) {
+                KernelCallResult::Handle(dup) => r[0] = dup.0 as u64,
                 _ => r[0] = u64::MAX,
             }
         } else if num == Syscall::PortCreate as u64 {
@@ -1118,7 +1140,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
         } else if num == Syscall::ChannelWrite as u64 {
             let channel = Handle(r[0] as u32);
             let user_ptr = r[1];
-            let len = (r[2] as usize).min(256);
+            let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
             if !user_range_ok(&sora.process, user_ptr, len as u64) {
                 r[0] = (-1i32) as u32 as u64;
                 return;
@@ -1144,7 +1166,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
         } else if num == Syscall::ChannelRead as u64 {
             let channel = Handle(r[0] as u32);
             let user_buf = r[1];
-            let cap = (r[2] as usize).min(256);
+            let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
             if !user_range_ok(&sora.process, user_buf, cap as u64) {
                 r[0] = 0;
                 return;

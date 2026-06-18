@@ -32,8 +32,8 @@ use kumo_abi::{BootInfo, Framebuffer, FramebufferFormat, MemRegion, Range, RawSl
 use niji_loader::elf::{parse_elf64, EM_AARCH64};
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
-    build_boot_info, efi_memory_type, efi_pixel_format, framebuffer_from_gop, is_fdt_magic,
-    mem_region_kind_from_efi, UefiHandoffSeed,
+    build_boot_info, efi_memory_type, efi_pixel_format, fdt_total_size, framebuffer_from_gop,
+    is_fdt_magic, mem_region_kind_from_efi, UefiHandoffSeed,
 };
 
 pub type EfiHandle = *mut c_void;
@@ -52,6 +52,7 @@ const INITRD_ESP_PATH: &str = "\\EFI\\KUMO\\initrd.img";
 // === EFI GUIDs ===============================================================
 
 #[repr(C)]
+#[derive(PartialEq, Eq)]
 struct EfiGuid {
     data1: u32,
     data2: u16,
@@ -86,6 +87,16 @@ const SIMPLE_FS_GUID: EfiGuid = guid(
     0x11d2,
     [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
 );
+/// `EFI_DTB_TABLE_GUID` — the firmware exposes the active flattened device tree as a
+/// configuration-table entry under this GUID (the Raspberry Pi pftf/EDK2 firmware does this;
+/// it is also what the Linux EFI stub consumes). Lets us recover a DTB on platforms that ship
+/// none on the ESP (Pi 5, generic UEFI), while x13s keeps its bundled, newer ESP DTB.
+const EFI_DTB_TABLE_GUID: EfiGuid = guid(
+    0xb1b6_21d5,
+    0xf19c,
+    0x41a5,
+    [0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0],
+);
 const FILE_INFO_GUID: EfiGuid = guid(
     0x0957_6e92,
     0x6d3f,
@@ -119,6 +130,14 @@ pub struct EfiSystemTable {
     boot_services: *mut EfiBootServices,
     number_of_table_entries: usize,
     configuration_table: *mut c_void,
+}
+
+/// One entry of the UEFI configuration table (`EfiSystemTable.configuration_table` is an
+/// array of `number_of_table_entries` of these). Scanned for [`EFI_DTB_TABLE_GUID`].
+#[repr(C)]
+struct EfiConfigurationTable {
+    vendor_guid: EfiGuid,
+    vendor_table: *mut c_void,
 }
 
 #[repr(C)]
@@ -439,7 +458,7 @@ unsafe fn boot_and_jump(
     };
 
     let framebuffer = unsafe { discover_framebuffer(boot_services, con_out) };
-    let (dtb_addr, _dtb_len) = unsafe { load_dtb(boot_services, root, con_out) };
+    let (dtb_addr, _dtb_len) = unsafe { load_dtb(boot_services, root, con_out, system_table) };
     let kernel = unsafe { load_kernel(boot_services, root, con_out) };
     let (initrd, _initrd_buf) = unsafe { load_initrd(boot_services, root, con_out) };
 
@@ -729,36 +748,87 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
     Some(u64::from_le_bytes(file_size))
 }
 
-/// Open the staged DTB, validate its FDT magic, and return `(phys_addr, len)`.
-/// The pool buffer is intentionally kept (handed to the kernel via BootInfo).
+/// Resolve the DTB, returning `(phys_addr, len)` or `(0, 0)` if none is found.
+///
+/// Preference order: (1) a DTB staged on the ESP at [`DTB_ESP_PATH`] — x13s ships its own,
+/// newer than the firmware's; (2) the firmware-provided DTB from the UEFI configuration table
+/// ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and other generic-UEFI boards supply
+/// their device tree, since they stage none on the ESP. The kept pool buffer / firmware blob
+/// is handed to the kernel via BootInfo.
 unsafe fn load_dtb(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
     con_out: *mut EfiSimpleTextOutputProtocol,
+    system_table: *mut EfiSystemTable,
 ) -> (u64, u64) {
-    match unsafe { read_esp_file(boot_services, root, DTB_ESP_PATH) } {
-        Some((buffer, len)) => {
-            let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
-            if is_fdt_magic(bytes) {
-                kprint!(
-                    con_out,
-                    "device tree  : {} @ {:#x} ({} bytes)\r\n",
-                    DTB_ESP_PATH,
-                    buffer as u64,
-                    len
-                );
-                (buffer as u64, len as u64)
-            } else {
-                kprint!(con_out, "device tree  : FDT magic missing - ignored\r\n");
-                unsafe { ((*boot_services).free_pool)(buffer) };
-                (0, 0)
-            }
+    // (1) Staged ESP DTB takes priority.
+    if let Some((buffer, len)) = unsafe { read_esp_file(boot_services, root, DTB_ESP_PATH) } {
+        let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
+        if is_fdt_magic(bytes) {
+            kprint!(
+                con_out,
+                "device tree  : {} @ {:#x} ({} bytes)\r\n",
+                DTB_ESP_PATH,
+                buffer as u64,
+                len
+            );
+            return (buffer as u64, len as u64);
         }
-        None => {
-            kprint!(con_out, "device tree  : absent\r\n");
-            (0, 0)
-        }
+        kprint!(
+            con_out,
+            "device tree  : ESP FDT magic missing - trying firmware\r\n"
+        );
+        unsafe { ((*boot_services).free_pool)(buffer) };
     }
+
+    // (2) Firmware configuration table (Pi 5 / generic UEFI).
+    if let Some((addr, len)) = unsafe { firmware_dtb(system_table, con_out) } {
+        return (addr, len);
+    }
+
+    kprint!(con_out, "device tree  : absent\r\n");
+    (0, 0)
+}
+
+/// Scan the UEFI configuration table for [`EFI_DTB_TABLE_GUID`] and, if its blob carries valid
+/// FDT magic, return `(phys_addr, totalsize)` read from the FDT header. The firmware owns this
+/// memory; it stays mapped through ExitBootServices, so the pointer is valid for the kernel.
+unsafe fn firmware_dtb(
+    system_table: *mut EfiSystemTable,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+) -> Option<(u64, u64)> {
+    if system_table.is_null() {
+        return None;
+    }
+    let count = unsafe { (*system_table).number_of_table_entries };
+    let tables = unsafe { (*system_table).configuration_table } as *const EfiConfigurationTable;
+    if tables.is_null() {
+        return None;
+    }
+    for index in 0..count {
+        let entry = unsafe { &*tables.add(index) };
+        if entry.vendor_guid != EFI_DTB_TABLE_GUID {
+            continue;
+        }
+        let ptr = entry.vendor_table as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        // Read the 8-byte FDT header (magic + totalsize) to validate and size the blob.
+        let head = unsafe { core::slice::from_raw_parts(ptr, 8) };
+        if !is_fdt_magic(head) {
+            return None;
+        }
+        let len = fdt_total_size(head)? as u64;
+        kprint!(
+            con_out,
+            "device tree  : firmware table @ {:#x} ({} bytes)\r\n",
+            ptr as u64,
+            len
+        );
+        return Some((ptr as u64, len));
+    }
+    None
 }
 
 const PT_DESC_VALID: u64 = 1 << 0;

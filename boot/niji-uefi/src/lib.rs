@@ -112,6 +112,16 @@ pub fn is_fdt_magic(bytes: &[u8]) -> bool {
     }
 }
 
+/// The FDT header's `totalsize` field (big-endian `u32` at byte offset 4). Used to size a
+/// firmware-provided DTB, where the EFI configuration table hands us only a pointer — the
+/// length must come from the blob itself. `None` if `bytes` is shorter than the header field.
+pub fn fdt_total_size(bytes: &[u8]) -> Option<u32> {
+    match bytes {
+        [_, _, _, _, a, b, c, d, ..] => Some(u32::from_be_bytes([*a, *b, *c, *d])),
+        _ => None,
+    }
+}
+
 /// The raw values Nijigumo gathers from UEFI before assembling a [`BootInfo`].
 ///
 /// Pointers are captured as `u64` so this stays a plain, `Copy` description of the
@@ -272,6 +282,16 @@ mod tests {
         assert!(is_fdt_magic(&[0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00]));
         assert!(!is_fdt_magic(&[0x7f, b'E', b'L', b'F']));
         assert!(!is_fdt_magic(&[0xd0, 0x0d]));
+    }
+
+    #[test]
+    fn reads_fdt_total_size() {
+        // magic(4) + totalsize(4, BE) = 0x1234
+        assert_eq!(
+            fdt_total_size(&[0xd0, 0x0d, 0xfe, 0xed, 0x00, 0x00, 0x12, 0x34]),
+            Some(0x1234)
+        );
+        assert_eq!(fdt_total_size(&[0xd0, 0x0d, 0xfe, 0xed]), None);
     }
 
     #[test]

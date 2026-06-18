@@ -20,10 +20,17 @@ use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
 const CHILD_PRIORITY: Priority = Priority(63);
-/// Upper bound on simultaneously-resident children. Two is the smallest that proves
-/// independent per-thread waits across distinct child koids (Journal 134); raise it when a
-/// real case needs more (`GUIDANCE/006 §6`: do not build the infinitely-extensible version).
-const MAX_RESIDENT_CHILDREN: usize = 2;
+/// Upper bound on simultaneously-resident children. Two proved independent per-thread waits
+/// across distinct child koids (Journal 134), but a live boot now has a real case for more:
+/// the two persistent async drivers (`drv-serial`, `drv-blk`) hold a slot each for the rest
+/// of boot, and the `svc-health` pair smoke needs two *more* concurrent residents on top
+/// (2 drivers + 2 servers = 4). With only two slots both drivers saturated the table, so
+/// every later child spawn — the blocking `M10` runs and the async `svc-health` smokes alike
+/// — returned `ShouldWait` and "failed" (it was the slot gate, not frames). Sized to that
+/// peak; `children` reserves this capacity up front (no realloc while a child awaits first
+/// entry — the J169 invariant). Raise again only when a real case needs more (`GUIDANCE/006
+/// §6`): e.g. once `drv-fb` also spawns it becomes a third persistent driver → 5.
+const MAX_RESIDENT_CHILDREN: usize = 4;
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
 /// Same priority as the blocking child — more urgent than Sora (64).
 const CHILD_ASYNC_PRIORITY: Priority = Priority(63);
@@ -275,7 +282,7 @@ pub fn init(
             )
             .map_err(|_| UserSchedError::OutOfFrames)?,
             user_fresh: true,
-            children: alloc::vec::Vec::new(),
+            children: alloc::vec::Vec::with_capacity(MAX_RESIDENT_CHILDREN),
             wait_queue: WaitQueue::new(),
             started: false,
             switches: 0,
@@ -341,12 +348,22 @@ fn install_child(
         sp_el0: sp,
         ttbr0,
     });
-    let state_ptr = child.thread.user_state.as_ref().expect("child user state") as *const UserState;
     let kernel_sp = child.thread.stack().top();
-    *child.thread.context_mut() = user_entry_context(state_ptr, kernel_sp);
     child.thread.ready();
     let koid = child.thread.koid();
     s.children.push(child);
+    // Build the entry context only AFTER the child (and its inline `UserState`) is in its
+    // final heap slot: `kumo_user_enter` reads `elr`/`ttbr0`/args through the `&UserState`
+    // baked into x19, so that pointer must outlive the move. Capturing it from the
+    // stack-local `child` before `push` left x19 dangling at a reused stack frame — both
+    // resident children then entered the last-installed image (J169).
+    let installed = s.children.last_mut().expect("just pushed child");
+    let state_ptr = installed
+        .thread
+        .user_state
+        .as_ref()
+        .expect("child user state") as *const UserState;
+    *installed.thread.context_mut() = user_entry_context(state_ptr, kernel_sp);
     koid
 }
 

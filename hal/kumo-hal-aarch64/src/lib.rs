@@ -2079,7 +2079,9 @@ pub struct TimerIrqReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimerIrqError {
-    NoGicv3,
+    /// No interrupt controller found in the DTB (neither GICv3 nor GICv2) — also the
+    /// `dtb == 0` case (no device tree was delivered to the kernel).
+    NoGic,
     BadTimerFrequency,
     BadPeriod,
 }
@@ -2116,25 +2118,48 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
         return Err(TimerIrqError::BadTimerFrequency);
     }
 
-    let config = unsafe { discover_gicv3(dtb) }.ok_or(TimerIrqError::NoGicv3)?;
     let period_ticks = core::cmp::max(freq / period_hz, 1);
-    TIMER_PERIOD_TICKS.store(period_ticks, ORD);
-    TIMER_IRQ_ID.store(config.timer_irq, ORD);
-    TIMER_IRQ_COUNT.store(0, ORD);
 
-    unsafe {
-        gicv3_init(&config);
-        virtual_timer_program(period_ticks);
-        enable_irq();
+    // GICv3 first (x13s, QEMU virt). Both discoverers return `None` when `dtb == 0`.
+    if let Some(config) = unsafe { discover_gicv3(dtb) } {
+        TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+        TIMER_IRQ_ID.store(config.timer_irq, ORD);
+        TIMER_IRQ_COUNT.store(0, ORD);
+        unsafe {
+            gicv3_init(&config);
+            virtual_timer_program(period_ticks);
+            enable_irq();
+        }
+        return Ok(TimerIrqReport {
+            counter_hz: freq,
+            period_hz,
+            irq: config.timer_irq,
+            distributor_base: config.distributor_base,
+            redistributor_base: config.redistributor_base,
+        });
     }
 
-    Ok(TimerIrqReport {
-        counter_hz: freq,
-        period_hz,
-        irq: config.timer_irq,
-        distributor_base: config.distributor_base,
-        redistributor_base: config.redistributor_base,
-    })
+    // GICv2 fallback (Raspberry Pi 5 / GIC-400). Same virtual-timer program; `gicv2_init`
+    // records the CPU-interface base so the IRQ handler EOIs the GICv2 way. No redistributor.
+    if let Some(config) = unsafe { discover_gicv2(dtb) } {
+        TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+        TIMER_IRQ_ID.store(config.timer_irq, ORD);
+        TIMER_IRQ_COUNT.store(0, ORD);
+        unsafe {
+            gicv2_init(&config);
+            virtual_timer_program(period_ticks);
+            enable_irq();
+        }
+        return Ok(TimerIrqReport {
+            counter_hz: freq,
+            period_hz,
+            irq: config.timer_irq,
+            distributor_base: config.distributor_base,
+            redistributor_base: 0,
+        });
+    }
+
+    Err(TimerIrqError::NoGic)
 }
 
 pub fn timer_irq_count() -> u64 {

@@ -51,9 +51,16 @@ extern "C" fn main(
     } else {
         MAX_VMO_MAP
     };
+    // Vmar::map requires a page-aligned length; round down so we never exceed
+    // the VMO. The initrd size Sora computes is not 4 KiB-aligned (J168).
+    let map_len = map_len & !0xFFF;
 
-    // Map the readable portion of the VMO into our address space.
-    let vmo_va = 0x0000_0000_1000_0000;
+    // Map the readable portion of the VMO into our address space. Use a base
+    // clear of the child stack — run_elf puts the stack at [0x1000_C000,
+    // 0x1001_0000), so mapping a multi-MiB VMO at 0x1000_0000 would remap the
+    // stack READ-only and fault on the next push (J168). 0x1100_0000 leaves the
+    // full 16 MiB below the 0x2000_0000 child-VMAR boundary.
+    let vmo_va = 0x0000_0000_1100_0000;
     if vmar_map(Handle(0), vmo, 0, vmo_va, map_len, (VmarFlags::READ).0) != 0 {
         debug_write(b"drv-blk: map failed\n".as_ptr(), 20);
         kumo_rt::process_exit(1);

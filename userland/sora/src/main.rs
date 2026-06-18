@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Handle, Rights, VmarFlags, DRV_BLK_PATH, DRV_FB_PATH, FAT32_IMG_PATH,
     PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
@@ -18,10 +19,53 @@ use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
 use svc_health::{Request as HealthRequest, Response as HealthResponse};
 
-kumo_rt::entry!(sora_main);
+/// The BootInfo VMO handle the kernel hands Sora in **x8** — the 9th bootstrap value, beyond
+/// the C-ABI argument registers x0–x7 (J159). x8 is caller-saved, so reading it inside
+/// `sora_main` via inline asm is unsound: the compiler may clobber x8 before the read. It did
+/// exactly that on the live X13s boot — reusing x8 as the `DebugWrite` syscall number (29) for
+/// the greeting and reordering the `options(nomem)` read after it — so Sora saw handle 29 and
+/// the BootInfo self-map returned `BadHandle` (`st=0xfffffffe`). Capture x8 in `_start`, the
+/// one place it is still guaranteed live, before any other instruction can touch it.
+static BOOTINFO_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+// Sora's entry. Mirrors `kumo_rt::entry!` (a bare `bl sora_main`) but first stashes x8 into
+// `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
+// untouched. `_start` runs at EL0 with Sora's address space live, so the static (.bss, mapped
+// RW) is writable here.
+core::arch::global_asm!(
+    ".section .text._start, \"ax\"",
+    ".global _start",
+    "_start:",
+    "  adrp x9, {slot}",
+    "  add  x9, x9, :lo12:{slot}",
+    "  str  x8, [x9]",
+    "  bl   sora_main",
+    "1: b 1b",
+    slot = sym BOOTINFO_VMO_HANDLE,
+);
 
 fn log(msg: &[u8]) {
     kumo_rt::debug_write(msg.as_ptr(), msg.len());
+}
+
+/// Log a `u64` as `0x…` hex on the live serial. `no_std` Sora has no formatter, so a
+/// failing syscall's raw status is otherwise invisible; this surfaces the kernel `Errno`
+/// behind a collapsed "fail" so a hardware boot localises the cause (mirrors the inline
+/// child-handle dump already used below).
+fn log_hex(mut v: u64) {
+    debug_write(b"0x".as_ptr(), 2);
+    let mut buf = [0u8; 16];
+    let mut hi = 16;
+    loop {
+        hi -= 1;
+        let d = (v & 0xF) as u8;
+        buf[hi] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    debug_write(buf[hi..].as_ptr(), 16 - hi);
 }
 
 /// Locate a file in the initrd by path, returning its `(offset, len)`. Sora
@@ -89,6 +133,64 @@ impl SectorReader for InitrdSectors {
     }
 }
 
+/// A [`SectorReader`] that reads 512-byte sectors **through `drv-blk` over IPC** rather than
+/// touching the initrd VMO directly — the `fatfs`-server path (the trait's intended client).
+/// `base` is the FS image's byte offset within `drv-blk`'s block space (the whole initrd, so
+/// `LBA·512 = initrd offset`). The image is not 512-aligned inside the initrd, so a logical
+/// sector generally straddles two `drv-blk` blocks; this splices them. `client` is the serve
+/// channel's client end Sora already holds.
+struct BlkSectors {
+    client: Handle,
+    base: u64,
+}
+
+impl BlkSectors {
+    /// Read one whole `drv-blk` block at absolute `lba` into `out` (write → pump → read →
+    /// `read_payload`, mirroring `request_reply`). Returns `false` on any failure.
+    fn read_block(&mut self, lba: u64, out: &mut [u8; kumo_fatfs::SECTOR_SIZE]) -> bool {
+        let req = drv_blk::Request::read(lba, 1).encode();
+        if channel_write(self.client, req.as_ptr(), req.len()) != 0 {
+            return false;
+        }
+        if !child_parked(process_wait()) {
+            return false;
+        }
+        let mut reply = [0u8; 1 + kumo_fatfs::SECTOR_SIZE];
+        let n = channel_read(self.client, reply.as_mut_ptr(), reply.len()) as usize;
+        match drv_blk::read_payload(&reply[..n]) {
+            Ok(data) if data.len() >= kumo_fatfs::SECTOR_SIZE => {
+                out.copy_from_slice(&data[..kumo_fatfs::SECTOR_SIZE]);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl SectorReader for BlkSectors {
+    fn read_sector(&mut self, lba: u32, buf: &mut [u8; kumo_fatfs::SECTOR_SIZE]) -> bool {
+        const S: u64 = kumo_fatfs::SECTOR_SIZE as u64;
+        let byte_off = self.base + lba as u64 * S;
+        let first = byte_off / S;
+        let skew = (byte_off % S) as usize;
+        let mut tmp = [0u8; kumo_fatfs::SECTOR_SIZE];
+        if !self.read_block(first, &mut tmp) {
+            return false;
+        }
+        if skew == 0 {
+            buf.copy_from_slice(&tmp);
+            return true;
+        }
+        let head = kumo_fatfs::SECTOR_SIZE - skew;
+        buf[..head].copy_from_slice(&tmp[skew..]);
+        if !self.read_block(first + 1, &mut tmp) {
+            return false;
+        }
+        buf[head..].copy_from_slice(&tmp[..skew]);
+        true
+    }
+}
+
 const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
 const QEMU_PL011_MMIO_SIZE: u64 = 0x1000;
 const QEMU_PL011_IRQ: u32 = 33; // SPI 1 = 33 on QEMU ARM virt
@@ -122,15 +224,10 @@ extern "C" fn sora_main(
     let net = Handle(net_handle as u32);
     let kbd = Handle(kbd_handle as u32);
 
-    // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8).
-    let bootinfo_vmo: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {0}, x8",
-            out(reg) bootinfo_vmo,
-            options(nostack, nomem)
-        );
-    }
+    // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8). `_start` captured it
+    // into `BOOTINFO_VMO_HANDLE` at entry — reading x8 here would race the compiler's reuse of
+    // it (see the static's doc-comment).
+    let bootinfo_vmo: u64 = BOOTINFO_VMO_HANDLE.load(Ordering::Relaxed);
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
@@ -360,8 +457,12 @@ extern "C" fn sora_main(
     // Duplicate the initrd VMO with read-only rights, compute the total
     // initrd size from the file table, and pass both (size + handle) to
     // drv-blk over a bootstrap channel.
+    let mut blk_serve: Option<Handle> = None; // serve-channel client end, kept for fatfs-over-blk
     {
-        let blk_vmo_h = handle_duplicate(initrd, Rights::READ);
+        // READ to map the VMO; TRANSFER so channel_write may move the handle to
+        // drv-blk (the engine requires Rights::TRANSFER on a transferred handle).
+        // Without TRANSFER the write fails AccessDenied and drv-blk sees no VMO (J167).
+        let blk_vmo_h = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
         if blk_vmo_h != 0 && blk_vmo_h != u64::MAX {
             // Compute the total initrd data size from the header + entry table.
             let mut initrd_size: u64 = 0;
@@ -406,6 +507,37 @@ extern "C" fn sora_main(
                     b"drv-blk",
                 ) {
                     log(b"drv-blk: run ok\n");
+                    // M6/P7 round-trip: drv-blk now serves the initrd VMO as a block
+                    // device over IPC. Sora holds the serve channel's client end
+                    // (`server_chan`). Pump once so drv-blk consumes its bootstrap
+                    // (VMO + size) and parks on the serve channel, then read LBA 0 — the
+                    // initrd header — and verify a FULL 512-byte sector survives the
+                    // client → drv-blk → client path (the J166 codec end to end; mirrors
+                    // the svc-health `request_reply` pump pattern). A whole sector only fits
+                    // now that the channel cap is `MAX_INLINE_BYTES`, not 256 (J173 → J174);
+                    // checking `data.len() == BLOCK_SIZE` is the proof it is not truncated.
+                    let blk_client = Handle(server_chan as u32);
+                    blk_serve = Some(blk_client); // reuse for the fatfs-over-drv-blk mount
+                    let _ = process_wait(); // let drv-blk (and drv-serial) reach their park
+                    let req = drv_blk::Request::read(0, 1).encode();
+                    let mut reply = [0u8; 1 + drv_blk::BLOCK_SIZE as usize];
+                    let rt_ok = channel_write(blk_client, req.as_ptr(), req.len()) == 0
+                        && child_parked(process_wait())
+                        && {
+                            let n =
+                                channel_read(blk_client, reply.as_mut_ptr(), reply.len()) as usize;
+                            matches!(
+                                drv_blk::read_payload(&reply[..n]),
+                                Ok(data)
+                                    if data.len() == drv_blk::BLOCK_SIZE as usize
+                                        && &data[..8] == b"KUMORD01"
+                            )
+                        };
+                    if rt_ok {
+                        log(b"blk-rt: ok\n");
+                    } else {
+                        log(b"blk-rt: fail\n");
+                    }
                 } else {
                     log(b"drv-blk: run fail\n");
                 }
@@ -443,6 +575,35 @@ extern "C" fn sora_main(
         log(b"fatfs: image not found\n");
     }
 
+    // M6/P7 fatfs-server gate: mount the SAME bin/fat32.img and read HELLO.TXT, but drive
+    // kumo-fatfs through `drv-blk` over IPC (a `BlkSectors` SectorReader) instead of reading
+    // the initrd VMO directly. Same engine, same image, sectors now served by the block
+    // driver — the end-to-end storage path. (drv-blk serves the whole initrd by LBA, so the
+    // image's byte offset is the SectorReader `base`.)
+    if let Some(blk) = blk_serve {
+        if let Some((fat_base, _len)) = initrd_find(initrd, FAT32_IMG_PATH.as_bytes()) {
+            let mut disk = BlkSectors {
+                client: blk,
+                base: fat_base,
+            };
+            match FatVolume::mount(&mut disk) {
+                Ok(vol) => match vol.find_in_root(&mut disk, b"HELLO   TXT") {
+                    Some(entry) => {
+                        let mut data = [0u8; 16];
+                        let n = vol.read_file(&mut disk, &entry, &mut data);
+                        log(b"fatfs-blk: HELLO.TXT = ");
+                        debug_write(data.as_ptr(), n);
+                        log(b"\n");
+                    }
+                    None => log(b"fatfs-blk: HELLO.TXT missing\n"),
+                },
+                Err(_) => log(b"fatfs-blk: mount failed\n"),
+            }
+        } else {
+            log(b"fatfs-blk: image not found\n");
+        }
+    }
+
     // J159: spawn drv-fb when a framebuffer is present.
     // Map the BootInfo VMO (populated by the kernel), read framebuffer geometry,
     // create a narrowed child Resource for the framebuffer MMIO range, and hand
@@ -451,7 +612,8 @@ extern "C" fn sora_main(
     if fb_va != 0 && bootinfo_vmo != 0 {
         let bi_vmo = Handle(bootinfo_vmo as u32);
         let bi_va = 0x0000_0000_3000_0000;
-        if vmar_map(Handle(0), bi_vmo, 0, bi_va, 4096, (VmarFlags::READ).0) == 0 {
+        let bi_map_st = vmar_map(Handle(0), bi_vmo, 0, bi_va, 4096, (VmarFlags::READ).0);
+        if bi_map_st == 0 {
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
             if bootinfo.has_framebuffer() {
                 let fb = bootinfo.framebuffer;
@@ -484,7 +646,14 @@ extern "C" fn sora_main(
                 }
             }
         } else {
-            log(b"drv-fb: bootinfo map fail\n");
+            // Static analysis says this self-map (in-bounds of Sora's root VMAR, READ right
+            // present, physical-backed BootInfo VMO, identity-map switch in the kernel
+            // VmarMap path) should succeed — yet it fails on X13s. Surface the real Errno so
+            // the next boot localises it (NoMemory vs InvalidArgs vs BadHandle) instead of a
+            // collapsed "fail".
+            log(b"drv-fb: bootinfo map fail st=");
+            log_hex(bi_map_st);
+            log(b"\n");
         }
     }
 
