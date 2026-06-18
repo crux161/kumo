@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC,
-    INITRD_PATH_MAX, INITRD_VERSION, PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
+    AUTOEXEC_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
+    INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION, LS_PATH,
+    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -558,7 +559,16 @@ fn stage_kernel(
 ///   sectors 2–31: reserved (zeroed)
 ///   sectors 32–63: FAT #1
 ///   sectors 64–95: FAT #2
-///   sector 96:  root directory (cluster 2) with a volume label + two test files
+///   sector 96:  root directory (cluster 2): volume label + README/HELLO + EFI/
+///   sector 97:  HELLO.TXT data (cluster 3)
+///   sector 98:  EFI/ directory (cluster 4)
+///   sector 99:  EFI/BOOT/ directory (cluster 5)
+///   sector 100: EFI/BOOT/BOOTAA64.EFI data (cluster 6)
+///
+/// The `EFI/BOOT/BOOTAA64.EFI` subtree mirrors the ESP shape so the reader's path
+/// resolution (`kumo-fatfs::resolve_path`) can be exercised against a real image;
+/// the total size is unchanged (the clusters were already inside the 2 MiB image),
+/// so the initrd layout — and `drv-blk`'s view of it — is untouched.
 ///
 /// Layout constants (must be internally consistent):
 const FAT_SEC_SIZE: u16 = 512;
@@ -569,6 +579,21 @@ const FAT_SPF: u32 = 32; // sectors per FAT
 const FAT_TOTAL_SECS: u32 = 4096;
 const ROOT_CLUSTER: u32 = 2;
 const DATA_START: u64 = FAT_RESERVED as u64 + (FAT_NUM_FATS as u64 * FAT_SPF as u64);
+
+/// Byte offset of the first sector of `cluster` within the FAT image.
+fn fat_cluster_off(cluster: u32) -> usize {
+    (DATA_START as usize + (cluster as usize - 2) * FAT_SPC as usize) * FAT_SEC_SIZE as usize
+}
+
+/// Write a 32-byte short (8.3) directory entry at `off` within a directory slice.
+fn put_dir_entry(dir: &mut [u8], off: usize, name: &[u8; 11], attr: u8, cluster: u32, size: u32) {
+    let e = &mut dir[off..off + 32];
+    e[..11].copy_from_slice(name);
+    e[11] = attr;
+    e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    e[28..32].copy_from_slice(&size.to_le_bytes());
+}
 
 fn build_fat32_image() -> Vec<u8> {
     let total = FAT_TOTAL_SECS as usize * FAT_SEC_SIZE as usize;
@@ -606,10 +631,14 @@ fn build_fat32_image() -> Vec<u8> {
     let fat_size = FAT_SPF as usize * FAT_SEC_SIZE as usize;
     {
         let fat1 = &mut img[fat1_off..fat1_off + fat_size];
-        fat1[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]);
-        fat1[4..8].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]);
-        fat1[8..12].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]); // cluster 2 = root dir = EOF
-        fat1[12..16].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0x0F]); // cluster 3 = HELLO.TXT = EOF
+        let eof: [u8; 4] = [0xFF, 0xFF, 0xFF, 0x0F];
+        fat1[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]); // media byte + reserved
+        fat1[4..8].copy_from_slice(&eof); // cluster 1 reserved
+        fat1[8..12].copy_from_slice(&eof); // cluster 2 = root dir = EOF
+        fat1[12..16].copy_from_slice(&eof); // cluster 3 = HELLO.TXT = EOF
+        fat1[16..20].copy_from_slice(&eof); // cluster 4 = EFI/ dir = EOF
+        fat1[20..24].copy_from_slice(&eof); // cluster 5 = EFI/BOOT/ dir = EOF
+        fat1[24..28].copy_from_slice(&eof); // cluster 6 = BOOTAA64.EFI = EOF
     }
 
     // ---- FAT #2 at sector 64 (copy of FAT #1) ----
@@ -617,36 +646,40 @@ fn build_fat32_image() -> Vec<u8> {
     img.copy_within(fat1_off..fat1_off + fat_size, fat2_off);
 
     // ---- cluster 3 (sector 97): HELLO.TXT payload ----
-    let cluster3_off =
-        (DATA_START as usize + (3 - 2) as usize * FAT_SPC as usize) * FAT_SEC_SIZE as usize;
-    img[cluster3_off..cluster3_off + 6].copy_from_slice(b"hello!");
+    img[fat_cluster_off(3)..fat_cluster_off(3) + 6].copy_from_slice(b"hello!");
 
     // ---- root directory at cluster 2 (sector 96) ----
-    let root_off = DATA_START as usize * FAT_SEC_SIZE as usize;
     {
-        let dir = &mut img[root_off..root_off + 512];
+        let dir = &mut img[fat_cluster_off(2)..fat_cluster_off(2) + 512];
+        put_dir_entry(dir, 0, b"KUMO       ", 0x08, 0, 0); // volume label
+        put_dir_entry(dir, 32, b"README  TXT", 0x20, 0, 128);
+        put_dir_entry(dir, 64, b"HELLO   TXT", 0x20, 3, 6); // cluster 3, 6 bytes
+        put_dir_entry(dir, 96, b"EFI        ", 0x10, 4, 0); // subdirectory, cluster 4
+        dir[128] = 0x00; // end of directory
+    }
 
-        fn put_entry(
-            dir: &mut [u8],
-            off: usize,
-            name: &[u8; 11],
-            attr: u8,
-            cluster: u32,
-            size: u32,
-        ) {
-            let e = &mut dir[off..off + 32];
-            e[..11].copy_from_slice(name);
-            e[11] = attr;
-            e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
-            e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
-            e[28..32].copy_from_slice(&size.to_le_bytes());
-        }
-
-        put_entry(dir, 0, b"KUMO       ", 0x08, 0, 0);
-        put_entry(dir, 32, b"README  TXT", 0x20, 0, 128);
-        put_entry(dir, 64, b"HELLO   TXT", 0x20, 3, 6); // cluster 3, 6 bytes
+    // ---- EFI/ directory at cluster 4 (sector 98) ----
+    // A real subdirectory opens with `.` (itself) and `..` (parent; the root is
+    // denoted by cluster 0); kumo-fatfs skips both while scanning for a name.
+    {
+        let dir = &mut img[fat_cluster_off(4)..fat_cluster_off(4) + 512];
+        put_dir_entry(dir, 0, b".          ", 0x10, 4, 0);
+        put_dir_entry(dir, 32, b"..         ", 0x10, 0, 0);
+        put_dir_entry(dir, 64, b"BOOT       ", 0x10, 5, 0); // subdirectory, cluster 5
         dir[96] = 0x00;
     }
+
+    // ---- EFI/BOOT/ directory at cluster 5 (sector 99) ----
+    {
+        let dir = &mut img[fat_cluster_off(5)..fat_cluster_off(5) + 512];
+        put_dir_entry(dir, 0, b".          ", 0x10, 5, 0);
+        put_dir_entry(dir, 32, b"..         ", 0x10, 4, 0);
+        put_dir_entry(dir, 64, b"BOOTAA64EFI", 0x20, 6, 6); // cluster 6, 6 bytes
+        dir[96] = 0x00;
+    }
+
+    // ---- cluster 6 (sector 100): EFI/BOOT/BOOTAA64.EFI payload ----
+    img[fat_cluster_off(6)..fat_cluster_off(6) + 6].copy_from_slice(b"esp-ok");
 
     img
 }
@@ -661,6 +694,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
+            let hello = build_hello_image(&workspace_root()?)?;
+            let ls = build_ls_image(&workspace_root()?)?;
+            let autoexec = build_autoexec();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
@@ -669,6 +705,9 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_BLK_PATH, drv_blk.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
+                (HELLO_PATH, hello.as_slice()),
+                (LS_PATH, ls.as_slice()),
+                (AUTOEXEC_PATH, autoexec.as_slice()),
             ])?
         }
         ImageArch::X86_64 => {
@@ -747,6 +786,67 @@ fn build_svc_health_image(root: &Path) -> Result<Vec<u8>, String> {
             source_path.display()
         )
     })?;
+    Ok(bytes)
+}
+
+/// The boot autoexec manifest shipped at `etc/autoexec`: one shell command per line,
+/// `#` comments and blanks ignored (`kumoza::autoexec_lines`), each dispatched by Sora's
+/// shared `eval_command`. `echo` proves a builtin runs at boot, `ls` lists what's
+/// installed, and `run hello` launches a program — together exercising the shared
+/// evaluator end to end; the comment line proves comment-skipping.
+fn build_autoexec() -> Vec<u8> {
+    b"# KUMO autoexec: shell command lines; '#' comments and blank lines ignored\n\
+      echo kumo autoexec online\n\
+      ls\n\
+      run hello\n"
+        .to_vec()
+}
+
+fn build_hello_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "hello",
+            "--bin",
+            "hello",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("hello");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as hello ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_ls_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "ls",
+            "--bin",
+            "ls",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root.join("target/aarch64-unknown-none/release").join("ls");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as ls ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 
@@ -1616,6 +1716,58 @@ Expected serial transcript is in:\n\
         files.run_script.display(),
         files.expected_serial.display()
     )
+}
+
+#[cfg(test)]
+mod fat32_image_tests {
+    use super::build_fat32_image;
+    use kumo_fatfs::{FatVolume, SectorReader, SECTOR_SIZE};
+
+    /// A `SectorReader` over the in-memory image `build_fat32_image` produces, so
+    /// the host test exercises the exact bytes the initrd ships, with the same
+    /// reader that runs on target.
+    struct ImageDisk(Vec<u8>);
+    impl SectorReader for ImageDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            let off = lba as usize * SECTOR_SIZE;
+            match self.0.get(off..off + SECTOR_SIZE) {
+                Some(s) => {
+                    buf.copy_from_slice(s);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    #[test]
+    fn generated_image_resolves_root_and_esp_paths() {
+        let mut disk = ImageDisk(build_fat32_image());
+        let vol = FatVolume::mount(&mut disk).expect("mount generated fat32.img");
+
+        // The existing root file still resolves (regression guard).
+        let hello = vol
+            .resolve_path(&mut disk, b"/HELLO.TXT")
+            .expect("/HELLO.TXT");
+        let mut out = [0u8; 16];
+        let n = vol.read_file(&mut disk, &hello, &mut out);
+        assert_eq!(&out[..n], b"hello!");
+
+        // The new subtree: descend EFI/BOOT and read the boot-loader-shaped file.
+        let app = vol
+            .resolve_path(&mut disk, b"/EFI/BOOT/BOOTAA64.EFI")
+            .expect("/EFI/BOOT/BOOTAA64.EFI");
+        assert!(!app.is_dir());
+        let mut out = [0u8; 16];
+        let n = vol.read_file(&mut disk, &app, &mut out);
+        assert_eq!(&out[..n], b"esp-ok");
+
+        // Case-insensitive, leading-slash-optional lookup hits the same entry.
+        assert_eq!(
+            vol.resolve_path(&mut disk, b"efi/boot/bootaa64.efi"),
+            Some(app)
+        );
+    }
 }
 
 fn print_help() {

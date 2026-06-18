@@ -11,8 +11,9 @@ pub use boot::{
     RawSlice,
 };
 pub use initrd::{
-    find_file, InitrdError, InitrdFile, DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, FAT32_IMG_PATH,
-    PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
+    entry_paths, entry_table_bytes, find_file, InitrdError, InitrdFile, AUTOEXEC_PATH,
+    DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, FAT32_IMG_PATH, HELLO_PATH, INITRD_HEADER_LEN,
+    LS_PATH, PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
 };
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
 pub use sys::{Errno, Status, Syscall, VmarFlags};

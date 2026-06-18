@@ -10,6 +10,18 @@ pub const DRV_FB_PATH: &str = "bin/drv-fb";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
+/// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
+/// template a program author copies, and the exec-vertical proof binary.
+pub const HELLO_PATH: &str = "bin/hello";
+/// `ls` as a real program: receives a read-only initrd VMO handle in `x0` and prints
+/// the entry list. The first program proven to *use* a passed capability (vs. the
+/// capability-less `hello`); launched by the shell's `ls` builtin, which narrows the
+/// initrd to read-only before granting it.
+pub const LS_PATH: &str = "bin/ls";
+/// The input-less boot script Sora runs from the initrd: one `bin/<name>` per
+/// line, `#` comments and blanks ignored. The X13s autoexec stopgap — programs
+/// run and paint to the framebuffer with no keyboard. Parsed by `kumoza`.
+pub const AUTOEXEC_PATH: &str = "etc/autoexec";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitrdError {
@@ -83,6 +95,57 @@ pub fn find_file<'a>(initrd: &'a [u8], path: &str) -> Result<Option<InitrdFile<'
     Ok(None)
 }
 
+/// Iterate the entry paths in an initrd, reading only the header + entry table from
+/// `buf` — the file *data* need not be present, so a listing (the shell's `ls`) can
+/// `vmo_read` just the first few KiB of the initrd VMO instead of the whole image.
+///
+/// Yields nothing if the magic or version is wrong. An entry whose path field or
+/// non-UTF-8 path runs past `buf` is skipped, so a too-small buffer truncates the list
+/// rather than faulting. The yielded `&str`s borrow from `buf`.
+pub fn entry_paths(buf: &[u8]) -> impl Iterator<Item = &str> {
+    let count = if buf.len() >= INITRD_HEADER_LEN
+        && buf[..8] == INITRD_MAGIC
+        && read_u32(buf, 8) == Ok(INITRD_VERSION)
+    {
+        read_u32(buf, 12).unwrap_or(0) as usize
+    } else {
+        0
+    };
+    (0..count).filter_map(move |index| {
+        let base = INITRD_HEADER_LEN + index * INITRD_ENTRY_LEN;
+        let path_field = buf.get(base..base + INITRD_PATH_MAX)?;
+        let path_len = path_field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(INITRD_PATH_MAX);
+        core::str::from_utf8(&path_field[..path_len]).ok()
+    })
+}
+
+/// Return the number of bytes needed to hold the initrd header plus its whole
+/// entry table. File payload bytes are not included.
+pub fn entry_table_bytes(buf: &[u8]) -> Result<usize, InitrdError> {
+    if buf.len() < INITRD_HEADER_LEN {
+        return Err(InitrdError::TooSmall);
+    }
+    if buf[..8] != INITRD_MAGIC {
+        return Err(InitrdError::BadMagic);
+    }
+
+    let version = read_u32(buf, 8)?;
+    if version != INITRD_VERSION {
+        return Err(InitrdError::BadVersion);
+    }
+
+    let entry_count = read_u32(buf, 12)? as usize;
+    let table_bytes = entry_count
+        .checked_mul(INITRD_ENTRY_LEN)
+        .ok_or(InitrdError::BadRange)?;
+    INITRD_HEADER_LEN
+        .checked_add(table_bytes)
+        .ok_or(InitrdError::BadRange)
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, InitrdError> {
     let end = offset.checked_add(4).ok_or(InitrdError::BadRange)?;
     if end > bytes.len() {
@@ -141,6 +204,57 @@ mod tests {
         let file = find_file(&initrd, SORA_INIT_PATH).unwrap().unwrap();
         assert_eq!(file.path, SORA_INIT_PATH);
         assert_eq!(file.bytes, b"elf-ish");
+    }
+
+    fn table_of(paths: &[&str]) -> std::vec::Vec<u8> {
+        let mut initrd = std::vec![0; INITRD_HEADER_LEN + paths.len() * INITRD_ENTRY_LEN];
+        initrd[..8].copy_from_slice(&INITRD_MAGIC);
+        initrd[8..12].copy_from_slice(&INITRD_VERSION.to_le_bytes());
+        initrd[12..16].copy_from_slice(&(paths.len() as u32).to_le_bytes());
+        for (index, path) in paths.iter().enumerate() {
+            let base = INITRD_HEADER_LEN + index * INITRD_ENTRY_LEN;
+            initrd[base..base + path.len()].copy_from_slice(path.as_bytes());
+        }
+        initrd
+    }
+
+    #[test]
+    fn entry_paths_lists_every_entry() {
+        let table = table_of(&[SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
+        let paths: std::vec::Vec<&str> = entry_paths(&table).collect();
+        assert_eq!(paths, std::vec![SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
+    }
+
+    #[test]
+    fn entry_table_bytes_counts_header_and_entries() {
+        let table = table_of(&[SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
+        assert_eq!(
+            entry_table_bytes(&table),
+            Ok(INITRD_HEADER_LEN + 3 * INITRD_ENTRY_LEN)
+        );
+    }
+
+    #[test]
+    fn entry_table_bytes_rejects_bad_header() {
+        assert_eq!(entry_table_bytes(b"short"), Err(InitrdError::TooSmall));
+        let mut table = table_of(&[HELLO_PATH]);
+        table[..8].copy_from_slice(b"badmagic");
+        assert_eq!(entry_table_bytes(&table), Err(InitrdError::BadMagic));
+        table[..8].copy_from_slice(&INITRD_MAGIC);
+        table[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(entry_table_bytes(&table), Err(InitrdError::BadVersion));
+    }
+
+    #[test]
+    fn entry_paths_empty_on_bad_magic_and_truncation() {
+        assert_eq!(entry_paths(b"not-an-initrd").count(), 0);
+        // A header claiming 2 entries but a buffer holding only one entry's bytes:
+        // the second (past the buffer) is skipped, not a panic.
+        let mut table = table_of(&[HELLO_PATH, AUTOEXEC_PATH]);
+        table[12..16].copy_from_slice(&2u32.to_le_bytes());
+        table.truncate(INITRD_HEADER_LEN + INITRD_ENTRY_LEN); // drop the 2nd entry's bytes
+        let paths: std::vec::Vec<&str> = entry_paths(&table).collect();
+        assert_eq!(paths, std::vec![HELLO_PATH]);
     }
 
     #[test]

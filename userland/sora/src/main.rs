@@ -5,7 +5,7 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
-    BootInfo, Errno, Handle, Rights, VmarFlags, DRV_BLK_PATH, DRV_FB_PATH, FAT32_IMG_PATH,
+    BootInfo, Errno, Handle, Rights, VmarFlags, AUTOEXEC_PATH, FAT32_IMG_PATH, LS_PATH,
     PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
@@ -429,28 +429,44 @@ extern "C" fn sora_main(
         debug_write(b"timer irq ok\n".as_ptr(), 13);
     }
 
-    // Spawn drv-serial with only the PL011 device grant — its MMIO page and its
-    // single IRQ line — not Sora's root Resource.
-    let serial_res_h = resource_create_child(
-        res,
-        QEMU_PL011_MMIO_BASE,
-        QEMU_PL011_MMIO_SIZE,
-        QEMU_PL011_IRQ,
-        1,
-    );
-    if serial_res_h == u64::MAX {
-        log(b"drv-serial: resource fail\n");
-    } else if run_elf(
-        initrd,
-        kumo_abi::DRV_SERIAL_PATH.as_bytes(),
-        serial_res_h,
-        console_handle,
-        1, // async
-        b"drv-serial",
-    ) {
-        log(b"drv-serial: run ok\n");
+    // Spawn drv-serial — but ONLY on the serial-console path (no framebuffer).
+    //
+    // drv-serial is the QEMU PL011 input driver: it owns the UART at 0x0900_0000 /
+    // IRQ 33 and forwards RX bytes to the console channel so the kernel's serial shell
+    // has a keyboard. On the framebuffer console path (the X13s) there is no PL011 at
+    // that address. The mint+map still SUCCEED (the root Resource spans all of phys, so
+    // resource_create_child/ResourceMintMmio range-checks pass), but drv-serial's first
+    // MMIO access — the RXIM unmask write at drv-serial/main.rs — stalls the interconnect
+    // on the absent/unclocked peripheral and hard-hangs the core. That is the boot freeze
+    // whose last visible line is "drv-serial starting" (printed just before that write).
+    // The kernel takes its own serial-shell branch exactly when there is no framebuffer
+    // (kernel/src/lib.rs: `if report.has_framebuffer { halt } else { serial shell }`), so
+    // gate the PL011 driver on the same signal: `fb_va == 0` ⇔ serial path. On the X13s
+    // there is no kernel keyboard anyway (the fb path halts), so skipping it loses nothing.
+    if fb_va == 0 {
+        let serial_res_h = resource_create_child(
+            res,
+            QEMU_PL011_MMIO_BASE,
+            QEMU_PL011_MMIO_SIZE,
+            QEMU_PL011_IRQ,
+            1,
+        );
+        if serial_res_h == u64::MAX {
+            log(b"drv-serial: resource fail\n");
+        } else if run_elf(
+            initrd,
+            kumo_abi::DRV_SERIAL_PATH.as_bytes(),
+            serial_res_h,
+            console_handle,
+            1, // async
+            b"drv-serial",
+        ) {
+            log(b"drv-serial: run ok\n");
+        } else {
+            log(b"drv-serial: run fail\n");
+        }
     } else {
-        log(b"drv-serial: run fail\n");
+        log(b"drv-serial: skipped (framebuffer console, no PL011)\n");
     }
 
     // J160/J161: spawn drv-blk — the ramdisk block driver (M6/P7).
@@ -559,16 +575,31 @@ extern "C" fn sora_main(
             len,
         };
         match FatVolume::mount(&mut disk) {
-            Ok(vol) => match vol.find_in_root(&mut disk, b"HELLO   TXT") {
-                Some(entry) => {
-                    let mut data = [0u8; 16];
-                    let n = vol.read_file(&mut disk, &entry, &mut data);
-                    log(b"fatfs: HELLO.TXT = ");
-                    debug_write(data.as_ptr(), n);
-                    log(b"\n");
+            Ok(vol) => {
+                match vol.find_in_root(&mut disk, b"HELLO   TXT") {
+                    Some(entry) => {
+                        let mut data = [0u8; 16];
+                        let n = vol.read_file(&mut disk, &entry, &mut data);
+                        log(b"fatfs: HELLO.TXT = ");
+                        debug_write(data.as_ptr(), n);
+                        log(b"\n");
+                    }
+                    None => log(b"fatfs: HELLO.TXT missing\n"),
                 }
-                None => log(b"fatfs: HELLO.TXT missing\n"),
-            },
+                // J179 consumer: resolve a file in a real SUBDIRECTORY by path
+                // (kumo-fatfs find_in_dir + resolve_path, J177/J178). The image
+                // now ships an ESP-shaped /EFI/BOOT/BOOTAA64.EFI subtree.
+                match vol.resolve_path(&mut disk, b"/EFI/BOOT/BOOTAA64.EFI") {
+                    Some(entry) => {
+                        let mut data = [0u8; 16];
+                        let n = vol.read_file(&mut disk, &entry, &mut data);
+                        log(b"fatfs-path: /EFI/BOOT/BOOTAA64.EFI = ");
+                        debug_write(data.as_ptr(), n);
+                        log(b"\n");
+                    }
+                    None => log(b"fatfs-path: /EFI/BOOT/BOOTAA64.EFI missing\n"),
+                }
+            }
             Err(_) => log(b"fatfs: mount failed\n"),
         }
     } else {
@@ -985,6 +1016,42 @@ extern "C" fn sora_main(
         log(b"M10 elf: run fail\n");
     }
 
+    // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
+    // authority; Sora keeps the full bootstrap handle for its own loader duties.
+    let prog_initrd = handle_duplicate(initrd, Rights::READ);
+    if prog_initrd == 0 || prog_initrd == u64::MAX {
+        log(b"initrd read-only dup fail\n");
+    }
+
+    // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
+    // one shell command per line, `#` comments and blanks skipped (`kumoza::autoexec_lines`).
+    // Each line is parsed and dispatched through the SAME `eval_command` as interactive input,
+    // so `run <prog>` launches a program (the J181 synchronous path) and `echo …` prints — the
+    // manifest speaks the shell's own syntax. This is the X13s shell-vertical stopgap: commands
+    // you add to the manifest run at boot and paint to the framebuffer with NO keyboard. Manifest
+    // is small; a fixed buffer avoids the heap.
+    let mut manifest = [0u8; 256];
+    match find_initrd_file(initrd, AUTOEXEC_PATH.as_bytes()) {
+        Some((off, len)) => {
+            let n = (len as usize).min(manifest.len());
+            if vmo_read(initrd, off, manifest.as_mut_ptr(), n) == 0 {
+                for line in kumoza::autoexec_lines(&manifest[..n]) {
+                    if let Ok(ls) = core::str::from_utf8(line) {
+                        if let Some(stmt) = parse(ls) {
+                            kumoza::evaluate(&stmt, |cmd| {
+                                eval_command(cmd, line, initrd, prog_initrd, root)
+                            });
+                        }
+                    }
+                }
+                log(b"autoexec: done\n");
+            } else {
+                log(b"autoexec: read fail\n");
+            }
+        }
+        None => log(b"autoexec: no manifest\n"),
+    }
+
     // Stage-C: spawn TWO real servers as independent resident processes, each with its own
     // request channel and port. Proves the kernel's per-thread wait queue routes each
     // client's traffic to exactly the server that owns its port — no cross-wake (Journal 134).
@@ -1131,23 +1198,7 @@ extern "C" fn sora_main(
                                 if let Some(stmt) = parse(ls) {
                                     let cl = &line_buf[..line_pos];
                                     kumoza::evaluate(&stmt, |cmd| {
-                                        if cmd.name == "echo" {
-                                            for (j, a) in cmd.args.iter().enumerate() {
-                                                if j > 0 {
-                                                    debug_write(b" ".as_ptr(), 1);
-                                                }
-                                                debug_write(a.as_ptr(), a.len());
-                                            }
-                                            debug_write(b"\n".as_ptr(), 1);
-                                        } else if cmd.name == "help" {
-                                            let msg = b"KUMO Sora userspace shell (scaffold)\n\
-                                                builtins: echo, help\n\
-                                                other commands run via kernel shell\n";
-                                            debug_write(msg.as_ptr(), msg.len());
-                                        } else if !cmd.name.is_empty() {
-                                            channel_write(root, cl.as_ptr(), cl.len());
-                                        }
-                                        true
+                                        eval_command(cmd, cl, initrd, prog_initrd, root)
                                     });
                                 }
                             }
@@ -1221,6 +1272,73 @@ fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {
         }
     }
     None
+}
+
+/// Dispatch one parsed shell command. Shared by the interactive line editor and the
+/// boot autoexec (J183), so both speak the same syntax: `echo`/`help`/`ls`/`run` are
+/// handled by this dispatcher; any other non-empty command is forwarded verbatim (`raw`, the
+/// original line bytes) to the kernel shell over the `root` channel. `prog_initrd` is a
+/// read-only initrd handle granted to `ls` (capability-passing, J186). Always returns
+/// `true` — a builtin failure logs but never aborts the surrounding `kumoza::evaluate`.
+fn eval_command(
+    cmd: &kumoza::Command,
+    raw: &[u8],
+    initrd: Handle,
+    prog_initrd: u64,
+    root: Handle,
+) -> bool {
+    if cmd.name == "echo" {
+        for (j, a) in cmd.args.iter().enumerate() {
+            if j > 0 {
+                debug_write(b" ".as_ptr(), 1);
+            }
+            debug_write(a.as_ptr(), a.len());
+        }
+        debug_write(b"\n".as_ptr(), 1);
+    } else if cmd.name == "help" {
+        let msg = b"KUMO Sora userspace shell (scaffold)\n\
+            builtins: echo, help, ls, run <program>\n\
+            other commands run via kernel shell\n";
+        debug_write(msg.as_ptr(), msg.len());
+    } else if cmd.name == "ls" {
+        // ls: list the initrd's entries from an ordinary program that receives only a
+        // read-only initrd handle — the first capability-using KUMO userland command.
+        if prog_initrd == 0 || prog_initrd == u64::MAX {
+            debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
+        } else {
+            run_elf(initrd, LS_PATH.as_bytes(), prog_initrd, 0, 0, b"ls");
+        }
+    } else if cmd.name == "run" {
+        // run <program>: spawn bin/<program> from the initrd and run it to completion.
+        // The interactive twin of the boot autoexec — both drive the same `run_program`.
+        if let Some(prog) = cmd.args.first() {
+            run_program(initrd, 0, prog.as_bytes());
+        } else {
+            debug_write(b"usage: run <program>\n".as_ptr(), 21);
+        }
+    } else if !cmd.name.is_empty() {
+        channel_write(root, raw.as_ptr(), raw.len());
+    }
+    true
+}
+
+/// Run an initrd program by short name: spawn `bin/<name>` to completion (synchronous,
+/// `flags=0` — the J181 exec-vertical path). `arg` is the single capability handed to
+/// the program in `x0` (the kernel dups it into the child on `ProcessRun`), or `0` to
+/// grant nothing — so the launcher decides what authority a program gets (`ls` grants a
+/// read-only initrd; `run <name>` grants none). The `bin/` prefix is built into a fixed
+/// buffer (no heap). Returns whether the program ran (false also logs the reason).
+fn run_program(initrd: Handle, arg: u64, name: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"bin/";
+    let mut path = [0u8; 64];
+    if PREFIX.len() + name.len() > path.len() {
+        debug_write(b"run: name too long\n".as_ptr(), 19);
+        return false;
+    }
+    path[..PREFIX.len()].copy_from_slice(PREFIX);
+    path[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
+    let full = &path[..PREFIX.len() + name.len()];
+    run_elf(initrd, full, arg, 0, 0, full)
 }
 
 fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {

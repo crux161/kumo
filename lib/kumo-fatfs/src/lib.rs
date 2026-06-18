@@ -15,7 +15,10 @@
 //!   * derive the on-disk geometry (FAT region, data region, cluster→sector),
 //!   * decode a 32-byte short (8.3) directory entry,
 //!   * decode a FAT-table entry and follow a file's cluster chain to its end,
-//!   * mount a volume and read a file by 8.3 name through a [`SectorReader`].
+//!   * mount a volume and read a file by 8.3 name through a [`SectorReader`],
+//!     including positioned reads for the vfs `Read { offset, len }` protocol,
+//!   * find an entry in any directory (not just the root), and resolve a
+//!     `/`-separated, case-insensitive ESP path (`/EFI/BOOT/BOOTAA64.EFI`).
 //!
 //! It owns no device and performs no I/O itself — every read goes through a
 //! [`SectorReader`] the caller supplies (over `drv-blk` in the server, over a
@@ -211,6 +214,43 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
     })
 }
 
+/// Encode one path component into the raw 8.3 name field a [`DirEntry`] stores
+/// (8-byte base + 3-byte extension, space-padded, no dot) so it can be matched
+/// against an on-disk entry.
+///
+/// The component must be a valid short name: a base of 1..=8 bytes and an
+/// optional extension of 1..=3 bytes separated by a single `.`. ASCII letters
+/// fold to upper case, because UEFI paths are case-insensitive (so `boot`
+/// matches the on-disk `BOOT`). A multi-dot name (a true long name) or one whose
+/// base/extension is too long has no 8.3 form and yields `None`; so do `.` and
+/// `..` (this is name encoding, not `.`/`..` path navigation). Allocation-free.
+pub fn name_to_83(component: &[u8]) -> Option<[u8; 11]> {
+    if component.is_empty() {
+        return None;
+    }
+    let (base, ext): (&[u8], &[u8]) = match component.iter().position(|&b| b == b'.') {
+        None => (component, b""),
+        Some(i) => {
+            let ext = &component[i + 1..];
+            if ext.contains(&b'.') {
+                return None; // a second dot -> not a short name
+            }
+            (&component[..i], ext)
+        }
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    for (i, &b) in base.iter().enumerate() {
+        out[i] = b.to_ascii_uppercase();
+    }
+    for (i, &b) in ext.iter().enumerate() {
+        out[8 + i] = b.to_ascii_uppercase();
+    }
+    Some(out)
+}
+
 /// FAT32 entries are 32-bit but only the low 28 bits are meaningful; the top 4
 /// bits are reserved and must be ignored when interpreting a link.
 pub const FAT32_ENTRY_MASK: u32 = 0x0FFF_FFFF;
@@ -332,15 +372,27 @@ impl FatVolume {
     }
 
     /// Find a file or subdirectory by raw 8.3 name (space-padded, e.g.
-    /// `b"HELLO   TXT"`) in the root directory. Walks the root's cluster chain
-    /// sector by sector; returns the first matching [`DirEntry`].
-    pub fn find_in_root<R: SectorReader>(
+    /// `b"HELLO   TXT"`) inside the directory whose data begins at `dir_cluster`.
+    /// Walks that directory's own cluster chain sector by sector and returns the
+    /// first matching [`DirEntry`].
+    ///
+    /// This is the engine behind [`find_in_root`]; pass a subdirectory entry's
+    /// [`DirEntry::first_cluster`] to descend the ESP tree one level at a time —
+    /// resolve `EFI`, then `BOOT`, then `BOOTAA64.EFI` (the nested layout the ESP
+    /// role requires, `DESIGN/010 §4`). Returns `None` if `dir_cluster` is a
+    /// reserved cluster (< 2), a sector read fails, or the directory ends with no
+    /// match.
+    pub fn find_in_dir<R: SectorReader>(
         &self,
         reader: &mut R,
+        dir_cluster: u32,
         name: &[u8; 11],
     ) -> Option<DirEntry> {
+        if dir_cluster < 2 {
+            return None;
+        }
         let spc = self.bpb.sectors_per_cluster as u32;
-        let mut cluster = self.bpb.root_cluster;
+        let mut cluster = dir_cluster;
         let mut buf = [0u8; SECTOR_SIZE];
         loop {
             let first = self.bpb.cluster_to_sector(cluster);
@@ -365,6 +417,45 @@ impl FatVolume {
         }
     }
 
+    /// Find a file or subdirectory by raw 8.3 name in the **root** directory — a
+    /// thin wrapper over [`find_in_dir`] at [`Bpb::root_cluster`].
+    pub fn find_in_root<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        name: &[u8; 11],
+    ) -> Option<DirEntry> {
+        self.find_in_dir(reader, self.bpb.root_cluster, name)
+    }
+
+    /// Resolve a `/`-separated path from the root to the [`DirEntry`] it names —
+    /// the ESP lookup `DESIGN/010 §4` needs (`/EFI/BOOT/BOOTAA64.EFI`). Splits
+    /// the path on `/` (a leading slash and empty components are ignored, so
+    /// `/EFI/BOOT/X`, `EFI/BOOT/X`, and `EFI//BOOT/X` are equivalent), encodes
+    /// each component with [`name_to_83`], and descends with [`find_in_dir`].
+    ///
+    /// Every component except the last must resolve to a subdirectory; otherwise
+    /// — or if any component is missing, is not a valid 8.3 name, or the path has
+    /// no components — returns `None`. Allocation-free.
+    pub fn resolve_path<R: SectorReader>(&self, reader: &mut R, path: &[u8]) -> Option<DirEntry> {
+        let mut comps = path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty())
+            .peekable();
+        let mut cluster = self.bpb.root_cluster;
+        while let Some(comp) = comps.next() {
+            let name = name_to_83(comp)?;
+            let entry = self.find_in_dir(reader, cluster, &name)?;
+            if comps.peek().is_none() {
+                return Some(entry); // last component: the target itself
+            }
+            if !entry.is_dir() {
+                return None; // an interior component must be a directory to descend
+            }
+            cluster = entry.first_cluster;
+        }
+        None // empty path (no components)
+    }
+
     /// Read `entry`'s data into `out`, following its cluster chain. Copies at
     /// most `min(entry.size, out.len())` bytes and returns how many were written
     /// (which may be short if a sector read fails or the chain ends early).
@@ -374,13 +465,29 @@ impl FatVolume {
         entry: &DirEntry,
         out: &mut [u8],
     ) -> usize {
-        let limit = (entry.size as usize).min(out.len());
-        if limit == 0 || entry.first_cluster < 2 {
+        self.read_file_at(reader, entry, 0, out)
+    }
+
+    /// Read `entry`'s data into `out` starting at byte `offset`, following its
+    /// cluster chain. Copies at most `min(entry.size - offset, out.len())` bytes
+    /// and returns how many were written. Offsets at or past EOF return 0. This
+    /// is the read primitive the vfs protocol's `Read { offset, len }` maps onto.
+    pub fn read_file_at<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        entry: &DirEntry,
+        offset: u64,
+        out: &mut [u8],
+    ) -> usize {
+        let size = entry.size as u64;
+        if offset >= size || out.is_empty() || entry.first_cluster < 2 {
             return 0;
         }
+        let limit = ((size - offset).min(out.len() as u64)) as usize;
         let spc = self.bpb.sectors_per_cluster as u32;
         let mut cluster = entry.first_cluster;
         let mut buf = [0u8; SECTOR_SIZE];
+        let mut skip = offset;
         let mut written = 0usize;
         loop {
             let first = self.bpb.cluster_to_sector(cluster);
@@ -388,11 +495,17 @@ impl FatVolume {
                 if written >= limit {
                     return written;
                 }
+                if skip >= SECTOR_SIZE as u64 {
+                    skip -= SECTOR_SIZE as u64;
+                    continue;
+                }
                 if !reader.read_sector(first + s, &mut buf) {
                     return written;
                 }
-                let take = (limit - written).min(SECTOR_SIZE);
-                out[written..written + take].copy_from_slice(&buf[..take]);
+                let start = skip as usize;
+                skip = 0;
+                let take = (limit - written).min(SECTOR_SIZE - start);
+                out[written..written + take].copy_from_slice(&buf[start..start + take]);
                 written += take;
             }
             match self.next_link(reader, cluster) {
@@ -634,9 +747,11 @@ mod tests {
     }
 
     /// A `SectorReader` over xtask's fixture image. Sectors 0/32/96/97 mirror the
-    /// real `build_fat32_image()` (BPB, FAT, root dir, HELLO.TXT). A synthetic
-    /// `BIG.BIN` (cluster 4 -> 5, 600 bytes) is added — the real fixture has no
-    /// multi-cluster file — to exercise the chain-spanning read loop.
+    /// real `build_fat32_image()` (BPB, FAT, root dir, HELLO.TXT). Two synthetic
+    /// additions exercise loops the real fixture cannot: `BIG.BIN` (cluster 4 -> 5,
+    /// 600 bytes) for the chain-spanning read, and an ESP-shaped subtree
+    /// `EFI/BOOT/BOOTAA64.EFI` (clusters 6/7/8) for nested-directory descent
+    /// (`DESIGN/010 §4`).
     struct FixtureDisk;
     impl SectorReader for FixtureDisk {
         fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
@@ -644,13 +759,18 @@ mod tests {
             match lba {
                 0 => *buf = fixture_boot_sector(),
                 32 => {
-                    // FAT: 0/1 reserved, 2/3 single-cluster EOF, 4 -> 5, 5 EOF.
+                    // FAT: 0/1 reserved; 2/3 single-cluster EOF; 4 -> 5, 5 EOF
+                    // (BIG.BIN); 6/7/8 single-cluster EOF (EFI dir, BOOT dir,
+                    // BOOTAA64.EFI).
                     let entries = [
                         0x0FFF_FFF8u32,
                         0x0FFF_FFFF,
                         0x0FFF_FFFF,
                         0x0FFF_FFFF,
                         5,
+                        0x0FFF_FFFF,
+                        0x0FFF_FFFF,
+                        0x0FFF_FFFF,
                         0x0FFF_FFFF,
                     ];
                     for (i, e) in entries.iter().enumerate() {
@@ -662,11 +782,37 @@ mod tests {
                     buf[32..64].copy_from_slice(&dir_entry(b"README  TXT", attr::ARCHIVE, 0, 128));
                     buf[64..96].copy_from_slice(&dir_entry(b"HELLO   TXT", attr::ARCHIVE, 3, 6));
                     buf[96..128].copy_from_slice(&dir_entry(b"BIG     BIN", attr::ARCHIVE, 4, 600));
-                    // offset 128 stays 0x00 -> end of directory.
+                    buf[128..160].copy_from_slice(&dir_entry(
+                        b"EFI        ",
+                        attr::DIRECTORY,
+                        6,
+                        0,
+                    ));
+                    // offset 160 stays 0x00 -> end of directory.
                 }
                 97 => buf[..6].copy_from_slice(b"hello!"),
                 98 => *buf = [0xAA; SECTOR_SIZE], // BIG.BIN cluster 4
                 99 => *buf = [0xBB; SECTOR_SIZE], // BIG.BIN cluster 5
+                100 => {
+                    // EFI/ (cluster 6): real subdirs open with `.` and `..`, which
+                    // the scan must skip before reaching BOOT (cluster 7).
+                    buf[0..32].copy_from_slice(&dir_entry(b".          ", attr::DIRECTORY, 6, 0));
+                    buf[32..64].copy_from_slice(&dir_entry(b"..         ", attr::DIRECTORY, 2, 0));
+                    buf[64..96].copy_from_slice(&dir_entry(b"BOOT       ", attr::DIRECTORY, 7, 0));
+                    // offset 96 stays 0x00 -> end of directory.
+                }
+                101 => {
+                    // EFI/BOOT/ (cluster 7): `.`, `..`, then BOOTAA64.EFI (cluster 8).
+                    buf[0..32].copy_from_slice(&dir_entry(b".          ", attr::DIRECTORY, 7, 0));
+                    buf[32..64].copy_from_slice(&dir_entry(b"..         ", attr::DIRECTORY, 6, 0));
+                    buf[64..96].copy_from_slice(&dir_entry(b"BOOTAA64EFI", attr::ARCHIVE, 8, 512));
+                    // offset 96 stays 0x00 -> end of directory.
+                }
+                102 => {
+                    // EFI/BOOT/BOOTAA64.EFI (cluster 8): a PE "MZ" header + filler.
+                    *buf = [0xCC; SECTOR_SIZE];
+                    buf[..2].copy_from_slice(b"MZ");
+                }
                 _ => {}
             }
             true
@@ -697,6 +843,27 @@ mod tests {
     }
 
     #[test]
+    fn reads_file_at_offset() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol.find_in_root(&mut FixtureDisk, b"HELLO   TXT").unwrap();
+
+        let mut out = [0u8; 4];
+        let n = vol.read_file_at(&mut FixtureDisk, &entry, 1, &mut out);
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], b"ello");
+    }
+
+    #[test]
+    fn read_file_at_offset_past_eof_is_empty() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol.find_in_root(&mut FixtureDisk, b"HELLO   TXT").unwrap();
+
+        let mut out = [0u8; 4];
+        assert_eq!(vol.read_file_at(&mut FixtureDisk, &entry, 6, &mut out), 0);
+        assert_eq!(vol.read_file_at(&mut FixtureDisk, &entry, 100, &mut out), 0);
+    }
+
+    #[test]
     fn reads_multi_cluster_file() {
         // BIG.BIN spans clusters 4 -> 5; 600 bytes = a full sector + 88 bytes.
         let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
@@ -711,9 +878,137 @@ mod tests {
     }
 
     #[test]
+    fn read_file_at_crosses_cluster_boundary() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let entry = vol.find_in_root(&mut FixtureDisk, b"BIG     BIN").unwrap();
+
+        let mut out = [0u8; 96];
+        let n = vol.read_file_at(&mut FixtureDisk, &entry, 510, &mut out);
+        assert_eq!(n, 90); // bytes 510..600
+        assert_eq!(&out[..2], &[0xAA, 0xAA]);
+        assert!(out[2..90].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
     fn missing_file_returns_none() {
         let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
         assert_eq!(vol.find_in_root(&mut FixtureDisk, b"NOPE    TXT"), None);
+    }
+
+    #[test]
+    fn resolves_file_in_nested_subdirectory() {
+        // The gate (DESIGN/010 §4): the ESP keeps its boot loader two directories
+        // deep at EFI/BOOT/BOOTAA64.EFI, so a root-only lookup cannot reach it.
+        // Descend by applying find_in_dir to each path component's cluster.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+
+        let efi = vol
+            .find_in_root(&mut FixtureDisk, b"EFI        ")
+            .expect("EFI dir in root");
+        assert!(efi.is_dir());
+
+        let boot = vol
+            .find_in_dir(&mut FixtureDisk, efi.first_cluster, b"BOOT       ")
+            .expect("BOOT dir in EFI");
+        assert!(boot.is_dir());
+
+        let app = vol
+            .find_in_dir(&mut FixtureDisk, boot.first_cluster, b"BOOTAA64EFI")
+            .expect("BOOTAA64.EFI in EFI/BOOT");
+        assert!(!app.is_dir());
+        assert_eq!(app.size, 512);
+
+        // And its bytes read back end-to-end through read_file.
+        let mut out = [0u8; 512];
+        let n = vol.read_file(&mut FixtureDisk, &app, &mut out);
+        assert_eq!(n, 512);
+        assert_eq!(&out[..2], b"MZ"); // the PE header the fixture planted
+
+        // A name absent from the subdirectory returns None, not a root hit.
+        assert_eq!(
+            vol.find_in_dir(&mut FixtureDisk, boot.first_cluster, b"HELLO   TXT"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_in_dir_rejects_reserved_clusters() {
+        // Clusters 0 and 1 are reserved; descending into them would underflow
+        // cluster_to_sector, so the guard must short-circuit to None.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        assert_eq!(vol.find_in_dir(&mut FixtureDisk, 0, b"EFI        "), None);
+        assert_eq!(vol.find_in_dir(&mut FixtureDisk, 1, b"EFI        "), None);
+    }
+
+    #[test]
+    fn name_to_83_encodes_short_names() {
+        assert_eq!(name_to_83(b"HELLO.TXT"), Some(*b"HELLO   TXT"));
+        assert_eq!(name_to_83(b"EFI"), Some(*b"EFI        ")); // no extension
+        assert_eq!(name_to_83(b"boot"), Some(*b"BOOT       ")); // case-folded
+        assert_eq!(name_to_83(b"bootaa64.efi"), Some(*b"BOOTAA64EFI")); // full 8.3
+    }
+
+    #[test]
+    fn name_to_83_rejects_non_short_names() {
+        assert_eq!(name_to_83(b""), None); // empty component
+        assert_eq!(name_to_83(b"."), None); // empty base
+        assert_eq!(name_to_83(b"TOOLONGAA.TXT"), None); // base > 8
+        assert_eq!(name_to_83(b"FILE.LONG"), None); // extension > 3
+        assert_eq!(name_to_83(b"A.B.C"), None); // multi-dot -> a true long name
+    }
+
+    #[test]
+    fn resolve_path_reaches_nested_esp_file() {
+        // The gate: hand the reader the ESP path and get the boot loader back.
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let app = vol
+            .resolve_path(&mut FixtureDisk, b"/EFI/BOOT/BOOTAA64.EFI")
+            .expect("resolve /EFI/BOOT/BOOTAA64.EFI");
+        assert!(!app.is_dir());
+        assert_eq!(app.size, 512);
+        assert_eq!(app.first_cluster, 8);
+
+        let mut out = [0u8; 512];
+        assert_eq!(vol.read_file(&mut FixtureDisk, &app, &mut out), 512);
+        assert_eq!(&out[..2], b"MZ"); // the PE header the fixture planted
+    }
+
+    #[test]
+    fn resolve_path_is_case_insensitive_and_slash_lenient() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let want = vol
+            .resolve_path(&mut FixtureDisk, b"/EFI/BOOT/BOOTAA64.EFI")
+            .unwrap();
+        // lower case (UEFI paths are case-insensitive)
+        assert_eq!(
+            vol.resolve_path(&mut FixtureDisk, b"/efi/boot/bootaa64.efi"),
+            Some(want)
+        );
+        // no leading slash, plus a doubled separator -> empty components ignored
+        assert_eq!(
+            vol.resolve_path(&mut FixtureDisk, b"EFI//BOOT/BOOTAA64.EFI"),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn resolve_path_root_entries_and_rejections() {
+        let vol = FatVolume::mount(&mut FixtureDisk).unwrap();
+        // a single component resolves a root file
+        let hello = vol.resolve_path(&mut FixtureDisk, b"/HELLO.TXT").unwrap();
+        assert_eq!(hello.size, 6);
+        assert_eq!(hello.first_cluster, 3);
+        // a path may also name a directory
+        assert!(vol
+            .resolve_path(&mut FixtureDisk, b"/EFI/BOOT")
+            .unwrap()
+            .is_dir());
+        // rejections: missing leaf, an interior component that is a file, and a
+        // path with no components.
+        assert_eq!(vol.resolve_path(&mut FixtureDisk, b"/EFI/NOPE.TXT"), None);
+        assert_eq!(vol.resolve_path(&mut FixtureDisk, b"/HELLO.TXT/X"), None);
+        assert_eq!(vol.resolve_path(&mut FixtureDisk, b""), None);
+        assert_eq!(vol.resolve_path(&mut FixtureDisk, b"/"), None);
     }
 
     #[test]

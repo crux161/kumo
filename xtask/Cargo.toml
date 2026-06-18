@@ -9,6 +9,10 @@ version.workspace = true
 imager = { path = "../imager" }
 kumo-abi.workspace = true
 
+[dev-dependencies]
+# Host-test the generated bin/fat32.img with the same reader that runs on target.
+kumo-fatfs = { path = "../lib/kumo-fatfs" }
+
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
