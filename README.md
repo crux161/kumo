@@ -9,7 +9,15 @@
 
 > *Outwardly, the system is KUMO — a drifting cloud. Inwardly, the privileged core is Ziwei (紫微) — the still seat residing in Pleroma. Nijigumo bridges earth to Heaven at boot; thereafter, Ziwei reigns at the still center and, should all else fall apart, remains to reconstruct the whole.*
 
-**KUMO** is a clean-room, `#![no_std]` Rust rewrite of the `soso` monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, and MMU plumbing, while pushing all other services (drivers, filesystems, network, TTY) into fault-isolated, restartable userspace servers.
+**KUMO** is a clean-room, `#![no_std]` Rust rewrite of the [soso](https://github.com/ozkl/soso) monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, and MMU plumbing, while pushing all other services (drivers, filesystems, network, TTY) into fault-isolated, restartable userspace servers.
+
+I'd like to take a brief moment to thank ozkl (and their contributors) for all the fine work they put into developing soso. It has provided a lot of inspiration to inform the general functionality of KUMO and it's core components. Also, the devs working on:
+- [motor-os](https://github.com/moturus/motor-os) 
+- Fuchia (Zircon)
+- XNU/Mach 
+- seL4
+
+All of them have given excellent points about pitfalls, implementation, and have truly shaped the internal discourse surrounding this project. KUMO is still obviously in active development, but over time I hope it can become something different but still purposeful in people's lives.
 
 ## 🏛️ Architecture
 
