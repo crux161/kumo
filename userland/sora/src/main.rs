@@ -5,7 +5,7 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
-    BootInfo, Errno, Handle, Rights, VmarFlags, AUTOEXEC_PATH, FAT32_IMG_PATH, LS_PATH,
+    BootInfo, Errno, Handle, Rights, VmarFlags, AUTOEXEC_PATH, CAT_PATH, FAT32_IMG_PATH, LS_PATH,
     PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
@@ -1345,6 +1345,29 @@ fn eval_command(
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
         return true;
+    } else if cmd.name == "cat" {
+        // cat combines both program-startup slots: the read-only initrd capability in
+        // x0 and its read-only argv VMO in x1. Only this explicit shell launcher grants
+        // the filesystem image; plain `run cat ...` remains authority-free.
+        if cmd.args.len() != 1 {
+            debug_write(b"usage: cat <path>\n".as_ptr(), 18);
+        } else if prog_initrd == 0 || prog_initrd == u64::MAX {
+            debug_write(b"cat: no initrd handle\n".as_ptr(), 22);
+        } else {
+            let argv_handle = build_command_argv_handle(cmd);
+            if argv_handle == 0 {
+                debug_write(b"cat: argv unavailable\n".as_ptr(), 22);
+            } else {
+                run_elf(
+                    initrd,
+                    CAT_PATH.as_bytes(),
+                    prog_initrd,
+                    argv_handle,
+                    0,
+                    b"cat",
+                );
+            }
+        }
     } else if cmd.name == "ls" {
         // ls: list the initrd's entries from an ordinary program that receives only a
         // read-only initrd handle — the first capability-using KUMO userland command.
@@ -1377,11 +1400,6 @@ fn build_argv_handle(argv: &[alloc::string::String]) -> u64 {
     if argv.is_empty() {
         return 0;
     }
-    let vmo = ARGV_VMO.load(Ordering::Relaxed);
-    let vmo_ro = ARGV_VMO_RO.load(Ordering::Relaxed);
-    if vmo == 0 || vmo == u64::MAX || vmo_ro == 0 || vmo_ro == u64::MAX {
-        return 0;
-    }
     // Collect argv as byte-slices in a bounded, heap-free array, then pack.
     const MAX_ARGS: usize = 16;
     let mut slots: [&[u8]; MAX_ARGS] = [b""; MAX_ARGS];
@@ -1390,8 +1408,31 @@ fn build_argv_handle(argv: &[alloc::string::String]) -> u64 {
         slots[count] = arg.as_bytes();
         count += 1;
     }
+    write_argv_handle(&slots[..count])
+}
+
+/// Build argv from a parsed command (`argv[0]` = command name), used by builtins
+/// that launch a native program while granting it an explicit capability.
+fn build_command_argv_handle(cmd: &kumoza::Command) -> u64 {
+    const MAX_ARGS: usize = 16;
+    let mut slots: [&[u8]; MAX_ARGS] = [b""; MAX_ARGS];
+    slots[0] = cmd.name.as_bytes();
+    let mut count = 1;
+    for arg in cmd.args.iter().take(MAX_ARGS - 1) {
+        slots[count] = arg.as_bytes();
+        count += 1;
+    }
+    write_argv_handle(&slots[..count])
+}
+
+fn write_argv_handle(argv: &[&[u8]]) -> u64 {
+    let vmo = ARGV_VMO.load(Ordering::Relaxed);
+    let vmo_ro = ARGV_VMO_RO.load(Ordering::Relaxed);
+    if vmo == 0 || vmo == u64::MAX || vmo_ro == 0 || vmo_ro == u64::MAX {
+        return 0;
+    }
     let mut buf = [0u8; 256];
-    let written = match kumo_abi::pack_argv(&slots[..count], &mut buf) {
+    let written = match kumo_abi::pack_argv(argv, &mut buf) {
         Some(n) => n,
         None => return 0, // argv exceeds the 256-byte VMO; run with none rather than fail
     };

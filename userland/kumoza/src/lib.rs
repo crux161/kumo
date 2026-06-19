@@ -44,7 +44,7 @@ pub struct Statement {
 
 /// Help text for the current Kumoza builtin scaffold.
 pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
-    builtins: echo, help, ls, run <program>\n\
+    builtins: cat <path>, echo, help, ls, run <program>\n\
     other commands run via kernel shell\n";
 
 /// Tokenize a line into a single `Command`. Splits on ASCII whitespace.

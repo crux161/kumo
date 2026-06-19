@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    ARGS_PATH, AUTOEXEC_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, HELLO_PATH,
+    ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH, HELLO_PATH,
     INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION, LS_PATH,
     PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
@@ -698,6 +698,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let hello = build_hello_image(&workspace_root()?)?;
             let ls = build_ls_image(&workspace_root()?)?;
             let args = build_args_image(&workspace_root()?)?;
+            let cat = build_cat_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
@@ -711,6 +712,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (HELLO_PATH, hello.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),
+                (CAT_PATH, cat.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
             ])?
         }
@@ -822,14 +824,16 @@ fn build_ttyd_image(root: &Path) -> Result<Vec<u8>, String> {
 /// `#` comments and blanks ignored (`kumoza::autoexec_lines`), each dispatched by Sora's
 /// shared `eval_command`. `echo` proves a builtin runs at boot, `ls` lists what's
 /// installed, `run hello` launches a program, and `run args alpha beta` proves argument
-/// passing (the program echoes its argv) — together exercising the shared evaluator end
-/// to end; the comment line proves comment-skipping.
+/// passing (the program echoes its argv), and `cat` combines argv with a granted read-only
+/// initrd capability — together exercising the shared evaluator end to end; the comment
+/// line proves comment-skipping.
 fn build_autoexec() -> Vec<u8> {
     b"# KUMO autoexec: shell command lines; '#' comments and blank lines ignored\n\
       echo kumo autoexec online\n\
       ls\n\
       run hello\n\
-      run args alpha beta\n"
+      run args alpha beta\n\
+      cat etc/autoexec\n"
         .to_vec()
 }
 
@@ -903,6 +907,29 @@ fn build_args_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as args ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_cat_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "cat",
+            "--bin",
+            "cat",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root.join("target/aarch64-unknown-none/release").join("cat");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as cat ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 

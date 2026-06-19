@@ -23,6 +23,9 @@ pub const LS_PATH: &str = "bin/ls";
 /// passing: it receives a read-only argv VMO handle in `x1` and walks it with
 /// [`crate::unpack_argv`].
 pub const ARGS_PATH: &str = "bin/args";
+/// `cat` receives a read-only initrd VMO in `x0` and argv in `x1`, then streams
+/// the named initrd entry to standard debug output.
+pub const CAT_PATH: &str = "bin/cat";
 /// The input-less boot script Sora runs from the initrd: one `bin/<name>` per
 /// line, `#` comments and blanks ignored. The X13s autoexec stopgap — programs
 /// run and paint to the framebuffer with no keyboard. Parsed by `kumoza`.
@@ -43,6 +46,54 @@ pub struct InitrdFile<'a> {
     pub path: &'a str,
     pub offset: u64,
     pub bytes: &'a [u8],
+}
+
+/// Metadata for one initrd entry, parsed from the header + entry table without
+/// requiring the file payload to be present in the input buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitrdEntry<'a> {
+    pub path: &'a str,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Find a named entry using only the initrd header + complete entry table.
+///
+/// This is the streaming counterpart to [`find_file`]: callers such as `cat`
+/// first read the small table, then read the payload directly from `offset` in
+/// bounded chunks instead of mapping or buffering the whole initrd.
+pub fn find_entry<'a>(table: &'a [u8], path: &str) -> Result<Option<InitrdEntry<'a>>, InitrdError> {
+    let table_end = entry_table_bytes(table)?;
+    if table_end > table.len() {
+        return Err(InitrdError::TruncatedTable);
+    }
+
+    let entry_count = read_u32(table, 12)? as usize;
+    for index in 0..entry_count {
+        let base = INITRD_HEADER_LEN + index * INITRD_ENTRY_LEN;
+        let path_bytes = &table[base..base + INITRD_PATH_MAX];
+        let path_len = path_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(INITRD_PATH_MAX);
+        let entry_path =
+            core::str::from_utf8(&path_bytes[..path_len]).map_err(|_| InitrdError::BadPath)?;
+        let offset = read_u64(table, base + INITRD_PATH_MAX)?;
+        let len = read_u64(table, base + INITRD_PATH_MAX + 8)?;
+        let _end = offset.checked_add(len).ok_or(InitrdError::BadRange)?;
+        if offset < table_end as u64 {
+            return Err(InitrdError::BadRange);
+        }
+
+        if entry_path == path {
+            return Ok(Some(InitrdEntry {
+                path: entry_path,
+                offset,
+                len,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub fn find_file<'a>(initrd: &'a [u8], path: &str) -> Result<Option<InitrdFile<'a>>, InitrdError> {
@@ -258,6 +309,28 @@ mod tests {
                 (HELLO_PATH, 15u64),
                 (AUTOEXEC_PATH, 73u64),
             ]
+        );
+    }
+
+    #[test]
+    fn finds_entry_metadata_without_payload() {
+        let initrd = one_file(AUTOEXEC_PATH, b"echo cloud\n");
+        let table_len = INITRD_HEADER_LEN + INITRD_ENTRY_LEN;
+        let entry = find_entry(&initrd[..table_len], AUTOEXEC_PATH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.path, AUTOEXEC_PATH);
+        assert_eq!(entry.offset, table_len as u64);
+        assert_eq!(entry.len, 11);
+        assert_eq!(find_entry(&initrd[..table_len], "missing"), Ok(None));
+    }
+
+    #[test]
+    fn find_entry_requires_the_complete_table() {
+        let table = table_of(&[HELLO_PATH, AUTOEXEC_PATH]);
+        assert_eq!(
+            find_entry(&table[..INITRD_HEADER_LEN + INITRD_ENTRY_LEN], HELLO_PATH),
+            Err(InitrdError::TruncatedTable)
         );
     }
 
