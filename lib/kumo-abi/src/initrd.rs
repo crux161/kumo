@@ -5,6 +5,7 @@ pub const INITRD_PATH_MAX: usize = 64;
 pub const INITRD_VERSION: u32 = 1;
 pub const SORA_INIT_PATH: &str = "bin/sora";
 pub const SVC_HEALTH_PATH: &str = "bin/svc-health";
+pub const TTYD_PATH: &str = "bin/ttyd";
 pub const DRV_SERIAL_PATH: &str = "bin/drv-serial";
 pub const DRV_FB_PATH: &str = "bin/drv-fb";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
@@ -103,6 +104,14 @@ pub fn find_file<'a>(initrd: &'a [u8], path: &str) -> Result<Option<InitrdFile<'
 /// non-UTF-8 path runs past `buf` is skipped, so a too-small buffer truncates the list
 /// rather than faulting. The yielded `&str`s borrow from `buf`.
 pub fn entry_paths(buf: &[u8]) -> impl Iterator<Item = &str> {
+    entries(buf).map(|(path, _size)| path)
+}
+
+/// Like [`entry_paths`], but also yields each entry's **payload size in bytes** (the
+/// `len` field of the entry, independent of the file data being present in `buf`). The
+/// shell's `ls` uses this for an `ls -l`-style listing. Same magic/version guard and
+/// past-`buf` truncation behavior as [`entry_paths`].
+pub fn entries(buf: &[u8]) -> impl Iterator<Item = (&str, u64)> {
     let count = if buf.len() >= INITRD_HEADER_LEN
         && buf[..8] == INITRD_MAGIC
         && read_u32(buf, 8) == Ok(INITRD_VERSION)
@@ -118,7 +127,10 @@ pub fn entry_paths(buf: &[u8]) -> impl Iterator<Item = &str> {
             .iter()
             .position(|byte| *byte == 0)
             .unwrap_or(INITRD_PATH_MAX);
-        core::str::from_utf8(&path_field[..path_len]).ok()
+        let path = core::str::from_utf8(&path_field[..path_len]).ok()?;
+        // Entry layout: path[0..64] · offset[64..72] · len[72..80] (LE).
+        let size = read_u64(buf, base + INITRD_PATH_MAX + 8).ok()?;
+        Some((path, size))
     })
 }
 
@@ -223,6 +235,26 @@ mod tests {
         let table = table_of(&[SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
         let paths: std::vec::Vec<&str> = entry_paths(&table).collect();
         assert_eq!(paths, std::vec![SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
+    }
+
+    #[test]
+    fn entries_yields_path_and_size() {
+        // table_of leaves the len field zero; stamp distinct sizes to prove `entries`
+        // reads each entry's `len` field, not the (absent) payload.
+        let mut table = table_of(&[SORA_INIT_PATH, HELLO_PATH, AUTOEXEC_PATH]);
+        for (index, size) in [4096u64, 15, 73].iter().enumerate() {
+            let len_off = INITRD_HEADER_LEN + index * INITRD_ENTRY_LEN + INITRD_PATH_MAX + 8;
+            table[len_off..len_off + 8].copy_from_slice(&size.to_le_bytes());
+        }
+        let listed: std::vec::Vec<(&str, u64)> = entries(&table).collect();
+        assert_eq!(
+            listed,
+            std::vec![
+                (SORA_INIT_PATH, 4096u64),
+                (HELLO_PATH, 15u64),
+                (AUTOEXEC_PATH, 73u64),
+            ]
+        );
     }
 
     #[test]

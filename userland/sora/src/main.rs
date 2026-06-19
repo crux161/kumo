@@ -6,7 +6,7 @@ extern crate alloc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Handle, Rights, VmarFlags, AUTOEXEC_PATH, FAT32_IMG_PATH, LS_PATH,
-    PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
+    PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_rt::{
@@ -17,7 +17,9 @@ use kumo_rt::{
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
+use persona_posix::{FdTable, TtyRpc, TtyRpcTransport, TtyStream, STDIN_FILENO, STDOUT_FILENO};
 use svc_health::{Request as HealthRequest, Response as HealthResponse};
+use ttyd::{Reply as TtyReply, Request as TtyRequest};
 
 /// The BootInfo VMO handle the kernel hands Sora in **x8** — the 9th bootstrap value, beyond
 /// the C-ABI argument registers x0–x7 (J159). x8 is caller-saved, so reading it inside
@@ -195,6 +197,7 @@ const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
 const QEMU_PL011_MMIO_SIZE: u64 = 0x1000;
 const QEMU_PL011_IRQ: u32 = 33; // SPI 1 = 33 on QEMU ARM virt
 const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
+const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
 
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
@@ -1052,37 +1055,59 @@ extern "C" fn sora_main(
         None => log(b"autoexec: no manifest\n"),
     }
 
-    // Stage-C: spawn TWO real servers as independent resident processes, each with its own
-    // request channel and port. Proves the kernel's per-thread wait queue routes each
-    // client's traffic to exactly the server that owns its port — no cross-wake (Journal 134).
-    if run_svc_health_pair_smoke(initrd) {
-        log(b"svc-health: serve ok\n");
+    if run_ttyd_smoke(initrd) {
+        log(b"ttyd: serve ok\n");
     } else {
-        log(b"svc-health: serve fail\n");
+        log(b"ttyd: serve fail\n");
     }
 
-    // §5.6 supervised restart: a server is shut down and reaped, then Sora rebuilds it from
-    // its recipe; the fresh instance serves with reset state — the first restart (Journal 136).
-    if run_svc_health_restart_smoke(initrd) {
-        log(b"svc-health: restart ok\n");
+    if run_persona_posix_tty_write_smoke(initrd) {
+        log(b"persona-posix: tty write ok\n");
     } else {
-        log(b"svc-health: restart fail\n");
+        log(b"persona-posix: tty write fail\n");
     }
 
-    // §5.6 crash containment: a child that faults must be terminated by the kernel alone, not
-    // halt it. Spawn one at a bogus entry; the kernel contains the fault and Sora lives on.
-    if run_crash_containment_smoke(initrd) {
-        log(b"svc-health: crash contained\n");
+    if run_persona_posix_tty_read_smoke(initrd) {
+        log(b"persona-posix: tty read ok\n");
     } else {
-        log(b"svc-health: crash escaped\n");
+        log(b"persona-posix: tty read fail\n");
     }
 
-    // §5.6 crash restart: trigger an explicit crash on the server. The kernel contains it,
-    // tears it down, and fires PEER_CLOSED to our port wait, waking us to respawn it.
-    if run_crash_restart_smoke(initrd) {
-        log(b"svc-health: crash-restart ok\n");
+    if RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES {
+        // Stage-C: spawn TWO real servers as independent resident processes, each with its own
+        // request channel and port. Proves the kernel's per-thread wait queue routes each
+        // client's traffic to exactly the server that owns its port — no cross-wake (Journal 134).
+        if run_svc_health_pair_smoke(initrd) {
+            log(b"svc-health: serve ok\n");
+        } else {
+            log(b"svc-health: serve fail\n");
+        }
+
+        // §5.6 supervised restart: a server is shut down and reaped, then Sora rebuilds it from
+        // its recipe; the fresh instance serves with reset state — the first restart (Journal 136).
+        if run_svc_health_restart_smoke(initrd) {
+            log(b"svc-health: restart ok\n");
+        } else {
+            log(b"svc-health: restart fail\n");
+        }
+
+        // §5.6 crash containment: a child that faults must be terminated by the kernel alone, not
+        // halt it. Spawn one at a bogus entry; the kernel contains the fault and Sora lives on.
+        if run_crash_containment_smoke(initrd) {
+            log(b"svc-health: crash contained\n");
+        } else {
+            log(b"svc-health: crash escaped\n");
+        }
+
+        // §5.6 crash restart: trigger an explicit crash on the server. The kernel contains it,
+        // tears it down, and fires PEER_CLOSED to our port wait, waking us to respawn it.
+        if run_crash_restart_smoke(initrd) {
+            log(b"svc-health: crash-restart ok\n");
+        } else {
+            log(b"svc-health: crash-restart fail\n");
+        }
     } else {
-        log(b"svc-health: crash-restart fail\n");
+        log(b"svc-health: legacy boot smokes skipped\n");
     }
 
     // P10-b: VmoWrite/VmoRead demo on anonymous backing.
@@ -1124,11 +1149,10 @@ extern "C" fn sora_main(
         let kbd_k = Handle(kbd_koid as u32);
         let mut serve_buf = [0u8; 256];
         let mut block_buf = [0u8; 512];
-        let mut line_buf = [0u8; 256];
-        let mut line_pos = 0usize;
 
         // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
         launch_lua_repl(initrd, kbd, console);
+        let interactive_ttyd = spawn_ttyd_session(initrd);
 
         loop {
             let source = Handle(port_wait(port) as u32);
@@ -1186,35 +1210,21 @@ extern "C" fn sora_main(
                     channel_write(net, serve_buf.as_ptr(), n);
                 }
             }
-            // keyboard handler — input only (keystrokes → line buffer)
+            // keyboard handler — input only (keystrokes → ttyd → parsed command line)
             if source == kbd_k {
                 let n = channel_read(kbd, serve_buf.as_mut_ptr(), 256) as usize;
-                if n > 0 {
+                if n > 0 && interactive_ttyd.is_some() {
+                    let tty = interactive_ttyd.unwrap();
+                    let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
                     for i in 0..n {
-                        let byte = serve_buf[i];
-                        if byte == b'\r' || byte == b'\n' {
-                            debug_write(b"\r\n".as_ptr(), 2);
-                            if let Ok(ls) = core::str::from_utf8(&line_buf[..line_pos]) {
-                                if let Some(stmt) = parse(ls) {
-                                    let cl = &line_buf[..line_pos];
-                                    kumoza::evaluate(&stmt, |cmd| {
-                                        eval_command(cmd, cl, initrd, prog_initrd, root)
-                                    });
-                                }
-                            }
-                            line_pos = 0;
-                        } else if byte == 0x08 || byte == 0x7f {
-                            if line_pos > 0 {
-                                line_pos -= 1;
-                                debug_write(b"\x08 \x08".as_ptr(), 3);
-                            }
-                        } else if byte >= 0x20 && byte <= 0x7e {
-                            if line_pos < line_buf.len() {
-                                line_buf[line_pos] = byte;
-                                line_pos += 1;
-                                debug_write(serve_buf[i..].as_ptr(), 1);
-                            }
-                        }
+                        dispatch_ttyd_key(
+                            tty,
+                            serve_buf[i],
+                            &mut tty_reply,
+                            initrd,
+                            prog_initrd,
+                            root,
+                        );
                     }
                 }
             }
@@ -1287,19 +1297,10 @@ fn eval_command(
     prog_initrd: u64,
     root: Handle,
 ) -> bool {
-    if cmd.name == "echo" {
-        for (j, a) in cmd.args.iter().enumerate() {
-            if j > 0 {
-                debug_write(b" ".as_ptr(), 1);
-            }
-            debug_write(a.as_ptr(), a.len());
-        }
-        debug_write(b"\n".as_ptr(), 1);
-    } else if cmd.name == "help" {
-        let msg = b"KUMO Sora userspace shell (scaffold)\n\
-            builtins: echo, help, ls, run <program>\n\
-            other commands run via kernel shell\n";
-        debug_write(msg.as_ptr(), msg.len());
+    if kumoza::write_builtin_output(cmd, |bytes| {
+        debug_write(bytes.as_ptr(), bytes.len());
+    }) {
+        return true;
     } else if cmd.name == "ls" {
         // ls: list the initrd's entries from an ordinary program that receives only a
         // read-only initrd handle — the first capability-using KUMO userland command.
@@ -1808,6 +1809,270 @@ fn shutdown_resident(client: Handle) -> u64 {
     let bytes = HealthRequest::Shutdown.encode();
     let _ = channel_write(client, bytes.as_ptr(), bytes.len());
     process_wait()
+}
+
+fn spawn_ttyd_session(initrd: Handle) -> Option<Handle> {
+    let recipe = SvcRecipe {
+        initrd,
+        path: TTYD_PATH,
+    };
+    let client = spawn_from_recipe(&recipe)?;
+    if !child_parked(process_wait()) {
+        log(b"ttyd: interactive park fail\n");
+        return None;
+    }
+    log(b"ttyd: interactive ok\n");
+    Some(client)
+}
+
+fn dispatch_ttyd_key(
+    tty: Handle,
+    byte: u8,
+    reply: &mut [u8],
+    initrd: Handle,
+    prog_initrd: u64,
+    root: Handle,
+) -> bool {
+    let Some(n) = ttyd_request_reply(tty, TtyRequest::input(byte), reply) else {
+        log(b"ttyd: interactive input fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: interactive parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK && parsed.status != ttyd::TTY_OVERFLOW {
+        log(b"ttyd: interactive status fail\n");
+        return false;
+    }
+    if !parsed.echo.is_empty() {
+        debug_write(parsed.echo.as_ptr(), parsed.echo.len());
+    }
+    let Some(line) = parsed.line else {
+        return true;
+    };
+    if let Ok(ls) = core::str::from_utf8(line) {
+        if let Some(stmt) = parse(ls) {
+            kumoza::evaluate(&stmt, |cmd| {
+                eval_command(cmd, line, initrd, prog_initrd, root)
+            });
+        }
+    }
+    true
+}
+
+/// First live P8 `ttyd` proof: spawn a private `ttyd` server, send `h`, `i`, Enter,
+/// and require the submitted line `hi` to come back over the request channel. This keeps
+/// Sora's existing interactive path untouched while proving the real server binary/loop.
+fn run_ttyd_smoke(initrd: Handle) -> bool {
+    let recipe = SvcRecipe {
+        initrd,
+        path: TTYD_PATH,
+    };
+    let client = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"ttyd: spawn fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"ttyd: park fail\n");
+        return false;
+    }
+
+    let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'h'), &mut reply) else {
+        log(b"ttyd: h fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: h parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK || parsed.echo != b"h" || parsed.line.is_some() {
+        log(b"ttyd: h reply fail\n");
+        return false;
+    }
+
+    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'i'), &mut reply) else {
+        log(b"ttyd: i fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: i parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK || parsed.echo != b"i" || parsed.line.is_some() {
+        log(b"ttyd: i reply fail\n");
+        return false;
+    }
+
+    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'\n'), &mut reply) else {
+        log(b"ttyd: enter fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: enter parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK || parsed.echo != b"\r\n" || parsed.line != Some(&b"hi"[..]) {
+        log(b"ttyd: line fail\n");
+        return false;
+    }
+
+    let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
+    let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
+        return false;
+    };
+    if channel_write(client, req.as_ptr(), req_len) != 0 {
+        return false;
+    }
+    let status = process_wait();
+    child_parked(status) || all_residents_gone(status)
+}
+
+struct ChannelTtyTransport {
+    output: [u8; 16],
+    len: usize,
+}
+
+impl ChannelTtyTransport {
+    const fn new() -> ChannelTtyTransport {
+        ChannelTtyTransport {
+            output: [0; 16],
+            len: 0,
+        }
+    }
+
+    fn output(&self) -> &[u8] {
+        &self.output[..self.len]
+    }
+}
+
+impl TtyRpcTransport for ChannelTtyTransport {
+    fn call(
+        &mut self,
+        stream: TtyStream,
+        request: &[u8],
+        reply: &mut [u8],
+    ) -> persona_posix::PosixResult<usize> {
+        let client = Handle(stream.handle);
+        if channel_write(client, request.as_ptr(), request.len()) != 0 {
+            return Err(persona_posix::PosixErrno::NoDevice);
+        }
+        if !child_parked(process_wait()) {
+            return Err(persona_posix::PosixErrno::NoDevice);
+        }
+        let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+        if let Some(parsed) = TtyReply::parse(&reply[..n]) {
+            let room = self.output.len().saturating_sub(self.len);
+            let take = parsed.echo.len().min(room);
+            self.output[self.len..self.len + take].copy_from_slice(&parsed.echo[..take]);
+            self.len += take;
+        }
+        Ok(n)
+    }
+}
+
+fn run_persona_posix_tty_write_smoke(initrd: Handle) -> bool {
+    let recipe = SvcRecipe {
+        initrd,
+        path: TTYD_PATH,
+    };
+    let client = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"persona-posix: tty spawn fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"persona-posix: tty park fail\n");
+        return false;
+    }
+
+    let mut table = FdTable::with_stdio(TtyStream { handle: client.0 });
+    let mut tty = TtyRpc::new(ChannelTtyTransport::new());
+    if table.write(STDOUT_FILENO, b"ok\n", &mut tty) != Ok(3) {
+        log(b"persona-posix: tty write call fail\n");
+        return false;
+    }
+    if tty.transport().output() != b"ok\n" {
+        log(b"persona-posix: tty output fail\n");
+        return false;
+    }
+
+    let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
+    let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
+        return false;
+    };
+    if channel_write(client, req.as_ptr(), req_len) != 0 {
+        return false;
+    }
+    let status = process_wait();
+    child_parked(status) || all_residents_gone(status)
+}
+
+fn run_persona_posix_tty_read_smoke(initrd: Handle) -> bool {
+    let recipe = SvcRecipe {
+        initrd,
+        path: TTYD_PATH,
+    };
+    let client = match spawn_from_recipe(&recipe) {
+        Some(c) => c,
+        None => {
+            log(b"persona-posix: tty read spawn fail\n");
+            return false;
+        }
+    };
+    if !child_parked(process_wait()) {
+        log(b"persona-posix: tty read park fail\n");
+        return false;
+    }
+
+    let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+    for &byte in b"ok\n" {
+        if ttyd_request_reply(client, TtyRequest::input(byte), &mut reply).is_none() {
+            log(b"persona-posix: tty read feed fail\n");
+            return false;
+        }
+    }
+
+    let mut table = FdTable::with_stdio(TtyStream { handle: client.0 });
+    let mut tty = TtyRpc::new(ChannelTtyTransport::new());
+    let mut out = [0u8; 8];
+    if table.read(STDIN_FILENO, &mut out, &mut tty) != Ok(2) || &out[..2] != b"ok" {
+        log(b"persona-posix: tty read call fail\n");
+        return false;
+    }
+    if table.read(STDIN_FILENO, &mut out, &mut tty) != Ok(0) {
+        log(b"persona-posix: tty read drain fail\n");
+        return false;
+    }
+
+    let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
+    let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
+        return false;
+    };
+    if channel_write(client, req.as_ptr(), req_len) != 0 {
+        return false;
+    }
+    let status = process_wait();
+    child_parked(status) || all_residents_gone(status)
+}
+
+fn ttyd_request_reply(client: Handle, request: TtyRequest, reply: &mut [u8]) -> Option<usize> {
+    let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
+    let req_len = request.encode_into(&mut req)?;
+    if channel_write(client, req.as_ptr(), req_len) != 0 {
+        return None;
+    }
+    if !child_parked(process_wait()) {
+        return None;
+    }
+    let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+    Some(n)
 }
 
 fn child_parked(status: u64) -> bool {

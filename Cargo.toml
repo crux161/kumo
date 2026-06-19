@@ -17,11 +17,13 @@ members = [
     "userland/kumo-rt",
     "userland/kumoza",
     "userland/persona-linux",
+    "userland/persona-posix",
     "userland/servers/drv-blk",
     "userland/servers/drv-fb",
     "userland/servers/drv-serial",
     "userland/servers/fatfs",
     "userland/servers/svc-health",
+    "userland/servers/ttyd",
     "userland/sora",
     "xtask",
 ]

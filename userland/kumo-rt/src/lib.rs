@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-use core::panic::PanicInfo;
 use kumo_abi::{Handle, Status};
 
 pub mod heap;
@@ -25,9 +24,9 @@ pub fn init() {
     // for future explicit initialization if we switch to VMO-backed heaps.
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     sys::process_exit(1);
 }
 

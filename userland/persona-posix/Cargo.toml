@@ -1,0 +1,12 @@
+[package]
+name = "persona-posix"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ttyd = { path = "../servers/ttyd" }

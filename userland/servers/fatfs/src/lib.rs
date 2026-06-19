@@ -8,15 +8,28 @@
 //! maps `kumo-vfs` Open/Read requests onto `kumo-fatfs`. It owns no device and
 //! has no runtime dependency: a resident binary will later wrap this handler with
 //! a `Channel` transport and a `SectorReader` over `drv-blk`.
+//!
+//! The durable truth is still the mounted FAT volume. The per-server open table is
+//! reconnectable soft state, so a supervised restart can rebuild it by reopening
+//! paths rather than recovering private RAM.
+
+#[cfg(test)]
+extern crate alloc;
 
 use kumo_fatfs::{DirEntry, FatVolume, SectorReader};
 use kumo_vfs::{
-    encode_open_ok, encode_status, Request, VFS_BAD_HANDLE, VFS_BAD_REQUEST, VFS_IS_DIR,
+    encode_open_ok, encode_status, Request, MAX_PATH, VFS_BAD_HANDLE, VFS_BAD_REQUEST, VFS_IS_DIR,
     VFS_NOT_FOUND, VFS_OK,
 };
 
 /// Maximum number of open file handles in this first fixed table.
 pub const MAX_OPEN_FILES: usize = 8;
+
+/// Largest `Open` request frame accepted by `kumo-vfs`.
+pub const REQUEST_BUF_BYTES: usize = 3 + MAX_PATH;
+
+/// Inline read payload cap for this first userspace loop, plus one status byte.
+pub const REPLY_BUF_BYTES: usize = 1 + 256;
 
 /// Per-server open file table. Handles are small positive integers; `0` is
 /// deliberately invalid so protocol bugs are easy to spot.
@@ -49,6 +62,77 @@ impl OpenTable {
 }
 
 impl Default for OpenTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The request/reply transport the server runs over. The real implementation
+/// will wrap a KUMO `Channel`; tests use an in-memory fake so the serve loop is
+/// host-testable before the resident binary exists.
+pub trait Transport {
+    /// Receive one request frame into `buf`, returning its length, or `None` when
+    /// the peer has closed and the serve loop should exit.
+    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+
+    /// Send one reply frame.
+    fn send(&mut self, frame: &[u8]);
+}
+
+/// FAT vfs server state. The open table is connection-local soft state; file
+/// bytes and metadata remain disk-backed through [`FatVolume`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FatServer {
+    open_files: OpenTable,
+}
+
+impl FatServer {
+    pub const fn new() -> FatServer {
+        FatServer {
+            open_files: OpenTable::new(),
+        }
+    }
+
+    /// Handle exactly one transport request/reply exchange. Returns `false` when
+    /// the transport closes before yielding a request.
+    pub fn serve_once<R: SectorReader, T: Transport>(
+        &mut self,
+        volume: &FatVolume,
+        reader: &mut R,
+        transport: &mut T,
+        request_buf: &mut [u8],
+        reply_buf: &mut [u8],
+    ) -> bool {
+        let Some(n) = transport.recv(request_buf) else {
+            return false;
+        };
+        let reply_len = dispatch(
+            volume,
+            reader,
+            &mut self.open_files,
+            &request_buf[..n],
+            reply_buf,
+        );
+        if reply_len != 0 {
+            transport.send(&reply_buf[..reply_len]);
+        }
+        true
+    }
+
+    /// Run request/reply exchanges until the transport closes.
+    pub fn serve<R: SectorReader, T: Transport>(
+        &mut self,
+        volume: &FatVolume,
+        reader: &mut R,
+        transport: &mut T,
+    ) {
+        let mut request_buf = [0u8; REQUEST_BUF_BYTES];
+        let mut reply_buf = [0u8; REPLY_BUF_BYTES];
+        while self.serve_once(volume, reader, transport, &mut request_buf, &mut reply_buf) {}
+    }
+}
+
+impl Default for FatServer {
     fn default() -> Self {
         Self::new()
     }
@@ -129,6 +213,8 @@ fn write_frame(reply: &mut [u8], frame: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::VecDeque;
+    use alloc::vec::Vec;
     use kumo_fatfs::{attr, FatError, SECTOR_SIZE};
     use kumo_vfs::{parse_open_reply, read_payload, VFS_BAD_REQUEST};
 
@@ -203,6 +289,29 @@ mod tests {
 
     fn mounted() -> FatVolume {
         FatVolume::mount(&mut FixtureDisk).expect("mount fixture")
+    }
+
+    fn encode_request(req: Request<'_>) -> Vec<u8> {
+        let mut buf = [0u8; REQUEST_BUF_BYTES];
+        let n = req.encode_into(&mut buf).expect("encode request");
+        buf[..n].to_vec()
+    }
+
+    struct MockTransport {
+        incoming: VecDeque<Vec<u8>>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl Transport for MockTransport {
+        fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+            let frame = self.incoming.pop_front()?;
+            buf[..frame.len()].copy_from_slice(&frame);
+            Some(frame.len())
+        }
+
+        fn send(&mut self, frame: &[u8]) {
+            self.sent.push(frame.to_vec());
+        }
     }
 
     #[test]
@@ -324,6 +433,69 @@ mod tests {
         );
         assert_eq!(n, 4);
         assert_eq!(read_payload(&tiny_reply[..n]), Ok(&b"hel"[..]));
+    }
+
+    #[test]
+    fn serve_once_replies_to_open_over_transport() {
+        let volume = mounted();
+        let mut server = FatServer::new();
+        let mut transport = MockTransport {
+            incoming: VecDeque::from([encode_request(Request::open(b"/HELLO.TXT"))]),
+            sent: Vec::new(),
+        };
+        let mut request_buf = [0u8; REQUEST_BUF_BYTES];
+        let mut reply_buf = [0u8; REPLY_BUF_BYTES];
+
+        assert!(server.serve_once(
+            &volume,
+            &mut FixtureDisk,
+            &mut transport,
+            &mut request_buf,
+            &mut reply_buf,
+        ));
+
+        assert_eq!(transport.sent.len(), 1);
+        assert_eq!(parse_open_reply(&transport.sent[0]), Ok((1, 6)));
+    }
+
+    #[test]
+    fn serve_preserves_open_table_across_requests() {
+        let volume = mounted();
+        let mut server = FatServer::new();
+        let mut transport = MockTransport {
+            incoming: VecDeque::from([
+                encode_request(Request::open(b"/HELLO.TXT")),
+                encode_request(Request::read(1, 1, 4)),
+            ]),
+            sent: Vec::new(),
+        };
+
+        server.serve(&volume, &mut FixtureDisk, &mut transport);
+
+        assert_eq!(transport.sent.len(), 2);
+        assert_eq!(parse_open_reply(&transport.sent[0]), Ok((1, 6)));
+        assert_eq!(read_payload(&transport.sent[1]), Ok(&b"ello"[..]));
+    }
+
+    #[test]
+    fn serve_stops_when_transport_closes() {
+        let volume = mounted();
+        let mut server = FatServer::new();
+        let mut transport = MockTransport {
+            incoming: VecDeque::new(),
+            sent: Vec::new(),
+        };
+        let mut request_buf = [0u8; REQUEST_BUF_BYTES];
+        let mut reply_buf = [0u8; REPLY_BUF_BYTES];
+
+        assert!(!server.serve_once(
+            &volume,
+            &mut FixtureDisk,
+            &mut transport,
+            &mut request_buf,
+            &mut reply_buf,
+        ));
+        assert!(transport.sent.is_empty());
     }
 
     #[test]

@@ -42,6 +42,11 @@ pub struct Statement {
     pub redirects: Vec<Redirect>,
 }
 
+/// Help text for the current Kumoza builtin scaffold.
+pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
+    builtins: echo, help, ls, run <program>\n\
+    other commands run via kernel shell\n";
+
 /// Tokenize a line into a single `Command`. Splits on ASCII whitespace.
 /// Returns `None` for an empty or all-whitespace line.
 pub fn tokenize(line: &str) -> Option<Command> {
@@ -88,6 +93,29 @@ pub fn evaluate(statement: &Statement, mut handler: impl FnMut(&Command) -> bool
         }
     }
     true
+}
+
+/// Render output-only builtins. Returns `true` when `cmd` was handled.
+///
+/// Sora still owns authority-bearing effects such as `ls`, `run`, and forwarding
+/// unknown commands. This helper is the first pure shell-owned output path so a
+/// future standalone Kumoza process can reuse the exact same builtin behavior.
+pub fn write_builtin_output(cmd: &Command, mut write: impl FnMut(&[u8])) -> bool {
+    if cmd.name == "echo" {
+        for (index, arg) in cmd.args.iter().enumerate() {
+            if index > 0 {
+                write(b" ");
+            }
+            write(arg.as_bytes());
+        }
+        write(b"\n");
+        true
+    } else if cmd.name == "help" {
+        write(HELP_TEXT);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -185,5 +213,45 @@ mod tests {
         });
         assert!(!ok);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn write_builtin_output_echoes_args() {
+        let cmd = tokenize("echo hello little cloud").unwrap();
+        let mut out = Vec::new();
+
+        assert!(write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
+
+        assert_eq!(out, b"hello little cloud\n");
+    }
+
+    #[test]
+    fn write_builtin_output_echoes_blank_line() {
+        let cmd = tokenize("echo").unwrap();
+        let mut out = Vec::new();
+
+        assert!(write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
+
+        assert_eq!(out, b"\n");
+    }
+
+    #[test]
+    fn write_builtin_output_prints_help() {
+        let cmd = tokenize("help").unwrap();
+        let mut out = Vec::new();
+
+        assert!(write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
+
+        assert_eq!(out, HELP_TEXT);
+    }
+
+    #[test]
+    fn write_builtin_output_leaves_effectful_commands_to_sora() {
+        let cmd = tokenize("run hello").unwrap();
+        let mut out = Vec::new();
+
+        assert!(!write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
+
+        assert!(out.is_empty());
     }
 }

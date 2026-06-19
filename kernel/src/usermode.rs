@@ -859,6 +859,32 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                         _ => r[0] = u64::MAX,
                     }
+                } else if num == Syscall::VmoRead as u64 {
+                    // A child reading a VMO it was handed (J186 capability-passing: `bin/ls`
+                    // gets a read-only initrd handle). Validate the destination buffer against
+                    // the CHILD's address space and resolve the handle in the CHILD's table —
+                    // not Sora's. Without this arm the call fell through to the final `else`
+                    // and every child VmoRead returned u64::MAX.
+                    let vmo = Handle(r[0] as u32);
+                    let offset = r[1];
+                    let user_buf = r[2];
+                    let len = (r[3] as usize).min(256);
+                    if !user_range_ok(child, user_buf, len as u64) {
+                        r[0] = u64::MAX;
+                        return;
+                    }
+                    match sora.engine.dispatch(
+                        child,
+                        KernelCall::VmoRead {
+                            vmo,
+                            offset,
+                            dest: user_buf as *mut u8,
+                            len,
+                        },
+                    ) {
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
                 } else {
                     r[0] = u64::MAX;
                 }
