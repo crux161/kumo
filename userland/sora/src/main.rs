@@ -30,6 +30,14 @@ use ttyd::{Reply as TtyReply, Request as TtyRequest};
 /// one place it is still guaranteed live, before any other instruction can touch it.
 static BOOTINFO_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
 
+/// A reusable scratch VMO for handing programs their argv in `x1` (J-argv). Created once
+/// and rewritten per `run`; `ARGV_VMO` is Sora's full-rights write handle and
+/// `ARGV_VMO_RO` the read-only alias granted to children (least privilege — a program
+/// reads its args, can't mutate the shared buffer). Runs are synchronous, so one buffer
+/// is safe to reuse. Statics avoid threading the handles through the shell dispatcher.
+static ARGV_VMO: AtomicU64 = AtomicU64::new(0);
+static ARGV_VMO_RO: AtomicU64 = AtomicU64::new(0);
+
 // Sora's entry. Mirrors `kumo_rt::entry!` (a bare `bl sora_main`) but first stashes x8 into
 // `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
 // untouched. `_start` runs at EL0 with Sora's address space live, so the static (.bss, mapped
@@ -676,7 +684,27 @@ extern "C" fn sora_main(
                         log(b"drv-fb: channel fail\n");
                     }
                 } else {
-                    log(b"drv-fb: resource fail\n");
+                    // X13s-only: this succeeds under QEMU (ramfb) but fails on the laptop,
+                    // and the Sora syscall path collapses the kernel errno to u64::MAX, so the
+                    // bare "resource fail" tells us nothing. The inputs *should* be in range —
+                    // the root Resource spans all of phys, and the loader rejects len==0 before
+                    // setting FLAG_FRAMEBUFFER_PRESENT (niji-uefi). So surface the geometry Sora
+                    // actually read from the BootInfo VMO: zero/garbage values implicate a bad
+                    // snapshot read (the frame-mapping hazard), while sane values (nonzero phys,
+                    // real w/h, len≈w*h*bpp) point instead at a Resource-rights / kernel
+                    // range-check issue to chase next. has_framebuffer() already read true here,
+                    // so the flags field at least came back correct.
+                    log(b"drv-fb: resource fail phys=");
+                    log_hex(fb.phys);
+                    log(b" len=");
+                    log_hex(fb.len);
+                    log(b" w=");
+                    log_hex(fb.width as u64);
+                    log(b" h=");
+                    log_hex(fb.height as u64);
+                    log(b" stride=");
+                    log_hex(fb.stride as u64);
+                    log(b"\n");
                 }
             }
         } else {
@@ -1026,6 +1054,22 @@ extern "C" fn sora_main(
         log(b"initrd read-only dup fail\n");
     }
 
+    // Create the reusable argv scratch VMO + its read-only alias (see the statics). A
+    // program launched with arguments gets the read-only alias in x1; failure here just
+    // means programs run with no argv (degrade, don't abort the boot).
+    let argv_vmo = vmo_create(256);
+    if argv_vmo != u64::MAX {
+        ARGV_VMO.store(argv_vmo, Ordering::Relaxed);
+        let argv_ro = handle_duplicate(Handle(argv_vmo as u32), Rights::READ);
+        if argv_ro != 0 && argv_ro != u64::MAX {
+            ARGV_VMO_RO.store(argv_ro, Ordering::Relaxed);
+        } else {
+            log(b"argv read-only dup fail\n");
+        }
+    } else {
+        log(b"argv vmo create fail\n");
+    }
+
     // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
     // one shell command per line, `#` comments and blanks skipped (`kumoza::autoexec_lines`).
     // Each line is parsed and dispatched through the SAME `eval_command` as interactive input,
@@ -1310,12 +1354,14 @@ fn eval_command(
             run_elf(initrd, LS_PATH.as_bytes(), prog_initrd, 0, 0, b"ls");
         }
     } else if cmd.name == "run" {
-        // run <program>: spawn bin/<program> from the initrd and run it to completion.
-        // The interactive twin of the boot autoexec — both drive the same `run_program`.
-        if let Some(prog) = cmd.args.first() {
-            run_program(initrd, 0, prog.as_bytes());
+        // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
+        // its arguments via a read-only argv VMO (x1). `cmd.args` is already [program, args…],
+        // i.e. the program's argv with argv[0] = its name. The interactive twin of the boot
+        // autoexec — both drive the same `run_program`.
+        if cmd.args.is_empty() {
+            debug_write(b"usage: run <program> [args...]\n".as_ptr(), 31);
         } else {
-            debug_write(b"usage: run <program>\n".as_ptr(), 21);
+            run_program(initrd, &cmd.args);
         }
     } else if !cmd.name.is_empty() {
         channel_write(root, raw.as_ptr(), raw.len());
@@ -1323,13 +1369,51 @@ fn eval_command(
     true
 }
 
-/// Run an initrd program by short name: spawn `bin/<name>` to completion (synchronous,
-/// `flags=0` — the J181 exec-vertical path). `arg` is the single capability handed to
-/// the program in `x0` (the kernel dups it into the child on `ProcessRun`), or `0` to
-/// grant nothing — so the launcher decides what authority a program gets (`ls` grants a
-/// read-only initrd; `run <name>` grants none). The `bin/` prefix is built into a fixed
-/// buffer (no heap). Returns whether the program ran (false also logs the reason).
-fn run_program(initrd: Handle, arg: u64, name: &[u8]) -> bool {
+/// Pack `argv` into the shared scratch VMO and return the read-only handle to grant the
+/// child in `x1`, or `0` for no argv (empty, the VMO unavailable, or argv too large for
+/// the 256-byte buffer). `argv[0]` is the program name (execve convention). The child
+/// `vmo_read`s the handle and walks it with `kumo_abi::unpack_argv`.
+fn build_argv_handle(argv: &[alloc::string::String]) -> u64 {
+    if argv.is_empty() {
+        return 0;
+    }
+    let vmo = ARGV_VMO.load(Ordering::Relaxed);
+    let vmo_ro = ARGV_VMO_RO.load(Ordering::Relaxed);
+    if vmo == 0 || vmo == u64::MAX || vmo_ro == 0 || vmo_ro == u64::MAX {
+        return 0;
+    }
+    // Collect argv as byte-slices in a bounded, heap-free array, then pack.
+    const MAX_ARGS: usize = 16;
+    let mut slots: [&[u8]; MAX_ARGS] = [b""; MAX_ARGS];
+    let mut count = 0;
+    for arg in argv.iter().take(MAX_ARGS) {
+        slots[count] = arg.as_bytes();
+        count += 1;
+    }
+    let mut buf = [0u8; 256];
+    let written = match kumo_abi::pack_argv(&slots[..count], &mut buf) {
+        Some(n) => n,
+        None => return 0, // argv exceeds the 256-byte VMO; run with none rather than fail
+    };
+    // VmoWrite is capped at 256/call; `written <= 256`, so one write suffices. The VMO is
+    // reused across runs — a partial write leaves stale tail bytes, but `unpack_argv`
+    // bounds its walk by the fresh `argc`, so they are never read.
+    if vmo_write(Handle(vmo as u32), 0, buf.as_ptr(), written) != 0 {
+        return 0;
+    }
+    vmo_ro
+}
+
+/// Run an initrd program: spawn `bin/<argv[0]>` to completion (synchronous, `flags=0` —
+/// the J181 exec-vertical path), handing it `argv` in a read-only VMO (`x1`). `x0` (the
+/// capability slot) is `0` — a plain `run` grants no authority; the `ls` builtin is the
+/// capability-granting launcher. The `bin/` prefix is built into a fixed buffer (no
+/// heap). Returns whether the program ran (false also logs the reason).
+fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
+    let name = match argv.first() {
+        Some(n) => n.as_bytes(),
+        None => return false,
+    };
     const PREFIX: &[u8] = b"bin/";
     let mut path = [0u8; 64];
     if PREFIX.len() + name.len() > path.len() {
@@ -1339,7 +1423,8 @@ fn run_program(initrd: Handle, arg: u64, name: &[u8]) -> bool {
     path[..PREFIX.len()].copy_from_slice(PREFIX);
     path[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
     let full = &path[..PREFIX.len() + name.len()];
-    run_elf(initrd, full, arg, 0, 0, full)
+    let argv_handle = build_argv_handle(argv);
+    run_elf(initrd, full, 0, argv_handle, 0, full)
 }
 
 fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {

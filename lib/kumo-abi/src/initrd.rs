@@ -19,6 +19,10 @@ pub const HELLO_PATH: &str = "bin/hello";
 /// capability-less `hello`); launched by the shell's `ls` builtin, which narrows the
 /// initrd to read-only before granting it.
 pub const LS_PATH: &str = "bin/ls";
+/// `args` echoes the arguments it was launched with — the proof program for argv
+/// passing: it receives a read-only argv VMO handle in `x1` and walks it with
+/// [`crate::unpack_argv`].
+pub const ARGS_PATH: &str = "bin/args";
 /// The input-less boot script Sora runs from the initrd: one `bin/<name>` per
 /// line, `#` comments and blanks ignored. The X13s autoexec stopgap — programs
 /// run and paint to the framebuffer with no keyboard. Parsed by `kumoza`.

@@ -12,6 +12,7 @@ members = [
     "lib/kumo-ipc",
     "lib/kumo-vfs",
     "tools/stage-a-smoke",
+    "userland/args",
     "userland/hello",
     "userland/ls",
     "userland/kumo-rt",
