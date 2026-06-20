@@ -5,14 +5,14 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
-    BootInfo, Errno, Handle, Rights, VmarFlags, AUTOEXEC_PATH, CAT_PATH, FAT32_IMG_PATH, LS_PATH,
-    PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
+    BootInfo, Errno, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH, CAT_PATH,
+    FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
-    channel_write_with_handle, debug_write, handle_duplicate, handle_koid, interrupt_create,
-    port_bind, port_create, port_wait, process_create, process_run, process_wait,
+    channel_write_with_handle, debug_write, handle_close, handle_duplicate, handle_koid,
+    interrupt_create, port_bind, port_create, port_wait, process_create, process_run, process_wait,
     resource_create_child, thread_create, thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
@@ -1049,7 +1049,7 @@ extern "C" fn sora_main(
 
     // Narrow the initrd handle before handing it to user programs. `ls` only needs READ
     // authority; Sora keeps the full bootstrap handle for its own loader duties.
-    let prog_initrd = handle_duplicate(initrd, Rights::READ);
+    let prog_initrd = handle_duplicate(initrd, Rights::READ | Rights::DUPLICATE);
     if prog_initrd == 0 || prog_initrd == u64::MAX {
         log(b"initrd read-only dup fail\n");
     }
@@ -1060,7 +1060,7 @@ extern "C" fn sora_main(
     let argv_vmo = vmo_create(256);
     if argv_vmo != u64::MAX {
         ARGV_VMO.store(argv_vmo, Ordering::Relaxed);
-        let argv_ro = handle_duplicate(Handle(argv_vmo as u32), Rights::READ);
+        let argv_ro = handle_duplicate(Handle(argv_vmo as u32), Rights::READ | Rights::DUPLICATE);
         if argv_ro != 0 && argv_ro != u64::MAX {
             ARGV_VMO_RO.store(argv_ro, Ordering::Relaxed);
         } else {
@@ -1068,6 +1068,20 @@ extern "C" fn sora_main(
         }
     } else {
         log(b"argv vmo create fail\n");
+    }
+
+    // Live Sora-side HandleClose proof: close a temporary read-only duplicate, then
+    // HandleKoid must reject that process-local number. The original initrd handle is
+    // untouched and remains the source for program loading.
+    let close_probe = handle_duplicate(initrd, Rights::READ);
+    if close_probe != 0
+        && close_probe != u64::MAX
+        && handle_close(Handle(close_probe as u32)) == Errno::Ok.status()
+        && handle_koid(Handle(close_probe as u32)) == u64::MAX
+    {
+        log(b"handle close: sora ok\n");
+    } else {
+        log(b"handle close: sora fail\n");
     }
 
     // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
@@ -1262,7 +1276,7 @@ extern "C" fn sora_main(
                     let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
                     for i in 0..n {
                         dispatch_ttyd_key(
-                            tty,
+                            tty.client,
                             serve_buf[i],
                             &mut tty_reply,
                             initrd,
@@ -1598,61 +1612,78 @@ fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &
     }
     let child_vmo = Handle(child_vmo_h as u32);
 
-    let mut chunk = [0u8; 256];
-    for segment in segments.iter().take(segment_count) {
-        let mut copied = 0u64;
-        while copied < segment.file_size {
-            let n = ((segment.file_size - copied) as usize).min(chunk.len());
-            if vmo_read(
-                initrd,
-                elf_off + segment.file_offset + copied,
-                chunk.as_mut_ptr(),
-                n,
-            ) != 0
-                || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
-            {
-                log(name);
-                log(b": copy fail\n");
-                return false;
+    // From the first successful allocation onward, all exits break through the one
+    // cleanup point below. Slot 0 owns the loader VMO; slot 1 begins empty and takes
+    // ownership of the process handle if ProcessCreate succeeds.
+    let mut loader_handles = [Some(child_vmo), None];
+    let loaded = 'load: {
+        let mut chunk = [0u8; 256];
+        for segment in segments.iter().take(segment_count) {
+            let mut copied = 0u64;
+            while copied < segment.file_size {
+                let n = ((segment.file_size - copied) as usize).min(chunk.len());
+                if vmo_read(
+                    initrd,
+                    elf_off + segment.file_offset + copied,
+                    chunk.as_mut_ptr(),
+                    n,
+                ) != 0
+                    || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
+                {
+                    log(name);
+                    log(b": copy fail\n");
+                    break 'load false;
+                }
+                copied += n as u64;
             }
-            copied += n as u64;
         }
-    }
 
-    let child_as_h = process_create(0, 0x2000_0000);
-    if child_as_h == u64::MAX {
-        log(name);
-        log(b": process fail\n");
-        return false;
-    }
-    let child_as = Handle(child_as_h as u32);
-
-    for segment in segments.iter().take(segment_count) {
-        let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
-        let virt = align_down(segment.virt_addr);
-        let vmo_offset = align_down(segment.file_offset);
-        let len = match align_up(page_delta.saturating_add(segment.mem_size)) {
-            Some(len) => len,
-            None => {
-                log(name);
-                log(b": map len fail\n");
-                return false;
-            }
-        };
-        if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
+        let child_as_h = process_create(0, 0x2000_0000);
+        if child_as_h == u64::MAX {
             log(name);
-            log(b": map fail\n");
-            return false;
+            log(b": process fail\n");
+            break 'load false;
         }
-    }
+        let child_as = Handle(child_as_h as u32);
+        loader_handles[1] = Some(child_as);
 
-    if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
+        for segment in segments.iter().take(segment_count) {
+            let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
+            let virt = align_down(segment.virt_addr);
+            let vmo_offset = align_down(segment.file_offset);
+            let len = match align_up(page_delta.saturating_add(segment.mem_size)) {
+                Some(len) => len,
+                None => {
+                    log(name);
+                    log(b": map len fail\n");
+                    break 'load false;
+                }
+            };
+            if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
+                log(name);
+                log(b": map fail\n");
+                break 'load false;
+            }
+        }
+
+        if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
+            log(name);
+            log(b": as fail\n");
+            break 'load false;
+        }
+
+        process_run(child_as, elf.entry, 0x1000FFF0, arg, arg2, flags) == 0
+    };
+
+    // `VmarMap`/`AddressSpaceCreate` copied everything an admitted child needs
+    // into its process record. Sora does not supervise this path by handle, so
+    // both success and every post-allocation failure surrender all acquired handles.
+    let cleanup_ok = sora::close_handles(&loader_handles, handle_close);
+    if !cleanup_ok {
         log(name);
-        log(b": as fail\n");
-        return false;
+        log(b": handle cleanup fail\n");
     }
-
-    process_run(child_as, elf.entry, 0x1000FFF0, arg, arg2, flags) == 0
+    loaded && cleanup_ok
 }
 
 /// Stage-C milestone (Journal 134): two `svc-health` servers run as **independent**
@@ -1672,15 +1703,32 @@ struct SvcRecipe {
 }
 
 /// Spawn one fresh server instance from its recipe: reload the ELF into a new address space,
-/// grant it a fresh request channel, and start it as a resident (async) process. Returns the
-/// client endpoint to talk to it. The caller pumps (`process_wait`) to let it reach `PortWait`.
-fn spawn_from_recipe(recipe: &SvcRecipe) -> Option<Handle> {
+/// grant it a fresh request channel, and start it as a resident (async) process. The server
+/// endpoint is moved into the child; Sora retains only the process handle for supervision
+/// and the client endpoint for RPC. The caller pumps (`process_wait`) to let the server reach
+/// `PortWait`.
+fn spawn_from_recipe(recipe: &SvcRecipe) -> Option<sora::SupervisedServer> {
     let (child_as, entry, stack_top, server_chan, client_chan) =
         run_initrd_elf_with_channel(recipe.initrd, recipe.path.as_bytes())?;
-    if process_run(child_as, entry, stack_top, server_chan.0 as u64, 0, 1) != 0 {
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    if process_run(child_as, entry, stack_top, server_chan.0 as u64, 0, flags) != 0 {
+        if !sora::close_handles(
+            &[Some(child_as), Some(server_chan), Some(client_chan)],
+            handle_close,
+        ) {
+            log(b"spawn: failure cleanup fail\n");
+        }
         return None;
     }
-    Some(client_chan)
+    if handle_koid(server_chan) != u64::MAX {
+        log(b"spawn: bootstrap transfer fail\n");
+        return None;
+    }
+    log(b"spawn: bootstrap transfer ok\n");
+    Some(sora::SupervisedServer {
+        process: child_as,
+        client: client_chan,
+    })
 }
 
 fn run_svc_health_pair_smoke(initrd: Handle) -> bool {
@@ -1868,13 +1916,13 @@ fn run_crash_restart_smoke(initrd: Handle) -> bool {
     if port.0 as u64 == u64::MAX {
         return false;
     }
-    if port_bind(port, server) != 0 {
+    if port_bind(port, server.client) != 0 {
         return false;
     }
 
     // 3. Send a Crash request (no reply expected)
     let bytes = HealthRequest::Crash.encode();
-    if channel_write(server, bytes.as_ptr(), bytes.len()) != 0 {
+    if channel_write(server.client, bytes.as_ptr(), bytes.len()) != 0 {
         return false;
     }
 
@@ -1915,29 +1963,29 @@ fn run_crash_restart_smoke(initrd: Handle) -> bool {
 
 /// Send one request to a resident server on `client`, pump the scheduler so that server
 /// wakes, serves, and re-parks, then read and decode its reply.
-fn request_reply(client: Handle, request: HealthRequest) -> Option<HealthResponse> {
+fn request_reply(client: sora::SupervisedServer, request: HealthRequest) -> Option<HealthResponse> {
     let bytes = request.encode();
-    if channel_write(client, bytes.as_ptr(), bytes.len()) != 0 {
+    if channel_write(client.client, bytes.as_ptr(), bytes.len()) != 0 {
         return None;
     }
     if !child_parked(process_wait()) {
         return None;
     }
     let mut reply = [0u8; 32];
-    let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+    let n = channel_read(client.client, reply.as_mut_ptr(), reply.len()) as usize;
     HealthResponse::decode(&reply[..n])
 }
 
 /// Send `Shutdown` to a resident on `client` and pump: the server's serve loop exits and it
 /// process-exits, so the harness reaps it. Returns the `ProcessWait` status — `ShouldWait`
 /// while another resident remains, `Ok` once none do.
-fn shutdown_resident(client: Handle) -> u64 {
+fn shutdown_resident(client: sora::SupervisedServer) -> u64 {
     let bytes = HealthRequest::Shutdown.encode();
-    let _ = channel_write(client, bytes.as_ptr(), bytes.len());
+    let _ = channel_write(client.client, bytes.as_ptr(), bytes.len());
     process_wait()
 }
 
-fn spawn_ttyd_session(initrd: Handle) -> Option<Handle> {
+fn spawn_ttyd_session(initrd: Handle) -> Option<sora::SupervisedServer> {
     let recipe = SvcRecipe {
         initrd,
         path: TTYD_PATH,
@@ -2002,13 +2050,18 @@ fn run_ttyd_smoke(initrd: Handle) -> bool {
             return false;
         }
     };
+    if handle_koid(client.process) == u64::MAX {
+        log(b"ttyd: process handle fail\n");
+        return false;
+    }
+    log(b"ttyd: process handle ok\n");
     if !child_parked(process_wait()) {
         log(b"ttyd: park fail\n");
         return false;
     }
 
     let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
-    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'h'), &mut reply) else {
+    let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(b'h'), &mut reply) else {
         log(b"ttyd: h fail\n");
         return false;
     };
@@ -2021,7 +2074,7 @@ fn run_ttyd_smoke(initrd: Handle) -> bool {
         return false;
     }
 
-    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'i'), &mut reply) else {
+    let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(b'i'), &mut reply) else {
         log(b"ttyd: i fail\n");
         return false;
     };
@@ -2034,7 +2087,7 @@ fn run_ttyd_smoke(initrd: Handle) -> bool {
         return false;
     }
 
-    let Some(n) = ttyd_request_reply(client, TtyRequest::input(b'\n'), &mut reply) else {
+    let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(b'\n'), &mut reply) else {
         log(b"ttyd: enter fail\n");
         return false;
     };
@@ -2051,7 +2104,7 @@ fn run_ttyd_smoke(initrd: Handle) -> bool {
     let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
         return false;
     };
-    if channel_write(client, req.as_ptr(), req_len) != 0 {
+    if channel_write(client.client, req.as_ptr(), req_len) != 0 {
         return false;
     }
     let status = process_wait();
@@ -2118,7 +2171,9 @@ fn run_persona_posix_tty_write_smoke(initrd: Handle) -> bool {
         return false;
     }
 
-    let mut table = FdTable::with_stdio(TtyStream { handle: client.0 });
+    let mut table = FdTable::with_stdio(TtyStream {
+        handle: client.client.0,
+    });
     let mut tty = TtyRpc::new(ChannelTtyTransport::new());
     if table.write(STDOUT_FILENO, b"ok\n", &mut tty) != Ok(3) {
         log(b"persona-posix: tty write call fail\n");
@@ -2133,7 +2188,7 @@ fn run_persona_posix_tty_write_smoke(initrd: Handle) -> bool {
     let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
         return false;
     };
-    if channel_write(client, req.as_ptr(), req_len) != 0 {
+    if channel_write(client.client, req.as_ptr(), req_len) != 0 {
         return false;
     }
     let status = process_wait();
@@ -2159,13 +2214,15 @@ fn run_persona_posix_tty_read_smoke(initrd: Handle) -> bool {
 
     let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
     for &byte in b"ok\n" {
-        if ttyd_request_reply(client, TtyRequest::input(byte), &mut reply).is_none() {
+        if ttyd_request_reply(client.client, TtyRequest::input(byte), &mut reply).is_none() {
             log(b"persona-posix: tty read feed fail\n");
             return false;
         }
     }
 
-    let mut table = FdTable::with_stdio(TtyStream { handle: client.0 });
+    let mut table = FdTable::with_stdio(TtyStream {
+        handle: client.client.0,
+    });
     let mut tty = TtyRpc::new(ChannelTtyTransport::new());
     let mut out = [0u8; 8];
     if table.read(STDIN_FILENO, &mut out, &mut tty) != Ok(2) || &out[..2] != b"ok" {
@@ -2181,7 +2238,7 @@ fn run_persona_posix_tty_read_smoke(initrd: Handle) -> bool {
     let Some(req_len) = TtyRequest::shutdown().encode_into(&mut req) else {
         return false;
     };
-    if channel_write(client, req.as_ptr(), req_len) != 0 {
+    if channel_write(client.client, req.as_ptr(), req_len) != 0 {
         return false;
     }
     let status = process_wait();
@@ -2327,62 +2384,93 @@ fn run_initrd_elf_with_channel(
     }
     let child_vmo = Handle(child_vmo_h as u32);
 
-    let mut chunk = [0u8; 256];
-    for segment in segments.iter().take(segment_count) {
-        let mut copied = 0u64;
-        while copied < segment.file_size {
-            let n = ((segment.file_size - copied) as usize).min(chunk.len());
-            if vmo_read(
-                initrd,
-                elf_off + segment.file_offset + copied,
-                chunk.as_mut_ptr(),
-                n,
-            ) != 0
-                || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
-            {
-                log(b"svc-health: copy fail\n");
-                return None;
+    // The loader VMO is always temporary. The process and channel handles are
+    // tracked as they are acquired, then preserved only when the full recipe is
+    // returned to the supervisor. Every post-allocation failure keeps nothing.
+    let mut loader_handles = [Some(child_vmo), None, None, None];
+    let loaded = 'load: {
+        let mut chunk = [0u8; 256];
+        for segment in segments.iter().take(segment_count) {
+            let mut copied = 0u64;
+            while copied < segment.file_size {
+                let n = ((segment.file_size - copied) as usize).min(chunk.len());
+                if vmo_read(
+                    initrd,
+                    elf_off + segment.file_offset + copied,
+                    chunk.as_mut_ptr(),
+                    n,
+                ) != 0
+                    || vmo_write(child_vmo, segment.file_offset + copied, chunk.as_ptr(), n) != 0
+                {
+                    log(b"svc-health: copy fail\n");
+                    break 'load None;
+                }
+                copied += n as u64;
             }
-            copied += n as u64;
         }
-    }
 
-    let child_as_h = process_create(0, 0x2000_0000);
-    if child_as_h == u64::MAX {
-        log(b"svc-health: process fail\n");
-        return None;
-    }
-    let child_as = Handle(child_as_h as u32);
-
-    for segment in segments.iter().take(segment_count) {
-        let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
-        let virt = align_down(segment.virt_addr);
-        let vmo_offset = align_down(segment.file_offset);
-        let len = align_up(page_delta.saturating_add(segment.mem_size))?;
-        if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
-            log(b"svc-health: map fail\n");
-            return None;
+        let child_as_h = process_create(0, 0x2000_0000);
+        if child_as_h == u64::MAX {
+            log(b"svc-health: process fail\n");
+            break 'load None;
         }
-    }
+        let child_as = Handle(child_as_h as u32);
+        loader_handles[1] = Some(child_as);
 
-    if address_space_create(child_as, STACK_TOP, STACK_SIZE) == u64::MAX {
-        log(b"svc-health: as fail\n");
+        for segment in segments.iter().take(segment_count) {
+            let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
+            let virt = align_down(segment.virt_addr);
+            let vmo_offset = align_down(segment.file_offset);
+            let len = match align_up(page_delta.saturating_add(segment.mem_size)) {
+                Some(len) => len,
+                None => {
+                    log(b"svc-health: map len fail\n");
+                    break 'load None;
+                }
+            };
+            if vmar_map(child_as, child_vmo, vmo_offset, virt, len, segment.flags) != 0 {
+                log(b"svc-health: map fail\n");
+                break 'load None;
+            }
+        }
+
+        if address_space_create(child_as, STACK_TOP, STACK_SIZE) == u64::MAX {
+            log(b"svc-health: as fail\n");
+            break 'load None;
+        }
+
+        let (client_h, server_h) = channel_create_pair();
+        if client_h != u64::MAX {
+            loader_handles[2] = Some(Handle(client_h as u32));
+        }
+        if server_h != u64::MAX {
+            loader_handles[3] = Some(Handle(server_h as u32));
+        }
+        if client_h == u64::MAX || server_h == u64::MAX {
+            log(b"svc-health: channel fail\n");
+            break 'load None;
+        }
+
+        break 'load Some((
+            child_as,
+            elf.entry,
+            STACK_TOP - 0x10,
+            Handle(server_h as u32),
+            Handle(client_h as u32),
+        ));
+    };
+
+    let cleanup_ok = match loaded {
+        Some((child_as, _, _, server, client)) => {
+            sora::close_handles_except(&loader_handles, &[child_as, server, client], handle_close)
+        }
+        None => sora::close_handles(&loader_handles, handle_close),
+    };
+    if !cleanup_ok {
+        log(b"svc-health: loader cleanup fail\n");
         return None;
     }
-
-    let (client, server) = channel_create_pair();
-    if client == u64::MAX || server == u64::MAX {
-        log(b"svc-health: channel fail\n");
-        return None;
-    }
-
-    Some((
-        child_as,
-        elf.entry,
-        STACK_TOP - 0x10,
-        Handle(server as u32),
-        Handle(client as u32),
-    ))
+    loaded
 }
 
 /// Resolve a file path against the FAT32 root directory and return up to `req_len` bytes

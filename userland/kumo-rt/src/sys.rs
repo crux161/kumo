@@ -108,6 +108,18 @@ pub fn channel_create_pair() -> (u64, u64) {
     (u64::MAX, u64::MAX)
 }
 
+/// Close one process-local handle. A successful close invalidates the handle
+/// immediately; closing it again returns `BadHandle`.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub fn handle_close(handle: Handle) -> Status {
+    syscall(Syscall::HandleClose, handle.0 as u64, 0, 0, 0) as Status
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+pub fn handle_close(_handle: Handle) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
 /// Duplicate a handle with a subset of its original rights.
 /// The new handle shares the same kernel object.
 #[cfg(target_arch = "aarch64")]

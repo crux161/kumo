@@ -39,6 +39,58 @@ pub enum Syscall {
     ResourceCreateChild = 35,
 }
 
+/// Options for [`Syscall::ProcessRun`].
+///
+/// Unmarked arguments are copied into the child when they name handles. A
+/// transfer-marked argument is instead moved: it is removed from the caller
+/// only after the child has been admitted successfully.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessRunFlags(pub u64);
+
+impl ProcessRunFlags {
+    /// Admit the child without blocking the caller.
+    pub const ASYNC: Self = Self(1 << 0);
+    /// Move `arg` (x0) from the caller's handle table into the child.
+    pub const TRANSFER_ARG: Self = Self(1 << 1);
+    /// Move `arg2` (x1) from the caller's handle table into the child.
+    pub const TRANSFER_ARG2: Self = Self(1 << 2);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn contains(self, needed: Self) -> bool {
+        self.0 & needed.0 == needed.0
+    }
+}
+
+impl core::ops::BitOr for ProcessRunFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_run_flags_are_composable() {
+        let flags = ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG;
+        assert!(flags.contains(ProcessRunFlags::ASYNC));
+        assert!(flags.contains(ProcessRunFlags::TRANSFER_ARG));
+        assert!(!flags.contains(ProcessRunFlags::TRANSFER_ARG2));
+        assert_eq!(flags.bits(), 0b011);
+    }
+}
+
 pub type Status = i32;
 
 #[repr(i32)]

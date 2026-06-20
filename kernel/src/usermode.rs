@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use kumo_abi::{
-    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, ObjectKind, Rights,
-    SORA_INIT_PATH,
+    find_file, sys::Syscall, BootInfo, Errno, Handle, InitrdError, KoId, ObjectKind,
+    ProcessRunFlags, Rights, SORA_INIT_PATH,
 };
 use kumo_hal::active::{UserImage, UserImageError, UserLoadSegment, UserMapping, UserState};
 use kumo_hal::PageFlags;
@@ -29,7 +29,10 @@ use crate::bootstrap::user::{
 };
 use crate::ipc::{ChannelEnd, IpcError, KernelMessage};
 use crate::mm::{alloc_zeroed_frame, Vmar, Vmo};
-use crate::syscall::{KernelCall, KernelCallResult, SyscallEngine};
+use crate::syscall::{
+    commit_process_grants, rollback_process_grants, stage_process_arg, KernelCall,
+    KernelCallResult, SyscallEngine,
+};
 use crate::task::{Job, Process, Thread, DEFAULT_KERNEL_STACK_SIZE};
 
 /// Maximum restart attempts before giving up and reporting failure.
@@ -357,7 +360,8 @@ fn run_sora_child_without_borrow(
     arg2: u64,
     flags: u64,
 ) -> i32 {
-    if flags & 1 != 0 {
+    let run_flags = ProcessRunFlags(flags);
+    if run_flags.contains(ProcessRunFlags::ASYNC) {
         return with_sora_mut(|sora| {
             match sora.engine.dispatch(
                 &mut sora.process,
@@ -394,24 +398,43 @@ fn run_sora_child_without_borrow(
         };
         let root_vmar = target.root_vmar();
 
-        let dup = |sora: &mut SoraState, a: u64| -> u64 {
-            if a == 0 {
-                return 0;
-            }
-            sora.process
-                .handles()
-                .get(Handle(a as u32))
-                .ok()
-                .and_then(|entry| {
-                    sora.engine
-                        .process_by_koid_mut(proc_koid)
-                        .and_then(|child| child.handles_mut().insert_entry(entry).ok())
-                })
-                .map(|h| h.0 as u64)
-                .unwrap_or(a)
+        if run_flags.contains(ProcessRunFlags::TRANSFER_ARG)
+            && run_flags.contains(ProcessRunFlags::TRANSFER_ARG2)
+            && arg != 0
+            && arg == arg2
+        {
+            return Err(Errno::InvalidArgs.status());
+        }
+
+        let target_ptr = match sora.engine.process_by_koid_mut(proc_koid) {
+            Some(child) => child as *mut Process,
+            None => return Err(Errno::BadHandle.status()),
         };
-        let child_arg = dup(sora, arg);
-        let child_arg2 = dup(sora, arg2);
+        let (child_arg, child_arg2, grants) = unsafe {
+            let child_handles = (*target_ptr).handles_mut();
+            let (child_arg, first) = match stage_process_arg(
+                sora.process.handles(),
+                child_handles,
+                arg,
+                run_flags.contains(ProcessRunFlags::TRANSFER_ARG),
+            ) {
+                Ok(staged) => staged,
+                Err(error) => return Err(crate::syscall::errno_from_object(error).status()),
+            };
+            let (child_arg2, second) = match stage_process_arg(
+                sora.process.handles(),
+                child_handles,
+                arg2,
+                run_flags.contains(ProcessRunFlags::TRANSFER_ARG2),
+            ) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let _ = rollback_process_grants(child_handles, &[first]);
+                    return Err(crate::syscall::errno_from_object(error).status());
+                }
+            };
+            (child_arg, child_arg2, [first, second])
+        };
 
         let temp_process = Process::from_parts(proc_koid, root_vmar);
         let thread = match Thread::new(
@@ -422,8 +445,17 @@ fn run_sora_child_without_borrow(
             DEFAULT_KERNEL_STACK_SIZE,
         ) {
             Ok(thread) => thread,
-            Err(_) => return Err(Errno::NoMemory.status()),
+            Err(_) => {
+                let child_handles = unsafe { (*target_ptr).handles_mut() };
+                let _ = rollback_process_grants(child_handles, &grants);
+                return Err(Errno::NoMemory.status());
+            }
         };
+        if commit_process_grants(sora.process.handles_mut(), &grants).is_err() {
+            let child_handles = unsafe { (*target_ptr).handles_mut() };
+            let _ = rollback_process_grants(child_handles, &grants);
+            return Err(Errno::Internal.status());
+        }
         Ok((thread, proc_koid, root_vmar, ttbr0, child_arg, child_arg2))
     });
 
@@ -773,6 +805,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
                     kumo_hal::active::early_console_write(bytes);
                     r[0] = len as u64;
+                } else if num == Syscall::HandleClose as u64 {
+                    let handle = Handle(r[0] as u32);
+                    match sora
+                        .engine
+                        .dispatch(child, KernelCall::HandleClose { handle })
+                    {
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
                 } else if num == Syscall::ChannelRead as u64 {
                     r[0] = 0;
                 } else if num == Syscall::ChannelWrite as u64 {
@@ -906,6 +947,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
             kumo_hal::active::early_console_write(bytes);
             sora.wrote += len;
             r[0] = len as u64;
+        } else if num == Syscall::HandleClose as u64 {
+            let handle = Handle(r[0] as u32);
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::HandleClose { handle })
+            {
+                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                _ => r[0] = u64::MAX,
+            }
         } else if num == Syscall::VmoWrite as u64 {
             let vmo = Handle(r[0] as u32);
             let offset = r[1];

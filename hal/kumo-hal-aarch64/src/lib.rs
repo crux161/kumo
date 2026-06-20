@@ -2430,10 +2430,19 @@ unsafe fn gicv3_init(_config: &Gicv3Config) {}
 
 // ---- GICv2 (GIC-400, Pi 5) ------------------------------------------------
 
-// GICv2 GICD registers (same offsets as GICv3 for basic ops).
+// GICv2 GICC (CPU interface) registers, relative to the GICC base.
 const GICV2_GICC_CTLR: u64 = 0x0000;
 const GICV2_GICC_PMR: u64 = 0x0004;
 const GICV2_GICC_CTLR_ENABLE_GRP1NS: u32 = 1;
+
+// GICv2 GICD (distributor) registers, relative to the GICD base. These are the
+// *distributor* banks — distinct from the GICv3 redistributor (GICR_*) offsets.
+#[cfg(target_os = "none")]
+const GICV2_GICD_IGROUPR0: u64 = 0x0080;
+#[cfg(target_os = "none")]
+const GICV2_GICD_ISENABLER0: u64 = 0x0100;
+#[cfg(target_os = "none")]
+const GICV2_GICD_IPRIORITYR: u64 = 0x0400;
 
 // GICv2 GICD_CTLR bits (no ARE_NS in GICv2).
 const GICD_CTLR_ENABLE_GRP0: u32 = 1;
@@ -2459,48 +2468,177 @@ unsafe fn discover_gicv2(_dtb: u64) -> Option<Gicv2Config> {
 }
 
 fn gicv2_from_dtb_bytes(bytes: &[u8]) -> Option<Gicv2Config> {
-    // Walk DTB nodes looking for a GICv2 compatible node.
-    // Minimal: find "arm,gic-400" or "arm,cortex-a15-gic" in compatible strings.
-    let gicv2_compatibles: &[&[u8]] = &[
-        b"arm,gic-400\0",
-        b"arm,cortex-a15-gic\0",
-        b"arm,cortex-a7-gic\0",
-        b"arm,gic-400",
-        b"arm,cortex-a15-gic",
-    ];
-    let mut gicd_base = None;
-    let mut gicc_base = None;
-    let mut timer_irq = None;
+    // Walk the FDT structure block (mirrors `gicv3_from_dtb_bytes`) and read the GIC
+    // node's `reg` property for real, rather than hardcoding addresses. The GIC `reg`
+    // is interpreted with the PARENT node's `#address-cells`/`#size-cells`: on the Pi 5
+    // the parent (`soc`) declares `#address-cells = 2`, so each address is a 64-bit
+    // big-endian pair and the GIC-400 sits at 0x10_7fff9000 (GICD) / 0x10_7fffa000
+    // (GICC). Each reg tuple is (address_cells + size_cells) cells, so GICC starts at the
+    // second tuple, not at byte 8.
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const FDT_BEGIN_NODE: u32 = 1;
+    const FDT_END_NODE: u32 = 2;
+    const FDT_PROP: u32 = 3;
+    const FDT_NOP: u32 = 4;
+    const FDT_END: u32 = 9;
 
-    // Simple linear scan for "interrupt-controller" compatible node.
-    // This is fragile — a proper FDT parser would walk the structure.
-    // For the Pi 5, we know the GIC-400 is at a fixed location.
-    // Fall back to known Pi 5 GIC-400 addresses if DTB parse fails.
-    let text = bytes;
+    // Per the DTB spec, the defaults when a node omits the cell counts.
+    const DEFAULT_ADDRESS_CELLS: u32 = 2;
+    const DEFAULT_SIZE_CELLS: u32 = 1;
 
-    // Check for "arm,gic-400" string in DTB.
-    for compat in gicv2_compatibles {
-        if text.windows(compat.len()).any(|w| w == *compat) {
-            // Found a GICv2. Use Pi 5 known addresses.
-            gicd_base = Some(0xff84_1000);
-            gicc_base = Some(0xff84_2000);
-            timer_irq = Some(TIMER_VIRTUAL_PPI);
-            break;
+    let magic = read_be_u32(bytes, 0)?;
+    if magic != FDT_MAGIC {
+        return None;
+    }
+
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len() {
+        return None;
+    }
+    let struct_end = checked_end(off_dt_struct, size_dt_struct, total_size)?;
+    let strings_end = checked_end(off_dt_strings, size_dt_strings, total_size)?;
+    let strings = &bytes[off_dt_strings..strings_end];
+
+    #[derive(Clone, Copy)]
+    struct NodeState {
+        compatible_gicv2: bool,
+        // `#address-cells` / `#size-cells` this node declares for ITS children. `None`
+        // until a property sets them; resolved against the parent / spec default.
+        address_cells: Option<u32>,
+        size_cells: Option<u32>,
+        // Location of this node's `reg` property in `bytes`, if present.
+        reg: Option<(usize, usize)>,
+    }
+
+    impl NodeState {
+        const fn empty() -> Self {
+            Self {
+                compatible_gicv2: false,
+                address_cells: None,
+                size_cells: None,
+                reg: None,
+            }
         }
     }
 
-    // Also try to parse reg property if we found a match.
+    let mut stack = [NodeState::empty(); 32];
+    let mut depth = 0usize;
+    let mut cursor = off_dt_struct;
+    let mut found = None;
+
+    while cursor < struct_end {
+        let token = read_be_u32(bytes, cursor)?;
+        cursor = cursor.checked_add(4)?;
+        match token {
+            FDT_BEGIN_NODE => {
+                if depth == stack.len() {
+                    return None;
+                }
+                let name_len = nul_terminated_len(bytes, cursor, struct_end)?;
+                cursor = align4(cursor.checked_add(name_len)?.checked_add(1)?)?;
+                stack[depth] = NodeState::empty();
+                depth += 1;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                let state = stack[depth - 1];
+                if state.compatible_gicv2 {
+                    if let Some((reg_off, reg_len)) = state.reg {
+                        // The GIC `reg` is decoded with the PARENT's cell counts.
+                        let (addr_cells, size_cells) = if depth >= 2 {
+                            let parent = stack[depth - 2];
+                            (
+                                parent.address_cells.unwrap_or(DEFAULT_ADDRESS_CELLS),
+                                parent.size_cells.unwrap_or(DEFAULT_SIZE_CELLS),
+                            )
+                        } else {
+                            (DEFAULT_ADDRESS_CELLS, DEFAULT_SIZE_CELLS)
+                        };
+                        if let Some(config) = parse_gicv2_reg(
+                            &bytes[reg_off..reg_off + reg_len],
+                            addr_cells,
+                            size_cells,
+                        ) {
+                            found = Some(config);
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                if depth == 0 {
+                    return None;
+                }
+                let len = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let name_offset = read_be_u32(bytes, cursor)? as usize;
+                cursor = cursor.checked_add(4)?;
+                let data_end = checked_end(cursor, len, struct_end)?;
+                let name = read_string(strings, name_offset)?;
+                let data = &bytes[cursor..data_end];
+                let state = &mut stack[depth - 1];
+                match name {
+                    "compatible" => {
+                        state.compatible_gicv2 = compatible_has(data, b"arm,gic-400")
+                            || compatible_has(data, b"arm,cortex-a15-gic")
+                            || compatible_has(data, b"arm,cortex-a7-gic");
+                    }
+                    "#address-cells" => state.address_cells = read_be_u32(data, 0),
+                    "#size-cells" => state.size_cells = read_be_u32(data, 0),
+                    "reg" => state.reg = Some((cursor, len)),
+                    _ => {}
+                }
+                cursor = align4(data_end)?;
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+
+    found
+}
+
+/// Decode a GICv2 `reg` blob into (GICD, GICC) bases using the parent's cell counts.
+/// Tuple 0 addresses the distributor, tuple 1 the CPU interface.
+fn parse_gicv2_reg(data: &[u8], address_cells: u32, size_cells: u32) -> Option<Gicv2Config> {
+    if address_cells == 0 || address_cells > 2 || size_cells > 2 {
+        return None;
+    }
+    let addr_bytes = address_cells as usize * 4;
+    let tuple_bytes = (address_cells + size_cells) as usize * 4;
+
+    let read_address = |tuple: usize| -> Option<u64> {
+        let base = tuple.checked_mul(tuple_bytes)?;
+        if base.checked_add(addr_bytes)? > data.len() {
+            return None;
+        }
+        Some(if address_cells == 2 {
+            read_be_u64_cells(data, base)?
+        } else {
+            read_be_u32(data, base)? as u64
+        })
+    };
+
+    let distributor_base = read_address(0)?;
+    let cpu_base = read_address(1)?;
     Some(Gicv2Config {
-        distributor_base: gicd_base?,
-        cpu_base: gicc_base?,
-        timer_irq: timer_irq?,
+        distributor_base,
+        cpu_base,
+        timer_irq: TIMER_VIRTUAL_PPI,
     })
 }
 
 #[cfg(target_os = "none")]
 unsafe fn gicv2_init(config: &Gicv2Config) {
     let timer_bit = 1u32 << (config.timer_irq % 32);
-    let timer_reg = (config.timer_irq / 32) as u64 * 4;
+    let bank = (config.timer_irq / 32) as u64 * 4;
 
     // Disable distributor, then enable with Group0 + Group1NS.
     unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
@@ -2513,8 +2651,22 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
     };
     unsafe { gicd_wait_rwp(config.distributor_base) };
 
-    // Store GICv2 CPU base for EOI in IRQ handler.
+    // Store GICv2 CPU base so the IRQ vector acks (GICC_IAR) and the handler EOIs
+    // (GICC_EOIR) via MMIO rather than the GICv3 system registers.
     GICV2_CPU_BASE.store(config.cpu_base, ORD);
+
+    // Configure the timer PPI explicitly rather than trusting firmware state: put it in
+    // Group1NS and give it a mid priority. These are distributor banks (GICD_*), NOT the
+    // GICv3 redistributor (GICR_*) banks — those don't exist on a GIC-400.
+    let group =
+        unsafe { mmio_read32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank) } | timer_bit;
+    unsafe { mmio_write32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank, group) };
+    unsafe {
+        mmio_write8(
+            config.distributor_base + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
+            0x80,
+        )
+    };
 
     // CPU interface: set priority mask to allow all, enable Group1NS.
     unsafe { mmio_write32(config.cpu_base + GICV2_GICC_PMR, 0xFF) };
@@ -2525,10 +2677,11 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
         )
     };
 
-    // Enable the timer IRQ in the distributor.
+    // Enable the timer IRQ in the distributor: GICD_ISENABLER0 at 0x100, not the GICv3
+    // redistributor's GICR_ISENABLER0 (0x10100).
     unsafe {
         mmio_write32(
-            config.distributor_base + GICR_ISENABLER0 + timer_reg,
+            config.distributor_base + GICV2_GICD_ISENABLER0 + bank,
             timer_bit,
         )
     };
@@ -2637,6 +2790,10 @@ static PREEMPT_HOOK: AtomicUsize = AtomicUsize::new(0);
 static INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// GICv2 CPU interface base (0 if using GICv3 system-register EOI).
 static GICV2_CPU_BASE: AtomicU64 = AtomicU64::new(0);
+/// GICC_IAR (Interrupt Acknowledge) — GICv2 acks via MMIO, not the GICv3 `icc_iar1_el1`
+/// system register, which is UNDEFINED on a GICv2-only PE (the Pi 5 / GIC-400).
+#[cfg(target_os = "none")]
+const GICV2_GICC_IAR: u64 = 0x000C;
 #[cfg(target_os = "none")]
 const GICV2_GICC_EOIR: u64 = 0x0010;
 
@@ -2821,7 +2978,7 @@ mod traps {
         "  mrs x0, elr_el1",
         "  mrs x1, spsr_el1",
         "  stp x0,  x1,  [sp, #248]",
-        "  mrs x0, icc_iar1_el1",
+        "  bl  irq_ack",
         "  cmp x0, #1020",
         "  b.hs 1f",
         "  bl  kumo_irq_entry",
@@ -2891,6 +3048,25 @@ mod traps {
             far
         );
         halt()
+    }
+
+    /// Acknowledge the pending interrupt and return its INTID. GICv2 (Pi 5 / GIC-400) reads
+    /// the CPU-interface GICC_IAR over MMIO; GICv3 (x13s / QEMU virt) reads `icc_iar1_el1`.
+    /// The vector calls this instead of a bare `mrs icc_iar1_el1`, because that system
+    /// register is UNDEFINED on a GICv2-only PE — the cause of the EC 0x00 fault the first
+    /// timer IRQ raised on the Pi 5.
+    #[no_mangle]
+    extern "C" fn irq_ack() -> u64 {
+        let gicv2_cpu = super::GICV2_CPU_BASE.load(super::ORD);
+        if gicv2_cpu != 0 {
+            unsafe { super::mmio_read32(gicv2_cpu + super::GICV2_GICC_IAR) as u64 }
+        } else {
+            let iar: u64;
+            unsafe {
+                core::arch::asm!("mrs {0}, icc_iar1_el1", out(reg) iar, options(nostack, nomem));
+            }
+            iar
+        }
     }
 
     #[no_mangle]
@@ -3030,6 +3206,167 @@ mod tests {
         assert_eq!(config.redistributor_base, 0x17a6_0000);
         assert_eq!(config.redistributor_stride, 0x0002_0000);
         assert_eq!(config.timer_irq, TIMER_VIRTUAL_PPI);
+    }
+
+    /// Encode device-tree cells (big-endian u32s) into `out`.
+    fn write_cells(values: &[u32], out: &mut [u8]) {
+        for (i, cell) in values.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&cell.to_be_bytes());
+        }
+    }
+
+    /// A tiny core-only flattened-device-tree writer (FDT v17). The Pi 5 GIC-400 blob
+    /// is not vendored like the X13s DTB, so we synthesise the shape the discovery walk
+    /// must handle: a parent declaring `#address-cells = <2>` and a `gic-400` node whose
+    /// `reg` holds the distributor tuple then the CPU-interface tuple.
+    struct FdtWriter {
+        structs: [u8; 384],
+        structs_len: usize,
+        strings: [u8; 128],
+        strings_len: usize,
+    }
+
+    impl FdtWriter {
+        fn new() -> Self {
+            Self {
+                structs: [0; 384],
+                structs_len: 0,
+                strings: [0; 128],
+                strings_len: 0,
+            }
+        }
+
+        fn push_struct(&mut self, bytes: &[u8]) {
+            self.structs[self.structs_len..self.structs_len + bytes.len()].copy_from_slice(bytes);
+            self.structs_len += bytes.len();
+        }
+
+        fn token(&mut self, tok: u32) {
+            self.push_struct(&tok.to_be_bytes());
+        }
+
+        fn align_structs(&mut self) {
+            while self.structs_len % 4 != 0 {
+                self.structs_len += 1; // already zero-initialised
+            }
+        }
+
+        fn begin_node(&mut self, name: &str) {
+            self.token(1); // FDT_BEGIN_NODE
+            self.push_struct(name.as_bytes());
+            self.push_struct(&[0]);
+            self.align_structs();
+        }
+
+        fn end_node(&mut self) {
+            self.token(2); // FDT_END_NODE
+        }
+
+        fn intern(&mut self, name: &str) -> u32 {
+            let off = self.strings_len as u32;
+            self.strings[self.strings_len..self.strings_len + name.len()]
+                .copy_from_slice(name.as_bytes());
+            self.strings_len += name.len() + 1; // trailing NUL already zero
+            off
+        }
+
+        fn prop(&mut self, name: &str, data: &[u8]) {
+            let name_off = self.intern(name);
+            self.token(3); // FDT_PROP
+            self.push_struct(&(data.len() as u32).to_be_bytes());
+            self.push_struct(&name_off.to_be_bytes());
+            self.push_struct(data);
+            self.align_structs();
+        }
+
+        fn prop_u32(&mut self, name: &str, value: u32) {
+            self.prop(name, &value.to_be_bytes());
+        }
+
+        /// Serialise header + struct + strings blocks into `out`, returning the length.
+        fn finish(&mut self, out: &mut [u8; 768]) -> usize {
+            self.token(9); // FDT_END
+            let off_dt_struct = 40usize; // ten header words
+            let off_dt_strings = off_dt_struct + self.structs_len;
+            let total = off_dt_strings + self.strings_len;
+            let header = [
+                0xd00d_feedu32,          // magic
+                total as u32,            // totalsize
+                off_dt_struct as u32,    // off_dt_struct
+                off_dt_strings as u32,   // off_dt_strings
+                0,                       // off_mem_rsvmap
+                17,                      // version
+                16,                      // last_comp_version
+                0,                       // boot_cpuid_phys
+                self.strings_len as u32, // size_dt_strings
+                self.structs_len as u32, // size_dt_struct
+            ];
+            for (i, word) in header.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            out[off_dt_struct..off_dt_strings].copy_from_slice(&self.structs[..self.structs_len]);
+            out[off_dt_strings..total].copy_from_slice(&self.strings[..self.strings_len]);
+            total
+        }
+    }
+
+    #[test]
+    fn discovers_pi5_gic400_from_synthetic_dtb() {
+        // Pi 5: the GIC parent declares `#address-cells = <2>`, so each reg address is a
+        // 64-bit pair and the CPU interface is the SECOND tuple — precisely what the old
+        // hardcoded Pi 4 addresses (and the byte-8 GICC assumption) got wrong.
+        let mut reg = [0u8; 32];
+        write_cells(
+            &[
+                0x10,
+                0x7fff_9000,
+                0x0,
+                0x1000, // GICD @ 0x10_7fff9000, len 0x1000
+                0x10,
+                0x7fff_a000,
+                0x0,
+                0x2000, // GICC @ 0x10_7fffa000, len 0x2000
+            ],
+            &mut reg,
+        );
+
+        let mut fdt = FdtWriter::new();
+        fdt.begin_node(""); // root
+        fdt.prop_u32("#address-cells", 2);
+        fdt.prop_u32("#size-cells", 2);
+        fdt.begin_node("interrupt-controller");
+        fdt.prop("compatible", b"arm,gic-400\0");
+        fdt.prop("reg", &reg);
+        fdt.end_node();
+        fdt.end_node();
+
+        let mut blob = [0u8; 768];
+        let len = fdt.finish(&mut blob);
+
+        let config =
+            gicv2_from_dtb_bytes(&blob[..len]).expect("synthetic Pi 5 DTB carries a GIC-400");
+        assert_eq!(config.distributor_base, 0x10_7fff_9000);
+        assert_eq!(config.cpu_base, 0x10_7fff_a000);
+        assert_eq!(config.timer_irq, TIMER_VIRTUAL_PPI);
+    }
+
+    #[test]
+    fn parse_gicv2_reg_decodes_cell_widths_and_rejects_bad_input() {
+        // 32-bit addresses (#address-cells = <1>): GICD then GICC in successive tuples.
+        let mut reg32 = [0u8; 16];
+        write_cells(&[0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000], &mut reg32);
+        let config = parse_gicv2_reg(&reg32, 1, 1).expect("one-cell reg decodes");
+        assert_eq!(config.distributor_base, 0x0800_0000);
+        assert_eq!(config.cpu_base, 0x0801_0000);
+
+        // A reg with only the distributor tuple cannot yield a CPU interface base.
+        let mut only_gicd = [0u8; 16];
+        write_cells(&[0x10, 0x7fff_9000, 0x0, 0x1000], &mut only_gicd);
+        assert!(parse_gicv2_reg(&only_gicd, 2, 2).is_none());
+
+        // Out-of-range cell counts are refused rather than mis-indexed.
+        assert!(parse_gicv2_reg(&reg32, 0, 1).is_none());
+        assert!(parse_gicv2_reg(&reg32, 3, 1).is_none());
     }
 
     #[test]

@@ -19,6 +19,6 @@ pub use initrd::{
     SORA_INIT_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
-pub use sys::{Errno, Status, Syscall, VmarFlags};
+pub use sys::{Errno, ProcessRunFlags, Status, Syscall, VmarFlags};
 
 pub const ABI_VERSION: u32 = 1;

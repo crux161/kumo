@@ -1,12 +1,14 @@
 use alloc::vec::Vec;
 
+#[cfg(target_os = "none")]
+use kumo_abi::ProcessRunFlags;
 use kumo_abi::{BootInfo, Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall};
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
 use crate::ipc::{IpcError, IpcRegistry, KernelMessage, PortPacket};
 use crate::mm::{Mapping, Vmar, Vmo};
-use crate::object::{ObjectError, ObjectManager};
+use crate::object::{HandleTable, ObjectError, ObjectManager, StagedHandleGrant};
 use crate::task::{Job, Process, Thread};
 
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +77,7 @@ pub enum KernelCall<'a> {
         sp: u64,
         arg: u64,
         arg2: u64,
-        /// Bit 0 = async (don't block, admit at low priority).
+        /// See [`kumo_abi::ProcessRunFlags`].
         flags: u64,
     },
     /// P10-g: block until the async child process exits.
@@ -110,6 +112,45 @@ pub enum KernelCall<'a> {
         size: u64,
     },
     Unsupported(Syscall),
+}
+
+/// Stage one `ProcessRun` argument. Plain integers pass through unchanged;
+/// values naming handles are copied unless their transfer flag is set.
+pub(crate) fn stage_process_arg(
+    source: &HandleTable,
+    target: &mut HandleTable,
+    raw: u64,
+    transfer: bool,
+) -> Result<(u64, Option<StagedHandleGrant>), ObjectError> {
+    if raw == 0 {
+        return Ok((0, None));
+    }
+    let handle = Handle(raw as u32);
+    if !transfer && matches!(source.get(handle), Err(ObjectError::BadHandle)) {
+        return Ok((raw, None));
+    }
+    let grant = source.stage_grant_to(target, handle, transfer)?;
+    Ok((grant.target().0 as u64, Some(grant)))
+}
+
+pub(crate) fn rollback_process_grants(
+    target: &mut HandleTable,
+    grants: &[Option<StagedHandleGrant>],
+) -> Result<(), ObjectError> {
+    for grant in grants.iter().flatten().rev() {
+        target.rollback_grant(*grant)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_process_grants(
+    source: &mut HandleTable,
+    grants: &[Option<StagedHandleGrant>],
+) -> Result<(), ObjectError> {
+    for grant in grants.iter().flatten() {
+        source.commit_grant(*grant)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1164,6 +1205,7 @@ impl SyscallEngine {
             } => {
                 #[cfg(target_os = "none")]
                 {
+                    let run_flags = ProcessRunFlags(flags);
                     let proc_koid = match process.handles().require(
                         process_handle,
                         ObjectKind::Process,
@@ -1179,31 +1221,50 @@ impl SyscallEngine {
                         return KernelCallResult::Status(Errno::InvalidArgs.status());
                     };
                     let root_vmar = target.root_vmar();
-                    // Duplicate bootstrap handles from the caller's table
-                    // into the child's handle namespace.
-                    let dup = |a: u64| -> u64 {
-                        if a != 0 {
-                            process
-                                .handles()
-                                .get(Handle(a as u32))
-                                .ok()
-                                .and_then(|entry| {
-                                    self.process_by_koid(proc_koid)
-                                        .map(|cp| cp as *const Process as *mut Process)
-                                        .and_then(|child_ptr| unsafe {
-                                            (*child_ptr).handles_mut().insert_entry(entry).ok()
-                                        })
-                                })
-                                .map(|h| h.0 as u64)
-                                .unwrap_or(a)
-                        } else {
-                            a
-                        }
+
+                    if run_flags.contains(ProcessRunFlags::TRANSFER_ARG)
+                        && run_flags.contains(ProcessRunFlags::TRANSFER_ARG2)
+                        && arg != 0
+                        && arg == arg2
+                    {
+                        return KernelCallResult::Status(Errno::InvalidArgs.status());
+                    }
+
+                    // Stage both grants in the child first. A failed second grant or
+                    // failed admission rolls them back without consuming either source.
+                    let target_ptr = self
+                        .process_by_koid(proc_koid)
+                        .map(|child| child as *const Process as *mut Process)
+                        .expect("ProcessRun target disappeared");
+                    let (child_arg, child_arg2, grants) = unsafe {
+                        let child_handles = (*target_ptr).handles_mut();
+                        let (child_arg, first) = match stage_process_arg(
+                            process.handles(),
+                            child_handles,
+                            arg,
+                            run_flags.contains(ProcessRunFlags::TRANSFER_ARG),
+                        ) {
+                            Ok(staged) => staged,
+                            Err(error) => {
+                                return KernelCallResult::Status(errno_from_object(error).status())
+                            }
+                        };
+                        let (child_arg2, second) = match stage_process_arg(
+                            process.handles(),
+                            child_handles,
+                            arg2,
+                            run_flags.contains(ProcessRunFlags::TRANSFER_ARG2),
+                        ) {
+                            Ok(staged) => staged,
+                            Err(error) => {
+                                let _ = rollback_process_grants(child_handles, &[first]);
+                                return KernelCallResult::Status(errno_from_object(error).status());
+                            }
+                        };
+                        (child_arg, child_arg2, [first, second])
                     };
-                    let child_arg = dup(arg);
-                    let child_arg2 = dup(arg2);
-                    // P10-g: flags & 1 = async (non-blocking, low-priority child).
-                    let status = if flags & 1 != 0 {
+
+                    let status = if run_flags.contains(ProcessRunFlags::ASYNC) {
                         crate::user_thread::spawn_child_async(
                             &mut self.objects,
                             proc_koid,
@@ -1226,6 +1287,16 @@ impl SyscallEngine {
                             child_arg2,
                         )
                     };
+                    if status == Errno::Ok.status() {
+                        if commit_process_grants(process.handles_mut(), &grants).is_err() {
+                            return KernelCallResult::Status(Errno::Internal.status());
+                        }
+                    } else {
+                        let child_handles = unsafe { (*target_ptr).handles_mut() };
+                        if rollback_process_grants(child_handles, &grants).is_err() {
+                            return KernelCallResult::Status(Errno::Internal.status());
+                        }
+                    }
                     KernelCallResult::Status(status)
                 }
                 #[cfg(not(target_os = "none"))]

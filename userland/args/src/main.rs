@@ -10,7 +10,7 @@
 //! `kumo_abi::unpack_argv`, shared with the host tests; `argv[0]` is the program name.
 
 use kumo_abi::{unpack_argv, Handle};
-use kumo_rt::{debug_write, process_exit, vmo_read};
+use kumo_rt::{debug_write, handle_close, process_exit, vmo_read};
 
 kumo_rt::entry!(main);
 
@@ -47,5 +47,17 @@ extern "C" fn main(
         debug_write(arg.as_ptr(), arg.len());
         debug_write(b"\n".as_ptr(), 1);
     }
+
+    // Prove HandleClose through the child-process SVC route: close argv, then the
+    // same handle must no longer authorize a VmoRead.
+    let argv = Handle(argv_handle as u32);
+    let mut probe = [0u8; 1];
+    if handle_close(argv) != 0 || vmo_read(argv, 0, probe.as_mut_ptr(), probe.len()) == 0 {
+        const ERR: &[u8] = b"args: close fail\n";
+        debug_write(ERR.as_ptr(), ERR.len());
+        process_exit(1);
+    }
+    const OK: &[u8] = b"args: close ok\n";
+    debug_write(OK.as_ptr(), OK.len());
     process_exit(0)
 }

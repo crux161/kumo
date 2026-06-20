@@ -78,6 +78,23 @@ pub struct HandleEntry {
     pub rights: Rights,
 }
 
+/// A handle grant staged in a target table but not yet committed in its source.
+///
+/// Staging makes `ProcessRun` transactional: admission failure can discard the
+/// target handle while leaving a transfer-marked source handle untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StagedHandleGrant {
+    source: Handle,
+    target: Handle,
+    transfer: bool,
+}
+
+impl StagedHandleGrant {
+    pub const fn target(self) -> Handle {
+        self.target
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HandleTable {
     entries: Vec<Option<HandleEntry>>,
@@ -154,6 +171,43 @@ impl HandleTable {
 
     pub fn insert_entry(&mut self, entry: HandleEntry) -> Result<Handle, ObjectError> {
         self.insert_parts(entry.koid, entry.kind, entry.rights)
+    }
+
+    /// Stage a copied or moved grant in `target` without changing this table.
+    pub fn stage_grant_to(
+        &self,
+        target: &mut Self,
+        source: Handle,
+        transfer: bool,
+    ) -> Result<StagedHandleGrant, ObjectError> {
+        let entry = self.get(source)?;
+        let required = if transfer {
+            Rights::TRANSFER
+        } else {
+            Rights::DUPLICATE
+        };
+        if !entry.rights.contains(required) {
+            return Err(ObjectError::AccessDenied);
+        }
+        let target = target.insert_entry(entry)?;
+        Ok(StagedHandleGrant {
+            source,
+            target,
+            transfer,
+        })
+    }
+
+    /// Commit a staged grant in its source table.
+    pub fn commit_grant(&mut self, grant: StagedHandleGrant) -> Result<(), ObjectError> {
+        if grant.transfer {
+            self.remove(grant.source)?;
+        }
+        Ok(())
+    }
+
+    /// Roll a staged grant back out of its target table.
+    pub fn rollback_grant(&mut self, grant: StagedHandleGrant) -> Result<(), ObjectError> {
+        self.remove(grant.target).map(|_| ())
     }
 
     fn insert_parts(
@@ -279,6 +333,58 @@ mod tests {
         assert_eq!(entry.kind, ObjectKind::Channel);
         assert_eq!(entry.rights, Rights::READ | Rights::TRANSFER);
         assert_eq!(handles.get(handle), Err(ObjectError::BadHandle));
+    }
+
+    #[test]
+    fn staged_grants_copy_move_and_rollback_transactionally() {
+        let mut objects = ObjectManager::new();
+        let channel = objects.create(ObjectKind::Channel);
+        let rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
+        let mut source = HandleTable::new();
+        let copied = source.insert(channel, rights).unwrap();
+        let moved = source.insert(channel, rights).unwrap();
+        let rolled_back = source.insert(channel, rights).unwrap();
+        let mut target = HandleTable::new();
+
+        let copy_grant = source.stage_grant_to(&mut target, copied, false).unwrap();
+        source.commit_grant(copy_grant).unwrap();
+        assert!(source.get(copied).is_ok());
+        assert!(target.get(copy_grant.target()).is_ok());
+
+        let move_grant = source.stage_grant_to(&mut target, moved, true).unwrap();
+        source.commit_grant(move_grant).unwrap();
+        assert_eq!(source.get(moved), Err(ObjectError::BadHandle));
+        assert!(target.get(move_grant.target()).is_ok());
+
+        let rollback_grant = source
+            .stage_grant_to(&mut target, rolled_back, true)
+            .unwrap();
+        target.rollback_grant(rollback_grant).unwrap();
+        assert!(source.get(rolled_back).is_ok());
+        assert_eq!(
+            target.get(rollback_grant.target()),
+            Err(ObjectError::BadHandle)
+        );
+    }
+
+    #[test]
+    fn staged_grants_enforce_copy_and_transfer_rights() {
+        let mut objects = ObjectManager::new();
+        let event = objects.create(ObjectKind::Event);
+        let mut source = HandleTable::new();
+        let copy_only = source.insert(event, Rights::DUPLICATE).unwrap();
+        let transfer_only = source.insert(event, Rights::TRANSFER).unwrap();
+        let mut target = HandleTable::new();
+
+        assert_eq!(
+            source.stage_grant_to(&mut target, copy_only, true),
+            Err(ObjectError::AccessDenied)
+        );
+        assert_eq!(
+            source.stage_grant_to(&mut target, transfer_only, false),
+            Err(ObjectError::AccessDenied)
+        );
+        assert_eq!(target.live_count(), 0);
     }
 
     #[test]

@@ -400,6 +400,16 @@ pub extern "efiapi" fn efi_main(
 
     kprint!(con_out, "\r\nNIJIGUMO X13S\r\n");
     kprint!(con_out, "BOOTAA64.EFI loaded\r\n");
+    // Report the Exception Level before handoff. EDK2-on-RPi enters the OS at EL2 while
+    // the X13s firmware enters at EL1; the kernel's high-VA TTBR1 jump assumes EL1, so an
+    // EL2 handoff faults at the `br` with no console up yet. Make the level visible here,
+    // over the firmware serial that still works.
+    #[cfg(target_arch = "aarch64")]
+    kprint!(
+        con_out,
+        "exception lvl: EL{} (kernel handoff assumes EL1)\r\n",
+        current_el()
+    );
 
     // On success this never returns — it jumps to the kernel. It returns only when
     // the machine cannot be brought up far enough to hand off; then we keep the
@@ -417,6 +427,21 @@ unsafe fn con_out_of(system_table: *mut EfiSystemTable) -> *mut EfiSimpleTextOut
         return ptr::null_mut();
     }
     unsafe { (*system_table).con_out }
+}
+
+/// Current Exception Level from `CurrentEL[3:2]` (readable at EL1/EL2/EL3). Used only to
+/// report the firmware handoff level; the kernel's high-VA jump requires EL1.
+#[cfg(target_arch = "aarch64")]
+fn current_el() -> u64 {
+    let el: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            el = out(reg) el,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (el >> 2) & 0x3
 }
 
 struct KernelLoad {
@@ -1322,6 +1347,122 @@ unsafe fn jump_to_kernel(
         while addr < end {
             core::arch::asm!("dc civac, {a}", a = in(reg) addr, options(nostack, preserves_flags));
             addr = addr.wrapping_add(line);
+        }
+
+        // EDK2-on-RPi enters the OS at EL2; the X13s firmware enters at EL1. The kernel is
+        // linked high and programs the EL1 translation regime, so at EL2 the `br` below
+        // instruction-aborts at zeroth-level translation (the top half is untranslatable
+        // under TTBR0_EL2, non-VHE). When we are at EL2, drop to EL1 first: reuse the
+        // firmware's EL2 identity map as TTBR0_EL1, install the boot map as TTBR1_EL1,
+        // mirror the EL2 T0/PS fields into TCR_EL1, enable the EL1 MMU, and `eret` to the
+        // high entry. (E2H is assumed 0, as on RPi EDK2 / QEMU AAVMF; it is cleared below.)
+        let current_el: u64;
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            el = out(reg) current_el,
+            options(nomem, nostack, preserves_flags),
+        );
+        if (current_el >> 2) & 0b11 == 2 {
+            let tcr_el2: u64;
+            let mair_el2: u64;
+            let ttbr0_el2: u64;
+            let sctlr_el1: u64;
+            let hcr_el2: u64;
+            core::arch::asm!(
+                "mrs {tcr}, tcr_el2",
+                "mrs {mair}, mair_el2",
+                "mrs {ttbr0}, ttbr0_el2",
+                "mrs {sctlr}, sctlr_el1",
+                "mrs {hcr}, hcr_el2",
+                tcr = out(reg) tcr_el2,
+                mair = out(reg) mair_el2,
+                ttbr0 = out(reg) ttbr0_el2,
+                sctlr = out(reg) sctlr_el1,
+                hcr = out(reg) hcr_el2,
+                options(nomem, nostack, preserves_flags),
+            );
+
+            // TCR_EL1: keep the firmware's T0SZ/IRGN0/ORGN0/SH0/TG0 (bits 0..=15) so
+            // TTBR0_EL1 walks the inherited identity map identically; relocate PS->IPS and
+            // TBI->TBI0 (their bit positions differ from TCR_EL2); add the same
+            // 48-bit / 4 KiB Normal-WB upper half the EL1 path programs for TTBR1.
+            let tcr_t1 = (16u64 << 16) // T1SZ
+                | (1u64 << 24) // IRGN1: WBWA
+                | (1u64 << 26) // ORGN1: WBWA
+                | (3u64 << 28) // SH1: inner-shareable
+                | (2u64 << 30); // TG1: 4 KiB
+            let tcr_el1 = (tcr_el2 & 0xffff)
+                | tcr_t1
+                | (((tcr_el2 >> 16) & 0x7) << 32) // PS -> IPS
+                | (((tcr_el2 >> 20) & 0x1) << 37); // TBI -> TBI0
+            let mair_el1 = (mair_el2 & !(0xffu64 << 56)) | (0xffu64 << 56); // slot 7 = Normal WB
+                                                                            // The kernel never reprograms SCTLR_EL1, so hand EL1 a complete MMU+caches-on
+                                                                            // value: start from its (reset) RES1 pattern and add M | C | I.
+            let sctlr_el1 = sctlr_el1 | (1u64 << 0) | (1u64 << 2) | (1u64 << 12);
+            // Hand EL1 a clean nVHE HCR_EL2: RW=1 (AArch64 EL1) and everything else 0 — in
+            // particular IMO/FMO/AMO=0 so physical IRQ/FIQ/SError are taken to EL1 (not
+            // trapped to EL2, where there is no handler after handoff), and E2H/TGE=0 so the
+            // EL1 system registers we program are the ones the `eret` uses.
+            let _ = hcr_el2;
+            let hcr_el2 = 1u64 << 31;
+            let spsr_el2 = 0x3c5u64; // EL1h, DAIF (D,A,I,F) masked
+
+            // Hand EL1 the EL2-owned timer/GIC controls, or the kernel's GIC/timer bring-up
+            // silently fails after the eret: CNTVOFF_EL2=0 aligns the virtual counter with
+            // physical (set in the commit below), and on a PE that has the GICv3 system-
+            // register interface (ID_AA64PFR0_EL1.GIC != 0) ICC_SRE_EL2.{Enable,SRE} lets EL1
+            // use ICC_*_EL1. A GIC-400/GICv2 board (the Pi 5) has no such interface, so the
+            // write is skipped there to avoid an UNDEF.
+            let pfr0: u64;
+            core::arch::asm!(
+                "mrs {pfr0}, id_aa64pfr0_el1",
+                pfr0 = out(reg) pfr0,
+                options(nomem, nostack, preserves_flags),
+            );
+            if (pfr0 >> 24) & 0xf != 0 {
+                core::arch::asm!(
+                    "mrs {t}, icc_sre_el2",
+                    "orr {t}, {t}, #1", // SRE (bit 0)
+                    "orr {t}, {t}, #8", // Enable (bit 3)
+                    "msr icc_sre_el2, {t}",
+                    "isb",
+                    t = out(reg) _,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+
+            core::arch::asm!(
+                "dsb sy",
+                "ic  iallu",
+                "dsb sy",
+                "msr hcr_el2, {hcr}",
+                "isb",
+                "msr mair_el1, {mair}",
+                "msr tcr_el1, {tcr}",
+                "msr ttbr0_el1, {ttbr0}",
+                "msr ttbr1_el1, {ttbr1}",
+                "msr sctlr_el1, {sctlr}",
+                "msr spsr_el2, {spsr}",
+                "msr elr_el2, {elr}",
+                "msr cntvoff_el2, xzr",
+                "msr cnthctl_el2, {cnthctl}",
+                "isb",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                "eret",
+                hcr = in(reg) hcr_el2,
+                mair = in(reg) mair_el1,
+                tcr = in(reg) tcr_el1,
+                ttbr0 = in(reg) ttbr0_el2,
+                ttbr1 = in(reg) boot_ttbr1,
+                sctlr = in(reg) sctlr_el1,
+                spsr = in(reg) spsr_el2,
+                elr = in(reg) entry,
+                cnthctl = in(reg) 3u64,
+                in("x0") boot,
+                options(noreturn),
+            );
         }
 
         // Preserve the firmware's TTBR0 geometry while defining a 48-bit, 4 KiB TTBR1
