@@ -26,6 +26,43 @@ impl RestartPolicy {
     }
 }
 
+/// A bounded restart budget: the floor of DESIGN/002 §5's "give up / escalate"
+/// ladder. A supervisor consumes one unit per restart *attempt*; once the cap is
+/// reached the service is given up rather than respawned, so a crash-looping
+/// instance cannot be restarted forever. The count is transient supervisor state
+/// (DESIGN/002 §4) — a Sora restart re-initialises the service plane and resets it,
+/// which is acceptable because it holds no critical durable truth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartBudget {
+    max_attempts: u32,
+    used: u32,
+}
+
+impl RestartBudget {
+    pub const fn new(max_attempts: u32) -> Self {
+        Self {
+            max_attempts,
+            used: 0,
+        }
+    }
+
+    /// Record one restart attempt. Returns true if it was within budget (the caller
+    /// may proceed to rebuild) and false once the cap is reached (the caller must give
+    /// up). Calling it while already exhausted stays false and consumes nothing.
+    pub fn try_consume(&mut self) -> bool {
+        if self.used >= self.max_attempts {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+
+    /// Whether the budget is spent: every future `try_consume` will refuse.
+    pub const fn exhausted(&self) -> bool {
+        self.used >= self.max_attempts
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerRecipe<'a> {
     pub name: &'a str,
@@ -160,5 +197,26 @@ mod tests {
             Errno::Ok.status()
         }));
         assert_eq!(closed, Handle(11));
+    }
+
+    #[test]
+    fn restart_budget_gives_up_after_its_cap() {
+        // A zero cap refuses immediately: a service that may not be restarted is given
+        // up on its first death, consuming nothing.
+        let mut none = RestartBudget::new(0);
+        assert!(none.exhausted());
+        assert!(!none.try_consume());
+
+        // A cap of two grants exactly two attempts, then refuses every further one and
+        // reports exhaustion. try_consume on a spent budget stays false and is a no-op.
+        let mut budget = RestartBudget::new(2);
+        assert!(!budget.exhausted());
+        assert!(budget.try_consume());
+        assert!(!budget.exhausted());
+        assert!(budget.try_consume());
+        assert!(budget.exhausted());
+        assert!(!budget.try_consume());
+        assert!(!budget.try_consume());
+        assert!(budget.exhausted());
     }
 }

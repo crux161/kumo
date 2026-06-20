@@ -105,6 +105,10 @@ pub enum KernelCall<'a> {
         port: Handle,
         object: Handle,
     },
+    PortUnbind {
+        port: Handle,
+        object: Handle,
+    },
     HandleKoid {
         handle: Handle,
     },
@@ -421,6 +425,20 @@ impl SyscallEngine {
     /// the port is signalled with the corresponding signals and the object koid as source.
     pub fn port_bind(&mut self, port_koid: KoId, object_koid: KoId) {
         self.port_bindings.push((port_koid, object_koid));
+    }
+
+    /// Remove the binding from `port_koid` to `object_koid`, if present — the inverse
+    /// of `port_bind`. A supervisor calls this to drop a watch it no longer needs (e.g.
+    /// a restarted instance's dead predecessor), so bindings do not accumulate once
+    /// repeated restarts become normal. Unlike `release_port_bindings` (teardown, keyed
+    /// on a single koid touching either endpoint), this removes exactly the one named
+    /// pair and leaves every other watch on that port intact. Returns true if a binding
+    /// was removed.
+    pub fn port_unbind(&mut self, port_koid: KoId, object_koid: KoId) -> bool {
+        let before = self.port_bindings.len();
+        self.port_bindings
+            .retain(|&(p, o)| !(p == port_koid && o == object_koid));
+        self.port_bindings.len() != before
     }
 
     /// Signal all ports bound to `object_koid`.
@@ -1431,6 +1449,29 @@ impl SyscallEngine {
                 self.port_bind(port_koid, obj_koid);
                 KernelCallResult::Status(Errno::Ok.status())
             }
+            KernelCall::PortUnbind { port, object } => {
+                let port_koid =
+                    match process
+                        .handles()
+                        .require(port, ObjectKind::Port, Rights::WAIT)
+                    {
+                        Ok(e) => e.koid,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                let obj_koid = match process.handles().get(object) {
+                    Ok(e) => {
+                        if !e.rights.contains(Rights::WAIT) {
+                            return KernelCallResult::Status(Errno::AccessDenied.status());
+                        }
+                        e.koid
+                    }
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                // Idempotent: removing an already-absent watch is a no-op success, so a
+                // supervisor need not track whether it already dropped a dead instance.
+                self.port_unbind(port_koid, obj_koid);
+                KernelCallResult::Status(Errno::Ok.status())
+            }
             KernelCall::HandleKoid { handle } => match process.handles().get(handle) {
                 Ok(entry) => KernelCallResult::Handle(Handle(entry.koid.0 as u32)),
                 Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
@@ -1859,6 +1900,69 @@ mod tests {
         assert_eq!(engine.port_bindings.len(), 1);
         assert!(engine.release_port_bindings(port_koid));
         assert_eq!(engine.port_bindings.len(), 0);
+    }
+
+    #[test]
+    fn port_unbind_drops_exactly_the_named_watch() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let port = create_port(&mut engine, &mut process);
+        let (left, right) = create_channel(&mut engine, &mut process);
+
+        // Two watches share one port: a supervisor replacing one instance must drop only
+        // that instance's watch, never a sibling's.
+        for object in [right, left] {
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::PortBind { port, object }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+        assert_eq!(engine.port_bindings.len(), 2);
+
+        let port_koid = process.handles().get(port).unwrap().koid;
+        let left_koid = process.handles().get(left).unwrap().koid;
+
+        // A handle that names no object is rejected before the table is touched (the rights
+        // guard runs), so a bad unbind cannot silently drop the wrong watch.
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortUnbind {
+                    port: Handle(9999),
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::BadHandle.status())
+        );
+        assert_eq!(engine.port_bindings.len(), 2);
+
+        // Unbinding (port, right) removes exactly that pair; the (port, left) watch survives.
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortUnbind {
+                    port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(engine.port_bindings.len(), 1);
+        assert_eq!(engine.port_bindings[0], (port_koid, left_koid));
+
+        // Idempotent: dropping the now-absent watch again is still a success and a no-op.
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortUnbind {
+                    port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(engine.port_bindings.len(), 1);
+        assert_eq!(engine.port_bindings[0], (port_koid, left_koid));
     }
 
     #[test]

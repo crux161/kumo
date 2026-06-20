@@ -500,6 +500,16 @@ pub fn port_bind(_port: Handle, _object: Handle) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+pub fn port_unbind(port: Handle, object: Handle) -> u64 {
+    syscall(Syscall::PortUnbind, port.0 as u64, object.0 as u64, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn port_unbind(_port: Handle, _object: Handle) -> u64 {
+    u64::MAX
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn process_exit(code: u64) -> ! {
     syscall(Syscall::ProcessExit, code, 0, 0, 0);
     loop {

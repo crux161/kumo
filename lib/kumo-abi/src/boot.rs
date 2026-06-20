@@ -129,6 +129,29 @@ pub struct Framebuffer {
     pub format: FramebufferFormat,
 }
 
+impl Framebuffer {
+    /// Whether the geometry is self-consistent and within sane bounds — a guard against
+    /// acting on a corrupt `BootInfo` read (e.g. a stale snapshot page on real hardware).
+    /// It cannot prove the values are *correct*, only that they are plausible: a non-zero
+    /// page-aligned scanout base, dimensions within a generous bound, a stride at least as
+    /// wide as the visible width, and a byte length large enough to hold `height` rows of
+    /// `stride` pixels. `stride` is in pixels (the GOP-native unit) and the renderer is
+    /// 32-bpp, so a row is `stride * 4` bytes.
+    pub const fn is_plausible(&self) -> bool {
+        const MAX_DIM: u32 = 16384;
+        const BYTES_PER_PIXEL: u64 = 4;
+        self.phys != 0
+            && self.phys % 4096 == 0
+            && self.width >= 1
+            && self.width <= MAX_DIM
+            && self.height >= 1
+            && self.height <= MAX_DIM
+            && self.stride >= self.width
+            && self.stride <= MAX_DIM
+            && self.len >= self.height as u64 * self.stride as u64 * BYTES_PER_PIXEL
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlatformTable {
@@ -215,5 +238,58 @@ mod tests {
         let raw = RawSlice::from_slice(&REGIONS);
         let slice = unsafe { raw.as_slice() };
         assert_eq!(slice, &REGIONS);
+    }
+
+    #[test]
+    fn framebuffer_plausibility_rejects_garbage_and_accepts_real_geometry() {
+        // The exact corrupt geometry from an X13s boot's stale BootInfo snapshot read
+        // (the drv-fb resource-fail log): every field is wild, so it must be rejected.
+        let garbage = Framebuffer {
+            phys: 0xeef9_d05f_b2a8_3610,
+            len: 0xa50e_cba3_ec34_d44c,
+            width: 0x6f3a_5649,
+            height: 0x91a7_b487,
+            stride: 0xb8dc_4268,
+            format: FramebufferFormat::Unknown,
+        };
+        assert!(!garbage.is_plausible());
+
+        // A real 1280x800 32-bpp scanout, page-aligned and tightly packed: accepted.
+        let real = Framebuffer {
+            phys: 0x8000_0000,
+            len: 800 * 1280 * 4,
+            width: 1280,
+            height: 800,
+            stride: 1280,
+            format: FramebufferFormat::Bgr,
+        };
+        assert!(real.is_plausible());
+
+        // Each invariant rejects on its own: a non-page-aligned base, an over-large
+        // dimension, a stride narrower than the width, and a length too small for
+        // height*stride*4.
+        assert!(!Framebuffer {
+            phys: 0x8000_0001,
+            ..real
+        }
+        .is_plausible());
+        assert!(!Framebuffer {
+            width: 20000,
+            ..real
+        }
+        .is_plausible());
+        assert!(!Framebuffer {
+            stride: 1279,
+            ..real
+        }
+        .is_plausible());
+        assert!(!Framebuffer {
+            len: real.len - 4,
+            ..real
+        }
+        .is_plausible());
+
+        // A zero-flagged framebuffer (no display) is not plausible either.
+        assert!(!Framebuffer::default().is_plausible());
     }
 }

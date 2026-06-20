@@ -37,6 +37,7 @@ pub enum Syscall {
     HandleKoid = 33,
     ProcessWait = 34,
     ResourceCreateChild = 35,
+    PortUnbind = 36,
 }
 
 /// Options for [`Syscall::ProcessRun`].

@@ -5,15 +5,16 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
-    BootInfo, Errno, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH, CAT_PATH,
-    FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
+    BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
+    CAT_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_close, handle_duplicate, handle_koid,
-    interrupt_create, port_bind, port_create, port_wait, process_create, process_run, process_wait,
-    resource_create_child, thread_create, thread_start, vmar_map, vmo_create, vmo_read, vmo_write,
+    interrupt_create, port_bind, port_create, port_unbind, port_wait, process_create, process_run,
+    process_wait, resource_create_child, thread_create, thread_start, vmar_map, vmo_create,
+    vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -76,6 +77,22 @@ fn log_hex(mut v: u64) {
         }
     }
     debug_write(buf[hi..].as_ptr(), 16 - hi);
+}
+
+/// Dump framebuffer geometry as `phys=… len=… w=… h=… stride=…`. Used by both drv-fb
+/// spawn failure paths so a corrupt or rejected geometry is always fully visible.
+fn log_fb_geometry(fb: &Framebuffer) {
+    log(b"phys=");
+    log_hex(fb.phys);
+    log(b" len=");
+    log_hex(fb.len);
+    log(b" w=");
+    log_hex(fb.width as u64);
+    log(b" h=");
+    log_hex(fb.height as u64);
+    log(b" stride=");
+    log_hex(fb.stride as u64);
+    log(b"\n");
 }
 
 /// Locate a file in the initrd by path, returning its `(offset, len)`. Sora
@@ -659,7 +676,14 @@ extern "C" fn sora_main(
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
             if bootinfo.has_framebuffer() {
                 let fb = bootinfo.framebuffer;
-                let fb_res_h = resource_create_child(res, fb.phys, fb.len, 0, 0);
+                // Refuse to mint an MMIO Resource over implausibly-shaped geometry: a corrupt
+                // snapshot read must fail here as a clear diagnostic, not reach the kernel's
+                // range check disguised as a rights problem.
+                let fb_res_h = if fb.is_plausible() {
+                    resource_create_child(res, fb.phys, fb.len, 0, 0)
+                } else {
+                    u64::MAX
+                };
                 if fb_res_h != u64::MAX {
                     let (server_chan, client_chan) = channel_create_pair();
                     if server_chan != u64::MAX && client_chan != u64::MAX {
@@ -684,27 +708,18 @@ extern "C" fn sora_main(
                         log(b"drv-fb: channel fail\n");
                     }
                 } else {
-                    // X13s-only: this succeeds under QEMU (ramfb) but fails on the laptop,
-                    // and the Sora syscall path collapses the kernel errno to u64::MAX, so the
-                    // bare "resource fail" tells us nothing. The inputs *should* be in range —
-                    // the root Resource spans all of phys, and the loader rejects len==0 before
-                    // setting FLAG_FRAMEBUFFER_PRESENT (niji-uefi). So surface the geometry Sora
-                    // actually read from the BootInfo VMO: zero/garbage values implicate a bad
-                    // snapshot read (the frame-mapping hazard), while sane values (nonzero phys,
-                    // real w/h, len≈w*h*bpp) point instead at a Resource-rights / kernel
-                    // range-check issue to chase next. has_framebuffer() already read true here,
-                    // so the flags field at least came back correct.
-                    log(b"drv-fb: resource fail phys=");
-                    log_hex(fb.phys);
-                    log(b" len=");
-                    log_hex(fb.len);
-                    log(b" w=");
-                    log_hex(fb.width as u64);
-                    log(b" h=");
-                    log_hex(fb.height as u64);
-                    log(b" stride=");
-                    log_hex(fb.stride as u64);
-                    log(b"\n");
+                    // Two failure modes, now separated by the plausibility gate above.
+                    // Implausible geometry is a corrupt BootInfo snapshot read (the kernel
+                    // cleans the snapshot to coherency as of J219; if this still fires the read
+                    // is wrong further upstream). Plausible geometry the kernel still rejects is
+                    // a real Resource-rights / range-check issue — and the Sora syscall path
+                    // collapses the kernel errno to u64::MAX, so surface the geometry either way.
+                    if fb.is_plausible() {
+                        log(b"drv-fb: resource fail ");
+                    } else {
+                        log(b"drv-fb: implausible framebuffer geometry ");
+                    }
+                    log_fb_geometry(&fb);
                 }
             }
         } else {
@@ -1241,6 +1256,12 @@ extern "C" fn sora_main(
             }
         }
 
+        // Bound how many times the interactive service may be respawned before Sora gives
+        // up on it (DESIGN/002 §5 give-up ladder floor): a crash-looping instance must not
+        // be restarted forever. The boot probe consumes exactly one unit, well within cap.
+        const TTYD_MAX_RESTARTS: u32 = 3;
+        let mut ttyd_restart_budget = sora::RestartBudget::new(TTYD_MAX_RESTARTS);
+
         loop {
             let source = Handle(port_wait(port) as u32);
             if Some(source) == interactive_ttyd_koid {
@@ -1251,10 +1272,21 @@ extern "C" fn sora_main(
                 interactive_ttyd_koid = None;
                 let recipe = dead.recipe;
                 let restart = recipe.restart.should_restart(true);
+                // Drop this instance's port watch before closing its handles. Teardown only
+                // reclaims bindings keyed on the dead process's *own* handles, never Sora's
+                // watch on it, so without this the permanent port would retain one inert
+                // binding per restart. Idempotent in the kernel; a real failure is loud.
+                if port_unbind(port, dead.instance.process) != 0 {
+                    log(b"ttyd: dead watch unbind fail\n");
+                }
                 if !close_supervised_service(dead) {
                     log(b"ttyd: dead instance cleanup fail\n");
                 }
-                if restart {
+                // Consume one unit of the give-up budget only when policy actually wants a
+                // restart — short-circuit means an intentional or Never termination spends
+                // nothing, and an exhausted budget gives the service up instead of looping.
+                let allowed = restart && ttyd_restart_budget.try_consume();
+                if allowed {
                     log(b"ttyd: restart required\n");
                     if let Some(replacement) = spawn_ttyd_session(initrd, recipe) {
                         let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
@@ -1287,6 +1319,8 @@ extern "C" fn sora_main(
                     } else {
                         log(b"ttyd: restart spawn fail\n");
                     }
+                } else if restart {
+                    log(b"ttyd: restart budget exhausted\n");
                 } else {
                     log(b"ttyd: terminated\n");
                 }

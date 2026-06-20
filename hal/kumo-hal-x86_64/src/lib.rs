@@ -262,6 +262,12 @@ pub fn fb_fill(_phys: u64, _len_bytes: u64, _color: u32) {
     // Direct-framebuffer fill; lands with the x86_64 framebuffer console.
 }
 
+pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {
+    // x86_64 data caches are hardware-coherent across cores (snooping), so a CPU writer
+    // and a CPU reader of the same physical frame need no explicit clean. The aarch64
+    // backend documents the hand-off hazard this guards against; here it is a no-op.
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct El0Report {
     pub entered: bool,

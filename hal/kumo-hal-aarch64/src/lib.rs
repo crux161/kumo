@@ -275,6 +275,39 @@ unsafe fn fb_clean_line(addr: usize) {
     };
 }
 
+/// Clean `[addr, addr + len)` from the data cache to the point of coherency, then
+/// barrier. A caller that writes a buffer through this CPU's cacheable mapping and then
+/// hands the *physical* frame to another reader — a different agent, or another mapping
+/// whose cacheability does not snoop these dirty lines — must clean first, or the reader
+/// sees stale RAM. This is the same hazard `fb_clean_line` handles for the scanout, for an
+/// arbitrary byte range (e.g. the kernel's BootInfo hand-off frame). No-op on the host;
+/// harmless on QEMU (no cache model) and on already-coherent memory.
+#[cfg(target_os = "none")]
+pub fn clean_dcache_to_poc(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // A-class D-cache line (X13s is Cortex-X1/A78, 64-byte lines). Over-stepping a larger
+    // line merely issues a redundant clean; it never skips one at this granule.
+    const LINE: usize = 64;
+    let mut line = addr & !(LINE - 1);
+    let end = addr.saturating_add(len);
+    while line < end {
+        // SAFETY: `dc cvac` cleans the line containing a normal-memory VA; it never faults.
+        unsafe {
+            core::arch::asm!("dc cvac, {a}", a = in(reg) line, options(nostack, preserves_flags));
+        }
+        line += LINE;
+    }
+    // Ensure the cleans have completed before the frame is observed elsewhere.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {}
+
 /// Blit one glyph into a 32-bpp framebuffer. Bounds-checked against `len_px`, so a
 /// bad geometry truncates instead of scribbling past the buffer. Pure with respect
 /// to console state, which makes it host-testable against an in-memory buffer.
@@ -3032,22 +3065,46 @@ mod traps {
             ["CurEL_SP0", "CurEL_SPx", "LowerEL_A64", "LowerEL_A32"][((index / 4) % 4) as usize];
         let kind = ["sync", "irq", "fiq", "serror"][(index % 4) as usize];
         let ec = ((esr >> 26) & 0x3f) as u32;
-        let mut out = ConsoleWriter;
-        let _ = write!(
-            out,
-            "\r\n*** TOWER: CPU EXCEPTION - Ziwei seizes the wheel ***\r\n\
-             src={}/{}  ec={:#04x} ({})\r\n\
-             ESR={:#018x}  ELR={:#018x}  FAR={:#018x}\r\n\
-             system halted; power-cycle to reboot\r\n",
-            src,
-            kind,
-            ec,
-            ec_name(ec),
-            esr,
-            elr,
-            far
-        );
-        halt()
+        // Faulting PSTATE: for EC 0x00 (undefined / illegal state) the ELR (faulting PC) and
+        // SPSR are the useful clues and FAR is meaningless, so capture SPSR too.
+        let spsr: u64;
+        unsafe {
+            core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr, options(nostack, nomem));
+        }
+
+        // The framebuffer console renders the freshest line at the BOTTOM, and a lossy
+        // HDMI/USB capture tends to drop or tear that bottom band — a one-shot dump then
+        // strands the report there with nothing to push it up. So repaint the report
+        // forever: each pass scrolls the prior copy up into the clean region (any upper copy
+        // is readable) and keeps the capture fed with fresh frames. The machine is
+        // effectively halted; this loop only paints, never returns.
+        let mut pass: u64 = 0;
+        loop {
+            let mut out = ConsoleWriter;
+            let _ = write!(
+                out,
+                "\r\n********** TOWER: CPU EXCEPTION **********\r\n\
+                 src={}/{}  ec={:#04x} ({})\r\n\
+                 ESR={:#018x}  ELR={:#018x}\r\n\
+                 FAR={:#018x}  SPSR={:#018x}\r\n\
+                 halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+                src,
+                kind,
+                ec,
+                ec_name(ec),
+                esr,
+                elr,
+                far,
+                spsr,
+                pass
+            );
+            pass = pass.wrapping_add(1);
+            // Crude spin so each repaint lingers across several capture frames before the
+            // next one scrolls it up; no timer/IRQ is safe to touch from a fault handler.
+            for _ in 0..500_000_000u64 {
+                core::hint::spin_loop();
+            }
+        }
     }
 
     /// Acknowledge the pending interrupt and return its INTID. GICv2 (Pi 5 / GIC-400) reads

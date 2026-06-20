@@ -12,13 +12,13 @@ compile_error!("select a HAL backend");
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
     pub use kumo_hal_aarch64::{
-        arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
-        early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
-        init_timer_interrupts, install_exception_vectors, irq_unmask, map_user_device_block,
-        map_user_page, monotonic_nanos, read_phys, read_user_aspace_root, run_el0_image,
-        run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
-        set_svc_hook, set_user_aspace_root, spin_once, switch_context, syscall_count,
-        timer_irq_count, user_device_page_desc, user_nc_page_desc, user_page_desc,
+        arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook, console_read_byte,
+        console_use_physmap, early_console_write, el0_exit, enable_kernel_mmu, fb_fill,
+        fb_paint_band, halt, init_timer_interrupts, install_exception_vectors, irq_unmask,
+        map_user_device_block, map_user_page, monotonic_nanos, read_phys, read_user_aspace_root,
+        run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
+        syscall_count, timer_irq_count, user_device_page_desc, user_nc_page_desc, user_page_desc,
         wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment,
         UserMapping, UserState, ARCH,
     };
@@ -27,13 +27,13 @@ pub mod active {
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        arch_name, build_user_tables, clear_preempt_hook, console_read_byte, console_use_physmap,
-        early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_paint_band, halt,
-        init_timer_interrupts, install_exception_vectors, irq_unmask, map_user_device_block,
-        map_user_page, monotonic_nanos, read_phys, read_user_aspace_root, run_el0_image,
-        run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
-        set_svc_hook, set_user_aspace_root, spin_once, switch_context, syscall_count,
-        timer_irq_count, user_device_page_desc, user_nc_page_desc, user_page_desc,
+        arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook, console_read_byte,
+        console_use_physmap, early_console_write, el0_exit, enable_kernel_mmu, fb_fill,
+        fb_paint_band, halt, init_timer_interrupts, install_exception_vectors, irq_unmask,
+        map_user_device_block, map_user_page, monotonic_nanos, read_phys, read_user_aspace_root,
+        run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
+        syscall_count, timer_irq_count, user_device_page_desc, user_nc_page_desc, user_page_desc,
         wait_for_timer_irqs, El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment,
         UserMapping, UserState, ARCH,
     };

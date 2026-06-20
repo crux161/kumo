@@ -854,6 +854,16 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                         _ => r[0] = u64::MAX,
                     }
+                } else if num == Syscall::PortUnbind as u64 {
+                    let port = Handle(r[0] as u32);
+                    let object = Handle(r[1] as u32);
+                    match sora
+                        .engine
+                        .dispatch(child, KernelCall::PortUnbind { port, object })
+                    {
+                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                        _ => r[0] = u64::MAX,
+                    }
                 } else if num == Syscall::VmarMap as u64 {
                     let process_handle = Handle(r[0] as u32);
                     let vmo_handle = Handle(r[1] as u32);
@@ -1044,6 +1054,16 @@ extern "C" fn svc_hook(regs: *mut u64) {
             match sora
                 .engine
                 .dispatch(&mut sora.process, KernelCall::PortBind { port, object })
+            {
+                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                _ => r[0] = u64::MAX,
+            }
+        } else if num == Syscall::PortUnbind as u64 {
+            let port = Handle(r[0] as u32);
+            let object = Handle(r[1] as u32);
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::PortUnbind { port, object })
             {
                 KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                 _ => r[0] = u64::MAX,
@@ -1406,6 +1426,15 @@ fn attempt_sora(
             .ok_or(UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
         // Write BootInfo into the identity-mapped frame (J153: identity, not physmap).
         unsafe { (bootinfo_frame as *mut BootInfo).write(*boot) };
+        // The struct was written through this CPU's cacheable mapping; clean the page to
+        // the point of coherency before wrapping it in a VMO for Sora. Without this, Sora's
+        // mapping of the same physical frame can read stale RAM on real hardware (X13s —
+        // observed as garbage framebuffer geometry), while QEMU's lack of a cache model
+        // hides it. Same hazard the scanout path handles with fb_clean_line.
+        kumo_hal::active::clean_dcache_to_poc(
+            bootinfo_frame as usize,
+            crate::mm::PAGE_SIZE as usize,
+        );
         let bootinfo_vmo = Vmo::from_physical_range(bootinfo_frame, crate::mm::PAGE_SIZE)
             .map_err(|_| UsermodeError::ChannelSetup)?;
         engine
