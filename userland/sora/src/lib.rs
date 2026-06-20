@@ -14,6 +14,18 @@ pub enum RestartPolicy {
     Always,
 }
 
+impl RestartPolicy {
+    /// Decide whether a terminated instance should be reconstructed. A persistent
+    /// service disappearing outside an intentional shutdown is a failure.
+    pub const fn should_restart(self, failed: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnFailure => failed,
+            Self::Always => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerRecipe<'a> {
     pub name: &'a str,
@@ -28,6 +40,14 @@ pub struct ServerRecipe<'a> {
 pub struct SupervisedServer {
     pub process: Handle,
     pub client: Handle,
+}
+
+/// One persistent supervisor record: the construction policy needed to rebuild a
+/// service and the capabilities for its current live instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SupervisedService<'a> {
+    pub recipe: ServerRecipe<'a>,
+    pub instance: SupervisedServer,
 }
 
 pub struct Sora;
@@ -99,6 +119,25 @@ mod tests {
         };
         assert_eq!(supervised.process, Handle(3));
         assert_eq!(supervised.client, Handle(5));
+
+        let service = SupervisedService {
+            recipe: ServerRecipe {
+                name: "ttyd",
+                image_path: "bin/ttyd",
+                restart: RestartPolicy::OnFailure,
+            },
+            instance: supervised,
+        };
+        assert_eq!(service.recipe.image_path, "bin/ttyd");
+        assert_eq!(service.recipe.restart, RestartPolicy::OnFailure);
+        assert_eq!(service.instance.process, Handle(3));
+        assert_eq!(service.instance.client, Handle(5));
+        assert!(!RestartPolicy::Never.should_restart(false));
+        assert!(!RestartPolicy::Never.should_restart(true));
+        assert!(!RestartPolicy::OnFailure.should_restart(false));
+        assert!(RestartPolicy::OnFailure.should_restart(true));
+        assert!(RestartPolicy::Always.should_restart(false));
+        assert!(RestartPolicy::Always.should_restart(true));
 
         let handles = [Some(Handle(7)), None, Some(Handle(11))];
         let mut seen = [Handle(0); 2];

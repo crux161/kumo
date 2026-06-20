@@ -21,10 +21,9 @@ build_x13s() {
 
 build_pi5() {
     echo "==> Building aarch64 (Raspberry Pi 5)..."
+    cargo xtask image --arch aarch64 --hardware rpi5
     if [ -x "scripts/mk-pi5-img.sh" ]; then
         ./scripts/mk-pi5-img.sh
-    else
-        cargo xtask image --arch aarch64 --hardware bcm2712-rpi5
     fi
 }
 

@@ -1210,10 +1210,88 @@ extern "C" fn sora_main(
 
         // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
         launch_lua_repl(initrd, kbd, console);
-        let interactive_ttyd = spawn_ttyd_session(initrd);
+        let ttyd_recipe = sora::ServerRecipe {
+            name: "ttyd",
+            image_path: TTYD_PATH,
+            restart: sora::RestartPolicy::OnFailure,
+        };
+        let mut interactive_ttyd = spawn_ttyd_session(initrd, ttyd_recipe);
+        let mut interactive_ttyd_koid = interactive_ttyd.and_then(|service| {
+            arm_supervised_process(port, service).inspect(|_| {
+                log(b"ttyd: supervision armed\n");
+            })
+        });
+        if interactive_ttyd_koid.is_none() {
+            log(b"ttyd: supervision arm fail\n");
+        }
+
+        // One bounded restart probe: ask the initial instance to stop, then let the
+        // permanent port observe its process TERMINATED signal. The replacement is not
+        // sent this frame, so the proof cannot loop indefinitely.
+        if let Some(service) = interactive_ttyd {
+            let mut request = [0u8; ttyd::REQUEST_BUF_BYTES];
+            let sent = TtyRequest::shutdown()
+                .encode_into(&mut request)
+                .map(|n| channel_write(service.instance.client, request.as_ptr(), n) == 0)
+                .unwrap_or(false);
+            if sent {
+                log(b"ttyd: restart probe sent\n");
+            } else {
+                log(b"ttyd: restart probe fail\n");
+            }
+        }
 
         loop {
             let source = Handle(port_wait(port) as u32);
+            if Some(source) == interactive_ttyd_koid {
+                let Some(dead) = interactive_ttyd.take() else {
+                    interactive_ttyd_koid = None;
+                    continue;
+                };
+                interactive_ttyd_koid = None;
+                let recipe = dead.recipe;
+                let restart = recipe.restart.should_restart(true);
+                if !close_supervised_service(dead) {
+                    log(b"ttyd: dead instance cleanup fail\n");
+                }
+                if restart {
+                    log(b"ttyd: restart required\n");
+                    if let Some(replacement) = spawn_ttyd_session(initrd, recipe) {
+                        let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+                        let serves = ttyd_request_reply(
+                            replacement.instance.client,
+                            TtyRequest::clear(),
+                            &mut reply,
+                        )
+                        .and_then(|n| TtyReply::parse(&reply[..n]))
+                        .map(|reply| reply.status == ttyd::TTY_OK)
+                        .unwrap_or(false);
+                        if serves {
+                            if let Some(koid) = arm_supervised_process(port, replacement) {
+                                if koid != source {
+                                    interactive_ttyd = Some(replacement);
+                                    interactive_ttyd_koid = Some(koid);
+                                    log(b"ttyd: restart ok\n");
+                                } else {
+                                    let _ = close_supervised_service(replacement);
+                                    log(b"ttyd: restart identity fail\n");
+                                }
+                            } else {
+                                let _ = close_supervised_service(replacement);
+                                log(b"ttyd: restart rearm fail\n");
+                            }
+                        } else {
+                            let _ = close_supervised_service(replacement);
+                            log(b"ttyd: restart serve fail\n");
+                        }
+                    } else {
+                        log(b"ttyd: restart spawn fail\n");
+                    }
+                } else {
+                    log(b"ttyd: terminated\n");
+                }
+                continue;
+            }
             // console handler — output only (klog! → DebugWrite)
             if source == cons_koid {
                 let n = channel_read(console, serve_buf.as_mut_ptr(), 256) as usize;
@@ -1272,7 +1350,7 @@ extern "C" fn sora_main(
             if source == kbd_k {
                 let n = channel_read(kbd, serve_buf.as_mut_ptr(), 256) as usize;
                 if n > 0 && interactive_ttyd.is_some() {
-                    let tty = interactive_ttyd.unwrap();
+                    let tty = interactive_ttyd.unwrap().instance;
                     let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
                     for i in 0..n {
                         dispatch_ttyd_key(
@@ -1292,6 +1370,25 @@ extern "C" fn sora_main(
             core::hint::spin_loop();
         }
     }
+}
+
+fn arm_supervised_process(port: Handle, service: sora::SupervisedService<'_>) -> Option<Handle> {
+    let koid = handle_koid(service.instance.process);
+    if koid != u64::MAX && port_bind(port, service.instance.process) == 0 {
+        Some(Handle(koid as u32))
+    } else {
+        None
+    }
+}
+
+fn close_supervised_service(service: sora::SupervisedService<'_>) -> bool {
+    sora::close_handles(
+        &[
+            Some(service.instance.process),
+            Some(service.instance.client),
+        ],
+        handle_close,
+    )
 }
 
 /// Convert a path like "HELLO.TXT" to an 11-byte 8.3 FAT directory entry name.
@@ -1985,18 +2082,21 @@ fn shutdown_resident(client: sora::SupervisedServer) -> u64 {
     process_wait()
 }
 
-fn spawn_ttyd_session(initrd: Handle) -> Option<sora::SupervisedServer> {
-    let recipe = SvcRecipe {
+fn spawn_ttyd_session(
+    initrd: Handle,
+    recipe: sora::ServerRecipe<'static>,
+) -> Option<sora::SupervisedService<'static>> {
+    let spawn_recipe = SvcRecipe {
         initrd,
-        path: TTYD_PATH,
+        path: recipe.image_path,
     };
-    let client = spawn_from_recipe(&recipe)?;
+    let instance = spawn_from_recipe(&spawn_recipe)?;
     if !child_parked(process_wait()) {
         log(b"ttyd: interactive park fail\n");
         return None;
     }
     log(b"ttyd: interactive ok\n");
-    Some(client)
+    Some(sora::SupervisedService { recipe, instance })
 }
 
 fn dispatch_ttyd_key(
