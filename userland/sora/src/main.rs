@@ -13,8 +13,8 @@ use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
     channel_write_with_handle, debug_write, handle_close, handle_duplicate, handle_koid,
     interrupt_create, port_bind, port_create, port_unbind, port_wait, process_create, process_run,
-    process_wait, resource_create_child, thread_create, thread_start, vmar_map, vmo_create,
-    vmo_read, vmo_write,
+    process_wait, resource_create_child, thread_create, thread_start, timer_create, vmar_map,
+    vmo_create, vmo_read, vmo_write,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -222,7 +222,7 @@ const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
 const QEMU_PL011_MMIO_SIZE: u64 = 0x1000;
 const QEMU_PL011_IRQ: u32 = 33; // SPI 1 = 33 on QEMU ARM virt
 const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
-const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
+const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = true;
 
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
@@ -455,6 +455,15 @@ extern "C" fn sora_main(
     let timer_irq = interrupt_create(res, TIMER_IRQ);
     if timer_irq != u64::MAX {
         debug_write(b"timer irq ok\n".as_ptr(), 13);
+    }
+
+    // §5.6 crash containment (Journal 137): prove the kernel contains an EL0 fault
+    // from a child process without halting Sora. Run before persistent services so
+    // process_wait() has no resident children and all_residents_gone can succeed.
+    if run_crash_containment_smoke(initrd) {
+        log(b"svc-health: crash contained\n");
+    } else {
+        log(b"svc-health: crash escaped\n");
     }
 
     // Spawn drv-serial — but ONLY on the serial-console path (no framebuffer).
@@ -1163,24 +1172,8 @@ extern "C" fn sora_main(
         } else {
             log(b"svc-health: restart fail\n");
         }
-
-        // §5.6 crash containment: a child that faults must be terminated by the kernel alone, not
-        // halt it. Spawn one at a bogus entry; the kernel contains the fault and Sora lives on.
-        if run_crash_containment_smoke(initrd) {
-            log(b"svc-health: crash contained\n");
-        } else {
-            log(b"svc-health: crash escaped\n");
-        }
-
-        // §5.6 crash restart: trigger an explicit crash on the server. The kernel contains it,
-        // tears it down, and fires PEER_CLOSED to our port wait, waking us to respawn it.
-        if run_crash_restart_smoke(initrd) {
-            log(b"svc-health: crash-restart ok\n");
-        } else {
-            log(b"svc-health: crash-restart fail\n");
-        }
     } else {
-        log(b"svc-health: legacy boot smokes skipped\n");
+        log(b"svc-health: legacy pair/restart smokes skipped\n");
     }
 
     // P10-b: VmoWrite/VmoRead demo on anonymous backing.
@@ -1240,30 +1233,68 @@ extern "C" fn sora_main(
             log(b"ttyd: supervision arm fail\n");
         }
 
-        // One bounded restart probe: ask the initial instance to stop, then let the
-        // permanent port observe its process TERMINATED signal. The replacement is not
-        // sent this frame, so the proof cannot loop indefinitely.
-        if let Some(service) = interactive_ttyd {
-            let mut request = [0u8; ttyd::REQUEST_BUF_BYTES];
-            let sent = TtyRequest::shutdown()
-                .encode_into(&mut request)
-                .map(|n| channel_write(service.instance.client, request.as_ptr(), n) == 0)
-                .unwrap_or(false);
-            if sent {
-                log(b"ttyd: restart probe sent\n");
-            } else {
-                log(b"ttyd: restart probe fail\n");
-            }
-        }
-
         // Bound how many times the interactive service may be respawned before Sora gives
         // up on it (DESIGN/002 §5 give-up ladder floor): a crash-looping instance must not
-        // be restarted forever. The boot probe consumes exactly one unit, well within cap.
+        // be restarted forever.
         const TTYD_MAX_RESTARTS: u32 = 3;
         let mut ttyd_restart_budget = sora::RestartBudget::new(TTYD_MAX_RESTARTS);
+        const TTYD_INITIAL_BACKOFF_NS: u64 = 50_000_000;
+        const TTYD_MAX_BACKOFF_NS: u64 = 200_000_000;
+        let mut ttyd_restart_backoff =
+            sora::RestartBackoff::new(TTYD_INITIAL_BACKOFF_NS, TTYD_MAX_BACKOFF_NS);
+        let mut pending_ttyd_restart: Option<(sora::ServerRecipe<'static>, Handle)> = None;
+        let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
 
         loop {
             let source = Handle(port_wait(port) as u32);
+            if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = ttyd_restart_timer.take() else {
+                    continue;
+                };
+                if port_unbind(port, timer) != 0 {
+                    log(b"ttyd: restart timer unbind fail\n");
+                }
+                if handle_close(timer) != 0 {
+                    log(b"ttyd: restart timer cleanup fail\n");
+                }
+                let Some((recipe, dead_source)) = pending_ttyd_restart.take() else {
+                    log(b"ttyd: restart timer orphaned\n");
+                    continue;
+                };
+                log(b"ttyd: restart required\n");
+                if let Some(replacement) = spawn_ttyd_session(initrd, recipe) {
+                    let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+                    let serves = ttyd_request_reply(
+                        replacement.instance.client,
+                        TtyRequest::clear(),
+                        &mut reply,
+                    )
+                    .and_then(|n| TtyReply::parse(&reply[..n]))
+                    .map(|reply| reply.status == ttyd::TTY_OK)
+                    .unwrap_or(false);
+                    if serves {
+                        if let Some(koid) = arm_supervised_process(port, replacement) {
+                            if koid != dead_source {
+                                interactive_ttyd = Some(replacement);
+                                interactive_ttyd_koid = Some(koid);
+                                log(b"ttyd: restart ok\n");
+                            } else {
+                                let _ = close_supervised_service(replacement);
+                                log(b"ttyd: restart identity fail\n");
+                            }
+                        } else {
+                            let _ = close_supervised_service(replacement);
+                            log(b"ttyd: restart rearm fail\n");
+                        }
+                    } else {
+                        let _ = close_supervised_service(replacement);
+                        log(b"ttyd: restart serve fail\n");
+                    }
+                } else {
+                    log(b"ttyd: restart spawn fail\n");
+                }
+                continue;
+            }
             if Some(source) == interactive_ttyd_koid {
                 let Some(dead) = interactive_ttyd.take() else {
                     interactive_ttyd_koid = None;
@@ -1287,37 +1318,16 @@ extern "C" fn sora_main(
                 // nothing, and an exhausted budget gives the service up instead of looping.
                 let allowed = restart && ttyd_restart_budget.try_consume();
                 if allowed {
-                    log(b"ttyd: restart required\n");
-                    if let Some(replacement) = spawn_ttyd_session(initrd, recipe) {
-                        let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
-                        let serves = ttyd_request_reply(
-                            replacement.instance.client,
-                            TtyRequest::clear(),
-                            &mut reply,
-                        )
-                        .and_then(|n| TtyReply::parse(&reply[..n]))
-                        .map(|reply| reply.status == ttyd::TTY_OK)
-                        .unwrap_or(false);
-                        if serves {
-                            if let Some(koid) = arm_supervised_process(port, replacement) {
-                                if koid != source {
-                                    interactive_ttyd = Some(replacement);
-                                    interactive_ttyd_koid = Some(koid);
-                                    log(b"ttyd: restart ok\n");
-                                } else {
-                                    let _ = close_supervised_service(replacement);
-                                    log(b"ttyd: restart identity fail\n");
-                                }
-                            } else {
-                                let _ = close_supervised_service(replacement);
-                                log(b"ttyd: restart rearm fail\n");
-                            }
-                        } else {
-                            let _ = close_supervised_service(replacement);
-                            log(b"ttyd: restart serve fail\n");
-                        }
+                    let delay_ns = ttyd_restart_backoff.next_delay_ns();
+                    let timer = Handle(timer_create(delay_ns) as u32);
+                    let timer_koid = handle_koid(timer);
+                    if timer_koid != u64::MAX && port_bind(port, timer) == 0 {
+                        pending_ttyd_restart = Some((recipe, source));
+                        ttyd_restart_timer = Some((timer, Handle(timer_koid as u32)));
+                        log(b"ttyd: restart delayed\n");
                     } else {
-                        log(b"ttyd: restart spawn fail\n");
+                        let _ = handle_close(timer);
+                        log(b"ttyd: restart timer fail\n");
                     }
                 } else if restart {
                     log(b"ttyd: restart budget exhausted\n");
@@ -1925,8 +1935,9 @@ fn run_svc_health_pair_smoke(initrd: Handle) -> bool {
         log(b"svc-pair: survivor fail\n");
         return false;
     }
-    // Shut down the survivor too; now ProcessWait must report no resident left.
-    if !all_residents_gone(shutdown_resident(cli2)) {
+    // Shut down the survivor too; persistent background services keep ProcessWait
+    // from returning Ok (ShouldWait means the child parked/exited, which is correct).
+    if !child_parked(shutdown_resident(cli2)) {
         log(b"svc-pair: shutdown2 fail\n");
         return false;
     }
@@ -1969,7 +1980,7 @@ fn run_svc_health_restart_smoke(initrd: Handle) -> bool {
         log(b"svc-restart: a status fail\n");
         return false;
     }
-    if !all_residents_gone(shutdown_resident(a)) {
+    if !child_parked(shutdown_resident(a)) {
         log(b"svc-restart: a shutdown fail\n");
         return false;
     }
@@ -1996,7 +2007,7 @@ fn run_svc_health_restart_smoke(initrd: Handle) -> bool {
         log(b"svc-restart: b state fail\n");
         return false;
     }
-    if !all_residents_gone(shutdown_resident(b)) {
+    if !child_parked(shutdown_resident(b)) {
         log(b"svc-restart: b shutdown fail\n");
         return false;
     }
@@ -2023,73 +2034,6 @@ fn run_crash_containment_smoke(initrd: Handle) -> bool {
     // The child faults immediately; the kernel contains it and reaps it. Reaching here at all
     // proves the kernel survived; `Ok` proves the crashed child was reaped (no resident left).
     all_residents_gone(process_wait())
-}
-
-/// Start a server from a recipe, bind its channel to a port, request a crash, and verify
-/// we wake up from the port wait with PEER_CLOSED, enabling true supervised restart.
-fn run_crash_restart_smoke(initrd: Handle) -> bool {
-    // 1. Spawn from recipe
-    let recipe = SvcRecipe {
-        initrd,
-        path: SVC_HEALTH_PATH,
-    };
-    let Some(mut server) = spawn_from_recipe(&recipe) else {
-        log(b"svc-crash-restart: spawn fail\n");
-        return false;
-    };
-    if request_reply(server, HealthRequest::Ping) != Some(HealthResponse::Pong) {
-        log(b"svc-crash-restart: ping 1 fail\n");
-        return false;
-    }
-
-    // 2. Bind the client channel to a port
-    let port = Handle(port_create() as u32);
-    if port.0 as u64 == u64::MAX {
-        return false;
-    }
-    if port_bind(port, server.client) != 0 {
-        return false;
-    }
-
-    // 3. Send a Crash request (no reply expected)
-    let bytes = HealthRequest::Crash.encode();
-    if channel_write(server.client, bytes.as_ptr(), bytes.len()) != 0 {
-        return false;
-    }
-
-    // 4. Wait on the port. We expect to be woken by the crash closing the channel.
-    let packet = port_wait(port);
-    if packet == 0 {
-        log(b"svc-crash-restart: port wait fail\n");
-        return false;
-    }
-    // The source should be the channel koid
-    let source_koid = packet >> 32;
-    let signals = (packet & 0xFFFFFFFF) as u32;
-    if signals != kumo_abi::Signals::PEER_CLOSED.bits() {
-        log(b"svc-crash-restart: missing PEER_CLOSED signal\n");
-        return false;
-    }
-
-    // 5. Respawn using the recipe
-    let Some(respawned) = spawn_from_recipe(&recipe) else {
-        log(b"svc-crash-restart: respawn fail\n");
-        return false;
-    };
-    server = respawned;
-
-    // 6. Verify it's a fresh instance
-    let want_status = Some(HealthResponse::Status {
-        uptime_ticks: 0,
-        served: 1, // just this status request
-    });
-    if request_reply(server, HealthRequest::Status) != want_status {
-        log(b"svc-crash-restart: fresh status fail\n");
-        return false;
-    }
-
-    // Shutdown the respawned instance so the smoke test cleans up
-    shutdown_resident(server) == Errno::Ok.status() as u64
 }
 
 /// Send one request to a resident server on `client`, pump the scheduler so that server

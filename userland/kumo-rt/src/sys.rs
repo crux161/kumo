@@ -411,6 +411,18 @@ pub fn port_wait(_port: Handle) -> u64 {
     0
 }
 
+/// Create a one-shot timer that signals after `delay_ns` of monotonic time.
+/// The returned handle is waitable and can be bound to a `Port`.
+#[cfg(target_arch = "aarch64")]
+pub fn timer_create(delay_ns: u64) -> u64 {
+    syscall(Syscall::TimerCreate, delay_ns, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn timer_create(_delay_ns: u64) -> u64 {
+    u64::MAX
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn interrupt_wait(interrupt: Handle) -> u64 {
     syscall(Syscall::InterruptWait, interrupt.0 as u64, 0, 0, 0)

@@ -29,6 +29,9 @@ pub const CAT_PATH: &str = "bin/cat";
 /// The input-less boot script Sora runs from the initrd: one `bin/<name>` per
 /// line, `#` comments and blanks ignored. The X13s autoexec stopgap — programs
 /// run and paint to the framebuffer with no keyboard. Parsed by `kumoza`.
+/// Placeholder Lua REPL — prints a status message and exits. Piccolo is deferred
+/// until vendored for offline builds (DEFERRED/003).
+pub const LUA_REPL_PATH: &str = "bin/lua-repl";
 pub const AUTOEXEC_PATH: &str = "etc/autoexec";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

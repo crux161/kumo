@@ -32,6 +32,9 @@ pub enum KernelCall<'a> {
     PortWait {
         port: Handle,
     },
+    TimerCreate {
+        deadline_ns: u64,
+    },
     VmoRead {
         vmo: Handle,
         offset: u64,
@@ -174,6 +177,15 @@ struct IrqBinding {
     count: u64,
 }
 
+/// A one-shot monotonic timer. `fired` retains the level after its deadline so a
+/// port bound just after expiry still observes the signal instead of losing a race.
+#[derive(Clone, Copy, Debug)]
+struct TimerBinding {
+    koid: KoId,
+    deadline_ns: u64,
+    fired: bool,
+}
+
 /// A Resource grant: the holder may mint VMOs from this MMIO range and create
 /// Interrupt objects for IRQs in `[irq_base, irq_base + irq_count)`.
 #[derive(Clone, Copy, Debug)]
@@ -269,6 +281,7 @@ pub struct SyscallEngine {
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
     interrupts: Vec<IrqBinding>,
+    timers: Vec<TimerBinding>,
     resources: Vec<ResourceBinding>,
     port_bindings: Vec<(KoId, KoId)>,
 }
@@ -283,6 +296,7 @@ impl SyscallEngine {
             threads: Vec::new(),
             boot_info: None,
             interrupts: Vec::new(),
+            timers: Vec::new(),
             resources: Vec::new(),
             port_bindings: Vec::new(),
         }
@@ -375,6 +389,14 @@ impl SyscallEngine {
         self.interrupts.len() != before
     }
 
+    /// Cancel a pending one-shot timer. Timer handles are intentionally not
+    /// duplicable, so closing the handle is sufficient to end its lifetime.
+    pub fn release_timer(&mut self, koid: KoId) -> bool {
+        let before = self.timers.len();
+        self.timers.retain(|binding| binding.koid != koid);
+        self.timers.len() != before
+    }
+
     /// Reclaim the Resource grant for `koid` at process teardown, so a restarted
     /// driver's re-carved grant does not accumulate orphaned bindings. Returns true
     /// if a binding was removed.
@@ -421,10 +443,32 @@ impl SyscallEngine {
         }
     }
 
+    /// Expire every one-shot timer whose monotonic deadline has arrived.
+    /// Marking the timer first makes the transition exactly-once and drops the
+    /// element borrow before `signal_ports` re-enters the engine.
+    pub fn signal_timers(&mut self, now_ns: u64) {
+        let mut i = 0;
+        while i < self.timers.len() {
+            if !self.timers[i].fired && self.timers[i].deadline_ns <= now_ns {
+                self.timers[i].fired = true;
+                let koid = self.timers[i].koid;
+                self.signal_ports(koid, kumo_abi::Signals::TIMER);
+            }
+            i += 1;
+        }
+    }
+
     /// Bind an object to a port. When an event occurs on that object,
     /// the port is signalled with the corresponding signals and the object koid as source.
     pub fn port_bind(&mut self, port_koid: KoId, object_koid: KoId) {
         self.port_bindings.push((port_koid, object_koid));
+        if self
+            .timers
+            .iter()
+            .any(|timer| timer.koid == object_koid && timer.fired)
+        {
+            self.signal_ports(object_koid, kumo_abi::Signals::TIMER);
+        }
     }
 
     /// Remove the binding from `port_koid` to `object_koid`, if present — the inverse
@@ -705,6 +749,10 @@ impl SyscallEngine {
                                 self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
                             }
                         }
+                        if entry.kind == ObjectKind::Timer {
+                            self.release_timer(entry.koid);
+                            self.release_port_bindings(entry.koid);
+                        }
                         Errno::Ok.status()
                     }
                     Err(error) => errno_from_object(error).status(),
@@ -754,6 +802,26 @@ impl SyscallEngine {
                 Ok(packet) => KernelCallResult::PortPacket(packet),
                 Err(error) => KernelCallResult::Status(errno_from_ipc(error).status()),
             },
+            KernelCall::TimerCreate { deadline_ns } => {
+                if deadline_ns == 0 {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                let object = self.objects.create(ObjectKind::Timer);
+                match process
+                    .handles_mut()
+                    .insert(object, Rights::WAIT | Rights::TRANSFER)
+                {
+                    Ok(handle) => {
+                        self.timers.push(TimerBinding {
+                            koid: object.koid(),
+                            deadline_ns,
+                            fired: false,
+                        });
+                        KernelCallResult::Handle(handle)
+                    }
+                    Err(error) => KernelCallResult::Status(errno_from_object(error).status()),
+                }
+            }
             KernelCall::VmoRead {
                 vmo,
                 offset,
@@ -2091,6 +2159,104 @@ mod tests {
             engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
             KernelCallResult::Handle(Handle(1))
         );
+    }
+
+    #[test]
+    fn one_shot_timer_signals_its_port_at_deadline_and_can_be_cancelled() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let port = create_port(&mut engine, &mut process);
+
+        let timer =
+            match engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 100 }) {
+                KernelCallResult::Handle(handle) => handle,
+                other => panic!("expected timer handle, got {other:?}"),
+            };
+        let timer_entry = process.handles().get(timer).unwrap();
+        assert_eq!(timer_entry.kind, ObjectKind::Timer);
+        assert!(timer_entry.rights.contains(Rights::WAIT));
+        assert!(!timer_entry.rights.contains(Rights::DUPLICATE));
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: timer,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        engine.signal_timers(99);
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+        engine.signal_timers(100);
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port })
+        else {
+            panic!("expected timer packet");
+        };
+        assert_eq!(packet.source, timer_entry.koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::TIMER));
+        engine.signal_timers(200);
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+
+        let cancelled =
+            match engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 300 }) {
+                KernelCallResult::Handle(handle) => handle,
+                other => panic!("expected timer handle, got {other:?}"),
+            };
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: cancelled,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::HandleClose { handle: cancelled }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        engine.signal_timers(300);
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+
+        // Expiry between TimerCreate and PortBind is retained as object state; the
+        // subsequent bind queues the signal instead of losing the wakeup.
+        let late_bound =
+            match engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 400 }) {
+                KernelCallResult::Handle(handle) => handle,
+                other => panic!("expected timer handle, got {other:?}"),
+            };
+        let late_koid = process.handles().get(late_bound).unwrap().koid;
+        engine.signal_timers(400);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: late_bound,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port })
+        else {
+            panic!("expected retained timer packet");
+        };
+        assert_eq!(packet.source, late_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::TIMER));
     }
 
     #[test]

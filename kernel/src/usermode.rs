@@ -127,8 +127,10 @@ where
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora if it's parked on InterruptWait.
 extern "C" fn signal_irq(irq: u32) {
+    let now_ns = kumo_hal::active::monotonic_nanos();
     with_sora_mut(|sora| {
         sora.engine.signal_interrupt(irq);
+        sora.engine.signal_timers(now_ns);
     });
     // Wake Sora if parked — InterruptWait uses park_current_user().
     if crate::user_thread::is_started()
@@ -844,6 +846,23 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         KernelCallResult::Status(status) => r[0] = status as u32 as u64,
                         _ => r[0] = u64::MAX,
                     }
+                } else if num == Syscall::TimerCreate as u64 {
+                    let delay_ns = r[0];
+                    let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
+                    if delay_ns == 0 || deadline_ns.is_none() {
+                        r[0] = Errno::InvalidArgs.status() as u32 as u64;
+                    } else {
+                        match sora.engine.dispatch(
+                            child,
+                            KernelCall::TimerCreate {
+                                deadline_ns: deadline_ns.unwrap(),
+                            },
+                        ) {
+                            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                            _ => r[0] = u64::MAX,
+                        }
+                    }
                 } else if num == Syscall::PortBind as u64 {
                     let port = Handle(r[0] as u32);
                     let object = Handle(r[1] as u32);
@@ -1047,6 +1066,23 @@ extern "C" fn svc_hook(regs: *mut u64) {
             {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
+            }
+        } else if num == Syscall::TimerCreate as u64 {
+            let delay_ns = r[0];
+            let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
+            if delay_ns == 0 || deadline_ns.is_none() {
+                r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            } else {
+                match sora.engine.dispatch(
+                    &mut sora.process,
+                    KernelCall::TimerCreate {
+                        deadline_ns: deadline_ns.unwrap(),
+                    },
+                ) {
+                    KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                    KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                    _ => r[0] = u64::MAX,
+                }
             }
         } else if num == Syscall::PortBind as u64 {
             let port = Handle(r[0] as u32);

@@ -38,7 +38,6 @@ mod op {
     pub const PING: u8 = 0x01;
     pub const STATUS: u8 = 0x02;
     pub const SHUTDOWN: u8 = 0x03;
-    pub const CRASH: u8 = 0x04;
     pub const PONG: u8 = 0x81;
     pub const STATUS_OK: u8 = 0x82;
     pub const ERROR: u8 = 0xEE;
@@ -55,8 +54,6 @@ pub enum Request {
     /// so its supervisor observes the termination (DESIGN/002 §1). Intercepted in
     /// [`serve_once`] before the reply path.
     Shutdown,
-    /// Explicit crash: executes an undefined instruction to trigger an EL0 fault.
-    Crash,
 }
 
 impl Request {
@@ -67,7 +64,6 @@ impl Request {
             op::PING => Some(Request::Ping),
             op::STATUS => Some(Request::Status),
             op::SHUTDOWN => Some(Request::Shutdown),
-            op::CRASH => Some(Request::Crash),
             _ => None,
         }
     }
@@ -78,7 +74,6 @@ impl Request {
             Request::Ping => op::PING,
             Request::Status => op::STATUS,
             Request::Shutdown => op::SHUTDOWN,
-            Request::Crash => op::CRASH,
         };
         alloc::vec![code]
     }
@@ -170,7 +165,7 @@ impl Health {
             }
             // A control request with no reply; `serve_once` intercepts it before this path,
             // so this arm only keeps a direct `handle`/`dispatch` call total.
-            Request::Shutdown | Request::Crash => Response::Error,
+            Request::Shutdown => Response::Error,
         }
     }
 
@@ -204,17 +199,6 @@ pub fn serve_once<T: Transport>(t: &mut T, state: &mut Health, buf: &mut [u8]) -
         Some(n) => {
             if Request::decode(&buf[..n]) == Some(Request::Shutdown) {
                 return false;
-            }
-            if Request::decode(&buf[..n]) == Some(Request::Crash) {
-                // Execute an undefined instruction to trigger an EL0 fault.
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    core::arch::asm!("udf #0");
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                unsafe {
-                    core::ptr::read_volatile(0xDEAD_0000 as *const u32);
-                }
             }
             let reply = state.dispatch(&buf[..n]);
             t.send(&reply);

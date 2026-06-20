@@ -63,6 +63,35 @@ impl RestartBudget {
     }
 }
 
+/// Capped exponential delay between restart attempts. Keeping the schedule as
+/// pure supervisor state makes the policy host-testable; the freestanding binary
+/// delivers each delay through a one-shot Timer bound to its permanent Port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartBackoff {
+    next_delay_ns: u64,
+    max_delay_ns: u64,
+}
+
+impl RestartBackoff {
+    pub const fn new(initial_delay_ns: u64, max_delay_ns: u64) -> Self {
+        Self {
+            next_delay_ns: if initial_delay_ns < max_delay_ns {
+                initial_delay_ns
+            } else {
+                max_delay_ns
+            },
+            max_delay_ns,
+        }
+    }
+
+    /// Return this attempt's delay and advance the next delay, saturating at the cap.
+    pub fn next_delay_ns(&mut self) -> u64 {
+        let delay = self.next_delay_ns;
+        self.next_delay_ns = self.next_delay_ns.saturating_mul(2).min(self.max_delay_ns);
+        delay
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerRecipe<'a> {
     pub name: &'a str,
@@ -218,5 +247,19 @@ mod tests {
         assert!(!budget.try_consume());
         assert!(!budget.try_consume());
         assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn restart_backoff_doubles_and_stays_capped() {
+        let mut backoff = RestartBackoff::new(50, 200);
+        assert_eq!(backoff.next_delay_ns(), 50);
+        assert_eq!(backoff.next_delay_ns(), 100);
+        assert_eq!(backoff.next_delay_ns(), 200);
+        assert_eq!(backoff.next_delay_ns(), 200);
+
+        // An initial delay above the cap starts at the cap; multiplication cannot wrap.
+        let mut capped = RestartBackoff::new(u64::MAX, 7);
+        assert_eq!(capped.next_delay_ns(), 7);
+        assert_eq!(capped.next_delay_ns(), 7);
     }
 }

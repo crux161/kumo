@@ -89,33 +89,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // phosphor, a RE-BOOT header, then a column of subsystem self-checks each ending in
     // OK. The Stage-A console now renders a curated CJK set (DESIGN/005), so the Japanese
     // system header stands beside the Latin POST instead of waiting for a font.
-    klog!("\nKUMO Hi-SYS Re-BOOT!\n");
-    // 雲 紫微 起動 / 記憶 検査 正常 = "KUMO Ziwei boot / memory check OK". A mixed
-    // ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
-    klog!("雲 紫微 起動    記憶 検査 正常\n");
-    // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
-    // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
-    klog!("简体中文  日本語漢字  ㄱㄴㄷㄹㅁ\n");
-    klog!(
-        "ZIWEI re-boot operating system, Ver 0.1.0  ({})\n",
-        report.arch
-    );
-    klog!("Copyright (C) 2026  Kumo Heavy Industries Consortium\n\n");
-    klog!("CPU MODE           High        EL1 / Ring0\n");
-    klog!(
-        "CO-CPU             Check       NIJIGUMO abi v{}        OK\n",
-        report.abi_version
-    );
-
-    // M1: bring up memory. The bump heap is already online; account the frames and
-    // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).
     let mm = unsafe { mm::init(boot) };
-    klog!(
-        "AETHER MEMORY      Check     {} + {} MiB  {} frames   OK\n",
-        report.usable_bytes >> 20,
-        (report.total_bytes - report.usable_bytes) >> 20,
-        mm.usable_frames
-    );
     if mm.sample_count > 0 {
         klog!("  AETHER free frames :");
         let mut i = 0;
@@ -126,6 +100,31 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("\n");
     }
 
+    klog!("\nCPU MODE High\n");
+    klog!(
+        "MEMORY Check      {} + {} MiB       OK\n\n",
+        report.usable_bytes >> 20,
+        (report.total_bytes - report.usable_bytes) >> 20
+    );
+    klog!("JA Hi-SYS BOOT!\n\n");
+    klog!("筋斗雲 NIMBUS・オペレーティングシステム, Ver.0.1.0a\n");
+    klog!("Copyright(c) 2025,2026 KOKEN.DEV 黄犬インターネット・ソフトウェア共同体\n\n");
+    // 雲 紫微 起動 / 記憶 検査 正常 = "KUMO Ziwei boot / memory check OK". A mixed
+    // ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
+    klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\nあ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
+    // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
+    // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
+    klog!("   中國漢字： 在線\n");
+    klog!("   日本漢字： 出力成功\n");
+    klog!("한국어 한글： 로드　 OK\n");
+    klog!("紫微 MUREX Ver 0.1.0a  ({})\n", report.arch);
+    klog!(
+        "NIJIGUMO abi v{}      Check        OK\n",
+        report.abi_version
+    );
+
+    // M1: bring up memory. The bump heap is already online; account the frames and
+    // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).
     // Prove the heap works on real silicon: build a small Vec and reduce it.
     let mut squares: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     let mut n = 1u32;

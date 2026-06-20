@@ -104,7 +104,9 @@ impl Request {
                 frame[0] = match *self {
                     Request::Input(_) => OP_INPUT,
                     Request::Write(_) => OP_WRITE,
-                    Request::Clear | Request::Read | Request::Shutdown => unreachable!(),
+                    Request::Clear | Request::Read | Request::Shutdown => {
+                        unreachable!()
+                    }
                 };
                 frame[1] = byte;
                 Some(2)
@@ -683,7 +685,7 @@ mod tests {
         let mut server = TtyServer::<8>::new();
         let mut reply = [0u8; REPLY_BUF_BYTES];
 
-        let n = server.dispatch(&[0xfe], &mut reply);
+        let n = server.dispatch(&[0xfd], &mut reply);
         let parsed = Reply::parse(&reply[..n]).unwrap();
 
         assert_eq!(parsed.status, TTY_BAD_REQUEST);

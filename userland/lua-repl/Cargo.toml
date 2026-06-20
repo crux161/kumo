@@ -7,6 +7,6 @@ edition = "2021"
 kumo-abi = { path = "../../lib/kumo-abi" }
 kumo-rt = { path = "../kumo-rt" }
 
-# Piccolo is a pure-Rust, no_std-friendly Lua 5.4 engine.
-# We disable default features to ensure it doesn't try to link std.
-piccolo = { version = "0.3", default-features = false, features = ["core"] }
+# Piccolo (pure-Rust Lua 5.4) is deferred until vendored for offline builds.
+# See DEFERRED/003-LUA-REPL-PACKAGING-DEFERRAL.md for the full plan.
+# This placeholder prints a status message and exits cleanly.

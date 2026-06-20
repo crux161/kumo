@@ -16,6 +16,7 @@ members = [
     "userland/cat",
     "userland/hello",
     "userland/ls",
+    "userland/lua-repl",
     "userland/kumo-rt",
     "userland/kumoza",
     "userland/persona-linux",
