@@ -7,9 +7,9 @@
 
 ---
 
-> *Outwardly, the system is KUMO — a drifting cloud. Inwardly, the privileged core is Ziwei (紫微) — the still seat residing in Pleroma. Nijigumo bridges earth to Heaven at boot; thereafter, Ziwei reigns at the still center and, should all else fall apart, remains to reconstruct the whole.*
-
 **KUMO** is a clean-room, `#![no_std]` Rust rewrite of the [soso](https://github.com/ozkl/soso) monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, and MMU plumbing, while pushing all other services (drivers, filesystems, network, TTY) into fault-isolated, restartable userspace servers.
+
+For clarity, KUMO represents the kernel core (MUREX core) and its various subsystem microservices that make up the other aspects of the microkernel. KUMO is fundamentally part of a larger "Flying Nimbus" System. Which is intended to function as a UNIX-like environment with the ability to run Linux applications via a custom hybrid Hypervisor that loads the Firecracker VM in tandem with a WSLv1 style linux->native shim for syscalls (similar to Fuchsia's Starnix). Linux applications see a native environment, Nimbus does the hard work and the two ride off in two the sunset together. At least, that's the plan 🤞
 
 I'd like to take a brief moment to thank ozkl (and their contributors) for all the fine work they put into developing soso. It has provided a lot of inspiration to inform the general functionality of KUMO and it's core components. Also, the devs working on:
 - [motor-os](https://github.com/moturus/motor-os) 
@@ -22,27 +22,27 @@ All of them have given excellent points about pitfalls, implementation, and have
 ## 🏛️ Architecture
 
 *   **Capability Microkernel:** Minimal Trusted Computing Base (TCB). All resources (memory, IPC, interrupts, address spaces) are exposed as Objects. Process authority is defined by unforgeable, capability-typed **Handles**.
-*   **Nijigumo (虹雲):** A UEFI-first staged bootloader providing a stable `BootInfo` handoff into Ziwei.
-*   **Ziwei (紫微):** The privileged core: scheduler, object tables, handle rights, VMOs/VMARs, IPC, traps, and MMU construction.
+*   **Nijigumo (虹雲):** A UEFI-first staged bootloader providing a stable `BootInfo` handoff into MUREX.
+*   **MUREX :** The privileged core: scheduler, object tables, handle rights, VMOs/VMARs, IPC, traps, and MMU construction.
 *   **Sora (空):** The root server and service-plane supervisor. It receives bootstrap capabilities, hosts early services, and spawns child processes from capability grants.
 *   **Hardware Abstraction Layer (HAL):** Clean separation of architecture-specific glue (`kumo-hal-aarch64`, `kumo-hal-x86_64`) from the generic core.
 
 ## 🚀 Current Status (P10-b Process Model)
 
-KUMO now boots through UEFI/AAVMF on **aarch64**, exits boot services, enters Ziwei at EL1, launches Sora in EL0, and keeps Sora alive as a parked userspace server. The active development spine is the aarch64 process model; x86_64 remains a backend target, but full QEMU parity is still future work.
+KUMO now boots through UEFI/AAVMF on **aarch64**, exits boot services, enters MUREX at EL1, launches Sora in EL0, and keeps Sora alive as a parked userspace server. The active development spine is the aarch64 process model; x86_64 remains a backend target, but full QEMU parity is still future work.
 
 **Recent execution milestones:**
-*   **UEFI handoff:** Nijigumo loads the kernel ELF and initrd from the ESP, builds a validated `BootInfo`, exits boot services, and jumps to Ziwei.
-*   **Higher-half kernel:** Ziwei runs with a TTBR0/TTBR1 split, a higher-half kernel at `0xffff800048000000`, a permanent physmap, and 4 KiB page granules.
+*   **UEFI handoff:** Nijigumo loads the kernel ELF and initrd from the ESP, builds a validated `BootInfo`, exits boot services, and jumps to MUREX.
+*   **Higher-half kernel:** MUREX runs with a TTBR0/TTBR1 split, a higher-half kernel at `0xffff800048000000`, a permanent physmap, and 4 KiB page granules.
 *   **Userspace Sora:** Sora is loaded from the initrd as an ELF process, receives bootstrap handles, serves channels through ports, and can park/wake through the scheduler harness.
 *   **Capability IPC:** Channels, ports, synchronous call, handle transfer, object rights, and interrupt objects are wired through EL0 `SVC` calls.
 *   **Process isolation slice:** P10-b is live. Sora creates an anonymous VMO, writes child code into it, maps it RX into a fresh child address space, builds the child's TTBR0, and runs the child. The live QEMU/AAVMF smoke prints `hello from child as`, `child as run=ok`, and `anon vmo write ok`.
 *   **Hardware interrupt lanes:** GICv3 remains the X13s/QEMU path; GICv2/GIC-400 discovery and timer setup have been added for Raspberry Pi 5 parity work.
 
 <div align="center">
-  <img src="resources/kumo-boot-status.png" alt="KUMO framebuffer boot status showing Ziwei and Sora diagnostics" width="640"/>
+  <img src="resources/kumo-boot-status.png" alt="KUMO framebuffer boot status showing MUREX and Sora diagnostics" width="640"/>
   <br/>
-  <sub>Earlier framebuffer smoke capture: Ziwei Stage-A diagnostics, Sora handoff, IPC, scheduler, and timer checks.</sub>
+  <sub>Earlier framebuffer smoke capture: MUREX Stage-A diagnostics, Sora handoff, IPC, scheduler, and timer checks.</sub>
 </div>
 
 **Next in the Forge:**

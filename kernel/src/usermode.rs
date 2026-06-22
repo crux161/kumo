@@ -127,6 +127,21 @@ where
     f(&*state)
 }
 
+/// Like [`with_sora_mut`], but yields `None` instead of panicking when the Sora cell is
+/// uninitialised (early boot, before Sora exists) or already borrowed — a `klog!` issued
+/// from inside a live `SoraState` borrow (e.g. mid-SVC). This is the GUIDANCE/006 §2.1
+/// re-entrancy guard: the console fallback can try to reach the framebuffer owner without
+/// ever risking a double-borrow panic.
+fn try_with_sora_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut SoraState) -> R,
+{
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let refcell = unsafe { (&mut *opt).as_mut()? };
+    let mut state = refcell.try_borrow_mut().ok()?;
+    Some(f(&mut *state))
+}
+
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora if it's parked on InterruptWait.
 extern "C" fn signal_irq(irq: u32) {
@@ -304,13 +319,30 @@ fn console_write_in_state(sora: &mut SoraState, bytes: &[u8]) {
     kumo_hal::active::early_console_write(bytes);
 }
 
-fn console_write_without_switch(bytes: &[u8]) {
-    if kumo_hal::active::framebuffer_console_owned_by_kernel() {
-        kumo_hal::active::early_console_write(bytes);
-        return;
-    }
-    let delivered = with_sora_mut(|sora| queue_framebuffer_console(sora, bytes));
-    if !delivered {
+/// Pure routing policy for [`console_write_without_switch`] (host-tested). Returns true
+/// when the fragment was handed to the framebuffer owner's queue and must therefore NOT
+/// also go to the HAL; false means the caller falls back to `early_console_write`. The
+/// kernel-owned epoch always paints via the HAL; only after handoff is the queue consulted.
+fn console_routed_to_owner(kernel_owns_fb: bool, queued_to_owner: bool) -> bool {
+    !kernel_owns_fb && queued_to_owner
+}
+
+/// Write a kernel console fragment without switching threads, honouring the framebuffer
+/// ownership epoch (J246). While the kernel owns the glass it paints via the HAL; once
+/// drv-fb has claimed the framebuffer the HAL cursor is dormant, so the fragment is queued
+/// to the owner's console channel instead of being dropped by `early_console_write`. This
+/// is the path every kernel `klog!` falls back to (via `bootstrap::console::write`) when
+/// routing through the Sora console server is not active. Re-entrancy safe: if the
+/// `SoraState` borrow is unavailable (or Sora does not yet exist) the fragment falls back
+/// to the HAL path rather than double-borrowing (GUIDANCE/006 §2.1).
+pub(crate) fn console_write_without_switch(bytes: &[u8]) {
+    let kernel_owns = kumo_hal::active::framebuffer_console_owned_by_kernel();
+    let queued = if kernel_owns {
+        false
+    } else {
+        try_with_sora_mut(|sora| queue_framebuffer_console(sora, bytes)).unwrap_or(false)
+    };
+    if !console_routed_to_owner(kernel_owns, queued) {
         kumo_hal::active::early_console_write(bytes);
     }
 }

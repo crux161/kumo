@@ -13,11 +13,15 @@ pub fn write(bytes: &[u8]) {
     // P6-e: when the Sora console server is live (and parked), `klog!` traffic rides the
     // console channel — Sora renders it via `DebugWrite`. Early boot, panic (the Tower
     // disables routing), and anything that runs while Sora itself is current fall back
-    // to the direct device path.
+    // to the direct path below.
     if crate::usermode::try_console_route(bytes) {
         return;
     }
-    kumo_hal::active::early_console_write(bytes);
+    // J247: the fallback is ownership-aware, not a raw device write. Before the J246
+    // framebuffer handoff the kernel owns the glass and this paints via the HAL; after
+    // handoff the HAL cursor is dormant, so `klog!` (e.g. the final Stage-A check block,
+    // emitted with `CONSOLE_ROUTE` off) is queued to the drv-fb owner rather than dropped.
+    crate::usermode::console_write_without_switch(bytes);
 }
 
 pub fn write_str(text: &str) {
