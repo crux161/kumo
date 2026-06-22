@@ -90,42 +90,57 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // OK. The Stage-A console now renders a curated CJK set (DESIGN/005), so the Japanese
     // system header stands beside the Latin POST instead of waiting for a font.
     let mm = unsafe { mm::init(boot) };
-    if mm.sample_count > 0 {
-        klog!("  AETHER free frames :");
-        let mut i = 0;
-        while i < mm.sample_count {
-            klog!(" {:#x}", mm.sample_frames[i]);
-            i += 1;
-        }
-        klog!("\n");
+
+    let mut free_frames: u64 = 0;
+    let mut samples: [u64; 10] = [0; 10];
+    for i in 0..mm.sample_count {
+        samples[i] = mm.sample_frames[i];
+        free_frames += mm.sample_frames[i];
     }
+    samples.sort();
+    klog!("\n");
 
     klog!("\nCPU MODE High\n");
     klog!(
-        "MEMORY Check      {} + {} MiB       OK\n\n",
+        "MEMORY Check      {} + {} MiB         OK\n\n",
         report.usable_bytes >> 20,
         (report.total_bytes - report.usable_bytes) >> 20
+
     );
-    klog!("JA Hi-SYS BOOT!\n\n");
-    klog!("筋斗雲 NIMBUS・オペレーティングシステム, Ver.0.1.0a\n");
+    klog!("AETHER: frames free {}\n", free_frames);
+    klog!("\tframe data:\n\t");
+    for (i, &frame) in samples.iter().enumerate() {
+        if i > 0 { klog!(" "); }
+    klog!("{}", frame);
+    }
+    klog!("\n\n");
+    klog!("Uni+CJK Hi-SYS BOOT!\n\n");
+    klog!("NIMBUS 筋斗雲・オペレーティングシステム, Ver.0.1.0a\n");
     klog!("Copyright(c) 2025,2026 KOKEN.DEV 黄犬インターネット・ソフトウェア共同体\n\n");
-    // 雲 紫微 起動 / 記憶 検査 正常 = "KUMO Ziwei boot / memory check OK". A mixed
-    // ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
-    klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\nあ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
+    // mixed ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
+    klog!("「我 所 思 兮 在 泰 山。路 遠 湲 且 阻、\n"); 
+    klog!("  側 身 東 望 涕 沾 翰。」\n\n");
+    klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\n"); 
+    klog!("  あ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n"); 
+    klog!("  姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
+    klog!("「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n"); 
+    klog!("  그 대 의 집 이 되 니、\n"); 
+    klog!("  명 월 을 벗 삼 아 외 로 이 앉 았 도 다 。」\n\n");
     // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
     // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
-    klog!("   中國漢字： 在線\n");
-    klog!("   日本漢字： 出力成功\n");
-    klog!("한국어 한글： 로드　 OK\n");
-    klog!("紫微 MUREX Ver 0.1.0a  ({})\n", report.arch);
+    klog!("  中國漢字  ........在線\n");
+    klog!("  日本漢字  ........出力成功\n");
+    klog!("  한국어한글 .......로드　 OK\n\n");
+    klog!("紫微 MUREX Core Ver 0.1.0a  ({})\n", report.arch);
     klog!(
-        "NIJIGUMO abi v{}      Check        OK\n",
+        "NIJIGUMO abi v{}    Check     OK\n",
         report.abi_version
     );
 
     // M1: bring up memory. The bump heap is already online; account the frames and
     // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).
     // Prove the heap works on real silicon: build a small Vec and reduce it.
+    
     let mut squares: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     let mut n = 1u32;
     while n <= 8 {
@@ -134,7 +149,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     }
     let sum: u32 = squares.iter().copied().sum();
     klog!(
-        "HEAP ALLOCATOR     Check     {} KiB bump  vec sum={}     OK\n",
+        "HEAP ALLOCATOR     Check     OK     [{} KiB bump  vec sum={}]\n",
         mm.heap_bytes >> 10,
         sum
     );
@@ -341,7 +356,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     if u.serving {
         let svc_before = kumo_hal::active::syscall_count();
         usermode::enable_console_route();
-        klog!("ZIWEI console     -> Sora console channel\n");
+        klog!("MUREX console     -> Sora console channel\n");
         let probe_svcs = kumo_hal::active::syscall_count().saturating_sub(svc_before);
         // Keep the route as a bounded probe. Later POST checks call back into Sora and
         // can otherwise re-enter the console server while another Sora wake is active.
@@ -531,9 +546,9 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     if report.has_framebuffer {
         // Framebuffer console (e.g. the X13s): no kernel keyboard yet, so idle here.
         // The screen keeps the boot report; a pre-handoff pause lives in the loader.
-        klog!("\nVIRUS PROTECTION   Check     GREEN                    OK\n");
-        klog!("\nZIWEI core online -- all subsystems nominal.\n");
-        klog!("KUMO Ziwei Stage-A core only; awaiting userspace.  HALT.\n");
+        klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
+        klog!("\nMUREX core online -- all subsystems nominal.\n");
+        klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
         kumo_hal::active::halt()
     } else {
         // P8-b: serial console (QEMU PL011) — forward keystrokes to Sora via the
@@ -553,7 +568,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             preempt_ticks: 0,
             preempt_switches: 0,
         };
-        klog!("\nKUMO Ziwei Stage-A serial shell. Type 'help'.\n");
+        klog!("\nKUMO MUREX core Stage-A serial shell. Type 'help'.\n");
         klog!("{}", shell::PROMPT);
         loop {
             match kumo_hal::active::console_read_byte() {
@@ -578,7 +593,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
     if boot.is_null() {
-        tower_halt_ascii("nijigumo->ziwei handoff pointer is null", None);
+        tower_halt_ascii("nijigumo->MUREX handoff pointer is null", None);
     }
 
     let boot = unsafe { &*boot };
@@ -592,7 +607,7 @@ pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
 /// `stage_a` parity (x86 IDT/paging/timer) is a later slice; for now we report and halt.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
-    klog!("\n[ZIWEI] KUMO x86_64 first light (Multiboot/GRUB)\n");
+    klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
     klog!("CPU MODE: long mode (64-bit), paging on, serial COM1 live\n");
     klog!(
         "multiboot: magic={:#010x} (want 0x2badb002), info@{:#x}\n",
@@ -616,7 +631,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
         }
     }
 
-    klog!("x86_64 bring-up reached; halting (stage_a parity is the next slice)\n");
+    klog!("x86_64 MUREX core online, first light reached; HALTING.\n");
     kumo_hal::active::halt()
 }
 
@@ -626,9 +641,10 @@ pub fn expected_abi_version() -> u32 {
 
 fn tower_halt_ascii(reason: &str, error: Option<HandoffError>) -> ! {
     // A fault path must never wake or switch threads: pin the console to the direct
-    // device path before printing anything.
+    // device path and reclaim a userspace-owned framebuffer before printing anything.
     usermode::disable_console_route();
-    klog!("TOWER: ");
+    kumo_hal::active::reclaim_framebuffer_console();
+    klog!("TOWER EXCEPTION: ");
     klog!("{}", reason);
     if let Some(error) = error {
         klog!(": {:?}", error);

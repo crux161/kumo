@@ -211,6 +211,62 @@ pub fn channel_read_with_handle(_channel: Handle, _buf: *mut u8, _cap: usize) ->
     (0, 0)
 }
 
+pub const STARTUP_TAG_STDIN: u8 = b'i';
+pub const STARTUP_TAG_STDOUT: u8 = b'o';
+pub const STARTUP_TAG_STDERR: u8 = b'e';
+pub const STARTUP_TAG_ARGV: u8 = b'a';
+pub const STARTUP_TAG_CAP0: u8 = b'c';
+
+/// Explicit capabilities supplied to a newly started program. Each present field came
+/// from one transferred handle on the bootstrap channel; absent fields grant no authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Startup {
+    pub stdin: Option<Handle>,
+    pub stdout: Option<Handle>,
+    pub stderr: Option<Handle>,
+    pub argv: Option<Handle>,
+    pub cap0: Option<Handle>,
+}
+
+impl Startup {
+    /// Install one tagged startup handle. The last value for a known tag wins; the
+    /// returned handle is no longer part of the startup set and must be closed.
+    fn install(&mut self, tag: u8, handle: Handle) -> Option<Handle> {
+        let slot = match tag {
+            STARTUP_TAG_STDIN => &mut self.stdin,
+            STARTUP_TAG_STDOUT => &mut self.stdout,
+            STARTUP_TAG_STDERR => &mut self.stderr,
+            STARTUP_TAG_ARGV => &mut self.argv,
+            STARTUP_TAG_CAP0 => &mut self.cap0,
+            _ => return Some(handle),
+        };
+        slot.replace(handle)
+    }
+}
+
+/// Drain a finite startup message and return its explicit capabilities. The sender
+/// must close its endpoint after queueing the set; empty + peer-closed then returns
+/// zero, so this loop terminates instead of parking. Unknown/duplicate handles are
+/// closed rather than becoming ambient authority.
+pub fn startup(bootstrap: Handle) -> Startup {
+    let mut startup = Startup::default();
+    let mut tag = [0u8; 1];
+    loop {
+        let (n, raw_handle) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+        if n == 0 {
+            break;
+        }
+        if raw_handle == 0 {
+            continue;
+        }
+        if let Some(unused) = startup.install(tag[0], Handle(raw_handle as u32)) {
+            let _ = handle_close(unused);
+        }
+    }
+    let _ = handle_close(bootstrap);
+    startup
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn channel_write(channel: Handle, ptr: *const u8, len: usize) -> Status {
     syscall(
@@ -449,6 +505,25 @@ pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 
     u64::MAX
 }
 
+/// Claim the boot framebuffer for a userspace console driver. The kernel accepts
+/// this only when `resource` grants the requested physical range and that range is
+/// the framebuffer currently owned by the Stage-A console.
+#[cfg(target_arch = "aarch64")]
+pub fn framebuffer_claim(resource: Handle, phys_base: u64, len: u64) -> Status {
+    syscall(
+        Syscall::FramebufferClaim,
+        resource.0 as u64,
+        phys_base,
+        len,
+        0,
+    ) as Status
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn framebuffer_claim(_resource: Handle, _phys_base: u64, _len: u64) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
 /// Carve a child Resource bounded to MMIO `[phys_base, phys_base + len)` and the IRQ
 /// window `[irq_base, irq_base + irq_count)`. The IRQ window is packed into one argument
 /// as `(irq_base << 32) | irq_count` so the call fits the four-register syscall ABI.
@@ -519,6 +594,32 @@ pub fn port_unbind(port: Handle, object: Handle) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn port_unbind(_port: Handle, _object: Handle) -> u64 {
     u64::MAX
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_tags_install_explicit_handles_and_reject_unknown_tags() {
+        let mut startup = Startup::default();
+        assert_eq!(startup.install(STARTUP_TAG_STDOUT, Handle(7)), None);
+        assert_eq!(startup.install(STARTUP_TAG_CAP0, Handle(9)), None);
+        assert_eq!(startup.stdout, Some(Handle(7)));
+        assert_eq!(startup.cap0, Some(Handle(9)));
+        assert_eq!(startup.install(b'?', Handle(11)), Some(Handle(11)));
+    }
+
+    #[test]
+    fn duplicate_startup_tag_replaces_and_returns_old_handle() {
+        let mut startup = Startup::default();
+        assert_eq!(startup.install(STARTUP_TAG_STDOUT, Handle(3)), None);
+        assert_eq!(
+            startup.install(STARTUP_TAG_STDOUT, Handle(4)),
+            Some(Handle(3))
+        );
+        assert_eq!(startup.stdout, Some(Handle(4)));
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

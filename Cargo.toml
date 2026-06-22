@@ -14,6 +14,7 @@ members = [
     "tools/stage-a-smoke",
     "userland/args",
     "userland/cat",
+    "userland/wc",
     "userland/hello",
     "userland/ls",
     "userland/lua-repl",

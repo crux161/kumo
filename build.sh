@@ -14,6 +14,11 @@ ESP="${KUMO_ESP:-}"
 
 X13S_DIR="build/images/thinkpad-x13s-gen1"
 
+build_qemu() {
+    echo "==> Building QEMU native image (virt, aarch64)..."
+    cargo xtask image --arch aarch64 --hardware qemu
+}
+
 build_x13s() {
     echo "==> Building aarch64 (ThinkPad X13s Gen 1)..."
     cargo xtask image --arch aarch64 --hardware thinkpad-x13s-gen1
@@ -58,12 +63,14 @@ case "$MODE" in
         OPEN_DIR="$X13S_DIR"
         ;;
     all)
-        echo "==> Full sweep: X13s + Pi5 + x86_64"
+        echo "==> Full sweep: X13s + Pi5 + x86_64 + qemu"
         build_x13s
         build_pi5
         build_x86
+	build_qemu
         report "$X13S_DIR" "thinkpad-x13s-gen1"
         report "build/images/generic-uefi-x86_64" "generic-uefi-x86_64"
+	report "build/images/qemu-virt-aarch64" "qemu-virt-aarch64"
         OPEN_DIR="build/images"
         ;;
     *)

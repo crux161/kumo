@@ -409,11 +409,17 @@ impl ChannelPair {
     }
 
     pub fn read(&mut self, end: ChannelEnd) -> Result<KernelMessage, IpcError> {
-        let endpoint = self.endpoint_mut(end);
-        if endpoint.inbox.is_empty() {
+        if !self.endpoint(end).inbox.is_empty() {
+            return Ok(self.endpoint_mut(end).inbox.remove(0));
+        }
+        // Inbox empty. A still-open peer means "wait for a future write" (ShouldWait → park); a
+        // closed peer means end-of-stream — no writer is left, so report PeerClosed so a drainer
+        // can stop instead of parking forever. This is the DESIGN/013 prerequisite that makes a
+        // synchronous "spawn, then drain the child's stdout channel" terminate.
+        if self.endpoint(peer(end)).open {
             Err(IpcError::ShouldWait)
         } else {
-            Ok(endpoint.inbox.remove(0))
+            Err(IpcError::PeerClosed)
         }
     }
 
@@ -585,6 +591,27 @@ mod tests {
             ),
             Err(IpcError::PeerClosed)
         );
+    }
+
+    #[test]
+    fn read_drains_queued_messages_then_reports_peer_closed() {
+        // The DESIGN/013 drain primitive: messages queued before the writer closed still read
+        // out, and the *empty* read afterward returns PeerClosed (not ShouldWait) so a drainer
+        // stops instead of parking forever.
+        let mut objects = ObjectManager::new();
+        let mut channel = ChannelPair::new(&mut objects);
+
+        channel
+            .write(
+                ChannelEnd::Left,
+                KernelMessage::new(1, b"out", &[]).unwrap(),
+            )
+            .unwrap();
+        channel.close(ChannelEnd::Left); // writer closes after queuing its output
+
+        let received = channel.read(ChannelEnd::Right).unwrap();
+        assert_eq!(received.bytes(), b"out");
+        assert_eq!(channel.read(ChannelEnd::Right), Err(IpcError::PeerClosed));
     }
 
     #[test]

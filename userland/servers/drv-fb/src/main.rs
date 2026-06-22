@@ -5,11 +5,35 @@
 use drv_fb::Console;
 use kumo_abi::{BootInfo, Handle, VmarFlags};
 use kumo_rt::{
-    channel_read, channel_read_with_handle, debug_write, handle_koid, port_bind, port_create,
-    port_wait, resource_mint_mmio, vmar_map,
+    channel_read, channel_read_with_handle, debug_write, framebuffer_claim, handle_koid, port_bind,
+    port_create, port_wait, resource_mint_mmio, vmar_map,
 };
 
 kumo_rt::entry!(main);
+
+/// Print `label` then `v` in decimal and a newline to the debug console. The bootstrap path only
+/// offers raw `debug_write(ptr, len)` (no `core::fmt`, no alloc), so format the integer by hand.
+/// Used by the J231 X13s framebuffer-geometry diagnostic.
+fn dbg_kv(label: &[u8], v: u64) {
+    debug_write(label.as_ptr(), label.len());
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        digits[n] = b'0' + (x % 10) as u8;
+        x /= 10;
+        n += 1;
+        if x == 0 {
+            break;
+        }
+    }
+    let mut line = [0u8; 21];
+    for i in 0..n {
+        line[i] = digits[n - 1 - i];
+    }
+    line[n] = b'\n';
+    debug_write(line.as_ptr(), n + 1);
+}
 
 #[no_mangle]
 extern "C" fn main(
@@ -67,6 +91,15 @@ extern "C" fn main(
     let height = bootinfo.framebuffer.height as usize;
     let stride = bootinfo.framebuffer.stride as usize;
 
+    // J231 diagnostic: dump the framebuffer geometry drv-fb reads from the BootInfo VMO, so the
+    // X13s scroll/overwrite bug can be pinned from serial. The scroll math is host-proven; if the
+    // screen corrupts, suspect geometry — chiefly `stride != width` (scroll() copies misaligned
+    // pixel bands) or an implausible `height`/`len`.
+    dbg_kv(b"drv-fb fb.width=", width as u64);
+    dbg_kv(b"drv-fb fb.height=", height as u64);
+    dbg_kv(b"drv-fb fb.stride=", stride as u64);
+    dbg_kv(b"drv-fb fb.len=", fb_len);
+
     // Mint and map the actual framebuffer.
     let fb_vmo_h = resource_mint_mmio(res, fb_phys, fb_len);
     if fb_vmo_h == u64::MAX {
@@ -91,17 +124,9 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
-    debug_write(b"drv-fb: initialized\n".as_ptr(), 20);
-
-    // Build the text console over the framebuffer (clears the screen) and show first
-    // light.
-    let mut con = unsafe { Console::new(fb_va as *mut u32, width, height, stride) };
-    con.write(b"KUMO drv-fb console ready\n");
-
-    debug_write(b"drv-fb: console ready\n".as_ptr(), 22);
-
-    // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
-    // Output-only — no keyboard device sits behind the framebuffer yet.
+    // Bind the console port before taking ownership. Diagnostics emitted immediately
+    // after the claim are queued to this channel; binding first guarantees each queued
+    // message also gets a port packet for the loop below.
     let port_h = port_create();
     let console_koid = handle_koid(console);
     if port_h == u64::MAX
@@ -114,6 +139,25 @@ extern "C" fn main(
     let port = Handle(port_h as u32);
     let console_source = Handle(console_koid as u32);
 
+    // This successful, capability-checked claim is the single ownership boundary:
+    // before it the HAL console alone may paint the GOP framebuffer; after it every
+    // kernel/user diagnostic is routed to this driver and the HAL cursor is dormant.
+    // Claim only after the mapping works, so a failed driver leaves the early console live.
+    if framebuffer_claim(res, fb_phys, fb_len) != 0 {
+        debug_write(b"drv-fb: framebuffer claim failed\n".as_ptr(), 33);
+        kumo_rt::process_exit(1);
+    }
+
+    // Build the text console over the framebuffer (clears the screen) and show first
+    // light.
+    let mut con = unsafe { Console::new(fb_va as *mut u32, width, height, stride) };
+    con.write(b"KUMO drv-fb console ready\n");
+
+    debug_write(b"drv-fb: initialized\n".as_ptr(), 20);
+    debug_write(b"drv-fb: console ready\n".as_ptr(), 22);
+
+    // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
+    // Output-only — no keyboard device sits behind the framebuffer yet.
     let mut rx = [0u8; 256];
     loop {
         let source = Handle(port_wait(port) as u32);

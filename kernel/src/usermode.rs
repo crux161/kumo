@@ -96,6 +96,9 @@ pub(crate) struct SoraState {
     /// Koid of Sora's keyboard endpoint — signalled when the kernel forwards a keystroke,
     /// so Sora's `PortWait` wakes for it (the other serve channels do the same).
     pub keyboard_koid: KoId,
+    /// Process currently owning the boot framebuffer after a capability-checked
+    /// [`Syscall::FramebufferClaim`]. `None` means the Stage-A HAL console owns it.
+    pub framebuffer_owner: Option<KoId>,
     /// Bytes written by `DebugWrite` syscalls during this run.
     pub wrote: usize,
 }
@@ -266,12 +269,62 @@ const LINUX_ARM64_MMAP: u64 = 222;
 const LINUX_ARM64_STDOUT: u64 = 1;
 const LINUX_ARM64_STDERR: u64 = 2;
 
+/// Queue bytes for the userspace framebuffer owner without switching threads. This
+/// helper is safe to call while an SVC already holds `&mut SoraState`: it takes that
+/// borrow explicitly instead of re-entering through `with_sora_mut`. `signal_ports`
+/// marks drv-fb runnable; the scheduler pumps it at the next ordinary boundary.
+fn queue_framebuffer_console(sora: &mut SoraState, bytes: &[u8]) -> bool {
+    let Ok(message) = Message::new(1, bytes, &[]) else {
+        return false;
+    };
+    let Ok(message) = KernelMessage::from_borrowed(message) else {
+        return false;
+    };
+    let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.console_channel) else {
+        return false;
+    };
+    if channel.write(sora.console_kernel_end, message).is_err() {
+        return false;
+    }
+    sora.engine
+        .signal_ports(sora.console_koid, kumo_abi::Signals::READABLE);
+    true
+}
+
+/// Direct diagnostics use the HAL only during its ownership epoch. Once drv-fb has
+/// claimed the framebuffer, enqueue to its console instead; never touch the dormant
+/// HAL cursor. If delivery fails, `early_console_write` intentionally drops framebuffer
+/// output until a fatal path explicitly reclaims ownership.
+fn console_write_in_state(sora: &mut SoraState, bytes: &[u8]) {
+    if !kumo_hal::active::framebuffer_console_owned_by_kernel()
+        && queue_framebuffer_console(sora, bytes)
+    {
+        return;
+    }
+    kumo_hal::active::early_console_write(bytes);
+}
+
+fn console_write_without_switch(bytes: &[u8]) {
+    if kumo_hal::active::framebuffer_console_owned_by_kernel() {
+        kumo_hal::active::early_console_write(bytes);
+        return;
+    }
+    let delivered = with_sora_mut(|sora| queue_framebuffer_console(sora, bytes));
+    if !delivered {
+        kumo_hal::active::early_console_write(bytes);
+    }
+}
+
 /// Temporary Stage-A M10 bridge for the first `persona-linux` smoke.
 ///
 /// The real design keeps the Linux personality in userspace. Until the upcall
 /// path exists, non-Sora child SVCs that use ARM64 Linux syscall numbers are
 /// translated here narrowly enough to run a static hello payload.
-fn handle_linux_persona_syscall(process: &Process, regs: &mut [u64]) -> bool {
+fn handle_linux_persona_syscall(
+    process: &Process,
+    regs: &mut [u64],
+    mut output: impl FnMut(&[u8]),
+) -> bool {
     match regs[8] {
         LINUX_ARM64_WRITE => {
             let fd = regs[0];
@@ -286,7 +339,7 @@ fn handle_linux_persona_syscall(process: &Process, regs: &mut [u64]) -> bool {
                 return true;
             }
             let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-            kumo_hal::active::early_console_write(bytes);
+            output(bytes);
             regs[0] = len as u64;
             true
         }
@@ -314,7 +367,7 @@ fn handle_linux_persona_syscall(process: &Process, regs: &mut [u64]) -> bool {
                     return true;
                 }
                 let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-                kumo_hal::active::early_console_write(bytes);
+                output(bytes);
                 total = total.saturating_add(len as u64);
             }
             regs[0] = total;
@@ -644,10 +697,14 @@ fn teardown_current_process_and_signal() {
     let Some(koid) = crate::user_thread::current_process_koid() else {
         return;
     };
-    with_sora_mut(|sora| {
+    let reclaim_framebuffer = with_sora_mut(|sora| {
+        let reclaim_framebuffer = sora.framebuffer_owner == Some(koid);
+        if reclaim_framebuffer {
+            sora.framebuffer_owner = None;
+        }
         let handles = {
             let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
-                return;
+                return reclaim_framebuffer;
             };
             proc.handles_mut().drain()
         };
@@ -675,12 +732,16 @@ fn teardown_current_process_and_signal() {
             sora.engine.release_port_bindings(entry.koid);
         }
         let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
-            return;
+            return reclaim_framebuffer;
         };
         proc.signal(kumo_abi::Signals::TERMINATED);
         sora.engine
             .signal_ports(koid, kumo_abi::Signals::TERMINATED);
+        reclaim_framebuffer
     });
+    if reclaim_framebuffer {
+        kumo_hal::active::reclaim_framebuffer_console();
+    }
 }
 
 /// Exit code stamped on a thread the kernel terminated for faulting (vs. a clean
@@ -692,7 +753,18 @@ const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
 /// that thread and switch to the scheduler, so one server's crash never halts the kernel
 /// (DESIGN/002, §5.6). Never returns to the faulting context.
 extern "C" fn fault_hook(_esr: u64, _elr: u64, _far: u64) -> ! {
-    kumo_hal::active::early_console_write(b"KUMO: EL0 fault contained; process terminated\n");
+    const REPORT: &[u8] = b"KUMO: EL0 fault contained; process terminated\n";
+    let owner_faulted = crate::user_thread::current_process_koid()
+        .map(|koid| with_sora(|sora| sora.framebuffer_owner == Some(koid)))
+        .unwrap_or(false);
+    if owner_faulted {
+        // The renderer itself faulted: no userspace consumer remains, so the kernel
+        // must reclaim the glass before reporting the failure.
+        kumo_hal::active::reclaim_framebuffer_console();
+        kumo_hal::active::early_console_write(REPORT);
+    } else {
+        console_write_without_switch(REPORT);
+    }
     if crate::user_thread::is_started() {
         teardown_current_process_and_signal();
         crate::user_thread::exit_current_user(EL0_FAULT_EXIT_CODE);
@@ -794,7 +866,18 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     return;
                 };
                 let child = unsafe { &mut *child_ptr };
-                if handle_linux_persona_syscall(child, r) {
+                let mut linux_output = [0u8; 8 * 256];
+                let mut linux_output_len = 0usize;
+                let handled_linux = handle_linux_persona_syscall(child, r, |bytes| {
+                    let n = bytes.len().min(linux_output.len() - linux_output_len);
+                    linux_output[linux_output_len..linux_output_len + n]
+                        .copy_from_slice(&bytes[..n]);
+                    linux_output_len += n;
+                });
+                if handled_linux {
+                    for chunk in linux_output[..linux_output_len].chunks(MAX_CHANNEL_BYTES) {
+                        console_write_in_state(sora, chunk);
+                    }
                     return;
                 }
                 if num == Syscall::DebugWrite as u64 {
@@ -805,7 +888,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         return;
                     }
                     let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-                    kumo_hal::active::early_console_write(bytes);
+                    // Use the already-held SoraState borrow: after drv-fb's explicit
+                    // claim this queues to its console without re-entering the RefCell;
+                    // before the claim it remains an ordinary Stage-A HAL write.
+                    console_write_in_state(sora, bytes);
                     r[0] = len as u64;
                 } else if num == Syscall::HandleClose as u64 {
                     let handle = Handle(r[0] as u32);
@@ -919,6 +1005,27 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                         _ => r[0] = u64::MAX,
                     }
+                } else if num == Syscall::FramebufferClaim as u64 {
+                    let resource = Handle(r[0] as u32);
+                    let phys_base = r[1];
+                    let len = r[2];
+                    let validated = matches!(
+                        sora.engine.dispatch(
+                            child,
+                            KernelCall::FramebufferClaim {
+                                resource,
+                                phys_base,
+                                len,
+                            },
+                        ),
+                        KernelCallResult::Status(status) if status == Errno::Ok.status()
+                    );
+                    if validated && kumo_hal::active::handoff_framebuffer_console(phys_base, len) {
+                        sora.framebuffer_owner = Some(cp_koid);
+                        r[0] = Errno::Ok.status() as u32 as u64;
+                    } else {
+                        r[0] = Errno::AccessDenied.status() as u32 as u64;
+                    }
                 } else if num == Syscall::InterruptCreate as u64 {
                     let resource = Handle(r[0] as u32);
                     let irq = r[1] as u32;
@@ -970,10 +1077,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 return;
             }
             let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-            // Render on the device directly (never through `bootstrap::console::write`):
-            // this is the console *server's own* output path — routing it back through the
-            // console channel would recurse into Sora forever (P6-e reentrancy guard).
-            kumo_hal::active::early_console_write(bytes);
+            // Never re-enter `with_sora_mut` from Sora's own syscall. The explicit
+            // state-borrowing helper routes to drv-fb after ownership handoff and uses
+            // the HAL only before that boundary.
+            console_write_in_state(sora, bytes);
             sora.wrote += len;
             r[0] = len as u64;
         } else if num == Syscall::HandleClose as u64 {
@@ -1118,6 +1225,27 @@ extern "C" fn svc_hook(regs: *mut u64) {
             ) {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
+            }
+        } else if num == Syscall::FramebufferClaim as u64 {
+            let resource = Handle(r[0] as u32);
+            let phys_base = r[1];
+            let len = r[2];
+            let validated = matches!(
+                sora.engine.dispatch(
+                    &mut sora.process,
+                    KernelCall::FramebufferClaim {
+                        resource,
+                        phys_base,
+                        len,
+                    },
+                ),
+                KernelCallResult::Status(status) if status == Errno::Ok.status()
+            );
+            if validated && kumo_hal::active::handoff_framebuffer_console(phys_base, len) {
+                sora.framebuffer_owner = Some(sora.process.koid());
+                r[0] = Errno::Ok.status() as u32 as u64;
+            } else {
+                r[0] = Errno::AccessDenied.status() as u32 as u64;
             }
         } else if num == Syscall::ResourceCreateChild as u64 {
             let parent = Handle(r[0] as u32);
@@ -1375,6 +1503,7 @@ pub fn run(boot: &BootInfo) -> UserReport {
             block_koid: KoId(0),
             net_koid: KoId(0),
             keyboard_koid: KoId(0),
+            framebuffer_owner: None,
             wrote: 0,
         }));
     }
@@ -1653,6 +1782,7 @@ fn attempt_sora(
             block_koid,
             net_koid,
             keyboard_koid,
+            framebuffer_owner: None,
             wrote: 0,
         }));
     }

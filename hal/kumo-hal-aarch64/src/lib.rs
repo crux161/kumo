@@ -234,6 +234,10 @@ static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static FB_STRIDE: AtomicU32 = AtomicU32::new(0);
 static FB_COL: AtomicU32 = AtomicU32::new(0);
 static FB_ROW: AtomicU32 = AtomicU32::new(0);
+/// True only while the Stage-A text console owns the framebuffer. A successful
+/// userspace driver claim clears this permanently until a fatal kernel path reclaims
+/// the glass; two independent cursors must never paint it concurrently.
+static FB_KERNEL_OWNER: AtomicBool = AtomicBool::new(true);
 
 fn font_field(offset: usize) -> usize {
     u32::from_le_bytes([
@@ -499,6 +503,7 @@ pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, strid
     FB_STRIDE.store(stride, ORD);
     FB_COL.store(0, ORD);
     FB_ROW.store(0, ORD);
+    FB_KERNEL_OWNER.store(true, ORD);
 
     // Clear to the black phosphor backdrop, then flush to RAM so it shows on real
     // hardware where the framebuffer may be write-back cached (see `fb_clean_line`).
@@ -519,6 +524,54 @@ pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, strid
     }
 
     FB_PRESENT.store(true, ORD);
+}
+
+fn framebuffer_claim_matches(
+    present: bool,
+    configured_base: u64,
+    configured_len_px: usize,
+    phys_base: u64,
+    len_bytes: u64,
+) -> bool {
+    present
+        && phys_base == configured_base
+        && len_bytes != 0
+        && (len_bytes / 4) >= configured_len_px as u64
+}
+
+/// Relinquish the Stage-A framebuffer cursor to a userspace console driver. The
+/// caller has already checked the driver's Resource capability; this backend check
+/// binds that authority to the framebuffer actually configured from BootInfo.
+pub fn handoff_framebuffer_console(phys_base: u64, len_bytes: u64) -> bool {
+    if !framebuffer_claim_matches(
+        FB_PRESENT.load(ORD),
+        FB_BASE.load(ORD),
+        FB_LEN_PX.load(ORD),
+        phys_base,
+        len_bytes,
+    ) {
+        return false;
+    }
+    FB_KERNEL_OWNER
+        .compare_exchange(true, false, ORD, ORD)
+        .is_ok()
+}
+
+pub fn framebuffer_console_owned_by_kernel() -> bool {
+    FB_KERNEL_OWNER.load(ORD)
+}
+
+/// Fatal kernel paths take the glass back because userspace can no longer be trusted
+/// to render the report. The stale Stage-A cursor is acceptable after the other owner
+/// has died; legibility matters, and there is again only one painter.
+pub fn reclaim_framebuffer_console() {
+    if FB_PRESENT.load(ORD) {
+        FB_KERNEL_OWNER.store(true, ORD);
+    }
+}
+
+fn framebuffer_console_writes_enabled(present: bool, kernel_owner: bool) -> bool {
+    present && kernel_owner
 }
 
 /// Fill the whole linear framebuffer with `color` (little-endian BGRx u32) and flush it
@@ -709,8 +762,14 @@ fn fb_putchar(scalar: u32) {
 
 pub fn early_console_write(bytes: &[u8]) {
     if FB_PRESENT.load(ORD) {
-        // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
-        for_each_scalar(bytes, fb_putchar);
+        if framebuffer_console_writes_enabled(true, FB_KERNEL_OWNER.load(ORD)) {
+            // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
+            for_each_scalar(bytes, fb_putchar);
+        }
+        // A framebuffer machine does not imply that the QEMU PL011 exists (the X13s
+        // explicitly does not expose it). After handoff, dropping an unroutable
+        // diagnostic is safer than either touching absent UART MMIO or corrupting the
+        // userspace console's pixels. Fatal paths reclaim the framebuffer first.
         return;
     }
 
@@ -730,7 +789,7 @@ pub fn early_console_write(bytes: &[u8]) {
 /// on PL011 it returns to the start of the current line (`\r`), which lets a single
 /// status line redraw in place (e.g. the heartbeat).
 pub fn console_set_cursor(col: u32, row: u32) {
-    if FB_PRESENT.load(ORD) {
+    if FB_PRESENT.load(ORD) && FB_KERNEL_OWNER.load(ORD) {
         FB_COL.store(col, ORD);
         FB_ROW.store(row, ORD);
     } else if UART_READY.load(ORD) {
@@ -2926,7 +2985,7 @@ unsafe fn mmio_write8(addr: u64, value: u8) {
 
 #[cfg(target_os = "none")]
 mod traps {
-    use super::{early_console_write, halt};
+    use super::{early_console_write, halt, reclaim_framebuffer_console};
     use core::fmt::Write;
 
     struct ConsoleWriter;
@@ -3061,6 +3120,9 @@ mod traps {
 
     #[no_mangle]
     extern "C" fn kumo_exception_entry(index: u64, esr: u64, elr: u64, far: u64) -> ! {
+        // A fatal EL1 exception ends the userspace ownership epoch. Take the glass
+        // back before rendering so the Tower remains visible even if drv-fb died.
+        reclaim_framebuffer_console();
         let src =
             ["CurEL_SP0", "CurEL_SPx", "LowerEL_A64", "LowerEL_A32"][((index / 4) % 4) as usize];
         let kind = ["sync", "irq", "fiq", "serror"][(index % 4) as usize];
@@ -3176,6 +3238,34 @@ mod tests {
         assert_eq!(arch_name(), "aarch64");
     }
 
+    #[test]
+    fn framebuffer_handoff_requires_the_configured_range() {
+        assert!(framebuffer_claim_matches(
+            true,
+            0x9000_0000,
+            0x2000,
+            0x9000_0000,
+            0x8000,
+        ));
+        assert!(!framebuffer_claim_matches(
+            true,
+            0x9000_0000,
+            0x2000,
+            0x9000_1000,
+            0x8000,
+        ));
+        assert!(!framebuffer_claim_matches(
+            false,
+            0x9000_0000,
+            0x2000,
+            0x9000_0000,
+            0x8000,
+        ));
+        assert!(framebuffer_console_writes_enabled(true, true));
+        assert!(!framebuffer_console_writes_enabled(true, false));
+        assert!(!framebuffer_console_writes_enabled(false, true));
+    }
+
     fn scalars<const N: usize>(bytes: &[u8]) -> ([u32; N], usize) {
         let mut out = [0u32; N];
         let mut n = 0;
@@ -3209,12 +3299,21 @@ mod tests {
         // Strictly ascending codepoints, so the binary search is valid.
         let code = |i: usize| u16::from_le_bytes([font[i * rec], font[i * rec + 1]]);
         assert!((1..cjk_font::GLYPH_COUNT).all(|i| code(i - 1) < code(i)));
-        // Broad set: common Han (一/的) and a Hangul jamo (ㄱ) are in; a precomposed Hangul
-        // syllable (가) and an astral codepoint are not (deferred to the BDF stage).
+        // Broad set: common Han (一/的), a Hangul compatibility jamo (ㄱ), the full precomposed
+        // Hangul Syllables block (가 first … 힣 last), and the Japanese kana + CJK punctuation /
+        // fullwidth forms the boot banner mixes with kanji (あ/カ/「/：) are all in. Full CJK
+        // Unified beyond the newspaper set (㐀, CJK Ext-A) and astral codepoints stay out — that
+        // megabyte-class coverage waits for the compressed/BDF font stage.
         assert_eq!(cjk_glyph('一' as u32).map(<[u8]>::len), Some(32));
         assert!(cjk_glyph('的' as u32).is_some());
         assert!(cjk_glyph('ㄱ' as u32).is_some());
-        assert!(cjk_glyph('가' as u32).is_none());
+        assert!(cjk_glyph('가' as u32).is_some()); // U+AC00, first precomposed syllable
+        assert!(cjk_glyph('힣' as u32).is_some()); // U+D7A3, last precomposed syllable
+        assert!(cjk_glyph('あ' as u32).is_some()); // U+3042, hiragana (banner)
+        assert!(cjk_glyph('カ' as u32).is_some()); // U+30AB, katakana (banner)
+        assert!(cjk_glyph('「' as u32).is_some()); // U+300C, CJK punctuation (banner)
+        assert!(cjk_glyph('：' as u32).is_some()); // U+FF1A, fullwidth colon (banner)
+        assert!(cjk_glyph('㐀' as u32).is_none()); // U+3400, CJK Ext-A, outside the set
         assert!(cjk_glyph(0x1_0000).is_none());
     }
 

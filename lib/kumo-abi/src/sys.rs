@@ -38,6 +38,9 @@ pub enum Syscall {
     ProcessWait = 34,
     ResourceCreateChild = 35,
     PortUnbind = 36,
+    /// Transfer framebuffer text-console ownership from the Stage-A HAL to a
+    /// userspace driver holding the matching Resource capability.
+    FramebufferClaim = 37,
 }
 
 /// Options for [`Syscall::ProcessRun`].

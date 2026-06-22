@@ -7,14 +7,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     CAT_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
+    WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_rt::{
-    address_space_create, channel_create, channel_create_pair, channel_read, channel_write,
-    channel_write_with_handle, debug_write, handle_close, handle_duplicate, handle_koid,
-    interrupt_create, port_bind, port_create, port_unbind, port_wait, process_create, process_run,
-    process_wait, resource_create_child, thread_create, thread_start, timer_create, vmar_map,
-    vmo_create, vmo_read, vmo_write,
+    address_space_create, channel_create, channel_create_pair, channel_read,
+    channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
+    handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
+    port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
+    thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_CAP0,
+    STARTUP_TAG_STDOUT,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -1123,9 +1125,7 @@ extern "C" fn sora_main(
                 for line in kumoza::autoexec_lines(&manifest[..n]) {
                     if let Ok(ls) = core::str::from_utf8(line) {
                         if let Some(stmt) = parse(ls) {
-                            kumoza::evaluate(&stmt, |cmd| {
-                                eval_command(cmd, line, initrd, prog_initrd, root)
-                            });
+                            run_statement(&stmt, line, initrd, prog_initrd, root);
                         }
                     }
                 }
@@ -1483,6 +1483,28 @@ fn find_initrd_file(initrd: Handle, target: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
+/// Run a parsed `Statement`. A single command dispatches through [`eval_command`] (shared by
+/// the interactive editor and the boot autoexec). A multi-stage pipeline has no execution model
+/// yet — that needs concurrent spawn plus a stdin/stdout channel wired between stages — so it is
+/// rejected honestly rather than running its stages disconnected (which would run stage 1 and
+/// then forward the whole line to the kernel shell).
+fn run_statement(
+    stmt: &kumoza::Statement,
+    raw: &[u8],
+    initrd: Handle,
+    prog_initrd: u64,
+    root: Handle,
+) {
+    if stmt.pipeline.commands.len() > 1 {
+        let msg = b"sora: pipelines not yet supported\n";
+        debug_write(msg.as_ptr(), msg.len());
+        return;
+    }
+    kumoza::evaluate(stmt, |cmd| {
+        eval_command(cmd, raw, initrd, prog_initrd, root)
+    });
+}
+
 /// Dispatch one parsed shell command. Shared by the interactive line editor and the
 /// boot autoexec (J183), so both speak the same syntax: `echo`/`help`/`ls`/`run` are
 /// handled by this dispatcher; any other non-empty command is forwarded verbatim (`raw`, the
@@ -1523,13 +1545,35 @@ fn eval_command(
                 );
             }
         }
+    } else if cmd.name == "wc" {
+        // wc: like cat, granted the read-only initrd capability (x0) and its argv VMO (x1);
+        // it counts the named file. Only this explicit launcher grants the initrd.
+        if cmd.args.len() != 1 {
+            debug_write(b"usage: wc <path>\n".as_ptr(), 17);
+        } else if prog_initrd == 0 || prog_initrd == u64::MAX {
+            debug_write(b"wc: no initrd handle\n".as_ptr(), 21);
+        } else {
+            let argv_handle = build_command_argv_handle(cmd);
+            if argv_handle == 0 {
+                debug_write(b"wc: argv unavailable\n".as_ptr(), 21);
+            } else {
+                run_elf(
+                    initrd,
+                    WC_PATH.as_bytes(),
+                    prog_initrd,
+                    argv_handle,
+                    0,
+                    b"wc",
+                );
+            }
+        }
     } else if cmd.name == "ls" {
-        // ls: list the initrd's entries from an ordinary program that receives only a
-        // read-only initrd handle — the first capability-using KUMO userland command.
+        // ls: one bootstrap channel is moved into x0. Its finite startup message carries
+        // the read-only initrd and stdout capabilities; no authority is inherited.
         if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
         } else {
-            run_elf(initrd, LS_PATH.as_bytes(), prog_initrd, 0, 0, b"ls");
+            run_ls_with_startup(initrd);
         }
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
@@ -1545,6 +1589,108 @@ fn eval_command(
         channel_write(root, raw.as_ptr(), raw.len());
     }
     true
+}
+
+/// Run `ls` with one self-terminating bootstrap startup message. The stdout writer
+/// and a fresh read-only initrd grant are transferred into the message; then Sora
+/// closes the sender before launching the child with the bootstrap receiver moved
+/// into x0. The child can drain the finite set to peer-closed without parking.
+fn run_ls_with_startup(initrd: Handle) {
+    let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
+    if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
+        debug_write(b"ls: stdout unavailable\n".as_ptr(), 23);
+        return;
+    }
+    let stdout_read = Handle(stdout_read_raw as u32);
+    let stdout_write = Handle(stdout_write_raw as u32);
+
+    let (bootstrap_send_raw, bootstrap_child_raw) = channel_create_pair();
+    if bootstrap_send_raw == u64::MAX || bootstrap_child_raw == u64::MAX {
+        let _ = handle_close(stdout_read);
+        let _ = handle_close(stdout_write);
+        debug_write(b"ls: bootstrap unavailable\n".as_ptr(), 26);
+        return;
+    }
+    let bootstrap_send = Handle(bootstrap_send_raw as u32);
+    let bootstrap_child = Handle(bootstrap_child_raw as u32);
+    let initrd_child_raw = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
+    if initrd_child_raw == 0 || initrd_child_raw == u64::MAX {
+        for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+            let _ = handle_close(handle);
+        }
+        debug_write(b"ls: initrd grant unavailable\n".as_ptr(), 28);
+        return;
+    }
+    let initrd_child = Handle(initrd_child_raw as u32);
+
+    let stdout_queued =
+        channel_write_with_handle(bootstrap_send, &STARTUP_TAG_STDOUT, 1, stdout_write)
+            == Errno::Ok.status();
+    if !stdout_queued {
+        let _ = handle_close(stdout_write);
+    }
+    let cap_queued = channel_write_with_handle(bootstrap_send, &STARTUP_TAG_CAP0, 1, initrd_child)
+        == Errno::Ok.status();
+    if !cap_queued {
+        let _ = handle_close(initrd_child);
+    }
+    let queued = stdout_queued as usize + cap_queued as usize;
+
+    if handle_close(bootstrap_send) != Errno::Ok.status() {
+        reclaim_startup_handles(bootstrap_child, Some(queued));
+        let _ = handle_close(bootstrap_child);
+        let _ = handle_close(stdout_read);
+        debug_write(b"ls: bootstrap close failed\n".as_ptr(), 27);
+        return;
+    }
+
+    let flags = ProcessRunFlags::TRANSFER_ARG.bits();
+    let _ = run_elf(
+        initrd,
+        LS_PATH.as_bytes(),
+        bootstrap_child_raw,
+        0,
+        flags,
+        b"ls",
+    );
+
+    if handle_koid(bootstrap_child) == u64::MAX {
+        pump_to_console(stdout_read);
+    } else {
+        // Admission failed before the bootstrap transfer committed. Recover and close
+        // every capability queued in its message so no authority is stranded.
+        reclaim_startup_handles(bootstrap_child, None);
+        let _ = handle_close(bootstrap_child);
+    }
+    let _ = handle_close(stdout_read);
+}
+
+/// Recover handles from a startup message that could not be delivered. `Some(n)` is
+/// used only when the sender could not be closed, so exactly the known queued messages
+/// are read without risking a park. With a closed sender, `None` safely drains to EOF.
+fn reclaim_startup_handles(bootstrap: Handle, count: Option<usize>) {
+    let mut tag = [0u8; 1];
+    let limit = count.unwrap_or(usize::MAX);
+    for _ in 0..limit {
+        let (n, raw_handle) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+        if n == 0 {
+            break;
+        }
+        if raw_handle != 0 {
+            let _ = handle_close(Handle(raw_handle as u32));
+        }
+    }
+}
+
+fn pump_to_console(read_end: Handle) {
+    let mut buf = [0u8; 256];
+    loop {
+        let n = channel_read(read_end, buf.as_mut_ptr(), buf.len());
+        if n == 0 || n == u64::MAX {
+            break;
+        }
+        debug_write(buf.as_ptr(), n as usize);
+    }
 }
 
 /// Pack `argv` into the shared scratch VMO and return the read-only handle to grant the
@@ -2105,9 +2251,7 @@ fn dispatch_ttyd_key(
     };
     if let Ok(ls) = core::str::from_utf8(line) {
         if let Some(stmt) = parse(ls) {
-            kumoza::evaluate(&stmt, |cmd| {
-                eval_command(cmd, line, initrd, prog_initrd, root)
-            });
+            run_statement(&stmt, line, initrd, prog_initrd, root);
         }
     }
     true

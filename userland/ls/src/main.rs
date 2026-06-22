@@ -3,12 +3,13 @@
 
 //! `ls` — the first KUMO program that *uses a capability*.
 //!
-//! Where `hello` only writes and exits, `ls` is handed a **read-only initrd VMO
-//! handle in `x0`** by the shell's `ls` builtin (which narrows Sora's initrd to
-//! `Rights::READ` before granting it — least privilege: `ls` can read the image but
-//! not write it). It reads the initrd header + entry table and prints each path, so a
-//! `bin/<name>` entry is visibly runnable via `run <name>`, with its payload size (an
-//! `ls -l`-style listing). The parsing is `kumo_abi::entries`, shared with the host tests.
+//! Where `hello` only writes and exits, `ls` receives one bootstrap channel in `x0`.
+//! Its startup message carries a **read-only initrd VMO** and stdout channel as explicit
+//! transferred capabilities. The initrd grant is least privilege: `ls` can read the
+//! image but not write it. It reads the initrd header + entry table and writes each path
+//! to stdout, so a `bin/<name>` entry is visibly runnable via `run <name>`, with its
+//! payload size (an `ls -l`-style listing). The parsing is `kumo_abi::entries`, shared
+//! with the host tests.
 //!
 //! `VmoRead` is capped at 256 bytes/call (kernel `usermode.rs`), so the table is read
 //! in 256-byte chunks — the same reason the loaders chunk. `ls` reads the header first,
@@ -17,7 +18,7 @@
 //! the listing.
 
 use kumo_abi::{entries, entry_table_bytes, Handle, INITRD_HEADER_LEN};
-use kumo_rt::{debug_write, process_exit, vmo_read};
+use kumo_rt::{channel_write, debug_write, process_exit, startup, vmo_read};
 
 kumo_rt::entry!(main);
 
@@ -37,9 +38,20 @@ fn fmt_dec_right(value: u64, field: &mut [u8]) {
     }
 }
 
+/// Write ordinary program output through the capability supplied by the shell. Keep
+/// `debug_write` only as a diagnostic fallback for direct/legacy launches that provide
+/// no stdout handle.
+fn emit(stdout: Handle, bytes: &[u8]) {
+    if stdout.0 == 0 {
+        debug_write(bytes.as_ptr(), bytes.len());
+    } else {
+        let _ = channel_write(stdout, bytes.as_ptr(), bytes.len());
+    }
+}
+
 #[no_mangle]
 extern "C" fn main(
-    initrd_handle: u64,
+    bootstrap_handle: u64,
     _a2: u64,
     _a3: u64,
     _a4: u64,
@@ -48,7 +60,16 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
-    let initrd = Handle(initrd_handle as u32);
+    let startup = startup(Handle(bootstrap_handle as u32));
+    let initrd = match startup.cap0 {
+        Some(handle) => handle,
+        None => {
+            const ERR: &[u8] = b"ls: no initrd handle\n";
+            debug_write(ERR.as_ptr(), ERR.len());
+            process_exit(1);
+        }
+    };
+    let stdout = startup.stdout.unwrap_or(Handle(0));
 
     let mut table = [0u8; 2048];
 
@@ -87,10 +108,10 @@ extern "C" fn main(
     for (path, size) in entries(&table[..table_len]) {
         let mut sizebuf = [b' '; 10];
         fmt_dec_right(size, &mut sizebuf);
-        debug_write(sizebuf.as_ptr(), sizebuf.len());
-        debug_write(b"  ".as_ptr(), 2);
-        debug_write(path.as_ptr(), path.len());
-        debug_write(b"\n".as_ptr(), 1);
+        emit(stdout, &sizebuf);
+        emit(stdout, b"  ");
+        emit(stdout, path.as_bytes());
+        emit(stdout, b"\n");
     }
     process_exit(0)
 }

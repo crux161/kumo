@@ -13,10 +13,13 @@ the table renders as the hardcoded tofu box in the HAL; this tool never decides 
 
 Coverage (`--coverage`):
   * `broad` (default): "newspaper literacy" — Jōyō kanji (Japanese) ∪ GB2312 Level-1 (common
-    simplified Chinese) ∪ Hangul compatibility jamo. The Han sets come from the Unicode
-    Unihan database (auto-downloaded + cached); jamo is a fixed block. ~4.6k glyphs, ~150 KiB.
-    Everything else (full CJK, traditional Han, precomposed Hangul syllables) is deferred to
-    the later BDF/GPU stage.
+    simplified Chinese) ∪ Hangul compatibility jamo ∪ Hangul Syllables (the full precomposed
+    block, so modern Korean is writable) ∪ Japanese kana + CJK punctuation / fullwidth forms
+    (Hiragana, Katakana, U+3000–303F, fullwidth ASCII — so the mixed kanji+kana boot banner
+    renders without tofu). The Han sets come from the Unicode Unihan database (auto-downloaded +
+    cached); the jamo, syllable, kana and punctuation blocks are fixed ranges. ~16.1k glyphs,
+    ~535 KiB. Everything else (full CJK, traditional Han) is deferred to the later BDF/GPU
+    stage — that is the megabyte-class coverage the compressed/ESP font slice exists for.
   * `curated`: the tiny VEIL-name + diagnostics allowlist (`GLYPHS`). ~33 glyphs.
 
 Glyph bitmaps always come from GNU Unifont's `.hex` (canonical 16x16); a `magick` fallback
@@ -45,6 +48,21 @@ GLYPHS = (
 
 # Hangul: the modern Compatibility Jamo block (the 24 basic letters + compound jamo).
 HANGUL_JAMO = range(0x3131, 0x3164)
+
+# Hangul Syllables: the full precomposed block (U+AC00–U+D7A3, 11,172 syllables). Makes modern
+# Korean writable, not just spellable in jamo. Unifont carries every syllable (rendered
+# algorithmically from Johab jamo), all full-width 16x16, so none are skipped. Still embedded,
+# still no boot-path change — the DESIGN/005 invariant the deferred ESP variant exists to keep.
+HANGUL_SYLLABLES = range(0xAC00, 0xD7A4)
+
+# Japanese kana + the CJK punctuation / fullwidth forms the Stage-A boot banner actually mixes
+# with kanji (kernel `stage_a_console_banner`). Without these the banner is half tofu: only the
+# Jōyō kanji render, while オペレーティングシステム (katakana), hiragana, 「」、。 and fullwidth ：
+# fall back to the box. All fixed ranges — no Unihan lookup.
+CJK_PUNCTUATION = range(0x3000, 0x3040)  # 　、。「」『』… (incl ideographic space U+3000)
+HIRAGANA = range(0x3040, 0x30A0)
+KATAKANA = range(0x30A0, 0x3100)  # incl ・ (U+30FB) and the ー long-vowel mark (U+30FC)
+FULLWIDTH_FORMS = range(0xFF01, 0xFF5F)  # fullwidth ASCII variants, incl ： (U+FF1A)
 
 UNIHAN_URL = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,12 +145,13 @@ def unihan_field(zf: zipfile.ZipFile, member: str, key: str) -> dict[int, str]:
 
 
 def broad_codepoints() -> set[int]:
-    """Jōyō kanji ∪ GB2312 Level-1 (ku 16–55) ∪ Hangul compatibility jamo."""
+    """Jōyō kanji ∪ GB2312 Level-1 (ku 16–55) ∪ Hangul jamo ∪ Hangul syllables ∪ kana/punct."""
     with zipfile.ZipFile(unihan_zip()) as zf:
         joyo = set(unihan_field(zf, "Unihan_OtherMappings.txt", "kJoyoKanji"))
         gb0 = unihan_field(zf, "Unihan_OtherMappings.txt", "kGB0")
     gb_l1 = {cp for cp, v in gb0.items() if 16 <= int(v) // 100 <= 55}
-    return joyo | gb_l1 | set(HANGUL_JAMO)
+    kana_punct = set(CJK_PUNCTUATION) | set(HIRAGANA) | set(KATAKANA) | set(FULLWIDTH_FORMS)
+    return joyo | gb_l1 | set(HANGUL_JAMO) | set(HANGUL_SYLLABLES) | kana_punct
 
 
 # ---- emit ------------------------------------------------------------------------------
@@ -157,7 +176,8 @@ def main() -> int:
     if args.coverage == "broad":
         codepoints = sorted(cp for cp in broad_codepoints() if cp <= 0xFFFF)
         coverage_note = ("newspaper literacy: Jōyō kanji ∪ GB2312 Level-1 (common simplified "
-                         "Chinese) ∪ Hangul jamo")
+                         "Chinese) ∪ Hangul jamo ∪ Hangul Syllables (precomposed, modern Korean) "
+                         "∪ kana + CJK punctuation")
     else:
         codepoints = sorted({ord(ch) for ch in GLYPHS if ord(ch) <= 0xFFFF})
         coverage_note = "curated VEIL names + diagnostics"
@@ -184,7 +204,7 @@ def main() -> int:
 //! ascending by codepoint (binary-searchable): a `u16` little-endian codepoint, then a
 //! 16x16 1bpp bitmap (16 rows x 2 bytes, MSB = leftmost pixel, set bit = foreground).
 //! Codepoints absent here render as the hardcoded tofu box. Beyond this set (full CJK,
-//! traditional Han, precomposed Hangul syllables) waits for the BDF/GPU font stage.
+//! traditional Han) waits for the BDF/GPU font stage.
 //! Regenerate: `python3 scripts/gen-cjk-font.py`.
 
 /// Packed glyph records, sorted ascending by codepoint. See [`RECORD`].

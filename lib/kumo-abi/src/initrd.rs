@@ -26,6 +26,9 @@ pub const ARGS_PATH: &str = "bin/args";
 /// `cat` receives a read-only initrd VMO in `x0` and argv in `x1`, then streams
 /// the named initrd entry to standard debug output.
 pub const CAT_PATH: &str = "bin/cat";
+/// `wc` receives a read-only initrd VMO in `x0` and argv in `x1`, then prints the line,
+/// word, and byte counts of the named initrd entry to standard debug output.
+pub const WC_PATH: &str = "bin/wc";
 /// The input-less boot script Sora runs from the initrd: one `bin/<name>` per
 /// line, `#` comments and blanks ignored. The X13s autoexec stopgap — programs
 /// run and paint to the framebuffer with no keyboard. Parsed by `kumoza`.

@@ -178,6 +178,16 @@ pub fn early_console_write(bytes: &[u8]) {
     let _ = bytes;
 }
 
+pub fn handoff_framebuffer_console(_phys_base: u64, _len_bytes: u64) -> bool {
+    false
+}
+
+pub fn framebuffer_console_owned_by_kernel() -> bool {
+    true
+}
+
+pub fn reclaim_framebuffer_console() {}
+
 /// P10-c: IDT deferred — BSS linker issue on x86_64 (non-zero bytes in .bss).
 // The IDT static triggers a linker error on x86_64-unknown-none. Revisit when
 // the target spec or linker script allows aligned statics in BSS.

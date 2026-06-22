@@ -97,6 +97,11 @@ pub enum KernelCall<'a> {
         phys_base: u64,
         len: u64,
     },
+    FramebufferClaim {
+        resource: Handle,
+        phys_base: u64,
+        len: u64,
+    },
     ResourceCreateChild {
         parent: Handle,
         phys_base: u64,
@@ -1484,6 +1489,32 @@ impl SyscallEngine {
                     Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
+            KernelCall::FramebufferClaim {
+                resource,
+                phys_base,
+                len,
+            } => {
+                let res_entry =
+                    match process
+                        .handles()
+                        .require(resource, ObjectKind::Resource, Rights::WRITE)
+                    {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            return KernelCallResult::Status(errno_from_object(error).status())
+                        }
+                    };
+                let Some(res) = self.resource_by_koid(res_entry.koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                if len == 0 {
+                    KernelCallResult::Status(Errno::InvalidArgs.status())
+                } else if !resource_contains(res, phys_base, len) {
+                    KernelCallResult::Status(Errno::AccessDenied.status())
+                } else {
+                    KernelCallResult::Status(Errno::Ok.status())
+                }
+            }
             KernelCall::ResourceCreateChild {
                 parent,
                 phys_base,
@@ -1804,6 +1835,49 @@ mod tests {
         assert_eq!(
             outside,
             KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn framebuffer_claim_is_limited_to_resource_range() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let resource = engine
+            .root_resource_create(&mut process, 0x9000_0000, 0x20_0000, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::FramebufferClaim {
+                    resource,
+                    phys_base: 0x9000_0000,
+                    len: 0x10_0000,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::FramebufferClaim {
+                    resource,
+                    phys_base: 0x8fff_f000,
+                    len: 0x1000,
+                },
+            ),
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::FramebufferClaim {
+                    resource,
+                    phys_base: 0x9000_0000,
+                    len: 0,
+                },
+            ),
+            KernelCallResult::Status(Errno::InvalidArgs.status())
         );
     }
 
