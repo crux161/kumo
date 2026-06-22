@@ -2238,3 +2238,37 @@ pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeEr
         Err(UsermodeError::ChannelSetup)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::console_routed_to_owner;
+
+    // J247: the post-handoff console fallback routing policy. The kernel-owned epoch must
+    // always paint via the HAL (the `early_console_write` fallback); only after drv-fb has
+    // claimed the framebuffer is a *successful* queue allowed to suppress the HAL write.
+    // This is the framebuffer-class behaviour qemu-smoke cannot prove (it has no FB), so it
+    // is pinned here per GUIDANCE/006 §4.
+
+    #[test]
+    fn kernel_owned_always_falls_back_to_hal() {
+        // While the kernel owns the glass, never route — even if a queue somehow reported
+        // success, ownership dominates so the HAL stays the single painter.
+        assert!(!console_routed_to_owner(true, false));
+        assert!(!console_routed_to_owner(true, true));
+    }
+
+    #[test]
+    fn after_handoff_successful_queue_suppresses_hal() {
+        // drv-fb owns the framebuffer and accepted the fragment: do not also touch the
+        // dormant HAL cursor.
+        assert!(console_routed_to_owner(false, true));
+    }
+
+    #[test]
+    fn after_handoff_failed_queue_falls_back_to_hal() {
+        // drv-fb owns the framebuffer but the queue was refused — a full channel, or the
+        // re-entrancy guard declining the borrow. Fall back to the HAL path (which itself
+        // drops on an owned framebuffer) rather than losing the bytes to a panic.
+        assert!(!console_routed_to_owner(false, false));
+    }
+}

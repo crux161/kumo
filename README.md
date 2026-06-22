@@ -9,15 +9,32 @@
 
 **KUMO** is a clean-room, `#![no_std]` Rust rewrite of the [soso](https://github.com/ozkl/soso) monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, and MMU plumbing, while pushing all other services (drivers, filesystems, network, TTY) into fault-isolated, restartable userspace servers.
 
-For clarity, KUMO represents the kernel core (MUREX core) and its various subsystem microservices that make up the other aspects of the microkernel. KUMO is fundamentally part of a larger "Flying Nimbus" System. Which is intended to function as a UNIX-like environment with the ability to run Linux applications via a custom hybrid Hypervisor that loads the Firecracker VM in tandem with a WSLv1 style linux->native shim for syscalls (similar to Fuchsia's Starnix). Linux applications see a native environment, Nimbus does the hard work and the two ride off in two the sunset together. At least, that's the plan 🤞
+For clarity, KUMO represents the microkernel core (named MUREX) and its various subsystem microservices that make up the other aspects of the microkernel. KUMO is fundamentally part of a larger "Flying Nimbus" System. Which is intended to function as a UNIX-like environment with the ability to run Linux applications via a custom hybrid Hypervisor that loads the Firecracker VM in tandem with a WSLv1 style linux->native shim for syscalls (similar to Fuchsia's Starnix). Linux applications see a native environment, Nimbus does the hard work and the two ride off in two the sunset together. At least, that's the plan 🤞
 
-I'd like to take a brief moment to thank ozkl (and their contributors) for all the fine work they put into developing soso. It has provided a lot of inspiration to inform the general functionality of KUMO and it's core components. Also, the devs working on:
+I'd like to take a brief moment to thank ozkl (and soso's other contributors). It has provided a lot of inspiration to inform the general functionality of KUMO and it's core components. 
+
+Also, the devs working on:
 - [motor-os](https://github.com/moturus/motor-os) 
 - Fuchia (Zircon)
 - XNU/Mach 
+- Redox OS 
 - seL4
 
 All of them have given excellent points about pitfalls, implementation, and have truly shaped the internal discourse surrounding this project. KUMO is still obviously in active development, but over time I hope it can become something different but still purposeful in people's lives.
+
+Redox has paved the way for other Rust based systems to exist without having to recreate the entire world of technologies all over again by hand. Writing a Read-Only FAT32 filesystem driver isn't beyond the pale but making something like zfs, butterfs, ext4, by hand is a massive undertaking in a system that's yet to even be built. Thank you to the Redox devs for RedoxFS! So for the time being until we get relibc integration under control (again Thank you guys!) KUMO is still rust only. That being said, we're not even booting into a userland proper yet but slowly that's chaning. Rust uutils/coreutils is on the horizon, but obviously we need Rust's `std` library first -- so again, building *everything* 🤦‍♂️  it's fun until you realize how much work it's going to be. 
+
+My hope is that with some minor adjustments, capability-based seams, and a good HAL that KUMO will be highly portable, stable, performant, and above all resilient in the face of failure.
+
+So far the code boots on real hardware, not just QEMU!
+
+- Thinkpad x13s gen 1, Qualcomm Snapdragon 8cx Gen 3 SoC (arm64)
+- Raspberry Pi 5, Broadcom BCM2712 (arm64)
+- HP Z4G4, Intel Xeon W2123 (amd64)
+- HP Z650, Intel Xeon E5-2620 v0 (amd64)
+- Thinkpad x220, Intel i7-2640m (amd64)
+
+
 
 ## 🏛️ Architecture
 

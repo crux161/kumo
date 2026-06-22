@@ -105,26 +105,27 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         "MEMORY Check      {} + {} MiB         OK\n\n",
         report.usable_bytes >> 20,
         (report.total_bytes - report.usable_bytes) >> 20
-
     );
     klog!("AETHER: frames free {}\n", free_frames);
     klog!("\tframe data:\n\t");
     for (i, &frame) in samples.iter().enumerate() {
-        if i > 0 { klog!(" "); }
-    klog!("{}", frame);
+        if i > 0 {
+            klog!(" ");
+        }
+        klog!("{}", frame);
     }
     klog!("\n\n");
     klog!("Uni+CJK Hi-SYS BOOT!\n\n");
     klog!("NIMBUS 筋斗雲・オペレーティングシステム, Ver.0.1.0a\n");
     klog!("Copyright(c) 2025,2026 KOKEN.DEV 黄犬インターネット・ソフトウェア共同体\n\n");
     // mixed ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
-    klog!("「我 所 思 兮 在 泰 山。路 遠 湲 且 阻、\n"); 
+    klog!("「我 所 思 兮 在 泰 山。路 遠 湲 且 阻、\n");
     klog!("  側 身 東 望 涕 沾 翰。」\n\n");
-    klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\n"); 
-    klog!("  あ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n"); 
+    klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\n");
+    klog!("  あ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n");
     klog!("  姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
-    klog!("「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n"); 
-    klog!("  그 대 의 집 이 되 니、\n"); 
+    klog!("「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n");
+    klog!("  그 대 의 집 이 되 니、\n");
     klog!("  명 월 을 벗 삼 아 외 로 이 앉 았 도 다 。」\n\n");
     // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
     // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
@@ -132,15 +133,12 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     klog!("  日本漢字  ........出力成功\n");
     klog!("  한국어한글 .......로드　 OK\n\n");
     klog!("紫微 MUREX Core Ver 0.1.0a  ({})\n", report.arch);
-    klog!(
-        "NIJIGUMO abi v{}    Check     OK\n",
-        report.abi_version
-    );
+    klog!("NIJIGUMO abi v{}    Check     OK\n", report.abi_version);
 
     // M1: bring up memory. The bump heap is already online; account the frames and
     // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).
     // Prove the heap works on real silicon: build a small Vec and reduce it.
-    
+
     let mut squares: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     let mut n = 1u32;
     while n <= 8 {
