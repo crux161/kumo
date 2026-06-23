@@ -238,6 +238,10 @@ static FB_ROW: AtomicU32 = AtomicU32::new(0);
 /// userspace driver claim clears this permanently until a fatal kernel path reclaims
 /// the glass; two independent cursors must never paint it concurrently.
 static FB_KERNEL_OWNER: AtomicBool = AtomicBool::new(true);
+/// Diagnostic one-way latch: once set, [`early_console_write`] drops all output so the panel
+/// holds its current screen. Lets a serial-less target (the X13s) capture a fault dump in a
+/// photo. Set via [`freeze_console`].
+static CONSOLE_FROZEN: AtomicBool = AtomicBool::new(false);
 
 fn font_field(offset: usize) -> usize {
     u32::from_le_bytes([
@@ -312,9 +316,8 @@ pub fn clean_dcache_to_poc(addr: usize, len: usize) {
 #[cfg(not(target_os = "none"))]
 pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {}
 
-/// Blit one glyph into a 32-bpp framebuffer. Bounds-checked against `len_px`, so a
-/// bad geometry truncates instead of scribbling past the buffer. Pure with respect
-/// to console state, which makes it host-testable against an in-memory buffer.
+/// Blit one printable ASCII glyph (the 8x16 PSF cell). Thin wrapper over
+/// [`blit_glyph_rows`]; the box-drawing path shares the same single-width blit.
 ///
 /// # Safety
 /// `base` must point at `len_px` writable `u32` pixels.
@@ -328,7 +331,27 @@ unsafe fn blit_glyph(
     fg: u32,
     bg: u32,
 ) {
-    let rows = glyph_rows(ch);
+    unsafe { blit_glyph_rows(base, len_px, stride, x_px, y_px, glyph_rows(ch), fg, bg) };
+}
+
+/// Blit a single-width 8x16 cell from a raw `rows` bitmap — one byte per scanline, MSB the
+/// leftmost pixel. Shared by the ASCII PSF path ([`blit_glyph`]) and the box-drawing path
+/// ([`box_bitmap`]). Bounds-checked against `len_px`, so a bad geometry truncates instead of
+/// scribbling past the buffer. Pure with respect to console state, which makes it host-testable
+/// against an in-memory buffer.
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_glyph_rows(
+    base: *mut u32,
+    len_px: usize,
+    stride: usize,
+    x_px: usize,
+    y_px: usize,
+    rows: &[u8],
+    fg: u32,
+    bg: u32,
+) {
     for (ry, &bits) in rows.iter().enumerate() {
         let py = y_px + ry;
         let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
@@ -357,6 +380,77 @@ unsafe fn blit_glyph(
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
+}
+
+// ---- Light box-drawing glyphs (single-width 8x16) -------------------
+//
+// Box-drawing scalars are >= 0x80, so they would otherwise fall into the double-width CJK
+// path and render as tofu (absent from the curated set) — and even if added there, the
+// double-width cell would misalign TUI frames against single-width text. Instead a small
+// explicit set renders single-width 8x16, generated from the four arms that reach the cell
+// centre so adjacent cells join flush. Heavy/double/dashed/rounded variants and block
+// elements are deliberately out of scope and still fall through to the CJK/tofu path.
+
+/// The four arms of a light box-drawing cell that reach the cell centre.
+struct BoxArms {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+}
+
+/// Map a light single-line box-drawing scalar (a subset of U+2500..U+257F) to its arms, or
+/// `None` for any codepoint this slice does not render single-width.
+fn box_arms(scalar: u32) -> Option<BoxArms> {
+    let (up, down, left, right) = match scalar {
+        0x2500 => (false, false, true, true), // ─ horizontal
+        0x2502 => (true, true, false, false), // │ vertical
+        0x250c => (false, true, false, true), // ┌ down + right
+        0x2510 => (false, true, true, false), // ┐ down + left
+        0x2514 => (true, false, false, true), // └ up + right
+        0x2518 => (true, false, true, false), // ┘ up + left
+        0x251c => (true, true, false, true),  // ├ vertical + right
+        0x2524 => (true, true, true, false),  // ┤ vertical + left
+        0x252c => (false, true, true, true),  // ┬ down + horizontal
+        0x2534 => (true, false, true, true),  // ┴ up + horizontal
+        0x253c => (true, true, true, true),   // ┼ cross
+        _ => return None,
+    };
+    Some(BoxArms {
+        up,
+        down,
+        left,
+        right,
+    })
+}
+
+/// Render a light box-drawing cell to an 8x16 single-width bitmap from its arms. The cell
+/// crosses at the 8x16 centre — columns 3-4 (`VBAR`) and scanlines 7-8 — so each arm runs
+/// from an edge to that centre and adjacent cells' arms meet flush.
+fn box_bitmap(arms: &BoxArms) -> [u8; GLYPH_H] {
+    const VBAR: u8 = 0b0001_1000; // columns 3-4 (the vertical run)
+    const LEFT: u8 = 0b1111_1000; // columns 0-4 (left edge → centre)
+    const RIGHT: u8 = 0b0001_1111; // columns 3-7 (centre → right edge)
+    let mut g = [0u8; GLYPH_H];
+    if arms.up {
+        for row in g.iter_mut().take(9) {
+            *row |= VBAR; // scanlines 0..=8
+        }
+    }
+    if arms.down {
+        for row in g.iter_mut().skip(7) {
+            *row |= VBAR; // scanlines 7..=15
+        }
+    }
+    if arms.left {
+        g[7] |= LEFT;
+        g[8] |= LEFT;
+    }
+    if arms.right {
+        g[7] |= RIGHT;
+        g[8] |= RIGHT;
+    }
+    g
 }
 
 // ---- CJK console glyphs (DESIGN/005) --------------------------------
@@ -722,6 +816,32 @@ fn fb_putchar(scalar: u32) {
             };
             col += 1;
         }
+        c if box_arms(c).is_some() => {
+            // Light box-drawing renders single-width (8x16), like ASCII — TUI frames must
+            // align with text, so these do NOT take the double-width CJK cell.
+            if col >= cols {
+                col = 0;
+                row += 1;
+            }
+            if row >= rows {
+                fb_scroll_up(base, len_px, stride, FB_HEIGHT.load(ORD) as usize);
+                row = rows - 1;
+            }
+            let glyph = box_bitmap(&box_arms(c).unwrap());
+            unsafe {
+                blit_glyph_rows(
+                    base,
+                    len_px,
+                    stride,
+                    col * GLYPH_W,
+                    row * GLYPH_H,
+                    &glyph,
+                    FG,
+                    BG,
+                )
+            };
+            col += 1;
+        }
         c if c >= 0x80 => {
             // A wide cell needs two columns; wrap first if it would not fit.
             if col + 2 > cols {
@@ -761,6 +881,10 @@ fn fb_putchar(scalar: u32) {
 }
 
 pub fn early_console_write(bytes: &[u8]) {
+    // Diagnostic freeze: hold the panel on whatever is currently shown (see `freeze_console`).
+    if CONSOLE_FROZEN.load(ORD) {
+        return;
+    }
     if FB_PRESENT.load(ORD) {
         if framebuffer_console_writes_enabled(true, FB_KERNEL_OWNER.load(ORD)) {
             // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
@@ -783,6 +907,14 @@ pub fn early_console_write(bytes: &[u8]) {
         }
         pl011_putc(byte);
     }
+}
+
+/// Freeze the console: subsequent [`early_console_write`] calls are dropped, so the panel
+/// holds whatever is currently on screen. One-way (no thaw). Intended for capturing a fault
+/// dump on a serial-less target — the X13s routes all diagnostics to the GOP framebuffer, so
+/// without this the dump scrolls away as the boot continues.
+pub fn freeze_console() {
+    CONSOLE_FROZEN.store(true, ORD);
 }
 
 /// Move the console cursor. On the framebuffer this is an absolute character cell;
@@ -3358,6 +3490,63 @@ mod tests {
         unsafe { blit_glyph(fb.as_mut_ptr(), fb.len(), 8, 0, 0, b'A', FG, BG) };
         // No panic / no out-of-bounds is the assertion; the one pixel is valid.
         let _ = fb[0];
+    }
+
+    #[test]
+    fn box_arms_cover_the_light_single_line_set() {
+        // The cross has all four arms; horizontal/vertical have exactly two.
+        let cross = box_arms(0x253c).unwrap();
+        assert!(cross.up && cross.down && cross.left && cross.right);
+        let horiz = box_arms(0x2500).unwrap();
+        assert!(horiz.left && horiz.right && !horiz.up && !horiz.down);
+        let vert = box_arms(0x2502).unwrap();
+        assert!(vert.up && vert.down && !vert.left && !vert.right);
+        // Out-of-set forms (heavy ━ U+2501, double ═ U+2550) and plain ASCII are NOT claimed,
+        // so they fall through unchanged to the CJK/tofu path.
+        assert!(box_arms(0x2501).is_none());
+        assert!(box_arms(0x2550).is_none());
+        assert!(box_arms('A' as u32).is_none());
+    }
+
+    #[test]
+    fn box_bitmap_draws_only_the_present_arms() {
+        // Horizontal ─: the two centre scanlines are lit edge-to-edge, every other row blank.
+        let h = box_bitmap(&box_arms(0x2500).unwrap());
+        assert_eq!(h[7], 0xff);
+        assert_eq!(h[8], 0xff);
+        assert!(h
+            .iter()
+            .enumerate()
+            .all(|(r, &b)| r == 7 || r == 8 || b == 0));
+        // Vertical │: the centre columns (3-4) are lit on every scanline, nothing else.
+        let v = box_bitmap(&box_arms(0x2502).unwrap());
+        assert!(v.iter().all(|&b| b == 0b0001_1000));
+        // Cross ┼: centre scanlines span full width; centre columns span full height.
+        let x = box_bitmap(&box_arms(0x253c).unwrap());
+        assert_eq!(x[7], 0xff);
+        assert_eq!(x[8], 0xff);
+        assert_eq!(x[0], 0b0001_1000);
+        assert_eq!(x[15], 0b0001_1000);
+    }
+
+    #[test]
+    fn box_glyph_blits_within_one_single_width_cell() {
+        // A box-drawing cell must paint inside ONE 8-wide column, unlike the double-width CJK
+        // path — otherwise TUI frames misalign with text. Render ┼ at column 0 and confirm
+        // every lit pixel stays in columns 0..GLYPH_W.
+        const STRIDE: usize = 64;
+        let mut fb = [0u32; STRIDE * 32];
+        let glyph = box_bitmap(&box_arms(0x253c).unwrap());
+        unsafe { blit_glyph_rows(fb.as_mut_ptr(), fb.len(), STRIDE, 0, 0, &glyph, FG, BG) };
+        let lit = (0..GLYPH_H)
+            .flat_map(|ry| (0..STRIDE).map(move |rx| (ry, rx)))
+            .filter(|&(ry, rx)| fb[ry * STRIDE + rx] == FG)
+            .count();
+        assert!(lit > 8, "cross should light pixels, got {lit}");
+        assert!(
+            (0..GLYPH_H).all(|ry| (GLYPH_W..STRIDE).all(|rx| fb[ry * STRIDE + rx] == BG)),
+            "box glyph must stay within a single 8px cell"
+        );
     }
 
     #[test]

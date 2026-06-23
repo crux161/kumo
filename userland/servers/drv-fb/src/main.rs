@@ -134,6 +134,10 @@ extern "C" fn main(
     // faults HERE, pre-claim — drv-fb dies, the HAL keeps the console, and the boot stays
     // legible (DESIGN/002: never hold critical state you cannot recover). If the probe survives,
     // the marker confirms on the next boot that the mapping is writable.
+    // Pinpoint breadcrumb for the X13s fault hunt: if the panel shows this line but not
+    // "fb probe ok", the FIRST framebuffer write faulted — compare the kernel's FAR dump
+    // against fb_va (0x1100_0000) to confirm it is this mapping.
+    debug_write(b"drv-fb: probing fb write\n".as_ptr(), 25);
     let fb_words = fb_va as *mut u32;
     let last_px = stride.saturating_mul(height).saturating_sub(1);
     unsafe {

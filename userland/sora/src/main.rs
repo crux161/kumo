@@ -743,6 +743,12 @@ extern "C" fn sora_main(
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
             if bootinfo.has_framebuffer() {
                 let fb = bootinfo.framebuffer;
+                // Unconditional pre-gate dump of the geometry read from the BootInfo snapshot, so a
+                // blank boot reveals whether the snapshot is stale/garbage (a coherency bug upstream)
+                // or sane-but-rejected (the is_plausible gate too strict). Fires every boot — unlike
+                // the failure-branch dump below, which never prints when the gate itself is the cause.
+                log(b"drv-fb: snapshot fb geometry ");
+                log_fb_geometry(&fb);
                 // Refuse to mint an MMIO Resource over implausibly-shaped geometry: a corrupt
                 // snapshot read must fail here as a clear diagnostic, not reach the kernel's
                 // range check disguised as a rights problem.

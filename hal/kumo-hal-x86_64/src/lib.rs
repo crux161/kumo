@@ -168,7 +168,14 @@ pub fn console_read_byte() -> Option<u8> {
     None
 }
 
+/// Diagnostic one-way latch mirroring the aarch64 backend: once set, [`early_console_write`]
+/// drops output. Set via [`freeze_console`].
+static CONSOLE_FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn early_console_write(bytes: &[u8]) {
+    if CONSOLE_FROZEN.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // On the freestanding kernel, drive the 16550 UART at COM1 (0x3F8) — the console
     // GRUB/QEMU leaves usable — so `klog!` produces real output. On the host (CI test
     // build) port I/O is privileged and meaningless, so this is a no-op there.
@@ -176,6 +183,12 @@ pub fn early_console_write(bytes: &[u8]) {
     serial::write(bytes);
     #[cfg(not(target_os = "none"))]
     let _ = bytes;
+}
+
+/// Freeze the console (drop subsequent output) — parity with the aarch64 backend so the
+/// shared kernel fault hook resolves on both targets.
+pub fn freeze_console() {
+    CONSOLE_FROZEN.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn handoff_framebuffer_console(_phys_base: u64, _len_bytes: u64) -> bool {

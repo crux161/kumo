@@ -780,11 +780,24 @@ fn teardown_current_process_and_signal() {
 /// `ProcessExit`). Cosmetic for resident children (the supervisor detects death by the reap).
 const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
 
+/// Format a `u64` as `0x` + 16 lowercase hex digits with no allocation — for the diagnostic
+/// fault dump in [`fault_hook`].
+fn hex64(v: u64) -> [u8; 18] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [b'0', b'x', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut i = 0;
+    while i < 16 {
+        out[2 + i] = HEX[((v >> (60 - i * 4)) & 0xf) as usize];
+        i += 1;
+    }
+    out
+}
+
 /// HAL fault hook (registered via `set_fault_hook`): an EL0 thread took a non-SVC sync
 /// exception — a *user* fault (bad access / illegal instruction). Contain it: terminate just
 /// that thread and switch to the scheduler, so one server's crash never halts the kernel
 /// (DESIGN/002, §5.6). Never returns to the faulting context.
-extern "C" fn fault_hook(_esr: u64, _elr: u64, _far: u64) -> ! {
+extern "C" fn fault_hook(esr: u64, elr: u64, far: u64) -> ! {
     const REPORT: &[u8] = b"KUMO: EL0 fault contained; process terminated\n";
     let owner_faulted = crate::user_thread::current_process_koid()
         .map(|koid| with_sora(|sora| sora.framebuffer_owner == Some(koid)))
@@ -793,10 +806,29 @@ extern "C" fn fault_hook(_esr: u64, _elr: u64, _far: u64) -> ! {
         // The renderer itself faulted: no userspace consumer remains, so the kernel
         // must reclaim the glass before reporting the failure.
         kumo_hal::active::reclaim_framebuffer_console();
-        kumo_hal::active::early_console_write(REPORT);
-    } else {
-        console_write_without_switch(REPORT);
     }
+    // Both console paths funnel through `early_console_write`; pick the one that honours the
+    // framebuffer-ownership epoch for this fault.
+    let emit: fn(&[u8]) = if owner_faulted {
+        kumo_hal::active::early_console_write
+    } else {
+        console_write_without_switch
+    };
+    emit(REPORT);
+    // DIAGNOSTIC (drv-fb fault hunt, 2026-06-22): the X13s has no serial, so dump the fault
+    // registers to the same console. ESR = exception class + fault status code, ELR = faulting
+    // instruction VA, FAR = faulting data address. Do NOT freeze the console here: the
+    // post-scheduler framebuffer blank only *recovers* because the boot keeps repainting
+    // (kdemo.rs §"SCHEDULER ok → blank → recovers at EL0 fault contained"), so a freeze would
+    // latch the blank. Let the boot continue; this line rides up with the rest of the log.
+    // Remove once the drv-fb fault is pinned.
+    emit(b"KUMO: fault ESR=");
+    emit(&hex64(esr));
+    emit(b" ELR=");
+    emit(&hex64(elr));
+    emit(b" FAR=");
+    emit(&hex64(far));
+    emit(b"\n");
     if crate::user_thread::is_started() {
         teardown_current_process_and_signal();
         crate::user_thread::exit_current_user(EL0_FAULT_EXIT_CODE);
