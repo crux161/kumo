@@ -14,6 +14,7 @@ pub mod sched;
 pub mod shell;
 pub mod syscall;
 pub mod task;
+pub mod tower;
 pub mod user_thread;
 pub mod usermode;
 

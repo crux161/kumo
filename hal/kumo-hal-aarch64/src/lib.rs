@@ -1194,10 +1194,23 @@ pub mod mmu {
                 "tlbi vmalle1",            // drop stale firmware TLB entries
                 "dsb ish",
                 "isb",
+                // Permit EL0 cache maintenance by VA: set SCTLR_EL1.UCI (bit 26), which
+                // un-traps DC CVAC/CVAU/CVAP/CIVAC and IC IVAU at EL0. UEFI hands off with
+                // UCI clear, so a userspace driver's `dc cvac` traps to EL1 as a sync
+                // exception with EC 0x18 (trapped system instruction) — e.g. drv-fb cleaning
+                // the framebuffer to the scanout PoC died here on the X13s while running fine
+                // under QEMU, which does not trap the op. This is the metal-vs-QEMU parity
+                // gap. DC by VA is a *clean*, not an invalidate, so granting it to EL0 is
+                // benign (the same access EL0 already has to the data it is flushing).
+                "mrs {tmp}, sctlr_el1",
+                "orr {tmp}, {tmp}, #(1 << 26)",
+                "msr sctlr_el1, {tmp}",
+                "isb",
                 mair = in(reg) MAIR_VALUE,
                 tcr = in(reg) tcr,
                 ttbr0 = in(reg) ttbr0,
                 ttbr1 = in(reg) ttbr1,
+                tmp = out(reg) _,
                 options(nostack, preserves_flags),
             );
         }

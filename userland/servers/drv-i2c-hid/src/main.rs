@@ -2,9 +2,9 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use drv_i2c_hid::ProbeConfig;
+use drv_i2c_hid::{bounded_report_descriptor_len, ProbeConfig, MAX_REPORT_DESCRIPTOR_BYTES};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_i2c_hid::{Controller, HidDescriptor, RegisterIo};
+use kumo_i2c_hid::{find_boot_keyboard, Controller, HidDescriptor, RegisterIo};
 use kumo_rt::{channel_read_with_handle, debug_write, resource_mint_mmio, vmar_map};
 
 kumo_rt::entry!(main);
@@ -148,5 +148,45 @@ extern "C" fn main(
         b"drv-i2c-hid: max-input=0x",
         descriptor.max_input_length as u64,
     );
+
+    let report_descriptor_len =
+        match bounded_report_descriptor_len(descriptor.report_descriptor_length) {
+            Ok(length) => length,
+            Err(error) => {
+                log_hex(
+                    b"drv-i2c-hid: report descriptor length error=0x",
+                    error as u64,
+                );
+                kumo_rt::process_exit(1);
+            }
+        };
+    let mut report_descriptor = [0u8; MAX_REPORT_DESCRIPTOR_BYTES];
+    if let Err(error) = controller.write_read(
+        config.i2c_address,
+        &descriptor.report_descriptor_register.to_le_bytes(),
+        &mut report_descriptor[..report_descriptor_len],
+    ) {
+        log_hex(
+            b"drv-i2c-hid: report descriptor transfer error=0x",
+            error as u64,
+        );
+        kumo_rt::process_exit(1);
+    }
+    let keyboard = match find_boot_keyboard(&report_descriptor[..report_descriptor_len]) {
+        Ok(keyboard) => keyboard,
+        Err(error) => {
+            log_hex(
+                b"drv-i2c-hid: report descriptor parse error=0x",
+                error as u64,
+            );
+            kumo_rt::process_exit(1);
+        }
+    };
+
+    log(b"drv-i2c-hid: report descriptor ok\n");
+    match keyboard.report_id {
+        Some(report_id) => log_hex(b"drv-i2c-hid: keyboard-report-id=0x", report_id as u64),
+        None => log(b"drv-i2c-hid: keyboard-report-id=none\n"),
+    }
     kumo_rt::process_exit(0);
 }

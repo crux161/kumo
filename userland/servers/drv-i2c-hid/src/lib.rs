@@ -3,6 +3,7 @@
 use kumo_i2c_hid::{KeyboardTopology, SourceClock};
 
 const MAGIC: [u8; 4] = *b"I2H1";
+pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -12,6 +13,12 @@ pub enum ConfigError {
     UnsupportedBusFrequency,
     UnsupportedSourceClock,
     InvalidAddress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportProbeError {
+    Empty,
+    TooLong,
 }
 
 /// Capability-adjacent bootstrap data. Authority remains in the separately transferred Resource.
@@ -101,6 +108,17 @@ const fn source_clock_hz(clock: SourceClock) -> u32 {
     }
 }
 
+pub fn bounded_report_descriptor_len(length: u16) -> Result<usize, ReportProbeError> {
+    let length = length as usize;
+    if length == 0 {
+        Err(ReportProbeError::Empty)
+    } else if length > MAX_REPORT_DESCRIPTOR_BYTES {
+        Err(ReportProbeError::TooLong)
+    } else {
+        Ok(length)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +161,18 @@ mod tests {
         let mut raw = ProbeConfig::for_x13s(topology()).unwrap().encode();
         raw[4] = 1;
         assert_eq!(ProbeConfig::decode(&raw), Err(ConfigError::InvalidMmio));
+    }
+
+    #[test]
+    fn bounds_report_descriptor_reads_to_the_probe_buffer() {
+        assert_eq!(
+            bounded_report_descriptor_len(0),
+            Err(ReportProbeError::Empty)
+        );
+        assert_eq!(bounded_report_descriptor_len(0xb9), Ok(0xb9));
+        assert_eq!(
+            bounded_report_descriptor_len((MAX_REPORT_DESCRIPTOR_BYTES + 1) as u16),
+            Err(ReportProbeError::TooLong)
+        );
     }
 }

@@ -430,6 +430,19 @@ fn handle_linux_persona_syscall(
             true
         }
         LINUX_ARM64_EXIT | LINUX_ARM64_EXIT_GROUP => {
+            // This dispatcher runs *inside* a `with_sora_mut` borrow and only for a child
+            // (the caller guards on `cp_koid != Sora`), so a non-zero exit is by construction
+            // a restartable microservice → reversed TOWER (contained), never a Sora-halt.
+            // Emit directly without re-entering `SoraState` (`current_process_koid` reads the
+            // scheduler, not Sora). A Linux-persona child is not the framebuffer owner.
+            if regs[0] != 0 {
+                crate::tower::raise_inverted(
+                    crate::tower::Cause::Abend { exit_code: regs[0] },
+                    crate::user_thread::current_process_koid(),
+                    false,
+                    console_write_without_switch,
+                );
+            }
             if crate::user_thread::is_started() {
                 crate::user_thread::exit_current_user(regs[0]);
             }
@@ -780,17 +793,35 @@ fn teardown_current_process_and_signal() {
 /// `ProcessExit`). Cosmetic for resident children (the supervisor detects death by the reap).
 const EL0_FAULT_EXIT_CODE: u64 = 0xFA17;
 
-/// Format a `u64` as `0x` + 16 lowercase hex digits with no allocation — for the diagnostic
-/// fault dump in [`fault_hook`].
-fn hex64(v: u64) -> [u8; 18] {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = [b'0', b'x', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let mut i = 0;
-    while i < 16 {
-        out[2 + i] = HEX[((v >> (60 - i * 4)) & 0xf) as usize];
-        i += 1;
+/// A process is exiting via a syscall; if the exit code is non-zero this is an *abend* (a
+/// microservice that gave up, not a clean shutdown), so raise a TOWER before it is reaped —
+/// the same no-silent-failure rule [`fault_hook`] enforces for CPU faults. A clean
+/// `exit(0)` returns immediately and is never reported. For a system-critical victim this
+/// never returns (the TOWER halts); otherwise it emits the reversed-TOWER banner and
+/// returns so the normal teardown/restart path proceeds.
+fn raise_tower_on_abend(exit_code: u64) {
+    if exit_code == 0 {
+        return;
     }
-    out
+    let victim = crate::user_thread::current_process_koid();
+    let (sora_koid, fb_owner) =
+        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
+            .unwrap_or((None, false));
+    if fb_owner {
+        kumo_hal::active::reclaim_framebuffer_console();
+    }
+    let emit: fn(&[u8]) = if fb_owner {
+        kumo_hal::active::early_console_write
+    } else {
+        console_write_without_switch
+    };
+    crate::tower::raise(
+        crate::tower::Cause::Abend { exit_code },
+        victim,
+        fb_owner,
+        sora_koid,
+        emit,
+    );
 }
 
 /// HAL fault hook (registered via `set_fault_hook`): an EL0 thread took a non-SVC sync
@@ -798,37 +829,40 @@ fn hex64(v: u64) -> [u8; 18] {
 /// that thread and switch to the scheduler, so one server's crash never halts the kernel
 /// (DESIGN/002, §5.6). Never returns to the faulting context.
 extern "C" fn fault_hook(esr: u64, elr: u64, far: u64) -> ! {
-    const REPORT: &[u8] = b"KUMO: EL0 fault contained; process terminated\n";
-    let owner_faulted = crate::user_thread::current_process_koid()
-        .map(|koid| with_sora(|sora| sora.framebuffer_owner == Some(koid)))
-        .unwrap_or(false);
-    if owner_faulted {
-        // The renderer itself faulted: no userspace consumer remains, so the kernel
-        // must reclaim the glass before reporting the failure.
+    let victim = crate::user_thread::current_process_koid();
+    // Identify the supervisor + framebuffer ownership without risking a double-borrow
+    // panic: a fault can land mid-SVC while `SoraState` is already borrowed, so use the
+    // non-panicking accessor. A borrowed/uninitialised cell yields `(None, false)` → the
+    // fault classifies as system-critical (the honest default when we cannot prove the
+    // victim is a restartable child).
+    let (sora_koid, fb_owner) =
+        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
+            .unwrap_or((None, false));
+    if fb_owner {
+        // The renderer itself faulted: no userspace consumer remains, so the kernel must
+        // reclaim the glass before the TOWER can be painted onto it.
         kumo_hal::active::reclaim_framebuffer_console();
     }
     // Both console paths funnel through `early_console_write`; pick the one that honours the
     // framebuffer-ownership epoch for this fault.
-    let emit: fn(&[u8]) = if owner_faulted {
+    let emit: fn(&[u8]) = if fb_owner {
         kumo_hal::active::early_console_write
     } else {
         console_write_without_switch
     };
-    emit(REPORT);
-    // DIAGNOSTIC (drv-fb fault hunt, 2026-06-22): the X13s has no serial, so dump the fault
-    // registers to the same console. ESR = exception class + fault status code, ELR = faulting
-    // instruction VA, FAR = faulting data address. Do NOT freeze the console here: the
-    // post-scheduler framebuffer blank only *recovers* because the boot keeps repainting
-    // (kdemo.rs §"SCHEDULER ok → blank → recovers at EL0 fault contained"), so a freeze would
-    // latch the blank. Let the boot continue; this line rides up with the rest of the log.
-    // Remove once the drv-fb fault is pinned.
-    emit(b"KUMO: fault ESR=");
-    emit(&hex64(esr));
-    emit(b" ELR=");
-    emit(&hex64(elr));
-    emit(b" FAR=");
-    emit(&hex64(far));
-    emit(b"\n");
+    // RULE (no silent failure): every process death raises a TOWER (`tower.rs`). A
+    // system-critical victim — the supervisor root, or a fault before any supervisor
+    // exists — never returns from `raise`: it halts and repaints the banner forever so the
+    // disaster cannot scroll away (the X13s has no serial). A restartable microservice gets
+    // the reversed-TOWER banner and `raise` returns, so we fall through to contained
+    // teardown: reap it, signal `TERMINATED`, and the supervisor restarts it (DESIGN/002).
+    crate::tower::raise(
+        crate::tower::Cause::Fault { esr, elr, far },
+        victim,
+        fb_owner,
+        sora_koid,
+        emit,
+    );
     if crate::user_thread::is_started() {
         teardown_current_process_and_signal();
         crate::user_thread::exit_current_user(EL0_FAULT_EXIT_CODE);
@@ -1106,6 +1140,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
     let num = r[8];
 
     if num == Syscall::ProcessExit as u64 {
+        raise_tower_on_abend(r[0]);
         if crate::user_thread::is_started() {
             teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);
@@ -1114,6 +1149,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 
     if num == LINUX_ARM64_EXIT || num == LINUX_ARM64_EXIT_GROUP {
+        raise_tower_on_abend(r[0]);
         if crate::user_thread::is_started() {
             teardown_current_process_and_signal();
             crate::user_thread::exit_current_user(r[0]);

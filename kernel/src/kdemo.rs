@@ -426,8 +426,9 @@ pub fn run_preemption() -> PreemptReport {
     // `irq_unmask` documents. Re-enable IRQs now. Without this the rest of Stage-A runs with
     // the timer dead until the first EL0 exception-return happens to restore DAIF (the crash
     // smoke), which on the X13s manifested as a ~16-line blank band in the framebuffer console
-    // (`SCHEDULER` ok → blank → recovers at `EL0 fault contained`). Invisible on QEMU, whose
-    // console is the PL011 serial byte-stream, not a 2D framebuffer.
+    // (`SCHEDULER` ok → blank → recovers when the contained EL0 fault raises its reversed-TOWER
+    // banner, see `tower.rs`). Invisible on QEMU, whose console is the PL011 serial byte-stream,
+    // not a 2D framebuffer.
     kumo_hal::active::irq_unmask();
 
     let p = demo_ptr();

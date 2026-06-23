@@ -9,7 +9,9 @@
 mod fdt;
 mod geni;
 mod protocol;
+mod report_descriptor;
 
 pub use fdt::{discover_keyboard, GicInterrupt, GpioInterrupt, KeyboardTopology};
 pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{boot_keyboard_report, HidDescriptor, InputFrame, ProtocolError};
+pub use report_descriptor::{find_boot_keyboard, KeyboardReport, ReportDescriptorError};

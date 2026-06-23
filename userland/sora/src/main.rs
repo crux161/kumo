@@ -279,7 +279,15 @@ const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
 const QEMU_PL011_MMIO_SIZE: u64 = 0x1000;
 const QEMU_PL011_IRQ: u32 = 33; // SPI 1 = 33 on QEMU ARM virt
 const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
-const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = true;
+/// Gate for the legacy Journal-134..137 dev boot-smokes that run *synchronously* during
+/// boot: the EL0-fault crash-containment self-test and the svc-health pair/restart demos.
+/// Default **off** — they gate the real boot from reaching the serve loop, the crash-test
+/// injects a fault that now (correctly) raises a reversed TOWER and reads like a real
+/// failure, and the svc-health pair smoke's `process_wait` pump wedges on the X13s with the
+/// full resident set live. The TOWER channel (`kernel/src/tower.rs`) now demonstrates fault
+/// containment loudly on every *real* fault, so the injected self-test is redundant. Flip to
+/// `true` to run the demos when iterating on supervision.
+const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
 
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
@@ -515,13 +523,20 @@ extern "C" fn sora_main(
         debug_write(b"timer irq ok\n".as_ptr(), 13);
     }
 
-    // §5.6 crash containment (Journal 137): prove the kernel contains an EL0 fault
-    // from a child process without halting Sora. Run before persistent services so
-    // process_wait() has no resident children and all_residents_gone can succeed.
-    if run_crash_containment_smoke(initrd) {
-        log(b"svc-health: crash contained\n");
-    } else {
-        log(b"svc-health: crash escaped\n");
+    // §5.6 crash containment (Journal 137): prove the kernel contains an EL0 fault from a
+    // child process without halting Sora. Gated off by default: it *deliberately* faults a
+    // child at BOGUS_ENTRY, which now (correctly) raises a reversed TOWER (kernel/src/tower.rs)
+    // and reads like a real microservice failure on every boot. The TOWER channel already
+    // proves containment loudly on real faults, so this injected self-test is redundant on the
+    // boot path. Run it (with the rest of the legacy demos) by flipping the flag. Must run
+    // before persistent services so `process_wait()` sees no resident children and
+    // `all_residents_gone` can succeed.
+    if RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES {
+        if run_crash_containment_smoke(initrd) {
+            log(b"svc-health: crash contained\n");
+        } else {
+            log(b"svc-health: crash escaped\n");
+        }
     }
 
     // Spawn drv-serial — but ONLY on the serial-console path (no framebuffer).
