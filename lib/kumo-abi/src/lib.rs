@@ -14,8 +14,8 @@ pub use boot::{
 };
 pub use initrd::{
     entries, entry_paths, entry_table_bytes, find_entry, find_file, InitrdEntry, InitrdError,
-    InitrdFile, ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_SERIAL_PATH,
-    FAT32_IMG_PATH, HELLO_PATH, INITRD_HEADER_LEN, LS_PATH, LUA_REPL_PATH,
+    InitrdFile, ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
+    DRV_SERIAL_PATH, FAT32_IMG_PATH, HELLO_PATH, INITRD_HEADER_LEN, LS_PATH, LUA_REPL_PATH,
     PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};

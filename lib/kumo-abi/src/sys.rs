@@ -93,6 +93,14 @@ mod tests {
         assert!(!flags.contains(ProcessRunFlags::TRANSFER_ARG2));
         assert_eq!(flags.bits(), 0b011);
     }
+
+    #[test]
+    fn framebuffer_mapping_policy_is_distinct_from_device_mmio() {
+        let framebuffer = VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED;
+        assert!(framebuffer.contains(VmarFlags::UNCACHED));
+        assert!(!framebuffer.contains(VmarFlags::DEVICE));
+        assert_ne!(VmarFlags::UNCACHED.0, VmarFlags::DEVICE.0);
+    }
 }
 
 pub type Status = i32;
@@ -137,6 +145,9 @@ impl VmarFlags {
     pub const USER: Self = Self(1 << 3);
     /// Map as Device-nGnRnE memory (MMIO registers), not Normal cacheable.
     pub const DEVICE: Self = Self(1 << 4);
+    /// Map MMIO-backed memory as Normal-NC. This is for linear framebuffers whose
+    /// bytes are memory-like scanout storage, not device registers.
+    pub const UNCACHED: Self = Self(1 << 5);
 
     pub const fn empty() -> Self {
         Self(0)

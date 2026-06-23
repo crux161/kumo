@@ -69,6 +69,8 @@ impl PageFlags {
     pub const USER: Self = Self(1 << 3);
     /// MMIO — map as Device-nGnRnE, not Normal cacheable memory.
     pub const DEVICE: Self = Self(1 << 4);
+    /// Memory-like MMIO (not registers) — map as Normal non-cacheable.
+    pub const UNCACHED: Self = Self(1 << 5);
 
     pub const fn empty() -> Self {
         Self(0)

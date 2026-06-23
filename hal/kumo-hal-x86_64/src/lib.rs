@@ -342,6 +342,7 @@ pub struct UserMapping {
     pub len: u64,
     pub writable: bool,
     pub device: bool,
+    pub uncached: bool,
     pub executable: bool,
 }
 

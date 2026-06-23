@@ -2,7 +2,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use drv_fb::Console;
+use drv_fb::{Console, BG};
 use kumo_abi::{BootInfo, Handle, VmarFlags};
 use kumo_rt::{
     channel_read, channel_read_with_handle, debug_write, framebuffer_claim, handle_koid, port_bind,
@@ -107,22 +107,41 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
-    // Map the framebuffer just after the bootinfo page. Both fit easily within
-    // the child VMAR ([0, 0x2000_0000) — 512 MiB, half-open). The original VA
-    // 0x2000_0000 was exactly at the boundary and would be rejected by Vmar::map.
-    let fb_va = 0x0000_0000_1000_1000;
+    // Keep the multi-megabyte framebuffer clear of this process's fixed user stack at
+    // [0x1000_C000, 0x1001_0000). The former 0x1000_1000 base silently remapped those
+    // stack PTEs, so drv-fb faulted immediately after VmarMap returned. 0x1100_0000
+    // leaves a full 16 MiB gap and still fits comfortably in the 512 MiB child VMAR.
+    let fb_va = 0x0000_0000_1100_0000;
     if vmar_map(
         Handle(0),
         Handle(fb_vmo_h as u32),
         0,
         fb_va,
         fb_len,
-        (VmarFlags::READ | VmarFlags::WRITE).0,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     ) != 0
     {
         debug_write(b"drv-fb: fb map failed\n".as_ptr(), 22);
         kumo_rt::process_exit(1);
     }
+
+    // Probe the framebuffer mapping BEFORE taking the glass. drv-fb must not claim ownership
+    // from the HAL unless it can actually write the panel: on the X13s the first write to this
+    // mapping faults, and because the claim had already made the HAL dormant, every subsequent
+    // line routed into an unrendered framebuffer (a ~20-line blank gap) until drv-fb died and
+    // the kernel reclaimed the glass. Touch both ends of the exact span Console will use (pixel
+    // 0 and the last pixel of `stride*height`) so a bad mapping OR an out-of-extent geometry
+    // faults HERE, pre-claim — drv-fb dies, the HAL keeps the console, and the boot stays
+    // legible (DESIGN/002: never hold critical state you cannot recover). If the probe survives,
+    // the marker confirms on the next boot that the mapping is writable.
+    let fb_words = fb_va as *mut u32;
+    let last_px = stride.saturating_mul(height).saturating_sub(1);
+    unsafe {
+        fb_words.write_volatile(BG);
+        fb_words.add(last_px).write_volatile(BG);
+    }
+    let probe_ok = b"drv-fb: fb probe ok\n";
+    debug_write(probe_ok.as_ptr(), probe_ok.len());
 
     // Bind the console port before taking ownership. Diagnostics emitted immediately
     // after the claim are queued to this channel; binding first guarantees each queued

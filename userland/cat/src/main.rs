@@ -3,13 +3,14 @@
 
 //! `cat` — stream one initrd file through explicit capabilities.
 //!
-//! Sora grants this process a read-only initrd VMO in `x0` and a read-only argv
-//! VMO in `x1`. `cat` reads only the initrd table into its stack, locates the one
-//! requested path, and streams the payload in 256-byte chunks. It has no ambient
-//! filesystem authority and cannot mutate either input VMO.
+//! Sora transfers one bootstrap channel in `x0`. Its finite startup message grants
+//! stdout, a read-only argv VMO, and a read-only initrd VMO as explicit capabilities.
+//! `cat` reads only the initrd table into its stack, locates the requested path, and
+//! streams the payload to stdout in 256-byte chunks. It has no ambient filesystem
+//! authority and cannot mutate either input VMO.
 
 use kumo_abi::{entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN};
-use kumo_rt::{debug_write, process_exit, vmo_read};
+use kumo_rt::{channel_write, debug_write, process_exit, startup, vmo_read};
 
 kumo_rt::entry!(main);
 
@@ -18,10 +19,18 @@ fn fail(message: &[u8]) -> ! {
     process_exit(1)
 }
 
+fn emit(stdout: Handle, bytes: &[u8]) {
+    if stdout.0 == 0 {
+        debug_write(bytes.as_ptr(), bytes.len());
+    } else {
+        let _ = channel_write(stdout, bytes.as_ptr(), bytes.len());
+    }
+}
+
 #[no_mangle]
 extern "C" fn main(
-    initrd_handle: u64,
-    argv_handle: u64,
+    bootstrap_handle: u64,
+    _a2: u64,
     _a3: u64,
     _a4: u64,
     _a5: u64,
@@ -29,19 +38,17 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
-    if initrd_handle == 0 || argv_handle == 0 {
-        fail(b"cat: missing capability\n");
-    }
-    let initrd = Handle(initrd_handle as u32);
+    let startup = startup(Handle(bootstrap_handle as u32));
+    let initrd = startup
+        .cap0
+        .unwrap_or_else(|| fail(b"cat: no initrd handle\n"));
+    let argv_handle = startup
+        .argv
+        .unwrap_or_else(|| fail(b"cat: no argv handle\n"));
+    let stdout = startup.stdout.unwrap_or(Handle(0));
 
     let mut argv_buf = [0u8; 256];
-    if vmo_read(
-        Handle(argv_handle as u32),
-        0,
-        argv_buf.as_mut_ptr(),
-        argv_buf.len(),
-    ) != 0
-    {
+    if vmo_read(argv_handle, 0, argv_buf.as_mut_ptr(), argv_buf.len()) != 0 {
         fail(b"cat: argv read fail\n");
     }
     let mut argv = unpack_argv(&argv_buf);
@@ -86,7 +93,7 @@ extern "C" fn main(
         if vmo_read(initrd, offset, buf.as_mut_ptr(), chunk) != 0 {
             fail(b"cat: file read fail\n");
         }
-        debug_write(buf.as_ptr(), chunk);
+        emit(stdout, &buf[..chunk]);
         offset += chunk as u64;
         remaining -= chunk as u64;
     }

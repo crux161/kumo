@@ -594,26 +594,44 @@ impl SyscallEngine {
         // W^X: writable wins → non-executable (matches user_page_desc).
         let writable = mapping.flags.contains(PageFlags::WRITE) && !executable;
         let device = mapping.flags.contains(PageFlags::DEVICE);
+        let uncached = mapping.flags.contains(PageFlags::UNCACHED);
+        if device && uncached {
+            return Err(Errno::InvalidArgs);
+        }
 
         let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
             return Err(Errno::BadHandle);
         };
 
-        // Choose the page descriptor based on VMO backing + flags.
-        // Physical non-DEVICE uses Normal-NC: correct for framebuffers and
-        // harmless for bootinfo (read-once, no cache-line sharing hazard).
+        // Choose the page descriptor from both the backing kind and mapping policy.
+        // Physical RAM must remain Normal-WB to match the kernel alias (notably the
+        // initrd used by drv-blk). Resource-minted MMIO defaults to Device-nGnRnE;
+        // only framebuffer callers opt into Normal-NC.
         let desc: u64;
         let needs_frame_alloc: bool;
         match vmo_entry.vmo.backing() {
-            crate::mm::VmoBacking::Physical { .. } => {
-                desc = if device {
-                    kumo_hal::active::user_device_page_desc(writable)
-                } else {
+            crate::mm::VmoBacking::PhysicalRam { .. } => {
+                if device || uncached {
+                    return Err(Errno::InvalidArgs);
+                }
+                desc = kumo_hal::active::user_page_desc(executable, writable);
+                needs_frame_alloc = false;
+            }
+            crate::mm::VmoBacking::Mmio { .. } => {
+                if executable {
+                    return Err(Errno::InvalidArgs);
+                }
+                desc = if uncached {
                     kumo_hal::active::user_nc_page_desc(writable)
+                } else {
+                    kumo_hal::active::user_device_page_desc(writable)
                 };
                 needs_frame_alloc = false;
             }
             crate::mm::VmoBacking::Anonymous => {
+                if device || uncached {
+                    return Err(Errno::InvalidArgs);
+                }
                 desc = kumo_hal::active::user_page_desc(executable, writable);
                 needs_frame_alloc = true;
             }
@@ -624,7 +642,8 @@ impl SyscallEngine {
         }
         let pages = mapping.len / crate::mm::PAGE_SIZE;
         let phys_base = match vmo_entry.vmo.backing() {
-            crate::mm::VmoBacking::Physical { phys_base } => phys_base,
+            crate::mm::VmoBacking::PhysicalRam { phys_base }
+            | crate::mm::VmoBacking::Mmio { phys_base } => phys_base,
             crate::mm::VmoBacking::Anonymous => 0,
         };
 
@@ -847,7 +866,8 @@ impl SyscallEngine {
                                 let dest_slice =
                                     unsafe { core::slice::from_raw_parts_mut(dest, len) };
                                 match vmo_entry.vmo.backing() {
-                                    crate::mm::VmoBacking::Physical { phys_base } => {
+                                    crate::mm::VmoBacking::PhysicalRam { phys_base }
+                                    | crate::mm::VmoBacking::Mmio { phys_base } => {
                                         kumo_hal::active::read_phys(phys_base + offset, dest_slice);
                                         Errno::Ok.status()
                                     }
@@ -904,7 +924,8 @@ impl SyscallEngine {
                             let backing = vmo_entry.vmo.backing();
                             let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
                             match backing {
-                                crate::mm::VmoBacking::Physical { phys_base } => {
+                                crate::mm::VmoBacking::PhysicalRam { phys_base }
+                                | crate::mm::VmoBacking::Mmio { phys_base } => {
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
                                             src_slice.as_ptr(),
@@ -992,6 +1013,9 @@ impl SyscallEngine {
                     // Self-map: map into the calling process's own VMAR.
                     let status = match process.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
                         Ok(mapping) => {
+                            if !process.user_range_is_free(mapping.virt, mapping.len) {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
                             process.add_mapping(mapping, vmo_koid);
                             // If this process is already running, eagerly write the
                             // mapping into the live page tables so the next access
@@ -1042,6 +1066,9 @@ impl SyscallEngine {
                     };
                     match target.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
                         Ok(mapping) => {
+                            if !target.user_range_is_free(mapping.virt, mapping.len) {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
                             target.add_mapping(mapping, vmo_koid);
                             let ttbr0 = target.ttbr0;
                             (
@@ -1183,6 +1210,16 @@ impl SyscallEngine {
                 let Some(ref boot_ref) = boot else {
                     return KernelCallResult::Status(Errno::Internal.status());
                 };
+                let Some(stack_base) = stack_virt.checked_sub(stack_size) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+                if stack_size == 0
+                    || !self
+                        .process_by_koid(proc_koid)
+                        .is_some_and(|target| target.user_range_is_free(stack_base, stack_size))
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
                 let process_mappings: Vec<(Mapping, KoId)> = {
                     let Some(target) = self.process_by_koid(proc_koid) else {
                         return KernelCallResult::Status(Errno::BadHandle.status());
@@ -1195,16 +1232,34 @@ impl SyscallEngine {
                     // W^X: an executable mapping is RX, never writable.
                     let writable = mapping.flags.contains(PageFlags::WRITE) && !executable;
                     let device = mapping.flags.contains(PageFlags::DEVICE);
+                    let uncached = mapping.flags.contains(PageFlags::UNCACHED);
+                    if device && uncached {
+                        return KernelCallResult::Status(Errno::InvalidArgs.status());
+                    }
                     let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
                         return KernelCallResult::Status(Errno::BadHandle.status());
                     };
                     match vmo_entry.vmo.backing() {
-                        crate::mm::VmoBacking::Physical { phys_base } => {
-                            // Executable code maps at its exact page-aligned VA (4 KiB pages);
-                            // device/framebuffer mappings ride a 2 MiB-aligned block slot.
-                            let virt_addr = if executable {
-                                mapping.virt
-                            } else {
+                        crate::mm::VmoBacking::PhysicalRam { phys_base } => {
+                            if device || uncached {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
+                            user_mappings.push(kumo_hal::active::UserMapping {
+                                phys_base: phys_base + mapping.vmo_offset,
+                                virt_addr: mapping.virt,
+                                len: mapping.len,
+                                writable,
+                                device: false,
+                                uncached: false,
+                                executable,
+                            });
+                        }
+                        crate::mm::VmoBacking::Mmio { phys_base } => {
+                            if executable {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
+                            // Device/framebuffer mappings ride a 2 MiB-aligned block slot.
+                            let virt_addr = {
                                 const BLOCK_MASK: u64 = (1 << 21) - 1;
                                 mapping.virt & !BLOCK_MASK
                             };
@@ -1213,11 +1268,15 @@ impl SyscallEngine {
                                 virt_addr,
                                 len: mapping.len,
                                 writable,
-                                device,
-                                executable,
+                                device: !uncached,
+                                uncached,
+                                executable: false,
                             });
                         }
                         crate::mm::VmoBacking::Anonymous => {
+                            if device || uncached {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
                             if mapping.len % crate::mm::PAGE_SIZE != 0 {
                                 return KernelCallResult::Status(Errno::InvalidArgs.status());
                             }
@@ -1243,6 +1302,7 @@ impl SyscallEngine {
                                     len: crate::mm::PAGE_SIZE,
                                     writable,
                                     device: false,
+                                    uncached: false,
                                     executable,
                                 });
                                 page += 1;
@@ -1280,6 +1340,7 @@ impl SyscallEngine {
                     Ok(ttbr0) => {
                         if let Some(target) = self.process_by_koid_mut(proc_koid) {
                             target.ttbr0 = Some(ttbr0);
+                            target.set_user_stack(stack_base, stack_size);
                         }
                         KernelCallResult::Handle(Handle(ttbr0 as u32))
                     }
@@ -1477,7 +1538,7 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
                 // Create a Physical VMO from the MMIO range.
-                match crate::mm::Vmo::from_physical_range(phys_base, len) {
+                match crate::mm::Vmo::from_mmio_range(phys_base, len) {
                     Ok(vmo) => match self.root_vmo_create(
                         process,
                         vmo,
@@ -1722,6 +1783,29 @@ mod tests {
             process.handles().get(read_only),
             Err(ObjectError::BadHandle)
         );
+    }
+
+    #[test]
+    fn dispatches_handle_koid_for_held_handle() {
+        // The koid lookup the bind-port-by-koid pattern depends on (e.g. drv-fb recognising
+        // its console channel as the source of a PortWait wake). Pins the engine contract
+        // behind J248's async-child `HandleKoid` SVC arm.
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let (left, _right) = create_channel(&mut engine, &mut process);
+
+        let want = process.handles().get(left).unwrap().koid.0 as u32;
+        let got = engine.dispatch(&mut process, KernelCall::HandleKoid { handle: left });
+        assert_eq!(got, KernelCallResult::Handle(Handle(want)));
+
+        // A handle the process does not hold reports BadHandle rather than a bogus koid.
+        let bogus = engine.dispatch(
+            &mut process,
+            KernelCall::HandleKoid {
+                handle: Handle(9999),
+            },
+        );
+        assert_eq!(bogus, KernelCallResult::Status(Errno::BadHandle.status()));
     }
 
     #[test]

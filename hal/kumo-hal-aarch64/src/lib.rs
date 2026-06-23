@@ -1153,11 +1153,14 @@ pub mod mmu {
         }
     }
 
-    /// Build a 4 KiB **Normal-NC** page descriptor for EL0 (framebuffer scanout, bootinfo).
+    /// Build a 4 KiB **Normal-NC** page descriptor for EL0 framebuffer scanout.
     /// Follows [`user_page_desc`]'s shape but uses `MAIR_NC` instead of `MAIR_WB`.
     /// Use with [`map_user_page`].
     pub fn user_nc_page_desc(writable: bool) -> u64 {
-        let base = DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (MAIR_NC << 2);
+        // Match the kernel framebuffer alias exactly: Normal-NC, non-shareable.
+        // Giving two aliases of the same PA different shareability attributes is
+        // architecturally unsafe and can fault on metal even though QEMU accepts it.
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_NC << 2);
         if writable {
             base | AP_EL1RW_EL0RW | UXN | PXN
         } else {
@@ -1369,9 +1372,11 @@ pub mod el0 {
         pub len: u64,
         /// Whether EL0 can write to this mapping.
         pub writable: bool,
-        /// If true, map as Device-nGnRnE; otherwise Normal-NC (for framebuffers). Ignored
-        /// when `executable` is set (code is always Normal-WB).
+        /// If true, map as Device-nGnRnE. Mutually exclusive with `uncached`.
         pub device: bool,
+        /// If true, map as Normal-NC (framebuffer scanout). When both memory-type flags
+        /// are false the mapping is ordinary Normal-WB RAM.
+        pub uncached: bool,
         /// If true, map as Normal-WB **RX** 4 KiB pages (EL0-executable code) rather than the
         /// device-block path. Page-granular, so it coexists with a stack in the same 2 MiB
         /// region; mutually exclusive with `writable` (W^X). The mapped range is cleaned to
@@ -1837,7 +1842,7 @@ pub mod el0 {
             // the backing physical range — page-granular so code, rodata, data, and stack can
             // share an L3 table without fighting over a 2 MiB L2 slot. W^X holds in
             // `user_page_desc`: writable pages are never executable.
-            if !mapping.device {
+            if !mapping.device && !mapping.uncached {
                 if mapping.virt_addr & (PAGE_4K - 1) != 0 || mapping.phys_base & (PAGE_4K - 1) != 0
                 {
                     return Err(UserImageError::BadSegment);
@@ -1879,7 +1884,7 @@ pub mod el0 {
                         root,
                         mapping.virt_addr + offset,
                         base + offset,
-                        !mapping.device, // false = Normal-NC (fb), true = Device (MMIO)
+                        mapping.uncached,
                         mapping.writable,
                         alloc,
                         &mut tables,
@@ -2064,6 +2069,7 @@ pub struct UserMapping {
     pub len: u64,
     pub writable: bool,
     pub device: bool,
+    pub uncached: bool,
     pub executable: bool,
 }
 

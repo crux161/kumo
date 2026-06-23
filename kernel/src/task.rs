@@ -51,6 +51,9 @@ pub struct Process {
     root_vmar: Vmar,
     handles: HandleTable,
     mappings: Vec<(Mapping, KoId)>,
+    /// User stack range installed by AddressSpaceCreate. Kept separately from VMO
+    /// mappings so later live VmarMap calls cannot silently overwrite it.
+    user_stack: Option<(u64, u64)>,
     pub ttbr0: Option<u64>,
 }
 
@@ -62,6 +65,7 @@ impl Process {
             root_vmar,
             handles: HandleTable::new(),
             mappings: Vec::new(),
+            user_stack: None,
             ttbr0: None,
         }
     }
@@ -77,6 +81,7 @@ impl Process {
             root_vmar,
             handles: HandleTable::new(),
             mappings: Vec::new(),
+            user_stack: None,
             ttbr0: None,
         }
     }
@@ -91,6 +96,29 @@ impl Process {
 
     pub fn add_mapping(&mut self, mapping: Mapping, vmo_koid: KoId) {
         self.mappings.push((mapping, vmo_koid));
+    }
+
+    /// Whether `[start, start + len)` is unused by both VMO mappings and the user stack.
+    pub fn user_range_is_free(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let overlaps = |other_start: u64, other_len: u64| {
+            other_start
+                .checked_add(other_len)
+                .is_none_or(|other_end| start < other_end && other_start < end)
+        };
+        !self
+            .mappings
+            .iter()
+            .any(|(mapping, _)| overlaps(mapping.virt, mapping.len))
+            && !self
+                .user_stack
+                .is_some_and(|(stack_start, stack_len)| overlaps(stack_start, stack_len))
+    }
+
+    pub fn set_user_stack(&mut self, start: u64, len: u64) {
+        self.user_stack = Some((start, len));
     }
 
     pub fn mappings(&self) -> &[(Mapping, KoId)] {
@@ -289,6 +317,7 @@ fn align_down_usize(value: usize, align: usize) -> usize {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+    use kumo_hal::PageFlags;
 
     extern "C" fn test_entry(_arg: usize) {}
 
@@ -342,6 +371,28 @@ mod tests {
             .handles()
             .require(handle, ObjectKind::Resource, Rights::MANAGE)
             .is_ok());
+    }
+
+    #[test]
+    fn process_rejects_ranges_overlapping_mappings_or_user_stack() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let base = test_vmar().base();
+        process.add_mapping(
+            Mapping {
+                virt: base,
+                len: PAGE_SIZE * 2,
+                vmo_offset: 0,
+                flags: PageFlags::READ,
+            },
+            KoId(99),
+        );
+        process.set_user_stack(base + PAGE_SIZE * 8, PAGE_SIZE * 4);
+
+        assert!(!process.user_range_is_free(base + PAGE_SIZE, PAGE_SIZE));
+        assert!(!process.user_range_is_free(base + PAGE_SIZE * 7, PAGE_SIZE * 2));
+        assert!(process.user_range_is_free(base + PAGE_SIZE * 3, PAGE_SIZE));
     }
 
     #[test]

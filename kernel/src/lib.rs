@@ -23,7 +23,7 @@ use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
 
 use crate::syscall::{KernelCall, KernelCallResult};
 
-pub const STAGE_A_BANNER: &str = "KUMO Ziwei Stage-A core only; halting";
+pub const STAGE_A_BANNER: &str = "KUMO MUREX Stage-A core only; halting";
 
 #[macro_export]
 macro_rules! klog {
@@ -75,9 +75,24 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // framebuffer console (the X13s has no serial here), which clears to the black
     // phosphor backdrop. Interrupts stay masked (see `_start`) until we own the GIC.
     kumo_hal::active::install_exception_vectors();
+
+    // Bring up the framebuffer console BEFORE any `klog!`. The X13s has no PL011, and the HAL
+    // console's pre-`set_framebuffer` fallback writes to 0x09000000, which HARD-HANGS the core
+    // (J182). So the framebuffer must own the console before the first line of output — otherwise
+    // the very first `klog!` wedges the board with a blank screen ("stuck at the bootloader, no
+    // handoff to MUREX"). This must stay ahead of every `klog!` in `stage_a`.
     if boot.has_framebuffer() {
         let fb = boot.framebuffer;
         kumo_hal::active::set_framebuffer(fb.phys, fb.len, fb.width, fb.height, fb.stride);
+        // FB GEOM as the very first rendered line — handy for X13s framebuffer bring-up.
+        klog!(
+            "FB GEOM w={} h={} stride={} len={} phys={:#x}\n",
+            fb.width,
+            fb.height,
+            fb.stride,
+            fb.len,
+            fb.phys
+        );
     }
 
     let report = match inspect_boot(boot) {
@@ -98,7 +113,6 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         free_frames += mm.sample_frames[i];
     }
     samples.sort();
-    klog!("\n");
 
     klog!("\nCPU MODE High\n");
     klog!(
@@ -106,6 +120,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         report.usable_bytes >> 20,
         (report.total_bytes - report.usable_bytes) >> 20
     );
+
     klog!("AETHER: frames free {}\n", free_frames);
     klog!("\tframe data:\n\t");
     for (i, &frame) in samples.iter().enumerate() {
@@ -116,24 +131,26 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     }
     klog!("\n\n");
     klog!("Uni+CJK Hi-SYS BOOT!\n\n");
-    klog!("NIMBUS 筋斗雲・オペレーティングシステム, Ver.0.1.0a\n");
-    klog!("Copyright(c) 2025,2026 KOKEN.DEV 黄犬インターネット・ソフトウェア共同体\n\n");
+    klog!("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n");
+    klog!("┃ NIMBUS    筋斗雲                   Ver.0.1.0a              ┃\n");
+    klog!("┃ Copyright(c) 2025,2026    KOKEN.DEV SOFTWARE CONSORTIUM    ┃\n");
+    klog!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n");
     // mixed ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
     klog!("「我 所 思 兮 在 泰 山。路 遠 湲 且 阻、\n");
     klog!("  側 身 東 望 涕 沾 翰。」\n\n");
     klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\n");
     klog!("  あ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n");
     klog!("  姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
-    klog!("「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n");
+    klog!(" 「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n");
     klog!("  그 대 의 집 이 되 니、\n");
     klog!("  명 월 을 벗 삼 아 외 로 이 앉 았 도 다 。」\n\n");
     // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
     // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
-    klog!("  中國漢字  ........在線\n");
-    klog!("  日本漢字  ........出力成功\n");
-    klog!("  한국어한글 .......로드　 OK\n\n");
-    klog!("紫微 MUREX Core Ver 0.1.0a  ({})\n", report.arch);
-    klog!("NIJIGUMO abi v{}    Check     OK\n", report.abi_version);
+    klog!("[中國漢字  ........在線    OK ]\n");
+    klog!("[日本漢字  ........出力成功 OK ]\n");
+    klog!("[한국어한글 .......로드      OK ]\n\n");
+    klog!("紫微  MUREX Core Ver 0.1.0a  ({})\n", report.arch);
+    klog!("虹雲  ABIv{}    Check     OK\n", report.abi_version);
 
     // M1: bring up memory. The bump heap is already online; account the frames and
     // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).

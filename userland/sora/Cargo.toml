@@ -7,8 +7,10 @@ version.workspace = true
 
 [dependencies]
 drv-blk = { path = "../servers/drv-blk" }
+drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 kumo-abi.workspace = true
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }
+kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
 kumo-ipc.workspace = true
 kumo-rt = { path = "../kumo-rt" }
 kumoza = { path = "../kumoza" }

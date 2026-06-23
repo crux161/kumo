@@ -3,21 +3,34 @@
 
 //! `wc` — line/word/byte counts of one initrd file, via explicit capabilities.
 //!
-//! Like `cat`, Sora grants this process a read-only initrd VMO in `x0` and a read-only argv
-//! VMO in `x1`. `wc` locates the named entry, streams it through the host-tested `wc` core in
-//! 256-byte chunks, and prints `<lines> <words> <bytes> <path>`. It has no ambient filesystem
-//! authority. (Reading standard input — the `… | wc` form — waits for the shell stdio model,
-//! DESIGN/013.)
+//! Like `cat`, Sora transfers one bootstrap channel in `x0`. Its finite startup message
+//! grants stdout, a read-only argv VMO, and a read-only initrd VMO as explicit capabilities.
+//! `wc` locates the named entry, streams it through the host-tested `wc` core in 256-byte
+//! chunks, and writes `<lines> <words> <bytes> <path>` to stdout. It has no ambient
+//! filesystem authority. (Reading standard input — the `… | wc` form — waits for the shell
+//! stdio model, DESIGN/013.)
 
 use kumo_abi::{entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN};
-use kumo_rt::{debug_write, process_exit, vmo_read};
+use kumo_rt::{channel_write, debug_write, process_exit, startup, vmo_read};
 use wc::Counter;
 
 kumo_rt::entry!(main);
 
+/// Diagnostics go to `DebugWrite` (the program's own error channel), distinct from the
+/// ordinary count output which travels over the granted stdout capability.
 fn fail(message: &[u8]) -> ! {
     debug_write(message.as_ptr(), message.len());
     process_exit(1)
+}
+
+/// Emit ordinary program output over stdout; fall back to `DebugWrite` only if Sora granted
+/// no stdout channel (`Handle(0)`).
+fn emit(stdout: Handle, bytes: &[u8]) {
+    if stdout.0 == 0 {
+        debug_write(bytes.as_ptr(), bytes.len());
+    } else {
+        let _ = channel_write(stdout, bytes.as_ptr(), bytes.len());
+    }
 }
 
 /// Append one byte to `buf` at `pos`, advancing `pos`; silently drops on overflow.
@@ -47,8 +60,8 @@ fn push_dec(buf: &mut [u8], pos: &mut usize, mut value: usize) {
 
 #[no_mangle]
 extern "C" fn main(
-    initrd_handle: u64,
-    argv_handle: u64,
+    bootstrap_handle: u64,
+    _a2: u64,
     _a3: u64,
     _a4: u64,
     _a5: u64,
@@ -56,19 +69,17 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
-    if initrd_handle == 0 || argv_handle == 0 {
-        fail(b"wc: missing capability\n");
-    }
-    let initrd = Handle(initrd_handle as u32);
+    let startup = startup(Handle(bootstrap_handle as u32));
+    let initrd = startup
+        .cap0
+        .unwrap_or_else(|| fail(b"wc: no initrd handle\n"));
+    let argv_handle = startup
+        .argv
+        .unwrap_or_else(|| fail(b"wc: no argv handle\n"));
+    let stdout = startup.stdout.unwrap_or(Handle(0));
 
     let mut argv_buf = [0u8; 256];
-    if vmo_read(
-        Handle(argv_handle as u32),
-        0,
-        argv_buf.as_mut_ptr(),
-        argv_buf.len(),
-    ) != 0
-    {
+    if vmo_read(argv_handle, 0, argv_buf.as_mut_ptr(), argv_buf.len()) != 0 {
         fail(b"wc: argv read fail\n");
     }
     let mut argv = unpack_argv(&argv_buf);
@@ -135,7 +146,7 @@ extern "C" fn main(
         push_byte(&mut line, &mut pos, byte);
     }
     push_byte(&mut line, &mut pos, b'\n');
-    debug_write(line.as_ptr(), pos);
+    emit(stdout, &line[..pos]);
 
     process_exit(0)
 }

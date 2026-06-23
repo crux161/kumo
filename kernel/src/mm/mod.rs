@@ -233,8 +233,11 @@ pub struct Mapping {
 pub enum VmoBacking {
     /// Anonymous memory: fresh zeroed frames allocated on map.
     Anonymous,
-    /// Physical memory: frames at a fixed physical address (MMIO, framebuffer).
-    Physical { phys_base: u64 },
+    /// Ordinary physical RAM at a fixed address (initrd, boot-info snapshot).
+    PhysicalRam { phys_base: u64 },
+    /// Resource-minted MMIO. Maps Device-nGnRnE unless the caller explicitly
+    /// requests the framebuffer-specific Normal-NC policy.
+    Mmio { phys_base: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,7 +266,20 @@ impl Vmo {
         }
         Ok(Self {
             len: align_up(len).ok_or(MemoryError::InvalidRange)?,
-            backing: VmoBacking::Physical { phys_base },
+            backing: VmoBacking::PhysicalRam { phys_base },
+        })
+    }
+
+    pub fn from_mmio_range(phys_base: u64, len: u64) -> Result<Self, MemoryError> {
+        if len == 0 {
+            return Err(MemoryError::Empty);
+        }
+        if !is_page_aligned(phys_base) {
+            return Err(MemoryError::Unaligned);
+        }
+        Ok(Self {
+            len: align_up(len).ok_or(MemoryError::InvalidRange)?,
+            backing: VmoBacking::Mmio { phys_base },
         })
     }
 
@@ -621,6 +637,20 @@ mod tests {
         let vmo = Vmo::new(PAGE_SIZE + 1).unwrap();
         assert_eq!(vmo.len(), PAGE_SIZE * 2);
         assert_eq!(vmo.frame_count(), 2);
+    }
+
+    #[test]
+    fn physical_ram_and_mmio_keep_distinct_mapping_policies() {
+        assert_eq!(
+            Vmo::from_physical_range(0x4000, PAGE_SIZE)
+                .unwrap()
+                .backing(),
+            VmoBacking::PhysicalRam { phys_base: 0x4000 }
+        );
+        assert_eq!(
+            Vmo::from_mmio_range(0x8000, PAGE_SIZE).unwrap().backing(),
+            VmoBacking::Mmio { phys_base: 0x8000 }
+        );
     }
 
     #[test]

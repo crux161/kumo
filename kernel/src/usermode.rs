@@ -805,6 +805,270 @@ extern "C" fn fault_hook(_esr: u64, _elr: u64, _far: u64) -> ! {
     kumo_hal::active::el0_exit(EL0_FAULT_EXIT_CODE);
 }
 
+/// Dispatch the **target-agnostic** syscalls — the "pure" arms that are simply
+/// `engine.dispatch(target, KernelCall::X { .. })` with uniform argument decoding and
+/// result mapping, identical regardless of which process issued the SVC. Both SVC
+/// dispatch chains route through this single helper: the async/resident-child chain
+/// (`cp_koid != sora_koid`, `target == child`) and Sora's own chain
+/// (`target == &mut sora.process`). A syscall added here is therefore available to
+/// *every* caller at once.
+///
+/// This retires the recurring missing-child-arm bug class: each of `HandleDuplicate`
+/// (J166, "so drv-blk never spawned"), the child `VmoRead` arm, and `HandleKoid`
+/// (J248, "drv-fb: port setup failed") was a pure arm that existed in Sora's chain but
+/// had to be hand-mirrored into the async chain, and a regression every time it was
+/// forgotten. With one shared list the two chains can no longer drift on these arms.
+///
+/// Returns `true` when `num` named one of these shared syscalls (and `r` now holds the
+/// result); `false` when it did not, leaving `r` untouched so the caller can handle its
+/// chain-specific arms — the ones that genuinely differ between the two chains
+/// (`DebugWrite` console routing, `ChannelRead`/`ChannelWrite`, the framebuffer claim's
+/// owner koid, `ProcessCreate`'s parent job, `InterruptWait`'s parking loop).
+///
+/// User buffers are validated with [`user_range_ok`] against `target`, so the same call
+/// issued by Sora or by a resident driver is checked against the *issuing* process's
+/// own address space.
+fn dispatch_object_syscall(
+    engine: &mut SyscallEngine,
+    target: &mut Process,
+    num: u64,
+    r: &mut [u64],
+) -> bool {
+    if num == Syscall::HandleClose as u64 {
+        let handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::HandleClose { handle }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::HandleDuplicate as u64 {
+        // Narrow-or-equal rights duplicate of a handle the issuer already holds (e.g. the
+        // initrd VMO shared read-only with drv-blk). The engine enforces that rights can
+        // only narrow (no ambient authority, PLAN §5.1). Was J166's missing async arm.
+        let handle = Handle(r[0] as u32);
+        let rights = Rights(r[1] as u32);
+        match engine.dispatch(target, KernelCall::HandleDuplicate { handle, rights }) {
+            KernelCallResult::Handle(dup) => r[0] = dup.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::HandleKoid as u64 {
+        // The koid of a handle the issuer holds — drv-fb needs it to recognise its console
+        // channel as the source of a `PortWait` wake (PortCreate + HandleKoid + PortBind).
+        // Was J248's missing async arm.
+        let handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::HandleKoid { handle }) {
+            KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreate as u64 {
+        let size = r[0];
+        match engine.dispatch(target, KernelCall::VmoCreate { size }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoRead as u64 {
+        // A process reading a VMO it was handed (J186 capability-passing). Validate the
+        // destination against the ISSUER's address space and resolve the handle in the
+        // ISSUER's table. Kernel `VmoRead` caps each read at 256 bytes.
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = (r[3] as usize).min(256);
+        if !user_range_ok(target, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::VmoRead {
+                vmo,
+                offset,
+                dest: user_buf as *mut u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoWrite as u64 {
+        let vmo = Handle(r[0] as u32);
+        let offset = r[1];
+        let user_buf = r[2];
+        let len = (r[3] as usize).min(256);
+        if !user_range_ok(target, user_buf, len as u64) {
+            r[0] = u64::MAX;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::VmoWrite {
+                vmo,
+                offset,
+                src: user_buf as *const u8,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortCreate as u64 {
+        match engine.dispatch(target, KernelCall::PortCreate) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortBind as u64 {
+        let port = Handle(r[0] as u32);
+        let object = Handle(r[1] as u32);
+        match engine.dispatch(target, KernelCall::PortBind { port, object }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::PortUnbind as u64 {
+        let port = Handle(r[0] as u32);
+        let object = Handle(r[1] as u32);
+        match engine.dispatch(target, KernelCall::PortUnbind { port, object }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::TimerCreate as u64 {
+        let delay_ns = r[0];
+        let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
+        if delay_ns == 0 || deadline_ns.is_none() {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+        } else {
+            match engine.dispatch(
+                target,
+                KernelCall::TimerCreate {
+                    deadline_ns: deadline_ns.unwrap(),
+                },
+            ) {
+                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+                _ => r[0] = u64::MAX,
+            }
+        }
+    } else if num == Syscall::VmarMap as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let vmo_handle = Handle(r[1] as u32);
+        let vmo_offset = r[2];
+        let virt = r[3];
+        let len = r[4];
+        let flags = PageFlags(r[5]);
+        match engine.dispatch(
+            target,
+            KernelCall::VmarMap {
+                process_handle,
+                vmo_handle,
+                vmo_offset,
+                virt,
+                len,
+                flags,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ResourceMintMmio as u64 {
+        let resource = Handle(r[0] as u32);
+        let phys_base = r[1];
+        let len = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base,
+                len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ResourceCreateChild as u64 {
+        let parent = Handle(r[0] as u32);
+        let phys_base = r[1];
+        let len = r[2];
+        // The IRQ window is packed into the fourth argument: (base << 32) | count.
+        let irq_base = (r[3] >> 32) as u32;
+        let irq_count = r[3] as u32;
+        match engine.dispatch(
+            target,
+            KernelCall::ResourceCreateChild {
+                parent,
+                phys_base,
+                len,
+                irq_base,
+                irq_count,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::InterruptCreate as u64 {
+        let resource = Handle(r[0] as u32);
+        let irq = r[1] as u32;
+        match engine.dispatch(target, KernelCall::InterruptCreate { resource, irq }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::AddressSpaceCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let stack_virt = r[1];
+        let stack_size = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::AddressSpaceCreate {
+                process_handle,
+                stack_virt,
+                stack_size,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadCreate as u64 {
+        let process_handle = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::ThreadCreate { process_handle }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ThreadStart as u64 {
+        let thread_handle = Handle(r[0] as u32);
+        let entry = r[1];
+        let sp = r[2];
+        let arg = r[3];
+        match engine.dispatch(
+            target,
+            KernelCall::ThreadStart {
+                thread_handle,
+                entry,
+                sp,
+                arg,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ChannelCreate as u64 {
+        match engine.dispatch(target, KernelCall::ChannelCreate) {
+            KernelCallResult::Handles { first, second } => {
+                r[0] = first.0 as u64;
+                r[1] = second.0 as u64;
+            }
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::ProcessWait as u64 {
+        // Unreachable in practice (the top-level `svc_hook` arm intercepts ProcessWait for
+        // every process before this chain), but kept so the shared list stays a faithful
+        // superset of Sora's former arm.
+        match engine.dispatch(target, KernelCall::ProcessWait) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
 extern "C" fn svc_hook(regs: *mut u64) {
     let r = unsafe { core::slice::from_raw_parts_mut(regs, 31) };
     let num = r[8];
@@ -912,6 +1176,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     }
                     return;
                 }
+                // Arms that genuinely differ for a resident child are handled inline; every
+                // target-agnostic syscall routes through the shared `dispatch_object_syscall`
+                // below (against the CHILD's table), so a resident driver now gets the full
+                // pure-syscall set Sora has — no more per-arm drift between the two chains.
                 if num == Syscall::DebugWrite as u64 {
                     let user_ptr = r[0];
                     let len = (r[1] as usize).min(256);
@@ -925,16 +1193,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     // before the claim it remains an ordinary Stage-A HAL write.
                     console_write_in_state(sora, bytes);
                     r[0] = len as u64;
-                } else if num == Syscall::HandleClose as u64 {
-                    let handle = Handle(r[0] as u32);
-                    match sora
-                        .engine
-                        .dispatch(child, KernelCall::HandleClose { handle })
-                    {
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
                 } else if num == Syscall::ChannelRead as u64 {
+                    // Child channel reads are served by the top-level
+                    // `read_child_channel_without_borrow` arm before this block; this stub is
+                    // the inert remainder of that earlier routing.
                     r[0] = 0;
                 } else if num == Syscall::ChannelWrite as u64 {
                     let channel = Handle(r[0] as u32);
@@ -958,85 +1220,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         }
                         Err(_) => r[0] = u64::MAX,
                     }
-                } else if num == Syscall::PortCreate as u64 {
-                    match sora.engine.dispatch(child, KernelCall::PortCreate) {
-                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else if num == Syscall::TimerCreate as u64 {
-                    let delay_ns = r[0];
-                    let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
-                    if delay_ns == 0 || deadline_ns.is_none() {
-                        r[0] = Errno::InvalidArgs.status() as u32 as u64;
-                    } else {
-                        match sora.engine.dispatch(
-                            child,
-                            KernelCall::TimerCreate {
-                                deadline_ns: deadline_ns.unwrap(),
-                            },
-                        ) {
-                            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                            _ => r[0] = u64::MAX,
-                        }
-                    }
-                } else if num == Syscall::PortBind as u64 {
-                    let port = Handle(r[0] as u32);
-                    let object = Handle(r[1] as u32);
-                    match sora
-                        .engine
-                        .dispatch(child, KernelCall::PortBind { port, object })
-                    {
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else if num == Syscall::PortUnbind as u64 {
-                    let port = Handle(r[0] as u32);
-                    let object = Handle(r[1] as u32);
-                    match sora
-                        .engine
-                        .dispatch(child, KernelCall::PortUnbind { port, object })
-                    {
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else if num == Syscall::VmarMap as u64 {
-                    let process_handle = Handle(r[0] as u32);
-                    let vmo_handle = Handle(r[1] as u32);
-                    let vmo_offset = r[2];
-                    let virt = r[3];
-                    let len = r[4];
-                    let flags = PageFlags(r[5]);
-                    match sora.engine.dispatch(
-                        child,
-                        KernelCall::VmarMap {
-                            process_handle,
-                            vmo_handle,
-                            vmo_offset,
-                            virt,
-                            len,
-                            flags,
-                        },
-                    ) {
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else if num == Syscall::ResourceMintMmio as u64 {
-                    let resource = Handle(r[0] as u32);
-                    let phys_base = r[1];
-                    let len = r[2];
-                    match sora.engine.dispatch(
-                        child,
-                        KernelCall::ResourceMintMmio {
-                            resource,
-                            phys_base,
-                            len,
-                        },
-                    ) {
-                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
                 } else if num == Syscall::FramebufferClaim as u64 {
                     let resource = Handle(r[0] as u32);
                     let phys_base = r[1];
@@ -1058,43 +1241,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     } else {
                         r[0] = Errno::AccessDenied.status() as u32 as u64;
                     }
-                } else if num == Syscall::InterruptCreate as u64 {
-                    let resource = Handle(r[0] as u32);
-                    let irq = r[1] as u32;
-                    match sora
-                        .engine
-                        .dispatch(child, KernelCall::InterruptCreate { resource, irq })
-                    {
-                        KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else if num == Syscall::VmoRead as u64 {
-                    // A child reading a VMO it was handed (J186 capability-passing: `bin/ls`
-                    // gets a read-only initrd handle). Validate the destination buffer against
-                    // the CHILD's address space and resolve the handle in the CHILD's table —
-                    // not Sora's. Without this arm the call fell through to the final `else`
-                    // and every child VmoRead returned u64::MAX.
-                    let vmo = Handle(r[0] as u32);
-                    let offset = r[1];
-                    let user_buf = r[2];
-                    let len = (r[3] as usize).min(256);
-                    if !user_range_ok(child, user_buf, len as u64) {
-                        r[0] = u64::MAX;
-                        return;
-                    }
-                    match sora.engine.dispatch(
-                        child,
-                        KernelCall::VmoRead {
-                            vmo,
-                            offset,
-                            dest: user_buf as *mut u8,
-                            len,
-                        },
-                    ) {
-                        KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                        _ => r[0] = u64::MAX,
-                    }
-                } else {
+                } else if !dispatch_object_syscall(&mut sora.engine, child, num, r) {
                     r[0] = u64::MAX;
                 }
                 return;
@@ -1115,149 +1262,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
             console_write_in_state(sora, bytes);
             sora.wrote += len;
             r[0] = len as u64;
-        } else if num == Syscall::HandleClose as u64 {
-            let handle = Handle(r[0] as u32);
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::HandleClose { handle })
-            {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::VmoWrite as u64 {
-            let vmo = Handle(r[0] as u32);
-            let offset = r[1];
-            let user_buf = r[2];
-            let len = (r[3] as usize).min(256);
-            if !user_range_ok(&sora.process, user_buf, len as u64) {
-                r[0] = u64::MAX;
-                return;
-            }
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::VmoWrite {
-                    vmo,
-                    offset,
-                    src: user_buf as *const u8,
-                    len,
-                },
-            ) {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::VmoCreate as u64 {
-            let size = r[0];
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::VmoCreate { size })
-            {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::VmoRead as u64 {
-            let vmo = Handle(r[0] as u32);
-            let offset = r[1];
-            let user_buf = r[2];
-            let len = (r[3] as usize).min(256);
-            if !user_range_ok(&sora.process, user_buf, len as u64) {
-                r[0] = u64::MAX;
-                return;
-            }
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::VmoRead {
-                    vmo,
-                    offset,
-                    dest: user_buf as *mut u8,
-                    len,
-                },
-            ) {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::HandleKoid as u64 {
-            let handle = Handle(r[0] as u32);
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::HandleKoid { handle })
-            {
-                KernelCallResult::Handle(koid_handle) => r[0] = koid_handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::HandleDuplicate as u64 {
-            // Narrow-or-equal rights duplicate of a handle Sora already holds (e.g. the
-            // initrd VMO shared read-only with drv-blk). The engine enforces that rights
-            // can only narrow (no ambient authority, PLAN §5.1). Without this arm the
-            // syscall fell through to the u64::MAX default, so drv-blk never spawned (J166).
-            let handle = Handle(r[0] as u32);
-            let rights = Rights(r[1] as u32);
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::HandleDuplicate { handle, rights },
-            ) {
-                KernelCallResult::Handle(dup) => r[0] = dup.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::PortCreate as u64 {
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::PortCreate)
-            {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::TimerCreate as u64 {
-            let delay_ns = r[0];
-            let deadline_ns = kumo_hal::active::monotonic_nanos().checked_add(delay_ns);
-            if delay_ns == 0 || deadline_ns.is_none() {
-                r[0] = Errno::InvalidArgs.status() as u32 as u64;
-            } else {
-                match sora.engine.dispatch(
-                    &mut sora.process,
-                    KernelCall::TimerCreate {
-                        deadline_ns: deadline_ns.unwrap(),
-                    },
-                ) {
-                    KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                    KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                    _ => r[0] = u64::MAX,
-                }
-            }
-        } else if num == Syscall::PortBind as u64 {
-            let port = Handle(r[0] as u32);
-            let object = Handle(r[1] as u32);
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::PortBind { port, object })
-            {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::PortUnbind as u64 {
-            let port = Handle(r[0] as u32);
-            let object = Handle(r[1] as u32);
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::PortUnbind { port, object })
-            {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::ResourceMintMmio as u64 {
-            let resource = Handle(r[0] as u32);
-            let phys_base = r[1];
-            let len = r[2];
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::ResourceMintMmio {
-                    resource,
-                    phys_base,
-                    len,
-                },
-            ) {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
+        } else if dispatch_object_syscall(&mut sora.engine, &mut sora.process, num, r) {
+            // Handled by the shared target-agnostic dispatcher (HandleClose, VmoRead/Write,
+            // VmoCreate, Handle{Koid,Duplicate}, Port{Create,Bind,Unbind}, TimerCreate,
+            // VmarMap, ResourceMintMmio/CreateChild, InterruptCreate, AddressSpaceCreate,
+            // Thread{Create,Start}, ChannelCreate, ProcessWait). One shared list — the async
+            // chain above and this Sora chain can no longer drift on these arms.
         } else if num == Syscall::FramebufferClaim as u64 {
             let resource = Handle(r[0] as u32);
             let phys_base = r[1];
@@ -1278,36 +1288,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 r[0] = Errno::Ok.status() as u32 as u64;
             } else {
                 r[0] = Errno::AccessDenied.status() as u32 as u64;
-            }
-        } else if num == Syscall::ResourceCreateChild as u64 {
-            let parent = Handle(r[0] as u32);
-            let phys_base = r[1];
-            let len = r[2];
-            // The IRQ window is packed into the fourth argument: (base << 32) | count.
-            let irq_base = (r[3] >> 32) as u32;
-            let irq_count = r[3] as u32;
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::ResourceCreateChild {
-                    parent,
-                    phys_base,
-                    len,
-                    irq_base,
-                    irq_count,
-                },
-            ) {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::InterruptCreate as u64 {
-            let resource = Handle(r[0] as u32);
-            let irq = r[1] as u32;
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::InterruptCreate { resource, irq },
-            ) {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
             }
         } else if num == Syscall::InterruptWait as u64 {
             let interrupt = Handle(r[0] as u32);
@@ -1332,55 +1312,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     }
                 }
             }
-        } else if num == Syscall::ProcessWait as u64 {
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::ProcessWait)
-            {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::AddressSpaceCreate as u64 {
-            let process_handle = Handle(r[0] as u32);
-            let stack_virt = r[1];
-            let stack_size = r[2];
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::AddressSpaceCreate {
-                    process_handle,
-                    stack_virt,
-                    stack_size,
-                },
-            ) {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::ThreadCreate as u64 {
-            let process_handle = Handle(r[0] as u32);
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::ThreadCreate { process_handle },
-            ) {
-                KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::ThreadStart as u64 {
-            let thread_handle = Handle(r[0] as u32);
-            let entry = r[1];
-            let sp = r[2];
-            let arg = r[3];
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::ThreadStart {
-                    thread_handle,
-                    entry,
-                    sp,
-                    arg,
-                },
-            ) {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
         } else if num == Syscall::ProcessCreate as u64 {
             let vmar_base = r[0];
             let vmar_size = r[1];
@@ -1394,39 +1325,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
             );
             match result {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::VmarMap as u64 {
-            let process_handle = Handle(r[0] as u32);
-            let vmo_handle = Handle(r[1] as u32);
-            let vmo_offset = r[2];
-            let virt = r[3];
-            let len = r[4];
-            let flags_raw = r[5];
-            let flags = PageFlags(flags_raw);
-            match sora.engine.dispatch(
-                &mut sora.process,
-                KernelCall::VmarMap {
-                    process_handle,
-                    vmo_handle,
-                    vmo_offset,
-                    virt,
-                    len,
-                    flags,
-                },
-            ) {
-                KernelCallResult::Status(status) => r[0] = status as u32 as u64,
-                _ => r[0] = u64::MAX,
-            }
-        } else if num == Syscall::ChannelCreate as u64 {
-            match sora
-                .engine
-                .dispatch(&mut sora.process, KernelCall::ChannelCreate)
-            {
-                KernelCallResult::Handles { first, second } => {
-                    r[0] = first.0 as u64;
-                    r[1] = second.0 as u64;
-                }
                 _ => r[0] = u64::MAX,
             }
         } else if num == Syscall::ChannelWrite as u64 {
@@ -1577,6 +1475,35 @@ fn build_recipe(initrd: &[u8]) -> Result<SoraRecipe, UsermodeError> {
     })
 }
 
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
+
+fn dtb_backing_range(address: u64, total_size: u64) -> Option<(u64, u64)> {
+    if address == 0 || !(40..=MAX_DTB_BYTES).contains(&total_size) {
+        return None;
+    }
+    let base = address & !(crate::mm::PAGE_SIZE - 1);
+    let offset = address.checked_sub(base)?;
+    let used = offset.checked_add(total_size)?;
+    let len = used.checked_add(crate::mm::PAGE_SIZE - 1)? & !(crate::mm::PAGE_SIZE - 1);
+    address.checked_add(total_size)?;
+    Some((base, len))
+}
+
+/// Validate the firmware/staged FDT header while the kernel identity map is live, then describe
+/// the page-aligned physical span that can be exposed to Sora as a read-only normal-memory VMO.
+unsafe fn discover_dtb_backing(address: u64) -> Option<(u64, u64)> {
+    if address == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total_size = u32::from_be_bytes(header[4..8].try_into().ok()?) as u64;
+    dtb_backing_range(address, total_size)
+}
+
 /// One attempt: build page tables, create root channel, spawn Sora, wait for exit.
 /// Returns the handshake and exit code.
 fn attempt_sora(
@@ -1641,6 +1568,20 @@ fn attempt_sora(
                 Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
             )
             .map_err(|_| UsermodeError::ChannelSetup)?
+    };
+
+    // A generic, read-only DTB capability for userland hardware discovery. The VMO aliases the
+    // bootloader-owned normal-memory pages; Sora receives no physical address authority through
+    // it and still must narrow the root Resource before launching a matched driver.
+    let dtb_vmo_handle = match unsafe { discover_dtb_backing(boot.platform.dtb) } {
+        Some((phys_base, len)) => {
+            let dtb_vmo = Vmo::from_physical_range(phys_base, len)
+                .map_err(|_| UsermodeError::ChannelSetup)?;
+            engine
+                .root_vmo_create(&mut process, dtb_vmo, Rights::READ | Rights::DUPLICATE)
+                .map_err(|_| UsermodeError::ChannelSetup)?
+        }
+        None => Handle(0),
     };
 
     // P9-b: root Resource — grants access to all physical MMIO and every IRQ line
@@ -1715,7 +1656,8 @@ fn attempt_sora(
             virt_addr: fb_slot,
             len: boot.framebuffer.len,
             writable: true,
-            device: false, // Normal-NC for framebuffer
+            device: false,
+            uncached: true, // Normal-NC for framebuffer
             executable: false,
         };
         extra_mappings = core::slice::from_ref(&fb_mapping);
@@ -1752,6 +1694,7 @@ fn attempt_sora(
             x[6] = net_handle.0 as u64; // network channel handle (P9-c)
             x[7] = kbd_handle.0 as u64; // keyboard channel handle (P8-a)
             x[8] = bootinfo_vmo_handle.0 as u64; // BootInfo VMO handle (J159)
+            x[9] = dtb_vmo_handle.0 as u64; // read-only DTB VMO handle
             x
         },
         elr: recipe.entry,
@@ -2241,7 +2184,18 @@ pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeEr
 
 #[cfg(test)]
 mod tests {
-    use super::console_routed_to_owner;
+    use super::{console_routed_to_owner, dtb_backing_range, MAX_DTB_BYTES};
+
+    #[test]
+    fn dtb_capability_span_is_page_bounded_and_finite() {
+        assert_eq!(
+            dtb_backing_range(0x4080_0123, 0x2345),
+            Some((0x4080_0000, 0x3000))
+        );
+        assert_eq!(dtb_backing_range(0, 0x1000), None);
+        assert_eq!(dtb_backing_range(0x4080_0000, 39), None);
+        assert_eq!(dtb_backing_range(0x4080_0000, MAX_DTB_BYTES + 1), None);
+    }
 
     // J247: the post-handoff console fallback routing policy. The kernel-owned epoch must
     // always paint via the HAL (the `early_console_write` fallback); only after drv-fb has
@@ -2270,5 +2224,150 @@ mod tests {
         // re-entrancy guard declining the borrow. Fall back to the HAL path (which itself
         // drops on an owned framebuffer) rather than losing the bytes to a panic.
         assert!(!console_routed_to_owner(false, false));
+    }
+
+    // The shared `dispatch_object_syscall` is the unification of the two SVC dispatch
+    // chains. Its *routing* used to be SVC-only (J248: "not host-reachable"), so the
+    // missing-arm bug class (J166 HandleDuplicate, the child VmoRead, J248 HandleKoid)
+    // could only surface on metal. As a plain function over an engine + a target process
+    // it is now host-testable, so these pin the contract both chains depend on.
+    use super::dispatch_object_syscall;
+    use crate::syscall::SyscallEngine;
+    use crate::task::Process;
+    use kumo_abi::{sys::Syscall, Errno, Handle};
+
+    fn engine_and_process() -> (SyscallEngine, Process) {
+        let mut engine = SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let process = Process::new(engine.objects_mut(), &job, vmar);
+        (engine, process)
+    }
+
+    #[test]
+    fn shared_dispatcher_serves_the_pure_syscall_set() {
+        // Every arm here is one a *resident child* used to be denied (the async chain
+        // returned u64::MAX for anything not hand-mirrored). Routing them through the one
+        // shared list gives any process the full pure set — the point of the unification.
+        let (mut engine, mut process) = engine_and_process();
+
+        let mut r = [0u64; 31];
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::PortCreate as u64,
+            &mut r,
+        ));
+        let port = r[0];
+        assert_ne!(port, u64::MAX, "PortCreate should yield a handle");
+
+        let mut r = [0u64; 31];
+        r[0] = 4096; // size
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::VmoCreate as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], u64::MAX, "VmoCreate should yield a handle");
+
+        let mut r = [0u64; 31];
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ChannelCreate as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], u64::MAX, "ChannelCreate should yield a handle pair");
+        assert_ne!(r[0], r[1], "the two channel ends are distinct handles");
+
+        // HandleKoid resolves a held handle's koid; the result mapping must surface it.
+        let want = process.handles().get(Handle(port as u32)).unwrap().koid.0 as u32 as u64;
+        let mut r = [0u64; 31];
+        r[0] = port;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleKoid as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], want, "HandleKoid should report the handle's koid");
+
+        // HandleClose frees it and reports Ok (status mapping, not the u64::MAX default).
+        let mut r = [0u64; 31];
+        r[0] = port;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], Errno::Ok.status() as u32 as u64);
+    }
+
+    #[test]
+    fn shared_dispatcher_passes_engine_errors_through_the_status_mapping() {
+        // A pure arm whose engine call fails must surface the errno (HandleClose maps
+        // Status → status), not collapse to the u64::MAX "unhandled" sentinel.
+        let (mut engine, mut process) = engine_and_process();
+        let mut r = [0u64; 31];
+        r[0] = 9999; // a handle the process does not hold
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r,
+        ));
+        assert_eq!(r[0], Errno::BadHandle.status() as u32 as u64);
+    }
+
+    #[test]
+    fn shared_dispatcher_declines_chain_specific_syscalls() {
+        // The arms that genuinely differ between the two chains (console routing, the
+        // blocking/queueing channel ops, the framebuffer claim's owner koid, ProcessCreate's
+        // parent job, InterruptWait's parking) must be left to the caller: the helper returns
+        // false AND leaves `r` untouched so the per-chain arm runs unshadowed.
+        let (mut engine, mut process) = engine_and_process();
+        for special in [
+            Syscall::DebugWrite,
+            Syscall::ChannelRead,
+            Syscall::ChannelWrite,
+            Syscall::FramebufferClaim,
+            Syscall::ProcessCreate,
+            Syscall::InterruptWait,
+        ] {
+            let mut r = [0u64; 31];
+            r[0] = 0xdead_beef;
+            assert!(
+                !dispatch_object_syscall(&mut engine, &mut process, special as u64, &mut r),
+                "{special:?} must be left to its per-chain arm",
+            );
+            assert_eq!(
+                r[0], 0xdead_beef,
+                "{special:?}: a declined syscall must not touch r",
+            );
+        }
+    }
+
+    #[test]
+    fn shared_dispatcher_keeps_handle_duplicate_available() {
+        // J166's regression in concrete form: HandleDuplicate was the arm whose absence from
+        // the async chain meant "drv-blk never spawned". The shared list keeps it wired for
+        // any process; a bogus handle still maps to the u64::MAX error sentinel.
+        let (mut engine, mut process) = engine_and_process();
+        let mut r = [0u64; 31];
+        r[0] = 9999; // bogus handle
+        r[1] = 0; // narrowest rights
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleDuplicate as u64,
+            &mut r,
+        ));
+        assert_eq!(
+            r[0],
+            u64::MAX,
+            "duplicating a handle the process lacks fails"
+        );
     }
 }

@@ -4,19 +4,21 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use drv_i2c_hid::ProbeConfig;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     CAT_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
     WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
+use kumo_i2c_hid::{discover_keyboard, KeyboardTopology};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
-    thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_CAP0,
-    STARTUP_TAG_STDOUT,
+    thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
+    STARTUP_TAG_CAP0, STARTUP_TAG_STDOUT,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -33,13 +35,16 @@ use ttyd::{Reply as TtyReply, Request as TtyRequest};
 /// one place it is still guaranteed live, before any other instruction can touch it.
 static BOOTINFO_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
 
-/// A reusable scratch VMO for handing programs their argv in `x1` (J-argv). Created once
-/// and rewritten per `run`; `ARGV_VMO` is Sora's full-rights write handle and
-/// `ARGV_VMO_RO` the read-only alias granted to children (least privilege — a program
-/// reads its args, can't mutate the shared buffer). Runs are synchronous, so one buffer
-/// is safe to reuse. Statics avoid threading the handles through the shell dispatcher.
+/// Read-only DTB VMO handle supplied in x9. `_start` must preserve it before using x9 as scratch.
+static DTB_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+/// A reusable scratch VMO for packing a program's argv before launch. Created once and
+/// rewritten per spawn; `ARGV_VMO` is Sora's full-rights write handle. Each launch mints a
+/// fresh one-shot read+transfer alias from it for the bootstrap startup message (least
+/// privilege — the child reads its args, can't mutate the shared buffer). Runs are
+/// synchronous, so one buffer is safe to reuse. The static avoids threading the handle
+/// through the shell dispatcher.
 static ARGV_VMO: AtomicU64 = AtomicU64::new(0);
-static ARGV_VMO_RO: AtomicU64 = AtomicU64::new(0);
 
 // Sora's entry. Mirrors `kumo_rt::entry!` (a bare `bl sora_main`) but first stashes x8 into
 // `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
@@ -49,12 +54,16 @@ core::arch::global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
     "_start:",
+    "  adrp x10, {dtb_slot}",
+    "  add  x10, x10, :lo12:{dtb_slot}",
+    "  str  x9, [x10]",
     "  adrp x9, {slot}",
     "  add  x9, x9, :lo12:{slot}",
     "  str  x8, [x9]",
     "  bl   sora_main",
     "1: b 1b",
     slot = sym BOOTINFO_VMO_HANDLE,
+    dtb_slot = sym DTB_VMO_HANDLE,
 );
 
 fn log(msg: &[u8]) {
@@ -95,6 +104,52 @@ fn log_fb_geometry(fb: &Framebuffer) {
     log(b" stride=");
     log_hex(fb.stride as u64);
     log(b"\n");
+}
+
+/// Map the read-only DTB capability in two stages, validate its declared extent, and discover the
+/// internal keyboard before any device Resource is minted or any controller MMIO is touched.
+fn keyboard_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<KeyboardTopology> {
+    const PAGE_SIZE: u64 = 4096;
+    const HEADER_VA: u64 = 0x0000_0000_3100_0000;
+    const DTB_VA: u64 = 0x0000_0000_3200_0000;
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
+
+    if dtb_vmo.0 == 0 || dtb_phys == 0 {
+        return None;
+    }
+    let offset = (dtb_phys & (PAGE_SIZE - 1)) as usize;
+    if offset > PAGE_SIZE as usize - 8
+        || vmar_map(
+            Handle(0),
+            dtb_vmo,
+            0,
+            HEADER_VA,
+            PAGE_SIZE,
+            VmarFlags::READ.0,
+        ) != 0
+    {
+        return None;
+    }
+    let header =
+        unsafe { core::slice::from_raw_parts((HEADER_VA as usize + offset) as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    let mapped_len = (offset as u64)
+        .checked_add(total as u64)?
+        .checked_add(PAGE_SIZE - 1)?
+        & !(PAGE_SIZE - 1);
+    if vmar_map(Handle(0), dtb_vmo, 0, DTB_VA, mapped_len, VmarFlags::READ.0) != 0 {
+        return None;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
+    discover_keyboard(bytes)
 }
 
 /// Locate a file in the initrd by path, returning its `(offset, len)`. Sora
@@ -258,6 +313,7 @@ extern "C" fn sora_main(
     // into `BOOTINFO_VMO_HANDLE` at entry — reading x8 here would race the compiler's reuse of
     // it (see the static's doc-comment).
     let bootinfo_vmo: u64 = BOOTINFO_VMO_HANDLE.load(Ordering::Relaxed);
+    let dtb_vmo: u64 = DTB_VMO_HANDLE.load(Ordering::Relaxed);
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
@@ -732,6 +788,56 @@ extern "C" fn sora_main(
                     }
                     log_fb_geometry(&fb);
                 }
+
+                // Match the built-in keyboard from the read-only DTB capability before granting
+                // hardware authority. QEMU and unrelated framebuffer boards stop here without
+                // ever mapping or touching the X13s GENI address.
+                let topology =
+                    keyboard_topology_from_dtb(Handle(dtb_vmo as u32), bootinfo.platform.dtb);
+                if let Some(topology) = topology {
+                    match ProbeConfig::for_x13s(topology) {
+                        Ok(config) => {
+                            let device_resource = resource_create_child(
+                                res,
+                                config.mmio_base,
+                                config.mmio_length,
+                                0,
+                                0,
+                            );
+                            let (sender, bootstrap) = channel_create_pair();
+                            if device_resource == u64::MAX {
+                                log(b"drv-i2c-hid: resource fail\n");
+                            } else if sender == u64::MAX || bootstrap == u64::MAX {
+                                log(b"drv-i2c-hid: channel fail\n");
+                            } else {
+                                let encoded = config.encode();
+                                let sent = channel_write_with_handle(
+                                    Handle(sender as u32),
+                                    encoded.as_ptr(),
+                                    encoded.len(),
+                                    Handle(device_resource as u32),
+                                );
+                                if sent != 0 {
+                                    log(b"drv-i2c-hid: bootstrap send fail\n");
+                                } else if run_elf(
+                                    initrd,
+                                    kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
+                                    0,
+                                    bootstrap,
+                                    ProcessRunFlags::ASYNC.bits(),
+                                    b"drv-i2c-hid",
+                                ) {
+                                    log(b"drv-i2c-hid: run ok\n");
+                                } else {
+                                    log(b"drv-i2c-hid: run fail\n");
+                                }
+                            }
+                        }
+                        Err(_) => log(b"drv-i2c-hid: topology invalid\n"),
+                    }
+                } else {
+                    log(b"drv-i2c-hid: no matched keyboard\n");
+                }
             }
         } else {
             // Static analysis says this self-map (in-bounds of Sora's root VMAR, READ right
@@ -1080,18 +1186,12 @@ extern "C" fn sora_main(
         log(b"initrd read-only dup fail\n");
     }
 
-    // Create the reusable argv scratch VMO + its read-only alias (see the statics). A
-    // program launched with arguments gets the read-only alias in x1; failure here just
-    // means programs run with no argv (degrade, don't abort the boot).
+    // Create the reusable argv scratch VMO (see the static). Each launch packs the program's
+    // argv into it and mints a fresh one-shot read+transfer alias for the bootstrap startup
+    // message; failure here just means programs run with no argv (degrade, don't abort the boot).
     let argv_vmo = vmo_create(256);
     if argv_vmo != u64::MAX {
         ARGV_VMO.store(argv_vmo, Ordering::Relaxed);
-        let argv_ro = handle_duplicate(Handle(argv_vmo as u32), Rights::READ | Rights::DUPLICATE);
-        if argv_ro != 0 && argv_ro != u64::MAX {
-            ARGV_VMO_RO.store(argv_ro, Ordering::Relaxed);
-        } else {
-            log(b"argv read-only dup fail\n");
-        }
     } else {
         log(b"argv vmo create fail\n");
     }
@@ -1193,22 +1293,47 @@ extern "C" fn sora_main(
     // either console or block has data. Source koid matching dispatches to
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
+    log(b"sora: serve setup\n");
     let port_h = port_create();
     let console_koid = handle_koid(console);
     let block_koid = handle_koid(block);
     let net_koid = handle_koid(net);
     let kbd_koid = handle_koid(kbd);
-    if port_h != u64::MAX
-        && console_koid != u64::MAX
-        && block_koid != u64::MAX
-        && net_koid != u64::MAX
-        && kbd_koid != u64::MAX
-    {
+    // Breadcrumb each unavailable handle so a metal boot that wedges here (the X13s "halts
+    // right after `anon vmo write ok`" report) names exactly what is missing on the next flash.
+    if port_h == u64::MAX {
+        log(b"sora: port create fail\n");
+    }
+    if console_koid == u64::MAX {
+        log(b"sora: console koid fail\n");
+    }
+    if block_koid == u64::MAX {
+        log(b"sora: block koid fail\n");
+    }
+    if net_koid == u64::MAX {
+        log(b"sora: net koid fail\n");
+    }
+    if kbd_koid == u64::MAX {
+        log(b"sora: kbd koid fail\n");
+    }
+    // The serve loop only needs the port and a console to be useful; the block/net/keyboard
+    // channels are bound only when available. A machine without a keyboard or net driver (the
+    // X13s today) therefore still serves its console instead of dropping into the silent
+    // busy-spin that looked like a halt after `anon vmo write ok`. Each per-source handler
+    // below already gates on a koid match, so an unbound channel simply never wakes the port.
+    if port_h != u64::MAX && console_koid != u64::MAX {
         let port = Handle(port_h as u32);
         port_bind(port, console);
-        port_bind(port, block);
-        port_bind(port, net);
-        port_bind(port, kbd);
+        if block_koid != u64::MAX {
+            port_bind(port, block);
+        }
+        if net_koid != u64::MAX {
+            port_bind(port, net);
+        }
+        if kbd_koid != u64::MAX {
+            port_bind(port, kbd);
+        }
+        log(b"sora: ports bound\n");
         let cons_koid = Handle(console_koid as u32);
         let blk_koid = Handle(block_koid as u32);
         let net_k = Handle(net_koid as u32);
@@ -1218,6 +1343,7 @@ extern "C" fn sora_main(
 
         // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
         launch_lua_repl(initrd, kbd, console);
+        log(b"sora: lua returned\n");
         let ttyd_recipe = sora::ServerRecipe {
             name: "ttyd",
             image_path: TTYD_PATH,
@@ -1245,6 +1371,7 @@ extern "C" fn sora_main(
         let mut pending_ttyd_restart: Option<(sora::ServerRecipe<'static>, Handle)> = None;
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
 
+        log(b"sora: entering serve loop\n");
         loop {
             let source = Handle(port_wait(port) as u32);
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
@@ -1410,6 +1537,10 @@ extern "C" fn sora_main(
             }
         }
     } else {
+        // Reached only when the port itself or the console channel is unavailable — Sora cannot
+        // serve, so it idles. The marker keeps this state honest on the framebuffer instead of
+        // looking like a halt after `anon vmo write ok`.
+        log(b"sora: no port/console; idle\n");
         loop {
             core::hint::spin_loop();
         }
@@ -1509,7 +1640,7 @@ fn run_statement(
 /// boot autoexec (J183), so both speak the same syntax: `echo`/`help`/`ls`/`run` are
 /// handled by this dispatcher; any other non-empty command is forwarded verbatim (`raw`, the
 /// original line bytes) to the kernel shell over the `root` channel. `prog_initrd` is a
-/// read-only initrd handle granted to `ls` (capability-passing, J186). Always returns
+/// read-only initrd handle granted to capability-aware coreutils (`ls`/`cat`). Always returns
 /// `true` — a builtin failure logs but never aborts the surrounding `kumoza::evaluate`.
 fn eval_command(
     cmd: &kumoza::Command,
@@ -1523,49 +1654,42 @@ fn eval_command(
     }) {
         return true;
     } else if cmd.name == "cat" {
-        // cat combines both program-startup slots: the read-only initrd capability in
-        // x0 and its read-only argv VMO in x1. Only this explicit shell launcher grants
-        // the filesystem image; plain `run cat ...` remains authority-free.
+        // cat receives stdout, argv, and read-only initrd in one finite bootstrap message.
+        // Only this explicit shell launcher grants the filesystem image; plain `run cat ...`
+        // remains authority-free.
         if cmd.args.len() != 1 {
             debug_write(b"usage: cat <path>\n".as_ptr(), 18);
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"cat: no initrd handle\n".as_ptr(), 22);
         } else {
-            let argv_handle = build_command_argv_handle(cmd);
-            if argv_handle == 0 {
-                debug_write(b"cat: argv unavailable\n".as_ptr(), 22);
-            } else {
-                run_elf(
-                    initrd,
-                    CAT_PATH.as_bytes(),
-                    prog_initrd,
-                    argv_handle,
-                    0,
-                    b"cat",
-                );
-            }
+            let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+            let count = command_argv_slots(cmd, &mut slots);
+            run_with_startup(
+                initrd,
+                CAT_PATH.as_bytes(),
+                b"cat",
+                Some(&slots[..count]),
+                true,
+            );
         }
     } else if cmd.name == "wc" {
-        // wc: like cat, granted the read-only initrd capability (x0) and its argv VMO (x1);
-        // it counts the named file. Only this explicit launcher grants the initrd.
+        // wc: like cat, granted stdout, its argv VMO, and the read-only initrd capability in
+        // one finite bootstrap startup message; it counts the named file. Only this explicit
+        // launcher grants the initrd — plain `run wc ...` stays authority-free.
         if cmd.args.len() != 1 {
             debug_write(b"usage: wc <path>\n".as_ptr(), 17);
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"wc: no initrd handle\n".as_ptr(), 21);
         } else {
-            let argv_handle = build_command_argv_handle(cmd);
-            if argv_handle == 0 {
-                debug_write(b"wc: argv unavailable\n".as_ptr(), 21);
-            } else {
-                run_elf(
-                    initrd,
-                    WC_PATH.as_bytes(),
-                    prog_initrd,
-                    argv_handle,
-                    0,
-                    b"wc",
-                );
-            }
+            let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+            let count = command_argv_slots(cmd, &mut slots);
+            run_with_startup(
+                initrd,
+                WC_PATH.as_bytes(),
+                b"wc",
+                Some(&slots[..count]),
+                true,
+            );
         }
     } else if cmd.name == "ls" {
         // ls: one bootstrap channel is moved into x0. Its finite startup message carries
@@ -1573,13 +1697,14 @@ fn eval_command(
         if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
         } else {
-            run_ls_with_startup(initrd);
+            run_with_startup(initrd, LS_PATH.as_bytes(), b"ls", None, true);
         }
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
-        // its arguments via a read-only argv VMO (x1). `cmd.args` is already [program, args…],
-        // i.e. the program's argv with argv[0] = its name. The interactive twin of the boot
-        // autoexec — both drive the same `run_program`.
+        // stdout + its arguments through the bootstrap startup message (x0) — no initrd, so a
+        // plain `run` stays authority-free. `cmd.args` is already [program, args…], i.e. the
+        // program's argv with argv[0] = its name. The interactive twin of the boot autoexec —
+        // both drive the same `run_program`.
         if cmd.args.is_empty() {
             debug_write(b"usage: run <program> [args...]\n".as_ptr(), 31);
         } else {
@@ -1591,14 +1716,30 @@ fn eval_command(
     true
 }
 
-/// Run `ls` with one self-terminating bootstrap startup message. The stdout writer
-/// and a fresh read-only initrd grant are transferred into the message; then Sora
-/// closes the sender before launching the child with the bootstrap receiver moved
-/// into x0. The child can drain the finite set to peer-closed without parking.
-fn run_ls_with_startup(initrd: Handle) {
+/// Run a program with one self-terminating bootstrap startup message. stdout (a channel Sora
+/// pumps to the console after the child exits) is always transferred; `argv` (when `Some`)
+/// attaches a one-shot read-only argv VMO built from its slots, and `grant_initrd` additionally
+/// attaches a read-only initrd alias as `cap0`. Sora closes the sender before launch so the
+/// child drains the finite set to peer-closed without parking, then moves the bootstrap receiver
+/// into the child's `x0`.
+///
+/// This one launcher serves every spawn: the capability-aware coreutils (`cat`/`wc` with argv +
+/// initrd; `ls` with initrd, no argv) and generic `run <program>` (argv, **no** initrd — a plain
+/// `run` is authority-free). Every minted capability is reclaimed on any construction or
+/// admission failure — no authority is stranded and none is inherited ambiently (DESIGN/004).
+/// The set is queued strictly: if any tagged handle fails to enqueue, the launch is abandoned
+/// rather than started with a missing capability.
+fn run_with_startup(
+    initrd: Handle,
+    path: &[u8],
+    name: &[u8],
+    argv: Option<&[&[u8]]>,
+    grant_initrd: bool,
+) {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
-        debug_write(b"ls: stdout unavailable\n".as_ptr(), 23);
+        log(name);
+        log(b": stdout unavailable\n");
         return;
     }
     let stdout_read = Handle(stdout_read_raw as u32);
@@ -1608,51 +1749,77 @@ fn run_ls_with_startup(initrd: Handle) {
     if bootstrap_send_raw == u64::MAX || bootstrap_child_raw == u64::MAX {
         let _ = handle_close(stdout_read);
         let _ = handle_close(stdout_write);
-        debug_write(b"ls: bootstrap unavailable\n".as_ptr(), 26);
+        log(name);
+        log(b": bootstrap unavailable\n");
         return;
     }
     let bootstrap_send = Handle(bootstrap_send_raw as u32);
     let bootstrap_child = Handle(bootstrap_child_raw as u32);
-    let initrd_child_raw = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
-    if initrd_child_raw == 0 || initrd_child_raw == u64::MAX {
+
+    // Mint the requested per-child capabilities: a one-shot read-only argv VMO when the program
+    // takes arguments, and a fresh read-only initrd alias only when the caller grants it.
+    let argv_child_raw = match argv {
+        Some(slots) => argv_transfer_handle(slots),
+        None => 0,
+    };
+    let initrd_child_raw = if grant_initrd {
+        handle_duplicate(initrd, Rights::READ | Rights::TRANSFER)
+    } else {
+        0
+    };
+    let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
+    let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
+    if argv_bad || initrd_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
-        debug_write(b"ls: initrd grant unavailable\n".as_ptr(), 28);
+        if argv.is_some() && !argv_bad {
+            let _ = handle_close(Handle(argv_child_raw as u32));
+        }
+        if grant_initrd && !initrd_bad {
+            let _ = handle_close(Handle(initrd_child_raw as u32));
+        }
+        log(name);
+        log(b": startup grant unavailable\n");
         return;
     }
-    let initrd_child = Handle(initrd_child_raw as u32);
 
-    let stdout_queued =
-        channel_write_with_handle(bootstrap_send, &STARTUP_TAG_STDOUT, 1, stdout_write)
-            == Errno::Ok.status();
-    if !stdout_queued {
-        let _ = handle_close(stdout_write);
+    // Assemble the tagged set: stdout, [argv], [cap0=initrd]. Order is immaterial — the child
+    // installs by tag — but kept as `cat`'s for continuity.
+    let mut tags: [(u8, Handle); 3] = [(0, Handle(0)); 3];
+    let mut expected = 0usize;
+    tags[expected] = (STARTUP_TAG_STDOUT, stdout_write);
+    expected += 1;
+    if argv.is_some() {
+        tags[expected] = (STARTUP_TAG_ARGV, Handle(argv_child_raw as u32));
+        expected += 1;
     }
-    let cap_queued = channel_write_with_handle(bootstrap_send, &STARTUP_TAG_CAP0, 1, initrd_child)
-        == Errno::Ok.status();
-    if !cap_queued {
-        let _ = handle_close(initrd_child);
+    if grant_initrd {
+        tags[expected] = (STARTUP_TAG_CAP0, Handle(initrd_child_raw as u32));
+        expected += 1;
     }
-    let queued = stdout_queued as usize + cap_queued as usize;
 
-    if handle_close(bootstrap_send) != Errno::Ok.status() {
+    let mut queued = 0usize;
+    for &(tag, handle) in &tags[..expected] {
+        if channel_write_with_handle(bootstrap_send, &tag, 1, handle) == Errno::Ok.status() {
+            queued += 1;
+        } else {
+            let _ = handle_close(handle);
+        }
+    }
+
+    let sender_closed = handle_close(bootstrap_send) == Errno::Ok.status();
+    if queued != expected || !sender_closed {
         reclaim_startup_handles(bootstrap_child, Some(queued));
         let _ = handle_close(bootstrap_child);
         let _ = handle_close(stdout_read);
-        debug_write(b"ls: bootstrap close failed\n".as_ptr(), 27);
+        log(name);
+        log(b": startup queue failed\n");
         return;
     }
 
     let flags = ProcessRunFlags::TRANSFER_ARG.bits();
-    let _ = run_elf(
-        initrd,
-        LS_PATH.as_bytes(),
-        bootstrap_child_raw,
-        0,
-        flags,
-        b"ls",
-    );
+    let _ = run_elf(initrd, path, bootstrap_child_raw, 0, flags, name);
 
     if handle_koid(bootstrap_child) == u64::MAX {
         pump_to_console(stdout_read);
@@ -1665,9 +1832,9 @@ fn run_ls_with_startup(initrd: Handle) {
     let _ = handle_close(stdout_read);
 }
 
-/// Recover handles from a startup message that could not be delivered. `Some(n)` is
-/// used only when the sender could not be closed, so exactly the known queued messages
-/// are read without risking a park. With a closed sender, `None` safely drains to EOF.
+/// Recover handles from a startup message that could not be delivered. `Some(n)` drains
+/// exactly the known queued messages without risking a park (including partial construction).
+/// With a closed sender, `None` safely drains to EOF.
 fn reclaim_startup_handles(bootstrap: Handle, count: Option<usize>) {
     let mut tag = [0u8; 1];
     let limit = count.unwrap_or(usize::MAX);
@@ -1693,64 +1860,65 @@ fn pump_to_console(read_end: Handle) {
     }
 }
 
-/// Pack `argv` into the shared scratch VMO and return the read-only handle to grant the
-/// child in `x1`, or `0` for no argv (empty, the VMO unavailable, or argv too large for
-/// the 256-byte buffer). `argv[0]` is the program name (execve convention). The child
-/// `vmo_read`s the handle and walks it with `kumo_abi::unpack_argv`.
-fn build_argv_handle(argv: &[alloc::string::String]) -> u64 {
-    if argv.is_empty() {
+/// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
+const MAX_ARGV: usize = 16;
+
+/// Pack `slots` (each element one argv entry, `slots[0]` = program name) into the shared scratch
+/// VMO and mint a one-shot read+transfer handle suitable for a bootstrap startup message; returns
+/// `0` if the VMO is unavailable or argv overflows the 256-byte buffer. The child `vmo_read`s the
+/// handle and walks it with `kumo_abi::unpack_argv`.
+fn argv_transfer_handle(slots: &[&[u8]]) -> u64 {
+    let Some(vmo) = write_argv(slots) else {
         return 0;
-    }
-    // Collect argv as byte-slices in a bounded, heap-free array, then pack.
-    const MAX_ARGS: usize = 16;
-    let mut slots: [&[u8]; MAX_ARGS] = [b""; MAX_ARGS];
-    let mut count = 0;
-    for arg in argv.iter().take(MAX_ARGS) {
-        slots[count] = arg.as_bytes();
-        count += 1;
-    }
-    write_argv_handle(&slots[..count])
+    };
+    handle_duplicate(vmo, Rights::READ | Rights::TRANSFER)
 }
 
-/// Build argv from a parsed command (`argv[0]` = command name), used by builtins
-/// that launch a native program while granting it an explicit capability.
-fn build_command_argv_handle(cmd: &kumoza::Command) -> u64 {
-    const MAX_ARGS: usize = 16;
-    let mut slots: [&[u8]; MAX_ARGS] = [b""; MAX_ARGS];
+/// Fill `slots` from a parsed command (`argv[0]` = the command name) and return the entry count.
+fn command_argv_slots<'a>(cmd: &'a kumoza::Command, slots: &mut [&'a [u8]; MAX_ARGV]) -> usize {
     slots[0] = cmd.name.as_bytes();
     let mut count = 1;
-    for arg in cmd.args.iter().take(MAX_ARGS - 1) {
+    for arg in cmd.args.iter().take(MAX_ARGV - 1) {
         slots[count] = arg.as_bytes();
         count += 1;
     }
-    write_argv_handle(&slots[..count])
+    count
 }
 
-fn write_argv_handle(argv: &[&[u8]]) -> u64 {
+/// Fill `slots` from a generic `run` argv (`argv[0]` already the program name) and return the count.
+fn string_argv_slots<'a>(
+    argv: &'a [alloc::string::String],
+    slots: &mut [&'a [u8]; MAX_ARGV],
+) -> usize {
+    let mut count = 0;
+    for arg in argv.iter().take(MAX_ARGV) {
+        slots[count] = arg.as_bytes();
+        count += 1;
+    }
+    count
+}
+
+fn write_argv(argv: &[&[u8]]) -> Option<Handle> {
     let vmo = ARGV_VMO.load(Ordering::Relaxed);
-    let vmo_ro = ARGV_VMO_RO.load(Ordering::Relaxed);
-    if vmo == 0 || vmo == u64::MAX || vmo_ro == 0 || vmo_ro == u64::MAX {
-        return 0;
+    if vmo == 0 || vmo == u64::MAX {
+        return None;
     }
     let mut buf = [0u8; 256];
-    let written = match kumo_abi::pack_argv(argv, &mut buf) {
-        Some(n) => n,
-        None => return 0, // argv exceeds the 256-byte VMO; run with none rather than fail
-    };
+    let written = kumo_abi::pack_argv(argv, &mut buf)?;
     // VmoWrite is capped at 256/call; `written <= 256`, so one write suffices. The VMO is
     // reused across runs — a partial write leaves stale tail bytes, but `unpack_argv`
     // bounds its walk by the fresh `argc`, so they are never read.
     if vmo_write(Handle(vmo as u32), 0, buf.as_ptr(), written) != 0 {
-        return 0;
+        return None;
     }
-    vmo_ro
+    Some(Handle(vmo as u32))
 }
 
-/// Run an initrd program: spawn `bin/<argv[0]>` to completion (synchronous, `flags=0` —
-/// the J181 exec-vertical path), handing it `argv` in a read-only VMO (`x1`). `x0` (the
-/// capability slot) is `0` — a plain `run` grants no authority; the `ls` builtin is the
-/// capability-granting launcher. The `bin/` prefix is built into a fixed buffer (no
-/// heap). Returns whether the program ran (false also logs the reason).
+/// Run an initrd program: spawn `bin/<argv[0]>` to completion via the same finite bootstrap
+/// startup message every program now receives. The child gets stdout + a one-shot read-only argv
+/// VMO; it is **not** granted the initrd, so a plain `run` stays authority-free (the `cat`/`wc`/
+/// `ls` builtins are the capability-granting launchers). The `bin/` prefix is built into a fixed
+/// buffer (no heap). Returns whether the spawn was attempted (false also logs the reason).
 fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
     let name = match argv.first() {
         Some(n) => n.as_bytes(),
@@ -1765,8 +1933,10 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
     path[..PREFIX.len()].copy_from_slice(PREFIX);
     path[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
     let full = &path[..PREFIX.len() + name.len()];
-    let argv_handle = build_argv_handle(argv);
-    run_elf(initrd, full, 0, argv_handle, 0, full)
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    let count = string_argv_slots(argv, &mut slots);
+    run_with_startup(initrd, full, full, Some(&slots[..count]), false);
+    true
 }
 
 fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {
