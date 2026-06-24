@@ -200,7 +200,17 @@ extern "C" fn main(
         log_hex(b"drv-i2c-hid: reset error=0x", error as u64);
         kumo_rt::process_exit(1);
     }
-    log(b"drv-i2c-hid: power-on + reset issued\n");
+    // Linux re-issues SET_POWER(On) after RESET (i2c_hid_finish_hwreset, unless
+    // QUIRK_NO_WAKEUP_AFTER_RESET): the reset can leave the device asleep, so wake it again before
+    // expecting input reports. — CORVUS
+    if let Err(error) = controller.write(
+        config.i2c_address,
+        &Command::set_power(descriptor.command_register, PowerState::On),
+    ) {
+        log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error as u64);
+        kumo_rt::process_exit(1);
+    }
+    log(b"drv-i2c-hid: power-on + reset + wake issued\n");
 
     let report_descriptor_len =
         match bounded_report_descriptor_len(descriptor.report_descriptor_length) {
@@ -281,12 +291,12 @@ extern "C" fn main(
         port_wait(port);
         let _ = handle_close(timer);
 
-        if let Err(error) = controller.write_read(
-            config.i2c_address,
-            &descriptor.input_register.to_le_bytes(),
-            &mut input_frame[..input_frame_len],
-        ) {
-            log_hex(b"drv-i2c-hid: input frame transfer error=0x", error as u64);
+        // Fetch the input report with a PLAIN read (Linux i2c_hid_get_input → i2c_master_recv);
+        // addressing the input register first returns the device's "no data" response instead of
+        // the pending report — which is why every earlier poll came back empty. — CORVUS
+        if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
+        {
+            log_hex(b"drv-i2c-hid: input frame read error=0x", error as u64);
             kumo_rt::process_exit(1);
         }
         let input = match input_decoder.decode(&input_frame[..input_frame_len], keyboard.report_id)

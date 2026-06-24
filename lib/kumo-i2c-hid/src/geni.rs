@@ -157,6 +157,20 @@ impl<Io: RegisterIo> Controller<Io> {
         self.write_message(address, written, true)
     }
 
+    /// Fetch an input report with a plain I2C read — no register address written first. This is how
+    /// HID-over-I2C delivers input reports (Linux `i2c_hid_get_input` → `i2c_master_recv`): the
+    /// device presents the pending report at its current pointer, and addressing the input register
+    /// first (as `write_read` does) returns the "no data" response instead. — CORVUS
+    pub fn read(&mut self, address: u8, read: &mut [u8]) -> Result<(), GeniError> {
+        if address > 0x7f {
+            return Err(GeniError::InvalidAddress);
+        }
+        if read.is_empty() {
+            return Err(GeniError::EmptyTransfer);
+        }
+        self.read_message(address, read)
+    }
+
     pub fn into_inner(self) -> Io {
         self.io
     }
@@ -340,6 +354,24 @@ mod tests {
         controller.write_read(0x68, &[1, 0], &mut output).unwrap();
         let fake = controller.into_inner();
         assert_eq!(&fake.tx[..2], &[1, 0]);
+        assert_eq!(output, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn plain_read_fetches_an_input_report_without_a_preceding_write() {
+        // HID-over-I2C input reports are a plain master read — no register address on the wire.
+        let mut fake = FakeRegisters::ready();
+        fake.irqs.extend([IRQ_RX, IRQ_DONE]);
+        fake.values.insert(register::RX_FIFO_STATUS, 2);
+        fake.rx.extend([0x0302_0100, 0x0706_0504]);
+        let mut controller = Controller::new(fake, SourceClock::Mhz19_2, 8).unwrap();
+        let mut output = [0u8; 8];
+        controller.read(0x68, &mut output).unwrap();
+        let fake = controller.into_inner();
+        assert!(
+            fake.tx.is_empty(),
+            "plain read must not write a register address"
+        );
         assert_eq!(output, [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
