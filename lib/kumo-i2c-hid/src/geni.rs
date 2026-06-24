@@ -144,6 +144,19 @@ impl<Io: RegisterIo> Controller<Io> {
         self.read_message(address, read)
     }
 
+    /// Issue a write-only transfer: an HID-over-I2C command (SET_POWER, RESET) that takes no
+    /// response payload, so [`write_read`](Self::write_read)'s non-empty-read guard does not fit.
+    /// — CORVUS
+    pub fn write(&mut self, address: u8, written: &[u8]) -> Result<(), GeniError> {
+        if address > 0x7f {
+            return Err(GeniError::InvalidAddress);
+        }
+        if written.is_empty() {
+            return Err(GeniError::EmptyTransfer);
+        }
+        self.write_message(address, written, true)
+    }
+
     pub fn into_inner(self) -> Io {
         self.io
     }

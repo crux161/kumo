@@ -60,6 +60,21 @@ impl InputProbeDecoder {
         report_id: Option<u8>,
     ) -> Result<InputProbe, InputProbeError> {
         let frame = InputFrame::parse(raw).map_err(InputProbeError::Protocol)?;
+        // A length-0 input frame is the HID-over-I2C reset-complete / empty notification, not a key
+        // report — it is exactly what the device returns to the RESET command during bring-up and
+        // whenever polled with no pending report. Treat it as a benign no-event frame; feeding it to
+        // boot_keyboard_report would wrongly fault as NotBootKeyboardReport. Safe because the driver
+        // polls on a timer yield (not a re-arming IRQ), so no interrupt storm can result. — CORVUS
+        let frame = match frame {
+            InputFrame::Reset => {
+                return Ok(InputProbe {
+                    event_count: 0,
+                    first_pressed_usage: None,
+                    first_pressed_ascii: None,
+                })
+            }
+            frame @ InputFrame::Report(_) => frame,
+        };
         let report = boot_keyboard_report(frame, report_id).map_err(InputProbeError::Protocol)?;
         let events = self
             .decoder
@@ -313,6 +328,21 @@ mod tests {
         let raw = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_input_probe(&raw, None),
+            Ok(InputProbe {
+                event_count: 0,
+                first_pressed_usage: None,
+                first_pressed_ascii: None,
+            })
+        );
+    }
+
+    #[test]
+    fn length_zero_reset_frame_is_a_benign_no_event_frame() {
+        // The RESET-complete sync and any empty poll both arrive as a length-0 frame; they must
+        // decode to a no-event frame, never NotBootKeyboardReport. — CORVUS
+        let reset = [0u8, 0u8];
+        assert_eq!(
+            decode_input_probe(&reset, Some(7)),
             Ok(InputProbe {
                 event_count: 0,
                 first_pressed_usage: None,

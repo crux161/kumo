@@ -107,9 +107,75 @@ const fn word(raw: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([raw[offset], raw[offset + 1]])
 }
 
+/// HID-over-I2C power state operand for `SET_POWER` (spec 1.0 §7.2.8; Linux `I2C_HID_PWR_*`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerState {
+    On = 0x00,
+    Sleep = 0x01,
+}
+
+/// Builds the 4-byte HID-over-I2C commands the driver writes to the command register to bring the
+/// device up. Layout matches the spec 1.0 §7.2 short form and Linux `i2c_hid_encode_command`:
+/// the command-register address as two little-endian bytes, then `report_type << 4 | report_id`,
+/// then the opcode. `SET_POWER` and `RESET` both use report_type=0 and a report_id below 0x0F
+/// (the power state, or 0), so neither needs the extended report-id byte.
+///
+/// Bring-up sequence (Linux `i2c_hid_start_hwreset`): `SET_POWER(On)` then `RESET`; the device
+/// answers RESET with a length-0 input report — the reset-complete sync, decoded as
+/// [`InputFrame::Reset`]. — CORVUS
+pub struct Command;
+
+impl Command {
+    const OPCODE_RESET: u8 = 0x01;
+    const OPCODE_SET_POWER: u8 = 0x08;
+
+    /// `SET_POWER` with the given power state.
+    pub fn set_power(command_register: u16, state: PowerState) -> [u8; 4] {
+        Self::encode(command_register, state as u8, Self::OPCODE_SET_POWER)
+    }
+
+    /// `RESET`. The device signals completion with a length-0 input report.
+    pub fn reset(command_register: u16) -> [u8; 4] {
+        Self::encode(command_register, 0, Self::OPCODE_RESET)
+    }
+
+    fn encode(command_register: u16, report_id: u8, opcode: u8) -> [u8; 4] {
+        let [lo, hi] = command_register.to_le_bytes();
+        // report_type is always 0 here, report_id < 0x0F → short form, no extended id byte.
+        [lo, hi, report_id & 0x0F, opcode]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_power_on_matches_spec_byte_layout() {
+        // cmd-reg 0x0005 LE, report_type/id byte 0x00, SET_POWER opcode 0x08.
+        assert_eq!(
+            Command::set_power(0x0005, PowerState::On),
+            [0x05, 0x00, 0x00, 0x08]
+        );
+    }
+
+    #[test]
+    fn set_power_sleep_carries_state_in_low_nibble() {
+        assert_eq!(
+            Command::set_power(0x0005, PowerState::Sleep),
+            [0x05, 0x00, 0x01, 0x08]
+        );
+    }
+
+    #[test]
+    fn reset_matches_spec_byte_layout() {
+        assert_eq!(Command::reset(0x0005), [0x05, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn command_register_address_is_little_endian() {
+        assert_eq!(Command::reset(0x1234), [0x34, 0x12, 0x00, 0x01]);
+    }
 
     #[test]
     fn parses_the_fixed_hid_descriptor() {
