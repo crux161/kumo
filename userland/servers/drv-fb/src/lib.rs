@@ -148,8 +148,20 @@ impl Console {
         con
     }
 
+    /// True when this console can actually paint: a non-null base over a non-empty extent
+    /// with a usable text grid. A console that fails this must never touch `base` — every
+    /// write path (`clear`, `write_byte`) bails early, so a null/implausible framebuffer
+    /// (e.g. garbage BootInfo geometry, see the `is_plausible` doctrine) raises no fault and
+    /// leaves the HAL console live (DESIGN/002: never hold critical state you cannot paint).
+    fn is_renderable(&self) -> bool {
+        !self.base.is_null() && self.len_px > 0 && self.cols > 0 && self.rows > 0
+    }
+
     /// Fill the whole framebuffer with [`BG`].
     pub fn clear(&mut self) {
+        if !self.is_renderable() {
+            return;
+        }
         for idx in 0..self.len_px {
             unsafe { self.base.add(idx).write_volatile(BG) };
         }
@@ -170,13 +182,15 @@ impl Console {
     /// `\n` and `\r` move it; anything else draws the font's `?` fallback. Wraps at the
     /// right edge and scrolls at the bottom.
     pub fn write_byte(&mut self, b: u8) {
+        // A null/implausible framebuffer must never be dereferenced — `newline`→`scroll`
+        // touches `base` just as the glyph path does, so gate the whole byte here.
+        if !self.is_renderable() {
+            return;
+        }
         match b {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
             _ => {
-                if self.cols == 0 || self.rows == 0 {
-                    return;
-                }
                 if self.col >= self.cols {
                     self.newline();
                 }

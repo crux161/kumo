@@ -19,6 +19,9 @@ pub use initrd::{
     PERSONA_LINUX_HELLO_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
-pub use sys::{Errno, ProcessRunFlags, Status, Syscall, VmarFlags};
+pub use sys::{
+    decode_tlmm_gpio_irq, interrupt_authority_key, tlmm_gpio_irq, tlmm_gpio_irq_window_base, Errno,
+    ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags,
+};
 
 pub const ABI_VERSION: u32 = 1;

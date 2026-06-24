@@ -822,8 +822,8 @@ extern "C" fn sora_main(
                                 res,
                                 config.mmio_base,
                                 config.mmio_length,
-                                0,
-                                0,
+                                kumo_abi::interrupt_authority_key(config.attention_irq),
+                                1,
                             );
                             let (sender, bootstrap) = channel_create_pair();
                             if device_resource == u64::MAX {
@@ -838,8 +838,29 @@ extern "C" fn sora_main(
                                     encoded.len(),
                                     Handle(device_resource as u32),
                                 );
+                                let keyboard_writer =
+                                    handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER);
+                                let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
+                                let keyboard_sent = if keyboard_writer != u64::MAX {
+                                    channel_write_with_handle(
+                                        Handle(sender as u32),
+                                        &tag,
+                                        1,
+                                        Handle(keyboard_writer as u32),
+                                    )
+                                } else {
+                                    Errno::BadHandle.status()
+                                };
                                 if sent != 0 {
+                                    if keyboard_writer != u64::MAX {
+                                        let _ = handle_close(Handle(keyboard_writer as u32));
+                                    }
                                     log(b"drv-i2c-hid: bootstrap send fail\n");
+                                } else if keyboard_sent != 0 {
+                                    if keyboard_writer != u64::MAX {
+                                        let _ = handle_close(Handle(keyboard_writer as u32));
+                                    }
+                                    log(b"drv-i2c-hid: keyboard bootstrap fail\n");
                                 } else if run_elf(
                                     initrd,
                                     kumo_abi::DRV_I2C_HID_PATH.as_bytes(),

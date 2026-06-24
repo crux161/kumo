@@ -37,8 +37,27 @@ use kumo_abi::KoId;
 pub enum Cause {
     /// An EL0 synchronous CPU fault (bad memory access, illegal instruction, …),
     /// carrying the AArch64 syndrome registers: `ESR` (exception class + fault status),
-    /// `ELR` (faulting instruction VA), `FAR` (faulting data address).
-    Fault { esr: u64, elr: u64, far: u64 },
+    /// `ELR` (faulting instruction VA), `FAR` (faulting data address), `LR` (the EL0
+    /// `x30` return address — the *caller* of the faulting function, which pins the
+    /// callsite when `ELR` lands inside a shared leaf like `memcmp`), and `SP` (the EL0
+    /// stack pointer — a wild value flags stack corruption as the fault's true source,
+    /// independent of where `ELR`/`FAR` happen to land).
+    /// Plus a few EL0 GP registers captured from the trap frame: `x0`/`x1` (the first
+    /// arg / sret pointer — the value a faulting `str [xN,#off]` is using), `x19` (a common
+    /// callee-saved pointer holding `self`/sret across calls), and `x29` (the frame pointer,
+    /// to sanity-check the stack). These turn "x0 must be 0x9 (inferred from FAR-offset)"
+    /// into a directly-observed value.
+    Fault {
+        esr: u64,
+        elr: u64,
+        far: u64,
+        lr: u64,
+        sp: u64,
+        x0: u64,
+        x1: u64,
+        x19: u64,
+        x29: u64,
+    },
     /// An abnormal process exit: a `ProcessExit` / `exit_group` with a non-zero code.
     /// A clean `exit(0)` is *not* a disaster and never reaches here.
     Abend { exit_code: u64 },
@@ -151,13 +170,35 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
     });
 
     match ev.cause {
-        Cause::Fault { esr, elr, far } => {
+        Cause::Fault {
+            esr,
+            elr,
+            far,
+            lr,
+            sp,
+            x0,
+            x1,
+            x19,
+            x29,
+        } => {
             emit(b"  cause=FAULT  ESR=");
             emit(&hex64(esr));
             emit(b" ELR=");
             emit(&hex64(elr));
             emit(b" FAR=");
             emit(&hex64(far));
+            emit(b" LR=");
+            emit(&hex64(lr));
+            emit(b" SP=");
+            emit(&hex64(sp));
+            emit(b"\r\n  x0=");
+            emit(&hex64(x0));
+            emit(b" x1=");
+            emit(&hex64(x1));
+            emit(b" x19=");
+            emit(&hex64(x19));
+            emit(b" x29=");
+            emit(&hex64(x29));
             emit(b"\r\n");
         }
         Cause::Abend { exit_code } => {
@@ -311,6 +352,12 @@ mod tests {
                 esr: 2,
                 elr: 3,
                 far: 4,
+                lr: 5,
+                sp: 6,
+                x0: 7,
+                x1: 8,
+                x19: 9,
+                x29: 10,
             },
             Some(KoId(2)),
             true,

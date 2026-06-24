@@ -828,7 +828,16 @@ fn raise_tower_on_abend(exit_code: u64) {
 /// exception — a *user* fault (bad access / illegal instruction). Contain it: terminate just
 /// that thread and switch to the scheduler, so one server's crash never halts the kernel
 /// (DESIGN/002, §5.6). Never returns to the faulting context.
-extern "C" fn fault_hook(esr: u64, elr: u64, far: u64) -> ! {
+extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: *const u64) -> ! {
+    // `frame` is the trap frame `kumo_svc_common` built: x0..x30 at indices 0..30. Pull the
+    // few GP registers that pin a bad-pointer fault (x0 = first arg / `self`, x1, x19 = a
+    // callee-saved pointer holding self/sret across calls, x29 = frame pointer). SAFETY:
+    // `frame` points at the live, fully-populated 31-entry register file on the kernel stack.
+    let (rx0, rx1, rx19, rx29) = if frame.is_null() {
+        (0, 0, 0, 0)
+    } else {
+        unsafe { (*frame.add(0), *frame.add(1), *frame.add(19), *frame.add(29)) }
+    };
     let victim = crate::user_thread::current_process_koid();
     // Identify the supervisor + framebuffer ownership without risking a double-borrow
     // panic: a fault can land mid-SVC while `SoraState` is already borrowed, so use the
@@ -857,7 +866,17 @@ extern "C" fn fault_hook(esr: u64, elr: u64, far: u64) -> ! {
     // the reversed-TOWER banner and `raise` returns, so we fall through to contained
     // teardown: reap it, signal `TERMINATED`, and the supervisor restarts it (DESIGN/002).
     crate::tower::raise(
-        crate::tower::Cause::Fault { esr, elr, far },
+        crate::tower::Cause::Fault {
+            esr,
+            elr,
+            far,
+            lr,
+            sp,
+            x0: rx0,
+            x1: rx1,
+            x19: rx19,
+            x29: rx29,
+        },
         victim,
         fb_owner,
         sora_koid,

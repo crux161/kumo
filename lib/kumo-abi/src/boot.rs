@@ -78,7 +78,7 @@ impl Range {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MemRegionKind {
     Usable = 0,
     Reserved = 1,
@@ -87,13 +87,8 @@ pub enum MemRegionKind {
     Bootloader = 4,
     Kernel = 5,
     Initrd = 6,
+    #[default]
     Unknown = u32::MAX,
-}
-
-impl Default for MemRegionKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[repr(C)]
@@ -105,17 +100,12 @@ pub struct MemRegion {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FramebufferFormat {
     Rgb = 0,
     Bgr = 1,
+    #[default]
     Unknown = u32::MAX,
-}
-
-impl Default for FramebufferFormat {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 #[repr(C)]
@@ -141,7 +131,7 @@ impl Framebuffer {
         const MAX_DIM: u32 = 16384;
         const BYTES_PER_PIXEL: u64 = 4;
         self.phys != 0
-            && self.phys % 4096 == 0
+            && (self.phys & 4095) == 0
             && self.width >= 1
             && self.width <= MAX_DIM
             && self.height >= 1

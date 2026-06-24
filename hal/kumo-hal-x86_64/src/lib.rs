@@ -291,6 +291,12 @@ pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {
     // backend documents the hand-off hazard this guards against; here it is a no-op.
 }
 
+pub fn sync_icache_to_pou(_addr: usize, _len: usize) {
+    // x86_64 instruction fetch snoops the (coherent) D-cache, so freshly-written code is
+    // visible without an explicit I-cache invalidate. The aarch64 backend must clean to
+    // PoC + invalidate the I-cache for VmarMap-loaded child code; here it is a no-op.
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct El0Report {
     pub entered: bool,
@@ -384,7 +390,7 @@ pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 
 /// x86_64 EL0-fault containment is deferred with the rest of the x86 EL0 path; the IDT will
 /// route #PF/#UD/#GP from ring 3 to this hook once it lands (P10). Stubbed for parity.
-pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64) -> !) {}
+pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
 
 pub fn el0_exit(_code: u64) -> ! {
     halt()
@@ -538,6 +544,10 @@ pub fn halt() -> ! {
 
 pub fn spin_once() {
     core::hint::spin_loop();
+}
+
+pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> bool {
+    false
 }
 
 #[cfg(test)]

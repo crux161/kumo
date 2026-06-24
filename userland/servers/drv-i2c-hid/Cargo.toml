@@ -19,8 +19,9 @@ bench = false
 doctest = false
 
 [dependencies]
+kumo-abi.workspace = true
+kumo-hid = { path = "../../../lib/kumo-hid" }
 kumo-i2c-hid = { path = "../../../lib/kumo-i2c-hid" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-kumo-abi.workspace = true
 kumo-rt = { path = "../../kumo-rt" }

@@ -43,6 +43,43 @@ pub enum Syscall {
     FramebufferClaim = 37,
 }
 
+pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
+pub const TLMM_GPIO_PIN_MASK: u32 = 0x0000_0fff;
+pub const TLMM_GPIO_FLAGS_SHIFT: u32 = 12;
+pub const TLMM_GPIO_FLAGS_MASK: u32 = 0x000f_f000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlmmGpioIrq {
+    pub pin: u32,
+    pub flags: u32,
+}
+
+pub const fn tlmm_gpio_irq_window_base(pin: u32) -> u32 {
+    IRQ_KIND_TLMM_GPIO | (pin & TLMM_GPIO_PIN_MASK)
+}
+
+pub const fn tlmm_gpio_irq(pin: u32, flags: u32) -> u32 {
+    tlmm_gpio_irq_window_base(pin) | ((flags << TLMM_GPIO_FLAGS_SHIFT) & TLMM_GPIO_FLAGS_MASK)
+}
+
+pub const fn decode_tlmm_gpio_irq(irq: u32) -> Option<TlmmGpioIrq> {
+    if irq & IRQ_KIND_TLMM_GPIO == 0 {
+        None
+    } else {
+        Some(TlmmGpioIrq {
+            pin: irq & TLMM_GPIO_PIN_MASK,
+            flags: (irq & TLMM_GPIO_FLAGS_MASK) >> TLMM_GPIO_FLAGS_SHIFT,
+        })
+    }
+}
+
+pub const fn interrupt_authority_key(irq: u32) -> u32 {
+    match decode_tlmm_gpio_irq(irq) {
+        Some(gpio) => tlmm_gpio_irq_window_base(gpio.pin),
+        None => irq,
+    }
+}
+
 /// Options for [`Syscall::ProcessRun`].
 ///
 /// Unmarked arguments are copied into the child when they name handles. A
@@ -100,6 +137,16 @@ mod tests {
         assert!(framebuffer.contains(VmarFlags::UNCACHED));
         assert!(!framebuffer.contains(VmarFlags::DEVICE));
         assert_ne!(VmarFlags::UNCACHED.0, VmarFlags::DEVICE.0);
+    }
+
+    #[test]
+    fn tlmm_gpio_irq_carries_pin_and_flags_but_authorizes_by_line() {
+        let irq = tlmm_gpio_irq(104, 8);
+        assert_eq!(
+            decode_tlmm_gpio_irq(irq),
+            Some(TlmmGpioIrq { pin: 104, flags: 8 })
+        );
+        assert_eq!(interrupt_authority_key(irq), tlmm_gpio_irq_window_base(104));
     }
 }
 

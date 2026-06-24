@@ -2,7 +2,10 @@ use alloc::vec::Vec;
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
-use kumo_abi::{BootInfo, Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall};
+use kumo_abi::{
+    decode_tlmm_gpio_irq, interrupt_authority_key, BootInfo, Errno, Handle, KoId, ObjectKind,
+    Rights, Status, Syscall,
+};
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
 
@@ -224,10 +227,20 @@ fn resource_contains_irq_window(parent: ResourceBinding, irq_base: u32, irq_coun
 
 /// True when the single IRQ `irq` falls within the resource's IRQ window.
 fn resource_contains_irq(parent: ResourceBinding, irq: u32) -> bool {
-    let irq = irq as u64;
+    let irq = interrupt_authority_key(irq) as u64;
     let parent_start = parent.irq_base as u64;
     let parent_end = parent_start + parent.irq_count as u64;
     irq >= parent_start && irq < parent_end
+}
+
+fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
+    let key = interrupt_authority_key(irq);
+    if let Some(gpio) = decode_tlmm_gpio_irq(irq) {
+        if !kumo_hal::active::configure_tlmm_gpio_interrupt(gpio.pin, gpio.flags, key) {
+            return Err(Errno::NotSupported);
+        }
+    }
+    Ok(key)
 }
 
 /// Stored VMO with optional pre-allocated frames for anonymous backing.
@@ -673,6 +686,25 @@ impl SyscallEngine {
                 kumo_hal::active::map_user_page(ttbr0, va, pa, desc, &mut alloc, &mut tables)
             }
             .map_err(|_| Errno::NoMemory)?;
+
+            // Cache-maintain cacheable-RAM pages so EL0 sees what was written. The child's
+            // segment bytes were written through a *data* mapping (Sora's copy / the anon
+            // frame's zeroing); on a core with no I/D coherency (X13s) EL0 would otherwise
+            // read stale RAM, and for code FETCH stale instructions — running garbage where
+            // a register holds a value no instruction wrote (the J… double-TOWER). EL0 can't
+            // self-clean (UCI=0 traps `dc cvac` at EL0), so the kernel does it here, the same
+            // way `build_user_space` flushes the first image. Device/MMIO/uncached pages are
+            // not cacheable RAM and are skipped. `pa` is identity-mapped (cacheable) here.
+            if !device && !uncached {
+                if executable {
+                    kumo_hal::active::sync_icache_to_pou(pa as usize, crate::mm::PAGE_SIZE as usize);
+                } else {
+                    kumo_hal::active::clean_dcache_to_poc(
+                        pa as usize,
+                        crate::mm::PAGE_SIZE as usize,
+                    );
+                }
+            }
 
             page += 1;
         }
@@ -1476,6 +1508,10 @@ impl SyscallEngine {
                 if !resource_contains_irq(res, irq) {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
+                let irq = match configure_interrupt_source(irq) {
+                    Ok(irq) => irq,
+                    Err(error) => return KernelCallResult::Status(error.status()),
+                };
                 let object = self.objects.create(ObjectKind::Interrupt);
                 let handle = match process
                     .handles_mut()
@@ -2003,6 +2039,64 @@ mod tests {
             KernelCall::InterruptCreate {
                 resource: device,
                 irq: 34,
+            },
+        );
+        assert_eq!(
+            outside,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn tlmm_gpio_interrupt_create_is_limited_to_resource_irq_window() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x0894_0000, 0x4000, 0, u32::MAX)
+            .unwrap();
+        let device = match engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x0894_0000,
+                len: 0x4000,
+                irq_base: kumo_abi::tlmm_gpio_irq_window_base(104),
+                irq_count: 1,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected child Resource handle, got {other:?}"),
+        };
+
+        let inside = engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate {
+                resource: device,
+                irq: kumo_abi::tlmm_gpio_irq(104, 8),
+            },
+        );
+        let irq_handle = match inside {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected TLMM GPIO interrupt handle, got {other:?}"),
+        };
+        let irq_koid = process.handles().get(irq_handle).unwrap().koid;
+        engine.signal_interrupt(kumo_abi::tlmm_gpio_irq_window_base(104));
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptWait {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Handle(Handle(1))
+        );
+        assert!(engine.release_interrupt(irq_koid));
+
+        let outside = engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate {
+                resource: device,
+                irq: kumo_abi::tlmm_gpio_irq(105, 8),
             },
         );
         assert_eq!(

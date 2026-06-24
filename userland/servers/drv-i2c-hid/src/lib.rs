@@ -1,8 +1,14 @@
 #![no_std]
 
-use kumo_i2c_hid::{KeyboardTopology, SourceClock};
+use kumo_hid::{DecodeError, Decoder, KeyState};
+use kumo_i2c_hid::{
+    boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError, SourceClock,
+};
 
 const MAGIC: [u8; 4] = *b"I2H1";
+pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
+pub const INPUT_POLL_FRAMES: usize = 32;
+pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,12 +19,54 @@ pub enum ConfigError {
     UnsupportedBusFrequency,
     UnsupportedSourceClock,
     InvalidAddress,
+    InvalidInterrupt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReportProbeError {
     Empty,
     TooLong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputProbeError {
+    InvalidLength,
+    Protocol(ProtocolError),
+    Decode(DecodeError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputProbe {
+    pub event_count: usize,
+    pub first_pressed_usage: Option<u8>,
+    pub first_pressed_ascii: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputProbeDecoder {
+    decoder: Decoder,
+}
+
+impl InputProbeDecoder {
+    pub const fn new() -> Self {
+        Self {
+            decoder: Decoder::new(),
+        }
+    }
+
+    pub fn decode(
+        &mut self,
+        raw: &[u8],
+        report_id: Option<u8>,
+    ) -> Result<InputProbe, InputProbeError> {
+        let frame = InputFrame::parse(raw).map_err(InputProbeError::Protocol)?;
+        let report = boot_keyboard_report(frame, report_id).map_err(InputProbeError::Protocol)?;
+        let events = self
+            .decoder
+            .decode(report)
+            .map_err(InputProbeError::Decode)?;
+        Ok(input_probe_from_events(&events))
+    }
 }
 
 /// Capability-adjacent bootstrap data. Authority remains in the separately transferred Resource.
@@ -30,10 +78,11 @@ pub struct ProbeConfig {
     pub source_clock: SourceClock,
     pub i2c_address: u8,
     pub hid_descriptor_register: u16,
+    pub attention_irq: u32,
 }
 
 impl ProbeConfig {
-    pub const BYTES: usize = 32;
+    pub const BYTES: usize = 36;
 
     pub fn for_x13s(topology: KeyboardTopology) -> Result<Self, ConfigError> {
         let config = Self {
@@ -43,6 +92,10 @@ impl ProbeConfig {
             source_clock: SourceClock::Mhz19_2,
             i2c_address: topology.i2c_address,
             hid_descriptor_register: topology.hid_descriptor_register,
+            attention_irq: kumo_abi::tlmm_gpio_irq(
+                topology.keyboard_interrupt.pin,
+                topology.keyboard_interrupt.flags,
+            ),
         };
         config.validate()?;
         Ok(config)
@@ -57,6 +110,7 @@ impl ProbeConfig {
         raw[24..28].copy_from_slice(&source_clock_hz(self.source_clock).to_le_bytes());
         raw[28] = self.i2c_address;
         raw[29..31].copy_from_slice(&self.hid_descriptor_register.to_le_bytes());
+        raw[32..36].copy_from_slice(&self.attention_irq.to_le_bytes());
         raw
     }
 
@@ -78,6 +132,7 @@ impl ProbeConfig {
             },
             i2c_address: raw[28],
             hid_descriptor_register: u16::from_le_bytes(raw[29..31].try_into().unwrap()),
+            attention_irq: u32::from_le_bytes(raw[32..36].try_into().unwrap()),
         };
         config.validate()?;
         Ok(config)
@@ -96,6 +151,9 @@ impl ProbeConfig {
         }
         if self.i2c_address > 0x7f {
             return Err(ConfigError::InvalidAddress);
+        }
+        if kumo_abi::decode_tlmm_gpio_irq(self.attention_irq).is_none() {
+            return Err(ConfigError::InvalidInterrupt);
         }
         Ok(())
     }
@@ -116,6 +174,40 @@ pub fn bounded_report_descriptor_len(length: u16) -> Result<usize, ReportProbeEr
         Err(ReportProbeError::TooLong)
     } else {
         Ok(length)
+    }
+}
+
+pub fn bounded_input_frame_len(length: u16) -> Result<usize, InputProbeError> {
+    let length = length as usize;
+    if !(2..=MAX_INPUT_FRAME_BYTES).contains(&length) {
+        Err(InputProbeError::InvalidLength)
+    } else {
+        Ok(length)
+    }
+}
+
+pub fn decode_input_probe(
+    raw: &[u8],
+    report_id: Option<u8>,
+) -> Result<InputProbe, InputProbeError> {
+    InputProbeDecoder::new().decode(raw, report_id)
+}
+
+fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
+    let mut first_pressed_usage = None;
+    let mut first_pressed_ascii = None;
+    for event in events.as_slice() {
+        if event.state == KeyState::Pressed {
+            first_pressed_usage = Some(event.usage);
+            first_pressed_ascii = event.symbol.ascii();
+            break;
+        }
+    }
+
+    InputProbe {
+        event_count: events.len(),
+        first_pressed_usage,
+        first_pressed_ascii,
     }
 }
 
@@ -153,6 +245,7 @@ mod tests {
         assert_eq!(config.source_clock, SourceClock::Mhz19_2);
         assert_eq!(config.mmio_base, 0x0089_4000);
         assert_eq!(config.i2c_address, 0x68);
+        assert_eq!(config.attention_irq, kumo_abi::tlmm_gpio_irq(104, 8));
     }
 
     #[test]
@@ -173,6 +266,99 @@ mod tests {
         assert_eq!(
             bounded_report_descriptor_len((MAX_REPORT_DESCRIPTOR_BYTES + 1) as u16),
             Err(ReportProbeError::TooLong)
+        );
+    }
+
+    #[test]
+    fn bounds_input_frame_reads_to_the_probe_buffer() {
+        assert_eq!(
+            bounded_input_frame_len(1),
+            Err(InputProbeError::InvalidLength)
+        );
+        assert_eq!(bounded_input_frame_len(0x22), Ok(0x22));
+        assert_eq!(
+            bounded_input_frame_len((MAX_INPUT_FRAME_BYTES + 1) as u16),
+            Err(InputProbeError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn decodes_one_boot_keyboard_input_frame() {
+        let raw = [10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_input_probe(&raw, None),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: Some(0x04),
+                first_pressed_ascii: Some(b'a'),
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_an_identified_boot_keyboard_input_frame() {
+        let raw = [11, 0, 7, 0, 0, 0x05, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_input_probe(&raw, Some(7)),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: Some(0x05),
+                first_pressed_ascii: Some(b'b'),
+            })
+        );
+    }
+
+    #[test]
+    fn empty_keyboard_report_is_a_decoded_no_event_frame() {
+        let raw = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_input_probe(&raw, None),
+            Ok(InputProbe {
+                event_count: 0,
+                first_pressed_usage: None,
+                first_pressed_ascii: None,
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_report_id_stays_a_protocol_error() {
+        let raw = [11, 0, 2, 0, 0, 0x05, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_input_probe(&raw, Some(7)),
+            Err(InputProbeError::Protocol(ProtocolError::UnexpectedReportId))
+        );
+    }
+
+    #[test]
+    fn stateful_decoder_does_not_repeat_a_held_key() {
+        let mut decoder = InputProbeDecoder::new();
+        let pressed = [10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0];
+        let released = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        assert_eq!(
+            decoder.decode(&pressed, None),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: Some(0x04),
+                first_pressed_ascii: Some(b'a'),
+            })
+        );
+        assert_eq!(
+            decoder.decode(&pressed, None),
+            Ok(InputProbe {
+                event_count: 0,
+                first_pressed_usage: None,
+                first_pressed_ascii: None,
+            })
+        );
+        assert_eq!(
+            decoder.decode(&released, None),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: None,
+                first_pressed_ascii: None,
+            })
         );
     }
 }

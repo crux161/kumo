@@ -316,6 +316,46 @@ pub fn clean_dcache_to_poc(addr: usize, len: usize) {
 #[cfg(not(target_os = "none"))]
 pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {}
 
+/// Make freshly-written **code** bytes fetchable at the same physical address: clean the
+/// D-cache to PoC (so the writes reach unified memory) then invalidate the I-cache to PoU
+/// over the range. Required whenever the kernel populates a page that EL0 will *execute*
+/// but wrote through a *data* mapping — notably [`VmarMap`]-loaded child images (drv-fb &c).
+/// Without it, on a core with no I/D coherency (X13s) EL0 fetches stale instructions and
+/// runs garbage — a register holds a value no instruction wrote (the J… double-TOWER).
+/// EL0 cannot do this itself: `SCTLR_EL1.UCI=0` traps `dc cvac`/`ic ivau` at EL0 on X13s.
+/// No-op on the host; harmless on QEMU and on already-coherent memory.
+#[cfg(target_os = "none")]
+pub fn sync_icache_to_pou(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    const LINE: usize = 64;
+    let end = addr.saturating_add(len);
+    // 1) Clean D-cache to PoC so the written bytes are visible to the I-side refill.
+    let mut line = addr & !(LINE - 1);
+    while line < end {
+        // SAFETY: `dc cvac` cleans the line containing a normal-memory VA; it never faults.
+        unsafe {
+            core::arch::asm!("dc cvac, {a}", a = in(reg) line, options(nostack, preserves_flags));
+        }
+        line += LINE;
+    }
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+    // 2) Invalidate I-cache to PoU over the range, then sync the fetch stream.
+    let mut line = addr & !(LINE - 1);
+    while line < end {
+        // SAFETY: `ic ivau` invalidates the I-cache line for a normal-memory VA; never faults.
+        unsafe {
+            core::arch::asm!("ic ivau, {a}", a = in(reg) line, options(nostack, preserves_flags));
+        }
+        line += LINE;
+    }
+    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sync_icache_to_pou(_addr: usize, _len: usize) {}
+
 /// Blit one printable ASCII glyph (the 8x16 PSF cell). Thin wrapper over
 /// [`blit_glyph_rows`]; the box-drawing path shares the same single-width blit.
 ///
@@ -1462,13 +1502,16 @@ pub mod el0 {
 
     /// The kernel's EL0-fault handler, registered via [`set_fault_hook`]. Called when a
     /// lower-EL (EL0) thread takes a non-SVC synchronous exception — a *user* fault (bad
-    /// access, illegal instruction). It receives `(esr, elr, far)` and must NOT return: it
+    /// access, illegal instruction). It receives `(esr, elr, far, lr, sp)` and must NOT return: it
     /// terminates the faulting thread and switches away, so one process's crash never halts
-    /// the kernel (DESIGN/002). 0 means "not installed" → fall back to the Tower halt.
+    /// the kernel (DESIGN/002). It receives `(esr, elr, far, lr, sp)` — `lr` is the faulting
+    /// thread's EL0 `x30`, which pins the callsite when `elr` lands inside a shared leaf
+    /// like `memcmp`; `sp` is the EL0 stack pointer, whose wildness flags stack corruption
+    /// as the true source. 0 means "not installed" → fall back to the Tower halt.
     static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
 
     /// Register the kernel's EL0-fault handler (see [`FAULT_HOOK`]).
-    pub fn set_fault_hook(hook: extern "C" fn(u64, u64, u64) -> !) {
+    pub fn set_fault_hook(hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {
         FAULT_HOOK.store(hook as usize, Ordering::Release);
     }
 
@@ -1795,6 +1838,9 @@ pub mod el0 {
         "  mrs  x0, esr_el1",
         "  mrs  x1, elr_el1",
         "  mrs  x2, far_el1",
+        "  ldr  x3, [sp, #240]", // EL0 x30 (LR): the faulting fn's caller — pins the callsite
+        "  ldr  x4, [sp, #264]", // EL0 SP (saved sp_el0): a wild value flags stack corruption
+        "  mov  x5, sp",         // trap frame base: x0..x30 at [sp+0..]; lets the hook dump GPRs
         "  bl   kumo_el0_fault",
         // Unhandled (no hook): the Tower.
         "  mrs  x1, esr_el1",
@@ -1845,13 +1891,14 @@ pub mod el0 {
     /// (it terminates the faulting thread and never returns); otherwise return so the
     /// vector falls through to the Tower (an *unhandled* fault still halts, as before).
     #[no_mangle]
-    extern "C" fn kumo_el0_fault(esr: u64, elr: u64, far: u64) {
+    extern "C" fn kumo_el0_fault(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: *const u64) {
         let hook = FAULT_HOOK.load(Ordering::Acquire);
         if hook != 0 {
-            // SAFETY: FAULT_HOOK only ever holds an `extern "C" fn(u64,u64,u64) -> !` set by
-            // `set_fault_hook`.
-            let hook: extern "C" fn(u64, u64, u64) -> ! = unsafe { core::mem::transmute(hook) };
-            hook(esr, elr, far);
+            // SAFETY: FAULT_HOOK only ever holds an
+            // `extern "C" fn(u64,u64,u64,u64,u64,*const u64) -> !` set by `set_fault_hook`.
+            let hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> ! =
+                unsafe { core::mem::transmute(hook) };
+            hook(esr, elr, far, lr, sp, frame);
         }
         // No hook installed: return to the vector, which branches to the Tower.
     }
@@ -1950,6 +1997,16 @@ pub mod el0 {
                     // SAFETY: clean this code frame to PoC + drop the I-cache so EL0 fetches
                     // the bytes we just wrote (the loader does the same for the kernel image).
                     unsafe { flush_for_exec(frame, PAGE_4K as usize) };
+                } else {
+                    // Non-executable segments (.rodata / .data / .bss) need the SAME clean to
+                    // PoC, just without the I-cache drop. We copied (or zeroed) these bytes
+                    // through the cacheable identity alias; EL0 reads them through TTBR0, a
+                    // different VA over the same physical page. On a core without hardware
+                    // coherency (X13s) the writes linger in the loader's L1 dcache, so EL0
+                    // would read STALE RAM — a const `&str`'s bytes come back as garbage and a
+                    // pointer reads as e.g. 0x9 (the J… double-TOWER). QEMU is coherent and
+                    // never shows this. Clean every loaded frame, not just code.
+                    super::clean_dcache_to_poc(frame as usize, PAGE_4K as usize);
                 }
                 if page == last {
                     break;
@@ -2187,7 +2244,7 @@ pub fn run_el0_image(
 pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 
 #[cfg(not(target_os = "none"))]
-pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64) -> !) {}
+pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
 
 #[cfg(not(target_os = "none"))]
 pub fn el0_exit(_code: u64) -> ! {
@@ -2285,6 +2342,14 @@ const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1;
 const GICD_CTLR_ARE_NS: u32 = 1 << 4;
 #[cfg(target_os = "none")]
 const GICD_CTLR_RWP: u32 = 1 << 31;
+#[cfg(target_os = "none")]
+const GICD_IGROUPR0: u64 = 0x0080;
+#[cfg(target_os = "none")]
+const GICD_ISENABLER0: u64 = 0x0100;
+#[cfg(target_os = "none")]
+const GICD_ICENABLER0: u64 = 0x0180;
+#[cfg(target_os = "none")]
+const GICD_IPRIORITYR: u64 = 0x0400;
 
 #[cfg(target_os = "none")]
 const GICR_TYPER: u64 = 0x0008;
@@ -2310,6 +2375,33 @@ const GICR_IPRIORITYR: u64 = GICR_SGI_BASE + 0x0400;
 static TIMER_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(0);
 static TIMER_IRQ_ID: AtomicU32 = AtomicU32::new(TIMER_VIRTUAL_PPI);
+#[cfg(target_os = "none")]
+static GIC_DISTRIBUTOR_BASE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+const TLMM_BASE: u64 = 0x0f10_0000;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_STRIDE: u64 = 0x1000;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_INTR_CFG: u64 = 0x008;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_INTR_STATUS: u64 = 0x00c;
+#[cfg(target_os = "none")]
+const TLMM_PARENT_IRQ: u32 = 32 + 0xd0;
+#[cfg(target_os = "none")]
+const TLMM_GPIO_FLAG_LEVEL_LOW: u32 = 8;
+#[cfg(target_os = "none")]
+const TLMM_INTR_ENABLE: u32 = 1 << 0;
+#[cfg(target_os = "none")]
+const TLMM_INTR_POLARITY: u32 = 1 << 1;
+#[cfg(target_os = "none")]
+const TLMM_INTR_RAW_STATUS_EN: u32 = 1 << 4;
+#[cfg(target_os = "none")]
+const TLMM_INTR_TARGET_APPS: u32 = 3 << 5;
+#[cfg(target_os = "none")]
+static TLMM_GPIO_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
+#[cfg(target_os = "none")]
+static TLMM_GPIO_IRQ_KEY: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {
@@ -2635,6 +2727,7 @@ fn read_string(strings: &[u8], offset: usize) -> Option<&str> {
 
 #[cfg(target_os = "none")]
 unsafe fn gicv3_init(config: &Gicv3Config) {
+    GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
     let redist = unsafe { current_redistributor(config) };
     let timer_bit = 1u32 << config.timer_irq;
 
@@ -2880,6 +2973,7 @@ fn parse_gicv2_reg(data: &[u8], address_cells: u32, size_cells: u32) -> Option<G
 
 #[cfg(target_os = "none")]
 unsafe fn gicv2_init(config: &Gicv2Config) {
+    GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
     let timer_bit = 1u32 << (config.timer_irq % 32);
     let bank = (config.timer_irq / 32) as u64 * 4;
 
@@ -3087,6 +3181,13 @@ fn on_irq(intid: u32) {
             unsafe { virtual_timer_program(period) };
         }
     }
+    let irq_hook = INTERRUPT_HOOK.load(ORD);
+    if intid == TLMM_PARENT_IRQ && irq_hook != 0 {
+        if let Some(irq_key) = unsafe { tlmm_gpio_ack_pending() } {
+            let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+            irq_hook(irq_key);
+        }
+    }
     // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
     // leaves this IRQ active across threads.
     unsafe { eoi(intid) };
@@ -3097,12 +3198,77 @@ fn on_irq(intid: u32) {
             let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
             hook();
         }
-        let irq_hook = INTERRUPT_HOOK.load(ORD);
         if irq_hook != 0 {
             let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
             irq_hook(intid);
         }
+    } else if intid != TLMM_PARENT_IRQ && irq_hook != 0 {
+        let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+        irq_hook(intid);
     }
+}
+
+#[cfg(target_os = "none")]
+pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool {
+    if flags != TLMM_GPIO_FLAG_LEVEL_LOW {
+        return false;
+    }
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 || pin > 0xe5 {
+        return false;
+    }
+    unsafe {
+        tlmm_gpio_configure_level_low(pin);
+        gic_configure_spi(gicd, TLMM_PARENT_IRQ);
+    }
+    TLMM_GPIO_PIN.store(pin, ORD);
+    TLMM_GPIO_IRQ_KEY.store(irq_key, ORD);
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> bool {
+    true
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    let cfg = TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS;
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg & !TLMM_INTR_POLARITY) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_ack_pending() -> Option<u32> {
+    let pin = TLMM_GPIO_PIN.load(ORD);
+    let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
+    if pin == u32::MAX || irq_key == 0 {
+        return None;
+    }
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
+        return None;
+    }
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    Some(irq_key)
+}
+
+#[cfg(target_os = "none")]
+unsafe fn gic_configure_spi(gicd: u64, irq: u32) {
+    let gicd = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(gicd + GICD_ICENABLER0 + bank, bit) };
+    let group = unsafe { mmio_read32(gicd + GICD_IGROUPR0 + bank) } | bit;
+    unsafe { mmio_write32(gicd + GICD_IGROUPR0 + bank, group) };
+    unsafe { mmio_write8(gicd + GICD_IPRIORITYR + irq as u64, 0x80) };
+    unsafe { mmio_write32(gicd + GICD_ISENABLER0 + bank, bit) };
+}
+
+#[cfg(target_os = "none")]
+const fn mmio_phys(phys: u64) -> u64 {
+    mmu::PHYSMAP_BASE + phys
 }
 
 #[cfg(target_os = "none")]

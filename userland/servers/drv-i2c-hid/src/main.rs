@@ -2,10 +2,16 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use drv_i2c_hid::{bounded_report_descriptor_len, ProbeConfig, MAX_REPORT_DESCRIPTOR_BYTES};
+use drv_i2c_hid::{
+    bounded_input_frame_len, bounded_report_descriptor_len, InputProbeDecoder, InputProbeError,
+    ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{find_boot_keyboard, Controller, HidDescriptor, RegisterIo};
-use kumo_rt::{channel_read_with_handle, debug_write, resource_mint_mmio, vmar_map};
+use kumo_rt::{
+    channel_read_with_handle, channel_write, debug_write, interrupt_create, interrupt_wait,
+    resource_mint_mmio, vmar_map,
+};
 
 kumo_rt::entry!(main);
 
@@ -56,6 +62,18 @@ fn log_hex(label: &[u8], mut value: u64) {
     log(b"\n");
 }
 
+fn log_input_probe_error(error: InputProbeError) {
+    match error {
+        InputProbeError::InvalidLength => log(b"drv-i2c-hid: input frame length invalid\n"),
+        InputProbeError::Protocol(error) => {
+            log_hex(b"drv-i2c-hid: input frame protocol error=0x", error as u64);
+        }
+        InputProbeError::Decode(error) => {
+            log_hex(b"drv-i2c-hid: input frame decode error=0x", error as u64);
+        }
+    }
+}
+
 #[no_mangle]
 extern "C" fn main(
     _arg0: u64,
@@ -83,6 +101,15 @@ extern "C" fn main(
         }
     };
     log(b"drv-i2c-hid: config ok\n");
+
+    let mut tag = [0u8; 1];
+    let (received, keyboard_raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+    if received != tag.len() || tag[0] != KEYBOARD_BOOTSTRAP_TAG || keyboard_raw == 0 {
+        log(b"drv-i2c-hid: keyboard bootstrap failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let keyboard_channel = Handle(keyboard_raw as u32);
+    log(b"drv-i2c-hid: keyboard channel ok\n");
 
     let resource = Handle(resource_raw as u32);
     let vmo_raw = resource_mint_mmio(resource, config.mmio_base, config.mmio_length);
@@ -188,5 +215,68 @@ extern "C" fn main(
         Some(report_id) => log_hex(b"drv-i2c-hid: keyboard-report-id=0x", report_id as u64),
         None => log(b"drv-i2c-hid: keyboard-report-id=none\n"),
     }
-    kumo_rt::process_exit(0);
+
+    let input_frame_len = match bounded_input_frame_len(descriptor.max_input_length) {
+        Ok(length) => length,
+        Err(error) => {
+            log_input_probe_error(error);
+            kumo_rt::process_exit(1);
+        }
+    };
+    log_hex(
+        b"drv-i2c-hid: attention-irq=0x",
+        config.attention_irq as u64,
+    );
+    let attention_irq_raw = interrupt_create(resource, config.attention_irq);
+    if attention_irq_raw == u64::MAX {
+        log(b"drv-i2c-hid: attention interrupt create failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let attention_irq = Handle(attention_irq_raw as u32);
+
+    let mut input_decoder = InputProbeDecoder::new();
+    let mut input_frame = [0u8; MAX_INPUT_FRAME_BYTES];
+    let mut decoded_frames = 0usize;
+    let mut forwarded_bytes = 0usize;
+    log(b"drv-i2c-hid: attention interrupt ready\n");
+    loop {
+        if interrupt_wait(attention_irq) == 0 {
+            log(b"drv-i2c-hid: attention interrupt wait failed\n");
+            kumo_rt::process_exit(1);
+        }
+        if let Err(error) = controller.write_read(
+            config.i2c_address,
+            &descriptor.input_register.to_le_bytes(),
+            &mut input_frame[..input_frame_len],
+        ) {
+            log_hex(b"drv-i2c-hid: input frame transfer error=0x", error as u64);
+            kumo_rt::process_exit(1);
+        }
+        let input = match input_decoder.decode(&input_frame[..input_frame_len], keyboard.report_id)
+        {
+            Ok(input) => input,
+            Err(error) => {
+                log_input_probe_error(error);
+                kumo_rt::process_exit(1);
+            }
+        };
+        decoded_frames += 1;
+        if let Some(ascii) = input.first_pressed_ascii {
+            let byte = [ascii];
+            if channel_write(keyboard_channel, byte.as_ptr(), byte.len()) == 0 {
+                forwarded_bytes += 1;
+                log_hex(b"drv-i2c-hid: key forwarded ascii=0x", ascii as u64);
+            } else {
+                log(b"drv-i2c-hid: keyboard byte forward failed\n");
+                kumo_rt::process_exit(1);
+            }
+        }
+        if decoded_frames == 1 || decoded_frames.is_multiple_of(128) {
+            log_hex(b"drv-i2c-hid: input-frames=0x", decoded_frames as u64);
+            log_hex(
+                b"drv-i2c-hid: keyboard-bytes-forwarded=0x",
+                forwarded_bytes as u64,
+            );
+        }
+    }
 }
