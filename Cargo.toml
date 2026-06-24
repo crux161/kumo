@@ -33,6 +33,7 @@ members = [
     "userland/servers/svc-health",
     "userland/servers/ttyd",
     "userland/sora",
+    "vendor/qrcodegen",
     "xtask",
 ]
 resolver = "2"

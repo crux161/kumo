@@ -128,6 +128,10 @@ pub fn raise(
 pub fn raise_inverted(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: fn(&[u8])) {
     let ev = record(Severity::Inverted, cause, victim, fb_owner);
     emit_banner(&ev, None, emit);
+    // Contained path: one banner, one QR, then return. Unlike the critical halt-loop,
+    // this must not arm the QR emissary replay latch: a live system's later console
+    // output should be able to reclaim the screen after the failure has been made loud.
+    emit_qr(&ev, emit, false);
 }
 
 /// The upright-Tower path: log, then halt and repaint the banner forever. Never returns.
@@ -135,7 +139,7 @@ fn critical(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: fn(&[u8]))
     let ev = record(Severity::Critical, cause, victim, fb_owner);
     let mut pass: u64 = 0;
     loop {
-        emit_banner(&ev, Some(pass), emit);
+        emit_critical_frame(&ev, pass, emit);
         pass = pass.wrapping_add(1);
         // Crude spin so each repaint lingers across several capture frames before the next
         // scrolls it up; no timer/IRQ is safe to touch from a fault/halt path. Mirrors the
@@ -144,6 +148,17 @@ fn critical(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: fn(&[u8]))
             core::hint::spin_loop();
         }
     }
+}
+
+/// Render one halt-loop frame. The QR is deliberately emitted last so any banner repaint that
+/// overlaps its pixels is repaired before the frame lingers for capture.
+fn emit_critical_frame(ev: &Event, pass: u64, emit: fn(&[u8])) {
+    emit_banner(ev, Some(pass), emit);
+    emit_qr(ev, emit, qr_sticky_for(ev.severity));
+}
+
+fn qr_sticky_for(severity: Severity) -> bool {
+    matches!(severity, Severity::Critical)
 }
 
 /// Render one copy of the TOWER banner via `emit`. `pass` is `Some(n)` for the upright
@@ -221,6 +236,118 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
             emit(b" logged - reaped; supervisor will restart (DESIGN/002)\r\n");
             emit(b"~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n");
         }
+    }
+}
+
+/// Max bytes of the QR diagnostic payload. The largest event (a `Fault` with all 9 registers)
+/// is ~260 bytes of `label=0x…hex`; 512 leaves generous headroom. Stack-only — no alloc, in
+/// keeping with the fault-context discipline (the QR encoder itself runs in the HAL, off this
+/// frame).
+const QR_PAYLOAD_CAP: usize = 512;
+
+/// Build a compact ASCII dump of the event into a stack buffer and hand it to the HAL to render
+/// as an on-screen QR (top-right of the framebuffer). Same fields as the text banner, so a
+/// single phone photo of the panic screen decodes to the *exact* dump — no hand-transcribing
+/// blurry green zeros (the X13s has no usable serial). No-op where there is no framebuffer
+/// (the HAL gates on that). Best-effort: the payload is silently truncated if it ever overflows,
+/// and the text banner — emitted first — is always the reliable channel.
+fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
+    struct Buf {
+        bytes: [u8; QR_PAYLOAD_CAP],
+        len: usize,
+    }
+    impl Buf {
+        fn push(&mut self, s: &[u8]) {
+            let n = s.len().min(QR_PAYLOAD_CAP - self.len);
+            self.bytes[self.len..self.len + n].copy_from_slice(&s[..n]);
+            self.len += n;
+        }
+    }
+    let mut b = Buf {
+        bytes: [0; QR_PAYLOAD_CAP],
+        len: 0,
+    };
+
+    // Framebuffer geometry: print it in the (reliable) text banner *and* fold it into the QR,
+    // so even a boot where the QR lands off-screen still reveals the real panel dimensions —
+    // ground truth for tuning placement. Hex to reuse the no-alloc `hex64`.
+    let (fb_w, fb_h, fb_stride) = kumo_hal::active::fb_geometry();
+    emit(b"  fbgeom w=");
+    emit(&hex64(fb_w as u64));
+    emit(b" h=");
+    emit(&hex64(fb_h as u64));
+    emit(b" stride=");
+    emit(&hex64(fb_stride as u64));
+    emit(b"\r\n");
+
+    b.push(b"KUMO TOWER\n");
+    b.push(b"fbgeom w=");
+    b.push(&hex64(fb_w as u64));
+    b.push(b" h=");
+    b.push(&hex64(fb_h as u64));
+    b.push(b" stride=");
+    b.push(&hex64(fb_stride as u64));
+    b.push(b"\n");
+    b.push(match ev.severity {
+        Severity::Critical => b"sev=CRITICAL\n" as &[u8],
+        Severity::Inverted => b"sev=INVERTED\n",
+    });
+    b.push(b"koid=");
+    match ev.victim {
+        Some(k) => b.push(&hex64(k.0)),
+        None => b.push(b"<none>"),
+    }
+    b.push(if ev.fb_owner {
+        b" fbowner=1\n"
+    } else {
+        b" fbowner=0\n"
+    });
+
+    match ev.cause {
+        Cause::Fault {
+            esr,
+            elr,
+            far,
+            lr,
+            sp,
+            x0,
+            x1,
+            x19,
+            x29,
+        } => {
+            b.push(b"FAULT\nesr=");
+            b.push(&hex64(esr));
+            b.push(b" elr=");
+            b.push(&hex64(elr));
+            b.push(b" far=");
+            b.push(&hex64(far));
+            b.push(b"\nlr=");
+            b.push(&hex64(lr));
+            b.push(b" sp=");
+            b.push(&hex64(sp));
+            b.push(b"\nx0=");
+            b.push(&hex64(x0));
+            b.push(b" x1=");
+            b.push(&hex64(x1));
+            b.push(b"\nx19=");
+            b.push(&hex64(x19));
+            b.push(b" x29=");
+            b.push(&hex64(x29));
+            b.push(b"\n");
+        }
+        Cause::Abend { exit_code } => {
+            b.push(b"ABEND exit=");
+            b.push(&hex64(exit_code));
+            b.push(b"\n");
+        }
+    }
+    b.push(b"seq=");
+    b.push(&hex64(ev.seq));
+
+    if sticky {
+        kumo_hal::active::render_qr_diag(&b.bytes[..b.len]);
+    } else {
+        kumo_hal::active::render_qr_diag_once(&b.bytes[..b.len]);
     }
 }
 
@@ -368,5 +495,50 @@ mod tests {
         // Visited oldest-first and strictly increasing.
         assert!(seqs.windows(2).all(|w| w[0] < w[1]));
         assert!(seqs.contains(&before));
+    }
+
+    #[test]
+    fn critical_frame_emits_qr_after_banner() {
+        use std::sync::Mutex;
+
+        static EMIT_BUF: Mutex<alloc::vec::Vec<u8>> = Mutex::new(alloc::vec::Vec::new());
+
+        fn capture_emit(bytes: &[u8]) {
+            EMIT_BUF.lock().unwrap().extend_from_slice(bytes);
+        }
+
+        let ev = Event {
+            seq: 0,
+            severity: Severity::Critical,
+            cause: Cause::Abend { exit_code: 0x2a },
+            victim: Some(KoId(2)),
+            fb_owner: true,
+        };
+
+        {
+            let mut buf = EMIT_BUF.lock().unwrap();
+            buf.clear();
+        }
+        emit_critical_frame(&ev, 3, capture_emit);
+        let buf = EMIT_BUF.lock().unwrap();
+
+        let banner = find_bytes(&buf, b"TOWER: SYSTEM-CRITICAL PROCESS DEATH").unwrap();
+        let repaint = find_bytes(&buf, b"HALT (repaint=0x0000000000000003)").unwrap();
+        let qr_diag = find_bytes(&buf, b"fbgeom w=").unwrap();
+
+        assert!(banner < repaint);
+        assert!(repaint < qr_diag);
+    }
+
+    #[test]
+    fn qr_replay_latch_is_only_for_critical_tower() {
+        assert!(qr_sticky_for(Severity::Critical));
+        assert!(!qr_sticky_for(Severity::Inverted));
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }

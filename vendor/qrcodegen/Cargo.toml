@@ -1,0 +1,13 @@
+# Vendored copy of qrcodegen 1.8.0 (Project Nayuki, MIT), patched to no_std + alloc for the
+# kernel TOWER QR diagnostic renderer. See src/lib.rs header for the (minimal) changes.
+# Kept in-tree on purpose: KUMO takes no crates.io registry dependencies.
+[package]
+name = "qrcodegen"
+version = "1.8.0"
+edition = "2018"
+license = "MIT"
+description = "High-quality QR Code generator library (vendored, no_std-patched)"
+repository = "https://github.com/nayuki/QR-Code-generator"
+
+[lib]
+path = "src/lib.rs"

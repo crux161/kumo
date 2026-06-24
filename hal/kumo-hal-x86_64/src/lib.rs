@@ -297,6 +297,18 @@ pub fn sync_icache_to_pou(_addr: usize, _len: usize) {
     // PoC + invalidate the I-cache for VmarMap-loaded child code; here it is a no-op.
 }
 
+/// On-screen TOWER QR diagnostic — aarch64-only (X13s has no serial). No framebuffer panic
+/// renderer on this backend, so it is a no-op; the human-readable banner still prints.
+pub fn render_qr_diag(_text: &[u8]) {}
+
+/// One-shot TOWER QR diagnostic — aarch64-only. No-op on x86_64.
+pub fn render_qr_diag_once(_text: &[u8]) {}
+
+/// Framebuffer geometry getter — no framebuffer console on this backend, so always zeros.
+pub fn fb_geometry() -> (u32, u32, u32) {
+    (0, 0, 0)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct El0Report {
     pub entered: bool,

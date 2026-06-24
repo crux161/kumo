@@ -242,6 +242,14 @@ static FB_KERNEL_OWNER: AtomicBool = AtomicBool::new(true);
 /// holds its current screen. Lets a serial-less target (the X13s) capture a fault dump in a
 /// photo. Set via [`freeze_console`].
 static CONSOLE_FROZEN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "none")]
+const QR_EMISSARY_CAP: usize = 512;
+#[cfg(target_os = "none")]
+static QR_EMISSARY_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "none")]
+static QR_EMISSARY_LEN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "none")]
+static mut QR_EMISSARY_BYTES: [u8; QR_EMISSARY_CAP] = [0; QR_EMISSARY_CAP];
 
 fn font_field(offset: usize) -> usize {
     u32::from_le_bytes([
@@ -281,6 +289,181 @@ unsafe fn fb_clean_line(addr: usize) {
     unsafe {
         core::arch::asm!("dc cvac, {a}", a = in(reg) addr, options(nostack, preserves_flags))
     };
+}
+
+/// On-screen QR diagnostic for the TOWER. Encodes `text` (ASCII) as a QR code and blits it to
+/// the centre of the framebuffer, so a single phone photo of the panic screen decodes to the
+/// exact dump bytes — no hand-transcription of blurry green zeros (the X13s has no usable
+/// serial, so the glass is the only output). Best-effort and *secondary* to the human-readable
+/// banner the caller emits first: if there is no framebuffer or encoding fails, this is a
+/// no-op and the text banner still stands.
+///
+/// Uses `alloc` (qrcodegen owns a `Vec` module grid). Safe here despite [`crate::tower`]'s
+/// no-alloc discipline: a TOWER is raised from an EL0-fault / contained-teardown path, which
+/// interrupts *EL0* code — the single-core kernel heap is quiescent, never mid-allocation.
+#[cfg(target_os = "none")]
+pub fn render_qr_diag(text: &[u8]) {
+    if !FB_PRESENT.load(ORD) {
+        return;
+    }
+    latch_qr_emissary(text);
+    repaint_qr_emissary();
+}
+
+/// Draw a QR diagnostic once without arming the emissary replay latch. Used by
+/// contained/reversed TOWER events: they must be visible, but a live system's
+/// later console output should be allowed to reclaim the screen.
+#[cfg(target_os = "none")]
+pub fn render_qr_diag_once(text: &[u8]) {
+    if !FB_PRESENT.load(ORD) {
+        return;
+    }
+    let Ok(s) = core::str::from_utf8(text) else {
+        return;
+    };
+    if let Ok(qr) = qrcodegen::QrCode::encode_text(s, qrcodegen::QrCodeEcc::Low) {
+        draw_qr_code(&qr);
+    }
+}
+
+#[cfg(target_os = "none")]
+fn latch_qr_emissary(text: &[u8]) {
+    let n = text.len().min(QR_EMISSARY_CAP);
+    QR_EMISSARY_ACTIVE.store(false, ORD);
+    unsafe {
+        QR_EMISSARY_BYTES[..n].copy_from_slice(&text[..n]);
+    }
+    QR_EMISSARY_LEN.store(n, ORD);
+    QR_EMISSARY_ACTIVE.store(n != 0, ORD);
+}
+
+#[cfg(target_os = "none")]
+fn repaint_qr_emissary() {
+    if !QR_EMISSARY_ACTIVE.load(ORD) || !FB_PRESENT.load(ORD) {
+        return;
+    }
+    let len = QR_EMISSARY_LEN.load(ORD).min(QR_EMISSARY_CAP);
+    let text = unsafe { &QR_EMISSARY_BYTES[..len] };
+    // The TOWER builds an ASCII payload; bail rather than panic if it somehow isn't UTF-8.
+    let Ok(s) = core::str::from_utf8(text) else {
+        return;
+    };
+    if let Ok(qr) = qrcodegen::QrCode::encode_text(s, qrcodegen::QrCodeEcc::Low) {
+        draw_qr_code(&qr);
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn repaint_qr_emissary() {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "none"))]
+struct QrDiagLayout {
+    quiet_zone: usize,
+    scale: usize,
+    total_size_px: usize,
+    x_offset: usize,
+    y_offset: usize,
+}
+
+#[cfg(any(test, target_os = "none"))]
+fn qr_diag_layout(fb_width: usize, fb_height: usize, qr_size: usize) -> Option<QrDiagLayout> {
+    if fb_width == 0 || fb_height == 0 || qr_size == 0 {
+        return None;
+    }
+
+    let quiet_zone = 4usize;
+    let total_modules = qr_size.checked_add(2 * quiet_zone)?;
+    // Keep the QR comfortably inside the visible glass. On the X13s GOP mode
+    // (1920x1200), this targets an ~600px square before module quantisation, leaving
+    // broad top/bottom margins even if the panel edge crops or rotates a little.
+    let target_px = fb_width.min(fb_height) / 2;
+    let scale = (target_px / total_modules).max(1);
+    let total_size_px = total_modules.checked_mul(scale)?;
+    Some(QrDiagLayout {
+        quiet_zone,
+        scale,
+        total_size_px,
+        x_offset: fb_width.saturating_sub(total_size_px) / 2,
+        y_offset: fb_height.saturating_sub(total_size_px) / 2,
+    })
+}
+
+/// Blit a generated QR into the **centre** of the framebuffer, scaled with a generous quiet
+/// zone and margin, then clean the painted region to PoC so the X13s scanout actually shows it.
+#[cfg(target_os = "none")]
+fn draw_qr_code(qr: &qrcodegen::QrCode) {
+    let size = qr.size() as usize;
+    let fb_width = FB_WIDTH.load(ORD) as usize;
+    let fb_height = FB_HEIGHT.load(ORD) as usize;
+    let stride = FB_STRIDE.load(ORD) as usize;
+    let len_px = FB_LEN_PX.load(ORD);
+    let base = (FB_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD)) as *mut u32;
+    if base.is_null() || size == 0 || fb_width == 0 || fb_height == 0 {
+        return;
+    }
+
+    let Some(layout) = qr_diag_layout(fb_width, fb_height, size) else {
+        return;
+    };
+
+    for y in 0..layout.total_size_px {
+        for x in 0..layout.total_size_px {
+            let qr_y = (y / layout.scale) as isize - layout.quiet_zone as isize;
+            let qr_x = (x / layout.scale) as isize - layout.quiet_zone as isize;
+            let is_dark = if qr_x >= 0 && qr_x < size as isize && qr_y >= 0 && qr_y < size as isize
+            {
+                qr.get_module(qr_x as i32, qr_y as i32)
+            } else {
+                false
+            };
+            // Black modules on a white quiet zone — what decoders expect, and it reads cleanly
+            // over the phosphor-green console without inversion.
+            let color = if is_dark { 0x0000_0000 } else { 0x00ff_ffff };
+            let py = layout.y_offset + y;
+            let px = layout.x_offset + x;
+            if py < fb_height && px < fb_width {
+                let idx = py * stride + px;
+                if idx < len_px {
+                    unsafe { base.add(idx).write_volatile(color) };
+                }
+            }
+        }
+    }
+
+    // X13s framebuffer has no I/D coherency with the scanout (see drv-fb coherency history):
+    // clean each painted row to PoC so the QR appears immediately rather than as torn garbage.
+    unsafe {
+        for py in layout.y_offset..(layout.y_offset + layout.total_size_px) {
+            let start_idx = py * stride + layout.x_offset;
+            if start_idx >= len_px {
+                continue;
+            }
+            let end_idx = (start_idx + layout.total_size_px).min(len_px);
+            let mut addr = ((base as usize) + start_idx * 4) & !63;
+            let stop = (base as usize) + end_idx * 4;
+            while addr < stop {
+                fb_clean_line(addr);
+                addr += 64;
+            }
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// Host/non-metal builds have no framebuffer; the QR diagnostic is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn render_qr_diag(_text: &[u8]) {}
+
+/// Host/non-metal builds have no framebuffer; the one-shot QR diagnostic is a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn render_qr_diag_once(_text: &[u8]) {}
+
+/// Current framebuffer geometry `(width, height, stride)` in pixels. The TOWER prints this in
+/// the (reliable) text banner so even a clipped-QR boot reveals the real panel dimensions —
+/// ground truth for the QR placement. Zeros before any framebuffer is set.
+pub fn fb_geometry() -> (u32, u32, u32) {
+    (FB_WIDTH.load(ORD), FB_HEIGHT.load(ORD), FB_STRIDE.load(ORD))
 }
 
 /// Clean `[addr, addr + len)` from the data cache to the point of coherency, then
@@ -708,6 +891,10 @@ fn framebuffer_console_writes_enabled(present: bool, kernel_owner: bool) -> bool
     present && kernel_owner
 }
 
+fn qr_emissary_replays_after_console_write(present: bool, kernel_owner: bool) -> bool {
+    framebuffer_console_writes_enabled(present, kernel_owner)
+}
+
 /// Fill the whole linear framebuffer with `color` (little-endian BGRx u32) and flush it
 /// to RAM. Used as a bring-up backdrop and a "the kernel is executing and this
 /// framebuffer is visible" proof that persists until something repaints over it. Painted
@@ -926,9 +1113,13 @@ pub fn early_console_write(bytes: &[u8]) {
         return;
     }
     if FB_PRESENT.load(ORD) {
-        if framebuffer_console_writes_enabled(true, FB_KERNEL_OWNER.load(ORD)) {
+        let kernel_owner = FB_KERNEL_OWNER.load(ORD);
+        if framebuffer_console_writes_enabled(true, kernel_owner) {
             // The framebuffer is a glyph grid, so decode UTF-8 and look glyphs up per scalar.
             for_each_scalar(bytes, fb_putchar);
+        }
+        if qr_emissary_replays_after_console_write(true, kernel_owner) {
+            repaint_qr_emissary();
         }
         // A framebuffer machine does not imply that the QEMU PL011 exists (the X13s
         // explicitly does not expose it). After handoff, dropping an unroutable
@@ -3327,9 +3518,11 @@ mod traps {
         "  mov x0, #\\idx",
         "  b   kumo_exception_common",
         ".endm",
+        // IRQ slots must branch without touching general registers: they may
+        // interrupt EL0 while x0 still holds a live user pointer. The interrupt
+        // ID comes from `irq_ack` after `kumo_irq_common` has saved the frame.
         ".macro KVEC_IRQ idx",
         ".balign 0x80",
-        "  mov x0, #\\idx",
         "  b   kumo_irq_common",
         ".endm",
         // Lower-EL synchronous: SVC from EL0 (and EL0 faults). Must NOT clobber x0 (a
@@ -3581,6 +3774,26 @@ mod tests {
         assert!(framebuffer_console_writes_enabled(true, true));
         assert!(!framebuffer_console_writes_enabled(true, false));
         assert!(!framebuffer_console_writes_enabled(false, true));
+    }
+
+    #[test]
+    fn qr_emissary_replays_after_kernel_owned_console_writes() {
+        assert!(qr_emissary_replays_after_console_write(true, true));
+        assert!(!qr_emissary_replays_after_console_write(true, false));
+        assert!(!qr_emissary_replays_after_console_write(false, true));
+    }
+
+    #[test]
+    fn qr_diag_layout_centres_x13s_framebuffer() {
+        let layout = qr_diag_layout(1920, 1200, 121).expect("valid QR layout");
+
+        assert_eq!(layout.scale, 4);
+        assert_eq!(layout.total_size_px, 516);
+        assert_eq!(layout.x_offset, 702);
+        assert_eq!(layout.y_offset, 342);
+        assert_eq!(layout.x_offset + layout.total_size_px / 2, 960);
+        assert_eq!(layout.y_offset + layout.total_size_px / 2, 600);
+        assert!(layout.y_offset > 300);
     }
 
     fn scalars<const N: usize>(bytes: &[u8]) -> ([u32; N], usize) {
