@@ -2082,7 +2082,14 @@ pub mod el0 {
     /// (it terminates the faulting thread and never returns); otherwise return so the
     /// vector falls through to the Tower (an *unhandled* fault still halts, as before).
     #[no_mangle]
-    extern "C" fn kumo_el0_fault(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: *const u64) {
+    extern "C" fn kumo_el0_fault(
+        esr: u64,
+        elr: u64,
+        far: u64,
+        lr: u64,
+        sp: u64,
+        frame: *const u64,
+    ) {
         let hook = FAULT_HOOK.load(Ordering::Acquire);
         if hook != 0 {
             // SAFETY: FAULT_HOOK only ever holds an
@@ -3374,7 +3381,7 @@ fn on_irq(intid: u32) {
     }
     let irq_hook = INTERRUPT_HOOK.load(ORD);
     if intid == TLMM_PARENT_IRQ && irq_hook != 0 {
-        if let Some(irq_key) = unsafe { tlmm_gpio_ack_pending() } {
+        if let Some(irq_key) = unsafe { tlmm_gpio_mask_pending() } {
             let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
             irq_hook(irq_key);
         }
@@ -3422,6 +3429,11 @@ pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> b
     true
 }
 
+#[cfg(not(target_os = "none"))]
+pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
+    true
+}
+
 #[cfg(target_os = "none")]
 unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
     let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
@@ -3431,7 +3443,7 @@ unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
 }
 
 #[cfg(target_os = "none")]
-unsafe fn tlmm_gpio_ack_pending() -> Option<u32> {
+unsafe fn tlmm_gpio_mask_pending() -> Option<u32> {
     let pin = TLMM_GPIO_PIN.load(ORD);
     let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
     if pin == u32::MAX || irq_key == 0 {
@@ -3441,8 +3453,24 @@ unsafe fn tlmm_gpio_ack_pending() -> Option<u32> {
     if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
         return None;
     }
-    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    let cfg = unsafe { mmio_read32(base + TLMM_GPIO_INTR_CFG) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg & !TLMM_INTR_ENABLE) };
     Some(irq_key)
+}
+
+#[cfg(target_os = "none")]
+pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
+    let pin = TLMM_GPIO_PIN.load(ORD);
+    if pin == u32::MAX || irq_key != TLMM_GPIO_IRQ_KEY.load(ORD) {
+        return false;
+    }
+    unsafe {
+        let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+        mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1);
+        let cfg = mmio_read32(base + TLMM_GPIO_INTR_CFG);
+        mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg | TLMM_INTR_ENABLE);
+    }
+    true
 }
 
 #[cfg(target_os = "none")]

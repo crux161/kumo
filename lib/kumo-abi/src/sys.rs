@@ -26,21 +26,22 @@ pub enum Syscall {
     ResourceMintMmio = 22,
     InterruptCreate = 23,
     InterruptWait = 24,
-    ClockGet = 25,
-    TimerCreate = 26,
-    FutexWait = 27,
-    FutexWake = 28,
-    DebugWrite = 29,
-    AddressSpaceCreate = 30,
-    ProcessRun = 31,
-    PortBind = 32,
-    HandleKoid = 33,
-    ProcessWait = 34,
-    ResourceCreateChild = 35,
-    PortUnbind = 36,
+    InterruptComplete = 25,
+    ClockGet = 26,
+    TimerCreate = 27,
+    FutexWait = 28,
+    FutexWake = 29,
+    DebugWrite = 30,
+    AddressSpaceCreate = 31,
+    ProcessRun = 32,
+    PortBind = 33,
+    HandleKoid = 34,
+    ProcessWait = 35,
+    ResourceCreateChild = 36,
+    PortUnbind = 37,
     /// Transfer framebuffer text-console ownership from the Stage-A HAL to a
     /// userspace driver holding the matching Resource capability.
-    FramebufferClaim = 37,
+    FramebufferClaim = 38,
 }
 
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
@@ -147,6 +148,12 @@ mod tests {
             Some(TlmmGpioIrq { pin: 104, flags: 8 })
         );
         assert_eq!(interrupt_authority_key(irq), tlmm_gpio_irq_window_base(104));
+    }
+
+    #[test]
+    fn interrupt_complete_occupies_the_designated_syscall_slot() {
+        assert_eq!(Syscall::InterruptComplete as usize, 25);
+        assert_eq!(Syscall::TimerCreate as usize, 27);
     }
 }
 

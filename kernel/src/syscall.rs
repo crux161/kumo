@@ -95,6 +95,9 @@ pub enum KernelCall<'a> {
     InterruptWait {
         interrupt: Handle,
     },
+    InterruptComplete {
+        interrupt: Handle,
+    },
     ResourceMintMmio {
         resource: Handle,
         phys_base: u64,
@@ -183,6 +186,8 @@ struct IrqBinding {
     irq: u32,
     koid: KoId,
     count: u64,
+    requires_complete: bool,
+    outstanding: bool,
 }
 
 /// A one-shot monotonic timer. `fired` retains the level after its deadline so a
@@ -241,6 +246,13 @@ fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
         }
     }
     Ok(key)
+}
+
+fn complete_interrupt_source(irq: u32) -> Result<(), Errno> {
+    if decode_tlmm_gpio_irq(irq).is_some() && !kumo_hal::active::complete_tlmm_gpio_interrupt(irq) {
+        return Err(Errno::NotSupported);
+    }
+    Ok(())
 }
 
 /// Stored VMO with optional pre-allocated frames for anonymous backing.
@@ -451,7 +463,12 @@ impl SyscallEngine {
         let mut i = 0;
         while i < self.interrupts.len() {
             if self.interrupts[i].irq == irq {
+                if self.interrupts[i].requires_complete && self.interrupts[i].outstanding {
+                    i += 1;
+                    continue;
+                }
                 self.interrupts[i].count = self.interrupts[i].count.saturating_add(1);
+                self.interrupts[i].outstanding = true;
                 let koid = self.interrupts[i].koid;
                 #[cfg(target_os = "none")]
                 crate::user_thread::wake_child_waiting_on_interrupt(koid);
@@ -697,7 +714,10 @@ impl SyscallEngine {
             // not cacheable RAM and are skipped. `pa` is identity-mapped (cacheable) here.
             if !device && !uncached {
                 if executable {
-                    kumo_hal::active::sync_icache_to_pou(pa as usize, crate::mm::PAGE_SIZE as usize);
+                    kumo_hal::active::sync_icache_to_pou(
+                        pa as usize,
+                        crate::mm::PAGE_SIZE as usize,
+                    );
                 } else {
                     kumo_hal::active::clean_dcache_to_poc(
                         pa as usize,
@@ -1524,6 +1544,8 @@ impl SyscallEngine {
                     irq,
                     koid: object.koid(),
                     count: 0,
+                    requires_complete: decode_tlmm_gpio_irq(irq).is_some(),
+                    outstanding: false,
                 });
                 KernelCallResult::Handle(handle)
             }
@@ -1547,6 +1569,29 @@ impl SyscallEngine {
                             return KernelCallResult::Handle(Handle(n as u32));
                         }
                         return KernelCallResult::Status(Errno::ShouldWait.status());
+                    }
+                }
+                KernelCallResult::Status(Errno::BadHandle.status())
+            }
+            KernelCall::InterruptComplete { interrupt } => {
+                let entry =
+                    match process
+                        .handles()
+                        .require(interrupt, ObjectKind::Interrupt, Rights::WAIT)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                for binding in &mut self.interrupts {
+                    if binding.koid == entry.koid {
+                        if !binding.outstanding {
+                            return KernelCallResult::Status(Errno::Ok.status());
+                        }
+                        if let Err(error) = complete_interrupt_source(binding.irq) {
+                            return KernelCallResult::Status(error.status());
+                        }
+                        binding.outstanding = false;
+                        return KernelCallResult::Status(Errno::Ok.status());
                     }
                 }
                 KernelCallResult::Status(Errno::BadHandle.status())
@@ -2102,6 +2147,98 @@ mod tests {
         assert_eq!(
             outside,
             KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn tlmm_gpio_interrupt_requires_completion_before_redelivery() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x0894_0000, 0x4000, 0, u32::MAX)
+            .unwrap();
+        let device = match engine.dispatch(
+            &mut process,
+            KernelCall::ResourceCreateChild {
+                parent: root,
+                phys_base: 0x0894_0000,
+                len: 0x4000,
+                irq_base: kumo_abi::tlmm_gpio_irq_window_base(104),
+                irq_count: 1,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected child Resource handle, got {other:?}"),
+        };
+        let irq_handle = match engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate {
+                resource: device,
+                irq: kumo_abi::tlmm_gpio_irq(104, 8),
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected TLMM GPIO interrupt handle, got {other:?}"),
+        };
+        let irq_key = kumo_abi::tlmm_gpio_irq_window_base(104);
+
+        engine.signal_interrupt(irq_key);
+        engine.signal_interrupt(irq_key);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptWait {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Handle(Handle(1))
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptWait {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptComplete {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        engine.signal_interrupt(irq_key);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptWait {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Handle(Handle(1))
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptComplete {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::InterruptComplete {
+                    interrupt: irq_handle
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
         );
     }
 

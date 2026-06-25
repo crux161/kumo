@@ -10,6 +10,7 @@ pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
 pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
+pub const ELAN_VENDOR_ID: u16 = 0x04f3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -43,6 +44,28 @@ pub struct InputProbe {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceQuirks {
+    pub no_wakeup_after_reset: bool,
+    pub bogus_irq: bool,
+}
+
+impl DeviceQuirks {
+    pub const fn for_vendor_product(vendor_id: u16, _product_id: u16) -> Self {
+        if vendor_id == ELAN_VENDOR_ID {
+            Self {
+                no_wakeup_after_reset: true,
+                bogus_irq: true,
+            }
+        } else {
+            Self {
+                no_wakeup_after_reset: false,
+                bogus_irq: false,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputProbeDecoder {
     decoder: Decoder,
 }
@@ -59,20 +82,24 @@ impl InputProbeDecoder {
         raw: &[u8],
         report_id: Option<u8>,
     ) -> Result<InputProbe, InputProbeError> {
+        self.decode_with_quirks(raw, report_id, DeviceQuirks::default())
+    }
+
+    pub fn decode_with_quirks(
+        &mut self,
+        raw: &[u8],
+        report_id: Option<u8>,
+        quirks: DeviceQuirks,
+    ) -> Result<InputProbe, InputProbeError> {
+        if quirks.bogus_irq && raw.len() >= 2 && raw[0] == 0xff && raw[1] == 0xff {
+            return Ok(no_input_probe());
+        }
         let frame = InputFrame::parse(raw).map_err(InputProbeError::Protocol)?;
         // A length-0 input frame is the HID-over-I2C reset-complete / empty notification, not a key
-        // report — it is exactly what the device returns to the RESET command during bring-up and
-        // whenever polled with no pending report. Treat it as a benign no-event frame; feeding it to
-        // boot_keyboard_report would wrongly fault as NotBootKeyboardReport. Safe because the driver
-        // polls on a timer yield (not a re-arming IRQ), so no interrupt storm can result. — CORVUS
+        // report. Treat it as benign only because the driver completes the GPIO attention IRQ after
+        // the plain I2C read has drained the level-low source. — KESTREL
         let frame = match frame {
-            InputFrame::Reset => {
-                return Ok(InputProbe {
-                    event_count: 0,
-                    first_pressed_usage: None,
-                    first_pressed_ascii: None,
-                })
-            }
+            InputFrame::Reset => return Ok(no_input_probe()),
             frame @ InputFrame::Report(_) => frame,
         };
         let report = boot_keyboard_report(frame, report_id).map_err(InputProbeError::Protocol)?;
@@ -208,6 +235,14 @@ pub fn decode_input_probe(
     InputProbeDecoder::new().decode(raw, report_id)
 }
 
+const fn no_input_probe() -> InputProbe {
+    InputProbe {
+        event_count: 0,
+        first_pressed_usage: None,
+        first_pressed_ascii: None,
+    }
+}
+
 fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
     let mut first_pressed_usage = None;
     let mut first_pressed_ascii = None;
@@ -294,6 +329,35 @@ mod tests {
         assert_eq!(
             bounded_input_frame_len((MAX_INPUT_FRAME_BYTES + 1) as u16),
             Err(InputProbeError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn elan_vendor_enables_linux_i2c_hid_quirks() {
+        assert_eq!(
+            DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0x1234),
+            DeviceQuirks {
+                no_wakeup_after_reset: true,
+                bogus_irq: true,
+            }
+        );
+        assert_eq!(
+            DeviceQuirks::for_vendor_product(0x17ef, 0x1234),
+            DeviceQuirks::default()
+        );
+    }
+
+    #[test]
+    fn elan_bogus_irq_frame_is_a_decoded_no_event_frame() {
+        let quirks = DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0);
+        let mut decoder = InputProbeDecoder::new();
+        assert_eq!(
+            decoder.decode_with_quirks(&[0xff, 0xff], Some(7), quirks),
+            Ok(InputProbe {
+                event_count: 0,
+                first_pressed_usage: None,
+                first_pressed_ascii: None,
+            })
         );
     }
 

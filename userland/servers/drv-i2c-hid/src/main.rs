@@ -3,15 +3,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
-    bounded_input_frame_len, bounded_report_descriptor_len, InputProbeDecoder, InputProbeError,
-    ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    bounded_input_frame_len, bounded_report_descriptor_len, DeviceQuirks, InputProbeDecoder,
+    InputProbeError, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
+    MAX_REPORT_DESCRIPTOR_BYTES,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{
     find_boot_keyboard, Command, Controller, HidDescriptor, PowerState, RegisterIo,
 };
 use kumo_rt::{
-    channel_read_with_handle, channel_write, debug_write, handle_close, port_bind, port_create,
+    channel_read_with_handle, channel_write, debug_write, handle_close, handle_koid,
+    interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
     port_wait, resource_mint_mmio, timer_create, vmar_map,
 };
 
@@ -19,9 +21,8 @@ kumo_rt::entry!(main);
 
 const MMIO_VA: u64 = 0x0000_0000_1100_0000;
 const POLL_LIMIT: usize = 1_000_000;
-/// Poll cadence for the input register while interrupt-completion (DESIGN/016) is unbuilt: 10 ms
-/// (~100 Hz), well under a keystroke and cheap on a cooperative scheduler that yields each tick.
-const POLL_INTERVAL_NS: u64 = 10_000_000;
+const POWER_ON_SETTLE_NS: u64 = 60_000_000;
+const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 
 struct MmioRegisters {
     base: *mut u8,
@@ -67,6 +68,21 @@ fn log_hex(label: &[u8], mut value: u64) {
     log(b"\n");
 }
 
+/// Diagnostic: dump raw frame bytes as space-separated hex. Bounded by the caller to the first few
+/// IRQ deliveries / non-empty frames so the framebuffer console is not flooded. — KESTREL
+fn log_frame(label: &[u8], bytes: &[u8]) {
+    log(label);
+    for &byte in bytes {
+        let pair = [
+            b"0123456789abcdef"[(byte >> 4) as usize],
+            b"0123456789abcdef"[(byte & 0xf) as usize],
+            b' ',
+        ];
+        debug_write(pair.as_ptr(), pair.len());
+    }
+    log(b"\n");
+}
+
 fn log_input_probe_error(error: InputProbeError) {
     match error {
         InputProbeError::InvalidLength => log(b"drv-i2c-hid: input frame length invalid\n"),
@@ -77,6 +93,53 @@ fn log_input_probe_error(error: InputProbeError) {
             log_hex(b"drv-i2c-hid: input frame decode error=0x", error as u64);
         }
     }
+}
+
+fn sleep_ns(delay_ns: u64) -> bool {
+    let port_raw = port_create();
+    if port_raw == u64::MAX {
+        return false;
+    }
+    let timer_raw = timer_create(delay_ns);
+    if timer_raw == u64::MAX {
+        let _ = handle_close(Handle(port_raw as u32));
+        return false;
+    }
+    let port = Handle(port_raw as u32);
+    let timer = Handle(timer_raw as u32);
+    let ok = port_bind(port, timer) == 0 && port_wait(port) != 0;
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    ok
+}
+
+fn wait_attention_or_timeout(attention_irq: Handle, timeout_ns: u64) -> bool {
+    let port_raw = port_create();
+    if port_raw == u64::MAX {
+        return false;
+    }
+    let timer_raw = timer_create(timeout_ns);
+    if timer_raw == u64::MAX {
+        let _ = handle_close(Handle(port_raw as u32));
+        return false;
+    }
+    let port = Handle(port_raw as u32);
+    let timer = Handle(timer_raw as u32);
+    if port_bind(port, attention_irq) != 0 || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        let _ = handle_close(port);
+        return false;
+    }
+    let timer_koid = handle_koid(timer);
+    let source = port_wait(port);
+    let _ = port_unbind(port, attention_irq);
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    if source == 0 || source == timer_koid {
+        return false;
+    }
+    interrupt_wait(attention_irq) != 0
 }
 
 #[no_mangle]
@@ -181,11 +244,27 @@ extern "C" fn main(
         descriptor.max_input_length as u64,
     );
 
-    // HID-over-I2C bring-up (spec 1.0 §7.2; order per Linux i2c-hid `i2c_hid_start_hwreset`):
-    // SET_POWER(On) then RESET, written to the command register. The device answers RESET with a
-    // length-0 input report (the reset-complete sync), which the poll loop decodes as a benign
-    // no-event frame. Without this the device stays unstarted and only ever returns that empty
-    // frame — the exact koid-0x2b exit=1 we kept hitting (it never powered on). — CORVUS
+    let quirks = DeviceQuirks::for_vendor_product(descriptor.vendor_id, descriptor.product_id);
+    if quirks.no_wakeup_after_reset {
+        log(b"drv-i2c-hid: elan no-wakeup-after-reset quirk\n");
+    }
+
+    let input_frame_len = match bounded_input_frame_len(descriptor.max_input_length) {
+        Ok(length) => length,
+        Err(error) => {
+            log_input_probe_error(error);
+            kumo_rt::process_exit(1);
+        }
+    };
+    log_hex(b"drv-i2c-hid: irq read size=0x", input_frame_len as u64);
+
+    // Keep the command phase fully observable on metal. The last failed flash stopped after the
+    // read-size line, so every step from SET_POWER through RESET gets a before/after breadcrumb.
+    // Create the GPIO attention object after RESET is on the bus: KUMO's `InterruptCreate` enables
+    // the line immediately, unlike Linux's IRQF_NO_AUTOEN request path. The HID reset-complete
+    // source is level-low-until-drained, so arming after RESET can still catch and drain it while
+    // avoiding a pre-reset asserted line during command writes. — KESTREL
+    log(b"drv-i2c-hid: set-power begin\n");
     if let Err(error) = controller.write(
         config.i2c_address,
         &Command::set_power(descriptor.command_register, PowerState::On),
@@ -193,6 +272,14 @@ extern "C" fn main(
         log_hex(b"drv-i2c-hid: set-power error=0x", error as u64);
         kumo_rt::process_exit(1);
     }
+    log(b"drv-i2c-hid: set-power done\n");
+    log(b"drv-i2c-hid: power-on settle begin\n");
+    if !sleep_ns(POWER_ON_SETTLE_NS) {
+        log(b"drv-i2c-hid: power-on settle wait failed\n");
+        kumo_rt::process_exit(1);
+    }
+    log(b"drv-i2c-hid: power-on settle done\n");
+    log(b"drv-i2c-hid: reset begin\n");
     if let Err(error) = controller.write(
         config.i2c_address,
         &Command::reset(descriptor.command_register),
@@ -200,17 +287,49 @@ extern "C" fn main(
         log_hex(b"drv-i2c-hid: reset error=0x", error as u64);
         kumo_rt::process_exit(1);
     }
-    // Linux re-issues SET_POWER(On) after RESET (i2c_hid_finish_hwreset, unless
-    // QUIRK_NO_WAKEUP_AFTER_RESET): the reset can leave the device asleep, so wake it again before
-    // expecting input reports. — CORVUS
-    if let Err(error) = controller.write(
-        config.i2c_address,
-        &Command::set_power(descriptor.command_register, PowerState::On),
-    ) {
-        log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error as u64);
+    log(b"drv-i2c-hid: reset done\n");
+    let attention_raw = interrupt_create(resource, config.attention_irq);
+    if attention_raw == u64::MAX {
+        log(b"drv-i2c-hid: attention interrupt create failed\n");
         kumo_rt::process_exit(1);
     }
-    log(b"drv-i2c-hid: power-on + reset + wake issued\n");
+    let attention_irq = Handle(attention_raw as u32);
+    log(b"drv-i2c-hid: attention interrupt created\n");
+    let mut input_frame = [0u8; MAX_INPUT_FRAME_BYTES];
+    log(b"drv-i2c-hid: reset sync wait begin\n");
+    if wait_attention_or_timeout(attention_irq, RESET_ACK_TIMEOUT_NS) {
+        if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
+        {
+            log_hex(b"drv-i2c-hid: reset sync read error=0x", error as u64);
+            kumo_rt::process_exit(1);
+        }
+        if interrupt_complete(attention_irq) != 0 {
+            log(b"drv-i2c-hid: reset sync complete failed\n");
+            kumo_rt::process_exit(1);
+        }
+        let reset_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
+        log_hex(b"drv-i2c-hid: reset sync len=0x", reset_len as u64);
+        log_frame(
+            b"drv-i2c-hid: reset raw= ",
+            &input_frame[..input_frame_len.min(16)],
+        );
+    } else {
+        log(b"drv-i2c-hid: reset sync timeout\n");
+    }
+    if !quirks.no_wakeup_after_reset {
+        if let Err(error) = controller.write(
+            config.i2c_address,
+            &Command::set_power(descriptor.command_register, PowerState::On),
+        ) {
+            log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error as u64);
+            kumo_rt::process_exit(1);
+        }
+        if !sleep_ns(POWER_ON_SETTLE_NS) {
+            log(b"drv-i2c-hid: post-reset settle wait failed\n");
+            kumo_rt::process_exit(1);
+        }
+    }
+    log(b"drv-i2c-hid: power-on + reset issued\n");
 
     let report_descriptor_len =
         match bounded_report_descriptor_len(descriptor.report_descriptor_length) {
@@ -252,44 +371,17 @@ extern "C" fn main(
         None => log(b"drv-i2c-hid: keyboard-report-id=none\n"),
     }
 
-    let input_frame_len = match bounded_input_frame_len(descriptor.max_input_length) {
-        Ok(length) => length,
-        Err(error) => {
-            log_input_probe_error(error);
-            kumo_rt::process_exit(1);
-        }
-    };
-    // Poll mode: deliberately do NOT arm the GPIO-104 attention IRQ. That line is level-low, and
-    // the kernel's clear-before-drain ack with no completion primitive storms a cooperative
-    // single-core kernel (DESIGN/016). Until that interrupt-completion lifecycle lands, yield on a
-    // one-shot timer bound to a port and poll the input register. Every failure here is <= the
-    // prior contained exit: a bad transfer exits (contained TOWER, boot proceeds); an idle device
-    // just yields and re-polls — never a storm. Swap to interrupt_wait once DESIGN/016 ships.
-    // — CORVUS
-    let port_raw = port_create();
-    if port_raw == u64::MAX {
-        log(b"drv-i2c-hid: poll port create failed\n");
-        kumo_rt::process_exit(1);
-    }
-    let port = Handle(port_raw as u32);
-
     let mut input_decoder = InputProbeDecoder::new();
-    let mut input_frame = [0u8; MAX_INPUT_FRAME_BYTES];
-    log(b"drv-i2c-hid: poll loop ready\n");
+    log(b"drv-i2c-hid: attention interrupt ready\n");
+    // Keep CORVUS's bounded frame dump on the interrupt path: now each line proves a real GPIO-104
+    // delivery survived mask -> drain -> complete, not just a timer poll. — KESTREL
+    let mut interrupts: u32 = 0;
+    let mut shown_nonempty: u32 = 0;
     loop {
-        // Cooperative yield: a one-shot timer bound to our port, awaited via PortWait.
-        let timer_raw = timer_create(POLL_INTERVAL_NS);
-        if timer_raw == u64::MAX {
-            log(b"drv-i2c-hid: poll timer create failed\n");
+        if interrupt_wait(attention_irq) == 0 {
+            log(b"drv-i2c-hid: attention wait failed\n");
             kumo_rt::process_exit(1);
         }
-        let timer = Handle(timer_raw as u32);
-        if port_bind(port, timer) != 0 {
-            log(b"drv-i2c-hid: poll timer bind failed\n");
-            kumo_rt::process_exit(1);
-        }
-        port_wait(port);
-        let _ = handle_close(timer);
 
         // Fetch the input report with a PLAIN read (Linux i2c_hid_get_input → i2c_master_recv);
         // addressing the input register first returns the device's "no data" response instead of
@@ -299,8 +391,42 @@ extern "C" fn main(
             log_hex(b"drv-i2c-hid: input frame read error=0x", error as u64);
             kumo_rt::process_exit(1);
         }
-        let input = match input_decoder.decode(&input_frame[..input_frame_len], keyboard.report_id)
-        {
+        if interrupt_complete(attention_irq) != 0 {
+            log(b"drv-i2c-hid: attention complete failed\n");
+            kumo_rt::process_exit(1);
+        }
+        // Ground-truth instrumentation. `irq tick` proves the attention line delivered and the
+        // length word shows whether the device supplied a reset/empty frame or report bytes.
+        // `frame=` dumps the first 16 non-empty reports. — KESTREL
+        interrupts = interrupts.wrapping_add(1);
+        let frame_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
+        // Log EVERY delivery (bounded to 64), not just the first 3, so a keypress that produces a
+        // NEW `irq tick` line is visible — this is what distinguishes "no attention IRQ on keypress"
+        // (device not reporting) from "IRQ fires but read is empty". Completion suppresses idle
+        // redelivery, so at idle this is silent; press a key and watch for a new line. — CORVUS
+        if interrupts <= 64 {
+            log_hex(b"drv-i2c-hid: irq tick len=0x", frame_len as u64);
+        }
+        // Dump the raw bytes of the first few reads even when empty, so we can see exactly what a
+        // len=0 read contains on the wire. — CORVUS
+        if interrupts <= 4 {
+            log_frame(
+                b"drv-i2c-hid: raw= ",
+                &input_frame[..input_frame_len.min(16)],
+            );
+        }
+        if frame_len != 0 && shown_nonempty < 16 {
+            shown_nonempty += 1;
+            log_frame(
+                b"drv-i2c-hid: frame= ",
+                &input_frame[..input_frame_len.min(16)],
+            );
+        }
+        let input = match input_decoder.decode_with_quirks(
+            &input_frame[..input_frame_len],
+            keyboard.report_id,
+            quirks,
+        ) {
             Ok(input) => input,
             Err(error) => {
                 log_input_probe_error(error);

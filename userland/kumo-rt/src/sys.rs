@@ -490,6 +490,16 @@ pub fn interrupt_wait(_interrupt: Handle) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+pub fn interrupt_complete(interrupt: Handle) -> Status {
+    syscall(Syscall::InterruptComplete, interrupt.0 as u64, 0, 0, 0) as Status
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn interrupt_complete(_interrupt: Handle) -> Status {
+    0
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
     syscall(
         Syscall::ResourceMintMmio,

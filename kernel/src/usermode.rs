@@ -1094,6 +1094,12 @@ fn dispatch_object_syscall(
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::InterruptComplete as u64 {
+        let interrupt = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::InterruptComplete { interrupt }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::AddressSpaceCreate as u64 {
         let process_handle = Handle(r[0] as u32);
         let stack_virt = r[1];
@@ -1878,6 +1884,8 @@ fn attempt_sora(
     kumo_hal::active::set_fault_hook(fault_hook);
     #[cfg(target_os = "none")]
     kumo_hal::active::set_interrupt_hook(signal_irq);
+    #[cfg(target_os = "none")]
+    crate::user_thread::install_preemption_hook();
     // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
     // a server — or exits (the legacy/fault path).
     unsafe { crate::user_thread::spawn_user(user_state, user_ttbr0) };

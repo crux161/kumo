@@ -483,6 +483,37 @@ pub fn spawn_child_async(
     Errno::Ok.status()
 }
 
+/// Install the live Sora/resident-child scheduler tick. Async children can become
+/// runnable from IRQ context (timers and device interrupts), where no Sora
+/// `ProcessWait` pump necessarily follows. The tick gives those ready children a
+/// normal dispatcher boundary instead of leaving them admitted but never run. — KESTREL
+#[cfg(target_os = "none")]
+pub fn install_preemption_hook() {
+    kumo_hal::active::set_preempt_hook(preempt_tick);
+}
+
+#[cfg(target_os = "none")]
+extern "C" fn preempt_tick() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let started = unsafe { (&*opt).is_some() };
+    if !started {
+        return;
+    }
+
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        if s.done {
+            return;
+        }
+        let decision = s.dispatcher.on_timer_tick();
+        dispatch_context(s, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+}
+
 /// P10-g: pump the resident children. Reschedules so every runnable child runs until it
 /// blocks or exits, then returns: `ShouldWait` while any child is still resident (blocked),
 /// `Ok` once all have exited. A single pump drains all woken children because each one's

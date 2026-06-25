@@ -562,6 +562,10 @@ pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> b
     false
 }
 
+pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
