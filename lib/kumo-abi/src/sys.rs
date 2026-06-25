@@ -148,6 +148,18 @@ mod tests {
             Some(TlmmGpioIrq { pin: 104, flags: 8 })
         );
         assert_eq!(interrupt_authority_key(irq), tlmm_gpio_irq_window_base(104));
+
+        // ELAN re-requests the SAME pin as falling-edge (flag 2); the authority key is pin-based, so
+        // the Resource window minted for the level-low encoding still covers the falling-edge one.
+        let falling = tlmm_gpio_irq(104, 2);
+        assert_eq!(
+            decode_tlmm_gpio_irq(falling),
+            Some(TlmmGpioIrq { pin: 104, flags: 2 })
+        );
+        assert_eq!(
+            interrupt_authority_key(falling),
+            interrupt_authority_key(irq)
+        );
     }
 
     #[test]

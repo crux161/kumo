@@ -178,9 +178,124 @@ pub fn validate_seed(seed: UefiHandoffSeed) -> Result<(), niji_loader::HandoffEr
     niji_loader::validate_boot_info(&boot).map(|_| ())
 }
 
+/// Where Nijigumo should obtain the device tree, per the staged boot config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbSource<'a> {
+    /// Use the firmware-provided DTB from the EFI configuration table — the universal
+    /// handoff that Pi 5 (EDK2 in Device-Tree mode), QEMU/AAVMF, and generic UEFI all
+    /// populate. The default when `dtb` is unspecified.
+    Firmware,
+    /// Load the DTB from this ESP path — an override for boards whose firmware DTB is
+    /// inadequate or absent (e.g. the ThinkPad X13s ships its own).
+    Esp(&'a str),
+}
+
+/// The declarative boot manifest Nijigumo reads from the ESP instead of hardcoding
+/// per-target paths and a DTB search heuristic (the GRUB/systemd-boot model). The KUMO
+/// imager stages one per target image describing exactly what to load, so the bootloader
+/// is handed the right data rather than re-deriving it.
+///
+/// Format: `key = value` lines, `#` comments, blank lines ignored — the same key=value
+/// shape the imager already emits. Unknown keys are ignored (forward-compatible). — CORVUS
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootConfig<'a> {
+    pub kernel: &'a str,
+    pub initrd: Option<&'a str>,
+    pub dtb: DtbSource<'a>,
+}
+
+impl<'a> BootConfig<'a> {
+    /// Parse the config text. Returns `None` if the mandatory `kernel` key is absent.
+    /// `dtb` defaults to [`DtbSource::Firmware`] (the universal handoff); `dtb = firmware`
+    /// is the explicit form and `dtb = esp:<path>` selects an ESP override.
+    pub fn parse(text: &'a str) -> Option<Self> {
+        let mut kernel: Option<&'a str> = None;
+        let mut initrd: Option<&'a str> = None;
+        let mut dtb = DtbSource::Firmware;
+        for raw in text.lines() {
+            let line = match raw.split_once('#') {
+                Some((before, _)) => before,
+                None => raw,
+            }
+            .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "kernel" => kernel = Some(value),
+                "initrd" => initrd = Some(value),
+                "dtb" => {
+                    dtb = if value.eq_ignore_ascii_case("firmware") {
+                        DtbSource::Firmware
+                    } else if let Some(path) = value.strip_prefix("esp:") {
+                        DtbSource::Esp(path.trim())
+                    } else {
+                        DtbSource::Esp(value)
+                    };
+                }
+                _ => {} // forward-compatible: ignore unknown keys
+            }
+        }
+        Some(Self {
+            kernel: kernel?,
+            initrd,
+            dtb,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_x13s_style_config_with_esp_dtb_override() {
+        let cfg = BootConfig::parse(
+            "# nijigumo boot config\n\
+             kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\n\
+             initrd = \\EFI\\KUMO\\initrd.img\n\
+             dtb    = esp:\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.kernel, "\\EFI\\KUMO\\kernel\\kumo-kernel.elf");
+        assert_eq!(cfg.initrd, Some("\\EFI\\KUMO\\initrd.img"));
+        assert_eq!(
+            cfg.dtb,
+            DtbSource::Esp("\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb")
+        );
+    }
+
+    #[test]
+    fn pi5_style_config_uses_firmware_dtb_and_no_initrd() {
+        let cfg =
+            BootConfig::parse("kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\ndtb = firmware\n")
+                .unwrap();
+        assert_eq!(cfg.dtb, DtbSource::Firmware);
+        assert_eq!(cfg.initrd, None);
+    }
+
+    #[test]
+    fn dtb_defaults_to_firmware_and_unknown_keys_are_ignored() {
+        let cfg = BootConfig::parse("kernel = k\nfuture_option = whatever\n").unwrap();
+        assert_eq!(cfg.dtb, DtbSource::Firmware);
+        assert_eq!(cfg.kernel, "k");
+    }
+
+    #[test]
+    fn missing_kernel_is_rejected() {
+        assert_eq!(BootConfig::parse("dtb = firmware\n"), None);
+    }
+
+    #[test]
+    fn comments_and_blank_lines_and_trailing_comments_are_ignored() {
+        let cfg =
+            BootConfig::parse("\n   # a comment\nkernel = k   # trailing comment\n\n").unwrap();
+        assert_eq!(cfg.kernel, "k");
+    }
 
     #[test]
     fn names_the_bootloader() {

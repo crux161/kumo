@@ -2596,6 +2596,16 @@ const TLMM_INTR_POLARITY: u32 = 1 << 1;
 const TLMM_INTR_RAW_STATUS_EN: u32 = 1 << 4;
 #[cfg(target_os = "none")]
 const TLMM_INTR_TARGET_APPS: u32 = 3 << 5;
+// Falling-edge trigger for ELAN i2c-hid (Linux FORCE_TRIGGER_FALLING). DT flag 2 = IRQ_TYPE_EDGE_FALLING.
+// The 2-bit INTR_DECT_CTL field sits at bits 2-3 (between POLARITY@1 and RAW_STATUS_EN@4), i.e.
+// intr_detection_width == 2 on SC8280XP. Per Linux msm_gpio_irq_set_type (width==2): falling edge =
+// detection value 2 with the polarity bit set. — CORVUS
+#[cfg(target_os = "none")]
+const TLMM_GPIO_FLAG_EDGE_FALLING: u32 = 2;
+#[cfg(target_os = "none")]
+const TLMM_INTR_DECT_SHIFT: u32 = 2;
+#[cfg(target_os = "none")]
+const TLMM_INTR_DECT_FALLING: u32 = 2;
 #[cfg(target_os = "none")]
 static TLMM_GPIO_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(target_os = "none")]
@@ -3408,15 +3418,18 @@ fn on_irq(intid: u32) {
 
 #[cfg(target_os = "none")]
 pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool {
-    if flags != TLMM_GPIO_FLAG_LEVEL_LOW {
-        return false;
-    }
     let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
     if gicd == 0 || pin > 0xe5 {
         return false;
     }
     unsafe {
-        tlmm_gpio_configure_level_low(pin);
+        if flags == TLMM_GPIO_FLAG_LEVEL_LOW {
+            tlmm_gpio_configure_level_low(pin);
+        } else if flags == TLMM_GPIO_FLAG_EDGE_FALLING {
+            tlmm_gpio_configure_falling_edge(pin);
+        } else {
+            return false;
+        }
         gic_configure_spi(gicd, TLMM_PARENT_IRQ);
     }
     TLMM_GPIO_PIN.store(pin, ORD);
@@ -3440,6 +3453,23 @@ unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
     let cfg = TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS;
     unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
     unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg & !TLMM_INTR_POLARITY) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_configure_falling_edge(pin: u32) {
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+    // INTR_DECT_CTL = 2 (negative/falling edge) on the 2-bit detection field at bits 2-3, with the
+    // polarity bit set — Linux `msm_gpio_irq_set_type` for `intr_detection_width == 2`. The mask/
+    // complete lifecycle (mask on delivery, clear-status + re-enable on complete) is trigger-agnostic
+    // and works unchanged for edge: an edge latch holds in INTR_STATUS until completion clears it,
+    // and re-enabling re-arms for the next falling edge — no held level to re-fire. — CORVUS
+    let cfg = TLMM_INTR_ENABLE
+        | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
+        | TLMM_INTR_POLARITY
+        | TLMM_INTR_RAW_STATUS_EN
+        | TLMM_INTR_TARGET_APPS;
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg) };
 }
 
 #[cfg(target_os = "none")]

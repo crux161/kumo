@@ -142,6 +142,10 @@ pub struct UserSched {
     children: alloc::vec::Vec<ResidentChild>,
     /// Threads parked on a typed wait target, keyed by thread and object koid.
     wait_queue: WaitQueue,
+    /// A timer/device wake admitted a resident child while some other EL0 thread kept
+    /// running. Pay this at the next SVC boundary, after SoraState borrows have dropped,
+    /// rather than preempting arbitrary EL0 from IRQ context. — KESTREL
+    safe_reschedule_pending: bool,
     /// Whether the user thread has been started (admitted to the scheduler).
     pub started: bool,
     /// Accumulated context-switch count.
@@ -284,6 +288,7 @@ pub fn init(
             user_fresh: true,
             children: alloc::vec::Vec::with_capacity(MAX_RESIDENT_CHILDREN),
             wait_queue: WaitQueue::new(),
+            safe_reschedule_pending: false,
             started: false,
             switches: 0,
             exit_code: 0,
@@ -485,8 +490,10 @@ pub fn spawn_child_async(
 
 /// Install the live Sora/resident-child scheduler tick. Async children can become
 /// runnable from IRQ context (timers and device interrupts), where no Sora
-/// `ProcessWait` pump necessarily follows. The tick gives those ready children a
-/// normal dispatcher boundary instead of leaving them admitted but never run. — KESTREL
+/// `ProcessWait` pump necessarily follows. This hook only dispatches from the
+/// boot/idle floor: preempting an active EL0 user thread would require full
+/// user-register save/restore, which this scheduler path does not own yet.
+/// — KESTREL
 #[cfg(target_os = "none")]
 pub fn install_preemption_hook() {
     kumo_hal::active::set_preempt_hook(preempt_tick);
@@ -504,6 +511,9 @@ extern "C" fn preempt_tick() {
     let switch = unsafe {
         let s = &mut *p;
         if s.done {
+            return;
+        }
+        if s.dispatcher.current() != Some(s.idle.koid()) {
             return;
         }
         let decision = s.dispatcher.on_timer_tick();
@@ -683,6 +693,14 @@ pub fn wake_child_waiting_on_interrupt(interrupt_koid: KoId) {
     wake_child_waiting_on(WaitTarget::Interrupt(interrupt_koid));
 }
 
+fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
+    matches!(target, WaitTarget::Port(_) | WaitTarget::Interrupt(_))
+}
+
+fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
+    current == idle || current == user
+}
+
 fn wake_child_waiting_on(target: WaitTarget) {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -712,6 +730,77 @@ fn wake_child_waiting_on(target: WaitTarget) {
         s.wait_queue.remove_thread(waiter);
         child.ready();
         s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
+        if wait_target_needs_safe_reschedule(target) {
+            s.safe_reschedule_pending = true;
+        }
+    }
+}
+
+/// Dispatch a resident child that was made runnable by a timer/device wake once we are
+/// back at a safe syscall boundary. The SVC entry frame already owns the interrupted
+/// EL0 GPR/FP state on the current thread's kernel stack; this avoids the J287/J288
+/// broad IRQ-preemption corruption while still giving timer-backed `PortWait` a
+/// deterministic resume point. — KESTREL
+pub fn reschedule_if_pending_after_svc() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let started = unsafe { (&*opt).is_some() };
+    if !started {
+        return;
+    }
+
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        if s.done || !s.safe_reschedule_pending {
+            return;
+        }
+        let decision = s.dispatcher.reschedule_current();
+        let switch = dispatch_context(s, decision);
+        if switch.is_some() || s.dispatcher.runnable_count() == 0 {
+            s.safe_reschedule_pending = false;
+        }
+        switch
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+}
+
+/// Dispatch a timer/device-woken resident child immediately after the IRQ signal path
+/// has queued its port/interrupt packet. The timer hook itself runs before
+/// `signal_timers`, so it can miss the just-expired timer; this post-signal handoff
+/// pays that wake without preempting an active driver child (the J288 corruption
+/// window). Sora may be interrupted because it is the supervisor pump that lent the
+/// child its resident slot; child-vs-child IRQ preemption still waits for the full
+/// EL0 register boundary. — KESTREL
+pub fn reschedule_pending_after_irq_signal_if_safe() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let started = unsafe { (&*opt).is_some() };
+    if !started {
+        return;
+    }
+
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        if s.done || !s.safe_reschedule_pending {
+            return;
+        }
+        let Some(current) = s.dispatcher.current() else {
+            return;
+        };
+        if !irq_handoff_allowed(current, s.idle.koid(), s.user_thread.koid()) {
+            return;
+        }
+        let decision = s.dispatcher.reschedule_current();
+        let switch = dispatch_context(s, decision);
+        if switch.is_some() || s.dispatcher.runnable_count() == 0 {
+            s.safe_reschedule_pending = false;
+        }
+        switch
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
     }
 }
 
@@ -845,7 +934,9 @@ fn dispatch_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{KoId, WaitQueue, WaitTarget};
+    use super::{
+        irq_handoff_allowed, wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget,
+    };
 
     #[test]
     fn park_then_waiter_for_finds_thread_by_object() {
@@ -895,5 +986,28 @@ mod tests {
         q.remove_thread(KoId(7));
         assert_eq!(q.waiter_for(WaitTarget::Port(KoId(42))), None);
         assert_eq!(q.waiter_for(WaitTarget::Port(KoId(43))), Some(KoId(8)));
+    }
+
+    #[test]
+    fn timer_and_device_waits_request_safe_reschedule() {
+        assert!(wait_target_needs_safe_reschedule(WaitTarget::Port(KoId(
+            42
+        ))));
+        assert!(wait_target_needs_safe_reschedule(WaitTarget::Interrupt(
+            KoId(43)
+        )));
+        assert!(!wait_target_needs_safe_reschedule(WaitTarget::Channel(
+            KoId(44)
+        )));
+    }
+
+    #[test]
+    fn irq_handoff_only_runs_from_idle_or_sora() {
+        let idle = KoId(1);
+        let sora = KoId(2);
+        let child = KoId(3);
+        assert!(irq_handoff_allowed(idle, idle, sora));
+        assert!(irq_handoff_allowed(sora, idle, sora));
+        assert!(!irq_handoff_allowed(child, idle, sora));
     }
 }

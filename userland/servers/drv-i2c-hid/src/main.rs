@@ -4,10 +4,10 @@
 
 use drv_i2c_hid::{
     bounded_input_frame_len, bounded_report_descriptor_len, DeviceQuirks, InputProbeDecoder,
-    InputProbeError, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
-    MAX_REPORT_DESCRIPTOR_BYTES,
+    InputProbeError, KeyboardForwardFailures, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG,
+    MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
 };
-use kumo_abi::{Handle, VmarFlags};
+use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
     find_boot_keyboard, Command, Controller, HidDescriptor, PowerState, RegisterIo,
 };
@@ -23,6 +23,9 @@ const MMIO_VA: u64 = 0x0000_0000_1100_0000;
 const POLL_LIMIT: usize = 1_000_000;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
+/// DT interrupt flag for IRQ_TYPE_EDGE_FALLING. ELAN i2c-hid needs the attention line treated as
+/// falling-edge (Linux FORCE_TRIGGER_FALLING), overriding the level-low (flag 8) the DT declares.
+const DT_IRQ_EDGE_FALLING: u32 = 2;
 
 struct MmioRegisters {
     base: *mut u8,
@@ -288,7 +291,21 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: reset done\n");
-    let attention_raw = interrupt_create(resource, config.attention_irq);
+    // ELAN i2c-hid needs the attention line as falling-edge, not the DT's level-low — Linux
+    // FORCE_TRIGGER_FALLING. Re-encode the same GPIO pin with the falling-edge flag; the authority
+    // key is pin-based, so the granted Resource window still covers it. — CORVUS
+    let attention_irq_encoded = if quirks.force_trigger_falling {
+        match decode_tlmm_gpio_irq(config.attention_irq) {
+            Some(gpio) => {
+                log(b"drv-i2c-hid: elan falling-edge attention quirk\n");
+                tlmm_gpio_irq(gpio.pin, DT_IRQ_EDGE_FALLING)
+            }
+            None => config.attention_irq,
+        }
+    } else {
+        config.attention_irq
+    };
+    let attention_raw = interrupt_create(resource, attention_irq_encoded);
     if attention_raw == u64::MAX {
         log(b"drv-i2c-hid: attention interrupt create failed\n");
         kumo_rt::process_exit(1);
@@ -377,6 +394,7 @@ extern "C" fn main(
     // delivery survived mask -> drain -> complete, not just a timer poll. — KESTREL
     let mut interrupts: u32 = 0;
     let mut shown_nonempty: u32 = 0;
+    let mut keyboard_forward_failures = KeyboardForwardFailures::new();
     loop {
         if interrupt_wait(attention_irq) == 0 {
             log(b"drv-i2c-hid: attention wait failed\n");
@@ -439,9 +457,13 @@ extern "C" fn main(
             let byte = [ascii];
             if channel_write(keyboard_channel, byte.as_ptr(), byte.len()) == 0 {
                 log_hex(b"drv-i2c-hid: key forwarded ascii=0x", ascii as u64);
-            } else {
-                log(b"drv-i2c-hid: keyboard byte forward failed\n");
-                kumo_rt::process_exit(1);
+            } else if keyboard_forward_failures.record() {
+                // A closed/restarting keyboard consumer is soft-state loss, not a hardware-driver
+                // death. Keep the IRQ loop alive and drop the byte per DESIGN/002. — KESTREL
+                log_hex(
+                    b"drv-i2c-hid: keyboard byte dropped count=0x",
+                    keyboard_forward_failures.count() as u64,
+                );
             }
         }
     }

@@ -1,12 +1,18 @@
-//! Stage-A kernel heap: a bump `#[global_allocator]` over a fixed in-image region.
+//! Kernel heap: a first-fit free-list (`linked_list_allocator`) over a fixed 8 MiB
+//! in-image region (`BACKING`).
 //!
-//! This is the simplest *correct* allocator — it hands out aligned slices and never
-//! reclaims (`dealloc` is a no-op). It exists so the kernel can use `alloc` (`Vec`,
-//! `Box`, `String`) while the object/task/IPC machinery is built; a reclaiming
-//! allocator (free-list/slab over the frame allocator) replaces it before that
-//! machinery actually needs to free. The global instance is gated to the
-//! freestanding kernel (`target_os = "none"`) so it never overrides the host
-//! allocator used by unit tests or the stage-a-smoke tool.
+//! This *does* reclaim — `dealloc` returns memory to the free list and coalesces
+//! adjacent holes — so the kernel can use `alloc` (`Vec`, `Box`, `String`) freely.
+//! Two caveats remain, and they matter for any future heavy-alloc kernel path
+//! (e.g. a write-back FS cache): the region is **fixed-size** (no growth yet — it
+//! cannot back-fill from the frame allocator) and first-fit is **fragmentation-prone**
+//! under sustained mixed-size churn. The planned upgrade is a growable slab/free-list
+//! over the frame allocator; until then, keep kernel-heap residents bounded. The
+//! global instance is gated to the freestanding kernel (`target_os = "none"`) so it
+//! never overrides the host allocator used by unit tests or the stage-a-smoke tool.
+//
+// — CORVUS 2026-06-24: corrected — this was documented as a non-reclaiming *bump*
+// allocator, but the code is `linked_list_allocator` with a real `deallocate`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

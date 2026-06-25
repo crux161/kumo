@@ -11,6 +11,7 @@ pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
 pub const ELAN_VENDOR_ID: u16 = 0x04f3;
+pub const KEYBOARD_FORWARD_FAILURE_LOG_LIMIT: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -43,10 +44,42 @@ pub struct InputProbe {
     pub first_pressed_ascii: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyboardForwardFailures {
+    count: u32,
+}
+
+impl KeyboardForwardFailures {
+    pub const fn new() -> Self {
+        Self { count: 0 }
+    }
+
+    pub const fn count(self) -> u32 {
+        self.count
+    }
+
+    pub fn record(&mut self) -> bool {
+        let should_log = self.count < KEYBOARD_FORWARD_FAILURE_LOG_LIMIT;
+        self.count = self.count.saturating_add(1);
+        should_log
+    }
+}
+
+impl Default for KeyboardForwardFailures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceQuirks {
     pub no_wakeup_after_reset: bool,
     pub bogus_irq: bool,
+    /// ELAN i2c-hid devices need the attention line treated as **falling-edge**, not the level-low
+    /// the DT declares (Linux `I2C_HID_QUIRK_FORCE_TRIGGER_FALLING`). Level-low re-fires while the
+    /// device holds the line asserted — the 30–40 empty boot-burst IRQs we saw on metal. Wiring this
+    /// to the attention IRQ request needs HAL TLMM edge-detection support (see J289 plan). — CORVUS
+    pub force_trigger_falling: bool,
 }
 
 impl DeviceQuirks {
@@ -55,11 +88,13 @@ impl DeviceQuirks {
             Self {
                 no_wakeup_after_reset: true,
                 bogus_irq: true,
+                force_trigger_falling: true,
             }
         } else {
             Self {
                 no_wakeup_after_reset: false,
                 bogus_irq: false,
+                force_trigger_falling: false,
             }
         }
     }
@@ -339,6 +374,7 @@ mod tests {
             DeviceQuirks {
                 no_wakeup_after_reset: true,
                 bogus_irq: true,
+                force_trigger_falling: true,
             }
         );
         assert_eq!(
@@ -413,6 +449,16 @@ mod tests {
                 first_pressed_ascii: None,
             })
         );
+    }
+
+    #[test]
+    fn keyboard_forward_failures_are_bounded_diagnostics() {
+        let mut failures = KeyboardForwardFailures::new();
+        for i in 0..KEYBOARD_FORWARD_FAILURE_LOG_LIMIT {
+            assert!(failures.record(), "failure {i} should still log");
+        }
+        assert!(!failures.record());
+        assert_eq!(failures.count(), KEYBOARD_FORWARD_FAILURE_LOG_LIMIT + 1);
     }
 
     #[test]

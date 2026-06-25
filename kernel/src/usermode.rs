@@ -150,6 +150,7 @@ extern "C" fn signal_irq(irq: u32) {
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);
     });
+    crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
     // Wake Sora if parked — InterruptWait uses park_current_user().
     if crate::user_thread::is_started()
         && !crate::user_thread::is_done()
@@ -1191,11 +1192,13 @@ extern "C" fn svc_hook(regs: *mut u64) {
         let flags = r[5];
         r[0] = run_sora_child_without_borrow(process_handle, entry, sp, arg, arg2, flags) as u32
             as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
         return;
     }
 
     if num == Syscall::ProcessWait as u64 {
         r[0] = crate::user_thread::process_wait() as u32 as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
         return;
     }
 
@@ -1205,10 +1208,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
             let sora_koid = with_sora(|sora| sora.process.koid());
             if cp_koid != sora_koid {
                 r[0] = wait_child_port_without_borrow(cp_koid, port);
+                crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
         }
         r[0] = wait_sora_port_without_borrow(port);
+        crate::user_thread::reschedule_if_pending_after_svc();
         return;
     }
 
@@ -1223,6 +1228,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
                 r[0] = n;
                 r[1] = handle;
+                crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
         }
@@ -1234,6 +1240,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
             if cp_koid != sora_koid {
                 let interrupt = Handle(r[0] as u32);
                 r[0] = wait_child_interrupt_without_borrow(cp_koid, interrupt);
+                crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
         }
@@ -1495,6 +1502,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
             r[0] = u64::MAX;
         }
     });
+    crate::user_thread::reschedule_if_pending_after_svc();
 }
 
 /// Fallback (no Sora in the initrd): run the embedded EL0 smoke payload via the old
