@@ -32,6 +32,8 @@
 use core::cell::UnsafeCell;
 use kumo_abi::KoId;
 
+use crate::task::ProcessLabel;
+
 /// Why a process died — the payload of a TOWER event.
 #[derive(Clone, Copy)]
 pub enum Cause {
@@ -83,6 +85,9 @@ pub struct Event {
     /// The dead process's koid, if the kernel could identify it. `None` means the fault
     /// landed with no current process (very early boot) — always treated as critical.
     pub victim: Option<KoId>,
+    /// Best-effort diagnostic process label copied at process creation. It grants no authority;
+    /// it only makes metal QR captures name the dying service. — KESTREL
+    pub victim_label: ProcessLabel,
     /// True if the victim owned the framebuffer (so the glass was reclaimed to render this).
     pub fb_owner: bool,
 }
@@ -110,13 +115,14 @@ pub fn classify(victim: Option<KoId>, sora_koid: Option<KoId>) -> Severity {
 pub fn raise(
     cause: Cause,
     victim: Option<KoId>,
+    victim_label: ProcessLabel,
     fb_owner: bool,
     sora_koid: Option<KoId>,
     emit: fn(&[u8]),
 ) {
     match classify(victim, sora_koid) {
-        Severity::Critical => critical(cause, victim, fb_owner, emit),
-        Severity::Inverted => raise_inverted(cause, victim, fb_owner, emit),
+        Severity::Critical => critical(cause, victim, victim_label, fb_owner, emit),
+        Severity::Inverted => raise_inverted(cause, victim, victim_label, fb_owner, emit),
     }
 }
 
@@ -125,8 +131,14 @@ pub fn raise(
 /// always returns. Use this on paths that cannot consult [`classify`] because the supervisor
 /// koid is unavailable — notably the Linux-persona child dispatcher, which runs *inside* a
 /// `SoraState` borrow and is reached only for a child (`cp_koid != Sora`).
-pub fn raise_inverted(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: fn(&[u8])) {
-    let ev = record(Severity::Inverted, cause, victim, fb_owner);
+pub fn raise_inverted(
+    cause: Cause,
+    victim: Option<KoId>,
+    victim_label: ProcessLabel,
+    fb_owner: bool,
+    emit: fn(&[u8]),
+) {
+    let ev = record(Severity::Inverted, cause, victim, victim_label, fb_owner);
     emit_banner(&ev, None, emit);
     // Contained path: one banner, one QR, then return. Unlike the critical halt-loop,
     // this must not arm the QR emissary replay latch: a live system's later console
@@ -135,8 +147,14 @@ pub fn raise_inverted(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: 
 }
 
 /// The upright-Tower path: log, then halt and repaint the banner forever. Never returns.
-fn critical(cause: Cause, victim: Option<KoId>, fb_owner: bool, emit: fn(&[u8])) -> ! {
-    let ev = record(Severity::Critical, cause, victim, fb_owner);
+fn critical(
+    cause: Cause,
+    victim: Option<KoId>,
+    victim_label: ProcessLabel,
+    fb_owner: bool,
+    emit: fn(&[u8]),
+) -> ! {
+    let ev = record(Severity::Critical, cause, victim, victim_label, fb_owner);
     let mut pass: u64 = 0;
     loop {
         emit_critical_frame(&ev, pass, emit);
@@ -178,6 +196,8 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
         Some(k) => emit(&hex64(k.0)),
         None => emit(b"<none>            "),
     }
+    emit(b"  label=");
+    emit_label(ev.victim_label, emit);
     emit(if ev.fb_owner {
         b"  fb-owner=yes\r\n"
     } else {
@@ -297,6 +317,12 @@ fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
         Some(k) => b.push(&hex64(k.0)),
         None => b.push(b"<none>"),
     }
+    b.push(b" label=");
+    if ev.victim_label.is_empty() {
+        b.push(b"<unlabeled>");
+    } else {
+        b.push(ev.victim_label.as_bytes());
+    }
     b.push(if ev.fb_owner {
         b" fbowner=1\n"
     } else {
@@ -351,6 +377,14 @@ fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
     }
 }
 
+fn emit_label(label: ProcessLabel, emit: fn(&[u8])) {
+    if label.is_empty() {
+        emit(b"<unlabeled>");
+    } else {
+        emit(label.as_bytes());
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Ledger — the durable-by-design record of every TOWER.
 // ---------------------------------------------------------------------------------------
@@ -382,7 +416,13 @@ static LEDGER: LedgerCell = LedgerCell(UnsafeCell::new(Ledger {
 /// **SEAM (efs ledger):** this is the single chokepoint every TOWER passes through. When a
 /// read/write `/var` exists (efs, `resources/efs`), flush `ev` to a durable append-only log
 /// here — the RAM ring then becomes a write-back cache for the most recent entries.
-fn record(severity: Severity, cause: Cause, victim: Option<KoId>, fb_owner: bool) -> Event {
+fn record(
+    severity: Severity,
+    cause: Cause,
+    victim: Option<KoId>,
+    victim_label: ProcessLabel,
+    fb_owner: bool,
+) -> Event {
     // SAFETY: single-core; no other code holds a reference to LEDGER across this call.
     let l = unsafe { &mut *LEDGER.0.get() };
     let seq = l.next;
@@ -392,6 +432,7 @@ fn record(severity: Severity, cause: Cause, victim: Option<KoId>, fb_owner: bool
         severity,
         cause,
         victim,
+        victim_label,
         fb_owner,
     };
     l.events[(seq as usize) % LEDGER_CAP] = Some(ev);
@@ -471,6 +512,7 @@ mod tests {
             Severity::Inverted,
             Cause::Abend { exit_code: 1 },
             Some(KoId(1)),
+            ProcessLabel::from_bytes(b"drv-i2c-hid"),
             false,
         );
         record(
@@ -487,6 +529,7 @@ mod tests {
                 x29: 10,
             },
             Some(KoId(2)),
+            ProcessLabel::from_bytes(b"ttyd"),
             true,
         );
         assert_eq!(count(), before + 2);
@@ -512,6 +555,7 @@ mod tests {
             severity: Severity::Critical,
             cause: Cause::Abend { exit_code: 0x2a },
             victim: Some(KoId(2)),
+            victim_label: ProcessLabel::from_bytes(b"drv-i2c-hid"),
             fb_owner: true,
         };
 
@@ -523,10 +567,12 @@ mod tests {
         let buf = EMIT_BUF.lock().unwrap();
 
         let banner = find_bytes(&buf, b"TOWER: SYSTEM-CRITICAL PROCESS DEATH").unwrap();
+        let label = find_bytes(&buf, b"label=drv-i2c-hid").unwrap();
         let repaint = find_bytes(&buf, b"HALT (repaint=0x0000000000000003)").unwrap();
         let qr_diag = find_bytes(&buf, b"fbgeom w=").unwrap();
 
-        assert!(banner < repaint);
+        assert!(banner < label);
+        assert!(label < repaint);
         assert!(repaint < qr_diag);
     }
 

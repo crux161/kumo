@@ -12,7 +12,7 @@ use kumo_ipc::Message;
 use crate::ipc::{IpcError, IpcRegistry, KernelMessage, PortPacket};
 use crate::mm::{Mapping, Vmar, Vmo};
 use crate::object::{HandleTable, ObjectError, ObjectManager, StagedHandleGrant};
-use crate::task::{Job, Process, Thread};
+use crate::task::{Job, Process, ProcessLabel, Thread};
 
 #[derive(Clone, Copy, Debug)]
 pub enum KernelCall<'a> {
@@ -54,6 +54,7 @@ pub enum KernelCall<'a> {
         parent_job: Job,
         vmar_base: u64,
         vmar_size: u64,
+        label: ProcessLabel,
     },
     VmarMap {
         process_handle: Handle,
@@ -529,7 +530,10 @@ impl SyscallEngine {
                 self.ipc
                     .port_queue_signal_by_koid(port_koid, object_koid, signals);
                 #[cfg(target_os = "none")]
-                crate::user_thread::wake_child_waiting_on_port(port_koid);
+                {
+                    crate::user_thread::wake_child_waiting_on_port(port_koid);
+                    crate::user_thread::wake_user_after_object_signal();
+                }
             }
         }
     }
@@ -792,9 +796,11 @@ impl SyscallEngine {
         caller: &mut Process,
         parent_job: &Job,
         vmar: Vmar,
+        label: ProcessLabel,
     ) -> Result<Handle, ObjectError> {
         let job = Job::child(&mut self.objects, parent_job);
-        let child = Process::new(&mut self.objects, &job, vmar);
+        let mut child = Process::new(&mut self.objects, &job, vmar);
+        child.set_label(label);
         let handle = caller.handles_mut().insert(
             child.object(),
             Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT,
@@ -1035,8 +1041,9 @@ impl SyscallEngine {
                 parent_job,
                 vmar_base,
                 vmar_size,
+                label,
             } => match Vmar::new(vmar_base, vmar_size) {
-                Ok(vmar) => match self.process_create(process, &parent_job, vmar) {
+                Ok(vmar) => match self.process_create(process, &parent_job, vmar, label) {
                     Ok(handle) => KernelCallResult::Handle(handle),
                     Err(error) => KernelCallResult::Status(errno_from_object(error).status()),
                 },
@@ -1887,6 +1894,31 @@ mod tests {
             },
         );
         assert_eq!(bogus, KernelCallResult::Status(Errno::BadHandle.status()));
+    }
+
+    #[test]
+    fn process_create_preserves_debug_label() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let parent_job = Job::root(engine.objects_mut());
+        let label = ProcessLabel::from_bytes(b"drv-i2c-hid");
+
+        let created = engine.dispatch(
+            &mut process,
+            KernelCall::ProcessCreate {
+                parent_job,
+                vmar_base: 0x2000_0000,
+                vmar_size: crate::mm::PAGE_SIZE,
+                label,
+            },
+        );
+        let KernelCallResult::Handle(handle) = created else {
+            panic!("expected process handle");
+        };
+        let koid = process.handles().get(handle).unwrap().koid;
+        let child = engine.process_by_koid(koid).unwrap();
+
+        assert_eq!(child.label().as_bytes(), b"drv-i2c-hid");
     }
 
     #[test]

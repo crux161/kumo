@@ -33,7 +33,9 @@ use crate::syscall::{
     commit_process_grants, rollback_process_grants, stage_process_arg, KernelCall,
     KernelCallResult, SyscallEngine,
 };
-use crate::task::{Job, Process, Thread, DEFAULT_KERNEL_STACK_SIZE};
+use crate::task::{
+    Job, Process, ProcessLabel, Thread, DEFAULT_KERNEL_STACK_SIZE, PROCESS_LABEL_BYTES,
+};
 
 /// Maximum restart attempts before giving up and reporting failure.
 const MAX_SORA_ATTEMPTS: u32 = 3;
@@ -151,12 +153,14 @@ extern "C" fn signal_irq(irq: u32) {
         sora.engine.signal_timers(now_ns);
     });
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
-    // Wake Sora if parked — InterruptWait uses park_current_user().
+    // Wake Sora if parked. If this IRQ interrupted the Current-EL boot/idle floor,
+    // the wake is deferred to `pump_idle_floor` so we do not switch out through an
+    // EL1h IRQ epilogue. — KESTREL 2026-06-26
     if crate::user_thread::is_started()
         && !crate::user_thread::is_done()
         && crate::user_thread::is_parked()
     {
-        crate::user_thread::wake_user();
+        crate::user_thread::wake_user_after_irq_signal();
     }
 }
 
@@ -348,6 +352,31 @@ pub(crate) fn console_write_without_switch(bytes: &[u8]) {
     }
 }
 
+fn label_for_victim(sora: &SoraState, victim: Option<KoId>) -> ProcessLabel {
+    let Some(koid) = victim else {
+        return ProcessLabel::empty();
+    };
+    if sora.process.koid() == koid {
+        return sora.process.label();
+    }
+    sora.engine
+        .process_by_koid(koid)
+        .map(Process::label)
+        .unwrap_or_default()
+}
+
+fn process_label_from_user(process: &Process, ptr: u64, len: u64) -> Option<ProcessLabel> {
+    let len = (len as usize).min(PROCESS_LABEL_BYTES);
+    if len == 0 {
+        return Some(ProcessLabel::empty());
+    }
+    if !user_range_ok(process, ptr, len as u64) {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    Some(ProcessLabel::from_bytes(bytes))
+}
+
 /// Temporary Stage-A M10 bridge for the first `persona-linux` smoke.
 ///
 /// The real design keeps the Linux personality in userspace. Until the upcall
@@ -355,6 +384,7 @@ pub(crate) fn console_write_without_switch(bytes: &[u8]) {
 /// translated here narrowly enough to run a static hello payload.
 fn handle_linux_persona_syscall(
     process: &Process,
+    process_label: ProcessLabel,
     regs: &mut [u64],
     mut output: impl FnMut(&[u8]),
 ) -> bool {
@@ -440,6 +470,7 @@ fn handle_linux_persona_syscall(
                 crate::tower::raise_inverted(
                     crate::tower::Cause::Abend { exit_code: regs[0] },
                     crate::user_thread::current_process_koid(),
+                    process_label,
                     false,
                     console_write_without_switch,
                 );
@@ -805,9 +836,14 @@ fn raise_tower_on_abend(exit_code: u64) {
         return;
     }
     let victim = crate::user_thread::current_process_koid();
-    let (sora_koid, fb_owner) =
-        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
-            .unwrap_or((None, false));
+    let (sora_koid, fb_owner, victim_label) = try_with_sora_mut(|sora| {
+        (
+            Some(sora.process.koid()),
+            sora.framebuffer_owner == victim,
+            label_for_victim(sora, victim),
+        )
+    })
+    .unwrap_or((None, false, ProcessLabel::empty()));
     if fb_owner {
         kumo_hal::active::reclaim_framebuffer_console();
     }
@@ -819,6 +855,7 @@ fn raise_tower_on_abend(exit_code: u64) {
     crate::tower::raise(
         crate::tower::Cause::Abend { exit_code },
         victim,
+        victim_label,
         fb_owner,
         sora_koid,
         emit,
@@ -845,9 +882,14 @@ extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: 
     // non-panicking accessor. A borrowed/uninitialised cell yields `(None, false)` → the
     // fault classifies as system-critical (the honest default when we cannot prove the
     // victim is a restartable child).
-    let (sora_koid, fb_owner) =
-        try_with_sora_mut(|sora| (Some(sora.process.koid()), sora.framebuffer_owner == victim))
-            .unwrap_or((None, false));
+    let (sora_koid, fb_owner, victim_label) = try_with_sora_mut(|sora| {
+        (
+            Some(sora.process.koid()),
+            sora.framebuffer_owner == victim,
+            label_for_victim(sora, victim),
+        )
+    })
+    .unwrap_or((None, false, ProcessLabel::empty()));
     if fb_owner {
         // The renderer itself faulted: no userspace consumer remains, so the kernel must
         // reclaim the glass before the TOWER can be painted onto it.
@@ -879,6 +921,7 @@ extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: 
             x29: rx29,
         },
         victim,
+        victim_label,
         fb_owner,
         sora_koid,
         emit,
@@ -1264,7 +1307,8 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 let child = unsafe { &mut *child_ptr };
                 let mut linux_output = [0u8; 8 * 256];
                 let mut linux_output_len = 0usize;
-                let handled_linux = handle_linux_persona_syscall(child, r, |bytes| {
+                let child_label = child.label();
+                let handled_linux = handle_linux_persona_syscall(child, child_label, r, |bytes| {
                     let n = bytes.len().min(linux_output.len() - linux_output_len);
                     linux_output[linux_output_len..linux_output_len + n]
                         .copy_from_slice(&bytes[..n]);
@@ -1415,12 +1459,17 @@ extern "C" fn svc_hook(regs: *mut u64) {
         } else if num == Syscall::ProcessCreate as u64 {
             let vmar_base = r[0];
             let vmar_size = r[1];
+            let Some(label) = process_label_from_user(&sora.process, r[2], r[3]) else {
+                r[0] = u64::MAX;
+                return;
+            };
             let result = sora.engine.dispatch(
                 &mut sora.process,
                 KernelCall::ProcessCreate {
                     parent_job: sora.root_job,
                     vmar_base,
                     vmar_size,
+                    label,
                 },
             );
             match result {
@@ -1512,7 +1561,8 @@ pub fn run(boot: &BootInfo) -> UserReport {
     let mut engine = SyscallEngine::new();
     let job = Job::root(engine.objects_mut());
     let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).expect("user vmar");
-    let process = Process::new(engine.objects_mut(), &job, vmar);
+    let mut process = Process::new(engine.objects_mut(), &job, vmar);
+    process.set_label(ProcessLabel::from_bytes(b"sora"));
 
     // SAFETY: single-threaded boot path; installed before any SVC can fire.
     unsafe {
@@ -1617,6 +1667,7 @@ fn attempt_sora(
     let job = Job::root(engine.objects_mut());
     let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).map_err(UserBootstrapError::from)?;
     let mut process = Process::new(engine.objects_mut(), &job, vmar);
+    process.set_label(ProcessLabel::from_bytes(b"sora"));
 
     // Root channel (bootstrap): kernel gets Left, Sora gets Right.
     let (sora_handle, root_channel, kernel_end) = engine

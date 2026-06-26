@@ -1390,6 +1390,19 @@ pub mod mmu {
             gi += 1;
         }
 
+        // A GICv2-only PE (Raspberry Pi 5 / GIC-400) acks/EOIs interrupts through GIC CPU-
+        // interface MMIO, and on the Pi 5 that sits at a high physical address (~0x10_7fff_a000)
+        // far above `top`, so the loop above never maps it. The IRQ hot path runs under whatever
+        // TTBR0 is live (a user process tree once userland runs), so it must reach the GIC via the
+        // always-active TTBR1 physmap. Map the single 2 MiB block covering the GIC-400 as
+        // Device-nGnRnE; `gicv2_init` then addresses it through `PHYSMAP_BASE`. GICv3 PEs ack via
+        // `ICC_*` system registers and need none of this. — CORVUS 2026-06-26
+        if !super::gicv3_sysreg_supported() {
+            let gic_block = super::PI5_GICV2.distributor_base & !(BLOCK_2M - 1);
+            let desc = block_desc(gic_block, MAIR_DEVICE, true) | PXN | UXN;
+            map_block(ttbr1, PHYSMAP_BASE + gic_block, gic_block, desc, alloc, &mut tables)?;
+        }
+
         let kernel_pages = kernel_len.div_ceil(PAGE_4K);
         let mut page = 0u64;
         while page < kernel_pages {
@@ -2651,6 +2664,63 @@ const QEMU_GICV3: Gicv3Config = Gicv3Config {
     timer_irq: TIMER_VIRTUAL_PPI,
 };
 
+/// Last-resort GICv2 config for a GICv2-only PE that boots with no devicetree — a Raspberry
+/// Pi 5 whose firmware ships none (or is set to ACPI). The BCM2712 GIC-400 window is fixed;
+/// these match what [`gicv2_from_dtb_bytes`] recovers from a real Pi 5 DTB (Journal 212).
+/// Only consulted via [`gicv2_no_dtb_fallback`] when `dtb == 0` and the PE lacks the GICv3
+/// system-register interface, so it can never shadow a discovered controller.
+/// — CORVUS 2026-06-26
+const PI5_GICV2: Gicv2Config = Gicv2Config {
+    distributor_base: 0x10_7fff_9000,
+    cpu_base: 0x10_7fff_a000,
+    timer_irq: TIMER_VIRTUAL_PPI,
+};
+
+/// Pick a GICv2 config when DTB discovery found none. Returns [`PI5_GICV2`] only for the exact
+/// stuck case — no devicetree (`dtb == 0`) on a PE without the GICv3 sysreg interface (a Pi 5
+/// that handed us no DTB) — and `None` otherwise, so a board with a DTB or a GICv3 PE is never
+/// forced onto Pi 5 addresses. Pure, so the routing is unit-tested. — CORVUS 2026-06-26
+fn gicv2_no_dtb_fallback(dtb: u64, has_gicv3_sysregs: bool) -> Option<Gicv2Config> {
+    if dtb == 0 && !has_gicv3_sysregs {
+        Some(PI5_GICV2)
+    } else {
+        None
+    }
+}
+
+/// Does `ID_AA64PFR0_EL1` advertise the GICv3+ CPU **system-register** interface? The `GIC`
+/// field (bits [27:24]) is `0b0000` when the PE has no `ICC_*_EL1` registers — a GICv2-only
+/// PE like the Pi 5 / GIC-400 — and non-zero (`0b0001` GICv3, `0b0011` GICv4.1) otherwise.
+/// Pulled out as a pure fn so the gate is unit-tested without executing a real `mrs`.
+/// — CORVUS 2026-06-26
+fn id_aa64pfr0_has_gic_sysregs(pfr0: u64) -> bool {
+    ((pfr0 >> 24) & 0xf) != 0
+}
+
+/// Whether this PE implements the GICv3+ CPU system-register interface (`ICC_*_EL1`).
+///
+/// On a GICv2-only PE (Pi 5 / GIC-400) those registers are not implemented, so `mrs/msr
+/// ICC_SRE_EL1` — the first thing [`gicv3_init`] runs — is an UNDEFINED instruction, raising
+/// a `CurrentEL/SPx sync` exception with `ESR.EC=0x00` (Unknown). Gate the entire GICv3 path
+/// on this so an absent device tree (`dtb == 0`, which [`discover_gicv3`] otherwise treats as
+/// QEMU/GICv3) cannot detonate on GICv2 silicon. QEMU `virt,gic-version=3` reports `0b0001`.
+/// — CORVUS 2026-06-26
+#[cfg(target_os = "none")]
+fn gicv3_sysreg_supported() -> bool {
+    let pfr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nostack, nomem))
+    };
+    id_aa64pfr0_has_gic_sysregs(pfr0)
+}
+
+/// Host builds never execute GIC init; assume the interface is present so the discovery
+/// unit tests still exercise the GICv3 path. — CORVUS 2026-06-26
+#[cfg(not(target_os = "none"))]
+fn gicv3_sysreg_supported() -> bool {
+    true
+}
+
 pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
     if period_hz == 0 {
         return Err(TimerIrqError::BadPeriod);
@@ -2663,8 +2733,20 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
 
     let period_ticks = core::cmp::max(freq / period_hz, 1);
 
-    // GICv3 first (x13s, QEMU virt). Both discoverers return `None` when `dtb == 0`.
-    if let Some(config) = unsafe { discover_gicv3(dtb) } {
+    // The GICv3 CPU system-register interface (`ICC_*_EL1`) is implemented on the x13s and
+    // QEMU `virt`, but NOT on a GICv2-only PE (Pi 5 / GIC-400) — there `mrs ICC_SRE_EL1` is
+    // UNDEFINED and `gicv3_init` would raise a `CurrentEL/sync ec=0x00` CPU exception. Detect
+    // it once and route accordingly. — CORVUS 2026-06-26
+    let has_gicv3_sysregs = gicv3_sysreg_supported();
+
+    // GICv3 first (x13s, QEMU virt), but only when this PE has the sysreg interface. Both
+    // discoverers return `None` when `dtb == 0`.
+    let gicv3 = if has_gicv3_sysregs {
+        unsafe { discover_gicv3(dtb) }
+    } else {
+        None
+    };
+    if let Some(config) = gicv3 {
         TIMER_PERIOD_TICKS.store(period_ticks, ORD);
         TIMER_IRQ_ID.store(config.timer_irq, ORD);
         TIMER_IRQ_COUNT.store(0, ORD);
@@ -2684,7 +2766,11 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
 
     // GICv2 fallback (Raspberry Pi 5 / GIC-400). Same virtual-timer program; `gicv2_init`
     // records the CPU-interface base so the IRQ handler EOIs the GICv2 way. No redistributor.
-    if let Some(config) = unsafe { discover_gicv2(dtb) } {
+    // When the firmware ships no devicetree (`dtb == 0`), a GICv2-only PE can't learn its GIC
+    // window from discovery, so fall back to the fixed BCM2712 GIC-400 addresses. — CORVUS
+    let gicv2 =
+        unsafe { discover_gicv2(dtb) }.or_else(|| gicv2_no_dtb_fallback(dtb, has_gicv3_sysregs));
+    if let Some(config) = gicv2 {
         TIMER_PERIOD_TICKS.store(period_ticks, ORD);
         TIMER_IRQ_ID.store(config.timer_irq, ORD);
         TIMER_IRQ_COUNT.store(0, ORD);
@@ -3181,55 +3267,51 @@ fn parse_gicv2_reg(data: &[u8], address_cells: u32, size_cells: u32) -> Option<G
 
 #[cfg(target_os = "none")]
 unsafe fn gicv2_init(config: &Gicv2Config) {
-    GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
+    // Reach the GIC-400 distributor and CPU interface through the TTBR1 physmap (mapped by
+    // `enable_kernel` for GICv2-only PEs) rather than the raw physical address: the IRQ hot
+    // path (`irq_ack` / `eoi`) runs under whatever TTBR0 is live, and on the Pi 5 the GIC sits
+    // at a high physical address that no user process tree maps. The stored bases below carry
+    // the physmap VA, so the vector reloads an always-mapped address. — CORVUS 2026-06-26
+    let dist = mmu::PHYSMAP_BASE + config.distributor_base;
+    let cpu = mmu::PHYSMAP_BASE + config.cpu_base;
+    GIC_DISTRIBUTOR_BASE.store(dist, ORD);
     let timer_bit = 1u32 << (config.timer_irq % 32);
     let bank = (config.timer_irq / 32) as u64 * 4;
 
     // Disable distributor, then enable with Group0 + Group1NS.
-    unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
-    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe { mmio_write32(dist + GICD_CTLR, 0) };
+    unsafe { gicd_wait_rwp(dist) };
     unsafe {
         mmio_write32(
-            config.distributor_base + GICD_CTLR,
+            dist + GICD_CTLR,
             GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1NS,
         )
     };
-    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe { gicd_wait_rwp(dist) };
 
     // Store GICv2 CPU base so the IRQ vector acks (GICC_IAR) and the handler EOIs
     // (GICC_EOIR) via MMIO rather than the GICv3 system registers.
-    GICV2_CPU_BASE.store(config.cpu_base, ORD);
+    GICV2_CPU_BASE.store(cpu, ORD);
 
     // Configure the timer PPI explicitly rather than trusting firmware state: put it in
     // Group1NS and give it a mid priority. These are distributor banks (GICD_*), NOT the
     // GICv3 redistributor (GICR_*) banks — those don't exist on a GIC-400.
-    let group =
-        unsafe { mmio_read32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank) } | timer_bit;
-    unsafe { mmio_write32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank, group) };
+    let group = unsafe { mmio_read32(dist + GICV2_GICD_IGROUPR0 + bank) } | timer_bit;
+    unsafe { mmio_write32(dist + GICV2_GICD_IGROUPR0 + bank, group) };
     unsafe {
         mmio_write8(
-            config.distributor_base + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
+            dist + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
             0x80,
         )
     };
 
     // CPU interface: set priority mask to allow all, enable Group1NS.
-    unsafe { mmio_write32(config.cpu_base + GICV2_GICC_PMR, 0xFF) };
-    unsafe {
-        mmio_write32(
-            config.cpu_base + GICV2_GICC_CTLR,
-            GICV2_GICC_CTLR_ENABLE_GRP1NS,
-        )
-    };
+    unsafe { mmio_write32(cpu + GICV2_GICC_PMR, 0xFF) };
+    unsafe { mmio_write32(cpu + GICV2_GICC_CTLR, GICV2_GICC_CTLR_ENABLE_GRP1NS) };
 
     // Enable the timer IRQ in the distributor: GICD_ISENABLER0 at 0x100, not the GICv3
     // redistributor's GICR_ISENABLER0 (0x10100).
-    unsafe {
-        mmio_write32(
-            config.distributor_base + GICV2_GICD_ISENABLER0 + bank,
-            timer_bit,
-        )
-    };
+    unsafe { mmio_write32(dist + GICV2_GICD_ISENABLER0 + bank, timer_bit) };
 }
 
 #[cfg(not(target_os = "none"))]
@@ -3613,12 +3695,20 @@ mod traps {
         "  mrs x2, elr_el1",
         "  mrs x3, far_el1",
         "  b   kumo_exception_entry",
-        // IRQ entry: save the FULL interrupted state (x0-x30 + ELR + SPSR) on the
-        // current stack, so the timer handler may context-switch to another thread
-        // (which has its own such frame). EOI happens inside `on_irq`, before any
-        // switch. Frame is 272 bytes (16-aligned).
+        // IRQ entry: save the COMPLETE interrupted EL0 context — x0-x30, ELR, SPSR,
+        // SP_EL0, and the FP/SIMD bank (FPSR/FPCR + q0-q31) — on the current thread's
+        // kernel stack, so `on_irq` may context-switch to another EL0 thread (which owns
+        // its own such frame) without corrupting the interrupted thread's user stack
+        // pointer or NEON state. This MIRRORS `kumo_svc_common`'s 800-byte frame exactly;
+        // that symmetry is what makes IRQ-context preemption as safe as the existing
+        // SVC-boundary cooperative switch (cooperative EL0 thread switches already round
+        // -trip sp_el0+FP per thread, so matching the SVC frame is the right completeness
+        // target). Before this, only x0-x30+ELR+SPSR were saved, so preempting an active
+        // EL0 child resumed it with the WRONG SP_EL0 (and stale NEON) — the J288 read
+        // -state corruption (the "impossible GENI base" was another thread's stack). EOI
+        // happens inside `on_irq`, before any switch. — CORVUS
         "kumo_irq_common:",
-        "  sub sp, sp, #272",
+        "  sub sp, sp, #800",
         "  stp x0,  x1,  [sp, #0]",
         "  stp x2,  x3,  [sp, #16]",
         "  stp x4,  x5,  [sp, #32]",
@@ -3638,14 +3728,66 @@ mod traps {
         "  mrs x0, elr_el1",
         "  mrs x1, spsr_el1",
         "  stp x0,  x1,  [sp, #248]",
+        "  mrs x0, sp_el0",
+        "  str x0,      [sp, #264]",
+        "  mrs x0, fpsr",
+        "  mrs x1, fpcr",
+        "  stp x0,  x1,  [sp, #272]",
+        "  stp q0,  q1,  [sp, #288]",
+        "  stp q2,  q3,  [sp, #320]",
+        "  stp q4,  q5,  [sp, #352]",
+        "  stp q6,  q7,  [sp, #384]",
+        "  stp q8,  q9,  [sp, #416]",
+        "  stp q10, q11, [sp, #448]",
+        "  stp q12, q13, [sp, #480]",
+        "  stp q14, q15, [sp, #512]",
+        "  stp q16, q17, [sp, #544]",
+        "  stp q18, q19, [sp, #576]",
+        "  stp q20, q21, [sp, #608]",
+        "  stp q22, q23, [sp, #640]",
+        "  stp q24, q25, [sp, #672]",
+        "  stp q26, q27, [sp, #704]",
+        "  stp q28, q29, [sp, #736]",
+        "  stp q30, q31, [sp, #768]",
         "  bl  irq_ack",
         "  cmp x0, #1020",
         "  b.hs 1f",
         "  bl  kumo_irq_entry",
         "1:",
         "  ldp x0,  x1,  [sp, #248]",
+        // IL guard: never `eret` INTO Illegal Execution State. PSTATE.IL set in a context we are
+        // about to resume is always a kernel bug; the X13s boot-floor timer preemption hits it
+        // deterministically (J302 TOWER: EL1h IL=1) and the eret then re-faults at this very `msr`.
+        // Log the saved ELR/SPSR once, clear IL, and resume so the idle floor lives — the root
+        // acquisition of IL is tracked separately. `tbz` keeps the normal (IL=0) path branchless. — CORVUS
+        "  tbz x1, #20, 2f",
+        "  bl  kumo_irq_il_seen",
+        "  ldp x0,  x1,  [sp, #248]",
+        "  bic x1, x1, #0x100000",
+        "2:",
         "  msr elr_el1, x0",
         "  msr spsr_el1, x1",
+        "  ldr x0,      [sp, #264]",
+        "  msr sp_el0, x0",
+        "  ldp x0,  x1,  [sp, #272]",
+        "  msr fpsr, x0",
+        "  msr fpcr, x1",
+        "  ldp q0,  q1,  [sp, #288]",
+        "  ldp q2,  q3,  [sp, #320]",
+        "  ldp q4,  q5,  [sp, #352]",
+        "  ldp q6,  q7,  [sp, #384]",
+        "  ldp q8,  q9,  [sp, #416]",
+        "  ldp q10, q11, [sp, #448]",
+        "  ldp q12, q13, [sp, #480]",
+        "  ldp q14, q15, [sp, #512]",
+        "  ldp q16, q17, [sp, #544]",
+        "  ldp q18, q19, [sp, #576]",
+        "  ldp q20, q21, [sp, #608]",
+        "  ldp q22, q23, [sp, #640]",
+        "  ldp q24, q25, [sp, #672]",
+        "  ldp q26, q27, [sp, #704]",
+        "  ldp q28, q29, [sp, #736]",
+        "  ldp q30, q31, [sp, #768]",
         "  ldp x0,  x1,  [sp, #0]",
         "  ldp x2,  x3,  [sp, #16]",
         "  ldp x4,  x5,  [sp, #32]",
@@ -3662,7 +3804,7 @@ mod traps {
         "  ldp x26, x27, [sp, #208]",
         "  ldp x28, x29, [sp, #224]",
         "  ldr x30,      [sp, #240]",
-        "  add sp, sp, #272",
+        "  add sp, sp, #800",
         "  eret",
     );
 
@@ -3688,13 +3830,39 @@ mod traps {
 
     #[no_mangle]
     extern "C" fn kumo_exception_entry(index: u64, esr: u64, elr: u64, far: u64) -> ! {
+        let ec = ((esr >> 26) & 0x3f) as u32;
+        // Recover from a spurious Illegal Execution State on a kernel (Current-EL) context BEFORE
+        // touching anything else — `ELR_EL1`/`SPSR_EL1` still hold the fault state here. Clearing
+        // `PSTATE.IL` and retrying the faulting instruction is always sound: an EL1 context must
+        // never carry IL, and on the X13s the boot-floor timer preemption sets it deterministically
+        // (SPSR `EL1h IL=1`). The J303 `kumo_irq_common` guard could not catch this — the bad `eret`
+        // reaches the faulting PC by a path it does not sit on — so recover at the fault itself.
+        // Bounded, so a genuinely stuck illegal state still reaches the Tower instead of livelocking;
+        // if the boot then proceeds, the IL was spurious and userspace lives. — CORVUS
+        if ec == 0x0e && (index / 4) < 2 {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static IL_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+            if IL_RECOVERIES.fetch_add(1, Ordering::Relaxed) < 256 {
+                // SAFETY: ELR_EL1/SPSR_EL1 are untouched since entry; clear IL and return to the
+                // faulting instruction, which now executes under a legal PSTATE. Never returns.
+                unsafe {
+                    core::arch::asm!(
+                        "mrs x9, spsr_el1",
+                        "bic x9, x9, #0x100000",
+                        "msr spsr_el1, x9",
+                        "eret",
+                        options(noreturn, nostack),
+                    );
+                }
+            }
+            // Fall through to the Tower: IL recovery exhausted (a genuinely stuck illegal state).
+        }
         // A fatal EL1 exception ends the userspace ownership epoch. Take the glass
         // back before rendering so the Tower remains visible even if drv-fb died.
         reclaim_framebuffer_console();
         let src =
             ["CurEL_SP0", "CurEL_SPx", "LowerEL_A64", "LowerEL_A32"][((index / 4) % 4) as usize];
         let kind = ["sync", "irq", "fiq", "serror"][(index % 4) as usize];
-        let ec = ((esr >> 26) & 0x3f) as u32;
         // Faulting PSTATE: for EC 0x00 (undefined / illegal state) the ELR (faulting PC) and
         // SPSR are the useful clues and FAR is meaningless, so capture SPSR too.
         let spsr: u64;
@@ -3716,16 +3884,18 @@ mod traps {
                 "\r\n********** TOWER: CPU EXCEPTION **********\r\n\
                  src={}/{}  ec={:#04x} ({})\r\n\
                  ESR={:#018x}  ELR={:#018x}\r\n\
-                 FAR={:#018x}  SPSR={:#018x}\r\n\
+                 FAR={:#018x}  SPSR={:#018x}  ({} IL={})\r\n\
                  halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
                 src,
                 kind,
                 ec,
-                ec_name(ec),
+                super::esr_class_name(ec),
                 esr,
                 elr,
                 far,
                 spsr,
+                super::spsr_mode_name(spsr),
+                super::spsr_is_illegal(spsr) as u8,
                 pass
             );
             pass = pass.wrapping_add(1);
@@ -3761,21 +3931,27 @@ mod traps {
         super::on_irq(intid as u32);
     }
 
-    fn ec_name(ec: u32) -> &'static str {
-        match ec {
-            0x15 => "SVC",
-            0x18 => "MSR/MRS/system trap",
-            0x20 => "instruction abort (lower EL)",
-            0x21 => "instruction abort",
-            0x22 => "PC alignment",
-            0x24 => "data abort (lower EL)",
-            0x25 => "data abort",
-            0x26 => "SP alignment",
-            0x2c => "FP exception",
-            0x2f => "SError",
-            0x3c => "BRK",
-            _ => "unknown",
+    /// Called from `kumo_irq_common`'s restore when the context it is about to resume carries
+    /// `PSTATE.IL` (the X13s boot-floor timer-preemption bug — J302 TOWER `EL1h IL=1`). The asm
+    /// clears IL and resumes; this prints the saved ELR/SPSR **once** so the next flash reveals
+    /// whether that context is otherwise sane (a clean idle-floor frame with a spurious IL bit)
+    /// or garbage (a wrong-stack read) — without re-crashing. Direct console write only; runs in
+    /// IRQ context with interrupts masked, so it is re-entrancy-safe. — CORVUS
+    #[no_mangle]
+    extern "C" fn kumo_irq_il_seen(elr: u64, spsr: u64) {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if SEEN.swap(true, Ordering::Relaxed) {
+            return;
         }
+        let mut out = ConsoleWriter;
+        let _ = write!(
+            out,
+            "\r\nkumo: IRQ-return IL guard — saved ELR={:#018x} SPSR={:#018x} ({} IL=1); cleared IL, resuming\r\n",
+            elr,
+            spsr,
+            super::spsr_mode_name(spsr)
+        );
     }
 }
 
@@ -3797,6 +3973,56 @@ pub fn spin_once() {
     core::hint::spin_loop();
 }
 
+/// AArch64 `ESR_EL1` exception-class (`EC`, bits[31:26]) → short human name, for the CPU
+/// EXCEPTION TOWER dump. Pure + host-tested so a kernel fault names its class instead of
+/// printing "unknown" — EC `0x0e` (Illegal Execution State) was the gap that left the X13s
+/// timer-preemption fault cryptic. Gated to the freestanding kernel + host tests so the
+/// host-non-test dep build (where `traps` is absent) does not flag it dead. — CORVUS
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn esr_class_name(ec: u32) -> &'static str {
+    match ec {
+        0x00 => "unknown/undefined",
+        0x07 => "SIMD/FP access",
+        0x0e => "illegal execution state",
+        0x15 => "SVC",
+        0x18 => "MSR/MRS/system trap",
+        0x20 => "instruction abort (lower EL)",
+        0x21 => "instruction abort",
+        0x22 => "PC alignment",
+        0x24 => "data abort (lower EL)",
+        0x25 => "data abort",
+        0x26 => "SP alignment",
+        0x2c => "FP exception",
+        0x2f => "SError",
+        0x3c => "BRK",
+        _ => "unknown",
+    }
+}
+
+/// `SPSR` `M[4:0]` → the saved Exception Level + stack-pointer select (e.g. `EL1h`). Spelling
+/// this out turns a raw fault SPSR into a readable "EL1h" on the panel. — CORVUS
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn spsr_mode_name(spsr: u64) -> &'static str {
+    match spsr & 0x1f {
+        0x00 => "EL0t",
+        0x04 => "EL1t",
+        0x05 => "EL1h",
+        0x08 => "EL2t",
+        0x09 => "EL2h",
+        0x0c => "EL3t",
+        0x0d => "EL3h",
+        _ => "EL?",
+    }
+}
+
+/// `SPSR.IL` (bit 20): the Illegal-Execution-State flag. Set ⇒ the saved context was about to
+/// fault on an illegal exception-return / state change — the decisive clue for an EC `0x0e`
+/// TOWER (the value `0x00100005` reads as `EL1h IL=1`). — CORVUS
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn spsr_is_illegal(spsr: u64) -> bool {
+    (spsr >> 20) & 1 != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3804,6 +4030,23 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "aarch64");
+    }
+
+    #[test]
+    fn esr_class_name_labels_illegal_execution_state() {
+        // EC 0x0e is the class behind the X13s timer-preemption TOWER; it must not read "unknown".
+        assert_eq!(esr_class_name(0x0e), "illegal execution state");
+        assert_eq!(esr_class_name(0x25), "data abort");
+        assert_eq!(esr_class_name(0x3f), "unknown");
+    }
+
+    #[test]
+    fn spsr_decode_spells_out_el1h_illegal_state() {
+        // The captured fault SPSR 0x00100005 decodes as EL1h with the Illegal-Execution-State bit.
+        assert_eq!(spsr_mode_name(0x0010_0005), "EL1h");
+        assert!(spsr_is_illegal(0x0010_0005));
+        assert_eq!(spsr_mode_name(0x0), "EL0t");
+        assert!(!spsr_is_illegal(0x5));
     }
 
     #[test]
@@ -4149,6 +4392,46 @@ mod tests {
         assert_eq!(config.distributor_base, 0x10_7fff_9000);
         assert_eq!(config.cpu_base, 0x10_7fff_a000);
         assert_eq!(config.timer_irq, TIMER_VIRTUAL_PPI);
+    }
+
+    #[test]
+    fn gic_sysreg_field_gates_gicv3_path() {
+        // Pi 5 / GIC-400: GIC field (bits [27:24]) == 0 → no ICC_*_EL1 → must NOT run gicv3
+        // init (the `mrs ICC_SRE_EL1` UNDEF that raised the Pi 5 TOWER). — CORVUS 2026-06-26
+        assert!(!id_aa64pfr0_has_gic_sysregs(0x0000_0000_0000_0000));
+        // QEMU virt gic-version=3 / x13s: GIC field == 0b0001 → system-register interface present.
+        assert!(id_aa64pfr0_has_gic_sysregs(0x0000_0000_0100_0000));
+        // GICv4.1 (0b0011) also counts.
+        assert!(id_aa64pfr0_has_gic_sysregs(0x0000_0000_0300_0000));
+        // Only bits [27:24] matter: a set [31:28] nibble (here 0xF) must not be read as present.
+        assert!(!id_aa64pfr0_has_gic_sysregs(0xffff_ffff_f0ff_ffff));
+    }
+
+    #[test]
+    fn gicv2_no_dtb_fallback_is_pi5_only_for_the_stuck_case() {
+        // Pi 5 that handed us no DTB: GICv2-only PE (no sysregs) + dtb == 0 → GIC-400 window.
+        let fb = gicv2_no_dtb_fallback(0, false).expect("Pi 5 no-DTB case must fall back");
+        assert_eq!(fb.distributor_base, 0x10_7fff_9000);
+        assert_eq!(fb.cpu_base, 0x10_7fff_a000);
+        assert_eq!(fb.timer_irq, TIMER_VIRTUAL_PPI);
+        // A real DTB is present → never override discovery, even on a GICv2-only PE.
+        assert_eq!(gicv2_no_dtb_fallback(0x4000_0000, false), None);
+        // A GICv3 PE with no DTB uses QEMU_GICV3, not the Pi 5 GICv2 fallback.
+        assert_eq!(gicv2_no_dtb_fallback(0, true), None);
+    }
+
+    #[test]
+    fn pi5_gic400_fits_in_one_2mib_device_block() {
+        // enable_kernel maps a single 2 MiB block (TTBR1 physmap) to cover the GIC-400; verify
+        // that block holds BOTH the distributor (…9000) and the CPU interface — specifically
+        // GICC_IAR at cpu_base+0xC, the address the Pi 5 IRQ-ack data abort faulted on.
+        // — CORVUS 2026-06-26
+        const BLOCK_2M: u64 = 1 << 21;
+        let block = PI5_GICV2.distributor_base & !(BLOCK_2M - 1);
+        assert_eq!(block, 0x10_7fe0_0000);
+        let gicc_iar = PI5_GICV2.cpu_base + 0x0c;
+        assert!((block..block + BLOCK_2M).contains(&PI5_GICV2.distributor_base));
+        assert!((block..block + BLOCK_2M).contains(&gicc_iar));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub use initrd::{
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
 pub use sys::{
     decode_tlmm_gpio_irq, interrupt_authority_key, tlmm_gpio_irq, tlmm_gpio_irq_window_base, Errno,
-    ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags,
+    ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags, PROCESS_LABEL_BYTES,
 };
 
 pub const ABI_VERSION: u32 = 1;

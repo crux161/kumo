@@ -16,4 +16,7 @@ pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{
     boot_keyboard_report, Command, HidDescriptor, InputFrame, PowerState, ProtocolError,
 };
-pub use report_descriptor::{find_boot_keyboard, KeyboardReport, ReportDescriptorError};
+pub use report_descriptor::{
+    find_boot_keyboard, inspect_report_descriptor, KeyboardReport, ReportDescriptorError,
+    ReportDescriptorInfo,
+};

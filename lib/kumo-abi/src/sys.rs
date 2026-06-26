@@ -44,6 +44,12 @@ pub enum Syscall {
     FramebufferClaim = 38,
 }
 
+/// Maximum debug label bytes accepted by [`Syscall::ProcessCreate`].
+///
+/// The label is diagnostic-only: it grants no authority and is copied/truncated by the kernel for
+/// TOWER/ledger output.
+pub const PROCESS_LABEL_BYTES: usize = 32;
+
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
 pub const TLMM_GPIO_PIN_MASK: u32 = 0x0000_0fff;
 pub const TLMM_GPIO_FLAGS_SHIFT: u32 = 12;

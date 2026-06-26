@@ -67,6 +67,17 @@ pub enum InputFrame<'a> {
 
 impl<'a> InputFrame<'a> {
     pub fn parse(raw: &'a [u8]) -> Result<Self, ProtocolError> {
+        Self::parse_inner(raw, false)
+    }
+
+    /// Parse a frame while tolerating devices whose length word is outside the actual read size.
+    /// This mirrors Linux's BAD_INPUT_SIZE quirk: the transport read succeeded, so consume the
+    /// bytes that are present instead of killing the device. — KESTREL
+    pub fn parse_with_bad_size_quirk(raw: &'a [u8]) -> Result<Self, ProtocolError> {
+        Self::parse_inner(raw, true)
+    }
+
+    fn parse_inner(raw: &'a [u8], clamp_bad_length: bool) -> Result<Self, ProtocolError> {
         if raw.len() < 2 {
             return Err(ProtocolError::Truncated);
         }
@@ -75,7 +86,11 @@ impl<'a> InputFrame<'a> {
             return Ok(Self::Reset);
         }
         if length < 2 || length > raw.len() {
-            return Err(ProtocolError::InvalidInputLength);
+            return if clamp_bad_length {
+                Ok(Self::Report(&raw[2..]))
+            } else {
+                Err(ProtocolError::InvalidInputLength)
+            };
         }
         Ok(Self::Report(&raw[2..length]))
     }
@@ -98,9 +113,10 @@ pub fn boot_keyboard_report(
         }
         payload = rest;
     }
-    payload
-        .try_into()
-        .map_err(|_| ProtocolError::NotBootKeyboardReport)
+    let mut report = [0u8; 8];
+    let copied = payload.len().min(report.len());
+    report[..copied].copy_from_slice(&payload[..copied]);
+    Ok(report)
 }
 
 const fn word(raw: &[u8], offset: usize) -> u16 {
@@ -228,6 +244,30 @@ mod tests {
         assert_eq!(
             boot_keyboard_report(InputFrame::Report(&identified), Some(7)),
             Ok(report)
+        );
+    }
+
+    #[test]
+    fn boot_report_is_zero_padded_or_trimmed_like_hid_core() {
+        assert_eq!(
+            boot_keyboard_report(InputFrame::Report(&[0, 0, 4]), None),
+            Ok([0, 0, 4, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            boot_keyboard_report(InputFrame::Report(&[0, 0, 4, 0, 0, 0, 0, 0, 0xaa]), None),
+            Ok([0, 0, 4, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn bad_input_size_quirk_clamps_the_frame_to_the_bytes_read() {
+        assert_eq!(
+            InputFrame::parse_with_bad_size_quirk(&[0x20, 0x00, 0xaa, 0xbb]),
+            Ok(InputFrame::Report(&[0xaa, 0xbb][..]))
+        );
+        assert_eq!(
+            InputFrame::parse(&[0x20, 0x00, 0xaa, 0xbb]),
+            Err(ProtocolError::InvalidInputLength)
         );
     }
 }

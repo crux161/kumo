@@ -335,6 +335,22 @@ pub fn process_create(_vmar_base: u64, _vmar_size: u64) -> u64 {
     u64::MAX
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn process_create_named(vmar_base: u64, vmar_size: u64, label: &[u8]) -> u64 {
+    syscall(
+        Syscall::ProcessCreate,
+        vmar_base,
+        vmar_size,
+        label.as_ptr() as u64,
+        label.len() as u64,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn process_create_named(_vmar_base: u64, _vmar_size: u64, _label: &[u8]) -> u64 {
+    u64::MAX
+}
+
 /// Map a VMO into a process's address space (syscall `VmarMap`).
 /// `flags` are [`kumo_abi::VmarFlags`] bits OR'd together.
 #[cfg(target_arch = "aarch64")]

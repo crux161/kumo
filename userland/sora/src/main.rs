@@ -16,9 +16,9 @@ use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
-    port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
-    thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
-    STARTUP_TAG_CAP0, STARTUP_TAG_STDOUT,
+    port_wait, process_create, process_create_named, process_run, process_wait,
+    resource_create_child, thread_create, thread_start, timer_create, vmar_map, vmo_create,
+    vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_STDOUT,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -745,6 +745,12 @@ extern "C" fn sora_main(
         }
     }
 
+    // Track whether Sora relinquishes its console channel to drv-fb below. On the framebuffer
+    // path the console handle is MOVED to drv-fb (which paints kernel console output), so its
+    // koid is later unresolvable in Sora's own table — by design, not a failure. The serve-setup
+    // diagnostic reads this flag so a healthy framebuffer boot is not misread as a regression. — CORVUS
+    let mut console_handed_to_fb = false;
+
     // J159: spawn drv-fb when a framebuffer is present.
     // Map the BootInfo VMO (populated by the kernel), read framebuffer geometry,
     // create a narrowed child Resource for the framebuffer MMIO range, and hand
@@ -780,6 +786,9 @@ extern "C" fn sora_main(
                         channel_write_with_handle(srv, b"F".as_ptr(), 1, Handle(fb_res_h as u32));
                         channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
                         channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
+                        // `console` is now MOVED out of Sora's handle table (write-with-handle has
+                        // move semantics); its koid is unresolvable from here on, by design. — CORVUS
+                        console_handed_to_fb = true;
                         if run_elf(
                             initrd,
                             kumo_abi::DRV_FB_PATH.as_bytes(),
@@ -1347,7 +1356,15 @@ extern "C" fn sora_main(
         log(b"sora: port create fail\n");
     }
     if console_koid == u64::MAX {
-        log(b"sora: console koid fail\n");
+        if console_handed_to_fb {
+            // Not a failure: on the framebuffer path Sora deliberately MOVED its console channel to
+            // drv-fb above, so the handle is gone from Sora's table and its koid cannot resolve here.
+            // Sora serves on the keyboard instead. Logged distinctly so a healthy X13s boot is not
+            // misread as the J300 "console koid fail" regression (the false alarm this resolves). — CORVUS
+            log(b"sora: console handed to drv-fb; serving on keyboard\n");
+        } else {
+            log(b"sora: console koid fail\n");
+        }
     }
     if block_koid == u64::MAX {
         log(b"sora: block koid fail\n");
@@ -1358,14 +1375,19 @@ extern "C" fn sora_main(
     if kbd_koid == u64::MAX {
         log(b"sora: kbd koid fail\n");
     }
-    // The serve loop only needs the port and a console to be useful; the block/net/keyboard
-    // channels are bound only when available. A machine without a keyboard or net driver (the
-    // X13s today) therefore still serves its console instead of dropping into the silent
-    // busy-spin that looked like a halt after `anon vmo write ok`. Each per-source handler
-    // below already gates on a koid match, so an unbound channel simply never wakes the port.
-    if port_h != u64::MAX && console_koid != u64::MAX {
+    // The serve loop needs the port and at least one INPUT source. On QEMU that is the console
+    // channel (the kernel pumps UART RX into it); on the X13s framebuffer path there is no UART
+    // console channel — the input source is the keyboard (`drv-i2c-hid` → kbd channel). Requiring
+    // the console specifically wedged the X13s into the idle busy-spin even though the keyboard was
+    // live (the `console koid fail` boot). Serve on `port + (console || kbd)` and bind whichever
+    // channels exist; output (echo) goes via `debug_write`, independent of the console channel.
+    // Each per-source handler below gates on a koid match, so an unbound channel never wakes the
+    // port. — CORVUS
+    if port_h != u64::MAX && (console_koid != u64::MAX || kbd_koid != u64::MAX) {
         let port = Handle(port_h as u32);
-        port_bind(port, console);
+        if console_koid != u64::MAX {
+            port_bind(port, console);
+        }
         if block_koid != u64::MAX {
             port_bind(port, block);
         }
@@ -1579,10 +1601,10 @@ extern "C" fn sora_main(
             }
         }
     } else {
-        // Reached only when the port itself or the console channel is unavailable — Sora cannot
-        // serve, so it idles. The marker keeps this state honest on the framebuffer instead of
-        // looking like a halt after `anon vmo write ok`.
-        log(b"sora: no port/console; idle\n");
+        // Reached only when the port failed OR there is no input source at all (neither console nor
+        // keyboard) — Sora cannot serve, so it idles. The marker keeps this state honest on the
+        // framebuffer instead of looking like a halt after `anon vmo write ok`.
+        log(b"sora: no port + no input source; idle\n");
         loop {
             core::hint::spin_loop();
         }
@@ -2137,7 +2159,7 @@ fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &
             }
         }
 
-        let child_as_h = process_create(0, 0x2000_0000);
+        let child_as_h = process_create_named(0, 0x2000_0000, name);
         if child_as_h == u64::MAX {
             log(name);
             log(b": process fail\n");

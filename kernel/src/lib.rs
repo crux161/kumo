@@ -565,7 +565,10 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
         klog!("\nMUREX core online -- all subsystems nominal.\n");
         klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
-        kumo_hal::active::halt()
+        loop {
+            user_thread::pump_idle_floor();
+            kumo_hal::active::spin_once();
+        }
     } else {
         // P8-b: serial console (QEMU PL011) — forward keystrokes to Sora via the
         // keyboard channel. Sora buffers keystrokes (minimal line editing: backspace),
@@ -602,6 +605,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             if usermode::poll_root_command(&mut env) > 0 {
                 klog!("{}", shell::PROMPT);
             }
+            user_thread::pump_idle_floor();
         }
     }
 }

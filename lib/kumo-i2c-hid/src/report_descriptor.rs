@@ -21,6 +21,8 @@ pub enum ReportDescriptorError {
     Unbalanced,
     /// Push/pop or collection nesting exceeded the fixed parser bounds.
     TooComplex,
+    /// A Report ID item used the forbidden ID 0 or overflowed the 8-bit report-id space.
+    InvalidReportId,
     /// No boot-shaped keyboard Application Collection (Generic Desktop / Keyboard, with a
     /// 64-bit input report) is present.
     NotBootKeyboard,
@@ -33,6 +35,20 @@ pub struct KeyboardReport {
     /// declares no Report ID (a single-report device, whose frames carry no ID byte). This is
     /// exactly the argument [`crate::boot_keyboard_report`] takes.
     pub report_id: Option<u8>,
+    /// Input payload bytes for the boot keyboard report, excluding HID-over-I2C's 2-byte length
+    /// field and excluding any Report ID prefix.
+    pub input_payload_bytes: usize,
+    /// Full HID-over-I2C input frame bytes for the boot keyboard report: 2-byte length, optional
+    /// Report ID, and payload.
+    pub input_frame_bytes: usize,
+}
+
+/// Linux-like report-descriptor summary: the keyboard report KUMO can decode today, plus the
+/// largest input frame implied by the parsed HID reports. — KESTREL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportDescriptorInfo {
+    pub keyboard: KeyboardReport,
+    pub max_input_frame_bytes: usize,
 }
 
 // HID usage pages / usages and the boot-keyboard report geometry (USB HID 1.11 App. B.1).
@@ -44,6 +60,8 @@ const BOOT_KEYBOARD_INPUT_BITS: u32 = 8 + 8 + 6 * 8;
 
 const MAX_GLOBAL_STACK: usize = 8; // HID Push/Pop depth we tolerate
 const MAX_COLLECTION_DEPTH: usize = 16;
+const HID_MAX_IDS: usize = 256;
+const INPUT_FRAME_LENGTH_BYTES: usize = 2;
 
 /// Global-item state, saved/restored by Push (0xA4) / Pop (0xB4).
 #[derive(Clone, Copy, Default)]
@@ -62,6 +80,14 @@ struct Globals {
 /// length. The first boot-shaped keyboard collection wins; other collections (consumer control,
 /// vendor) are skipped.
 pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescriptorError> {
+    Ok(inspect_report_descriptor(desc)?.keyboard)
+}
+
+/// Parse the report descriptor far enough to mirror Linux's i2c-hid sizing discipline:
+/// report sizes come from HID report fields, not just from the firmware's wMaxInputLength. — KESTREL
+pub fn inspect_report_descriptor(
+    desc: &[u8],
+) -> Result<ReportDescriptorInfo, ReportDescriptorError> {
     let mut globals = Globals::default();
     let mut gstack = [Globals::default(); MAX_GLOBAL_STACK];
     let mut gsp = 0usize;
@@ -74,6 +100,11 @@ pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescripto
     let mut kbd_open_depth: Option<usize> = None;
     let mut kbd_input_bits = 0u32;
     let mut kbd_report_id: Option<u8> = None;
+    let mut keyboard = None;
+
+    let mut input_bits = [0u32; HID_MAX_IDS];
+    let mut input_seen = [false; HID_MAX_IDS];
+    let mut input_numbered = false;
 
     let mut i = 0usize;
     while i < desc.len() {
@@ -111,10 +142,21 @@ pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescripto
                 // Main item. Clears local state afterward (HID 1.11 §6.2.2.8).
                 match b_tag {
                     0x8 => {
-                        // Input: count its bits while inside the keyboard collection.
+                        // Input: account per-report size like Linux hid_add_field(), and count
+                        // keyboard bits while inside the boot-keyboard collection. — KESTREL
+                        let bits = report_bits(globals)?;
+                        let report_index = report_index(globals.report_id)?;
+                        input_seen[report_index] = true;
+                        input_bits[report_index] = input_bits[report_index]
+                            .checked_add(bits)
+                            .ok_or(ReportDescriptorError::TooComplex)?;
+                        if globals.report_id.is_some() {
+                            input_numbered = true;
+                        }
                         if kbd_open_depth.is_some() {
-                            let bits = globals.report_size.saturating_mul(globals.report_count);
-                            kbd_input_bits = kbd_input_bits.saturating_add(bits);
+                            kbd_input_bits = kbd_input_bits
+                                .checked_add(bits)
+                                .ok_or(ReportDescriptorError::TooComplex)?;
                             kbd_report_id = globals.report_id;
                         }
                     }
@@ -141,9 +183,14 @@ pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescripto
                             .ok_or(ReportDescriptorError::Unbalanced)?;
                         if kbd_open_depth == Some(depth) {
                             // Closing the keyboard collection: accept iff it is boot-shaped.
-                            if kbd_input_bits == BOOT_KEYBOARD_INPUT_BITS {
-                                return Ok(KeyboardReport {
+                            if keyboard.is_none() && kbd_input_bits == BOOT_KEYBOARD_INPUT_BITS {
+                                keyboard = Some(KeyboardReport {
                                     report_id: kbd_report_id,
+                                    input_payload_bytes: bits_to_bytes(kbd_input_bits)?,
+                                    input_frame_bytes: frame_bytes(
+                                        kbd_input_bits,
+                                        kbd_report_id.is_some(),
+                                    )?,
                                 });
                             }
                             // Not boot-shaped: keep scanning for another keyboard collection.
@@ -157,7 +204,12 @@ pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescripto
             1 => match b_tag {
                 0x0 => globals.usage_page = data as u16,
                 0x7 => globals.report_size = data,
-                0x8 => globals.report_id = Some(data as u8),
+                0x8 => {
+                    if data == 0 || data >= HID_MAX_IDS as u32 {
+                        return Err(ReportDescriptorError::InvalidReportId);
+                    }
+                    globals.report_id = Some(data as u8);
+                }
                 0x9 => globals.report_count = data,
                 0xA => {
                     // Push
@@ -188,7 +240,17 @@ pub fn find_boot_keyboard(desc: &[u8]) -> Result<KeyboardReport, ReportDescripto
         i = data_end;
     }
 
-    Err(ReportDescriptorError::NotBootKeyboard)
+    if depth != 0 {
+        return Err(ReportDescriptorError::Unbalanced);
+    }
+
+    let keyboard = keyboard.ok_or(ReportDescriptorError::NotBootKeyboard)?;
+    let max_input_frame_bytes = max_input_frame_bytes(&input_bits, &input_seen, input_numbered)?
+        .max(keyboard.input_frame_bytes);
+    Ok(ReportDescriptorInfo {
+        keyboard,
+        max_input_frame_bytes,
+    })
 }
 
 /// Read up to four little-endian bytes as a `u32` (HID item data is little-endian, 0/1/2/4 bytes).
@@ -198,6 +260,44 @@ fn le_u32(bytes: &[u8]) -> u32 {
         v |= (b as u32) << (8 * n as u32);
     }
     v
+}
+
+fn report_bits(globals: Globals) -> Result<u32, ReportDescriptorError> {
+    globals
+        .report_size
+        .checked_mul(globals.report_count)
+        .ok_or(ReportDescriptorError::TooComplex)
+}
+
+fn report_index(report_id: Option<u8>) -> Result<usize, ReportDescriptorError> {
+    Ok(report_id.unwrap_or(0) as usize)
+}
+
+fn max_input_frame_bytes(
+    input_bits: &[u32; HID_MAX_IDS],
+    input_seen: &[bool; HID_MAX_IDS],
+    input_numbered: bool,
+) -> Result<usize, ReportDescriptorError> {
+    let mut max = 0usize;
+    for (&bits, &seen) in input_bits.iter().zip(input_seen.iter()) {
+        if seen {
+            max = max.max(frame_bytes(bits, input_numbered)?);
+        }
+    }
+    Ok(max)
+}
+
+fn frame_bytes(bits: u32, numbered: bool) -> Result<usize, ReportDescriptorError> {
+    bits_to_bytes(bits)?
+        .checked_add(INPUT_FRAME_LENGTH_BYTES + usize::from(numbered))
+        .ok_or(ReportDescriptorError::TooComplex)
+}
+
+fn bits_to_bytes(bits: u32) -> Result<usize, ReportDescriptorError> {
+    Ok(bits
+        .checked_add(7)
+        .ok_or(ReportDescriptorError::TooComplex)? as usize
+        / 8)
 }
 
 #[cfg(test)]
@@ -294,7 +394,11 @@ mod tests {
     fn accepts_the_conventional_boot_keyboard_with_no_report_id() {
         assert_eq!(
             find_boot_keyboard(BOOT_KEYBOARD),
-            Ok(KeyboardReport { report_id: None })
+            Ok(KeyboardReport {
+                report_id: None,
+                input_payload_bytes: 8,
+                input_frame_bytes: 10,
+            })
         );
     }
 
@@ -302,7 +406,11 @@ mod tests {
     fn extracts_the_report_id_when_present() {
         assert_eq!(
             find_boot_keyboard(BOOT_KEYBOARD_RID7),
-            Ok(KeyboardReport { report_id: Some(7) })
+            Ok(KeyboardReport {
+                report_id: Some(7),
+                input_payload_bytes: 8,
+                input_frame_bytes: 11,
+            })
         );
     }
 
@@ -311,8 +419,21 @@ mod tests {
         // The consumer collection (Report ID 2) is skipped; the keyboard's Report ID 1 wins.
         assert_eq!(
             find_boot_keyboard(CONSUMER_THEN_KEYBOARD),
-            Ok(KeyboardReport { report_id: Some(1) })
+            Ok(KeyboardReport {
+                report_id: Some(1),
+                input_payload_bytes: 8,
+                input_frame_bytes: 11,
+            })
         );
+    }
+
+    #[test]
+    fn summarizes_the_largest_input_frame_like_linux_i2c_hid() {
+        let info = inspect_report_descriptor(CONSUMER_THEN_KEYBOARD).unwrap();
+        assert_eq!(info.keyboard.report_id, Some(1));
+        // The consumer report is 16 bits and the keyboard report is 64 bits; numbered input reports
+        // carry a report-id byte after HID-over-I2C's 2-byte length field.
+        assert_eq!(info.max_input_frame_bytes, 11);
     }
 
     #[test]
@@ -364,6 +485,20 @@ mod tests {
         assert_eq!(
             find_boot_keyboard(&[0xC0]),
             Err(ReportDescriptorError::Unbalanced)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_report_ids() {
+        assert_eq!(
+            find_boot_keyboard(&[
+                0x05, 0x01, // Usage Page (Generic Desktop)
+                0x09, 0x06, // Usage (Keyboard)
+                0xA1, 0x01, // Collection (Application)
+                0x85, 0x00, //   Report ID (0) is invalid in Linux hid-core too.
+                0xC0, // End Collection
+            ]),
+            Err(ReportDescriptorError::InvalidReportId)
         );
     }
 }

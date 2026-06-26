@@ -7,6 +7,7 @@ use crate::mm::{Mapping, Vmar, PAGE_SIZE};
 use crate::object::{HandleTable, KernelObject, ObjectManager};
 
 pub const DEFAULT_KERNEL_STACK_SIZE: usize = 16 * 1024;
+pub const PROCESS_LABEL_BYTES: usize = kumo_abi::PROCESS_LABEL_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskError {
@@ -44,9 +45,55 @@ impl Job {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessLabel {
+    bytes: [u8; PROCESS_LABEL_BYTES],
+    len: u8,
+}
+
+impl ProcessLabel {
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; PROCESS_LABEL_BYTES],
+            len: 0,
+        }
+    }
+
+    pub fn from_bytes(label: &[u8]) -> Self {
+        let mut out = Self::empty();
+        let mut i = 0;
+        while i < label.len() && i < PROCESS_LABEL_BYTES {
+            let byte = label[i];
+            out.bytes[i] = if byte.is_ascii_graphic() || byte == b' ' {
+                byte
+            } else {
+                b'?'
+            };
+            i += 1;
+        }
+        out.len = i as u8;
+        out
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for ProcessLabel {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     object: KernelObject,
+    label: ProcessLabel,
     job: KoId,
     root_vmar: Vmar,
     handles: HandleTable,
@@ -61,6 +108,7 @@ impl Process {
     pub fn new(objects: &mut ObjectManager, job: &Job, root_vmar: Vmar) -> Self {
         Self {
             object: objects.create(ObjectKind::Process),
+            label: ProcessLabel::empty(),
             job: job.koid(),
             root_vmar,
             handles: HandleTable::new(),
@@ -77,6 +125,7 @@ impl Process {
     pub fn from_parts(koid: KoId, root_vmar: Vmar) -> Self {
         Self {
             object: crate::object::KernelObject::new(koid, kumo_abi::ObjectKind::Process),
+            label: ProcessLabel::empty(),
             job: KoId(0),
             root_vmar,
             handles: HandleTable::new(),
@@ -92,6 +141,14 @@ impl Process {
 
     pub const fn object(&self) -> KernelObject {
         self.object
+    }
+
+    pub const fn label(&self) -> ProcessLabel {
+        self.label
+    }
+
+    pub fn set_label(&mut self, label: ProcessLabel) {
+        self.label = label;
     }
 
     pub fn add_mapping(&mut self, mapping: Mapping, vmo_koid: KoId) {
@@ -371,6 +428,21 @@ mod tests {
             .handles()
             .require(handle, ObjectKind::Resource, Rights::MANAGE)
             .is_ok());
+    }
+
+    #[test]
+    fn process_label_truncates_and_sanitizes_for_tower_output() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let mut raw = [b'x'; PROCESS_LABEL_BYTES + 4];
+        raw[1] = 0;
+
+        process.set_label(ProcessLabel::from_bytes(&raw));
+
+        assert_eq!(process.label().as_bytes().len(), PROCESS_LABEL_BYTES);
+        assert_eq!(process.label().as_bytes()[0], b'x');
+        assert_eq!(process.label().as_bytes()[1], b'?');
     }
 
     #[test]
