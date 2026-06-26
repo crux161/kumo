@@ -24,7 +24,7 @@ pub fn init() {
     // for future explicit initialization if we switch to VMO-backed heaps.
 }
 
-#[cfg(all(not(test), target_os = "none"))]
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     sys::process_exit(1);

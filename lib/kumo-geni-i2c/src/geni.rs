@@ -2,6 +2,8 @@ pub mod register {
     pub const FORCE_DEFAULT: u32 = 0x20;
     pub const OUTPUT_CTRL: u32 = 0x24;
     pub const CGC_CTRL: u32 = 0x28;
+    pub const GENI_STATUS: u32 = 0x40;
+    pub const M_CLK_CFG: u32 = 0x48;
     pub const FW_REVISION: u32 = 0x68;
     pub const CLK_SEL: u32 = 0x7c;
     pub const DMA_MODE_EN: u32 = 0x258;
@@ -13,7 +15,6 @@ pub mod register {
     pub const SCL_COUNTERS: u32 = 0x278;
     pub const RX_PACKING0: u32 = 0x284;
     pub const RX_PACKING1: u32 = 0x288;
-    pub const M_CLK_CFG: u32 = 0x48;
     pub const FIFO_DISABLE: u32 = 0x64;
     pub const M_CMD0: u32 = 0x600;
     pub const M_CMD_CTRL: u32 = 0x604;
@@ -60,10 +61,33 @@ pub enum GeniError {
     InvalidAddress,
     EmptyTransfer,
     TransferTooLong,
-    Nack,
-    Bus,
-    Timeout,
+    Nack { m_irq: u32, geni_status: u32 },
+    Bus { m_irq: u32, geni_status: u32 },
+    Timeout { m_irq: u32, geni_status: u32 },
     IncompleteRead,
+}
+
+impl GeniError {
+    pub fn code(self) -> u64 {
+        match self {
+            GeniError::WrongProtocol => 0,
+            GeniError::FifoUnavailable => 1,
+            GeniError::InvalidFifoDepth => 2,
+            GeniError::InvalidAddress => 3,
+            GeniError::EmptyTransfer => 4,
+            GeniError::TransferTooLong => 5,
+            GeniError::Nack { m_irq, geni_status } => {
+                0x1000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::Bus { m_irq, geni_status } => {
+                0x2000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::Timeout { m_irq, geni_status } => {
+                0x3000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::IncompleteRead => 9,
+        }
+    }
 }
 
 pub struct Controller<Io> {
@@ -193,7 +217,7 @@ impl<Io: RegisterIo> Controller<Io> {
         let mut cursor = 0usize;
         for _ in 0..self.poll_limit {
             let irq = self.io.read(register::M_IRQ_STATUS);
-            if let Err(error) = check_irq(irq) {
+            if let Err(error) = check_irq(&mut self.io, irq) {
                 self.io.write(register::TX_WATERMARK, 0);
                 self.io.write(register::M_IRQ_CLEAR, irq);
                 return Err(error);
@@ -222,7 +246,10 @@ impl<Io: RegisterIo> Controller<Io> {
             }
         }
         self.abort();
-        Err(GeniError::Timeout)
+        Err(GeniError::Timeout {
+            m_irq: self.io.read(register::M_IRQ_STATUS),
+            geni_status: self.io.read(register::GENI_STATUS),
+        })
     }
 
     fn read_message(&mut self, address: u8, bytes: &mut [u8]) -> Result<(), GeniError> {
@@ -235,7 +262,7 @@ impl<Io: RegisterIo> Controller<Io> {
         let mut cursor = 0usize;
         for _ in 0..self.poll_limit {
             let irq = self.io.read(register::M_IRQ_STATUS);
-            if let Err(error) = check_irq(irq) {
+            if let Err(error) = check_irq(&mut self.io, irq) {
                 self.io.write(register::M_IRQ_CLEAR, irq);
                 return Err(error);
             }
@@ -263,7 +290,10 @@ impl<Io: RegisterIo> Controller<Io> {
             }
         }
         self.abort();
-        Err(GeniError::Timeout)
+        Err(GeniError::Timeout {
+            m_irq: self.io.read(register::M_IRQ_STATUS),
+            geni_status: self.io.read(register::GENI_STATUS),
+        })
     }
 
     fn abort(&mut self) {
@@ -277,11 +307,17 @@ fn update(io: &mut impl RegisterIo, offset: u32, operation: impl FnOnce(u32) -> 
     io.write(offset, operation(value));
 }
 
-fn check_irq(irq: u32) -> Result<(), GeniError> {
+fn check_irq(io: &mut impl RegisterIo, irq: u32) -> Result<(), GeniError> {
     if irq & IRQ_NACK != 0 {
-        Err(GeniError::Nack)
+        Err(GeniError::Nack {
+            m_irq: irq,
+            geni_status: io.read(register::GENI_STATUS),
+        })
     } else if irq & IRQ_ERROR != 0 {
-        Err(GeniError::Bus)
+        Err(GeniError::Bus {
+            m_irq: irq,
+            geni_status: io.read(register::GENI_STATUS),
+        })
     } else {
         Ok(())
     }
@@ -382,7 +418,10 @@ mod tests {
         let mut controller = Controller::new(nack, SourceClock::Mhz19_2, 2).unwrap();
         assert_eq!(
             controller.write_read(0x68, &[1], &mut [0u8; 2]),
-            Err(GeniError::Nack)
+            Err(GeniError::Nack {
+                m_irq: IRQ_NACK,
+                geni_status: 0
+            })
         );
         let nack = controller.into_inner();
         assert_eq!(nack.values[&register::TX_WATERMARK], 0);
@@ -392,7 +431,10 @@ mod tests {
             Controller::new(FakeRegisters::ready(), SourceClock::Mhz19_2, 2).unwrap();
         assert_eq!(
             controller.write_read(0x68, &[1], &mut [0u8; 2]),
-            Err(GeniError::Timeout)
+            Err(GeniError::Timeout {
+                m_irq: 0,
+                geni_status: 0
+            })
         );
         let fake = controller.into_inner();
         assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);

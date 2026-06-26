@@ -1,28 +1,25 @@
 [package]
-name = "drv-i2c-hid"
+name = "drv-geni-i2c"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [lib]
-name = "drv_i2c_hid"
+name = "drv_geni_i2c"
 path = "src/lib.rs"
-test = true
-doctest = false
 
 [[bin]]
-name = "drv-i2c-hid"
+name = "drv-geni-i2c"
 path = "src/main.rs"
 test = false
 bench = false
 doctest = false
 
+
 [dependencies]
 kumo-abi.workspace = true
-kumo-hid = { path = "../../../lib/kumo-hid" }
 kumo-geni-i2c = { path = "../../../lib/kumo-geni-i2c" }
-kumo-i2c-hid = { path = "../../../lib/kumo-i2c-hid" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 kumo-rt = { path = "../../kumo-rt" }

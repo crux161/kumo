@@ -1,9 +1,8 @@
 #![no_std]
 
+use kumo_geni_i2c::SourceClock;
 use kumo_hid::{DecodeError, Decoder, KeyState};
-use kumo_i2c_hid::{
-    boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError, SourceClock,
-};
+use kumo_i2c_hid::{boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError};
 
 const MAGIC: [u8; 4] = *b"I2H1";
 pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
@@ -258,24 +257,16 @@ impl InputProbeDecoder {
 /// Capability-adjacent bootstrap data. Authority remains in the separately transferred Resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProbeConfig {
-    pub mmio_base: u64,
-    pub mmio_length: u64,
-    pub bus_frequency_hz: u32,
-    pub source_clock: SourceClock,
     pub i2c_address: u8,
     pub hid_descriptor_register: u16,
     pub attention_irq: u32,
 }
 
 impl ProbeConfig {
-    pub const BYTES: usize = 36;
+    pub const BYTES: usize = 12;
 
     pub fn for_x13s(topology: KeyboardTopology) -> Result<Self, ConfigError> {
         let config = Self {
-            mmio_base: topology.controller_mmio_base,
-            mmio_length: topology.controller_mmio_length,
-            bus_frequency_hz: topology.bus_frequency_hz,
-            source_clock: SourceClock::Mhz19_2,
             i2c_address: topology.i2c_address,
             hid_descriptor_register: topology.hid_descriptor_register,
             attention_irq: kumo_abi::tlmm_gpio_irq(
@@ -290,13 +281,9 @@ impl ProbeConfig {
     pub fn encode(self) -> [u8; Self::BYTES] {
         let mut raw = [0u8; Self::BYTES];
         raw[..4].copy_from_slice(&MAGIC);
-        raw[4..12].copy_from_slice(&self.mmio_base.to_le_bytes());
-        raw[12..20].copy_from_slice(&self.mmio_length.to_le_bytes());
-        raw[20..24].copy_from_slice(&self.bus_frequency_hz.to_le_bytes());
-        raw[24..28].copy_from_slice(&source_clock_hz(self.source_clock).to_le_bytes());
-        raw[28] = self.i2c_address;
-        raw[29..31].copy_from_slice(&self.hid_descriptor_register.to_le_bytes());
-        raw[32..36].copy_from_slice(&self.attention_irq.to_le_bytes());
+        raw[4] = self.i2c_address;
+        raw[5..7].copy_from_slice(&self.hid_descriptor_register.to_le_bytes());
+        raw[8..12].copy_from_slice(&self.attention_irq.to_le_bytes());
         raw
     }
 
@@ -308,33 +295,15 @@ impl ProbeConfig {
             return Err(ConfigError::BadMagic);
         }
         let config = Self {
-            mmio_base: u64::from_le_bytes(raw[4..12].try_into().unwrap()),
-            mmio_length: u64::from_le_bytes(raw[12..20].try_into().unwrap()),
-            bus_frequency_hz: u32::from_le_bytes(raw[20..24].try_into().unwrap()),
-            source_clock: match u32::from_le_bytes(raw[24..28].try_into().unwrap()) {
-                19_200_000 => SourceClock::Mhz19_2,
-                32_000_000 => SourceClock::Mhz32,
-                _ => return Err(ConfigError::UnsupportedSourceClock),
-            },
-            i2c_address: raw[28],
-            hid_descriptor_register: u16::from_le_bytes(raw[29..31].try_into().unwrap()),
-            attention_irq: u32::from_le_bytes(raw[32..36].try_into().unwrap()),
+            i2c_address: raw[4],
+            hid_descriptor_register: u16::from_le_bytes(raw[5..7].try_into().unwrap()),
+            attention_irq: u32::from_le_bytes(raw[8..12].try_into().unwrap()),
         };
         config.validate()?;
         Ok(config)
     }
 
     fn validate(self) -> Result<(), ConfigError> {
-        if self.mmio_base == 0
-            || self.mmio_base & 0xfff != 0
-            || self.mmio_length < 0x1000
-            || self.mmio_length & 0xfff != 0
-        {
-            return Err(ConfigError::InvalidMmio);
-        }
-        if self.bus_frequency_hz != 400_000 {
-            return Err(ConfigError::UnsupportedBusFrequency);
-        }
         if self.i2c_address > 0x7f {
             return Err(ConfigError::InvalidAddress);
         }

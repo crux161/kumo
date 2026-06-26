@@ -825,56 +825,70 @@ extern "C" fn sora_main(
                 let topology =
                     keyboard_topology_from_dtb(Handle(dtb_vmo as u32), bootinfo.platform.dtb);
                 if let Some(topology) = topology {
-                    match ProbeConfig::for_x13s(topology) {
-                        Ok(config) => {
-                            let device_resource = resource_create_child(
+                    let geni_cfg_res: Result<_, drv_geni_i2c::ConfigError> = {
+                        let cfg = drv_geni_i2c::ProbeConfig {
+                            mmio_base: topology.controller_mmio_base,
+                            mmio_length: topology.controller_mmio_length,
+                            bus_frequency_hz: topology.bus_frequency_hz,
+                            source_clock: drv_geni_i2c::SourceClock::Mhz19_2,
+                        };
+                        Ok(cfg)
+                    };
+                    match (
+                        geni_cfg_res,
+                        drv_i2c_hid::ProbeConfig::for_x13s(topology),
+                    ) {
+                        (Ok(geni_config), Ok(hid_config)) => {
+                            let geni_res = resource_create_child(
                                 res,
-                                config.mmio_base,
-                                config.mmio_length,
-                                kumo_abi::interrupt_authority_key(config.attention_irq),
+                                geni_config.mmio_base,
+                                geni_config.mmio_length,
+                                0,
                                 1,
                             );
-                            let (sender, bootstrap) = channel_create_pair();
-                            if device_resource == u64::MAX {
-                                log(b"drv-i2c-hid: resource fail\n");
-                            } else if sender == u64::MAX || bootstrap == u64::MAX {
-                                log(b"drv-i2c-hid: channel fail\n");
+                            let hid_res = resource_create_child(
+                                res,
+                                0,
+                                0,
+                                kumo_abi::interrupt_authority_key(hid_config.attention_irq),
+                                1,
+                            );
+                            let (geni_sender, geni_bootstrap) = channel_create_pair();
+                            let (hid_sender, hid_bootstrap) = channel_create_pair();
+                            let (i2c_serve, i2c_client) = channel_create_pair();
+                            
+                            if geni_res == u64::MAX || hid_res == u64::MAX || geni_sender == u64::MAX || hid_sender == u64::MAX || i2c_serve == u64::MAX {
+                                log(b"sora: i2c/hid resource or channel fail\n");
                             } else {
-                                let encoded = config.encode();
-                                let sent = channel_write_with_handle(
-                                    Handle(sender as u32),
-                                    encoded.as_ptr(),
-                                    encoded.len(),
-                                    Handle(device_resource as u32),
-                                );
-                                let keyboard_writer =
-                                    handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER);
-                                let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
-                                let keyboard_sent = if keyboard_writer != u64::MAX {
-                                    channel_write_with_handle(
-                                        Handle(sender as u32),
-                                        &tag,
-                                        1,
-                                        Handle(keyboard_writer as u32),
-                                    )
+                                let geni_enc = geni_config.encode();
+                                let hid_enc = hid_config.encode();
+                                
+                                let _ = channel_write_with_handle(Handle(geni_sender as u32), geni_enc.as_ptr(), geni_enc.len(), Handle(geni_res as u32));
+                                let _ = channel_write_with_handle(Handle(geni_sender as u32), b"S".as_ptr(), 1, Handle(i2c_serve as u32));
+                                
+                                let keyboard_writer = handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER);
+                                let _ = channel_write_with_handle(Handle(hid_sender as u32), hid_enc.as_ptr(), hid_enc.len(), Handle(hid_res as u32));
+                                let _ = channel_write_with_handle(Handle(hid_sender as u32), [drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG].as_ptr(), 1, Handle(keyboard_writer as u32));
+                                let _ = channel_write_with_handle(Handle(hid_sender as u32), b"I".as_ptr(), 1, Handle(i2c_client as u32));
+                                
+                                if run_elf(
+                                    initrd,
+                                    kumo_abi::DRV_GENI_I2C_PATH.as_bytes(),
+                                    0,
+                                    geni_bootstrap,
+                                    ProcessRunFlags::ASYNC.bits(),
+                                    b"drv-geni-i2c",
+                                ) {
+                                    log(b"drv-geni-i2c: run ok\n");
                                 } else {
-                                    Errno::BadHandle.status()
-                                };
-                                if sent != 0 {
-                                    if keyboard_writer != u64::MAX {
-                                        let _ = handle_close(Handle(keyboard_writer as u32));
-                                    }
-                                    log(b"drv-i2c-hid: bootstrap send fail\n");
-                                } else if keyboard_sent != 0 {
-                                    if keyboard_writer != u64::MAX {
-                                        let _ = handle_close(Handle(keyboard_writer as u32));
-                                    }
-                                    log(b"drv-i2c-hid: keyboard bootstrap fail\n");
-                                } else if run_elf(
+                                    log(b"drv-geni-i2c: run fail\n");
+                                }
+
+                                if run_elf(
                                     initrd,
                                     kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
                                     0,
-                                    bootstrap,
+                                    hid_bootstrap,
                                     ProcessRunFlags::ASYNC.bits(),
                                     b"drv-i2c-hid",
                                 ) {
@@ -884,7 +898,7 @@ extern "C" fn sora_main(
                                 }
                             }
                         }
-                        Err(_) => log(b"drv-i2c-hid: topology invalid\n"),
+                        _ => log(b"drv-i2c-hid: topology invalid\n"),
                     }
                 } else {
                     log(b"drv-i2c-hid: no matched keyboard\n");

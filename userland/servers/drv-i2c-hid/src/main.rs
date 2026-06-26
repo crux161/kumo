@@ -7,10 +7,9 @@ use drv_i2c_hid::{
     DecodedReport, DeviceQuirks, InputProbeDecoder, InputProbeError, ProbeConfig,
     KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
 };
-use kumo_abi::{Handle, VmarFlags};
-use kumo_i2c_hid::{
-    inspect_report_descriptor, Command, Controller, HidDescriptor, PowerState, RegisterIo,
-};
+use kumo_abi::i2c::{I2cOpcode, I2cRequestHeader, I2cTransferRequest, I2cTransferResponse};
+use kumo_abi::Handle;
+use kumo_i2c_hid::{inspect_report_descriptor, Command, HidDescriptor, PowerState};
 use kumo_rt::{
     channel_read_with_handle, channel_write, debug_write, handle_close, handle_koid,
     interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
@@ -19,7 +18,107 @@ use kumo_rt::{
 
 kumo_rt::entry!(main);
 
-const MMIO_VA: u64 = 0x0000_0000_1100_0000;
+fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
+    unsafe { core::slice::from_raw_parts((p as *const T) as *const u8, core::mem::size_of::<T>()) }
+}
+
+struct IpcError {
+    code: u64,
+}
+
+impl IpcError {
+    fn code(&self) -> u64 {
+        self.code
+    }
+}
+
+struct IpcController {
+    channel: Handle,
+}
+
+impl IpcController {
+    fn write(&mut self, address: u8, data: &[u8]) -> Result<(), IpcError> {
+        self.write_read(address, data, &mut [])
+    }
+    
+    fn read(&mut self, address: u8, buffer: &mut [u8]) -> Result<(), IpcError> {
+        self.write_read(address, &[], buffer)
+    }
+    
+    fn write_read(&mut self, address: u8, write_data: &[u8], read_data: &mut [u8]) -> Result<(), IpcError> {
+        let req = kumo_abi::i2c::I2cTransferRequest {
+            header: kumo_abi::i2c::I2cRequestHeader {
+                opcode: kumo_abi::i2c::I2cOpcode::Transfer,
+                bus: 0,
+                address: address as u16,
+                _pad: 0,
+            },
+            write_len: write_data.len() as u16,
+            read_len: read_data.len() as u16,
+        };
+        
+        let mut req_msg = [0u8; 512];
+        let req_hdr = any_as_u8_slice(&req);
+        req_msg[..req_hdr.len()].copy_from_slice(req_hdr);
+        if write_data.len() > 0 {
+            req_msg[req_hdr.len()..req_hdr.len() + write_data.len()].copy_from_slice(write_data);
+        }
+        
+        let (local_resp, remote_resp) = kumo_rt::channel_create_pair();
+        if local_resp == u64::MAX || remote_resp == u64::MAX {
+            return Err(IpcError { code: 1000 });
+        }
+        
+        let status = kumo_rt::channel_write_with_handle(
+            self.channel,
+            req_msg.as_ptr(),
+            req_hdr.len() + write_data.len(),
+            Handle(remote_resp as u32),
+        );
+        if status != 0 {
+            let _ = kumo_rt::handle_close(Handle(local_resp as u32));
+            return Err(IpcError { code: 1001 });
+        }
+        
+        let port_raw = kumo_rt::port_create();
+        let port = Handle(port_raw as u32);
+        kumo_rt::port_bind(port, Handle(local_resp as u32));
+        let _ = kumo_rt::port_wait(port);
+        let _ = kumo_rt::handle_close(port);
+        
+        let mut resp_msg = [0u8; 512];
+        let (received, tag_raw) = kumo_rt::channel_read_with_handle(
+            Handle(local_resp as u32),
+            resp_msg.as_mut_ptr(),
+            resp_msg.len(),
+        );
+        
+        let _ = kumo_rt::handle_close(Handle(local_resp as u32));
+        if tag_raw != 0 {
+            let _ = kumo_rt::handle_close(Handle(tag_raw as u32));
+        }
+        
+        if received < core::mem::size_of::<kumo_abi::i2c::I2cTransferResponse>() {
+            return Err(IpcError { code: 1003 });
+        }
+        
+        let resp: kumo_abi::i2c::I2cTransferResponse = unsafe { core::ptr::read_unaligned(resp_msg.as_ptr() as *const _) };
+        if resp.status != 0 {
+            return Err(IpcError { code: (-resp.status) as u64 });
+        }
+        
+        if resp.read_len as usize > 0 && resp.read_len as usize <= read_data.len() {
+            let hdr_len = core::mem::size_of::<kumo_abi::i2c::I2cTransferResponse>();
+            if received >= hdr_len + resp.read_len as usize {
+                read_data[..resp.read_len as usize].copy_from_slice(&resp_msg[hdr_len..hdr_len + resp.read_len as usize]);
+            } else {
+                return Err(IpcError { code: 1004 });
+            }
+        }
+        Ok(())
+    }
+}
+
 const POLL_LIMIT: usize = 1_000_000;
 const WAKE_RETRY_NS: u64 = 500_000;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
@@ -30,25 +129,6 @@ const STEADY_POLL_FALLBACK_NS: u64 = 20_000_000;
 const RESET_ATTEMPTS: u32 = 3;
 const ATTENTION_WAIT_TIMEOUT: u64 = 0;
 const ATTENTION_WAIT_FAILED: u64 = u64::MAX;
-
-struct MmioRegisters {
-    base: *mut u8,
-}
-
-impl RegisterIo for MmioRegisters {
-    fn read(&mut self, offset: u32) -> u32 {
-        unsafe { self.base.add(offset as usize).cast::<u32>().read_volatile() }
-    }
-
-    fn write(&mut self, offset: u32, value: u32) {
-        unsafe {
-            self.base
-                .add(offset as usize)
-                .cast::<u32>()
-                .write_volatile(value)
-        }
-    }
-}
 
 fn log(message: &[u8]) {
     debug_write(message.as_ptr(), message.len());
@@ -203,37 +283,15 @@ extern "C" fn main(
     let keyboard_channel = Handle(keyboard_raw as u32);
     log(b"drv-i2c-hid: keyboard channel ok\n");
 
-    let resource = Handle(resource_raw as u32);
-    let vmo_raw = resource_mint_mmio(resource, config.mmio_base, config.mmio_length);
-    if vmo_raw == u64::MAX {
-        log(b"drv-i2c-hid: MMIO mint failed\n");
+    let (received, i2c_client_raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+    if received != tag.len() || tag[0] != b'I' || i2c_client_raw == 0 {
+        log(b"drv-i2c-hid: i2c client bootstrap failed\n");
         kumo_rt::process_exit(1);
     }
-    if vmar_map(
-        Handle(0),
-        Handle(vmo_raw as u32),
-        0,
-        MMIO_VA,
-        config.mmio_length,
-        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE).0,
-    ) != 0
-    {
-        log(b"drv-i2c-hid: MMIO map failed\n");
-        kumo_rt::process_exit(1);
-    }
-    log(b"drv-i2c-hid: MMIO mapped\n");
+    let mut controller = IpcController { channel: Handle(i2c_client_raw as u32) };
+    log(b"drv-i2c-hid: I2C IPC ready\n");
 
-    let registers = MmioRegisters {
-        base: MMIO_VA as *mut u8,
-    };
-    let mut controller = match Controller::new(registers, config.source_clock, POLL_LIMIT) {
-        Ok(controller) => controller,
-        Err(error) => {
-            log_hex(b"drv-i2c-hid: GENI init error=0x", error as u64);
-            kumo_rt::process_exit(1);
-        }
-    };
-    log(b"drv-i2c-hid: GENI FIFO ready\n");
+    let resource = Handle(resource_raw as u32);
 
     let mut raw_descriptor = [0u8; HidDescriptor::BYTES];
     if let Err(error) = controller.write_read(
@@ -243,7 +301,7 @@ extern "C" fn main(
     ) {
         log_hex(
             b"drv-i2c-hid: descriptor transfer retry error=0x",
-            error as u64,
+            error.code(),
         );
         if !sleep_ns(WAKE_RETRY_NS) {
             log(b"drv-i2c-hid: descriptor retry wait failed\n");
@@ -254,7 +312,7 @@ extern "C" fn main(
             &config.hid_descriptor_register.to_le_bytes(),
             &mut raw_descriptor,
         ) {
-            log_hex(b"drv-i2c-hid: transfer error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: transfer error=0x", error.code());
             kumo_rt::process_exit(1);
         }
     }
@@ -336,7 +394,7 @@ extern "C" fn main(
             set_power
         };
         if let Err(error) = set_power {
-            log_hex(b"drv-i2c-hid: set-power error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: set-power error=0x", error.code());
         } else {
             log(b"drv-i2c-hid: set-power done\n");
             log(b"drv-i2c-hid: power-on settle begin\n");
@@ -355,7 +413,7 @@ extern "C" fn main(
                     log(b"drv-i2c-hid: reset done\n");
                     break;
                 }
-                Err(error) => log_hex(b"drv-i2c-hid: reset error=0x", error as u64),
+                Err(error) => log_hex(b"drv-i2c-hid: reset error=0x", error.code()),
             }
         }
         if attempt == RESET_ATTEMPTS {
@@ -405,7 +463,7 @@ extern "C" fn main(
                 config.i2c_address,
                 &mut input_frame[..reset_input_frame_len],
             ) {
-                log_hex(b"drv-i2c-hid: reset sync read error=0x", error as u64);
+                log_hex(b"drv-i2c-hid: reset sync read error=0x", error.code());
                 kumo_rt::process_exit(1);
             }
             if interrupt_complete(attention_irq) != 0 {
@@ -427,7 +485,7 @@ extern "C" fn main(
             config.i2c_address,
             &Command::set_power(descriptor.command_register, PowerState::On),
         ) {
-            log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error.code());
             kumo_rt::process_exit(1);
         }
         if !sleep_ns(POWER_ON_SETTLE_NS) {
@@ -456,7 +514,7 @@ extern "C" fn main(
     ) {
         log_hex(
             b"drv-i2c-hid: report descriptor transfer error=0x",
-            error as u64,
+            error.code(),
         );
         kumo_rt::process_exit(1);
     }
@@ -503,7 +561,7 @@ extern "C" fn main(
             config.i2c_address,
             &Command::set_power(descriptor.command_register, PowerState::On),
         ) {
-            log_hex(b"drv-i2c-hid: re-power-on error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: re-power-on error=0x", error.code());
             kumo_rt::process_exit(1);
         }
         if !sleep_ns(POWER_ON_SETTLE_NS) {
@@ -552,11 +610,11 @@ extern "C" fn main(
         if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
         {
             if attention_fired {
-                log_hex(b"drv-i2c-hid: input frame read error=0x", error as u64);
+                log_hex(b"drv-i2c-hid: input frame read error=0x", error.code());
                 kumo_rt::process_exit(1);
             }
             if poll_read_failures.record() {
-                log_hex(b"drv-i2c-hid: poll read error=0x", error as u64);
+                log_hex(b"drv-i2c-hid: poll read error=0x", error.code());
             }
             continue;
         }

@@ -1400,7 +1400,14 @@ pub mod mmu {
         if !super::gicv3_sysreg_supported() {
             let gic_block = super::PI5_GICV2.distributor_base & !(BLOCK_2M - 1);
             let desc = block_desc(gic_block, MAIR_DEVICE, true) | PXN | UXN;
-            map_block(ttbr1, PHYSMAP_BASE + gic_block, gic_block, desc, alloc, &mut tables)?;
+            map_block(
+                ttbr1,
+                PHYSMAP_BASE + gic_block,
+                gic_block,
+                desc,
+                alloc,
+                &mut tables,
+            )?;
         }
 
         let kernel_pages = kernel_len.div_ceil(PAGE_4K);
@@ -2708,9 +2715,7 @@ fn id_aa64pfr0_has_gic_sysregs(pfr0: u64) -> bool {
 #[cfg(target_os = "none")]
 fn gicv3_sysreg_supported() -> bool {
     let pfr0: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nostack, nomem))
-    };
+    unsafe { core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nostack, nomem)) };
     id_aa64pfr0_has_gic_sysregs(pfr0)
 }
 
@@ -3298,12 +3303,7 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
     // GICv3 redistributor (GICR_*) banks — those don't exist on a GIC-400.
     let group = unsafe { mmio_read32(dist + GICV2_GICD_IGROUPR0 + bank) } | timer_bit;
     unsafe { mmio_write32(dist + GICV2_GICD_IGROUPR0 + bank, group) };
-    unsafe {
-        mmio_write8(
-            dist + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
-            0x80,
-        )
-    };
+    unsafe { mmio_write8(dist + GICV2_GICD_IPRIORITYR + config.timer_irq as u64, 0x80) };
 
     // CPU interface: set priority mask to allow all, enable Group1NS.
     unsafe { mmio_write32(cpu + GICV2_GICC_PMR, 0xFF) };

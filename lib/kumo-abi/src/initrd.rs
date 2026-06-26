@@ -8,6 +8,7 @@ pub const SVC_HEALTH_PATH: &str = "bin/svc-health";
 pub const TTYD_PATH: &str = "bin/ttyd";
 pub const DRV_SERIAL_PATH: &str = "bin/drv-serial";
 pub const DRV_FB_PATH: &str = "bin/drv-fb";
+pub const DRV_GENI_I2C_PATH: &str = "bin/drv-geni-i2c";
 pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
