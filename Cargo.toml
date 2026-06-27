@@ -26,6 +26,7 @@ members = [
     "userland/kumoza",
     "userland/persona-linux",
     "userland/persona-posix",
+    "userland/i2cdetect",
     "userland/servers/drv-blk",
     "userland/servers/drv-fb",
     "userland/servers/drv-geni-i2c",

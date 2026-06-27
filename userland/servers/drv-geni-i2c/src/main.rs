@@ -6,7 +6,8 @@ use drv_geni_i2c::ProbeConfig;
 use kumo_abi::{
     i2c::{
         I2cFuncsResponse, I2cOpcode, I2cRequestHeader, I2cSmbusReadByteResponse,
-        I2cSmbusWriteQuickResponse, I2C_FUNC_I2C, I2C_FUNC_SMBUS_QUICK, I2C_FUNC_SMBUS_READ_BYTE, I2C_FUNC_I2C_TRANSFER,
+        I2cSmbusWriteQuickResponse, I2cTransferRequest, I2cTransferResponse, I2C_FUNC_I2C,
+        I2C_FUNC_I2C_TRANSFER, I2C_FUNC_SMBUS_QUICK, I2C_FUNC_SMBUS_READ_BYTE,
     },
     Handle, VmarFlags,
 };
@@ -19,7 +20,19 @@ use kumo_rt::{
 kumo_rt::entry!(main);
 
 const MMIO_VA: u64 = 0x0000_0000_1100_0000;
-const POLL_LIMIT: usize = 1_000_000;
+// GENI transactions busy-poll M_IRQ_STATUS (no completion IRQ wired yet), and the metal
+// framebuffer path is cooperatively scheduled with no preemption during boot/halt — so a
+// long busy-poll starves the boot flow (the `wake_user`-driven POST checks hung here). A
+// real ~30-byte read at 400 kHz needs ~9k polls, so 100k keeps a ~10x false-timeout margin
+// while capping a stuck transaction's spin to ~10 ms (was ~100 ms at 1,000,000) — short
+// enough for the cooperative scheduler to make progress between transactions. The proper
+// fix is to block on the GENI completion IRQ instead of polling. — CORVUS 2026-06-26
+const POLL_LIMIT: usize = 100_000;
+const MAX_I2C_TRANSFER_BYTES: usize = 512;
+const MAX_I2C_REQUEST_BYTES: usize =
+    core::mem::size_of::<I2cTransferRequest>() + MAX_I2C_TRANSFER_BYTES;
+const MAX_I2C_RESPONSE_BYTES: usize =
+    core::mem::size_of::<I2cTransferResponse>() + MAX_I2C_TRANSFER_BYTES;
 
 struct MmioRegisters {
     base: *mut u8,
@@ -79,6 +92,32 @@ fn log_hex(label: &[u8], mut value: u64) {
 
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((p as *const T) as *const u8, core::mem::size_of::<T>()) }
+}
+
+fn send_transfer_response(response_handle: Handle, status: i32, read_data: &[u8]) {
+    let read_len = if status == 0 {
+        read_data.len().min(MAX_I2C_TRANSFER_BYTES)
+    } else {
+        0
+    };
+    let resp = I2cTransferResponse {
+        status,
+        read_len: read_len as u16,
+        _pad: 0,
+    };
+
+    let mut resp_msg = [0u8; MAX_I2C_RESPONSE_BYTES];
+    let resp_hdr = unsafe { any_as_u8_slice(&resp) };
+    resp_msg[..resp_hdr.len()].copy_from_slice(resp_hdr);
+    if read_len > 0 {
+        resp_msg[resp_hdr.len()..resp_hdr.len() + read_len].copy_from_slice(&read_data[..read_len]);
+    }
+
+    let _ = channel_write(
+        response_handle,
+        resp_msg.as_ptr(),
+        resp_hdr.len() + read_len,
+    );
 }
 
 #[no_mangle]
@@ -163,6 +202,8 @@ extern "C" fn main(
     }
     let serve_koid = handle_koid(serve_channel);
     log(b"drv-geni-i2c: ready\n");
+    let mut logged_first_transfer = false;
+    let mut transfer_errors: u32 = 0;
 
     loop {
         let source = port_wait(port);
@@ -170,11 +211,12 @@ extern "C" fn main(
             continue;
         }
 
-        let mut req_buf = [0u8; core::mem::size_of::<I2cRequestHeader>()];
+        let mut req_buf = [0u8; MAX_I2C_REQUEST_BYTES];
         let (n, response_handle_raw) =
             channel_read_with_handle(serve_channel, req_buf.as_mut_ptr(), req_buf.len());
         if n == 0 || response_handle_raw == 0 {
-            continue;
+            log(b"drv-geni-i2c: client disconnected, exiting\n");
+            process_exit(0);
         }
         let response_handle = Handle(response_handle_raw as u32);
 
@@ -191,7 +233,10 @@ extern "C" fn main(
         if opcode == I2cOpcode::Funcs as u32 {
             let resp = I2cFuncsResponse {
                 status: 0,
-                funcs: I2C_FUNC_I2C | I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_READ_BYTE | I2C_FUNC_I2C_TRANSFER,
+                funcs: I2C_FUNC_I2C
+                    | I2C_FUNC_SMBUS_QUICK
+                    | I2C_FUNC_SMBUS_READ_BYTE
+                    | I2C_FUNC_I2C_TRANSFER,
             };
             let out = unsafe { any_as_u8_slice(&resp) };
             let _ = channel_write(response_handle, out.as_ptr(), out.len());
@@ -217,55 +262,64 @@ extern "C" fn main(
             let out = unsafe { any_as_u8_slice(&resp) };
             let _ = channel_write(response_handle, out.as_ptr(), out.len());
         } else if opcode == I2cOpcode::Transfer as u32 {
-            if n >= core::mem::size_of::<kumo_abi::i2c::I2cTransferRequest>() {
-                let treq: kumo_abi::i2c::I2cTransferRequest = unsafe { core::ptr::read_unaligned(req_buf.as_ptr() as *const _) };
-                let payload_start = core::mem::size_of::<kumo_abi::i2c::I2cTransferRequest>();
-                let payload_len = treq.write_len as usize;
-                
-                let mut status = 0;
-                let mut out_buf = [0u8; 512]; // reasonable max for KUMO I2C
-                
-                if payload_start + payload_len <= n && treq.read_len as usize <= out_buf.len() {
-                    let write_data = &req_buf[payload_start..payload_start + payload_len];
-                    let read_data = &mut out_buf[..treq.read_len as usize];
-                    
-                    let res = if treq.write_len > 0 && treq.read_len > 0 {
-                        controller.write_read(address, write_data, read_data)
-                    } else if treq.write_len > 0 {
-                        controller.write(address, write_data)
-                    } else if treq.read_len > 0 {
-                        controller.read(address, read_data)
+            if n < core::mem::size_of::<I2cTransferRequest>() {
+                send_transfer_response(response_handle, -1, &[]);
+            } else {
+                let treq: I2cTransferRequest =
+                    unsafe { core::ptr::read_unaligned(req_buf.as_ptr() as *const _) };
+                let payload_start = core::mem::size_of::<I2cTransferRequest>();
+                let write_len = treq.write_len as usize;
+                let read_len = treq.read_len as usize;
+                if !logged_first_transfer {
+                    logged_first_transfer = true;
+                    log_hex(b"drv-geni-i2c: first transfer write=0x", write_len as u64);
+                    log_hex(b"drv-geni-i2c: first transfer read=0x", read_len as u64);
+                }
+
+                let mut out_buf = [0u8; MAX_I2C_TRANSFER_BYTES];
+                if let Some(payload_end) = payload_start.checked_add(write_len) {
+                    if payload_end <= n
+                        && write_len <= MAX_I2C_TRANSFER_BYTES
+                        && read_len <= MAX_I2C_TRANSFER_BYTES
+                    {
+                        let write_data = &req_buf[payload_start..payload_end];
+                        let read_data = &mut out_buf[..read_len];
+
+                        let res = if write_len > 0 && read_len > 0 {
+                            controller.write_read(address, write_data, read_data)
+                        } else if write_len > 0 {
+                            controller.write(address, write_data)
+                        } else if read_len > 0 {
+                            controller.read(address, read_data)
+                        } else {
+                            Ok(())
+                        };
+
+                        let status = match res {
+                            Ok(_) => 0,
+                            Err(e) => -(e.code() as i32),
+                        };
+                        if status != 0 && transfer_errors < 4 {
+                            transfer_errors = transfer_errors.saturating_add(1);
+                            log_hex(b"drv-geni-i2c: transfer error=0x", (-status) as u64);
+                        }
+                        let response_bytes = if status == 0 {
+                            &out_buf[..read_len]
+                        } else {
+                            &[]
+                        };
+                        send_transfer_response(response_handle, status, response_bytes);
                     } else {
-                        Ok(())
-                    };
-                    
-                    status = match res {
-                        Ok(_) => 0,
-                        Err(e) => -(e.code() as i32),
-                    };
+                        send_transfer_response(response_handle, -1, &[]);
+                    }
                 } else {
-                    status = -1; // EINVAL
+                    send_transfer_response(response_handle, -1, &[]);
                 }
-                
-                let resp = kumo_abi::i2c::I2cTransferResponse {
-                    status,
-                    read_len: if status == 0 { treq.read_len } else { 0 },
-                    _pad: 0,
-                };
-                
-                let mut resp_msg = [0u8; 512 + core::mem::size_of::<kumo_abi::i2c::I2cTransferResponse>()];
-                let resp_hdr = unsafe { any_as_u8_slice(&resp) };
-                resp_msg[..resp_hdr.len()].copy_from_slice(resp_hdr);
-                
-                if status == 0 && treq.read_len > 0 {
-                    resp_msg[resp_hdr.len()..resp_hdr.len() + treq.read_len as usize]
-                        .copy_from_slice(&out_buf[..treq.read_len as usize]);
-                }
-                
-                let _ = channel_write(response_handle, resp_msg.as_ptr(), resp_hdr.len() + resp.read_len as usize);
             }
         } else {
-            // Unknown opcode, ignore.
+            let status = -1i32;
+            let out = unsafe { any_as_u8_slice(&status) };
+            let _ = channel_write(response_handle, out.as_ptr(), out.len());
         }
 
         let _ = handle_close(response_handle);

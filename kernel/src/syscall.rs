@@ -505,6 +505,15 @@ impl SyscallEngine {
         {
             self.signal_ports(object_koid, kumo_abi::Signals::TIMER);
         }
+        if self
+            .interrupts
+            .iter()
+            .any(|binding| binding.koid == object_koid && binding.count > 0)
+        {
+            // Preserve IRQ wakeups that arrive before a transient waiter binds its port; the
+            // HID attention loop recreates this wait shape each tick. — KESTREL 2026-06-26
+            self.signal_ports(object_koid, kumo_abi::Signals::IRQ);
+        }
     }
 
     /// Remove the binding from `port_koid` to `object_koid`, if present — the inverse
@@ -2576,6 +2585,47 @@ mod tests {
         );
 
         // The legacy InterruptWait drain path still sees the same fire (count incremented).
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+            KernelCallResult::Handle(Handle(1))
+        );
+    }
+
+    #[test]
+    fn port_bind_observes_retained_interrupt_count() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 33, 1)
+            .unwrap();
+        let irq = match engine.dispatch(
+            &mut process,
+            KernelCall::InterruptCreate { resource, irq: 33 },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected interrupt handle, got {other:?}"),
+        };
+        let irq_koid = process.handles().get(irq).unwrap().koid;
+
+        engine.signal_interrupt(33);
+
+        let watched = create_port(&mut engine, &mut process);
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: watched,
+                    object: irq,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let result = engine.dispatch(&mut process, KernelCall::PortWait { port: watched });
+        let KernelCallResult::PortPacket(packet) = result else {
+            panic!("expected retained IRQ port packet, got {result:?}");
+        };
+        assert_eq!(packet.source, irq_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::IRQ));
         assert_eq!(
             engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
             KernelCallResult::Handle(Handle(1))

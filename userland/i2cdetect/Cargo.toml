@@ -1,0 +1,17 @@
+[package]
+name = "i2cdetect"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-rt = { path = "../kumo-rt" }
+kumo-abi.workspace = true
+
+[[bin]]
+name = "i2cdetect"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

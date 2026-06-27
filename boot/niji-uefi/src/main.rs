@@ -7,7 +7,7 @@
 //! This app discovers the machine over UEFI Boot Services (GOP framebuffer, the
 //! staged device tree, the firmware memory map), loads the KUMO kernel ELF (and an
 //! optional initrd) from the EFI System Partition, assembles and validates the
-//! `kumo_abi::BootInfo` handoff, then **exits boot services and jumps to Ziwei**
+//! `kumo_abi::BootInfo` handoff, then **exits boot services and jumps to MUREX**
 //! (the kernel `_start`) with `x0` holding the `BootInfo` pointer.
 //!
 //! Boot-log honesty rule (Guidance 002 §1): every reported line carries real
@@ -581,7 +581,7 @@ unsafe fn boot_and_jump(
 
     kprint!(
         con_out,
-        "\r\nExiting boot services; jumping to Ziwei at {:#x}...\r\n",
+        "\r\nExiting boot services; jumping to MUREX at {:#x}...\r\n",
         kernel.entry_virt
     );
 

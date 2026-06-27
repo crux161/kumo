@@ -4,7 +4,6 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use drv_i2c_hid::ProbeConfig;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     CAT_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,

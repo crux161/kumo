@@ -1,6 +1,5 @@
 #![no_std]
 
-use kumo_geni_i2c::SourceClock;
 use kumo_hid::{DecodeError, Decoder, KeyState};
 use kumo_i2c_hid::{boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError};
 
@@ -27,9 +26,6 @@ pub const SOFT_FAILURE_LOG_LIMIT: u32 = 4;
 pub enum ConfigError {
     Truncated,
     BadMagic,
-    InvalidMmio,
-    UnsupportedBusFrequency,
-    UnsupportedSourceClock,
     InvalidAddress,
     InvalidInterrupt,
 }
@@ -45,6 +41,48 @@ pub enum InputProbeError {
     InvalidLength,
     Protocol(ProtocolError),
     Decode(DecodeError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputReadMode {
+    /// A real GPIO attention delivery means the device pushed an input frame; drain it with the
+    /// plain input-register read, matching Linux `i2c_hid_get_input`.
+    PlainInputRegister,
+    /// Timeout fallback only: actively ask for the current input report while PDC delivery is absent.
+    GetReportInput,
+}
+
+pub const fn input_read_mode(attention_fired: bool) -> InputReadMode {
+    if attention_fired {
+        InputReadMode::PlainInputRegister
+    } else {
+        InputReadMode::GetReportInput
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum I2cIpcReplyWake {
+    Response,
+    Timeout,
+    Unexpected,
+}
+
+pub const I2C_IPC_REPLY_TIMEOUT_NS: u64 = 250_000_000;
+pub const I2C_IPC_REPLY_TIMEOUT_ERROR: u64 = 1006;
+pub const I2C_IPC_UNEXPECTED_WAKE_ERROR: u64 = 1007;
+
+pub const fn classify_i2c_ipc_reply_wake(
+    source: u64,
+    response_koid: u64,
+    timer_koid: u64,
+) -> I2cIpcReplyWake {
+    if source == response_koid {
+        I2cIpcReplyWake::Response
+    } else if source == 0 || source == timer_koid {
+        I2cIpcReplyWake::Timeout
+    } else {
+        I2cIpcReplyWake::Unexpected
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,13 +352,6 @@ impl ProbeConfig {
     }
 }
 
-const fn source_clock_hz(clock: SourceClock) -> u32 {
-    match clock {
-        SourceClock::Mhz19_2 => 19_200_000,
-        SourceClock::Mhz32 => 32_000_000,
-    }
-}
-
 pub fn bounded_report_descriptor_len(length: u16) -> Result<usize, ReportProbeError> {
     let length = length as usize;
     if length == 0 {
@@ -425,8 +456,6 @@ mod tests {
         let discovered = kumo_i2c_hid::discover_keyboard(dtb).unwrap();
         let config = ProbeConfig::for_x13s(discovered).unwrap();
         assert_eq!(ProbeConfig::decode(&config.encode()), Ok(config));
-        assert_eq!(config.source_clock, SourceClock::Mhz19_2);
-        assert_eq!(config.mmio_base, 0x0089_4000);
         assert_eq!(config.i2c_address, 0x68);
         assert_eq!(config.attention_irq, kumo_abi::tlmm_gpio_irq(104, 8));
     }
@@ -435,8 +464,15 @@ mod tests {
     fn rejects_malformed_or_dangerous_bootstrap_data() {
         assert_eq!(ProbeConfig::decode(b"short"), Err(ConfigError::Truncated));
         let mut raw = ProbeConfig::for_x13s(topology()).unwrap().encode();
-        raw[4] = 1;
-        assert_eq!(ProbeConfig::decode(&raw), Err(ConfigError::InvalidMmio));
+        raw[4] = 0x80;
+        assert_eq!(ProbeConfig::decode(&raw), Err(ConfigError::InvalidAddress));
+
+        let mut raw = ProbeConfig::for_x13s(topology()).unwrap().encode();
+        raw[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            ProbeConfig::decode(&raw),
+            Err(ConfigError::InvalidInterrupt)
+        );
     }
 
     #[test]
@@ -612,6 +648,32 @@ mod tests {
         assert_eq!(
             strict_input_frame_len(0x200),
             Err(InputProbeError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn attention_delivery_uses_plain_input_read_and_timeout_uses_get_report() {
+        assert_eq!(input_read_mode(true), InputReadMode::PlainInputRegister);
+        assert_eq!(input_read_mode(false), InputReadMode::GetReportInput);
+    }
+
+    #[test]
+    fn i2c_ipc_reply_wait_classifies_response_timeout_and_wrong_source() {
+        assert_eq!(
+            classify_i2c_ipc_reply_wake(0x10, 0x10, 0x20),
+            I2cIpcReplyWake::Response
+        );
+        assert_eq!(
+            classify_i2c_ipc_reply_wake(0x20, 0x10, 0x20),
+            I2cIpcReplyWake::Timeout
+        );
+        assert_eq!(
+            classify_i2c_ipc_reply_wake(0, 0x10, 0x20),
+            I2cIpcReplyWake::Timeout
+        );
+        assert_eq!(
+            classify_i2c_ipc_reply_wake(0x30, 0x10, 0x20),
+            I2cIpcReplyWake::Unexpected
         );
     }
 

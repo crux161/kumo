@@ -275,6 +275,39 @@ fn user_range_ok(process: &Process, ptr: u64, len: u64) -> bool {
     }
 }
 
+fn channel_write_from_user(
+    engine: &mut SyscallEngine,
+    process: &mut Process,
+    channel: Handle,
+    user_ptr: u64,
+    len: usize,
+    transfer_raw: u64,
+    error_status: u64,
+) -> u64 {
+    let len = len.min(MAX_CHANNEL_BYTES);
+    if !user_range_ok(process, user_ptr, len as u64) {
+        return error_status;
+    }
+
+    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+    let transfer = [Handle(transfer_raw as u32)];
+    let transfers = if transfer_raw != 0 {
+        &transfer[..]
+    } else {
+        &[][..]
+    };
+
+    match Message::new(1, bytes, transfers) {
+        Ok(message) => {
+            match engine.dispatch(process, KernelCall::ChannelWrite { channel, message }) {
+                KernelCallResult::Status(status) => status as u32 as u64,
+                _ => error_status,
+            }
+        }
+        Err(_) => error_status,
+    }
+}
+
 const LINUX_ARM64_READ: u64 = 63;
 const LINUX_ARM64_OPENAT: u64 = 56;
 const LINUX_ARM64_CLOSE: u64 = 57;
@@ -1344,26 +1377,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     r[0] = 0;
                 } else if num == Syscall::ChannelWrite as u64 {
                     let channel = Handle(r[0] as u32);
-                    let user_ptr = r[1];
-                    let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
-                    if !user_range_ok(child, user_ptr, len as u64) {
-                        r[0] = u64::MAX;
-                        return;
-                    }
-                    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-                    match Message::new(1, bytes, &[]) {
-                        Ok(message) => {
-                            // P10-e: use child's own process.
-                            match sora
-                                .engine
-                                .dispatch(child, KernelCall::ChannelWrite { channel, message })
-                            {
-                                KernelCallResult::Status(s) => r[0] = s as u32 as u64,
-                                _ => r[0] = u64::MAX,
-                            }
-                        }
-                        Err(_) => r[0] = u64::MAX,
-                    }
+                    r[0] = channel_write_from_user(
+                        &mut sora.engine,
+                        child,
+                        channel,
+                        r[1],
+                        r[2] as usize,
+                        r[3],
+                        u64::MAX,
+                    );
                 } else if num == Syscall::FramebufferClaim as u64 {
                     let resource = Handle(r[0] as u32);
                     let phys_base = r[1];
@@ -1478,30 +1500,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
         } else if num == Syscall::ChannelWrite as u64 {
             let channel = Handle(r[0] as u32);
-            let user_ptr = r[1];
-            let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
-            if !user_range_ok(&sora.process, user_ptr, len as u64) {
-                r[0] = (-1i32) as u32 as u64;
-                return;
-            }
-            let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-            // P9-e: r[3] is an optional handle to transfer alongside the message.
-            let transfer_handle = if r[3] != 0 {
-                &[Handle(r[3] as u32)]
-            } else {
-                &[][..]
-            };
-            let status = match Message::new(1, bytes, transfer_handle) {
-                Ok(message) => match sora.engine.dispatch(
-                    &mut sora.process,
-                    KernelCall::ChannelWrite { channel, message },
-                ) {
-                    KernelCallResult::Status(s) => s,
-                    _ => -1,
-                },
-                Err(_) => -1,
-            };
-            r[0] = status as u32 as u64;
+            r[0] = channel_write_from_user(
+                &mut sora.engine,
+                &mut sora.process,
+                channel,
+                r[1],
+                r[2] as usize,
+                r[3],
+                (-1i32) as u32 as u64,
+            );
         } else if num == Syscall::ChannelRead as u64 {
             let channel = Handle(r[0] as u32);
             let user_buf = r[1];
@@ -2385,10 +2392,10 @@ mod tests {
     // missing-arm bug class (J166 HandleDuplicate, the child VmoRead, J248 HandleKoid)
     // could only surface on metal. As a plain function over an engine + a target process
     // it is now host-testable, so these pin the contract both chains depend on.
-    use super::dispatch_object_syscall;
-    use crate::syscall::SyscallEngine;
-    use crate::task::Process;
-    use kumo_abi::{sys::Syscall, Errno, Handle};
+    use super::{channel_write_from_user, dispatch_object_syscall};
+    use crate::syscall::{KernelCall, KernelCallResult, SyscallEngine};
+    use crate::task::{Job, Process};
+    use kumo_abi::{sys::Syscall, Errno, Handle, ObjectKind, Rights};
 
     fn engine_and_process() -> (SyscallEngine, Process) {
         let mut engine = SyscallEngine::new();
@@ -2396,6 +2403,17 @@ mod tests {
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         let process = Process::new(engine.objects_mut(), &job, vmar);
         (engine, process)
+    }
+
+    fn process_covering_user_buffer(engine: &mut SyscallEngine, buffer: &[u8]) -> Process {
+        let job = Job::root(engine.objects_mut());
+        let page_size = crate::mm::PAGE_SIZE;
+        let ptr = buffer.as_ptr() as u64;
+        let base = ptr & !(page_size - 1);
+        let end = (ptr + buffer.len() as u64 + page_size - 1) & !(page_size - 1);
+        let len = (end - base).max(page_size);
+        let vmar = crate::mm::Vmar::new(base, len).unwrap();
+        Process::new(engine.objects_mut(), &job, vmar)
     }
 
     #[test]
@@ -2457,6 +2475,49 @@ mod tests {
             &mut r,
         ));
         assert_eq!(r[0], Errno::Ok.status() as u32 as u64);
+    }
+
+    #[test]
+    fn channel_write_from_user_preserves_transfer_handle() {
+        let mut engine = SyscallEngine::new();
+        let payload = *b"i2c-request";
+        let mut process = process_covering_user_buffer(&mut engine, &payload);
+        let (request_sender, request_receiver) = engine.channel_create(&mut process).unwrap();
+        let (_local_reply, remote_reply) = engine.channel_create(&mut process).unwrap();
+
+        let status = channel_write_from_user(
+            &mut engine,
+            &mut process,
+            request_sender,
+            payload.as_ptr() as u64,
+            payload.len(),
+            remote_reply.0 as u64,
+            u64::MAX,
+        );
+
+        assert_eq!(status, Errno::Ok.status() as u32 as u64);
+        assert!(
+            process.handles().get(remote_reply).is_err(),
+            "transferred reply handle must leave the sender table"
+        );
+
+        let read = engine.dispatch(
+            &mut process,
+            KernelCall::ChannelRead {
+                channel: request_receiver,
+            },
+        );
+        let KernelCallResult::Message(message) = read else {
+            panic!("expected request message");
+        };
+        assert_eq!(message.bytes(), &payload);
+        assert_eq!(message.handles().len(), 1);
+
+        let received_reply = message.handles()[0];
+        assert!(process
+            .handles()
+            .require(received_reply, ObjectKind::Channel, Rights::WRITE)
+            .is_ok());
     }
 
     #[test]

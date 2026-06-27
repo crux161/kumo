@@ -2568,6 +2568,8 @@ const GICD_ISENABLER0: u64 = 0x0100;
 const GICD_ICENABLER0: u64 = 0x0180;
 #[cfg(target_os = "none")]
 const GICD_IPRIORITYR: u64 = 0x0400;
+#[cfg(any(target_os = "none", test))]
+const GICD_IROUTER: u64 = 0x6000;
 
 #[cfg(target_os = "none")]
 const GICR_TYPER: u64 = 0x0008;
@@ -2630,6 +2632,114 @@ const TLMM_INTR_DECT_FALLING: u32 = 2;
 static TLMM_GPIO_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(target_os = "none")]
 static TLMM_GPIO_IRQ_KEY: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(any(target_os = "none", test))]
+const PDC_BASE: u64 = 0x0b22_0000;
+#[cfg(any(target_os = "none", test))]
+const PDC_VERSION_REG: u64 = 0x1000;
+#[cfg(any(target_os = "none", test))]
+const PDC_VERSION_3_2: u32 = 0x0003_0200;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_ENABLE_BANK: u64 = 0x10;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_I_CFG: u64 = 0x110;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_I_CFG_ENABLE: u32 = 1 << 3;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_I_CFG_TYPE_MASK: u32 = 0b111;
+#[cfg(any(target_os = "none", test))]
+const PDC_LEVEL_HIGH: u32 = 0b100;
+#[cfg(any(target_os = "none", test))]
+const X13S_KEYBOARD_TLMM_GPIO: u32 = 104;
+#[cfg(any(target_os = "none", test))]
+const X13S_KEYBOARD_PDC_PIN: u32 = 216;
+#[cfg(any(target_os = "none", test))]
+const X13S_KEYBOARD_PDC_PARENT_SPI: u32 = 646;
+
+// DISCOURSE/010 pins GPIO-104 as a PDC-only wake IRQ: TLMM keeps the DT level-low detection, while
+// the PDC parent presents a level-high SPI to the GIC and wants IRQ_i_CFG bits[2:0] = LEVEL_HIGH.
+// — KESTREL 2026-06-26
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PdcRoute {
+    tlmm_gpio: u32,
+    pdc_pin: u32,
+    parent_spi: u32,
+    parent_intid: u32,
+    cfg_offset: u64,
+    enable_bank_offset: u64,
+    enable_bit: u32,
+    pdc_type: u32,
+}
+
+#[cfg(any(target_os = "none", test))]
+impl PdcRoute {
+    const fn new(tlmm_gpio: u32, pdc_pin: u32, parent_spi: u32, pdc_type: u32) -> Self {
+        Self {
+            tlmm_gpio,
+            pdc_pin,
+            parent_spi,
+            parent_intid: 32 + parent_spi,
+            cfg_offset: PDC_IRQ_I_CFG + pdc_pin as u64 * 4,
+            enable_bank_offset: PDC_IRQ_ENABLE_BANK + (pdc_pin / 32) as u64 * 4,
+            enable_bit: 1u32 << (pdc_pin % 32),
+            pdc_type,
+        }
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+const X13S_KEYBOARD_PDC_ROUTE: PdcRoute = PdcRoute::new(
+    X13S_KEYBOARD_TLMM_GPIO,
+    X13S_KEYBOARD_PDC_PIN,
+    X13S_KEYBOARD_PDC_PARENT_SPI,
+    PDC_LEVEL_HIGH,
+);
+
+#[cfg(any(target_os = "none", test))]
+const fn pdc_route_for_tlmm_gpio(pin: u32) -> Option<PdcRoute> {
+    if pin == X13S_KEYBOARD_TLMM_GPIO {
+        Some(X13S_KEYBOARD_PDC_ROUTE)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn pdc_route_for_parent_intid(intid: u32) -> Option<PdcRoute> {
+    if intid == X13S_KEYBOARD_PDC_ROUTE.parent_intid {
+        Some(X13S_KEYBOARD_PDC_ROUTE)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn pdc_version_uses_cfg_enable(version: u32) -> bool {
+    version >= PDC_VERSION_3_2
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn pdc_cfg_value(previous: u32, route: PdcRoute, version: u32, enabled: bool) -> u32 {
+    let mut cfg = (previous & !PDC_IRQ_I_CFG_TYPE_MASK) | route.pdc_type;
+    if pdc_version_uses_cfg_enable(version) {
+        if enabled {
+            cfg |= PDC_IRQ_I_CFG_ENABLE;
+        } else {
+            cfg &= !PDC_IRQ_I_CFG_ENABLE;
+        }
+    }
+    cfg
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn pdc_enable_bank_value(previous: u32, route: PdcRoute, enabled: bool) -> u32 {
+    if enabled {
+        previous | route.enable_bit
+    } else {
+        previous & !route.enable_bit
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {
@@ -3352,6 +3462,20 @@ fn mpidr_affinity() -> u32 {
     ((aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0) as u32
 }
 
+#[cfg(any(target_os = "none", test))]
+const fn gicv3_irouter_offset(intid: u32) -> u64 {
+    GICD_IROUTER + intid as u64 * 8
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn gicv3_irouter_value_from_affinity(affinity: u32) -> u64 {
+    let aff0 = (affinity & 0xff) as u64;
+    let aff1 = ((affinity >> 8) & 0xff) as u64;
+    let aff2 = ((affinity >> 16) & 0xff) as u64;
+    let aff3 = ((affinity >> 24) & 0xff) as u64;
+    aff0 | (aff1 << 8) | (aff2 << 16) | (aff3 << 32)
+}
+
 #[cfg(target_os = "none")]
 unsafe fn gicd_wait_rwp(gicd: u64) {
     while unsafe { mmio_read32(gicd + GICD_CTLR) } & GICD_CTLR_RWP != 0 {
@@ -3472,10 +3596,28 @@ fn on_irq(intid: u32) {
         }
     }
     let irq_hook = INTERRUPT_HOOK.load(ORD);
+    let mut delivered_gpio = false;
+    if let Some(route) = pdc_route_for_parent_intid(intid) {
+        if irq_hook != 0 && TLMM_GPIO_PIN.load(ORD) == route.tlmm_gpio {
+            let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
+            if irq_key != 0 {
+                // PDC presents the GPIO wake as a level IRQ to the GIC. Mask it until the
+                // userspace driver completes the interrupt and `complete_tlmm_gpio_interrupt`
+                // clears the TLMM latch, or EOI can immediately re-present the same level.
+                // The first metal pass must confirm this TLMM-clear/PDC-level/GIC-EOI lifecycle.
+                // — KESTREL 2026-06-26
+                unsafe { pdc_set_route_enabled(route, false) };
+                let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+                irq_hook(irq_key);
+                delivered_gpio = true;
+            }
+        }
+    }
     if intid == TLMM_PARENT_IRQ && irq_hook != 0 {
         if let Some(irq_key) = unsafe { tlmm_gpio_mask_pending() } {
             let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
             irq_hook(irq_key);
+            delivered_gpio = true;
         }
     }
     // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
@@ -3492,7 +3634,7 @@ fn on_irq(intid: u32) {
             let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
             irq_hook(intid);
         }
-    } else if intid != TLMM_PARENT_IRQ && irq_hook != 0 {
+    } else if intid != TLMM_PARENT_IRQ && !delivered_gpio && irq_hook != 0 {
         let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
         irq_hook(intid);
     }
@@ -3504,18 +3646,27 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
     if gicd == 0 || pin > 0xe5 {
         return false;
     }
+    if flags != TLMM_GPIO_FLAG_LEVEL_LOW && flags != TLMM_GPIO_FLAG_EDGE_FALLING {
+        return false;
+    }
+    // Publish the demux state before unmasking TLMM/PDC/GIC; a level attention line
+    // may already be asserted and enter `on_irq` as soon as the route is enabled.
+    // — KESTREL 2026-06-26
+    TLMM_GPIO_PIN.store(pin, ORD);
+    TLMM_GPIO_IRQ_KEY.store(irq_key, ORD);
     unsafe {
         if flags == TLMM_GPIO_FLAG_LEVEL_LOW {
             tlmm_gpio_configure_level_low(pin);
-        } else if flags == TLMM_GPIO_FLAG_EDGE_FALLING {
-            tlmm_gpio_configure_falling_edge(pin);
         } else {
-            return false;
+            tlmm_gpio_configure_falling_edge(pin);
         }
-        gic_configure_spi(gicd, TLMM_PARENT_IRQ);
+        if let Some(route) = pdc_route_for_tlmm_gpio(pin) {
+            pdc_configure_route(route);
+            gic_configure_spi(gicd, route.parent_intid);
+        } else {
+            gic_configure_spi(gicd, TLMM_PARENT_IRQ);
+        }
     }
-    TLMM_GPIO_PIN.store(pin, ORD);
-    TLMM_GPIO_IRQ_KEY.store(irq_key, ORD);
     true
 }
 
@@ -3555,6 +3706,35 @@ unsafe fn tlmm_gpio_configure_falling_edge(pin: u32) {
 }
 
 #[cfg(target_os = "none")]
+unsafe fn pdc_configure_route(route: PdcRoute) {
+    let base = mmio_phys(PDC_BASE);
+    let version = unsafe { mmio_read32(base + PDC_VERSION_REG) };
+    let cfg_addr = base + route.cfg_offset;
+    let previous = unsafe { mmio_read32(cfg_addr) };
+    unsafe { mmio_write32(cfg_addr, pdc_cfg_value(previous, route, version, true)) };
+    if !pdc_version_uses_cfg_enable(version) {
+        let enable_addr = base + route.enable_bank_offset;
+        let bank = unsafe { mmio_read32(enable_addr) };
+        unsafe { mmio_write32(enable_addr, pdc_enable_bank_value(bank, route, true)) };
+    }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn pdc_set_route_enabled(route: PdcRoute, enabled: bool) {
+    let base = mmio_phys(PDC_BASE);
+    let version = unsafe { mmio_read32(base + PDC_VERSION_REG) };
+    if pdc_version_uses_cfg_enable(version) {
+        let cfg_addr = base + route.cfg_offset;
+        let previous = unsafe { mmio_read32(cfg_addr) };
+        unsafe { mmio_write32(cfg_addr, pdc_cfg_value(previous, route, version, enabled)) };
+    } else {
+        let enable_addr = base + route.enable_bank_offset;
+        let bank = unsafe { mmio_read32(enable_addr) };
+        unsafe { mmio_write32(enable_addr, pdc_enable_bank_value(bank, route, enabled)) };
+    }
+}
+
+#[cfg(target_os = "none")]
 unsafe fn tlmm_gpio_mask_pending() -> Option<u32> {
     let pin = TLMM_GPIO_PIN.load(ORD);
     let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
@@ -3581,20 +3761,41 @@ pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
         mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1);
         let cfg = mmio_read32(base + TLMM_GPIO_INTR_CFG);
         mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg | TLMM_INTR_ENABLE);
+        if let Some(route) = pdc_route_for_tlmm_gpio(pin) {
+            pdc_set_route_enabled(route, true);
+        }
     }
     true
 }
 
 #[cfg(target_os = "none")]
 unsafe fn gic_configure_spi(gicd: u64, irq: u32) {
-    let gicd = mmio_phys(gicd);
+    let is_gicv3 = GICV2_CPU_BASE.load(ORD) == 0;
+    let gicd = if is_gicv3 { mmio_phys(gicd) } else { gicd };
     let bit = 1u32 << (irq % 32);
     let bank = (irq / 32) as u64 * 4;
     unsafe { mmio_write32(gicd + GICD_ICENABLER0 + bank, bit) };
+    if is_gicv3 {
+        unsafe { gicd_wait_rwp(gicd) };
+    }
     let group = unsafe { mmio_read32(gicd + GICD_IGROUPR0 + bank) } | bit;
     unsafe { mmio_write32(gicd + GICD_IGROUPR0 + bank, group) };
+    if is_gicv3 && irq >= 32 {
+        // GICv3 timer PPIs working only proves redistributor delivery; an external PDC SPI still
+        // needs an IROUTER target once affinity routing is enabled in GICD_CTLR.ARE_NS.
+        // — KESTREL 2026-06-26
+        unsafe {
+            mmio_write64(
+                gicd + gicv3_irouter_offset(irq),
+                gicv3_irouter_value_from_affinity(mpidr_affinity()),
+            )
+        };
+    }
     unsafe { mmio_write8(gicd + GICD_IPRIORITYR + irq as u64, 0x80) };
     unsafe { mmio_write32(gicd + GICD_ISENABLER0 + bank, bit) };
+    if is_gicv3 {
+        unsafe { gicd_wait_rwp(gicd) };
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -3615,6 +3816,11 @@ unsafe fn mmio_write32(addr: u64, value: u32) {
 #[cfg(target_os = "none")]
 unsafe fn mmio_read64(addr: u64) -> u64 {
     unsafe { (addr as *const u64).read_volatile() }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn mmio_write64(addr: u64, value: u64) {
+    unsafe { (addr as *mut u64).write_volatile(value) };
 }
 
 #[cfg(target_os = "none")]
@@ -4418,6 +4624,73 @@ mod tests {
         assert_eq!(gicv2_no_dtb_fallback(0x4000_0000, false), None);
         // A GICv3 PE with no DTB uses QEMU_GICV3, not the Pi 5 GICv2 fallback.
         assert_eq!(gicv2_no_dtb_fallback(0, true), None);
+    }
+
+    #[test]
+    fn x13s_keyboard_pdc_route_math_matches_linux_sources() {
+        let route = pdc_route_for_tlmm_gpio(104).expect("GPIO 104 has an X13s PDC route");
+
+        assert_eq!(PDC_BASE, 0x0b22_0000);
+        assert_eq!(PDC_VERSION_REG, 0x1000);
+        assert_eq!(route.tlmm_gpio, 104);
+        assert_eq!(route.pdc_pin, 216);
+        assert_eq!(route.parent_spi, 646);
+        assert_eq!(route.parent_intid, 678);
+        assert_eq!(route.cfg_offset, 0x470);
+        assert_eq!(route.enable_bank_offset, 0x28);
+        assert_eq!(route.enable_bit, 1 << 24);
+        assert_eq!(route.pdc_type, PDC_LEVEL_HIGH);
+        assert_eq!(pdc_route_for_parent_intid(678), Some(route));
+        assert_eq!(pdc_route_for_tlmm_gpio(103), None);
+        assert_eq!(pdc_route_for_parent_intid(32 + 0xd0), None);
+    }
+
+    #[test]
+    fn gicv3_irouter_math_routes_keyboard_spi_to_current_pe() {
+        assert_eq!(GICD_IROUTER, 0x6000);
+        assert_eq!(gicv3_irouter_offset(0), 0x6000);
+        assert_eq!(gicv3_irouter_offset(32), 0x6100);
+        assert_eq!(
+            gicv3_irouter_offset(X13S_KEYBOARD_PDC_ROUTE.parent_intid),
+            0x7530
+        );
+
+        assert_eq!(gicv3_irouter_value_from_affinity(0), 0);
+        assert_eq!(
+            gicv3_irouter_value_from_affinity(0x0102_0304),
+            0x0000_0001_0002_0304
+        );
+        assert_eq!(
+            gicv3_irouter_value_from_affinity(0xff00_0001),
+            0x0000_00ff_0000_0001
+        );
+    }
+
+    #[test]
+    fn x13s_keyboard_pdc_enable_encoding_tracks_version_split() {
+        let route = X13S_KEYBOARD_PDC_ROUTE;
+        let previous_cfg = 0xffff_fff8;
+        let previous_bank = 0;
+
+        assert!(!pdc_version_uses_cfg_enable(PDC_VERSION_3_2 - 1));
+        assert!(pdc_version_uses_cfg_enable(PDC_VERSION_3_2));
+
+        assert_eq!(
+            pdc_cfg_value(previous_cfg, route, PDC_VERSION_3_2 - 1, true),
+            previous_cfg | PDC_LEVEL_HIGH
+        );
+        assert_eq!(pdc_enable_bank_value(previous_bank, route, true), 1 << 24);
+        assert_eq!(
+            pdc_enable_bank_value(0xffff_ffff, route, false),
+            0xfeff_ffff
+        );
+
+        let enabled_cfg = pdc_cfg_value(previous_cfg, route, PDC_VERSION_3_2, true);
+        assert_eq!(enabled_cfg & PDC_IRQ_I_CFG_TYPE_MASK, PDC_LEVEL_HIGH);
+        assert_ne!(enabled_cfg & PDC_IRQ_I_CFG_ENABLE, 0);
+        let disabled_cfg = pdc_cfg_value(enabled_cfg, route, PDC_VERSION_3_2, false);
+        assert_eq!(disabled_cfg & PDC_IRQ_I_CFG_TYPE_MASK, PDC_LEVEL_HIGH);
+        assert_eq!(disabled_cfg & PDC_IRQ_I_CFG_ENABLE, 0);
     }
 
     #[test]

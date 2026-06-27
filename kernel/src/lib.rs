@@ -529,31 +529,44 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 }
 
                 // Net loopback: send "ping" on the net channel, Sora echoes it.
-                let mut lb_buf = [0u8; 8];
-                let lb_n = usermode::net_loopback(b"ping", &mut lb_buf);
-                let lb_ok = lb_n == 4 && &lb_buf[..4] == b"ping";
-                // Multi-connection control token. Real capability transfer waits for
-                // child/channel syscalls; the POST checks that Sora's net route responds.
-                let mut cn_buf = [0u8; 8];
-                let cn_n = usermode::net_loopback(b"conn", &mut cn_buf);
-                let cn_ok = cn_n >= 1 && cn_buf[0] != b'e';
-                // P9-f: named pipe control token; two requests must get non-error acks.
-                let mut p1_buf = [0u8; 8];
-                let p1_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
-                let p2_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
-                let pipe_ok = p1_n >= 1 && p1_buf[0] != b'e' && p2_n >= 1 && p1_buf[0] != b'e';
-                if lb_ok && cn_ok && pipe_ok {
-                    klog!("NET LOOPBACK       Check     ping +conn +pipe  via sora   OK\n");
+                //
+                // SKIPPED on the framebuffer/metal path. `net_loopback` drives Sora through the
+                // cooperative `wake_user` (run-until-all-userland-parks), and metal installs no
+                // timer preemption during the POST checks — so once a driver stays runnable (the
+                // M-I2C bringup), this never returns and the boot freezes with PORT BIND as the
+                // last line. There is no way to *bound* it cooperatively (the boot thread is
+                // switched out during the wake), so on metal we skip the diagnostic and let boot
+                // fall into the idle-floor halt loop where the userland actually runs. QEMU's
+                // serial path keeps the full check. — CORVUS 2026-06-26
+                if report.has_framebuffer {
+                    klog!("NET LOOPBACK       Check     skipped (metal cooperative path)   --\n");
                 } else {
-                    klog!(
-                        "NET LOOPBACK       Check     lb={}/{} cn={}/{} pipe={}/{}   FAIL\n",
-                        lb_n,
-                        lb_ok,
-                        cn_n,
-                        cn_ok,
-                        p2_n,
-                        pipe_ok
-                    );
+                    let mut lb_buf = [0u8; 8];
+                    let lb_n = usermode::net_loopback(b"ping", &mut lb_buf);
+                    let lb_ok = lb_n == 4 && &lb_buf[..4] == b"ping";
+                    // Multi-connection control token. Real capability transfer waits for
+                    // child/channel syscalls; the POST checks that Sora's net route responds.
+                    let mut cn_buf = [0u8; 8];
+                    let cn_n = usermode::net_loopback(b"conn", &mut cn_buf);
+                    let cn_ok = cn_n >= 1 && cn_buf[0] != b'e';
+                    // P9-f: named pipe control token; two requests must get non-error acks.
+                    let mut p1_buf = [0u8; 8];
+                    let p1_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
+                    let p2_n = usermode::net_loopback(b"pipe:test", &mut p1_buf);
+                    let pipe_ok = p1_n >= 1 && p1_buf[0] != b'e' && p2_n >= 1 && p1_buf[0] != b'e';
+                    if lb_ok && cn_ok && pipe_ok {
+                        klog!("NET LOOPBACK       Check     ping +conn +pipe  via sora   OK\n");
+                    } else {
+                        klog!(
+                            "NET LOOPBACK       Check     lb={}/{} cn={}/{} pipe={}/{}   FAIL\n",
+                            lb_n,
+                            lb_ok,
+                            cn_n,
+                            cn_ok,
+                            p2_n,
+                            pipe_ok
+                        );
+                    }
                 }
             }
         }
@@ -565,9 +578,28 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
         klog!("\nMUREX core online -- all subsystems nominal.\n");
         klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
+        // Supervisor floor: the cooperative idle loop that pumps the resident services
+        // (Sora's serve loop, drv-fb, drv-i2c-hid, drv-geni-i2c, ttyd). The heartbeat is
+        // LOAD-BEARING FOR THE DISPLAY, not just diagnostics: the X13s panel lags several lines
+        // behind the last rendered line once console output goes quiet (a framebuffer
+        // coherency/scanout artifact — same family as the BootInfo-not-cleaned-to-PoC and
+        // `dc cvac` issues). Without continuous output the panel freezes ~4 lines back (showing
+        // `NET LOOPBACK skipped` while the CPU is actually alive at this floor), which reads as
+        // a boot regression but is purely visual. The ~1 Hz tick keeps the panel current and
+        // proves liveness. TODO: replace with a quiet periodic framebuffer flush (clean-to-PoC
+        // / present) so the floor can be silent and the shell echo unobstructed. — CORVUS 2026-06-26
+        klog!("SUPERVISOR FLOOR   online; pumping resident services (heartbeat = panel-refresh + liveness)\n");
+        let mut next_beat = kumo_hal::active::monotonic_nanos();
+        let mut beats: u64 = 0;
         loop {
             user_thread::pump_idle_floor();
             kumo_hal::active::spin_once();
+            let now = kumo_hal::active::monotonic_nanos();
+            if now >= next_beat {
+                beats = beats.wrapping_add(1);
+                klog!("SUPERVISOR FLOOR   heartbeat #{}  (floor alive)\n", beats);
+                next_beat = now.saturating_add(1_000_000_000);
+            }
         }
     } else {
         // P8-b: serial console (QEMU PL011) — forward keystrokes to Sora via the

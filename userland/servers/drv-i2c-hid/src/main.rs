@@ -3,17 +3,19 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
-    bounded_input_frame_len, bounded_report_descriptor_len, input_read_len, BoundedFailureLog,
-    DecodedReport, DeviceQuirks, InputProbeDecoder, InputProbeError, ProbeConfig,
+    bounded_input_frame_len, bounded_report_descriptor_len, classify_i2c_ipc_reply_wake,
+    input_read_len, input_read_mode, BoundedFailureLog, DecodedReport, DeviceQuirks,
+    I2cIpcReplyWake, InputProbeDecoder, InputProbeError, InputReadMode, ProbeConfig,
+    I2C_IPC_REPLY_TIMEOUT_ERROR, I2C_IPC_REPLY_TIMEOUT_NS, I2C_IPC_UNEXPECTED_WAKE_ERROR,
     KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
 };
 use kumo_abi::i2c::{I2cOpcode, I2cRequestHeader, I2cTransferRequest, I2cTransferResponse};
 use kumo_abi::Handle;
 use kumo_i2c_hid::{inspect_report_descriptor, Command, HidDescriptor, PowerState};
 use kumo_rt::{
-    channel_read_with_handle, channel_write, debug_write, handle_close, handle_koid,
-    interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
-    port_wait, resource_mint_mmio, timer_create, vmar_map,
+    channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
+    handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create,
+    port_unbind, port_wait, timer_create,
 };
 
 kumo_rt::entry!(main);
@@ -34,21 +36,40 @@ impl IpcError {
 
 struct IpcController {
     channel: Handle,
+    logged_first_transfer: bool,
+    reply_timeouts: BoundedFailureLog,
 }
+
+const I2C_IPC_MAX_TRANSFER_BYTES: usize = 512;
+const I2C_IPC_MAX_REQUEST_BYTES: usize =
+    core::mem::size_of::<I2cTransferRequest>() + I2C_IPC_MAX_TRANSFER_BYTES;
+const I2C_IPC_MAX_RESPONSE_BYTES: usize =
+    core::mem::size_of::<I2cTransferResponse>() + I2C_IPC_MAX_TRANSFER_BYTES;
 
 impl IpcController {
     fn write(&mut self, address: u8, data: &[u8]) -> Result<(), IpcError> {
         self.write_read(address, data, &mut [])
     }
-    
+
     fn read(&mut self, address: u8, buffer: &mut [u8]) -> Result<(), IpcError> {
         self.write_read(address, &[], buffer)
     }
-    
-    fn write_read(&mut self, address: u8, write_data: &[u8], read_data: &mut [u8]) -> Result<(), IpcError> {
-        let req = kumo_abi::i2c::I2cTransferRequest {
-            header: kumo_abi::i2c::I2cRequestHeader {
-                opcode: kumo_abi::i2c::I2cOpcode::Transfer,
+
+    fn write_read(
+        &mut self,
+        address: u8,
+        write_data: &[u8],
+        read_data: &mut [u8],
+    ) -> Result<(), IpcError> {
+        if write_data.len() > I2C_IPC_MAX_TRANSFER_BYTES
+            || read_data.len() > I2C_IPC_MAX_TRANSFER_BYTES
+        {
+            return Err(IpcError { code: 1005 });
+        }
+
+        let req = I2cTransferRequest {
+            header: I2cRequestHeader {
+                opcode: I2cOpcode::Transfer,
                 bus: 0,
                 address: address as u16,
                 _pad: 0,
@@ -56,70 +77,132 @@ impl IpcController {
             write_len: write_data.len() as u16,
             read_len: read_data.len() as u16,
         };
-        
-        let mut req_msg = [0u8; 512];
+
+        let mut req_msg = [0u8; I2C_IPC_MAX_REQUEST_BYTES];
         let req_hdr = any_as_u8_slice(&req);
         req_msg[..req_hdr.len()].copy_from_slice(req_hdr);
-        if write_data.len() > 0 {
+        if !write_data.is_empty() {
             req_msg[req_hdr.len()..req_hdr.len() + write_data.len()].copy_from_slice(write_data);
         }
-        
+
         let (local_resp, remote_resp) = kumo_rt::channel_create_pair();
         if local_resp == u64::MAX || remote_resp == u64::MAX {
             return Err(IpcError { code: 1000 });
         }
-        
-        let status = kumo_rt::channel_write_with_handle(
+        let local_resp = Handle(local_resp as u32);
+        let remote_resp = Handle(remote_resp as u32);
+
+        let port_raw = port_create();
+        if port_raw == u64::MAX {
+            let _ = handle_close(local_resp);
+            let _ = handle_close(remote_resp);
+            return Err(IpcError { code: 1002 });
+        }
+        let port = Handle(port_raw as u32);
+        if port_bind(port, local_resp) != 0 {
+            let _ = handle_close(port);
+            let _ = handle_close(local_resp);
+            let _ = handle_close(remote_resp);
+            return Err(IpcError { code: 1002 });
+        }
+        let local_resp_koid = handle_koid(local_resp);
+        if local_resp_koid == u64::MAX {
+            let _ = handle_close(port);
+            let _ = handle_close(local_resp);
+            let _ = handle_close(remote_resp);
+            return Err(IpcError { code: 1002 });
+        }
+
+        let status = channel_write_with_handle(
             self.channel,
             req_msg.as_ptr(),
             req_hdr.len() + write_data.len(),
-            Handle(remote_resp as u32),
+            remote_resp,
         );
         if status != 0 {
-            let _ = kumo_rt::handle_close(Handle(local_resp as u32));
+            let _ = handle_close(port);
+            let _ = handle_close(local_resp);
+            let _ = handle_close(remote_resp);
             return Err(IpcError { code: 1001 });
         }
-        
-        let port_raw = kumo_rt::port_create();
-        let port = Handle(port_raw as u32);
-        kumo_rt::port_bind(port, Handle(local_resp as u32));
-        let _ = kumo_rt::port_wait(port);
-        let _ = kumo_rt::handle_close(port);
-        
-        let mut resp_msg = [0u8; 512];
-        let (received, tag_raw) = kumo_rt::channel_read_with_handle(
-            Handle(local_resp as u32),
-            resp_msg.as_mut_ptr(),
-            resp_msg.len(),
-        );
-        
-        let _ = kumo_rt::handle_close(Handle(local_resp as u32));
-        if tag_raw != 0 {
-            let _ = kumo_rt::handle_close(Handle(tag_raw as u32));
+        if !self.logged_first_transfer {
+            self.logged_first_transfer = true;
+            log(b"drv-i2c-hid: i2c ipc transfer begin\n");
         }
-        
-        if received < core::mem::size_of::<kumo_abi::i2c::I2cTransferResponse>() {
+
+        let timer_raw = timer_create(I2C_IPC_REPLY_TIMEOUT_NS);
+        if timer_raw == u64::MAX {
+            let _ = handle_close(port);
+            let _ = handle_close(local_resp);
+            return Err(IpcError { code: 1002 });
+        }
+        let timer = Handle(timer_raw as u32);
+        let timer_koid = handle_koid(timer);
+        if timer_koid == u64::MAX || port_bind(port, timer) != 0 {
+            let _ = handle_close(timer);
+            let _ = handle_close(port);
+            let _ = handle_close(local_resp);
+            return Err(IpcError { code: 1002 });
+        }
+
+        let source = port_wait(port);
+        let _ = port_unbind(port, local_resp);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        let _ = handle_close(port);
+        match classify_i2c_ipc_reply_wake(source, local_resp_koid, timer_koid) {
+            I2cIpcReplyWake::Response => {}
+            I2cIpcReplyWake::Timeout => {
+                let _ = handle_close(local_resp);
+                if self.reply_timeouts.record() {
+                    log(b"drv-i2c-hid: i2c ipc reply timeout\n");
+                }
+                return Err(IpcError {
+                    code: I2C_IPC_REPLY_TIMEOUT_ERROR,
+                });
+            }
+            I2cIpcReplyWake::Unexpected => {
+                let _ = handle_close(local_resp);
+                log_hex(b"drv-i2c-hid: i2c ipc wrong wake=0x", source);
+                return Err(IpcError {
+                    code: I2C_IPC_UNEXPECTED_WAKE_ERROR,
+                });
+            }
+        }
+
+        let mut resp_msg = [0u8; I2C_IPC_MAX_RESPONSE_BYTES];
+        let (received, tag_raw) =
+            channel_read_with_handle(local_resp, resp_msg.as_mut_ptr(), resp_msg.len());
+
+        let _ = handle_close(local_resp);
+        if tag_raw != 0 {
+            let _ = handle_close(Handle(tag_raw as u32));
+        }
+
+        if received < core::mem::size_of::<I2cTransferResponse>() {
             return Err(IpcError { code: 1003 });
         }
-        
-        let resp: kumo_abi::i2c::I2cTransferResponse = unsafe { core::ptr::read_unaligned(resp_msg.as_ptr() as *const _) };
+
+        let resp: I2cTransferResponse =
+            unsafe { core::ptr::read_unaligned(resp_msg.as_ptr() as *const _) };
         if resp.status != 0 {
-            return Err(IpcError { code: (-resp.status) as u64 });
+            return Err(IpcError {
+                code: (-resp.status) as u64,
+            });
         }
-        
-        if resp.read_len as usize > 0 && resp.read_len as usize <= read_data.len() {
-            let hdr_len = core::mem::size_of::<kumo_abi::i2c::I2cTransferResponse>();
-            if received >= hdr_len + resp.read_len as usize {
-                read_data[..resp.read_len as usize].copy_from_slice(&resp_msg[hdr_len..hdr_len + resp.read_len as usize]);
-            } else {
-                return Err(IpcError { code: 1004 });
-            }
+
+        let read_len = resp.read_len as usize;
+        let hdr_len = core::mem::size_of::<I2cTransferResponse>();
+        if read_len > read_data.len() || received < hdr_len + read_len {
+            return Err(IpcError { code: 1004 });
+        }
+        if read_len > 0 {
+            read_data[..read_len].copy_from_slice(&resp_msg[hdr_len..hdr_len + read_len]);
         }
         Ok(())
     }
 }
 
-const POLL_LIMIT: usize = 1_000_000;
 const WAKE_RETRY_NS: u64 = 500_000;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_RETRY_NS: u64 = 1_000_000_000;
@@ -283,15 +366,21 @@ extern "C" fn main(
     let keyboard_channel = Handle(keyboard_raw as u32);
     log(b"drv-i2c-hid: keyboard channel ok\n");
 
-    let (received, i2c_client_raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+    let (received, i2c_client_raw) =
+        channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
     if received != tag.len() || tag[0] != b'I' || i2c_client_raw == 0 {
         log(b"drv-i2c-hid: i2c client bootstrap failed\n");
         kumo_rt::process_exit(1);
     }
-    let mut controller = IpcController { channel: Handle(i2c_client_raw as u32) };
+    let mut controller = IpcController {
+        channel: Handle(i2c_client_raw as u32),
+        logged_first_transfer: false,
+        reply_timeouts: BoundedFailureLog::new(),
+    };
     log(b"drv-i2c-hid: I2C IPC ready\n");
 
     let resource = Handle(resource_raw as u32);
+    // I2C MMIO now belongs to drv-geni-i2c; HID keeps the IRQ resource for attention waits.
 
     let mut raw_descriptor = [0u8; HidDescriptor::BYTES];
     if let Err(error) = controller.write_read(
@@ -577,12 +666,16 @@ extern "C" fn main(
     // paths log (bounded), plus a one-shot `keyboard input live` marker on the first forwarded key so
     // a fresh flash can still tell "forwarding works" from "echo path broken". — CORVUS
     // Keep GPIO attention first, but do not let a missing TLMM/PDC delivery park the only keyboard
-    // producer forever. The 20 ms timeout restores J267's timer-paced plain-read bridge while still
-    // completing real DESIGN/016 deliveries after a successful drain. — KESTREL
+    // producer forever. The 20 ms timeout keeps D10's bounded GET_REPORT fallback alive while real
+    // attention deliveries drain with Linux's plain input-register read. — KESTREL 2026-06-26
     let mut input_decode_failures = BoundedFailureLog::new();
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut non_keyboard_reports = BoundedFailureLog::new();
     let mut poll_read_failures = BoundedFailureLog::new();
+    // Keyboard bring-up probe: a bounded sample of whichever raw read carried data. Attention uses
+    // the pushed-report input-register path; timeout fallback uses GET_REPORT to keep the dead-end
+    // polling bridge visible until PDC is confirmed. Idle = silent; capped at 32. — KESTREL 2026-06-26
+    let mut raw_read_samples: u32 = 0;
     let mut logged_first_key = false;
     let mut logged_first_attention = false;
     let mut logged_first_read = false;
@@ -604,11 +697,25 @@ extern "C" fn main(
             log(b"drv-i2c-hid: input read begin\n");
         }
 
-        // Fetch the input report with a PLAIN read (Linux i2c_hid_get_input → i2c_master_recv);
-        // addressing the input register first returns the device's "no data" response instead of
-        // the pending report — which is why every earlier poll came back empty. — CORVUS
-        if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
-        {
+        let read_result = match input_read_mode(attention_fired) {
+            InputReadMode::PlainInputRegister => {
+                controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
+            }
+            InputReadMode::GetReportInput => {
+                let get_report = Command::get_report_input(
+                    descriptor.command_register,
+                    descriptor.data_register,
+                    // No report IDs → GET_REPORT uses id 0 (the device omits the id prefix).
+                    keyboard.report_id.unwrap_or(0),
+                );
+                controller.write_read(
+                    config.i2c_address,
+                    &get_report,
+                    &mut input_frame[..input_frame_len],
+                )
+            }
+        };
+        if let Err(error) = read_result {
             if attention_fired {
                 log_hex(b"drv-i2c-hid: input frame read error=0x", error.code());
                 kumo_rt::process_exit(1);
@@ -628,6 +735,32 @@ extern "C" fn main(
         if !logged_first_read {
             logged_first_read = true;
             log(b"drv-i2c-hid: input read ok\n");
+        }
+        // PROBE: surface the raw read when it carries data, BEFORE the decoder classifies it.
+        // Label the source so the first PDC metal pass distinguishes a real GPIO attention delivery
+        // from the timer-paced fallback CORVUS used to prove polling was empty. — KESTREL 2026-06-26
+        let report_len = u16::from_le_bytes([input_frame[0], input_frame[1]]) as usize;
+        if report_len > 2 && raw_read_samples < 32 {
+            raw_read_samples += 1;
+            if attention_fired {
+                log_hex(b"drv-i2c-hid: attention report len=0x", report_len as u64);
+            } else {
+                log_hex(b"drv-i2c-hid: poll report len=0x", report_len as u64);
+            }
+            let report_bytes = u32::from_le_bytes([
+                *input_frame.get(2).unwrap_or(&0),
+                *input_frame.get(3).unwrap_or(&0),
+                *input_frame.get(4).unwrap_or(&0),
+                *input_frame.get(5).unwrap_or(&0),
+            ]);
+            if attention_fired {
+                log_hex(
+                    b"drv-i2c-hid: attention report bytes=0x",
+                    report_bytes as u64,
+                );
+            } else {
+                log_hex(b"drv-i2c-hid: poll report bytes=0x", report_bytes as u64);
+            }
         }
         let input = match input_decoder.decode_report_with_quirks(
             &input_frame[..input_frame_len],

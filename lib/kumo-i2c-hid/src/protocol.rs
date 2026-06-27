@@ -143,7 +143,9 @@ pub struct Command;
 
 impl Command {
     const OPCODE_RESET: u8 = 0x01;
+    const OPCODE_GET_REPORT: u8 = 0x02;
     const OPCODE_SET_POWER: u8 = 0x08;
+    const REPORT_TYPE_INPUT: u8 = 0x01;
 
     /// `SET_POWER` with the given power state.
     pub fn set_power(command_register: u16, state: PowerState) -> [u8; 4] {
@@ -153,6 +155,27 @@ impl Command {
     /// `RESET`. The device signals completion with a length-0 input report.
     pub fn reset(command_register: u16) -> [u8; 4] {
         Self::encode(command_register, 0, Self::OPCODE_RESET)
+    }
+
+    /// `GET_REPORT` for an INPUT report — the HID-over-I2C **active poll**. It asks the device for
+    /// the current input report state via the command→data register handshake, unlike the input-
+    /// register read which only returns reports the device pushed alongside an interrupt. D10 keeps
+    /// this as a bounded timeout fallback only; real GPIO attention uses the plain input-register
+    /// read. Short form only (report_id < 0x0F). Layout:
+    /// command_register(2) | (REPORT_TYPE_INPUT<<4 | report_id) | opcode | data_register(2); the
+    /// device replies with `[length(2), report…]` at the data register, so issue it as a write_read.
+    /// — CORVUS 2026-06-26
+    pub fn get_report_input(command_register: u16, data_register: u16, report_id: u8) -> [u8; 6] {
+        let [clo, chi] = command_register.to_le_bytes();
+        let [dlo, dhi] = data_register.to_le_bytes();
+        [
+            clo,
+            chi,
+            (Self::REPORT_TYPE_INPUT << 4) | (report_id & 0x0F),
+            Self::OPCODE_GET_REPORT,
+            dlo,
+            dhi,
+        ]
     }
 
     fn encode(command_register: u16, report_id: u8, opcode: u8) -> [u8; 4] {
@@ -191,6 +214,20 @@ mod tests {
     #[test]
     fn command_register_address_is_little_endian() {
         assert_eq!(Command::reset(0x1234), [0x34, 0x12, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn get_report_input_matches_spec_byte_layout() {
+        // cmd-reg 0x0022 LE, (INPUT<<4 | id=3) = 0x13, GET_REPORT opcode 0x02, data-reg 0x0024 LE.
+        assert_eq!(
+            Command::get_report_input(0x0022, 0x0024, 3),
+            [0x22, 0x00, 0x13, 0x02, 0x24, 0x00]
+        );
+        // No report id → low nibble 0 (type byte 0x10), still input GET_REPORT.
+        assert_eq!(
+            Command::get_report_input(0x0005, 0x0006, 0),
+            [0x05, 0x00, 0x10, 0x02, 0x06, 0x00]
+        );
     }
 
     #[test]

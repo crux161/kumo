@@ -704,6 +704,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let cat = build_cat_image(&workspace_root()?)?;
             let wc = build_wc_image(&workspace_root()?)?;
             let lua_repl = build_lua_repl_image(&workspace_root()?)?;
+            let i2cdetect = build_i2cdetect_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
@@ -722,6 +723,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (CAT_PATH, cat.as_slice()),
                 (WC_PATH, wc.as_slice()),
                 (LUA_REPL_PATH, lua_repl.as_slice()),
+                ("bin/i2cdetect", i2cdetect.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
             ])?
         }
@@ -988,6 +990,31 @@ fn build_lua_repl_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as lua-repl ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_i2cdetect_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "i2cdetect",
+            "--bin",
+            "i2cdetect",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("i2cdetect");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as i2cdetect ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 
