@@ -2586,30 +2586,187 @@ const TLMM_GPIO_INTR_CFG: u64 = 0x008;
 const TLMM_GPIO_INTR_STATUS: u64 = 0x00c;
 #[cfg(target_os = "none")]
 const TLMM_PARENT_IRQ: u32 = 32 + 0xd0;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_GPIO_FLAG_LEVEL_LOW: u32 = 8;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_ENABLE: u32 = 1 << 0;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_POLARITY: u32 = 1 << 1;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_RAW_STATUS_EN: u32 = 1 << 4;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_TARGET_APPS: u32 = 3 << 5;
 // Falling-edge trigger for ELAN i2c-hid (Linux FORCE_TRIGGER_FALLING). DT flag 2 = IRQ_TYPE_EDGE_FALLING.
 // The 2-bit INTR_DECT_CTL field sits at bits 2-3 (between POLARITY@1 and RAW_STATUS_EN@4), i.e.
 // intr_detection_width == 2 on SC8280XP. Per Linux msm_gpio_irq_set_type (width==2): falling edge =
 // detection value 2 with the polarity bit set. — CORVUS
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_GPIO_FLAG_EDGE_FALLING: u32 = 2;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_DECT_SHIFT: u32 = 2;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 const TLMM_INTR_DECT_FALLING: u32 = 2;
 #[cfg(target_os = "none")]
 static TLMM_GPIO_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(target_os = "none")]
 static TLMM_GPIO_IRQ_KEY: AtomicU32 = AtomicU32::new(0);
+
+// ---- SC8280XP PDC (Power Domain Controller) wake-interrupt routing ----------------------------
+// Wake-capable TLMM GPIOs on SC8280XP do not reach the GIC through the TLMM summary SPI
+// (TLMM_PARENT_IRQ); they are routed through the PDC, which presents a dedicated SPI per wake port.
+// KUMO had no PDC support, so the keyboard's GPIO-104 attention line never reached the CPU — the root
+// cause of the slow/inconsistent first-light keyboard (J315). The routing arithmetic below is pure so
+// it is host-provable; the MMIO that programs the PDC with it is metal-only (a later slice).
+// Sources: sc8280xp.dtsi `qcom,pdc-ranges = <216 646 5 ...>`, pinctrl-sc8280xp wakeirq `{104, 216}`,
+// drivers/irqchip/qcom-pdc.c. — CORVUS
+const PDC_IRQ_ENABLE_BANK: u64 = 0x10;
+const PDC_IRQ_CFG: u64 = 0x110;
+#[cfg(target_os = "none")]
+const PDC_VERSION: u64 = 0x1000;
+#[cfg(any(target_os = "none", test))]
+const PDC_VERSION_3_2: u32 = 0x0003_0200;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_CFG_TYPE_MASK: u32 = 0b111;
+#[cfg(any(target_os = "none", test))]
+const PDC_IRQ_CFG_ENABLE: u32 = 1 << 3;
+/// PDC config type for a GPIO declared `IRQ_TYPE_LEVEL_LOW`: Linux normalizes the PDC side to
+/// LEVEL_HIGH (the PDC inverts) while the TLMM keeps the real level-low detection (`qcom_pdc_alloc`).
+const PDC_TYPE_LEVEL_HIGH: u32 = 0b100;
+/// The keyboard attention line: TLMM GPIO 104 is presented by PDC wake port 216 (wakeirq map).
+const KEYBOARD_GPIO_PIN: u32 = 104;
+const KEYBOARD_PDC_PORT: u32 = 216;
+/// `qcom,pdc-ranges = <216 646 5>`: PDC port `PDC_PORT_BASE` maps to GIC SPI `PDC_SPI_BASE`.
+const PDC_PORT_BASE: u32 = 216;
+const PDC_SPI_BASE: u32 = 646;
+/// GIC SPIs begin at INTID 32 (INTIDs 0-31 are SGIs/PPIs).
+const GIC_SPI_INTID_BASE: u32 = 32;
+
+/// The fully-derived PDC route for one wake GPIO: the PDC port that presents it, the GIC INTID the
+/// PDC raises on the CPU, and the exact PDC register writes (offset + value) that configure and
+/// enable it. Pure arithmetic, host-provable; consumed by metal MMIO in a later slice. — CORVUS
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PdcRoute {
+    pub port: u32,
+    pub gic_intid: u32,
+    pub cfg_offset: u64,
+    pub cfg_type: u32,
+    pub enable_bank_offset: u64,
+    pub enable_bit: u32,
+}
+
+impl PdcRoute {
+    /// The PDC route for a TLMM GPIO, or `None` if the pin has no known PDC wake mapping. Only the
+    /// keyboard attention line (GPIO 104 -> port 216) is mapped today — one acceptance, not a general
+    /// wakeirq table (GUIDANCE/006 §6). — CORVUS
+    pub fn for_gpio(pin: u32) -> Option<Self> {
+        let port = match pin {
+            KEYBOARD_GPIO_PIN => KEYBOARD_PDC_PORT,
+            _ => return None,
+        };
+        // port P in [PDC_PORT_BASE, +5) -> GIC SPI PDC_SPI_BASE + (P - PDC_PORT_BASE), then +32 to INTID.
+        let spi = PDC_SPI_BASE + (port - PDC_PORT_BASE);
+        Some(Self {
+            port,
+            gic_intid: GIC_SPI_INTID_BASE + spi,
+            cfg_offset: PDC_IRQ_CFG + port as u64 * 4,
+            cfg_type: PDC_TYPE_LEVEL_HIGH,
+            enable_bank_offset: PDC_IRQ_ENABLE_BANK + (port as u64 >> 5) * 4,
+            enable_bit: 1u32 << (port & 31),
+        })
+    }
+}
+
+#[cfg(target_os = "none")]
+const PDC_BASE: u64 = 0x0b22_0000;
+/// The GIC INTID the PDC raises for the configured wake GPIO (0 = none). Lets `on_irq` recognise a
+/// PDC-delivered keyboard attention and route it through the same mask/dispatch path as the TLMM
+/// summary SPI. — CORVUS
+#[cfg(target_os = "none")]
+static PDC_GIC_INTID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PdcEnableStyle {
+    EnableBank,
+    ConfigBit,
+}
+
+#[cfg(any(target_os = "none", test))]
+fn pdc_enable_style(version: u32) -> PdcEnableStyle {
+    if version >= PDC_VERSION_3_2 {
+        PdcEnableStyle::ConfigBit
+    } else {
+        PdcEnableStyle::EnableBank
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn pdc_cfg_value(existing: u32, route: PdcRoute, enabled: bool) -> u32 {
+    let enable = if enabled { PDC_IRQ_CFG_ENABLE } else { 0 };
+    (existing & !(PDC_IRQ_CFG_TYPE_MASK | PDC_IRQ_CFG_ENABLE)) | route.cfg_type | enable
+}
+
+#[cfg(any(target_os = "none", test))]
+fn pdc_enable_bank_value(existing: u32, route: PdcRoute, enabled: bool) -> u32 {
+    if enabled {
+        existing | route.enable_bit
+    } else {
+        existing & !route.enable_bit
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_level_low_cfg() -> u32 {
+    (TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS) & !TLMM_INTR_POLARITY
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_falling_edge_cfg() -> u32 {
+    TLMM_INTR_ENABLE
+        | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
+        | TLMM_INTR_POLARITY
+        | TLMM_INTR_RAW_STATUS_EN
+        | TLMM_INTR_TARGET_APPS
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_masked_cfg(existing: u32) -> u32 {
+    existing & !TLMM_INTR_ENABLE
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tlmm_gpio_enabled_cfg(existing: u32) -> u32 {
+    existing | TLMM_INTR_ENABLE
+}
+
+/// Which path delivered the configured GPIO attention interrupt. The TLMM summary path still needs
+/// the TLMM pending-status demux; the PDC wake path is already the keyboard's 1:1 wake SPI and must
+/// dispatch the stored GPIO key directly. — KESTREL
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpioAttentionDelivery {
+    None,
+    TlmmSummary,
+    PdcWake,
+}
+
+/// Classify whether a delivered INTID is the keyboard GPIO attention — either the TLMM summary SPI or
+/// the PDC wake SPI for the configured pin (`pdc_intid == 0` means no PDC route). Pure so the routing
+/// decision is host-testable. — KESTREL
+#[cfg(any(target_os = "none", test))]
+fn classify_gpio_attention_delivery(
+    intid: u32,
+    tlmm_parent_intid: u32,
+    pdc_intid: u32,
+) -> GpioAttentionDelivery {
+    if intid == tlmm_parent_intid {
+        GpioAttentionDelivery::TlmmSummary
+    } else if pdc_intid != 0 && intid == pdc_intid {
+        GpioAttentionDelivery::PdcWake
+    } else {
+        GpioAttentionDelivery::None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {
@@ -3390,10 +3547,20 @@ fn on_irq(intid: u32) {
         }
     }
     let irq_hook = INTERRUPT_HOOK.load(ORD);
-    if intid == TLMM_PARENT_IRQ && irq_hook != 0 {
-        if let Some(irq_key) = unsafe { tlmm_gpio_mask_pending() } {
-            let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
-            irq_hook(irq_key);
+    // The keyboard attention arrives either as the TLMM summary SPI or, for a PDC-routed wake pin,
+    // as its dedicated PDC SPI. The summary path must demux TLMM status; the PDC path is already the
+    // one configured wake line, so dispatch it directly after masking the configured TLMM/PDC line. — KESTREL
+    let gpio_delivery =
+        classify_gpio_attention_delivery(intid, TLMM_PARENT_IRQ, PDC_GIC_INTID.load(ORD));
+    if irq_hook != 0 {
+        let irq_key = match gpio_delivery {
+            GpioAttentionDelivery::TlmmSummary => unsafe { tlmm_gpio_mask_pending() },
+            GpioAttentionDelivery::PdcWake => unsafe { tlmm_gpio_mask_configured() },
+            GpioAttentionDelivery::None => None,
+        };
+        if let Some(irq_key) = irq_key {
+            let hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
+            hook(irq_key);
         }
     }
     // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
@@ -3410,7 +3577,7 @@ fn on_irq(intid: u32) {
             let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
             irq_hook(intid);
         }
-    } else if intid != TLMM_PARENT_IRQ && irq_hook != 0 {
+    } else if gpio_delivery == GpioAttentionDelivery::None && irq_hook != 0 {
         let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
         irq_hook(intid);
     }
@@ -3431,6 +3598,16 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
             return false;
         }
         gic_configure_spi(gicd, TLMM_PARENT_IRQ);
+        // Wake-capable GPIOs (the keyboard attention line) are PDC-routed: the TLMM summary SPI does
+        // not reliably reach the CPU for them. Program the PDC to present this pin as a dedicated GIC
+        // SPI and enable that SPI so the attention interrupt actually arrives. The TLMM detection
+        // config above is kept — the TLMM still latches and `complete_tlmm_gpio_interrupt` clears
+        // it (J315). — CORVUS
+        if let Some(route) = PdcRoute::for_gpio(pin) {
+            pdc_enable_pin(route);
+            gic_configure_spi(gicd, route.gic_intid);
+            PDC_GIC_INTID.store(route.gic_intid, ORD);
+        }
     }
     TLMM_GPIO_PIN.store(pin, ORD);
     TLMM_GPIO_IRQ_KEY.store(irq_key, ORD);
@@ -3450,9 +3627,8 @@ pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
 #[cfg(target_os = "none")]
 unsafe fn tlmm_gpio_configure_level_low(pin: u32) {
     let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
-    let cfg = TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS;
     unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
-    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg & !TLMM_INTR_POLARITY) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_level_low_cfg()) };
 }
 
 #[cfg(target_os = "none")]
@@ -3463,28 +3639,36 @@ unsafe fn tlmm_gpio_configure_falling_edge(pin: u32) {
     // complete lifecycle (mask on delivery, clear-status + re-enable on complete) is trigger-agnostic
     // and works unchanged for edge: an edge latch holds in INTR_STATUS until completion clears it,
     // and re-enabling re-arms for the next falling edge — no held level to re-fire. — CORVUS
-    let cfg = TLMM_INTR_ENABLE
-        | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
-        | TLMM_INTR_POLARITY
-        | TLMM_INTR_RAW_STATUS_EN
-        | TLMM_INTR_TARGET_APPS;
     unsafe { mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1) };
-    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_falling_edge_cfg()) };
 }
 
 #[cfg(target_os = "none")]
 unsafe fn tlmm_gpio_mask_pending() -> Option<u32> {
     let pin = TLMM_GPIO_PIN.load(ORD);
-    let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
-    if pin == u32::MAX || irq_key == 0 {
+    if pin == u32::MAX {
         return None;
     }
     let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
     if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
         return None;
     }
+    unsafe { tlmm_gpio_mask_configured() }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn tlmm_gpio_mask_configured() -> Option<u32> {
+    let pin = TLMM_GPIO_PIN.load(ORD);
+    let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
+    if pin == u32::MAX || irq_key == 0 {
+        return None;
+    }
+    if let Some(route) = PdcRoute::for_gpio(pin) {
+        unsafe { pdc_set_pin_enabled(route, false) };
+    }
+    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
     let cfg = unsafe { mmio_read32(base + TLMM_GPIO_INTR_CFG) };
-    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg & !TLMM_INTR_ENABLE) };
+    unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_masked_cfg(cfg)) };
     Some(irq_key)
 }
 
@@ -3498,9 +3682,42 @@ pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
         let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
         mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1);
         let cfg = mmio_read32(base + TLMM_GPIO_INTR_CFG);
-        mmio_write32(base + TLMM_GPIO_INTR_CFG, cfg | TLMM_INTR_ENABLE);
+        mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_enabled_cfg(cfg));
+        if let Some(route) = PdcRoute::for_gpio(pin) {
+            pdc_set_pin_enabled(route, true);
+        }
     }
     true
+}
+
+#[cfg(target_os = "none")]
+unsafe fn pdc_enable_pin(route: PdcRoute) {
+    unsafe { pdc_set_pin_enabled(route, true) };
+}
+
+#[cfg(target_os = "none")]
+unsafe fn pdc_set_pin_enabled(route: PdcRoute, enabled: bool) {
+    // PDC v3.2+ uses bit 3 in IRQ_i_CFG as the enable; older PDCs use IRQ_ENABLE_BANK. Keep the
+    // LEVEL_HIGH type write in the same helper so mask/complete cannot disagree with configure. — KESTREL
+    unsafe {
+        let pdc = mmio_phys(PDC_BASE);
+        let version = mmio_read32(pdc + PDC_VERSION);
+        let cfg = pdc + route.cfg_offset;
+        match pdc_enable_style(version) {
+            PdcEnableStyle::ConfigBit => {
+                let existing = mmio_read32(cfg);
+                mmio_write32(cfg, pdc_cfg_value(existing, route, enabled));
+            }
+            PdcEnableStyle::EnableBank => {
+                if enabled {
+                    mmio_write32(cfg, route.cfg_type);
+                }
+                let bank = pdc + route.enable_bank_offset;
+                let existing = mmio_read32(bank);
+                mmio_write32(bank, pdc_enable_bank_value(existing, route, enabled));
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -3551,7 +3768,7 @@ unsafe fn mmio_write8(addr: u64, value: u8) {
 
 #[cfg(target_os = "none")]
 mod traps {
-    use super::{early_console_write, halt, reclaim_framebuffer_console};
+    use super::{early_console_write, reclaim_framebuffer_console};
     use core::fmt::Write;
 
     struct ConsoleWriter;
@@ -3804,6 +4021,119 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "aarch64");
+    }
+
+    #[test]
+    fn pdc_route_for_the_keyboard_gpio_matches_sc8280xp_tables() {
+        // SC8280XP: TLMM GPIO 104 -> PDC wake port 216 (pinctrl wakeirq map); pdc-ranges <216 646 5>
+        // -> GIC SPI 646 -> INTID 678. Register offsets per qcom-pdc.c: IRQ_i_CFG = 0x110 + port*4,
+        // IRQ_ENABLE_BANK = 0x10 + (port>>5)*4 bit (port&31). Pin a wrong value would silently
+        // mis-route the only keyboard producer, so pin them. — CORVUS
+        let route = PdcRoute::for_gpio(104).expect("keyboard gpio has a PDC route");
+        assert_eq!(route.port, 216);
+        assert_eq!(route.gic_intid, 678);
+        assert_eq!(route.cfg_offset, 0x470);
+        assert_eq!(route.cfg_type, 0b100); // LEVEL_HIGH = inverted LEVEL_LOW
+        assert_eq!(route.enable_bank_offset, 0x28);
+        assert_eq!(route.enable_bit, 1 << 24);
+        // A pin with no PDC wake mapping must not fabricate a route.
+        assert_eq!(PdcRoute::for_gpio(105), None);
+    }
+
+    #[test]
+    fn pdc_enable_style_switches_at_v3_2() {
+        assert_eq!(pdc_enable_style(0x0003_01ff), PdcEnableStyle::EnableBank);
+        assert_eq!(pdc_enable_style(0x0003_0200), PdcEnableStyle::ConfigBit);
+        assert_eq!(pdc_enable_style(0x0004_0000), PdcEnableStyle::ConfigBit);
+    }
+
+    #[test]
+    fn pdc_cfg_bit_enable_preserves_non_type_bits() {
+        let route = PdcRoute::for_gpio(104).unwrap();
+        let existing = 0xa5a5_a5af;
+        assert_eq!(
+            pdc_cfg_value(existing, route, true),
+            (existing & !(PDC_IRQ_CFG_TYPE_MASK | PDC_IRQ_CFG_ENABLE))
+                | route.cfg_type
+                | PDC_IRQ_CFG_ENABLE
+        );
+        assert_eq!(
+            pdc_cfg_value(existing, route, false),
+            (existing & !(PDC_IRQ_CFG_TYPE_MASK | PDC_IRQ_CFG_ENABLE)) | route.cfg_type
+        );
+    }
+
+    #[test]
+    fn pdc_enable_bank_sets_and_clears_only_the_route_bit() {
+        let route = PdcRoute::for_gpio(104).unwrap();
+        assert_eq!(pdc_enable_bank_value(0, route, true), route.enable_bit);
+        assert_eq!(
+            pdc_enable_bank_value(u32::MAX, route, false),
+            u32::MAX & !route.enable_bit
+        );
+    }
+
+    #[test]
+    fn tlmm_keyboard_trigger_cfg_values_match_the_x13s_contract() {
+        assert_eq!(
+            tlmm_gpio_level_low_cfg(),
+            TLMM_INTR_ENABLE | TLMM_INTR_RAW_STATUS_EN | TLMM_INTR_TARGET_APPS
+        );
+        assert_eq!(tlmm_gpio_level_low_cfg() & TLMM_INTR_POLARITY, 0);
+        assert_eq!(
+            tlmm_gpio_falling_edge_cfg(),
+            TLMM_INTR_ENABLE
+                | (TLMM_INTR_DECT_FALLING << TLMM_INTR_DECT_SHIFT)
+                | TLMM_INTR_POLARITY
+                | TLMM_INTR_RAW_STATUS_EN
+                | TLMM_INTR_TARGET_APPS
+        );
+        assert_eq!(TLMM_GPIO_FLAG_LEVEL_LOW, 8);
+        assert_eq!(TLMM_GPIO_FLAG_EDGE_FALLING, 2);
+    }
+
+    #[test]
+    fn tlmm_mask_and_complete_only_toggle_enable() {
+        let existing = 0xa5a5_a5a5;
+        assert_eq!(tlmm_gpio_masked_cfg(existing), existing & !TLMM_INTR_ENABLE);
+        assert_eq!(
+            tlmm_gpio_enabled_cfg(existing & !TLMM_INTR_ENABLE),
+            existing | TLMM_INTR_ENABLE
+        );
+        assert_eq!(
+            tlmm_gpio_enabled_cfg(tlmm_gpio_masked_cfg(existing)),
+            existing | TLMM_INTR_ENABLE
+        );
+    }
+
+    #[test]
+    fn pdc_and_tlmm_summary_both_route_as_gpio_attention() {
+        // 240 = TLMM summary SPI (32 + 0xd0); 678 = the keyboard's PDC wake SPI. Both must dispatch
+        // the stored GPIO key; the timer PPI and unrelated SPIs must not. With no PDC route
+        // configured (0), 678 is not special. — CORVUS
+        let tlmm = 32 + 0xd0;
+        let pdc = PdcRoute::for_gpio(104).unwrap().gic_intid;
+        assert_eq!(pdc, 678);
+        assert_eq!(
+            classify_gpio_attention_delivery(tlmm, tlmm, pdc),
+            GpioAttentionDelivery::TlmmSummary
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(pdc, tlmm, pdc),
+            GpioAttentionDelivery::PdcWake
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(30, tlmm, pdc),
+            GpioAttentionDelivery::None
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(999, tlmm, pdc),
+            GpioAttentionDelivery::None
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(pdc, tlmm, 0),
+            GpioAttentionDelivery::None
+        );
     }
 
     #[test]

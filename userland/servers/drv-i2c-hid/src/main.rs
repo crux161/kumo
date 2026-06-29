@@ -3,9 +3,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
-    bounded_input_frame_len, bounded_report_descriptor_len, DeviceQuirks, InputProbeDecoder,
-    InputProbeError, KeyboardForwardFailures, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG,
-    MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    bounded_input_frame_len, bounded_report_descriptor_len, BoundedFailureLog, DeviceQuirks,
+    InputProbeDecoder, InputProbeError, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
+    MAX_REPORT_DESCRIPTOR_BYTES,
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
@@ -394,7 +394,8 @@ extern "C" fn main(
     // delivery survived mask -> drain -> complete, not just a timer poll. — KESTREL
     let mut interrupts: u32 = 0;
     let mut shown_nonempty: u32 = 0;
-    let mut keyboard_forward_failures = KeyboardForwardFailures::new();
+    let mut keyboard_forward_failures = BoundedFailureLog::new();
+    let mut input_decode_failures = BoundedFailureLog::new();
     loop {
         if interrupt_wait(attention_irq) == 0 {
             log(b"drv-i2c-hid: attention wait failed\n");
@@ -446,9 +447,20 @@ extern "C" fn main(
             quirks,
         ) {
             Ok(input) => input,
+            // After first light, a single odd input report is soft-state loss, not a driver death:
+            // the Elan is a keyboard+pointer combo, so a non-keyboard report ID, a rollover, or a
+            // malformed frame can all reach here. Bounded-log a few and keep serving the IRQ loop
+            // (DESIGN/002). The true transport failures above — attention wait, I2C read, interrupt
+            // complete — stay fatal; only per-report decode loss is recoverable. — CORVUS
             Err(error) => {
-                log_input_probe_error(error);
-                kumo_rt::process_exit(1);
+                if input_decode_failures.record() {
+                    log_input_probe_error(error);
+                    log_hex(
+                        b"drv-i2c-hid: input report dropped count=0x",
+                        input_decode_failures.count() as u64,
+                    );
+                }
+                continue;
             }
         };
         // Only emit on a real keypress; idle polls (the common case at 100 Hz) stay silent so the

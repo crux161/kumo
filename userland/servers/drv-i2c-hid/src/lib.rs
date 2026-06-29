@@ -11,7 +11,7 @@ pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
 pub const ELAN_VENDOR_ID: u16 = 0x04f3;
-pub const KEYBOARD_FORWARD_FAILURE_LOG_LIMIT: u32 = 4;
+pub const SOFT_FAILURE_LOG_LIMIT: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -44,12 +44,16 @@ pub struct InputProbe {
     pub first_pressed_ascii: Option<u8>,
 }
 
+/// A bounded soft-failure diagnostic: it lets the first `SOFT_FAILURE_LOG_LIMIT` recoverable
+/// failures log, then stays silent so a persistent error cannot flood the framebuffer console. Used
+/// for any post-first-light per-event soft-state loss — keyboard-forward drops AND input-report
+/// decode drops — so the resident driver records the loss without dying (DESIGN/002). — CORVUS
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyboardForwardFailures {
+pub struct BoundedFailureLog {
     count: u32,
 }
 
-impl KeyboardForwardFailures {
+impl BoundedFailureLog {
     pub const fn new() -> Self {
         Self { count: 0 }
     }
@@ -59,13 +63,13 @@ impl KeyboardForwardFailures {
     }
 
     pub fn record(&mut self) -> bool {
-        let should_log = self.count < KEYBOARD_FORWARD_FAILURE_LOG_LIMIT;
+        let should_log = self.count < SOFT_FAILURE_LOG_LIMIT;
         self.count = self.count.saturating_add(1);
         should_log
     }
 }
 
-impl Default for KeyboardForwardFailures {
+impl Default for BoundedFailureLog {
     fn default() -> Self {
         Self::new()
     }
@@ -424,6 +428,21 @@ mod tests {
     }
 
     #[test]
+    fn decodes_the_x13s_first_light_keyboard_frame_shape() {
+        // Metal first-light captured `0b 00 08 00 00 0b ...` for `h`; keep that wire shape pinned
+        // before changing the restored driver path again. — KESTREL
+        let raw = [0x0b, 0x00, 0x08, 0x00, 0x00, 0x0b, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decode_input_probe(&raw, Some(0x08)),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: Some(0x0b),
+                first_pressed_ascii: Some(b'h'),
+            })
+        );
+    }
+
+    #[test]
     fn empty_keyboard_report_is_a_decoded_no_event_frame() {
         let raw = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
@@ -452,13 +471,34 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_forward_failures_are_bounded_diagnostics() {
-        let mut failures = KeyboardForwardFailures::new();
-        for i in 0..KEYBOARD_FORWARD_FAILURE_LOG_LIMIT {
+    fn bounded_failure_log_is_a_bounded_diagnostic() {
+        let mut failures = BoundedFailureLog::new();
+        for i in 0..SOFT_FAILURE_LOG_LIMIT {
             assert!(failures.record(), "failure {i} should still log");
         }
         assert!(!failures.record());
-        assert_eq!(failures.count(), KEYBOARD_FORWARD_FAILURE_LOG_LIMIT + 1);
+        assert_eq!(failures.count(), SOFT_FAILURE_LOG_LIMIT + 1);
+    }
+
+    #[test]
+    fn decoder_recovers_after_a_dropped_input_error() {
+        // The steady-state IRQ loop now logs+continues on a recoverable InputProbeError instead of
+        // process_exit(1). The host-side guarantee behind that "drop + continue" is that one bad
+        // report does not poison the shared decoder: a foreign report-id frame errors, and the very
+        // next real keyboard frame still decodes to a key. — CORVUS
+        let mut decoder = InputProbeDecoder::new();
+        assert_eq!(
+            decoder.decode(&[11, 0, 2, 0, 0, 0x05, 0, 0, 0, 0, 0], Some(7)),
+            Err(InputProbeError::Protocol(ProtocolError::UnexpectedReportId))
+        );
+        assert_eq!(
+            decoder.decode(&[10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0], None),
+            Ok(InputProbe {
+                event_count: 1,
+                first_pressed_usage: Some(0x04),
+                first_pressed_ascii: Some(b'a'),
+            })
+        );
     }
 
     #[test]
