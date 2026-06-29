@@ -179,7 +179,7 @@ impl Console {
     }
 
     /// Render one console byte: printable ASCII draws a glyph and advances the cursor;
-    /// `\n` and `\r` move it; anything else draws the font's `?` fallback. Wraps at the
+    /// `\n`, `\r`, and backspace move it; anything else draws the font's `?` fallback. Wraps at the
     /// right edge and scrolls at the bottom.
     pub fn write_byte(&mut self, b: u8) {
         // A null/implausible framebuffer must never be dereferenced — `newline`→`scroll`
@@ -190,6 +190,11 @@ impl Console {
         match b {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
+            0x08 => {
+                if self.col > 0 {
+                    self.col -= 1;
+                }
+            }
             _ => {
                 if self.col >= self.cols {
                     self.newline();
@@ -332,6 +337,16 @@ mod tests {
         let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
         con.write(b"A\rB");
         assert_cell(&buf, b'B', 0, 0);
+    }
+
+    #[test]
+    fn backspace_moves_left_so_space_can_erase() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+        con.write(b"AB\x08 \x08C");
+        assert_cell(&buf, b'A', 0, 0);
+        assert_cell(&buf, b'C', 1, 0);
+        assert_cell(&buf, b' ', 2, 0);
     }
 
     #[test]

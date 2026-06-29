@@ -12,6 +12,8 @@ pub const REPORT_BYTES: usize = 8;
 pub const REPORT_KEYS: usize = 6;
 /// Most edges one report transition can produce: six releases plus six presses.
 pub const MAX_EVENTS: usize = REPORT_KEYS * 2;
+/// Longest terminal byte sequence emitted for one decoded key.
+pub const MAX_TERMINAL_BYTES: usize = 4;
 
 /// Modifier bits from byte zero of a boot-keyboard report.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,12 +80,56 @@ pub enum KeySym {
 }
 
 impl KeySym {
-    /// Return the byte that can be forwarded to the existing keyboard channel, if any.
+    /// Return the single byte meaning for printable/control keys, if any.
     pub const fn ascii(self) -> Option<u8> {
         match self {
             Self::Ascii(byte) => Some(byte),
             _ => None,
         }
+    }
+
+    /// Return the terminal byte sequence for keys that fit the current tty byte stream.
+    pub const fn terminal_bytes(self) -> TerminalBytes {
+        match self {
+            Self::Ascii(byte) => TerminalBytes::one(byte),
+            Self::Home => TerminalBytes::sequence([0x1b, b'[', b'H', 0], 3),
+            Self::End => TerminalBytes::sequence([0x1b, b'[', b'F', 0], 3),
+            Self::Right => TerminalBytes::sequence([0x1b, b'[', b'C', 0], 3),
+            Self::Left => TerminalBytes::sequence([0x1b, b'[', b'D', 0], 3),
+            Self::Down => TerminalBytes::sequence([0x1b, b'[', b'B', 0], 3),
+            Self::Up => TerminalBytes::sequence([0x1b, b'[', b'A', 0], 3),
+            Self::Delete => TerminalBytes::sequence([0x1b, b'[', b'3', b'~'], 4),
+            _ => TerminalBytes::none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalBytes {
+    bytes: [u8; MAX_TERMINAL_BYTES],
+    len: u8,
+}
+
+impl TerminalBytes {
+    pub const fn none() -> Self {
+        Self {
+            bytes: [0; MAX_TERMINAL_BYTES],
+            len: 0,
+        }
+    }
+
+    pub const fn one(byte: u8) -> Self {
+        let mut bytes = [0; MAX_TERMINAL_BYTES];
+        bytes[0] = byte;
+        Self { bytes, len: 1 }
+    }
+
+    const fn sequence(bytes: [u8; MAX_TERMINAL_BYTES], len: u8) -> Self {
+        Self { bytes, len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
     }
 }
 
@@ -278,7 +324,7 @@ pub fn key_sym(usage: u8, modifiers: Modifiers) -> KeySym {
         0x49 => KeySym::Insert,
         0x4a => KeySym::Home,
         0x4b => KeySym::PageUp,
-        0x4c => KeySym::Delete,
+        0x4c => KeySym::Ascii(0x7f),
         0x4d => KeySym::End,
         0x4e => KeySym::PageDown,
         0x4f => KeySym::Right,
@@ -381,6 +427,40 @@ mod tests {
         assert_eq!(key_sym(0x1e, shift), KeySym::Ascii(b'!'));
         assert_eq!(key_sym(0x38, shift), KeySym::Ascii(b'?'));
         assert_eq!(key_sym(0x2a, shift), KeySym::Ascii(0x7f));
+    }
+
+    #[test]
+    fn delete_usage_maps_to_the_terminal_delete_byte() {
+        assert_eq!(key_sym(0x4c, Modifiers::default()), KeySym::Ascii(0x7f));
+    }
+
+    #[test]
+    fn terminal_byte_contract_covers_cooked_tty_goals() {
+        let plain = Modifiers::default();
+        let shift = Modifiers::from_bits(Modifiers::LEFT_SHIFT);
+        let ctrl = Modifiers::from_bits(Modifiers::LEFT_CTRL);
+
+        assert_eq!(key_sym(0x04, plain), KeySym::Ascii(b'a'));
+        assert_eq!(key_sym(0x28, plain), KeySym::Ascii(b'\n'));
+        assert_eq!(key_sym(0x2a, plain), KeySym::Ascii(0x7f));
+        assert_eq!(key_sym(0x4c, plain), KeySym::Ascii(0x7f));
+        assert_eq!(key_sym(0x33, shift), KeySym::Ascii(b':'));
+        assert_eq!(key_sym(0x38, shift), KeySym::Ascii(b'?'));
+        assert_eq!(key_sym(0x06, ctrl), KeySym::Ascii(0x03)); // Ctrl-C
+        assert_eq!(key_sym(0x0b, ctrl), KeySym::Ascii(0x08)); // Ctrl-H
+        assert_eq!(key_sym(0x10, ctrl), KeySym::Ascii(0x0d)); // Ctrl-M
+    }
+
+    #[test]
+    fn navigation_keys_emit_terminal_sequences() {
+        let plain = Modifiers::default();
+
+        assert_eq!(key_sym(0x4f, plain).terminal_bytes().as_slice(), b"\x1b[C");
+        assert_eq!(key_sym(0x50, plain).terminal_bytes().as_slice(), b"\x1b[D");
+        assert_eq!(key_sym(0x51, plain).terminal_bytes().as_slice(), b"\x1b[B");
+        assert_eq!(key_sym(0x52, plain).terminal_bytes().as_slice(), b"\x1b[A");
+        assert_eq!(key_sym(0x4a, plain).terminal_bytes().as_slice(), b"\x1b[H");
+        assert_eq!(key_sym(0x4d, plain).terminal_bytes().as_slice(), b"\x1b[F");
     }
 
     #[test]

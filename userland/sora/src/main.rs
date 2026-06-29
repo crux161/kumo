@@ -2495,6 +2495,32 @@ fn run_ttyd_smoke(initrd: Handle) -> bool {
     }
 
     let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+    let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(b'x'), &mut reply) else {
+        log(b"ttyd: cancel seed fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: cancel seed parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK || parsed.echo != b"x" || parsed.line.is_some() {
+        log(b"ttyd: cancel seed reply fail\n");
+        return false;
+    }
+
+    let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(0x03), &mut reply) else {
+        log(b"ttyd: ctrl-c fail\n");
+        return false;
+    };
+    let Some(parsed) = TtyReply::parse(&reply[..n]) else {
+        log(b"ttyd: ctrl-c parse fail\n");
+        return false;
+    };
+    if parsed.status != ttyd::TTY_OK || parsed.echo != b"^C\r\n" || parsed.line.is_some() {
+        log(b"ttyd: ctrl-c reply fail\n");
+        return false;
+    }
+
     let Some(n) = ttyd_request_reply(client.client, TtyRequest::input(b'h'), &mut reply) else {
         log(b"ttyd: h fail\n");
         return false;

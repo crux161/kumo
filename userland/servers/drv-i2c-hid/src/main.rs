@@ -3,8 +3,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
-    bounded_input_frame_len, bounded_report_descriptor_len, BoundedFailureLog, DeviceQuirks,
-    InputProbeDecoder, InputProbeError, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
+    bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report,
+    should_log_input_report_stats, BoundedFailureLog, DeviceQuirks, InputProbeDecoder,
+    InputProbeError, InputReportStats, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
     MAX_REPORT_DESCRIPTOR_BYTES,
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
@@ -50,8 +51,13 @@ fn log(message: &[u8]) {
     debug_write(message.as_ptr(), message.len());
 }
 
-fn log_hex(label: &[u8], mut value: u64) {
+fn log_hex(label: &[u8], value: u64) {
     log(label);
+    log_hex_inline(value);
+    log(b"\n");
+}
+
+fn log_hex_inline(mut value: u64) {
     let mut digits = [0u8; 16];
     let mut start = digits.len();
     loop {
@@ -68,7 +74,6 @@ fn log_hex(label: &[u8], mut value: u64) {
         }
     }
     log(&digits[start..]);
-    log(b"\n");
 }
 
 /// Diagnostic: dump raw frame bytes as space-separated hex. Bounded by the caller to the first few
@@ -95,6 +100,47 @@ fn log_input_probe_error(error: InputProbeError) {
         InputProbeError::Decode(error) => {
             log_hex(b"drv-i2c-hid: input frame decode error=0x", error as u64);
         }
+    }
+}
+
+fn log_input_report_stats(stats: &InputReportStats) {
+    log(b"drv-i2c-hid: stats f=0x");
+    log_hex_inline(stats.frames as u64);
+    log(b" k=0x");
+    log_hex_inline(stats.keyboard_reports as u64);
+    log(b" rst=0x");
+    log_hex_inline(stats.reset_frames as u64);
+    log(b" bog=0x");
+    log_hex_inline(stats.bogus_irq_frames as u64);
+    log(b" foreign=0x");
+    log_hex_inline(stats.foreign_report_ids as u64);
+    log(b" proto=0x");
+    log_hex_inline(stats.protocol_errors as u64);
+    log(b" decode=0x");
+    log_hex_inline(stats.decode_errors as u64);
+    log(b" ascii=0x");
+    log_hex_inline(stats.forwarded_ascii as u64);
+    log(b" drop=0x");
+    log_hex_inline(stats.keyboard_write_drops as u64);
+    log(b"\n");
+    if stats.last_report_id.is_some()
+        || stats.last_protocol_error.is_some()
+        || stats.last_decode_error.is_some()
+    {
+        log(b"drv-i2c-hid: stats last rid=0x");
+        log_hex_inline(stats.last_report_id.unwrap_or(0xff) as u64);
+        log(b" proto=0x");
+        log_hex_inline(stats.last_protocol_error.map_or(0xff, |error| error as u8) as u64);
+        log(b" decode=0x");
+        log_hex_inline(stats.last_decode_error.map_or(0xff, |error| error as u8) as u64);
+        log(b"\n");
+    }
+}
+
+fn maybe_log_input_report_stats(stats: &InputReportStats, logged: &mut u32) {
+    if should_log_input_report_stats(stats.frames, *logged) {
+        *logged = logged.saturating_add(1);
+        log_input_report_stats(stats);
     }
 }
 
@@ -396,6 +442,8 @@ extern "C" fn main(
     let mut shown_nonempty: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
+    let mut input_stats = InputReportStats::new();
+    let mut input_stats_logs: u32 = 0;
     loop {
         if interrupt_wait(attention_irq) == 0 {
             log(b"drv-i2c-hid: attention wait failed\n");
@@ -419,6 +467,9 @@ extern "C" fn main(
         // `frame=` dumps the first 16 non-empty reports. — KESTREL
         interrupts = interrupts.wrapping_add(1);
         let frame_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
+        let report_class =
+            classify_input_report(&input_frame[..input_frame_len], keyboard.report_id, quirks);
+        input_stats.record_class(report_class);
         // Log EVERY delivery (bounded to 64), not just the first 3, so a keypress that produces a
         // NEW `irq tick` line is visible — this is what distinguishes "no attention IRQ on keypress"
         // (device not reporting) from "IRQ fires but read is empty". Completion suppresses idle
@@ -453,6 +504,9 @@ extern "C" fn main(
             // (DESIGN/002). The true transport failures above — attention wait, I2C read, interrupt
             // complete — stay fatal; only per-report decode loss is recoverable. — CORVUS
             Err(error) => {
+                if let InputProbeError::Decode(decode_error) = error {
+                    input_stats.record_decode_error(decode_error);
+                }
                 if input_decode_failures.record() {
                     log_input_probe_error(error);
                     log_hex(
@@ -460,16 +514,20 @@ extern "C" fn main(
                         input_decode_failures.count() as u64,
                     );
                 }
+                maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
                 continue;
             }
         };
-        // Only emit on a real keypress; idle polls (the common case at 100 Hz) stay silent so the
-        // framebuffer console is not flooded.
-        if let Some(ascii) = input.first_pressed_ascii {
+        // Only emit on real terminal keypress bytes; idle reports and non-byte keys stay silent so
+        // the framebuffer console is not flooded. The log label keeps the historic `ascii=...`
+        // spelling so metal captures remain comparable across HID slices.
+        for &ascii in input.pressed_terminal_bytes() {
             let byte = [ascii];
             if channel_write(keyboard_channel, byte.as_ptr(), byte.len()) == 0 {
+                input_stats.record_forwarded_ascii();
                 log_hex(b"drv-i2c-hid: key forwarded ascii=0x", ascii as u64);
             } else if keyboard_forward_failures.record() {
+                input_stats.record_keyboard_write_drop();
                 // A closed/restarting keyboard consumer is soft-state loss, not a hardware-driver
                 // death. Keep the IRQ loop alive and drop the byte per DESIGN/002. — KESTREL
                 log_hex(
@@ -478,5 +536,6 @@ extern "C" fn main(
                 );
             }
         }
+        maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
     }
 }

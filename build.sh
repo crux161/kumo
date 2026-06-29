@@ -11,6 +11,7 @@ set -eu
 
 MODE="${1:-x13s}"
 ESP="${KUMO_ESP:-}"
+deploy_thinkpad="false"
 
 X13S_DIR="build/images/thinkpad-x13s-gen1"
 
@@ -57,6 +58,7 @@ report() {
 
 case "$MODE" in
     x13s)
+	deploy_thinkpad="true"
         echo "==> Quick build: ThinkPad X13s only (use './build.sh all' for Pi5 + x86_64)"
         build_x13s
         report "$X13S_DIR" "thinkpad-x13s-gen1"
@@ -95,4 +97,10 @@ fi
 if command -v open >/dev/null 2>&1; then
     echo "==> Opening ${OPEN_DIR}..."
     open "$OPEN_DIR"
+fi
+
+if [[ "$deploy_thinkpad" == "true" ]]; then
+	echo "==> Updating EFI..."
+	echo "    via ThinkPad X13s route..."
+	#cp -rv build/images/thinkpad-x13s-gen1/EFI /Volumes/NIMBUS
 fi

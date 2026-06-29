@@ -1,6 +1,6 @@
 #![no_std]
 
-use kumo_hid::{DecodeError, Decoder, KeyState};
+use kumo_hid::{DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS};
 use kumo_i2c_hid::{
     boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError, SourceClock,
 };
@@ -10,8 +10,11 @@ pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
 pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
+pub const MAX_PRESSED_ASCII_BYTES: usize = REPORT_KEYS;
+pub const MAX_PRESSED_TERMINAL_BYTES: usize = REPORT_KEYS * MAX_TERMINAL_BYTES;
 pub const ELAN_VENDOR_ID: u16 = 0x04f3;
 pub const SOFT_FAILURE_LOG_LIMIT: u32 = 4;
+pub const INPUT_REPORT_STATS_LOG_LIMIT: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -42,6 +45,102 @@ pub struct InputProbe {
     pub event_count: usize,
     pub first_pressed_usage: Option<u8>,
     pub first_pressed_ascii: Option<u8>,
+    pub pressed_ascii: [u8; MAX_PRESSED_ASCII_BYTES],
+    pub pressed_ascii_len: usize,
+    pub pressed_terminal: [u8; MAX_PRESSED_TERMINAL_BYTES],
+    pub pressed_terminal_len: usize,
+}
+
+impl InputProbe {
+    pub fn pressed_ascii(&self) -> &[u8] {
+        &self.pressed_ascii[..self.pressed_ascii_len.min(MAX_PRESSED_ASCII_BYTES)]
+    }
+
+    pub fn pressed_terminal_bytes(&self) -> &[u8] {
+        &self.pressed_terminal[..self.pressed_terminal_len.min(MAX_PRESSED_TERMINAL_BYTES)]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputReportClass {
+    Reset,
+    BogusIrq,
+    KeyboardReport,
+    ForeignReportId { report_id: u8 },
+    ProtocolError(ProtocolError),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputReportStats {
+    pub frames: u32,
+    pub reset_frames: u32,
+    pub bogus_irq_frames: u32,
+    pub keyboard_reports: u32,
+    pub foreign_report_ids: u32,
+    pub protocol_errors: u32,
+    pub decode_errors: u32,
+    pub forwarded_ascii: u32,
+    pub keyboard_write_drops: u32,
+    pub last_report_id: Option<u8>,
+    pub last_protocol_error: Option<ProtocolError>,
+    pub last_decode_error: Option<DecodeError>,
+}
+
+impl InputReportStats {
+    pub const fn new() -> Self {
+        Self {
+            frames: 0,
+            reset_frames: 0,
+            bogus_irq_frames: 0,
+            keyboard_reports: 0,
+            foreign_report_ids: 0,
+            protocol_errors: 0,
+            decode_errors: 0,
+            forwarded_ascii: 0,
+            keyboard_write_drops: 0,
+            last_report_id: None,
+            last_protocol_error: None,
+            last_decode_error: None,
+        }
+    }
+
+    pub fn record_class(&mut self, class: InputReportClass) {
+        bump(&mut self.frames);
+        match class {
+            InputReportClass::Reset => bump(&mut self.reset_frames),
+            InputReportClass::BogusIrq => bump(&mut self.bogus_irq_frames),
+            InputReportClass::KeyboardReport => bump(&mut self.keyboard_reports),
+            InputReportClass::ForeignReportId { report_id } => {
+                bump(&mut self.foreign_report_ids);
+                self.last_report_id = Some(report_id);
+            }
+            InputReportClass::ProtocolError(error) => {
+                bump(&mut self.protocol_errors);
+                self.last_protocol_error = Some(error);
+            }
+        }
+    }
+
+    pub fn record_decode_error(&mut self, error: DecodeError) {
+        bump(&mut self.decode_errors);
+        self.last_decode_error = Some(error);
+    }
+
+    pub fn record_forwarded_ascii(&mut self) {
+        bump(&mut self.forwarded_ascii);
+    }
+
+    pub fn record_keyboard_write_drop(&mut self) {
+        bump(&mut self.keyboard_write_drops);
+    }
+}
+
+fn bump(counter: &mut u32) {
+    *counter = counter.saturating_add(1);
+}
+
+pub fn should_log_input_report_stats(frames: u32, already_logged: u32) -> bool {
+    already_logged < INPUT_REPORT_STATS_LOG_LIMIT && frames != 0 && frames.is_power_of_two()
 }
 
 /// A bounded soft-failure diagnostic: it lets the first `SOFT_FAILURE_LOG_LIMIT` recoverable
@@ -274,22 +373,78 @@ pub fn decode_input_probe(
     InputProbeDecoder::new().decode(raw, report_id)
 }
 
+pub fn classify_input_report(
+    raw: &[u8],
+    report_id: Option<u8>,
+    quirks: DeviceQuirks,
+) -> InputReportClass {
+    if quirks.bogus_irq && raw.len() >= 2 && raw[0] == 0xff && raw[1] == 0xff {
+        return InputReportClass::BogusIrq;
+    }
+    let frame = match InputFrame::parse(raw) {
+        Ok(frame) => frame,
+        Err(error) => return InputReportClass::ProtocolError(error),
+    };
+    let InputFrame::Report(payload) = frame else {
+        return InputReportClass::Reset;
+    };
+    match report_id {
+        Some(expected) => {
+            let Some((&actual, rest)) = payload.split_first() else {
+                return InputReportClass::ProtocolError(ProtocolError::Truncated);
+            };
+            if actual != expected {
+                return InputReportClass::ForeignReportId { report_id: actual };
+            }
+            if rest.len() == kumo_hid::REPORT_BYTES {
+                InputReportClass::KeyboardReport
+            } else {
+                InputReportClass::ProtocolError(ProtocolError::NotBootKeyboardReport)
+            }
+        }
+        None if payload.len() == kumo_hid::REPORT_BYTES => InputReportClass::KeyboardReport,
+        None => InputReportClass::ProtocolError(ProtocolError::NotBootKeyboardReport),
+    }
+}
+
 const fn no_input_probe() -> InputProbe {
     InputProbe {
         event_count: 0,
         first_pressed_usage: None,
         first_pressed_ascii: None,
+        pressed_ascii: [0; MAX_PRESSED_ASCII_BYTES],
+        pressed_ascii_len: 0,
+        pressed_terminal: [0; MAX_PRESSED_TERMINAL_BYTES],
+        pressed_terminal_len: 0,
     }
 }
 
 fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
     let mut first_pressed_usage = None;
     let mut first_pressed_ascii = None;
+    let mut pressed_ascii = [0u8; MAX_PRESSED_ASCII_BYTES];
+    let mut pressed_ascii_len = 0;
+    let mut pressed_terminal = [0u8; MAX_PRESSED_TERMINAL_BYTES];
+    let mut pressed_terminal_len = 0;
     for event in events.as_slice() {
         if event.state == KeyState::Pressed {
-            first_pressed_usage = Some(event.usage);
-            first_pressed_ascii = event.symbol.ascii();
-            break;
+            let ascii = event.symbol.ascii();
+            if first_pressed_usage.is_none() {
+                first_pressed_usage = Some(event.usage);
+                first_pressed_ascii = ascii;
+            }
+            if let Some(byte) = ascii {
+                if pressed_ascii_len < MAX_PRESSED_ASCII_BYTES {
+                    pressed_ascii[pressed_ascii_len] = byte;
+                    pressed_ascii_len += 1;
+                }
+            }
+            for &byte in event.symbol.terminal_bytes().as_slice() {
+                if pressed_terminal_len < MAX_PRESSED_TERMINAL_BYTES {
+                    pressed_terminal[pressed_terminal_len] = byte;
+                    pressed_terminal_len += 1;
+                }
+            }
         }
     }
 
@@ -297,6 +452,10 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
         event_count: events.len(),
         first_pressed_usage,
         first_pressed_ascii,
+        pressed_ascii,
+        pressed_ascii_len,
+        pressed_terminal,
+        pressed_terminal_len,
     }
 }
 
@@ -304,6 +463,43 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
 mod tests {
     use super::*;
     use kumo_i2c_hid::{GicInterrupt, GpioInterrupt};
+
+    fn probe(
+        event_count: usize,
+        first_pressed_usage: Option<u8>,
+        first_pressed_ascii: Option<u8>,
+        ascii: &[u8],
+    ) -> InputProbe {
+        probe_with_terminal(
+            event_count,
+            first_pressed_usage,
+            first_pressed_ascii,
+            ascii,
+            ascii,
+        )
+    }
+
+    fn probe_with_terminal(
+        event_count: usize,
+        first_pressed_usage: Option<u8>,
+        first_pressed_ascii: Option<u8>,
+        ascii: &[u8],
+        terminal: &[u8],
+    ) -> InputProbe {
+        let mut pressed_ascii = [0; MAX_PRESSED_ASCII_BYTES];
+        pressed_ascii[..ascii.len()].copy_from_slice(ascii);
+        let mut pressed_terminal = [0; MAX_PRESSED_TERMINAL_BYTES];
+        pressed_terminal[..terminal.len()].copy_from_slice(terminal);
+        InputProbe {
+            event_count,
+            first_pressed_usage,
+            first_pressed_ascii,
+            pressed_ascii,
+            pressed_ascii_len: ascii.len(),
+            pressed_terminal,
+            pressed_terminal_len: terminal.len(),
+        }
+    }
 
     fn topology() -> KeyboardTopology {
         KeyboardTopology {
@@ -393,12 +589,69 @@ mod tests {
         let mut decoder = InputProbeDecoder::new();
         assert_eq!(
             decoder.decode_with_quirks(&[0xff, 0xff], Some(7), quirks),
-            Ok(InputProbe {
-                event_count: 0,
-                first_pressed_usage: None,
-                first_pressed_ascii: None,
-            })
+            Ok(probe(0, None, None, b""))
         );
+    }
+
+    #[test]
+    fn classifies_input_reports_without_changing_decode_policy() {
+        let quirks = DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0);
+        assert_eq!(
+            classify_input_report(&[0xff, 0xff], Some(7), quirks),
+            InputReportClass::BogusIrq
+        );
+        assert_eq!(
+            classify_input_report(&[0, 0], Some(7), quirks),
+            InputReportClass::Reset
+        );
+        assert_eq!(
+            classify_input_report(&[11, 0, 7, 0, 0, 0x05, 0, 0, 0, 0, 0], Some(7), quirks),
+            InputReportClass::KeyboardReport
+        );
+        assert_eq!(
+            classify_input_report(&[11, 0, 2, 0, 0, 0x05, 0, 0, 0, 0, 0], Some(7), quirks),
+            InputReportClass::ForeignReportId { report_id: 2 }
+        );
+        assert_eq!(
+            classify_input_report(&[1, 0], Some(7), quirks),
+            InputReportClass::ProtocolError(ProtocolError::InvalidInputLength)
+        );
+    }
+
+    #[test]
+    fn input_report_stats_count_classes_and_bound_summary_cadence() {
+        let mut stats = InputReportStats::new();
+        stats.record_class(InputReportClass::KeyboardReport);
+        stats.record_class(InputReportClass::ForeignReportId { report_id: 2 });
+        stats.record_class(InputReportClass::ProtocolError(
+            ProtocolError::InvalidInputLength,
+        ));
+        stats.record_decode_error(DecodeError::Rollover);
+        stats.record_forwarded_ascii();
+        stats.record_forwarded_ascii();
+        stats.record_keyboard_write_drop();
+
+        assert_eq!(stats.frames, 3);
+        assert_eq!(stats.keyboard_reports, 1);
+        assert_eq!(stats.foreign_report_ids, 1);
+        assert_eq!(stats.protocol_errors, 1);
+        assert_eq!(stats.decode_errors, 1);
+        assert_eq!(stats.forwarded_ascii, 2);
+        assert_eq!(stats.keyboard_write_drops, 1);
+        assert_eq!(stats.last_report_id, Some(2));
+        assert_eq!(
+            stats.last_protocol_error,
+            Some(ProtocolError::InvalidInputLength)
+        );
+        assert_eq!(stats.last_decode_error, Some(DecodeError::Rollover));
+
+        assert!(should_log_input_report_stats(1, 0));
+        assert!(should_log_input_report_stats(128, 7));
+        assert!(!should_log_input_report_stats(3, 0));
+        assert!(!should_log_input_report_stats(
+            256,
+            INPUT_REPORT_STATS_LOG_LIMIT
+        ));
     }
 
     #[test]
@@ -406,11 +659,7 @@ mod tests {
         let raw = [10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_input_probe(&raw, None),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: Some(0x04),
-                first_pressed_ascii: Some(b'a'),
-            })
+            Ok(probe(1, Some(0x04), Some(b'a'), b"a"))
         );
     }
 
@@ -419,11 +668,7 @@ mod tests {
         let raw = [11, 0, 7, 0, 0, 0x05, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_input_probe(&raw, Some(7)),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: Some(0x05),
-                first_pressed_ascii: Some(b'b'),
-            })
+            Ok(probe(1, Some(0x05), Some(b'b'), b"b"))
         );
     }
 
@@ -434,12 +679,67 @@ mod tests {
         let raw = [0x0b, 0x00, 0x08, 0x00, 0x00, 0x0b, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_input_probe(&raw, Some(0x08)),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: Some(0x0b),
-                first_pressed_ascii: Some(b'h'),
-            })
+            Ok(probe(1, Some(0x0b), Some(b'h'), b"h"))
         );
+    }
+
+    #[test]
+    fn decodes_x13s_arrow_frames_as_terminal_sequences() {
+        for (usage, sequence) in [
+            (0x52, b"\x1b[A" as &[u8]),
+            (0x51, b"\x1b[B"),
+            (0x4f, b"\x1b[C"),
+            (0x50, b"\x1b[D"),
+        ] {
+            let raw = [0x0b, 0x00, 0x08, 0x00, 0x00, usage, 0, 0, 0, 0, 0];
+            let input = decode_input_probe(&raw, Some(0x08)).unwrap();
+            assert_eq!(
+                input,
+                probe_with_terminal(1, Some(usage), None, b"", sequence)
+            );
+            assert_eq!(input.pressed_ascii(), b"");
+            assert_eq!(input.pressed_terminal_bytes(), sequence);
+        }
+    }
+
+    #[test]
+    fn decodes_x13s_home_end_frames_as_terminal_sequences() {
+        for (usage, sequence) in [(0x4a, b"\x1b[H" as &[u8]), (0x4d, b"\x1b[F")] {
+            let raw = [0x0b, 0x00, 0x08, 0x00, 0x00, usage, 0, 0, 0, 0, 0];
+            let input = decode_input_probe(&raw, Some(0x08)).unwrap();
+            assert_eq!(
+                input,
+                probe_with_terminal(1, Some(usage), None, b"", sequence)
+            );
+            assert_eq!(input.pressed_terminal_bytes(), sequence);
+        }
+    }
+
+    #[test]
+    fn decodes_all_ascii_press_edges_from_one_keyboard_report() {
+        let raw = [10, 0, 0, 0, 0x04, 0x05, 0x06, 0, 0, 0];
+        let input = decode_input_probe(&raw, None).unwrap();
+        assert_eq!(input, probe(3, Some(0x04), Some(b'a'), b"abc"));
+        assert_eq!(input.pressed_ascii(), b"abc");
+        assert_eq!(input.pressed_terminal_bytes(), b"abc");
+    }
+
+    #[test]
+    fn keeps_first_pressed_probe_fields_while_collecting_later_ascii() {
+        let raw = [10, 0, 0, 0, 0x39, 0x04, 0, 0, 0, 0];
+        let input = decode_input_probe(&raw, None).unwrap();
+        assert_eq!(input, probe(2, Some(0x39), None, b"a"));
+        assert_eq!(input.pressed_ascii(), b"a");
+        assert_eq!(input.pressed_terminal_bytes(), b"a");
+    }
+
+    #[test]
+    fn decodes_hid_delete_usage_as_terminal_delete_byte() {
+        let raw = [10, 0, 0, 0, 0x4c, 0, 0, 0, 0, 0];
+        let input = decode_input_probe(&raw, None).unwrap();
+        assert_eq!(input, probe(1, Some(0x4c), Some(0x7f), &[0x7f]));
+        assert_eq!(input.pressed_ascii(), &[0x7f]);
+        assert_eq!(input.pressed_terminal_bytes(), &[0x7f]);
     }
 
     #[test]
@@ -447,11 +747,7 @@ mod tests {
         let raw = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_input_probe(&raw, None),
-            Ok(InputProbe {
-                event_count: 0,
-                first_pressed_usage: None,
-                first_pressed_ascii: None,
-            })
+            Ok(probe(0, None, None, b""))
         );
     }
 
@@ -462,11 +758,7 @@ mod tests {
         let reset = [0u8, 0u8];
         assert_eq!(
             decode_input_probe(&reset, Some(7)),
-            Ok(InputProbe {
-                event_count: 0,
-                first_pressed_usage: None,
-                first_pressed_ascii: None,
-            })
+            Ok(probe(0, None, None, b""))
         );
     }
 
@@ -493,11 +785,7 @@ mod tests {
         );
         assert_eq!(
             decoder.decode(&[10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0], None),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: Some(0x04),
-                first_pressed_ascii: Some(b'a'),
-            })
+            Ok(probe(1, Some(0x04), Some(b'a'), b"a"))
         );
     }
 
@@ -518,27 +806,15 @@ mod tests {
 
         assert_eq!(
             decoder.decode(&pressed, None),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: Some(0x04),
-                first_pressed_ascii: Some(b'a'),
-            })
+            Ok(probe(1, Some(0x04), Some(b'a'), b"a"))
         );
         assert_eq!(
             decoder.decode(&pressed, None),
-            Ok(InputProbe {
-                event_count: 0,
-                first_pressed_usage: None,
-                first_pressed_ascii: None,
-            })
+            Ok(probe(0, None, None, b""))
         );
         assert_eq!(
             decoder.decode(&released, None),
-            Ok(InputProbe {
-                event_count: 1,
-                first_pressed_usage: None,
-                first_pressed_ascii: None,
-            })
+            Ok(probe(1, None, None, b""))
         );
     }
 }
