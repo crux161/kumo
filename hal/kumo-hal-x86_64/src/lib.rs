@@ -575,3 +575,18 @@ mod tests {
         assert_eq!(arch_name(), "x86_64");
     }
 }
+
+pub fn iommu_init(_kind: u32, _phys_base: u64, _len: u64) -> bool {
+    false
+}
+
+pub fn iommu_create_device_context(
+    _kind: u32,
+    _phys_base: u64,
+    _stream_id: u32,
+    _pgd_phys: u64,
+) -> bool {
+    false
+}
+
+pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) {}

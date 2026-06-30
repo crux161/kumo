@@ -129,12 +129,37 @@ pub enum KernelCall<'a> {
     VmoCreate {
         size: u64,
     },
-    IoMmuFromResource,
-    DeviceCtxCreate,
-    DeviceVmarMap,
-    DeviceVmarUnmap,
-    DeviceCtxWaitFault,
-    DeviceCtxInfo,
+    IoMmuFromResource {
+        resource: Handle,
+        kind: u32,
+        phys_base: u64,
+        len: u64,
+    },
+    DeviceCtxCreate {
+        iommu: Handle,
+        stream_or_rid: u64,
+    },
+    DeviceVmarMap {
+        ctx: Handle,
+        vmo: Handle,
+        vmo_offset: u64,
+        len: u64,
+        iova_hint: u64,
+        rights: Rights,
+    },
+    DeviceVmarUnmap {
+        ctx: Handle,
+        iova: u64,
+        len: u64,
+    },
+    DeviceCtxWaitFault {
+        ctx: Handle,
+    },
+    DeviceCtxInfo {
+        ctx: Handle,
+        user_ptr: u64,
+        user_len: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -205,6 +230,28 @@ struct TimerBinding {
     fired: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IoMmuBinding {
+    koid: KoId,
+    iommu_kind: u32,
+    phys_base: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceCtxBinding {
+    koid: KoId,
+    iommu_koid: KoId,
+    stream_id: u32,
+    pgd_phys: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceVmarMapping {
+    ctx_koid: KoId,
+    iova: u64,
+    len: u64,
+}
+
 /// A Resource grant: the holder may mint VMOs from this MMIO range and create
 /// Interrupt objects for IRQs in `[irq_base, irq_base + irq_count)`.
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +289,33 @@ fn resource_contains_irq(parent: ResourceBinding, irq: u32) -> bool {
     let parent_start = parent.irq_base as u64;
     let parent_end = parent_start + parent.irq_count as u64;
     irq >= parent_start && irq < parent_end
+}
+
+fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    let Some(a_end) = a_start.checked_add(a_len) else {
+        return true;
+    };
+    let Some(b_end) = b_start.checked_add(b_len) else {
+        return true;
+    };
+    a_start < b_end && b_start < a_end
+}
+
+fn device_dma_rights_valid(rights: Rights) -> bool {
+    let allowed = (Rights::READ | Rights::WRITE).bits();
+    let bits = rights.bits();
+    bits != 0 && (bits & !allowed) == 0
+}
+
+fn vmo_rights_for_device_dma(rights: Rights) -> Rights {
+    let mut needed = Rights::empty();
+    if rights.contains(Rights::READ) {
+        needed |= Rights::READ;
+    }
+    if rights.contains(Rights::WRITE) {
+        needed |= Rights::WRITE;
+    }
+    needed
 }
 
 fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
@@ -320,6 +394,9 @@ pub struct SyscallEngine {
     timers: Vec<TimerBinding>,
     resources: Vec<ResourceBinding>,
     port_bindings: Vec<(KoId, KoId)>,
+    iommus: Vec<IoMmuBinding>,
+    device_ctxs: Vec<DeviceCtxBinding>,
+    device_vmar_mappings: Vec<DeviceVmarMapping>,
 }
 
 impl SyscallEngine {
@@ -335,6 +412,9 @@ impl SyscallEngine {
             timers: Vec::new(),
             resources: Vec::new(),
             port_bindings: Vec::new(),
+            iommus: Vec::new(),
+            device_ctxs: Vec::new(),
+            device_vmar_mappings: Vec::new(),
         }
     }
 
@@ -1734,12 +1814,193 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
-            KernelCall::IoMmuFromResource
-            | KernelCall::DeviceCtxCreate
-            | KernelCall::DeviceVmarMap
-            | KernelCall::DeviceVmarUnmap
-            | KernelCall::DeviceCtxWaitFault
-            | KernelCall::DeviceCtxInfo
+            KernelCall::IoMmuFromResource {
+                resource,
+                kind: _kind,
+                phys_base,
+                len,
+            } => {
+                let res_entry =
+                    match process
+                        .handles()
+                        .require(resource, ObjectKind::Resource, Rights::WRITE)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                let Some(res) = self.resource_by_koid(res_entry.koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                if len == 0 || !resource_contains(res, phys_base, len) {
+                    return KernelCallResult::Status(Errno::AccessDenied.status());
+                }
+
+                if !kumo_hal::active::iommu_init(_kind as u32, phys_base, len) {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+
+                let object = self.objects.create(ObjectKind::IoMmu);
+                self.iommus.push(IoMmuBinding {
+                    koid: object.koid(),
+                    iommu_kind: _kind as u32,
+                    phys_base,
+                });
+
+                let handle = match process.handles_mut().insert(
+                    object,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                KernelCallResult::Handle(handle)
+            }
+            KernelCall::DeviceCtxCreate {
+                iommu,
+                stream_or_rid: _stream_or_rid,
+            } => {
+                let _iommu_entry =
+                    match process
+                        .handles()
+                        .require(iommu, ObjectKind::IoMmu, Rights::WRITE)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+
+                let Some(iommu_binding) = self.iommus.iter().find(|b| b.koid == _iommu_entry.koid)
+                else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+
+                let Ok(stream_id) = u32::try_from(_stream_or_rid) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+
+                let pgd_phys =
+                    unsafe { crate::mm::alloc_zeroed_frame(self.boot_info.as_ref().unwrap()) };
+                let Some(pgd_phys) = pgd_phys else {
+                    return KernelCallResult::Status(Errno::NoMemory.status());
+                };
+
+                if !kumo_hal::active::iommu_create_device_context(
+                    iommu_binding.iommu_kind,
+                    iommu_binding.phys_base,
+                    stream_id,
+                    pgd_phys,
+                ) {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+
+                let object = self.objects.create(ObjectKind::DeviceCtx);
+
+                self.device_ctxs.push(DeviceCtxBinding {
+                    koid: object.koid(),
+                    iommu_koid: _iommu_entry.koid,
+                    stream_id,
+                    pgd_phys,
+                });
+
+                let handle = match process.handles_mut().insert(
+                    object,
+                    Rights::MAP | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                KernelCallResult::Handle(handle)
+            }
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset,
+                len,
+                iova_hint,
+                rights,
+            } => {
+                let ctx_entry =
+                    match process
+                        .handles()
+                        .require(ctx, ObjectKind::DeviceCtx, Rights::MAP)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                }
+                if !device_dma_rights_valid(rights)
+                    || len == 0
+                    || !crate::mm::is_page_aligned(vmo_offset)
+                    || !crate::mm::is_page_aligned(iova_hint)
+                    || !crate::mm::is_page_aligned(len)
+                    || iova_hint.checked_add(len).is_none()
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                let vmo_entry = match process.handles().require(
+                    vmo,
+                    ObjectKind::Vmo,
+                    vmo_rights_for_device_dma(rights),
+                ) {
+                    Ok(e) => e,
+                    Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                };
+                let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_entry.koid) else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
+                if vmo_offset
+                    .checked_add(len)
+                    .is_none_or(|end| end > vmo_entry.vmo.len())
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                if self.device_vmar_mappings.iter().any(|mapping| {
+                    mapping.ctx_koid == ctx_entry.koid
+                        && ranges_overlap(mapping.iova, mapping.len, iova_hint, len)
+                }) {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                self.device_vmar_mappings.push(DeviceVmarMapping {
+                    ctx_koid: ctx_entry.koid,
+                    iova: iova_hint,
+                    len,
+                });
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::DeviceVmarUnmap { ctx, iova, len } => {
+                let ctx_entry =
+                    match process
+                        .handles()
+                        .require(ctx, ObjectKind::DeviceCtx, Rights::MAP)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                }
+                if len == 0
+                    || !crate::mm::is_page_aligned(iova)
+                    || !crate::mm::is_page_aligned(len)
+                    || iova.checked_add(len).is_none()
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                let Some(index) = self.device_vmar_mappings.iter().position(|mapping| {
+                    mapping.ctx_koid == ctx_entry.koid && mapping.iova == iova && mapping.len == len
+                }) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+
+                self.device_vmar_mappings.remove(index);
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::DeviceCtxWaitFault { .. }
+            | KernelCall::DeviceCtxInfo { .. }
             | KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }
@@ -1816,6 +2077,54 @@ mod tests {
         match engine.dispatch(process, KernelCall::PortCreate) {
             KernelCallResult::Handle(handle) => handle,
             other => panic!("expected port handle, got {other:?}"),
+        }
+    }
+
+    fn create_smmuv3_iommu(engine: &mut SyscallEngine, process: &mut Process) -> Handle {
+        let resource = engine
+            .root_resource_create(process, 0x1500_0000, 0x20_0000, 0, u32::MAX)
+            .unwrap();
+        match engine.dispatch(
+            process,
+            KernelCall::IoMmuFromResource {
+                resource,
+                kind: kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
+                phys_base: 0x1500_0000,
+                len: 0x20_0000,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected IoMmu handle, got {other:?}"),
+        }
+    }
+
+    fn create_test_device_ctx(engine: &mut SyscallEngine, process: &mut Process) -> Handle {
+        let object = engine.objects.create(ObjectKind::DeviceCtx);
+        let koid = object.koid();
+        let handle = process
+            .handles_mut()
+            .insert(
+                object,
+                Rights::MAP | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap();
+        engine.device_ctxs.push(DeviceCtxBinding {
+            koid,
+            iommu_koid: KoId(0),
+            stream_id: 1,
+            pgd_phys: 0,
+        });
+        handle
+    }
+
+    fn create_anonymous_vmo(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        size: u64,
+    ) -> Handle {
+        match engine.dispatch(process, KernelCall::VmoCreate { size }) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected VMO handle, got {other:?}"),
         }
     }
 
@@ -2012,6 +2321,155 @@ mod tests {
         assert_eq!(
             outside,
             KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn device_ctx_create_rejects_stream_ids_outside_backend_width() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let iommu = create_smmuv3_iommu(&mut engine, &mut process);
+
+        let result = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceCtxCreate {
+                iommu,
+                stream_or_rid: u64::from(u32::MAX) + 1,
+            },
+        );
+
+        assert_eq!(
+            result,
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+        assert!(engine.device_ctxs.is_empty());
+    }
+
+    #[test]
+    fn device_vmar_map_records_explicit_iova_and_rejects_overlap() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE * 2);
+
+        let first = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset: 0,
+                len: crate::mm::PAGE_SIZE,
+                iova_hint: 0x4000_0000,
+                rights: Rights::READ,
+            },
+        );
+        assert_eq!(first, KernelCallResult::Status(Errno::Ok.status()));
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+        assert_eq!(engine.device_vmar_mappings[0].iova, 0x4000_0000);
+        assert_eq!(engine.device_vmar_mappings[0].len, crate::mm::PAGE_SIZE);
+
+        let overlap = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset: crate::mm::PAGE_SIZE,
+                len: crate::mm::PAGE_SIZE,
+                iova_hint: 0x4000_0000,
+                rights: Rights::READ,
+            },
+        );
+        assert_eq!(
+            overlap,
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+    }
+
+    #[test]
+    fn device_vmar_map_requires_vmo_rights_for_requested_dma() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE);
+        let read_only = process.handles_mut().duplicate(vmo, Rights::READ).unwrap();
+
+        let result = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo: read_only,
+                vmo_offset: 0,
+                len: crate::mm::PAGE_SIZE,
+                iova_hint: 0x5000_0000,
+                rights: Rights::WRITE,
+            },
+        );
+
+        assert_eq!(
+            result,
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+        assert!(engine.device_vmar_mappings.is_empty());
+    }
+
+    #[test]
+    fn device_vmar_unmap_requires_exact_record() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE * 2);
+
+        let map = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset: 0,
+                len: crate::mm::PAGE_SIZE * 2,
+                iova_hint: 0x6000_0000,
+                rights: Rights::READ | Rights::WRITE,
+            },
+        );
+        assert_eq!(map, KernelCallResult::Status(Errno::Ok.status()));
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+
+        let partial = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarUnmap {
+                ctx,
+                iova: 0x6000_0000,
+                len: crate::mm::PAGE_SIZE,
+            },
+        );
+        assert_eq!(
+            partial,
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+
+        let exact = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarUnmap {
+                ctx,
+                iova: 0x6000_0000,
+                len: crate::mm::PAGE_SIZE * 2,
+            },
+        );
+        assert_eq!(exact, KernelCallResult::Status(Errno::Ok.status()));
+        assert!(engine.device_vmar_mappings.is_empty());
+
+        let repeat = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarUnmap {
+                ctx,
+                iova: 0x6000_0000,
+                len: crate::mm::PAGE_SIZE * 2,
+            },
+        );
+        assert_eq!(
+            repeat,
+            KernelCallResult::Status(Errno::InvalidArgs.status())
         );
     }
 

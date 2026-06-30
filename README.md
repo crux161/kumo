@@ -7,11 +7,11 @@
 
 ---
 
-**KUMO** is a clean-room, `#![no_std]` Rust rewrite of the [soso](https://github.com/ozkl/soso) monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, and MMU plumbing, while pushing all other services (drivers, filesystems, network, TTY) into fault-isolated, restartable userspace servers.
+**KUMO** is a clean-room, `#![no_std]` Rust rewrite of the [soso](https://github.com/ozkl/soso) monolithic kernel, reimagined as a modern, capability-based microkernel. It strips the privileged kernel down to the irreducible minimum: address spaces, scheduling, IPC, capabilities, traps, MMU plumbing, and the small amount of hardware confinement needed to make user-mode drivers honest.
 
-For clarity, KUMO represents the microkernel core (named MUREX) and its various subsystem microservices that make up the other aspects of the microkernel. KUMO is fundamentally part of a larger "Flying Nimbus" System. Which is intended to function as a UNIX-like environment with the ability to run Linux applications via a custom hybrid Hypervisor that loads the Firecracker VM in tandem with a WSLv1 style linux->native shim for syscalls (similar to Fuchsia's Starnix). Linux applications see a native environment, Nimbus does the hard work and the two ride off in two the sunset together. At least, that's the plan 🤞
+The larger "Flying Nimbus" system is intended to become a UNIX-like environment with native KUMO services, a Rust userspace, persistent storage, graphics, and Linux-application compatibility through a demand-driven persona layer. The project already boots a real EL0 root server and user processes; it is not yet a complete daily-driver OS.
 
-I'd like to take a brief moment to thank ozkl (and soso's other contributors). It has provided a lot of inspiration to inform the general functionality of KUMO and it's core components. 
+I'd like to take a brief moment to thank ozkl and soso's other contributors. soso provided a lot of inspiration for KUMO's early shape and core components.
 
 Also, the devs working on:
 - [motor-os](https://github.com/moturus/motor-os) 
@@ -22,11 +22,11 @@ Also, the devs working on:
 
 All of them have given excellent points about pitfalls, implementation, and have truly shaped the internal discourse surrounding this project. KUMO is still obviously in active development, but over time I hope it can become something different but still purposeful in people's lives.
 
-Redox has paved the way for other Rust based systems to exist without having to recreate the entire world of technologies all over again by hand. Writing a Read-Only FAT32 filesystem driver isn't beyond the pale but making something like zfs, butterfs, ext4, by hand is a massive undertaking in a system that's yet to even be built. Thank you to the Redox devs for RedoxFS! So for the time being until we get relibc integration under control (again Thank you guys!) KUMO is still rust only. That being said, we're not even booting into a userland proper yet but slowly that's changing. Rust uutils/coreutils is on the horizon, but obviously we need Rust's `std` library first -- so again, building *everything* 🤦‍♂️  it's fun until you realize how much work it's going to be. 
+Redox has paved the way for other Rust-based systems to exist without recreating every storage and libc component by hand. KUMO's longer-term storage plan leans on RedoxFS, and the libc/`std` plan builds toward a native Rust target instead of pretending the whole userspace stack appears at once.
 
 My hope is that with some minor adjustments, capability-based seams, and a good HAL that KUMO will be highly portable, stable, performant, and above all resilient in the face of failure.
 
-So far the code boots on real hardware, not just QEMU!
+So far the code boots on real hardware, not just QEMU. Hardware bring-up has covered:
 
 - Thinkpad x13s gen 1, Qualcomm Snapdragon 8cx Gen 3 SoC (arm64)
 - Raspberry Pi 5, Broadcom BCM2712 (arm64)
@@ -40,21 +40,24 @@ So far the code boots on real hardware, not just QEMU!
 
 *   **Capability Microkernel:** Minimal Trusted Computing Base (TCB). All resources (memory, IPC, interrupts, address spaces) are exposed as Objects. Process authority is defined by unforgeable, capability-typed **Handles**.
 *   **Nijigumo (虹雲):** A UEFI-first staged bootloader providing a stable `BootInfo` handoff into MUREX.
-*   **MUREX :** The privileged core: scheduler, object tables, handle rights, VMOs/VMARs, IPC, traps, and MMU construction.
-*   **Sora (空):** The root server and service-plane supervisor. It receives bootstrap capabilities, hosts early services, and spawns child processes from capability grants.
+*   **MUREX:** The privileged core: scheduler, object tables, handle rights, VMOs/VMARs, IPC, traps, and MMU construction.
+*   **Sora (空):** The root server and service-plane supervisor. It receives bootstrap capabilities, hosts early services, spawns child processes from capability grants, and drives the current service smoke path.
 *   **Hardware Abstraction Layer (HAL):** Clean separation of architecture-specific glue (`kumo-hal-aarch64`, `kumo-hal-x86_64`) from the generic core.
+*   **Device-VMAR / IOMMU:** The active M13 work: confining DMA-capable devices to `Vmo`s explicitly mapped into their `DeviceCtx`, so user-mode drivers cannot bypass capabilities through raw physical DMA.
 
-## 🚀 Current Status (P10-b Process Model)
+## 🚀 Current Status (M13 Binding Circle)
 
-KUMO now boots through UEFI/AAVMF on **aarch64**, exits boot services, enters MUREX at EL1, launches Sora in EL0, and keeps Sora alive as a parked userspace server. The active development spine is the aarch64 process model; x86_64 remains a backend target, but full QEMU parity is still future work.
+KUMO now boots through UEFI/AAVMF on **aarch64**, exits boot services, enters the kernel at EL1, launches Sora in EL0, and exercises a live userspace path through the scheduler, IPC, and serial console. The current development spine is **M13: Device-VMAR/IOMMU DMA isolation**. x86_64 remains a required build target, while full x86 runtime parity is still deferred.
 
 **Recent execution milestones:**
 *   **UEFI handoff:** Nijigumo loads the kernel ELF and initrd from the ESP, builds a validated `BootInfo`, exits boot services, and jumps to MUREX.
 *   **Higher-half kernel:** MUREX runs with a TTBR0/TTBR1 split, a higher-half kernel at `0xffff800048000000`, a permanent physmap, and 4 KiB page granules.
-*   **Userspace Sora:** Sora is loaded from the initrd as an ELF process, receives bootstrap handles, serves channels through ports, and can park/wake through the scheduler harness.
-*   **Capability IPC:** Channels, ports, synchronous call, handle transfer, object rights, and interrupt objects are wired through EL0 `SVC` calls.
-*   **Process isolation slice:** P10-b is live. Sora creates an anonymous VMO, writes child code into it, maps it RX into a fresh child address space, builds the child's TTBR0, and runs the child. The live QEMU/AAVMF smoke prints `hello from child as`, `child as run=ok`, and `anon vmo write ok`.
-*   **Hardware interrupt lanes:** GICv3 remains the X13s/QEMU path; GICv2/GIC-400 discovery and timer setup have been added for Raspberry Pi 5 parity work.
+*   **Userspace and process model:** Sora is loaded from the initrd as an ELF process, receives bootstrap handles, serves channels through ports, spawns child address spaces, and keeps the root service path alive.
+*   **Capability IPC:** Channels, ports, synchronous call, handle transfer, object rights, interrupt objects, timers, and wait paths are wired through EL0 `SVC` calls.
+*   **Persona Linux MVP:** The compatibility path can run a static arm64 Linux ELF through the native persona layer; expansion is demand-driven, one missing syscall at a time.
+*   **Input and console:** The serial/TTY path supports line editing, history navigation, typed HID keyboard input, and a typed mouse-event forwarding path that currently drains in Sora.
+*   **Device-VMAR/IOMMU:** The ABI and kernel object surface for `IoMmu` and `DeviceCtx` exists. The aarch64 HAL has an SMMUv3 binding stub, `DeviceCtxCreate` guards backend stream-width, and `DeviceVmarMap` now validates and records page-aligned IOVA mappings for VMOs. `DeviceVmarUnmap`, fault delivery, and real SMMU queue programming are still in progress.
+*   **Hardware interrupt lanes:** GICv3 remains the X13s/QEMU path; GICv2/GIC-400 discovery and timer setup support Raspberry Pi 5 parity work.
 
 <div align="center">
   <img src="resources/kumo-boot-status.png" alt="KUMO framebuffer boot status showing MUREX and Sora diagnostics" width="640"/>
@@ -63,15 +66,15 @@ KUMO now boots through UEFI/AAVMF on **aarch64**, exits boot services, enters MU
 </div>
 
 **Next in the Forge:**
-*   **P10-c:** Move child execution off the synchronous `run_child` detour and onto the scheduler/user-thread path, with per-thread TTBR0 save/restore.
-*   **VMO maturity:** Extend anonymous mappings beyond executable child-code pages, add real VMO lifetime/reclaim, and split loader segments into distinct VMOs.
-*   **Hardware smoke:** Reconfirm the current arm64 path on the ThinkPad X13s; QEMU covers the core process-model path, while metal covers firmware, DTB, GIC, and platform details.
+*   **M13 Device-VMAR:** Grow the current record-only map surface into `DeviceVmarUnmap`, backend map/unmap plumbing, and fault reporting.
+*   **SMMUv3 and virtio-iommu proof:** Prove DMA confinement first in the safe QEMU IOMMU lane, then on the ThinkPad X13s SMMUv3 path.
+*   **PLAN IV pillars:** Continue the independent relibc/`std`, RedoxFS/Houtu, and graphics/compositor tracks once their prerequisites are ready.
 
 ## 💻 Hardware Targets
 
 The genesis hardware target is the **Lenovo ThinkPad X13s Gen 1** (Snapdragon 8cx Gen 3 / SC8280XP). Bare-metal validation is prioritized on this specific arm64 SoC, using GICv3, the ARM generic timer, UEFI, GOP framebuffer discovery, and DTB handoff.
 
-QEMU `virt` (AAVMF) is the fast local smoke path for the aarch64 kernel/userspace spine. Raspberry Pi 5 is a secondary arm64 lane for GICv2/PL011 parity. x86_64 `q35`/OVMF remains part of the architecture goal, but it is not the current critical path.
+QEMU `virt` (AAVMF) is the fast local smoke path for the aarch64 kernel/userspace spine. Raspberry Pi 5 is a secondary arm64 lane for GICv2/PL011 parity. x86_64 generic UEFI images are kept building as an architectural guardrail, but x86 runtime parity is not the current critical path.
 
 <div align="center">
   <img src="resources/kumo_silhouette.jpg" alt="KUMO Silhouette" width="200"/> 
@@ -88,9 +91,17 @@ cargo xtask image --arch aarch64 --hardware qemu-virt-aarch64
 # Build the ThinkPad X13s image
 cargo xtask image --arch aarch64 --hardware thinkpad-x13s-gen1
 
-# Run the kernel test suite
+# Build the generic x86_64 UEFI image
+cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
+
+# Run the aarch64 QEMU smoke test
+cargo xtask qemu-smoke --arch aarch64
+
+# Run the core host checks
+cargo fmt --check
+cargo test -p kumo-abi
 cargo test -p kernel
 
-# Run the broader xtask suite
-cargo xtask test
+# Run the contributor preflight used by current green slices
+./scripts/preflight.sh
 ```

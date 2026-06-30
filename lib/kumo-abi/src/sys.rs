@@ -55,6 +55,20 @@ pub const TLMM_GPIO_PIN_MASK: u32 = 0x0000_0fff;
 pub const TLMM_GPIO_FLAGS_SHIFT: u32 = 12;
 pub const TLMM_GPIO_FLAGS_MASK: u32 = 0x000f_f000;
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoMmuKind {
+    Virtio = 1,
+    SmmuV3 = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCtxInfo {
+    pub fault_record: u64,
+    pub fault_addr: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TlmmGpioIrq {
     pub pin: u32,

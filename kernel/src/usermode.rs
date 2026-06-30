@@ -1156,32 +1156,84 @@ fn dispatch_object_syscall(
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::IoMmuFromResource as u64 {
-        match engine.dispatch(target, KernelCall::IoMmuFromResource) {
+        let resource = Handle(r[0] as u32);
+        let kind = r[1] as u32;
+        let phys_base = r[2];
+        let len = r[3];
+        match engine.dispatch(
+            target,
+            KernelCall::IoMmuFromResource {
+                resource,
+                kind,
+                phys_base,
+                len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::DeviceCtxCreate as u64 {
-        match engine.dispatch(target, KernelCall::DeviceCtxCreate) {
+        let iommu = Handle(r[0] as u32);
+        let stream_or_rid = r[1];
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceCtxCreate {
+                iommu,
+                stream_or_rid,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::DeviceVmarMap as u64 {
-        match engine.dispatch(target, KernelCall::DeviceVmarMap) {
+        let ctx = Handle(r[0] as u32);
+        let vmo = Handle(r[1] as u32);
+        let vmo_offset = r[2];
+        let len = r[3];
+        let iova_hint = r[4];
+        let rights = Rights(r[5] as u32);
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset,
+                len,
+                iova_hint,
+                rights,
+            },
+        ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::DeviceVmarUnmap as u64 {
-        match engine.dispatch(target, KernelCall::DeviceVmarUnmap) {
+        let ctx = Handle(r[0] as u32);
+        let iova = r[1];
+        let len = r[2];
+        match engine.dispatch(target, KernelCall::DeviceVmarUnmap { ctx, iova, len }) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::DeviceCtxWaitFault as u64 {
-        match engine.dispatch(target, KernelCall::DeviceCtxWaitFault) {
+        let ctx = Handle(r[0] as u32);
+        match engine.dispatch(target, KernelCall::DeviceCtxWaitFault { ctx }) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::DeviceCtxInfo as u64 {
-        match engine.dispatch(target, KernelCall::DeviceCtxInfo) {
+        let ctx = Handle(r[0] as u32);
+        let user_ptr = r[1];
+        let user_len = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::DeviceCtxInfo {
+                ctx,
+                user_ptr,
+                user_len,
+            },
+        ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }

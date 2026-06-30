@@ -16,7 +16,8 @@ pub mod active {
         complete_tlmm_gpio_interrupt, configure_tlmm_gpio_interrupt, console_read_byte,
         console_use_physmap, early_console_write, el0_exit, enable_kernel_mmu, fb_fill,
         fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console, halt,
-        handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors, irq_unmask,
+        handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
+        iommu_create_device_context, iommu_destroy_device_context, iommu_init, irq_unmask,
         map_user_device_block, map_user_page, monotonic_nanos, read_phys, read_user_aspace_root,
         reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once, run_el0_image,
         run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
@@ -34,7 +35,8 @@ pub mod active {
         complete_tlmm_gpio_interrupt, configure_tlmm_gpio_interrupt, console_read_byte,
         console_use_physmap, early_console_write, el0_exit, enable_kernel_mmu, fb_fill,
         fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console, halt,
-        handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors, irq_unmask,
+        handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
+        iommu_create_device_context, iommu_destroy_device_context, iommu_init, irq_unmask,
         map_user_device_block, map_user_page, monotonic_nanos, read_phys, read_user_aspace_root,
         reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once, run_el0_image,
         run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
@@ -160,4 +162,16 @@ pub trait EarlyConsole {
 pub trait Microcode {
     fn current_revision() -> u32;
     fn apply(blob: &[u8]) -> Result<u32, McErr>;
+}
+
+pub trait IoMmuController {
+    type Context;
+
+    fn init(phys_base: u64, len: u64) -> Result<Self::Context, McErr>;
+    fn create_device_context(
+        iommu: &mut Self::Context,
+        stream_id: u32,
+        pgd_phys: u64,
+    ) -> Result<(), McErr>;
+    fn destroy_device_context(iommu: &mut Self::Context, stream_id: u32);
 }

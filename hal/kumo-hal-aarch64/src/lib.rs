@@ -4,6 +4,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod smmuv3;
+pub use smmuv3::{iommu_create_device_context, iommu_destroy_device_context, iommu_init};
 
 pub const ARCH: &str = "aarch64";
 
