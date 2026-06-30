@@ -24,6 +24,8 @@ pub enum ObjectKind {
     Timer = 9,
     Resource = 10,
     Interrupt = 11,
+    IoMmu = 12,
+    DeviceCtx = 13,
 }
 
 #[repr(transparent)]

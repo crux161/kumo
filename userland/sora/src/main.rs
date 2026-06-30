@@ -316,6 +316,8 @@ extern "C" fn sora_main(
     let res = Handle(resource_handle as u32);
     let net = Handle(net_handle as u32);
     let kbd = Handle(kbd_handle as u32);
+    let mut mouse_input: Option<Handle> = None;
+    let mut pointer_state = sora::PointerState::default();
 
     // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8). `_start` captured it
     // into `BOOTINFO_VMO_HANDLE` at entry — reading x8 here would race the compiler's reuse of
@@ -764,6 +766,9 @@ extern "C" fn sora_main(
                 // the failure-branch dump below, which never prints when the gate itself is the cause.
                 log(b"drv-fb: snapshot fb geometry ");
                 log_fb_geometry(&fb);
+                if fb.is_plausible() {
+                    pointer_state = sora::PointerState::new(fb.width, fb.height);
+                }
                 // Refuse to mint an MMIO Resource over implausibly-shaped geometry: a corrupt
                 // snapshot read must fail here as a clear diagnostic, not reach the kernel's
                 // range check disguised as a rights problem.
@@ -831,47 +836,82 @@ extern "C" fn sora_main(
                             } else if sender == u64::MAX || bootstrap == u64::MAX {
                                 log(b"drv-i2c-hid: channel fail\n");
                             } else {
-                                let encoded = config.encode();
-                                let sent = channel_write_with_handle(
-                                    Handle(sender as u32),
-                                    encoded.as_ptr(),
-                                    encoded.len(),
-                                    Handle(device_resource as u32),
-                                );
-                                let keyboard_writer =
-                                    handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER);
-                                let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
-                                let keyboard_sent = if keyboard_writer != u64::MAX {
-                                    channel_write_with_handle(
+                                let (mouse_reader, mouse_writer) = channel_create_pair();
+                                if mouse_reader == u64::MAX || mouse_writer == u64::MAX {
+                                    if mouse_reader != u64::MAX {
+                                        let _ = handle_close(Handle(mouse_reader as u32));
+                                    }
+                                    if mouse_writer != u64::MAX {
+                                        let _ = handle_close(Handle(mouse_writer as u32));
+                                    }
+                                    log(b"drv-i2c-hid: mouse channel fail\n");
+                                } else {
+                                    let encoded = config.encode();
+                                    let sent = channel_write_with_handle(
                                         Handle(sender as u32),
-                                        &tag,
-                                        1,
-                                        Handle(keyboard_writer as u32),
-                                    )
-                                } else {
-                                    Errno::BadHandle.status()
-                                };
-                                if sent != 0 {
-                                    if keyboard_writer != u64::MAX {
-                                        let _ = handle_close(Handle(keyboard_writer as u32));
+                                        encoded.as_ptr(),
+                                        encoded.len(),
+                                        Handle(device_resource as u32),
+                                    );
+                                    let keyboard_writer = if sent == 0 {
+                                        handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER)
+                                    } else {
+                                        u64::MAX
+                                    };
+                                    let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
+                                    let keyboard_sent = if sent == 0 && keyboard_writer != u64::MAX
+                                    {
+                                        channel_write_with_handle(
+                                            Handle(sender as u32),
+                                            &tag,
+                                            1,
+                                            Handle(keyboard_writer as u32),
+                                        )
+                                    } else if sent == 0 {
+                                        Errno::BadHandle.status()
+                                    } else {
+                                        Errno::Ok.status()
+                                    };
+                                    let mouse_tag = drv_i2c_hid::MOUSE_BOOTSTRAP_TAG;
+                                    let mouse_sent = if keyboard_sent == 0 {
+                                        channel_write_with_handle(
+                                            Handle(sender as u32),
+                                            &mouse_tag,
+                                            1,
+                                            Handle(mouse_writer as u32),
+                                        )
+                                    } else {
+                                        Errno::Ok.status()
+                                    };
+                                    if sent != 0 {
+                                        let _ = handle_close(Handle(mouse_reader as u32));
+                                        let _ = handle_close(Handle(mouse_writer as u32));
+                                        log(b"drv-i2c-hid: bootstrap send fail\n");
+                                    } else if keyboard_sent != 0 {
+                                        let _ = handle_close(Handle(mouse_reader as u32));
+                                        let _ = handle_close(Handle(mouse_writer as u32));
+                                        if keyboard_writer != u64::MAX {
+                                            let _ = handle_close(Handle(keyboard_writer as u32));
+                                        }
+                                        log(b"drv-i2c-hid: keyboard bootstrap fail\n");
+                                    } else if mouse_sent != 0 {
+                                        let _ = handle_close(Handle(mouse_reader as u32));
+                                        let _ = handle_close(Handle(mouse_writer as u32));
+                                        log(b"drv-i2c-hid: mouse bootstrap fail\n");
+                                    } else if run_elf(
+                                        initrd,
+                                        kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
+                                        0,
+                                        bootstrap,
+                                        ProcessRunFlags::ASYNC.bits(),
+                                        b"drv-i2c-hid",
+                                    ) {
+                                        mouse_input = Some(Handle(mouse_reader as u32));
+                                        log(b"drv-i2c-hid: run ok\n");
+                                    } else {
+                                        let _ = handle_close(Handle(mouse_reader as u32));
+                                        log(b"drv-i2c-hid: run fail\n");
                                     }
-                                    log(b"drv-i2c-hid: bootstrap send fail\n");
-                                } else if keyboard_sent != 0 {
-                                    if keyboard_writer != u64::MAX {
-                                        let _ = handle_close(Handle(keyboard_writer as u32));
-                                    }
-                                    log(b"drv-i2c-hid: keyboard bootstrap fail\n");
-                                } else if run_elf(
-                                    initrd,
-                                    kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
-                                    0,
-                                    bootstrap,
-                                    ProcessRunFlags::ASYNC.bits(),
-                                    b"drv-i2c-hid",
-                                ) {
-                                    log(b"drv-i2c-hid: run ok\n");
-                                } else {
-                                    log(b"drv-i2c-hid: run fail\n");
                                 }
                             }
                         }
@@ -1341,6 +1381,7 @@ extern "C" fn sora_main(
     let block_koid = handle_koid(block);
     let net_koid = handle_koid(net);
     let kbd_koid = handle_koid(kbd);
+    let mouse_koid = mouse_input.map(handle_koid).unwrap_or(u64::MAX);
     // Breadcrumb each unavailable handle so a metal boot that wedges here (the X13s "halts
     // right after `anon vmo write ok`" report) names exactly what is missing on the next flash.
     if port_h == u64::MAX {
@@ -1357,6 +1398,9 @@ extern "C" fn sora_main(
     }
     if kbd_koid == u64::MAX {
         log(b"sora: kbd koid fail\n");
+    }
+    if mouse_input.is_some() && mouse_koid == u64::MAX {
+        log(b"sora: mouse koid fail\n");
     }
     // The serve loop only needs the port and a console to be useful; the block/net/keyboard
     // channels are bound only when available. A machine without a keyboard or net driver (the
@@ -1375,13 +1419,21 @@ extern "C" fn sora_main(
         if kbd_koid != u64::MAX {
             port_bind(port, kbd);
         }
+        if let Some(mouse) = mouse_input {
+            if mouse_koid != u64::MAX {
+                port_bind(port, mouse);
+            }
+        }
         log(b"sora: ports bound\n");
         let cons_koid = Handle(console_koid as u32);
         let blk_koid = Handle(block_koid as u32);
         let net_k = Handle(net_koid as u32);
         let kbd_k = Handle(kbd_koid as u32);
+        let mouse_k = Handle(mouse_koid as u32);
         let mut serve_buf = [0u8; 256];
         let mut block_buf = [0u8; 512];
+        let mut mouse_events_seen: u32 = 0;
+        let mut malformed_mouse_events_seen: u32 = 0;
 
         // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
         launch_lua_repl(initrd, kbd, console);
@@ -1557,6 +1609,33 @@ extern "C" fn sora_main(
                     channel_write(net, b"pipe".as_ptr(), 4);
                 } else if n > 0 {
                     channel_write(net, serve_buf.as_ptr(), n);
+                }
+            }
+            // mouse handler — drain fixed boot-mouse records until a UI consumer exists.
+            if mouse_koid != u64::MAX && source == mouse_k {
+                if let Some(mouse) = mouse_input {
+                    let n = channel_read(mouse, serve_buf.as_mut_ptr(), 256) as usize;
+                    if n == drv_i2c_hid::MOUSE_EVENT_BYTES {
+                        if let Some(report) = drv_i2c_hid::decode_mouse_event(&serve_buf[..n]) {
+                            mouse_events_seen = mouse_events_seen.saturating_add(1);
+                            pointer_state.apply_boot_mouse(report);
+                            if mouse_events_seen <= 8 {
+                                let position = pointer_state.position();
+                                log(b"sora: mouse pointer x=");
+                                log_hex(position.x as u64);
+                                log(b" y=");
+                                log_hex(position.y as u64);
+                                log(b" buttons=");
+                                log_hex(pointer_state.buttons() as u64);
+                                log(b"\n");
+                            }
+                        }
+                    } else if n > 0 {
+                        malformed_mouse_events_seen = malformed_mouse_events_seen.saturating_add(1);
+                        if malformed_mouse_events_seen <= 8 {
+                            log(b"sora: mouse event malformed\n");
+                        }
+                    }
                 }
             }
             // keyboard handler — input only (keystrokes → ttyd → parsed command line)

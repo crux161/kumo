@@ -1155,6 +1155,36 @@ fn dispatch_object_syscall(
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::IoMmuFromResource as u64 {
+        match engine.dispatch(target, KernelCall::IoMmuFromResource) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxCreate as u64 {
+        match engine.dispatch(target, KernelCall::DeviceCtxCreate) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceVmarMap as u64 {
+        match engine.dispatch(target, KernelCall::DeviceVmarMap) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceVmarUnmap as u64 {
+        match engine.dispatch(target, KernelCall::DeviceVmarUnmap) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxWaitFault as u64 {
+        match engine.dispatch(target, KernelCall::DeviceCtxWaitFault) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceCtxInfo as u64 {
+        match engine.dispatch(target, KernelCall::DeviceCtxInfo) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else {
         return false;
     }

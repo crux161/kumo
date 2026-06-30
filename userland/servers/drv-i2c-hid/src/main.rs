@@ -3,14 +3,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
-    bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report,
-    should_log_input_report_stats, BoundedFailureLog, DeviceQuirks, InputProbeDecoder,
-    InputProbeError, InputReportStats, ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
-    MAX_REPORT_DESCRIPTOR_BYTES,
+    bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report_with_mouse,
+    decode_mouse_probe, encode_mouse_event, should_log_input_report_stats, BoundedFailureLog,
+    DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass, InputReportStats,
+    ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    MOUSE_BOOTSTRAP_TAG,
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
-    find_boot_keyboard, Command, Controller, HidDescriptor, PowerState, RegisterIo,
+    find_boot_keyboard, find_boot_mouse, Command, Controller, HidDescriptor, PowerState, RegisterIo,
 };
 use kumo_rt::{
     channel_read_with_handle, channel_write, debug_write, handle_close, handle_koid,
@@ -108,6 +109,8 @@ fn log_input_report_stats(stats: &InputReportStats) {
     log_hex_inline(stats.frames as u64);
     log(b" k=0x");
     log_hex_inline(stats.keyboard_reports as u64);
+    log(b" m=0x");
+    log_hex_inline(stats.mouse_reports as u64);
     log(b" rst=0x");
     log_hex_inline(stats.reset_frames as u64);
     log(b" bog=0x");
@@ -120,8 +123,12 @@ fn log_input_report_stats(stats: &InputReportStats) {
     log_hex_inline(stats.decode_errors as u64);
     log(b" ascii=0x");
     log_hex_inline(stats.forwarded_ascii as u64);
+    log(b" mouse=0x");
+    log_hex_inline(stats.forwarded_mouse as u64);
     log(b" drop=0x");
     log_hex_inline(stats.keyboard_write_drops as u64);
+    log(b" mdrop=0x");
+    log_hex_inline(stats.mouse_write_drops as u64);
     log(b"\n");
     if stats.last_report_id.is_some()
         || stats.last_protocol_error.is_some()
@@ -227,6 +234,14 @@ extern "C" fn main(
     }
     let keyboard_channel = Handle(keyboard_raw as u32);
     log(b"drv-i2c-hid: keyboard channel ok\n");
+
+    let (received, mouse_raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+    if received != tag.len() || tag[0] != MOUSE_BOOTSTRAP_TAG || mouse_raw == 0 {
+        log(b"drv-i2c-hid: mouse bootstrap failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let mouse_channel = Handle(mouse_raw as u32);
+    log(b"drv-i2c-hid: mouse channel ok\n");
 
     let resource = Handle(resource_raw as u32);
     let vmo_raw = resource_mint_mmio(resource, config.mmio_base, config.mmio_length);
@@ -429,9 +444,21 @@ extern "C" fn main(
     };
 
     log(b"drv-i2c-hid: report descriptor ok\n");
+    let led_output_report_id = kumo_i2c_hid::find_led_output_report_id(&report_descriptor);
+    let mouse = find_boot_mouse(&report_descriptor[..report_descriptor_len]).ok();
+    if let Some(id) = led_output_report_id {
+        log_hex(b"drv-i2c-hid: led-output-report-id=0x", id as u64);
+    } else {
+        log(b"drv-i2c-hid: led-output-report-id=none\n");
+    }
     match keyboard.report_id {
         Some(report_id) => log_hex(b"drv-i2c-hid: keyboard-report-id=0x", report_id as u64),
         None => log(b"drv-i2c-hid: keyboard-report-id=none\n"),
+    }
+    match mouse.and_then(|report| report.report_id) {
+        Some(report_id) => log_hex(b"drv-i2c-hid: mouse-report-id=0x", report_id as u64),
+        None if mouse.is_some() => log(b"drv-i2c-hid: mouse-report-id=none\n"),
+        None => log(b"drv-i2c-hid: mouse-report=none\n"),
     }
 
     let mut input_decoder = InputProbeDecoder::new();
@@ -441,9 +468,11 @@ extern "C" fn main(
     let mut interrupts: u32 = 0;
     let mut shown_nonempty: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
+    let mut mouse_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
     let mut input_stats = InputReportStats::new();
     let mut input_stats_logs: u32 = 0;
+    let mut caps_lock = false;
     loop {
         if interrupt_wait(attention_irq) == 0 {
             log(b"drv-i2c-hid: attention wait failed\n");
@@ -467,8 +496,12 @@ extern "C" fn main(
         // `frame=` dumps the first 16 non-empty reports. — KESTREL
         interrupts = interrupts.wrapping_add(1);
         let frame_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
-        let report_class =
-            classify_input_report(&input_frame[..input_frame_len], keyboard.report_id, quirks);
+        let report_class = classify_input_report_with_mouse(
+            &input_frame[..input_frame_len],
+            keyboard.report_id,
+            mouse,
+            quirks,
+        );
         input_stats.record_class(report_class);
         // Log EVERY delivery (bounded to 64), not just the first 3, so a keypress that produces a
         // NEW `irq tick` line is visible — this is what distinguishes "no attention IRQ on keypress"
@@ -491,6 +524,32 @@ extern "C" fn main(
                 b"drv-i2c-hid: frame= ",
                 &input_frame[..input_frame_len.min(16)],
             );
+        }
+        if report_class == InputReportClass::MouseReport {
+            if let Some(mouse_report) = mouse {
+                match decode_mouse_probe(&input_frame[..input_frame_len], mouse_report, quirks) {
+                    Ok(Some(report)) => {
+                        let event = encode_mouse_event(report);
+                        if channel_write(mouse_channel, event.as_ptr(), event.len()) == 0 {
+                            input_stats.record_forwarded_mouse();
+                        } else if mouse_forward_failures.record() {
+                            input_stats.record_mouse_write_drop();
+                            log_hex(
+                                b"drv-i2c-hid: mouse event dropped count=0x",
+                                mouse_forward_failures.count() as u64,
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if input_decode_failures.record() {
+                            log_hex(b"drv-i2c-hid: mouse report decode error=0x", error as u64);
+                        }
+                    }
+                }
+            }
+            maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
+            continue;
         }
         let input = match input_decoder.decode_with_quirks(
             &input_frame[..input_frame_len],
@@ -518,6 +577,67 @@ extern "C" fn main(
                 continue;
             }
         };
+        if input.caps_lock_toggle {
+            caps_lock = !caps_lock;
+            let report_id = led_output_report_id.or(keyboard.report_id);
+            let report_id_byte = report_id.unwrap_or(0);
+
+            let mut payload = [0u8; 8];
+            let mut len = 0;
+
+            if descriptor.output_register != 0 {
+                // Output Register Write:
+                // [OutRegLo, OutRegHi, LenLo, LenHi, (ReportID), Payload]
+                payload[len] = (descriptor.output_register & 0xff) as u8;
+                len += 1;
+                payload[len] = (descriptor.output_register >> 8) as u8;
+                len += 1;
+
+                let report_len: u16 = if report_id.is_some() { 5 } else { 4 };
+                payload[len] = (report_len & 0xff) as u8;
+                len += 1;
+                payload[len] = (report_len >> 8) as u8;
+                len += 1;
+
+                if let Some(id) = report_id {
+                    payload[len] = id;
+                    len += 1;
+                }
+                payload[len] = if caps_lock { 0x02 } else { 0x00 };
+                len += 1;
+                payload[len] = 0x00; // Second byte for extra LEDs like Mic Mute
+                len += 1;
+
+                let _ = controller.write(config.i2c_address, &payload[..len]);
+            } else {
+                // Fallback: Data Register + SET_REPORT
+                payload[len] = (descriptor.data_register & 0xff) as u8;
+                len += 1;
+                payload[len] = (descriptor.data_register >> 8) as u8;
+                len += 1;
+
+                let report_len: u16 = if report_id.is_some() { 5 } else { 4 };
+                payload[len] = (report_len & 0xff) as u8;
+                len += 1;
+                payload[len] = (report_len >> 8) as u8;
+                len += 1;
+
+                if let Some(id) = report_id {
+                    payload[len] = id;
+                    len += 1;
+                }
+                payload[len] = if caps_lock { 0x02 } else { 0x00 };
+                len += 1;
+                payload[len] = 0x00;
+                len += 1;
+
+                let _ = controller.write(config.i2c_address, &payload[..len]);
+                let _ = controller.write(
+                    config.i2c_address,
+                    &kumo_i2c_hid::Command::set_report(descriptor.command_register, report_id_byte),
+                );
+            }
+        }
         // Only emit on real terminal keypress bytes; idle reports and non-byte keys stay silent so
         // the framebuffer console is not flooded. The log label keeps the historic `ascii=...`
         // spelling so metal captures remain comparable across HID slices.

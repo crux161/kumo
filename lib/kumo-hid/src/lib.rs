@@ -324,7 +324,7 @@ pub fn key_sym(usage: u8, modifiers: Modifiers) -> KeySym {
         0x49 => KeySym::Insert,
         0x4a => KeySym::Home,
         0x4b => KeySym::PageUp,
-        0x4c => KeySym::Ascii(0x7f),
+        0x4c => KeySym::Delete,
         0x4d => KeySym::End,
         0x4e => KeySym::PageDown,
         0x4f => KeySym::Right,
@@ -430,8 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn delete_usage_maps_to_the_terminal_delete_byte() {
-        assert_eq!(key_sym(0x4c, Modifiers::default()), KeySym::Ascii(0x7f));
+    fn delete_usage_maps_to_the_terminal_delete_sequence() {
+        assert_eq!(key_sym(0x4c, Modifiers::default()), KeySym::Delete);
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(key_sym(0x04, plain), KeySym::Ascii(b'a'));
         assert_eq!(key_sym(0x28, plain), KeySym::Ascii(b'\n'));
         assert_eq!(key_sym(0x2a, plain), KeySym::Ascii(0x7f));
-        assert_eq!(key_sym(0x4c, plain), KeySym::Ascii(0x7f));
+        assert_eq!(key_sym(0x4c, plain), KeySym::Delete);
         assert_eq!(key_sym(0x33, shift), KeySym::Ascii(b':'));
         assert_eq!(key_sym(0x38, shift), KeySym::Ascii(b'?'));
         assert_eq!(key_sym(0x06, ctrl), KeySym::Ascii(0x03)); // Ctrl-C

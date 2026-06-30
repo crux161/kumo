@@ -42,6 +42,12 @@ pub enum Syscall {
     /// Transfer framebuffer text-console ownership from the Stage-A HAL to a
     /// userspace driver holding the matching Resource capability.
     FramebufferClaim = 38,
+    IoMmuFromResource = 39,
+    DeviceCtxCreate = 40,
+    DeviceVmarMap = 41,
+    DeviceVmarUnmap = 42,
+    DeviceCtxWaitFault = 43,
+    DeviceCtxInfo = 44,
 }
 
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;

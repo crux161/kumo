@@ -14,6 +14,10 @@ mod report_descriptor;
 pub use fdt::{discover_keyboard, GicInterrupt, GpioInterrupt, KeyboardTopology};
 pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{
-    boot_keyboard_report, Command, HidDescriptor, InputFrame, PowerState, ProtocolError,
+    boot_keyboard_report, boot_mouse_report, BootMouseReport, Command, HidDescriptor, InputFrame,
+    MouseButtons, PowerState, ProtocolError, BOOT_MOUSE_REPORT_BYTES,
 };
-pub use report_descriptor::{find_boot_keyboard, KeyboardReport, ReportDescriptorError};
+pub use report_descriptor::{
+    find_boot_keyboard, find_boot_mouse, find_led_output_report_id, KeyboardReport, MouseReport,
+    ReportDescriptorError,
+};

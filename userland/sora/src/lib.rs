@@ -2,10 +2,88 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use kumo_abi::{Errno, Handle, Status};
+use kumo_i2c_hid::BootMouseReport;
 use kumo_ipc::{Message, MessageError};
 
 pub const SORA_NAME: &str = "Sora";
 pub const ROOT_SERVER_ORDINAL_ECHO: u32 = 1;
+pub const POINTER_BUTTON_MASK: u8 = 0x07;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PointerPosition {
+    pub x: u32,
+    pub y: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PointerState {
+    width: u32,
+    height: u32,
+    position: PointerPosition,
+    buttons: u8,
+    events: u32,
+}
+
+impl PointerState {
+    pub const fn new(width: u32, height: u32) -> Self {
+        let width = if width == 0 { 1 } else { width };
+        let height = if height == 0 { 1 } else { height };
+        Self {
+            width,
+            height,
+            position: PointerPosition {
+                x: width / 2,
+                y: height / 2,
+            },
+            buttons: 0,
+            events: 0,
+        }
+    }
+
+    pub const fn position(self) -> PointerPosition {
+        self.position
+    }
+
+    pub const fn buttons(self) -> u8 {
+        self.buttons
+    }
+
+    pub const fn events(self) -> u32 {
+        self.events
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    pub fn apply_boot_mouse(&mut self, report: BootMouseReport) {
+        self.position.x = clamp_delta(self.position.x, report.x_delta, self.width);
+        self.position.y = clamp_delta(self.position.y, report.y_delta, self.height);
+        self.buttons = report.buttons.bits() & POINTER_BUTTON_MASK;
+        self.events = self.events.saturating_add(1);
+    }
+}
+
+impl Default for PointerState {
+    fn default() -> Self {
+        Self::new(1, 1)
+    }
+}
+
+fn clamp_delta(position: u32, delta: i8, extent: u32) -> u32 {
+    let max = extent.saturating_sub(1);
+    let delta = i32::from(delta);
+    let next = if delta < 0 {
+        position.saturating_sub((-delta) as u32)
+    } else {
+        position.saturating_add(delta as u32)
+    };
+    next.min(max)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartPolicy {
@@ -170,6 +248,7 @@ pub fn close_handles_except(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kumo_i2c_hid::{BootMouseReport, MouseButtons};
 
     #[test]
     fn root_logic_is_host_testable() {
@@ -226,6 +305,55 @@ mod tests {
             Errno::Ok.status()
         }));
         assert_eq!(closed, Handle(11));
+    }
+
+    #[test]
+    fn pointer_state_starts_centered_and_sanitizes_empty_bounds() {
+        let pointer = PointerState::new(1920, 1080);
+        assert_eq!(pointer.width(), 1920);
+        assert_eq!(pointer.height(), 1080);
+        assert_eq!(pointer.position(), PointerPosition { x: 960, y: 540 });
+        assert_eq!(pointer.buttons(), 0);
+        assert_eq!(pointer.events(), 0);
+
+        let empty = PointerState::new(0, 0);
+        assert_eq!(empty.width(), 1);
+        assert_eq!(empty.height(), 1);
+        assert_eq!(empty.position(), PointerPosition { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn pointer_state_applies_signed_deltas_buttons_and_clamps() {
+        let mut pointer = PointerState::new(4, 3);
+        pointer.apply_boot_mouse(BootMouseReport {
+            buttons: MouseButtons::from_bits(MouseButtons::LEFT | 0x80),
+            x_delta: 1,
+            y_delta: -1,
+        });
+        assert_eq!(pointer.position(), PointerPosition { x: 3, y: 0 });
+        assert_eq!(pointer.buttons(), MouseButtons::LEFT);
+        assert_eq!(pointer.events(), 1);
+
+        pointer.apply_boot_mouse(BootMouseReport {
+            buttons: MouseButtons::from_bits(MouseButtons::RIGHT | MouseButtons::MIDDLE),
+            x_delta: 100,
+            y_delta: 100,
+        });
+        assert_eq!(pointer.position(), PointerPosition { x: 3, y: 2 });
+        assert_eq!(
+            pointer.buttons(),
+            MouseButtons::RIGHT | MouseButtons::MIDDLE
+        );
+        assert_eq!(pointer.events(), 2);
+
+        pointer.apply_boot_mouse(BootMouseReport {
+            buttons: MouseButtons::from_bits(0),
+            x_delta: -100,
+            y_delta: -100,
+        });
+        assert_eq!(pointer.position(), PointerPosition { x: 0, y: 0 });
+        assert_eq!(pointer.buttons(), 0);
+        assert_eq!(pointer.events(), 3);
     }
 
     #[test]

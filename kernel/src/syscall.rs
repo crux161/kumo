@@ -129,6 +129,12 @@ pub enum KernelCall<'a> {
     VmoCreate {
         size: u64,
     },
+    IoMmuFromResource,
+    DeviceCtxCreate,
+    DeviceVmarMap,
+    DeviceVmarUnmap,
+    DeviceCtxWaitFault,
+    DeviceCtxInfo,
     Unsupported(Syscall),
 }
 
@@ -1728,7 +1734,13 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
-            KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
+            KernelCall::IoMmuFromResource
+            | KernelCall::DeviceCtxCreate
+            | KernelCall::DeviceVmarMap
+            | KernelCall::DeviceVmarUnmap
+            | KernelCall::DeviceCtxWaitFault
+            | KernelCall::DeviceCtxInfo
+            | KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }
 

@@ -2,11 +2,14 @@
 
 use kumo_hid::{DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS};
 use kumo_i2c_hid::{
-    boot_keyboard_report, InputFrame, KeyboardTopology, ProtocolError, SourceClock,
+    boot_keyboard_report, boot_mouse_report, BootMouseReport, InputFrame, KeyboardTopology,
+    MouseButtons, MouseReport, ProtocolError, SourceClock, BOOT_MOUSE_REPORT_BYTES,
 };
 
 const MAGIC: [u8; 4] = *b"I2H1";
 pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
+pub const MOUSE_BOOTSTRAP_TAG: u8 = b'M';
+pub const MOUSE_EVENT_BYTES: usize = BOOT_MOUSE_REPORT_BYTES;
 pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
 pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 256;
@@ -45,6 +48,7 @@ pub struct InputProbe {
     pub event_count: usize,
     pub first_pressed_usage: Option<u8>,
     pub first_pressed_ascii: Option<u8>,
+    pub caps_lock_toggle: bool,
     pub pressed_ascii: [u8; MAX_PRESSED_ASCII_BYTES],
     pub pressed_ascii_len: usize,
     pub pressed_terminal: [u8; MAX_PRESSED_TERMINAL_BYTES],
@@ -66,6 +70,7 @@ pub enum InputReportClass {
     Reset,
     BogusIrq,
     KeyboardReport,
+    MouseReport,
     ForeignReportId { report_id: u8 },
     ProtocolError(ProtocolError),
 }
@@ -76,11 +81,14 @@ pub struct InputReportStats {
     pub reset_frames: u32,
     pub bogus_irq_frames: u32,
     pub keyboard_reports: u32,
+    pub mouse_reports: u32,
     pub foreign_report_ids: u32,
     pub protocol_errors: u32,
     pub decode_errors: u32,
     pub forwarded_ascii: u32,
+    pub forwarded_mouse: u32,
     pub keyboard_write_drops: u32,
+    pub mouse_write_drops: u32,
     pub last_report_id: Option<u8>,
     pub last_protocol_error: Option<ProtocolError>,
     pub last_decode_error: Option<DecodeError>,
@@ -93,11 +101,14 @@ impl InputReportStats {
             reset_frames: 0,
             bogus_irq_frames: 0,
             keyboard_reports: 0,
+            mouse_reports: 0,
             foreign_report_ids: 0,
             protocol_errors: 0,
             decode_errors: 0,
             forwarded_ascii: 0,
+            forwarded_mouse: 0,
             keyboard_write_drops: 0,
+            mouse_write_drops: 0,
             last_report_id: None,
             last_protocol_error: None,
             last_decode_error: None,
@@ -110,6 +121,7 @@ impl InputReportStats {
             InputReportClass::Reset => bump(&mut self.reset_frames),
             InputReportClass::BogusIrq => bump(&mut self.bogus_irq_frames),
             InputReportClass::KeyboardReport => bump(&mut self.keyboard_reports),
+            InputReportClass::MouseReport => bump(&mut self.mouse_reports),
             InputReportClass::ForeignReportId { report_id } => {
                 bump(&mut self.foreign_report_ids);
                 self.last_report_id = Some(report_id);
@@ -130,8 +142,16 @@ impl InputReportStats {
         bump(&mut self.forwarded_ascii);
     }
 
+    pub fn record_forwarded_mouse(&mut self) {
+        bump(&mut self.forwarded_mouse);
+    }
+
     pub fn record_keyboard_write_drop(&mut self) {
         bump(&mut self.keyboard_write_drops);
+    }
+
+    pub fn record_mouse_write_drop(&mut self) {
+        bump(&mut self.mouse_write_drops);
     }
 }
 
@@ -378,6 +398,15 @@ pub fn classify_input_report(
     report_id: Option<u8>,
     quirks: DeviceQuirks,
 ) -> InputReportClass {
+    classify_input_report_with_mouse(raw, report_id, None, quirks)
+}
+
+pub fn classify_input_report_with_mouse(
+    raw: &[u8],
+    keyboard_report_id: Option<u8>,
+    mouse_report: Option<MouseReport>,
+    quirks: DeviceQuirks,
+) -> InputReportClass {
     if quirks.bogus_irq && raw.len() >= 2 && raw[0] == 0xff && raw[1] == 0xff {
         return InputReportClass::BogusIrq;
     }
@@ -388,7 +417,17 @@ pub fn classify_input_report(
     let InputFrame::Report(payload) = frame else {
         return InputReportClass::Reset;
     };
-    match report_id {
+
+    if let Some(mouse_report) = mouse_report {
+        if payload_could_be_report(payload, mouse_report.report_id) {
+            return match boot_mouse_report(frame, mouse_report.report_id) {
+                Ok(_) => InputReportClass::MouseReport,
+                Err(error) => InputReportClass::ProtocolError(error),
+            };
+        }
+    }
+
+    match keyboard_report_id {
         Some(expected) => {
             let Some((&actual, rest)) = payload.split_first() else {
                 return InputReportClass::ProtocolError(ProtocolError::Truncated);
@@ -407,11 +446,54 @@ pub fn classify_input_report(
     }
 }
 
+pub fn decode_mouse_probe(
+    raw: &[u8],
+    mouse_report: MouseReport,
+    quirks: DeviceQuirks,
+) -> Result<Option<BootMouseReport>, ProtocolError> {
+    if quirks.bogus_irq && raw.len() >= 2 && raw[0] == 0xff && raw[1] == 0xff {
+        return Ok(None);
+    }
+    let frame = InputFrame::parse(raw)?;
+    match frame {
+        InputFrame::Reset => Ok(None),
+        frame @ InputFrame::Report(_) => boot_mouse_report(frame, mouse_report.report_id).map(Some),
+    }
+}
+
+pub fn encode_mouse_event(report: BootMouseReport) -> [u8; MOUSE_EVENT_BYTES] {
+    [
+        report.buttons.bits(),
+        report.x_delta as u8,
+        report.y_delta as u8,
+    ]
+}
+
+pub fn decode_mouse_event(raw: &[u8]) -> Option<BootMouseReport> {
+    if raw.len() == MOUSE_EVENT_BYTES {
+        Some(BootMouseReport {
+            buttons: MouseButtons::from_bits(raw[0]),
+            x_delta: raw[1] as i8,
+            y_delta: raw[2] as i8,
+        })
+    } else {
+        None
+    }
+}
+
+fn payload_could_be_report(payload: &[u8], report_id: Option<u8>) -> bool {
+    match report_id {
+        Some(expected) => payload.first().copied() == Some(expected),
+        None => payload.len() == BOOT_MOUSE_REPORT_BYTES,
+    }
+}
+
 const fn no_input_probe() -> InputProbe {
     InputProbe {
         event_count: 0,
         first_pressed_usage: None,
         first_pressed_ascii: None,
+        caps_lock_toggle: false,
         pressed_ascii: [0; MAX_PRESSED_ASCII_BYTES],
         pressed_ascii_len: 0,
         pressed_terminal: [0; MAX_PRESSED_TERMINAL_BYTES],
@@ -422,12 +504,16 @@ const fn no_input_probe() -> InputProbe {
 fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
     let mut first_pressed_usage = None;
     let mut first_pressed_ascii = None;
+    let mut caps_lock_toggle = false;
     let mut pressed_ascii = [0u8; MAX_PRESSED_ASCII_BYTES];
     let mut pressed_ascii_len = 0;
     let mut pressed_terminal = [0u8; MAX_PRESSED_TERMINAL_BYTES];
     let mut pressed_terminal_len = 0;
     for event in events.as_slice() {
         if event.state == KeyState::Pressed {
+            if event.usage == 0x39 {
+                caps_lock_toggle = true;
+            }
             let ascii = event.symbol.ascii();
             if first_pressed_usage.is_none() {
                 first_pressed_usage = Some(event.usage);
@@ -452,6 +538,7 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
         event_count: events.len(),
         first_pressed_usage,
         first_pressed_ascii,
+        caps_lock_toggle,
         pressed_ascii,
         pressed_ascii_len,
         pressed_terminal,
@@ -462,7 +549,7 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kumo_i2c_hid::{GicInterrupt, GpioInterrupt};
+    use kumo_i2c_hid::{GicInterrupt, GpioInterrupt, MouseButtons, MouseReport};
 
     fn probe(
         event_count: usize,
@@ -494,6 +581,7 @@ mod tests {
             event_count,
             first_pressed_usage,
             first_pressed_ascii,
+            caps_lock_toggle: false,
             pressed_ascii,
             pressed_ascii_len: ascii.len(),
             pressed_terminal,
@@ -619,9 +707,106 @@ mod tests {
     }
 
     #[test]
+    fn classifies_known_mouse_reports_without_treating_them_as_keyboard_errors() {
+        let quirks = DeviceQuirks::default();
+        assert_eq!(
+            classify_input_report_with_mouse(
+                &[5, 0, 0x01, 0x05, 0xfb],
+                None,
+                Some(MouseReport { report_id: None }),
+                quirks
+            ),
+            InputReportClass::MouseReport
+        );
+        let mouse = MouseReport { report_id: Some(9) };
+        assert_eq!(
+            classify_input_report_with_mouse(
+                &[6, 0, 9, 0x01, 0x05, 0xfb],
+                Some(8),
+                Some(mouse),
+                quirks
+            ),
+            InputReportClass::MouseReport
+        );
+        assert_eq!(
+            classify_input_report_with_mouse(
+                &[6, 0, 7, 0x01, 0x05, 0xfb],
+                Some(8),
+                Some(mouse),
+                quirks
+            ),
+            InputReportClass::ForeignReportId { report_id: 7 }
+        );
+        assert_eq!(
+            classify_input_report_with_mouse(&[5, 0, 9, 0x01, 0x05], Some(8), Some(mouse), quirks),
+            InputReportClass::ProtocolError(ProtocolError::NotBootMouseReport)
+        );
+    }
+
+    #[test]
+    fn decodes_mouse_probe_without_touching_the_channel() {
+        let quirks = DeviceQuirks::default();
+        let report = BootMouseReport {
+            buttons: MouseButtons::from_bits(MouseButtons::LEFT | MouseButtons::MIDDLE),
+            x_delta: 5,
+            y_delta: -5,
+        };
+        assert_eq!(
+            decode_mouse_probe(
+                &[6, 0, 9, MouseButtons::LEFT | MouseButtons::MIDDLE, 5, 0xfb],
+                MouseReport { report_id: Some(9) },
+                quirks
+            ),
+            Ok(Some(report))
+        );
+        assert_eq!(
+            decode_mouse_probe(
+                &[5, 0, MouseButtons::RIGHT, 0xff, 1],
+                MouseReport { report_id: None },
+                quirks
+            ),
+            Ok(Some(BootMouseReport {
+                buttons: MouseButtons::from_bits(MouseButtons::RIGHT),
+                x_delta: -1,
+                y_delta: 1,
+            }))
+        );
+        assert_eq!(
+            decode_mouse_probe(&[0, 0], MouseReport { report_id: Some(9) }, quirks),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_mouse_probe(
+                &[0xff, 0xff],
+                MouseReport { report_id: Some(9) },
+                DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0)
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn mouse_events_encode_as_fixed_three_byte_ipc_records() {
+        let report = BootMouseReport {
+            buttons: MouseButtons::from_bits(MouseButtons::LEFT | MouseButtons::RIGHT | 0x80),
+            x_delta: -2,
+            y_delta: 127,
+        };
+        let encoded = encode_mouse_event(report);
+        assert_eq!(
+            encoded,
+            [MouseButtons::LEFT | MouseButtons::RIGHT, 0xfe, 0x7f]
+        );
+        assert_eq!(decode_mouse_event(&encoded), Some(report));
+        assert_eq!(decode_mouse_event(&encoded[..2]), None);
+        assert_eq!(decode_mouse_event(&[0, 0, 0, 0]), None);
+    }
+
+    #[test]
     fn input_report_stats_count_classes_and_bound_summary_cadence() {
         let mut stats = InputReportStats::new();
         stats.record_class(InputReportClass::KeyboardReport);
+        stats.record_class(InputReportClass::MouseReport);
         stats.record_class(InputReportClass::ForeignReportId { report_id: 2 });
         stats.record_class(InputReportClass::ProtocolError(
             ProtocolError::InvalidInputLength,
@@ -629,15 +814,20 @@ mod tests {
         stats.record_decode_error(DecodeError::Rollover);
         stats.record_forwarded_ascii();
         stats.record_forwarded_ascii();
+        stats.record_forwarded_mouse();
         stats.record_keyboard_write_drop();
+        stats.record_mouse_write_drop();
 
-        assert_eq!(stats.frames, 3);
+        assert_eq!(stats.frames, 4);
         assert_eq!(stats.keyboard_reports, 1);
+        assert_eq!(stats.mouse_reports, 1);
         assert_eq!(stats.foreign_report_ids, 1);
         assert_eq!(stats.protocol_errors, 1);
         assert_eq!(stats.decode_errors, 1);
         assert_eq!(stats.forwarded_ascii, 2);
+        assert_eq!(stats.forwarded_mouse, 1);
         assert_eq!(stats.keyboard_write_drops, 1);
+        assert_eq!(stats.mouse_write_drops, 1);
         assert_eq!(stats.last_report_id, Some(2));
         assert_eq!(
             stats.last_protocol_error,
@@ -728,18 +918,23 @@ mod tests {
     fn keeps_first_pressed_probe_fields_while_collecting_later_ascii() {
         let raw = [10, 0, 0, 0, 0x39, 0x04, 0, 0, 0, 0];
         let input = decode_input_probe(&raw, None).unwrap();
-        assert_eq!(input, probe(2, Some(0x39), None, b"a"));
+        let mut expected = probe(2, Some(0x39), None, b"a");
+        expected.caps_lock_toggle = true;
+        assert_eq!(input, expected);
         assert_eq!(input.pressed_ascii(), b"a");
         assert_eq!(input.pressed_terminal_bytes(), b"a");
     }
 
     #[test]
-    fn decodes_hid_delete_usage_as_terminal_delete_byte() {
+    fn decodes_hid_delete_usage_as_terminal_delete_sequence() {
         let raw = [10, 0, 0, 0, 0x4c, 0, 0, 0, 0, 0];
         let input = decode_input_probe(&raw, None).unwrap();
-        assert_eq!(input, probe(1, Some(0x4c), Some(0x7f), &[0x7f]));
-        assert_eq!(input.pressed_ascii(), &[0x7f]);
-        assert_eq!(input.pressed_terminal_bytes(), &[0x7f]);
+        assert_eq!(
+            input,
+            probe_with_terminal(1, Some(0x4c), None, &[], b"\x1b[3~")
+        );
+        assert_eq!(input.pressed_ascii(), &[]);
+        assert_eq!(input.pressed_terminal_bytes(), b"\x1b[3~");
     }
 
     #[test]
