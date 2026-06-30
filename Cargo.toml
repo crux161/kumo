@@ -12,6 +12,7 @@ members = [
     "lib/kumo-hid",
     "lib/kumo-i2c-hid",
     "lib/kumo-ipc",
+    "lib/kumo-pdc",
     "lib/kumo-vfs",
     "lib/kumo-xhci",
     "tools/stage-a-smoke",
@@ -50,6 +51,7 @@ kumo-hal = { path = "hal/kumo-hal", default-features = false }
 kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
 kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }
 kumo-ipc = { path = "lib/kumo-ipc" }
+kumo-pdc = { path = "lib/kumo-pdc" }
 
 [profile.release]
 codegen-units = 1

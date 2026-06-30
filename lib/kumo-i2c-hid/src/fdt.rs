@@ -5,6 +5,7 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_DEPTH: usize = 32;
+pub const MAX_I2C_HID_DEVICES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GicInterrupt {
@@ -31,6 +32,94 @@ pub struct GpioInterrupt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HidDeviceKind {
+    Keyboard,
+    Touchpad,
+    Unknown,
+}
+
+impl HidDeviceKind {
+    const fn from_node_name(name: &[u8]) -> Self {
+        if starts_with(name, b"keyboard@") {
+            Self::Keyboard
+        } else if starts_with(name, b"touchpad@") {
+            Self::Touchpad
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HidDeviceTopology {
+    pub kind: HidDeviceKind,
+    pub i2c_address: u8,
+    pub hid_descriptor_register: u16,
+    pub interrupt: GpioInterrupt,
+}
+
+impl HidDeviceTopology {
+    const EMPTY: Self = Self {
+        kind: HidDeviceKind::Unknown,
+        i2c_address: 0,
+        hid_descriptor_register: 0,
+        interrupt: GpioInterrupt {
+            controller_phandle: 0,
+            pin: 0,
+            flags: 0,
+        },
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct I2cHidBusTopology {
+    pub controller_mmio_base: u64,
+    pub controller_mmio_length: u64,
+    pub controller_interrupt: GicInterrupt,
+    pub bus_frequency_hz: u32,
+    devices: [HidDeviceTopology; MAX_I2C_HID_DEVICES],
+    device_count: usize,
+}
+
+impl I2cHidBusTopology {
+    pub fn devices(&self) -> &[HidDeviceTopology] {
+        &self.devices[..self.device_count]
+    }
+
+    fn push(&mut self, device: HidDeviceTopology) -> bool {
+        if self.device_count == self.devices.len() {
+            return false;
+        }
+        self.devices[self.device_count] = device;
+        self.device_count += 1;
+        true
+    }
+
+    fn same_controller(self, other: Self) -> bool {
+        self.controller_mmio_base == other.controller_mmio_base
+            && self.controller_mmio_length == other.controller_mmio_length
+            && self.controller_interrupt == other.controller_interrupt
+            && self.bus_frequency_hz == other.bus_frequency_hz
+    }
+
+    pub fn keyboard(self) -> Option<KeyboardTopology> {
+        let keyboard = self
+            .devices()
+            .iter()
+            .find(|device| device.kind == HidDeviceKind::Keyboard)?;
+        Some(KeyboardTopology {
+            controller_mmio_base: self.controller_mmio_base,
+            controller_mmio_length: self.controller_mmio_length,
+            controller_interrupt: self.controller_interrupt,
+            bus_frequency_hz: self.bus_frequency_hz,
+            i2c_address: keyboard.i2c_address,
+            hid_descriptor_register: keyboard.hid_descriptor_register,
+            keyboard_interrupt: keyboard.interrupt,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardTopology {
     pub controller_mmio_base: u64,
     pub controller_mmio_length: u64,
@@ -43,7 +132,7 @@ pub struct KeyboardTopology {
 
 #[derive(Clone, Copy, Default)]
 struct Node {
-    name_keyboard: bool,
+    device_kind: Option<HidDeviceKind>,
     compatible_geni_i2c: bool,
     compatible_hid_i2c: bool,
     reg: [u32; 4],
@@ -58,7 +147,21 @@ struct Node {
     has_hid_descriptor_register: bool,
 }
 
+pub fn discover_i2c_hid_bus(dtb: &[u8]) -> Option<I2cHidBusTopology> {
+    parse(dtb).and_then(|topology| {
+        if topology.device_count == 0 {
+            None
+        } else {
+            Some(topology)
+        }
+    })
+}
+
 pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
+    discover_i2c_hid_bus(dtb)?.keyboard()
+}
+
+fn parse(dtb: &[u8]) -> Option<I2cHidBusTopology> {
     if be32(dtb, 0)? != FDT_MAGIC {
         return None;
     }
@@ -73,6 +176,7 @@ pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
     let mut stack = [Node::default(); MAX_DEPTH];
     let mut depth = 0usize;
     let mut cursor = 0usize;
+    let mut topology: Option<I2cHidBusTopology> = None;
     while cursor < structures.len() {
         let token = be32(structures, cursor)?;
         cursor += 4;
@@ -88,7 +192,7 @@ pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
                     + cursor;
                 let name = structures.get(cursor..end)?;
                 stack[depth] = Node {
-                    name_keyboard: name.starts_with(b"keyboard@"),
+                    device_kind: Some(HidDeviceKind::from_node_name(name)),
                     ..Node::default()
                 };
                 depth += 1;
@@ -99,9 +203,16 @@ pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
                     return None;
                 }
                 let node = stack[depth - 1];
-                if node.name_keyboard && node.compatible_hid_i2c && depth >= 2 {
-                    if let Some(topology) = topology(&stack[depth - 2], &node) {
-                        return Some(topology);
+                if node.compatible_hid_i2c && depth >= 2 {
+                    let mut controller = bus_topology(&stack[depth - 2])?;
+                    let device = hid_device_topology(&node)?;
+                    if let Some(topology) = topology.as_mut() {
+                        if topology.same_controller(controller) {
+                            let _ = topology.push(device);
+                        }
+                    } else {
+                        let _ = controller.push(device);
+                        topology = Some(controller);
                     }
                 }
                 depth -= 1;
@@ -123,23 +234,18 @@ pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
             _ => return None,
         }
     }
-    None
+    topology
 }
 
-fn topology(controller: &Node, keyboard: &Node) -> Option<KeyboardTopology> {
+fn bus_topology(controller: &Node) -> Option<I2cHidBusTopology> {
     if !controller.compatible_geni_i2c
         || controller.reg_len < 4
         || controller.interrupts_len < 3
         || !controller.has_clock_frequency
-        || keyboard.reg_len < 1
-        || keyboard.interrupts_extended_len < 3
-        || !keyboard.has_hid_descriptor_register
-        || keyboard.reg[0] > 0x7f
-        || keyboard.hid_descriptor_register > u16::MAX as u32
     {
         return None;
     }
-    Some(KeyboardTopology {
+    Some(I2cHidBusTopology {
         controller_mmio_base: cells64(controller.reg[0], controller.reg[1]),
         controller_mmio_length: cells64(controller.reg[2], controller.reg[3]),
         controller_interrupt: GicInterrupt {
@@ -148,12 +254,28 @@ fn topology(controller: &Node, keyboard: &Node) -> Option<KeyboardTopology> {
             flags: controller.interrupts[2],
         },
         bus_frequency_hz: controller.clock_frequency,
-        i2c_address: keyboard.reg[0] as u8,
-        hid_descriptor_register: keyboard.hid_descriptor_register as u16,
-        keyboard_interrupt: GpioInterrupt {
-            controller_phandle: keyboard.interrupts_extended[0],
-            pin: keyboard.interrupts_extended[1],
-            flags: keyboard.interrupts_extended[2],
+        devices: [HidDeviceTopology::EMPTY; MAX_I2C_HID_DEVICES],
+        device_count: 0,
+    })
+}
+
+fn hid_device_topology(device: &Node) -> Option<HidDeviceTopology> {
+    if device.reg_len < 1
+        || device.interrupts_extended_len < 3
+        || !device.has_hid_descriptor_register
+        || device.reg[0] > 0x7f
+        || device.hid_descriptor_register > u16::MAX as u32
+    {
+        return None;
+    }
+    Some(HidDeviceTopology {
+        kind: device.device_kind.unwrap_or(HidDeviceKind::Unknown),
+        i2c_address: device.reg[0] as u8,
+        hid_descriptor_register: device.hid_descriptor_register as u16,
+        interrupt: GpioInterrupt {
+            controller_phandle: device.interrupts_extended[0],
+            pin: device.interrupts_extended[1],
+            flags: device.interrupts_extended[2],
         },
     })
 }
@@ -203,6 +325,20 @@ fn string_list_contains(mut value: &[u8], expected: &[u8]) -> bool {
     value == expected
 }
 
+const fn starts_with(value: &[u8], prefix: &[u8]) -> bool {
+    if prefix.len() > value.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < prefix.len() {
+        if value[index] != prefix[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 fn property_name(strings: &[u8], offset: usize) -> Option<&[u8]> {
     let rest = strings.get(offset..)?;
     let end = rest.iter().position(|byte| *byte == 0)?;
@@ -228,6 +364,36 @@ mod tests {
     use super::*;
 
     const X13S_DTB: &[u8] = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+
+    #[test]
+    fn discovers_the_real_x13s_i2c21_hid_bus_children() {
+        let topology = discover_i2c_hid_bus(X13S_DTB).expect("X13s i2c21 HID bus");
+        assert_eq!(topology.controller_mmio_base, 0x0089_4000);
+        assert_eq!(topology.controller_mmio_length, 0x4000);
+        assert_eq!(topology.controller_interrupt.number, 0x24b);
+        assert_eq!(topology.controller_interrupt.global_id(), Some(0x26b));
+        assert_eq!(topology.bus_frequency_hz, 400_000);
+
+        let devices = topology.devices();
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[0].kind, HidDeviceKind::Touchpad);
+        assert_eq!(devices[0].i2c_address, 0x15);
+        assert_eq!(devices[0].hid_descriptor_register, 1);
+        assert_eq!(devices[0].interrupt.pin, 182);
+        assert_eq!(devices[0].interrupt.flags, 8);
+
+        assert_eq!(devices[1].kind, HidDeviceKind::Touchpad);
+        assert_eq!(devices[1].i2c_address, 0x2c);
+        assert_eq!(devices[1].hid_descriptor_register, 0x20);
+        assert_eq!(devices[1].interrupt.pin, 182);
+        assert_eq!(devices[1].interrupt.flags, 8);
+
+        assert_eq!(devices[2].kind, HidDeviceKind::Keyboard);
+        assert_eq!(devices[2].i2c_address, 0x68);
+        assert_eq!(devices[2].hid_descriptor_register, 1);
+        assert_eq!(devices[2].interrupt.pin, 104);
+        assert_eq!(devices[2].interrupt.flags, 8);
+    }
 
     #[test]
     fn discovers_the_real_x13s_internal_keyboard_path() {

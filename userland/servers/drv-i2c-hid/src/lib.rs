@@ -18,6 +18,101 @@ pub const MAX_PRESSED_TERMINAL_BYTES: usize = REPORT_KEYS * MAX_TERMINAL_BYTES;
 pub const ELAN_VENDOR_ID: u16 = 0x04f3;
 pub const SOFT_FAILURE_LOG_LIMIT: u32 = 4;
 pub const INPUT_REPORT_STATS_LOG_LIMIT: u32 = 8;
+pub const INPUT_REPORT_STATS_FIRST_LOG_FRAME: u32 = 8;
+pub const IRQ_TICK_LOG_LIMIT: u32 = 8;
+pub const RAW_FRAME_LOG_LIMIT: u32 = 2;
+pub const NONEMPTY_FRAME_LOG_LIMIT: u32 = 8;
+pub const RESET_STORM_YIELD_AFTER: u32 = 8;
+pub const RESET_STORM_YIELD_EVERY: u32 = 8;
+pub const RESET_STORM_YIELD_NS: u64 = 1_000_000;
+pub const STARTUP_MILESTONE_COUNT: usize = 13;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupMilestone {
+    ConfigOk,
+    ChannelsOk,
+    MmioMapped,
+    GeniReady,
+    HidDescriptorOk,
+    SetPowerDone,
+    PowerSettleDone,
+    ResetBegin,
+    ResetDone,
+    AttentionCreated,
+    ResetSyncDone,
+    ReportDescriptorOk,
+    Ready,
+}
+
+impl StartupMilestone {
+    const fn index(self) -> usize {
+        match self {
+            Self::ConfigOk => 0,
+            Self::ChannelsOk => 1,
+            Self::MmioMapped => 2,
+            Self::GeniReady => 3,
+            Self::HidDescriptorOk => 4,
+            Self::SetPowerDone => 5,
+            Self::PowerSettleDone => 6,
+            Self::ResetBegin => 7,
+            Self::ResetDone => 8,
+            Self::AttentionCreated => 9,
+            Self::ResetSyncDone => 10,
+            Self::ReportDescriptorOk => 11,
+            Self::Ready => 12,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupLatencyTrace {
+    start_ns: u64,
+    marks_ns: [u64; STARTUP_MILESTONE_COUNT],
+    seen: u16,
+}
+
+impl StartupLatencyTrace {
+    pub const fn new(start_ns: u64) -> Self {
+        Self {
+            start_ns,
+            marks_ns: [0; STARTUP_MILESTONE_COUNT],
+            seen: 0,
+        }
+    }
+
+    pub const fn start_ns(self) -> u64 {
+        self.start_ns
+    }
+
+    pub fn record(&mut self, milestone: StartupMilestone, now_ns: u64) {
+        let index = milestone.index();
+        self.marks_ns[index] = now_ns;
+        self.seen |= 1u16 << index;
+    }
+
+    pub fn elapsed_ns(self, milestone: StartupMilestone) -> Option<u64> {
+        let index = milestone.index();
+        if self.seen & (1u16 << index) == 0 {
+            return None;
+        }
+        Some(self.marks_ns[index].saturating_sub(self.start_ns))
+    }
+
+    pub fn span_ns(self, start: StartupMilestone, end: StartupMilestone) -> Option<u64> {
+        let start_index = start.index();
+        let end_index = end.index();
+        if self.seen & (1u16 << start_index) == 0 || self.seen & (1u16 << end_index) == 0 {
+            return None;
+        }
+        Some(self.marks_ns[end_index].saturating_sub(self.marks_ns[start_index]))
+    }
+}
+
+impl Default for StartupLatencyTrace {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -160,7 +255,62 @@ fn bump(counter: &mut u32) {
 }
 
 pub fn should_log_input_report_stats(frames: u32, already_logged: u32) -> bool {
-    already_logged < INPUT_REPORT_STATS_LOG_LIMIT && frames != 0 && frames.is_power_of_two()
+    already_logged < INPUT_REPORT_STATS_LOG_LIMIT
+        && frames >= INPUT_REPORT_STATS_FIRST_LOG_FRAME
+        && frames.is_power_of_two()
+}
+
+pub fn should_log_input_report_stats_snapshot(
+    stats: &InputReportStats,
+    already_logged: u32,
+) -> bool {
+    let has_actionable_activity = stats.keyboard_reports != 0
+        || stats.mouse_reports != 0
+        || stats.foreign_report_ids != 0
+        || stats.protocol_errors != 0
+        || stats.decode_errors != 0
+        || stats.forwarded_ascii != 0
+        || stats.forwarded_mouse != 0
+        || stats.keyboard_write_drops != 0
+        || stats.mouse_write_drops != 0;
+    has_actionable_activity && should_log_input_report_stats(stats.frames, already_logged)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResetStormGuard {
+    consecutive_reset_like: u32,
+}
+
+impl ResetStormGuard {
+    pub const fn new() -> Self {
+        Self {
+            consecutive_reset_like: 0,
+        }
+    }
+
+    pub const fn consecutive_reset_like(self) -> u32 {
+        self.consecutive_reset_like
+    }
+
+    pub fn record(&mut self, class: InputReportClass) -> bool {
+        match class {
+            InputReportClass::Reset | InputReportClass::BogusIrq => {
+                bump(&mut self.consecutive_reset_like);
+                self.consecutive_reset_like >= RESET_STORM_YIELD_AFTER
+                    && self.consecutive_reset_like % RESET_STORM_YIELD_EVERY == 0
+            }
+            _ => {
+                self.consecutive_reset_like = 0;
+                false
+            }
+        }
+    }
+}
+
+impl Default for ResetStormGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A bounded soft-failure diagnostic: it lets the first `SOFT_FAILURE_LOG_LIMIT` recoverable
@@ -835,13 +985,66 @@ mod tests {
         );
         assert_eq!(stats.last_decode_error, Some(DecodeError::Rollover));
 
-        assert!(should_log_input_report_stats(1, 0));
+        assert!(!should_log_input_report_stats(1, 0));
+        assert!(should_log_input_report_stats(
+            INPUT_REPORT_STATS_FIRST_LOG_FRAME,
+            0
+        ));
         assert!(should_log_input_report_stats(128, 7));
         assert!(!should_log_input_report_stats(3, 0));
         assert!(!should_log_input_report_stats(
             256,
             INPUT_REPORT_STATS_LOG_LIMIT
         ));
+
+        let mut reset_only = InputReportStats::new();
+        for _ in 0..INPUT_REPORT_STATS_FIRST_LOG_FRAME {
+            reset_only.record_class(InputReportClass::Reset);
+        }
+        assert!(!should_log_input_report_stats_snapshot(&reset_only, 0));
+
+        let mut active = InputReportStats::new();
+        for _ in 1..INPUT_REPORT_STATS_FIRST_LOG_FRAME {
+            active.record_class(InputReportClass::Reset);
+        }
+        active.record_class(InputReportClass::KeyboardReport);
+        assert!(should_log_input_report_stats_snapshot(&active, 0));
+    }
+
+    #[test]
+    fn reset_storm_guard_yields_periodically_and_resets_on_activity() {
+        let mut guard = ResetStormGuard::new();
+        for _ in 1..RESET_STORM_YIELD_AFTER {
+            assert!(!guard.record(InputReportClass::Reset));
+        }
+        assert!(guard.record(InputReportClass::Reset));
+        assert_eq!(guard.consecutive_reset_like(), RESET_STORM_YIELD_AFTER);
+        assert!(!guard.record(InputReportClass::Reset));
+
+        assert!(!guard.record(InputReportClass::KeyboardReport));
+        assert_eq!(guard.consecutive_reset_like(), 0);
+    }
+
+    #[test]
+    fn startup_latency_trace_records_elapsed_and_span_without_allocations() {
+        let mut trace = StartupLatencyTrace::new(1_000);
+
+        assert_eq!(trace.start_ns(), 1_000);
+        assert_eq!(trace.elapsed_ns(StartupMilestone::ConfigOk), None);
+        assert_eq!(
+            trace.span_ns(StartupMilestone::ConfigOk, StartupMilestone::Ready),
+            None
+        );
+
+        trace.record(StartupMilestone::ConfigOk, 1_250);
+        trace.record(StartupMilestone::Ready, 2_500);
+
+        assert_eq!(trace.elapsed_ns(StartupMilestone::ConfigOk), Some(250));
+        assert_eq!(trace.elapsed_ns(StartupMilestone::Ready), Some(1_500));
+        assert_eq!(
+            trace.span_ns(StartupMilestone::ConfigOk, StartupMilestone::Ready),
+            Some(1_250)
+        );
     }
 
     #[test]

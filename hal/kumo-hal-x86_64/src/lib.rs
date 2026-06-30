@@ -590,3 +590,26 @@ pub fn iommu_create_device_context(
 }
 
 pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) {}
+
+pub fn iommu_map_device_page(
+    _kind: u32,
+    _phys_base: u64,
+    _stream_id: u32,
+    _pgd_phys: u64,
+    _iova: u64,
+    _phys: u64,
+    _rights: u32,
+) -> bool {
+    false
+}
+
+pub fn iommu_unmap_device_range(
+    _kind: u32,
+    _phys_base: u64,
+    _stream_id: u32,
+    _pgd_phys: u64,
+    _iova: u64,
+    _len: u64,
+) -> bool {
+    false
+}

@@ -11,7 +11,7 @@ use kumo_abi::{
     WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
-use kumo_i2c_hid::{discover_keyboard, KeyboardTopology};
+use kumo_i2c_hid::{discover_i2c_hid_bus, HidDeviceKind, I2cHidBusTopology};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
@@ -107,8 +107,8 @@ fn log_fb_geometry(fb: &Framebuffer) {
 }
 
 /// Map the read-only DTB capability in two stages, validate its declared extent, and discover the
-/// internal keyboard before any device Resource is minted or any controller MMIO is touched.
-fn keyboard_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<KeyboardTopology> {
+/// X13s i2c21 HID children before any device Resource is minted or controller MMIO is touched.
+fn i2c_hid_bus_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<I2cHidBusTopology> {
     const PAGE_SIZE: u64 = 4096;
     const HEADER_VA: u64 = 0x0000_0000_3100_0000;
     const DTB_VA: u64 = 0x0000_0000_3200_0000;
@@ -149,7 +149,41 @@ fn keyboard_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<Keyboard
     }
     let bytes =
         unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
-    discover_keyboard(bytes)
+    discover_i2c_hid_bus(bytes)
+}
+
+fn log_i2c_hid_kind(kind: HidDeviceKind) {
+    match kind {
+        HidDeviceKind::Keyboard => log(b"keyboard"),
+        HidDeviceKind::Touchpad => log(b"touchpad"),
+        HidDeviceKind::Unknown => log(b"unknown"),
+    }
+}
+
+fn log_i2c_hid_topology(topology: &I2cHidBusTopology) {
+    let summary = sora::summarize_i2c_hid_bus(topology);
+    log(b"drv-i2c-hid: topology total=");
+    log_hex(summary.total as u64);
+    log(b" keyboard=");
+    log_hex(summary.keyboards as u64);
+    log(b" touchpad=");
+    log_hex(summary.touchpads as u64);
+    log(b" unknown=");
+    log_hex(summary.unknown as u64);
+    log(b"\n");
+    for device in topology.devices() {
+        log(b"drv-i2c-hid: child ");
+        log_i2c_hid_kind(device.kind);
+        log(b" addr=");
+        log_hex(device.i2c_address as u64);
+        log(b" hid=");
+        log_hex(device.hid_descriptor_register as u64);
+        log(b" gpio=");
+        log_hex(device.interrupt.pin as u64);
+        log(b" flags=");
+        log_hex(device.interrupt.flags as u64);
+        log(b"\n");
+    }
 }
 
 /// Locate a file in the initrd by path, returning its `(offset, len)`. Sora
@@ -815,110 +849,118 @@ extern "C" fn sora_main(
                     log_fb_geometry(&fb);
                 }
 
-                // Match the built-in keyboard from the read-only DTB capability before granting
-                // hardware authority. QEMU and unrelated framebuffer boards stop here without
-                // ever mapping or touching the X13s GENI address.
+                // Match HID children from the read-only DTB capability before granting hardware
+                // authority. QEMU and unrelated framebuffer boards stop here without ever mapping
+                // or touching the X13s GENI address. This slice logs all Linux-described children
+                // but still launches only the keyboard until shared-controller probing lands.
                 let topology =
-                    keyboard_topology_from_dtb(Handle(dtb_vmo as u32), bootinfo.platform.dtb);
-                if let Some(topology) = topology {
-                    match ProbeConfig::for_x13s(topology) {
-                        Ok(config) => {
-                            let device_resource = resource_create_child(
-                                res,
-                                config.mmio_base,
-                                config.mmio_length,
-                                kumo_abi::interrupt_authority_key(config.attention_irq),
-                                1,
-                            );
-                            let (sender, bootstrap) = channel_create_pair();
-                            if device_resource == u64::MAX {
-                                log(b"drv-i2c-hid: resource fail\n");
-                            } else if sender == u64::MAX || bootstrap == u64::MAX {
-                                log(b"drv-i2c-hid: channel fail\n");
-                            } else {
-                                let (mouse_reader, mouse_writer) = channel_create_pair();
-                                if mouse_reader == u64::MAX || mouse_writer == u64::MAX {
-                                    if mouse_reader != u64::MAX {
-                                        let _ = handle_close(Handle(mouse_reader as u32));
-                                    }
-                                    if mouse_writer != u64::MAX {
-                                        let _ = handle_close(Handle(mouse_writer as u32));
-                                    }
-                                    log(b"drv-i2c-hid: mouse channel fail\n");
+                    i2c_hid_bus_topology_from_dtb(Handle(dtb_vmo as u32), bootinfo.platform.dtb);
+                if let Some(bus_topology) = topology {
+                    log_i2c_hid_topology(&bus_topology);
+                    let topology = sora::select_i2c_hid_keyboard(bus_topology);
+                    if let Some(topology) = topology {
+                        match ProbeConfig::for_x13s(topology) {
+                            Ok(config) => {
+                                let device_resource = resource_create_child(
+                                    res,
+                                    config.mmio_base,
+                                    config.mmio_length,
+                                    kumo_abi::interrupt_authority_key(config.attention_irq),
+                                    1,
+                                );
+                                let (sender, bootstrap) = channel_create_pair();
+                                if device_resource == u64::MAX {
+                                    log(b"drv-i2c-hid: resource fail\n");
+                                } else if sender == u64::MAX || bootstrap == u64::MAX {
+                                    log(b"drv-i2c-hid: channel fail\n");
                                 } else {
-                                    let encoded = config.encode();
-                                    let sent = channel_write_with_handle(
-                                        Handle(sender as u32),
-                                        encoded.as_ptr(),
-                                        encoded.len(),
-                                        Handle(device_resource as u32),
-                                    );
-                                    let keyboard_writer = if sent == 0 {
-                                        handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER)
-                                    } else {
-                                        u64::MAX
-                                    };
-                                    let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
-                                    let keyboard_sent = if sent == 0 && keyboard_writer != u64::MAX
-                                    {
-                                        channel_write_with_handle(
-                                            Handle(sender as u32),
-                                            &tag,
-                                            1,
-                                            Handle(keyboard_writer as u32),
-                                        )
-                                    } else if sent == 0 {
-                                        Errno::BadHandle.status()
-                                    } else {
-                                        Errno::Ok.status()
-                                    };
-                                    let mouse_tag = drv_i2c_hid::MOUSE_BOOTSTRAP_TAG;
-                                    let mouse_sent = if keyboard_sent == 0 {
-                                        channel_write_with_handle(
-                                            Handle(sender as u32),
-                                            &mouse_tag,
-                                            1,
-                                            Handle(mouse_writer as u32),
-                                        )
-                                    } else {
-                                        Errno::Ok.status()
-                                    };
-                                    if sent != 0 {
-                                        let _ = handle_close(Handle(mouse_reader as u32));
-                                        let _ = handle_close(Handle(mouse_writer as u32));
-                                        log(b"drv-i2c-hid: bootstrap send fail\n");
-                                    } else if keyboard_sent != 0 {
-                                        let _ = handle_close(Handle(mouse_reader as u32));
-                                        let _ = handle_close(Handle(mouse_writer as u32));
-                                        if keyboard_writer != u64::MAX {
-                                            let _ = handle_close(Handle(keyboard_writer as u32));
+                                    let (mouse_reader, mouse_writer) = channel_create_pair();
+                                    if mouse_reader == u64::MAX || mouse_writer == u64::MAX {
+                                        if mouse_reader != u64::MAX {
+                                            let _ = handle_close(Handle(mouse_reader as u32));
                                         }
-                                        log(b"drv-i2c-hid: keyboard bootstrap fail\n");
-                                    } else if mouse_sent != 0 {
-                                        let _ = handle_close(Handle(mouse_reader as u32));
-                                        let _ = handle_close(Handle(mouse_writer as u32));
-                                        log(b"drv-i2c-hid: mouse bootstrap fail\n");
-                                    } else if run_elf(
-                                        initrd,
-                                        kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
-                                        0,
-                                        bootstrap,
-                                        ProcessRunFlags::ASYNC.bits(),
-                                        b"drv-i2c-hid",
-                                    ) {
-                                        mouse_input = Some(Handle(mouse_reader as u32));
-                                        log(b"drv-i2c-hid: run ok\n");
+                                        if mouse_writer != u64::MAX {
+                                            let _ = handle_close(Handle(mouse_writer as u32));
+                                        }
+                                        log(b"drv-i2c-hid: mouse channel fail\n");
                                     } else {
-                                        let _ = handle_close(Handle(mouse_reader as u32));
-                                        log(b"drv-i2c-hid: run fail\n");
+                                        let encoded = config.encode();
+                                        let sent = channel_write_with_handle(
+                                            Handle(sender as u32),
+                                            encoded.as_ptr(),
+                                            encoded.len(),
+                                            Handle(device_resource as u32),
+                                        );
+                                        let keyboard_writer = if sent == 0 {
+                                            handle_duplicate(kbd, Rights::WRITE | Rights::TRANSFER)
+                                        } else {
+                                            u64::MAX
+                                        };
+                                        let tag = drv_i2c_hid::KEYBOARD_BOOTSTRAP_TAG;
+                                        let keyboard_sent =
+                                            if sent == 0 && keyboard_writer != u64::MAX {
+                                                channel_write_with_handle(
+                                                    Handle(sender as u32),
+                                                    &tag,
+                                                    1,
+                                                    Handle(keyboard_writer as u32),
+                                                )
+                                            } else if sent == 0 {
+                                                Errno::BadHandle.status()
+                                            } else {
+                                                Errno::Ok.status()
+                                            };
+                                        let mouse_tag = drv_i2c_hid::MOUSE_BOOTSTRAP_TAG;
+                                        let mouse_sent = if keyboard_sent == 0 {
+                                            channel_write_with_handle(
+                                                Handle(sender as u32),
+                                                &mouse_tag,
+                                                1,
+                                                Handle(mouse_writer as u32),
+                                            )
+                                        } else {
+                                            Errno::Ok.status()
+                                        };
+                                        if sent != 0 {
+                                            let _ = handle_close(Handle(mouse_reader as u32));
+                                            let _ = handle_close(Handle(mouse_writer as u32));
+                                            log(b"drv-i2c-hid: bootstrap send fail\n");
+                                        } else if keyboard_sent != 0 {
+                                            let _ = handle_close(Handle(mouse_reader as u32));
+                                            let _ = handle_close(Handle(mouse_writer as u32));
+                                            if keyboard_writer != u64::MAX {
+                                                let _ =
+                                                    handle_close(Handle(keyboard_writer as u32));
+                                            }
+                                            log(b"drv-i2c-hid: keyboard bootstrap fail\n");
+                                        } else if mouse_sent != 0 {
+                                            let _ = handle_close(Handle(mouse_reader as u32));
+                                            let _ = handle_close(Handle(mouse_writer as u32));
+                                            log(b"drv-i2c-hid: mouse bootstrap fail\n");
+                                        } else if run_elf(
+                                            initrd,
+                                            kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
+                                            0,
+                                            bootstrap,
+                                            ProcessRunFlags::ASYNC.bits(),
+                                            b"drv-i2c-hid",
+                                        ) {
+                                            mouse_input = Some(Handle(mouse_reader as u32));
+                                            log(b"drv-i2c-hid: run ok\n");
+                                        } else {
+                                            let _ = handle_close(Handle(mouse_reader as u32));
+                                            log(b"drv-i2c-hid: run fail\n");
+                                        }
                                     }
                                 }
                             }
+                            Err(_) => log(b"drv-i2c-hid: topology invalid\n"),
                         }
-                        Err(_) => log(b"drv-i2c-hid: topology invalid\n"),
+                    } else {
+                        log(b"drv-i2c-hid: no matched keyboard\n");
                     }
                 } else {
-                    log(b"drv-i2c-hid: no matched keyboard\n");
+                    log(b"drv-i2c-hid: no matched i2c21 hid bus\n");
                 }
             }
         } else {

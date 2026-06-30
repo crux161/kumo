@@ -4,17 +4,18 @@
 
 use drv_i2c_hid::{
     bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report_with_mouse,
-    decode_mouse_probe, encode_mouse_event, should_log_input_report_stats, BoundedFailureLog,
-    DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass, InputReportStats,
-    ProbeConfig, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
-    MOUSE_BOOTSTRAP_TAG,
+    decode_mouse_probe, encode_mouse_event, should_log_input_report_stats_snapshot,
+    BoundedFailureLog, DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass,
+    InputReportStats, ProbeConfig, ResetStormGuard, StartupLatencyTrace, StartupMilestone,
+    IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
     find_boot_keyboard, find_boot_mouse, Command, Controller, HidDescriptor, PowerState, RegisterIo,
 };
 use kumo_rt::{
-    channel_read_with_handle, channel_write, debug_write, handle_close, handle_koid,
+    channel_read_with_handle, channel_write, clock_get, debug_write, handle_close, handle_koid,
     interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
     port_wait, resource_mint_mmio, timer_create, vmar_map,
 };
@@ -145,10 +146,109 @@ fn log_input_report_stats(stats: &InputReportStats) {
 }
 
 fn maybe_log_input_report_stats(stats: &InputReportStats, logged: &mut u32) {
-    if should_log_input_report_stats(stats.frames, *logged) {
+    if should_log_input_report_stats_snapshot(stats, *logged) {
         *logged = logged.saturating_add(1);
         log_input_report_stats(stats);
     }
+}
+
+fn log_optional_hex(value: Option<u64>) {
+    match value {
+        Some(ns) => {
+            log(b"0x");
+            log_hex_inline(ns);
+        }
+        None => log(b"none"),
+    }
+}
+
+fn log_startup_line(
+    trace: StartupLatencyTrace,
+    label: &[u8],
+    milestone: StartupMilestone,
+    previous: Option<StartupMilestone>,
+) {
+    log(b"drv-i2c-hid: startup ");
+    log(label);
+    log(b" total=");
+    log_optional_hex(trace.elapsed_ns(milestone));
+    if let Some(previous) = previous {
+        log(b" step=");
+        log_optional_hex(trace.span_ns(previous, milestone));
+    }
+    log(b"\n");
+}
+
+fn log_startup_latency(trace: StartupLatencyTrace) {
+    log(b"drv-i2c-hid: startup-latency-ns begin\n");
+    log_startup_line(trace, b"config", StartupMilestone::ConfigOk, None);
+    log_startup_line(
+        trace,
+        b"channels",
+        StartupMilestone::ChannelsOk,
+        Some(StartupMilestone::ConfigOk),
+    );
+    log_startup_line(
+        trace,
+        b"mmio",
+        StartupMilestone::MmioMapped,
+        Some(StartupMilestone::ChannelsOk),
+    );
+    log_startup_line(
+        trace,
+        b"geni",
+        StartupMilestone::GeniReady,
+        Some(StartupMilestone::MmioMapped),
+    );
+    log_startup_line(
+        trace,
+        b"hdesc",
+        StartupMilestone::HidDescriptorOk,
+        Some(StartupMilestone::GeniReady),
+    );
+    log_startup_line(
+        trace,
+        b"set-power",
+        StartupMilestone::SetPowerDone,
+        Some(StartupMilestone::HidDescriptorOk),
+    );
+    log_startup_line(
+        trace,
+        b"settle",
+        StartupMilestone::PowerSettleDone,
+        Some(StartupMilestone::SetPowerDone),
+    );
+    log_startup_line(
+        trace,
+        b"reset-write",
+        StartupMilestone::ResetDone,
+        Some(StartupMilestone::ResetBegin),
+    );
+    log_startup_line(
+        trace,
+        b"irq-create",
+        StartupMilestone::AttentionCreated,
+        Some(StartupMilestone::ResetDone),
+    );
+    log_startup_line(
+        trace,
+        b"reset-sync",
+        StartupMilestone::ResetSyncDone,
+        Some(StartupMilestone::AttentionCreated),
+    );
+    log_startup_line(
+        trace,
+        b"rdesc",
+        StartupMilestone::ReportDescriptorOk,
+        Some(StartupMilestone::ResetSyncDone),
+    );
+    log_startup_line(
+        trace,
+        b"ready",
+        StartupMilestone::Ready,
+        Some(StartupMilestone::ReportDescriptorOk),
+    );
+    log(b"drv-i2c-hid: startup-latency-ns end\n");
 }
 
 fn sleep_ns(delay_ns: u64) -> bool {
@@ -209,6 +309,7 @@ extern "C" fn main(
     _arg6: u64,
     _arg7: u64,
 ) -> ! {
+    let mut startup_trace = StartupLatencyTrace::new(clock_get());
     log(b"drv-i2c-hid: starting\n");
     let bootstrap = Handle(bootstrap_channel as u32);
     let mut raw = [0u8; ProbeConfig::BYTES];
@@ -225,6 +326,7 @@ extern "C" fn main(
         }
     };
     log(b"drv-i2c-hid: config ok\n");
+    startup_trace.record(StartupMilestone::ConfigOk, clock_get());
 
     let mut tag = [0u8; 1];
     let (received, keyboard_raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
@@ -242,6 +344,7 @@ extern "C" fn main(
     }
     let mouse_channel = Handle(mouse_raw as u32);
     log(b"drv-i2c-hid: mouse channel ok\n");
+    startup_trace.record(StartupMilestone::ChannelsOk, clock_get());
 
     let resource = Handle(resource_raw as u32);
     let vmo_raw = resource_mint_mmio(resource, config.mmio_base, config.mmio_length);
@@ -262,6 +365,7 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: MMIO mapped\n");
+    startup_trace.record(StartupMilestone::MmioMapped, clock_get());
 
     let registers = MmioRegisters {
         base: MMIO_VA as *mut u8,
@@ -274,6 +378,7 @@ extern "C" fn main(
         }
     };
     log(b"drv-i2c-hid: GENI FIFO ready\n");
+    startup_trace.record(StartupMilestone::GeniReady, clock_get());
 
     let mut raw_descriptor = [0u8; HidDescriptor::BYTES];
     if let Err(error) = controller.write_read(
@@ -293,6 +398,7 @@ extern "C" fn main(
     };
 
     log(b"drv-i2c-hid: descriptor ok\n");
+    startup_trace.record(StartupMilestone::HidDescriptorOk, clock_get());
     log_hex(b"drv-i2c-hid: vendor=0x", descriptor.vendor_id as u64);
     log_hex(b"drv-i2c-hid: product=0x", descriptor.product_id as u64);
     log_hex(
@@ -337,13 +443,16 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: set-power done\n");
+    startup_trace.record(StartupMilestone::SetPowerDone, clock_get());
     log(b"drv-i2c-hid: power-on settle begin\n");
     if !sleep_ns(POWER_ON_SETTLE_NS) {
         log(b"drv-i2c-hid: power-on settle wait failed\n");
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: power-on settle done\n");
+    startup_trace.record(StartupMilestone::PowerSettleDone, clock_get());
     log(b"drv-i2c-hid: reset begin\n");
+    startup_trace.record(StartupMilestone::ResetBegin, clock_get());
     if let Err(error) = controller.write(
         config.i2c_address,
         &Command::reset(descriptor.command_register),
@@ -352,6 +461,7 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: reset done\n");
+    startup_trace.record(StartupMilestone::ResetDone, clock_get());
     // ELAN i2c-hid needs the attention line as falling-edge, not the DT's level-low — Linux
     // FORCE_TRIGGER_FALLING. Re-encode the same GPIO pin with the falling-edge flag; the authority
     // key is pin-based, so the granted Resource window still covers it. — CORVUS
@@ -373,6 +483,7 @@ extern "C" fn main(
     }
     let attention_irq = Handle(attention_raw as u32);
     log(b"drv-i2c-hid: attention interrupt created\n");
+    startup_trace.record(StartupMilestone::AttentionCreated, clock_get());
     let mut input_frame = [0u8; MAX_INPUT_FRAME_BYTES];
     log(b"drv-i2c-hid: reset sync wait begin\n");
     if wait_attention_or_timeout(attention_irq, RESET_ACK_TIMEOUT_NS) {
@@ -394,6 +505,7 @@ extern "C" fn main(
     } else {
         log(b"drv-i2c-hid: reset sync timeout\n");
     }
+    startup_trace.record(StartupMilestone::ResetSyncDone, clock_get());
     if !quirks.no_wakeup_after_reset {
         if let Err(error) = controller.write(
             config.i2c_address,
@@ -444,6 +556,7 @@ extern "C" fn main(
     };
 
     log(b"drv-i2c-hid: report descriptor ok\n");
+    startup_trace.record(StartupMilestone::ReportDescriptorOk, clock_get());
     let led_output_report_id = kumo_i2c_hid::find_led_output_report_id(&report_descriptor);
     let mouse = find_boot_mouse(&report_descriptor[..report_descriptor_len]).ok();
     if let Some(id) = led_output_report_id {
@@ -462,9 +575,11 @@ extern "C" fn main(
     }
 
     let mut input_decoder = InputProbeDecoder::new();
+    startup_trace.record(StartupMilestone::Ready, clock_get());
+    log_startup_latency(startup_trace);
     log(b"drv-i2c-hid: attention interrupt ready\n");
-    // Keep CORVUS's bounded frame dump on the interrupt path: now each line proves a real GPIO-104
-    // delivery survived mask -> drain -> complete, not just a timer poll. — KESTREL
+    // Keep a small boot sample on the interrupt path without pushing startup timing off-screen.
+    // Non-empty frames and forwarded keys still log after the boot sample expires. — KESTREL
     let mut interrupts: u32 = 0;
     let mut shown_nonempty: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
@@ -472,6 +587,7 @@ extern "C" fn main(
     let mut input_decode_failures = BoundedFailureLog::new();
     let mut input_stats = InputReportStats::new();
     let mut input_stats_logs: u32 = 0;
+    let mut reset_storm = ResetStormGuard::new();
     let mut caps_lock = false;
     loop {
         if interrupt_wait(attention_irq) == 0 {
@@ -493,7 +609,7 @@ extern "C" fn main(
         }
         // Ground-truth instrumentation. `irq tick` proves the attention line delivered and the
         // length word shows whether the device supplied a reset/empty frame or report bytes.
-        // `frame=` dumps the first 16 non-empty reports. — KESTREL
+        // Keep this short: the startup latency block is now the primary boot capture.
         interrupts = interrupts.wrapping_add(1);
         let frame_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
         let report_class = classify_input_report_with_mouse(
@@ -503,27 +619,29 @@ extern "C" fn main(
             quirks,
         );
         input_stats.record_class(report_class);
-        // Log EVERY delivery (bounded to 64), not just the first 3, so a keypress that produces a
-        // NEW `irq tick` line is visible — this is what distinguishes "no attention IRQ on keypress"
-        // (device not reporting) from "IRQ fires but read is empty". Completion suppresses idle
-        // redelivery, so at idle this is silent; press a key and watch for a new line. — CORVUS
-        if interrupts <= 64 {
+        let reset_storm_yield = reset_storm.record(report_class);
+        if interrupts <= IRQ_TICK_LOG_LIMIT {
             log_hex(b"drv-i2c-hid: irq tick len=0x", frame_len as u64);
         }
-        // Dump the raw bytes of the first few reads even when empty, so we can see exactly what a
-        // len=0 read contains on the wire. — CORVUS
-        if interrupts <= 4 {
+        if interrupts <= RAW_FRAME_LOG_LIMIT {
             log_frame(
                 b"drv-i2c-hid: raw= ",
                 &input_frame[..input_frame_len.min(16)],
             );
         }
-        if frame_len != 0 && shown_nonempty < 16 {
+        if frame_len != 0 && shown_nonempty < NONEMPTY_FRAME_LOG_LIMIT {
             shown_nonempty += 1;
             log_frame(
                 b"drv-i2c-hid: frame= ",
                 &input_frame[..input_frame_len.min(16)],
             );
+        }
+        if report_class == InputReportClass::Reset || report_class == InputReportClass::BogusIrq {
+            maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
+            if reset_storm_yield {
+                let _ = sleep_ns(RESET_STORM_YIELD_NS);
+            }
+            continue;
         }
         if report_class == InputReportClass::MouseReport {
             if let Some(mouse_report) = mouse {

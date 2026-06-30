@@ -48,6 +48,7 @@ enum WaitTarget {
     Channel(KoId),
     Port(KoId),
     Interrupt(KoId),
+    DeviceCtx(KoId),
 }
 
 /// One parked thread and the typed object it blocked on.
@@ -650,6 +651,10 @@ pub fn park_current_child_on_interrupt(interrupt_koid: KoId) {
     park_current_child_on(WaitTarget::Interrupt(interrupt_koid));
 }
 
+pub fn park_current_child_on_device_ctx_fault(ctx_koid: KoId) {
+    park_current_child_on(WaitTarget::DeviceCtx(ctx_koid));
+}
+
 fn park_current_child_on(target: WaitTarget) {
     let p = sched_ptr();
     let switch = unsafe {
@@ -693,8 +698,15 @@ pub fn wake_child_waiting_on_interrupt(interrupt_koid: KoId) {
     wake_child_waiting_on(WaitTarget::Interrupt(interrupt_koid));
 }
 
+pub fn wake_child_waiting_on_device_ctx_fault(ctx_koid: KoId) {
+    wake_child_waiting_on(WaitTarget::DeviceCtx(ctx_koid));
+}
+
 fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
-    matches!(target, WaitTarget::Port(_) | WaitTarget::Interrupt(_))
+    matches!(
+        target,
+        WaitTarget::Port(_) | WaitTarget::Interrupt(_) | WaitTarget::DeviceCtx(_)
+    )
 }
 
 fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
@@ -947,6 +959,7 @@ mod tests {
         assert_eq!(q.waiter_for(WaitTarget::Port(KoId(43))), None);
         // The channel/port distinction is part of the key.
         assert_eq!(q.waiter_for(WaitTarget::Channel(KoId(42))), None);
+        assert_eq!(q.waiter_for(WaitTarget::DeviceCtx(KoId(42))), None);
     }
 
     #[test]
@@ -995,6 +1008,9 @@ mod tests {
         ))));
         assert!(wait_target_needs_safe_reschedule(WaitTarget::Interrupt(
             KoId(43)
+        )));
+        assert!(wait_target_needs_safe_reschedule(WaitTarget::DeviceCtx(
+            KoId(45)
         )));
         assert!(!wait_target_needs_safe_reschedule(WaitTarget::Channel(
             KoId(44)

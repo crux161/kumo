@@ -107,6 +107,7 @@ impl Signals {
     pub const TERMINATED: Self = Self(1 << 3);
     pub const IRQ: Self = Self(1 << 4);
     pub const TIMER: Self = Self(1 << 5);
+    pub const DEVICE_FAULT: Self = Self(1 << 6);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -145,5 +146,14 @@ mod tests {
         assert!(rw.contains(Rights::READ));
         assert!(rw.contains(Rights::WRITE));
         assert!(!rw.contains(Rights::MAP));
+    }
+
+    #[test]
+    fn signal_masks_are_composable() {
+        let ready_or_fault = Signals::READABLE | Signals::DEVICE_FAULT;
+        assert!(ready_or_fault.contains(Signals::READABLE));
+        assert!(ready_or_fault.contains(Signals::DEVICE_FAULT));
+        assert!(!ready_or_fault.contains(Signals::TIMER));
+        assert_eq!(Signals::DEVICE_FAULT.bits(), 1 << 6);
     }
 }

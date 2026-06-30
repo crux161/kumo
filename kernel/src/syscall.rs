@@ -1,10 +1,11 @@
 use alloc::vec::Vec;
+use core::mem;
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
 use kumo_abi::{
-    decode_tlmm_gpio_irq, interrupt_authority_key, BootInfo, Errno, Handle, KoId, ObjectKind,
-    Rights, Status, Syscall,
+    decode_tlmm_gpio_irq, interrupt_authority_key, sys::DeviceCtxInfo, BootInfo, Errno, Handle,
+    KoId, ObjectKind, Rights, Status, Syscall,
 };
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
@@ -252,6 +253,12 @@ struct DeviceVmarMapping {
     len: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeviceCtxFault {
+    ctx_koid: KoId,
+    info: DeviceCtxInfo,
+}
+
 /// A Resource grant: the holder may mint VMOs from this MMIO range and create
 /// Interrupt objects for IRQs in `[irq_base, irq_base + irq_count)`.
 #[derive(Clone, Copy, Debug)]
@@ -397,6 +404,7 @@ pub struct SyscallEngine {
     iommus: Vec<IoMmuBinding>,
     device_ctxs: Vec<DeviceCtxBinding>,
     device_vmar_mappings: Vec<DeviceVmarMapping>,
+    device_ctx_faults: Vec<DeviceCtxFault>,
 }
 
 impl SyscallEngine {
@@ -415,6 +423,7 @@ impl SyscallEngine {
             iommus: Vec::new(),
             device_ctxs: Vec::new(),
             device_vmar_mappings: Vec::new(),
+            device_ctx_faults: Vec::new(),
         }
     }
 
@@ -579,6 +588,28 @@ impl SyscallEngine {
         }
     }
 
+    pub fn signal_device_ctx_fault(
+        &mut self,
+        ctx_koid: KoId,
+        fault_record: u64,
+        fault_addr: u64,
+    ) -> Result<(), Errno> {
+        if self.device_ctxs.iter().all(|ctx| ctx.koid != ctx_koid) {
+            return Err(Errno::BadHandle);
+        }
+        self.device_ctx_faults.push(DeviceCtxFault {
+            ctx_koid,
+            info: DeviceCtxInfo {
+                fault_record,
+                fault_addr,
+            },
+        });
+        #[cfg(target_os = "none")]
+        crate::user_thread::wake_child_waiting_on_device_ctx_fault(ctx_koid);
+        self.signal_ports(ctx_koid, kumo_abi::Signals::DEVICE_FAULT);
+        Ok(())
+    }
+
     /// Bind an object to a port. When an event occurs on that object,
     /// the port is signalled with the corresponding signals and the object koid as source.
     pub fn port_bind(&mut self, port_koid: KoId, object_koid: KoId) {
@@ -589,6 +620,13 @@ impl SyscallEngine {
             .any(|timer| timer.koid == object_koid && timer.fired)
         {
             self.signal_ports(object_koid, kumo_abi::Signals::TIMER);
+        }
+        if self
+            .device_ctx_faults
+            .iter()
+            .any(|fault| fault.ctx_koid == object_koid)
+        {
+            self.signal_ports(object_koid, kumo_abi::Signals::DEVICE_FAULT);
         }
     }
 
@@ -685,6 +723,108 @@ impl SyscallEngine {
 
     fn vmo_entry_by_koid_mut(&mut self, koid: KoId) -> Option<&mut VmoEntry> {
         self.vmos.iter_mut().find(|entry| entry.koid == koid)
+    }
+
+    fn device_dma_phys_page(&mut self, vmo_koid: KoId, vmo_offset: u64) -> Result<u64, Errno> {
+        let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
+            return Err(Errno::BadHandle);
+        };
+        match vmo_entry.vmo.backing() {
+            crate::mm::VmoBacking::PhysicalRam { phys_base }
+            | crate::mm::VmoBacking::Mmio { phys_base } => {
+                phys_base.checked_add(vmo_offset).ok_or(Errno::InvalidArgs)
+            }
+            crate::mm::VmoBacking::Anonymous => {
+                let Some(boot) = self.boot_info else {
+                    return Err(Errno::Internal);
+                };
+                let page_index = (vmo_offset / crate::mm::PAGE_SIZE) as usize;
+                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                    return Err(Errno::BadHandle);
+                };
+                ensure_anonymous_frame(vmo_entry, page_index, &boot)
+            }
+        }
+    }
+
+    fn device_vmar_backend_map(
+        &mut self,
+        ctx: DeviceCtxBinding,
+        iommu: IoMmuBinding,
+        vmo_koid: KoId,
+        vmo_offset: u64,
+        len: u64,
+        iova: u64,
+        rights: Rights,
+    ) -> Result<(), Errno> {
+        let pages = len / crate::mm::PAGE_SIZE;
+        let mut page = 0;
+        while page < pages {
+            let off = page * crate::mm::PAGE_SIZE;
+            let phys = match self.device_dma_phys_page(vmo_koid, vmo_offset + off) {
+                Ok(phys) => phys,
+                Err(errno) => {
+                    self.device_vmar_backend_unmap_prefix(ctx, iommu, iova, page);
+                    return Err(errno);
+                }
+            };
+            if !kumo_hal::active::iommu_map_device_page(
+                iommu.iommu_kind,
+                iommu.phys_base,
+                ctx.stream_id,
+                ctx.pgd_phys,
+                iova + off,
+                phys,
+                rights.bits(),
+            ) {
+                self.device_vmar_backend_unmap_prefix(ctx, iommu, iova, page);
+                return Err(Errno::NotSupported);
+            }
+            page += 1;
+        }
+        Ok(())
+    }
+
+    fn device_vmar_backend_unmap_prefix(
+        &self,
+        ctx: DeviceCtxBinding,
+        iommu: IoMmuBinding,
+        iova: u64,
+        pages: u64,
+    ) {
+        if pages == 0 {
+            return;
+        }
+        let len = pages * crate::mm::PAGE_SIZE;
+        let _ = kumo_hal::active::iommu_unmap_device_range(
+            iommu.iommu_kind,
+            iommu.phys_base,
+            ctx.stream_id,
+            ctx.pgd_phys,
+            iova,
+            len,
+        );
+    }
+
+    fn device_vmar_backend_unmap_range(
+        &self,
+        ctx: DeviceCtxBinding,
+        iommu: IoMmuBinding,
+        iova: u64,
+        len: u64,
+    ) -> Result<(), Errno> {
+        if kumo_hal::active::iommu_unmap_device_range(
+            iommu.iommu_kind,
+            iommu.phys_base,
+            ctx.stream_id,
+            ctx.pgd_phys,
+            iova,
+            len,
+        ) {
+            Ok(())
+        } else {
+            Err(Errno::NotSupported)
+        }
     }
 
     /// Write a single mapping into an already-live page table tree.
@@ -1926,11 +2066,25 @@ impl SyscallEngine {
                         Ok(e) => e,
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                     };
-                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                let Some(ctx_binding) = self
+                    .device_ctxs
+                    .iter()
+                    .find(|b| b.koid == ctx_entry.koid)
+                    .copied()
+                else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
-                }
+                };
+                let Some(iommu_binding) = self
+                    .iommus
+                    .iter()
+                    .find(|b| b.koid == ctx_binding.iommu_koid)
+                    .copied()
+                else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
                 if !device_dma_rights_valid(rights)
                     || len == 0
+                    || iova_hint == 0
                     || !crate::mm::is_page_aligned(vmo_offset)
                     || !crate::mm::is_page_aligned(iova_hint)
                     || !crate::mm::is_page_aligned(len)
@@ -1950,6 +2104,7 @@ impl SyscallEngine {
                 let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_entry.koid) else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
+                let vmo_koid = vmo_entry.koid;
                 if vmo_offset
                     .checked_add(len)
                     .is_none_or(|end| end > vmo_entry.vmo.len())
@@ -1961,6 +2116,18 @@ impl SyscallEngine {
                         && ranges_overlap(mapping.iova, mapping.len, iova_hint, len)
                 }) {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                if let Err(errno) = self.device_vmar_backend_map(
+                    ctx_binding,
+                    iommu_binding,
+                    vmo_koid,
+                    vmo_offset,
+                    len,
+                    iova_hint,
+                    rights,
+                ) {
+                    return KernelCallResult::Status(errno.status());
                 }
 
                 self.device_vmar_mappings.push(DeviceVmarMapping {
@@ -1979,10 +2146,24 @@ impl SyscallEngine {
                         Ok(e) => e,
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                     };
-                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                let Some(ctx_binding) = self
+                    .device_ctxs
+                    .iter()
+                    .find(|b| b.koid == ctx_entry.koid)
+                    .copied()
+                else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
-                }
+                };
+                let Some(iommu_binding) = self
+                    .iommus
+                    .iter()
+                    .find(|b| b.koid == ctx_binding.iommu_koid)
+                    .copied()
+                else {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                };
                 if len == 0
+                    || iova == 0
                     || !crate::mm::is_page_aligned(iova)
                     || !crate::mm::is_page_aligned(len)
                     || iova.checked_add(len).is_none()
@@ -1996,12 +2177,72 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
 
+                if let Err(errno) =
+                    self.device_vmar_backend_unmap_range(ctx_binding, iommu_binding, iova, len)
+                {
+                    return KernelCallResult::Status(errno.status());
+                }
+
                 self.device_vmar_mappings.remove(index);
                 KernelCallResult::Status(Errno::Ok.status())
             }
-            KernelCall::DeviceCtxWaitFault { .. }
-            | KernelCall::DeviceCtxInfo { .. }
-            | KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
+            KernelCall::DeviceCtxWaitFault { ctx } => {
+                let ctx_entry =
+                    match process
+                        .handles()
+                        .require(ctx, ObjectKind::DeviceCtx, Rights::WAIT)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                }
+                if self
+                    .device_ctx_faults
+                    .iter()
+                    .any(|fault| fault.ctx_koid == ctx_entry.koid)
+                {
+                    KernelCallResult::Status(Errno::Ok.status())
+                } else {
+                    KernelCallResult::Status(Errno::ShouldWait.status())
+                }
+            }
+            KernelCall::DeviceCtxInfo {
+                ctx,
+                user_ptr,
+                user_len,
+            } => {
+                let ctx_entry =
+                    match process
+                        .handles()
+                        .require(ctx, ObjectKind::DeviceCtx, Rights::WAIT)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
+                    };
+                if self.device_ctxs.iter().all(|b| b.koid != ctx_entry.koid) {
+                    return KernelCallResult::Status(Errno::BadHandle.status());
+                }
+                let info_len = mem::size_of::<DeviceCtxInfo>() as u64;
+                if user_ptr == 0 || user_len < info_len || user_ptr.checked_add(info_len).is_none()
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                let Some(index) = self
+                    .device_ctx_faults
+                    .iter()
+                    .position(|fault| fault.ctx_koid == ctx_entry.koid)
+                else {
+                    return KernelCallResult::Status(Errno::ShouldWait.status());
+                };
+                let fault = self.device_ctx_faults.remove(index);
+                unsafe {
+                    core::ptr::write_unaligned(user_ptr as *mut DeviceCtxInfo, fault.info);
+                }
+                KernelCallResult::Status(Errno::Ok.status())
+            }
+            KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }
 
@@ -2098,7 +2339,18 @@ mod tests {
         }
     }
 
-    fn create_test_device_ctx(engine: &mut SyscallEngine, process: &mut Process) -> Handle {
+    fn create_test_device_ctx_with_kind(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        iommu_kind: u32,
+    ) -> Handle {
+        let iommu = engine.objects.create(ObjectKind::IoMmu);
+        let iommu_koid = iommu.koid();
+        engine.iommus.push(IoMmuBinding {
+            koid: iommu_koid,
+            iommu_kind,
+            phys_base: 0x1500_0000,
+        });
         let object = engine.objects.create(ObjectKind::DeviceCtx);
         let koid = object.koid();
         let handle = process
@@ -2110,22 +2362,30 @@ mod tests {
             .unwrap();
         engine.device_ctxs.push(DeviceCtxBinding {
             koid,
-            iommu_koid: KoId(0),
+            iommu_koid,
             stream_id: 1,
-            pgd_phys: 0,
+            pgd_phys: 0x8000_0000,
         });
         handle
     }
 
-    fn create_anonymous_vmo(
+    fn create_test_device_ctx(engine: &mut SyscallEngine, process: &mut Process) -> Handle {
+        create_test_device_ctx_with_kind(engine, process, kumo_abi::sys::IoMmuKind::SmmuV3 as u32)
+    }
+
+    fn create_physical_vmo(
         engine: &mut SyscallEngine,
         process: &mut Process,
+        phys_base: u64,
         size: u64,
     ) -> Handle {
-        match engine.dispatch(process, KernelCall::VmoCreate { size }) {
-            KernelCallResult::Handle(handle) => handle,
-            other => panic!("expected VMO handle, got {other:?}"),
-        }
+        engine
+            .root_vmo_create(
+                process,
+                crate::mm::Vmo::from_physical_range(phys_base, size).unwrap(),
+                Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -2350,7 +2610,12 @@ mod tests {
         let mut engine = SyscallEngine::new();
         let mut process = test_process(&mut engine);
         let ctx = create_test_device_ctx(&mut engine, &mut process);
-        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE * 2);
+        let vmo = create_physical_vmo(
+            &mut engine,
+            &mut process,
+            0x9000_0000,
+            crate::mm::PAGE_SIZE * 2,
+        );
 
         let first = engine.dispatch(
             &mut process,
@@ -2391,7 +2656,7 @@ mod tests {
         let mut engine = SyscallEngine::new();
         let mut process = test_process(&mut engine);
         let ctx = create_test_device_ctx(&mut engine, &mut process);
-        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE);
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9100_0000, crate::mm::PAGE_SIZE);
         let read_only = process.handles_mut().duplicate(vmo, Rights::READ).unwrap();
 
         let result = engine.dispatch(
@@ -2414,11 +2679,46 @@ mod tests {
     }
 
     #[test]
+    fn device_vmar_map_refuses_backend_rejection_without_recording() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx_with_kind(
+            &mut engine,
+            &mut process,
+            kumo_abi::sys::IoMmuKind::Virtio as u32,
+        );
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9300_0000, crate::mm::PAGE_SIZE);
+
+        let result = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset: 0,
+                len: crate::mm::PAGE_SIZE,
+                iova_hint: 0x7000_0000,
+                rights: Rights::READ,
+            },
+        );
+
+        assert_eq!(
+            result,
+            KernelCallResult::Status(Errno::NotSupported.status())
+        );
+        assert!(engine.device_vmar_mappings.is_empty());
+    }
+
+    #[test]
     fn device_vmar_unmap_requires_exact_record() {
         let mut engine = SyscallEngine::new();
         let mut process = test_process(&mut engine);
         let ctx = create_test_device_ctx(&mut engine, &mut process);
-        let vmo = create_anonymous_vmo(&mut engine, &mut process, crate::mm::PAGE_SIZE * 2);
+        let vmo = create_physical_vmo(
+            &mut engine,
+            &mut process,
+            0x9200_0000,
+            crate::mm::PAGE_SIZE * 2,
+        );
 
         let map = engine.dispatch(
             &mut process,
@@ -2470,6 +2770,185 @@ mod tests {
         assert_eq!(
             repeat,
             KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+    }
+
+    #[test]
+    fn device_vmar_unmap_refuses_backend_rejection_without_removing_record() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9400_0000, crate::mm::PAGE_SIZE);
+
+        let map = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarMap {
+                ctx,
+                vmo,
+                vmo_offset: 0,
+                len: crate::mm::PAGE_SIZE,
+                iova_hint: 0x8000_0000,
+                rights: Rights::READ,
+            },
+        );
+        assert_eq!(map, KernelCallResult::Status(Errno::Ok.status()));
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+
+        engine.iommus[0].iommu_kind = kumo_abi::sys::IoMmuKind::Virtio as u32;
+        let unmap = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceVmarUnmap {
+                ctx,
+                iova: 0x8000_0000,
+                len: crate::mm::PAGE_SIZE,
+            },
+        );
+
+        assert_eq!(
+            unmap,
+            KernelCallResult::Status(Errno::NotSupported.status())
+        );
+        assert_eq!(engine.device_vmar_mappings.len(), 1);
+    }
+
+    #[test]
+    fn device_ctx_fault_wait_and_info_drain_fifo_record() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let ctx_koid = process.handles().get(ctx).unwrap().koid;
+
+        let empty = engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx });
+        assert_eq!(empty, KernelCallResult::Status(Errno::ShouldWait.status()));
+
+        engine
+            .signal_device_ctx_fault(ctx_koid, 0xabc, 0x4000_1000)
+            .unwrap();
+        let ready = engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx });
+        assert_eq!(ready, KernelCallResult::Status(Errno::Ok.status()));
+
+        let mut info = DeviceCtxInfo {
+            fault_record: 0,
+            fault_addr: 0,
+        };
+        let read = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceCtxInfo {
+                ctx,
+                user_ptr: (&mut info as *mut DeviceCtxInfo) as u64,
+                user_len: mem::size_of::<DeviceCtxInfo>() as u64,
+            },
+        );
+        assert_eq!(read, KernelCallResult::Status(Errno::Ok.status()));
+        assert_eq!(
+            info,
+            DeviceCtxInfo {
+                fault_record: 0xabc,
+                fault_addr: 0x4000_1000,
+            }
+        );
+
+        let drained = engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx });
+        assert_eq!(
+            drained,
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+    }
+
+    #[test]
+    fn device_ctx_fault_signals_bound_and_late_bound_ports() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let ctx_koid = process.handles().get(ctx).unwrap().koid;
+        let watched = create_port(&mut engine, &mut process);
+        let late_bound = create_port(&mut engine, &mut process);
+
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: watched,
+                    object: ctx,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        engine
+            .signal_device_ctx_fault(ctx_koid, 0xfeed, 0x6000_0000)
+            .unwrap();
+
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: watched })
+        else {
+            panic!("expected device fault packet for bound port");
+        };
+        assert_eq!(packet.source, ctx_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::DEVICE_FAULT));
+
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: late_bound,
+                    object: ctx,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: late_bound })
+        else {
+            panic!("expected retained device fault packet for late-bound port");
+        };
+        assert_eq!(packet.source, ctx_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::DEVICE_FAULT));
+    }
+
+    #[test]
+    fn device_ctx_info_rejects_short_buffer_without_draining_fault() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let ctx_koid = process.handles().get(ctx).unwrap().koid;
+        engine
+            .signal_device_ctx_fault(ctx_koid, 0x1234, 0x5000_0000)
+            .unwrap();
+
+        let mut info = DeviceCtxInfo {
+            fault_record: 0,
+            fault_addr: 0,
+        };
+        let short = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceCtxInfo {
+                ctx,
+                user_ptr: (&mut info as *mut DeviceCtxInfo) as u64,
+                user_len: (mem::size_of::<DeviceCtxInfo>() - 1) as u64,
+            },
+        );
+        assert_eq!(short, KernelCallResult::Status(Errno::InvalidArgs.status()));
+
+        let ready = engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx });
+        assert_eq!(ready, KernelCallResult::Status(Errno::Ok.status()));
+    }
+
+    #[test]
+    fn device_ctx_fault_wait_requires_wait_right() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx(&mut engine, &mut process);
+        let map_only = process.handles_mut().duplicate(ctx, Rights::MAP).unwrap();
+
+        let result = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceCtxWaitFault { ctx: map_only },
+        );
+        assert_eq!(
+            result,
+            KernelCallResult::Status(Errno::AccessDenied.status())
         );
     }
 

@@ -607,6 +607,12 @@ enum ChildInterruptWaitOutcome {
     Done,
 }
 
+enum ChildDeviceCtxWaitOutcome {
+    Status(u64),
+    ShouldWait(KoId),
+    Done,
+}
+
 fn read_child_channel_without_borrow(
     process_koid: KoId,
     channel: Handle,
@@ -733,6 +739,46 @@ fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) ->
                 crate::user_thread::park_current_child_on_interrupt(wait_koid);
             }
             ChildInterruptWaitOutcome::Done => return 0,
+        }
+    }
+}
+
+fn wait_child_device_ctx_fault_without_borrow(process_koid: KoId, ctx: Handle) -> u64 {
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            let Some(child_ptr) = sora
+                .engine
+                .process_by_koid_mut(process_koid)
+                .map(|p| p as *mut Process)
+            else {
+                return ChildDeviceCtxWaitOutcome::Done;
+            };
+            let child = unsafe { &mut *child_ptr };
+            let wait_koid = child.handles().get(ctx).ok().map(|entry| entry.koid);
+
+            match sora
+                .engine
+                .dispatch(child, KernelCall::DeviceCtxWaitFault { ctx })
+            {
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    match wait_koid {
+                        Some(wait_koid) => ChildDeviceCtxWaitOutcome::ShouldWait(wait_koid),
+                        None => ChildDeviceCtxWaitOutcome::Status(status as u32 as u64),
+                    }
+                }
+                KernelCallResult::Status(status) => {
+                    ChildDeviceCtxWaitOutcome::Status(status as u32 as u64)
+                }
+                _ => ChildDeviceCtxWaitOutcome::Done,
+            }
+        });
+
+        match outcome {
+            ChildDeviceCtxWaitOutcome::Status(status) => return status,
+            ChildDeviceCtxWaitOutcome::ShouldWait(wait_koid) => {
+                crate::user_thread::park_current_child_on_device_ctx_fault(wait_koid);
+            }
+            ChildDeviceCtxWaitOutcome::Done => return u64::MAX,
         }
     }
 }
@@ -920,7 +966,9 @@ fn dispatch_object_syscall(
     num: u64,
     r: &mut [u64],
 ) -> bool {
-    if num == Syscall::HandleClose as u64 {
+    if num == Syscall::ClockGet as u64 {
+        r[0] = kumo_hal::active::monotonic_nanos();
+    } else if num == Syscall::HandleClose as u64 {
         let handle = Handle(r[0] as u32);
         match engine.dispatch(target, KernelCall::HandleClose { handle }) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
@@ -1226,6 +1274,11 @@ fn dispatch_object_syscall(
         let ctx = Handle(r[0] as u32);
         let user_ptr = r[1];
         let user_len = r[2];
+        let info_len = core::mem::size_of::<kumo_abi::sys::DeviceCtxInfo>() as u64;
+        if user_len < info_len || !user_range_ok(target, user_ptr, info_len) {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        }
         match engine.dispatch(
             target,
             KernelCall::DeviceCtxInfo {
@@ -1322,6 +1375,18 @@ extern "C" fn svc_hook(regs: *mut u64) {
             if cp_koid != sora_koid {
                 let interrupt = Handle(r[0] as u32);
                 r[0] = wait_child_interrupt_without_borrow(cp_koid, interrupt);
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+        }
+    }
+
+    if num == Syscall::DeviceCtxWaitFault as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                let ctx = Handle(r[0] as u32);
+                r[0] = wait_child_device_ctx_fault_without_borrow(cp_koid, ctx);
                 crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
@@ -2435,6 +2500,16 @@ mod tests {
         // returned u64::MAX for anything not hand-mirrored). Routing them through the one
         // shared list gives any process the full pure set — the point of the unification.
         let (mut engine, mut process) = engine_and_process();
+
+        let mut r = [0u64; 31];
+        r[0] = 0xdead_beef;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ClockGet as u64,
+            &mut r,
+        ));
+        assert_ne!(r[0], 0xdead_beef, "ClockGet should write a timestamp");
 
         let mut r = [0u64; 31];
         assert!(dispatch_object_syscall(

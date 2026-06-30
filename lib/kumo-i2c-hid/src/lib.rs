@@ -11,7 +11,10 @@ mod geni;
 mod protocol;
 mod report_descriptor;
 
-pub use fdt::{discover_keyboard, GicInterrupt, GpioInterrupt, KeyboardTopology};
+pub use fdt::{
+    discover_i2c_hid_bus, discover_keyboard, GicInterrupt, GpioInterrupt, HidDeviceKind,
+    HidDeviceTopology, I2cHidBusTopology, KeyboardTopology, MAX_I2C_HID_DEVICES,
+};
 pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{
     boot_keyboard_report, boot_mouse_report, BootMouseReport, Command, HidDescriptor, InputFrame,

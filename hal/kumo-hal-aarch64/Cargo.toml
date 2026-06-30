@@ -11,3 +11,4 @@ path = "src/lib.rs"
 [dependencies]
 # Vendored, no_std-patched QR generator for the on-screen TOWER diagnostic (see vendor/).
 qrcodegen = { path = "../../vendor/qrcodegen" }
+kumo-pdc = { workspace = true }

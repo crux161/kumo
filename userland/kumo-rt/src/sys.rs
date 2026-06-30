@@ -467,6 +467,17 @@ pub fn port_wait(_port: Handle) -> u64 {
     0
 }
 
+/// Read the kernel monotonic clock in nanoseconds.
+#[cfg(target_arch = "aarch64")]
+pub fn clock_get() -> u64 {
+    syscall(Syscall::ClockGet, 0, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn clock_get() -> u64 {
+    0
+}
+
 /// Create a one-shot timer that signals after `delay_ns` of monotonic time.
 /// The returned handle is waitable and can be bound to a `Port`.
 #[cfg(target_arch = "aarch64")]

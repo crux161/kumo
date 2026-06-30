@@ -39,6 +39,7 @@ const IRQ_NACK: u32 = 1 << 10;
 const IRQ_ERROR: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 13);
 const IRQ_RX: u32 = (1 << 26) | (1 << 27);
 const IRQ_TX: u32 = 1 << 30;
+const IRQ_ABORT_DONE: u32 = 1 << 5;
 const COMMON_IRQS: u32 = 0x7e | (3 << 22) | (3 << 24) | (3 << 28);
 
 pub trait RegisterIo {
@@ -269,6 +270,15 @@ impl<Io: RegisterIo> Controller<Io> {
     fn abort(&mut self) {
         self.io.write(register::TX_WATERMARK, 0);
         self.io.write(register::M_CMD_CTRL, 1 << 1);
+        for _ in 0..self.poll_limit {
+            let irq = self.io.read(register::M_IRQ_STATUS);
+            if irq != 0 {
+                self.io.write(register::M_IRQ_CLEAR, irq);
+            }
+            if irq & IRQ_ABORT_DONE != 0 {
+                break;
+            }
+        }
     }
 }
 
@@ -396,5 +406,23 @@ mod tests {
         );
         let fake = controller.into_inner();
         assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
+    }
+
+    #[test]
+    fn reports_abort_done_cleanly() {
+        let mut timeout = FakeRegisters::ready();
+        // Delay the abort done IRQ so it must be polled
+        timeout.irqs.push_back(0);
+        timeout.irqs.push_back(IRQ_ABORT_DONE);
+        let mut controller = Controller::new(timeout, SourceClock::Mhz19_2, 5).unwrap();
+
+        assert_eq!(
+            controller.write_read(0x68, &[1], &mut [0u8; 2]),
+            Err(GeniError::Timeout)
+        );
+        let fake = controller.into_inner();
+        assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
+        // Ensure the abort was polled and cleared
+        assert_eq!(fake.values[&register::M_IRQ_CLEAR], IRQ_ABORT_DONE);
     }
 }

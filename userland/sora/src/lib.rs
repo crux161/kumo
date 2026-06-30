@@ -2,7 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use kumo_abi::{Errno, Handle, Status};
-use kumo_i2c_hid::BootMouseReport;
+use kumo_i2c_hid::{BootMouseReport, HidDeviceKind, I2cHidBusTopology, KeyboardTopology};
 use kumo_ipc::{Message, MessageError};
 
 pub const SORA_NAME: &str = "Sora";
@@ -245,10 +245,37 @@ pub fn close_handles_except(
     all_closed
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct I2cHidBusSummary {
+    pub total: usize,
+    pub keyboards: usize,
+    pub touchpads: usize,
+    pub unknown: usize,
+}
+
+pub fn summarize_i2c_hid_bus(topology: &I2cHidBusTopology) -> I2cHidBusSummary {
+    let mut summary = I2cHidBusSummary::default();
+    for device in topology.devices() {
+        summary.total += 1;
+        match device.kind {
+            HidDeviceKind::Keyboard => summary.keyboards += 1,
+            HidDeviceKind::Touchpad => summary.touchpads += 1,
+            HidDeviceKind::Unknown => summary.unknown += 1,
+        }
+    }
+    summary
+}
+
+/// The current runtime can safely launch one HID-over-I2C child: the internal keyboard.
+/// Touchpad probing still needs shared-controller arbitration, so this policy remains explicit.
+pub fn select_i2c_hid_keyboard(topology: I2cHidBusTopology) -> Option<KeyboardTopology> {
+    topology.keyboard()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kumo_i2c_hid::{BootMouseReport, MouseButtons};
+    use kumo_i2c_hid::{discover_i2c_hid_bus, BootMouseReport, MouseButtons};
 
     #[test]
     fn root_logic_is_host_testable() {
@@ -354,6 +381,27 @@ mod tests {
         assert_eq!(pointer.position(), PointerPosition { x: 0, y: 0 });
         assert_eq!(pointer.buttons(), 0);
         assert_eq!(pointer.events(), 3);
+    }
+
+    #[test]
+    fn i2c_hid_policy_summarizes_bus_and_selects_keyboard_only() {
+        let dtb = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+        let topology = discover_i2c_hid_bus(dtb).expect("X13s i2c21 HID bus");
+
+        assert_eq!(
+            summarize_i2c_hid_bus(&topology),
+            I2cHidBusSummary {
+                total: 3,
+                keyboards: 1,
+                touchpads: 2,
+                unknown: 0,
+            }
+        );
+
+        let keyboard = select_i2c_hid_keyboard(topology).expect("keyboard child");
+        assert_eq!(keyboard.i2c_address, 0x68);
+        assert_eq!(keyboard.hid_descriptor_register, 1);
+        assert_eq!(keyboard.keyboard_interrupt.pin, 104);
     }
 
     #[test]
