@@ -12,7 +12,8 @@ use drv_i2c_hid::{
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
-    find_boot_keyboard, find_boot_mouse, Command, Controller, HidDescriptor, PowerState, RegisterIo,
+    find_boot_keyboard, find_boot_mouse, find_led_output_report, Command, Controller,
+    HidDescriptor, LedOutputReport, PowerState, RegisterIo,
 };
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, handle_close, handle_koid,
@@ -26,9 +27,20 @@ const MMIO_VA: u64 = 0x0000_0000_1100_0000;
 const POLL_LIMIT: usize = 1_000_000;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
+const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
+const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
 /// DT interrupt flag for IRQ_TYPE_EDGE_FALLING. ELAN i2c-hid needs the attention line treated as
 /// falling-edge (Linux FORCE_TRIGGER_FALLING), overriding the level-low (flag 8) the DT declares.
 const DT_IRQ_EDGE_FALLING: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LedSyncError {
+    NoCapsLockLed,
+    PayloadTooLong,
+    NoOutputPath,
+    Format,
+    Transfer,
+}
 
 struct MmioRegisters {
     base: *mut u8,
@@ -150,6 +162,52 @@ fn maybe_log_input_report_stats(stats: &InputReportStats, logged: &mut u32) {
         *logged = logged.saturating_add(1);
         log_input_report_stats(stats);
     }
+}
+
+fn send_caps_lock_led<R: RegisterIo>(
+    controller: &mut Controller<R>,
+    i2c_address: u8,
+    descriptor: HidDescriptor,
+    led_report: LedOutputReport,
+    caps_lock: bool,
+) -> Result<(), LedSyncError> {
+    let bit = led_report
+        .caps_lock_bit_offset
+        .ok_or(LedSyncError::NoCapsLockLed)? as usize;
+    let payload_len = led_report.payload_bytes;
+    if payload_len == 0 || payload_len > MAX_LED_OUTPUT_PAYLOAD_BYTES || bit / 8 >= payload_len {
+        return Err(LedSyncError::PayloadTooLong);
+    }
+
+    let mut payload = [0u8; MAX_LED_OUTPUT_PAYLOAD_BYTES];
+    if caps_lock {
+        payload[bit / 8] |= 1u8 << (bit % 8);
+    }
+
+    let mut transfer = [0u8; MAX_OUTPUT_REPORT_TRANSFER_BYTES];
+    let transfer_len = if descriptor.output_register != 0 && descriptor.max_output_length != 0 {
+        Command::plain_output_report(
+            descriptor.output_register,
+            led_report.report_id,
+            &payload[..payload_len],
+            &mut transfer,
+        )
+    } else if descriptor.command_register != 0 && descriptor.data_register != 0 {
+        Command::set_output_report(
+            descriptor.command_register,
+            descriptor.data_register,
+            led_report.report_id,
+            &payload[..payload_len],
+            &mut transfer,
+        )
+    } else {
+        return Err(LedSyncError::NoOutputPath);
+    }
+    .map_err(|_| LedSyncError::Format)?;
+
+    controller
+        .write(i2c_address, &transfer[..transfer_len])
+        .map_err(|_| LedSyncError::Transfer)
 }
 
 fn log_optional_hex(value: Option<u64>) {
@@ -557,12 +615,25 @@ extern "C" fn main(
 
     log(b"drv-i2c-hid: report descriptor ok\n");
     startup_trace.record(StartupMilestone::ReportDescriptorOk, clock_get());
-    let led_output_report_id = kumo_i2c_hid::find_led_output_report_id(&report_descriptor);
+    let led_output_report = find_led_output_report(&report_descriptor[..report_descriptor_len]);
     let mouse = find_boot_mouse(&report_descriptor[..report_descriptor_len]).ok();
-    if let Some(id) = led_output_report_id {
-        log_hex(b"drv-i2c-hid: led-output-report-id=0x", id as u64);
-    } else {
-        log(b"drv-i2c-hid: led-output-report-id=none\n");
+    match led_output_report {
+        Some(report) => {
+            if let Some(id) = report.report_id {
+                log_hex(b"drv-i2c-hid: led-output-report-id=0x", id as u64);
+            } else {
+                log(b"drv-i2c-hid: led-output-report-id=none\n");
+            }
+            log_hex(
+                b"drv-i2c-hid: led-output-bytes=0x",
+                report.payload_bytes as u64,
+            );
+            log_hex(
+                b"drv-i2c-hid: led-caps-bit=0x",
+                report.caps_lock_bit_offset.unwrap_or(0xffff) as u64,
+            );
+        }
+        None => log(b"drv-i2c-hid: led-output-report=none\n"),
     }
     match keyboard.report_id {
         Some(report_id) => log_hex(b"drv-i2c-hid: keyboard-report-id=0x", report_id as u64),
@@ -572,6 +643,18 @@ extern "C" fn main(
         Some(report_id) => log_hex(b"drv-i2c-hid: mouse-report-id=0x", report_id as u64),
         None if mouse.is_some() => log(b"drv-i2c-hid: mouse-report-id=none\n"),
         None => log(b"drv-i2c-hid: mouse-report=none\n"),
+    }
+    if let Some(report) = led_output_report {
+        match send_caps_lock_led(
+            &mut controller,
+            config.i2c_address,
+            descriptor,
+            report,
+            false,
+        ) {
+            Ok(()) => log(b"drv-i2c-hid: led-state sync off\n"),
+            Err(error) => log_hex(b"drv-i2c-hid: led-state sync error=0x", error as u64),
+        }
     }
 
     let mut input_decoder = InputProbeDecoder::new();
@@ -585,6 +668,7 @@ extern "C" fn main(
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut mouse_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
+    let mut led_sync_failures = BoundedFailureLog::new();
     let mut input_stats = InputReportStats::new();
     let mut input_stats_logs: u32 = 0;
     let mut reset_storm = ResetStormGuard::new();
@@ -697,63 +781,18 @@ extern "C" fn main(
         };
         if input.caps_lock_toggle {
             caps_lock = !caps_lock;
-            let report_id = led_output_report_id.or(keyboard.report_id);
-            let report_id_byte = report_id.unwrap_or(0);
-
-            let mut payload = [0u8; 8];
-            let mut len = 0;
-
-            if descriptor.output_register != 0 {
-                // Output Register Write:
-                // [OutRegLo, OutRegHi, LenLo, LenHi, (ReportID), Payload]
-                payload[len] = (descriptor.output_register & 0xff) as u8;
-                len += 1;
-                payload[len] = (descriptor.output_register >> 8) as u8;
-                len += 1;
-
-                let report_len: u16 = if report_id.is_some() { 5 } else { 4 };
-                payload[len] = (report_len & 0xff) as u8;
-                len += 1;
-                payload[len] = (report_len >> 8) as u8;
-                len += 1;
-
-                if let Some(id) = report_id {
-                    payload[len] = id;
-                    len += 1;
-                }
-                payload[len] = if caps_lock { 0x02 } else { 0x00 };
-                len += 1;
-                payload[len] = 0x00; // Second byte for extra LEDs like Mic Mute
-                len += 1;
-
-                let _ = controller.write(config.i2c_address, &payload[..len]);
-            } else {
-                // Fallback: Data Register + SET_REPORT
-                payload[len] = (descriptor.data_register & 0xff) as u8;
-                len += 1;
-                payload[len] = (descriptor.data_register >> 8) as u8;
-                len += 1;
-
-                let report_len: u16 = if report_id.is_some() { 5 } else { 4 };
-                payload[len] = (report_len & 0xff) as u8;
-                len += 1;
-                payload[len] = (report_len >> 8) as u8;
-                len += 1;
-
-                if let Some(id) = report_id {
-                    payload[len] = id;
-                    len += 1;
-                }
-                payload[len] = if caps_lock { 0x02 } else { 0x00 };
-                len += 1;
-                payload[len] = 0x00;
-                len += 1;
-
-                let _ = controller.write(config.i2c_address, &payload[..len]);
-                let _ = controller.write(
+            if let Some(report) = led_output_report {
+                if let Err(error) = send_caps_lock_led(
+                    &mut controller,
                     config.i2c_address,
-                    &kumo_i2c_hid::Command::set_report(descriptor.command_register, report_id_byte),
-                );
+                    descriptor,
+                    report,
+                    caps_lock,
+                ) {
+                    if led_sync_failures.record() {
+                        log_hex(b"drv-i2c-hid: led-state sync error=0x", error as u64);
+                    }
+                }
             }
         }
         // Only emit on real terminal keypress bytes; idle reports and non-byte keys stay silent so

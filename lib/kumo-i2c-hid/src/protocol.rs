@@ -10,6 +10,13 @@ pub enum ProtocolError {
     NotBootMouseReport,
 }
 
+/// Why formatting a host-to-device output report failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputReportError {
+    BufferTooSmall,
+    PayloadTooLong,
+}
+
 /// Bytes in a USB HID boot-mouse input report after any Report ID prefix.
 pub const BOOT_MOUSE_REPORT_BYTES: usize = 3;
 
@@ -193,7 +200,9 @@ pub struct Command;
 
 impl Command {
     const OPCODE_RESET: u8 = 0x01;
+    const OPCODE_SET_REPORT: u8 = 0x03;
     const OPCODE_SET_POWER: u8 = 0x08;
+    const REPORT_TYPE_OUTPUT: u8 = 0x02;
 
     /// `SET_POWER` with the given power state.
     pub fn set_power(command_register: u16, state: PowerState) -> [u8; 4] {
@@ -208,7 +217,48 @@ impl Command {
     /// `SET_REPORT` (Output).
     pub fn set_report(command_register: u16, report_id: u8) -> [u8; 4] {
         let [lo, hi] = command_register.to_le_bytes();
-        [lo, hi, (0x02 << 4) | (report_id & 0x0F), 0x03]
+        [
+            lo,
+            hi,
+            (Self::REPORT_TYPE_OUTPUT << 4) | (report_id & 0x0F),
+            Self::OPCODE_SET_REPORT,
+        ]
+    }
+
+    /// Linux-style plain OUTPUT report: output register, two-byte total report length, optional
+    /// Report ID, then payload bytes.
+    pub fn plain_output_report(
+        output_register: u16,
+        report_id: Option<u8>,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, OutputReportError> {
+        let mut len = push_word(out, 0, output_register)?;
+        len = format_report(out, len, report_id, payload)?;
+        Ok(len)
+    }
+
+    /// Linux-style SET_REPORT(Output): command register, encoded SET_REPORT, data register, then
+    /// the formatted report payload.
+    pub fn set_output_report(
+        command_register: u16,
+        data_register: u16,
+        report_id: Option<u8>,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, OutputReportError> {
+        let report_id_byte = report_id.unwrap_or(0);
+        let mut len = push_word(out, 0, command_register)?;
+        len = encode_report_command(
+            out,
+            len,
+            Self::OPCODE_SET_REPORT,
+            Self::REPORT_TYPE_OUTPUT,
+            report_id_byte,
+        )?;
+        len = push_word(out, len, data_register)?;
+        len = format_report(out, len, report_id, payload)?;
+        Ok(len)
     }
 
     fn encode(command_register: u16, report_id: u8, opcode: u8) -> [u8; 4] {
@@ -216,6 +266,60 @@ impl Command {
         // report_type is always 0 here, report_id < 0x0F → short form, no extended id byte.
         [lo, hi, report_id & 0x0F, opcode]
     }
+}
+
+fn format_report(
+    out: &mut [u8],
+    offset: usize,
+    report_id: Option<u8>,
+    payload: &[u8],
+) -> Result<usize, OutputReportError> {
+    let report_len = 2usize
+        .checked_add(if report_id.is_some() { 1 } else { 0 })
+        .and_then(|len| len.checked_add(payload.len()))
+        .filter(|len| *len <= u16::MAX as usize)
+        .ok_or(OutputReportError::PayloadTooLong)?;
+    let mut len = push_word(out, offset, report_len as u16)?;
+    if let Some(id) = report_id {
+        len = push_byte(out, len, id)?;
+    }
+    for &byte in payload {
+        len = push_byte(out, len, byte)?;
+    }
+    Ok(len)
+}
+
+fn encode_report_command(
+    out: &mut [u8],
+    offset: usize,
+    opcode: u8,
+    report_type: u8,
+    report_id: u8,
+) -> Result<usize, OutputReportError> {
+    let mut len = offset;
+    if report_id < 0x0f {
+        len = push_byte(out, len, (report_type << 4) | report_id)?;
+        len = push_byte(out, len, opcode)?;
+    } else {
+        len = push_byte(out, len, (report_type << 4) | 0x0f)?;
+        len = push_byte(out, len, opcode)?;
+        len = push_byte(out, len, report_id)?;
+    }
+    Ok(len)
+}
+
+fn push_word(out: &mut [u8], offset: usize, value: u16) -> Result<usize, OutputReportError> {
+    let [lo, hi] = value.to_le_bytes();
+    let len = push_byte(out, offset, lo)?;
+    push_byte(out, len, hi)
+}
+
+fn push_byte(out: &mut [u8], offset: usize, value: u8) -> Result<usize, OutputReportError> {
+    if offset >= out.len() {
+        return Err(OutputReportError::BufferTooSmall);
+    }
+    out[offset] = value;
+    Ok(offset + 1)
 }
 
 #[cfg(test)]
@@ -247,6 +351,41 @@ mod tests {
     #[test]
     fn command_register_address_is_little_endian() {
         assert_eq!(Command::reset(0x1234), [0x34, 0x12, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn plain_output_report_matches_linux_format_report_shape() {
+        let mut out = [0u8; 8];
+        let len = Command::plain_output_report(0x0025, Some(8), &[0x02], &mut out).unwrap();
+        assert_eq!(len, 6);
+        assert_eq!(&out[..len], &[0x25, 0x00, 0x04, 0x00, 0x08, 0x02]);
+
+        let len = Command::plain_output_report(0x0025, None, &[0x02], &mut out).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(&out[..len], &[0x25, 0x00, 0x03, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn set_output_report_matches_linux_command_envelope() {
+        let mut out = [0u8; 12];
+        let len = Command::set_output_report(0x0040, 0x0042, Some(8), &[0x02], &mut out).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(
+            &out[..len],
+            &[0x40, 0x00, 0x28, 0x03, 0x42, 0x00, 0x04, 0x00, 0x08, 0x02]
+        );
+    }
+
+    #[test]
+    fn set_output_report_uses_extended_report_id_encoding() {
+        let mut out = [0u8; 12];
+        let len =
+            Command::set_output_report(0x0040, 0x0042, Some(0x15), &[0x02], &mut out).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(
+            &out[..len],
+            &[0x40, 0x00, 0x2f, 0x03, 0x15, 0x42, 0x00, 0x04, 0x00, 0x15, 0x02,]
+        );
     }
 
     #[test]

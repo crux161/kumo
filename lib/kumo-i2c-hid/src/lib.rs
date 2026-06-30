@@ -18,9 +18,9 @@ pub use fdt::{
 pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{
     boot_keyboard_report, boot_mouse_report, BootMouseReport, Command, HidDescriptor, InputFrame,
-    MouseButtons, PowerState, ProtocolError, BOOT_MOUSE_REPORT_BYTES,
+    MouseButtons, OutputReportError, PowerState, ProtocolError, BOOT_MOUSE_REPORT_BYTES,
 };
 pub use report_descriptor::{
-    find_boot_keyboard, find_boot_mouse, find_led_output_report_id, KeyboardReport, MouseReport,
-    ReportDescriptorError,
+    find_boot_keyboard, find_boot_mouse, find_led_output_report, find_led_output_report_id,
+    KeyboardReport, LedOutputReport, MouseReport, ReportDescriptorError,
 };

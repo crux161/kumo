@@ -46,10 +46,23 @@ pub struct MouseReport {
     pub report_id: Option<u8>,
 }
 
+/// The wire-relevant facts about a keyboard LED output report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedOutputReport {
+    /// The Report ID prefixing this output report, or `None` for an unnumbered report.
+    pub report_id: Option<u8>,
+    /// Output payload bytes excluding the optional Report ID byte.
+    pub payload_bytes: usize,
+    /// Bit offset, within the payload bytes, of LED Usage 0x02 (Caps Lock), when proven.
+    pub caps_lock_bit_offset: Option<u16>,
+}
+
 // HID usage pages / usages and the boot-keyboard report geometry (USB HID 1.11 App. B.1).
 const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+const USAGE_PAGE_LEDS: u16 = 0x08;
 const USAGE_KEYBOARD: u16 = 0x06;
 const USAGE_MOUSE: u16 = 0x02;
+const LED_USAGE_CAPS_LOCK: u16 = 0x02;
 const COLLECTION_APPLICATION: u32 = 0x01;
 /// 8 modifier bits + 8 reserved bits + six 8-bit keycodes.
 const BOOT_KEYBOARD_INPUT_BITS: u32 = 8 + 8 + 6 * 8;
@@ -58,6 +71,8 @@ const BOOT_MOUSE_INPUT_BITS: u32 = (crate::protocol::BOOT_MOUSE_REPORT_BYTES as 
 
 const MAX_GLOBAL_STACK: usize = 8; // HID Push/Pop depth we tolerate
 const MAX_COLLECTION_DEPTH: usize = 16;
+const MAX_OUTPUT_REPORTS: usize = 8;
+const MAX_LOCAL_USAGES: usize = 16;
 
 /// Global-item state, saved/restored by Push (0xA4) / Pop (0xB4).
 #[derive(Clone, Copy, Default)]
@@ -66,6 +81,66 @@ struct Globals {
     report_size: u32,
     report_count: u32,
     report_id: Option<u8>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LocalState {
+    usages: [u16; MAX_LOCAL_USAGES],
+    usage_count: usize,
+    usage_min: Option<u16>,
+    usage_max: Option<u16>,
+}
+
+impl LocalState {
+    fn push_usage(&mut self, usage: u16) {
+        if self.usage_count < MAX_LOCAL_USAGES {
+            self.usages[self.usage_count] = usage;
+            self.usage_count += 1;
+        }
+    }
+
+    fn caps_lock_index(self, report_count: u32) -> Option<u32> {
+        if let Some(minimum) = self.usage_min {
+            if let Some(maximum) = self.usage_max {
+                if (minimum..=maximum).contains(&LED_USAGE_CAPS_LOCK) {
+                    let index = (LED_USAGE_CAPS_LOCK - minimum) as u32;
+                    if index < report_count {
+                        return Some(index);
+                    }
+                }
+            }
+        }
+        let mut index = 0usize;
+        while index < self.usage_count {
+            if self.usages[index] == LED_USAGE_CAPS_LOCK && index < report_count as usize {
+                return Some(index as u32);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct OutputReportAccumulator {
+    present: bool,
+    report_id: Option<u8>,
+    output_bits: u32,
+    has_led_output: bool,
+    caps_lock_bit_offset: Option<u16>,
+}
+
+impl OutputReportAccumulator {
+    fn finish(self) -> Option<LedOutputReport> {
+        if !self.present || !self.has_led_output || self.output_bits == 0 {
+            return None;
+        }
+        Some(LedOutputReport {
+            report_id: self.report_id,
+            payload_bytes: self.output_bits.div_ceil(8) as usize,
+            caps_lock_bit_offset: self.caps_lock_bit_offset,
+        })
+    }
 }
 
 /// Parse a HID report descriptor and confirm it contains a boot-shaped keyboard Application
@@ -322,11 +397,15 @@ pub fn find_boot_mouse(desc: &[u8]) -> Result<MouseReport, ReportDescriptorError
     Err(ReportDescriptorError::NotBootMouse)
 }
 
-/// Find the Report ID for the LED Output report (Usage Page 0x08).
-pub fn find_led_output_report_id(desc: &[u8]) -> Option<u8> {
+/// Find the LED Output report (Usage Page 0x08), including its full payload size and the
+/// Caps Lock LED bit when the descriptor proves one.
+pub fn find_led_output_report(desc: &[u8]) -> Option<LedOutputReport> {
     let mut globals = Globals::default();
     let mut gstack = [Globals::default(); MAX_GLOBAL_STACK];
     let mut gsp = 0usize;
+    let mut locals = LocalState::default();
+    let mut outputs = [OutputReportAccumulator::default(); MAX_OUTPUT_REPORTS];
+    let mut first_led_index: Option<usize> = None;
 
     let mut i = 0usize;
     while i < desc.len() {
@@ -356,15 +435,36 @@ pub fn find_led_output_report_id(desc: &[u8]) -> Option<u8> {
                 // Main item
                 if b_tag == 0x9 {
                     // Output item
-                    if globals.usage_page == 0x08 {
-                        // LEDs
-                        return globals.report_id;
+                    let entry_index = output_entry_index(&mut outputs, globals.report_id);
+                    if let Some(index) = entry_index {
+                        let entry = &mut outputs[index];
+                        let field_bits = globals.report_size.saturating_mul(globals.report_count);
+                        if globals.usage_page == USAGE_PAGE_LEDS {
+                            if first_led_index.is_none() {
+                                first_led_index = Some(index);
+                            }
+                            entry.has_led_output = true;
+                            if globals.report_size == 1 {
+                                if let Some(bit_index) =
+                                    locals.caps_lock_index(globals.report_count)
+                                {
+                                    let offset = entry.output_bits.saturating_add(bit_index);
+                                    if offset <= u16::MAX as u32 {
+                                        entry.caps_lock_bit_offset = Some(offset as u16);
+                                    }
+                                }
+                            }
+                        }
+                        entry.output_bits = entry.output_bits.saturating_add(field_bits);
                     }
                 }
+                locals = LocalState::default();
             }
             1 => match b_tag {
                 0x0 => globals.usage_page = data as u16,
+                0x7 => globals.report_size = data,
                 0x8 => globals.report_id = Some(data as u8),
+                0x9 => globals.report_count = data,
                 0xA => {
                     if gsp < MAX_GLOBAL_STACK {
                         gstack[gsp] = globals;
@@ -379,11 +479,59 @@ pub fn find_led_output_report_id(desc: &[u8]) -> Option<u8> {
                 }
                 _ => {}
             },
+            2 => match b_tag {
+                0x0 => locals.push_usage(data as u16),
+                0x1 => locals.usage_min = Some(data as u16),
+                0x2 => locals.usage_max = Some(data as u16),
+                _ => {}
+            },
             _ => {}
         }
         i = data_end;
     }
+
+    if let Some(index) = first_led_index {
+        if let Some(report) = outputs[index].finish() {
+            return Some(report);
+        }
+    }
     None
+}
+
+/// Find the Report ID for the LED Output report (Usage Page 0x08).
+pub fn find_led_output_report_id(desc: &[u8]) -> Option<u8> {
+    find_led_output_report(desc)
+        .map(|report| report.report_id)
+        .flatten()
+}
+
+fn output_entry_index(
+    outputs: &mut [OutputReportAccumulator; MAX_OUTPUT_REPORTS],
+    report_id: Option<u8>,
+) -> Option<usize> {
+    let mut first_empty = None;
+    let mut index = 0usize;
+    while index < outputs.len() {
+        if outputs[index].present && outputs[index].report_id == report_id {
+            return Some(index);
+        }
+        if !outputs[index].present && first_empty.is_none() {
+            first_empty = Some(index);
+        }
+        index += 1;
+    }
+    if let Some(index) = first_empty {
+        outputs[index] = OutputReportAccumulator {
+            present: true,
+            report_id,
+            output_bits: 0,
+            has_led_output: false,
+            caps_lock_bit_offset: None,
+        };
+        Some(index)
+    } else {
+        None
+    }
 }
 
 /// Read up to four little-endian bytes as a `u32` (HID item data is little-endian, 0/1/2/4 bytes).
@@ -544,6 +692,56 @@ mod tests {
         0xC0, // End Collection
     ];
 
+    /// A keyboard Report ID 8 with the conventional one-byte LED output report in the same
+    /// Application collection.
+    const KEYBOARD_RID8_WITH_LEDS: &[u8] = &[
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x06, // Usage (Keyboard)
+        0xA1, 0x01, // Collection (Application)
+        0x85, 0x08, //   Report ID (8)
+        0x75, 0x01, //   Report Size (1)
+        0x95, 0x08, //   Report Count (8)
+        0x81, 0x02, //   Input: modifiers
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x01, //   Report Count (1)
+        0x81, 0x03, //   Input: reserved
+        0x95, 0x05, //   Report Count (5)
+        0x75, 0x01, //   Report Size (1)
+        0x05, 0x08, //   Usage Page (LEDs)
+        0x19, 0x01, //   Usage Minimum (Num Lock)
+        0x29, 0x05, //   Usage Maximum (Kana)
+        0x91, 0x02, //   Output: LEDs
+        0x95, 0x01, //   Report Count (1)
+        0x75, 0x03, //   Report Size (3)
+        0x91, 0x03, //   Output: LED padding
+        0x95, 0x06, //   Report Count (6)
+        0x75, 0x08, //   Report Size (8)
+        0x05, 0x07, //   Usage Page (Keyboard/Keypad)
+        0x19, 0x00, //   Usage Minimum (0)
+        0x29, 0x65, //   Usage Maximum (101)
+        0x81, 0x00, //   Input: keycodes
+        0xC0, // End Collection
+    ];
+
+    /// Report ID 8 has a vendor output byte before its LED byte. The parser should account for the
+    /// whole payload length and offset the Caps Lock bit accordingly.
+    const VENDOR_BYTE_THEN_LED_OUTPUT: &[u8] = &[
+        0x85, 0x08, // Report ID (8)
+        0x75, 0x08, // Report Size (8)
+        0x95, 0x01, // Report Count (1)
+        0x09, 0x01, // Usage (Vendor-ish local value under the default page)
+        0x91, 0x02, // Output: vendor byte
+        0x05, 0x08, // Usage Page (LEDs)
+        0x75, 0x01, // Report Size (1)
+        0x95, 0x05, // Report Count (5)
+        0x19, 0x01, // Usage Minimum (Num Lock)
+        0x29, 0x05, // Usage Maximum (Kana)
+        0x91, 0x02, // Output: LEDs
+        0x75, 0x03, // Report Size (3)
+        0x95, 0x01, // Report Count (1)
+        0x91, 0x03, // Output: LED padding
+    ];
+
     #[test]
     fn accepts_the_conventional_boot_keyboard_with_no_report_id() {
         assert_eq!(
@@ -584,8 +782,41 @@ mod tests {
     fn extracts_led_output_report_id_when_present() {
         // BOOT_KEYBOARD has no report ID, but has LED output
         assert_eq!(find_led_output_report_id(BOOT_KEYBOARD), None);
-        // BOOT_KEYBOARD_RID7 has Report ID 7 for both input and output
+        // BOOT_KEYBOARD_RID7 intentionally has no LED output block.
         assert_eq!(find_led_output_report_id(BOOT_KEYBOARD_RID7), None);
+        assert_eq!(find_led_output_report_id(KEYBOARD_RID8_WITH_LEDS), Some(8));
+    }
+
+    #[test]
+    fn extracts_led_output_report_shape() {
+        assert_eq!(
+            find_led_output_report(BOOT_KEYBOARD),
+            Some(LedOutputReport {
+                report_id: None,
+                payload_bytes: 1,
+                caps_lock_bit_offset: Some(1),
+            })
+        );
+        assert_eq!(
+            find_led_output_report(KEYBOARD_RID8_WITH_LEDS),
+            Some(LedOutputReport {
+                report_id: Some(8),
+                payload_bytes: 1,
+                caps_lock_bit_offset: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn led_output_shape_accounts_for_prior_output_fields() {
+        assert_eq!(
+            find_led_output_report(VENDOR_BYTE_THEN_LED_OUTPUT),
+            Some(LedOutputReport {
+                report_id: Some(8),
+                payload_bytes: 2,
+                caps_lock_bit_offset: Some(9),
+            })
+        );
     }
 
     #[test]
