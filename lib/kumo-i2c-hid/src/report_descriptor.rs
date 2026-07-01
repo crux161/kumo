@@ -1,3 +1,4 @@
+//j379
 //! HID **report-descriptor** parsing: prove a device emits boot-shaped input reports.
 //!
 //! The HID-over-I2C descriptor (`protocol::HidDescriptor`) tells us a keyboard's report-descriptor
@@ -353,7 +354,10 @@ pub fn find_boot_mouse(desc: &[u8]) -> Result<MouseReport, ReportDescriptorError
                             .checked_sub(1)
                             .ok_or(ReportDescriptorError::Unbalanced)?;
                         if mouse_open_depth == Some(depth) {
-                            if mouse_input_bits == BOOT_MOUSE_INPUT_BITS {
+                            // Accept the boot buttons+X+Y prefix even when the report carries extra
+                            // trailing fields (the X13s Elan mouse, report-id 0x01, appends 5 pad
+                            // bytes); the boot decoder reads only the first three bytes. — CORVUS
+                            if mouse_input_bits >= BOOT_MOUSE_INPUT_BITS {
                                 return Ok(MouseReport {
                                     report_id: mouse_report_id,
                                 });
@@ -844,6 +848,47 @@ mod tests {
             Err(ReportDescriptorError::NotBootKeyboard)
         );
         assert_eq!(find_boot_mouse(mouse), Ok(MouseReport { report_id: None }));
+    }
+
+    #[test]
+    fn accepts_a_report_protocol_mouse_with_trailing_fields() {
+        // Mirrors the X13s Elan mouse (report-id 0x01): 3 button bits + 5 pad, X+Y (8-bit rel), then
+        // 5 trailing pad bytes = 64 input bits — the boot buttons+X+Y prefix is present.
+        let elan_mouse = &[
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x01, //   Report ID (1)
+            0x09, 0x01, //   Usage (Pointer)
+            0xA1, 0x00, //   Collection (Physical)
+            0x05, 0x09, //     Usage Page (Button)
+            0x19, 0x01, //     Usage Minimum (1)
+            0x29, 0x03, //     Usage Maximum (3)
+            0x15, 0x00, //     Logical Minimum (0)
+            0x25, 0x01, //     Logical Maximum (1)
+            0x75, 0x01, //     Report Size (1)
+            0x95, 0x03, //     Report Count (3)
+            0x81, 0x02, //     Input (Data,Var,Abs) - 3 button bits
+            0x95, 0x05, //     Report Count (5)
+            0x81, 0x03, //     Input (Const) - 5 pad bits
+            0x05, 0x01, //     Usage Page (Generic Desktop)
+            0x09, 0x30, //     Usage (X)
+            0x09, 0x31, //     Usage (Y)
+            0x15, 0x81, //     Logical Minimum (-127)
+            0x25, 0x7F, //     Logical Maximum (127)
+            0x75, 0x08, //     Report Size (8)
+            0x95, 0x02, //     Report Count (2)
+            0x81, 0x06, //     Input (Data,Var,Rel) - X, Y
+            0x75, 0x08, //     Report Size (8)
+            0x95, 0x05, //     Report Count (5)
+            0x81, 0x03, //     Input (Const) - 5 pad bytes
+            0xC0, //   End Collection (Physical)
+            0xC0, // End Collection (Application)
+        ];
+        assert_eq!(
+            find_boot_mouse(elan_mouse),
+            Ok(MouseReport { report_id: Some(1) })
+        );
     }
 
     #[test]

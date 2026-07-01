@@ -1,3 +1,4 @@
+//j379
 /// HID-over-I2C protocol decoding failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
@@ -146,7 +147,12 @@ pub fn boot_mouse_report(
     report_id: Option<u8>,
 ) -> Result<BootMouseReport, ProtocolError> {
     let payload = report_payload(frame, report_id, ProtocolError::NotBootMouseReport)?;
+    // Take the boot buttons+X+Y prefix; a report-protocol pointing report (the X13s Elan mouse,
+    // report-id 0x01) carries trailing fields we ignore. A payload shorter than the prefix is still
+    // rejected. — CORVUS
     let raw: [u8; BOOT_MOUSE_REPORT_BYTES] = payload
+        .get(..BOOT_MOUSE_REPORT_BYTES)
+        .ok_or(ProtocolError::NotBootMouseReport)?
         .try_into()
         .map_err(|_| ProtocolError::NotBootMouseReport)?;
     Ok(BootMouseReport {
@@ -479,5 +485,20 @@ mod tests {
             boot_mouse_report(InputFrame::Report(&[8, 0, 1, 2]), Some(9)),
             Err(ProtocolError::UnexpectedReportId)
         );
+    }
+
+    #[test]
+    fn decodes_a_report_protocol_mouse_ignoring_trailing_bytes() {
+        // The X13s Elan mouse (report-id 0x01) sends 8 data bytes: buttons, X, Y, then 5 pad;
+        // boot_mouse_report reads only the boot prefix and ignores the trailing bytes.
+        let report = boot_mouse_report(
+            InputFrame::Report(&[1, 0x01, 0x03, 0xfe, 0, 0, 0, 0, 0]),
+            Some(1),
+        )
+        .unwrap();
+        assert!(report.buttons.left());
+        assert!(!report.buttons.right());
+        assert_eq!(report.x_delta, 3);
+        assert_eq!(report.y_delta, -2);
     }
 }
