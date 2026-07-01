@@ -398,7 +398,7 @@ pub extern "efiapi" fn efi_main(
 ) -> EfiStatus {
     let con_out = unsafe { con_out_of(system_table) };
 
-    kprint!(con_out, "\r\nNIJIGUMO X13S\r\n");
+    kprint!(con_out, "\r\nNIJIGUMO Boot Loader v0.1.0\r\n");
     kprint!(con_out, "BOOTAA64.EFI loaded\r\n");
     // Report the Exception Level before handoff. EDK2-on-RPi enters the OS at EL2 while
     // the X13s firmware enters at EL1; the kernel's high-VA TTBR1 jump assumes EL1, so an
@@ -469,7 +469,7 @@ unsafe fn boot_and_jump(
         return;
     }
 
-    kprint!(con_out, "\r\n--- Nijigumo platform discovery ---\r\n");
+    kprint!(con_out, "\r\n--- platform discovery ---\r\n");
 
     let root = match unsafe { open_boot_volume(image_handle, boot_services) } {
         Some(root) => root,
@@ -581,7 +581,7 @@ unsafe fn boot_and_jump(
 
     kprint!(
         con_out,
-        "\r\nExiting boot services; jumping to Ziwei at {:#x}...\r\n",
+        "\r\nLoading MUREX => {:#x}...\r\n",
         kernel.entry_virt
     );
 
