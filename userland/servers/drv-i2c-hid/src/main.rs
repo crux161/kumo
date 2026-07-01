@@ -1,4 +1,5 @@
 //j377
+//j378
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -616,8 +617,28 @@ extern "C" fn main(
 
     log(b"drv-i2c-hid: report descriptor ok\n");
     startup_trace.record(StartupMilestone::ReportDescriptorOk, clock_get());
+    // Capture the raw HID report descriptor so the combo device's non-boot pointing collection
+    // (report-id 0x01, which find_boot_mouse rejects as NotBootMouse) can be decoded offline against
+    // the HID spec — measure the silicon before wiring the pointer. Temporary: remove once decoded,
+    // like the QR/poll-report probes. — CORVUS
+    log_hex(b"drv-i2c-hid: rdesc-len=0x", report_descriptor_len as u64);
+    {
+        let desc = &report_descriptor[..report_descriptor_len];
+        let mut offset = 0;
+        while offset < desc.len() {
+            let end = (offset + 16).min(desc.len());
+            log_frame(b"drv-i2c-hid: rdesc= ", &desc[offset..end]);
+            offset = end;
+        }
+    }
     let led_output_report = find_led_output_report(&report_descriptor[..report_descriptor_len]);
-    let mouse = find_boot_mouse(&report_descriptor[..report_descriptor_len]).ok();
+    let mouse = match find_boot_mouse(&report_descriptor[..report_descriptor_len]) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            log_hex(b"drv-i2c-hid: boot-mouse reject reason=0x", error as u64);
+            None
+        }
+    };
     match led_output_report {
         Some(report) => {
             if let Some(id) = report.report_id {
