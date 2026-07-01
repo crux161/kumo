@@ -33,7 +33,7 @@ pub struct TaskInfo {
     pub label: &'static str,
 }
 
-pub const PROMPT: &str = "ziwei> ";
+pub const PROMPT: &str = "[MUREX>";
 
 const HELP: &str = "commands:\r\n\
      help            this list\r\n\

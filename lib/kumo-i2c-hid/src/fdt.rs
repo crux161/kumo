@@ -6,6 +6,9 @@ const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_DEPTH: usize = 32;
 pub const MAX_I2C_HID_DEVICES: usize = 4;
+pub const MAX_PINCTRL_REFS: usize = 4;
+pub const MAX_TLMM_PINCTRL_GROUPS: usize = 8;
+pub const MAX_TLMM_PINS_PER_GROUP: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GicInterrupt {
@@ -47,6 +50,139 @@ impl HidDeviceKind {
         } else {
             Self::Unknown
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinctrlRefs {
+    refs: [u32; MAX_PINCTRL_REFS],
+    len: usize,
+}
+
+impl PinctrlRefs {
+    const EMPTY: Self = Self {
+        refs: [0; MAX_PINCTRL_REFS],
+        len: 0,
+    };
+
+    pub fn as_slice(&self) -> &[u32] {
+        &self.refs[..self.len]
+    }
+
+    fn push(&mut self, phandle: u32) {
+        if self.len < self.refs.len() {
+            self.refs[self.len] = phandle;
+            self.len += 1;
+        }
+    }
+
+    fn contains(self, phandle: u32) -> bool {
+        self.as_slice().contains(&phandle)
+    }
+
+    fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for PinctrlRefs {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlmmFunction {
+    Gpio,
+    Qup21,
+    Unknown,
+}
+
+impl Default for TlmmFunction {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlmmOutput {
+    None,
+    Low,
+    High,
+}
+
+impl Default for TlmmOutput {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlmmPinctrlGroup {
+    pub state_phandle: u32,
+    pins: [u16; MAX_TLMM_PINS_PER_GROUP],
+    pin_count: usize,
+    pub function: TlmmFunction,
+    pub drive_strength: Option<u8>,
+    pub bias_disable: bool,
+    pub output: TlmmOutput,
+}
+
+impl TlmmPinctrlGroup {
+    const EMPTY: Self = Self {
+        state_phandle: 0,
+        pins: [0; MAX_TLMM_PINS_PER_GROUP],
+        pin_count: 0,
+        function: TlmmFunction::Unknown,
+        drive_strength: None,
+        bias_disable: false,
+        output: TlmmOutput::None,
+    };
+
+    pub fn pins(&self) -> &[u16] {
+        &self.pins[..self.pin_count]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct I2c21PinctrlTopology {
+    pub controller: PinctrlRefs,
+    pub keyboard: PinctrlRefs,
+    groups: [TlmmPinctrlGroup; MAX_TLMM_PINCTRL_GROUPS],
+    group_count: usize,
+}
+
+impl I2c21PinctrlTopology {
+    const EMPTY: Self = Self {
+        controller: PinctrlRefs::EMPTY,
+        keyboard: PinctrlRefs::EMPTY,
+        groups: [TlmmPinctrlGroup::EMPTY; MAX_TLMM_PINCTRL_GROUPS],
+        group_count: 0,
+    };
+
+    pub fn groups(&self) -> &[TlmmPinctrlGroup] {
+        &self.groups[..self.group_count]
+    }
+
+    fn push_group(&mut self, group: TlmmPinctrlGroup) {
+        if self.group_count < self.groups.len() {
+            self.groups[self.group_count] = group;
+            self.group_count += 1;
+        }
+    }
+
+    fn references_state(&self, phandle: u32) -> bool {
+        self.controller.contains(phandle) || self.keyboard.contains(phandle)
+    }
+
+    fn is_complete(self) -> bool {
+        !self.controller.is_empty() && !self.keyboard.is_empty() && self.group_count != 0
+    }
+}
+
+impl Default for I2c21PinctrlTopology {
+    fn default() -> Self {
+        Self::EMPTY
     }
 }
 
@@ -135,20 +271,38 @@ struct Node {
     device_kind: Option<HidDeviceKind>,
     compatible_geni_i2c: bool,
     compatible_hid_i2c: bool,
+    phandle: u32,
+    has_phandle: bool,
     reg: [u32; 4],
     reg_len: u8,
     interrupts: [u32; 3],
     interrupts_len: u8,
     interrupts_extended: [u32; 3],
     interrupts_extended_len: u8,
+    pinctrl_refs: [u32; MAX_PINCTRL_REFS],
+    pinctrl_refs_len: u8,
+    pins: [u16; MAX_TLMM_PINS_PER_GROUP],
+    pin_count: u8,
+    function: TlmmFunction,
+    drive_strength: u8,
+    has_drive_strength: bool,
+    bias_disable: bool,
+    output: TlmmOutput,
     clock_frequency: u32,
     has_clock_frequency: bool,
     hid_descriptor_register: u32,
     has_hid_descriptor_register: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ParseResult {
+    bus: Option<I2cHidBusTopology>,
+    pinctrl: I2c21PinctrlTopology,
+}
+
 pub fn discover_i2c_hid_bus(dtb: &[u8]) -> Option<I2cHidBusTopology> {
-    parse(dtb).and_then(|topology| {
+    parse(dtb).and_then(|parsed| {
+        let topology = parsed.bus?;
         if topology.device_count == 0 {
             None
         } else {
@@ -161,7 +315,17 @@ pub fn discover_keyboard(dtb: &[u8]) -> Option<KeyboardTopology> {
     discover_i2c_hid_bus(dtb)?.keyboard()
 }
 
-fn parse(dtb: &[u8]) -> Option<I2cHidBusTopology> {
+pub fn discover_i2c21_pinctrl(dtb: &[u8]) -> Option<I2c21PinctrlTopology> {
+    parse(dtb).and_then(|parsed| {
+        if parsed.pinctrl.is_complete() {
+            Some(parsed.pinctrl)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse(dtb: &[u8]) -> Option<ParseResult> {
     if be32(dtb, 0)? != FDT_MAGIC {
         return None;
     }
@@ -176,7 +340,7 @@ fn parse(dtb: &[u8]) -> Option<I2cHidBusTopology> {
     let mut stack = [Node::default(); MAX_DEPTH];
     let mut depth = 0usize;
     let mut cursor = 0usize;
-    let mut topology: Option<I2cHidBusTopology> = None;
+    let mut parsed = ParseResult::default();
     while cursor < structures.len() {
         let token = be32(structures, cursor)?;
         cursor += 4;
@@ -203,16 +367,42 @@ fn parse(dtb: &[u8]) -> Option<I2cHidBusTopology> {
                     return None;
                 }
                 let node = stack[depth - 1];
+                if node.compatible_geni_i2c && node.pinctrl_refs_len != 0 {
+                    if let Some(controller) = bus_topology(&node) {
+                        if controller.controller_mmio_base == 0x0089_4000 {
+                            parsed.pinctrl.controller =
+                                pinctrl_refs(node.pinctrl_refs, node.pinctrl_refs_len);
+                        }
+                    }
+                }
                 if node.compatible_hid_i2c && depth >= 2 {
                     let mut controller = bus_topology(&stack[depth - 2])?;
                     let device = hid_device_topology(&node)?;
-                    if let Some(topology) = topology.as_mut() {
+                    if device.kind == HidDeviceKind::Keyboard && node.pinctrl_refs_len != 0 {
+                        parsed.pinctrl.keyboard =
+                            pinctrl_refs(node.pinctrl_refs, node.pinctrl_refs_len);
+                    }
+                    if let Some(topology) = parsed.bus.as_mut() {
                         if topology.same_controller(controller) {
                             let _ = topology.push(device);
                         }
                     } else {
                         let _ = controller.push(device);
-                        topology = Some(controller);
+                        parsed.bus = Some(controller);
+                    }
+                }
+                let state_phandle = if node.has_phandle {
+                    Some(node.phandle)
+                } else if depth >= 2 && stack[depth - 2].has_phandle {
+                    Some(stack[depth - 2].phandle)
+                } else {
+                    None
+                };
+                if let Some(state_phandle) = state_phandle {
+                    if parsed.pinctrl.references_state(state_phandle) {
+                        if let Some(group) = pinctrl_group_topology(&node, state_phandle) {
+                            parsed.pinctrl.push_group(group);
+                        }
                     }
                 }
                 depth -= 1;
@@ -234,7 +424,7 @@ fn parse(dtb: &[u8]) -> Option<I2cHidBusTopology> {
             _ => return None,
         }
     }
-    topology
+    Some(parsed)
 }
 
 fn bus_topology(controller: &Node) -> Option<I2cHidBusTopology> {
@@ -280,17 +470,64 @@ fn hid_device_topology(device: &Node) -> Option<HidDeviceTopology> {
     })
 }
 
+fn pinctrl_refs(raw: [u32; MAX_PINCTRL_REFS], len: u8) -> PinctrlRefs {
+    let mut refs = PinctrlRefs::EMPTY;
+    for phandle in raw.iter().take(len as usize) {
+        refs.push(*phandle);
+    }
+    refs
+}
+
+fn pinctrl_group_topology(node: &Node, state_phandle: u32) -> Option<TlmmPinctrlGroup> {
+    if node.pin_count == 0 {
+        return None;
+    }
+    Some(TlmmPinctrlGroup {
+        state_phandle,
+        pins: node.pins,
+        pin_count: node.pin_count as usize,
+        function: node.function,
+        drive_strength: if node.has_drive_strength {
+            Some(node.drive_strength)
+        } else {
+            None
+        },
+        bias_disable: node.bias_disable,
+        output: node.output,
+    })
+}
+
 fn apply_property(node: &mut Node, name: &[u8], value: &[u8]) {
     match name {
         b"compatible" => {
             node.compatible_geni_i2c = string_list_contains(value, b"qcom,geni-i2c");
             node.compatible_hid_i2c = string_list_contains(value, b"hid-over-i2c");
         }
+        b"phandle" => {
+            if let Some(value) = be32(value, 0) {
+                node.phandle = value;
+                node.has_phandle = true;
+            }
+        }
         b"reg" => node.reg_len = copy_cells(value, &mut node.reg),
         b"interrupts" => node.interrupts_len = copy_cells(value, &mut node.interrupts),
         b"interrupts-extended" => {
             node.interrupts_extended_len = copy_cells(value, &mut node.interrupts_extended)
         }
+        b"pinctrl-0" => node.pinctrl_refs_len = copy_cells(value, &mut node.pinctrl_refs),
+        b"pins" => node.pin_count = copy_gpio_pins(value, &mut node.pins),
+        b"function" => node.function = pinctrl_function(value),
+        b"drive-strength" => {
+            if let Some(value) = be32(value, 0) {
+                if value <= u8::MAX as u32 {
+                    node.drive_strength = value as u8;
+                    node.has_drive_strength = true;
+                }
+            }
+        }
+        b"bias-disable" => node.bias_disable = true,
+        b"output-low" => node.output = TlmmOutput::Low,
+        b"output-high" => node.output = TlmmOutput::High,
         b"clock-frequency" => {
             if let Some(value) = be32(value, 0) {
                 node.clock_frequency = value;
@@ -304,6 +541,48 @@ fn apply_property(node: &mut Node, name: &[u8], value: &[u8]) {
             }
         }
         _ => {}
+    }
+}
+
+fn copy_gpio_pins<const N: usize>(mut value: &[u8], out: &mut [u16; N]) -> u8 {
+    let mut count = 0usize;
+    while count < N {
+        let Some(end) = value.iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        if let Some(pin) = gpio_pin_number(&value[..end]) {
+            out[count] = pin;
+            count += 1;
+        }
+        value = &value[end + 1..];
+    }
+    count as u8
+}
+
+fn gpio_pin_number(value: &[u8]) -> Option<u16> {
+    let rest = value.strip_prefix(b"gpio")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut pin = 0u16;
+    for digit in rest {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        pin = pin.checked_mul(10)?.checked_add((digit - b'0') as u16)?;
+    }
+    Some(pin)
+}
+
+fn pinctrl_function(value: &[u8]) -> TlmmFunction {
+    let end = value
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value.len());
+    match &value[..end] {
+        b"gpio" => TlmmFunction::Gpio,
+        b"qup21" => TlmmFunction::Qup21,
+        _ => TlmmFunction::Unknown,
     }
 }
 
@@ -410,8 +689,46 @@ mod tests {
     }
 
     #[test]
+    fn discovers_the_real_x13s_i2c21_pinctrl_states() {
+        let pinctrl = discover_i2c21_pinctrl(X13S_DTB).expect("X13s i2c21 pinctrl");
+        assert_eq!(pinctrl.controller.as_slice(), &[0x3e, 0x3f]);
+        assert_eq!(pinctrl.keyboard.as_slice(), &[0x43]);
+
+        let groups = pinctrl.groups();
+        assert_eq!(groups.len(), 5);
+        assert_eq!(groups[0].state_phandle, 0x3e);
+        assert_eq!(groups[0].pins(), &[81, 82]);
+        assert_eq!(groups[0].function, TlmmFunction::Qup21);
+        assert_eq!(groups[0].drive_strength, Some(16));
+        assert!(groups[0].bias_disable);
+        assert_eq!(groups[0].output, TlmmOutput::None);
+
+        assert_eq!(groups[1].state_phandle, 0x43);
+        assert_eq!(groups[1].pins(), &[102]);
+        assert_eq!(groups[1].function, TlmmFunction::Gpio);
+        assert_eq!(groups[1].output, TlmmOutput::Low);
+
+        assert_eq!(groups[2].state_phandle, 0x43);
+        assert_eq!(groups[2].pins(), &[104]);
+        assert_eq!(groups[2].function, TlmmFunction::Gpio);
+        assert!(groups[2].bias_disable);
+
+        assert_eq!(groups[3].state_phandle, 0x43);
+        assert_eq!(groups[3].pins(), &[105]);
+        assert_eq!(groups[3].function, TlmmFunction::Gpio);
+        assert!(groups[3].bias_disable);
+
+        assert_eq!(groups[4].state_phandle, 0x3f);
+        assert_eq!(groups[4].pins(), &[182]);
+        assert_eq!(groups[4].function, TlmmFunction::Gpio);
+        assert!(groups[4].bias_disable);
+    }
+
+    #[test]
     fn rejects_truncation_and_non_fdt_data() {
         assert_eq!(discover_keyboard(&X13S_DTB[..32]), None);
         assert_eq!(discover_keyboard(b"not a device tree"), None);
+        assert_eq!(discover_i2c21_pinctrl(&X13S_DTB[..32]), None);
+        assert_eq!(discover_i2c21_pinctrl(b"not a device tree"), None);
     }
 }

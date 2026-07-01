@@ -2,7 +2,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use kumo_abi::{Errno, Handle, Status};
-use kumo_i2c_hid::{BootMouseReport, HidDeviceKind, I2cHidBusTopology, KeyboardTopology};
+use kumo_i2c_hid::{
+    discover_i2c21_pinctrl, discover_i2c_hid_bus, sc8280xp_i2c21_tlmm_plan, BootMouseReport,
+    HidDeviceKind, I2cHidBusTopology, KeyboardTopology, TlmmPinctrlPlan,
+};
 use kumo_ipc::{Message, MessageError};
 
 pub const SORA_NAME: &str = "Sora";
@@ -266,6 +269,21 @@ pub fn summarize_i2c_hid_bus(topology: &I2cHidBusTopology) -> I2cHidBusSummary {
     summary
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct I2cHidRuntimeTopology {
+    pub bus: I2cHidBusTopology,
+    pub pinctrl_plan: Option<TlmmPinctrlPlan>,
+}
+
+/// Discover the HID-over-I2C bus and its board pinctrl plan from one immutable DTB snapshot.
+/// Sora owns only policy here: this does not map or write TLMM MMIO.
+pub fn discover_i2c_hid_runtime_topology(dtb: &[u8]) -> Option<I2cHidRuntimeTopology> {
+    let bus = discover_i2c_hid_bus(dtb)?;
+    let pinctrl_plan =
+        discover_i2c21_pinctrl(dtb).and_then(|topology| sc8280xp_i2c21_tlmm_plan(&topology).ok());
+    Some(I2cHidRuntimeTopology { bus, pinctrl_plan })
+}
+
 /// The current runtime can safely launch one HID-over-I2C child: the internal keyboard.
 /// Touchpad probing still needs shared-controller arbitration, so this policy remains explicit.
 pub fn select_i2c_hid_keyboard(topology: I2cHidBusTopology) -> Option<KeyboardTopology> {
@@ -275,7 +293,7 @@ pub fn select_i2c_hid_keyboard(topology: I2cHidBusTopology) -> Option<KeyboardTo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kumo_i2c_hid::{discover_i2c_hid_bus, BootMouseReport, MouseButtons};
+    use kumo_i2c_hid::{BootMouseReport, MouseButtons};
 
     #[test]
     fn root_logic_is_host_testable() {
@@ -386,10 +404,11 @@ mod tests {
     #[test]
     fn i2c_hid_policy_summarizes_bus_and_selects_keyboard_only() {
         let dtb = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
-        let topology = discover_i2c_hid_bus(dtb).expect("X13s i2c21 HID bus");
+        let discovery =
+            discover_i2c_hid_runtime_topology(dtb).expect("X13s i2c21 HID runtime topology");
 
         assert_eq!(
-            summarize_i2c_hid_bus(&topology),
+            summarize_i2c_hid_bus(&discovery.bus),
             I2cHidBusSummary {
                 total: 3,
                 keyboards: 1,
@@ -398,7 +417,12 @@ mod tests {
             }
         );
 
-        let keyboard = select_i2c_hid_keyboard(topology).expect("keyboard child");
+        let plan = discovery.pinctrl_plan.expect("X13s i2c21 TLMM plan");
+        assert_eq!(plan.updates().len(), 15);
+        assert_eq!(plan.updates()[0].offset, 0x51000);
+        assert_eq!(plan.updates()[14].offset, 0xb6000);
+
+        let keyboard = select_i2c_hid_keyboard(discovery.bus).expect("keyboard child");
         assert_eq!(keyboard.i2c_address, 0x68);
         assert_eq!(keyboard.hid_descriptor_register, 1);
         assert_eq!(keyboard.keyboard_interrupt.pin, 104);

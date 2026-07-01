@@ -10,10 +10,13 @@ mod fdt;
 mod geni;
 mod protocol;
 mod report_descriptor;
+mod tlmm;
 
 pub use fdt::{
-    discover_i2c_hid_bus, discover_keyboard, GicInterrupt, GpioInterrupt, HidDeviceKind,
-    HidDeviceTopology, I2cHidBusTopology, KeyboardTopology, MAX_I2C_HID_DEVICES,
+    discover_i2c21_pinctrl, discover_i2c_hid_bus, discover_keyboard, GicInterrupt, GpioInterrupt,
+    HidDeviceKind, HidDeviceTopology, I2c21PinctrlTopology, I2cHidBusTopology, KeyboardTopology,
+    PinctrlRefs, TlmmFunction, TlmmOutput, TlmmPinctrlGroup, MAX_I2C_HID_DEVICES, MAX_PINCTRL_REFS,
+    MAX_TLMM_PINCTRL_GROUPS, MAX_TLMM_PINS_PER_GROUP,
 };
 pub use geni::{register, Controller, GeniError, RegisterIo, SourceClock};
 pub use protocol::{
@@ -23,4 +26,9 @@ pub use protocol::{
 pub use report_descriptor::{
     find_boot_keyboard, find_boot_mouse, find_led_output_report, find_led_output_report_id,
     KeyboardReport, LedOutputReport, MouseReport, ReportDescriptorError,
+};
+pub use tlmm::{
+    apply_tlmm_pinctrl_plan, sc8280xp_i2c21_tlmm_plan, TlmmPinctrlPlan, TlmmPinctrlPlanError,
+    TlmmRegisterIo, TlmmRegisterUpdate, MAX_TLMM_PINCTRL_UPDATES, SC8280XP_TLMM_GPIO_CTL_OFFSET,
+    SC8280XP_TLMM_GPIO_IO_OFFSET, SC8280XP_TLMM_GPIO_STRIDE,
 };

@@ -98,7 +98,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
 
     let report = match inspect_boot(boot) {
         Ok(report) => report,
-        Err(err) => tower_halt_ascii("nijigumo->ziwei handoff invalid", Some(err)),
+        Err(err) => tower_halt_ascii("nijigumo->MUREX handoff invalid", Some(err)),
     };
 
     // Boot banner in the idiom of the Jet Alone OS POST screen (Evangelion): green
@@ -142,16 +142,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     klog!("「葡 萄 染 の 御 衣、う つ ろ ひ た る 菊 の 織 物 な ど、\n");
     klog!("  あ ま た あ る 中 に、今 様 色 の 優 れ た る を、\n");
     klog!("  姫 君 の 御 料 と て 選 ば せ た ま ふ 。」\n\n");
-    klog!(" 「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n");
+    klog!("「하 늘 한 가 은 데 고 기 뜨 는 백 운(白 雲)이\n");
     klog!("  그 대 의 집 이 되 니、\n");
     klog!("  명 월 을 벗 삼 아 외 로 이 앉 았 도 다 。」\n\n");
     // Broad CJK is embedded now (DESIGN/005): common simplified Chinese + Japanese kanji +
     // Korean jamo. "简体中文 / 日本語漢字 / [Hangul jamo]".
-    klog!("[中國漢字  ........在線    OK ]\n");
-    klog!("[日本漢字  ........出力成功 OK ]\n");
+    klog!("[中國漢字  ........在線      OK ]\n");
+    klog!("[日本漢字  ........出力成功  OK ]\n");
     klog!("[한국어한글 .......로드      OK ]\n\n");
-    klog!("紫微  MUREX Core Ver 0.1.0a  ({})\n", report.arch);
-    klog!("虹雲  ABIv{}    Check     OK\n", report.abi_version);
+    klog!("紫微     MUREX Core Ver 0.1.0a  ({})\n", report.arch);
+    klog!("虹雲     ABIv{}     Check     OK\n", report.abi_version);
 
     // M1: bring up memory. The bump heap is already online; account the frames and
     // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).

@@ -11,7 +11,7 @@ use kumo_abi::{
     WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
-use kumo_i2c_hid::{discover_i2c_hid_bus, HidDeviceKind, I2cHidBusTopology};
+use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
@@ -107,8 +107,12 @@ fn log_fb_geometry(fb: &Framebuffer) {
 }
 
 /// Map the read-only DTB capability in two stages, validate its declared extent, and discover the
-/// X13s i2c21 HID children before any device Resource is minted or controller MMIO is touched.
-fn i2c_hid_bus_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<I2cHidBusTopology> {
+/// X13s i2c21 HID children plus pinctrl plan before any device Resource is minted or controller
+/// MMIO is touched.
+fn i2c_hid_runtime_topology_from_dtb(
+    dtb_vmo: Handle,
+    dtb_phys: u64,
+) -> Option<sora::I2cHidRuntimeTopology> {
     const PAGE_SIZE: u64 = 4096;
     const HEADER_VA: u64 = 0x0000_0000_3100_0000;
     const DTB_VA: u64 = 0x0000_0000_3200_0000;
@@ -149,7 +153,7 @@ fn i2c_hid_bus_topology_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<I2cHi
     }
     let bytes =
         unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
-    discover_i2c_hid_bus(bytes)
+    sora::discover_i2c_hid_runtime_topology(bytes)
 }
 
 fn log_i2c_hid_kind(kind: HidDeviceKind) {
@@ -183,6 +187,17 @@ fn log_i2c_hid_topology(topology: &I2cHidBusTopology) {
         log(b" flags=");
         log_hex(device.interrupt.flags as u64);
         log(b"\n");
+    }
+}
+
+fn log_i2c_hid_pinctrl_plan(discovery: &sora::I2cHidRuntimeTopology) {
+    match discovery.pinctrl_plan {
+        Some(plan) => {
+            log(b"drv-i2c-hid: pinctrl plan updates=");
+            log_hex(plan.updates().len() as u64);
+            log(b"\n");
+        }
+        None => log(b"drv-i2c-hid: pinctrl plan missing\n"),
     }
 }
 
@@ -853,11 +868,14 @@ extern "C" fn sora_main(
                 // authority. QEMU and unrelated framebuffer boards stop here without ever mapping
                 // or touching the X13s GENI address. This slice logs all Linux-described children
                 // but still launches only the keyboard until shared-controller probing lands.
-                let topology =
-                    i2c_hid_bus_topology_from_dtb(Handle(dtb_vmo as u32), bootinfo.platform.dtb);
-                if let Some(bus_topology) = topology {
-                    log_i2c_hid_topology(&bus_topology);
-                    let topology = sora::select_i2c_hid_keyboard(bus_topology);
+                let discovery = i2c_hid_runtime_topology_from_dtb(
+                    Handle(dtb_vmo as u32),
+                    bootinfo.platform.dtb,
+                );
+                if let Some(discovery) = discovery {
+                    log_i2c_hid_topology(&discovery.bus);
+                    log_i2c_hid_pinctrl_plan(&discovery);
+                    let topology = sora::select_i2c_hid_keyboard(discovery.bus);
                     if let Some(topology) = topology {
                         match ProbeConfig::for_x13s(topology) {
                             Ok(config) => {
