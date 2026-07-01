@@ -1,6 +1,8 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j381
+
 pub const ARCH: &str = "x86_64";
 
 pub fn arch_name() -> &'static str {
@@ -560,6 +562,10 @@ pub fn spin_once() {
 
 pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> bool {
     false
+}
+
+pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
+    None
 }
 
 pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {

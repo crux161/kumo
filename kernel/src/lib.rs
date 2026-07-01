@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j381
+
 extern crate alloc;
 
 pub mod bootstrap;
@@ -214,6 +216,14 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             );
             kumo_hal::active::halt();
         }
+    }
+
+    match kumo_hal::active::configure_i2c21_tlmm_pinctrl_from_dtb(boot.platform.dtb) {
+        Some(updates) => klog!(
+            "TLMM PINCTRL       Check     i2c21 {} updates via DTB   OK\n",
+            updates
+        ),
+        None => klog!("TLMM PINCTRL       Check     no i2c21 DTB plan      --\n"),
     }
 
     // M3 (opening): run more than one thread of control. A couple of kernel threads

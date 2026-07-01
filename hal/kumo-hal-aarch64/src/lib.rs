@@ -1,6 +1,8 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j381
+
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
@@ -2618,6 +2620,58 @@ static TLMM_GPIO_IRQ_KEY: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "none")]
 static TLMM_GPIO_FLAGS: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(any(target_os = "none", test))]
+fn i2c21_tlmm_pinctrl_plan(dtb: &[u8]) -> Option<kumo_i2c_hid::TlmmPinctrlPlan> {
+    let topology = kumo_i2c_hid::discover_i2c21_pinctrl(dtb)?;
+    kumo_i2c_hid::sc8280xp_i2c21_tlmm_plan(&topology).ok()
+}
+
+#[cfg(target_os = "none")]
+struct Sc8280xpTlmmMmio;
+
+#[cfg(target_os = "none")]
+impl kumo_i2c_hid::TlmmRegisterIo for Sc8280xpTlmmMmio {
+    fn read(&mut self, offset: u32) -> u32 {
+        unsafe { mmio_read32(mmio_phys(TLMM_BASE + offset as u64)) }
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        unsafe { mmio_write32(mmio_phys(TLMM_BASE + offset as u64), value) };
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn configure_i2c21_tlmm_pinctrl_from_dtb(dtb: u64) -> Option<usize> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let plan = i2c21_tlmm_pinctrl_plan(bytes)?;
+    let mut io = Sc8280xpTlmmMmio;
+    Some(kumo_i2c_hid::apply_tlmm_pinctrl_plan(&mut io, &plan))
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "none")]
+unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
+
+    if dtb == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(dtb as *const u8, total) })
+}
+
 // ---- SC8280XP PDC (Power Domain Controller) wake-interrupt routing ----------------------------
 // Wake-capable TLMM GPIOs on SC8280XP do not reach the GIC through the TLMM summary SPI
 // (TLMM_PARENT_IRQ); they are routed through the PDC, which presents a dedicated SPI per wake port.
@@ -4037,6 +4091,18 @@ mod tests {
             classify_gpio_attention_delivery(pdc, tlmm, 0),
             GpioAttentionDelivery::None
         );
+    }
+
+    #[test]
+    fn x13s_i2c21_tlmm_pinctrl_plan_is_dtb_backed() {
+        let dtb = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+        let plan = i2c21_tlmm_pinctrl_plan(dtb).expect("X13s i2c21 TLMM pinctrl plan");
+
+        assert_eq!(plan.updates().len(), 15);
+        assert_eq!(plan.updates()[0].offset, 0x51000);
+        assert_eq!(plan.updates()[14].offset, 0xb6000);
+        assert_eq!(i2c21_tlmm_pinctrl_plan(&dtb[..32]), None);
+        assert_eq!(i2c21_tlmm_pinctrl_plan(b"not a device tree"), None);
     }
 
     #[test]
