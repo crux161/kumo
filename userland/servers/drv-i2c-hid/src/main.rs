@@ -1,3 +1,4 @@
+//j377
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -431,7 +432,7 @@ extern "C" fn main(
     let mut controller = match Controller::new(registers, config.source_clock, POLL_LIMIT) {
         Ok(controller) => controller,
         Err(error) => {
-            log_hex(b"drv-i2c-hid: GENI init error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: GENI init error=0x", error.code());
             kumo_rt::process_exit(1);
         }
     };
@@ -444,7 +445,7 @@ extern "C" fn main(
         &config.hid_descriptor_register.to_le_bytes(),
         &mut raw_descriptor,
     ) {
-        log_hex(b"drv-i2c-hid: transfer error=0x", error as u64);
+        log_hex(b"drv-i2c-hid: transfer error=0x", error.code());
         kumo_rt::process_exit(1);
     }
     let descriptor = match HidDescriptor::parse(&raw_descriptor) {
@@ -497,7 +498,7 @@ extern "C" fn main(
         config.i2c_address,
         &Command::set_power(descriptor.command_register, PowerState::On),
     ) {
-        log_hex(b"drv-i2c-hid: set-power error=0x", error as u64);
+        log_hex(b"drv-i2c-hid: set-power error=0x", error.code());
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: set-power done\n");
@@ -515,7 +516,7 @@ extern "C" fn main(
         config.i2c_address,
         &Command::reset(descriptor.command_register),
     ) {
-        log_hex(b"drv-i2c-hid: reset error=0x", error as u64);
+        log_hex(b"drv-i2c-hid: reset error=0x", error.code());
         kumo_rt::process_exit(1);
     }
     log(b"drv-i2c-hid: reset done\n");
@@ -547,7 +548,7 @@ extern "C" fn main(
     if wait_attention_or_timeout(attention_irq, RESET_ACK_TIMEOUT_NS) {
         if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
         {
-            log_hex(b"drv-i2c-hid: reset sync read error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: reset sync read error=0x", error.code());
             kumo_rt::process_exit(1);
         }
         if interrupt_complete(attention_irq) != 0 {
@@ -569,7 +570,7 @@ extern "C" fn main(
             config.i2c_address,
             &Command::set_power(descriptor.command_register, PowerState::On),
         ) {
-            log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: post-reset set-power error=0x", error.code());
             kumo_rt::process_exit(1);
         }
         if !sleep_ns(POWER_ON_SETTLE_NS) {
@@ -598,7 +599,7 @@ extern "C" fn main(
     ) {
         log_hex(
             b"drv-i2c-hid: report descriptor transfer error=0x",
-            error as u64,
+            error.code(),
         );
         kumo_rt::process_exit(1);
     }
@@ -684,7 +685,7 @@ extern "C" fn main(
         // the pending report — which is why every earlier poll came back empty. — CORVUS
         if let Err(error) = controller.read(config.i2c_address, &mut input_frame[..input_frame_len])
         {
-            log_hex(b"drv-i2c-hid: input frame read error=0x", error as u64);
+            log_hex(b"drv-i2c-hid: input frame read error=0x", error.code());
             kumo_rt::process_exit(1);
         }
         if interrupt_complete(attention_irq) != 0 {

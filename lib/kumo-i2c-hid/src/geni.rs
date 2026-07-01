@@ -1,7 +1,9 @@
+//j377
 pub mod register {
     pub const FORCE_DEFAULT: u32 = 0x20;
     pub const OUTPUT_CTRL: u32 = 0x24;
     pub const CGC_CTRL: u32 = 0x28;
+    pub const GENI_STATUS: u32 = 0x40;
     pub const FW_REVISION: u32 = 0x68;
     pub const CLK_SEL: u32 = 0x7c;
     pub const DMA_MODE_EN: u32 = 0x258;
@@ -37,6 +39,7 @@ const I2C_PROTOCOL: u32 = 3;
 const IRQ_DONE: u32 = 1 << 0;
 const IRQ_NACK: u32 = 1 << 10;
 const IRQ_ERROR: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 13);
+const IRQ_FAULT: u32 = IRQ_NACK | IRQ_ERROR;
 const IRQ_RX: u32 = (1 << 26) | (1 << 27);
 const IRQ_TX: u32 = 1 << 30;
 const IRQ_ABORT_DONE: u32 = 1 << 5;
@@ -61,10 +64,37 @@ pub enum GeniError {
     InvalidAddress,
     EmptyTransfer,
     TransferTooLong,
-    Nack,
-    Bus,
-    Timeout,
+    Nack { m_irq: u32, geni_status: u32 },
+    Bus { m_irq: u32, geni_status: u32 },
+    Timeout { m_irq: u32, geni_status: u32 },
     IncompleteRead,
+}
+
+impl GeniError {
+    /// Pack this error into one diagnostic word for `log_hex`: the top nibble is the fault kind and,
+    /// for a hardware fault, the GENI_STATUS snapshot rides in the mid word and the M_IRQ_STATUS bits
+    /// in the low word — so a single hex line shows exactly why a transfer failed. Simple validation
+    /// errors keep their small ordinal. — CORVUS
+    pub fn code(&self) -> u64 {
+        match *self {
+            GeniError::WrongProtocol => 0,
+            GeniError::FifoUnavailable => 1,
+            GeniError::InvalidFifoDepth => 2,
+            GeniError::InvalidAddress => 3,
+            GeniError::EmptyTransfer => 4,
+            GeniError::TransferTooLong => 5,
+            GeniError::Nack { m_irq, geni_status } => {
+                0x1000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::Bus { m_irq, geni_status } => {
+                0x2000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::Timeout { m_irq, geni_status } => {
+                0x3000_0000_0000_0000 | ((geni_status as u64) << 32) | (m_irq as u64)
+            }
+            GeniError::IncompleteRead => 9,
+        }
+    }
 }
 
 pub struct Controller<Io> {
@@ -194,10 +224,11 @@ impl<Io: RegisterIo> Controller<Io> {
         let mut cursor = 0usize;
         for _ in 0..self.poll_limit {
             let irq = self.io.read(register::M_IRQ_STATUS);
-            if let Err(error) = check_irq(irq) {
+            if irq & IRQ_FAULT != 0 {
+                let geni_status = self.io.read(register::GENI_STATUS);
                 self.io.write(register::TX_WATERMARK, 0);
                 self.io.write(register::M_IRQ_CLEAR, irq);
-                return Err(error);
+                return Err(fault_error(irq, geni_status));
             }
             if irq & IRQ_TX != 0 {
                 for _ in 0..self.tx_words - 1 {
@@ -222,8 +253,10 @@ impl<Io: RegisterIo> Controller<Io> {
                 return Ok(());
             }
         }
+        let m_irq = self.io.read(register::M_IRQ_STATUS);
+        let geni_status = self.io.read(register::GENI_STATUS);
         self.abort();
-        Err(GeniError::Timeout)
+        Err(GeniError::Timeout { m_irq, geni_status })
     }
 
     fn read_message(&mut self, address: u8, bytes: &mut [u8]) -> Result<(), GeniError> {
@@ -236,9 +269,10 @@ impl<Io: RegisterIo> Controller<Io> {
         let mut cursor = 0usize;
         for _ in 0..self.poll_limit {
             let irq = self.io.read(register::M_IRQ_STATUS);
-            if let Err(error) = check_irq(irq) {
+            if irq & IRQ_FAULT != 0 {
+                let geni_status = self.io.read(register::GENI_STATUS);
                 self.io.write(register::M_IRQ_CLEAR, irq);
-                return Err(error);
+                return Err(fault_error(irq, geni_status));
             }
             if irq & IRQ_RX != 0 {
                 let words = (self.io.read(register::RX_FIFO_STATUS) & 0x00ff_ffff) as usize;
@@ -263,8 +297,10 @@ impl<Io: RegisterIo> Controller<Io> {
                 };
             }
         }
+        let m_irq = self.io.read(register::M_IRQ_STATUS);
+        let geni_status = self.io.read(register::GENI_STATUS);
         self.abort();
-        Err(GeniError::Timeout)
+        Err(GeniError::Timeout { m_irq, geni_status })
     }
 
     fn abort(&mut self) {
@@ -287,13 +323,22 @@ fn update(io: &mut impl RegisterIo, offset: u32, operation: impl FnOnce(u32) -> 
     io.write(offset, operation(value));
 }
 
-fn check_irq(irq: u32) -> Result<(), GeniError> {
+/// Classify a completion IRQ whose fault bits are set into a diagnostic error, capturing the
+/// M_IRQ_STATUS bits (`m_irq`) and the GENI_STATUS sequencer state (`geni_status`) at the point of
+/// failure so a NACK or bus fault is diagnosable in a log instead of opaque — Linux i2c-qcom-geni
+/// surfaces the same pair. Callers gate on `irq & IRQ_FAULT` so GENI_STATUS is read only on fault.
+/// — CORVUS
+fn fault_error(irq: u32, geni_status: u32) -> GeniError {
     if irq & IRQ_NACK != 0 {
-        Err(GeniError::Nack)
-    } else if irq & IRQ_ERROR != 0 {
-        Err(GeniError::Bus)
+        GeniError::Nack {
+            m_irq: irq,
+            geni_status,
+        }
     } else {
-        Ok(())
+        GeniError::Bus {
+            m_irq: irq,
+            geni_status,
+        }
     }
 }
 
@@ -392,7 +437,10 @@ mod tests {
         let mut controller = Controller::new(nack, SourceClock::Mhz19_2, 2).unwrap();
         assert_eq!(
             controller.write_read(0x68, &[1], &mut [0u8; 2]),
-            Err(GeniError::Nack)
+            Err(GeniError::Nack {
+                m_irq: IRQ_NACK,
+                geni_status: 0
+            })
         );
         let nack = controller.into_inner();
         assert_eq!(nack.values[&register::TX_WATERMARK], 0);
@@ -402,7 +450,10 @@ mod tests {
             Controller::new(FakeRegisters::ready(), SourceClock::Mhz19_2, 2).unwrap();
         assert_eq!(
             controller.write_read(0x68, &[1], &mut [0u8; 2]),
-            Err(GeniError::Timeout)
+            Err(GeniError::Timeout {
+                m_irq: 0,
+                geni_status: 0
+            })
         );
         let fake = controller.into_inner();
         assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
@@ -416,13 +467,56 @@ mod tests {
         timeout.irqs.push_back(IRQ_ABORT_DONE);
         let mut controller = Controller::new(timeout, SourceClock::Mhz19_2, 5).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             controller.write_read(0x68, &[1], &mut [0u8; 2]),
-            Err(GeniError::Timeout)
-        );
+            Err(GeniError::Timeout { .. })
+        ));
         let fake = controller.into_inner();
         assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
         // Ensure the abort was polled and cleared
         assert_eq!(fake.values[&register::M_IRQ_CLEAR], IRQ_ABORT_DONE);
+    }
+
+    #[test]
+    fn fault_errors_carry_the_irq_and_geni_status_snapshot() {
+        // A NACK captures the M_IRQ_STATUS bits and the GENI_STATUS sequencer state.
+        let mut nack = FakeRegisters::ready();
+        nack.values.insert(register::GENI_STATUS, 0x00b1_0000);
+        nack.irqs.push_back(IRQ_NACK);
+        let mut controller = Controller::new(nack, SourceClock::Mhz19_2, 2).unwrap();
+        assert_eq!(
+            controller.write_read(0x68, &[1], &mut [0u8; 2]),
+            Err(GeniError::Nack {
+                m_irq: IRQ_NACK,
+                geni_status: 0x00b1_0000
+            })
+        );
+
+        // A non-NACK error bit classifies as Bus, carrying the same snapshot.
+        let mut bus = FakeRegisters::ready();
+        bus.values.insert(register::GENI_STATUS, 0x0000_00c2);
+        bus.irqs.push_back(1 << 2);
+        let mut controller = Controller::new(bus, SourceClock::Mhz19_2, 2).unwrap();
+        assert_eq!(
+            controller.write_read(0x68, &[1], &mut [0u8; 2]),
+            Err(GeniError::Bus {
+                m_irq: 1 << 2,
+                geni_status: 0x0000_00c2
+            })
+        );
+    }
+
+    #[test]
+    fn error_code_packs_kind_and_register_snapshot() {
+        assert_eq!(GeniError::WrongProtocol.code(), 0);
+        assert_eq!(GeniError::IncompleteRead.code(), 9);
+        assert_eq!(
+            GeniError::Nack {
+                m_irq: IRQ_NACK,
+                geni_status: 0x00b1_0000
+            }
+            .code(),
+            0x1000_0000_0000_0000 | (0x00b1_0000u64 << 32) | (IRQ_NACK as u64)
+        );
     }
 }
