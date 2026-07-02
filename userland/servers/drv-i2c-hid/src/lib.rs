@@ -2,6 +2,7 @@
 
 //j382
 //j383
+//j385
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -15,6 +16,7 @@ use kumo_i2c_hid::{
 const MAGIC: [u8; 4] = *b"I2H1";
 pub const KEYBOARD_BOOTSTRAP_TAG: u8 = b'K';
 pub const MOUSE_BOOTSTRAP_TAG: u8 = b'M';
+pub const OPTIONAL_PROBE_BOOTSTRAP_TAG: u8 = b'P';
 pub const MOUSE_EVENT_BYTES: usize = BOOT_MOUSE_REPORT_BYTES;
 pub const INPUT_POLL_FRAMES: usize = 32;
 pub const MAX_INPUT_FRAME_BYTES: usize = 64;
@@ -660,6 +662,96 @@ impl ProbePlan {
         self.device_count += 1;
         Ok(())
     }
+
+    /// The plan's `Optional` children, reduced to what a read-only bus probe needs. Attention-IRQ
+    /// binding is deliberately NOT carried here — that authority stays with the later per-device
+    /// launch slice (DESIGN/015); this message only lets the driver ask "who else is on my bus".
+    /// — CORVUS
+    pub fn optional_probe_candidates(&self) -> OptionalProbeCandidates {
+        let mut candidates = OptionalProbeCandidates::EMPTY;
+        for device in self.devices() {
+            if device.failure_policy == ProbeFailurePolicy::Optional {
+                candidates.candidates[candidates.count] = OptionalProbeCandidate {
+                    i2c_address: device.config.i2c_address,
+                    hid_descriptor_register: device.config.hid_descriptor_register,
+                };
+                candidates.count += 1;
+            }
+        }
+        candidates
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OptionalProbeCandidate {
+    pub i2c_address: u8,
+    pub hid_descriptor_register: u16,
+}
+
+/// Bootstrap message carrying the optional (skippable) i2c21 HID children from Sora to
+/// `drv-i2c-hid`, sent after the keyboard and mouse channels. Self-tagged with
+/// [`OPTIONAL_PROBE_BOOTSTRAP_TAG`]; fixed-size like [`ProbeConfig`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OptionalProbeCandidates {
+    candidates: [OptionalProbeCandidate; MAX_I2C_HID_DEVICES],
+    count: usize,
+}
+
+impl OptionalProbeCandidates {
+    pub const BYTES: usize = 2 + MAX_I2C_HID_DEVICES * 3;
+    pub const EMPTY: Self = Self {
+        candidates: [OptionalProbeCandidate {
+            i2c_address: 0,
+            hid_descriptor_register: 0,
+        }; MAX_I2C_HID_DEVICES],
+        count: 0,
+    };
+
+    pub fn candidates(&self) -> &[OptionalProbeCandidate] {
+        &self.candidates[..self.count]
+    }
+
+    pub fn encode(&self) -> [u8; Self::BYTES] {
+        let mut raw = [0u8; Self::BYTES];
+        raw[0] = OPTIONAL_PROBE_BOOTSTRAP_TAG;
+        raw[1] = self.count as u8;
+        for (index, candidate) in self.candidates().iter().enumerate() {
+            let base = 2 + index * 3;
+            raw[base] = candidate.i2c_address;
+            raw[base + 1..base + 3]
+                .copy_from_slice(&candidate.hid_descriptor_register.to_le_bytes());
+        }
+        raw
+    }
+
+    pub fn decode(raw: &[u8]) -> Result<Self, ConfigError> {
+        if raw.len() < Self::BYTES {
+            return Err(ConfigError::Truncated);
+        }
+        if raw[0] != OPTIONAL_PROBE_BOOTSTRAP_TAG {
+            return Err(ConfigError::BadMagic);
+        }
+        let count = raw[1] as usize;
+        if count > MAX_I2C_HID_DEVICES {
+            return Err(ConfigError::TooManyDevices);
+        }
+        let mut decoded = Self::EMPTY;
+        for index in 0..count {
+            let base = 2 + index * 3;
+            let i2c_address = raw[base];
+            if i2c_address == 0 || i2c_address > 0x7f {
+                return Err(ConfigError::InvalidAddress);
+            }
+            decoded.candidates[index] = OptionalProbeCandidate {
+                i2c_address,
+                hid_descriptor_register: u16::from_le_bytes(
+                    raw[base + 1..base + 3].try_into().unwrap(),
+                ),
+            };
+        }
+        decoded.count = count;
+        Ok(decoded)
+    }
 }
 
 const fn source_clock_hz(clock: SourceClock) -> u32 {
@@ -979,6 +1071,60 @@ mod tests {
             kumo_abi::tlmm_gpio_irq(104, 8)
         );
         assert_eq!(plan.keyboard(), Some(&devices[2]));
+    }
+
+    #[test]
+    fn optional_probe_candidates_carry_the_x13s_touchpads() {
+        let plan = x13s_probe_plan();
+        let candidates = plan.optional_probe_candidates();
+
+        assert_eq!(
+            candidates.candidates(),
+            &[
+                OptionalProbeCandidate {
+                    i2c_address: 0x15,
+                    hid_descriptor_register: 0x0001,
+                },
+                OptionalProbeCandidate {
+                    i2c_address: 0x2c,
+                    hid_descriptor_register: 0x0020,
+                },
+            ]
+        );
+
+        let encoded = candidates.encode();
+        assert_eq!(encoded[0], OPTIONAL_PROBE_BOOTSTRAP_TAG);
+        let decoded = OptionalProbeCandidates::decode(&encoded).unwrap();
+        assert_eq!(decoded, candidates);
+    }
+
+    #[test]
+    fn optional_probe_candidates_decode_rejects_malformed_messages() {
+        let encoded = x13s_probe_plan().optional_probe_candidates().encode();
+
+        assert_eq!(
+            OptionalProbeCandidates::decode(&encoded[..5]),
+            Err(ConfigError::Truncated)
+        );
+        let mut bad_tag = encoded;
+        bad_tag[0] = b'X';
+        assert_eq!(
+            OptionalProbeCandidates::decode(&bad_tag),
+            Err(ConfigError::BadMagic)
+        );
+        let mut bad_count = encoded;
+        bad_count[1] = (MAX_I2C_HID_DEVICES + 1) as u8;
+        assert_eq!(
+            OptionalProbeCandidates::decode(&bad_count),
+            Err(ConfigError::TooManyDevices)
+        );
+        let mut bad_address = encoded;
+        bad_address[2] = 0xa9;
+        assert_eq!(
+            OptionalProbeCandidates::decode(&bad_address),
+            Err(ConfigError::InvalidAddress)
+        );
+        assert!(OptionalProbeCandidates::EMPTY.candidates().is_empty());
     }
 
     #[test]

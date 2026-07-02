@@ -2,6 +2,7 @@
 //j378
 //j383
 //j384
+//j385
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -10,9 +11,10 @@ use drv_i2c_hid::{
     bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report_with_mouse,
     decode_mouse_probe, encode_mouse_event, should_log_input_report_stats_snapshot,
     BoundedFailureLog, DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass,
-    InputReportStats, ProbeConfig, ResetStormGuard, StartupLatencyTrace, StartupMilestone,
-    IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
-    MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
+    InputReportStats, OptionalProbeCandidates, ProbeConfig, ResetStormGuard, StartupLatencyTrace,
+    StartupMilestone, IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
+    MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT,
+    RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
 };
 use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
 use kumo_i2c_hid::{
@@ -406,6 +408,25 @@ extern "C" fn main(
     }
     let mouse_channel = Handle(mouse_raw as u32);
     log(b"drv-i2c-hid: mouse channel ok\n");
+
+    let mut probe_raw = [0u8; OptionalProbeCandidates::BYTES];
+    let (received, spare_raw) =
+        channel_read_with_handle(bootstrap, probe_raw.as_mut_ptr(), probe_raw.len());
+    if received != probe_raw.len() || spare_raw != 0 {
+        log(b"drv-i2c-hid: probe bootstrap failed\n");
+        kumo_rt::process_exit(1);
+    }
+    let optional_probes = match OptionalProbeCandidates::decode(&probe_raw) {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            log(b"drv-i2c-hid: probe candidates invalid\n");
+            kumo_rt::process_exit(1);
+        }
+    };
+    log_hex(
+        b"drv-i2c-hid: probe candidates=0x",
+        optional_probes.candidates().len() as u64,
+    );
     startup_trace.record(StartupMilestone::ChannelsOk, clock_get());
 
     let resource = Handle(resource_raw as u32);
@@ -665,6 +686,71 @@ extern "C" fn main(
         ) {
             Ok(()) => log(b"drv-i2c-hid: led-state sync off\n"),
             Err(error) => log_hex(b"drv-i2c-hid: led-state sync error=0x", error as u64),
+        }
+    }
+
+    // PLAN_V Slice 8 (measure first): probe the DT-declared optional i2c21 children read-only on
+    // the still-quiet bus, before the keyboard loop starts. A missing device NACKs and is skipped
+    // — ProbeFailurePolicy::Optional exercised on metal. The report-descriptor dump is temporary,
+    // like J378's keyboard dump: it is the measurement the touchpad decode slice needs. — CORVUS
+    for candidate in optional_probes.candidates() {
+        log_hex(
+            b"drv-i2c-hid: tp probe addr=0x",
+            candidate.i2c_address as u64,
+        );
+        let mut tp_raw = [0u8; HidDescriptor::BYTES];
+        if let Err(error) = controller.write_read(
+            candidate.i2c_address,
+            &candidate.hid_descriptor_register.to_le_bytes(),
+            &mut tp_raw,
+        ) {
+            log_hex(b"drv-i2c-hid: tp probe skipped error=0x", error.code());
+            continue;
+        }
+        let tp_descriptor = match HidDescriptor::parse(&tp_raw) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                log_hex(b"drv-i2c-hid: tp descriptor error=0x", error as u64);
+                continue;
+            }
+        };
+        log_hex(b"drv-i2c-hid: tp vendor=0x", tp_descriptor.vendor_id as u64);
+        log_hex(
+            b"drv-i2c-hid: tp product=0x",
+            tp_descriptor.product_id as u64,
+        );
+        log_hex(
+            b"drv-i2c-hid: tp input-reg=0x",
+            tp_descriptor.input_register as u64,
+        );
+        log_hex(
+            b"drv-i2c-hid: tp max-input=0x",
+            tp_descriptor.max_input_length as u64,
+        );
+        let tp_rdesc_len =
+            match bounded_report_descriptor_len(tp_descriptor.report_descriptor_length) {
+                Ok(length) => length,
+                Err(error) => {
+                    log_hex(b"drv-i2c-hid: tp rdesc length error=0x", error as u64);
+                    continue;
+                }
+            };
+        log_hex(b"drv-i2c-hid: tp rdesc-len=0x", tp_rdesc_len as u64);
+        let mut tp_report_descriptor = [0u8; MAX_REPORT_DESCRIPTOR_BYTES];
+        if let Err(error) = controller.write_read(
+            candidate.i2c_address,
+            &tp_descriptor.report_descriptor_register.to_le_bytes(),
+            &mut tp_report_descriptor[..tp_rdesc_len],
+        ) {
+            log_hex(b"drv-i2c-hid: tp rdesc read error=0x", error.code());
+            continue;
+        }
+        let tp_desc = &tp_report_descriptor[..tp_rdesc_len];
+        let mut offset = 0;
+        while offset < tp_desc.len() {
+            let end = (offset + 16).min(tp_desc.len());
+            log_frame(b"drv-i2c-hid: tp rdesc= ", &tp_desc[offset..end]);
+            offset = end;
         }
     }
 

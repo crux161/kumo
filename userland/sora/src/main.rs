@@ -2,6 +2,7 @@
 #![no_main]
 
 //j382
+//j385
 
 extern crate alloc;
 
@@ -973,6 +974,21 @@ extern "C" fn sora_main(
                                 } else {
                                     Errno::Ok.status()
                                 };
+                                // PLAN_V Slice 8: hand the driver the DT-derived optional
+                                // (skippable) bus siblings so it can probe them itself. — CORVUS
+                                let probe_encoded = match discovery.probe_plan.as_ref() {
+                                    Some(plan) => plan.optional_probe_candidates().encode(),
+                                    None => drv_i2c_hid::OptionalProbeCandidates::EMPTY.encode(),
+                                };
+                                let probe_sent = if mouse_sent == 0 {
+                                    channel_write(
+                                        Handle(sender as u32),
+                                        probe_encoded.as_ptr(),
+                                        probe_encoded.len(),
+                                    )
+                                } else {
+                                    Errno::Ok.status()
+                                };
                                 if sent != 0 {
                                     let _ = handle_close(Handle(mouse_reader as u32));
                                     let _ = handle_close(Handle(mouse_writer as u32));
@@ -988,6 +1004,9 @@ extern "C" fn sora_main(
                                     let _ = handle_close(Handle(mouse_reader as u32));
                                     let _ = handle_close(Handle(mouse_writer as u32));
                                     log(b"drv-i2c-hid: mouse bootstrap fail\n");
+                                } else if probe_sent != 0 {
+                                    let _ = handle_close(Handle(mouse_reader as u32));
+                                    log(b"drv-i2c-hid: probe bootstrap fail\n");
                                 } else if run_elf(
                                     initrd,
                                     kumo_abi::DRV_I2C_HID_PATH.as_bytes(),
