@@ -1,8 +1,8 @@
-//j377
 //j378
 //j383
 //j384
 //j385
+//j387
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -31,6 +31,10 @@ kumo_rt::entry!(main);
 
 const MMIO_VA: u64 = 0x0000_0000_1100_0000;
 const POLL_LIMIT: usize = 1_000_000;
+/// Probe-only report-descriptor read budget (the Elan touchpad's descriptor outgrows the 256-byte
+/// keyboard cap). Transient in main's frame; the child stack is 16 KiB (Sora's STACK_SIZE), so a
+/// 1 KiB scratch buffer is comfortably inside budget.
+const PROBE_RDESC_BYTES: usize = 1024;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
@@ -727,16 +731,24 @@ extern "C" fn main(
             b"drv-i2c-hid: tp max-input=0x",
             tp_descriptor.max_input_length as u64,
         );
-        let tp_rdesc_len =
-            match bounded_report_descriptor_len(tp_descriptor.report_descriptor_length) {
-                Ok(length) => length,
-                Err(error) => {
-                    log_hex(b"drv-i2c-hid: tp rdesc length error=0x", error as u64);
-                    continue;
-                }
-            };
-        log_hex(b"drv-i2c-hid: tp rdesc-len=0x", tp_rdesc_len as u64);
-        let mut tp_report_descriptor = [0u8; MAX_REPORT_DESCRIPTOR_BYTES];
+        // Probe-local descriptor budget: the touchpad's report descriptor is bigger than the
+        // keyboard-sized MAX_REPORT_DESCRIPTOR_BYTES cap (the live J385/J386 boot rejected it
+        // TooLong), so the probe reads up to PROBE_RDESC_BYTES and says so if it truncates. The
+        // keyboard path's own bound is unchanged. — CORVUS
+        let tp_declared = tp_descriptor.report_descriptor_length as usize;
+        log_hex(b"drv-i2c-hid: tp rdesc-declared=0x", tp_declared as u64);
+        if tp_declared == 0 {
+            log(b"drv-i2c-hid: tp rdesc empty\n");
+            continue;
+        }
+        let tp_rdesc_len = tp_declared.min(PROBE_RDESC_BYTES);
+        if tp_rdesc_len < tp_declared {
+            log_hex(
+                b"drv-i2c-hid: tp rdesc truncated to=0x",
+                tp_rdesc_len as u64,
+            );
+        }
+        let mut tp_report_descriptor = [0u8; PROBE_RDESC_BYTES];
         if let Err(error) = controller.write_read(
             candidate.i2c_address,
             &tp_descriptor.report_descriptor_register.to_le_bytes(),
