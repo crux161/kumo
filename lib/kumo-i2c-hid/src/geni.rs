@@ -1,4 +1,5 @@
 //j377
+//j386
 pub mod register {
     pub const FORCE_DEFAULT: u32 = 0x20;
     pub const OUTPUT_CTRL: u32 = 0x24;
@@ -228,6 +229,7 @@ impl<Io: RegisterIo> Controller<Io> {
                 let geni_status = self.io.read(register::GENI_STATUS);
                 self.io.write(register::TX_WATERMARK, 0);
                 self.io.write(register::M_IRQ_CLEAR, irq);
+                self.quiesce_after_fault(irq);
                 return Err(fault_error(irq, geni_status));
             }
             if irq & IRQ_TX != 0 {
@@ -272,6 +274,7 @@ impl<Io: RegisterIo> Controller<Io> {
             if irq & IRQ_FAULT != 0 {
                 let geni_status = self.io.read(register::GENI_STATUS);
                 self.io.write(register::M_IRQ_CLEAR, irq);
+                self.quiesce_after_fault(irq);
                 return Err(fault_error(irq, geni_status));
             }
             if irq & IRQ_RX != 0 {
@@ -301,6 +304,28 @@ impl<Io: RegisterIo> Controller<Io> {
         let geni_status = self.io.read(register::GENI_STATUS);
         self.abort();
         Err(GeniError::Timeout { m_irq, geni_status })
+    }
+
+    /// A faulted command (NACK, bus error) may still be terminating in the sequencer when the
+    /// fault bit is observed; issuing the next M_CMD while GENI_STATUS reads CMD_ACTIVE raises
+    /// M_CMD_OVERRUN (M_IRQ bit 1) and wedges the bus — seen live on the X13s as
+    /// `input frame read error=0x2000004100000002` after a NACKed touchpad probe (J386). Wait for
+    /// M_CMD_DONE, clearing status as it lands, and fall back to a hard abort if it never does —
+    /// Linux i2c-qcom-geni's cancel/abort-on-error discipline. — CORVUS
+    fn quiesce_after_fault(&mut self, first_irq: u32) {
+        if first_irq & IRQ_DONE != 0 {
+            return;
+        }
+        for _ in 0..self.poll_limit {
+            let irq = self.io.read(register::M_IRQ_STATUS);
+            if irq != 0 {
+                self.io.write(register::M_IRQ_CLEAR, irq);
+            }
+            if irq & IRQ_DONE != 0 {
+                return;
+            }
+        }
+        self.abort();
     }
 
     fn abort(&mut self) {
@@ -504,6 +529,37 @@ mod tests {
                 geni_status: 0x0000_00c2
             })
         );
+    }
+
+    #[test]
+    fn fault_waits_for_done_so_the_next_command_is_not_overrun() {
+        // The NACKed command terminates (DONE lands two polls later); quiesce must consume it
+        // without needing a hard abort, leaving the sequencer idle for the next M_CMD.
+        let mut nack = FakeRegisters::ready();
+        nack.irqs.extend([IRQ_NACK, 0, IRQ_DONE]);
+        let mut controller = Controller::new(nack, SourceClock::Mhz19_2, 8).unwrap();
+        assert!(matches!(
+            controller.write_read(0x15, &[1, 0], &mut [0u8; 2]),
+            Err(GeniError::Nack { .. })
+        ));
+        let fake = controller.into_inner();
+        assert_eq!(fake.values[&register::M_IRQ_CLEAR], IRQ_DONE);
+        assert_eq!(fake.values.get(&register::M_CMD_CTRL), None);
+    }
+
+    #[test]
+    fn fault_aborts_when_done_never_lands() {
+        // No DONE after the NACK; quiesce must fall back to the hard abort and drain it.
+        let mut nack = FakeRegisters::ready();
+        nack.irqs.extend([IRQ_NACK, 0, 0, 0, IRQ_ABORT_DONE]);
+        let mut controller = Controller::new(nack, SourceClock::Mhz19_2, 3).unwrap();
+        assert!(matches!(
+            controller.write_read(0x15, &[1, 0], &mut [0u8; 2]),
+            Err(GeniError::Nack { .. })
+        ));
+        let fake = controller.into_inner();
+        assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
+        assert_eq!(fake.values[&register::M_IRQ_CLEAR], IRQ_ABORT_DONE);
     }
 
     #[test]
