@@ -1,5 +1,6 @@
 //j377
 //j378
+//j383
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -775,10 +776,11 @@ extern "C" fn main(
             maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
             continue;
         }
-        let input = match input_decoder.decode_with_quirks(
+        let input = match input_decoder.decode_with_quirks_and_caps_lock(
             &input_frame[..input_frame_len],
             keyboard.report_id,
             quirks,
+            caps_lock,
         ) {
             Ok(input) => input,
             // After first light, a single odd input report is soft-state loss, not a driver death:

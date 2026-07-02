@@ -1,8 +1,11 @@
 #![no_std]
 
 //j382
+//j383
 
-use kumo_hid::{DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS};
+use kumo_hid::{
+    apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
+};
 use kumo_i2c_hid::{
     boot_keyboard_report, boot_mouse_report, BootMouseReport, HidDeviceKind, HidDeviceTopology,
     I2cHidBusTopology, InputFrame, KeyboardTopology, MouseButtons, MouseReport, ProtocolError,
@@ -404,6 +407,16 @@ impl InputProbeDecoder {
         report_id: Option<u8>,
         quirks: DeviceQuirks,
     ) -> Result<InputProbe, InputProbeError> {
+        self.decode_with_quirks_and_caps_lock(raw, report_id, quirks, false)
+    }
+
+    pub fn decode_with_quirks_and_caps_lock(
+        &mut self,
+        raw: &[u8],
+        report_id: Option<u8>,
+        quirks: DeviceQuirks,
+        caps_lock: bool,
+    ) -> Result<InputProbe, InputProbeError> {
         if quirks.bogus_irq && raw.len() >= 2 && raw[0] == 0xff && raw[1] == 0xff {
             return Ok(no_input_probe());
         }
@@ -420,7 +433,7 @@ impl InputProbeDecoder {
             .decoder
             .decode(report)
             .map_err(InputProbeError::Decode)?;
-        Ok(input_probe_from_events(&events))
+        Ok(input_probe_from_events_with_caps_lock(&events, caps_lock))
     }
 }
 
@@ -791,7 +804,10 @@ const fn no_input_probe() -> InputProbe {
     }
 }
 
-fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
+fn input_probe_from_events_with_caps_lock(
+    events: &kumo_hid::Events,
+    caps_lock: bool,
+) -> InputProbe {
     let mut first_pressed_usage = None;
     let mut first_pressed_ascii = None;
     let mut caps_lock_toggle = false;
@@ -804,7 +820,10 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
             if event.usage == 0x39 {
                 caps_lock_toggle = true;
             }
-            let ascii = event.symbol.ascii();
+            let ascii = event
+                .symbol
+                .ascii()
+                .map(|byte| apply_caps_lock_to_ascii(byte, caps_lock));
             if first_pressed_usage.is_none() {
                 first_pressed_usage = Some(event.usage);
                 first_pressed_ascii = ascii;
@@ -814,11 +833,16 @@ fn input_probe_from_events(events: &kumo_hid::Events) -> InputProbe {
                     pressed_ascii[pressed_ascii_len] = byte;
                     pressed_ascii_len += 1;
                 }
-            }
-            for &byte in event.symbol.terminal_bytes().as_slice() {
                 if pressed_terminal_len < MAX_PRESSED_TERMINAL_BYTES {
                     pressed_terminal[pressed_terminal_len] = byte;
                     pressed_terminal_len += 1;
+                }
+            } else {
+                for &byte in event.symbol.terminal_bytes().as_slice() {
+                    if pressed_terminal_len < MAX_PRESSED_TERMINAL_BYTES {
+                        pressed_terminal[pressed_terminal_len] = byte;
+                        pressed_terminal_len += 1;
+                    }
                 }
             }
         }
@@ -1279,6 +1303,53 @@ mod tests {
             assert_eq!(input.pressed_ascii(), b"");
             assert_eq!(input.pressed_terminal_bytes(), sequence);
         }
+    }
+
+    #[test]
+    fn caps_lock_state_toggles_letters_without_rewriting_escape_sequences() {
+        let quirks = DeviceQuirks::default();
+        let mut decoder = InputProbeDecoder::new();
+
+        let raw_a = [10, 0, 0, 0, 0x04, 0, 0, 0, 0, 0];
+        let input = decoder
+            .decode_with_quirks_and_caps_lock(&raw_a, None, quirks, true)
+            .unwrap();
+        assert_eq!(input, probe(1, Some(0x04), Some(b'A'), b"A"));
+        assert_eq!(input.pressed_terminal_bytes(), b"A");
+
+        let raw_empty = [10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            decoder.decode_with_quirks_and_caps_lock(&raw_empty, None, quirks, true),
+            Ok(probe(1, None, None, b""))
+        );
+
+        let raw_shift_a = [
+            10,
+            0,
+            kumo_hid::Modifiers::LEFT_SHIFT,
+            0,
+            0x04,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let input = decoder
+            .decode_with_quirks_and_caps_lock(&raw_shift_a, None, quirks, true)
+            .unwrap();
+        assert_eq!(input, probe(1, Some(0x04), Some(b'a'), b"a"));
+
+        let mut arrows = InputProbeDecoder::new();
+        let raw_up = [10, 0, 0, 0, 0x52, 0, 0, 0, 0, 0];
+        let input = arrows
+            .decode_with_quirks_and_caps_lock(&raw_up, None, quirks, true)
+            .unwrap();
+        assert_eq!(
+            input,
+            probe_with_terminal(1, Some(0x52), None, b"", b"\x1b[A")
+        );
+        assert_eq!(input.pressed_terminal_bytes(), b"\x1b[A");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 #![no_std]
+//j383
 
 //! Allocation-free USB HID boot-keyboard report decoding.
 //!
@@ -101,6 +102,17 @@ impl KeySym {
             Self::Delete => TerminalBytes::sequence([0x1b, b'[', b'3', b'~'], 4),
             _ => TerminalBytes::none(),
         }
+    }
+}
+
+pub const fn apply_caps_lock_to_ascii(byte: u8, caps_lock: bool) -> u8 {
+    if !caps_lock {
+        return byte;
+    }
+    match byte {
+        b'a'..=b'z' => byte - (b'a' - b'A'),
+        b'A'..=b'Z' => byte + (b'a' - b'A'),
+        _ => byte,
     }
 }
 
@@ -427,6 +439,16 @@ mod tests {
         assert_eq!(key_sym(0x1e, shift), KeySym::Ascii(b'!'));
         assert_eq!(key_sym(0x38, shift), KeySym::Ascii(b'?'));
         assert_eq!(key_sym(0x2a, shift), KeySym::Ascii(0x7f));
+    }
+
+    #[test]
+    fn caps_lock_toggles_only_printable_letter_case() {
+        assert_eq!(apply_caps_lock_to_ascii(b'a', true), b'A');
+        assert_eq!(apply_caps_lock_to_ascii(b'A', true), b'a');
+        assert_eq!(apply_caps_lock_to_ascii(b'1', true), b'1');
+        assert_eq!(apply_caps_lock_to_ascii(b'\x1b', true), b'\x1b');
+        assert_eq!(apply_caps_lock_to_ascii(b'a', false), b'a');
+        assert_eq!(apply_caps_lock_to_ascii(b'A', false), b'A');
     }
 
     #[test]
