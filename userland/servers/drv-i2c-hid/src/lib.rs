@@ -1,9 +1,12 @@
 #![no_std]
 
+//j382
+
 use kumo_hid::{DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS};
 use kumo_i2c_hid::{
-    boot_keyboard_report, boot_mouse_report, BootMouseReport, InputFrame, KeyboardTopology,
-    MouseButtons, MouseReport, ProtocolError, SourceClock, BOOT_MOUSE_REPORT_BYTES,
+    boot_keyboard_report, boot_mouse_report, BootMouseReport, HidDeviceKind, HidDeviceTopology,
+    I2cHidBusTopology, InputFrame, KeyboardTopology, MouseButtons, MouseReport, ProtocolError,
+    SourceClock, BOOT_MOUSE_REPORT_BYTES, MAX_I2C_HID_DEVICES,
 };
 
 const MAGIC: [u8; 4] = *b"I2H1";
@@ -123,6 +126,8 @@ pub enum ConfigError {
     UnsupportedSourceClock,
     InvalidAddress,
     InvalidInterrupt,
+    MissingKeyboard,
+    TooManyDevices,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,19 +438,57 @@ pub struct ProbeConfig {
 
 impl ProbeConfig {
     pub const BYTES: usize = 36;
+    const EMPTY: Self = Self {
+        mmio_base: 0,
+        mmio_length: 0,
+        bus_frequency_hz: 0,
+        source_clock: SourceClock::Mhz19_2,
+        i2c_address: 0,
+        hid_descriptor_register: 0,
+        attention_irq: 0,
+    };
 
     pub fn for_x13s(topology: KeyboardTopology) -> Result<Self, ConfigError> {
+        Self::for_x13s_parts(
+            topology.controller_mmio_base,
+            topology.controller_mmio_length,
+            topology.bus_frequency_hz,
+            topology.i2c_address,
+            topology.hid_descriptor_register,
+            topology.keyboard_interrupt,
+        )
+    }
+
+    pub fn for_x13s_device(
+        topology: I2cHidBusTopology,
+        device: HidDeviceTopology,
+    ) -> Result<Self, ConfigError> {
+        Self::for_x13s_parts(
+            topology.controller_mmio_base,
+            topology.controller_mmio_length,
+            topology.bus_frequency_hz,
+            device.i2c_address,
+            device.hid_descriptor_register,
+            device.interrupt,
+        )
+    }
+
+    fn for_x13s_parts(
+        mmio_base: u64,
+        mmio_length: u64,
+        bus_frequency_hz: u32,
+        i2c_address: u8,
+        hid_descriptor_register: u16,
+        interrupt: kumo_i2c_hid::GpioInterrupt,
+    ) -> Result<Self, ConfigError> {
         let config = Self {
-            mmio_base: topology.controller_mmio_base,
-            mmio_length: topology.controller_mmio_length,
-            bus_frequency_hz: topology.bus_frequency_hz,
+            mmio_base,
+            mmio_length,
+            bus_frequency_hz,
             source_clock: SourceClock::Mhz19_2,
-            i2c_address: topology.i2c_address,
-            hid_descriptor_register: topology.hid_descriptor_register,
-            attention_irq: kumo_abi::tlmm_gpio_irq(
-                topology.keyboard_interrupt.pin,
-                topology.keyboard_interrupt.flags,
-            ),
+            i2c_address,
+            hid_descriptor_register,
+            attention_irq: kumo_abi::tlmm_gpio_irq(interrupt.pin, interrupt.flags),
         };
         config.validate()?;
         Ok(config)
@@ -505,6 +548,103 @@ impl ProbeConfig {
         if kumo_abi::decode_tlmm_gpio_irq(self.attention_irq).is_none() {
             return Err(ConfigError::InvalidInterrupt);
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeFailurePolicy {
+    Required,
+    Optional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceProbeConfig {
+    pub kind: HidDeviceKind,
+    pub failure_policy: ProbeFailurePolicy,
+    pub config: ProbeConfig,
+}
+
+impl DeviceProbeConfig {
+    const EMPTY: Self = Self {
+        kind: HidDeviceKind::Unknown,
+        failure_policy: ProbeFailurePolicy::Optional,
+        config: ProbeConfig::EMPTY,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbePlan {
+    devices: [DeviceProbeConfig; MAX_I2C_HID_DEVICES],
+    device_count: usize,
+    keyboard_index: usize,
+}
+
+impl ProbePlan {
+    const EMPTY: Self = Self {
+        devices: [DeviceProbeConfig::EMPTY; MAX_I2C_HID_DEVICES],
+        device_count: 0,
+        keyboard_index: usize::MAX,
+    };
+
+    pub fn for_x13s(topology: I2cHidBusTopology) -> Result<Self, ConfigError> {
+        let mut plan = Self::EMPTY;
+        for device in topology.devices() {
+            let config = ProbeConfig::for_x13s_device(topology, *device)?;
+            let failure_policy = match device.kind {
+                HidDeviceKind::Keyboard => ProbeFailurePolicy::Required,
+                HidDeviceKind::Touchpad | HidDeviceKind::Unknown => ProbeFailurePolicy::Optional,
+            };
+            plan.push(DeviceProbeConfig {
+                kind: device.kind,
+                failure_policy,
+                config,
+            })?;
+        }
+        if plan.keyboard_index == usize::MAX {
+            return Err(ConfigError::MissingKeyboard);
+        }
+        Ok(plan)
+    }
+
+    pub fn devices(&self) -> &[DeviceProbeConfig] {
+        &self.devices[..self.device_count]
+    }
+
+    pub fn keyboard(&self) -> Option<&DeviceProbeConfig> {
+        self.devices().get(self.keyboard_index)
+    }
+
+    pub fn required_count(&self) -> usize {
+        self.devices()
+            .iter()
+            .filter(|device| device.failure_policy == ProbeFailurePolicy::Required)
+            .count()
+    }
+
+    pub fn optional_count(&self) -> usize {
+        self.devices()
+            .iter()
+            .filter(|device| device.failure_policy == ProbeFailurePolicy::Optional)
+            .count()
+    }
+
+    pub fn can_skip_missing_address(&self, i2c_address: u8) -> bool {
+        self.devices().iter().any(|device| {
+            device.config.i2c_address == i2c_address
+                && device.failure_policy == ProbeFailurePolicy::Optional
+        })
+    }
+
+    fn push(&mut self, device: DeviceProbeConfig) -> Result<(), ConfigError> {
+        if self.device_count == self.devices.len() {
+            return Err(ConfigError::TooManyDevices);
+        }
+        if device.kind == HidDeviceKind::Keyboard && self.keyboard_index == usize::MAX {
+            self.keyboard_index = self.device_count;
+        }
+        self.devices[self.device_count] = device;
+        self.device_count += 1;
         Ok(())
     }
 }
@@ -759,16 +899,62 @@ mod tests {
         }
     }
 
+    fn x13s_probe_plan() -> ProbePlan {
+        let dtb = include_bytes!("../../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+        let topology = kumo_i2c_hid::discover_i2c_hid_bus(dtb).unwrap();
+        ProbePlan::for_x13s(topology).unwrap()
+    }
+
     #[test]
     fn x13s_config_round_trips_without_carrying_authority() {
-        let dtb = include_bytes!("../../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
-        let discovered = kumo_i2c_hid::discover_keyboard(dtb).unwrap();
-        let config = ProbeConfig::for_x13s(discovered).unwrap();
+        let plan = x13s_probe_plan();
+        let config = plan.keyboard().expect("X13s keyboard probe").config;
         assert_eq!(ProbeConfig::decode(&config.encode()), Ok(config));
         assert_eq!(config.source_clock, SourceClock::Mhz19_2);
         assert_eq!(config.mmio_base, 0x0089_4000);
         assert_eq!(config.i2c_address, 0x68);
         assert_eq!(config.attention_irq, kumo_abi::tlmm_gpio_irq(104, 8));
+    }
+
+    #[test]
+    fn x13s_probe_plan_keeps_keyboard_required_and_touchpads_skippable() {
+        let plan = x13s_probe_plan();
+        let devices = plan.devices();
+
+        assert_eq!(devices.len(), 3);
+        assert_eq!(plan.required_count(), 1);
+        assert_eq!(plan.optional_count(), 2);
+        assert!(plan.can_skip_missing_address(0x15));
+        assert!(plan.can_skip_missing_address(0x2c));
+        assert!(!plan.can_skip_missing_address(0x68));
+
+        assert_eq!(devices[0].kind, HidDeviceKind::Touchpad);
+        assert_eq!(devices[0].failure_policy, ProbeFailurePolicy::Optional);
+        assert_eq!(devices[0].config.i2c_address, 0x15);
+        assert_eq!(devices[0].config.hid_descriptor_register, 1);
+        assert_eq!(
+            devices[0].config.attention_irq,
+            kumo_abi::tlmm_gpio_irq(182, 8)
+        );
+
+        assert_eq!(devices[1].kind, HidDeviceKind::Touchpad);
+        assert_eq!(devices[1].failure_policy, ProbeFailurePolicy::Optional);
+        assert_eq!(devices[1].config.i2c_address, 0x2c);
+        assert_eq!(devices[1].config.hid_descriptor_register, 0x20);
+        assert_eq!(
+            devices[1].config.attention_irq,
+            kumo_abi::tlmm_gpio_irq(182, 8)
+        );
+
+        assert_eq!(devices[2].kind, HidDeviceKind::Keyboard);
+        assert_eq!(devices[2].failure_policy, ProbeFailurePolicy::Required);
+        assert_eq!(devices[2].config.i2c_address, 0x68);
+        assert_eq!(devices[2].config.hid_descriptor_register, 1);
+        assert_eq!(
+            devices[2].config.attention_irq,
+            kumo_abi::tlmm_gpio_irq(104, 8)
+        );
+        assert_eq!(plan.keyboard(), Some(&devices[2]));
     }
 
     #[test]
