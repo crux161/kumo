@@ -1,8 +1,8 @@
-//j383
 //j384
 //j385
 //j387
 //j388
+//j389
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -418,9 +418,9 @@ extern "C" fn main(
     log(b"drv-i2c-hid: mouse channel ok\n");
 
     let mut probe_raw = [0u8; OptionalProbeCandidates::BYTES];
-    let (received, spare_raw) =
+    let (received, optional_attention_resource_raw) =
         channel_read_with_handle(bootstrap, probe_raw.as_mut_ptr(), probe_raw.len());
-    if received != probe_raw.len() || spare_raw != 0 {
+    if received != probe_raw.len() {
         log(b"drv-i2c-hid: probe bootstrap failed\n");
         kumo_rt::process_exit(1);
     }
@@ -430,6 +430,22 @@ extern "C" fn main(
             log(b"drv-i2c-hid: probe candidates invalid\n");
             kumo_rt::process_exit(1);
         }
+    };
+    let _optional_attention_resource = if optional_probes.candidates().is_empty() {
+        if optional_attention_resource_raw != 0 {
+            log(b"drv-i2c-hid: unexpected probe resource\n");
+            kumo_rt::process_exit(1);
+        }
+        None
+    } else if optional_probes.shared_attention_irq().is_none() {
+        log(b"drv-i2c-hid: split probe attention unsupported\n");
+        kumo_rt::process_exit(1);
+    } else if optional_attention_resource_raw == 0 {
+        log(b"drv-i2c-hid: probe resource missing\n");
+        kumo_rt::process_exit(1);
+    } else {
+        log(b"drv-i2c-hid: probe attention resource ok\n");
+        Some(Handle(optional_attention_resource_raw as u32))
     };
     log_hex(
         b"drv-i2c-hid: probe candidates=0x",

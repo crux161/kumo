@@ -2,8 +2,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //j382
+//j389
 
-use drv_i2c_hid::{ProbeConfig, ProbePlan};
+use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
 use kumo_i2c_hid::{
     discover_i2c21_pinctrl, discover_i2c_hid_bus, sc8280xp_i2c21_tlmm_plan, BootMouseReport,
@@ -303,6 +304,19 @@ pub fn select_i2c_hid_keyboard_probe(discovery: &I2cHidRuntimeTopology) -> Optio
         .map(|device| device.config)
 }
 
+pub fn select_i2c_hid_optional_probe_candidates(
+    discovery: &I2cHidRuntimeTopology,
+) -> OptionalProbeCandidates {
+    match discovery.probe_plan.as_ref() {
+        Some(plan) => plan.optional_probe_candidates(),
+        None => OptionalProbeCandidates::EMPTY,
+    }
+}
+
+pub fn select_i2c_hid_optional_attention_irq(discovery: &I2cHidRuntimeTopology) -> Option<u32> {
+    select_i2c_hid_optional_probe_candidates(discovery).shared_attention_irq()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +461,13 @@ mod tests {
         assert_eq!(keyboard.i2c_address, 0x68);
         assert_eq!(keyboard.hid_descriptor_register, 1);
         assert_eq!(keyboard.attention_irq, kumo_abi::tlmm_gpio_irq(104, 8));
+
+        let optional = select_i2c_hid_optional_probe_candidates(&discovery);
+        assert_eq!(optional.candidates().len(), 2);
+        assert_eq!(
+            select_i2c_hid_optional_attention_irq(&discovery),
+            Some(kumo_abi::tlmm_gpio_irq(182, 8))
+        );
     }
 
     #[test]

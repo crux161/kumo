@@ -3,6 +3,7 @@
 //j382
 //j383
 //j385
+//j389
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -663,10 +664,9 @@ impl ProbePlan {
         Ok(())
     }
 
-    /// The plan's `Optional` children, reduced to what a read-only bus probe needs. Attention-IRQ
-    /// binding is deliberately NOT carried here — that authority stays with the later per-device
-    /// launch slice (DESIGN/015); this message only lets the driver ask "who else is on my bus".
-    /// — CORVUS
+    /// The plan's `Optional` children, reduced to what a read-only bus probe plus later attention
+    /// binding needs. The encoded IRQ is descriptive bootstrap data; authority still arrives in a
+    /// separately transferred Resource handle. — KESTREL
     pub fn optional_probe_candidates(&self) -> OptionalProbeCandidates {
         let mut candidates = OptionalProbeCandidates::EMPTY;
         for device in self.devices() {
@@ -674,6 +674,7 @@ impl ProbePlan {
                 candidates.candidates[candidates.count] = OptionalProbeCandidate {
                     i2c_address: device.config.i2c_address,
                     hid_descriptor_register: device.config.hid_descriptor_register,
+                    attention_irq: device.config.attention_irq,
                 };
                 candidates.count += 1;
             }
@@ -686,11 +687,13 @@ impl ProbePlan {
 pub struct OptionalProbeCandidate {
     pub i2c_address: u8,
     pub hid_descriptor_register: u16,
+    pub attention_irq: u32,
 }
 
 /// Bootstrap message carrying the optional (skippable) i2c21 HID children from Sora to
 /// `drv-i2c-hid`, sent after the keyboard and mouse channels. Self-tagged with
-/// [`OPTIONAL_PROBE_BOOTSTRAP_TAG`]; fixed-size like [`ProbeConfig`].
+/// [`OPTIONAL_PROBE_BOOTSTRAP_TAG`]; fixed-size like [`ProbeConfig`]. IRQs name the attention lines
+/// the runtime slice will bind; the matching Resource capability travels as the message handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OptionalProbeCandidates {
     candidates: [OptionalProbeCandidate; MAX_I2C_HID_DEVICES],
@@ -698,11 +701,12 @@ pub struct OptionalProbeCandidates {
 }
 
 impl OptionalProbeCandidates {
-    pub const BYTES: usize = 2 + MAX_I2C_HID_DEVICES * 3;
+    pub const BYTES: usize = 2 + MAX_I2C_HID_DEVICES * 7;
     pub const EMPTY: Self = Self {
         candidates: [OptionalProbeCandidate {
             i2c_address: 0,
             hid_descriptor_register: 0,
+            attention_irq: 0,
         }; MAX_I2C_HID_DEVICES],
         count: 0,
     };
@@ -711,15 +715,26 @@ impl OptionalProbeCandidates {
         &self.candidates[..self.count]
     }
 
+    pub fn shared_attention_irq(&self) -> Option<u32> {
+        let first = self.candidates().first()?.attention_irq;
+        for candidate in self.candidates() {
+            if candidate.attention_irq != first {
+                return None;
+            }
+        }
+        Some(first)
+    }
+
     pub fn encode(&self) -> [u8; Self::BYTES] {
         let mut raw = [0u8; Self::BYTES];
         raw[0] = OPTIONAL_PROBE_BOOTSTRAP_TAG;
         raw[1] = self.count as u8;
         for (index, candidate) in self.candidates().iter().enumerate() {
-            let base = 2 + index * 3;
+            let base = 2 + index * 7;
             raw[base] = candidate.i2c_address;
             raw[base + 1..base + 3]
                 .copy_from_slice(&candidate.hid_descriptor_register.to_le_bytes());
+            raw[base + 3..base + 7].copy_from_slice(&candidate.attention_irq.to_le_bytes());
         }
         raw
     }
@@ -737,16 +752,21 @@ impl OptionalProbeCandidates {
         }
         let mut decoded = Self::EMPTY;
         for index in 0..count {
-            let base = 2 + index * 3;
+            let base = 2 + index * 7;
             let i2c_address = raw[base];
             if i2c_address == 0 || i2c_address > 0x7f {
                 return Err(ConfigError::InvalidAddress);
+            }
+            let attention_irq = u32::from_le_bytes(raw[base + 3..base + 7].try_into().unwrap());
+            if kumo_abi::decode_tlmm_gpio_irq(attention_irq).is_none() {
+                return Err(ConfigError::InvalidInterrupt);
             }
             decoded.candidates[index] = OptionalProbeCandidate {
                 i2c_address,
                 hid_descriptor_register: u16::from_le_bytes(
                     raw[base + 1..base + 3].try_into().unwrap(),
                 ),
+                attention_irq,
             };
         }
         decoded.count = count;
@@ -1084,12 +1104,18 @@ mod tests {
                 OptionalProbeCandidate {
                     i2c_address: 0x15,
                     hid_descriptor_register: 0x0001,
+                    attention_irq: kumo_abi::tlmm_gpio_irq(182, 8),
                 },
                 OptionalProbeCandidate {
                     i2c_address: 0x2c,
                     hid_descriptor_register: 0x0020,
+                    attention_irq: kumo_abi::tlmm_gpio_irq(182, 8),
                 },
             ]
+        );
+        assert_eq!(
+            candidates.shared_attention_irq(),
+            Some(kumo_abi::tlmm_gpio_irq(182, 8))
         );
 
         let encoded = candidates.encode();
@@ -1123,6 +1149,15 @@ mod tests {
         assert_eq!(
             OptionalProbeCandidates::decode(&bad_address),
             Err(ConfigError::InvalidAddress)
+        );
+        let mut bad_irq = encoded;
+        bad_irq[2 + 3] = 0x2a;
+        bad_irq[2 + 4] = 0;
+        bad_irq[2 + 5] = 0;
+        bad_irq[2 + 6] = 0;
+        assert_eq!(
+            OptionalProbeCandidates::decode(&bad_irq),
+            Err(ConfigError::InvalidInterrupt)
         );
         assert!(OptionalProbeCandidates::EMPTY.candidates().is_empty());
     }

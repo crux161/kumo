@@ -3,6 +3,7 @@
 
 //j382
 //j385
+//j389
 
 extern crate alloc;
 
@@ -975,17 +976,41 @@ extern "C" fn sora_main(
                                     Errno::Ok.status()
                                 };
                                 // PLAN_V Slice 8: hand the driver the DT-derived optional
-                                // (skippable) bus siblings so it can probe them itself. — CORVUS
-                                let probe_encoded = match discovery.probe_plan.as_ref() {
-                                    Some(plan) => plan.optional_probe_candidates().encode(),
-                                    None => drv_i2c_hid::OptionalProbeCandidates::EMPTY.encode(),
-                                };
-                                let probe_sent = if mouse_sent == 0 {
-                                    channel_write(
-                                        Handle(sender as u32),
-                                        probe_encoded.as_ptr(),
-                                        probe_encoded.len(),
-                                    )
+                                // (skippable) bus siblings plus the narrow shared touchpad
+                                // attention Resource. The encoded IRQ names intent; this handle is
+                                // the actual authority to bind gpio182 later. — KESTREL
+                                let probe_candidates =
+                                    sora::select_i2c_hid_optional_probe_candidates(&discovery);
+                                let probe_attention_irq =
+                                    sora::select_i2c_hid_optional_attention_irq(&discovery);
+                                let probe_encoded = probe_candidates.encode();
+                                let mut probe_resource = 0;
+                                let probe_sent = if sent == 0 && mouse_sent == 0 {
+                                    if !probe_candidates.candidates().is_empty()
+                                        && probe_attention_irq.is_none()
+                                    {
+                                        Errno::InvalidArgs.status()
+                                    } else {
+                                        if let Some(attention_irq) = probe_attention_irq {
+                                            probe_resource = resource_create_child(
+                                                res,
+                                                config.mmio_base,
+                                                config.mmio_length,
+                                                kumo_abi::interrupt_authority_key(attention_irq),
+                                                1,
+                                            );
+                                        }
+                                        if probe_resource == u64::MAX {
+                                            Errno::BadHandle.status()
+                                        } else {
+                                            channel_write_with_handle(
+                                                Handle(sender as u32),
+                                                probe_encoded.as_ptr(),
+                                                probe_encoded.len(),
+                                                Handle(probe_resource as u32),
+                                            )
+                                        }
+                                    }
                                 } else {
                                     Errno::Ok.status()
                                 };
@@ -1005,6 +1030,9 @@ extern "C" fn sora_main(
                                     let _ = handle_close(Handle(mouse_writer as u32));
                                     log(b"drv-i2c-hid: mouse bootstrap fail\n");
                                 } else if probe_sent != 0 {
+                                    if probe_resource != 0 && probe_resource != u64::MAX {
+                                        let _ = handle_close(Handle(probe_resource as u32));
+                                    }
                                     let _ = handle_close(Handle(mouse_reader as u32));
                                     log(b"drv-i2c-hid: probe bootstrap fail\n");
                                 } else if run_elf(
