@@ -1,8 +1,8 @@
-//j378
 //j383
 //j384
 //j385
 //j387
+//j388
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -35,6 +35,10 @@ const POLL_LIMIT: usize = 1_000_000;
 /// keyboard cap). Transient in main's frame; the child stack is 16 KiB (Sora's STACK_SIZE), so a
 /// 1 KiB scratch buffer is comfortably inside budget.
 const PROBE_RDESC_BYTES: usize = 1024;
+/// Optional-child probe retry budget: attempts per address, and the settle between them. Worst
+/// case for a genuinely absent address is (attempts - 1) * settle of added boot time.
+const PROBE_ATTEMPTS: usize = 3;
+const PROBE_RETRY_SETTLE_NS: u64 = 50_000_000;
 const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
@@ -703,11 +707,29 @@ extern "C" fn main(
             candidate.i2c_address as u64,
         );
         let mut tp_raw = [0u8; HidDescriptor::BYTES];
-        if let Err(error) = controller.write_read(
-            candidate.i2c_address,
-            &candidate.hid_descriptor_register.to_le_bytes(),
-            &mut tp_raw,
-        ) {
+        // An asleep HID child may NACK its first touch: tp@0x15 answered one live boot and
+        // NACKed the next with identical code (J387 read-out), so presence is power/wake-state
+        // dependent until Slice 9 owns the vdd/vddl rails. Retry with a settle to measure the
+        // wake latency; a device dark across all attempts is skipped as before. — CORVUS
+        let mut attempt = 0usize;
+        let tp_probe = loop {
+            attempt += 1;
+            match controller.write_read(
+                candidate.i2c_address,
+                &candidate.hid_descriptor_register.to_le_bytes(),
+                &mut tp_raw,
+            ) {
+                Ok(()) => break Ok(()),
+                Err(_) if attempt < PROBE_ATTEMPTS => {
+                    let _ = sleep_ns(PROBE_RETRY_SETTLE_NS);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        if attempt > 1 {
+            log_hex(b"drv-i2c-hid: tp probe attempts=0x", attempt as u64);
+        }
+        if let Err(error) = tp_probe {
             log_hex(b"drv-i2c-hid: tp probe skipped error=0x", error.code());
             continue;
         }
