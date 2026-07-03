@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //j381
+//j389
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2613,12 +2614,41 @@ const TLMM_GPIO_FLAG_EDGE_FALLING: u32 = 2;
 const TLMM_INTR_DECT_SHIFT: u32 = 2;
 #[cfg(any(target_os = "none", test))]
 const TLMM_INTR_DECT_FALLING: u32 = 2;
+/// TLMM wake-line table. The X13s `i2c21` bus carries TWO attention lines (keyboard gpio104,
+/// touchpad gpio182), so the former single-slot wake state is a small fixed table: one slot per
+/// configured pin, each with its own dispatch key, trigger flags, and — when the pin is
+/// PDC-routed — its dedicated wake SPI. The slot count is a platform ceiling, not discovery;
+/// raise it when a board brings more wake pins. — CORVUS
 #[cfg(target_os = "none")]
-static TLMM_GPIO_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
+const MAX_TLMM_WAKE_LINES: usize = 4;
 #[cfg(target_os = "none")]
-static TLMM_GPIO_IRQ_KEY: AtomicU32 = AtomicU32::new(0);
+static TLMM_WAKE_PIN: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+];
 #[cfg(target_os = "none")]
-static TLMM_GPIO_FLAGS: AtomicU32 = AtomicU32::new(0);
+static TLMM_WAKE_IRQ_KEY: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+#[cfg(target_os = "none")]
+static TLMM_WAKE_FLAGS: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+#[cfg(target_os = "none")]
+static TLMM_WAKE_PDC_INTID: [AtomicU32; MAX_TLMM_WAKE_LINES] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
 #[cfg(any(target_os = "none", test))]
 fn i2c21_tlmm_pinctrl_plan(dtb: &[u8]) -> Option<kumo_i2c_hid::TlmmPinctrlPlan> {
@@ -2689,12 +2719,6 @@ const KEYBOARD_PDC_PORT: u32 = 216;
 const TOUCHPAD_GPIO_PIN: u32 = 182;
 const TOUCHPAD_PDC_PORT: u32 = 240;
 
-/// The GIC INTID the PDC raises for the configured wake GPIO (0 = none). Lets `on_irq` recognise a
-/// PDC-delivered keyboard attention and route it through the same mask/dispatch path as the TLMM
-/// summary SPI. — CORVUS
-#[cfg(target_os = "none")]
-static PDC_GIC_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 /// Resolves a PDC route for a TLMM GPIO.
 pub fn pdc_route_for_gpio(pin: u32, flags: u32) -> Option<PdcRoute> {
     let port = match pin {
@@ -2738,25 +2762,28 @@ fn tlmm_gpio_enabled_cfg(existing: u32) -> u32 {
 enum GpioAttentionDelivery {
     None,
     TlmmSummary,
-    PdcWake,
+    PdcWake(usize),
 }
 
-/// Classify whether a delivered INTID is the keyboard GPIO attention — either the TLMM summary SPI or
-/// the PDC wake SPI for the configured pin (`pdc_intid == 0` means no PDC route). Pure so the routing
-/// decision is host-testable. — KESTREL
+/// Classify whether a delivered INTID is a configured GPIO attention — the TLMM summary SPI, or any
+/// wake-table slot's PDC wake SPI (a slot's `0` means no PDC route). A PDC match names its slot so
+/// dispatch needs no demux. Pure so the routing decision is host-testable. — KESTREL
+/// (slotted for the touchpad's second wake line — CORVUS 2026-07-01)
 #[cfg(any(target_os = "none", test))]
 fn classify_gpio_attention_delivery(
     intid: u32,
     tlmm_parent_intid: u32,
-    pdc_intid: u32,
+    pdc_intids: &[u32],
 ) -> GpioAttentionDelivery {
     if intid == tlmm_parent_intid {
-        GpioAttentionDelivery::TlmmSummary
-    } else if pdc_intid != 0 && intid == pdc_intid {
-        GpioAttentionDelivery::PdcWake
-    } else {
-        GpioAttentionDelivery::None
+        return GpioAttentionDelivery::TlmmSummary;
     }
+    for (slot, &pdc_intid) in pdc_intids.iter().enumerate() {
+        if pdc_intid != 0 && intid == pdc_intid {
+            return GpioAttentionDelivery::PdcWake(slot);
+        }
+    }
+    GpioAttentionDelivery::None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3558,15 +3585,19 @@ fn on_irq(intid: u32) {
         }
     }
     let irq_hook = INTERRUPT_HOOK.load(ORD);
-    // The keyboard attention arrives either as the TLMM summary SPI or, for a PDC-routed wake pin,
-    // as its dedicated PDC SPI. The summary path must demux TLMM status; the PDC path is already the
-    // one configured wake line, so dispatch it directly after masking the configured TLMM/PDC line. — KESTREL
-    let gpio_delivery =
-        classify_gpio_attention_delivery(intid, TLMM_PARENT_IRQ, PDC_GIC_INTID.load(ORD));
+    // A GPIO attention arrives either as the TLMM summary SPI or, for a PDC-routed wake pin, as
+    // its dedicated PDC SPI. The summary path demuxes INTR_STATUS across the wake table; a PDC SPI
+    // names its slot directly. Mask the delivering line, then dispatch its key. — KESTREL
+    // (slotted for the touchpad's second wake line — CORVUS 2026-07-01)
+    let mut pdc_intids = [0u32; MAX_TLMM_WAKE_LINES];
+    for (slot, slot_intid) in pdc_intids.iter_mut().enumerate() {
+        *slot_intid = TLMM_WAKE_PDC_INTID[slot].load(ORD);
+    }
+    let gpio_delivery = classify_gpio_attention_delivery(intid, TLMM_PARENT_IRQ, &pdc_intids);
     if irq_hook != 0 {
         let irq_key = match gpio_delivery {
             GpioAttentionDelivery::TlmmSummary => unsafe { tlmm_gpio_mask_pending() },
-            GpioAttentionDelivery::PdcWake => unsafe { tlmm_gpio_mask_configured() },
+            GpioAttentionDelivery::PdcWake(slot) => unsafe { tlmm_gpio_mask_slot(slot) },
             GpioAttentionDelivery::None => None,
         };
         if let Some(irq_key) = irq_key {
@@ -3600,6 +3631,11 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
     if gicd == 0 || pin > 0xe5 {
         return false;
     }
+    // Reconfiguring a pin reuses its slot; a new pin claims the first empty one. No free slot means
+    // the platform ceiling is too low — fail loudly rather than silently evict a live line. — CORVUS
+    let Some(slot) = tlmm_wake_slot_for_pin(pin) else {
+        return false;
+    };
     unsafe {
         if flags == TLMM_GPIO_FLAG_LEVEL_LOW {
             tlmm_gpio_configure_level_low(pin);
@@ -3609,7 +3645,7 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
             return false;
         }
         gic_configure_spi(gicd, TLMM_PARENT_IRQ);
-        PDC_GIC_INTID.store(0, ORD);
+        TLMM_WAKE_PDC_INTID[slot].store(0, ORD);
         // Wake-capable GPIOs (the keyboard attention line) are PDC-routed: the TLMM summary SPI does
         // not reliably reach the CPU for them. Program the PDC to present this pin as a dedicated GIC
         // SPI and enable that SPI so the attention interrupt actually arrives. The TLMM detection
@@ -3618,13 +3654,36 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
         if let Some(route) = pdc_route_for_gpio(pin, flags) {
             pdc_enable_pin(route);
             gic_configure_spi(gicd, route.gic_intid);
-            PDC_GIC_INTID.store(route.gic_intid, ORD);
+            TLMM_WAKE_PDC_INTID[slot].store(route.gic_intid, ORD);
         }
     }
-    TLMM_GPIO_PIN.store(pin, ORD);
-    TLMM_GPIO_IRQ_KEY.store(irq_key, ORD);
-    TLMM_GPIO_FLAGS.store(flags, ORD);
+    TLMM_WAKE_PIN[slot].store(pin, ORD);
+    TLMM_WAKE_IRQ_KEY[slot].store(irq_key, ORD);
+    TLMM_WAKE_FLAGS[slot].store(flags, ORD);
     true
+}
+
+#[cfg(target_os = "none")]
+fn tlmm_wake_slot_for_pin(pin: u32) -> Option<usize> {
+    let mut empty = None;
+    for slot in 0..MAX_TLMM_WAKE_LINES {
+        let occupant = TLMM_WAKE_PIN[slot].load(ORD);
+        if occupant == pin {
+            return Some(slot);
+        }
+        if occupant == u32::MAX && empty.is_none() {
+            empty = Some(slot);
+        }
+    }
+    empty
+}
+
+#[cfg(target_os = "none")]
+fn tlmm_wake_slot_for_key(irq_key: u32) -> Option<usize> {
+    if irq_key == 0 {
+        return None;
+    }
+    (0..MAX_TLMM_WAKE_LINES).find(|&slot| TLMM_WAKE_IRQ_KEY[slot].load(ORD) == irq_key)
 }
 
 #[cfg(not(target_os = "none"))]
@@ -3658,22 +3717,27 @@ unsafe fn tlmm_gpio_configure_falling_edge(pin: u32) {
 
 #[cfg(target_os = "none")]
 unsafe fn tlmm_gpio_mask_pending() -> Option<u32> {
-    let pin = TLMM_GPIO_PIN.load(ORD);
-    if pin == u32::MAX {
-        return None;
+    // Summary-SPI path: demux INTR_STATUS across every configured wake pin and service the first
+    // pending one. — CORVUS
+    for slot in 0..MAX_TLMM_WAKE_LINES {
+        let pin = TLMM_WAKE_PIN[slot].load(ORD);
+        if pin == u32::MAX {
+            continue;
+        }
+        let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
+        if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
+            continue;
+        }
+        return unsafe { tlmm_gpio_mask_slot(slot) };
     }
-    let base = mmio_phys(TLMM_BASE + TLMM_GPIO_STRIDE * pin as u64);
-    if unsafe { mmio_read32(base + TLMM_GPIO_INTR_STATUS) } & 1 == 0 {
-        return None;
-    }
-    unsafe { tlmm_gpio_mask_configured() }
+    None
 }
 
 #[cfg(target_os = "none")]
-unsafe fn tlmm_gpio_mask_configured() -> Option<u32> {
-    let pin = TLMM_GPIO_PIN.load(ORD);
-    let irq_key = TLMM_GPIO_IRQ_KEY.load(ORD);
-    let flags = TLMM_GPIO_FLAGS.load(ORD);
+unsafe fn tlmm_gpio_mask_slot(slot: usize) -> Option<u32> {
+    let pin = TLMM_WAKE_PIN[slot].load(ORD);
+    let irq_key = TLMM_WAKE_IRQ_KEY[slot].load(ORD);
+    let flags = TLMM_WAKE_FLAGS[slot].load(ORD);
     if pin == u32::MAX || irq_key == 0 {
         return None;
     }
@@ -3688,8 +3752,11 @@ unsafe fn tlmm_gpio_mask_configured() -> Option<u32> {
 
 #[cfg(target_os = "none")]
 pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
-    let pin = TLMM_GPIO_PIN.load(ORD);
-    if pin == u32::MAX || irq_key != TLMM_GPIO_IRQ_KEY.load(ORD) {
+    let Some(slot) = tlmm_wake_slot_for_key(irq_key) else {
+        return false;
+    };
+    let pin = TLMM_WAKE_PIN[slot].load(ORD);
+    if pin == u32::MAX {
         return false;
     }
     unsafe {
@@ -3697,7 +3764,7 @@ pub fn complete_tlmm_gpio_interrupt(irq_key: u32) -> bool {
         mmio_write32(base + TLMM_GPIO_INTR_STATUS, 1);
         let cfg = mmio_read32(base + TLMM_GPIO_INTR_CFG);
         mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_enabled_cfg(cfg));
-        if let Some(route) = pdc_route_for_gpio(pin, TLMM_GPIO_FLAGS.load(ORD)) {
+        if let Some(route) = pdc_route_for_gpio(pin, TLMM_WAKE_FLAGS[slot].load(ORD)) {
             pdc_set_pin_enabled(route, true);
         }
     }
@@ -4066,29 +4133,34 @@ mod tests {
 
     #[test]
     fn pdc_and_tlmm_summary_both_route_as_gpio_attention() {
-        // 240 = TLMM summary SPI (32 + 0xd0); 678 = the keyboard's PDC wake SPI. Both must dispatch
-        // the stored GPIO key; the timer PPI and unrelated SPIs must not. With no PDC route
-        // configured (0), 678 is not special. — CORVUS
+        // 240 = TLMM summary SPI (32 + 0xd0); 678/398 = the keyboard and touchpad PDC wake SPIs in
+        // wake-table slots 0/1. The summary and every configured PDC SPI must classify as GPIO
+        // attention (PDC ones naming their slot); the timer PPI and unrelated SPIs must not. An
+        // all-zero table makes no PDC SPI special. — CORVUS
         let tlmm = 32 + 0xd0;
-        let pdc = 678;
+        let pdc = [678, 398, 0, 0];
         assert_eq!(
-            classify_gpio_attention_delivery(tlmm, tlmm, pdc),
+            classify_gpio_attention_delivery(tlmm, tlmm, &pdc),
             GpioAttentionDelivery::TlmmSummary
         );
         assert_eq!(
-            classify_gpio_attention_delivery(pdc, tlmm, pdc),
-            GpioAttentionDelivery::PdcWake
+            classify_gpio_attention_delivery(678, tlmm, &pdc),
+            GpioAttentionDelivery::PdcWake(0)
         );
         assert_eq!(
-            classify_gpio_attention_delivery(30, tlmm, pdc),
+            classify_gpio_attention_delivery(398, tlmm, &pdc),
+            GpioAttentionDelivery::PdcWake(1)
+        );
+        assert_eq!(
+            classify_gpio_attention_delivery(30, tlmm, &pdc),
             GpioAttentionDelivery::None
         );
         assert_eq!(
-            classify_gpio_attention_delivery(999, tlmm, pdc),
+            classify_gpio_attention_delivery(999, tlmm, &pdc),
             GpioAttentionDelivery::None
         );
         assert_eq!(
-            classify_gpio_attention_delivery(pdc, tlmm, 0),
+            classify_gpio_attention_delivery(678, tlmm, &[0, 0, 0, 0]),
             GpioAttentionDelivery::None
         );
     }
