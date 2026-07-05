@@ -1,8 +1,8 @@
-//j387
 //j388
 //j389
 //j397
 //j398
+//j399
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -899,6 +899,7 @@ extern "C" fn main(
     let mut shown_nonempty: u32 = 0;
     let mut touchpad_interrupts: u32 = 0;
     let mut touchpad_shown_nonempty: u32 = 0;
+    let mut touchpad_forward_logs: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut mouse_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
@@ -973,7 +974,11 @@ extern "C" fn main(
                                 let event = encode_mouse_event(report);
                                 if channel_write(mouse_channel, event.as_ptr(), event.len()) == 0 {
                                     input_stats.record_forwarded_mouse();
-                                    log(b"drv-i2c-hid: tp mouse forwarded\n");
+                                    if touchpad_forward_logs < NONEMPTY_FRAME_LOG_LIMIT {
+                                        touchpad_forward_logs =
+                                            touchpad_forward_logs.saturating_add(1);
+                                        log(b"drv-i2c-hid: tp mouse forwarded\n");
+                                    }
                                 } else if mouse_forward_failures.record() {
                                     input_stats.record_mouse_write_drop();
                                     log_hex(

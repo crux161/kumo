@@ -1,3 +1,5 @@
+//j399
+
 use alloc::vec::Vec;
 
 use kumo_abi::{Handle, KoId, ObjectKind, Rights, Signals};
@@ -491,6 +493,14 @@ impl Port {
     }
 
     pub fn queue_signal(&mut self, source: KoId, signals: Signals) {
+        if let Some(packet) = self
+            .packets
+            .iter_mut()
+            .find(|packet| packet.source == source)
+        {
+            packet.signals |= signals;
+            return;
+        }
         self.packets.push(PortPacket { source, signals });
     }
 
@@ -672,6 +682,31 @@ mod tests {
         assert_eq!(packet.source, source);
         assert!(packet.signals.contains(Signals::READABLE));
         assert!(packet.signals.contains(Signals::PEER_CLOSED));
+    }
+
+    #[test]
+    fn port_coalesces_duplicate_source_signals_without_starving_peers() {
+        let mut objects = ObjectManager::new();
+        let mut port = Port::new(&mut objects);
+        let noisy = KoId(55);
+        let peer = KoId(77);
+
+        port.queue_signal(noisy, Signals::READABLE);
+        port.queue_signal(noisy, Signals::PEER_CLOSED);
+        port.queue_signal(noisy, Signals::READABLE);
+        port.queue_signal(peer, Signals::IRQ);
+        port.queue_signal(noisy, Signals::IRQ);
+
+        let first = port.wait().unwrap();
+        assert_eq!(first.source, noisy);
+        assert!(first.signals.contains(Signals::READABLE));
+        assert!(first.signals.contains(Signals::PEER_CLOSED));
+        assert!(first.signals.contains(Signals::IRQ));
+
+        let second = port.wait().unwrap();
+        assert_eq!(second.source, peer);
+        assert!(second.signals.contains(Signals::IRQ));
+        assert_eq!(port.wait(), Err(IpcError::ShouldWait));
     }
 
     #[test]
