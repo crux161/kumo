@@ -160,6 +160,20 @@ impl<Io: RegisterIo> Controller<Io> {
         })
     }
 
+    /// Current per-transfer poll budget: the maximum number of `M_IRQ_STATUS` reads a transfer
+    /// will spin before reporting `Timeout`. Exposed so a caller can bound a best-effort transfer
+    /// more tightly than the steady-state budget and restore this value afterward.
+    pub fn poll_limit(&self) -> usize {
+        self.poll_limit
+    }
+
+    /// Override the per-transfer poll budget. A smaller budget makes a non-responsive device fail
+    /// fast instead of spinning the full steady-state ceiling (which, at priority 63, starves the
+    /// supervisor). Pair with [`Controller::poll_limit`] to save and restore the prior value.
+    pub fn set_poll_limit(&mut self, limit: usize) {
+        self.poll_limit = limit;
+    }
+
     pub fn write_read(
         &mut self,
         address: u8,
@@ -482,6 +496,27 @@ mod tests {
         );
         let fake = controller.into_inner();
         assert_eq!(fake.values[&register::M_CMD_CTRL], 1 << 1);
+    }
+
+    #[test]
+    fn set_poll_limit_overrides_the_transfer_budget() {
+        let mut controller =
+            Controller::new(FakeRegisters::ready(), SourceClock::Mhz19_2, 1_000_000).unwrap();
+        assert_eq!(controller.poll_limit(), 1_000_000);
+
+        // A caller tightens the budget for a best-effort probe, then restores it.
+        let saved = controller.poll_limit();
+        controller.set_poll_limit(4);
+        assert_eq!(controller.poll_limit(), 4);
+
+        // The tightened budget still terminates on a silent (never-ready) device.
+        assert!(matches!(
+            controller.write_read(0x68, &[1], &mut [0u8; 2]),
+            Err(GeniError::Timeout { .. })
+        ));
+
+        controller.set_poll_limit(saved);
+        assert_eq!(controller.poll_limit(), 1_000_000);
     }
 
     #[test]

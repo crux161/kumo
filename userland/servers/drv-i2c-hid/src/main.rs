@@ -4,6 +4,7 @@
 //j399
 //j400
 //j401
+//j403
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -46,12 +47,21 @@ const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
 const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
-/// Gate the optional touchpad probe. The probe issues I2C transactions to the touchpad address(es)
-/// while the device may be unresponsive (boot-state-dependent), and each write_read can hang the
-/// GENI controller in a 1M-iteration poll loop when the touchpad is asleep. This delays Sora's
-/// serve loop setup (priority 64) by seconds while drv-i2c-hid (priority 63) spins. Default OFF
-/// until Slice 9 owns the vdd/vddl regulator sequencing needed for reliable probe timing. — MERLIN
-const RUN_TOUCHPAD_PROBE: bool = false;
+/// Gate the optional touchpad probe. Now ON: the probe is bounded by `OPTIONAL_PROBE_POLL_LIMIT`
+/// so a non-responsive address fails fast instead of spinning the full `POLL_LIMIT` per transfer.
+/// The original starvation was *not* a power-sequencing problem — the X13s HID children share
+/// `vdd`/`vddl` with the working keyboard, so those rails are firmware-up (see
+/// `DEFERRED/005`, Slice 9). It was the 1M-iteration busy-poll at priority 63 spinning on a
+/// NACKing pad. Bounding that poll is the fix; the regulator/reset driver is deferred, not the
+/// blocker. — CORVUS
+const RUN_TOUCHPAD_PROBE: bool = true;
+/// Per-transfer poll budget used only while probing the *optional* touchpad addresses. A live pad
+/// answers in far fewer iterations than the steady-state `POLL_LIMIT` ceiling; a dark/asleep pad
+/// therefore fails fast here (~one order of magnitude above a live read, ~20x below `POLL_LIMIT`)
+/// instead of burning `POLL_LIMIT` × attempts × addresses of priority-63 spin. The keyboard path
+/// keeps the full `POLL_LIMIT`. If a *present* touchpad is ever falsely skipped on metal (a probe
+/// error where a live pad exists), raise this toward `POLL_LIMIT`. — CORVUS
+const OPTIONAL_PROBE_POLL_LIMIT: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveTouchpad {
@@ -727,12 +737,14 @@ extern "C" fn main(
     }
 
     // PLAN_V Slice 8 (measure first): probe the DT-declared optional i2c21 children read-only on
-    // the still-quiet bus, before the keyboard loop starts. Gated by `RUN_TOUCHPAD_PROBE` (default
-    // OFF) because a non-responsive touchpad hangs each GENI transaction in a 1M-iteration poll,
-    // delaying Sora's serve loop setup. Re-enable when Slice 9 owns the regulator/reset sequencing
-    // that makes probe timing reliable. — MERLIN
+    // the still-quiet bus, before the keyboard loop starts. Runs under a tightened
+    // `OPTIONAL_PROBE_POLL_LIMIT` so a NACKing/asleep address fails fast instead of spinning the
+    // full keyboard `POLL_LIMIT` at priority 63 (the boot-starvation MERLIN gated); the keyboard
+    // budget is restored before the input loop. — CORVUS
     let mut touchpad_runtime: Option<OptionalMouseRuntimeConfig> = None;
     if RUN_TOUCHPAD_PROBE {
+        let restore_poll_limit = controller.poll_limit();
+        controller.set_poll_limit(OPTIONAL_PROBE_POLL_LIMIT);
         for candidate in optional_probes.candidates() {
             log_hex(
                 b"drv-i2c-hid: tp probe addr=0x",
@@ -843,6 +855,7 @@ extern "C" fn main(
                 Err(error) => log_optional_mouse_runtime_error(error),
             }
         }
+        controller.set_poll_limit(restore_poll_limit);
     } else if !optional_probes.candidates().is_empty() {
         log(b"drv-i2c-hid: tp probe skipped (gated by RUN_TOUCHPAD_PROBE)\n");
     }
