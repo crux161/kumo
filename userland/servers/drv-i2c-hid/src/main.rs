@@ -3,19 +3,21 @@
 //j397
 //j398
 //j399
+//j400
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
     bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report_with_mouse,
-    decode_mouse_probe, encode_mouse_event, optional_mouse_runtime_config,
-    should_log_input_report_stats_snapshot, BoundedFailureLog, DeviceQuirks, InputProbeDecoder,
-    InputProbeError, InputReportClass, InputReportStats, OptionalMouseRuntimeConfig,
-    OptionalMouseRuntimeError, OptionalProbeCandidates, ProbeConfig, ResetStormGuard,
-    StartupLatencyTrace, StartupMilestone, IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG,
-    MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG,
-    NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
+    decode_mouse_probe, encode_mouse_event, mouse_report_has_activity,
+    optional_mouse_runtime_config, should_log_input_report_stats_snapshot, BoundedFailureLog,
+    DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass, InputReportStats,
+    OptionalMouseRuntimeConfig, OptionalMouseRuntimeError, OptionalProbeCandidates, ProbeConfig,
+    ResetStormGuard, StartupLatencyTrace, StartupMilestone, IRQ_TICK_LOG_LIMIT,
+    KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_AFTER,
+    RESET_STORM_YIELD_EVERY, RESET_STORM_YIELD_NS,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{
@@ -900,6 +902,7 @@ extern "C" fn main(
     let mut touchpad_interrupts: u32 = 0;
     let mut touchpad_shown_nonempty: u32 = 0;
     let mut touchpad_forward_logs: u32 = 0;
+    let mut touchpad_idle_frames: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut mouse_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
@@ -971,6 +974,20 @@ extern "C" fn main(
                             tp.runtime.quirks,
                         ) {
                             Ok(Some(report)) => {
+                                if !mouse_report_has_activity(report) {
+                                    touchpad_idle_frames = touchpad_idle_frames.wrapping_add(1);
+                                    maybe_log_input_report_stats(
+                                        &input_stats,
+                                        &mut input_stats_logs,
+                                    );
+                                    if touchpad_idle_frames >= RESET_STORM_YIELD_AFTER
+                                        && touchpad_idle_frames % RESET_STORM_YIELD_EVERY == 0
+                                    {
+                                        let _ = sleep_ns(RESET_STORM_YIELD_NS);
+                                    }
+                                    continue;
+                                }
+                                touchpad_idle_frames = 0;
                                 let event = encode_mouse_event(report);
                                 if channel_write(mouse_channel, event.as_ptr(), event.len()) == 0 {
                                     input_stats.record_forwarded_mouse();

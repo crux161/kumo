@@ -1,10 +1,10 @@
 #![no_std]
 
-//j383
 //j385
 //j389
 //j397
 //j398
+//j400
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -912,6 +912,10 @@ pub fn encode_mouse_event(report: BootMouseReport) -> [u8; MOUSE_EVENT_BYTES] {
     ]
 }
 
+pub fn mouse_report_has_activity(report: BootMouseReport) -> bool {
+    report.buttons.bits() != 0 || report.x_delta != 0 || report.y_delta != 0
+}
+
 pub fn decode_mouse_event(raw: &[u8]) -> Option<BootMouseReport> {
     if raw.len() == MOUSE_EVENT_BYTES {
         Some(BootMouseReport {
@@ -1450,6 +1454,30 @@ mod tests {
         assert_eq!(decode_mouse_event(&encoded), Some(report));
         assert_eq!(decode_mouse_event(&encoded[..2]), None);
         assert_eq!(decode_mouse_event(&[0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn mouse_report_activity_ignores_idle_samples() {
+        assert!(!mouse_report_has_activity(BootMouseReport {
+            buttons: MouseButtons::from_bits(0),
+            x_delta: 0,
+            y_delta: 0,
+        }));
+        assert!(mouse_report_has_activity(BootMouseReport {
+            buttons: MouseButtons::from_bits(MouseButtons::LEFT),
+            x_delta: 0,
+            y_delta: 0,
+        }));
+        assert!(mouse_report_has_activity(BootMouseReport {
+            buttons: MouseButtons::from_bits(0),
+            x_delta: -1,
+            y_delta: 0,
+        }));
+        assert!(mouse_report_has_activity(BootMouseReport {
+            buttons: MouseButtons::from_bits(0),
+            x_delta: 0,
+            y_delta: 1,
+        }));
     }
 
     #[test]
