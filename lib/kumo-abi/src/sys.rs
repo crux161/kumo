@@ -1,3 +1,5 @@
+//j397
+
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Syscall {
@@ -169,8 +171,9 @@ mod tests {
         );
         assert_eq!(interrupt_authority_key(irq), tlmm_gpio_irq_window_base(104));
 
-        // ELAN re-requests the SAME pin as falling-edge (flag 2); the authority key is pin-based, so
-        // the Resource window minted for the level-low encoding still covers the falling-edge one.
+        // Trigger flags ride with the synthetic IRQ for HAL configuration, while authority stays
+        // keyed by TLMM pin. A Resource minted for one trigger encoding therefore still covers the
+        // same line if a future board legitimately requests another trigger type. — KESTREL
         let falling = tlmm_gpio_irq(104, 2);
         assert_eq!(
             decode_tlmm_gpio_irq(falling),

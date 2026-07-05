@@ -3,6 +3,7 @@
 
 //j381
 //j389
+//j397
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2604,10 +2605,11 @@ const TLMM_INTR_POLARITY: u32 = 1 << 1;
 const TLMM_INTR_RAW_STATUS_EN: u32 = 1 << 4;
 #[cfg(any(target_os = "none", test))]
 const TLMM_INTR_TARGET_APPS: u32 = 3 << 5;
-// Falling-edge trigger for ELAN i2c-hid (Linux FORCE_TRIGGER_FALLING). DT flag 2 = IRQ_TYPE_EDGE_FALLING.
-// The 2-bit INTR_DECT_CTL field sits at bits 2-3 (between POLARITY@1 and RAW_STATUS_EN@4), i.e.
-// intr_detection_width == 2 on SC8280XP. Per Linux msm_gpio_irq_set_type (width==2): falling edge =
-// detection value 2 with the polarity bit set. — CORVUS
+// DT flag 2 = IRQ_TYPE_EDGE_FALLING. The 2-bit INTR_DECT_CTL field sits at bits 2-3 (between
+// POLARITY@1 and RAW_STATUS_EN@4), i.e. intr_detection_width == 2 on SC8280XP. Per Linux
+// msm_gpio_irq_set_type (width==2): falling edge = detection value 2 with the polarity bit set.
+// X13s HID attention lines stay on their DT level-low trigger unless the DT itself says otherwise.
+// — KESTREL
 #[cfg(any(target_os = "none", test))]
 const TLMM_GPIO_FLAG_EDGE_FALLING: u32 = 2;
 #[cfg(any(target_os = "none", test))]

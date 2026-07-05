@@ -4,6 +4,7 @@
 //j383
 //j385
 //j389
+//j397
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -359,11 +360,6 @@ impl Default for BoundedFailureLog {
 pub struct DeviceQuirks {
     pub no_wakeup_after_reset: bool,
     pub bogus_irq: bool,
-    /// ELAN i2c-hid devices need the attention line treated as **falling-edge**, not the level-low
-    /// the DT declares (Linux `I2C_HID_QUIRK_FORCE_TRIGGER_FALLING`). Level-low re-fires while the
-    /// device holds the line asserted — the 30–40 empty boot-burst IRQs we saw on metal. Wiring this
-    /// to the attention IRQ request needs HAL TLMM edge-detection support (see J289 plan). — CORVUS
-    pub force_trigger_falling: bool,
 }
 
 impl DeviceQuirks {
@@ -372,13 +368,11 @@ impl DeviceQuirks {
             Self {
                 no_wakeup_after_reset: true,
                 bogus_irq: true,
-                force_trigger_falling: true,
             }
         } else {
             Self {
                 no_wakeup_after_reset: false,
                 bogus_irq: false,
-                force_trigger_falling: false,
             }
         }
     }
@@ -1203,7 +1197,6 @@ mod tests {
             DeviceQuirks {
                 no_wakeup_after_reset: true,
                 bogus_irq: true,
-                force_trigger_falling: true,
             }
         );
         assert_eq!(

@@ -1,8 +1,8 @@
-//j384
 //j385
 //j387
 //j388
 //j389
+//j397
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -16,7 +16,7 @@ use drv_i2c_hid::{
     MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT,
     RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
 };
-use kumo_abi::{decode_tlmm_gpio_irq, tlmm_gpio_irq, Handle, VmarFlags};
+use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{
     find_boot_keyboard, find_boot_mouse, find_led_output_report, Command, Controller,
     HidDescriptor, LedOutputReport, PowerState, RegisterIo,
@@ -43,10 +43,6 @@ const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
 const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
-/// DT interrupt flag for IRQ_TYPE_EDGE_FALLING. ELAN i2c-hid needs the attention line treated as
-/// falling-edge (Linux FORCE_TRIGGER_FALLING), overriding the level-low (flag 8) the DT declares.
-const DT_IRQ_EDGE_FALLING: u32 = 2;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LedSyncError {
     NoCapsLockLed,
@@ -569,21 +565,10 @@ extern "C" fn main(
     }
     log(b"drv-i2c-hid: reset done\n");
     startup_trace.record(StartupMilestone::ResetDone, clock_get());
-    // ELAN i2c-hid needs the attention line as falling-edge, not the DT's level-low — Linux
-    // FORCE_TRIGGER_FALLING. Re-encode the same GPIO pin with the falling-edge flag; the authority
-    // key is pin-based, so the granted Resource window still covers it. — CORVUS
-    let attention_irq_encoded = if quirks.force_trigger_falling {
-        match decode_tlmm_gpio_irq(config.attention_irq) {
-            Some(gpio) => {
-                log(b"drv-i2c-hid: elan falling-edge attention quirk\n");
-                tlmm_gpio_irq(gpio.pin, DT_IRQ_EDGE_FALLING)
-            }
-            None => config.attention_irq,
-        }
-    } else {
-        config.attention_irq
-    };
-    let attention_raw = interrupt_create(resource, attention_irq_encoded);
+    // Linux requests the X13s HID attention IRQ with the DT trigger (level-low) plus ONESHOT. KUMO's
+    // mask/read/complete lifecycle is the ONESHOT equivalent, so do not override the DT flags here.
+    // — KESTREL
+    let attention_raw = interrupt_create(resource, config.attention_irq);
     if attention_raw == u64::MAX {
         log(b"drv-i2c-hid: attention interrupt create failed\n");
         kumo_rt::process_exit(1);
