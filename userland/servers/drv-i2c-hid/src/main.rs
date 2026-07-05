@@ -5,6 +5,7 @@
 //j400
 //j401
 //j403
+//j404
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -62,6 +63,10 @@ const RUN_TOUCHPAD_PROBE: bool = true;
 /// keeps the full `POLL_LIMIT`. If a *present* touchpad is ever falsely skipped on metal (a probe
 /// error where a live pad exists), raise this toward `POLL_LIMIT`. — CORVUS
 const OPTIONAL_PROBE_POLL_LIMIT: usize = 50_000;
+/// Bounded input-register drain reads used to deassert the touchpad's level-low attention line
+/// during quiesce, before its IRQ is armed. Each non-empty read consumes one pending report; a
+/// zero-length read means the line is quiet. Bounded so a chatty/half-awake pad cannot loop. — CORVUS
+const OPTIONAL_DRAIN_READS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveTouchpad {
@@ -256,6 +261,86 @@ fn send_caps_lock_led<R: RegisterIo>(
     controller
         .write(i2c_address, &transfer[..transfer_len])
         .map_err(|_| LedSyncError::Transfer)
+}
+
+/// Quiesce an optional HID touchpad before its level-low attention line is armed, mirroring the
+/// keyboard bring-up (Linux `i2c_hid_of` power-up + `RESET`). KUMO's `InterruptCreate` has no
+/// `IRQF_NO_AUTOEN`, so arming an un-reset device whose attention line is still asserted storms the
+/// serve loop at priority 63 and starves boot (the symptom J401 gated). This runs
+/// `SET_POWER(On)` -> settle -> `RESET`, then drains the reset-complete and any queued reports by
+/// plain read until the device returns empty — the read is what deasserts the HID attention line —
+/// so the line is quiet *before* the IRQ is created. All transfers run under the tightened
+/// `OPTIONAL_PROBE_POLL_LIMIT`, restored on return, so a NACKing pad fails fast into keyboard-only
+/// rather than starving boot. Returns true only when power-on and reset both succeeded. — CORVUS
+fn quiesce_optional_touchpad<R: RegisterIo>(
+    controller: &mut Controller<R>,
+    runtime: &OptionalMouseRuntimeConfig,
+    input_frame: &mut [u8],
+) -> bool {
+    let saved = controller.poll_limit();
+    controller.set_poll_limit(OPTIONAL_PROBE_POLL_LIMIT);
+    let quiesced = quiesce_optional_touchpad_inner(controller, runtime, input_frame);
+    controller.set_poll_limit(saved);
+    quiesced
+}
+
+fn quiesce_optional_touchpad_inner<R: RegisterIo>(
+    controller: &mut Controller<R>,
+    runtime: &OptionalMouseRuntimeConfig,
+    input_frame: &mut [u8],
+) -> bool {
+    if controller
+        .write(
+            runtime.i2c_address,
+            &Command::set_power(runtime.command_register, PowerState::On),
+        )
+        .is_err()
+    {
+        log(b"drv-i2c-hid: tp set-power error\n");
+        return false;
+    }
+    if !sleep_ns(POWER_ON_SETTLE_NS) {
+        return false;
+    }
+    if controller
+        .write(
+            runtime.i2c_address,
+            &Command::reset(runtime.command_register),
+        )
+        .is_err()
+    {
+        log(b"drv-i2c-hid: tp reset error\n");
+        return false;
+    }
+    let _ = sleep_ns(POWER_ON_SETTLE_NS);
+    // Drain the reset-complete and any queued report so the level-low attention line is deasserted
+    // before the IRQ is armed (the NO_AUTOEN quiesce). A plain read of the input register returns
+    // the pending report and clears the device's attention; a zero-length read means the line is
+    // quiet. Bounded so a chatty or half-awake pad cannot loop here.
+    for _ in 0..OPTIONAL_DRAIN_READS {
+        if controller
+            .read(
+                runtime.i2c_address,
+                &mut input_frame[..runtime.input_frame_len],
+            )
+            .is_err()
+        {
+            break;
+        }
+        if u16::from_le_bytes([input_frame[0], input_frame[1]]) == 0 {
+            break;
+        }
+    }
+    // Elan pads share the keyboard's no-wakeup-after-reset quirk: re-issue SET_POWER only when the
+    // quirk is absent, exactly as the keyboard path does.
+    if !runtime.quirks.no_wakeup_after_reset {
+        let _ = controller.write(
+            runtime.i2c_address,
+            &Command::set_power(runtime.command_register, PowerState::On),
+        );
+        let _ = sleep_ns(POWER_ON_SETTLE_NS);
+    }
+    true
 }
 
 fn log_optional_hex(value: Option<u64>) {
@@ -873,6 +958,13 @@ extern "C" fn main(
                 keyboard_attention_koid = handle_koid(attention_irq);
                 if port_bind(port, attention_irq) != 0 {
                     log(b"drv-i2c-hid: tp irq port bind keyboard failed; keyboard-only\n");
+                    let _ = handle_close(port);
+                    keyboard_attention_koid = 0;
+                } else if !quiesce_optional_touchpad(&mut controller, &runtime, &mut input_frame) {
+                    // Power-on/reset did not take: do NOT arm the level-low attention on an
+                    // un-quiesced device (that is the storm). Fall back to keyboard-only.
+                    log(b"drv-i2c-hid: tp quiesce failed; keyboard-only\n");
+                    let _ = port_unbind(port, attention_irq);
                     let _ = handle_close(port);
                     keyboard_attention_koid = 0;
                 } else {

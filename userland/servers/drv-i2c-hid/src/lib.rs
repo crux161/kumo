@@ -5,6 +5,7 @@
 //j397
 //j398
 //j400
+//j404
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -698,6 +699,9 @@ pub struct OptionalMouseRuntimeConfig {
     pub input_frame_len: usize,
     pub mouse_report: MouseReport,
     pub quirks: DeviceQuirks,
+    /// The HID command register, carried so the runtime can run the same SET_POWER(On) + RESET
+    /// bring-up the keyboard does before its attention line is armed (Linux `i2c_hid_of` power-up).
+    pub command_register: u16,
 }
 
 pub fn optional_mouse_runtime_config(
@@ -715,6 +719,7 @@ pub fn optional_mouse_runtime_config(
         input_frame_len,
         mouse_report,
         quirks: DeviceQuirks::for_vendor_product(descriptor.vendor_id, descriptor.product_id),
+        command_register: descriptor.command_register,
     })
 }
 
@@ -1236,6 +1241,7 @@ mod tests {
                 input_frame_len: 14,
                 mouse_report: MouseReport { report_id: Some(1) },
                 quirks: DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0x3193),
+                command_register: 0,
             })
         );
     }
