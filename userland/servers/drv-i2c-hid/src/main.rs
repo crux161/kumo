@@ -1,9 +1,9 @@
-//j388
 //j389
 //j397
 //j398
 //j399
 //j400
+//j401
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -46,6 +46,12 @@ const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
 const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
+/// Gate the optional touchpad probe. The probe issues I2C transactions to the touchpad address(es)
+/// while the device may be unresponsive (boot-state-dependent), and each write_read can hang the
+/// GENI controller in a 1M-iteration poll loop when the touchpad is asleep. This delays Sora's
+/// serve loop setup (priority 64) by seconds while drv-i2c-hid (priority 63) spins. Default OFF
+/// until Slice 9 owns the vdd/vddl regulator sequencing needed for reliable probe timing. — MERLIN
+const RUN_TOUCHPAD_PROBE: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveTouchpad {
@@ -721,123 +727,124 @@ extern "C" fn main(
     }
 
     // PLAN_V Slice 8 (measure first): probe the DT-declared optional i2c21 children read-only on
-    // the still-quiet bus, before the keyboard loop starts. A missing device NACKs and is skipped
-    // — ProbeFailurePolicy::Optional exercised on metal. The report-descriptor dump is temporary,
-    // like J378's keyboard dump: it is the measurement the touchpad decode slice needs. — CORVUS
+    // the still-quiet bus, before the keyboard loop starts. Gated by `RUN_TOUCHPAD_PROBE` (default
+    // OFF) because a non-responsive touchpad hangs each GENI transaction in a 1M-iteration poll,
+    // delaying Sora's serve loop setup. Re-enable when Slice 9 owns the regulator/reset sequencing
+    // that makes probe timing reliable. — MERLIN
     let mut touchpad_runtime: Option<OptionalMouseRuntimeConfig> = None;
-    for candidate in optional_probes.candidates() {
-        log_hex(
-            b"drv-i2c-hid: tp probe addr=0x",
-            candidate.i2c_address as u64,
-        );
-        let mut tp_raw = [0u8; HidDescriptor::BYTES];
-        // An asleep HID child may NACK its first touch: tp@0x15 answered one live boot and
-        // NACKed the next with identical code (J387 read-out), so presence is power/wake-state
-        // dependent until Slice 9 owns the vdd/vddl rails. Retry with a settle to measure the
-        // wake latency; a device dark across all attempts is skipped as before. — CORVUS
-        let mut attempt = 0usize;
-        let tp_probe = loop {
-            attempt += 1;
-            match controller.write_read(
-                candidate.i2c_address,
-                &candidate.hid_descriptor_register.to_le_bytes(),
-                &mut tp_raw,
-            ) {
-                Ok(()) => break Ok(()),
-                Err(_) if attempt < PROBE_ATTEMPTS => {
-                    let _ = sleep_ns(PROBE_RETRY_SETTLE_NS);
+    if RUN_TOUCHPAD_PROBE {
+        for candidate in optional_probes.candidates() {
+            log_hex(
+                b"drv-i2c-hid: tp probe addr=0x",
+                candidate.i2c_address as u64,
+            );
+            let mut tp_raw = [0u8; HidDescriptor::BYTES];
+            // An asleep HID child may NACK its first touch: tp@0x15 answered one live boot and
+            // NACKed the next with identical code (J387 read-out), so presence is power/wake-state
+            // dependent until Slice 9 owns the vdd/vddl rails. Retry with a settle to measure the
+            // wake latency; a device dark across all attempts is skipped as before. — CORVUS
+            let mut attempt = 0usize;
+            let tp_probe = loop {
+                attempt += 1;
+                match controller.write_read(
+                    candidate.i2c_address,
+                    &candidate.hid_descriptor_register.to_le_bytes(),
+                    &mut tp_raw,
+                ) {
+                    Ok(()) => break Ok(()),
+                    Err(_) if attempt < PROBE_ATTEMPTS => {
+                        let _ = sleep_ns(PROBE_RETRY_SETTLE_NS);
+                    }
+                    Err(error) => break Err(error),
                 }
-                Err(error) => break Err(error),
+            };
+            if attempt > 1 {
+                log_hex(b"drv-i2c-hid: tp probe attempts=0x", attempt as u64);
             }
-        };
-        if attempt > 1 {
-            log_hex(b"drv-i2c-hid: tp probe attempts=0x", attempt as u64);
-        }
-        if let Err(error) = tp_probe {
-            log_hex(b"drv-i2c-hid: tp probe skipped error=0x", error.code());
-            continue;
-        }
-        let tp_descriptor = match HidDescriptor::parse(&tp_raw) {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                log_hex(b"drv-i2c-hid: tp descriptor error=0x", error as u64);
+            if let Err(error) = tp_probe {
+                log_hex(b"drv-i2c-hid: tp probe skipped error=0x", error.code());
                 continue;
             }
-        };
-        log_hex(b"drv-i2c-hid: tp vendor=0x", tp_descriptor.vendor_id as u64);
-        log_hex(
-            b"drv-i2c-hid: tp product=0x",
-            tp_descriptor.product_id as u64,
-        );
-        log_hex(
-            b"drv-i2c-hid: tp input-reg=0x",
-            tp_descriptor.input_register as u64,
-        );
-        log_hex(
-            b"drv-i2c-hid: tp max-input=0x",
-            tp_descriptor.max_input_length as u64,
-        );
-        // Probe-local descriptor budget: the touchpad's report descriptor is bigger than the
-        // keyboard-sized MAX_REPORT_DESCRIPTOR_BYTES cap (the live J385/J386 boot rejected it
-        // TooLong), so the probe reads up to PROBE_RDESC_BYTES and says so if it truncates. The
-        // keyboard path's own bound is unchanged. — CORVUS
-        let tp_declared = tp_descriptor.report_descriptor_length as usize;
-        log_hex(b"drv-i2c-hid: tp rdesc-declared=0x", tp_declared as u64);
-        if tp_declared == 0 {
-            log(b"drv-i2c-hid: tp rdesc empty\n");
-            continue;
-        }
-        let tp_rdesc_len = tp_declared.min(PROBE_RDESC_BYTES);
-        if tp_rdesc_len < tp_declared {
-            log_hex(
-                b"drv-i2c-hid: tp rdesc truncated to=0x",
-                tp_rdesc_len as u64,
-            );
-        }
-        let mut tp_report_descriptor = [0u8; PROBE_RDESC_BYTES];
-        if let Err(error) = controller.write_read(
-            candidate.i2c_address,
-            &tp_descriptor.report_descriptor_register.to_le_bytes(),
-            &mut tp_report_descriptor[..tp_rdesc_len],
-        ) {
-            log_hex(b"drv-i2c-hid: tp rdesc read error=0x", error.code());
-            continue;
-        }
-        let tp_desc = &tp_report_descriptor[..tp_rdesc_len];
-        let mut offset = 0;
-        while offset < tp_desc.len() {
-            let end = (offset + 16).min(tp_desc.len());
-            log_frame(b"drv-i2c-hid: tp rdesc= ", &tp_desc[offset..end]);
-            offset = end;
-        }
-        if touchpad_runtime.is_some() {
-            log(b"drv-i2c-hid: tp runtime already selected\n");
-            continue;
-        }
-        match optional_mouse_runtime_config(*candidate, tp_descriptor, tp_desc) {
-            Ok(runtime) => {
-                log_hex(
-                    b"drv-i2c-hid: tp runtime addr=0x",
-                    runtime.i2c_address as u64,
-                );
-                log_hex(
-                    b"drv-i2c-hid: tp runtime irq=0x",
-                    runtime.attention_irq as u64,
-                );
-                log_hex(
-                    b"drv-i2c-hid: tp runtime read size=0x",
-                    runtime.input_frame_len as u64,
-                );
-                match runtime.mouse_report.report_id {
-                    Some(report_id) => {
-                        log_hex(b"drv-i2c-hid: tp mouse-report-id=0x", report_id as u64);
-                    }
-                    None => log(b"drv-i2c-hid: tp mouse-report-id=none\n"),
+            let tp_descriptor = match HidDescriptor::parse(&tp_raw) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    log_hex(b"drv-i2c-hid: tp descriptor error=0x", error as u64);
+                    continue;
                 }
-                touchpad_runtime = Some(runtime);
+            };
+            log_hex(b"drv-i2c-hid: tp vendor=0x", tp_descriptor.vendor_id as u64);
+            log_hex(
+                b"drv-i2c-hid: tp product=0x",
+                tp_descriptor.product_id as u64,
+            );
+            log_hex(
+                b"drv-i2c-hid: tp input-reg=0x",
+                tp_descriptor.input_register as u64,
+            );
+            log_hex(
+                b"drv-i2c-hid: tp max-input=0x",
+                tp_descriptor.max_input_length as u64,
+            );
+            let tp_declared = tp_descriptor.report_descriptor_length as usize;
+            log_hex(b"drv-i2c-hid: tp rdesc-declared=0x", tp_declared as u64);
+            if tp_declared == 0 {
+                log(b"drv-i2c-hid: tp rdesc empty\n");
+                continue;
             }
-            Err(error) => log_optional_mouse_runtime_error(error),
+            let tp_rdesc_len = tp_declared.min(PROBE_RDESC_BYTES);
+            if tp_rdesc_len < tp_declared {
+                log_hex(
+                    b"drv-i2c-hid: tp rdesc truncated to=0x",
+                    tp_rdesc_len as u64,
+                );
+            }
+            let mut tp_report_descriptor = [0u8; PROBE_RDESC_BYTES];
+            if let Err(error) = controller.write_read(
+                candidate.i2c_address,
+                &tp_descriptor.report_descriptor_register.to_le_bytes(),
+                &mut tp_report_descriptor[..tp_rdesc_len],
+            ) {
+                log_hex(b"drv-i2c-hid: tp rdesc read error=0x", error.code());
+                continue;
+            }
+            let tp_desc = &tp_report_descriptor[..tp_rdesc_len];
+            let mut offset = 0;
+            while offset < tp_desc.len() {
+                let end = (offset + 16).min(tp_desc.len());
+                log_frame(b"drv-i2c-hid: tp rdesc= ", &tp_desc[offset..end]);
+                offset = end;
+            }
+            if touchpad_runtime.is_some() {
+                log(b"drv-i2c-hid: tp runtime already selected\n");
+                continue;
+            }
+            match optional_mouse_runtime_config(*candidate, tp_descriptor, tp_desc) {
+                Ok(runtime) => {
+                    log_hex(
+                        b"drv-i2c-hid: tp runtime addr=0x",
+                        runtime.i2c_address as u64,
+                    );
+                    log_hex(
+                        b"drv-i2c-hid: tp runtime irq=0x",
+                        runtime.attention_irq as u64,
+                    );
+                    log_hex(
+                        b"drv-i2c-hid: tp runtime read size=0x",
+                        runtime.input_frame_len as u64,
+                    );
+                    match runtime.mouse_report.report_id {
+                        Some(report_id) => {
+                            log_hex(b"drv-i2c-hid: tp mouse-report-id=0x", report_id as u64);
+                        }
+                        None => log(b"drv-i2c-hid: tp mouse-report-id=none\n"),
+                    }
+                    touchpad_runtime = Some(runtime);
+                }
+                Err(error) => log_optional_mouse_runtime_error(error),
+            }
         }
+    } else if !optional_probes.candidates().is_empty() {
+        log(b"drv-i2c-hid: tp probe skipped (gated by RUN_TOUCHPAD_PROBE)\n");
     }
 
     let mut irq_port: Option<Handle> = None;
