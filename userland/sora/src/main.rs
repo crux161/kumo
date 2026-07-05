@@ -4,6 +4,7 @@
 //j382
 //j385
 //j389
+//j402
 
 extern crate alloc;
 
@@ -1454,6 +1455,44 @@ extern "C" fn sora_main(
             }
         }
         None => log(b"autoexec: no manifest\n"),
+    }
+
+    // Flush the kernel console backlog accumulated during autoexec into drv-fb, so boot
+    // progress is visible immediately rather than trickling through the serve loop where it
+    // must compete with keyboard and other port sources.
+    //
+    // Hardened over MERLIN's J402 first cut. On the claimed-framebuffer path `debug_write`
+    // routes through `queue_framebuffer_console`, which re-enqueues into the *same*
+    // kernel->Sora console inbox this code reads from (kernel end = Left; Sora's `console`
+    // handle = Right). So a plain read->debug_write loop feeds itself: it only terminates once
+    // drv-fb (prio 63) preempts Sora (prio 64) to drain the inbox — an unbounded spin, with no
+    // yield, that hangs boot if drv-fb ever stalls, and doubles lines when it re-reads its own
+    // re-queue. Instead: drain the inbox into a fixed staging buffer FIRST (no debug_write, so
+    // nothing is re-queued and no line is doubled), then emit the staged bytes once in
+    // DebugWrite-sized (<=256B) chunks. The fixed buffer bounds the work absolutely: a backlog
+    // larger than it — or a stalled drv-fb — costs a truncated or late flush that the serve
+    // loop still drains one message per wake, never a boot hang. On the serial path the inbox
+    // is empty (klog goes straight to the HAL), so this is a clean no-op. — CORVUS
+    const CONSOLE_FLUSH_STAGE_BYTES: usize = 1024;
+    const CONSOLE_CHUNK_BYTES: usize = 256;
+    let mut flush_stage = [0u8; CONSOLE_FLUSH_STAGE_BYTES];
+    let mut staged = 0usize;
+    while staged + CONSOLE_CHUNK_BYTES <= flush_stage.len() {
+        let n = channel_read(
+            console,
+            flush_stage[staged..].as_mut_ptr(),
+            CONSOLE_CHUNK_BYTES,
+        ) as usize;
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        staged += n;
+    }
+    let mut emitted = 0usize;
+    while emitted < staged {
+        let end = (emitted + CONSOLE_CHUNK_BYTES).min(staged);
+        debug_write(flush_stage[emitted..end].as_ptr(), end - emitted);
+        emitted = end;
     }
 
     if run_ttyd_smoke(initrd) {
