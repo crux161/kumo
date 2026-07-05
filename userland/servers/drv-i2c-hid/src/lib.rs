@@ -1,18 +1,19 @@
 #![no_std]
 
-//j382
 //j383
 //j385
 //j389
 //j397
+//j398
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
 };
 use kumo_i2c_hid::{
-    boot_keyboard_report, boot_mouse_report, BootMouseReport, HidDeviceKind, HidDeviceTopology,
-    I2cHidBusTopology, InputFrame, KeyboardTopology, MouseButtons, MouseReport, ProtocolError,
-    SourceClock, BOOT_MOUSE_REPORT_BYTES, MAX_I2C_HID_DEVICES,
+    boot_keyboard_report, boot_mouse_report, find_boot_mouse, BootMouseReport, HidDescriptor,
+    HidDeviceKind, HidDeviceTopology, I2cHidBusTopology, InputFrame, KeyboardTopology,
+    MouseButtons, MouseReport, ProtocolError, SourceClock, BOOT_MOUSE_REPORT_BYTES,
+    MAX_I2C_HID_DEVICES,
 };
 
 const MAGIC: [u8; 4] = *b"I2H1";
@@ -141,6 +142,12 @@ pub enum ConfigError {
 pub enum ReportProbeError {
     Empty,
     TooLong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionalMouseRuntimeError {
+    InvalidInputLength,
+    NoBootMouse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -684,6 +691,33 @@ pub struct OptionalProbeCandidate {
     pub attention_irq: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OptionalMouseRuntimeConfig {
+    pub i2c_address: u8,
+    pub attention_irq: u32,
+    pub input_frame_len: usize,
+    pub mouse_report: MouseReport,
+    pub quirks: DeviceQuirks,
+}
+
+pub fn optional_mouse_runtime_config(
+    candidate: OptionalProbeCandidate,
+    descriptor: HidDescriptor,
+    report_descriptor: &[u8],
+) -> Result<OptionalMouseRuntimeConfig, OptionalMouseRuntimeError> {
+    let input_frame_len = bounded_input_frame_len(descriptor.max_input_length)
+        .map_err(|_| OptionalMouseRuntimeError::InvalidInputLength)?;
+    let mouse_report =
+        find_boot_mouse(report_descriptor).map_err(|_| OptionalMouseRuntimeError::NoBootMouse)?;
+    Ok(OptionalMouseRuntimeConfig {
+        i2c_address: candidate.i2c_address,
+        attention_irq: candidate.attention_irq,
+        input_frame_len,
+        mouse_report,
+        quirks: DeviceQuirks::for_vendor_product(descriptor.vendor_id, descriptor.product_id),
+    })
+}
+
 /// Bootstrap message carrying the optional (skippable) i2c21 HID children from Sora to
 /// `drv-i2c-hid`, sent after the keyboard and mouse channels. Self-tagged with
 /// [`OPTIONAL_PROBE_BOOTSTRAP_TAG`]; fixed-size like [`ProbeConfig`]. IRQs name the attention lines
@@ -1154,6 +1188,88 @@ mod tests {
             Err(ConfigError::InvalidInterrupt)
         );
         assert!(OptionalProbeCandidates::EMPTY.candidates().is_empty());
+    }
+
+    #[test]
+    fn optional_mouse_runtime_config_promotes_a_boot_mouse_child() {
+        let candidate = OptionalProbeCandidate {
+            i2c_address: 0x15,
+            hid_descriptor_register: 1,
+            attention_irq: kumo_abi::tlmm_gpio_irq(182, 8),
+        };
+        let descriptor = HidDescriptor {
+            report_descriptor_length: 50,
+            report_descriptor_register: 2,
+            input_register: 3,
+            max_input_length: 14,
+            output_register: 0,
+            max_output_length: 0,
+            command_register: 0,
+            data_register: 0,
+            vendor_id: ELAN_VENDOR_ID,
+            product_id: 0x3193,
+            version_id: 1,
+        };
+        let boot_mouse = [
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x01, //   Report ID (1)
+            0x09, 0x01, //   Usage (Pointer)
+            0xA1, 0x00, //   Collection (Physical)
+            0x75, 0x08, //     Report Size (8)
+            0x95, 0x03, //     Report Count (3)
+            0x81, 0x06, //     Input: boot mouse prefix
+            0xC0, //   End Collection
+            0xC0, // End Collection
+        ];
+
+        assert_eq!(
+            optional_mouse_runtime_config(candidate, descriptor, &boot_mouse),
+            Ok(OptionalMouseRuntimeConfig {
+                i2c_address: 0x15,
+                attention_irq: kumo_abi::tlmm_gpio_irq(182, 8),
+                input_frame_len: 14,
+                mouse_report: MouseReport { report_id: Some(1) },
+                quirks: DeviceQuirks::for_vendor_product(ELAN_VENDOR_ID, 0x3193),
+            })
+        );
+    }
+
+    #[test]
+    fn optional_mouse_runtime_config_rejects_non_mouse_or_oversized_input() {
+        let candidate = OptionalProbeCandidate {
+            i2c_address: 0x15,
+            hid_descriptor_register: 1,
+            attention_irq: kumo_abi::tlmm_gpio_irq(182, 8),
+        };
+        let descriptor = HidDescriptor {
+            report_descriptor_length: 0,
+            report_descriptor_register: 0,
+            input_register: 0,
+            max_input_length: 14,
+            output_register: 0,
+            max_output_length: 0,
+            command_register: 0,
+            data_register: 0,
+            vendor_id: ELAN_VENDOR_ID,
+            product_id: 0x3193,
+            version_id: 1,
+        };
+
+        assert_eq!(
+            optional_mouse_runtime_config(candidate, descriptor, &[0x05, 0x01]),
+            Err(OptionalMouseRuntimeError::NoBootMouse)
+        );
+
+        let oversized = HidDescriptor {
+            max_input_length: (MAX_INPUT_FRAME_BYTES + 1) as u16,
+            ..descriptor
+        };
+        assert_eq!(
+            optional_mouse_runtime_config(candidate, oversized, &[0x05, 0x01]),
+            Err(OptionalMouseRuntimeError::InvalidInputLength)
+        );
     }
 
     #[test]

@@ -1,20 +1,21 @@
-//j385
 //j387
 //j388
 //j389
 //j397
+//j398
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use drv_i2c_hid::{
     bounded_input_frame_len, bounded_report_descriptor_len, classify_input_report_with_mouse,
-    decode_mouse_probe, encode_mouse_event, should_log_input_report_stats_snapshot,
-    BoundedFailureLog, DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass,
-    InputReportStats, OptionalProbeCandidates, ProbeConfig, ResetStormGuard, StartupLatencyTrace,
-    StartupMilestone, IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES,
-    MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT,
-    RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
+    decode_mouse_probe, encode_mouse_event, optional_mouse_runtime_config,
+    should_log_input_report_stats_snapshot, BoundedFailureLog, DeviceQuirks, InputProbeDecoder,
+    InputProbeError, InputReportClass, InputReportStats, OptionalMouseRuntimeConfig,
+    OptionalMouseRuntimeError, OptionalProbeCandidates, ProbeConfig, ResetStormGuard,
+    StartupLatencyTrace, StartupMilestone, IRQ_TICK_LOG_LIMIT, KEYBOARD_BOOTSTRAP_TAG,
+    MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG,
+    NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_NS,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{
@@ -43,6 +44,14 @@ const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
 const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveTouchpad {
+    interrupt: Handle,
+    koid: u64,
+    runtime: OptionalMouseRuntimeConfig,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LedSyncError {
     NoCapsLockLed,
@@ -123,6 +132,17 @@ fn log_input_probe_error(error: InputProbeError) {
         }
         InputProbeError::Decode(error) => {
             log_hex(b"drv-i2c-hid: input frame decode error=0x", error as u64);
+        }
+    }
+}
+
+fn log_optional_mouse_runtime_error(error: OptionalMouseRuntimeError) {
+    match error {
+        OptionalMouseRuntimeError::InvalidInputLength => {
+            log(b"drv-i2c-hid: tp runtime invalid input length\n");
+        }
+        OptionalMouseRuntimeError::NoBootMouse => {
+            log(b"drv-i2c-hid: tp runtime no boot mouse\n");
         }
     }
 }
@@ -427,7 +447,7 @@ extern "C" fn main(
             kumo_rt::process_exit(1);
         }
     };
-    let _optional_attention_resource = if optional_probes.candidates().is_empty() {
+    let optional_attention_resource = if optional_probes.candidates().is_empty() {
         if optional_attention_resource_raw != 0 {
             log(b"drv-i2c-hid: unexpected probe resource\n");
             kumo_rt::process_exit(1);
@@ -702,6 +722,7 @@ extern "C" fn main(
     // the still-quiet bus, before the keyboard loop starts. A missing device NACKs and is skipped
     // — ProbeFailurePolicy::Optional exercised on metal. The report-descriptor dump is temporary,
     // like J378's keyboard dump: it is the measurement the touchpad decode slice needs. — CORVUS
+    let mut touchpad_runtime: Option<OptionalMouseRuntimeConfig> = None;
     for candidate in optional_probes.candidates() {
         log_hex(
             b"drv-i2c-hid: tp probe addr=0x",
@@ -787,6 +808,85 @@ extern "C" fn main(
             log_frame(b"drv-i2c-hid: tp rdesc= ", &tp_desc[offset..end]);
             offset = end;
         }
+        if touchpad_runtime.is_some() {
+            log(b"drv-i2c-hid: tp runtime already selected\n");
+            continue;
+        }
+        match optional_mouse_runtime_config(*candidate, tp_descriptor, tp_desc) {
+            Ok(runtime) => {
+                log_hex(
+                    b"drv-i2c-hid: tp runtime addr=0x",
+                    runtime.i2c_address as u64,
+                );
+                log_hex(
+                    b"drv-i2c-hid: tp runtime irq=0x",
+                    runtime.attention_irq as u64,
+                );
+                log_hex(
+                    b"drv-i2c-hid: tp runtime read size=0x",
+                    runtime.input_frame_len as u64,
+                );
+                match runtime.mouse_report.report_id {
+                    Some(report_id) => {
+                        log_hex(b"drv-i2c-hid: tp mouse-report-id=0x", report_id as u64);
+                    }
+                    None => log(b"drv-i2c-hid: tp mouse-report-id=none\n"),
+                }
+                touchpad_runtime = Some(runtime);
+            }
+            Err(error) => log_optional_mouse_runtime_error(error),
+        }
+    }
+
+    let mut irq_port: Option<Handle> = None;
+    let mut keyboard_attention_koid: u64 = 0;
+    let mut touchpad: Option<ActiveTouchpad> = None;
+    if let Some(runtime) = touchpad_runtime {
+        if let Some(optional_resource) = optional_attention_resource {
+            let port_raw = port_create();
+            if port_raw == u64::MAX {
+                log(b"drv-i2c-hid: tp irq port create failed; keyboard-only\n");
+            } else {
+                let port = Handle(port_raw as u32);
+                keyboard_attention_koid = handle_koid(attention_irq);
+                if port_bind(port, attention_irq) != 0 {
+                    log(b"drv-i2c-hid: tp irq port bind keyboard failed; keyboard-only\n");
+                    let _ = handle_close(port);
+                    keyboard_attention_koid = 0;
+                } else {
+                    let touchpad_raw = interrupt_create(optional_resource, runtime.attention_irq);
+                    if touchpad_raw == u64::MAX {
+                        log(b"drv-i2c-hid: tp interrupt create failed; keyboard-only\n");
+                        let _ = port_unbind(port, attention_irq);
+                        let _ = handle_close(port);
+                        keyboard_attention_koid = 0;
+                    } else {
+                        let touchpad_irq = Handle(touchpad_raw as u32);
+                        let touchpad_koid = handle_koid(touchpad_irq);
+                        if port_bind(port, touchpad_irq) != 0 {
+                            log(b"drv-i2c-hid: tp irq port bind failed\n");
+                            kumo_rt::process_exit(1);
+                        }
+                        log_hex(b"drv-i2c-hid: tp irq koid=0x", touchpad_koid);
+                        log_hex(
+                            b"drv-i2c-hid: keyboard irq koid=0x",
+                            keyboard_attention_koid,
+                        );
+                        log(b"drv-i2c-hid: tp attention interrupt ready\n");
+                        irq_port = Some(port);
+                        touchpad = Some(ActiveTouchpad {
+                            interrupt: touchpad_irq,
+                            koid: touchpad_koid,
+                            runtime,
+                        });
+                    }
+                }
+            }
+        } else {
+            log(b"drv-i2c-hid: tp runtime lacks attention resource; keyboard-only\n");
+        }
+    } else if !optional_probes.candidates().is_empty() {
+        log(b"drv-i2c-hid: no optional boot-mouse runtime; keyboard-only\n");
     }
 
     let mut input_decoder = InputProbeDecoder::new();
@@ -797,6 +897,8 @@ extern "C" fn main(
     // Non-empty frames and forwarded keys still log after the boot sample expires. — KESTREL
     let mut interrupts: u32 = 0;
     let mut shown_nonempty: u32 = 0;
+    let mut touchpad_interrupts: u32 = 0;
+    let mut touchpad_shown_nonempty: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut mouse_forward_failures = BoundedFailureLog::new();
     let mut input_decode_failures = BoundedFailureLog::new();
@@ -806,7 +908,106 @@ extern "C" fn main(
     let mut reset_storm = ResetStormGuard::new();
     let mut caps_lock = false;
     loop {
-        if interrupt_wait(attention_irq) == 0 {
+        if let Some(port) = irq_port {
+            let source = port_wait(port);
+            if source == 0 {
+                log(b"drv-i2c-hid: irq port wait failed\n");
+                kumo_rt::process_exit(1);
+            }
+            if let Some(tp) = touchpad {
+                if source == tp.koid {
+                    if interrupt_wait(tp.interrupt) == 0 {
+                        log(b"drv-i2c-hid: tp attention wait failed; disabling touchpad\n");
+                        touchpad = None;
+                        continue;
+                    }
+                    if let Err(error) = controller.read(
+                        tp.runtime.i2c_address,
+                        &mut input_frame[..tp.runtime.input_frame_len],
+                    ) {
+                        log_hex(b"drv-i2c-hid: tp input frame read error=0x", error.code());
+                        log(b"drv-i2c-hid: tp left masked after read error\n");
+                        touchpad = None;
+                        continue;
+                    }
+                    if interrupt_complete(tp.interrupt) != 0 {
+                        log(b"drv-i2c-hid: tp attention complete failed; disabling touchpad\n");
+                        touchpad = None;
+                        continue;
+                    }
+
+                    touchpad_interrupts = touchpad_interrupts.wrapping_add(1);
+                    let frame_len = u16::from_le_bytes([input_frame[0], input_frame[1]]);
+                    let report_class = classify_input_report_with_mouse(
+                        &input_frame[..tp.runtime.input_frame_len],
+                        None,
+                        Some(tp.runtime.mouse_report),
+                        tp.runtime.quirks,
+                    );
+                    input_stats.record_class(report_class);
+                    if touchpad_interrupts <= IRQ_TICK_LOG_LIMIT {
+                        log_hex(b"drv-i2c-hid: tp irq tick len=0x", frame_len as u64);
+                    }
+                    if touchpad_interrupts <= RAW_FRAME_LOG_LIMIT {
+                        let shown = tp.runtime.input_frame_len.min(16);
+                        log_frame(b"drv-i2c-hid: tp raw= ", &input_frame[..shown]);
+                    }
+                    if frame_len != 0 && touchpad_shown_nonempty < NONEMPTY_FRAME_LOG_LIMIT {
+                        touchpad_shown_nonempty += 1;
+                        let shown = (frame_len as usize).min(tp.runtime.input_frame_len).min(16);
+                        log_frame(b"drv-i2c-hid: tp frame= ", &input_frame[..shown]);
+                    }
+                    if report_class == InputReportClass::Reset
+                        || report_class == InputReportClass::BogusIrq
+                    {
+                        maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
+                        continue;
+                    }
+                    if report_class == InputReportClass::MouseReport {
+                        match decode_mouse_probe(
+                            &input_frame[..tp.runtime.input_frame_len],
+                            tp.runtime.mouse_report,
+                            tp.runtime.quirks,
+                        ) {
+                            Ok(Some(report)) => {
+                                let event = encode_mouse_event(report);
+                                if channel_write(mouse_channel, event.as_ptr(), event.len()) == 0 {
+                                    input_stats.record_forwarded_mouse();
+                                    log(b"drv-i2c-hid: tp mouse forwarded\n");
+                                } else if mouse_forward_failures.record() {
+                                    input_stats.record_mouse_write_drop();
+                                    log_hex(
+                                        b"drv-i2c-hid: tp mouse event dropped count=0x",
+                                        mouse_forward_failures.count() as u64,
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if input_decode_failures.record() {
+                                    log_hex(
+                                        b"drv-i2c-hid: tp mouse report decode error=0x",
+                                        error as u64,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        log(b"drv-i2c-hid: tp non-mouse report dropped\n");
+                    }
+                    maybe_log_input_report_stats(&input_stats, &mut input_stats_logs);
+                    continue;
+                }
+            }
+            if source != keyboard_attention_koid {
+                log_hex(b"drv-i2c-hid: unknown irq source=0x", source);
+                continue;
+            }
+            if interrupt_wait(attention_irq) == 0 {
+                log(b"drv-i2c-hid: attention wait failed\n");
+                kumo_rt::process_exit(1);
+            }
+        } else if interrupt_wait(attention_irq) == 0 {
             log(b"drv-i2c-hid: attention wait failed\n");
             kumo_rt::process_exit(1);
         }
