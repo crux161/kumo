@@ -1649,14 +1649,18 @@ extern "C" fn sora_main(
     if mouse_input.is_some() && mouse_koid == u64::MAX {
         log(b"sora: mouse koid fail\n");
     }
-    // The serve loop only needs the port and a console to be useful; the block/net/keyboard
-    // channels are bound only when available. A machine without a keyboard or net driver (the
-    // X13s today) therefore still serves its console instead of dropping into the silent
-    // busy-spin that looked like a halt after `anon vmo write ok`. Each per-source handler
-    // below already gates on a koid match, so an unbound channel simply never wakes the port.
-    if port_h != u64::MAX && console_koid != u64::MAX {
+    // The serve loop needs only the PORT; every source (console, block, net, keyboard, mouse) is
+    // bound only when its koid is live. On the X13s framebuffer path the console handle has
+    // already been moved to drv-fb, so `console_koid` legitimately fails — Sora must still enter
+    // the loop to serve the keyboard/mouse rather than drop into the idle busy-spin. This is the
+    // J407 repair, restored after the J405 reset re-required the console and re-broke X13s input
+    // (the "serve setup / console koid fail / no port; idle" symptom). Each per-source handler
+    // below gates on a koid match, so an unbound channel simply never wakes the port.
+    if port_h != u64::MAX {
         let port = Handle(port_h as u32);
-        port_bind(port, console);
+        if console_koid != u64::MAX {
+            port_bind(port, console);
+        }
         if block_koid != u64::MAX {
             port_bind(port, block);
         }
@@ -1905,10 +1909,11 @@ extern "C" fn sora_main(
             }
         }
     } else {
-        // Reached only when the port itself or the console channel is unavailable — Sora cannot
-        // serve, so it idles. The marker keeps this state honest on the framebuffer instead of
-        // looking like a halt after `anon vmo write ok`.
-        log(b"sora: no port/console; idle\n");
+        // Reached only when the serve PORT itself could not be created — Sora cannot wait on any
+        // source, so it idles. Console absence no longer lands here: it is expected on the
+        // framebuffer path and must not stop keyboard serving. The marker keeps this state honest
+        // on the framebuffer instead of looking like a halt after `anon vmo write ok`.
+        log(b"sora: no serve port; idle\n");
         loop {
             core::hint::spin_loop();
         }
