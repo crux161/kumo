@@ -1,3 +1,4 @@
+#j415
 [workspace]
 members = [
     "boot/niji-loader",
@@ -13,6 +14,7 @@ members = [
     "lib/kumo-i2c-hid",
     "lib/kumo-ipc",
     "lib/kumo-pdc",
+    "lib/kumo-virtio",
     "lib/kumo-vfs",
     "lib/kumo-xhci",
     "tools/stage-a-smoke",
