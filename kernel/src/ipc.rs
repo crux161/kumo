@@ -1,4 +1,5 @@
 //j399
+//j409
 
 use alloc::vec::Vec;
 
@@ -312,6 +313,22 @@ impl IpcRegistry {
             }
             if channel.object(ChannelEnd::Right).koid() == koid {
                 return Ok(channel.object(ChannelEnd::Left).koid());
+            }
+        }
+        Err(IpcError::NotChannel)
+    }
+
+    /// Report the pending [`Signals`] on the channel endpoint identified by `koid`
+    /// (`READABLE` iff its inbox is non-empty, plus `WRITABLE`/`PEER_CLOSED` per peer
+    /// state). Read-only. Used by the `ChannelRead` re-arm to decide whether a bound
+    /// port still owes the reader a wake for a message left behind by a coalesced burst.
+    pub fn channel_signals_by_koid(&self, koid: KoId) -> Result<Signals, IpcError> {
+        for channel in &self.channels {
+            if channel.object(ChannelEnd::Left).koid() == koid {
+                return Ok(channel.signals(ChannelEnd::Left));
+            }
+            if channel.object(ChannelEnd::Right).koid() == koid {
+                return Ok(channel.signals(ChannelEnd::Right));
             }
         }
         Err(IpcError::NotChannel)

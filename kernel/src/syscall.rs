@@ -1,3 +1,4 @@
+//j409
 use alloc::vec::Vec;
 use core::mem;
 
@@ -658,6 +659,26 @@ impl SyscallEngine {
         }
     }
 
+    /// Level-triggered READABLE over coalescing ports. A burst of channel writes merges
+    /// into ONE port packet ([`Port::queue_signal`] coalesces per source), yet each write
+    /// is a distinct channel message. A reader that consumes one message per port wake
+    /// then strands the rest of the burst until some *unrelated* signal re-arms the port —
+    /// the X13s boot-tail "framebuffer repaints only on keypress" lag (`DEFERRED/004`) and
+    /// the same piecemeal draining for a keystroke burst. So: after a `ChannelRead`, if the
+    /// endpoint just read still holds a queued message, re-queue its bound port packet, so
+    /// the reader's next `PortWait` returns immediately and drains the whole backlog in one
+    /// quantum. **Port-signal only** — this never pokes channel waiters (that, paired with
+    /// the j408 deferred IRQ handoff, was the j409 keypress lock; both are gone). It fires
+    /// only when a real message remains, so it cannot spuriously spin.
+    fn rearm_port_if_channel_readable(&mut self, channel_koid: KoId) {
+        if matches!(
+            self.ipc.channel_signals_by_koid(channel_koid),
+            Ok(signals) if signals.contains(kumo_abi::Signals::READABLE)
+        ) {
+            self.signal_ports(channel_koid, kumo_abi::Signals::READABLE);
+        }
+    }
+
     pub fn set_boot_info(&mut self, boot: kumo_abi::BootInfo) {
         self.boot_info = Some(boot);
     }
@@ -1092,10 +1113,21 @@ impl SyscallEngine {
                 };
                 KernelCallResult::Status(status)
             }
-            KernelCall::ChannelRead { channel } => match self.ipc.channel_read(process, channel) {
-                Ok(message) => KernelCallResult::Message(message),
-                Err(error) => KernelCallResult::Status(errno_from_ipc(error).status()),
-            },
+            KernelCall::ChannelRead { channel } => {
+                // Resolve the endpoint koid before the read borrows `process`, so the
+                // re-arm below can re-signal its bound port (see
+                // `rearm_port_if_channel_readable`).
+                let read_koid = process.handles().get(channel).ok().map(|entry| entry.koid);
+                match self.ipc.channel_read(process, channel) {
+                    Ok(message) => {
+                        if let Some(koid) = read_koid {
+                            self.rearm_port_if_channel_readable(koid);
+                        }
+                        KernelCallResult::Message(message)
+                    }
+                    Err(error) => KernelCallResult::Status(errno_from_ipc(error).status()),
+                }
+            }
             KernelCall::PortCreate => match self.ipc.port_create(&mut self.objects, process) {
                 Ok(handle) => KernelCallResult::Handle(handle),
                 Err(error) => KernelCallResult::Status(errno_from_ipc(error).status()),
@@ -3441,6 +3473,80 @@ mod tests {
         let right_koid = process.handles().get(right).unwrap().koid;
         assert_eq!(packet.source, right_koid);
         assert!(packet.signals.contains(kumo_abi::Signals::READABLE));
+    }
+
+    #[test]
+    fn channel_read_rearms_bound_port_while_more_is_queued() {
+        // Regression for DEFERRED/004: a burst of writes coalesces into one port packet,
+        // but each write is a separate message. Reading one must re-arm the reader's bound
+        // port so the next PortWait returns immediately and drains the rest in one quantum —
+        // instead of stranding the backlog until an unrelated (keypress) signal.
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let reader_port = create_port(&mut engine, &mut process);
+        let (left, right) = create_channel(&mut engine, &mut process);
+        let right_koid = process.handles().get(right).unwrap().koid;
+
+        // The reader watches the read end via a Port (drv-fb's console shape).
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: reader_port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        // Two writes → two messages, but the port coalesces them into one packet.
+        for body in [b"aaa".as_slice(), b"bbb".as_slice()] {
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::ChannelWrite {
+                        channel: left,
+                        message: Message::new(1, body, &[]).unwrap(),
+                    },
+                ),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+
+        // First wake: one coalesced packet. Consume the first message.
+        let KernelCallResult::PortPacket(first) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: reader_port })
+        else {
+            panic!("expected the coalesced port packet");
+        };
+        assert_eq!(first.source, right_koid);
+        let KernelCallResult::Message(msg1) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("expected first message");
+        };
+        assert_eq!(msg1.bytes(), b"aaa");
+
+        // The read re-armed the port because a second message is still queued: PortWait
+        // returns another packet WITHOUT any new write — this is what unstalls the backlog.
+        let KernelCallResult::PortPacket(second) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: reader_port })
+        else {
+            panic!("read must re-arm the bound port while more is queued");
+        };
+        assert_eq!(second.source, right_koid);
+        let KernelCallResult::Message(msg2) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("expected second message");
+        };
+        assert_eq!(msg2.bytes(), b"bbb");
+
+        // Channel now drained: the final read must NOT re-arm (no spurious spin).
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::PortWait { port: reader_port }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
     }
 
     #[test]
