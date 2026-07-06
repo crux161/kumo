@@ -1,4 +1,8 @@
 #![no_std]
+//j161
+//j166
+//j413
+//j414
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -15,6 +19,10 @@ pub const CMD_READ: u8 = 0x00;
 /// Command byte: write blocks. A write frame carries its data after the header (see
 /// [`split_write_frame`]).
 pub const CMD_WRITE: u8 = 0x01;
+/// Command byte: flush/sync. A no-op ack for the RAM-backed ramdisk (data is already durable
+/// in RAM); it exists so a filesystem client can request a barrier without special-casing the
+/// backend. Carries no data; `lba`/`count` are ignored.
+pub const CMD_FLUSH: u8 = 0x02;
 
 /// Response status: success.
 pub const STATUS_OK: u8 = 0x00;
@@ -128,6 +136,15 @@ impl Request {
             cmd: CMD_WRITE,
             lba,
             count,
+        }
+    }
+
+    /// A flush/sync request. `lba`/`count` are unused (zero).
+    pub const fn flush() -> Request {
+        Request {
+            cmd: CMD_FLUSH,
+            lba: 0,
+            count: 0,
         }
     }
 
@@ -339,5 +356,12 @@ mod tests {
         // A read command is not a valid write frame.
         let read = Request::read(0, 1).encode();
         assert_eq!(split_write_frame(&read), Err(STATUS_BAD_LBA));
+    }
+
+    #[test]
+    fn flush_request_round_trips() {
+        let req = Request::flush();
+        assert_eq!(req.cmd, CMD_FLUSH);
+        assert_eq!(Request::decode(&req.encode()), Some(req));
     }
 }

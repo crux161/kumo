@@ -5,6 +5,7 @@
 //j385
 //j389
 //j402
+//j414
 
 extern crate alloc;
 
@@ -361,6 +362,53 @@ impl SectorReader for BlkSectors {
         buf[head..].copy_from_slice(&tmp[..skew]);
         true
     }
+}
+
+/// Send a `drv-blk` request frame, pump the driver child to service it, and read the reply.
+/// Returns the number of reply bytes (0 on any failure). Mirrors the inline blk round-trip
+/// (write → `process_wait` → read), shared by the boot read/write-back proof.
+fn blk_request(client: Handle, frame: &[u8], reply: &mut [u8]) -> usize {
+    if channel_write(client, frame.as_ptr(), frame.len()) != 0 {
+        return 0;
+    }
+    if !child_parked(process_wait()) {
+        return 0;
+    }
+    channel_read(client, reply.as_mut_ptr(), reply.len()) as usize
+}
+
+/// Prove `drv-blk`'s writable private backing end to end: write a recognizable pattern to
+/// `lba`, read it back, and confirm the bytes survived — then restore `original` so the block
+/// in drv-blk's private copy is left as it was. Returns true only if the round-trip AND the
+/// restore succeeded. Non-destructive by construction. — KESTREL
+fn blk_write_read_back_proof(client: Handle, lba: u64, original: &[u8]) -> bool {
+    let block = drv_blk::BLOCK_SIZE as usize;
+    if original.len() != block {
+        return false;
+    }
+    let mut pattern = [0u8; drv_blk::BLOCK_SIZE as usize];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    let mut frame = [0u8; drv_blk::REQUEST_LEN + drv_blk::BLOCK_SIZE as usize];
+    let mut reply = [0u8; 1 + drv_blk::BLOCK_SIZE as usize];
+
+    // Write the pattern.
+    frame[..drv_blk::REQUEST_LEN].copy_from_slice(&drv_blk::Request::write(lba, 1).encode());
+    frame[drv_blk::REQUEST_LEN..].copy_from_slice(&pattern);
+    let wrote = blk_request(client, &frame, &mut reply) >= 1 && reply[0] == drv_blk::STATUS_OK;
+
+    // Read it back and compare.
+    let read_ok = wrote && {
+        let n = blk_request(client, &drv_blk::Request::read(lba, 1).encode(), &mut reply);
+        matches!(drv_blk::read_payload(&reply[..n]), Ok(data) if data == &pattern[..])
+    };
+
+    // Always restore the original bytes, even if the check failed, so the FAT image is intact.
+    frame[drv_blk::REQUEST_LEN..].copy_from_slice(original);
+    let restored = blk_request(client, &frame, &mut reply) >= 1 && reply[0] == drv_blk::STATUS_OK;
+
+    read_ok && restored
 }
 
 const QEMU_PL011_MMIO_BASE: u64 = 0x0900_0000;
@@ -751,6 +799,17 @@ extern "C" fn sora_main(
                         };
                     if rt_ok {
                         log(b"blk-rt: ok\n");
+                        // Write-then-read-back proof over the block protocol (PLAN/008 S2):
+                        // LBA 0's original bytes are still in `reply[1..]` from the read above.
+                        // Prove a write persists in drv-blk's private copy, then restore LBA 0
+                        // so later blk-backed initrd reads still see the original KUMORD01 header. — KESTREL
+                        let mut original = [0u8; drv_blk::BLOCK_SIZE as usize];
+                        original.copy_from_slice(&reply[1..1 + drv_blk::BLOCK_SIZE as usize]);
+                        if blk_write_read_back_proof(blk_client, 0, &original) {
+                            log(b"blk-wr: ok\n");
+                        } else {
+                            log(b"blk-wr: fail\n");
+                        }
                     } else {
                         log(b"blk-rt: fail\n");
                     }
