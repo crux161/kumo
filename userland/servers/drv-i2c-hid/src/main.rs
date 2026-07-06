@@ -6,6 +6,7 @@
 //j401
 //j403
 //j404
+//j405
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -48,14 +49,15 @@ const POWER_ON_SETTLE_NS: u64 = 60_000_000;
 const RESET_ACK_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAX_LED_OUTPUT_PAYLOAD_BYTES: usize = 16;
 const MAX_OUTPUT_REPORT_TRANSFER_BYTES: usize = 32;
-/// Gate the optional touchpad probe. Now ON: the probe is bounded by `OPTIONAL_PROBE_POLL_LIMIT`
-/// so a non-responsive address fails fast instead of spinning the full `POLL_LIMIT` per transfer.
-/// The original starvation was *not* a power-sequencing problem — the X13s HID children share
-/// `vdd`/`vddl` with the working keyboard, so those rails are firmware-up (see
-/// `DEFERRED/005`, Slice 9). It was the 1M-iteration busy-poll at priority 63 spinning on a
-/// NACKing pad. Bounding that poll is the fix; the regulator/reset driver is deferred, not the
-/// blocker. — CORVUS
-const RUN_TOUCHPAD_PROBE: bool = true;
+/// Gate the optional touchpad probe. Held OFF by decision (CRUX, J405): with it ON the touchpad's
+/// level-low attention still storms and boot halts around `argv[1] = alpha`, even after the J403
+/// fail-fast poll budget and the J404 `SET_POWER`/`RESET`/drain quiesce. Keyboard input is confirmed
+/// working and is the boot-critical path, and the touchpad-as-mouse is not needed yet, so it stays
+/// gated OFF to keep boot progressing. Flipping this back ON re-arms the full bounded-probe +
+/// quiesce path (J403/J404), which remain in place for that revisit; the residual storm is then the
+/// next thing to chase — a wake/reset question, not power (`DEFERRED/005`) and likely entangled with
+/// the `DEFERRED/004` repaint-on-interrupt cadence. — CORVUS
+const RUN_TOUCHPAD_PROBE: bool = false;
 /// Per-transfer poll budget used only while probing the *optional* touchpad addresses. A live pad
 /// answers in far fewer iterations than the steady-state `POLL_LIMIT` ceiling; a dark/asleep pad
 /// therefore fails fast here (~one order of magnitude above a live read, ~20x below `POLL_LIMIT`)
