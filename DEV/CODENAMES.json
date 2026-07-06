@@ -1,0 +1,67 @@
+{
+  "CODENAMES": {
+    "expired": {
+	"words": [ 
+		"NONE"
+	         ]
+    },
+    "assigned": ["Agate"],
+    "categories": [
+      {
+        "name": "GEMSTONES",
+        "words": [
+          "Agate",
+          "Alexandrite",
+          "Amber",
+          "Amethyst",
+          "Ametrine",
+          "Aquamarine",
+          "Aventurine",
+          "Azurite",
+          "Beryl",
+          "Bloodstone",
+          "Carnelian",
+          "Chalcedony",
+          "Chrysoberyl",
+          "Chrysocolla",
+          "Citrine",
+          "Coral",
+          "Diamond",
+          "Emerald",
+          "Fluorite",
+          "Garnet",
+          "Hematite",
+          "Howlite",
+          "Jade",
+          "Jasper",
+          "Kunzite",
+          "Kyanite",
+          "Labradorite",
+          "Lapis Lazuli",
+          "Larimar",
+          "Malachite",
+          "Moonstone",
+          "Morganite",
+          "Obsidian",
+          "Onyx",
+          "Opal",
+          "Pearl",
+          "Peridot",
+          "Pyrite",
+          "Quartz",
+          "Rhodochrosite",
+          "Rhodonite",
+          "Ruby",
+          "Sapphire",
+          "Spinel",
+          "Sunstone",
+          "Tanzanite",
+          "Topaz",
+          "Tourmaline",
+          "Turquoise",
+          "Zircon"
+        ]
+      }
+    ]
+  }
+}
