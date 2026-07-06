@@ -58,10 +58,12 @@ else
 fi
 
 # 4. Host tests for the host-testable crates (the cheap correctness floor). The no_std
-#    binaries (sora, kumo-rt, niji-*) define their own panic_impl and cannot link the std
-#    test harness, so they are validated by the image + qemu-smoke path (--full), not here.
+#    binaries (sora, niji-*) define their own panic_impl and cannot link the std test
+#    harness, so they are validated by the image + qemu-smoke path (--full), not here.
+#    `kumo-rt` is no_std but its panic_impl is cfg'd out under `test`, so its lib tests
+#    (e.g. the growable-heap soak) DO link on the host and are policed here.
 #    Add new host-testable crates (e.g. a new server) to this list.
-HOST_TEST_CRATES="kumo-abi kumo-ipc kernel persona-linux kumoza svc-health"
+HOST_TEST_CRATES="kumo-abi kumo-ipc kumo-rt kernel persona-linux kumoza svc-health"
 for p in $HOST_TEST_CRATES; do
     if cargo test -p "$p" --quiet >/dev/null 2>&1; then
         pass "cargo test -p $p"
