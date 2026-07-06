@@ -1,12 +1,16 @@
-//! Growable userland heap (PLAN/008 S1, first slice).
+//! Growable userland heap with a size-class front end (PLAN/008 S1).
 //!
-//! The heap is a set of **regions**, each an independent `linked_list_allocator::Heap`
-//! over a contiguous span. Region 0 is a fixed BSS floor available before any syscall
-//! runs (bootstrap). When every region is full, the allocator asks its [`RegionSource`]
-//! for another span and admits it as a new region — so the heap grows on demand instead
-//! of hitting the old fixed 64 KiB ceiling that could not host a heavy-alloc userland
-//! (RedoxFS; see PLAN/008 Pushback 2). `dealloc` routes a pointer back to the region that
-//! owns its address range, so freed blocks return to the right allocator.
+//! Two layers, both host-provable:
+//! - [`HeapCore`] — a **size-class free-list front end**: small allocations (`<= 256` bytes,
+//!   `align <= 16`) recycle through per-class intrusive free lists in O(1), resisting the
+//!   fragmentation a heavy-alloc userland (RedoxFS's CoW B-tree churn) inflicts on a plain
+//!   first-fit heap. Larger or over-aligned requests pass straight through to the backing.
+//! - [`MultiRegionHeap`] — the backing: a set of **regions**, each an independent
+//!   `linked_list_allocator::Heap` over a contiguous span. Region 0 is a fixed BSS floor
+//!   available before any syscall runs (bootstrap). When every region is full it asks its
+//!   [`RegionSource`] for another span and admits it as a new region — so the heap grows on
+//!   demand instead of hitting the old fixed 64 KiB ceiling (PLAN/008 Pushback 2). `dealloc`
+//!   routes a pointer back to the region that owns its address range.
 //!
 //! The multi-region growth *logic* is host-provable: [`MultiRegionHeap`] is generic over
 //! its [`RegionSource`], so a host `#[cfg(test)]` source can hand it real spans (from
@@ -179,6 +183,144 @@ impl<S: RegionSource> MultiRegionHeap<S> {
     }
 }
 
+/// Size classes served by the fast free-list front end (bytes). Powers of two so a block
+/// carved for a class satisfies any request that rounds up to it; 16-byte alignment covers
+/// the common `align <= 16` allocations (Box/Vec of primitives), which is why over-aligned
+/// requests bypass the cache.
+const CLASS_SIZES: [usize; 5] = [16, 32, 64, 128, 256];
+const NUM_CLASSES: usize = CLASS_SIZES.len();
+const CLASS_ALIGN: usize = 16;
+/// Cap on retained free blocks per class. Bounds the memory the cache holds back from the
+/// backing under churn — worst case `sum(CLASS_SIZES) * RETAIN_CAP` — so a burst of frees in
+/// one class cannot hoard the whole heap (the slab tradeoff PLAN/008 S1 calls out).
+const RETAIN_CAP: usize = 64;
+
+/// An intrusive singly-linked free list of same-class blocks: each free block's first word
+/// holds the next pointer. Blocks are `>= 16` bytes, always big enough for the pointer.
+struct FreeList {
+    head: *mut u8,
+    len: usize,
+}
+
+impl FreeList {
+    const fn new() -> Self {
+        Self {
+            head: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    /// Pop a recycled block, or null when the list is empty.
+    fn pop(&mut self) -> *mut u8 {
+        if self.head.is_null() {
+            return core::ptr::null_mut();
+        }
+        let block = self.head;
+        // SAFETY: `head` is a live free block whose first word is the next pointer (written
+        // by `push`); the block is >= 16 bytes so the read is in-bounds.
+        self.head = unsafe { *(block as *const *mut u8) };
+        self.len -= 1;
+        block
+    }
+
+    /// Retain `block` if under the cap. Returns false when full, so the caller frees the
+    /// block to the backing instead of hoarding it.
+    fn push(&mut self, block: *mut u8) -> bool {
+        if self.len >= RETAIN_CAP {
+            return false;
+        }
+        // SAFETY: `block` is an exclusively-owned free span >= 16 bytes; writing the next
+        // pointer into its first word is in-bounds and cannot alias a live allocation.
+        unsafe { *(block as *mut *mut u8) = self.head };
+        self.head = block;
+        self.len += 1;
+        true
+    }
+}
+
+/// Index of the smallest class that fits `layout`, or `None` when the request cannot use the
+/// cache (larger than the biggest class, or aligned beyond [`CLASS_ALIGN`]).
+fn class_index(layout: Layout) -> Option<usize> {
+    if layout.align() > CLASS_ALIGN {
+        return None;
+    }
+    let size = layout.size().max(1);
+    CLASS_SIZES.iter().position(|&class| size <= class)
+}
+
+/// The layout a class's backing block is carved and freed with — fixed per class so the
+/// backing allocator always sees a matching alloc/dealloc pair for a recycled block.
+fn class_layout(index: usize) -> Layout {
+    // SAFETY: `CLASS_ALIGN` is a power of two and `CLASS_SIZES[index]` rounded up to it does
+    // not overflow, so the layout is always valid — avoids a panic path in the allocator.
+    unsafe { Layout::from_size_align_unchecked(CLASS_SIZES[index], CLASS_ALIGN) }
+}
+
+/// The full userland heap: a size-class free-list front end over a growable
+/// [`MultiRegionHeap`] backing. Small allocations recycle through the per-class lists (O(1),
+/// fragmentation-resistant); everything else goes straight to the backing.
+struct HeapCore<S: RegionSource> {
+    classes: [FreeList; NUM_CLASSES],
+    backing: MultiRegionHeap<S>,
+}
+
+impl<S: RegionSource> HeapCore<S> {
+    /// # Safety
+    /// Same contract as [`MultiRegionHeap::new`] for `base`/`len`.
+    const unsafe fn new(base: *mut u8, len: usize, source: S) -> Self {
+        Self {
+            classes: [const { FreeList::new() }; NUM_CLASSES],
+            // SAFETY: forwarded to the caller of `HeapCore::new`.
+            backing: unsafe { MultiRegionHeap::new(base, len, source) },
+        }
+    }
+
+    /// # Safety
+    /// Must run exactly once; see [`MultiRegionHeap::init_floor`].
+    unsafe fn init_floor(&mut self) {
+        unsafe { self.backing.init_floor() };
+    }
+
+    fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        if let Some(index) = class_index(layout) {
+            let recycled = self.classes[index].pop();
+            if !recycled.is_null() {
+                return recycled;
+            }
+            // Cold class: carve a fresh block sized/aligned for the whole class so it can be
+            // recycled for any request that maps here.
+            return self.backing.alloc(class_layout(index));
+        }
+        self.backing.alloc(layout)
+    }
+
+    /// # Safety
+    /// `ptr`/`layout` must come from a prior [`alloc`](Self::alloc) on this heap.
+    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        if let Some(index) = class_index(layout) {
+            if self.classes[index].push(ptr) {
+                return;
+            }
+            // Over the retention cap: hand the class-sized block back to the backing.
+            unsafe { self.backing.dealloc(ptr, class_layout(index)) };
+            return;
+        }
+        unsafe { self.backing.dealloc(ptr, layout) };
+    }
+
+    /// Retained free-block count for a class. Test/observability only.
+    #[cfg(test)]
+    fn cache_len(&self, index: usize) -> usize {
+        self.classes[index].len
+    }
+
+    /// Number of backing regions (floor + grown). Test/observability only.
+    #[cfg(test)]
+    fn region_count(&self) -> usize {
+        self.backing.region_count()
+    }
+}
+
 // The bootstrap floor must be interior-mutable: the allocator hands out `*mut u8` pointers
 // into it and writes through them. A plain `static [u8; N]` is immutable — casting `&` to
 // `*mut` and writing is UB (recorded in the J221/223/224 heap history). `UnsafeCell` tells
@@ -253,7 +395,7 @@ impl RegionSource for TargetRegionSource {
 }
 
 pub struct KumoHeap {
-    inner: UnsafeCell<MultiRegionHeap<TargetRegionSource>>,
+    inner: UnsafeCell<HeapCore<TargetRegionSource>>,
     initialized: AtomicBool,
     lock: sync::SpinLock,
 }
@@ -266,7 +408,7 @@ impl KumoHeap {
             // SAFETY: `HEAP` is a process-lifetime, unaliased, 16-aligned BSS span; it is
             // this heap's exclusive region 0.
             inner: UnsafeCell::new(unsafe {
-                MultiRegionHeap::new(HEAP.0.get() as *mut u8, INITIAL_FLOOR, TargetRegionSource)
+                HeapCore::new(HEAP.0.get() as *mut u8, INITIAL_FLOOR, TargetRegionSource)
             }),
             initialized: AtomicBool::new(false),
             lock: sync::SpinLock::new(),
@@ -444,6 +586,115 @@ mod tests {
             heap.region_count(),
             1,
             "no region admitted when growth is denied"
+        );
+    }
+
+    // Build a full `HeapCore` (size-class front end + backing) over a leaked System floor.
+    fn core_with_floor(floor: usize, grows_allowed: usize) -> HeapCore<HostSource> {
+        let layout = Layout::from_size_align(floor, 16).unwrap();
+        let base = unsafe { std::alloc::System.alloc(layout) };
+        assert!(!base.is_null());
+        let mut core = unsafe { HeapCore::new(base, floor, HostSource::new(grows_allowed)) };
+        unsafe { core.init_floor() };
+        core
+    }
+
+    #[test]
+    fn size_class_recycles_a_freed_block_of_the_same_class() {
+        let mut core = core_with_floor(16 * 1024, 4);
+        let layout = Layout::from_size_align(48, 8).unwrap(); // rounds up to the 64 class
+        let p1 = core.alloc(layout);
+        assert!(!p1.is_null());
+        unsafe { core.dealloc(p1, layout) };
+        // The free went to the class list, not the backing.
+        assert_eq!(core.cache_len(2), 1, "a class-sized free must be retained");
+        // The next same-class alloc pops that exact block back — the O(1) recycle path.
+        let p2 = core.alloc(layout);
+        assert_eq!(p2, p1, "a same-class alloc must recycle the freed block");
+        assert_eq!(core.cache_len(2), 0, "the recycled block leaves the list");
+        unsafe { core.dealloc(p2, layout) };
+    }
+
+    #[test]
+    fn size_class_returns_overflow_past_the_retention_cap_to_the_backing() {
+        let mut core = core_with_floor(256 * 1024, 8);
+        let layout = Layout::from_size_align(16, 8).unwrap(); // the smallest class
+                                                              // Allocate then free more than the cap; the list must saturate at RETAIN_CAP and the
+                                                              // remainder must go back to the backing rather than hoard unboundedly.
+        let mut ptrs = Vec::new();
+        for _ in 0..(RETAIN_CAP + 10) {
+            let p = core.alloc(layout);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in ptrs {
+            unsafe { core.dealloc(p, layout) };
+        }
+        assert_eq!(
+            core.cache_len(0),
+            RETAIN_CAP,
+            "the class list must saturate at the retention cap"
+        );
+    }
+
+    #[test]
+    fn large_and_overaligned_requests_bypass_the_cache() {
+        let mut core = core_with_floor(64 * 1024, 8);
+        // Larger than the biggest class: served by the backing, never cached on free.
+        let big = Layout::from_size_align(1024, 8).unwrap();
+        let pb = core.alloc(big);
+        assert!(!pb.is_null());
+        unsafe { core.dealloc(pb, big) };
+        // Over-aligned but small: also bypasses (align > CLASS_ALIGN).
+        let aligned = Layout::from_size_align(64, 64).unwrap();
+        let pa = core.alloc(aligned);
+        assert!(!pa.is_null());
+        assert_eq!(
+            pa as usize % 64,
+            0,
+            "over-aligned request must honor its align"
+        );
+        unsafe { core.dealloc(pa, aligned) };
+        for index in 0..NUM_CLASSES {
+            assert_eq!(
+                core.cache_len(index),
+                0,
+                "bypassing requests must never populate a class list"
+            );
+        }
+    }
+
+    #[test]
+    fn size_class_round_trips_memory_under_mixed_churn() {
+        let mut core = core_with_floor(4 * 1024, 32);
+        let mut live: Vec<(*mut u8, Layout, u8)> = Vec::new();
+        for i in 0..400usize {
+            // Sizes spanning several classes plus a bypass (600 > max class).
+            let size = [8, 24, 100, 200, 600][i % 5];
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            let p = core.alloc(layout);
+            assert!(!p.is_null(), "alloc {i} failed");
+            let tag = (i & 0xff) as u8;
+            unsafe { core::ptr::write_bytes(p, tag, size) };
+            live.push((p, layout, tag));
+            if i % 3 == 0 && live.len() > 5 {
+                let (op, ol, _) = live.remove(1);
+                unsafe { core.dealloc(op, ol) };
+            }
+        }
+        for (p, layout, tag) in &live {
+            let slice = unsafe { core::slice::from_raw_parts(*p, layout.size()) };
+            assert!(
+                slice.iter().all(|b| b == tag),
+                "live allocation corrupted / aliased through the cache"
+            );
+        }
+        for (p, layout, _) in live {
+            unsafe { core.dealloc(p, layout) };
+        }
+        assert!(
+            core.region_count() > 1,
+            "sustained churn should still drive backing growth under the cache"
         );
     }
 }
