@@ -9,6 +9,12 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
+//j368
+//j393
+//j396
+//j408
+//j422
+
 use core::cell::UnsafeCell;
 
 use alloc::string::ToString;
@@ -142,8 +148,9 @@ where
     Some(f(&mut *state))
 }
 
-/// P9-a: signal all interrupt objects bound to `irq`. Called from the timer IRQ
-/// handler via `set_interrupt_hook`. Wakes Sora if it's parked on InterruptWait.
+/// P9-a: signal all interrupt objects bound to `irq`. Called from the timer/device IRQ
+/// handler via `set_interrupt_hook`. Wakes Sora after the IRQ epilogue when the boot
+/// floor is current.
 extern "C" fn signal_irq(irq: u32) {
     let now_ns = kumo_hal::active::monotonic_nanos();
     with_sora_mut(|sora| {
@@ -156,7 +163,7 @@ extern "C" fn signal_irq(irq: u32) {
         && !crate::user_thread::is_done()
         && crate::user_thread::is_parked()
     {
-        crate::user_thread::wake_user();
+        crate::user_thread::wake_user_after_irq_signal();
     }
 }
 

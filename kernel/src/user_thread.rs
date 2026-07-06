@@ -8,6 +8,12 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
+//j368
+//j392
+//j393
+//j408
+//j422
+
 use core::cell::UnsafeCell;
 
 use kumo_abi::{Errno, KoId, Status};
@@ -147,6 +153,9 @@ pub struct UserSched {
     /// running. Pay this at the next SVC boundary, after SoraState borrows have dropped,
     /// rather than preempting arbitrary EL0 from IRQ context. — KESTREL
     safe_reschedule_pending: bool,
+    /// An IRQ woke parked Sora while the boot/idle floor was current. The boot loop
+    /// pays this after the IRQ epilogue returns instead of switching from `kumo_irq_common`.
+    user_wake_pending: bool,
     /// Whether the user thread has been started (admitted to the scheduler).
     pub started: bool,
     /// Accumulated context-switch count.
@@ -290,6 +299,7 @@ pub fn init(
             children: alloc::vec::Vec::with_capacity(MAX_RESIDENT_CHILDREN),
             wait_queue: WaitQueue::new(),
             safe_reschedule_pending: false,
+            user_wake_pending: false,
             started: false,
             switches: 0,
             exit_code: 0,
@@ -490,10 +500,10 @@ pub fn spawn_child_async(
 }
 
 /// Install the live Sora/resident-child scheduler tick. Async children can become
-/// runnable from IRQ context (timers and device interrupts), where no Sora
-/// `ProcessWait` pump necessarily follows. This hook only dispatches from the
-/// boot/idle floor: preempting an active EL0 user thread would require full
-/// user-register save/restore, which this scheduler path does not own yet.
+/// runnable from IRQ context (timers and device interrupts), but this hook must not
+/// switch from `kumo_irq_common`: the saved Current-EL frame belongs to the interrupted
+/// context and is restored by the vector epilogue. Timer/device work is paid by
+/// [`pump_idle_floor`] after exception return, or by the next SVC boundary for active EL0.
 /// — KESTREL
 #[cfg(target_os = "none")]
 pub fn install_preemption_hook() {
@@ -501,29 +511,7 @@ pub fn install_preemption_hook() {
 }
 
 #[cfg(target_os = "none")]
-extern "C" fn preempt_tick() {
-    let opt: *const Option<UserSched> = USER_SCHED.0.get();
-    let started = unsafe { (&*opt).is_some() };
-    if !started {
-        return;
-    }
-
-    let p = sched_ptr();
-    let switch = unsafe {
-        let s = &mut *p;
-        if s.done {
-            return;
-        }
-        if s.dispatcher.current() != Some(s.idle.koid()) {
-            return;
-        }
-        let decision = s.dispatcher.on_timer_tick();
-        dispatch_context(s, decision)
-    };
-    if let Some((prev, next)) = switch {
-        unsafe { switch_context(prev, next) };
-    }
-}
+extern "C" fn preempt_tick() {}
 
 /// P10-g: pump the resident children. Reschedules so every runnable child runs until it
 /// blocks or exits, then returns: `ShouldWait` while any child is still resident (blocked),
@@ -709,10 +697,6 @@ fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
     )
 }
 
-fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
-    current == idle || current == user
-}
-
 fn wake_child_waiting_on(target: WaitTarget) {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -779,13 +763,42 @@ pub fn reschedule_if_pending_after_svc() {
 }
 
 /// Dispatch a timer/device-woken resident child immediately after the IRQ signal path
-/// has queued its port/interrupt packet. The timer hook itself runs before
-/// `signal_timers`, so it can miss the just-expired timer; this post-signal handoff
-/// pays that wake without preempting an active driver child (the J288 corruption
-/// window). Sora may be interrupted because it is the supervisor pump that lent the
-/// child its resident slot; child-vs-child IRQ preemption still waits for the full
-/// EL0 register boundary. — KESTREL
+/// has queued its port/interrupt packet.
+///
+/// This deliberately does not switch: the hook is reached from `kumo_irq_common`, and
+/// switching there can poison the saved IRQ return frame. The runnable work stays
+/// queued until [`pump_idle_floor`] (boot/idle) or [`reschedule_if_pending_after_svc`]
+/// (active EL0) can pay it from a normal scheduler boundary. — KESTREL
 pub fn reschedule_pending_after_irq_signal_if_safe() {
+    // Intentionally empty: IRQ signal delivery only marks runnable work. The switch is
+    // paid after `eret` by `pump_idle_floor` or at the next SVC boundary.
+}
+
+/// Wake Sora from an IRQ signal path without switching away from the Current-EL IRQ
+/// frame. The framebuffer/serial boot loop calls [`pump_idle_floor`] after exception
+/// return to pay deferred user wakes.
+pub fn wake_user_after_irq_signal() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let started = unsafe { (&*opt).is_some() };
+    if !started {
+        return;
+    }
+
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        if s.done || !matches!(s.user_thread.state(), ThreadState::Blocked) {
+            s.user_wake_pending = false;
+            return;
+        }
+        s.user_wake_pending = true;
+    }
+}
+
+/// Run one deferred user/resident-child handoff from the boot/idle floor. This is the
+/// safe replacement for switching directly out of `kumo_irq_common` when a timer or
+/// device IRQ makes EL0 work runnable.
+pub fn pump_idle_floor() {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
     if !started {
@@ -795,13 +808,17 @@ pub fn reschedule_pending_after_irq_signal_if_safe() {
     let p = sched_ptr();
     let switch = unsafe {
         let s = &mut *p;
-        if s.done || !s.safe_reschedule_pending {
+        if s.done || s.dispatcher.current() != Some(s.idle.koid()) {
             return;
         }
-        let Some(current) = s.dispatcher.current() else {
-            return;
-        };
-        if !irq_handoff_allowed(current, s.idle.koid(), s.user_thread.koid()) {
+        if s.user_wake_pending {
+            s.user_wake_pending = false;
+            if matches!(s.user_thread.state(), ThreadState::Blocked) {
+                s.user_thread.ready();
+                s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+            }
+        }
+        if !s.safe_reschedule_pending && s.dispatcher.runnable_count() == 0 {
             return;
         }
         let decision = s.dispatcher.reschedule_current();
@@ -813,6 +830,7 @@ pub fn reschedule_pending_after_irq_signal_if_safe() {
     };
     if let Some((prev, next)) = switch {
         unsafe { switch_context(prev, next) };
+        boot_flow_resumed(p);
     }
 }
 
@@ -946,9 +964,7 @@ fn dispatch_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        irq_handoff_allowed, wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget,
-    };
+    use super::{wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget};
 
     #[test]
     fn park_then_waiter_for_finds_thread_by_object() {
@@ -1015,15 +1031,5 @@ mod tests {
         assert!(!wait_target_needs_safe_reschedule(WaitTarget::Channel(
             KoId(44)
         )));
-    }
-
-    #[test]
-    fn irq_handoff_only_runs_from_idle_or_sora() {
-        let idle = KoId(1);
-        let sora = KoId(2);
-        let child = KoId(3);
-        assert!(irq_handoff_allowed(idle, idle, sora));
-        assert!(irq_handoff_allowed(sora, idle, sora));
-        assert!(!irq_handoff_allowed(child, idle, sora));
     }
 }

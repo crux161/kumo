@@ -4,6 +4,7 @@
 //j381
 //j389
 //j397
+//j422
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -18,6 +19,49 @@ pub const ARCH: &str = "aarch64";
 
 pub fn arch_name() -> &'static str {
     ARCH
+}
+
+#[cfg(any(target_os = "none", test))]
+const SPSR_IL_BIT: u64 = 1 << 20;
+
+#[cfg(any(target_os = "none", test))]
+fn esr_class_name(ec: u32) -> &'static str {
+    match ec {
+        0x00 => "unknown/undefined",
+        0x07 => "SIMD/FP access",
+        0x0e => "illegal execution state",
+        0x15 => "SVC",
+        0x18 => "MSR/MRS/system trap",
+        0x20 => "instruction abort (lower EL)",
+        0x21 => "instruction abort",
+        0x22 => "PC alignment",
+        0x24 => "data abort (lower EL)",
+        0x25 => "data abort",
+        0x26 => "SP alignment",
+        0x2c => "FP exception",
+        0x2f => "SError",
+        0x3c => "BRK",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn spsr_mode_name(spsr: u64) -> &'static str {
+    match spsr & 0x1f {
+        0x00 => "EL0t",
+        0x04 => "EL1t",
+        0x05 => "EL1h",
+        0x08 => "EL2t",
+        0x09 => "EL2h",
+        0x0c => "EL3t",
+        0x0d => "EL3h",
+        _ => "unknown mode",
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn spsr_is_illegal(spsr: u64) -> bool {
+    spsr & SPSR_IL_BIT != 0
 }
 
 // ---- Thread contexts -------------------------------------------------
@@ -3845,8 +3889,12 @@ unsafe fn mmio_write8(addr: u64, value: u8) {
 
 #[cfg(target_os = "none")]
 mod traps {
-    use super::{early_console_write, reclaim_framebuffer_console};
+    use super::{
+        early_console_write, esr_class_name, reclaim_framebuffer_console, spsr_is_illegal,
+        spsr_mode_name,
+    };
     use core::fmt::Write;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     struct ConsoleWriter;
 
@@ -3856,6 +3904,8 @@ mod traps {
             Ok(())
         }
     }
+
+    static IRQ_IL_SEEN: AtomicBool = AtomicBool::new(false);
 
     // 16-entry, 2 KiB-aligned EL1 vector table. Sync/FIQ/SError entries report and
     // halt; IRQ entries save the interrupted context, dispatch the interrupt, EOI,
@@ -3938,6 +3988,11 @@ mod traps {
         "  bl  kumo_irq_entry",
         "1:",
         "  ldp x0,  x1,  [sp, #248]",
+        "  tbz x1, #20, 2f",
+        "  bl  kumo_irq_il_seen",
+        "  ldp x0,  x1,  [sp, #248]",
+        "  bic x1, x1, #0x100000",
+        "2:",
         "  msr elr_el1, x0",
         "  msr spsr_el1, x1",
         "  ldp x0,  x1,  [sp, #0]",
@@ -4010,16 +4065,18 @@ mod traps {
                 "\r\n********** TOWER: CPU EXCEPTION **********\r\n\
                  src={}/{}  ec={:#04x} ({})\r\n\
                  ESR={:#018x}  ELR={:#018x}\r\n\
-                 FAR={:#018x}  SPSR={:#018x}\r\n\
+                 FAR={:#018x}  SPSR={:#018x}  ({} IL={})\r\n\
                  halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
                 src,
                 kind,
                 ec,
-                ec_name(ec),
+                esr_class_name(ec),
                 esr,
                 elr,
                 far,
                 spsr,
+                spsr_mode_name(spsr),
+                u8::from(spsr_is_illegal(spsr)),
                 pass
             );
             pass = pass.wrapping_add(1);
@@ -4051,25 +4108,23 @@ mod traps {
     }
 
     #[no_mangle]
-    extern "C" fn kumo_irq_entry(intid: u64) {
-        super::on_irq(intid as u32);
+    extern "C" fn kumo_irq_il_seen(elr: u64, spsr: u64) {
+        if IRQ_IL_SEEN.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut out = ConsoleWriter;
+        let _ = write!(
+            out,
+            "\r\nkumo: IRQ-return IL guard: saved ELR={:#018x} SPSR={:#018x} ({} IL=1); cleared IL\r\n",
+            elr,
+            spsr,
+            spsr_mode_name(spsr)
+        );
     }
 
-    fn ec_name(ec: u32) -> &'static str {
-        match ec {
-            0x15 => "SVC",
-            0x18 => "MSR/MRS/system trap",
-            0x20 => "instruction abort (lower EL)",
-            0x21 => "instruction abort",
-            0x22 => "PC alignment",
-            0x24 => "data abort (lower EL)",
-            0x25 => "data abort",
-            0x26 => "SP alignment",
-            0x2c => "FP exception",
-            0x2f => "SError",
-            0x3c => "BRK",
-            _ => "unknown",
-        }
+    #[no_mangle]
+    extern "C" fn kumo_irq_entry(intid: u64) {
+        super::on_irq(intid as u32);
     }
 }
 
@@ -4098,6 +4153,19 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "aarch64");
+    }
+
+    #[test]
+    fn esr_class_name_labels_illegal_execution_state() {
+        assert_eq!(esr_class_name(0x0e), "illegal execution state");
+    }
+
+    #[test]
+    fn spsr_decode_spells_out_el1h_illegal_state() {
+        let spsr = 0x0010_0005;
+
+        assert_eq!(spsr_mode_name(spsr), "EL1h");
+        assert!(spsr_is_illegal(spsr));
     }
 
     #[test]
