@@ -5,6 +5,7 @@
 //j389
 //j397
 //j422
+//j423
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2832,6 +2833,24 @@ fn classify_gpio_attention_delivery(
     GpioAttentionDelivery::None
 }
 
+#[cfg(any(target_os = "none", test))]
+fn post_eoi_interrupt_key(
+    intid: u32,
+    is_timer: bool,
+    gpio_delivery: GpioAttentionDelivery,
+    gpio_irq_key: Option<u32>,
+) -> Option<u32> {
+    if is_timer {
+        Some(intid)
+    } else if let Some(irq_key) = gpio_irq_key {
+        Some(irq_key)
+    } else if gpio_delivery == GpioAttentionDelivery::None {
+        Some(intid)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {
     pub counter_hz: u64,
@@ -3633,24 +3652,23 @@ fn on_irq(intid: u32) {
     let irq_hook = INTERRUPT_HOOK.load(ORD);
     // A GPIO attention arrives either as the TLMM summary SPI or, for a PDC-routed wake pin, as
     // its dedicated PDC SPI. The summary path demuxes INTR_STATUS across the wake table; a PDC SPI
-    // names its slot directly. Mask the delivering line, then dispatch its key. — KESTREL
+    // names its slot directly. Mask the delivering line, but do not signal the kernel hook until
+    // after EOI; even deferred scheduler work must not run under an active GIC delivery. — KESTREL
     // (slotted for the touchpad's second wake line — CORVUS 2026-07-01)
     let mut pdc_intids = [0u32; MAX_TLMM_WAKE_LINES];
     for (slot, slot_intid) in pdc_intids.iter_mut().enumerate() {
         *slot_intid = TLMM_WAKE_PDC_INTID[slot].load(ORD);
     }
     let gpio_delivery = classify_gpio_attention_delivery(intid, TLMM_PARENT_IRQ, &pdc_intids);
-    if irq_hook != 0 {
-        let irq_key = match gpio_delivery {
+    let gpio_irq_key = if irq_hook != 0 {
+        match gpio_delivery {
             GpioAttentionDelivery::TlmmSummary => unsafe { tlmm_gpio_mask_pending() },
             GpioAttentionDelivery::PdcWake(slot) => unsafe { tlmm_gpio_mask_slot(slot) },
             GpioAttentionDelivery::None => None,
-        };
-        if let Some(irq_key) = irq_key {
-            let hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
-            hook(irq_key);
         }
-    }
+    } else {
+        None
+    };
     // Deactivate the interrupt BEFORE any context switch, so a preempting switch never
     // leaves this IRQ active across threads.
     unsafe { eoi(intid) };
@@ -3661,13 +3679,12 @@ fn on_irq(intid: u32) {
             let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
             hook();
         }
-        if irq_hook != 0 {
-            let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
-            irq_hook(intid);
-        }
-    } else if gpio_delivery == GpioAttentionDelivery::None && irq_hook != 0 {
+    }
+    if irq_hook != 0 {
         let irq_hook: extern "C" fn(u32) = unsafe { core::mem::transmute(irq_hook) };
-        irq_hook(intid);
+        if let Some(key) = post_eoi_interrupt_key(intid, is_timer, gpio_delivery, gpio_irq_key) {
+            irq_hook(key);
+        }
     }
 }
 
@@ -4232,6 +4249,30 @@ mod tests {
         assert_eq!(
             classify_gpio_attention_delivery(678, tlmm, &[0, 0, 0, 0]),
             GpioAttentionDelivery::None
+        );
+    }
+
+    #[test]
+    fn interrupt_signal_key_is_selected_for_post_eoi_delivery() {
+        assert_eq!(
+            post_eoi_interrupt_key(30, true, GpioAttentionDelivery::None, None),
+            Some(30)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(240, false, GpioAttentionDelivery::TlmmSummary, Some(104)),
+            Some(104)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(678, false, GpioAttentionDelivery::PdcWake(0), Some(104)),
+            Some(104)
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(240, false, GpioAttentionDelivery::TlmmSummary, None),
+            None
+        );
+        assert_eq!(
+            post_eoi_interrupt_key(999, false, GpioAttentionDelivery::None, None),
+            Some(999)
         );
     }
 
