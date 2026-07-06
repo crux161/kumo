@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j382
 //j385
 //j389
 //j402
 //j414
+//j417
 
 extern crate alloc;
 
@@ -109,6 +109,18 @@ fn log_fb_geometry(fb: &Framebuffer) {
     log(b" stride=");
     log_hex(fb.stride as u64);
     log(b"\n");
+}
+
+fn log_process_koid(name: &[u8], process: Handle) {
+    log(name);
+    log(b": proc koid=");
+    let koid = handle_koid(process);
+    if koid == u64::MAX {
+        log(b"fail\n");
+    } else {
+        log_hex(koid);
+        log(b"\n");
+    }
 }
 
 /// Map the read-only DTB capability in two stages, validate its declared extent, and discover the
@@ -2459,6 +2471,7 @@ fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &
         }
         let child_as = Handle(child_as_h as u32);
         loader_handles[1] = Some(child_as);
+        log_process_koid(name, child_as);
 
         for segment in segments.iter().take(segment_count) {
             let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
