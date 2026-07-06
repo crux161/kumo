@@ -1,5 +1,6 @@
 #![no_std]
 //j415
+//j416
 //! Pure virtio constants and helpers shared by future transport drivers.
 
 pub mod mmio {
@@ -60,6 +61,27 @@ pub mod block {
     pub const STATUS_UNSUPP: u8 = 2;
 }
 
+pub mod split_ring {
+    pub const DESC_ALIGN: u64 = 16;
+    pub const AVAIL_ALIGN: u64 = 2;
+    pub const USED_ALIGN: u64 = 4;
+
+    pub const DESC_LEN: u64 = 16;
+    pub const AVAIL_HEADER_LEN: u64 = 4;
+    pub const AVAIL_ENTRY_LEN: u64 = 2;
+    pub const AVAIL_USED_EVENT_LEN: u64 = 2;
+    pub const USED_HEADER_LEN: u64 = 4;
+    pub const USED_ELEM_LEN: u64 = 8;
+    pub const USED_AVAIL_EVENT_LEN: u64 = 2;
+
+    pub const DESC_F_NEXT: u16 = 1;
+    pub const DESC_F_WRITE: u16 = 2;
+    pub const DESC_F_INDIRECT: u16 = 4;
+
+    pub const AVAIL_F_NO_INTERRUPT: u16 = 1;
+    pub const USED_F_NO_NOTIFY: u16 = 1;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     BadMagic,
@@ -69,6 +91,12 @@ pub enum Error {
     UnsupportedDevice,
     ConfigTooShort,
     CapacityOverflow,
+    QueueSizeZero,
+    QueueSizeNotPowerOfTwo,
+    QueueAlignInvalid,
+    QueueLayoutOverflow,
+    BlockCountZero,
+    BlockDataLenOverflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,9 +163,178 @@ impl BlockConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SplitQueueLayout {
+    pub queue_size: u16,
+    pub align: u64,
+    pub desc_offset: u64,
+    pub avail_offset: u64,
+    pub used_offset: u64,
+    pub total_len: u64,
+}
+
+impl SplitQueueLayout {
+    pub fn new(queue_size: u16, align: u64) -> Result<Self, Error> {
+        if queue_size == 0 {
+            return Err(Error::QueueSizeZero);
+        }
+        if !queue_size.is_power_of_two() {
+            return Err(Error::QueueSizeNotPowerOfTwo);
+        }
+        if align < split_ring::USED_ALIGN || !align.is_power_of_two() {
+            return Err(Error::QueueAlignInvalid);
+        }
+
+        let entries = u64::from(queue_size);
+        let desc_offset = 0;
+        let desc_len = entries
+            .checked_mul(split_ring::DESC_LEN)
+            .ok_or(Error::QueueLayoutOverflow)?;
+        let avail_offset = desc_len;
+        let avail_len = split_ring::AVAIL_HEADER_LEN
+            .checked_add(
+                entries
+                    .checked_mul(split_ring::AVAIL_ENTRY_LEN)
+                    .ok_or(Error::QueueLayoutOverflow)?,
+            )
+            .and_then(|len| len.checked_add(split_ring::AVAIL_USED_EVENT_LEN))
+            .ok_or(Error::QueueLayoutOverflow)?;
+        let used_offset = align_up(
+            avail_offset
+                .checked_add(avail_len)
+                .ok_or(Error::QueueLayoutOverflow)?,
+            align,
+        )?;
+        let used_len = split_ring::USED_HEADER_LEN
+            .checked_add(
+                entries
+                    .checked_mul(split_ring::USED_ELEM_LEN)
+                    .ok_or(Error::QueueLayoutOverflow)?,
+            )
+            .and_then(|len| len.checked_add(split_ring::USED_AVAIL_EVENT_LEN))
+            .ok_or(Error::QueueLayoutOverflow)?;
+        let total_len = used_offset
+            .checked_add(used_len)
+            .ok_or(Error::QueueLayoutOverflow)?;
+
+        Ok(Self {
+            queue_size,
+            align,
+            desc_offset,
+            avail_offset,
+            used_offset,
+            total_len,
+        })
+    }
+
+    pub const fn desc_table_len(self) -> u64 {
+        self.avail_offset - self.desc_offset
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SplitDescriptor {
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: u16,
+}
+
+impl SplitDescriptor {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn new(addr: u64, len: u32, flags: u16, next: u16) -> Self {
+        Self {
+            addr,
+            len,
+            flags,
+            next,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..8].copy_from_slice(&self.addr.to_le_bytes());
+        out[8..12].copy_from_slice(&self.len.to_le_bytes());
+        out[12..14].copy_from_slice(&self.flags.to_le_bytes());
+        out[14..16].copy_from_slice(&self.next.to_le_bytes());
+        out
+    }
+
+    pub const fn with_next(mut self, next: u16) -> Self {
+        self.flags |= split_ring::DESC_F_NEXT;
+        self.next = next;
+        self
+    }
+
+    pub const fn writable(mut self) -> Self {
+        self.flags |= split_ring::DESC_F_WRITE;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRequestHeader {
+    pub request_type: u32,
+    pub sector: u64,
+}
+
+impl BlockRequestHeader {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn read(sector: u64) -> Self {
+        Self {
+            request_type: block::T_IN,
+            sector,
+        }
+    }
+
+    pub const fn write(sector: u64) -> Self {
+        Self {
+            request_type: block::T_OUT,
+            sector,
+        }
+    }
+
+    pub const fn flush() -> Self {
+        Self {
+            request_type: block::T_FLUSH,
+            sector: 0,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..4].copy_from_slice(&self.request_type.to_le_bytes());
+        out[4..8].copy_from_slice(&0u32.to_le_bytes());
+        out[8..16].copy_from_slice(&self.sector.to_le_bytes());
+        out
+    }
+
+    pub fn data_len_for_sectors(count: u32) -> Result<u32, Error> {
+        if count == 0 {
+            return Err(Error::BlockCountZero);
+        }
+        count
+            .checked_mul(block::SECTOR_SIZE as u32)
+            .ok_or(Error::BlockDataLenOverflow)
+    }
+}
+
+fn align_up(value: u64, align: u64) -> Result<u64, Error> {
+    let mask = align.checked_sub(1).ok_or(Error::QueueAlignInvalid)?;
+    value
+        .checked_add(mask)
+        .map(|v| v & !mask)
+        .ok_or(Error::QueueLayoutOverflow)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{block, ids, mmio, BlockConfig, Error, MmioIdentity};
+    use super::{
+        block, ids, mmio, split_ring, BlockConfig, BlockRequestHeader, Error, MmioIdentity,
+        SplitDescriptor, SplitQueueLayout,
+    };
 
     #[test]
     fn mmio_offsets_match_modern_transport_layout() {
@@ -229,5 +426,88 @@ mod tests {
         assert_eq!(block::STATUS_OK, 0);
         assert_eq!(block::STATUS_IOERR, 1);
         assert_eq!(block::STATUS_UNSUPP, 2);
+    }
+
+    #[test]
+    fn split_queue_layout_matches_vring_size_formula() {
+        let layout = SplitQueueLayout::new(8, 4096).unwrap();
+        assert_eq!(
+            layout,
+            SplitQueueLayout {
+                queue_size: 8,
+                align: 4096,
+                desc_offset: 0,
+                avail_offset: 128,
+                used_offset: 4096,
+                total_len: 4166,
+            }
+        );
+        assert_eq!(layout.desc_table_len(), 8 * split_ring::DESC_LEN);
+
+        let larger = SplitQueueLayout::new(128, 4096).unwrap();
+        assert_eq!(larger.avail_offset, 2048);
+        assert_eq!(larger.used_offset, 4096);
+        assert_eq!(larger.total_len, 5126);
+    }
+
+    #[test]
+    fn split_queue_layout_rejects_unusable_queue_shapes() {
+        assert_eq!(SplitQueueLayout::new(0, 4096), Err(Error::QueueSizeZero));
+        assert_eq!(
+            SplitQueueLayout::new(3, 4096),
+            Err(Error::QueueSizeNotPowerOfTwo)
+        );
+        assert_eq!(SplitQueueLayout::new(8, 0), Err(Error::QueueAlignInvalid));
+        assert_eq!(SplitQueueLayout::new(8, 2), Err(Error::QueueAlignInvalid));
+        assert_eq!(SplitQueueLayout::new(8, 24), Err(Error::QueueAlignInvalid));
+        assert_eq!(
+            super::align_up(u64::MAX, 2),
+            Err(Error::QueueLayoutOverflow)
+        );
+    }
+
+    #[test]
+    fn split_descriptor_encodes_in_virtio_little_endian_order() {
+        let desc = SplitDescriptor::new(0x1122_3344_5566_7788, 0x99aa_bbcc, 0, 0)
+            .with_next(5)
+            .writable();
+        assert_eq!(
+            desc.encode(),
+            [
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xcc, 0xbb, 0xaa, 0x99, 0x03, 0x00,
+                0x05, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn block_request_header_encodes_type_ioprio_and_sector() {
+        assert_eq!(
+            BlockRequestHeader::read(0x1122_3344_5566_7788).encode(),
+            [
+                0x00, 0x00, 0x00, 0x00, // request type
+                0x00, 0x00, 0x00, 0x00, // ioprio
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            ]
+        );
+        assert_eq!(BlockRequestHeader::write(7).request_type, block::T_OUT);
+        assert_eq!(
+            BlockRequestHeader::flush().encode()[0],
+            block::T_FLUSH as u8
+        );
+    }
+
+    #[test]
+    fn block_request_data_len_is_sector_count_in_bytes() {
+        assert_eq!(BlockRequestHeader::data_len_for_sectors(1), Ok(512));
+        assert_eq!(BlockRequestHeader::data_len_for_sectors(8), Ok(4096));
+        assert_eq!(
+            BlockRequestHeader::data_len_for_sectors(0),
+            Err(Error::BlockCountZero)
+        );
+        assert_eq!(
+            BlockRequestHeader::data_len_for_sectors(u32::MAX),
+            Err(Error::BlockDataLenOverflow)
+        );
     }
 }
