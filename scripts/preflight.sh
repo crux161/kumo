@@ -66,7 +66,7 @@ fi
 #    `kumo-rt` is no_std but its panic_impl is cfg'd out under `test`, so its lib tests
 #    (e.g. the growable-heap soak) DO link on the host and are policed here.
 #    Add new host-testable crates (e.g. a new server) to this list.
-HOST_TEST_CRATES="kumo-abi kumo-ipc kumo-rt drv-blk kernel persona-linux kumoza svc-health kumo-virtio"
+HOST_TEST_CRATES="kumo-abi kumo-bsp kumo-ipc kumo-rt drv-blk kernel persona-linux kumoza svc-health kumo-virtio"
 for p in $HOST_TEST_CRATES; do
     if cargo test -p "$p" --quiet >/dev/null 2>&1; then
         pass "cargo test -p $p"

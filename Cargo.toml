@@ -9,6 +9,7 @@ members = [
     "imager",
     "kernel",
     "lib/kumo-abi",
+    "lib/kumo-bsp",
     "lib/kumo-fatfs",
     "lib/kumo-hid",
     "lib/kumo-i2c-hid",
