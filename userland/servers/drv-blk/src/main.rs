@@ -67,6 +67,11 @@ extern "C" fn main(
     }
 
     let dev = BlockDevice::new(vmo_len);
+    // The mapped VMO as a byte slice — the backing store the block-device logic reads from.
+    // Read-only for now (the write path lands with a private RW backing in the next slice);
+    // `read_blocks` bounds every access to `map_len`, so a request past the mapped extent is a
+    // clean STATUS_BAD_LBA, never a fault.
+    let store = unsafe { core::slice::from_raw_parts(vmo_va as *const u8, map_len as usize) };
     debug_write(b"drv-blk: initialized\n".as_ptr(), 20);
 
     // Serve loop: read request, perform block I/O, write response.
@@ -78,34 +83,29 @@ extern "C" fn main(
             Some(r) => r,
             None => continue, // empty/partial frame (e.g. a spurious wake)
         };
-        let lba = request.lba;
-        let count = request.count as u64;
 
         match request.cmd {
-            CMD_READ => {
-                if !dev.check_bounds(lba, count) {
-                    buf[0] = STATUS_BAD_LBA;
-                    channel_write(ch, buf.as_ptr(), 1);
-                    continue;
-                }
-                let offset = BlockDevice::offset_for_lba(lba);
-                let byte_len = (count * drv_blk::BLOCK_SIZE) as usize;
-                // Read directly from the mapped VMO.
-                let src = unsafe { (vmo_va + offset) as *const u8 };
-                buf[0] = STATUS_OK;
-                let copy_len = byte_len.min(buf.len() - 1);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src, buf[1..].as_mut_ptr(), copy_len);
-                }
-                channel_write(ch, buf.as_ptr(), 1 + copy_len);
-            }
-            CMD_WRITE => {
-                // Read-only ramdisk: acknowledge but ignore data.
-                if !dev.check_bounds(lba, count) {
-                    buf[0] = STATUS_BAD_LBA;
-                } else {
+            CMD_READ => match dev.read_blocks(store, request.lba, request.count) {
+                Ok(data) => {
                     buf[0] = STATUS_OK;
+                    let copy_len = data.len().min(buf.len() - 1);
+                    buf[1..1 + copy_len].copy_from_slice(&data[..copy_len]);
+                    channel_write(ch, buf.as_ptr(), 1 + copy_len);
                 }
+                Err(status) => {
+                    buf[0] = status;
+                    channel_write(ch, buf.as_ptr(), 1);
+                }
+            },
+            CMD_WRITE => {
+                // Read-only ramdisk for now: acknowledge in-range writes but ignore data.
+                // The real write path (a private RW backing) lands in the next slice; until
+                // then this preserves the historical "ack but discard" behavior.
+                buf[0] = if dev.check_bounds(request.lba, request.count as u64) {
+                    STATUS_OK
+                } else {
+                    STATUS_BAD_LBA
+                };
                 channel_write(ch, buf.as_ptr(), 1);
             }
             _ => {
