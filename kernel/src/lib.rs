@@ -154,6 +154,19 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     klog!("[한국어한글 .......로드      OK ]\n\n");
     klog!("紫微     MUREX Core Ver 0.1.0a  ({})\n", report.arch);
     klog!("虹雲     ABIv{}     Check     OK\n", report.abi_version);
+    // Resolve the baked board identity (DESIGN/017 §4 step 2). Until the loader stamps
+    // `board_id` from `nijigumo.conf`, this reads empty on QEMU (`-kernel` path) and prints
+    // "unknown"; a stamped image names the board and confirms it is a supported BSP entry.
+    match kumo_bsp::Board::from_id(boot.board_id()) {
+        Some(board) => klog!("盤石     BOARD {}     Check     OK\n", board.id()),
+        None if boot.board_id().is_empty() => {
+            klog!("盤石     BOARD unknown (unstamped)     Check     --\n")
+        }
+        None => klog!(
+            "盤石     BOARD {} (unresolved)     Check     --\n",
+            boot.board_id()
+        ),
+    }
 
     // M1: bring up memory. The bump heap is already online; account the frames and
     // prove the allocator yields real addresses (Guidance 002 §5: AETHER is real now).

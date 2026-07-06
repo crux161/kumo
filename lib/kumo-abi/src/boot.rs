@@ -162,11 +162,19 @@ pub struct BootInfo {
     pub platform: PlatformTable,
     pub cmdline: RawSlice<u8>,
     pub verified_boot_sig: [u8; 64],
+    /// The runtime board identity, null-padded (its `kumo_bsp::Board` / `imager::HardwareTarget`
+    /// id string, e.g. `thinkpad-x13s-gen1`). Baked into the image for a specific board and set by
+    /// the loader from the `nijigumo.conf` `board = <id>` key; empty = unknown (DESIGN/017 §4).
+    /// The kernel resolves it with `kumo_bsp::Board::from_id`.
+    pub board_id: [u8; 32],
 }
 
 impl BootInfo {
     pub const FLAG_FRAMEBUFFER_PRESENT: u32 = 1 << 0;
     pub const FLAG_VERIFIED_BOOT_PRESENT: u32 = 1 << 1;
+
+    /// Length of the [`BootInfo::board_id`] byte field.
+    pub const BOARD_ID_LEN: usize = 32;
 
     pub const fn empty(version: u32) -> Self {
         Self {
@@ -190,6 +198,7 @@ impl BootInfo {
             },
             cmdline: RawSlice::empty(),
             verified_boot_sig: [0; 64],
+            board_id: [0; Self::BOARD_ID_LEN],
         }
     }
 
@@ -199,6 +208,26 @@ impl BootInfo {
 
     pub const fn has_verified_boot_sig(self) -> bool {
         self.flags & Self::FLAG_VERIFIED_BOOT_PRESENT != 0
+    }
+
+    /// Stamp the runtime board identity (null-padded, truncated to [`BootInfo::BOARD_ID_LEN`]).
+    /// The loader calls this from the baked `nijigumo.conf` `board = <id>` key.
+    pub fn set_board_id(&mut self, id: &str) {
+        self.board_id = [0; Self::BOARD_ID_LEN];
+        let bytes = id.as_bytes();
+        let n = bytes.len().min(Self::BOARD_ID_LEN);
+        self.board_id[..n].copy_from_slice(&bytes[..n]);
+    }
+
+    /// The stamped board identity as a `&str` (empty when unset), ready for
+    /// `kumo_bsp::Board::from_id`.
+    pub fn board_id(&self) -> &str {
+        let end = self
+            .board_id
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(Self::BOARD_ID_LEN);
+        core::str::from_utf8(&self.board_id[..end]).unwrap_or("")
     }
 }
 
@@ -213,6 +242,26 @@ mod tests {
         assert_eq!(boot.version, ABI_VERSION);
         assert!(boot.initrd.is_empty());
         assert!(!boot.has_framebuffer());
+        assert_eq!(boot.board_id(), "", "an unstamped board id reads as empty");
+    }
+
+    #[test]
+    fn board_id_round_trips_and_restamps_cleanly() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("thinkpad-x13s-gen1");
+        assert_eq!(boot.board_id(), "thinkpad-x13s-gen1");
+        // Re-stamping a shorter id must not leave a stale tail.
+        boot.set_board_id("raspberry-pi-5");
+        assert_eq!(boot.board_id(), "raspberry-pi-5");
+    }
+
+    #[test]
+    fn board_id_truncates_rather_than_overflowing() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        let long = "x".repeat(BootInfo::BOARD_ID_LEN + 8);
+        boot.set_board_id(&long);
+        // Stored value is bounded by the field and stays valid UTF-8.
+        assert_eq!(boot.board_id().len(), BootInfo::BOARD_ID_LEN);
     }
 
     #[test]

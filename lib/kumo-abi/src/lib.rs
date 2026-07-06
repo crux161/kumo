@@ -24,4 +24,5 @@ pub use sys::{
     ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags,
 };
 
-pub const ABI_VERSION: u32 = 1;
+// v2: BootInfo carries `board_id` (the baked board identity — DESIGN/017 §4 step 2).
+pub const ABI_VERSION: u32 = 2;
