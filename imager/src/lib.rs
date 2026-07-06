@@ -112,6 +112,21 @@ impl HardwareTarget {
             },
         }
     }
+
+    /// The runtime [`kumo_bsp::Board`] this build-time target corresponds to, or `None` for
+    /// targets with no aarch64 Board Support Package entry (the x86_64 target). This is the
+    /// build-time → runtime identity bridge of `DESIGN/017` §3: an image is built for one
+    /// `HardwareTarget`, and (in a later slice) bakes the matching `Board` id into `BootInfo`
+    /// so the kernel resolves the same board with `Board::from_id`. The `id` strings on both
+    /// sides are asserted equal by the tests, so the two board models cannot drift.
+    pub fn board(self) -> Option<kumo_bsp::Board> {
+        match self {
+            Self::ThinkPadX13sGen1 => Some(kumo_bsp::Board::ThinkPadX13sGen1),
+            Self::QemuVirtAarch64 => Some(kumo_bsp::Board::QemuVirtAarch64),
+            Self::RaspberryPi5 => Some(kumo_bsp::Board::RaspberryPi5),
+            Self::GenericUefiX86_64 => None,
+        }
+    }
 }
 
 impl fmt::Display for HardwareTarget {
@@ -477,5 +492,41 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+
+    #[test]
+    fn aarch64_targets_bridge_to_a_board_and_the_x86_target_does_not() {
+        assert_eq!(
+            HardwareTarget::ThinkPadX13sGen1.board(),
+            Some(kumo_bsp::Board::ThinkPadX13sGen1)
+        );
+        assert_eq!(
+            HardwareTarget::QemuVirtAarch64.board(),
+            Some(kumo_bsp::Board::QemuVirtAarch64)
+        );
+        assert_eq!(
+            HardwareTarget::RaspberryPi5.board(),
+            Some(kumo_bsp::Board::RaspberryPi5)
+        );
+        assert_eq!(HardwareTarget::GenericUefiX86_64.board(), None);
+    }
+
+    #[test]
+    fn build_time_and_runtime_board_ids_cannot_drift() {
+        // The identity bridge is only sound if the build-time profile id and the runtime BSP id
+        // agree for every board — and round-trip back through `Board::from_id` (DESIGN/017 §3).
+        for target in [
+            HardwareTarget::ThinkPadX13sGen1,
+            HardwareTarget::QemuVirtAarch64,
+            HardwareTarget::RaspberryPi5,
+        ] {
+            let board = target.board().expect("aarch64 target maps to a Board");
+            assert_eq!(
+                board.id(),
+                target.profile().id,
+                "profile id and BSP id diverged for {target}"
+            );
+            assert_eq!(kumo_bsp::Board::from_id(target.profile().id), Some(board));
+        }
     }
 }

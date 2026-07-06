@@ -50,6 +50,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 kumo-abi = { path = "lib/kumo-abi" }
+kumo-bsp = { path = "lib/kumo-bsp" }
 kumo-hal = { path = "hal/kumo-hal", default-features = false }
 kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
 kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }
