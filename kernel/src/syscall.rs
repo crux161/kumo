@@ -1,4 +1,10 @@
+//j366
+//j367
+//j368
+//j392
+//j406
 //j409
+//j410
 use alloc::vec::Vec;
 use core::mem;
 
@@ -609,6 +615,27 @@ impl SyscallEngine {
         crate::user_thread::wake_child_waiting_on_device_ctx_fault(ctx_koid);
         self.signal_ports(ctx_koid, kumo_abi::Signals::DEVICE_FAULT);
         Ok(())
+    }
+
+    pub fn signal_iommu_stream_fault(
+        &mut self,
+        iommu_koid: KoId,
+        stream_id: u32,
+        fault_record: u64,
+        fault_addr: u64,
+    ) -> Result<KoId, Errno> {
+        let mut matched = None;
+        for ctx in &self.device_ctxs {
+            if ctx.iommu_koid == iommu_koid && ctx.stream_id == stream_id {
+                if matched.is_some() {
+                    return Err(Errno::InvalidArgs);
+                }
+                matched = Some(ctx.koid);
+            }
+        }
+        let ctx_koid = matched.ok_or(Errno::BadHandle)?;
+        self.signal_device_ctx_fault(ctx_koid, fault_record, fault_addr)?;
+        Ok(ctx_koid)
     }
 
     /// Bind an object to a port. When an event occurs on that object,
@@ -1439,15 +1466,18 @@ impl SyscallEngine {
                     Ok(e) => e.koid,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
-                // Two-pass: first extract the process koid (mutable borrow), then
-                // look up the process's ttbr0 (immutable borrow).
-                let proc_koid = {
-                    let Some(thread) = self.thread_by_koid_mut(thread_koid) else {
-                        return KernelCallResult::Status(Errno::BadHandle.status());
+                #[cfg(target_os = "none")]
+                let proc_ttbr0 = {
+                    // Two-pass: first extract the process koid (mutable borrow), then
+                    // look up the process's ttbr0 (immutable borrow).
+                    let proc_koid = {
+                        let Some(thread) = self.thread_by_koid_mut(thread_koid) else {
+                            return KernelCallResult::Status(Errno::BadHandle.status());
+                        };
+                        thread.process()
                     };
-                    thread.process()
+                    self.process_by_koid(proc_koid).and_then(|p| p.ttbr0)
                 };
-                let proc_ttbr0 = self.process_by_koid(proc_koid).and_then(|p| p.ttbr0);
                 let Some(thread) = self.thread_by_koid_mut(thread_koid) else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
@@ -2048,6 +2078,13 @@ impl SyscallEngine {
                 let Ok(stream_id) = u32::try_from(_stream_or_rid) else {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
+                if self
+                    .device_ctxs
+                    .iter()
+                    .any(|ctx| ctx.iommu_koid == _iommu_entry.koid && ctx.stream_id == stream_id)
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
 
                 let pgd_phys =
                     unsafe { crate::mm::alloc_zeroed_frame(self.boot_info.as_ref().unwrap()) };
@@ -2371,18 +2408,43 @@ mod tests {
         }
     }
 
-    fn create_test_device_ctx_with_kind(
+    fn create_test_iommu_with_kind(
         engine: &mut SyscallEngine,
         process: &mut Process,
         iommu_kind: u32,
-    ) -> Handle {
+    ) -> (Handle, KoId) {
         let iommu = engine.objects.create(ObjectKind::IoMmu);
         let iommu_koid = iommu.koid();
+        let handle = process
+            .handles_mut()
+            .insert(
+                iommu,
+                Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap();
         engine.iommus.push(IoMmuBinding {
             koid: iommu_koid,
             iommu_kind,
             phys_base: 0x1500_0000,
         });
+        (handle, iommu_koid)
+    }
+
+    fn create_test_device_ctx_with_kind(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        iommu_kind: u32,
+    ) -> Handle {
+        create_test_device_ctx_with_kind_and_stream(engine, process, iommu_kind, 1)
+    }
+
+    fn create_test_device_ctx_with_kind_and_stream(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        iommu_kind: u32,
+        stream_id: u32,
+    ) -> Handle {
+        let (_iommu, iommu_koid) = create_test_iommu_with_kind(engine, process, iommu_kind);
         let object = engine.objects.create(ObjectKind::DeviceCtx);
         let koid = object.koid();
         let handle = process
@@ -2395,7 +2457,7 @@ mod tests {
         engine.device_ctxs.push(DeviceCtxBinding {
             koid,
             iommu_koid,
-            stream_id: 1,
+            stream_id,
             pgd_phys: 0x8000_0000,
         });
         handle
@@ -2635,6 +2697,38 @@ mod tests {
             KernelCallResult::Status(Errno::InvalidArgs.status())
         );
         assert!(engine.device_ctxs.is_empty());
+    }
+
+    #[test]
+    fn device_ctx_create_rejects_duplicate_stream_in_same_iommu() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let (iommu, iommu_koid) = create_test_iommu_with_kind(
+            &mut engine,
+            &mut process,
+            kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
+        );
+        let object = engine.objects.create(ObjectKind::DeviceCtx);
+        engine.device_ctxs.push(DeviceCtxBinding {
+            koid: object.koid(),
+            iommu_koid,
+            stream_id: 0x820,
+            pgd_phys: 0x8000_0000,
+        });
+
+        let duplicate = engine.dispatch(
+            &mut process,
+            KernelCall::DeviceCtxCreate {
+                iommu,
+                stream_or_rid: 0x820,
+            },
+        );
+
+        assert_eq!(
+            duplicate,
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+        assert_eq!(engine.device_ctxs.len(), 1);
     }
 
     #[test]
@@ -2937,6 +3031,120 @@ mod tests {
         };
         assert_eq!(packet.source, ctx_koid);
         assert!(packet.signals.contains(kumo_abi::Signals::DEVICE_FAULT));
+    }
+
+    #[test]
+    fn iommu_stream_fault_routes_to_matching_device_ctx() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let first = create_test_device_ctx_with_kind_and_stream(
+            &mut engine,
+            &mut process,
+            kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
+            0x820,
+        );
+        let second = create_test_device_ctx_with_kind_and_stream(
+            &mut engine,
+            &mut process,
+            kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
+            0x820,
+        );
+        let second_koid = process.handles().get(second).unwrap().koid;
+        let first_iommu = engine.device_ctxs[0].iommu_koid;
+        let second_iommu = engine.device_ctxs[1].iommu_koid;
+        let watched = create_port(&mut engine, &mut process);
+
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: watched,
+                    object: second,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        let routed = engine
+            .signal_iommu_stream_fault(second_iommu, 0x820, 0xfeed, 0x6000_0000)
+            .unwrap();
+        assert_eq!(routed, second_koid);
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx: first }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx: second }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: watched })
+        else {
+            panic!("expected routed device fault packet");
+        };
+        assert_eq!(packet.source, second_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::DEVICE_FAULT));
+
+        let mut info = DeviceCtxInfo {
+            fault_record: 0,
+            fault_addr: 0,
+        };
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::DeviceCtxInfo {
+                    ctx: second,
+                    user_ptr: (&mut info as *mut DeviceCtxInfo) as u64,
+                    user_len: mem::size_of::<DeviceCtxInfo>() as u64,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            info,
+            DeviceCtxInfo {
+                fault_record: 0xfeed,
+                fault_addr: 0x6000_0000,
+            }
+        );
+        assert_eq!(
+            engine.signal_iommu_stream_fault(first_iommu, 0x999, 0, 0),
+            Err(Errno::BadHandle)
+        );
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx: first }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+    }
+
+    #[test]
+    fn iommu_stream_fault_rejects_ambiguous_legacy_bindings() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let ctx = create_test_device_ctx_with_kind_and_stream(
+            &mut engine,
+            &mut process,
+            kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
+            0x42,
+        );
+        let iommu_koid = engine.device_ctxs[0].iommu_koid;
+        let object = engine.objects.create(ObjectKind::DeviceCtx);
+        engine.device_ctxs.push(DeviceCtxBinding {
+            koid: object.koid(),
+            iommu_koid,
+            stream_id: 0x42,
+            pgd_phys: 0x9000_0000,
+        });
+
+        assert_eq!(
+            engine.signal_iommu_stream_fault(iommu_koid, 0x42, 0xaaa, 0xbbb),
+            Err(Errno::InvalidArgs)
+        );
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::DeviceCtxWaitFault { ctx }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
     }
 
     #[test]
