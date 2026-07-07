@@ -6,6 +6,7 @@
 //j397
 //j422
 //j423
+//j425
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3911,7 +3912,7 @@ mod traps {
         spsr_mode_name,
     };
     use core::fmt::Write;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     struct ConsoleWriter;
 
@@ -3922,7 +3923,11 @@ mod traps {
         }
     }
 
-    static IRQ_IL_SEEN: AtomicBool = AtomicBool::new(false);
+    /// Bound the IL-guard breadcrumb so a persistent poison cannot flood the framebuffer console,
+    /// while still proving on metal that the guard fires and recovers rather than the earlier
+    /// silent single line. — CORVUS
+    const IRQ_IL_LOG_LIMIT: u32 = 8;
+    static IRQ_IL_SEEN: AtomicU32 = AtomicU32::new(0);
 
     // 16-entry, 2 KiB-aligned EL1 vector table. Sync/FIQ/SError entries report and
     // halt; IRQ entries save the interrupted context, dispatch the interrupt, EOI,
@@ -4126,13 +4131,18 @@ mod traps {
 
     #[no_mangle]
     extern "C" fn kumo_irq_il_seen(elr: u64, spsr: u64) {
-        if IRQ_IL_SEEN.swap(true, Ordering::Relaxed) {
+        // The asm epilogue has already cleared the IL bit and will `eret` on the repaired frame;
+        // this only records the recovery. Bounded-count so a persistent poison self-throttles but
+        // the running tally still shows how often the restored Sora-context handoff trips it.
+        let seen = IRQ_IL_SEEN.fetch_add(1, Ordering::Relaxed);
+        if seen >= IRQ_IL_LOG_LIMIT {
             return;
         }
         let mut out = ConsoleWriter;
         let _ = write!(
             out,
-            "\r\nkumo: IRQ-return IL guard: saved ELR={:#018x} SPSR={:#018x} ({} IL=1); cleared IL\r\n",
+            "\r\nkumo: IRQ-return IL guard #{}: saved ELR={:#018x} SPSR={:#018x} ({} IL=1); cleared IL\r\n",
+            seen + 1,
             elr,
             spsr,
             spsr_mode_name(spsr)

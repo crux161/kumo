@@ -6,6 +6,7 @@
 //j398
 //j400
 //j404
+//j425
 
 use kumo_hid::{
     apply_caps_lock_to_ascii, DecodeError, Decoder, KeyState, MAX_TERMINAL_BYTES, REPORT_KEYS,
@@ -34,6 +35,13 @@ pub const INPUT_REPORT_STATS_FIRST_LOG_FRAME: u32 = 8;
 pub const IRQ_TICK_LOG_LIMIT: u32 = 8;
 pub const RAW_FRAME_LOG_LIMIT: u32 = 2;
 pub const NONEMPTY_FRAME_LOG_LIMIT: u32 = 8;
+/// Steady-state cap on the per-key `key forwarded ascii=` breadcrumb. Since j424 the forwarded
+/// keyboard bytes reach Sora's reader and echo through `ttyd` onto the same framebuffer console the
+/// driver logs to, so the echoed glyph is now the ground-truth proof the forward path works. Logging
+/// every forwarded byte on top of that echo garbles the interactive console (the "malformed"
+/// interleave). Log the first few as a boot sample, then fall silent — the `forwarded_ascii` stat
+/// still carries the running count for triage. Mirrors the touchpad forward-log bound. — CORVUS
+pub const KEY_FORWARD_LOG_LIMIT: u32 = 8;
 pub const RESET_STORM_YIELD_AFTER: u32 = 8;
 pub const RESET_STORM_YIELD_EVERY: u32 = 8;
 pub const RESET_STORM_YIELD_NS: u64 = 1_000_000;

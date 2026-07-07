@@ -1737,6 +1737,12 @@ extern "C" fn sora_main(
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
 
         log(b"sora: entering serve loop\n");
+        // First light of the interactive shell: render the prompt once so the settled framebuffer
+        // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
+        // without one there is no line editor to receive the command the prompt would solicit.
+        if interactive_ttyd.is_some() {
+            debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+        }
         loop {
             let source = Handle(port_wait(port) as u32);
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
@@ -2263,6 +2269,12 @@ fn pump_to_console(read_end: Handle) {
 
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
 const MAX_ARGV: usize = 16;
+
+/// Interactive shell prompt for the framebuffer `ttyd` session. Matches the kernel serial shell's
+/// `[MUREX>` identity so both consoles read as one shell. Emitted once when the serve loop is ready to
+/// accept input, and again after every submitted line, so the console always invites the next command
+/// rather than sitting on a bare echo. — CORVUS
+const SHELL_PROMPT: &[u8] = b"[MUREX> ";
 
 /// Pack `slots` (each element one argv entry, `slots[0]` = program name) into the shared scratch
 /// VMO and mint a one-shot read+transfer handle suitable for a bootstrap startup message; returns
@@ -2826,6 +2838,10 @@ fn dispatch_ttyd_key(
             run_statement(&stmt, line, initrd, prog_initrd, root);
         }
     }
+    // A line was submitted (Enter): the command (if any) has finished writing its output, so render
+    // the next prompt. Command output ends in a newline, so the prompt lands on a fresh line; an
+    // empty line just re-prompts after ttyd's CRLF echo. This is the loop that makes it a shell.
+    debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
     true
 }
 

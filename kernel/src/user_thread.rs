@@ -13,6 +13,7 @@
 //j393
 //j408
 //j422
+//j425
 
 use core::cell::UnsafeCell;
 
@@ -697,6 +698,18 @@ fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
     )
 }
 
+/// IRQ-context handoff gate. A device/timer IRQ can make a resident child or Sora runnable, but
+/// switching context out of `kumo_irq_common` is only safe when the interrupted context is Sora —
+/// the supervisor pump that lent the child its resident slot. Switching from a driver child's frame
+/// is the J288 corruption window; a child made runnable waits for its own SVC/park boundary, and the
+/// idle floor is paid by [`pump_idle_floor`] after `eret`. Restored from the SANITARY
+/// IRQ/scheduler-invariant reference after the j422 over-defer stranded the Sora-context wake and
+/// halted keypress serving once input was mid-flight. — CORVUS
+fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
+    let _ = idle;
+    current == user
+}
+
 fn wake_child_waiting_on(target: WaitTarget) {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -762,16 +775,41 @@ pub fn reschedule_if_pending_after_svc() {
     }
 }
 
-/// Dispatch a timer/device-woken resident child immediately after the IRQ signal path
-/// has queued its port/interrupt packet.
-///
-/// This deliberately does not switch: the hook is reached from `kumo_irq_common`, and
-/// switching there can poison the saved IRQ return frame. The runnable work stays
-/// queued until [`pump_idle_floor`] (boot/idle) or [`reschedule_if_pending_after_svc`]
-/// (active EL0) can pay it from a normal scheduler boundary. — KESTREL
+/// Dispatch a timer/device-woken resident child immediately after the IRQ signal path has queued
+/// its port/interrupt packet. Pays the wake only when [`irq_handoff_allowed`] holds — i.e. Sora is
+/// the interrupted context — so it never preempts an active driver child (the J288 corruption
+/// window) and never switches from the idle floor (paid by [`pump_idle_floor`] after `eret`
+/// instead). Without this, a keyboard IRQ that fires while Sora is mid-serve strands the wake and
+/// the serve loop halts (j422 over-defer). Restored from the SANITARY reference. — CORVUS
 pub fn reschedule_pending_after_irq_signal_if_safe() {
-    // Intentionally empty: IRQ signal delivery only marks runnable work. The switch is
-    // paid after `eret` by `pump_idle_floor` or at the next SVC boundary.
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let started = unsafe { (&*opt).is_some() };
+    if !started {
+        return;
+    }
+
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        if s.done || !s.safe_reschedule_pending {
+            return;
+        }
+        let Some(current) = s.dispatcher.current() else {
+            return;
+        };
+        if !irq_handoff_allowed(current, s.idle.koid(), s.user_thread.koid()) {
+            return;
+        }
+        let decision = s.dispatcher.reschedule_current();
+        let switch = dispatch_context(s, decision);
+        if switch.is_some() || s.dispatcher.runnable_count() == 0 {
+            s.safe_reschedule_pending = false;
+        }
+        switch
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
 }
 
 /// Wake Sora from an IRQ signal path without switching away from the Current-EL IRQ
@@ -785,13 +823,29 @@ pub fn wake_user_after_irq_signal() {
     }
 
     let p = sched_ptr();
-    unsafe {
+    let should_wake_now = unsafe {
         let s = &mut *p;
         if s.done || !matches!(s.user_thread.state(), ThreadState::Blocked) {
             s.user_wake_pending = false;
             return;
         }
-        s.user_wake_pending = true;
+        // Sora interrupted itself while parked mid-transition: it is the supervisor pump, so a
+        // switch back into it is safe now. From the idle floor or a driver child, defer to
+        // `pump_idle_floor` after `eret` instead. Restored from SANITARY. — CORVUS
+        match s.dispatcher.current() {
+            Some(current) if current == s.idle.koid() => {
+                s.user_wake_pending = true;
+                false
+            }
+            Some(current) if current == s.user_thread.koid() => true,
+            _ => {
+                s.user_wake_pending = true;
+                false
+            }
+        }
+    };
+    if should_wake_now {
+        wake_user();
     }
 }
 

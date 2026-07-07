@@ -7,6 +7,7 @@
 //j403
 //j404
 //j405
+//j425
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -18,9 +19,9 @@ use drv_i2c_hid::{
     DeviceQuirks, InputProbeDecoder, InputProbeError, InputReportClass, InputReportStats,
     OptionalMouseRuntimeConfig, OptionalMouseRuntimeError, OptionalProbeCandidates, ProbeConfig,
     ResetStormGuard, StartupLatencyTrace, StartupMilestone, IRQ_TICK_LOG_LIMIT,
-    KEYBOARD_BOOTSTRAP_TAG, MAX_INPUT_FRAME_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
-    MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT, RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_AFTER,
-    RESET_STORM_YIELD_EVERY, RESET_STORM_YIELD_NS,
+    KEYBOARD_BOOTSTRAP_TAG, KEY_FORWARD_LOG_LIMIT, MAX_INPUT_FRAME_BYTES,
+    MAX_REPORT_DESCRIPTOR_BYTES, MOUSE_BOOTSTRAP_TAG, NONEMPTY_FRAME_LOG_LIMIT,
+    RAW_FRAME_LOG_LIMIT, RESET_STORM_YIELD_AFTER, RESET_STORM_YIELD_EVERY, RESET_STORM_YIELD_NS,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_i2c_hid::{
@@ -37,6 +38,17 @@ kumo_rt::entry!(main);
 
 const MMIO_VA: u64 = 0x0000_0000_1100_0000;
 const POLL_LIMIT: usize = 1_000_000;
+/// Master gate for the driver's bring-up instrumentation — the per-IRQ `irq tick`, raw/`frame=`
+/// dumps, per-key `key forwarded`, stats snapshots, and the startup-latency block.
+///
+/// Held ON. Flipping it OFF regressed X13s boot to a console freeze: the driver's per-interrupt
+/// `debug_write` SVCs are, on this scheduler, the boundaries that let `drv-fb` repaint, so quieting
+/// the driver starves the console (DEFERRED/004). Two attempts to decouple the painter from driver
+/// chatter (a display-priority painter; broadening Sora's wake payment) each regressed boot further,
+/// so they were reverted. Quieting the console needs a deliberate, instrumented fix, not a stacked
+/// guess — until then a noisy-but-working console beats a frozen one. The steady-state per-key/frame
+/// logs are bounded, so the console settles after the boot sample. — CORVUS
+const DEBUG_TRACE: bool = true;
 /// Probe-only report-descriptor read budget (the Elan touchpad's descriptor outgrows the 256-byte
 /// keyboard cap). Transient in main's frame; the child stack is 16 KiB (Sora's STACK_SIZE), so a
 /// 1 KiB scratch buffer is comfortably inside budget.
@@ -213,6 +225,9 @@ fn log_input_report_stats(stats: &InputReportStats) {
 }
 
 fn maybe_log_input_report_stats(stats: &InputReportStats, logged: &mut u32) {
+    if !DEBUG_TRACE {
+        return;
+    }
     if should_log_input_report_stats_snapshot(stats, *logged) {
         *logged = logged.saturating_add(1);
         log_input_report_stats(stats);
@@ -1007,7 +1022,9 @@ extern "C" fn main(
 
     let mut input_decoder = InputProbeDecoder::new();
     startup_trace.record(StartupMilestone::Ready, clock_get());
-    log_startup_latency(startup_trace);
+    if DEBUG_TRACE {
+        log_startup_latency(startup_trace);
+    }
     log(b"drv-i2c-hid: attention interrupt ready\n");
     // Keep a small boot sample on the interrupt path without pushing startup timing off-screen.
     // Non-empty frames and forwarded keys still log after the boot sample expires. — KESTREL
@@ -1016,6 +1033,7 @@ extern "C" fn main(
     let mut touchpad_interrupts: u32 = 0;
     let mut touchpad_shown_nonempty: u32 = 0;
     let mut touchpad_forward_logs: u32 = 0;
+    let mut keyboard_forward_logs: u32 = 0;
     let mut touchpad_idle_frames: u32 = 0;
     let mut keyboard_forward_failures = BoundedFailureLog::new();
     let mut mouse_forward_failures = BoundedFailureLog::new();
@@ -1173,16 +1191,16 @@ extern "C" fn main(
         );
         input_stats.record_class(report_class);
         let reset_storm_yield = reset_storm.record(report_class);
-        if interrupts <= IRQ_TICK_LOG_LIMIT {
+        if DEBUG_TRACE && interrupts <= IRQ_TICK_LOG_LIMIT {
             log_hex(b"drv-i2c-hid: irq tick len=0x", frame_len as u64);
         }
-        if interrupts <= RAW_FRAME_LOG_LIMIT {
+        if DEBUG_TRACE && interrupts <= RAW_FRAME_LOG_LIMIT {
             log_frame(
                 b"drv-i2c-hid: raw= ",
                 &input_frame[..input_frame_len.min(16)],
             );
         }
-        if frame_len != 0 && shown_nonempty < NONEMPTY_FRAME_LOG_LIMIT {
+        if DEBUG_TRACE && frame_len != 0 && shown_nonempty < NONEMPTY_FRAME_LOG_LIMIT {
             shown_nonempty += 1;
             log_frame(
                 b"drv-i2c-hid: frame= ",
@@ -1272,7 +1290,13 @@ extern "C" fn main(
             let byte = [ascii];
             if channel_write(keyboard_channel, byte.as_ptr(), byte.len()) == 0 {
                 input_stats.record_forwarded_ascii();
-                log_hex(b"drv-i2c-hid: key forwarded ascii=0x", ascii as u64);
+                // The forwarded byte now echoes through Sora/ttyd onto this same framebuffer
+                // console, so the shell's own echo is the ground truth; the driver stays silent on
+                // the hot path unless `DEBUG_TRACE` re-arms the bring-up breadcrumb.
+                if DEBUG_TRACE && keyboard_forward_logs < KEY_FORWARD_LOG_LIMIT {
+                    keyboard_forward_logs = keyboard_forward_logs.saturating_add(1);
+                    log_hex(b"drv-i2c-hid: key forwarded ascii=0x", ascii as u64);
+                }
             } else if keyboard_forward_failures.record() {
                 input_stats.record_keyboard_write_drop();
                 // A closed/restarting keyboard consumer is soft-state loss, not a hardware-driver
