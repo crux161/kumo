@@ -1,4 +1,5 @@
 #![no_std]
+//j426
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -7,6 +8,9 @@
 //! `DeviceCtx`; the future controller driver owns the unsafe register and DMA synchronization edge.
 
 mod context;
+mod fdt;
+mod probe;
+mod registers;
 mod ring;
 mod trb;
 
@@ -14,6 +18,13 @@ pub use context::{
     endpoint_context_index, ContextSize, EndpointContext, EndpointType, InputControlContext,
     SlotContext, UsbSpeed,
 };
+pub use fdt::{
+    discover_x13s_usb0_xhci, GicInterrupt, XhciControllerTopology,
+    X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN, X13S_USB0_XHCI_MMIO_BASE, X13S_USB0_XHCI_MMIO_MIN_LEN,
+    X13S_USB0_XHCI_STREAM_ID,
+};
+pub use probe::{XhciProbeConfig, XHCI_PROBE_CONFIG_LEN};
+pub use registers::{portsc_offset, CapabilityRegisters, PortStatus};
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
 };

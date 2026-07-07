@@ -1,3 +1,5 @@
+//j426
+
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
 pub const INITRD_ENTRY_LEN: usize = 80;
@@ -9,6 +11,7 @@ pub const TTYD_PATH: &str = "bin/ttyd";
 pub const DRV_SERIAL_PATH: &str = "bin/drv-serial";
 pub const DRV_FB_PATH: &str = "bin/drv-fb";
 pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
+pub const DRV_XHCI_PATH: &str = "bin/drv-xhci";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";

@@ -1,19 +1,19 @@
 #![no_std]
 #![no_main]
 
-//j389
 //j402
 //j414
 //j417
 //j424
+//j426
 
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH, TTYD_PATH,
-    WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
+    TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -171,6 +171,114 @@ fn i2c_hid_runtime_topology_from_dtb(
     let bytes =
         unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
     sora::discover_i2c_hid_runtime_topology(bytes)
+}
+
+fn xhci_usb0_probe_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<kumo_xhci::XhciProbeConfig> {
+    const PAGE_SIZE: u64 = 4096;
+    const HEADER_VA: u64 = 0x0000_0000_3300_0000;
+    const DTB_VA: u64 = 0x0000_0000_3400_0000;
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
+
+    if dtb_vmo.0 == 0 || dtb_phys == 0 {
+        return None;
+    }
+    let offset = (dtb_phys & (PAGE_SIZE - 1)) as usize;
+    if offset > PAGE_SIZE as usize - 8
+        || vmar_map(
+            Handle(0),
+            dtb_vmo,
+            0,
+            HEADER_VA,
+            PAGE_SIZE,
+            VmarFlags::READ.0,
+        ) != 0
+    {
+        return None;
+    }
+    let header =
+        unsafe { core::slice::from_raw_parts((HEADER_VA as usize + offset) as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    let mapped_len = (offset as u64)
+        .checked_add(total as u64)?
+        .checked_add(PAGE_SIZE - 1)?
+        & !(PAGE_SIZE - 1);
+    if vmar_map(Handle(0), dtb_vmo, 0, DTB_VA, mapped_len, VmarFlags::READ.0) != 0 {
+        return None;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
+    kumo_xhci::discover_x13s_usb0_xhci(bytes)?.probe_config()
+}
+
+fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handle, dtb_phys: u64) {
+    let Some(config) = xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) else {
+        log(b"drv-xhci: no x13s usb0 xhci\n");
+        return;
+    };
+
+    log(b"drv-xhci: topology usb0 mmio=");
+    log_hex(config.mmio_base);
+    log(b" len=");
+    log_hex(config.mmio_length);
+    log(b" irq=");
+    log_hex(config.irq as u64);
+    log(b" stream=");
+    log_hex(config.stream_id as u64);
+    log(b"\n");
+
+    let device_resource =
+        resource_create_child(root_resource, config.mmio_base, config.mmio_length, 0, 0);
+    if device_resource == u64::MAX {
+        log(b"drv-xhci: resource fail\n");
+        return;
+    }
+    let (sender, bootstrap) = channel_create_pair();
+    if sender == u64::MAX || bootstrap == u64::MAX {
+        log(b"drv-xhci: channel fail\n");
+        let _ = handle_close(Handle(device_resource as u32));
+        if sender != u64::MAX {
+            let _ = handle_close(Handle(sender as u32));
+        }
+        if bootstrap != u64::MAX {
+            let _ = handle_close(Handle(bootstrap as u32));
+        }
+        return;
+    }
+    let encoded = config.encode();
+    let sent = channel_write_with_handle(
+        Handle(sender as u32),
+        encoded.as_ptr(),
+        encoded.len(),
+        Handle(device_resource as u32),
+    );
+    if sent != 0 {
+        log(b"drv-xhci: bootstrap send fail\n");
+        let _ = handle_close(Handle(device_resource as u32));
+        let _ = handle_close(Handle(sender as u32));
+        let _ = handle_close(Handle(bootstrap as u32));
+    } else if run_elf(
+        initrd,
+        DRV_XHCI_PATH.as_bytes(),
+        0,
+        bootstrap,
+        ProcessRunFlags::ASYNC.bits(),
+        b"drv-xhci",
+    ) {
+        log(b"drv-xhci: run ok\n");
+        let _ = handle_close(Handle(sender as u32));
+        let _ = handle_close(Handle(bootstrap as u32));
+    } else {
+        log(b"drv-xhci: run fail\n");
+        let _ = handle_close(Handle(sender as u32));
+        let _ = handle_close(Handle(bootstrap as u32));
+    }
 }
 
 fn log_i2c_hid_kind(kind: HidDeviceKind) {
@@ -974,6 +1082,8 @@ extern "C" fn sora_main(
                     }
                     log_fb_geometry(&fb);
                 }
+
+                launch_xhci_first_light(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
 
                 // Match HID children from the read-only DTB capability before granting hardware
                 // authority. QEMU and unrelated framebuffer boards stop here without ever mapping

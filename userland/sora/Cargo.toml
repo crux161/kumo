@@ -1,3 +1,5 @@
+#j426
+
 [package]
 name = "sora"
 authors.workspace = true
@@ -13,6 +15,7 @@ kumo-fatfs = { path = "../../lib/kumo-fatfs" }
 kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
 kumo-ipc.workspace = true
 kumo-rt = { path = "../kumo-rt" }
+kumo-xhci = { path = "../../lib/kumo-xhci" }
 kumoza = { path = "../kumoza" }
 linked_list_allocator = "0.10.6"
 persona-linux = { path = "../persona-linux" }
