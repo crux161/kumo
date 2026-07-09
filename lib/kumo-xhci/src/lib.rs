@@ -3,6 +3,7 @@
 //j429
 //j430
 //j431
+//j432
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -13,6 +14,7 @@
 mod context;
 mod controller;
 mod fdt;
+mod noop;
 mod probe;
 mod registers;
 mod ring;
@@ -28,6 +30,7 @@ pub use fdt::{
     X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN, X13S_USB0_XHCI_MMIO_BASE, X13S_USB0_XHCI_MMIO_MIN_LEN,
     X13S_USB0_XHCI_REGISTER_MMIO_LEN, X13S_USB0_XHCI_STREAM_ID,
 };
+pub use noop::{prepare_noop_command_image, NoOpCommandImage, NoOpCommandIovas};
 pub use probe::{XhciProbeConfig, XHCI_PROBE_CONFIG_LEN};
 pub use registers::{portsc_offset, CapabilityRegisters, PortStatus};
 pub use ring::{
