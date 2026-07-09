@@ -1,7 +1,9 @@
 //j432
+//j433
 
 use crate::{
-    CommandRing, Error, EventRing, EventRingSegmentTableEntry, NoOpRegisterConfig, RingToken, Trb,
+    CommandRing, Error, Event, EventRing, EventRingSegmentTableEntry, NoOpRegisterConfig,
+    RingToken, Trb,
 };
 
 const DCBAA_ALIGNMENT: u64 = 64;
@@ -26,6 +28,47 @@ pub struct NoOpCommandImage {
     pub command_ring: CommandRing,
     pub event_ring: EventRing,
     pub command_token: RingToken,
+}
+
+/// A Command Completion Event for the No-Op command prepared by [`NoOpCommandImage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NoOpCommandCompletion {
+    pub completion_code: u8,
+    pub parameter: u32,
+    pub slot_id: u8,
+}
+
+impl NoOpCommandImage {
+    /// Consume one event-ring entry if it completes this image's No-Op command.
+    pub fn poll_completion(
+        &mut self,
+        event_segment: &[Trb],
+    ) -> Result<Option<NoOpCommandCompletion>, Error> {
+        let Some(event_trb) = self.event_ring.pop(event_segment)? else {
+            return Ok(None);
+        };
+        let Some(event) = event_trb.decode_event() else {
+            return Err(Error::WrongRingType);
+        };
+        let Event::CommandCompletion {
+            command_iova,
+            parameter,
+            completion_code,
+            slot_id,
+        } = event
+        else {
+            return Err(Error::WrongRingType);
+        };
+        if command_iova != self.command_token.iova {
+            return Err(Error::CompletionNotPending);
+        }
+        self.command_ring.reclaim_through(command_iova)?;
+        Ok(Some(NoOpCommandCompletion {
+            completion_code,
+            parameter,
+            slot_id,
+        }))
+    }
 }
 
 /// Initialize the minimum DMA image needed before ringing one xHCI No-Op command.
@@ -201,5 +244,94 @@ mod tests {
             ),
             Err(Error::MisalignedIova)
         );
+    }
+
+    #[test]
+    fn noop_image_consumes_matching_command_completion() {
+        let mut dcbaa = [0u64; 9];
+        let mut command_segment = RingSegment::<16>::new();
+        let mut event_segment = RingSegment::<16>::new();
+        let mut erst_entry = EventRingSegmentTableEntry::default();
+        let mut image = prepare_noop_command_image(
+            8,
+            &mut dcbaa,
+            command_segment.entries_mut(),
+            event_segment.entries_mut(),
+            &mut erst_entry,
+            IOVAS,
+        )
+        .unwrap();
+
+        event_segment.entries_mut()[0] =
+            command_completion_event(image.command_token.iova, 1, 0xabcd, 0);
+
+        assert_eq!(
+            image.poll_completion(event_segment.entries()),
+            Ok(Some(NoOpCommandCompletion {
+                completion_code: 1,
+                parameter: 0xabcd,
+                slot_id: 0,
+            }))
+        );
+        assert_eq!(image.command_ring.queued(), 0);
+        assert_eq!(image.event_ring.dequeue_iova(), IOVAS.event_ring + 16);
+        assert_eq!(image.poll_completion(event_segment.entries()), Ok(None));
+    }
+
+    #[test]
+    fn noop_image_rejects_unmatched_or_wrong_event() {
+        let mut dcbaa = [0u64; 9];
+        let mut command_segment = RingSegment::<16>::new();
+        let mut event_segment = RingSegment::<16>::new();
+        let mut erst_entry = EventRingSegmentTableEntry::default();
+        let mut image = prepare_noop_command_image(
+            8,
+            &mut dcbaa,
+            command_segment.entries_mut(),
+            event_segment.entries_mut(),
+            &mut erst_entry,
+            IOVAS,
+        )
+        .unwrap();
+        event_segment.entries_mut()[0] =
+            command_completion_event(image.command_token.iova + 16, 1, 0, 0);
+        assert_eq!(
+            image.poll_completion(event_segment.entries()),
+            Err(Error::CompletionNotPending)
+        );
+
+        let mut image = prepare_noop_command_image(
+            8,
+            &mut dcbaa,
+            command_segment.entries_mut(),
+            event_segment.entries_mut(),
+            &mut erst_entry,
+            IOVAS,
+        )
+        .unwrap();
+        event_segment.entries_mut()[0] = Trb::from_words([
+            0,
+            0,
+            1 << 24,
+            ((TrbType::HostControllerEvent as u32) << 10) | 1,
+        ]);
+        assert_eq!(
+            image.poll_completion(event_segment.entries()),
+            Err(Error::WrongRingType)
+        );
+    }
+
+    fn command_completion_event(
+        command_iova: u64,
+        completion_code: u8,
+        parameter: u32,
+        slot_id: u8,
+    ) -> Trb {
+        Trb::from_words([
+            command_iova as u32,
+            (command_iova >> 32) as u32,
+            (parameter & 0x00ff_ffff) | ((completion_code as u32) << 24),
+            ((TrbType::CommandCompletionEvent as u32) << 10) | ((slot_id as u32) << 24) | 1,
+        ])
     }
 }
