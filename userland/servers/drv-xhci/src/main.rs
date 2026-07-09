@@ -2,11 +2,13 @@
 #![no_main]
 
 //j426
+//j430
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_rt::{channel_read_with_handle, debug_write, process_exit, resource_mint_mmio, vmar_map};
 use kumo_xhci::{
-    portsc_offset, CapabilityRegisters, PortStatus, XhciProbeConfig, XHCI_PROBE_CONFIG_LEN,
+    portsc_offset, CapabilityRegisters, PortStatus, RegisterLayout, XhciProbeConfig,
+    XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -88,6 +90,8 @@ extern "C" fn main(
     let cap_word = read32(0);
     let hcsparams1 = read32(0x04);
     let hccparams1 = read32(0x10);
+    let dboff = read32(0x14);
+    let rtsoff = read32(0x18);
     let caps = match CapabilityRegisters::from_words(cap_word, hcsparams1, hccparams1) {
         Ok(caps) => caps,
         Err(_) => {
@@ -117,6 +121,16 @@ extern "C" fn main(
     log(b" xecp=");
     log_hex(caps.extended_capabilities_offset() as u64);
     log(b"\n");
+
+    log(b"drv-xhci: layout raw dboff=");
+    log_hex(dboff as u64);
+    log(b" rtsoff=");
+    log_hex(rtsoff as u64);
+    log(b"\n");
+    match RegisterLayout::new(caps.caplength(), dboff, rtsoff, config.mmio_length) {
+        Ok(layout) => log_layout(layout),
+        Err(_) => log(b"drv-xhci: layout outside grant\n"),
+    }
 
     let mut port = 0u8;
     let max_ports = caps.max_ports().min(MAX_LOGGED_PORTS);
@@ -155,6 +169,22 @@ fn log_port(index: u8, port: PortStatus) {
     log_hex(port.speed() as u64);
     log(b" pp=");
     log_hex(port.powered() as u64);
+    log(b"\n");
+}
+
+fn log_layout(layout: RegisterLayout) {
+    log(b"drv-xhci: layout op=");
+    log_hex(layout.operational_offset() as u64);
+    log(b" run=");
+    log_hex(layout.runtime_offset() as u64);
+    log(b" db=");
+    log_hex(layout.doorbell_offset() as u64);
+    log(b" crcr=");
+    log_hex(layout.command_ring_offset() as u64);
+    log(b" dcbaa=");
+    log_hex(layout.dcbaa_offset() as u64);
+    log(b" ir0_erstsz=");
+    log_hex(layout.interrupter0_erst_size_offset() as u64);
     log(b"\n");
 }
 

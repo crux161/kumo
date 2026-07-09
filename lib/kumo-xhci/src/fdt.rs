@@ -1,7 +1,9 @@
 //j426
+//j430
 
 use crate::XhciProbeConfig;
 
+const PAGE_SIZE: u64 = 0x1000;
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
@@ -13,6 +15,7 @@ const MAX_DEPTH: usize = 32;
 pub const X13S_USB0_XHCI_MMIO_BASE: u64 = 0x0a60_0000;
 pub const X13S_USB0_XHCI_MMIO_MIN_LEN: u64 = 0x800;
 pub const X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN: u64 = 0x1000;
+pub const X13S_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0xd000;
 pub const X13S_USB0_XHCI_STREAM_ID: u32 = 0x820;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,9 +46,10 @@ pub struct XhciControllerTopology {
 impl XhciControllerTopology {
     pub fn probe_config(self) -> Option<XhciProbeConfig> {
         let irq = self.interrupt.global_id()?;
+        let grant_len = align_up(self.mmio_length, PAGE_SIZE)?;
         Some(XhciProbeConfig::new(
             self.mmio_base,
-            X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN,
+            grant_len,
             irq,
             self.stream_id,
         ))
@@ -158,8 +162,8 @@ fn xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
     let mmio_base = cells64(node.reg[0], node.reg[1]);
     let mmio_length = cells64(node.reg[2], node.reg[3]);
     // The Linux-derived plan and the staged X13s DTB disagree on the full dwc3 child range
-    // (`0xd950` vs `0xcd00`). This slice reads only xHCI capability/operational/PORTSC registers,
-    // so trust the DTB's range if it covers that first-light window. - KESTREL
+    // (`0xd950` vs `0xcd00`). Trust the staged DTB if it covers the read-only register probe window;
+    // `probe_config` page-rounds it so Sora can map the runtime/doorbell windows too. - KESTREL
     if mmio_base != X13S_USB0_XHCI_MMIO_BASE || mmio_length < X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN {
         return None;
     }
@@ -219,6 +223,12 @@ fn align4(value: usize) -> Option<usize> {
     value.checked_add(3).map(|value| value & !3)
 }
 
+fn align_up(value: u64, align: u64) -> Option<u64> {
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +243,10 @@ mod tests {
         assert!(topology.mmio_length >= X13S_USB0_XHCI_MMIO_MIN_LEN);
         assert!(topology.mmio_length >= X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN);
         assert_eq!(
+            align_up(topology.mmio_length, PAGE_SIZE),
+            Some(X13S_USB0_XHCI_REGISTER_MMIO_LEN)
+        );
+        assert_eq!(
             topology.interrupt,
             GicInterrupt {
                 kind: 0,
@@ -246,7 +260,7 @@ mod tests {
             topology.probe_config(),
             Some(XhciProbeConfig::new(
                 X13S_USB0_XHCI_MMIO_BASE,
-                X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN,
+                X13S_USB0_XHCI_REGISTER_MMIO_LEN,
                 835,
                 X13S_USB0_XHCI_STREAM_ID
             ))
