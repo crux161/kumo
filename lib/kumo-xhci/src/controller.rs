@@ -1,4 +1,5 @@
 //j429
+//j431
 
 use crate::Error;
 
@@ -7,6 +8,7 @@ const RTSOFF_MASK: u32 = 0xffff_ffe0;
 
 const OP_USBCMD: usize = 0x00;
 const OP_USBSTS: usize = 0x04;
+const OP_PAGESIZE: usize = 0x08;
 const OP_CRCR: usize = 0x18;
 const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
@@ -16,7 +18,10 @@ const CMD_RESET: u32 = 1 << 1;
 const CMD_EIE: u32 = 1 << 2;
 
 const STS_HALT: u32 = 1 << 0;
+const STS_HOST_SYSTEM_ERROR: u32 = 1 << 2;
 const STS_CNR: u32 = 1 << 11;
+
+const PAGESIZE_4K: u32 = 1 << 0;
 
 const CMD_RING_CYCLE: u64 = 1 << 0;
 const CMD_RING_PTR_MASK: u64 = !0x3f;
@@ -84,6 +89,18 @@ impl RegisterLayout {
         self.doorbell
     }
 
+    pub const fn command_offset(self) -> usize {
+        self.operational + OP_USBCMD
+    }
+
+    pub const fn status_offset(self) -> usize {
+        self.operational + OP_USBSTS
+    }
+
+    pub const fn page_size_offset(self) -> usize {
+        self.operational + OP_PAGESIZE
+    }
+
     pub const fn command_ring_offset(self) -> usize {
         self.operational + OP_CRCR
     }
@@ -110,14 +127,19 @@ impl RegisterLayout {
 
     pub fn ready_for_ring_programming<IO: RegisterIo>(self, io: &mut IO) -> Result<(), Error> {
         self.check32(self.operational + OP_USBSTS)?;
-        let status = io.read32(self.operational + OP_USBSTS);
-        if status & STS_HALT == 0 {
-            return Err(Error::ControllerNotHalted);
-        }
-        if status & STS_CNR != 0 {
-            return Err(Error::ControllerNotReady);
-        }
-        Ok(())
+        ControllerStatus::from_words(0, io.read32(self.operational + OP_USBSTS), 0)
+            .ready_for_ring_programming()
+    }
+
+    pub fn snapshot_status<IO: RegisterIo>(self, io: &mut IO) -> Result<ControllerStatus, Error> {
+        self.check32(self.command_offset())?;
+        self.check32(self.status_offset())?;
+        self.check32(self.page_size_offset())?;
+        Ok(ControllerStatus::from_words(
+            io.read32(self.command_offset()),
+            io.read32(self.status_offset()),
+            io.read32(self.page_size_offset()),
+        ))
     }
 
     /// Program the register state needed to ring one No-Op Command and observe completion on IR0.
@@ -197,6 +219,78 @@ impl RegisterLayout {
     }
 }
 
+/// Read-only controller state needed before a live reset/ring-programming slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerStatus {
+    command: u32,
+    status: u32,
+    page_size: u32,
+}
+
+impl ControllerStatus {
+    pub const fn from_words(command: u32, status: u32, page_size: u32) -> Self {
+        Self {
+            command,
+            status,
+            page_size,
+        }
+    }
+
+    pub const fn raw_command(self) -> u32 {
+        self.command
+    }
+
+    pub const fn raw_status(self) -> u32 {
+        self.status
+    }
+
+    pub const fn raw_page_size(self) -> u32 {
+        self.page_size
+    }
+
+    pub const fn running(self) -> bool {
+        self.command & CMD_RUN != 0
+    }
+
+    pub const fn reset_requested(self) -> bool {
+        self.command & CMD_RESET != 0
+    }
+
+    pub const fn interrupts_enabled(self) -> bool {
+        self.command & CMD_EIE != 0
+    }
+
+    pub const fn halted(self) -> bool {
+        self.status & STS_HALT != 0
+    }
+
+    pub const fn controller_not_ready(self) -> bool {
+        self.status & STS_CNR != 0
+    }
+
+    pub const fn host_system_error(self) -> bool {
+        self.status & STS_HOST_SYSTEM_ERROR != 0
+    }
+
+    pub const fn supports_4k_pages(self) -> bool {
+        self.page_size & PAGESIZE_4K != 0
+    }
+
+    pub const fn ring_programming_ready(self) -> bool {
+        self.halted() && !self.controller_not_ready()
+    }
+
+    pub fn ready_for_ring_programming(self) -> Result<(), Error> {
+        if !self.halted() {
+            return Err(Error::ControllerNotHalted);
+        }
+        if self.controller_not_ready() {
+            return Err(Error::ControllerNotReady);
+        }
+        Ok(())
+    }
+}
+
 /// Device-visible addresses for the first Slice-2 command/event-ring register program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NoOpRegisterConfig {
@@ -258,6 +352,7 @@ mod tests {
         erst_size: u32,
         usbcmd: u32,
         usbsts: u32,
+        page_size: u32,
         iman: u32,
         writes: [(usize, u32); 16],
         write_len: usize,
@@ -274,6 +369,7 @@ mod tests {
             match offset {
                 0x40 => self.usbcmd,
                 0x44 => self.usbsts,
+                0x48 => self.page_size,
                 0x78 => self.config,
                 0x828 => self.erst_size,
                 0x820 => self.iman,
@@ -300,6 +396,9 @@ mod tests {
         assert_eq!(layout.operational_offset(), 0x40);
         assert_eq!(layout.runtime_offset(), 0x800);
         assert_eq!(layout.doorbell_offset(), 0x1000);
+        assert_eq!(layout.command_offset(), 0x40);
+        assert_eq!(layout.status_offset(), 0x44);
+        assert_eq!(layout.page_size_offset(), 0x48);
         assert_eq!(layout.command_ring_offset(), 0x58);
         assert_eq!(layout.dcbaa_offset(), 0x70);
         assert_eq!(layout.interrupter0_erst_size_offset(), 0x828);
@@ -307,6 +406,31 @@ mod tests {
             RegisterLayout::new(0x40, 0x1000, 0x800, 0x83b),
             Err(Error::RegisterWindowTooSmall)
         );
+    }
+
+    #[test]
+    fn status_snapshot_reads_the_read_only_gate() {
+        let layout = RegisterLayout::new(0x40, 0x1000, 0x800, 0x2000).unwrap();
+        let mut bus = ReplayBus {
+            usbcmd: CMD_RUN | CMD_EIE,
+            usbsts: STS_HALT | STS_HOST_SYSTEM_ERROR,
+            page_size: PAGESIZE_4K | (1 << 2),
+            ..ReplayBus::default()
+        };
+
+        let status = layout.snapshot_status(&mut bus).unwrap();
+
+        assert_eq!(bus.write_len, 0);
+        assert_eq!(status.raw_command(), CMD_RUN | CMD_EIE);
+        assert_eq!(status.raw_status(), STS_HALT | STS_HOST_SYSTEM_ERROR);
+        assert_eq!(status.raw_page_size(), PAGESIZE_4K | (1 << 2));
+        assert!(status.running());
+        assert!(!status.reset_requested());
+        assert!(status.interrupts_enabled());
+        assert!(status.halted());
+        assert!(status.host_system_error());
+        assert!(status.supports_4k_pages());
+        assert!(status.ring_programming_ready());
     }
 
     #[test]

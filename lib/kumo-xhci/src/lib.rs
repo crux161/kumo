@@ -2,6 +2,7 @@
 //j426
 //j429
 //j430
+//j431
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -21,7 +22,7 @@ pub use context::{
     endpoint_context_index, ContextSize, EndpointContext, EndpointType, InputControlContext,
     SlotContext, UsbSpeed,
 };
-pub use controller::{NoOpRegisterConfig, RegisterIo, RegisterLayout};
+pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
 pub use fdt::{
     discover_x13s_usb0_xhci, GicInterrupt, XhciControllerTopology,
     X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN, X13S_USB0_XHCI_MMIO_BASE, X13S_USB0_XHCI_MMIO_MIN_LEN,

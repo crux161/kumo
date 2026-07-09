@@ -3,12 +3,13 @@
 
 //j426
 //j430
+//j431
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_rt::{channel_read_with_handle, debug_write, process_exit, resource_mint_mmio, vmar_map};
 use kumo_xhci::{
-    portsc_offset, CapabilityRegisters, PortStatus, RegisterLayout, XhciProbeConfig,
-    XHCI_PROBE_CONFIG_LEN,
+    portsc_offset, CapabilityRegisters, ControllerStatus, PortStatus, RegisterLayout,
+    XhciProbeConfig, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -128,7 +129,14 @@ extern "C" fn main(
     log_hex(rtsoff as u64);
     log(b"\n");
     match RegisterLayout::new(caps.caplength(), dboff, rtsoff, config.mmio_length) {
-        Ok(layout) => log_layout(layout),
+        Ok(layout) => {
+            log_layout(layout);
+            log_controller_status(ControllerStatus::from_words(
+                read32(layout.command_offset()),
+                read32(layout.status_offset()),
+                read32(layout.page_size_offset()),
+            ));
+        }
         Err(_) => log(b"drv-xhci: layout outside grant\n"),
     }
 
@@ -185,6 +193,30 @@ fn log_layout(layout: RegisterLayout) {
     log_hex(layout.dcbaa_offset() as u64);
     log(b" ir0_erstsz=");
     log_hex(layout.interrupter0_erst_size_offset() as u64);
+    log(b"\n");
+}
+
+fn log_controller_status(status: ControllerStatus) {
+    log(b"drv-xhci: status usbcmd=");
+    log_hex(status.raw_command() as u64);
+    log(b" usbsts=");
+    log_hex(status.raw_status() as u64);
+    log(b" pagesize=");
+    log_hex(status.raw_page_size() as u64);
+    log(b" run=");
+    log_hex(status.running() as u64);
+    log(b" hcrst=");
+    log_hex(status.reset_requested() as u64);
+    log(b" hch=");
+    log_hex(status.halted() as u64);
+    log(b" cnr=");
+    log_hex(status.controller_not_ready() as u64);
+    log(b" hse=");
+    log_hex(status.host_system_error() as u64);
+    log(b" page4k=");
+    log_hex(status.supports_4k_pages() as u64);
+    log(b" ring_ready=");
+    log_hex(status.ring_programming_ready() as u64);
     log(b"\n");
 }
 
