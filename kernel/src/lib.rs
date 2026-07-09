@@ -4,6 +4,7 @@
 //j381
 //j421
 //j422
+//j427
 
 extern crate alloc;
 
@@ -239,6 +240,21 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             updates
         ),
         None => klog!("TLMM PINCTRL       Check     no i2c21 DTB plan      --\n"),
+    }
+
+    // Own the system MMU before userspace drivers touch DMA. The SC8280XP `apps_smmu` is an
+    // MMU-500 (SMMUv2); this puts it into a globally-enabled, all-streams-bypass state — KUMO
+    // holds the SMMU but every master (the live display included) still bypasses translation, so
+    // nothing regresses. Per-stream translation contexts (confining USB DMA behind stream 0x820,
+    // DESIGN/009) are a later slice. No-op on boards without an MMU-500 node (QEMU `virt`). — CORVUS
+    match kumo_hal::active::smmu_apps_bypass_from_dtb(boot.platform.dtb) {
+        Some(smmu) => klog!(
+            "APPS SMMU          Check     MMU-500 {:#x}  {} SMR bypass  scr0 {:#x}   OK\n",
+            smmu.base,
+            smmu.num_stream_map_groups,
+            smmu.scr0
+        ),
+        None => klog!("APPS SMMU          Check     no MMU-500 in DTB      --\n"),
     }
 
     // M3 (opening): run more than one thread of control. A couple of kernel threads

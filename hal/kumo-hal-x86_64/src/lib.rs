@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //j381
+//j427
 
 pub const ARCH: &str = "x86_64";
 
@@ -565,6 +566,20 @@ pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> b
 }
 
 pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
+    None
+}
+
+/// SMMU bring-up report, mirrored from the aarch64 backend so arch-generic kernel code names one
+/// type. There is no MMU-500 on the x86 backend; the bring-up is aarch64/X13s-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SmmuBypassReport {
+    pub base: u64,
+    pub num_stream_map_groups: u32,
+    pub num_context_banks: u32,
+    pub scr0: u32,
+}
+
+pub fn smmu_apps_bypass_from_dtb(_dtb: u64) -> Option<SmmuBypassReport> {
     None
 }
 

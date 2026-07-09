@@ -1,4 +1,5 @@
 //j397
+//j427
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +63,9 @@ pub const TLMM_GPIO_FLAGS_MASK: u32 = 0x000f_f000;
 pub enum IoMmuKind {
     Virtio = 1,
     SmmuV3 = 2,
+    /// ARM MMU-500 (SMMUv2) — the SC8280XP `apps_smmu` the X13s USB/display/etc. ride. A wholly
+    /// different programming model from SmmuV3 (Stream Match Registers → context banks).
+    SmmuV2 = 3,
 }
 
 #[repr(C)]

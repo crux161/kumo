@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //j381
+//j427
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -24,10 +25,10 @@ pub mod active {
         irq_unmask, map_user_device_block, map_user_page, monotonic_nanos, read_phys,
         read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once,
         run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
-        sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
-        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, El0Report, ThreadContext,
-        UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, smmu_apps_bypass_from_dtb, spin_once,
+        switch_context, sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
+        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, El0Report, SmmuBypassReport,
+        ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 
@@ -44,10 +45,10 @@ pub mod active {
         irq_unmask, map_user_device_block, map_user_page, monotonic_nanos, read_phys,
         read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once,
         run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_user_aspace_root, spin_once, switch_context,
-        sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
-        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, El0Report, ThreadContext,
-        UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        set_preempt_hook, set_svc_hook, set_user_aspace_root, smmu_apps_bypass_from_dtb, spin_once,
+        switch_context, sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
+        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, El0Report, SmmuBypassReport,
+        ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 
