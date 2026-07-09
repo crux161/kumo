@@ -1,5 +1,6 @@
 #![no_std]
 //j426
+//j429
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -8,6 +9,7 @@
 //! `DeviceCtx`; the future controller driver owns the unsafe register and DMA synchronization edge.
 
 mod context;
+mod controller;
 mod fdt;
 mod probe;
 mod registers;
@@ -18,6 +20,7 @@ pub use context::{
     endpoint_context_index, ContextSize, EndpointContext, EndpointType, InputControlContext,
     SlotContext, UsbSpeed,
 };
+pub use controller::{NoOpRegisterConfig, RegisterIo, RegisterLayout};
 pub use fdt::{
     discover_x13s_usb0_xhci, GicInterrupt, XhciControllerTopology,
     X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN, X13S_USB0_XHCI_MMIO_BASE, X13S_USB0_XHCI_MMIO_MIN_LEN,
@@ -42,4 +45,7 @@ pub enum Error {
     RingFull,
     CompletionNotPending,
     WrongRingType,
+    RegisterWindowTooSmall,
+    ControllerNotHalted,
+    ControllerNotReady,
 }
