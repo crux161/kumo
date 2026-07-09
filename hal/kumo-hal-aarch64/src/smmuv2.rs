@@ -1,4 +1,5 @@
 //j427
+//j428
 
 //! ARM SMMUv2 / MMU-500 model + bring-up (the X13s `apps_smmu`).
 //!
@@ -109,6 +110,14 @@ pub struct SmmuBypassReport {
 /// group invalid/bypass, invalidate the TLB, then write `sCR0`. Context-bank teardown is omitted
 /// deliberately — with every `SMRn` invalid and `USFCFG` clear no stream is ever routed to a
 /// context bank, so their state is unreachable until the per-stream-context slice programs them.
+///
+/// **DO NOT call on the X13s / any Qualcomm MMU-500 yet.** This is the *generic* `arm-smmu` reset.
+/// It is missing the Qualcomm impl (`arm-smmu-qcom.c` `qcom_smmu_cfg_probe`): on qcom the bootloader
+/// leaves the **continuous-splash display** stream programmed in an `SMRn`, and the qcom driver
+/// *preserves* those bootloader SMRs (plus reserves a context bank for the S2CR-bypass quirk).
+/// Blindly invalidating every SMR here wipes the display stream, so flipping `SMMUEN` blanks the
+/// panel and the board resets — this is exactly the j427 regression. Kept for host tests and as the
+/// spine of the future qcom-aware bring-up; gate any metal caller behind that work. — CORVUS j428
 pub fn global_bypass_init<IO: SmmuRegisterIo>(io: &mut IO, base: u64) -> SmmuBypassReport {
     // Clear any latched global fault (write-1-to-clear the bits we read).
     let gfsr = io.read(GR0_SGFSR);

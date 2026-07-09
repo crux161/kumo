@@ -5,6 +5,7 @@
 //j421
 //j422
 //j427
+//j428
 
 extern crate alloc;
 
@@ -242,17 +243,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         None => klog!("TLMM PINCTRL       Check     no i2c21 DTB plan      --\n"),
     }
 
-    // Own the system MMU before userspace drivers touch DMA. The SC8280XP `apps_smmu` is an
-    // MMU-500 (SMMUv2); this puts it into a globally-enabled, all-streams-bypass state — KUMO
-    // holds the SMMU but every master (the live display included) still bypasses translation, so
-    // nothing regresses. Per-stream translation contexts (confining USB DMA behind stream 0x820,
-    // DESIGN/009) are a later slice. No-op on boards without an MMU-500 node (QEMU `virt`). — CORVUS
-    match kumo_hal::active::smmu_apps_bypass_from_dtb(boot.platform.dtb) {
+    // Discover (only) the SC8280XP `apps_smmu` (MMU-500 / SMMUv2) from the DTB and log its window.
+    // This does NOT program the SMMU: j427's generic all-bypass enable reset the X13s — it wiped the
+    // bootloader's continuous-splash display stream (Qualcomm needs the arm-smmu-qcom preservation +
+    // S2CR-bypass-quirk handling before `SMMUEN` is safe). The real enable, and per-stream USB
+    // translation (DESIGN/009), are later slices. No-op without an MMU-500 node (QEMU `virt`). — CORVUS
+    match kumo_hal::active::smmu_apps_discover_from_dtb(boot.platform.dtb) {
         Some(smmu) => klog!(
-            "APPS SMMU          Check     MMU-500 {:#x}  {} SMR bypass  scr0 {:#x}   OK\n",
+            "APPS SMMU          Check     MMU-500 {:#x} win {:#x}  (discovery only)   OK\n",
             smmu.base,
-            smmu.num_stream_map_groups,
-            smmu.scr0
+            smmu.length
         ),
         None => klog!("APPS SMMU          Check     no MMU-500 in DTB      --\n"),
     }

@@ -1,19 +1,19 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j389
 //j397
 //j422
 //j423
 //j425
 //j427
+//j428
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
 pub mod smmuv2;
 pub mod smmuv3;
-pub use smmuv2::SmmuBypassReport;
+pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
 pub use smmuv3::{
     decode_smmuv3_fault_event, iommu_create_device_context, iommu_destroy_device_context,
     iommu_init, iommu_map_device_page, iommu_unmap_device_range, SmmuFaultEvent,
@@ -2733,36 +2733,23 @@ pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
     None
 }
 
-/// One MMU-500 GR0 register block, addressed through the TTBR1 physmap.
+/// Discover the X13s `apps_smmu` (MMU-500) from the DTB and return its register window. This does
+/// **not** touch the SMMU's registers — zero MMIO, zero display risk.
+///
+/// j427 also drove the SMMU to global-enable/all-bypass here and reset the X13s: the generic
+/// `arm_smmu_device_reset` blindly invalidates every `SMRn`, wiping the bootloader's continuous-
+/// splash display stream, and Qualcomm's plain-S2CR bypass is quirky (`arm-smmu-qcom.c`
+/// `qcom_smmu_cfg_probe`) — enabling `SMMUEN` blanked the panel and the board reset. Until the
+/// qcom-aware bring-up lands (preserve bootloader SMRs + the bypass-quirk context bank), the boot
+/// path only discovers/logs the controller. `None` off the X13s (e.g. QEMU `virt`). — CORVUS
 #[cfg(target_os = "none")]
-struct AppsSmmuMmio {
-    base: u64,
-}
-
-#[cfg(target_os = "none")]
-impl smmuv2::SmmuRegisterIo for AppsSmmuMmio {
-    fn read(&mut self, offset: usize) -> u32 {
-        unsafe { mmio_read32(mmio_phys(self.base + offset as u64)) }
-    }
-    fn write(&mut self, offset: usize, value: u32) {
-        unsafe { mmio_write32(mmio_phys(self.base + offset as u64), value) };
-    }
-}
-
-/// Discover the X13s `apps_smmu` (MMU-500) from the DTB and drive it into the all-streams-bypass,
-/// globally-enabled state (KUMO owns the SMMU; every stream still bypasses translation). Returns
-/// `None` on boards without an MMU-500 node (e.g. QEMU `virt`), so it is a no-op everywhere but the
-/// X13s. Per-stream translation contexts are a later slice. — CORVUS
-#[cfg(target_os = "none")]
-pub fn smmu_apps_bypass_from_dtb(dtb: u64) -> Option<SmmuBypassReport> {
+pub fn smmu_apps_discover_from_dtb(dtb: u64) -> Option<AppsSmmuTopology> {
     let bytes = unsafe { dtb_bytes(dtb)? };
-    let topo = smmuv2::discover_apps_smmu(bytes)?;
-    let mut io = AppsSmmuMmio { base: topo.base };
-    Some(smmuv2::global_bypass_init(&mut io, topo.base))
+    smmuv2::discover_apps_smmu(bytes)
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn smmu_apps_bypass_from_dtb(_dtb: u64) -> Option<SmmuBypassReport> {
+pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
     None
 }
 

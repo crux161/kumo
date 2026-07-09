@@ -3,6 +3,7 @@
 
 //j381
 //j427
+//j428
 
 pub const ARCH: &str = "x86_64";
 
@@ -569,17 +570,15 @@ pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
     None
 }
 
-/// SMMU bring-up report, mirrored from the aarch64 backend so arch-generic kernel code names one
-/// type. There is no MMU-500 on the x86 backend; the bring-up is aarch64/X13s-only.
+/// SMMU register window, mirrored from the aarch64 backend so arch-generic kernel code names one
+/// type. There is no MMU-500 on the x86 backend; SMMU discovery is aarch64/X13s-only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SmmuBypassReport {
+pub struct AppsSmmuTopology {
     pub base: u64,
-    pub num_stream_map_groups: u32,
-    pub num_context_banks: u32,
-    pub scr0: u32,
+    pub length: u64,
 }
 
-pub fn smmu_apps_bypass_from_dtb(_dtb: u64) -> Option<SmmuBypassReport> {
+pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
     None
 }
 
