@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
+//j434
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -45,7 +46,12 @@ const EFI_PAGE_SIZE: u64 = 4096;
 const EFI_ALLOCATE_ANY_PAGES: u32 = 0;
 
 /// Staged asset paths on the ESP (backslash-separated, as UEFI expects).
-const DTB_ESP_PATH: &str = "\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb";
+/// One image stages at most one DTB; the loader probes each known board path in order and
+/// takes the first that exists (PLAN_VII R1 added the RK3588 entry). — CORVUS
+const DTB_ESP_PATHS: &[&str] = &[
+    "\\EFI\\KUMO\\dtb\\qcom\\sc8280xp-lenovo-thinkpad-x13s.dtb",
+    "\\EFI\\KUMO\\dtb\\rockchip\\rk3588-orangepi-5-plus.dtb",
+];
 const KERNEL_ESP_PATH: &str = "\\EFI\\KUMO\\kernel\\kumo-kernel.elf";
 const INITRD_ESP_PATH: &str = "\\EFI\\KUMO\\initrd.img";
 
@@ -775,25 +781,28 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
 
 /// Resolve the DTB, returning `(phys_addr, len)` or `(0, 0)` if none is found.
 ///
-/// Preference order: (1) a DTB staged on the ESP at [`DTB_ESP_PATH`] — x13s ships its own,
-/// newer than the firmware's; (2) the firmware-provided DTB from the UEFI configuration table
-/// ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and other generic-UEFI boards supply
-/// their device tree, since they stage none on the ESP. The kept pool buffer / firmware blob
-/// is handed to the kernel via BootInfo.
+/// Preference order: (1) a DTB staged on the ESP at one of [`DTB_ESP_PATHS`] — the X13s and
+/// the Orange Pi 5 Plus ship their own, newer than the firmware's; (2) the firmware-provided
+/// DTB from the UEFI configuration table ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and
+/// other generic-UEFI boards supply their device tree, since they stage none on the ESP. The
+/// kept pool buffer / firmware blob is handed to the kernel via BootInfo.
 unsafe fn load_dtb(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
     con_out: *mut EfiSimpleTextOutputProtocol,
     system_table: *mut EfiSystemTable,
 ) -> (u64, u64) {
-    // (1) Staged ESP DTB takes priority.
-    if let Some((buffer, len)) = unsafe { read_esp_file(boot_services, root, DTB_ESP_PATH) } {
+    // (1) A staged ESP DTB takes priority; an image stages at most one of these paths.
+    for path in DTB_ESP_PATHS {
+        let Some((buffer, len)) = (unsafe { read_esp_file(boot_services, root, path) }) else {
+            continue;
+        };
         let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
         if is_fdt_magic(bytes) {
             kprint!(
                 con_out,
                 "device tree  : {} @ {:#x} ({} bytes)\r\n",
-                DTB_ESP_PATH,
+                path,
                 buffer as u64,
                 len
             );
@@ -801,7 +810,7 @@ unsafe fn load_dtb(
         }
         kprint!(
             con_out,
-            "device tree  : ESP FDT magic missing - trying firmware\r\n"
+            "device tree  : ESP FDT magic missing - trying next source\r\n"
         );
         unsafe { ((*boot_services).free_pool)(buffer) };
     }

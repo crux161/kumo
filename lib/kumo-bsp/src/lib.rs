@@ -1,4 +1,5 @@
 #![no_std]
+//j434
 
 //! `kumo-bsp` — the Board Support Package: the **runtime** board-specific parameters the
 //! generic arm64 kernel and HAL must not hardcode.
@@ -29,6 +30,8 @@ pub enum Board {
     ThinkPadX13sGen1,
     /// Raspberry Pi 5 (Broadcom BCM2712).
     RaspberryPi5,
+    /// Xunlong Orange Pi 5 Plus (Rockchip RK3588) — the PLAN_VII documented-silicon target.
+    OrangePi5Plus,
 }
 
 /// The early/boot console a board exposes before userspace drivers take over.
@@ -36,17 +39,30 @@ pub enum Board {
 pub enum Console {
     /// A PL011 UART at this MMIO physical base. The kernel's serial shell drives it directly.
     Pl011 { base: u64 },
+    /// A Synopsys DW-APB UART (16550-class) at this MMIO physical base, with 32-bit registers
+    /// at stride 4 (`reg-io-width = <4>`, `reg-shift = <2>`) — the Rockchip debug UART shape.
+    /// The HAL 8250 backend that drives it is PLAN_VII R3; until it lands this variant only
+    /// records the board fact.
+    Dw8250 { base: u64 },
     /// No usable early UART reachable at a known fixed base; the boot console paints the
     /// UEFI GOP framebuffer instead. Fault dumps go to the glass (see the HAL QR path).
     Framebuffer,
 }
 
 impl Console {
-    /// The PL011 base if this board boots on a UART, else `None` (framebuffer console).
+    /// The PL011 base if this board boots on a PL011, else `None`.
     pub const fn pl011_base(self) -> Option<u64> {
         match self {
             Console::Pl011 { base } => Some(base),
-            Console::Framebuffer => None,
+            Console::Dw8250 { .. } | Console::Framebuffer => None,
+        }
+    }
+
+    /// The DW-APB/16550-class base if this board boots on one, else `None`.
+    pub const fn dw8250_base(self) -> Option<u64> {
+        match self {
+            Console::Dw8250 { base } => Some(base),
+            Console::Pl011 { .. } | Console::Framebuffer => None,
         }
     }
 }
@@ -99,6 +115,15 @@ impl Board {
                 // BCM2712 uses GIC-400 (GICv2) — the known divergence from the GICv3 kernel.
                 gic: GicVersion::V2,
             },
+            Board::OrangePi5Plus => BoardSpec {
+                id: "orange-pi-5-plus",
+                // RK3588 debug UART: uart2 @ 0xfeb50000, snps,dw-apb-uart, boot-chain baud
+                // 1500000 (TRM part1 ch19; rk3588-base.dtsi). The accessible 3-pin header is
+                // the whole point of this board (PLAN_VII §0). — CORVUS
+                console: Console::Dw8250 { base: 0xfeb5_0000 },
+                // GIC600 (GICv3): GICD 0xfe600000, GICR 0xfe680000.
+                gic: GicVersion::V3,
+            },
         }
     }
 
@@ -113,6 +138,7 @@ impl Board {
             Board::QemuVirtAarch64,
             Board::ThinkPadX13sGen1,
             Board::RaspberryPi5,
+            Board::OrangePi5Plus,
         ]
         .into_iter()
         .find(|board| board.id() == id)
@@ -143,9 +169,22 @@ mod tests {
     #[test]
     fn pi5_records_the_gicv2_divergence() {
         assert_eq!(Board::RaspberryPi5.spec().gic, GicVersion::V2);
-        // The two currently-supported metal/test targets are GICv3.
+        // The other supported metal/test targets are GICv3.
         assert_eq!(Board::ThinkPadX13sGen1.spec().gic, GicVersion::V3);
         assert_eq!(Board::QemuVirtAarch64.spec().gic, GicVersion::V3);
+        assert_eq!(Board::OrangePi5Plus.spec().gic, GicVersion::V3);
+    }
+
+    #[test]
+    fn orange_pi_5_plus_boots_on_the_rk3588_debug_uart() {
+        // PLAN_VII R1: the RK3588 debug UART is uart2 @ 0xfeb50000, a DW-APB 16550-class
+        // device — NOT a PL011 — per TRM part1 ch19 and rk3588-base.dtsi.
+        let spec = Board::OrangePi5Plus.spec();
+        assert_eq!(spec.console, Console::Dw8250 { base: 0xfeb5_0000 });
+        assert_eq!(spec.console.dw8250_base(), Some(0xfeb5_0000));
+        assert_eq!(spec.console.pl011_base(), None);
+        // And the PL011 boards report no DW-APB base.
+        assert_eq!(Board::QemuVirtAarch64.spec().console.dw8250_base(), None);
     }
 
     #[test]
@@ -154,13 +193,17 @@ mod tests {
             Board::QemuVirtAarch64,
             Board::ThinkPadX13sGen1,
             Board::RaspberryPi5,
+            Board::OrangePi5Plus,
         ];
         for board in boards {
             assert_eq!(Board::from_id(board.id()), Some(board));
         }
         // Distinct ids.
-        assert_ne!(Board::QemuVirtAarch64.id(), Board::ThinkPadX13sGen1.id());
-        assert_ne!(Board::ThinkPadX13sGen1.id(), Board::RaspberryPi5.id());
+        for (i, a) in boards.iter().enumerate() {
+            for b in boards.iter().skip(i + 1) {
+                assert_ne!(a.id(), b.id());
+            }
+        }
         // Unknown id resolves to None.
         assert_eq!(Board::from_id("generic-uefi-x86_64"), None);
     }

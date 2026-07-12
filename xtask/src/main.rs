@@ -1,4 +1,5 @@
 //j426
+//j434
 
 use std::env;
 use std::fmt;
@@ -180,6 +181,11 @@ fn parse_hardware_target(value: &str) -> Result<HardwareTarget, String> {
         "rpi5" | "pi5" | "raspberry-pi-5" | "raspberrypi5" | "raspberry-pi5" => {
             Ok(HardwareTarget::RaspberryPi5)
         }
+        "opi5plus"
+        | "orange-pi-5-plus"
+        | "orangepi-5-plus"
+        | "orangepi5plus"
+        | "rk3588-orangepi-5-plus" => Ok(HardwareTarget::OrangePi5Plus),
         "generic-x86_64" | "generic-uefi-x86_64" | "x86_64" => {
             Ok(HardwareTarget::GenericUefiX86_64)
         }

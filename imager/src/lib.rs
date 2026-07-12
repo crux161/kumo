@@ -1,9 +1,17 @@
+//j434
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const X13S_DTB_SOURCE_PATH: &str = "sc8280xp-lenovo-thinkpad-x13s.dtb";
 pub const X13S_DTB_ESP_PATH: &str = "EFI/KUMO/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb";
 pub const X13S_DTB_COMPATIBLES: &[&str] = &["lenovo,thinkpad-x13s", "qcom,sc8280xp"];
+
+// Compiled from mainline `resources/linux/.../rockchip/rk3588-orangepi-5-plus.dts`
+// (cpp + dtc 1.8.1); provenance in JOURNAL/434. — CORVUS
+pub const OPI5PLUS_DTB_SOURCE_PATH: &str = "rk3588-orangepi-5-plus.dtb";
+pub const OPI5PLUS_DTB_ESP_PATH: &str = "EFI/KUMO/dtb/rockchip/rk3588-orangepi-5-plus.dtb";
+pub const OPI5PLUS_DTB_COMPATIBLES: &[&str] = &["xunlong,orangepi-5-plus", "rockchip,rk3588"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageArch {
@@ -34,6 +42,7 @@ pub enum HardwareTarget {
     ThinkPadX13sGen1,
     QemuVirtAarch64,
     RaspberryPi5,
+    OrangePi5Plus,
     GenericUefiX86_64,
 }
 
@@ -97,6 +106,23 @@ impl HardwareTarget {
                     "full boot past the ladder needs GIC-400/GICv2 support (kernel is GICv3 today)",
                 ],
             },
+            Self::OrangePi5Plus => HardwareProfile {
+                id: "orange-pi-5-plus",
+                name: "Xunlong Orange Pi 5 Plus",
+                arch: ImageArch::Aarch64,
+                soc: "Rockchip RK3588",
+                firmware: "UEFI (EDK2-rk3588 community port; U-Boot EFI fallback)",
+                interrupt_controller: "GIC600 (GICv3)",
+                early_console: "uart2 DW-APB @ 0xfeb50000, 1500000 baud; UEFI GOP on HDMI",
+                dtb_source_path: Some(OPI5PLUS_DTB_SOURCE_PATH),
+                dtb_path: Some(OPI5PLUS_DTB_ESP_PATH),
+                dtb_compatibles: OPI5PLUS_DTB_COMPATIBLES,
+                firmware_notes: &[
+                    "flash EDK2-rk3588 (or U-Boot with EFI) to the on-board SPI NOR",
+                    "KUMO image goes on SD/eMMC; SPI firmware stays put across iterations",
+                    "serial console needs a 3.3V adapter that speaks 1500000 baud (FTDI-class)",
+                ],
+            },
             Self::GenericUefiX86_64 => HardwareProfile {
                 id: "generic-uefi-x86_64",
                 name: "Generic x86_64 UEFI",
@@ -124,6 +150,7 @@ impl HardwareTarget {
             Self::ThinkPadX13sGen1 => Some(kumo_bsp::Board::ThinkPadX13sGen1),
             Self::QemuVirtAarch64 => Some(kumo_bsp::Board::QemuVirtAarch64),
             Self::RaspberryPi5 => Some(kumo_bsp::Board::RaspberryPi5),
+            Self::OrangePi5Plus => Some(kumo_bsp::Board::OrangePi5Plus),
             Self::GenericUefiX86_64 => None,
         }
     }
@@ -487,6 +514,32 @@ mod tests {
         assert!(summary.has_compatibles(X13S_DTB_COMPATIBLES));
     }
 
+    #[test]
+    fn orange_pi_5_plus_dtb_matches_hardware_contract() {
+        // PLAN_VII R1: the staged RK3588 DTB (compiled from mainline) must carry the board
+        // + SoC compatibles the loader/kernel will trust.
+        let bytes = fs::read(workspace_root().join(OPI5PLUS_DTB_SOURCE_PATH)).unwrap();
+        let summary = DtbSummary::parse(&bytes).unwrap();
+        assert_eq!(summary.version, 17);
+        assert_eq!(summary.total_size as usize, bytes.len());
+        assert_eq!(summary.model.as_deref(), Some("Xunlong Orange Pi 5 Plus"));
+        assert!(summary.has_compatibles(OPI5PLUS_DTB_COMPATIBLES));
+    }
+
+    #[test]
+    fn orange_pi_5_plus_profile_carries_dtb_contract() {
+        let plan = ImagePlan::new("/kumo", HardwareTarget::OrangePi5Plus);
+        assert_eq!(plan.arch, ImageArch::Aarch64);
+        assert_eq!(
+            plan.dtb_source_path,
+            Some(PathBuf::from("/kumo").join(OPI5PLUS_DTB_SOURCE_PATH))
+        );
+        assert_eq!(plan.dtb_path, Some(PathBuf::from(OPI5PLUS_DTB_ESP_PATH)));
+        assert!(plan
+            .manifest()
+            .contains("dtb_compatible=xunlong,orangepi-5-plus;rockchip,rk3588"));
+    }
+
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -508,6 +561,10 @@ mod tests {
             HardwareTarget::RaspberryPi5.board(),
             Some(kumo_bsp::Board::RaspberryPi5)
         );
+        assert_eq!(
+            HardwareTarget::OrangePi5Plus.board(),
+            Some(kumo_bsp::Board::OrangePi5Plus)
+        );
         assert_eq!(HardwareTarget::GenericUefiX86_64.board(), None);
     }
 
@@ -519,6 +576,7 @@ mod tests {
             HardwareTarget::ThinkPadX13sGen1,
             HardwareTarget::QemuVirtAarch64,
             HardwareTarget::RaspberryPi5,
+            HardwareTarget::OrangePi5Plus,
         ] {
             let board = target.board().expect("aarch64 target maps to a Board");
             assert_eq!(
