@@ -1,10 +1,13 @@
 //j441
+//j443
 
 //! Allocation-free ACPI root-table parsing.
 //!
 //! The caller owns physical-address translation. This module accepts bounded byte slices, validates
 //! every checksum and declared length before exposing fields, and returns the physical addresses that
 //! the next discovery layer may map. ACPI 6.3 §§5.2.5–5.2.8 are the governing format definitions.
+
+pub mod madt;
 
 pub const RSDP_V1_LEN: usize = 20;
 pub const RSDP_V2_MIN_LEN: usize = 36;
