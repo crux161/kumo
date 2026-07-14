@@ -1,6 +1,7 @@
 //j441
 //j443
 //j444
+//j445
 
 //! Allocation-free ACPI root-table parsing.
 //!
@@ -182,14 +183,9 @@ pub struct SdtHeader {
     pub revision: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DescriptionTable<'a> {
-    header: SdtHeader,
-    bytes: &'a [u8],
-}
-
-impl<'a> DescriptionTable<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, AcpiError> {
+impl SdtHeader {
+    /// Decode the fixed header before the caller maps the complete declared table.
+    pub fn parse(bytes: &[u8]) -> Result<Self, AcpiError> {
         require_len(bytes, SDT_HEADER_LEN)?;
         let length = read_u32(bytes, 4) as usize;
         if length < SDT_HEADER_LEN {
@@ -198,21 +194,31 @@ impl<'a> DescriptionTable<'a> {
                 minimum: SDT_HEADER_LEN,
             });
         }
-        require_len(bytes, length)?;
-        let bytes = &bytes[..length];
+        Ok(Self {
+            signature: read_array_4(bytes, 0),
+            length,
+            revision: bytes[8],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DescriptionTable<'a> {
+    header: SdtHeader,
+    bytes: &'a [u8],
+}
+
+impl<'a> DescriptionTable<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, AcpiError> {
+        let header = SdtHeader::parse(bytes)?;
+        require_len(bytes, header.length)?;
+        let bytes = &bytes[..header.length];
         if !checksum_is_zero(bytes) {
             return Err(AcpiError::InvalidChecksum(
                 ChecksumKind::SystemDescriptionTable,
             ));
         }
-        Ok(Self {
-            header: SdtHeader {
-                signature: read_array_4(bytes, 0),
-                length,
-                revision: bytes[8],
-            },
-            bytes,
-        })
+        Ok(Self { header, bytes })
     }
 
     pub const fn header(self) -> SdtHeader {
@@ -502,6 +508,31 @@ mod tests {
             Err(AcpiError::Truncated {
                 needed: 64,
                 available: SDT_HEADER_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_sdt_header_exposes_the_length_needed_for_mapping() {
+        let mut header = [0u8; SDT_HEADER_LEN];
+        header[..4].copy_from_slice(b"APIC");
+        header[4..8].copy_from_slice(&52u32.to_le_bytes());
+        header[8] = 5;
+        assert_eq!(
+            SdtHeader::parse(&header),
+            Ok(SdtHeader {
+                signature: *b"APIC",
+                length: 52,
+                revision: 5,
+            })
+        );
+
+        header[4..8].copy_from_slice(&35u32.to_le_bytes());
+        assert_eq!(
+            SdtHeader::parse(&header),
+            Err(AcpiError::InvalidLength {
+                length: 35,
+                minimum: SDT_HEADER_LEN,
             })
         );
     }

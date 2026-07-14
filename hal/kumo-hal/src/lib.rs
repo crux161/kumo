@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j427
 //j428
 //j435
 //j439
 //j444
+//j445
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -41,10 +41,10 @@ pub mod active {
     pub use kumo_hal_x86_64::{
         arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
-        configure_tlmm_gpio_interrupt, console_read_byte, console_use_physmap, discover_acpi_root,
-        early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry,
-        fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console, halt,
-        handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
+        configure_tlmm_gpio_interrupt, console_read_byte, console_use_physmap, discover_acpi_madt,
+        discover_acpi_root, early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen,
+        fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
+        halt, handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
         install_exception_vectors, iommu_create_device_context, iommu_destroy_device_context,
         iommu_init, iommu_map_device_page, iommu_unmap_device_range, irq_unmask,
         local_timer_irq_count, map_user_device_block, map_user_page, monotonic_nanos, read_phys,
@@ -53,8 +53,8 @@ pub mod active {
         set_preempt_hook, set_svc_hook, set_user_aspace_root, smmu_apps_discover_from_dtb,
         spin_once, switch_context, sync_icache_to_pou, syscall_count, timer_irq_count,
         user_device_page_desc, user_nc_page_desc, user_page_desc, wait_for_local_timer_irqs,
-        wait_for_timer_irqs, AcpiRootReport, AppsSmmuTopology, El0Report, ThreadContext, UserImage,
-        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        wait_for_timer_irqs, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology, El0Report,
+        ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 

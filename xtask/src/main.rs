@@ -1,8 +1,8 @@
-//j426
 //j434
 //j438
 //j439
 //j444
+//j445
 
 use std::env;
 use std::fmt;
@@ -1850,6 +1850,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
         &[
             b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
             b"ACPI TABLES        Check     RSDP",
+            b"ACPI MADT          Check     APIC",
             b"IDT / TOWER        Check     int3 caught + resumed",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
             b"x2APIC / TIMER    Check",
@@ -1875,7 +1876,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: ACPI RSDP found, int3 resumed, PIT and x2APIC delivered 3 ticks"
+        "KUMO x86 QEMU smoke green: ACPI RSDP/MADT found, int3 resumed, PIT and x2APIC delivered 3 ticks"
     );
     Ok(())
 }
@@ -1885,6 +1886,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
     for marker in [
         "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
         "ACPI TABLES        Check     RSDP",
+        "ACPI MADT          Check     APIC",
         "IDT / TOWER        Check     int3 caught + resumed",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
         "x2APIC / TIMER    Check",
@@ -2101,6 +2103,7 @@ mod x86_smoke_tests {
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
 ACPI TABLES        Check     RSDP 0x000f59d0 rev 2  XSDT 0x07fe1e98   OK\n\
+ACPI MADT          Check     APIC 0x07fe2100  LAPIC 0xfee00000  IOAPIC 1  ISO 0  PCAT true   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
 x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\

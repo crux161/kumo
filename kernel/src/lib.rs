@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j428
 //j435
 //j436
 //j439
 //j444
+//j445
 
 extern crate alloc;
 
@@ -693,7 +693,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
         }
     }
 
-    match kumo_hal::active::discover_acpi_root() {
+    let acpi_root = match kumo_hal::active::discover_acpi_root() {
         Some(acpi) => {
             let root = if acpi.uses_xsdt { "XSDT" } else { "RSDT" };
             klog!(
@@ -703,9 +703,25 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 root,
                 acpi.root_address
             );
+            acpi
         }
         None => {
             klog!("ACPI TABLES        Check     RSDP absent   FAIL\n");
+            kumo_hal::active::halt();
+        }
+    };
+
+    match kumo_hal::active::discover_acpi_madt(acpi_root) {
+        Some(madt) => klog!(
+            "ACPI MADT          Check     APIC {:#x}  LAPIC {:#x}  IOAPIC {}  ISO {}  PCAT {}   OK\n",
+            madt.address,
+            madt.local_interrupt_controller_address,
+            madt.io_apic_count,
+            madt.source_override_count,
+            madt.pcat_compatible
+        ),
+        None => {
+            klog!("ACPI MADT          Check     APIC absent or invalid   FAIL\n");
             kumo_hal::active::halt();
         }
     }

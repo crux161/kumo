@@ -1,18 +1,18 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j428
 //j435
 //j436
 //j439
 //j444
+//j445
 
 pub mod idt;
 mod legacy_irq;
 mod local_apic;
 mod platform_acpi;
 
-pub use platform_acpi::{discover_acpi_root, AcpiRootReport};
+pub use platform_acpi::{discover_acpi_madt, discover_acpi_root, AcpiMadtReport, AcpiRootReport};
 
 pub const ARCH: &str = "x86_64";
 
