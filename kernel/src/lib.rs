@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j447
 //j448
 //j449
 //j450
 //j451
+//j452
 
 extern crate alloc;
 
@@ -981,6 +981,46 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
             seen
         );
         kumo_hal::active::halt();
+    }
+
+    // j452: route the timer *through* the I/O APIC. The IDT (vec 0x31) is live and interrupts are
+    // enabled, so mask the PIC's IRQ0 (taking the PIT off vector 0x20), unmask the redirection entry
+    // written masked by j451, and wait for the j450 dispatcher's counter to advance from real,
+    // controller-delivered interrupts — the first non-software IOAPIC delivery.
+    if let Some(route) = madt.legacy_timer_route {
+        let before = kumo_hal::active::io_apic_timer_irq_count();
+        kumo_hal::active::mask_pic_timer_source();
+        match kumo_hal::active::unmask_boot_io_apic_timer(route) {
+            Some(applied) if applied.is_live_timer() => {
+                let seen = kumo_hal::active::wait_for_io_apic_timer_irqs(before, 3);
+                if seen >= 3 {
+                    klog!(
+                        "IOAPIC TIMER       Check     PIC IRQ0 masked  GSI {} vec {:#04x} unmasked  hb {}t via I/O APIC   OK\n",
+                        applied.plan.gsi,
+                        applied.plan.entry.vector,
+                        seen
+                    );
+                } else {
+                    klog!(
+                        "IOAPIC TIMER       Check     vec {:#04x} delivery timeout ({}t)   FAIL\n",
+                        applied.plan.entry.vector,
+                        seen
+                    );
+                    kumo_hal::active::halt();
+                }
+            }
+            Some(applied) => {
+                klog!(
+                    "IOAPIC TIMER       Check     entry not live  low {:#010x}   FAIL\n",
+                    applied.low_readback
+                );
+                kumo_hal::active::halt();
+            }
+            None => {
+                klog!("IOAPIC TIMER       Check     unmask unavailable   FAIL\n");
+                kumo_hal::active::halt();
+            }
+        }
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");

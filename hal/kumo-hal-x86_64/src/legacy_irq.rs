@@ -1,4 +1,5 @@
 //j436
+//j452
 
 #![cfg_attr(not(any(target_os = "none", test)), allow(dead_code))]
 
@@ -27,6 +28,10 @@ const MODE_8086: u8 = 0x01;
 const END_OF_INTERRUPT: u8 = 0x20;
 const PIT_CHANNEL0_RATE_GENERATOR: u8 = 0x34;
 const PIT_INPUT_HZ: u64 = 1_193_182;
+
+/// All primary-PIC lines masked. [`initialize_sequence`] leaves the primary at `0xfe` (only IRQ0
+/// live), so writing this masks IRQ0 while the already-masked lines stay masked. — CORVUS
+const PRIMARY_ALL_MASKED: u8 = 0xff;
 
 static TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
@@ -80,6 +85,12 @@ fn initialize_sequence<IO: PortIo>(io: &mut IO, setup: TimerSetup) {
     io.write8(PIT_CHANNEL0, (setup.divisor >> 8) as u8);
 }
 
+/// Mask IRQ0 on the primary PIC — take the PIT off the legacy vector 0x20 path so the I/O APIC
+/// redirection entry can own the timer without double delivery.
+fn mask_timer_source_sequence<IO: PortIo>(io: &mut IO) {
+    io.write8(PRIMARY_DATA, PRIMARY_ALL_MASKED);
+}
+
 fn acknowledge<IO: PortIo>(io: &mut IO, vector: u8) {
     let secondary_base = INTERRUPT_VECTOR_BASE + LEGACY_INTERRUPT_VECTORS / 2;
     if (secondary_base..INTERRUPT_VECTOR_BASE + LEGACY_INTERRUPT_VECTORS).contains(&vector) {
@@ -116,6 +127,11 @@ impl PortIo for HardwarePorts {
 pub(crate) fn initialize(setup: TimerSetup) {
     TIMER_INTERRUPTS.store(0, Ordering::Relaxed);
     initialize_sequence(&mut HardwarePorts, setup);
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn mask_timer_source() {
+    mask_timer_source_sequence(&mut HardwarePorts);
 }
 
 #[cfg(target_os = "none")]
@@ -214,6 +230,14 @@ mod tests {
                 (PIT_CHANNEL0, 0x2e),
             ]
         );
+    }
+
+    #[test]
+    fn masking_the_timer_source_masks_irq0_on_the_primary_pic() {
+        let mut io = RecordingIo::default();
+        mask_timer_source_sequence(&mut io);
+        // Only IRQ0 was live (0xfe) after init, so masking it fully masks the primary.
+        assert_eq!(io.recorded(), &[(PRIMARY_DATA, 0xff)]);
     }
 
     #[test]

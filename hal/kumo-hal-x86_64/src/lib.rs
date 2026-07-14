@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j447
 //j448
 //j449
 //j450
 //j451
+//j452
 
 pub mod idt;
 mod io_apic;
@@ -15,7 +15,8 @@ mod platform_acpi;
 
 pub use io_apic::{
     apply_boot_io_apic_timer, inspect_boot_io_apic, plan_boot_io_apic_timer,
-    IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied, IoApicTimerPlan,
+    unmask_boot_io_apic_timer, IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied,
+    IoApicTimerPlan,
 };
 pub use platform_acpi::{
     discover_acpi_madt, discover_acpi_root, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport,
@@ -457,6 +458,27 @@ pub fn probe_io_apic_timer_interrupt() {
             "int {vector}",
             vector = const io_apic::TIMER_VECTOR
         );
+    }
+}
+
+/// Mask IRQ0 on the legacy PIC so the PIT stops delivering through vector 0x20 — a precondition for
+/// unmasking the I/O APIC timer route so the timer is not delivered on two paths at once.
+pub fn mask_pic_timer_source() {
+    #[cfg(target_os = "none")]
+    legacy_irq::mask_timer_source();
+}
+
+/// Wait (bounded) for the I/O APIC timer vector to reach `start + needed` controller-delivered
+/// interrupts. The bound is a hang guard; the running local-APIC timer supplies the `hlt` beat.
+pub fn wait_for_io_apic_timer_irqs(start: u64, needed: u64) -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        io_apic::wait_for_timer_interrupts(start, needed, 1 << 12)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = start;
+        needed
     }
 }
 

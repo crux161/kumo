@@ -1,12 +1,13 @@
-//j447
 //j448
 //j449
 //j450
 //j451
+//j452
 
 //! Read-only inspection of the bootstrap I/O APIC, plus applying the masked first-light timer
 //! redirection entry (j451: write the two dwords, read both back; the entry stays masked and the
-//! PIC heartbeat is untouched — no interrupt is delivered).
+//! PIC heartbeat is untouched — no interrupt is delivered) and, once the PIC's IRQ0 is masked,
+//! unmasking that entry so the timer is delivered through the I/O APIC to vector 0x31 (j452).
 
 use crate::AcpiLegacyIrqRoute;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -130,6 +131,12 @@ impl IoApicTimerApplied {
             self.low_readback,
             self.high_readback,
         )
+    }
+
+    /// The route read back **unmasked** with the timer vector intact — i.e. it is now live and the
+    /// controller will deliver the timer to [`TIMER_VECTOR`].
+    pub fn is_live_timer(self) -> bool {
+        !self.stays_masked() && self.readback_entry().vector == TIMER_VECTOR
     }
 }
 
@@ -262,6 +269,56 @@ pub fn apply_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimer
     {
         // No MMIO off metal; host tests construct `IoApicTimerApplied` directly.
         None
+    }
+}
+
+/// Unmask the already-written timer redirection entry so the controller delivers the timer to
+/// [`TIMER_VECTOR`]. Rewrites only the low dword with the mask bit cleared (the high/destination
+/// dword was set by [`apply_boot_io_apic_timer`]), then reads both back.
+///
+/// After this the route is **live** — the caller MUST have masked the PIC's IRQ0 first, or the
+/// timer would be delivered on both the legacy and I/O APIC paths at once.
+pub fn unmask_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimerApplied> {
+    let plan = plan_boot_io_apic_timer(route)?;
+    #[cfg(target_os = "none")]
+    {
+        let address = route.candidate_io_apic_address;
+        let end = address.checked_add(IOWIN_OFFSET as u32 + 4)?;
+        if address < BOOT_IOAPIC_WINDOW
+            || end > BOOT_IOAPIC_WINDOW.checked_add(BOOT_IOAPIC_WINDOW_LEN)?
+        {
+            return None;
+        }
+        let base = address as usize;
+        let unmasked_low = plan.low_dword & !IOAPIC_MASKED;
+        unsafe { write_indirect(base, u32::from(plan.low_register), unmasked_low) };
+        let low_readback = unsafe { read_indirect(base, u32::from(plan.low_register)) };
+        let high_readback = unsafe { read_indirect(base, u32::from(plan.high_register)) };
+        Some(IoApicTimerApplied {
+            plan,
+            low_readback,
+            high_readback,
+        })
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
+}
+
+/// Wait (bounded) for the timer vector's delivery count to reach `start + needed`. `max_wakes`
+/// caps the `hlt` loop so a route that never delivers cannot hang forever — the still-running
+/// local-APIC timer provides the wake beat. Returns the deliveries observed.
+#[cfg(target_os = "none")]
+pub(crate) fn wait_for_timer_interrupts(start: u64, needed: u64, max_wakes: u64) -> u64 {
+    let mut wakes = 0u64;
+    loop {
+        let seen = timer_interrupt_count().saturating_sub(start);
+        if seen >= needed || wakes >= max_wakes {
+            return seen;
+        }
+        wakes += 1;
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
 }
 
@@ -484,6 +541,33 @@ mod tests {
             high_readback: plan.high_dword,
         };
         assert!(!applied.stays_masked());
+    }
+
+    #[test]
+    fn live_timer_requires_unmasked_and_the_timer_vector() {
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        // Unmasked with the timer vector -> live.
+        let live = IoApicTimerApplied {
+            plan,
+            low_readback: plan.low_dword & !IOAPIC_MASKED,
+            high_readback: plan.high_dword,
+        };
+        assert!(live.is_live_timer());
+        assert_eq!(live.readback_entry().vector, TIMER_VECTOR);
+        // Still masked -> not live.
+        let masked = IoApicTimerApplied {
+            plan,
+            low_readback: plan.low_dword,
+            high_readback: plan.high_dword,
+        };
+        assert!(!masked.is_live_timer());
+        // Unmasked but wrong vector -> not live.
+        let wrong_vector = IoApicTimerApplied {
+            plan,
+            low_readback: (plan.low_dword & !IOAPIC_MASKED & !0xff) | 0x40,
+            high_readback: plan.high_dword,
+        };
+        assert!(!wrong_vector.is_live_timer());
     }
 
     #[test]
