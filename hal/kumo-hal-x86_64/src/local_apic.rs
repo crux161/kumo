@@ -1,5 +1,6 @@
 //j439
 //j450
+//j454
 
 #![cfg_attr(not(any(target_os = "none", test)), allow(dead_code))]
 
@@ -205,6 +206,9 @@ pub(crate) fn handle(vector: u8) -> bool {
     }
     TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     acknowledge(&mut HardwareMsrs);
+    // Drive preemption after EOI (mirrors the aarch64 timer IRQ), so the installed scheduler tick
+    // runs once per canonical local-APIC timer interrupt. — CORVUS
+    crate::run_preempt_hook();
     true
 }
 

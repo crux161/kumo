@@ -1,8 +1,8 @@
-//j449
 //j450
 //j451
 //j452
 //j453
+//j454
 
 use std::env;
 use std::fmt;
@@ -1863,6 +1863,9 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
             b"IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK",
             b"TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK",
+            // The hook count trails non-deterministically (the hook fires async with the timer);
+            // match the deterministic prefix, which only appears on the OK path.
+            b"PREEMPT HOOK       Check     local APIC timer drives hook",
             b"x86_64 MUREX core online, first light reached; HALTING.",
         ],
         Duration::from_secs(5),
@@ -1884,7 +1887,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: local APIC timer elected canonical (I/O APIC route re-masked), int3 resumed, PIC/PIT then x2APIC then I/O APIC timer all proven"
+        "KUMO x86 QEMU smoke green: canonical local APIC timer drives the preempt hook (scheduler-tick parity), int3 resumed, PIC/PIT + x2APIC + I/O APIC timer all proven"
     );
     Ok(())
 }
@@ -1907,6 +1910,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
         "IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK",
         "TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK",
+        "PREEMPT HOOK       Check     local APIC timer drives hook",
         "x86_64 MUREX core online, first light reached; HALTING.",
     ] {
         if !text.contains(marker) {
@@ -2131,6 +2135,7 @@ x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   
 IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK\n\
 IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK\n\
 TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK\n\
+PREEMPT HOOK       Check     local APIC timer drives hook  3t  hook 3x   OK\n\
 x86_64 MUREX core online, first light reached; HALTING.\n";
 
     #[test]

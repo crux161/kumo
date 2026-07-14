@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j449
 //j450
 //j451
 //j452
 //j453
+//j454
 
 extern crate alloc;
 
@@ -1061,6 +1061,40 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 klog!("TIMER SOURCE       Check     re-mask unavailable   FAIL\n");
                 kumo_hal::active::halt();
             }
+        }
+    }
+
+    // j454: preempt-hook parity with the aarch64 spine. The canonical local APIC timer ISR now
+    // calls the installed preemption hook after EOI. Install a probe hook, wait for the timer to
+    // tick, and prove the hook fired in lockstep — the exact wiring a scheduler tick will ride once
+    // x86 joins the shared `stage_a`.
+    {
+        static PREEMPT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        extern "C" fn preempt_probe() {
+            PREEMPT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        let hook_before = PREEMPT_PROBE.load(core::sync::atomic::Ordering::Relaxed);
+        kumo_hal::active::set_preempt_hook(preempt_probe);
+        let tick_before = kumo_hal::active::local_timer_irq_count();
+        let ticks = kumo_hal::active::wait_for_local_timer_irqs(tick_before, 3);
+        kumo_hal::active::clear_preempt_hook();
+        let hooks = PREEMPT_PROBE
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .wrapping_sub(hook_before);
+        if ticks >= 3 && hooks >= 3 {
+            klog!(
+                "PREEMPT HOOK       Check     local APIC timer drives hook  {}t  hook {}x   OK\n",
+                ticks,
+                hooks
+            );
+        } else {
+            klog!(
+                "PREEMPT HOOK       Check     ticks {}  hook {} (want >=3 / >=3)   FAIL\n",
+                ticks,
+                hooks
+            );
+            kumo_hal::active::halt();
         }
     }
 

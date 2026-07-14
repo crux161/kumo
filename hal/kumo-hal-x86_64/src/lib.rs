@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j448
 //j449
 //j450
 //j451
 //j452
+//j454
 
 pub mod idt;
 mod io_apic;
@@ -482,13 +482,30 @@ pub fn wait_for_io_apic_timer_irqs(start: u64, needed: u64) -> u64 {
     }
 }
 
-pub fn set_preempt_hook(_hook: extern "C" fn()) {
-    // Timer-driven preemption is wired on the arm64 spine first. The x86_64 backend
-    // keeps this API symmetric for shared-kernel tests and the later parity milestone.
+/// A hook the local-APIC timer IRQ calls (after EOI) to drive preemptive scheduling. Raw
+/// `extern "C" fn()` address; 0 means none. Mirrors the aarch64 spine's `PREEMPT_HOOK`.
+static PREEMPT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the preemption hook (the scheduler tick). It runs in timer-IRQ context after the
+/// local-APIC EOI and may context-switch.
+pub fn set_preempt_hook(hook: extern "C" fn()) {
+    PREEMPT_HOOK.store(hook as usize, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Stop calling the preemption hook (back to plain timer ticks).
 pub fn clear_preempt_hook() {
-    // See `set_preempt_hook`.
+    PREEMPT_HOOK.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run the installed preemption hook, if any — called by the local-APIC timer ISR after EOI.
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn run_preempt_hook() {
+    let hook = PREEMPT_HOOK.load(core::sync::atomic::Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: only ever set from `set_preempt_hook` with a real `extern "C" fn()`.
+        let hook: extern "C" fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
 }
 
 /// Stub: P9-a interrupt-signal hook — arm64 spine first.
@@ -715,10 +732,37 @@ pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "x86_64");
+    }
+
+    static PROBE: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn probe() {
+        PROBE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn preempt_hook_runs_only_while_installed() {
+        // No hook installed -> running it does nothing.
+        PROBE.store(0, Ordering::Relaxed);
+        clear_preempt_hook();
+        run_preempt_hook();
+        assert_eq!(PROBE.load(Ordering::Relaxed), 0);
+
+        // Installed -> each run fires it exactly once.
+        set_preempt_hook(probe);
+        run_preempt_hook();
+        run_preempt_hook();
+        assert_eq!(PROBE.load(Ordering::Relaxed), 2);
+
+        // Cleared -> stops firing.
+        clear_preempt_hook();
+        run_preempt_hook();
+        assert_eq!(PROBE.load(Ordering::Relaxed), 2);
     }
 }
 
