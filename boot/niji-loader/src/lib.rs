@@ -1,6 +1,8 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+//j441
 
+pub mod acpi;
 pub mod elf;
 
 use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range, ABI_VERSION};
