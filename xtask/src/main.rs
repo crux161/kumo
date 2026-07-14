@@ -1,8 +1,8 @@
-//j439
 //j444
 //j445
 //j446
 //j447
+//j448
 
 use std::env;
 use std::fmt;
@@ -1853,6 +1853,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"ACPI MADT          Check     APIC",
             b"ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK",
             b"IOAPIC HW          Check     id 0  ver 0x20  entries 24  GSI 0-23 contains 2   OK",
+            b"IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high edge masked idle rirr 0   OK",
             b"IDT / TOWER        Check     int3 caught + resumed",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
             b"x2APIC / TIMER    Check",
@@ -1878,7 +1879,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: IOAPIC GSI range proved, int3 resumed, PIT and x2APIC delivered 3 ticks"
+        "KUMO x86 QEMU smoke green: IOAPIC timer entry observed, int3 resumed, PIT and x2APIC delivered 3 ticks"
     );
     Ok(())
 }
@@ -1891,6 +1892,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "ACPI MADT          Check     APIC",
         "ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK",
         "IOAPIC HW          Check     id 0  ver 0x20  entries 24  GSI 0-23 contains 2   OK",
+        "IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high edge masked idle rirr 0   OK",
         "IDT / TOWER        Check     int3 caught + resumed",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
         "x2APIC / TIMER    Check",
@@ -2110,6 +2112,7 @@ ACPI TABLES        Check     RSDP 0x000f59d0 rev 2  XSDT 0x07fe1e98   OK\n\
 ACPI MADT          Check     APIC 0x07fe2100  LAPIC 0xfee00000  IOAPIC 1  ISO 0  PCAT true   OK\n\
 ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK\n\
 IOAPIC HW          Check     id 0  ver 0x20  entries 24  GSI 0-23 contains 2   OK\n\
+IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high edge masked idle rirr 0   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
 x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\

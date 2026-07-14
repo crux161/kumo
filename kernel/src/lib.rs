@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j439
 //j444
 //j445
 //j446
 //j447
+//j448
 
 extern crate alloc;
 
@@ -753,7 +753,11 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 origin
             );
             match kumo_hal::active::inspect_boot_io_apic(route) {
-                Some(io_apic) if io_apic.id_matches_madt() && io_apic.contains_routed_gsi() => {
+                Some(io_apic)
+                    if io_apic.id_matches_madt()
+                        && io_apic.contains_routed_gsi()
+                        && io_apic.routed_entry.is_some() =>
+                {
                     klog!(
                         "IOAPIC HW          Check     id {}  ver {:#04x}  entries {}  GSI {}-{} contains {}   OK\n",
                         io_apic.hardware_id,
@@ -762,6 +766,38 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                         io_apic.gsi_base,
                         io_apic.gsi_end,
                         io_apic.routed_gsi
+                    );
+                    let entry = io_apic.routed_entry.unwrap();
+                    let destination_mode = if entry.logical_destination {
+                        "logical"
+                    } else {
+                        "physical"
+                    };
+                    let polarity = if entry.active_low { "low" } else { "high" };
+                    let trigger = if entry.level_triggered {
+                        "level"
+                    } else {
+                        "edge"
+                    };
+                    let mask = if entry.masked { "masked" } else { "unmasked" };
+                    let delivery = if entry.delivery_pending {
+                        "pending"
+                    } else {
+                        "idle"
+                    };
+                    klog!(
+                        "IOAPIC INPUT       Check     GSI {} pin {}  vec {:#04x} {} {} dest {}  {} {} {} {} rirr {}   OK\n",
+                        io_apic.routed_gsi,
+                        entry.input_pin,
+                        entry.vector,
+                        entry.delivery_mode_name(),
+                        destination_mode,
+                        entry.destination,
+                        polarity,
+                        trigger,
+                        mask,
+                        delivery,
+                        entry.remote_irr as u8
                     );
                 }
                 Some(io_apic) => {

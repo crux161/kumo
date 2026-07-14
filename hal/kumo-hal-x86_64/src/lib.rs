@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j439
 //j444
 //j445
 //j446
 //j447
+//j448
 
 pub mod idt;
 mod io_apic;
@@ -13,7 +13,7 @@ mod legacy_irq;
 mod local_apic;
 mod platform_acpi;
 
-pub use io_apic::{inspect_boot_io_apic, IoApicReport};
+pub use io_apic::{inspect_boot_io_apic, IoApicRedirectionEntry, IoApicReport};
 pub use platform_acpi::{
     discover_acpi_madt, discover_acpi_root, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport,
 };
