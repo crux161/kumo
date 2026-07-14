@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j446
 //j447
 //j448
 //j449
 //j450
+//j451
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -39,8 +39,8 @@ pub mod active {
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
-        complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
+        apply_boot_io_apic_timer, arch_name, build_user_tables, clean_dcache_to_poc,
+        clear_preempt_hook, complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_tlmm_gpio_interrupt, console_read_byte, console_use_physmap, discover_acpi_madt,
         discover_acpi_root, early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen,
         fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
@@ -56,8 +56,8 @@ pub mod active {
         sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
         user_nc_page_desc, user_page_desc, wait_for_local_timer_irqs, wait_for_timer_irqs,
         AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology, El0Report,
-        IoApicRedirectionEntry, IoApicReport, IoApicTimerPlan, ThreadContext, UserImage,
-        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied, IoApicTimerPlan, ThreadContext,
+        UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j446
 //j447
 //j448
 //j449
 //j450
+//j451
 
 pub mod idt;
 mod io_apic;
@@ -14,8 +14,8 @@ mod local_apic;
 mod platform_acpi;
 
 pub use io_apic::{
-    inspect_boot_io_apic, plan_boot_io_apic_timer, IoApicRedirectionEntry, IoApicReport,
-    IoApicTimerPlan,
+    apply_boot_io_apic_timer, inspect_boot_io_apic, plan_boot_io_apic_timer,
+    IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied, IoApicTimerPlan,
 };
 pub use platform_acpi::{
     discover_acpi_madt, discover_acpi_root, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport,

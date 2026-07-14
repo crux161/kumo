@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j446
 //j447
 //j448
 //j449
 //j450
+//j451
 
 extern crate alloc;
 
@@ -818,6 +818,41 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                                 plan.high_dword,
                                 plan.low_dword
                             );
+                            // j451: apply the masked route — write the destination (high) then the
+                            // vector (low) dword and read both back. The entry stays masked and the
+                            // PIC heartbeat is untouched, so nothing is delivered; this only stages
+                            // the redirection register for a later unmask + source-transition slice.
+                            match kumo_hal::active::apply_boot_io_apic_timer(route) {
+                                Some(applied)
+                                    if applied.matches_plan() && applied.stays_masked() =>
+                                {
+                                    klog!(
+                                        "IOAPIC WRITE       Check     GSI {} pin {}  wrote {:#010x}:{:#010x}  readback {:#010x}:{:#010x} masked   OK\n",
+                                        applied.plan.gsi,
+                                        applied.plan.entry.input_pin,
+                                        applied.plan.high_dword,
+                                        applied.plan.low_dword,
+                                        applied.high_readback,
+                                        applied.low_readback
+                                    );
+                                }
+                                Some(applied) => {
+                                    klog!(
+                                        "IOAPIC WRITE       Check     readback {:#010x}:{:#010x} != plan {:#010x}:{:#010x}   FAIL\n",
+                                        applied.high_readback,
+                                        applied.low_readback,
+                                        applied.plan.high_dword,
+                                        applied.plan.low_dword
+                                    );
+                                    kumo_hal::active::halt();
+                                }
+                                None => {
+                                    klog!(
+                                        "IOAPIC WRITE       Check     apply unavailable   FAIL\n"
+                                    );
+                                    kumo_hal::active::halt();
+                                }
+                            }
                         }
                         None => {
                             klog!(

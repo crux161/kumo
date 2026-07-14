@@ -2,8 +2,11 @@
 //j448
 //j449
 //j450
+//j451
 
-//! Read-only inspection of the bootstrap I/O APIC.
+//! Read-only inspection of the bootstrap I/O APIC, plus applying the masked first-light timer
+//! redirection entry (j451: write the two dwords, read both back; the entry stays masked and the
+//! PIC heartbeat is untouched — no interrupt is delivered).
 
 use crate::AcpiLegacyIrqRoute;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +90,47 @@ pub struct IoApicTimerPlan {
     pub low_dword: u32,
     pub high_dword: u32,
     pub entry: IoApicRedirectionEntry,
+}
+
+impl IoApicTimerPlan {
+    /// The indirect writes that apply this plan, **destination (high) before vector (low)**. The
+    /// entry stays masked throughout because `low_dword` already carries the mask bit.
+    pub const fn write_ops(self) -> [(u8, u32); 2] {
+        [
+            (self.high_register, self.high_dword),
+            (self.low_register, self.low_dword),
+        ]
+    }
+}
+
+/// The result of applying [`IoApicTimerPlan`]: the plan plus what the two dwords read back as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoApicTimerApplied {
+    pub plan: IoApicTimerPlan,
+    pub low_readback: u32,
+    pub high_readback: u32,
+}
+
+impl IoApicTimerApplied {
+    /// Both dwords read back exactly as planned (a masked, idle entry has no read-only status bits
+    /// set, so an exact compare is the honest check).
+    pub const fn matches_plan(self) -> bool {
+        self.low_readback == self.plan.low_dword && self.high_readback == self.plan.high_dword
+    }
+
+    /// The mask bit survived the write — this slice must never unmask the route.
+    pub const fn stays_masked(self) -> bool {
+        self.low_readback & IOAPIC_MASKED != 0
+    }
+
+    /// Decode what the controller actually holds now, from the read-back dwords.
+    pub fn readback_entry(self) -> IoApicRedirectionEntry {
+        decode_redirection_entry(
+            self.plan.entry.input_pin,
+            self.low_readback,
+            self.high_readback,
+        )
+    }
 }
 
 fn decode_registers(
@@ -183,6 +227,44 @@ pub fn plan_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimerP
     })
 }
 
+/// Apply the masked first-light timer route: write the destination (high) dword then the vector
+/// (low) dword, then read both back. The entry stays **masked** (the mask bit is part of
+/// `low_dword`) so no interrupt is delivered, and only IOREGSEL/IOWIN are touched — the PIC and
+/// its heartbeat are left exactly as they were. Returns the plan plus the read-back dwords.
+pub fn apply_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimerApplied> {
+    let plan = plan_boot_io_apic_timer(route)?;
+    #[cfg(target_os = "none")]
+    {
+        let address = route.candidate_io_apic_address;
+        let end = address.checked_add(IOWIN_OFFSET as u32 + 4)?;
+        if address < BOOT_IOAPIC_WINDOW
+            || end > BOOT_IOAPIC_WINDOW.checked_add(BOOT_IOAPIC_WINDOW_LEN)?
+        {
+            return None;
+        }
+
+        // Firmware-described address inside the bootstrap's identity-mapped 2 MiB window. The entry
+        // is programmed masked (high/destination first, then low/vector), so this delivers nothing;
+        // it only stages the route for a later unmask + source-transition slice. — CORVUS
+        let base = address as usize;
+        for (register, value) in plan.write_ops() {
+            unsafe { write_indirect(base, u32::from(register), value) };
+        }
+        let low_readback = unsafe { read_indirect(base, u32::from(plan.low_register)) };
+        let high_readback = unsafe { read_indirect(base, u32::from(plan.high_register)) };
+        Some(IoApicTimerApplied {
+            plan,
+            low_readback,
+            high_readback,
+        })
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        // No MMIO off metal; host tests construct `IoApicTimerApplied` directly.
+        None
+    }
+}
+
 #[cfg(any(target_os = "none", test))]
 fn dispatch_timer(vector: u8, acknowledge: impl FnOnce()) -> bool {
     if vector != TIMER_VECTOR {
@@ -238,6 +320,14 @@ unsafe fn read_indirect(base: usize, register: u32) -> u32 {
     unsafe {
         core::ptr::write_volatile((base + IOREGSEL_OFFSET) as *mut u32, register);
         core::ptr::read_volatile((base + IOWIN_OFFSET) as *const u32)
+    }
+}
+
+#[cfg(target_os = "none")]
+unsafe fn write_indirect(base: usize, register: u32, value: u32) {
+    unsafe {
+        core::ptr::write_volatile((base + IOREGSEL_OFFSET) as *mut u32, register);
+        core::ptr::write_volatile((base + IOWIN_OFFSET) as *mut u32, value);
     }
 }
 
@@ -344,6 +434,56 @@ mod tests {
         assert_eq!(plan.low_dword, 0x0001_a031);
         assert!(plan.entry.active_low);
         assert!(plan.entry.level_triggered);
+    }
+
+    #[test]
+    fn write_ops_program_destination_before_vector_and_stay_masked() {
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        // Destination (high, 0x15) first, then vector (low, 0x14).
+        assert_eq!(plan.write_ops(), [(0x15, 0x0000_0000), (0x14, 0x0001_0031)]);
+        // The low write carries the mask bit, so applying it delivers nothing.
+        assert_ne!(plan.write_ops()[1].1 & IOAPIC_MASKED, 0);
+    }
+
+    #[test]
+    fn applied_accepts_an_exact_masked_readback() {
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        let applied = IoApicTimerApplied {
+            plan,
+            low_readback: plan.low_dword,
+            high_readback: plan.high_dword,
+        };
+        assert!(applied.matches_plan());
+        assert!(applied.stays_masked());
+        let entry = applied.readback_entry();
+        assert_eq!(entry.vector, TIMER_VECTOR);
+        assert_eq!(entry.input_pin, 2);
+        assert!(entry.masked);
+        assert_eq!(entry.delivery_mode_name(), "fixed");
+    }
+
+    #[test]
+    fn applied_rejects_a_readback_that_differs_from_the_plan() {
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        // A single flipped vector bit must fail the exact compare.
+        let applied = IoApicTimerApplied {
+            plan,
+            low_readback: plan.low_dword ^ 1,
+            high_readback: plan.high_dword,
+        };
+        assert!(!applied.matches_plan());
+        assert!(applied.stays_masked());
+    }
+
+    #[test]
+    fn applied_detects_an_unmasked_readback() {
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        let applied = IoApicTimerApplied {
+            plan,
+            low_readback: plan.low_dword & !IOAPIC_MASKED,
+            high_readback: plan.high_dword,
+        };
+        assert!(!applied.stays_masked());
     }
 
     #[test]
