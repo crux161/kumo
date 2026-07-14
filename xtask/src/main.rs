@@ -1,5 +1,6 @@
 //j426
 //j434
+//j438
 
 use std::env;
 use std::fmt;
@@ -115,6 +116,7 @@ fn run() -> Result<(), String> {
             verify_arm64_qemu_boot_files(&boot)?;
             run_qemu_smoke_if_available(&boot)
         }
+        "x86-smoke" => run_x86_qemu_smoke(&root),
         "image" => image(&root, args.arch, hardware),
         "product" => {
             let products = build_products(&root)?;
@@ -1779,6 +1781,114 @@ fn run_qemu_serial_smoke(files: &Arm64QemuBootFiles) -> Result<(), String> {
     Ok(())
 }
 
+fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
+    if !command_exists("qemu-system-x86_64") {
+        return Err("qemu-system-x86_64 is required for the x86 smoke".to_owned());
+    }
+
+    let build_script = root.join("scripts/x86-multiboot.sh");
+    run_tool(root, "bash", &[path_arg(&build_script)?, "build"])?;
+
+    let kernel = root.join("target/x86_64-unknown-none/release/kumo-kernel.bin");
+    let kernel_len = fs::metadata(&kernel)
+        .map_err(|err| format!("metadata {}: {err}", kernel.display()))?
+        .len();
+    if kernel_len == 0 {
+        return Err(format!("{} is empty", kernel.display()));
+    }
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-kernel",
+            path_arg(&kernel)?,
+            "-m",
+            "128",
+            "-display",
+            "none",
+            "-no-reboot",
+            "-serial",
+            "stdio",
+            "-monitor",
+            "none",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn qemu-system-x86_64 x86 smoke: {err}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "x86 smoke stdout unavailable".to_owned())?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let smoke_result = read_serial_until(
+        &rx,
+        &mut transcript,
+        "x86 first-light proof",
+        &[
+            b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+            b"IDT / TOWER        Check     int3 caught + resumed",
+            b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
+            b"x86_64 MUREX core online, first light reached; HALTING.",
+        ],
+        Duration::from_secs(5),
+    )
+    .and_then(|()| validate_x86_smoke_transcript(&transcript));
+
+    stop_qemu_child(&mut child);
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    smoke_result.map_err(|err| {
+        if stderr.is_empty() {
+            err
+        } else {
+            format!("{err}\nqemu stderr:\n{stderr}")
+        }
+    })?;
+
+    println!("KUMO x86 QEMU smoke green: int3 resumed, IRQ0 delivered 3 ticks");
+    Ok(())
+}
+
+fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(transcript);
+    for marker in [
+        "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+        "IDT / TOWER        Check     int3 caught + resumed",
+        "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
+        "x86_64 MUREX core online, first light reached; HALTING.",
+    ] {
+        if !text.contains(marker) {
+            return Err(format!("x86 smoke transcript missing {marker:?}:\n{text}"));
+        }
+    }
+    if text.contains("FAIL") || text.contains("TOWER-x86: fatal exception") {
+        return Err(format!("x86 smoke transcript contains a failure:\n{text}"));
+    }
+    Ok(())
+}
+
 fn read_serial_until(
     rx: &Receiver<Vec<u8>>,
     transcript: &mut Vec<u8>,
@@ -1973,9 +2083,36 @@ mod fat32_image_tests {
     }
 }
 
+#[cfg(test)]
+mod x86_smoke_tests {
+    use super::validate_x86_smoke_transcript;
+
+    const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
+IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
+PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
+x86_64 MUREX core online, first light reached; HALTING.\n";
+
+    #[test]
+    fn x86_transcript_requires_both_live_interrupt_proofs() {
+        assert_eq!(validate_x86_smoke_transcript(GREEN.as_bytes()), Ok(()));
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("IRQ 0  hb 3t   OK", "IRQ 0  hb 2t   OK")
+                .as_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn x86_transcript_rejects_a_failure_even_after_first_light() {
+        let transcript = format!("{GREEN}TOWER-x86: fatal exception; HALT\n");
+        assert!(validate_x86_smoke_transcript(transcript.as_bytes()).is_err());
+    }
+}
+
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
     );
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
     println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
