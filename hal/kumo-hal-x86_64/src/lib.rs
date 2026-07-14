@@ -4,6 +4,9 @@
 //j381
 //j427
 //j428
+//j435
+
+pub mod idt;
 
 pub const ARCH: &str = "x86_64";
 
@@ -205,16 +208,9 @@ pub fn framebuffer_console_owned_by_kernel() -> bool {
 
 pub fn reclaim_framebuffer_console() {}
 
-/// P10-c: IDT deferred — BSS linker issue on x86_64 (non-zero bytes in .bss).
-// The IDT static triggers a linker error on x86_64-unknown-none. Revisit when
-// the target spec or linker script allows aligned statics in BSS.
-
-mod idt_dummy { /* placeholder — idt module removed to resolve BSS link error */
-}
-
 /// 16550 UART (COM1) early console for the freestanding x86_64 kernel.
 #[cfg(target_os = "none")]
-mod serial {
+pub(crate) mod serial {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     const COM1: u16 = 0x3F8;
@@ -416,10 +412,24 @@ pub fn syscall_count() -> u32 {
     0
 }
 
-/// P10-c: install a minimal x86_64 IDT with fault handlers that print exception
-/// info via serial and halt. Covers #DE, #UD, #PF, #GP, #DF.
+/// Install the x86_64 IDT ("the Tower"): all 32 CPU-exception vectors route to a common handler
+/// that reports vector/error/rip over COM1; fatal vectors halt, `#BP` resumes (j435, resolving the
+/// P10-c `.bss` blocker). External-interrupt vectors arrive with the PIC/APIC + timer slice.
 pub fn install_exception_vectors() {
-    // P10: IDT lands when BSS linker issue is resolved.
+    #[cfg(target_os = "none")]
+    idt::install();
+}
+
+/// How many CPU exceptions the Tower has fielded — a boot-time liveness proof for the IDT.
+pub fn exceptions_seen() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        idt::exceptions_seen()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
 }
 
 pub fn set_preempt_hook(_hook: extern "C" fn()) {

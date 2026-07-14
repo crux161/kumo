@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j381
 //j421
 //j422
 //j427
 //j428
+//j435
 
 extern crate alloc;
 
@@ -665,7 +665,7 @@ pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
 /// `main.rs`. This is the GRUB/Multiboot analog of the aarch64 Nijigumo handoff — it
 /// proves the loader → 32→64-bit → serial chain and reads the Multiboot memory info.
 /// `mbi` is the Multiboot1 info pointer, `magic` the boot magic (`0x2BADB002`). Full
-/// `stage_a` parity (x86 IDT/paging/timer) is a later slice; for now we report and halt.
+/// `stage_a` parity (x86 paging/timer/ring-3) is a later slice; j435 adds the IDT.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
     klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
@@ -690,6 +690,27 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 (mem_lower + mem_upper) / 1024
             );
         }
+    }
+
+    // The Tower, AMD64 edition (j435): own the fault path before anything else can trap silently.
+    // Install the IDT, then deliberately execute `int3` — a resumable breakpoint. The #BP handler
+    // reports over COM1 and returns; if the IDT is live we land back here and the counter reads 1.
+    // Before j435 this `int3` triple-faulted the machine into a reboot.
+    kumo_hal::active::install_exception_vectors();
+    klog!("IDT / TOWER        Check     32 CPU vectors installed\n");
+    let before = kumo_hal::active::exceptions_seen();
+    unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
+    let seen = kumo_hal::active::exceptions_seen().wrapping_sub(before);
+    if seen == 1 {
+        klog!(
+            "IDT / TOWER        Check     int3 caught + resumed  seen {}   OK\n",
+            seen
+        );
+    } else {
+        klog!(
+            "IDT / TOWER        Check     breakpoint not fielded (seen {})   FAIL\n",
+            seen
+        );
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");

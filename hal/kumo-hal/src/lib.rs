@@ -4,6 +4,7 @@
 //j381
 //j427
 //j428
+//j435
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -40,7 +41,7 @@ pub mod active {
         arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_tlmm_gpio_interrupt, console_read_byte, console_use_physmap, early_console_write,
-        el0_exit, enable_kernel_mmu, fb_fill, fb_geometry, fb_paint_band,
+        el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry, fb_paint_band,
         framebuffer_console_owned_by_kernel, freeze_console, halt, handoff_framebuffer_console,
         init_timer_interrupts, install_exception_vectors, iommu_create_device_context,
         iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
