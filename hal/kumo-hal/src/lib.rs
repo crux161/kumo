@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j381
 //j427
 //j428
 //j435
+//j439
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -43,14 +43,15 @@ pub mod active {
         configure_tlmm_gpio_interrupt, console_read_byte, console_use_physmap, early_console_write,
         el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry, fb_paint_band,
         framebuffer_console_owned_by_kernel, freeze_console, halt, handoff_framebuffer_console,
-        init_timer_interrupts, install_exception_vectors, iommu_create_device_context,
-        iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
-        irq_unmask, map_user_device_block, map_user_page, monotonic_nanos, read_phys,
-        read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once,
-        run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_user_aspace_root, smmu_apps_discover_from_dtb,
-        spin_once, switch_context, sync_icache_to_pou, syscall_count, timer_irq_count,
-        user_device_page_desc, user_nc_page_desc, user_page_desc, wait_for_timer_irqs,
+        init_local_timer_from_reference, init_timer_interrupts, install_exception_vectors,
+        iommu_create_device_context, iommu_destroy_device_context, iommu_init,
+        iommu_map_device_page, iommu_unmap_device_range, irq_unmask, local_timer_irq_count,
+        map_user_device_block, map_user_page, monotonic_nanos, read_phys, read_user_aspace_root,
+        reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once, run_el0_image,
+        run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
+        set_svc_hook, set_user_aspace_root, smmu_apps_discover_from_dtb, spin_once, switch_context,
+        sync_icache_to_pou, syscall_count, timer_irq_count, user_device_page_desc,
+        user_nc_page_desc, user_page_desc, wait_for_local_timer_irqs, wait_for_timer_irqs,
         AppsSmmuTopology, El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment,
         UserMapping, UserState, ARCH,
     };

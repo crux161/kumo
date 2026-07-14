@@ -1,5 +1,6 @@
 //j435
 //j436
+//j439
 
 //! x86_64 Interrupt Descriptor Table + CPU-exception handlers — "the Tower" for AMD64.
 //!
@@ -20,6 +21,10 @@
 //! j436 extends the same table and normalized frame through vectors 32..47 for the remapped legacy
 //! PIC. IRQ dispatch stays silent and delegates acknowledgement to `legacy_irq`, so a timer tick
 //! cannot re-enter the serial console while ordinary kernel logging is in progress. — KESTREL
+//!
+//! j439 extends the table through vector 63 for the x2APIC timer at 48 and its spurious vector at
+//! 63. Local-APIC dispatch precedes the legacy range and acknowledges only real timer interrupts.
+//! — KESTREL 2026-07-14
 
 /// One 16-byte x86_64 IDT gate descriptor (Intel SDM Vol.3 §6.14.1).
 #[repr(C)]
@@ -88,8 +93,8 @@ struct Idtr {
 pub const EXCEPTION_VECTORS: usize = 32;
 /// Number of remapped legacy PIC interrupt vectors.
 pub const LEGACY_INTERRUPT_VECTORS: usize = 16;
-/// Total live gates in the first-light IDT.
-pub const IDT_VECTORS: usize = EXCEPTION_VECTORS + LEGACY_INTERRUPT_VECTORS;
+/// Total live gates through the local-APIC spurious vector.
+pub const IDT_VECTORS: usize = 64;
 
 #[cfg(any(target_os = "none", test))]
 fn populated_idt(handlers: &[u64; IDT_VECTORS]) -> [IdtEntry64; IDT_VECTORS] {
@@ -171,6 +176,23 @@ mod metal {
         "isr45: push $0; push $45; jmp isr_common",
         "isr46: push $0; push $46; jmp isr_common",
         "isr47: push $0; push $47; jmp isr_common",
+        // --- local APIC timer + reserved first-light range + spurious vector ---
+        "isr48: push $0; push $48; jmp isr_common",
+        "isr49: push $0; push $49; jmp isr_common",
+        "isr50: push $0; push $50; jmp isr_common",
+        "isr51: push $0; push $51; jmp isr_common",
+        "isr52: push $0; push $52; jmp isr_common",
+        "isr53: push $0; push $53; jmp isr_common",
+        "isr54: push $0; push $54; jmp isr_common",
+        "isr55: push $0; push $55; jmp isr_common",
+        "isr56: push $0; push $56; jmp isr_common",
+        "isr57: push $0; push $57; jmp isr_common",
+        "isr58: push $0; push $58; jmp isr_common",
+        "isr59: push $0; push $59; jmp isr_common",
+        "isr60: push $0; push $60; jmp isr_common",
+        "isr61: push $0; push $61; jmp isr_common",
+        "isr62: push $0; push $62; jmp isr_common",
+        "isr63: push $0; push $63; jmp isr_common",
         // --- common dispatcher: save GPRs, call Rust, restore, drop [vector,errcode], iretq ---
         "isr_common:",
         "  push %rax",
@@ -224,6 +246,8 @@ mod metal {
         "  .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31",
         "  .quad isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39",
         "  .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47",
+        "  .quad isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55",
+        "  .quad isr56, isr57, isr58, isr59, isr60, isr61, isr62, isr63",
         options(att_syntax),
     );
 
@@ -267,6 +291,9 @@ mod metal {
     #[no_mangle]
     extern "C" fn x86_interrupt_dispatch(frame: *mut ExceptionFrame) {
         let frame = unsafe { &*frame };
+        if crate::local_apic::handle(frame.vector as u8) {
+            return;
+        }
         if frame.vector >= crate::legacy_irq::INTERRUPT_VECTOR_BASE as u64
             && frame.vector
                 < (crate::legacy_irq::INTERRUPT_VECTOR_BASE
@@ -376,17 +403,21 @@ mod tests {
     }
 
     #[test]
-    fn populated_table_covers_cpu_exceptions_and_legacy_interrupts() {
+    fn populated_table_covers_cpu_exceptions_and_interrupt_controllers() {
         let mut handlers = [0u64; IDT_VECTORS];
         for (index, handler) in handlers.iter_mut().enumerate() {
             *handler = 0x1000 + index as u64 * 0x10;
         }
 
         let idt = populated_idt(&handlers);
-        assert_eq!(idt.len(), 48);
+        assert_eq!(idt.len(), 64);
         assert_eq!(idt[EXCEPTION_VECTORS - 1].handler(), handlers[31]);
         assert_eq!(idt[EXCEPTION_VECTORS].handler(), handlers[32]);
-        assert_eq!(idt[IDT_VECTORS - 1].handler(), handlers[47]);
+        assert_eq!(
+            idt[crate::local_apic::TIMER_VECTOR as usize].handler(),
+            handlers[48]
+        );
+        assert_eq!(idt[IDT_VECTORS - 1].handler(), handlers[63]);
         assert!(idt.iter().all(|gate| gate.present()));
     }
 }

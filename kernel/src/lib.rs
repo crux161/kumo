@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j422
 //j427
 //j428
 //j435
 //j436
+//j439
 
 extern crate alloc;
 
@@ -698,7 +698,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
     // reports over COM1 and returns; if the IDT is live we land back here and the counter reads 1.
     // Before j435 this `int3` triple-faulted the machine into a reboot.
     kumo_hal::active::install_exception_vectors();
-    klog!("IDT / TOWER        Check     32 CPU + 16 IRQ vectors installed\n");
+    klog!("IDT / TOWER        Check     64 CPU/IRQ/APIC vectors installed\n");
     let before = kumo_hal::active::exceptions_seen();
     unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
     let seen = kumo_hal::active::exceptions_seen().wrapping_sub(before);
@@ -714,7 +714,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
         );
     }
 
-    match kumo_hal::active::init_timer_interrupts(0, 20) {
+    let reference_timer = match kumo_hal::active::init_timer_interrupts(0, 20) {
         Ok(timer) => {
             let start = kumo_hal::active::timer_irq_count();
             let seen = kumo_hal::active::wait_for_timer_irqs(start, 3, 1_000_000_000);
@@ -734,10 +734,41 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 );
                 kumo_hal::active::halt();
             }
+            timer
         }
         Err(err) => {
             klog!(
                 "PIC / PIT          Check     unavailable: {:?}   FAIL\n",
+                err
+            );
+            kumo_hal::active::halt();
+        }
+    };
+
+    match kumo_hal::active::init_local_timer_from_reference(reference_timer.period_hz, 20) {
+        Ok(timer) => {
+            let start = kumo_hal::active::local_timer_irq_count();
+            let seen = kumo_hal::active::wait_for_local_timer_irqs(start, 3);
+            if seen >= 3 {
+                klog!(
+                    "x2APIC / TIMER    Check     {} Hz calibrated  {} Hz tick  vec {}  hb {}t   OK\n",
+                    timer.counter_hz,
+                    timer.period_hz,
+                    timer.vector,
+                    seen
+                );
+            } else {
+                klog!(
+                    "x2APIC / TIMER    Check     vec {} heartbeat timeout ({}t)   FAIL\n",
+                    timer.vector,
+                    seen
+                );
+                kumo_hal::active::halt();
+            }
+        }
+        Err(err) => {
+            klog!(
+                "x2APIC / TIMER    Check     unavailable: {:?}   FAIL\n",
                 err
             );
             kumo_hal::active::halt();

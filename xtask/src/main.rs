@@ -1,6 +1,7 @@
 //j426
 //j434
 //j438
+//j439
 
 use std::env;
 use std::fmt;
@@ -1801,6 +1802,8 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
         .args([
             "-kernel",
             path_arg(&kernel)?,
+            "-cpu",
+            "qemu64,+x2apic",
             "-m",
             "128",
             "-display",
@@ -1847,6 +1850,8 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
             b"IDT / TOWER        Check     int3 caught + resumed",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
+            b"x2APIC / TIMER    Check",
+            b"20 Hz tick  vec 48  hb 3t   OK",
             b"x86_64 MUREX core online, first light reached; HALTING.",
         ],
         Duration::from_secs(5),
@@ -1867,7 +1872,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
         }
     })?;
 
-    println!("KUMO x86 QEMU smoke green: int3 resumed, IRQ0 delivered 3 ticks");
+    println!("KUMO x86 QEMU smoke green: int3 resumed, PIT and x2APIC delivered 3 ticks");
     Ok(())
 }
 
@@ -1877,6 +1882,8 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
         "IDT / TOWER        Check     int3 caught + resumed",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
+        "x2APIC / TIMER    Check",
+        "20 Hz tick  vec 48  hb 3t   OK",
         "x86_64 MUREX core online, first light reached; HALTING.",
     ] {
         if !text.contains(marker) {
@@ -2090,14 +2097,21 @@ mod x86_smoke_tests {
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
+x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\
 x86_64 MUREX core online, first light reached; HALTING.\n";
 
     #[test]
-    fn x86_transcript_requires_both_live_interrupt_proofs() {
+    fn x86_transcript_requires_all_live_interrupt_proofs() {
         assert_eq!(validate_x86_smoke_transcript(GREEN.as_bytes()), Ok(()));
         assert!(validate_x86_smoke_transcript(
             GREEN
                 .replace("IRQ 0  hb 3t   OK", "IRQ 0  hb 2t   OK")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("vec 48  hb 3t   OK", "vec 48  hb 2t   OK")
                 .as_bytes()
         )
         .is_err());

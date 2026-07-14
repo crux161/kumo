@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#j439
 # x86-multiboot.sh - build the x86_64 KUMO kernel as a Multiboot flat binary and (by
 # default) boot it under QEMU's built-in Multiboot loader. The same flat binary is what
 # GRUB's `multiboot` command loads (see boot/grub/grub.cfg).
@@ -36,4 +37,4 @@ if [ "$MODE" = "build" ]; then
 fi
 
 echo "booting under QEMU (Ctrl-A X to quit)..."
-exec qemu-system-x86_64 -kernel "$BIN" -m 128 -display none -no-reboot -serial stdio
+exec qemu-system-x86_64 -kernel "$BIN" -cpu qemu64,+x2apic -m 128 -display none -no-reboot -serial stdio

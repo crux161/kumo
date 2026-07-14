@@ -6,9 +6,11 @@
 //j428
 //j435
 //j436
+//j439
 
 pub mod idt;
 mod legacy_irq;
+mod local_apic;
 
 pub const ARCH: &str = "x86_64";
 
@@ -457,6 +459,8 @@ pub struct TimerIrqReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimerIrqError {
     BadPeriod,
+    Unsupported,
+    Calibration,
 }
 
 pub fn init_timer_interrupts(_dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
@@ -486,6 +490,53 @@ pub fn wait_for_timer_irqs(_start: u64, needed: u64, _timeout_ns: u64) -> u64 {
         // TSC/HPET calibration will make `timeout_ns` enforceable with the APIC timer lane.
         // HLT keeps the successful path idle between ticks. — KESTREL 2026-07-14
         legacy_irq::wait(_start, needed)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        needed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalTimerReport {
+    pub counter_hz: u64,
+    pub period_hz: u64,
+    pub vector: u32,
+}
+
+pub fn init_local_timer_from_reference(
+    reference_hz: u64,
+    period_hz: u64,
+) -> Result<LocalTimerReport, TimerIrqError> {
+    if reference_hz == 0 || period_hz == 0 {
+        return Err(TimerIrqError::BadPeriod);
+    }
+    #[cfg(target_os = "none")]
+    let setup = local_apic::initialize(reference_hz, period_hz).map_err(|err| match err {
+        local_apic::Error::Unsupported => TimerIrqError::Unsupported,
+        local_apic::Error::Calibration => TimerIrqError::Calibration,
+    })?;
+    #[cfg(not(target_os = "none"))]
+    let setup = local_apic::TimerSetup {
+        counter_hz: reference_hz,
+        period_hz,
+        initial_count: 1,
+    };
+    Ok(LocalTimerReport {
+        counter_hz: setup.counter_hz,
+        period_hz: setup.period_hz,
+        vector: u32::from(local_apic::TIMER_VECTOR),
+    })
+}
+
+pub fn local_timer_irq_count() -> u64 {
+    local_apic::count()
+}
+
+pub fn wait_for_local_timer_irqs(_start: u64, needed: u64) -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        local_apic::wait(_start, needed)
     }
     #[cfg(not(target_os = "none"))]
     {
