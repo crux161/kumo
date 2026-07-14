@@ -1,6 +1,7 @@
 //j435
 //j436
 //j439
+//j449
 
 //! x86_64 Interrupt Descriptor Table + CPU-exception handlers — "the Tower" for AMD64.
 //!
@@ -416,6 +417,10 @@ mod tests {
         assert_eq!(
             idt[crate::local_apic::TIMER_VECTOR as usize].handler(),
             handlers[48]
+        );
+        assert_eq!(
+            idt[crate::io_apic::TIMER_VECTOR as usize].handler(),
+            handlers[49]
         );
         assert_eq!(idt[IDT_VECTORS - 1].handler(), handlers[63]);
         assert!(idt.iter().all(|gate| gate.present()));

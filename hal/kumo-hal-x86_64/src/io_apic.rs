@@ -1,5 +1,6 @@
 //j447
 //j448
+//j449
 
 //! Read-only inspection of the bootstrap I/O APIC.
 
@@ -11,6 +12,14 @@ const IOAPIC_ID_REGISTER: u32 = 0x00;
 const IOAPIC_VERSION_REGISTER: u32 = 0x01;
 const IOAPIC_REDIRECTION_BASE: u32 = 0x10;
 const IOAPIC_LAST_INDIRECT_REGISTER: u32 = 0xff;
+const IOAPIC_MINIMUM_VECTOR: u8 = 0x10;
+const IOAPIC_MAXIMUM_VECTOR: u8 = 0xfe;
+const IOAPIC_POLARITY_ACTIVE_LOW: u32 = 1 << 13;
+const IOAPIC_TRIGGER_LEVEL: u32 = 1 << 15;
+const IOAPIC_MASKED: u32 = 1 << 16;
+
+pub(crate) const TIMER_VECTOR: u8 = 0x31;
+const BOOT_DESTINATION: u8 = 0;
 
 /// The one non-RAM window mapped by the Multiboot bootstrap page tables.
 const BOOT_IOAPIC_WINDOW: u32 = 0xfec0_0000;
@@ -66,6 +75,16 @@ impl IoApicRedirectionEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoApicTimerPlan {
+    pub gsi: u32,
+    pub low_register: u8,
+    pub high_register: u8,
+    pub low_dword: u32,
+    pub high_dword: u32,
+    pub entry: IoApicRedirectionEntry,
+}
+
 fn decode_registers(
     route: AcpiLegacyIrqRoute,
     id_register: u32,
@@ -112,6 +131,52 @@ fn decode_redirection_entry(input_pin: u8, low: u32, high: u32) -> IoApicRedirec
         masked: low & (1 << 16) != 0,
         destination: (high >> 24) as u8,
     }
+}
+
+fn encode_masked_fixed_physical(
+    vector: u8,
+    destination: u8,
+    active_low: bool,
+    level_triggered: bool,
+) -> Option<(u32, u32)> {
+    if !(IOAPIC_MINIMUM_VECTOR..=IOAPIC_MAXIMUM_VECTOR).contains(&vector) {
+        return None;
+    }
+    let mut low = u32::from(vector) | IOAPIC_MASKED;
+    if active_low {
+        low |= IOAPIC_POLARITY_ACTIVE_LOW;
+    }
+    if level_triggered {
+        low |= IOAPIC_TRIGGER_LEVEL;
+    }
+    Some((low, u32::from(destination) << 24))
+}
+
+/// Build, but do not apply, the masked first-light route for the legacy timer.
+pub fn plan_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimerPlan> {
+    let input_pin = route
+        .global_system_interrupt
+        .checked_sub(route.candidate_io_apic_gsi_base)?;
+    let low_register = IOAPIC_REDIRECTION_BASE.checked_add(input_pin.checked_mul(2)?)?;
+    let high_register = low_register.checked_add(1)?;
+    if high_register > IOAPIC_LAST_INDIRECT_REGISTER {
+        return None;
+    }
+    let input_pin = u8::try_from(input_pin).ok()?;
+    let (low_dword, high_dword) = encode_masked_fixed_physical(
+        TIMER_VECTOR,
+        BOOT_DESTINATION,
+        route.active_low,
+        route.level_triggered,
+    )?;
+    Some(IoApicTimerPlan {
+        gsi: route.global_system_interrupt,
+        low_register: low_register as u8,
+        high_register: high_register as u8,
+        low_dword,
+        high_dword,
+        entry: decode_redirection_entry(input_pin, low_dword, high_dword),
+    })
 }
 
 /// Read the ID and version registers without modifying any redirection entry.
@@ -221,5 +286,40 @@ mod tests {
         report.routed_gsi = 120;
         report.redirection_entries = 121;
         assert_eq!(redirection_registers(report), None);
+    }
+
+    #[test]
+    fn timer_plan_uses_a_free_installed_vector_and_stays_masked() {
+        assert!((TIMER_VECTOR as usize) < crate::idt::IDT_VECTORS);
+        assert!(
+            TIMER_VECTOR
+                >= crate::legacy_irq::INTERRUPT_VECTOR_BASE
+                    + crate::legacy_irq::LEGACY_INTERRUPT_VECTORS
+        );
+        assert_ne!(TIMER_VECTOR, crate::local_apic::TIMER_VECTOR);
+        assert_ne!(TIMER_VECTOR, crate::local_apic::SPURIOUS_VECTOR);
+
+        let plan = plan_boot_io_apic_timer(route(0, 2)).unwrap();
+        assert_eq!((plan.low_register, plan.high_register), (0x14, 0x15));
+        assert_eq!((plan.low_dword, plan.high_dword), (0x0001_0031, 0));
+        assert_eq!(plan.entry.input_pin, 2);
+        assert_eq!(plan.entry.vector, TIMER_VECTOR);
+        assert_eq!(plan.entry.delivery_mode_name(), "fixed");
+        assert!(!plan.entry.logical_destination);
+        assert_eq!(plan.entry.destination, 0);
+        assert!(!plan.entry.active_low);
+        assert!(!plan.entry.level_triggered);
+        assert!(plan.entry.masked);
+    }
+
+    #[test]
+    fn timer_plan_carries_acpi_polarity_and_trigger() {
+        let mut routed = route(24, 26);
+        routed.active_low = true;
+        routed.level_triggered = true;
+        let plan = plan_boot_io_apic_timer(routed).unwrap();
+        assert_eq!(plan.low_dword, 0x0001_a031);
+        assert!(plan.entry.active_low);
+        assert!(plan.entry.level_triggered);
     }
 }

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j444
 //j445
 //j446
 //j447
 //j448
+//j449
 
 extern crate alloc;
 
@@ -799,6 +799,33 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                         delivery,
                         entry.remote_irr as u8
                     );
+                    match kumo_hal::active::plan_boot_io_apic_timer(route) {
+                        Some(plan) => {
+                            let polarity = if plan.entry.active_low { "low" } else { "high" };
+                            let trigger = if plan.entry.level_triggered {
+                                "level"
+                            } else {
+                                "edge"
+                            };
+                            klog!(
+                                "IOAPIC PLAN        Check     GSI {} pin {}  vec {:#04x} fixed physical dest {}  {} {} masked  raw {:#010x}:{:#010x}   OK\n",
+                                plan.gsi,
+                                plan.entry.input_pin,
+                                plan.entry.vector,
+                                plan.entry.destination,
+                                polarity,
+                                trigger,
+                                plan.high_dword,
+                                plan.low_dword
+                            );
+                        }
+                        None => {
+                            klog!(
+                                "IOAPIC PLAN        Check     timer route not encodable   FAIL\n"
+                            );
+                            kumo_hal::active::halt();
+                        }
+                    }
                 }
                 Some(io_apic) => {
                     klog!(

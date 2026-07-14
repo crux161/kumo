@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j444
 //j445
 //j446
 //j447
 //j448
+//j449
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -48,14 +48,15 @@ pub mod active {
         inspect_boot_io_apic, install_exception_vectors, iommu_create_device_context,
         iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
         irq_unmask, local_timer_irq_count, map_user_device_block, map_user_page, monotonic_nanos,
-        read_phys, read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag,
-        render_qr_diag_once, run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer,
-        set_interrupt_hook, set_preempt_hook, set_svc_hook, set_user_aspace_root,
+        plan_boot_io_apic_timer, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
+        render_qr_diag, render_qr_diag_once, run_el0_image, run_el0_smoke, set_fault_hook,
+        set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook, set_user_aspace_root,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
         timer_irq_count, user_device_page_desc, user_nc_page_desc, user_page_desc,
         wait_for_local_timer_irqs, wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport,
         AcpiRootReport, AppsSmmuTopology, El0Report, IoApicRedirectionEntry, IoApicReport,
-        ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        IoApicTimerPlan, ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping,
+        UserState, ARCH,
     };
 }
 
