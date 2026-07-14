@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j445
 //j446
 //j447
 //j448
 //j449
+//j450
 
 extern crate alloc;
 
@@ -930,6 +930,22 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
             );
             kumo_hal::active::halt();
         }
+    }
+
+    let before = kumo_hal::active::io_apic_timer_irq_count();
+    kumo_hal::active::probe_io_apic_timer_interrupt();
+    let seen = kumo_hal::active::io_apic_timer_irq_count().wrapping_sub(before);
+    if seen == 1 {
+        klog!(
+            "IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen {}   OK\n",
+            seen
+        );
+    } else {
+        klog!(
+            "IOAPIC DISPATCH    Check     vec 0x31 software probe seen {}   FAIL\n",
+            seen
+        );
+        kumo_hal::active::halt();
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");

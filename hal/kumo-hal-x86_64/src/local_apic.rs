@@ -1,4 +1,5 @@
 //j439
+//j450
 
 #![cfg_attr(not(any(target_os = "none", test)), allow(dead_code))]
 
@@ -99,6 +100,11 @@ fn arm_periodic<IO: ApicIo>(io: &mut IO, setup: TimerSetup) {
 
 fn acknowledge<IO: ApicIo>(io: &mut IO) {
     io.write(END_OF_INTERRUPT, 0);
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn acknowledge_external() {
+    acknowledge(&mut HardwareMsrs);
 }
 
 #[cfg(target_os = "none")]

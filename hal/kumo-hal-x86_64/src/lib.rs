@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j445
 //j446
 //j447
 //j448
 //j449
+//j450
 
 pub mod idt;
 mod io_apic;
@@ -441,6 +441,22 @@ pub fn exceptions_seen() -> u64 {
     #[cfg(not(target_os = "none"))]
     {
         0
+    }
+}
+
+/// How many interrupts have reached the dedicated bootstrap I/O APIC timer vector.
+pub fn io_apic_timer_irq_count() -> u64 {
+    io_apic::timer_interrupt_count()
+}
+
+/// Exercise the installed I/O APIC timer vector without applying its masked route.
+pub fn probe_io_apic_timer_interrupt() {
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!(
+            "int {vector}",
+            vector = const io_apic::TIMER_VECTOR
+        );
     }
 }
 

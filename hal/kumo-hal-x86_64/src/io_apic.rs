@@ -1,10 +1,12 @@
 //j447
 //j448
 //j449
+//j450
 
 //! Read-only inspection of the bootstrap I/O APIC.
 
 use crate::AcpiLegacyIrqRoute;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const IOREGSEL_OFFSET: usize = 0x00;
 const IOWIN_OFFSET: usize = 0x10;
@@ -20,6 +22,8 @@ const IOAPIC_MASKED: u32 = 1 << 16;
 
 pub(crate) const TIMER_VECTOR: u8 = 0x31;
 const BOOT_DESTINATION: u8 = 0;
+
+static TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 
 /// The one non-RAM window mapped by the Multiboot bootstrap page tables.
 const BOOT_IOAPIC_WINDOW: u32 = 0xfec0_0000;
@@ -179,6 +183,25 @@ pub fn plan_boot_io_apic_timer(route: AcpiLegacyIrqRoute) -> Option<IoApicTimerP
     })
 }
 
+#[cfg(any(target_os = "none", test))]
+fn dispatch_timer(vector: u8, acknowledge: impl FnOnce()) -> bool {
+    if vector != TIMER_VECTOR {
+        return false;
+    }
+    TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    acknowledge();
+    true
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn handle(vector: u8) -> bool {
+    dispatch_timer(vector, crate::local_apic::acknowledge_external)
+}
+
+pub(crate) fn timer_interrupt_count() -> u64 {
+    TIMER_INTERRUPTS.load(Ordering::Relaxed)
+}
+
 /// Read the ID and version registers without modifying any redirection entry.
 pub fn inspect_boot_io_apic(route: AcpiLegacyIrqRoute) -> Option<IoApicReport> {
     #[cfg(target_os = "none")]
@@ -321,5 +344,19 @@ mod tests {
         assert_eq!(plan.low_dword, 0x0001_a031);
         assert!(plan.entry.active_low);
         assert!(plan.entry.level_triggered);
+    }
+
+    #[test]
+    fn timer_dispatch_counts_only_its_vector_and_acknowledges_once() {
+        let before = timer_interrupt_count();
+        let mut acknowledgements = 0;
+
+        assert!(!dispatch_timer(TIMER_VECTOR + 1, || acknowledgements += 1));
+        assert_eq!(timer_interrupt_count(), before);
+        assert_eq!(acknowledgements, 0);
+
+        assert!(dispatch_timer(TIMER_VECTOR, || acknowledgements += 1));
+        assert_eq!(timer_interrupt_count().wrapping_sub(before), 1);
+        assert_eq!(acknowledgements, 1);
     }
 }

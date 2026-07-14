@@ -1,8 +1,8 @@
-//j445
 //j446
 //j447
 //j448
 //j449
+//j450
 
 use std::env;
 use std::fmt;
@@ -1859,6 +1859,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
             b"x2APIC / TIMER    Check",
             b"20 Hz tick  vec 48  hb 3t   OK",
+            b"IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
             b"x86_64 MUREX core online, first light reached; HALTING.",
         ],
         Duration::from_secs(5),
@@ -1880,7 +1881,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: IOAPIC timer route planned, int3 resumed, PIT and x2APIC delivered 3 ticks"
+        "KUMO x86 QEMU smoke green: IOAPIC timer dispatch-safe, int3 resumed, PIT and x2APIC delivered 3 ticks"
     );
     Ok(())
 }
@@ -1899,6 +1900,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
         "x2APIC / TIMER    Check",
         "20 Hz tick  vec 48  hb 3t   OK",
+        "IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
         "x86_64 MUREX core online, first light reached; HALTING.",
     ] {
         if !text.contains(marker) {
@@ -2119,6 +2121,7 @@ IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high e
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
 x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\
+IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK\n\
 x86_64 MUREX core online, first light reached; HALTING.\n";
 
     #[test]

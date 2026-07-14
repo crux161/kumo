@@ -2,6 +2,7 @@
 //j436
 //j439
 //j449
+//j450
 
 //! x86_64 Interrupt Descriptor Table + CPU-exception handlers — "the Tower" for AMD64.
 //!
@@ -293,6 +294,9 @@ mod metal {
     extern "C" fn x86_interrupt_dispatch(frame: *mut ExceptionFrame) {
         let frame = unsafe { &*frame };
         if crate::local_apic::handle(frame.vector as u8) {
+            return;
+        }
+        if crate::io_apic::handle(frame.vector as u8) {
             return;
         }
         if frame.vector >= crate::legacy_irq::INTERRUPT_VECTOR_BASE as u64
