@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j448
 //j449
 //j450
 //j451
 //j452
+//j453
 
 extern crate alloc;
 
@@ -1018,6 +1018,47 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
             }
             None => {
                 klog!("IOAPIC TIMER       Check     unmask unavailable   FAIL\n");
+                kumo_hal::active::halt();
+            }
+        }
+    }
+
+    // j453: collapse to a single canonical timer. The PIT existed only to calibrate the local APIC
+    // timer (local_apic.rs), and j451/j452 proved the I/O APIC timer route end to end. Now elect the
+    // local APIC timer (vec 0x30) as the sole tick and re-mask the I/O APIC route: re-apply the
+    // masked entry, then prove the local timer keeps ticking on its own while the I/O APIC timer
+    // count stays frozen. The I/O APIC itself stays live for real device interrupts later.
+    if let Some(route) = madt.legacy_timer_route {
+        match kumo_hal::active::apply_boot_io_apic_timer(route) {
+            Some(remask) if remask.matches_plan() && remask.stays_masked() => {
+                let local_before = kumo_hal::active::local_timer_irq_count();
+                let io_before = kumo_hal::active::io_apic_timer_irq_count();
+                let local_seen = kumo_hal::active::wait_for_local_timer_irqs(local_before, 3);
+                let io_seen = kumo_hal::active::io_apic_timer_irq_count().wrapping_sub(io_before);
+                if local_seen >= 3 && io_seen == 0 {
+                    klog!(
+                        "TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb {}t  ioapic +{}   OK\n",
+                        local_seen,
+                        io_seen
+                    );
+                } else {
+                    klog!(
+                        "TIMER SOURCE       Check     local {}t  ioapic +{} (want 3 / 0)   FAIL\n",
+                        local_seen,
+                        io_seen
+                    );
+                    kumo_hal::active::halt();
+                }
+            }
+            Some(remask) => {
+                klog!(
+                    "TIMER SOURCE       Check     re-mask readback {:#010x} not masked   FAIL\n",
+                    remask.low_readback
+                );
+                kumo_hal::active::halt();
+            }
+            None => {
+                klog!("TIMER SOURCE       Check     re-mask unavailable   FAIL\n");
                 kumo_hal::active::halt();
             }
         }
