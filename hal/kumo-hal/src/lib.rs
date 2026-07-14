@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j428
 //j435
 //j439
 //j444
 //j445
+//j446
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -53,8 +53,9 @@ pub mod active {
         set_preempt_hook, set_svc_hook, set_user_aspace_root, smmu_apps_discover_from_dtb,
         spin_once, switch_context, sync_icache_to_pou, syscall_count, timer_irq_count,
         user_device_page_desc, user_nc_page_desc, user_page_desc, wait_for_local_timer_irqs,
-        wait_for_timer_irqs, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology, El0Report,
-        ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
+        El0Report, ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping,
+        UserState, ARCH,
     };
 }
 

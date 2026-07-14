@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j435
 //j436
 //j439
 //j444
 //j445
+//j446
 
 extern crate alloc;
 
@@ -711,17 +711,50 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
         }
     };
 
-    match kumo_hal::active::discover_acpi_madt(acpi_root) {
-        Some(madt) => klog!(
+    let madt = match kumo_hal::active::discover_acpi_madt(acpi_root) {
+        Some(madt) => {
+            klog!(
             "ACPI MADT          Check     APIC {:#x}  LAPIC {:#x}  IOAPIC {}  ISO {}  PCAT {}   OK\n",
             madt.address,
             madt.local_interrupt_controller_address,
             madt.io_apic_count,
             madt.source_override_count,
             madt.pcat_compatible
-        ),
+            );
+            madt
+        }
         None => {
             klog!("ACPI MADT          Check     APIC absent or invalid   FAIL\n");
+            kumo_hal::active::halt();
+        }
+    };
+
+    match madt.legacy_timer_route {
+        Some(route) => {
+            let polarity = if route.active_low { "low" } else { "high" };
+            let trigger = if route.level_triggered {
+                "level"
+            } else {
+                "edge"
+            };
+            let origin = if route.overridden {
+                "override"
+            } else {
+                "identity"
+            };
+            klog!(
+                "ACPI IRQ ROUTE     Check     ISA IRQ {} -> GSI {}  IOAPIC {:#x} base {}  {} {}  {} candidate   OK\n",
+                route.isa_irq,
+                route.global_system_interrupt,
+                route.candidate_io_apic_address,
+                route.candidate_io_apic_gsi_base,
+                polarity,
+                trigger,
+                origin
+            );
+        }
+        None => {
+            klog!("ACPI IRQ ROUTE     Check     ISA IRQ 0 unresolved   FAIL\n");
             kumo_hal::active::halt();
         }
     }

@@ -1,12 +1,13 @@
 //j444
 //j445
+//j446
 
 //! Legacy IA-PC ACPI discovery windows.
 
 #[cfg(target_os = "none")]
 use niji_loader::acpi::find_rsdp;
 #[cfg(any(target_os = "none", test))]
-use niji_loader::acpi::madt::{Madt, MadtEntry};
+use niji_loader::acpi::madt::{InterruptPolarity, InterruptTriggerMode, Madt, MadtEntry};
 #[cfg(target_os = "none")]
 use niji_loader::acpi::{RootTable, SdtHeader, SDT_HEADER_LEN};
 use niji_loader::acpi::{RootTableKind, RsdpLocation};
@@ -43,6 +44,18 @@ pub struct AcpiMadtReport {
     pub first_io_apic_address: Option<u32>,
     pub first_io_apic_gsi_base: Option<u32>,
     pub source_override_count: usize,
+    pub legacy_timer_route: Option<AcpiLegacyIrqRoute>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcpiLegacyIrqRoute {
+    pub isa_irq: u8,
+    pub global_system_interrupt: u32,
+    pub active_low: bool,
+    pub level_triggered: bool,
+    pub overridden: bool,
+    pub candidate_io_apic_address: u32,
+    pub candidate_io_apic_gsi_base: u32,
 }
 
 impl From<RsdpLocation> for AcpiRootReport {
@@ -138,6 +151,31 @@ fn summarize_madt(address: u64, bytes: &[u8]) -> Option<AcpiMadtReport> {
             MadtEntry::Other { .. } => {}
         }
     }
+    let legacy_timer_route = madt.legacy_irq_route(0).ok().and_then(|route| {
+        let mut candidate = None;
+        for entry in madt.entries() {
+            let MadtEntry::IoApic(io_apic) = entry else {
+                continue;
+            };
+            if io_apic.global_system_interrupt_base <= route.global_system_interrupt
+                && candidate.is_none_or(|current: niji_loader::acpi::madt::IoApic| {
+                    io_apic.global_system_interrupt_base > current.global_system_interrupt_base
+                })
+            {
+                candidate = Some(io_apic);
+            }
+        }
+        let candidate = candidate?;
+        Some(AcpiLegacyIrqRoute {
+            isa_irq: route.isa_irq,
+            global_system_interrupt: route.global_system_interrupt,
+            active_low: route.polarity == InterruptPolarity::ActiveLow,
+            level_triggered: route.trigger_mode == InterruptTriggerMode::Level,
+            overridden: route.overridden,
+            candidate_io_apic_address: candidate.address,
+            candidate_io_apic_gsi_base: candidate.global_system_interrupt_base,
+        })
+    });
     Some(AcpiMadtReport {
         address,
         local_interrupt_controller_address: madt.local_interrupt_controller_address(),
@@ -146,6 +184,7 @@ fn summarize_madt(address: u64, bytes: &[u8]) -> Option<AcpiMadtReport> {
         first_io_apic_address,
         first_io_apic_gsi_base,
         source_override_count,
+        legacy_timer_route,
     })
 }
 
@@ -188,7 +227,7 @@ mod tests {
 
     #[test]
     fn madt_summary_uses_the_existing_record_decoder() {
-        const LEN: usize = niji_loader::acpi::madt::MADT_HEADER_LEN + 22;
+        const LEN: usize = niji_loader::acpi::madt::MADT_HEADER_LEN + 34;
         let mut bytes = [0u8; LEN];
         bytes[..4].copy_from_slice(b"APIC");
         bytes[4..8].copy_from_slice(&(LEN as u32).to_le_bytes());
@@ -196,7 +235,8 @@ mod tests {
         bytes[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
         bytes[40..44].copy_from_slice(&1u32.to_le_bytes());
         bytes[44..56].copy_from_slice(&[1, 12, 7, 0, 0x00, 0x00, 0xc0, 0xfe, 0, 0, 0, 0]);
-        bytes[56..].copy_from_slice(&[2, 10, 0, 0, 2, 0, 0, 0, 0, 0]);
+        bytes[56..68].copy_from_slice(&[1, 12, 8, 0, 0x00, 0x10, 0xc0, 0xfe, 24, 0, 0, 0]);
+        bytes[68..].copy_from_slice(&[2, 10, 0, 0, 26, 0, 0, 0, 0, 0]);
         let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
         bytes[9] = 0u8.wrapping_sub(sum);
 
@@ -206,10 +246,19 @@ mod tests {
                 address: 0x7fe2_1000,
                 local_interrupt_controller_address: 0xfee0_0000,
                 pcat_compatible: true,
-                io_apic_count: 1,
+                io_apic_count: 2,
                 first_io_apic_address: Some(0xfec0_0000),
                 first_io_apic_gsi_base: Some(0),
                 source_override_count: 1,
+                legacy_timer_route: Some(AcpiLegacyIrqRoute {
+                    isa_irq: 0,
+                    global_system_interrupt: 26,
+                    active_low: false,
+                    level_triggered: false,
+                    overridden: true,
+                    candidate_io_apic_address: 0xfec0_1000,
+                    candidate_io_apic_gsi_base: 24,
+                }),
             })
         );
     }

@@ -1,4 +1,5 @@
 //j443
+//j446
 
 //! Multiple APIC Description Table records needed to route legacy interrupt sources.
 //!
@@ -43,6 +44,24 @@ pub enum MadtError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyIrqRouteError {
+    NonIsaBus { source: u8, bus: u8 },
+    DuplicateOverride { source: u8 },
+    ReservedFlagBits { source: u8, flags: u16 },
+    ReservedPolarity { source: u8 },
+    ReservedTriggerMode { source: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyIrqRoute {
+    pub isa_irq: u8,
+    pub global_system_interrupt: u32,
+    pub polarity: InterruptPolarity,
+    pub trigger_mode: InterruptTriggerMode,
+    pub overridden: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Madt<'a> {
     table: DescriptionTable<'a>,
 }
@@ -78,6 +97,72 @@ impl<'a> Madt<'a> {
         MadtEntries {
             remaining: &self.table.bytes()[MADT_HEADER_LEN..],
         }
+    }
+
+    /// Resolve one ISA IRQ through its optional MADT override.
+    ///
+    /// ACPI 6.3 §5.2.12.5 defines absent overrides as identity mappings. MPS flag values that
+    /// conform to ISA resolve to active-high, edge-triggered inputs.
+    pub fn legacy_irq_route(self, source: u8) -> Result<LegacyIrqRoute, LegacyIrqRouteError> {
+        let mut selected = None;
+        for entry in self.entries() {
+            let MadtEntry::InterruptSourceOverride(override_entry) = entry else {
+                continue;
+            };
+            if override_entry.source != source {
+                continue;
+            }
+            if override_entry.bus != 0 {
+                return Err(LegacyIrqRouteError::NonIsaBus {
+                    source,
+                    bus: override_entry.bus,
+                });
+            }
+            if selected.replace(override_entry).is_some() {
+                return Err(LegacyIrqRouteError::DuplicateOverride { source });
+            }
+        }
+
+        let Some(override_entry) = selected else {
+            return Ok(LegacyIrqRoute {
+                isa_irq: source,
+                global_system_interrupt: u32::from(source),
+                polarity: InterruptPolarity::ActiveHigh,
+                trigger_mode: InterruptTriggerMode::Edge,
+                overridden: false,
+            });
+        };
+        if !override_entry.flags.reserved_bits_are_zero() {
+            return Err(LegacyIrqRouteError::ReservedFlagBits {
+                source,
+                flags: override_entry.flags.0,
+            });
+        }
+        let polarity = match override_entry.flags.polarity() {
+            InterruptPolarity::Conforms | InterruptPolarity::ActiveHigh => {
+                InterruptPolarity::ActiveHigh
+            }
+            InterruptPolarity::ActiveLow => InterruptPolarity::ActiveLow,
+            InterruptPolarity::Reserved => {
+                return Err(LegacyIrqRouteError::ReservedPolarity { source });
+            }
+        };
+        let trigger_mode = match override_entry.flags.trigger_mode() {
+            InterruptTriggerMode::Conforms | InterruptTriggerMode::Edge => {
+                InterruptTriggerMode::Edge
+            }
+            InterruptTriggerMode::Level => InterruptTriggerMode::Level,
+            InterruptTriggerMode::Reserved => {
+                return Err(LegacyIrqRouteError::ReservedTriggerMode { source });
+            }
+        };
+        Ok(LegacyIrqRoute {
+            isa_irq: source,
+            global_system_interrupt: override_entry.global_system_interrupt,
+            polarity,
+            trigger_mode,
+            overridden: true,
+        })
     }
 }
 
@@ -278,6 +363,16 @@ mod tests {
 
         assert_eq!(table.local_interrupt_controller_address(), 0xfee0_0000);
         assert!(table.pcat_compatible());
+        assert_eq!(
+            table.legacy_irq_route(0),
+            Ok(LegacyIrqRoute {
+                isa_irq: 0,
+                global_system_interrupt: 2,
+                polarity: InterruptPolarity::ActiveLow,
+                trigger_mode: InterruptTriggerMode::Level,
+                overridden: true,
+            })
+        );
         let mut entries = table.entries();
         assert_eq!(
             entries.next(),
@@ -314,6 +409,56 @@ mod tests {
         assert!(low_level.reserved_bits_are_zero());
 
         assert!(!MpsIntiFlags(0x0010).reserved_bits_are_zero());
+    }
+
+    #[test]
+    fn resolves_identity_and_conforming_isa_routes() {
+        let identity_bytes = madt::<MADT_HEADER_LEN>(&[]);
+        let identity = Madt::parse(&identity_bytes).unwrap();
+        assert_eq!(
+            identity.legacy_irq_route(0),
+            Ok(LegacyIrqRoute {
+                isa_irq: 0,
+                global_system_interrupt: 0,
+                polarity: InterruptPolarity::ActiveHigh,
+                trigger_mode: InterruptTriggerMode::Edge,
+                overridden: false,
+            })
+        );
+
+        let bytes = madt::<{ MADT_HEADER_LEN + SOURCE_OVERRIDE_ENTRY_LEN }>(&[
+            2, 10, 0, 0, 2, 0, 0, 0, 0, 0,
+        ]);
+        let overridden = Madt::parse(&bytes).unwrap();
+        assert_eq!(
+            overridden.legacy_irq_route(0),
+            Ok(LegacyIrqRoute {
+                isa_irq: 0,
+                global_system_interrupt: 2,
+                polarity: InterruptPolarity::ActiveHigh,
+                trigger_mode: InterruptTriggerMode::Edge,
+                overridden: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_reserved_legacy_routes() {
+        let duplicate = madt::<{ MADT_HEADER_LEN + SOURCE_OVERRIDE_ENTRY_LEN * 2 }>(&[
+            2, 10, 0, 0, 2, 0, 0, 0, 0, 0, 2, 10, 0, 0, 2, 0, 0, 0, 0, 0,
+        ]);
+        assert_eq!(
+            Madt::parse(&duplicate).unwrap().legacy_irq_route(0),
+            Err(LegacyIrqRouteError::DuplicateOverride { source: 0 })
+        );
+
+        let reserved = madt::<{ MADT_HEADER_LEN + SOURCE_OVERRIDE_ENTRY_LEN }>(&[
+            2, 10, 0, 0, 2, 0, 0, 0, 2, 0,
+        ]);
+        assert_eq!(
+            Madt::parse(&reserved).unwrap().legacy_irq_route(0),
+            Err(LegacyIrqRouteError::ReservedPolarity { source: 0 })
+        );
     }
 
     #[test]
