@@ -1,6 +1,7 @@
 //j444
 //j445
 //j446
+//j447
 
 //! Legacy IA-PC ACPI discovery windows.
 
@@ -54,6 +55,7 @@ pub struct AcpiLegacyIrqRoute {
     pub active_low: bool,
     pub level_triggered: bool,
     pub overridden: bool,
+    pub candidate_io_apic_id: u8,
     pub candidate_io_apic_address: u32,
     pub candidate_io_apic_gsi_base: u32,
 }
@@ -172,6 +174,7 @@ fn summarize_madt(address: u64, bytes: &[u8]) -> Option<AcpiMadtReport> {
             active_low: route.polarity == InterruptPolarity::ActiveLow,
             level_triggered: route.trigger_mode == InterruptTriggerMode::Level,
             overridden: route.overridden,
+            candidate_io_apic_id: candidate.id,
             candidate_io_apic_address: candidate.address,
             candidate_io_apic_gsi_base: candidate.global_system_interrupt_base,
         })
@@ -256,6 +259,7 @@ mod tests {
                     active_low: false,
                     level_triggered: false,
                     overridden: true,
+                    candidate_io_apic_id: 8,
                     candidate_io_apic_address: 0xfec0_1000,
                     candidate_io_apic_gsi_base: 24,
                 }),

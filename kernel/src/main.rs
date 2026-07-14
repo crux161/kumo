@@ -6,6 +6,8 @@
 //! build) this file is just an empty `main` so the workspace still builds and
 //! tests with `std`.
 
+//j447
+
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
@@ -95,6 +97,14 @@ mod boot_x86 {
         "  movl $pd, %eax",
         "  orl  $0x3, %eax",
         "  movl %eax, pdpt",
+        // pdpt[3] + pd_ioapic[502] identity-map only 0xfec00000..0xfee00000.
+        // This makes the firmware-described QEMU I/O APIC readable without mapping the
+        // rest of the 3-4 GiB PCI/MMIO hole.
+        "  movl $pd_ioapic, %eax",
+        "  orl  $0x3, %eax",
+        "  movl %eax, pdpt+24",
+        "  movl $0xfec00083, pd_ioapic+4016",
+        "  movl $0, pd_ioapic+4020",
         // pd[i] = (i*2MiB) | (PRESENT|WRITE|HUGE), i in 0..512  -> identity-map low 1 GiB
         "  xorl %ecx, %ecx",
         "  movl $0x83, %eax",
@@ -157,6 +167,7 @@ mod boot_x86 {
         "pml4: .skip 4096",
         "pdpt: .skip 4096",
         "pd:   .skip 4096",
+        "pd_ioapic: .skip 4096",
         ".align 16",
         "boot_stack: .skip 0x4000",
         "boot_stack_top:",

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j436
 //j439
 //j444
 //j445
 //j446
+//j447
 
 extern crate alloc;
 
@@ -752,6 +752,34 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 trigger,
                 origin
             );
+            match kumo_hal::active::inspect_boot_io_apic(route) {
+                Some(io_apic) if io_apic.id_matches_madt() && io_apic.contains_routed_gsi() => {
+                    klog!(
+                        "IOAPIC HW          Check     id {}  ver {:#04x}  entries {}  GSI {}-{} contains {}   OK\n",
+                        io_apic.hardware_id,
+                        io_apic.version,
+                        io_apic.redirection_entries,
+                        io_apic.gsi_base,
+                        io_apic.gsi_end,
+                        io_apic.routed_gsi
+                    );
+                }
+                Some(io_apic) => {
+                    klog!(
+                        "IOAPIC HW          Check     MADT id {} / HW id {}  GSI {}-{} route {}   FAIL\n",
+                        io_apic.madt_id,
+                        io_apic.hardware_id,
+                        io_apic.gsi_base,
+                        io_apic.gsi_end,
+                        io_apic.routed_gsi
+                    );
+                    kumo_hal::active::halt();
+                }
+                None => {
+                    klog!("IOAPIC HW          Check     bootstrap window unavailable   FAIL\n");
+                    kumo_hal::active::halt();
+                }
+            }
         }
         None => {
             klog!("ACPI IRQ ROUTE     Check     ISA IRQ 0 unresolved   FAIL\n");
