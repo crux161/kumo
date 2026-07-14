@@ -1,9 +1,13 @@
+#j444
 [package]
 name = "kumo-hal-x86_64"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+
+[dependencies]
+niji-loader = { path = "../../boot/niji-loader" }
 
 [lib]
 path = "src/lib.rs"

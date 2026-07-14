@@ -1,5 +1,6 @@
 //j441
 //j443
+//j444
 
 //! Allocation-free ACPI root-table parsing.
 //!
@@ -79,6 +80,33 @@ pub struct Rsdp {
     pub length: usize,
     pub rsdt_address: u32,
     pub xsdt_address: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RsdpLocation {
+    pub physical_address: u64,
+    pub rsdp: Rsdp,
+}
+
+/// Search a bounded physical-memory window on the 16-byte boundaries required by ACPI 6.3 §5.2.5.1.
+///
+/// `physical_base` may itself be unaligned; candidate alignment is computed in physical-address
+/// space rather than relative to the supplied slice.
+pub fn find_rsdp(bytes: &[u8], physical_base: u64) -> Option<RsdpLocation> {
+    let first = ((16 - (physical_base & 15)) & 15) as usize;
+    let mut offset = first;
+    while offset.checked_add(RSDP_V1_LEN)? <= bytes.len() {
+        if bytes[offset..].starts_with(&RSDP_SIGNATURE) {
+            if let Ok(rsdp) = Rsdp::parse(&bytes[offset..]) {
+                return Some(RsdpLocation {
+                    physical_address: physical_base.checked_add(offset as u64)?,
+                    rsdp,
+                });
+            }
+        }
+        offset = offset.checked_add(16)?;
+    }
+    None
 }
 
 impl Rsdp {
@@ -476,5 +504,32 @@ mod tests {
                 available: SDT_HEADER_LEN,
             })
         );
+    }
+
+    #[test]
+    fn rsdp_search_uses_absolute_physical_alignment() {
+        let candidate = rsdp_v2();
+        let mut window = [0u8; 64];
+        window[5..5 + RSDP_V2_MIN_LEN].copy_from_slice(&candidate);
+        assert_eq!(find_rsdp(&window, 0xe0003), None);
+
+        window.fill(0);
+        window[13..13 + RSDP_V2_MIN_LEN].copy_from_slice(&candidate);
+        let found = find_rsdp(&window, 0xe0003).unwrap();
+        assert_eq!(found.physical_address, 0xe0010);
+        assert_eq!(found.rsdp, Rsdp::parse(&candidate).unwrap());
+    }
+
+    #[test]
+    fn rsdp_search_skips_a_corrupt_aligned_candidate() {
+        let mut window = [0u8; 112];
+        let mut corrupt = rsdp_v2();
+        corrupt[8] ^= 1;
+        window[13..13 + RSDP_V2_MIN_LEN].copy_from_slice(&corrupt);
+        let valid = rsdp_v2();
+        window[61..61 + RSDP_V2_MIN_LEN].copy_from_slice(&valid);
+
+        let found = find_rsdp(&window, 0xe0003).unwrap();
+        assert_eq!(found.physical_address, 0xe0040);
     }
 }

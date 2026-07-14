@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j427
 //j428
 //j435
 //j436
 //j439
+//j444
 
 extern crate alloc;
 
@@ -690,6 +690,23 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 mem_upper,
                 (mem_lower + mem_upper) / 1024
             );
+        }
+    }
+
+    match kumo_hal::active::discover_acpi_root() {
+        Some(acpi) => {
+            let root = if acpi.uses_xsdt { "XSDT" } else { "RSDT" };
+            klog!(
+                "ACPI TABLES        Check     RSDP {:#x} rev {}  {} {:#x}   OK\n",
+                acpi.rsdp_address,
+                acpi.revision,
+                root,
+                acpi.root_address
+            );
+        }
+        None => {
+            klog!("ACPI TABLES        Check     RSDP absent   FAIL\n");
+            kumo_hal::active::halt();
         }
     }
 
