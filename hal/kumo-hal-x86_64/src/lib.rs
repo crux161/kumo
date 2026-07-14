@@ -5,8 +5,10 @@
 //j427
 //j428
 //j435
+//j436
 
 pub mod idt;
+mod legacy_irq;
 
 pub const ARCH: &str = "x86_64";
 
@@ -412,9 +414,8 @@ pub fn syscall_count() -> u32 {
     0
 }
 
-/// Install the x86_64 IDT ("the Tower"): all 32 CPU-exception vectors route to a common handler
-/// that reports vector/error/rip over COM1; fatal vectors halt, `#BP` resumes (j435, resolving the
-/// P10-c `.bss` blocker). External-interrupt vectors arrive with the PIC/APIC + timer slice.
+/// Install the x86_64 IDT ("the Tower"): 32 CPU-exception vectors report through the j435 handler,
+/// and 16 remapped legacy-PIC vectors route through the silent j436 IRQ path.
 pub fn install_exception_vectors() {
     #[cfg(target_os = "none")]
     idt::install();
@@ -455,15 +456,19 @@ pub struct TimerIrqReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimerIrqError {
-    Unsupported,
+    BadPeriod,
 }
 
-pub fn init_timer_interrupts(_dtb: u64, _period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
-    // P10: fake timer — x86_64 local-APIC timer arrives with the metal slice.
-    // Return a plausible report so the shared kernel POST doesn't halt.
+pub fn init_timer_interrupts(_dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
+    let setup = legacy_irq::timer_setup(period_hz).ok_or(TimerIrqError::BadPeriod)?;
+    #[cfg(target_os = "none")]
+    {
+        legacy_irq::initialize(setup);
+        irq_unmask();
+    }
     Ok(TimerIrqReport {
-        counter_hz: 1_000_000_000,
-        period_hz: 100,
+        counter_hz: setup.input_hz,
+        period_hz: setup.actual_hz,
         irq: 0,
         distributor_base: 0,
         redistributor_base: 0,
@@ -471,16 +476,29 @@ pub fn init_timer_interrupts(_dtb: u64, _period_hz: u64) -> Result<TimerIrqRepor
 }
 
 pub fn timer_irq_count() -> u64 {
-    0
+    legacy_irq::count()
 }
 
 pub fn wait_for_timer_irqs(_start: u64, needed: u64, _timeout_ns: u64) -> u64 {
-    // P10 stub: return the needed count immediately (no real timer).
-    needed
+    #[cfg(target_os = "none")]
+    {
+        // The PIT is the first live x86 clock, so this proof has no independent deadline yet;
+        // TSC/HPET calibration will make `timeout_ns` enforceable with the APIC timer lane.
+        // HLT keeps the successful path idle between ticks. — KESTREL 2026-07-14
+        legacy_irq::wait(_start, needed)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        needed
+    }
 }
 
-/// Stub: x86_64 ring-3 entry (and its IRQ-mask handling) lands with the metal milestone.
-pub fn irq_unmask() {}
+pub fn irq_unmask() {
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+}
 
 /// Stub: the x86_64 physmap console migration lands with its paging slice.
 pub fn console_use_physmap() {}
@@ -562,7 +580,7 @@ pub fn halt() -> ! {
     loop {
         #[cfg(target_os = "none")]
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
         }
         core::hint::spin_loop();
     }

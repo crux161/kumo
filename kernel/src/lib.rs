@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j421
 //j422
 //j427
 //j428
 //j435
+//j436
 
 extern crate alloc;
 
@@ -665,7 +665,8 @@ pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
 /// `main.rs`. This is the GRUB/Multiboot analog of the aarch64 Nijigumo handoff — it
 /// proves the loader → 32→64-bit → serial chain and reads the Multiboot memory info.
 /// `mbi` is the Multiboot1 info pointer, `magic` the boot magic (`0x2BADB002`). Full
-/// `stage_a` parity (x86 paging/timer/ring-3) is a later slice; j435 adds the IDT.
+/// `stage_a` parity (x86 paging/ring-3) is a later slice; j435 adds CPU exceptions and j436 adds
+/// the first external-interrupt timer heartbeat.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
     klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
@@ -697,7 +698,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
     // reports over COM1 and returns; if the IDT is live we land back here and the counter reads 1.
     // Before j435 this `int3` triple-faulted the machine into a reboot.
     kumo_hal::active::install_exception_vectors();
-    klog!("IDT / TOWER        Check     32 CPU vectors installed\n");
+    klog!("IDT / TOWER        Check     32 CPU + 16 IRQ vectors installed\n");
     let before = kumo_hal::active::exceptions_seen();
     unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
     let seen = kumo_hal::active::exceptions_seen().wrapping_sub(before);
@@ -711,6 +712,36 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
             "IDT / TOWER        Check     breakpoint not fielded (seen {})   FAIL\n",
             seen
         );
+    }
+
+    match kumo_hal::active::init_timer_interrupts(0, 20) {
+        Ok(timer) => {
+            let start = kumo_hal::active::timer_irq_count();
+            let seen = kumo_hal::active::wait_for_timer_irqs(start, 3, 1_000_000_000);
+            if seen >= 3 {
+                klog!(
+                    "PIC / PIT          Check     {} Hz input  {} Hz tick  IRQ {}  hb {}t   OK\n",
+                    timer.counter_hz,
+                    timer.period_hz,
+                    timer.irq,
+                    seen
+                );
+            } else {
+                klog!(
+                    "PIC / PIT          Check     IRQ {} heartbeat timeout ({}t)   FAIL\n",
+                    timer.irq,
+                    seen
+                );
+                kumo_hal::active::halt();
+            }
+        }
+        Err(err) => {
+            klog!(
+                "PIC / PIT          Check     unavailable: {:?}   FAIL\n",
+                err
+            );
+            kumo_hal::active::halt();
+        }
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");

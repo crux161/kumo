@@ -1,4 +1,5 @@
 //j435
+//j436
 
 //! x86_64 Interrupt Descriptor Table + CPU-exception handlers — "the Tower" for AMD64.
 //!
@@ -14,8 +15,11 @@
 //!
 //! The descriptor *encoding* is pure and host-tested; the stubs, `lidt`, and the fault round-trip
 //! are proven under `qemu-system-x86_64` by executing `int3` and observing it caught **and
-//! resumed**. Vectors 0..31 (CPU exceptions) are covered here; external-interrupt vectors arrive
-//! with the PIC/APIC + timer slice. — CORVUS
+//! resumed**. Vectors 0..31 (CPU exceptions) are covered here. — CORVUS
+//!
+//! j436 extends the same table and normalized frame through vectors 32..47 for the remapped legacy
+//! PIC. IRQ dispatch stays silent and delegates acknowledgement to `legacy_irq`, so a timer tick
+//! cannot re-enter the serial console while ordinary kernel logging is in progress. — KESTREL
 
 /// One 16-byte x86_64 IDT gate descriptor (Intel SDM Vol.3 §6.14.1).
 #[repr(C)]
@@ -73,6 +77,7 @@ impl IdtEntry64 {
 }
 
 /// The IDT limit/base operand for `lidt`.
+#[cfg(target_os = "none")]
 #[repr(C, packed)]
 struct Idtr {
     limit: u16,
@@ -81,14 +86,29 @@ struct Idtr {
 
 /// Number of CPU-exception vectors this slice installs.
 pub const EXCEPTION_VECTORS: usize = 32;
+/// Number of remapped legacy PIC interrupt vectors.
+pub const LEGACY_INTERRUPT_VECTORS: usize = 16;
+/// Total live gates in the first-light IDT.
+pub const IDT_VECTORS: usize = EXCEPTION_VECTORS + LEGACY_INTERRUPT_VECTORS;
+
+#[cfg(any(target_os = "none", test))]
+fn populated_idt(handlers: &[u64; IDT_VECTORS]) -> [IdtEntry64; IDT_VECTORS] {
+    let mut idt = [IdtEntry64::ZERO; IDT_VECTORS];
+    let mut index = 0;
+    while index < IDT_VECTORS {
+        idt[index] = IdtEntry64::new(handlers[index], KERNEL_CS, 0, GATE_INTERRUPT_KERNEL);
+        index += 1;
+    }
+    idt
+}
 
 #[cfg(target_os = "none")]
 mod metal {
-    use super::{IdtEntry64, Idtr, EXCEPTION_VECTORS, GATE_INTERRUPT_KERNEL, KERNEL_CS};
+    use super::{IdtEntry64, Idtr, IDT_VECTORS};
     use core::sync::atomic::{AtomicU64, Ordering};
 
     /// Zero-initialized so it lands in `.bss` (NOBITS) — see the module note on the P10-c blocker.
-    static mut IDT: [IdtEntry64; EXCEPTION_VECTORS] = [IdtEntry64::ZERO; EXCEPTION_VECTORS];
+    static mut IDT: [IdtEntry64; IDT_VECTORS] = [IdtEntry64::ZERO; IDT_VECTORS];
 
     /// Count of exceptions the Tower has handled, for a boot-time liveness assertion.
     static EXCEPTIONS_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -134,6 +154,23 @@ mod metal {
         "isr29: push $29; jmp isr_common",
         "isr30: push $30; jmp isr_common",
         "isr31: push $0; push $31; jmp isr_common",
+        // --- remapped legacy PIC interrupts: no CPU-pushed error code ---
+        "isr32: push $0; push $32; jmp isr_common",
+        "isr33: push $0; push $33; jmp isr_common",
+        "isr34: push $0; push $34; jmp isr_common",
+        "isr35: push $0; push $35; jmp isr_common",
+        "isr36: push $0; push $36; jmp isr_common",
+        "isr37: push $0; push $37; jmp isr_common",
+        "isr38: push $0; push $38; jmp isr_common",
+        "isr39: push $0; push $39; jmp isr_common",
+        "isr40: push $0; push $40; jmp isr_common",
+        "isr41: push $0; push $41; jmp isr_common",
+        "isr42: push $0; push $42; jmp isr_common",
+        "isr43: push $0; push $43; jmp isr_common",
+        "isr44: push $0; push $44; jmp isr_common",
+        "isr45: push $0; push $45; jmp isr_common",
+        "isr46: push $0; push $46; jmp isr_common",
+        "isr47: push $0; push $47; jmp isr_common",
         // --- common dispatcher: save GPRs, call Rust, restore, drop [vector,errcode], iretq ---
         "isr_common:",
         "  push %rax",
@@ -152,8 +189,13 @@ mod metal {
         "  push %r14",
         "  push %r15",
         "  mov %rsp, %rdi",
+        // An asynchronous IRQ may land at either SysV stack phase. Preserve the normalized-frame
+        // pointer in callee-saved RBX and align RSP before entering Rust. — KESTREL 2026-07-14
+        "  mov %rsp, %rbx",
+        "  and $-16, %rsp",
         "  cld",
-        "  call x86_exception",
+        "  call x86_interrupt_dispatch",
+        "  mov %rbx, %rsp",
         "  pop %r15",
         "  pop %r14",
         "  pop %r13",
@@ -180,14 +222,16 @@ mod metal {
         "  .quad isr8,  isr9,  isr10, isr11, isr12, isr13, isr14, isr15",
         "  .quad isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23",
         "  .quad isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31",
+        "  .quad isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39",
+        "  .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47",
         options(att_syntax),
     );
 
     extern "C" {
-        static isr_table: [u64; EXCEPTION_VECTORS];
+        static isr_table: [u64; IDT_VECTORS];
     }
 
-    /// The saved machine state an exception stub hands to [`x86_exception`], low address first
+    /// The saved machine state an IDT stub hands to [`x86_interrupt_dispatch`], low address first
     /// (the push order in `isr_common` plus the CPU-pushed interrupt frame).
     #[repr(C)]
     struct ExceptionFrame {
@@ -221,8 +265,17 @@ mod metal {
     const VECTOR_BREAKPOINT: u64 = 3;
 
     #[no_mangle]
-    extern "C" fn x86_exception(frame: *mut ExceptionFrame) {
+    extern "C" fn x86_interrupt_dispatch(frame: *mut ExceptionFrame) {
         let frame = unsafe { &*frame };
+        if frame.vector >= crate::legacy_irq::INTERRUPT_VECTOR_BASE as u64
+            && frame.vector
+                < (crate::legacy_irq::INTERRUPT_VECTOR_BASE
+                    + crate::legacy_irq::LEGACY_INTERRUPT_VECTORS) as u64
+        {
+            crate::legacy_irq::handle(frame.vector as u8);
+            return;
+        }
+
         EXCEPTIONS_SEEN.fetch_add(1, Ordering::Relaxed);
 
         crate::serial::write(b"TOWER-x86 EXCEPTION vec=");
@@ -243,19 +296,12 @@ mod metal {
     /// Fill the zeroed IDT from the stub table and load it. Idempotent.
     pub fn install() {
         unsafe {
-            let idt = core::ptr::addr_of_mut!(IDT) as *mut IdtEntry64;
-            let table = core::ptr::addr_of!(isr_table) as *const u64;
-            for i in 0..EXCEPTION_VECTORS {
-                let handler = table.add(i).read();
-                idt.add(i).write(IdtEntry64::new(
-                    handler,
-                    KERNEL_CS,
-                    0,
-                    GATE_INTERRUPT_KERNEL,
-                ));
-            }
+            let idt_array = core::ptr::addr_of_mut!(IDT);
+            let table = &*core::ptr::addr_of!(isr_table);
+            idt_array.write(super::populated_idt(table));
+            let idt = idt_array.cast::<IdtEntry64>();
             let idtr = Idtr {
-                limit: (core::mem::size_of::<[IdtEntry64; EXCEPTION_VECTORS]>() - 1) as u16,
+                limit: (core::mem::size_of::<[IdtEntry64; IDT_VECTORS]>() - 1) as u16,
                 base: idt as u64,
             };
             core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
@@ -327,5 +373,20 @@ mod tests {
     #[test]
     fn descriptor_is_sixteen_bytes() {
         assert_eq!(core::mem::size_of::<IdtEntry64>(), 16);
+    }
+
+    #[test]
+    fn populated_table_covers_cpu_exceptions_and_legacy_interrupts() {
+        let mut handlers = [0u64; IDT_VECTORS];
+        for (index, handler) in handlers.iter_mut().enumerate() {
+            *handler = 0x1000 + index as u64 * 0x10;
+        }
+
+        let idt = populated_idt(&handlers);
+        assert_eq!(idt.len(), 48);
+        assert_eq!(idt[EXCEPTION_VECTORS - 1].handler(), handlers[31]);
+        assert_eq!(idt[EXCEPTION_VECTORS].handler(), handlers[32]);
+        assert_eq!(idt[IDT_VECTORS - 1].handler(), handlers[47]);
+        assert!(idt.iter().all(|gate| gate.present()));
     }
 }
