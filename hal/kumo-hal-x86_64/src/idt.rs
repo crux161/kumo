@@ -43,8 +43,10 @@ pub struct IdtEntry64 {
 
 /// Present, DPL=0, 64-bit interrupt gate (`P=1`, `type=0xE`) — masks IF on entry.
 pub const GATE_INTERRUPT_KERNEL: u8 = 0x8E;
-/// The ring-0 code selector from the long-mode trampoline GDT (`kernel/src/main.rs`).
-pub const KERNEL_CS: u16 = 0x08;
+/// Present, DPL=3 interrupt gate used by the first ring-3 syscall proof.
+pub const GATE_INTERRUPT_USER: u8 = 0xEE;
+/// The ring-0 code selector from the permanent long-mode GDT.
+pub const KERNEL_CS: u16 = crate::gdt::KERNEL_CODE_SELECTOR;
 
 impl IdtEntry64 {
     pub const ZERO: Self = Self {
@@ -95,23 +97,29 @@ struct Idtr {
 pub const EXCEPTION_VECTORS: usize = 32;
 /// Number of remapped legacy PIC interrupt vectors.
 pub const LEGACY_INTERRUPT_VECTORS: usize = 16;
-/// Total live gates through the local-APIC spurious vector.
-pub const IDT_VECTORS: usize = 64;
+/// Contiguous kernel exception/interrupt gates through the local-APIC spurious vector.
+pub const KERNEL_VECTORS: usize = 64;
+/// The 64 kernel stubs plus the sparse `int 0x80` userspace entry stub.
+const HANDLER_COUNT: usize = KERNEL_VECTORS + 1;
+/// Table size including the sparse ring-3 syscall gate at vector 128.
+pub const IDT_VECTORS: usize = crate::ring3::SYSCALL_VECTOR + 1;
 
 #[cfg(any(target_os = "none", test))]
-fn populated_idt(handlers: &[u64; IDT_VECTORS]) -> [IdtEntry64; IDT_VECTORS] {
+fn populated_idt(handlers: &[u64; HANDLER_COUNT]) -> [IdtEntry64; IDT_VECTORS] {
     let mut idt = [IdtEntry64::ZERO; IDT_VECTORS];
     let mut index = 0;
-    while index < IDT_VECTORS {
+    while index < KERNEL_VECTORS {
         idt[index] = IdtEntry64::new(handlers[index], KERNEL_CS, 0, GATE_INTERRUPT_KERNEL);
         index += 1;
     }
+    idt[crate::ring3::SYSCALL_VECTOR] =
+        IdtEntry64::new(handlers[KERNEL_VECTORS], KERNEL_CS, 0, GATE_INTERRUPT_USER);
     idt
 }
 
 #[cfg(target_os = "none")]
 mod metal {
-    use super::{IdtEntry64, Idtr, IDT_VECTORS};
+    use super::{IdtEntry64, Idtr, HANDLER_COUNT, IDT_VECTORS};
     use core::sync::atomic::{AtomicU64, Ordering};
 
     /// Zero-initialized so it lands in `.bss` (NOBITS) — see the module note on the P10-c blocker.
@@ -195,6 +203,8 @@ mod metal {
         "isr61: push $0; push $61; jmp isr_common",
         "isr62: push $0; push $62; jmp isr_common",
         "isr63: push $0; push $63; jmp isr_common",
+        // --- DPL3 software-interrupt syscall gate ---
+        "isr128: push $0; push $128; jmp isr_common",
         // --- common dispatcher: save GPRs, call Rust, restore, drop [vector,errcode], iretq ---
         "isr_common:",
         "  push %rax",
@@ -250,11 +260,12 @@ mod metal {
         "  .quad isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47",
         "  .quad isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55",
         "  .quad isr56, isr57, isr58, isr59, isr60, isr61, isr62, isr63",
+        "  .quad isr128",
         options(att_syntax),
     );
 
     extern "C" {
-        static isr_table: [u64; IDT_VECTORS];
+        static isr_table: [u64; HANDLER_COUNT];
     }
 
     /// The saved machine state an IDT stub hands to [`x86_interrupt_dispatch`], low address first
@@ -292,7 +303,14 @@ mod metal {
 
     #[no_mangle]
     extern "C" fn x86_interrupt_dispatch(frame: *mut ExceptionFrame) {
-        let frame = unsafe { &*frame };
+        let frame = unsafe { &mut *frame };
+        if frame.vector == crate::ring3::SYSCALL_VECTOR as u64 && frame.cs & 3 == 3 {
+            match crate::ring3::dispatch(frame.rax, frame.rdi) {
+                crate::ring3::Dispatch::Return(value) => frame.rax = value,
+                crate::ring3::Dispatch::Exit(code) => crate::ring3::resume(code),
+            }
+            return;
+        }
         if crate::local_apic::handle(frame.vector as u8) {
             return;
         }
@@ -409,13 +427,13 @@ mod tests {
 
     #[test]
     fn populated_table_covers_cpu_exceptions_and_interrupt_controllers() {
-        let mut handlers = [0u64; IDT_VECTORS];
+        let mut handlers = [0u64; HANDLER_COUNT];
         for (index, handler) in handlers.iter_mut().enumerate() {
             *handler = 0x1000 + index as u64 * 0x10;
         }
 
         let idt = populated_idt(&handlers);
-        assert_eq!(idt.len(), 64);
+        assert_eq!(idt.len(), 129);
         assert_eq!(idt[EXCEPTION_VECTORS - 1].handler(), handlers[31]);
         assert_eq!(idt[EXCEPTION_VECTORS].handler(), handlers[32]);
         assert_eq!(
@@ -426,7 +444,17 @@ mod tests {
             idt[crate::io_apic::TIMER_VECTOR as usize].handler(),
             handlers[49]
         );
-        assert_eq!(idt[IDT_VECTORS - 1].handler(), handlers[63]);
-        assert!(idt.iter().all(|gate| gate.present()));
+        assert_eq!(
+            idt[crate::ring3::SYSCALL_VECTOR].handler(),
+            handlers[KERNEL_VECTORS]
+        );
+        assert_eq!(
+            idt[crate::ring3::SYSCALL_VECTOR].type_attr,
+            GATE_INTERRUPT_USER
+        );
+        assert!(idt[..KERNEL_VECTORS].iter().all(|gate| gate.present()));
+        assert!(idt[KERNEL_VECTORS..crate::ring3::SYSCALL_VECTOR]
+            .iter()
+            .all(|gate| !gate.present()));
     }
 }

@@ -7,12 +7,17 @@
 //j452
 //j454
 
+mod gdt;
 pub mod idt;
 mod io_apic;
 mod legacy_irq;
 mod local_apic;
+mod paging;
 mod platform_acpi;
+mod ring3;
+mod userspace;
 
+pub use gdt::{install as install_descriptor_tables, DescriptorTableReport};
 pub use io_apic::{
     apply_boot_io_apic_timer, inspect_boot_io_apic, plan_boot_io_apic_timer,
     unmask_boot_io_apic_timer, IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied,
@@ -21,6 +26,8 @@ pub use io_apic::{
 pub use platform_acpi::{
     discover_acpi_madt, discover_acpi_root, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport,
 };
+pub use ring3::{Ring3Error, Ring3Report};
+pub use userspace::first_light_smoke as run_ring3_smoke;
 
 pub const ARCH: &str = "x86_64";
 
@@ -28,28 +35,29 @@ pub fn arch_name() -> &'static str {
     ARCH
 }
 
-/// x86_64 thread context: callee-saved registers + return address. The
-/// `switch_context` asm saves/restores this exact layout.
-#[derive(Clone, Copy, Debug, Default)]
+/// x86_64 kernel-thread context. `r12_entry` and `r13_arg` seed a fresh thread; after
+/// first entry they are ordinary callee-saved registers. The switch assembly saves and
+/// restores this exact layout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct ThreadContext {
-    pub rip: u64,
-    pub arg: u64,
-    pub rbx: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rbp: u64,
-    pub rsp: u64,
-    pub user: bool,
+    r12_entry: u64,
+    r13_arg: u64,
+    rbx: u64,
+    r14: u64,
+    r15: u64,
+    rbp: u64,
+    rip: u64,
+    rsp: u64,
+    user: bool,
 }
 
 impl ThreadContext {
     pub fn new(entry: usize, arg: usize, stack_top: usize, user: bool) -> Self {
         Self {
-            rip: entry as u64,
-            arg: arg as u64,
+            r12_entry: entry as u64,
+            r13_arg: arg as u64,
+            rip: context_trampoline_addr(),
             rsp: stack_top as u64,
             user,
             ..Self::default()
@@ -57,11 +65,11 @@ impl ThreadContext {
     }
 
     pub const fn entry(self) -> u64 {
-        self.rip
+        self.r12_entry
     }
 
     pub const fn arg(self) -> u64 {
-        self.arg
+        self.r13_arg
     }
 
     pub const fn stack_top(self) -> u64 {
@@ -73,18 +81,78 @@ impl ThreadContext {
     }
 }
 
-/// P10-d: context-switch asm deferred (BSS linker issue on x86_64).
-/// The `global_asm!` block triggers a `.bss` non-zero-bytes error.
-
 #[cfg(target_os = "none")]
-extern "C" {
-    fn kumo_context_switch(prev: *mut ThreadContext, next: *const ThreadContext);
-    // Dummy: actual asm deferred until BSS linker issue resolved.
+fn context_trampoline_addr() -> u64 {
+    extern "C" {
+        fn kumo_context_trampoline();
+    }
+    kumo_context_trampoline as *const () as usize as u64
+}
+
+#[cfg(not(target_os = "none"))]
+fn context_trampoline_addr() -> u64 {
+    0
 }
 
 #[cfg(target_os = "none")]
-pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadContext) {
-    // Stub — real context switch deferred.
+core::arch::global_asm!(
+    ".section .text.kumo_context,\"ax\",@progbits",
+    ".code64",
+    ".global kumo_context_switch",
+    ".type kumo_context_switch,@function",
+    "kumo_context_switch:",
+    // Preserve the SysV AMD64 callee-saved set in `prev`.
+    "  mov %r12, 0(%rdi)",
+    "  mov %r13, 8(%rdi)",
+    "  mov %rbx, 16(%rdi)",
+    "  mov %r14, 24(%rdi)",
+    "  mov %r15, 32(%rdi)",
+    "  mov %rbp, 40(%rdi)",
+    // Save the caller continuation and the post-return stack pointer. Restoring with
+    // `jmp` then has exactly the stack effect of returning from this call.
+    "  mov (%rsp), %rax",
+    "  mov %rax, 48(%rdi)",
+    "  lea 8(%rsp), %rax",
+    "  mov %rax, 56(%rdi)",
+    // Load the next context. RSI remains the context pointer until the final indirect jump.
+    "  mov 0(%rsi), %r12",
+    "  mov 8(%rsi), %r13",
+    "  mov 16(%rsi), %rbx",
+    "  mov 24(%rsi), %r14",
+    "  mov 32(%rsi), %r15",
+    "  mov 40(%rsi), %rbp",
+    "  mov 56(%rsi), %rsp",
+    "  jmp *48(%rsi)",
+    ".size kumo_context_switch,.-kumo_context_switch",
+    ".global kumo_context_trampoline",
+    ".type kumo_context_trampoline,@function",
+    "kumo_context_trampoline:",
+    // A fresh thread may have been selected from interrupt context. Re-enable maskable
+    // interrupts before entering its body, then pass the seeded argument in SysV RDI.
+    "  sti",
+    "  mov %r13, %rdi",
+    "  call *%r12",
+    // Thread bodies are expected to terminate through the scheduler. A stray return must
+    // not run into adjacent text.
+    "1:",
+    "  cli",
+    "  hlt",
+    "  jmp 1b",
+    ".size kumo_context_trampoline,.-kumo_context_trampoline",
+    options(att_syntax),
+);
+
+/// Switch from `prev` to `next`, returning only when another context restores `prev`.
+///
+/// # Safety
+/// Both pointers must identify live, non-aliasing contexts. `next.rsp` must name a valid
+/// stack and `next.rip` a valid continuation or the fresh-thread trampoline.
+#[cfg(target_os = "none")]
+pub unsafe fn switch_context(prev: *mut ThreadContext, next: *const ThreadContext) {
+    extern "C" {
+        fn kumo_context_switch(prev: *mut ThreadContext, next: *const ThreadContext);
+    }
+    unsafe { kumo_context_switch(prev, next) };
 }
 
 #[cfg(not(target_os = "none"))]
@@ -332,20 +400,19 @@ pub struct El0Report {
 }
 
 pub fn build_user_tables(
-    _image: &UserImage<'_>,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    image: &UserImage<'_>,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<u64, UserImageError> {
-    Err(UserImageError::Unsupported)
+    userspace::build_user_tables(image, alloc)
 }
 
 pub fn run_el0_smoke(
-    _base: u64,
-    _stack_top: u64,
-    _stack_size: u64,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    base: u64,
+    stack_top: u64,
+    stack_size: u64,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<El0Report, UserImageError> {
-    // Ring-3 entry + the IDT/syscall path land with the x86_64 metal milestone.
-    Err(UserImageError::Unsupported)
+    userspace::run_el0_smoke(base, stack_top, stack_size, alloc)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,7 +427,7 @@ pub enum UserImageError {
     StackOutsideStackBlock,
 }
 
-/// Saved EL0 execution context (stub — Ring-3 entry lands with the x86_64 metal milestone).
+/// Saved userspace execution context (stub — scheduler-driven x86 ring-3 entry lands later).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct UserState {
@@ -396,20 +463,18 @@ pub struct UserImage<'a> {
     pub entry: u64,
     pub stack_top: u64,
     pub stack_size: u64,
-    /// Bootstrap handle passed to the process at entry (Ring-3 entry lands later).
+    /// Bootstrap handle passed to the process in RDI at entry.
     pub bootstrap: u64,
     pub segments: &'a [UserLoadSegment<'a>],
-    /// Extra physical mappings (framebuffer, MMIO). x86_64 stub — unused until
-    /// Ring-3 entry lands.
+    /// Extra physical mappings (RAM, framebuffer, or MMIO), materialized as 4 KiB leaves.
     pub extra_mappings: &'a [UserMapping],
 }
 
 pub fn run_el0_image(
-    _image: UserImage<'_>,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    image: UserImage<'_>,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<El0Report, UserImageError> {
-    // Ring-3 image entry lands with the x86_64 metal milestone.
-    Err(UserImageError::Unsupported)
+    userspace::run_el0_image(image, alloc)
 }
 
 pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
@@ -418,12 +483,20 @@ pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
 /// route #PF/#UD/#GP from ring 3 to this hook once it lands (P10). Stubbed for parity.
 pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
 
-pub fn el0_exit(_code: u64) -> ! {
-    halt()
+pub fn el0_exit(code: u64) -> ! {
+    #[cfg(target_os = "none")]
+    {
+        ring3::resume(code)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = code;
+        halt()
+    }
 }
 
 pub fn syscall_count() -> u32 {
-    0
+    ring3::syscall_count()
 }
 
 /// Install the x86_64 IDT ("the Tower"): 32 CPU-exception vectors report through the j435 handler,
@@ -621,74 +694,72 @@ pub fn console_use_physmap() {}
 /// Stub: physical memory read not yet wired for x86_64.
 pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
 
-// ---- mmu stubs (x86 paging lands with the x86 metal milestone) ----
+// ---- x86 user page-table primitives -------------------------------------------------
 
-/// Stub: build a 4 KiB user page descriptor (aarch64 TTBR0 format).
-pub fn user_page_desc(_executable: bool, _writable: bool) -> u64 {
-    0
+pub fn user_page_desc(executable: bool, writable: bool) -> u64 {
+    paging::user_page_desc(executable, writable)
 }
 
-/// Stub: build a 4 KiB Device-nGnRnE page descriptor.
-pub fn user_device_page_desc(_writable: bool) -> u64 {
-    0
+pub fn user_device_page_desc(writable: bool) -> u64 {
+    paging::user_device_page_desc(writable)
 }
 
-/// Stub: build a 4 KiB Normal-NC page descriptor.
-pub fn user_nc_page_desc(_writable: bool) -> u64 {
-    0
+pub fn user_nc_page_desc(writable: bool) -> u64 {
+    paging::user_nc_page_desc(writable)
 }
 
-/// Stub: map one 4 KiB user page.
+/// Map one 4 KiB leaf in an x86 process page-table root.
 ///
 /// # Safety
-/// Stub; `unsafe` to match the aarch64 backend's contract.
+/// `root`, `pa`, and frames returned by `alloc` must be identity-accessible writable RAM.
 pub unsafe fn map_user_page(
-    _root: u64,
-    _va: u64,
-    _pa: u64,
-    _desc: u64,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
-    _tables: &mut usize,
+    root: u64,
+    va: u64,
+    pa: u64,
+    desc: u64,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+    tables: &mut usize,
 ) -> Result<(), ()> {
-    Ok(())
+    unsafe { paging::map_user_page(root, va, pa, desc, alloc, tables) }
 }
 
-/// Stub: map a 2 MiB device block.
+/// Map a 2 MiB device window using page-granular uncached user leaves.
 ///
 /// # Safety
-/// Stub; `unsafe` to match the aarch64 backend's contract.
+/// `root`, `pa`, and frames returned by `alloc` must be identity-accessible writable RAM.
 pub unsafe fn map_user_device_block(
-    _root: u64,
-    _va: u64,
-    _pa: u64,
-    _nc: bool,
-    _writable: bool,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
-    _tables: &mut usize,
+    root: u64,
+    va: u64,
+    pa: u64,
+    nc: bool,
+    writable: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+    tables: &mut usize,
 ) -> Result<(), ()> {
-    Ok(())
+    unsafe { paging::map_user_device_block(root, va, pa, nc, writable, alloc, tables) }
 }
 
 pub fn read_ttbr0() -> u64 {
-    0 // x86_64 stub — paging lands with the x86_64 metal milestone.
+    paging::read_root()
 }
 
 /// # Safety
-/// Stub (no paging yet); unsafe to match the aarch64 backend's contract.
-pub unsafe fn set_ttbr0(_root: u64) {
-    // x86_64 stub.
+/// `root` must identify a live, identity-accessible x86 PML4.
+pub unsafe fn set_ttbr0(root: u64) {
+    unsafe { paging::set_root(root) };
 }
 
-/// Arch-neutral name the kernel uses to switch the user address-space root. This backend
-/// will program `cr3` once x86 paging lands (x86 metal milestone).
+/// Arch-neutral name the kernel uses to switch the user address-space root (CR3 here).
 ///
 /// # Safety
-/// Stub; `unsafe` to match the hardware contract.
-pub unsafe fn set_user_aspace_root(_root: u64) {}
+/// `root` must identify a live, identity-accessible x86 PML4.
+pub unsafe fn set_user_aspace_root(root: u64) {
+    unsafe { paging::set_root(root) };
+}
 
-/// Arch-neutral name the kernel uses to read the current user address-space root (x86 stub).
+/// Arch-neutral name the kernel uses to read the current user address-space root (CR3 here).
 pub fn read_user_aspace_root() -> u64 {
-    0
+    paging::read_root()
 }
 
 pub fn halt() -> ! {
@@ -737,6 +808,30 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "x86_64");
+    }
+
+    #[test]
+    fn thread_context_layout_matches_switch_assembly() {
+        assert_eq!(core::mem::offset_of!(ThreadContext, r12_entry), 0);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r13_arg), 8);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rbx), 16);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r14), 24);
+        assert_eq!(core::mem::offset_of!(ThreadContext, r15), 32);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rbp), 40);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rip), 48);
+        assert_eq!(core::mem::offset_of!(ThreadContext, rsp), 56);
+        assert_eq!(core::mem::offset_of!(ThreadContext, user), 64);
+        assert_eq!(core::mem::size_of::<ThreadContext>(), 72);
+    }
+
+    #[test]
+    fn fresh_thread_context_retains_entry_argument_and_stack() {
+        let context = ThreadContext::new(0x1234, 0x5678, 0x9000, false);
+        assert_eq!(context.entry(), 0x1234);
+        assert_eq!(context.arg(), 0x5678);
+        assert_eq!(context.stack_top(), 0x9000);
+        assert!(!context.is_user());
+        assert_eq!(context.rip, 0, "host trampoline is deliberately absent");
     }
 
     static PROBE: AtomicU64 = AtomicU64::new(0);

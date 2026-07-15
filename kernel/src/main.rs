@@ -59,7 +59,7 @@ mod boot {
 // x86_64 freestanding entry: booted by GRUB (Multiboot) or `qemu-system-x86_64 -kernel`
 // (Multiboot1). The loader enters `_start` in 32-bit protected mode with `eax = boot
 // magic` and `ebx = *multiboot_info`; the trampoline builds an identity-mapped long
-// mode and tail-calls Rust with `(rdi = mbi, rsi = magic)`.
+// mode and tail-calls Rust with `(rdi = mbi, rsi = magic, rdx = kernel_stack_top)`.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod boot_x86 {
     use core::panic::PanicInfo;
@@ -146,6 +146,7 @@ mod boot_x86 {
         "  movq $boot_stack_top, %rsp",
         "  movl mb_info_ptr, %edi", // rdi = multiboot info (zero-extended)
         "  movl mb_magic, %esi",    // rsi = boot magic
+        "  movq $boot_stack_top, %rdx", // rdx = TSS RSP0 for future ring-3 transitions
         "  call x86_kernel_entry",
         "3:",
         "  hlt",
@@ -177,8 +178,8 @@ mod boot_x86 {
     );
 
     #[no_mangle]
-    extern "C" fn x86_kernel_entry(mbi: u64, magic: u64) -> ! {
-        kernel::x86_first_light(mbi, magic)
+    extern "C" fn x86_kernel_entry(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
+        kernel::x86_first_light(mbi, magic, kernel_stack_top)
     }
 
     #[panic_handler]

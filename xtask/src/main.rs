@@ -1849,6 +1849,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
         "x86 first-light proof",
         &[
             b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+            b"GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28",
             b"ACPI TABLES        Check     RSDP",
             b"ACPI MADT          Check     APIC",
             b"ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK",
@@ -1857,15 +1858,17 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
             b"IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
             b"IDT / TOWER        Check     int3 caught + resumed",
+            b"RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
+            b"RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
             b"x2APIC / TIMER    Check",
             b"20 Hz tick  vec 48  hb 3t   OK",
             b"IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
             b"IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK",
             b"TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK",
-            // The hook count trails non-deterministically (the hook fires async with the timer);
-            // match the deterministic prefix, which only appears on the OK path.
-            b"PREEMPT HOOK       Check     local APIC timer drives hook",
+            b"CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK",
+            b"PREEMPT SCHED      Check     2 kthreads",
+            b"timer-preempted both bodies   OK",
             b"x86_64 MUREX core online, first light reached; HALTING.",
         ],
         Duration::from_secs(5),
@@ -1887,7 +1890,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: canonical local APIC timer drives the preempt hook (scheduler-tick parity), int3 resumed, PIC/PIT + x2APIC + I/O APIC timer all proven"
+        "KUMO x86 QEMU smoke green: real cooperative + timer-preempted context switching, private-CR3 CPL3/int80, int3, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
     );
     Ok(())
 }
@@ -1896,6 +1899,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
     let text = String::from_utf8_lossy(transcript);
     for marker in [
         "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+        "GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28",
         "ACPI TABLES        Check     RSDP",
         "ACPI MADT          Check     APIC",
         "ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK",
@@ -1904,13 +1908,17 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
         "IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
         "IDT / TOWER        Check     int3 caught + resumed",
+        "RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
+        "RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
         "x2APIC / TIMER    Check",
         "20 Hz tick  vec 48  hb 3t   OK",
         "IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK",
         "IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK",
         "TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK",
-        "PREEMPT HOOK       Check     local APIC timer drives hook",
+        "CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK",
+        "PREEMPT SCHED      Check     2 kthreads",
+        "timer-preempted both bodies   OK",
         "x86_64 MUREX core online, first light reached; HALTING.",
     ] {
         if !text.contains(marker) {
@@ -2122,6 +2130,7 @@ mod x86_smoke_tests {
     use super::validate_x86_smoke_transcript;
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
+GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28  rsp0 0x10ff00   OK\n\
 ACPI TABLES        Check     RSDP 0x000f59d0 rev 2  XSDT 0x07fe1e98   OK\n\
 ACPI MADT          Check     APIC 0x07fe2100  LAPIC 0xfee00000  IOAPIC 1  ISO 0  PCAT true   OK\n\
 ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK\n\
@@ -2130,12 +2139,15 @@ IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high e
 IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK\n\
 IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
+RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK\n\
+RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
 x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\
 IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK\n\
 IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via I/O APIC   OK\n\
 TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK\n\
-PREEMPT HOOK       Check     local APIC timer drives hook  3t  hook 3x   OK\n\
+CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK\n\
+PREEMPT SCHED      Check     2 kthreads  4 body switches  5 ticks  timer-preempted both bodies   OK\n\
 x86_64 MUREX core online, first light reached; HALTING.\n";
 
     #[test]

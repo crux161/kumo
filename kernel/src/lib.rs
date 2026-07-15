@@ -668,7 +668,7 @@ pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
 /// `stage_a` parity (x86 paging/ring-3) is a later slice; j435 adds CPU exceptions and j436 adds
 /// the first external-interrupt timer heartbeat.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
+pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
     klog!("CPU MODE: long mode (64-bit), paging on, serial COM1 live\n");
     klog!(
@@ -691,6 +691,30 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
                 (mem_lower + mem_upper) / 1024
             );
         }
+    }
+
+    // Supersede the Multiboot trampoline's minimal GDT before the IDT starts consuming its code
+    // selector. This adds the CPL3 segments and activates a 64-bit TSS with a valid RSP0.
+    let descriptors = kumo_hal::active::install_descriptor_tables(kernel_stack_top);
+    if descriptors.is_live() {
+        klog!(
+            "GDT / TSS          Check     kernel {:#04x}/{:#04x}  user {:#04x}/{:#04x}  TR {:#04x}  rsp0 {:#x}   OK\n",
+            descriptors.kernel_code_selector,
+            descriptors.kernel_data_selector,
+            descriptors.user_code_selector,
+            descriptors.user_data_selector,
+            descriptors.task_selector,
+            descriptors.rsp0
+        );
+    } else {
+        klog!(
+            "GDT / TSS          Check     limit {:#x}  CS {:#04x} SS {:#04x} TR {:#04x}   FAIL\n",
+            descriptors.gdt_limit,
+            descriptors.kernel_code_selector,
+            descriptors.kernel_data_selector,
+            descriptors.task_selector
+        );
+        kumo_hal::active::halt();
     }
 
     let acpi_root = match kumo_hal::active::discover_acpi_root() {
@@ -890,7 +914,7 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
     // reports over COM1 and returns; if the IDT is live we land back here and the counter reads 1.
     // Before j435 this `int3` triple-faulted the machine into a reboot.
     kumo_hal::active::install_exception_vectors();
-    klog!("IDT / TOWER        Check     64 CPU/IRQ/APIC vectors installed\n");
+    klog!("IDT / TOWER        Check     64 kernel vectors + ring3 int80 installed\n");
     let before = kumo_hal::active::exceptions_seen();
     unsafe { core::arch::asm!("int3", options(nomem, nostack)) };
     let seen = kumo_hal::active::exceptions_seen().wrapping_sub(before);
@@ -904,6 +928,39 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
             "IDT / TOWER        Check     breakpoint not fielded (seen {})   FAIL\n",
             seen
         );
+    }
+
+    // First CPL3 proof: an RX user page pings through the DPL3 int80 gate, receives its value
+    // back via `iretq`, then exits through the same gate to the suspended kernel flow. The
+    // privilege transition uses a dedicated TSS.RSP0 stack rather than the boot call stack.
+    match kumo_hal::active::run_ring3_smoke() {
+        Ok(report) if report.is_live() => {
+            klog!(
+                "RING3 / PAGING     Check     private CR3  RX code {:#x}  NX stack {:#x}  4K guard   OK\n",
+                report.code_address,
+                report.stack_top
+            );
+            klog!(
+                "RING3 / INT80      Check     CPL3 entered  {} calls  ping {:#x}  exit {}   OK\n",
+                report.calls,
+                report.ping_echo,
+                report.exit_code
+            );
+        }
+        Ok(report) => {
+            klog!(
+                "RING3 / INT80      Check     entered={} calls={} ping={:#x} exit={}   FAIL\n",
+                report.entered,
+                report.calls,
+                report.ping_echo,
+                report.exit_code
+            );
+            kumo_hal::active::halt();
+        }
+        Err(err) => {
+            klog!("RING3 / INT80      Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
     }
 
     let reference_timer = match kumo_hal::active::init_timer_interrupts(0, 20) {
@@ -1064,38 +1121,52 @@ pub fn x86_first_light(mbi: u64, magic: u64) -> ! {
         }
     }
 
-    // j454: preempt-hook parity with the aarch64 spine. The canonical local APIC timer ISR now
-    // calls the installed preemption hook after EOI. Install a probe hook, wait for the timer to
-    // tick, and prove the hook fired in lockstep — the exact wiring a scheduler tick will ride once
-    // x86 joins the shared `stage_a`.
-    {
-        static PREEMPT_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        extern "C" fn preempt_probe() {
-            PREEMPT_PROBE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+    // The first shared scheduler substrate on x86: enter two kernel threads on independent
+    // stacks, let each yield three times, and restore the suspended boot context after both
+    // terminate. This exercises fresh-thread trampoline entry plus continuation RIP/RSP and
+    // callee-saved-register restoration through the real HAL switch primitive.
+    let context = kdemo::run();
+    if context.threads == 2 && context.switches == 16 && context.work == 6 {
+        klog!(
+            "CONTEXT SWITCH     Check     {} kthreads  {} switches  work {}  callee-saved + stack resume   OK\n",
+            context.threads,
+            context.switches,
+            context.work
+        );
+    } else {
+        klog!(
+            "CONTEXT SWITCH     Check     {} kthreads  {} switches  work {}   FAIL\n",
+            context.threads,
+            context.switches,
+            context.work
+        );
+        kumo_hal::active::halt();
+    }
 
-        let hook_before = PREEMPT_PROBE.load(core::sync::atomic::Ordering::Relaxed);
-        kumo_hal::active::set_preempt_hook(preempt_probe);
-        let tick_before = kumo_hal::active::local_timer_irq_count();
-        let ticks = kumo_hal::active::wait_for_local_timer_irqs(tick_before, 3);
-        kumo_hal::active::clear_preempt_hook();
-        let hooks = PREEMPT_PROBE
-            .load(core::sync::atomic::Ordering::Relaxed)
-            .wrapping_sub(hook_before);
-        if ticks >= 3 && hooks >= 3 {
-            klog!(
-                "PREEMPT HOOK       Check     local APIC timer drives hook  {}t  hook {}x   OK\n",
-                ticks,
-                hooks
-            );
-        } else {
-            klog!(
-                "PREEMPT HOOK       Check     ticks {}  hook {} (want >=3 / >=3)   FAIL\n",
-                ticks,
-                hooks
-            );
-            kumo_hal::active::halt();
-        }
+    // Run two non-yielding bodies under the real Dispatcher. The local APIC timer hook rotates
+    // between their saved interrupt continuations, then restores the suspended boot context once
+    // both have executed and at least four body-to-body switches completed.
+    let preempt = kdemo::run_preemption();
+    if preempt.threads == 2
+        && preempt.switches >= 4
+        && preempt.ticks >= 4
+        && preempt.work.iter().all(|&work| work > 0)
+    {
+        klog!(
+            "PREEMPT SCHED      Check     {} kthreads  {} body switches  {} ticks  timer-preempted both bodies   OK\n",
+            preempt.threads,
+            preempt.switches,
+            preempt.ticks
+        );
+    } else {
+        klog!(
+            "PREEMPT SCHED      Check     {} kthreads  {} body switches  {} ticks  work {:?}   FAIL\n",
+            preempt.threads,
+            preempt.switches,
+            preempt.ticks,
+            preempt.work
+        );
+        kumo_hal::active::halt();
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");
