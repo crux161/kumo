@@ -4,7 +4,7 @@
 //! `iretq` entry, a dedicated TSS.RSP0 kernel stack, the tiny first-light payload, and return to
 //! the suspended kernel flow. — KESTREL
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub const SYSCALL_VECTOR: usize = 0x80;
 pub const PING_TOKEN: u64 = 0x4b55_4d4f_c0de_cafe;
@@ -41,9 +41,33 @@ pub(crate) enum Dispatch {
 
 static CALLS: AtomicU32 = AtomicU32::new(0);
 static PING_ECHO: AtomicU64 = AtomicU64::new(0);
+static SVC_HOOK: AtomicUsize = AtomicUsize::new(0);
+static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn set_svc_hook(hook: extern "C" fn(*mut u64)) {
+    SVC_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub(crate) fn svc_hook() -> Option<extern "C" fn(*mut u64)> {
+    let hook = SVC_HOOK.load(Ordering::Acquire);
+    (hook != 0).then(|| unsafe { core::mem::transmute(hook) })
+}
+
+pub(crate) fn set_fault_hook(hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {
+    FAULT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub(crate) fn fault_hook() -> Option<extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !> {
+    let hook = FAULT_HOOK.load(Ordering::Acquire);
+    (hook != 0).then(|| unsafe { core::mem::transmute(hook) })
+}
+
+pub(crate) fn record_call() {
+    CALLS.fetch_add(1, Ordering::Relaxed);
+}
 
 pub(crate) fn dispatch(operation: u64, argument: u64) -> Dispatch {
-    CALLS.fetch_add(1, Ordering::Relaxed);
+    record_call();
     match operation {
         OP_PING => {
             PING_ECHO.store(argument, Ordering::Relaxed);

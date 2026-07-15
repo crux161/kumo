@@ -24,10 +24,13 @@ pub use io_apic::{
     IoApicTimerPlan,
 };
 pub use platform_acpi::{
-    discover_acpi_madt, discover_acpi_root, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport,
+    discover_acpi_madt, discover_acpi_root, inspect_acpi_rsdp, AcpiLegacyIrqRoute, AcpiMadtReport,
+    AcpiRootReport,
 };
-pub use ring3::{Ring3Error, Ring3Report};
+pub use ring3::{Ring3Error, Ring3Report, PING_TOKEN as RING3_PING_TOKEN};
 pub use userspace::first_light_smoke as run_ring3_smoke;
+pub use userspace::prepare_scheduled_smoke as prepare_scheduled_ring3_smoke;
+pub use userspace::prepare_scheduled_user_image;
 
 pub const ARCH: &str = "x86_64";
 
@@ -139,8 +142,56 @@ core::arch::global_asm!(
     "  hlt",
     "  jmp 1b",
     ".size kumo_context_trampoline,.-kumo_context_trampoline",
+    ".global kumo_user_enter",
+    ".type kumo_user_enter,@function",
+    "kumo_user_enter:",
+    // R12 points at UserState and R13 carries this thread's kernel-stack top. Install
+    // TSS.RSP0 before CPL3 can take an interrupt, then switch to the process PML4.
+    "  mov %r13, %rdi",
+    "  call x86_set_user_kernel_stack",
+    "  mov %r12, %r15",
+    "  mov 272(%r15), %rax",
+    "  mov %rax, %cr3",
+    // Build the hardware privilege-return frame. Only arithmetic flags from `spsr` are
+    // admitted; IF and the architecturally fixed bit are always set, while IOPL/NT/VM stay clear.
+    "  mov $0x1b, %ax",
+    "  mov %ax, %ds",
+    "  mov %ax, %es",
+    "  pushq $0x1b",
+    "  pushq 264(%r15)",
+    "  mov 256(%r15), %rax",
+    "  and $0xcd5, %rax",
+    "  or $0x202, %rax",
+    "  push %rax",
+    "  pushq $0x23",
+    "  pushq 248(%r15)",
+    // x[0..14] is Kumo's architecture-neutral initial register image. On AMD64 it
+    // materializes as RDI,RSI,RDX,RCX,R8,R9,R10,R11,RAX,RBX,RBP,R12-R15.
+    "  mov 0(%r15), %rdi",
+    "  mov 8(%r15), %rsi",
+    "  mov 16(%r15), %rdx",
+    "  mov 24(%r15), %rcx",
+    "  mov 32(%r15), %r8",
+    "  mov 40(%r15), %r9",
+    "  mov 48(%r15), %r10",
+    "  mov 56(%r15), %r11",
+    "  mov 64(%r15), %rax",
+    "  mov 72(%r15), %rbx",
+    "  mov 80(%r15), %rbp",
+    "  mov 88(%r15), %r12",
+    "  mov 96(%r15), %r13",
+    "  mov 104(%r15), %r14",
+    "  mov 112(%r15), %r15",
+    "  iretq",
+    ".size kumo_user_enter,.-kumo_user_enter",
     options(att_syntax),
 );
+
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn x86_set_user_kernel_stack(stack_top: u64) {
+    gdt::set_kernel_stack(stack_top);
+}
 
 /// Switch from `prev` to `next`, returning only when another context restores `prev`.
 ///
@@ -160,80 +211,142 @@ pub unsafe fn switch_context(_prev: *mut ThreadContext, _next: *const ThreadCont
     // Host stub — context switching is a no-op in tests.
 }
 
-/// P10-b: build x86_64 identity page tables with 2 MiB huge pages and enable paging.
-/// Maps `[0, top)` as RW supervisor, allocates page-table frames via `alloc`.
-/// Returns `(tables_used, bytes_mapped)`.
-#[cfg(target_os = "none")]
-pub fn enable_kernel_mmu(
+const KERNEL_PAGE_PRESENT: u64 = 1 << 0;
+const KERNEL_PAGE_RW: u64 = 1 << 1;
+const KERNEL_PAGE_WRITE_THROUGH: u64 = 1 << 3;
+const KERNEL_PAGE_CACHE_DISABLE: u64 = 1 << 4;
+const KERNEL_PAGE_PS: u64 = 1 << 7;
+const KERNEL_PAGE_GLOBAL: u64 = 1 << 8;
+const KERNEL_PAGE_NO_EXECUTE: u64 = 1 << 63;
+const KERNEL_PAGE_SIZE: u64 = 0x1000;
+const KERNEL_PAGE_2M: u64 = 0x20_0000;
+const KERNEL_PAGE_1G: u64 = 0x4000_0000;
+const KERNEL_MIN_MAP_TOP: u64 = 4 * KERNEL_PAGE_1G;
+const KERNEL_MAP_LIMIT: u64 = paging::USER_BASE;
+const KERNEL_TABLE_ENTRIES: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelMapPlan {
     top: u64,
-    _kernel_phys: u64,
+    page_directories: usize,
+    tables: usize,
+}
+
+fn kernel_map_plan(requested_top: u64) -> Option<KernelMapPlan> {
+    if requested_top > KERNEL_MAP_LIMIT {
+        return None;
+    }
+    let requested_top = requested_top.max(KERNEL_MIN_MAP_TOP);
+    let top = requested_top.checked_add(KERNEL_PAGE_1G - 1)? & !(KERNEL_PAGE_1G - 1);
+    if top > KERNEL_MAP_LIMIT {
+        return None;
+    }
+    let page_directories = usize::try_from(top / KERNEL_PAGE_1G).ok()?;
+    Some(KernelMapPlan {
+        top,
+        page_directories,
+        // One PML4, one PDPT, then one page directory per mapped GiB.
+        tables: 2usize.checked_add(page_directories)?,
+    })
+}
+
+fn kernel_leaf_flags(is_ram: bool, is_framebuffer: bool, is_kernel: bool) -> u64 {
+    let mut flags = KERNEL_PAGE_PRESENT | KERNEL_PAGE_RW | KERNEL_PAGE_PS | KERNEL_PAGE_GLOBAL;
+    if !is_kernel {
+        flags |= KERNEL_PAGE_NO_EXECUTE;
+    }
+    if !is_ram || is_framebuffer {
+        // Safe first-light policy that does not depend on firmware PAT programming.
+        flags |= KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE;
+    }
+    flags
+}
+
+fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+#[cfg(target_os = "none")]
+fn alloc_kernel_table(
+    alloc: &mut dyn FnMut() -> Option<u64>,
+    tables: &mut usize,
+) -> Result<u64, ()> {
+    let frame = alloc().ok_or(())?;
+    if frame == 0 || frame & (KERNEL_PAGE_SIZE - 1) != 0 {
+        return Err(());
+    }
+    unsafe { core::ptr::write_bytes(frame as *mut u8, 0, KERNEL_PAGE_SIZE as usize) };
+    *tables = tables.checked_add(1).ok_or(())?;
+    Ok(frame)
+}
+
+/// Build the permanent x86_64 supervisor identity map with 2 MiB leaves and switch CR3.
+/// The map always covers the legacy 32-bit MMIO aperture, including the local and I/O APICs,
+/// and may grow to (but never overlap) the PML4[1] userspace arena at 512 GiB.
+/// Returns `(tables_used, bytes_mapped)`.
+///
+/// # Safety
+/// Every frame returned by `alloc` must be unique, writable through the active identity map,
+/// and unavailable to other owners. The caller must be executing in long mode with paging on.
+#[cfg(target_os = "none")]
+pub unsafe fn enable_kernel_mmu(
+    top: u64,
+    kernel_phys: u64,
     _kernel_virt: u64,
-    _kernel_len: u64,
-    _fb_phys: u64,
-    _fb_len: u64,
-    _is_ram: &dyn Fn(u64) -> bool,
+    kernel_len: u64,
+    fb_phys: u64,
+    fb_len: u64,
+    is_ram: &dyn Fn(u64) -> bool,
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(usize, u64), ()> {
-    const PAGE_PRESENT: u64 = 1 << 0;
-    const PAGE_RW: u64 = 1 << 1;
-    const PAGE_PS: u64 = 1 << 7; // 2 MiB huge page (in PDE)
-    const PAGE_GLOBAL: u64 = 1 << 8;
-    const PAGE_SIZE: u64 = 0x1000;
-    const PAGE_2M: u64 = 0x20_0000;
-    const PAGE_1G: u64 = 0x4000_0000;
-    const TABLE_ENTRIES: usize = 512;
+    let plan = kernel_map_plan(top).ok_or(())?;
+    let mut tables = 0usize;
+    let pml4_frame = alloc_kernel_table(alloc, &mut tables)?;
+    let pdpt_frame = alloc_kernel_table(alloc, &mut tables)?;
+    let pml4 = pml4_frame as *mut u64;
+    let pdpt = pdpt_frame as *mut u64;
+    unsafe {
+        pml4.write_volatile(pdpt_frame | KERNEL_PAGE_PRESENT | KERNEL_PAGE_RW);
+    }
 
-    // Allocate a PML4 table.
-    let pml4_frame = alloc().ok_or(())?;
-    let pml4: *mut u64 = pml4_frame as *mut u64;
-    unsafe { core::ptr::write_bytes(pml4, 0, TABLE_ENTRIES) };
-    let mut tables = 1usize;
-
-    // Iterate over physical memory in 1 GiB chunks (PDPT table each).
-    let mut phys: u64 = 0;
-    while phys < top {
-        let pdpt_frame = alloc().ok_or(())?;
-        let pdpt: *mut u64 = pdpt_frame as *mut u64;
-        unsafe { core::ptr::write_bytes(pdpt, 0, TABLE_ENTRIES) };
-        tables += 1;
-
-        let pml4_idx = (phys / PAGE_1G) as usize;
+    for directory_index in 0..plan.page_directories {
+        let pd_frame = alloc_kernel_table(alloc, &mut tables)?;
         unsafe {
-            pml4.add(pml4_idx)
-                .write_volatile(pdpt_frame | PAGE_PRESENT | PAGE_RW);
+            pdpt.add(directory_index)
+                .write_volatile(pd_frame | KERNEL_PAGE_PRESENT | KERNEL_PAGE_RW);
         }
-
-        // Fill the PDPT with 2 MiB huge pages.
-        let gb_end = (phys + PAGE_1G).min(top);
-        while phys < gb_end {
-            let pdpt_idx = (phys % PAGE_1G / PAGE_2M) as usize;
-            unsafe {
-                pdpt.add(pdpt_idx)
-                    .write_volatile(phys | PAGE_PRESENT | PAGE_RW | PAGE_PS | PAGE_GLOBAL);
-            }
-            phys += PAGE_2M;
+        let pd = pd_frame as *mut u64;
+        for leaf_index in 0..KERNEL_TABLE_ENTRIES {
+            let phys = (directory_index as u64)
+                .saturating_mul(KERNEL_PAGE_1G)
+                .saturating_add((leaf_index as u64).saturating_mul(KERNEL_PAGE_2M));
+            let framebuffer = ranges_overlap(phys, KERNEL_PAGE_2M, fb_phys, fb_len);
+            let kernel = ranges_overlap(phys, KERNEL_PAGE_2M, kernel_phys, kernel_len);
+            let flags = kernel_leaf_flags(is_ram(phys), framebuffer, kernel);
+            unsafe { pd.add(leaf_index).write_volatile(phys | flags) };
         }
     }
 
-    // Load CR3 and enable paging (PAE is already set in long mode).
+    if tables != plan.tables {
+        return Err(());
+    }
+
+    // NX is used by every non-kernel leaf. Long mode and CR0.PG are already active here.
+    paging::enable_execute_disable();
     unsafe {
         core::arch::asm!(
-            "mov cr3, {cr3}",
-            "mov rax, cr0",
-            "bts rax, 31", // set CR0.PG (bit 31)
-            "mov cr0, rax",
-            cr3 = in(reg) pml4_frame,
-            out("rax") _,
-            options(nostack, nomem),
+            "mov cr3, {root}",
+            root = in(reg) pml4_frame,
+            options(nostack, preserves_flags),
         );
     }
 
-    Ok((tables, top))
+    Ok((tables, plan.top))
 }
 
 /// Host stub: paging setup is a no-op (tests don't run on bare metal).
 #[cfg(not(target_os = "none"))]
-pub fn enable_kernel_mmu(
+pub unsafe fn enable_kernel_mmu(
     _top: u64,
     _kernel_phys: u64,
     _kernel_virt: u64,
@@ -427,7 +540,11 @@ pub enum UserImageError {
     StackOutsideStackBlock,
 }
 
-/// Saved userspace execution context (stub — scheduler-driven x86 ring-3 entry lands later).
+/// Initial userspace execution context for scheduler-driven CPL3 entry.
+///
+/// The shared kernel names the register image `x` to keep one syscall-frame contract. AMD64
+/// materializes x0..x14 as RDI, RSI, RDX, RCX, R8, R9, R10, R11, RAX, RBX, RBP, R12..R15.
+/// `elr`, `spsr`, `sp_el0`, and `ttbr0` correspond to RIP, sanitized RFLAGS, RSP, and CR3.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct UserState {
@@ -436,6 +553,36 @@ pub struct UserState {
     pub spsr: u64,
     pub sp_el0: u64,
     pub ttbr0: u64,
+}
+
+/// Build the kernel context that enters `state` at CPL3 on its first dispatch.
+pub fn user_entry_context(state: *const UserState, kernel_stack_top: usize) -> ThreadContext {
+    #[cfg(target_os = "none")]
+    let rip = {
+        extern "C" {
+            fn kumo_user_enter();
+        }
+        kumo_user_enter as *const () as usize as u64
+    };
+    #[cfg(not(target_os = "none"))]
+    let rip = 0;
+
+    ThreadContext {
+        r12_entry: state as u64,
+        r13_arg: kernel_stack_top as u64,
+        rip,
+        rsp: kernel_stack_top as u64,
+        user: true,
+        ..ThreadContext::default()
+    }
+}
+
+/// Select the ring-0 entry stack for the next scheduled userspace thread.
+pub fn set_user_kernel_stack(kernel_stack_top: usize) {
+    #[cfg(target_os = "none")]
+    gdt::set_kernel_stack(kernel_stack_top as u64);
+    #[cfg(not(target_os = "none"))]
+    let _ = kernel_stack_top;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -477,11 +624,14 @@ pub fn run_el0_image(
     userspace::run_el0_image(image, alloc)
 }
 
-pub fn set_svc_hook(_hook: extern "C" fn(*mut u64)) {}
+pub fn set_svc_hook(hook: extern "C" fn(*mut u64)) {
+    ring3::set_svc_hook(hook);
+}
 
-/// x86_64 EL0-fault containment is deferred with the rest of the x86 EL0 path; the IDT will
-/// route #PF/#UD/#GP from ring 3 to this hook once it lands (P10). Stubbed for parity.
-pub fn set_fault_hook(_hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {}
+/// Register the containment hook for ring-3 CPU exceptions such as #PF, #UD, and #GP.
+pub fn set_fault_hook(hook: extern "C" fn(u64, u64, u64, u64, u64, *const u64) -> !) {
+    ring3::set_fault_hook(hook);
+}
 
 pub fn el0_exit(code: u64) -> ! {
     #[cfg(target_os = "none")]
@@ -811,6 +961,56 @@ mod tests {
     }
 
     #[test]
+    fn kernel_map_plan_uses_one_page_directory_per_gib() {
+        assert_eq!(
+            kernel_map_plan(KERNEL_PAGE_1G),
+            Some(KernelMapPlan {
+                top: KERNEL_MIN_MAP_TOP,
+                page_directories: 4,
+                tables: 6,
+            })
+        );
+        assert_eq!(
+            kernel_map_plan(32 * KERNEL_PAGE_1G),
+            Some(KernelMapPlan {
+                top: 32 * KERNEL_PAGE_1G,
+                page_directories: 32,
+                tables: 34,
+            })
+        );
+        assert_eq!(
+            kernel_map_plan(KERNEL_MAP_LIMIT).unwrap().tables,
+            KERNEL_TABLE_ENTRIES + 2
+        );
+        assert_eq!(kernel_map_plan(KERNEL_MAP_LIMIT + 1), None);
+    }
+
+    #[test]
+    fn kernel_leaf_policy_is_wx_and_uncaches_devices() {
+        let kernel_ram = kernel_leaf_flags(true, false, true);
+        assert_eq!(kernel_ram & KERNEL_PAGE_NO_EXECUTE, 0);
+        assert_eq!(
+            kernel_ram & (KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE),
+            0
+        );
+
+        let ordinary_ram = kernel_leaf_flags(true, false, false);
+        assert_ne!(ordinary_ram & KERNEL_PAGE_NO_EXECUTE, 0);
+        assert_eq!(ordinary_ram & KERNEL_PAGE_CACHE_DISABLE, 0);
+
+        for device in [
+            kernel_leaf_flags(false, false, false),
+            kernel_leaf_flags(true, true, false),
+        ] {
+            assert_ne!(device & KERNEL_PAGE_NO_EXECUTE, 0);
+            assert_eq!(
+                device & (KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE),
+                KERNEL_PAGE_WRITE_THROUGH | KERNEL_PAGE_CACHE_DISABLE
+            );
+        }
+    }
+
+    #[test]
     fn thread_context_layout_matches_switch_assembly() {
         assert_eq!(core::mem::offset_of!(ThreadContext, r12_entry), 0);
         assert_eq!(core::mem::offset_of!(ThreadContext, r13_arg), 8);
@@ -832,6 +1032,32 @@ mod tests {
         assert_eq!(context.stack_top(), 0x9000);
         assert!(!context.is_user());
         assert_eq!(context.rip, 0, "host trampoline is deliberately absent");
+    }
+
+    #[test]
+    fn user_context_layout_matches_entry_assembly() {
+        let state = UserState {
+            x: [0; 31],
+            elr: 0x8000_1234,
+            spsr: 0,
+            sp_el0: 0x1000_0000_0000,
+            ttbr0: 0x2000,
+        };
+        assert_eq!(core::mem::offset_of!(UserState, elr), 248);
+        assert_eq!(core::mem::offset_of!(UserState, spsr), 256);
+        assert_eq!(core::mem::offset_of!(UserState, sp_el0), 264);
+        assert_eq!(core::mem::offset_of!(UserState, ttbr0), 272);
+        assert_eq!(core::mem::size_of::<UserState>(), 280);
+
+        let context = user_entry_context(&state, 0x9000);
+        assert_eq!(context.entry(), &state as *const UserState as u64);
+        assert_eq!(context.arg(), 0x9000);
+        assert_eq!(context.stack_top(), 0x9000);
+        assert!(context.is_user());
+        assert_eq!(
+            context.rip, 0,
+            "host user trampoline is deliberately absent"
+        );
     }
 
     static PROBE: AtomicU64 = AtomicU64::new(0);

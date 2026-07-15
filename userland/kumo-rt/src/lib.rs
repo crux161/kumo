@@ -33,12 +33,28 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 #[macro_export]
 macro_rules! entry {
     ($path:ident) => {
+        #[cfg(target_arch = "aarch64")]
         core::arch::global_asm!(
             ".section .text._start, \"ax\"",
             ".global _start",
             "_start:",
             concat!("  bl  ", stringify!($path)),
             "1: b 1b",
+        );
+
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        core::arch::global_asm!(
+            ".section .text._start, \"ax\"",
+            ".global _start",
+            "_start:",
+            // The architecture-neutral program ABI supplies eight bootstrap words. AMD64
+            // carries the first six in registers and finds the final two on the stack.
+            "  subq $16, %rsp",
+            "  movq $0, 0(%rsp)",
+            "  movq $0, 8(%rsp)",
+            concat!("  call ", stringify!($path)),
+            "1: jmp 1b",
+            options(att_syntax),
         );
     };
 }

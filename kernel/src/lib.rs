@@ -24,7 +24,9 @@ pub mod tower;
 pub mod user_thread;
 pub mod usermode;
 
-use kumo_abi::{BootInfo, Errno, ObjectKind, Rights, Signals, ABI_VERSION};
+use kumo_abi::{BootInfo, Errno, Rights, Signals, ABI_VERSION};
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use kumo_abi::{MemRegion, MemRegionKind, Range, RawSlice};
 use kumo_ipc::Message;
 use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
 
@@ -665,20 +667,622 @@ pub extern "C" fn kmain(boot: *const BootInfo) -> ! {
 /// `main.rs`. This is the GRUB/Multiboot analog of the aarch64 Nijigumo handoff — it
 /// proves the loader → 32→64-bit → serial chain and reads the Multiboot memory info.
 /// `mbi` is the Multiboot1 info pointer, `magic` the boot magic (`0x2BADB002`). Full
-/// `stage_a` parity (x86 paging/ring-3) is a later slice; j435 adds CPU exceptions and j436 adds
-/// the first external-interrupt timer heartbeat.
+/// This path now owns descriptor tables, paging, ACPI/APIC timers, scheduling, and native CPL3
+/// execution while retaining the compact serial-first bring-up harness.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_MULTIBOOT1_MAGIC: u64 = 0x2bad_b002;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_MULTIBOOT2_MAGIC: u64 = bootstrap::multiboot::MULTIBOOT2_BOOT_MAGIC;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_PHYS_MAP_LIMIT: u64 = 1 << 39;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86MultibootInitrdError {
+    WrongMagic,
+    BadInfo,
+    MissingModules,
+    BadModuleTable,
+    BadModuleRange,
+    Initrd(kumo_abi::InitrdError),
+    MissingHello,
+    Multiboot2(bootstrap::multiboot::Multiboot2Error),
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86MultibootMemoryError {
+    WrongMagic,
+    BadInfo,
+    MissingMemoryMap,
+    BadMemoryMapRange,
+    Parse(bootstrap::multiboot::MemoryMapError),
+    BadKernelRange,
+    InitrdOverlapsKernel,
+    Multiboot2(bootstrap::multiboot::Multiboot2Error),
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct X86MultibootInitrd {
+    bytes: &'static [u8],
+    hello: &'static [u8],
+    module_count: u32,
+    start: u64,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_multiboot2_info(
+    mbi: u64,
+) -> Result<bootstrap::multiboot::Multiboot2Info<'static>, bootstrap::multiboot::Multiboot2Error> {
+    const MAX_INFO_BYTES: u64 = 1 << 20;
+    if mbi == 0
+        || mbi & 7 != 0
+        || mbi
+            .checked_add(8)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(bootstrap::multiboot::Multiboot2Error::BadTotalSize);
+    }
+    let total_size = u64::from(unsafe { core::ptr::read_volatile(mbi as *const u32) });
+    if total_size < 16
+        || total_size > MAX_INFO_BYTES
+        || total_size & 7 != 0
+        || mbi
+            .checked_add(total_size)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(bootstrap::multiboot::Multiboot2Error::BadTotalSize);
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            mbi as *const u8,
+            usize::try_from(total_size)
+                .map_err(|_| bootstrap::multiboot::Multiboot2Error::BadTotalSize)?,
+        )
+    };
+    bootstrap::multiboot::Multiboot2Info::parse(bytes)
+}
+
+/// Resolve the first Multiboot1/2 module as a KUMO initrd and locate `bin/hello` inside it.
+/// The trampoline maps the low 1 GiB, so every metadata and payload access is bounded there
+/// before a pointer is formed.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_multiboot_initrd(
+    mbi: u64,
+    magic: u64,
+) -> Result<X86MultibootInitrd, X86MultibootInitrdError> {
+    const MODULE_FLAG: u32 = 1 << 3;
+    const MODULE_ENTRY_LEN: u64 = 16;
+    const MAX_MODULES: u32 = 64;
+
+    if magic == X86_MULTIBOOT2_MAGIC {
+        let info =
+            unsafe { x86_multiboot2_info(mbi) }.map_err(X86MultibootInitrdError::Multiboot2)?;
+        let module = info
+            .first_module()
+            .map_err(X86MultibootInitrdError::Multiboot2)?
+            .ok_or(X86MultibootInitrdError::MissingModules)?;
+        if module.start == 0 || module.start >= module.end || module.end > X86_BOOT_IDENTITY_LIMIT {
+            return Err(X86MultibootInitrdError::BadModuleRange);
+        }
+        let len = usize::try_from(module.end - module.start)
+            .map_err(|_| X86MultibootInitrdError::BadModuleRange)?;
+        let bytes = unsafe { core::slice::from_raw_parts(module.start as *const u8, len) };
+        let hello = kumo_abi::find_file(bytes, kumo_abi::HELLO_PATH)
+            .map_err(X86MultibootInitrdError::Initrd)?
+            .ok_or(X86MultibootInitrdError::MissingHello)?;
+        return Ok(X86MultibootInitrd {
+            bytes,
+            hello: hello.bytes,
+            module_count: info.module_count(),
+            start: module.start,
+        });
+    }
+    if magic != X86_MULTIBOOT1_MAGIC {
+        return Err(X86MultibootInitrdError::WrongMagic);
+    }
+    if mbi == 0
+        || mbi & 3 != 0
+        || mbi
+            .checked_add(28)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(X86MultibootInitrdError::BadInfo);
+    }
+    let info = mbi as *const u8;
+    let read_info =
+        |offset: usize| unsafe { core::ptr::read_volatile(info.add(offset).cast::<u32>()) };
+    let flags = read_info(0);
+    if flags & MODULE_FLAG == 0 {
+        return Err(X86MultibootInitrdError::MissingModules);
+    }
+    let module_count = read_info(20);
+    let module_table = read_info(24) as u64;
+    let table_len = u64::from(module_count)
+        .checked_mul(MODULE_ENTRY_LEN)
+        .ok_or(X86MultibootInitrdError::BadModuleTable)?;
+    if module_count == 0
+        || module_count > MAX_MODULES
+        || module_table == 0
+        || module_table & 3 != 0
+        || module_table
+            .checked_add(table_len)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(X86MultibootInitrdError::BadModuleTable);
+    }
+
+    let module = module_table as *const u8;
+    let start = unsafe { core::ptr::read_volatile(module.cast::<u32>()) } as u64;
+    let end = unsafe { core::ptr::read_volatile(module.add(4).cast::<u32>()) } as u64;
+    if start == 0 || start >= end || end > X86_BOOT_IDENTITY_LIMIT {
+        return Err(X86MultibootInitrdError::BadModuleRange);
+    }
+    let len = usize::try_from(end - start).map_err(|_| X86MultibootInitrdError::BadModuleRange)?;
+    let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, len) };
+    let hello = kumo_abi::find_file(bytes, kumo_abi::HELLO_PATH)
+        .map_err(X86MultibootInitrdError::Initrd)?
+        .ok_or(X86MultibootInitrdError::MissingHello)?;
+    Ok(X86MultibootInitrd {
+        bytes,
+        hello: hello.bytes,
+        module_count,
+        start,
+    })
+}
+
+/// Copy the Multiboot1/2 firmware map into KUMO ABI regions, clipping physical extents to
+/// `accessible_limit`. The map metadata itself must remain inside the trampoline's low
+/// identity window because this parser runs before the permanent CR3 is installed.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_multiboot_memory_map(
+    mbi: u64,
+    magic: u64,
+    accessible_limit: u64,
+) -> Result<alloc::vec::Vec<MemRegion>, X86MultibootMemoryError> {
+    const MEMORY_MAP_FLAG: u32 = 1 << 6;
+    const MEMORY_MAP_INFO_END: u64 = 52;
+    const MAX_MEMORY_MAP_BYTES: u64 = 1 << 20;
+
+    if magic == X86_MULTIBOOT2_MAGIC {
+        let info =
+            unsafe { x86_multiboot2_info(mbi) }.map_err(X86MultibootMemoryError::Multiboot2)?;
+        let map = info
+            .memory_map()
+            .map_err(X86MultibootMemoryError::Multiboot2)?
+            .ok_or(X86MultibootMemoryError::MissingMemoryMap)?;
+        return bootstrap::multiboot::normalize_multiboot2_memory_map(map, accessible_limit)
+            .map_err(X86MultibootMemoryError::Parse);
+    }
+    if magic != X86_MULTIBOOT1_MAGIC {
+        return Err(X86MultibootMemoryError::WrongMagic);
+    }
+    if mbi == 0
+        || mbi & 3 != 0
+        || mbi
+            .checked_add(MEMORY_MAP_INFO_END)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(X86MultibootMemoryError::BadInfo);
+    }
+    let info = mbi as *const u8;
+    let read_info =
+        |offset: usize| unsafe { core::ptr::read_volatile(info.add(offset).cast::<u32>()) };
+    if read_info(0) & MEMORY_MAP_FLAG == 0 {
+        return Err(X86MultibootMemoryError::MissingMemoryMap);
+    }
+    let map_len = u64::from(read_info(44));
+    let map_start = u64::from(read_info(48));
+    if map_len == 0
+        || map_len > MAX_MEMORY_MAP_BYTES
+        || map_start == 0
+        || map_start
+            .checked_add(map_len)
+            .is_none_or(|end| end > X86_BOOT_IDENTITY_LIMIT)
+    {
+        return Err(X86MultibootMemoryError::BadMemoryMapRange);
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            map_start as *const u8,
+            usize::try_from(map_len).map_err(|_| X86MultibootMemoryError::BadMemoryMapRange)?,
+        )
+    };
+    bootstrap::multiboot::normalize_memory_map(bytes, accessible_limit)
+        .map_err(X86MultibootMemoryError::Parse)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn x86_boot_info(
+    regions: &[MemRegion],
+    initrd: X86MultibootInitrd,
+) -> Result<BootInfo, X86MultibootMemoryError> {
+    extern "C" {
+        static __kernel_start: u8;
+        static __bss_end: u8;
+    }
+
+    let kernel_start = core::ptr::addr_of!(__kernel_start) as u64;
+    let kernel_end = core::ptr::addr_of!(__bss_end) as u64;
+    if kernel_start == 0 || kernel_start >= kernel_end || kernel_end > X86_BOOT_IDENTITY_LIMIT {
+        return Err(X86MultibootMemoryError::BadKernelRange);
+    }
+
+    let mut boot = BootInfo::empty(ABI_VERSION);
+    boot.mem_regions = RawSlice::from_slice(regions);
+    boot.kernel_phys = Range::new(kernel_start, kernel_end - kernel_start);
+    boot.kernel_virt = boot.kernel_phys;
+    boot.initrd = Range::new(initrd.start, initrd.bytes.len() as u64);
+    if boot.initrd.start < boot.kernel_phys.end() && boot.kernel_phys.start < boot.initrd.end() {
+        return Err(X86MultibootMemoryError::InitrdOverlapsKernel);
+    }
+    Ok(boot)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86ScheduledSmokeError {
+    Elf(bootstrap::user::ElfError),
+    Segment,
+    Image(kumo_hal::active::UserImageError),
+    Runtime(usermode::UsermodeError),
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+const X86_HELLO_LEN: usize = b"hello from a native KUMO program!\n".len();
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct X86FrameTrace {
+    frames: u32,
+    first: u64,
+    last: u64,
+    limit: u64,
+    safe: bool,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl X86FrameTrace {
+    const fn new(limit: u64) -> Self {
+        Self {
+            frames: 0,
+            first: 0,
+            last: 0,
+            limit,
+            safe: true,
+        }
+    }
+
+    fn record(&mut self, boot: &BootInfo, frame: u64) {
+        let end = frame.saturating_add(mm::PAGE_SIZE);
+        let overlaps = |range: Range| frame < range.end() && range.start < end;
+        let in_usable_ram = unsafe { boot.mem_regions.as_slice() }.iter().any(|region| {
+            region.kind == MemRegionKind::Usable
+                && region.range.start <= frame
+                && end <= region.range.end()
+        });
+        self.safe &= frame & (mm::PAGE_SIZE - 1) == 0
+            && end <= self.limit
+            && in_usable_ram
+            && (self.frames == 0 || frame > self.last)
+            && !overlaps(boot.kernel_phys)
+            && !overlaps(boot.initrd);
+        if self.frames == 0 {
+            self.first = frame;
+        }
+        self.last = frame;
+        self.frames = self.frames.saturating_add(1);
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct X86ScheduledSmokeReport {
+    entry: u64,
+    segments: usize,
+    bootstrap: u64,
+    syscalls: u32,
+    wrote: usize,
+    exit_code: u64,
+    switches: u64,
+    done: bool,
+    user_root: u64,
+    frame_trace: X86FrameTrace,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn run_x86_scheduled_ring3_smoke(
+    bytes: &[u8],
+    boot: &BootInfo,
+) -> Result<X86ScheduledSmokeReport, X86ScheduledSmokeError> {
+    let elf = bootstrap::user::parse_user_elf(bytes).map_err(X86ScheduledSmokeError::Elf)?;
+    let mut segments = alloc::vec::Vec::with_capacity(elf.segments.len());
+    for segment in &elf.segments {
+        let start =
+            usize::try_from(segment.file_offset).map_err(|_| X86ScheduledSmokeError::Segment)?;
+        let file_size =
+            usize::try_from(segment.file_size).map_err(|_| X86ScheduledSmokeError::Segment)?;
+        let end = start
+            .checked_add(file_size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or(X86ScheduledSmokeError::Segment)?;
+        segments.push(kumo_hal::active::UserLoadSegment {
+            source: &bytes[start..end],
+            virt_addr: segment.virt_addr,
+            mem_size: segment.mem_size,
+            writable: segment.flags.contains(kumo_hal::PageFlags::WRITE),
+            executable: segment.flags.contains(kumo_hal::PageFlags::EXECUTE),
+        });
+    }
+    let kernel_root = kumo_hal::active::read_user_aspace_root();
+    let root_vmar = mm::Vmar::new(
+        bootstrap::user::USER_ROOT_BASE,
+        bootstrap::user::USER_ROOT_SIZE,
+    )
+    .map_err(|_| X86ScheduledSmokeError::Runtime(usermode::UsermodeError::ChannelSetup))?;
+    let bootstrap_handle = usermode::install_standalone_user_runtime(root_vmar, kernel_root)
+        .map_err(X86ScheduledSmokeError::Runtime)?;
+    let image = kumo_hal::active::UserImage {
+        entry: elf.entry,
+        stack_top: bootstrap::user::USER_STACK_TOP,
+        stack_size: bootstrap::user::USER_STACK_SIZE,
+        bootstrap: bootstrap_handle.0 as u64,
+        segments: &segments,
+        extra_mappings: &[],
+    };
+    let mut frame_trace = X86FrameTrace::new(X86_PHYS_MAP_LIMIT);
+    let state = {
+        let mut alloc = || {
+            let frame = unsafe { mm::alloc_zeroed_frame(boot) };
+            if let Some(frame) = frame {
+                frame_trace.record(boot, frame);
+            }
+            frame
+        };
+        kumo_hal::active::prepare_scheduled_user_image(&image, &mut alloc)
+            .map_err(X86ScheduledSmokeError::Image)?
+    };
+    let user_root = state.ttbr0;
+    usermode::set_standalone_user_aspace(user_root);
+    unsafe { user_thread::spawn_user(state, user_root) };
+
+    Ok(X86ScheduledSmokeReport {
+        entry: elf.entry,
+        segments: elf.segments.len(),
+        bootstrap: bootstrap_handle.0 as u64,
+        syscalls: kumo_hal::active::syscall_count(),
+        wrote: usermode::standalone_user_bytes_written(),
+        exit_code: user_thread::exit_code(),
+        switches: user_thread::switch_count(),
+        done: user_thread::is_done(),
+        user_root,
+        frame_trace,
+    })
+}
+
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     klog!("\n[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n");
     klog!("CPU MODE: long mode (64-bit), paging on, serial COM1 live\n");
+    let multiboot2 = if magic == X86_MULTIBOOT2_MAGIC {
+        match unsafe { x86_multiboot2_info(mbi) } {
+            Ok(info) => Some(info),
+            Err(err) => {
+                klog!("multiboot2: info {:?}   FAIL\n", err);
+                kumo_hal::active::halt();
+            }
+        }
+    } else {
+        None
+    };
+    let protocol = if multiboot2.is_some() { 2 } else { 1 };
     klog!(
-        "multiboot: magic={:#010x} (want 0x2badb002), info@{:#x}\n",
+        "multiboot: v{} magic={:#010x} info@{:#x}\n",
+        protocol,
         magic,
         mbi
     );
 
-    // Multiboot1 info block: flags at +0; if bit0, mem_lower/mem_upper (KiB) at +4/+8.
-    if mbi != 0 {
+    let initrd = match unsafe { x86_multiboot_initrd(mbi, magic) } {
+        Ok(initrd) => {
+            klog!(
+                "MULTIBOOT INITRD   Check     {} module  KUMORD01 {}b  {} {}b  phys {:#x}   OK\n",
+                initrd.module_count,
+                initrd.bytes.len(),
+                kumo_abi::HELLO_PATH,
+                initrd.hello.len(),
+                initrd.start
+            );
+            initrd
+        }
+        Err(err) => {
+            klog!("MULTIBOOT INITRD   Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    };
+
+    let memory_regions = match unsafe { x86_multiboot_memory_map(mbi, magic, X86_PHYS_MAP_LIMIT) } {
+        Ok(regions) => regions,
+        Err(err) => {
+            klog!("MULTIBOOT BOOTINFO Check     memory map {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    };
+    let bootstrap_regions =
+        match unsafe { x86_multiboot_memory_map(mbi, magic, X86_BOOT_IDENTITY_LIMIT) } {
+            Ok(regions) => regions,
+            Err(err) => {
+                klog!(
+                    "MULTIBOOT BOOTINFO Check     bootstrap map {:?}   FAIL\n",
+                    err
+                );
+                kumo_hal::active::halt();
+            }
+        };
+    let boot = match unsafe { x86_boot_info(&memory_regions, initrd) } {
+        Ok(boot) => boot,
+        Err(err) => {
+            klog!("MULTIBOOT BOOTINFO Check     handoff {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    };
+    let bootstrap_boot = match unsafe { x86_boot_info(&bootstrap_regions, initrd) } {
+        Ok(boot) => boot,
+        Err(err) => {
+            klog!(
+                "MULTIBOOT BOOTINFO Check     bootstrap handoff {:?}   FAIL\n",
+                err
+            );
+            kumo_hal::active::halt();
+        }
+    };
+    let handoff = match inspect_boot(&boot) {
+        Ok(report) if report.has_initrd => report,
+        Ok(report) => {
+            klog!("MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", report);
+            kumo_hal::active::halt();
+        }
+        Err(err) => {
+            klog!("MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    };
+    klog!(
+        "MULTIBOOT BOOTINFO Check     ABIv{}  {} regions  {} MiB usable / {} MiB mapped  kernel {:#x}+{} KiB  initrd {:#x}+{}b  phys<512G   OK\n",
+        handoff.abi_version,
+        handoff.mem_region_count,
+        handoff.usable_bytes >> 20,
+        handoff.total_bytes >> 20,
+        boot.kernel_phys.start,
+        boot.kernel_phys.len >> 10,
+        boot.initrd.start,
+        boot.initrd.len
+    );
+
+    // Exercise the architecture-neutral M1 plan, not a parallel x86 allocator. The plan
+    // subtracts the linker-derived kernel extent and Multiboot module before yielding frames.
+    let memory = unsafe { mm::init(&boot) };
+    let samples_safe = memory.sample_count == memory.sample_frames.len()
+        && memory.sample_frames.iter().all(|&frame| {
+            let end = frame.saturating_add(mm::PAGE_SIZE);
+            let overlaps = |range: Range| frame < range.end() && range.start < end;
+            frame >= 1 << 20
+                && end <= X86_BOOT_IDENTITY_LIMIT
+                && !overlaps(boot.kernel_phys)
+                && !overlaps(boot.initrd)
+        });
+    if memory.usable_frames == 0 || !samples_safe {
+        klog!("M1 MEMORY PLAN     Check     {:?}   FAIL\n", memory);
+        kumo_hal::active::halt();
+    }
+    klog!(
+        "M1 MEMORY PLAN     Check     {} frames / {} MiB  kernel+initrd excluded  samples {:#x} {:#x} {:#x}   OK\n",
+        memory.usable_frames,
+        memory.usable_bytes >> 20,
+        memory.sample_frames[0],
+        memory.sample_frames[1],
+        memory.sample_frames[2]
+    );
+
+    // The trampoline only makes low RAM writable, so bootstrap-owned frames build the
+    // permanent tree even though that tree is sized and typed from the full firmware map.
+    // Once CR3 moves, all normalized RAM below the userspace boundary is identity-reachable.
+    let old_root = kumo_hal::active::read_user_aspace_root();
+    let mut paging_frames = X86FrameTrace::new(X86_BOOT_IDENTITY_LIMIT);
+    let paging = {
+        let mut alloc = || {
+            let frame = unsafe { mm::alloc_zeroed_frame(&bootstrap_boot) };
+            if let Some(frame) = frame {
+                paging_frames.record(&bootstrap_boot, frame);
+            }
+            frame
+        };
+        unsafe { mm::enable_paging_with_allocator(&boot, &mut alloc) }
+    };
+    let new_root = kumo_hal::active::read_user_aspace_root();
+    let paging = match paging {
+        Some(report)
+            if paging_frames.safe
+                && paging_frames.frames as usize == report.tables
+                && paging_frames.first == new_root
+                && old_root != new_root
+                && report.mapped_bytes >= 4 * (1 << 30) =>
+        {
+            report
+        }
+        report => {
+            klog!(
+                "KERNEL CR3 / PHYSMAP Check     old {:#x} new {:#x} report {:?} frames {:?}   FAIL\n",
+                old_root,
+                new_root,
+                report,
+                paging_frames
+            );
+            kumo_hal::active::halt();
+        }
+    };
+
+    let high_probe = memory_regions.iter().find_map(|region| {
+        if region.kind != MemRegionKind::Usable || region.range.end() <= X86_BOOT_IDENTITY_LIMIT {
+            return None;
+        }
+        let address = mm::align_up(region.range.start.max(X86_BOOT_IDENTITY_LIMIT))?;
+        address
+            .checked_add(core::mem::size_of::<u64>() as u64)
+            .filter(|&end| end <= region.range.end())
+            .map(|_| address)
+    });
+    if let Some(address) = high_probe {
+        let pointer = address as *mut u64;
+        let original = unsafe { pointer.read_volatile() };
+        let pattern = original ^ 0x4b55_4d4f_cafe_f00d;
+        unsafe { pointer.write_volatile(pattern) };
+        let observed = unsafe { pointer.read_volatile() };
+        unsafe { pointer.write_volatile(original) };
+        if observed != pattern {
+            klog!(
+                "KERNEL CR3 / PHYSMAP Check     high RAM probe {:#x} read {:#x} wanted {:#x}   FAIL\n",
+                address,
+                observed,
+                pattern
+            );
+            kumo_hal::active::halt();
+        }
+        klog!(
+            "KERNEL CR3 / PHYSMAP Check     old {:#x} new {:#x}  {} tables  {} GiB  {} low BootInfo frames  RAM WB  holes UC/NX  high RAM yes {:#x}   OK\n",
+            old_root,
+            new_root,
+            paging.tables,
+            paging.mapped_bytes >> 30,
+            paging_frames.frames,
+            address
+        );
+    } else {
+        klog!(
+            "KERNEL CR3 / PHYSMAP Check     old {:#x} new {:#x}  {} tables  {} GiB  {} low BootInfo frames  RAM WB  holes UC/NX  high RAM absent   OK\n",
+            old_root,
+            new_root,
+            paging.tables,
+            paging.mapped_bytes >> 30,
+            paging_frames.frames
+        );
+    }
+
+    // Keep the diagnostic memory summary honest for either boot protocol.
+    if let Some(info) = multiboot2 {
+        klog!("multiboot2: {}b tagged handoff\n", info.total_size());
+        if let Some((mem_lower, mem_upper)) = info.basic_memory() {
+            klog!(
+                "AETHER: {} KiB lower + {} KiB upper (~{} MiB usable)  OK\n",
+                mem_lower,
+                mem_upper,
+                (mem_lower + mem_upper) / 1024
+            );
+        }
+    } else if magic == X86_MULTIBOOT1_MAGIC && mbi != 0 {
         let flags = unsafe { core::ptr::read_volatile(mbi as *const u32) };
         klog!("multiboot: flags={:#010x}\n", flags);
         if flags & 0x1 != 0 {
@@ -717,25 +1321,37 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         kumo_hal::active::halt();
     }
 
-    let acpi_root = match kumo_hal::active::discover_acpi_root() {
-        Some(acpi) => {
-            let root = if acpi.uses_xsdt { "XSDT" } else { "RSDT" };
-            klog!(
-                "ACPI TABLES        Check     RSDP {:#x} rev {}  {} {:#x}   OK\n",
-                acpi.rsdp_address,
-                acpi.revision,
-                root,
-                acpi.root_address
-            );
-            acpi
+    let tagged_acpi = multiboot2.and_then(|info| {
+        let rsdp = info.acpi_rsdp()?;
+        match kumo_hal::active::inspect_acpi_rsdp(rsdp, rsdp.as_ptr() as u64) {
+            Some(acpi) => Some(acpi),
+            None => {
+                klog!("ACPI TABLES        Check     Multiboot2 RSDP invalid   FAIL\n");
+                kumo_hal::active::halt();
+            }
         }
-        None => {
-            klog!("ACPI TABLES        Check     RSDP absent   FAIL\n");
-            kumo_hal::active::halt();
-        }
+    });
+    let (acpi_root, acpi_source) = match tagged_acpi {
+        Some(acpi) => (acpi, "Multiboot2"),
+        None => match kumo_hal::active::discover_acpi_root() {
+            Some(acpi) => (acpi, "legacy scan"),
+            None => {
+                klog!("ACPI TABLES        Check     RSDP absent   FAIL\n");
+                kumo_hal::active::halt();
+            }
+        },
     };
+    let root = if acpi_root.uses_xsdt { "XSDT" } else { "RSDT" };
+    klog!(
+        "ACPI TABLES        Check     RSDP {:#x} rev {}  {} {:#x}  via {}   OK\n",
+        acpi_root.rsdp_address,
+        acpi_root.revision,
+        root,
+        acpi_root.root_address,
+        acpi_source
+    );
 
-    let madt = match kumo_hal::active::discover_acpi_madt(acpi_root) {
+    let madt = match kumo_hal::active::discover_acpi_madt(acpi_root, paging.mapped_bytes) {
         Some(madt) => {
             klog!(
             "ACPI MADT          Check     APIC {:#x}  LAPIC {:#x}  IOAPIC {}  ISO {}  PCAT {}   OK\n",
@@ -933,8 +1549,25 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     // First CPL3 proof: an RX user page pings through the DPL3 int80 gate, receives its value
     // back via `iretq`, then exits through the same gate to the suspended kernel flow. The
     // privilege transition uses a dedicated TSS.RSP0 stack rather than the boot call stack.
-    match kumo_hal::active::run_ring3_smoke() {
-        Ok(report) if report.is_live() => {
+    let mut ring3_frames = X86FrameTrace::new(X86_PHYS_MAP_LIMIT);
+    let ring3 = {
+        let mut alloc = || {
+            let frame = unsafe { mm::alloc_zeroed_frame(&boot) };
+            if let Some(frame) = frame {
+                ring3_frames.record(&boot, frame);
+            }
+            frame
+        };
+        kumo_hal::active::run_ring3_smoke(&mut alloc)
+    };
+    match ring3 {
+        Ok(report) if report.is_live() && ring3_frames.safe && ring3_frames.frames >= 6 => {
+            klog!(
+                "RING3 / FRAMES     Check     {} BootInfo frames  first {:#x}  last {:#x}  monotonic  kernel+initrd excluded   OK\n",
+                ring3_frames.frames,
+                ring3_frames.first,
+                ring3_frames.last
+            );
             klog!(
                 "RING3 / PAGING     Check     private CR3  RX code {:#x}  NX stack {:#x}  4K guard   OK\n",
                 report.code_address,
@@ -949,11 +1582,12 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         }
         Ok(report) => {
             klog!(
-                "RING3 / INT80      Check     entered={} calls={} ping={:#x} exit={}   FAIL\n",
+                "RING3 / INT80      Check     entered={} calls={} ping={:#x} exit={} frames={:?}   FAIL\n",
                 report.entered,
                 report.calls,
                 report.ping_echo,
-                report.exit_code
+                report.exit_code,
+                ring3_frames
             );
             kumo_hal::active::halt();
         }
@@ -1167,6 +1801,51 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             preempt.work
         );
         kumo_hal::active::halt();
+    }
+
+    // Drive the initrd-resident KUMO ELF through the shared user-thread dispatcher. Its runtime
+    // drains startup, emits the canonical hello through DebugWrite, and exits; ProcessExit restores
+    // this boot context, proving module ingestion, named-file lookup, ELF load, runtime ABI, traps,
+    // and exit are schedulable continuations.
+    match run_x86_scheduled_ring3_smoke(initrd.hello, &boot) {
+        Ok(report)
+            if report.done
+                && report.segments >= 2
+                && report.bootstrap != 0
+                && report.syscalls == 4
+                && report.wrote == X86_HELLO_LEN
+                && report.exit_code == 0
+                && report.switches == 2
+                && report.frame_trace.safe
+                && report.frame_trace.frames >= 6
+                && report.user_root == report.frame_trace.first =>
+        {
+            klog!(
+                "USER ELF / FRAMES  Check     {} BootInfo frames  first {:#x}  last {:#x}  CR3 {:#x}  monotonic  kernel+initrd excluded   OK\n",
+                report.frame_trace.frames,
+                report.frame_trace.first,
+                report.frame_trace.last,
+                report.user_root
+            );
+            klog!(
+                "USER ELF / ENGINE  Check     {} PT_LOAD  entry {:#x}  boot h{}  {} int80  wrote {}b  {} switches  exit {}   OK\n",
+                report.segments,
+                report.entry,
+                report.bootstrap,
+                report.syscalls,
+                report.wrote,
+                report.switches,
+                report.exit_code
+            );
+        }
+        Ok(report) => {
+            klog!("USER ELF / ENGINE  Check     {:?}   FAIL\n", report);
+            kumo_hal::active::halt();
+        }
+        Err(err) => {
+            klog!("USER ELF / ENGINE  Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
     }
 
     klog!("x86_64 MUREX core online, first light reached; HALTING.\n");

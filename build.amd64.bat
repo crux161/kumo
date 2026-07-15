@@ -2,10 +2,10 @@
 setlocal
 
 set "FORMAT=%~1"
-if "%FORMAT%"=="" set "FORMAT=img"
+if "%FORMAT%"=="" set "FORMAT=iso"
 
 if /I not "%FORMAT%"=="iso" if /I not "%FORMAT%"=="img" (
-    echo usage: build.arm64.bat [iso^|img]
+    echo usage: build.amd64.bat [iso^|img]
     exit /b 2
 )
 
@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 pushd "%~dp0"
-bash ./build.sh arm64 "%FORMAT%"
+bash ./build.sh amd64 "%FORMAT%"
 set "RESULT=%ERRORLEVEL%"
 popd
 exit /b %RESULT%

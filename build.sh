@@ -1,19 +1,43 @@
 #!/bin/sh
-# build.sh — crux's quick deploy loop.
+# build.sh — quick staging, deploy, and boot-media entry point.
 #
-#   ./build.sh            # FAST: build the ThinkPad X13s image, open its product dir (drag EFI/ -> USB)
-#   ./build.sh all        # build X13s + Raspberry Pi 5 + x86_64 (the old full sweep)
-#   KUMO_ESP=/Volumes/ESP ./build.sh   # also copy the EFI tree straight onto a mounted ESP/USB
+# Boot-media products:
+#   ./build.sh arm64 iso    -> build/kumo-arm64.iso
+#   ./build.sh arm64 img    -> build/kumo-arm64.img
+#   ./build.sh amd64 iso    -> build/kumo-amd64.iso
+#   ./build.sh amd64 img    -> build/kumo-amd64.img
 #
-# After `./build.sh`, the X13s image dir opens in Finder; drag its EFI/ folder onto the USB key's
-# EFI System Partition, then boot the ThinkPad. (No need to append `open build` anymore.)
+# `.iso` selects UEFI optical media. `.img` selects disk-writeable media: a raw MBR/FAT32
+# ESP on ARM64 and GRUB's USB-bootable ISO-hybrid layout on AMD64.
+#
+# Legacy shortcuts remain available:
+#   ./build.sh              -> stage the ThinkPad X13s EFI tree
+#   ./build.sh x13s         -> same as above
+#   ./build.sh all          -> stage every existing architecture/hardware profile
+#
+# KUMO_ESP=/Volumes/ESP ./build.sh x13s copies the staged X13s EFI tree to a mounted ESP.
+# KUMO_NO_OPEN=1 suppresses opening the output directory on macOS.
 set -eu
 
 MODE="${1:-x13s}"
+PRODUCT="${2:-}"
 ESP="${KUMO_ESP:-}"
-deploy_thinkpad="false"
+OPEN_DIR=""
+DEPLOY_DIR=""
 
 X13S_DIR="build/images/thinkpad-x13s-gen1"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage:
+  ./build.sh <arm64|amd64> <iso|img>
+  ./build.sh [x13s|all]
+
+examples:
+  ./build.sh arm64 img
+  ./build.sh amd64 iso
+USAGE
+}
 
 build_qemu() {
     echo "==> Building QEMU native image (virt, aarch64)..."
@@ -34,12 +58,13 @@ build_pi5() {
 }
 
 build_x86() {
-    echo "==> Building x86_64 (Generic UEFI)..."
+    echo "==> Building x86_64 (Generic UEFI staging tree)..."
     cargo xtask image --arch x86_64 --hardware generic-uefi-x86_64
 }
 
 report() {
-    dir="$1"; name="$2"
+    dir="$1"
+    name="$2"
     kernel="${dir}/EFI/KUMO/kernel/kumo-kernel.elf"
     initrd="${dir}/EFI/KUMO/initrd.img"
     plan="${dir}/kumo-image-plan-${name}.txt"
@@ -56,51 +81,127 @@ report() {
     fi
 }
 
+report_media() {
+    artifact="$1"
+    if [ ! -s "$artifact" ]; then
+        echo "error: media builder did not produce $artifact" >&2
+        exit 1
+    fi
+    echo ""
+    echo "==> Boot-media product:"
+    ls -lh "$artifact"
+}
+
+build_media() {
+    arch="$1"
+    format="$2"
+
+    case "$format" in
+        iso|img) ;;
+        *)
+            echo "error: unknown media format '$format' (expected iso or img)" >&2
+            usage
+            exit 2
+            ;;
+    esac
+
+    case "$arch" in
+        arm64|aarch64)
+            artifact="build/kumo-arm64.${format}"
+            build_x13s
+            if [ "$format" = "iso" ]; then
+                echo "==> Building ARM64 UEFI ISO: $artifact"
+                ./scripts/mkiso.sh aarch64 "$artifact" "$X13S_DIR"
+            else
+                echo "==> Building ARM64 raw MBR/FAT32 image: $artifact"
+                ./scripts/mkimg.sh arm64 "$artifact" "$X13S_DIR"
+            fi
+            DEPLOY_DIR="$X13S_DIR"
+            ;;
+        amd64|x86_64|x86-64)
+            artifact="build/kumo-amd64.${format}"
+            if [ "$format" = "iso" ]; then
+                echo "==> Building AMD64 GRUB/Multiboot2 ISO: $artifact"
+                ./scripts/mkiso.sh amd64 "$artifact"
+            else
+                echo "==> Building AMD64 GRUB/Multiboot2 hybrid image: $artifact"
+                ./scripts/mkimg.sh amd64 "$artifact"
+            fi
+            ;;
+        *)
+            echo "error: unknown architecture '$arch' (expected arm64 or amd64)" >&2
+            usage
+            exit 2
+            ;;
+    esac
+
+    report_media "$artifact"
+    OPEN_DIR="build"
+}
+
+if [ "$#" -gt 2 ]; then
+    usage
+    exit 2
+fi
+
 case "$MODE" in
+    arm64|aarch64|amd64|x86_64|x86-64)
+        if [ -z "$PRODUCT" ]; then
+            echo "error: architecture builds require an iso or img product" >&2
+            usage
+            exit 2
+        fi
+        build_media "$MODE" "$PRODUCT"
+        ;;
     x13s)
-	deploy_thinkpad="true"
-        echo "==> Quick build: ThinkPad X13s only (use './build.sh all' for Pi5 + x86_64)"
+        if [ -n "$PRODUCT" ]; then
+            usage
+            exit 2
+        fi
+        echo "==> Quick build: ThinkPad X13s only (use './build.sh all' for the full sweep)"
         build_x13s
         report "$X13S_DIR" "thinkpad-x13s-gen1"
         OPEN_DIR="$X13S_DIR"
+        DEPLOY_DIR="$X13S_DIR"
         ;;
     all)
-        echo "==> Full sweep: X13s + Pi5 + x86_64 + qemu"
+        if [ -n "$PRODUCT" ]; then
+            usage
+            exit 2
+        fi
+        echo "==> Full sweep: X13s + Pi5 + x86_64 + QEMU"
         build_x13s
         build_pi5
         build_x86
-	build_qemu
+        build_qemu
         report "$X13S_DIR" "thinkpad-x13s-gen1"
         report "build/images/generic-uefi-x86_64" "generic-uefi-x86_64"
-	report "build/images/qemu-virt-aarch64" "qemu-virt-aarch64"
+        report "build/images/qemu-virt-aarch64" "qemu-virt-aarch64"
         OPEN_DIR="build/images"
+        DEPLOY_DIR="$X13S_DIR"
         ;;
     *)
-        echo "usage: ./build.sh [x13s|all]   (default: x13s)" >&2
+        usage
         exit 2
         ;;
 esac
 
-# ---- deploy to a mounted ESP/USB if KUMO_ESP is set ----
+# Deploy a staged EFI tree to a mounted ESP/USB when requested. Media-only AMD64 builds do
+# not expose a persistent staging directory, so they deliberately skip this convenience path.
 if [ -n "$ESP" ]; then
-    if ! mountpoint -q "$ESP" 2>/dev/null && [ ! -d "$ESP/EFI" ]; then
+    if [ -z "$DEPLOY_DIR" ]; then
+        echo "Warning: this build has no staged EFI tree to deploy; use the generated media."
+    elif ! mountpoint -q "$ESP" 2>/dev/null && [ ! -d "$ESP/EFI" ]; then
         echo "Warning: $ESP does not look like a mounted EFI partition; skipping deploy."
     else
-        echo "==> Deploying X13s EFI tree to ESP at $ESP"
-        cp -r "$X13S_DIR/EFI/"* "$ESP/EFI/"
+        echo "==> Deploying EFI tree from $DEPLOY_DIR to ESP at $ESP"
+        cp -r "$DEPLOY_DIR/EFI/"* "$ESP/EFI/"
         sync
         echo "    Deploy complete."
     fi
 fi
 
-# ---- open the product dir so the EFI/ folder is ready to drag onto the USB key ----
-if command -v open >/dev/null 2>&1; then
+if [ "${KUMO_NO_OPEN:-0}" != "1" ] && command -v open >/dev/null 2>&1; then
     echo "==> Opening ${OPEN_DIR}..."
     open "$OPEN_DIR"
-fi
-
-if [[ "$deploy_thinkpad" == "true" ]]; then
-	echo "==> Updating EFI..."
-	echo "    via ThinkPad X13s route..."
-	#cp -rv build/images/thinkpad-x13s-gen1/EFI /Volumes/NIMBUS
 fi

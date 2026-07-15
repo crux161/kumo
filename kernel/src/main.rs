@@ -80,6 +80,39 @@ mod boot_x86 {
         ".long __load_end",                 // load_end_addr (end of file data)
         ".long __bss_end",                  // bss_end_addr (loader zeroes up to here)
         ".long _start",                     // entry_addr
+        // ---- Multiboot2 header -------------------------------------------------------
+        // GRUB's UEFI path cannot expose ACPI through Multiboot1. Keep both headers so QEMU's
+        // direct MB1 loader remains a fast smoke while real UEFI/GRUB boots carry ACPI tags.
+        ".align 8",
+        "mb2_header:",
+        ".long 0xe85250d6", // Multiboot2 header magic
+        ".long 0",          // i386 protected-mode architecture
+        ".long mb2_header_end - mb2_header",
+        ".long -(0xe85250d6 + (mb2_header_end - mb2_header))",
+        // Optional information request: prefer the ACPI v1/v2 tags when firmware has them.
+        ".short 1",
+        ".short 1",
+        ".long 16",
+        ".long 14",
+        ".long 15",
+        // Address tag for the same flat image used by the Multiboot1 a.out kludge.
+        ".short 2",
+        ".short 0",
+        ".long 24",
+        ".long mb2_header",
+        ".long 0x100000",
+        ".long __load_end",
+        ".long __bss_end",
+        // Enter the common 32-bit trampoline.
+        ".short 3",
+        ".short 0",
+        ".long 12",
+        ".long _start",
+        ".long 0", // 8-byte tag padding
+        ".short 0",
+        ".short 0",
+        ".long 8",
+        "mb2_header_end:",
         // ---- 32-bit entry stub --------------------------------------------------------
         ".section .text._start",
         ".code32",

@@ -30,6 +30,7 @@ const FAT32_IMG_PATH: &str = "bin/fat32.img";
 /// `niji-uefi` opens at runtime).
 const KERNEL_ESP_PATH: &str = "EFI/KUMO/kernel/kumo-kernel.elf";
 const INITRD_ESP_PATH: &str = "EFI/KUMO/initrd.img";
+const X86_MULTIBOOT_INITRD_PATH: &str = "target/x86_64-unknown-none/release/kumo-initrd.img";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Arch {
@@ -119,6 +120,12 @@ fn run() -> Result<(), String> {
             run_qemu_smoke_if_available(&boot)
         }
         "x86-smoke" => run_x86_qemu_smoke(&root),
+        "x86-uefi-smoke" => run_x86_uefi_smoke(&root),
+        "x86-initrd" => {
+            let initrd = build_x86_multiboot_initrd(&root)?;
+            println!("{}", initrd.display());
+            Ok(())
+        }
         "image" => image(&root, args.arch, hardware),
         "product" => {
             let products = build_products(&root)?;
@@ -738,10 +745,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             ])?
         }
         ImageArch::X86_64 => {
-            // P10: empty initrd placeholder — Sora is aarch64-only. The kernel
-            // boots without userspace; Nijigumo still needs a valid initrd image
-            // to pass via BootInfo.
-            build_initrd(&[])?
+            let hello = build_x86_hello_image(&workspace_root()?)?;
+            build_initrd(&[(HELLO_PATH, hello.as_slice())])?
         }
     };
 
@@ -882,6 +887,48 @@ fn build_hello_image(root: &Path) -> Result<Vec<u8>, String> {
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as hello ELF: {err}", source_path.display()))?;
     Ok(bytes)
+}
+
+fn build_x86_hello_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "hello",
+            "--bin",
+            "hello",
+            "--target",
+            "x86_64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/x86_64-unknown-none/release")
+        .join("hello");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_x86_64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as hello ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_x86_multiboot_initrd(root: &Path) -> Result<PathBuf, String> {
+    let hello = build_x86_hello_image(root)?;
+    let initrd = build_initrd(&[(HELLO_PATH, hello.as_slice())])?;
+    let hello_file = kumo_abi::find_file(&initrd, HELLO_PATH)
+        .map_err(|err| format!("validate x86 initrd: {err:?}"))?
+        .ok_or_else(|| format!("x86 initrd is missing {HELLO_PATH}"))?;
+    validate_x86_64_kernel_elf(hello_file.bytes)
+        .map_err(|err| format!("validate x86 initrd {HELLO_PATH}: {err}"))?;
+
+    let path = root.join(X86_MULTIBOOT_INITRD_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    fs::write(&path, initrd).map_err(|err| format!("write {}: {err}", path.display()))?;
+    Ok(path)
 }
 
 fn build_ls_image(root: &Path) -> Result<Vec<u8>, String> {
@@ -1798,15 +1845,25 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     if kernel_len == 0 {
         return Err(format!("{} is empty", kernel.display()));
     }
+    let initrd = root.join(X86_MULTIBOOT_INITRD_PATH);
+    let initrd_bytes = fs::read(&initrd)
+        .map_err(|err| format!("read x86 Multiboot initrd {}: {err}", initrd.display()))?;
+    let hello = kumo_abi::find_file(&initrd_bytes, HELLO_PATH)
+        .map_err(|err| format!("validate x86 Multiboot initrd: {err:?}"))?
+        .ok_or_else(|| format!("{} does not contain {HELLO_PATH}", initrd.display()))?;
+    validate_x86_64_kernel_elf(hello.bytes)
+        .map_err(|err| format!("validate {} from x86 initrd: {err}", HELLO_PATH))?;
 
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-kernel",
             path_arg(&kernel)?,
+            "-initrd",
+            path_arg(&initrd)?,
             "-cpu",
             "qemu64,+x2apic",
             "-m",
-            "128",
+            "1088",
             "-display",
             "none",
             "-no-reboot",
@@ -1849,6 +1906,14 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
         "x86 first-light proof",
         &[
             b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+            b"MULTIBOOT INITRD   Check     1 module  KUMORD01",
+            b"bin/hello",
+            b"MULTIBOOT BOOTINFO Check     ABIv2",
+            b"phys<512G   OK",
+            b"M1 MEMORY PLAN     Check",
+            b"kernel+initrd excluded",
+            b"KERNEL CR3 / PHYSMAP Check",
+            b"RAM WB  holes UC/NX  high RAM yes",
             b"GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28",
             b"ACPI TABLES        Check     RSDP",
             b"ACPI MADT          Check     APIC",
@@ -1858,6 +1923,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
             b"IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
             b"IDT / TOWER        Check     int3 caught + resumed",
+            b"RING3 / FRAMES     Check",
             b"RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
             b"RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
@@ -1869,9 +1935,13 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK",
             b"PREEMPT SCHED      Check     2 kthreads",
             b"timer-preempted both bodies   OK",
+            b"hello from a native KUMO program!",
+            b"USER ELF / FRAMES  Check",
+            b"USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80",
+            b"wrote 34b  2 switches  exit 0   OK",
             b"x86_64 MUREX core online, first light reached; HALTING.",
         ],
-        Duration::from_secs(5),
+        Duration::from_secs(8),
     )
     .and_then(|()| validate_x86_smoke_transcript(&transcript));
 
@@ -1890,8 +1960,218 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: real cooperative + timer-preempted context switching, private-CR3 CPL3/int80, int3, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
+        "KUMO x86 QEMU smoke green: full Multiboot physical map + kernel-owned CR3/high-RAM probe, shared frame allocation + initrd native ELF on shared SyscallEngine, scheduled CPL3/int80, real cooperative/timer-preempted contexts, private process CR3, int3, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
     );
+    Ok(())
+}
+
+fn run_x86_uefi_smoke(root: &Path) -> Result<(), String> {
+    for program in ["qemu-system-x86_64", "mformat", "xorriso"] {
+        if !command_exists(program) {
+            return Err(format!("{program} is required for the x86 UEFI smoke"));
+        }
+    }
+    if !command_exists("x86_64-elf-grub-mkrescue") && !command_exists("grub-mkrescue") {
+        return Err(
+            "x86_64-elf-grub-mkrescue or grub-mkrescue is required for the x86 UEFI smoke"
+                .to_owned(),
+        );
+    }
+
+    let (ovmf_code, ovmf_vars_template) = find_ovmf_firmware()?;
+    let out_dir = root.join("target/x86-uefi-smoke");
+    fs::create_dir_all(&out_dir).map_err(|err| format!("create {}: {err}", out_dir.display()))?;
+    let iso = out_dir.join("kumo-amd64.iso");
+    let ovmf_vars = out_dir.join("OVMF_VARS.fd");
+    fs::copy(&ovmf_vars_template, &ovmf_vars).map_err(|err| {
+        format!(
+            "copy OVMF variables {} to {}: {err}",
+            ovmf_vars_template.display(),
+            ovmf_vars.display()
+        )
+    })?;
+
+    let mkiso = root.join("scripts/mkiso.sh");
+    run_tool(root, "bash", &[path_arg(&mkiso)?, "amd64", path_arg(&iso)?])?;
+    if fs::metadata(&iso)
+        .map_err(|err| format!("metadata {}: {err}", iso.display()))?
+        .len()
+        == 0
+    {
+        return Err(format!("{} is empty", iso.display()));
+    }
+
+    let code_drive = format!(
+        "if=pflash,unit=0,format=raw,readonly=on,file={}",
+        ovmf_code.display()
+    );
+    let vars_drive = format!("if=pflash,unit=1,format=raw,file={}", ovmf_vars.display());
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(["-machine", "q35", "-drive"])
+        .arg(&code_drive)
+        .args(["-drive"])
+        .arg(&vars_drive)
+        .args(["-cdrom"])
+        .arg(&iso)
+        .args([
+            "-boot",
+            "d",
+            "-cpu",
+            "qemu64,+x2apic",
+            "-m",
+            "1088",
+            "-display",
+            "none",
+            "-serial",
+            "stdio",
+            "-monitor",
+            "none",
+            "-no-reboot",
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn qemu-system-x86_64 UEFI smoke: {err}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "x86 UEFI smoke stdout unavailable".to_owned())?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut transcript = Vec::new();
+    let reached_first_light = read_serial_until(
+        &rx,
+        &mut transcript,
+        "x86 UEFI/GRUB first-light proof",
+        &[b"x86_64 MUREX core online, first light reached; HALTING."],
+        Duration::from_secs(30),
+    );
+    let smoke_result = match reached_first_light {
+        Ok(()) => validate_x86_uefi_smoke_transcript(&transcript),
+        Err(err) => Err(format!(
+            "{err}\nx86 UEFI transcript:\n{}",
+            String::from_utf8_lossy(&transcript)
+        )),
+    };
+
+    stop_qemu_child(&mut child);
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    smoke_result.map_err(|err| {
+        if stderr.is_empty() {
+            err
+        } else {
+            format!("{err}\nqemu stderr:\n{stderr}")
+        }
+    })?;
+
+    println!(
+        "KUMO x86 UEFI smoke green: OVMF -> GRUB -> Multiboot2 supplied the initrd, full firmware memory map, and ACPI RSDP; first light completed"
+    );
+    Ok(())
+}
+
+fn find_ovmf_firmware() -> Result<(PathBuf, PathBuf), String> {
+    let code_override = env::var_os("KUMO_OVMF_CODE").map(PathBuf::from);
+    let vars_override = env::var_os("KUMO_OVMF_VARS").map(PathBuf::from);
+    match (code_override, vars_override) {
+        (Some(code), Some(vars)) => {
+            if !code.is_file() {
+                return Err(format!("KUMO_OVMF_CODE is not a file: {}", code.display()));
+            }
+            if !vars.is_file() {
+                return Err(format!("KUMO_OVMF_VARS is not a file: {}", vars.display()));
+            }
+            return Ok((code, vars));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "set both KUMO_OVMF_CODE and KUMO_OVMF_VARS when overriding OVMF discovery"
+                    .to_owned(),
+            );
+        }
+        (None, None) => {}
+    }
+
+    for (code, vars) in [
+        (
+            "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+            "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/local/share/qemu/edk2-x86_64-code.fd",
+            "/usr/local/share/qemu/edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/share/qemu/edk2-x86_64-code.fd",
+            "/usr/share/qemu/edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/share/OVMF/OVMF_CODE.fd",
+            "/usr/share/OVMF/OVMF_VARS.fd",
+        ),
+        (
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        ),
+        (
+            "/usr/share/edk2/x64/OVMF_CODE.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.fd",
+        ),
+        (
+            "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+            "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+        ),
+    ] {
+        let code = PathBuf::from(code);
+        let vars = PathBuf::from(vars);
+        if code.is_file() && vars.is_file() {
+            return Ok((code, vars));
+        }
+    }
+
+    Err(
+        "could not find a matching OVMF code/variables pair; set KUMO_OVMF_CODE and KUMO_OVMF_VARS"
+            .to_owned(),
+    )
+}
+
+fn validate_x86_uefi_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
+    validate_x86_smoke_transcript(transcript)?;
+    let text = String::from_utf8_lossy(transcript);
+    for marker in [
+        "GNU GRUB",
+        "multiboot: v2 magic=0x36d76289",
+        "multiboot2:",
+        "via Multiboot2   OK",
+    ] {
+        if !text.contains(marker) {
+            return Err(format!(
+                "x86 UEFI smoke transcript missing {marker:?}:\n{text}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1899,6 +2179,14 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
     let text = String::from_utf8_lossy(transcript);
     for marker in [
         "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
+        "MULTIBOOT INITRD   Check     1 module  KUMORD01",
+        "bin/hello",
+        "MULTIBOOT BOOTINFO Check     ABIv2",
+        "phys<512G   OK",
+        "M1 MEMORY PLAN     Check",
+        "kernel+initrd excluded",
+        "KERNEL CR3 / PHYSMAP Check",
+        "RAM WB  holes UC/NX  high RAM yes",
         "GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28",
         "ACPI TABLES        Check     RSDP",
         "ACPI MADT          Check     APIC",
@@ -1908,6 +2196,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
         "IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
         "IDT / TOWER        Check     int3 caught + resumed",
+        "RING3 / FRAMES     Check",
         "RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
         "RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
@@ -1919,6 +2208,10 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK",
         "PREEMPT SCHED      Check     2 kthreads",
         "timer-preempted both bodies   OK",
+        "hello from a native KUMO program!",
+        "USER ELF / FRAMES  Check",
+        "USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80",
+        "wrote 34b  2 switches  exit 0   OK",
         "x86_64 MUREX core online, first light reached; HALTING.",
     ] {
         if !text.contains(marker) {
@@ -2127,10 +2420,14 @@ mod fat32_image_tests {
 
 #[cfg(test)]
 mod x86_smoke_tests {
-    use super::validate_x86_smoke_transcript;
+    use super::{validate_x86_smoke_transcript, validate_x86_uefi_smoke_transcript};
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
-GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28  rsp0 0x10ff00   OK\n\
+MULTIBOOT INITRD   Check     1 module  KUMORD01 9000b  bin/hello 8904b  phys 0x938000   OK\n\
+MULTIBOOT BOOTINFO Check     ABIv2  4 regions  1086 MiB usable / 1087 MiB mapped  kernel 0x100000+8411 KiB  initrd 0x938000+9000b  phys<512G   OK\n\
+M1 MEMORY PLAN     Check     276134 frames / 1078 MiB  kernel+initrd excluded  samples 0x937000 0x93b000 0x93c000   OK\n\
+KERNEL CR3 / PHYSMAP Check     old 0x930000 new 0x937000  6 tables  4 GiB  6 low BootInfo frames  RAM WB  holes UC/NX  high RAM yes 0x40000000   OK\n\
+GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28  rsp0 0x132000   OK\n\
 ACPI TABLES        Check     RSDP 0x000f59d0 rev 2  XSDT 0x07fe1e98   OK\n\
 ACPI MADT          Check     APIC 0x07fe2100  LAPIC 0xfee00000  IOAPIC 1  ISO 0  PCAT true   OK\n\
 ACPI IRQ ROUTE     Check     ISA IRQ 0 -> GSI 2  IOAPIC 0xfec00000 base 0  high edge  override candidate   OK\n\
@@ -2139,6 +2436,7 @@ IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high e
 IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK\n\
 IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
+RING3 / FRAMES     Check     8 BootInfo frames  first 0x937000  last 0x941000  monotonic  kernel+initrd excluded   OK\n\
 RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK\n\
 RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
@@ -2148,11 +2446,32 @@ IOAPIC TIMER       Check     PIC IRQ0 masked  GSI 2 vec 0x31 unmasked  hb 3t via
 TIMER SOURCE       Check     local APIC vec 0x30 canonical  I/O APIC route re-masked  hb 3t  ioapic +0   OK\n\
 CONTEXT SWITCH     Check     2 kthreads  16 switches  work 6  callee-saved + stack resume   OK\n\
 PREEMPT SCHED      Check     2 kthreads  4 body switches  5 ticks  timer-preempted both bodies   OK\n\
+hello from a native KUMO program!\n\
+USER ELF / FRAMES  Check     24 BootInfo frames  first 0x942000  last 0x959000  CR3 0x942000  monotonic  kernel+initrd excluded   OK\n\
+USER ELF / ENGINE  Check     2 PT_LOAD  entry 0x8000000000  boot h1  4 int80  wrote 34b  2 switches  exit 0   OK\n\
 x86_64 MUREX core online, first light reached; HALTING.\n";
 
     #[test]
     fn x86_transcript_requires_all_live_interrupt_proofs() {
         assert_eq!(validate_x86_smoke_transcript(GREEN.as_bytes()), Ok(()));
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("KERNEL CR3 / PHYSMAP Check", "TRAMPOLINE CR3       Check")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("RING3 / FRAMES     Check", "RING3 / STATIC     Check")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("USER ELF / FRAMES  Check", "USER ELF / STATIC  Check")
+                .as_bytes()
+        )
+        .is_err());
         assert!(validate_x86_smoke_transcript(
             GREEN
                 .replace("IRQ 0  hb 3t   OK", "IRQ 0  hb 2t   OK")
@@ -2172,12 +2491,40 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
         let transcript = format!("{GREEN}TOWER-x86: fatal exception; HALT\n");
         assert!(validate_x86_smoke_transcript(transcript.as_bytes()).is_err());
     }
+
+    #[test]
+    fn x86_uefi_transcript_requires_grub_multiboot2_and_tagged_acpi() {
+        let transcript = format!(
+            "GNU GRUB  version 2.12\nmultiboot: v2 magic=0x36d76289 info@0x4000\nmultiboot2: 5816b tagged handoff\n{}",
+            GREEN.replace(
+                "XSDT 0x07fe1e98   OK",
+                "XSDT 0x07fe1e98  via Multiboot2   OK"
+            )
+        );
+        assert_eq!(
+            validate_x86_uefi_smoke_transcript(transcript.as_bytes()),
+            Ok(())
+        );
+        assert!(validate_x86_uefi_smoke_transcript(
+            transcript
+                .replace("v2 magic=0x36d76289", "v1 magic=0x2badb002")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_uefi_smoke_transcript(
+            transcript
+                .replace("via Multiboot2", "legacy scan")
+                .as_bytes()
+        )
+        .is_err());
+    }
 }
 
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
     );
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
+    println!("x86-uefi-smoke: exact OVMF -> GRUB -> Multiboot2 ISO path; KUMO_OVMF_CODE/KUMO_OVMF_VARS override firmware discovery");
     println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
 }

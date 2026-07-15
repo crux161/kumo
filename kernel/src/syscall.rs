@@ -1494,20 +1494,13 @@ impl SyscallEngine {
                     };
                     user_state.x[0] = arg; // bootstrap arg
                     let kernel_sp = thread.stack().top();
-                    extern "C" {
-                        fn kumo_user_enter();
-                    }
-                    let mut ctx = kumo_hal::active::ThreadContext::default();
-                    unsafe {
-                        let raw = &mut ctx as *mut kumo_hal::active::ThreadContext as *mut u64;
-                        *raw = &user_state as *const kumo_hal::active::UserState as *const ()
-                            as usize as u64; // x19_entry
-                        *raw.add(11) = kumo_user_enter as *const () as usize as u64; // x30_lr
-                        *raw.add(12) = kernel_sp as u64; // sp
-                        *raw.add(13) = 1; // user = true
-                    }
                     thread.user_state = Some(user_state);
-                    *thread.context_mut() = ctx;
+                    let state = thread
+                        .user_state
+                        .as_ref()
+                        .expect("user state just installed")
+                        as *const kumo_hal::active::UserState;
+                    *thread.context_mut() = kumo_hal::active::user_entry_context(state, kernel_sp);
                 }
                 #[cfg(not(target_os = "none"))]
                 {

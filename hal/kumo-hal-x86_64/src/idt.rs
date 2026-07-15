@@ -305,9 +305,28 @@ mod metal {
     extern "C" fn x86_interrupt_dispatch(frame: *mut ExceptionFrame) {
         let frame = unsafe { &mut *frame };
         if frame.vector == crate::ring3::SYSCALL_VECTOR as u64 && frame.cs & 3 == 3 {
-            match crate::ring3::dispatch(frame.rax, frame.rdi) {
-                crate::ring3::Dispatch::Return(value) => frame.rax = value,
-                crate::ring3::Dispatch::Exit(code) => crate::ring3::resume(code),
+            if let Some(hook) = crate::ring3::svc_hook() {
+                crate::ring3::record_call();
+                // Adapt the AMD64 int80 ABI to the shared Kumo syscall frame: RAX is the
+                // number, RDI/RSI/RDX/RCX/R8/R9 are arguments, and x0/x1 results return
+                // through RAX/RDX. The hardware frame below remains the authoritative full
+                // user register image while a blocking syscall is switched out.
+                let mut regs = [0u64; 31];
+                regs[0] = frame.rdi;
+                regs[1] = frame.rsi;
+                regs[2] = frame.rdx;
+                regs[3] = frame.rcx;
+                regs[4] = frame.r8;
+                regs[5] = frame.r9;
+                regs[8] = frame.rax;
+                hook(regs.as_mut_ptr());
+                frame.rax = regs[0];
+                frame.rdx = regs[1];
+            } else {
+                match crate::ring3::dispatch(frame.rax, frame.rdi) {
+                    crate::ring3::Dispatch::Return(value) => frame.rax = value,
+                    crate::ring3::Dispatch::Exit(code) => crate::ring3::resume(code),
+                }
             }
             return;
         }
@@ -324,6 +343,34 @@ mod metal {
         {
             crate::legacy_irq::handle(frame.vector as u8);
             return;
+        }
+
+        if frame.cs & 3 == 3 {
+            if let Some(hook) = crate::ring3::fault_hook() {
+                let mut regs = [0u64; 31];
+                regs[0] = frame.rdi;
+                regs[1] = frame.rsi;
+                regs[2] = frame.rdx;
+                regs[3] = frame.rcx;
+                regs[4] = frame.r8;
+                regs[5] = frame.r9;
+                regs[8] = frame.rax;
+                // Preserve the two diagnostic slots consumed by the shared fault reporter:
+                // x19 is the nearest AMD64 callee-saved analogue (R12), x29 is RBP.
+                regs[19] = frame.r12;
+                regs[29] = frame.rbp;
+                let far = if frame.vector == 14 {
+                    let cr2: u64;
+                    unsafe {
+                        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+                    }
+                    cr2
+                } else {
+                    0
+                };
+                let cause = frame.vector << 32 | frame.error_code;
+                hook(cause, frame.rip, far, 0, frame.rsp, regs.as_ptr());
+            }
         }
 
         EXCEPTIONS_SEEN.fetch_add(1, Ordering::Relaxed);

@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
-# Runtime deps gated to the image target (aarch64), like the server bins: the bin
-# is only ever built for aarch64-unknown-none via `cargo xtask image`.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# Native image dependencies stay out of host builds, but both freestanding backends
+# compile the same program and KUMO syscall surface.
+[target.'cfg(target_os = "none")'.dependencies]
 kumo-rt = { path = "../kumo-rt" }
 kumo-abi.workspace = true
 

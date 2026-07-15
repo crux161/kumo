@@ -195,6 +195,12 @@ pub fn is_started() -> bool {
     unsafe { (&*opt).is_some() }
 }
 
+/// Number of scheduler context switches performed by the user-thread harness.
+pub fn switch_count() -> u64 {
+    let p = sched_ptr();
+    unsafe { (&*p).switches }
+}
+
 /// The kernel identity-map TTBR0 captured at launch. A syscall handler running on the
 /// user thread (TTBR0 = the process tree) switches to this before building page tables by
 /// physical address, then restores the process tree. Valid once `init` has run.
@@ -218,27 +224,9 @@ fn set_active_aspace_root(root: u64) {
     unsafe { kumo_hal::active::set_user_aspace_root(root) };
 }
 
-/// Create a `ThreadContext` for the first entry of a user thread. `x19_entry` points at
-/// the `UserState`; `x30_lr` is `kumo_user_enter` (not `kumo_context_trampoline`).
+/// Create the architecture-specific first-entry context for a user thread.
 fn user_entry_context(user_state: *const UserState, kernel_sp: usize) -> ThreadContext {
-    extern "C" {
-        fn kumo_user_enter();
-    }
-    let mut ctx = ThreadContext::default();
-    // Set fields directly: ThreadContext layout is x19_entry, x20_arg, x21-x28, x29_fp,
-    // x30_lr, sp, user. We only need x19_entry (UserState pointer), x30_lr (user enter
-    // trampoline), and sp (kernel stack).
-    //
-    // SAFETY: ThreadContext is repr(C) and the layout matches what kumo_context_switch
-    // expects. We're writing into a freshly-defaulted struct.
-    unsafe {
-        let raw = &mut ctx as *mut ThreadContext as *mut u64;
-        *raw = user_state as u64; // x19_entry
-        *raw.add(11) = kumo_user_enter as *const () as usize as u64; // x30_lr
-        *raw.add(12) = kernel_sp as u64; // sp
-        *raw.add(13) = 1; // user = true
-    }
-    ctx
+    kumo_hal::active::user_entry_context(user_state, kernel_sp)
 }
 
 /// Pin the boot-flow's current execution context so the user thread can return here on
@@ -988,6 +976,7 @@ fn dispatch_context(
             };
             let next = if to == s.user_thread.koid() {
                 s.user_thread.run();
+                kumo_hal::active::set_user_kernel_stack(s.user_thread.stack().top());
                 if s.user_fresh {
                     s.user_fresh = false;
                 } else {
@@ -996,6 +985,7 @@ fn dispatch_context(
                 s.user_thread.context() as *const ThreadContext
             } else if let Some(child) = s.children.iter_mut().find(|c| c.thread.koid() == to) {
                 child.thread.run();
+                kumo_hal::active::set_user_kernel_stack(child.thread.stack().top());
                 if child.fresh {
                     child.fresh = false;
                 } else {

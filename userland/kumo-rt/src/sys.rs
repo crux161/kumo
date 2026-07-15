@@ -31,7 +31,30 @@ fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
     ret
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// AMD64 KUMO syscall ABI: `rax` = number, arguments in the SysV integer registers,
+/// and the primary result returned in `rax`. `int 0x80` enters the ring-3 IDT gate.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+    let mut ret = num as u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") ret,
+            in("rdi") x0,
+            in("rsi") x1,
+            in("rdx") x2,
+            in("rcx") x3,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 fn syscall(_num: Syscall, _x0: u64, _x1: u64, _x2: u64, _x3: u64) -> u64 {
     0
 }
@@ -59,17 +82,47 @@ fn syscall6(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) 
     ret
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+#[allow(dead_code)]
+fn syscall6(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64) -> u64 {
+    let mut ret = num as u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") ret,
+            in("rdi") x0,
+            in("rsi") x1,
+            in("rdx") x2,
+            in("rcx") x3,
+            in("r8") x4,
+            in("r9") x5,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 fn syscall6(_num: Syscall, _x0: u64, _x1: u64, _x2: u64, _x3: u64, _x4: u64, _x5: u64) -> u64 {
     0
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn debug_write(ptr: *const u8, len: usize) -> u64 {
     syscall(Syscall::DebugWrite, ptr as u64, len as u64, 0, 0)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn debug_write(_ptr: *const u8, _len: usize) -> u64 {
     0
 }
@@ -110,12 +163,18 @@ pub fn channel_create_pair() -> (u64, u64) {
 
 /// Close one process-local handle. A successful close invalidates the handle
 /// immediately; closing it again returns `BadHandle`.
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "none"),
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn handle_close(handle: Handle) -> Status {
     syscall(Syscall::HandleClose, handle.0 as u64, 0, 0, 0) as Status
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_os = "none"),
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn handle_close(_handle: Handle) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
@@ -206,7 +265,28 @@ pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (u
     (ret as usize, handle)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn channel_read_with_handle(channel: Handle, buf: *mut u8, cap: usize) -> (usize, u64) {
+    let mut ret = Syscall::ChannelRead as u64;
+    let mut handle = cap as u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") ret,
+            in("rdi") channel.0 as u64,
+            in("rsi") buf as u64,
+            inlateout("rdx") handle,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (ret as usize, handle)
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_read_with_handle(_channel: Handle, _buf: *mut u8, _cap: usize) -> (usize, u64) {
     (0, 0)
 }
@@ -267,7 +347,10 @@ pub fn startup(bootstrap: Handle) -> Startup {
     startup
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn channel_write(channel: Handle, ptr: *const u8, len: usize) -> Status {
     syscall(
         Syscall::ChannelWrite,
@@ -278,7 +361,10 @@ pub fn channel_write(channel: Handle, ptr: *const u8, len: usize) -> Status {
     ) as Status
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn channel_write(_channel: Handle, _ptr: *const u8, _len: usize) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
@@ -643,7 +729,10 @@ mod tests {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
 pub fn process_exit(code: u64) -> ! {
     syscall(Syscall::ProcessExit, code, 0, 0, 0);
     loop {
@@ -651,7 +740,10 @@ pub fn process_exit(code: u64) -> ! {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
 pub fn process_exit(_code: u64) -> ! {
     loop {
         core::hint::spin_loop();

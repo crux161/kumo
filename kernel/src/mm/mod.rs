@@ -60,17 +60,19 @@ fn is_ram_kind(kind: MemRegionKind) -> bool {
     )
 }
 
-/// Build KUMO-owned split page tables and switch to them. TTBR0 retains the bootstrap
-/// identity map; TTBR1 owns the high-linked kernel and the permanent physical-memory
-/// window. RAM becomes Normal-WB, unlisted/MMIO ranges become Device, and the
-/// framebuffer becomes Normal-NC so the display controller sees writes.
+/// Build KUMO-owned page tables with frames supplied by `alloc`, then switch to them.
+/// RAM becomes cacheable, while unlisted/MMIO ranges and the framebuffer receive the
+/// architecture's conservative device policy.
 ///
 /// # Safety
 ///
-/// Must run once at EL1 while the firmware identity map is active, before anything
-/// depends on a particular page table. `boot.mem_regions` must be the validated
-/// handoff slice and remain readable for the call.
-pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
+/// Must run once while the bootstrap identity map is active. `boot.mem_regions` must be
+/// the validated handoff slice and remain readable. Every frame returned by `alloc` must
+/// be unique, zeroable, and reachable through the active bootstrap map.
+pub unsafe fn enable_paging_with_allocator(
+    boot: &BootInfo,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Option<PagingReport> {
     let regions = unsafe { boot.mem_regions.as_slice() };
     if regions.is_empty() {
         return None;
@@ -91,14 +93,12 @@ pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
         return None;
     }
 
-    // Page-table frames come from usable RAM (which we then map Normal-WB) via the shared
-    // watermark allocator, so frames spent on kernel tables here are off-limits when a
-    // process address space is built later. The boot frame allocator already excludes the
-    // kernel, initrd, and framebuffer.
-    let mut alloc = || -> Option<u64> { unsafe { alloc_zeroed_frame(boot) } };
     let is_ram = |pa: u64| {
+        let Some(end) = pa.checked_add(BLOCK_2M) else {
+            return false;
+        };
         regions.iter().any(|region| {
-            is_ram_kind(region.kind) && overlaps(pa, BLOCK_2M, region.range.start, region.range.len)
+            is_ram_kind(region.kind) && region.range.start <= pa && end <= region.range.end()
         })
     };
 
@@ -113,7 +113,7 @@ pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
             fb_phys,
             fb_len,
             &is_ram,
-            &mut alloc,
+            alloc,
         )
     }
     .ok()?;
@@ -121,6 +121,17 @@ pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
         tables,
         mapped_bytes,
     })
+}
+
+/// Build permanent kernel paging using the shared BootInfo frame allocator.
+///
+/// # Safety
+/// See [`enable_paging_with_allocator`]. The active bootstrap map must cover frames yielded
+/// from `boot`; frames spent here remain excluded from every later allocation by the global
+/// watermark.
+pub unsafe fn enable_paging(boot: &BootInfo) -> Option<PagingReport> {
+    let mut alloc = || -> Option<u64> { unsafe { alloc_zeroed_frame(boot) } };
+    unsafe { enable_paging_with_allocator(boot, &mut alloc) }
 }
 
 /// What M1 memory bring-up found and proved.

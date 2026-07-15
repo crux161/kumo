@@ -118,6 +118,10 @@ impl ThreadContext {
     }
 }
 
+/// AArch64 has no TSS-style per-thread ring-0 stack selector: exception entry continues on
+/// SP_EL1, which is already the scheduled thread's kernel stack.
+pub fn set_user_kernel_stack(_kernel_stack_top: usize) {}
+
 #[cfg(target_os = "none")]
 fn context_trampoline_addr() -> u64 {
     extern "C" {
@@ -1872,6 +1876,23 @@ pub mod el0 {
         pub ttbr0: u64,
     }
 
+    /// Build the kernel context that restores `state` and enters EL0 on its first dispatch.
+    pub fn user_entry_context(
+        state: *const UserState,
+        kernel_stack_top: usize,
+    ) -> super::ThreadContext {
+        extern "C" {
+            fn kumo_user_enter();
+        }
+        super::ThreadContext {
+            x19_entry: state as u64,
+            x30_lr: kumo_user_enter as *const () as usize as u64,
+            sp: kernel_stack_top as u64,
+            user: true,
+            ..super::ThreadContext::default()
+        }
+    }
+
     core::arch::global_asm!(
         ".global kumo_user_enter",
         ".balign 4",
@@ -2435,7 +2456,8 @@ pub mod el0 {
 #[cfg(target_os = "none")]
 pub use el0::{
     build_user_tables, el0_exit, run_el0_image, run_el0_smoke, set_fault_hook, set_svc_hook,
-    syscall_count, El0Report, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState,
+    syscall_count, user_entry_context, El0Report, UserImage, UserImageError, UserLoadSegment,
+    UserMapping, UserState,
 };
 
 /// Host/x86 builds have no EL0 path yet; report "not entered" so the shared kernel can
@@ -2516,6 +2538,16 @@ pub struct UserState {
     pub spsr: u64,
     pub sp_el0: u64,
     pub ttbr0: u64,
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn user_entry_context(state: *const UserState, kernel_stack_top: usize) -> ThreadContext {
+    ThreadContext {
+        x19_entry: state as u64,
+        sp: kernel_stack_top as u64,
+        user: true,
+        ..ThreadContext::default()
+    }
 }
 
 #[cfg(not(target_os = "none"))]

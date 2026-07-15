@@ -227,28 +227,75 @@ pub fn run_el0_smoke(
     }
 }
 
+/// Build a user image in a private address space without entering it. The kernel's shared
+/// `user_thread` dispatcher consumes the returned state, so compiler-produced ELF images and
+/// first-light probes use exactly the same scheduled CPL3 path. Physical ownership stays in
+/// the kernel: callers supply the validated BootInfo-backed frame allocator.
 #[cfg(target_os = "none")]
-pub fn first_light_smoke() -> Result<crate::Ring3Report, crate::Ring3Error> {
-    const FRAME_COUNT: usize = 16;
-    #[repr(C, align(4096))]
-    struct SmokeFrames([u8; FRAME_COUNT * PAGE_SIZE as usize]);
-    static mut FRAMES: SmokeFrames = SmokeFrames([0; FRAME_COUNT * PAGE_SIZE as usize]);
+pub fn prepare_scheduled_user_image(
+    image: &UserImage<'_>,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<crate::UserState, UserImageError> {
+    let root = build_user_tables(image, alloc)?;
+    crate::ring3::reset_counters();
+    let mut x = [0; 31];
+    x[0] = image.bootstrap;
+    Ok(crate::UserState {
+        x,
+        elr: image.entry,
+        spsr: 0,
+        sp_el0: image.stack_top - 16,
+        ttbr0: root,
+    })
+}
 
-    let base = core::ptr::addr_of_mut!(FRAMES).cast::<u8>() as u64;
-    let mut next = 0usize;
-    let mut alloc = || {
-        if next == FRAME_COUNT {
-            return None;
-        }
-        let frame = base + next as u64 * PAGE_SIZE;
-        next += 1;
-        Some(frame)
-    };
+#[cfg(not(target_os = "none"))]
+pub fn prepare_scheduled_user_image(
+    _image: &UserImage<'_>,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<crate::UserState, UserImageError> {
+    Err(UserImageError::Unsupported)
+}
+
+/// First-light wrapper retained for the synchronous ring-3 diagnostic and host API parity.
+pub fn prepare_scheduled_smoke(
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<crate::UserState, UserImageError> {
+    #[cfg(target_os = "none")]
+    {
+        let segment = UserLoadSegment {
+            source: crate::ring3::payload(),
+            virt_addr: FIRST_LIGHT_BASE,
+            mem_size: crate::ring3::payload().len() as u64,
+            writable: false,
+            executable: true,
+        };
+        let image = UserImage {
+            entry: FIRST_LIGHT_BASE,
+            stack_top: FIRST_LIGHT_STACK_TOP,
+            stack_size: FIRST_LIGHT_STACK_SIZE,
+            bootstrap: 0,
+            segments: core::slice::from_ref(&segment),
+            extra_mappings: &[],
+        };
+        prepare_scheduled_user_image(&image, alloc)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = alloc;
+        Err(UserImageError::Unsupported)
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn first_light_smoke(
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<crate::Ring3Report, crate::Ring3Error> {
     let report = run_el0_smoke(
         FIRST_LIGHT_BASE,
         FIRST_LIGHT_STACK_TOP,
         FIRST_LIGHT_STACK_SIZE,
-        &mut alloc,
+        alloc,
     )
     .map_err(crate::Ring3Error::UserImage)?;
     Ok(crate::Ring3Report {
@@ -262,7 +309,9 @@ pub fn first_light_smoke() -> Result<crate::Ring3Report, crate::Ring3Error> {
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn first_light_smoke() -> Result<crate::Ring3Report, crate::Ring3Error> {
+pub fn first_light_smoke(
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<crate::Ring3Report, crate::Ring3Error> {
     Err(crate::Ring3Error::Unsupported)
 }
 

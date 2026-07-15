@@ -11,7 +11,7 @@ use niji_loader::acpi::find_rsdp;
 use niji_loader::acpi::madt::{InterruptPolarity, InterruptTriggerMode, Madt, MadtEntry};
 #[cfg(target_os = "none")]
 use niji_loader::acpi::{RootTable, SdtHeader, SDT_HEADER_LEN};
-use niji_loader::acpi::{RootTableKind, RsdpLocation};
+use niji_loader::acpi::{RootTableKind, Rsdp, RsdpLocation};
 
 #[cfg(target_os = "none")]
 const EBDA_SEGMENT_POINTER: usize = 0x040e;
@@ -25,8 +25,8 @@ const CONVENTIONAL_MEMORY_END: u64 = 0x0a_0000;
 const BIOS_ROM_START: u64 = 0x0e_0000;
 #[cfg(target_os = "none")]
 const BIOS_ROM_LEN: usize = 0x02_0000;
-#[cfg(target_os = "none")]
-const BOOT_IDENTITY_MAP_END: u64 = 0x4000_0000;
+#[cfg(any(target_os = "none", test))]
+const KERNEL_PHYS_MAP_END: u64 = crate::paging::USER_BASE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AcpiRootReport {
@@ -72,6 +72,17 @@ impl From<RsdpLocation> for AcpiRootReport {
     }
 }
 
+/// Validate an RSDP supplied by a structured boot protocol such as Multiboot2.
+pub fn inspect_acpi_rsdp(bytes: &[u8], physical_address: u64) -> Option<AcpiRootReport> {
+    Some(
+        RsdpLocation {
+            physical_address,
+            rsdp: Rsdp::parse(bytes).ok()?,
+        }
+        .into(),
+    )
+}
+
 /// Find the RSDP in the ACPI-defined EBDA/BIOS windows of an IA-PC boot.
 pub fn discover_acpi_root() -> Option<AcpiRootReport> {
     #[cfg(target_os = "none")]
@@ -102,8 +113,9 @@ pub fn discover_acpi_root() -> Option<AcpiRootReport> {
     }
 }
 
-/// Validate the selected root table and decode its first checksum-valid MADT.
-pub fn discover_acpi_madt(root: AcpiRootReport) -> Option<AcpiMadtReport> {
+/// Validate the selected root table and decode its first checksum-valid MADT. `mapped_top`
+/// is the exclusive end of the permanent physical map installed before ACPI discovery.
+pub fn discover_acpi_madt(root: AcpiRootReport, mapped_top: u64) -> Option<AcpiMadtReport> {
     #[cfg(target_os = "none")]
     unsafe {
         let kind = if root.uses_xsdt {
@@ -111,10 +123,10 @@ pub fn discover_acpi_madt(root: AcpiRootReport) -> Option<AcpiMadtReport> {
         } else {
             RootTableKind::Rsdt
         };
-        let root_bytes = mapped_sdt(root.root_address)?;
+        let root_bytes = mapped_sdt(root.root_address, mapped_top)?;
         let root_table = RootTable::parse(root_bytes, kind).ok()?;
         for address in root_table.entries() {
-            let Some(bytes) = mapped_sdt(address) else {
+            let Some(bytes) = mapped_sdt(address, mapped_top) else {
                 continue;
             };
             if !bytes.starts_with(b"APIC") {
@@ -128,7 +140,7 @@ pub fn discover_acpi_madt(root: AcpiRootReport) -> Option<AcpiMadtReport> {
     }
     #[cfg(not(target_os = "none"))]
     {
-        let _ = root;
+        let _ = (root, mapped_top);
         None
     }
 }
@@ -192,20 +204,29 @@ fn summarize_madt(address: u64, bytes: &[u8]) -> Option<AcpiMadtReport> {
 }
 
 #[cfg(target_os = "none")]
-unsafe fn mapped_sdt(address: u64) -> Option<&'static [u8]> {
-    if address == 0 || address.checked_add(SDT_HEADER_LEN as u64)? > BOOT_IDENTITY_MAP_END {
+unsafe fn mapped_sdt(address: u64, mapped_top: u64) -> Option<&'static [u8]> {
+    if !sdt_range_is_mapped(address, SDT_HEADER_LEN as u64, mapped_top) {
         return None;
     }
     let address = usize::try_from(address).ok()?;
-    // The Multiboot trampoline maps every low-GiB page. Firmware owns the root-table pointers;
-    // validate their fixed header before extending the slice to its bounded declared length. — KESTREL
+    // Firmware owns the root-table pointers. Validate their fixed header before extending the
+    // slice to its declared length inside the permanent kernel physical map. — KESTREL
     let header_bytes = unsafe { core::slice::from_raw_parts(address as *const u8, SDT_HEADER_LEN) };
     let header = SdtHeader::parse(header_bytes).ok()?;
-    let end = (address as u64).checked_add(header.length as u64)?;
-    if end > BOOT_IDENTITY_MAP_END {
+    if !sdt_range_is_mapped(address as u64, header.length as u64, mapped_top) {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(address as *const u8, header.length) })
+}
+
+#[cfg(any(target_os = "none", test))]
+fn sdt_range_is_mapped(address: u64, len: u64, mapped_top: u64) -> bool {
+    address != 0
+        && len != 0
+        && mapped_top <= KERNEL_PHYS_MAP_END
+        && address
+            .checked_add(len)
+            .is_some_and(|end| end <= mapped_top)
 }
 
 #[cfg(test)]
@@ -226,6 +247,17 @@ mod tests {
         assert_eq!(report.rsdp_address, 0xe0010);
         assert_eq!(report.root_address, 0x1234_5678_0000);
         assert!(report.uses_xsdt);
+    }
+
+    #[test]
+    fn permanent_physmap_admits_acpi_above_bootstrap_gib() {
+        const FOUR_GIB: u64 = 4 << 30;
+        assert!(sdt_range_is_mapped(0x43fe_2328, 128, FOUR_GIB));
+        assert!(!sdt_range_is_mapped(0x43fe_2328, 128, 1 << 30));
+        assert!(sdt_range_is_mapped(FOUR_GIB - 128, 128, FOUR_GIB));
+        assert!(!sdt_range_is_mapped(0, 128, FOUR_GIB));
+        assert!(!sdt_range_is_mapped(FOUR_GIB - 127, 128, FOUR_GIB));
+        assert!(!sdt_range_is_mapped(0x1000, 128, KERNEL_PHYS_MAP_END + 1));
     }
 
     #[test]

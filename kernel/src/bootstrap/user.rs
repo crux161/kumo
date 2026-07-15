@@ -13,7 +13,10 @@ use crate::mm::{Mapping, MemoryError, Vmar, Vmo, PAGE_SIZE};
 use crate::object::ObjectManager;
 use crate::task::{Job, Process};
 
+#[cfg(feature = "arch_aarch64")]
 pub const USER_ROOT_BASE: u64 = 0x0000_0000_0020_0000;
+#[cfg(feature = "arch_x86_64")]
+pub const USER_ROOT_BASE: u64 = 0x0000_0080_0000_0000;
 pub const USER_ROOT_SIZE: u64 = 0x0000_0000_8000_0000;
 pub const USER_IMAGE_BASE: u64 = USER_ROOT_BASE;
 pub const USER_STACK_SIZE: u64 = PAGE_SIZE * 16;
@@ -22,7 +25,10 @@ pub const USER_STACK_TOP: u64 = USER_ROOT_BASE + USER_ROOT_SIZE;
 const ELF_HEADER_LEN: usize = 64;
 const ELF_PHDR_LEN: usize = 56;
 const ET_EXEC: u16 = 2;
-const EM_AARCH64: u16 = 0xb7;
+#[cfg(feature = "arch_aarch64")]
+const EM_USER: u16 = 0xb7;
+#[cfg(feature = "arch_x86_64")]
+const EM_USER: u16 = 0x3e;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -229,7 +235,7 @@ pub fn parse_user_elf(image: &[u8]) -> Result<UserElfImage, ElfError> {
     if read_u16(image, 16)? != ET_EXEC {
         return Err(ElfError::NotExecutable);
     }
-    if read_u16(image, 18)? != EM_AARCH64 {
+    if read_u16(image, 18)? != EM_USER {
         return Err(ElfError::WrongMachine);
     }
 
@@ -395,8 +401,8 @@ mod tests {
         elf[5] = 1;
         elf[6] = 1;
         put_u16(&mut elf, 16, ET_EXEC);
-        put_u16(&mut elf, 18, EM_AARCH64);
-        put_u64(&mut elf, 24, 0x0021_0004);
+        put_u16(&mut elf, 18, EM_USER);
+        put_u64(&mut elf, 24, USER_ROOT_BASE + 0x1_0004);
         put_u64(&mut elf, 32, ELF_HEADER_LEN as u64);
         put_u16(&mut elf, 54, ELF_PHDR_LEN as u16);
         put_u16(&mut elf, 56, 2);
@@ -405,7 +411,7 @@ mod tests {
         put_u32(&mut elf, ro, PT_LOAD);
         put_u32(&mut elf, ro + 4, PF_R);
         put_u64(&mut elf, ro + 8, 0);
-        put_u64(&mut elf, ro + 16, 0x0020_0000);
+        put_u64(&mut elf, ro + 16, USER_ROOT_BASE);
         put_u64(&mut elf, ro + 32, 0x1b4);
         put_u64(&mut elf, ro + 40, 0x1b4);
 
@@ -413,7 +419,7 @@ mod tests {
         put_u32(&mut elf, text, PT_LOAD);
         put_u32(&mut elf, text + 4, PF_R | PF_X);
         put_u64(&mut elf, text + 8, 0x1004);
-        put_u64(&mut elf, text + 16, 0x0021_0004);
+        put_u64(&mut elf, text + 16, USER_ROOT_BASE + 0x1_0004);
         put_u64(&mut elf, text + 32, 0x8);
         put_u64(&mut elf, text + 40, 0x8);
         elf
@@ -464,15 +470,15 @@ mod tests {
         let mut objects = ObjectManager::new();
         let plan = plan_sora_from_initrd(&mut objects, &initrd).unwrap();
         assert_eq!(plan.image_mappings.len(), 2);
-        assert_eq!(plan.entry, 0x0021_0004);
-        assert_eq!(plan.image_mappings[0].virt, 0x0020_0000);
+        assert_eq!(plan.entry, USER_ROOT_BASE + 0x1_0004);
+        assert_eq!(plan.image_mappings[0].virt, USER_ROOT_BASE);
         assert_eq!(plan.image_mappings[0].len, PAGE_SIZE);
         assert_eq!(plan.image_mappings[0].vmo_offset, 0);
         assert!(plan.image_mappings[0]
             .flags
             .contains(PageFlags::READ | PageFlags::USER));
         assert!(!plan.image_mappings[0].flags.contains(PageFlags::EXECUTE));
-        assert_eq!(plan.image_mappings[1].virt, 0x0021_0000);
+        assert_eq!(plan.image_mappings[1].virt, USER_ROOT_BASE + 0x1_0000);
         assert_eq!(plan.image_mappings[1].len, PAGE_SIZE);
         assert_eq!(plan.image_mappings[1].vmo_offset, PAGE_SIZE);
         assert!(plan.image_mappings[1]

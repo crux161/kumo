@@ -133,6 +133,78 @@ where
     f(&*state)
 }
 
+/// Install the ordinary process/syscall runtime for a standalone user image.
+///
+/// This is the small bootstrapping half shared by non-Sora launchers: the process gets a real
+/// handle table and a root channel whose kernel endpoint is already closed, so startup draining
+/// observes a genuine channel EOF. Syscalls then enter the same [`svc_hook`] and
+/// [`SyscallEngine`] used by Sora rather than a launch-specific trap handler.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn install_standalone_user_runtime(
+    root_vmar: Vmar,
+    kernel_ttbr0: u64,
+) -> Result<Handle, UsermodeError> {
+    let mut engine = SyscallEngine::new();
+    let job = Job::root(engine.objects_mut());
+    let mut process = Process::new(engine.objects_mut(), &job, root_vmar);
+    let (bootstrap, root_channel, kernel_end) = engine
+        .root_channel_create(&mut process)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+    engine
+        .ipc_mut()
+        .channel_pair_mut(root_channel)
+        .ok_or(UsermodeError::ChannelSetup)?
+        .close(kernel_end);
+
+    crate::user_thread::init(
+        engine.objects_mut(),
+        process.koid(),
+        process.root_vmar(),
+        kernel_ttbr0,
+    )
+    .map_err(|_| UsermodeError::ChannelSetup)?;
+
+    // SAFETY: single-core boot setup; installed before the user thread can issue a syscall.
+    unsafe {
+        *SORA.0.get() = Some(RefCell::new(SoraState {
+            engine,
+            process,
+            root_job: job,
+            root_channel,
+            kernel_end,
+            console_channel: root_channel,
+            console_kernel_end: kernel_end,
+            block_channel: root_channel,
+            block_kernel_end: kernel_end,
+            net_channel: root_channel,
+            net_kernel_end: kernel_end,
+            keyboard_channel: root_channel,
+            keyboard_kernel_end: kernel_end,
+            console_koid: KoId(0),
+            block_koid: KoId(0),
+            net_koid: KoId(0),
+            keyboard_koid: KoId(0),
+            framebuffer_owner: None,
+            wrote: 0,
+        }));
+    }
+    kumo_hal::active::set_svc_hook(svc_hook);
+    Ok(bootstrap)
+}
+
+/// Attach the materialized address-space root to the standalone process. This activates the
+/// normal live-tree checks used by later VMAR syscalls as well as documenting process ownership.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn set_standalone_user_aspace(root: u64) {
+    with_sora_mut(|state| state.process.ttbr0 = Some(root));
+}
+
+/// Bytes accepted by the shared `DebugWrite` path for the primary user process.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn standalone_user_bytes_written() -> usize {
+    with_sora(|state| state.wrote)
+}
+
 /// Like [`with_sora_mut`], but yields `None` instead of panicking when the Sora cell is
 /// uninitialised (early boot, before Sora exists) or already borrowed — a `klog!` issued
 /// from inside a live `SoraState` borrow (e.g. mid-SVC). This is the GUIDANCE/006 §2.1
@@ -801,7 +873,10 @@ fn teardown_current_process_and_signal() {
         if reclaim_framebuffer {
             sora.framebuffer_owner = None;
         }
-        let handles = {
+        let primary = koid == sora.process.koid();
+        let handles = if primary {
+            sora.process.handles_mut().drain()
+        } else {
             let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
                 return reclaim_framebuffer;
             };
@@ -830,10 +905,13 @@ fn teardown_current_process_and_signal() {
             // drop port bindings on either side so a dead watch never lingers.
             sora.engine.release_port_bindings(entry.koid);
         }
-        let Some(proc) = sora.engine.process_by_koid_mut(koid) else {
+        if primary {
+            sora.process.signal(kumo_abi::Signals::TERMINATED);
+        } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {
+            proc.signal(kumo_abi::Signals::TERMINATED);
+        } else {
             return reclaim_framebuffer;
-        };
-        proc.signal(kumo_abi::Signals::TERMINATED);
+        }
         sora.engine
             .signal_ports(koid, kumo_abi::Signals::TERMINATED);
         reclaim_framebuffer

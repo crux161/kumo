@@ -5,8 +5,8 @@
 #   scripts/mkiso.sh aarch64 [out.iso] [esp_dir]
 #
 # amd64:  a UEFI-bootable GRUB rescue ISO. GRUB loads the x86_64 KUMO kernel via
-#         Multiboot (the kernel ships as a flat 64-bit image with the a.out address
-#         kludge, which GRUB's `multiboot` command loads directly). Boot it on real
+#         Multiboot2 (the kernel ships as a flat 64-bit image with an explicit
+#         Multiboot2 address tag). Boot it on real
 #         amd64 hardware (dd to a USB key) or in QEMU with OVMF. This is the
 #         unambiguous "does KUMO boot via GRUB" pathway.
 #         Needs: x86_64-elf-grub (mkrescue), mtools, xorriso.
@@ -29,23 +29,17 @@ build_amd64() {
   need mformat "brew install mtools"
   need xorriso "brew install xorriso"
 
-  # 1. Build the x86_64 Multiboot kernel and flatten it (GRUB/QEMU reject a 64-bit ELF).
-  rustup target list --installed 2>/dev/null | grep -qx x86_64-unknown-none \
-    || rustup target add x86_64-unknown-none
-  ( cd "$ROOT" && cargo build -p kernel --bin kumo-kernel \
-      --target x86_64-unknown-none --release \
-      --no-default-features --features arch_x86_64 )
+  # 1. Build the x86_64 Multiboot kernel, native-user initrd, and flattened image.
+  ( cd "$ROOT" && scripts/x86-multiboot.sh build )
   local elf="$ROOT/target/x86_64-unknown-none/release/kumo-kernel"
-  local objcopy
-  objcopy="$(command -v llvm-objcopy || command -v rust-objcopy || command -v gobjcopy || command -v objcopy)"
-  [ -n "$objcopy" ] || { echo "error: need an objcopy (rustup component add llvm-tools-preview)" >&2; exit 1; }
-  "$objcopy" -O binary "$elf" "$elf.bin"
+  local initrd="$ROOT/target/x86_64-unknown-none/release/kumo-initrd.img"
 
-  # 2. Stage the ISO root: kernel + a GRUB Multiboot menu entry.
+  # 2. Stage the ISO root: kernel + initrd module + a GRUB Multiboot2 menu entry.
   local work; work="$(mktemp -d)"
   trap "rm -rf '$work'" RETURN
   mkdir -p "$work/boot/grub"
   cp "$elf.bin" "$work/boot/kumo-kernel"
+  cp "$initrd" "$work/boot/kumo-initrd.img"
   cat > "$work/boot/grub/grub.cfg" <<'CFG'
 set timeout=3
 set default=0
@@ -54,9 +48,15 @@ serial --unit=0 --speed=115200
 terminal_input console serial
 terminal_output console serial
 menuentry "KUMO (Ziwei) x86_64 - Multiboot" {
-    insmod multiboot
+    insmod multiboot2
+    insmod mmap
+    # A Multiboot2 module is allowed at physical zero, but Rust references may not use a
+    # null data pointer. Keep the null page out of GRUB's module allocator; KUMO applies its
+    # broader legacy-megabyte reservation when it normalizes the firmware map.
+    cutmem 0 4K
     set gfxpayload=text
-    multiboot /boot/kumo-kernel
+    multiboot2 /boot/kumo-kernel
+    module2 /boot/kumo-initrd.img kumo-initrd
     boot
 }
 CFG
@@ -65,7 +65,7 @@ CFG
   mkdir -p "$(dirname "$out")"
   "$mkrescue" -o "$out" "$work" >/dev/null 2>&1
   echo "wrote $out ($(du -h "$out" | cut -f1))"
-  echo "  - boot in QEMU (UEFI):  qemu-system-x86_64 -bios <OVMF.fd> -cdrom $out -serial stdio"
+  echo "  - verified QEMU path:   cargo xtask x86-uefi-smoke --arch x86_64"
   echo "  - or dd to a USB key:   sudo dd if=$out of=/dev/rdiskN bs=4m   (then boot it)"
 }
 
@@ -79,19 +79,28 @@ build_aarch64() {
     exit 1
   }
   local work; work="$(mktemp -d)"; trap "rm -rf '$work'" RETURN
+  local iso_root="$work/iso-root"; mkdir -p "$iso_root"
   local esp="$work/esp.img"
   local kib mib
+  # El Torito stores its 512-byte load count in 16 bits, so its EFI image must stay below
+  # 32 MiB. FAT16 is valid UEFI removable-media storage at this size; the raw IMG builder
+  # uses a separate 64 MiB standards-compliant FAT32 ESP.
   kib=$(( $(du -sk "$esp_dir" | cut -f1) + 4096 )); mib=$(( (kib + 1023) / 1024 )); [ "$mib" -lt 16 ] && mib=16
+  [ "$mib" -lt 32 ] || { echo "error: ARM64 ISO EFI payload exceeds the 31 MiB El Torito limit" >&2; exit 1; }
   dd if=/dev/zero of="$esp" bs=1m count="$mib" status=none
-  mformat -i "$esp" -F ::
+  mformat -i "$esp" ::
   copy_tree() { local d name; for d in "$1"/*; do name="$(basename "$d")"
     if [ -d "$d" ]; then mmd -i "$esp" "$2/$name"; copy_tree "$d" "$2/$name"
     else mcopy -i "$esp" "$d" "$2/$name"; fi; done; }
   mmd -i "$esp" ::/EFI; copy_tree "$esp_dir/EFI" "::/EFI"
-  mkdir -p "$(dirname "$out")"; cp "$esp" "$work/efiboot.img"
+  mkdir -p "$(dirname "$out")"
+  # Use the FAT16 image both as the UEFI El Torito image and as an appended type-0xef
+  # partition, keeping the optical product inspectable with ordinary disk tooling.
   xorriso -as mkisofs -V KUMO -iso-level 3 -full-iso9660-filenames \
-    -eltorito-alt-boot -e efiboot.img -no-emul-boot -isohybrid-gpt-basdat \
-    -o "$out" "$work" 2>/dev/null
+    -append_partition 2 0xef "$esp" \
+    -e --interval:appended_partition_2:all:: -no-emul-boot \
+    -isohybrid-gpt-basdat -partition_cyl_align all \
+    -o "$out" "$iso_root" 2>/dev/null
   echo "wrote $out ($(du -h "$out" | cut -f1))"
 }
 
