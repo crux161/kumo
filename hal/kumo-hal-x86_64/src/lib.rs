@@ -1,12 +1,13 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j449
 //j450
 //j451
 //j452
 //j454
+//j455
 
+mod fpsimd;
 mod gdt;
 pub mod idt;
 mod io_apic;
@@ -17,6 +18,7 @@ mod platform_acpi;
 mod ring3;
 mod userspace;
 
+pub use fpsimd::{prove_fpsimd_boundary, FpSimdReport};
 pub use gdt::{install as install_descriptor_tables, DescriptorTableReport};
 pub use io_apic::{
     apply_boot_io_apic_timer, inspect_boot_io_apic, plan_boot_io_apic_timer,

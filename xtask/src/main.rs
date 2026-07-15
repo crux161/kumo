@@ -1,8 +1,8 @@
-//j450
 //j451
 //j452
 //j453
 //j454
+//j455
 
 use std::env;
 use std::fmt;
@@ -1923,6 +1923,9 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
             b"IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
             b"IDT / TOWER        Check     int3 caught + resumed",
+            // FP/SIMD boundary (j455): CR0/CR4 values are CPU-dependent; match the OK-only
+            // "SSE on" prefix (the FAIL branch has no such text). — KESTREL
+            b"FPSIMD / SSE       Check     SSE on",
             b"RING3 / FRAMES     Check",
             b"RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
             b"RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
@@ -1960,7 +1963,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: full Multiboot physical map + kernel-owned CR3/high-RAM probe, shared frame allocation + initrd native ELF on shared SyscallEngine, scheduled CPL3/int80, real cooperative/timer-preempted contexts, private process CR3, int3, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
+        "KUMO x86 QEMU smoke green: full Multiboot physical map + kernel-owned CR3/high-RAM probe, shared frame allocation + initrd native ELF on shared SyscallEngine, scheduled CPL3/int80, real cooperative/timer-preempted contexts, private process CR3, int3 + interrupt-transparent FP/SIMD state, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
     );
     Ok(())
 }
@@ -2196,6 +2199,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK",
         "IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
         "IDT / TOWER        Check     int3 caught + resumed",
+        "FPSIMD / SSE       Check     SSE on",
         "RING3 / FRAMES     Check",
         "RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
         "RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
@@ -2436,6 +2440,7 @@ IOAPIC INPUT       Check     GSI 2 pin 2  vec 0x00 fixed physical dest 0  high e
 IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high edge masked  raw 0x00000000:0x00010031   OK\n\
 IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
+FPSIMD / SSE       Check     SSE on (CR0 0x80000013 CR4 0x620)  xmm 0xf00d5555aaaac0de survived int3 ISR   OK\n\
 RING3 / FRAMES     Check     8 BootInfo frames  first 0x937000  last 0x941000  monotonic  kernel+initrd excluded   OK\n\
 RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK\n\
 RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK\n\

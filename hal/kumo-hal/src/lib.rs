@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j448
 //j449
 //j450
 //j451
 //j452
+//j455
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -51,17 +51,17 @@ pub mod active {
         irq_unmask, local_timer_irq_count, map_user_device_block, map_user_page,
         mask_pic_timer_source, monotonic_nanos, plan_boot_io_apic_timer,
         prepare_scheduled_ring3_smoke, prepare_scheduled_user_image, probe_io_apic_timer_interrupt,
-        read_phys, read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag,
-        render_qr_diag_once, run_el0_image, run_el0_smoke, run_ring3_smoke, set_fault_hook,
-        set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook, set_user_aspace_root,
-        set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once, switch_context,
-        sync_icache_to_pou, syscall_count, timer_irq_count, unmask_boot_io_apic_timer,
-        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
-        wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs, wait_for_timer_irqs,
-        AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
-        DescriptorTableReport, El0Report, IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied,
-        IoApicTimerPlan, Ring3Error, Ring3Report, ThreadContext, UserImage, UserImageError,
-        UserLoadSegment, UserMapping, UserState, ARCH, RING3_PING_TOKEN,
+        prove_fpsimd_boundary, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
+        render_qr_diag, render_qr_diag_once, run_el0_image, run_el0_smoke, run_ring3_smoke,
+        set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
+        set_user_aspace_root, set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once,
+        switch_context, sync_icache_to_pou, syscall_count, timer_irq_count,
+        unmask_boot_io_apic_timer, user_device_page_desc, user_entry_context, user_nc_page_desc,
+        user_page_desc, wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs,
+        wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
+        DescriptorTableReport, El0Report, FpSimdReport, IoApicRedirectionEntry, IoApicReport,
+        IoApicTimerApplied, IoApicTimerPlan, Ring3Error, Ring3Report, ThreadContext, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH, RING3_PING_TOKEN,
     };
 }
 

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j450
 //j451
 //j452
 //j453
 //j454
+//j455
 
 extern crate alloc;
 
@@ -1544,6 +1544,29 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             "IDT / TOWER        Check     breakpoint not fielded (seen {})   FAIL\n",
             seen
         );
+    }
+
+    // DEFERRED/000 (j455): first FP/SIMD boundary-parity gate. The x86 kernel is built soft-float,
+    // so its interrupt path does not touch xmm. Enable SSE in hardware, then prove an xmm sentinel
+    // survives int3 through isr_common unchanged. Per-user-thread FP ownership remains deferred.
+    // — KESTREL
+    let fpsimd = kumo_hal::active::prove_fpsimd_boundary(0xf00d_5555_aaaa_c0de);
+    if fpsimd.is_transparent() {
+        klog!(
+            "FPSIMD / SSE       Check     SSE on (CR0 {:#x} CR4 {:#x})  xmm {:#x} survived int3 ISR   OK\n",
+            fpsimd.cr0,
+            fpsimd.cr4,
+            fpsimd.xmm_after_isr
+        );
+    } else {
+        klog!(
+            "FPSIMD / SSE       Check     CR0 {:#x} CR4 {:#x}  xmm {:#x}->{:#x}   FAIL\n",
+            fpsimd.cr0,
+            fpsimd.cr4,
+            fpsimd.xmm_sentinel,
+            fpsimd.xmm_after_isr
+        );
+        kumo_hal::active::halt();
     }
 
     // First CPL3 proof: an RX user page pings through the DPL3 int80 gate, receives its value
