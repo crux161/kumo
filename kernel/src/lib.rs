@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j451
 //j452
 //j453
 //j454
 //j455
+//j456
 
 extern crate alloc;
 
@@ -23,6 +23,8 @@ pub mod task;
 pub mod tower;
 pub mod user_thread;
 pub mod usermode;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod x86_fpsimd_smoke;
 
 use kumo_abi::{BootInfo, Errno, Rights, Signals, ABI_VERSION};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -1616,6 +1618,27 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         }
         Err(err) => {
             klog!("RING3 / INT80      Check     {:?}   FAIL\n", err);
+            kumo_hal::active::halt();
+        }
+    }
+
+    // j456: prove eager FXSAVE/FXRSTOR ownership with two actual CPL3 contexts. Each private CR3
+    // loads a distinct XMM0 sentinel, yields to its peer through int80, then resumes and validates
+    // its own value. This catches both a missing save and a restore from the wrong thread. — KESTREL
+    match x86_fpsimd_smoke::run(&boot) {
+        Ok(report) if report.is_live() => {
+            klog!(
+                "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 {:#x}/{:#x}  distinct xmm survived   OK\n",
+                report.roots[0],
+                report.roots[1]
+            );
+        }
+        Ok(report) => {
+            klog!("FPSIMD / SWITCH   Check     {:?}   FAIL\n", report);
+            kumo_hal::active::halt();
+        }
+        Err(err) => {
+            klog!("FPSIMD / SWITCH   Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     }

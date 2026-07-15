@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j450
 //j451
 //j452
 //j454
 //j455
+//j456
 
 mod fpsimd;
 mod gdt;
@@ -31,6 +31,7 @@ pub use platform_acpi::{
 };
 pub use ring3::{Ring3Error, Ring3Report, PING_TOKEN as RING3_PING_TOKEN};
 pub use userspace::first_light_smoke as run_ring3_smoke;
+pub use userspace::prepare_scheduled_fpsimd_smoke;
 pub use userspace::prepare_scheduled_smoke as prepare_scheduled_ring3_smoke;
 pub use userspace::prepare_scheduled_user_image;
 
@@ -40,11 +41,30 @@ pub fn arch_name() -> &'static str {
     ARCH
 }
 
-/// x86_64 kernel-thread context. `r12_entry` and `r13_arg` seed a fresh thread; after
-/// first entry they are ordinary callee-saved registers. The switch assembly saves and
-/// restores this exact layout.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(C)]
+/// Architectural x87/SSE state saved by `FXSAVE64`. The initial image is the architectural
+/// reset contract used for a fresh thread: x87 exceptions masked and MXCSR `0x1f80`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+struct FxState {
+    bytes: [u8; 512],
+}
+
+impl FxState {
+    const fn initial() -> Self {
+        let mut bytes = [0; 512];
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        Self { bytes }
+    }
+}
+
+/// x86_64 thread context. `r12_entry` and `r13_arg` seed a fresh thread; after first entry they
+/// are ordinary callee-saved registers. Every switch also eagerly saves/restores the complete
+/// legacy x87/SSE image, so two user threads cannot inherit one another's XMM state. — KESTREL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
 pub struct ThreadContext {
     r12_entry: u64,
     r13_arg: u64,
@@ -54,7 +74,25 @@ pub struct ThreadContext {
     rbp: u64,
     rip: u64,
     rsp: u64,
+    fx_state: FxState,
     user: bool,
+}
+
+impl Default for ThreadContext {
+    fn default() -> Self {
+        Self {
+            r12_entry: 0,
+            r13_arg: 0,
+            rbx: 0,
+            r14: 0,
+            r15: 0,
+            rbp: 0,
+            rip: 0,
+            rsp: 0,
+            fx_state: FxState::initial(),
+            user: false,
+        }
+    }
 }
 
 impl ThreadContext {
@@ -119,6 +157,10 @@ core::arch::global_asm!(
     "  mov %rax, 48(%rdi)",
     "  lea 8(%rsp), %rax",
     "  mov %rax, 56(%rdi)",
+    // Eager FP ownership: the kernel is soft-float, but user XMM/x87 state belongs to the
+    // thread and must cross scheduler switches. Both context slots are 16-byte aligned.
+    "  fxsave64 64(%rdi)",
+    "  fxrstor64 64(%rsi)",
     // Load the next context. RSI remains the context pointer until the final indirect jump.
     "  mov 0(%rsi), %r12",
     "  mov 8(%rsi), %r13",
@@ -1022,8 +1064,18 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ThreadContext, rbp), 40);
         assert_eq!(core::mem::offset_of!(ThreadContext, rip), 48);
         assert_eq!(core::mem::offset_of!(ThreadContext, rsp), 56);
-        assert_eq!(core::mem::offset_of!(ThreadContext, user), 64);
-        assert_eq!(core::mem::size_of::<ThreadContext>(), 72);
+        assert_eq!(core::mem::offset_of!(ThreadContext, fx_state), 64);
+        assert_eq!(core::mem::offset_of!(ThreadContext, user), 576);
+        assert_eq!(core::mem::align_of::<ThreadContext>(), 16);
+        assert_eq!(core::mem::size_of::<ThreadContext>(), 592);
+    }
+
+    #[test]
+    fn fresh_thread_fx_state_uses_architectural_defaults() {
+        let context = ThreadContext::default();
+        assert_eq!(&context.fx_state.bytes[..2], &0x037fu16.to_le_bytes());
+        assert_eq!(&context.fx_state.bytes[24..28], &0x1f80u32.to_le_bytes());
+        assert!(context.fx_state.bytes[28..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+//j456
+
 //! x86_64 ring-3 transition and `int 0x80` dispatch mechanics.
 //!
 //! Address-space construction lives in `userspace`; this module owns the privilege boundary:
@@ -108,6 +110,8 @@ mod metal {
     extern "C" {
         static ring3_payload_start: u8;
         static ring3_payload_end: u8;
+        static fpsimd_payload_start: u8;
+        static fpsimd_payload_end: u8;
         fn kumo_enter_ring3(entry: u64, user_sp: u64, arg0: u64) -> u64;
         fn kumo_ring3_resume(code: u64) -> !;
     }
@@ -134,6 +138,30 @@ mod metal {
         "2: hlt",
         "  jmp 2b",
         "ring3_payload_end:",
+        // Two-context FP ownership probe. RDI supplies this context's sentinel. Yield once
+        // through the test hook (op 0xf0), then report whether XMM0 still holds it (op 0xf1,
+        // RDI=0 success / 1 failure). Raw bytes keep the kernel target itself `-sse`. — KESTREL
+        ".globl fpsimd_payload_start",
+        ".globl fpsimd_payload_end",
+        "fpsimd_payload_start:",
+        "  mov %rdi, %r12",
+        "  mov %rdi, %rax",
+        "  .byte 0x66, 0x48, 0x0f, 0x6e, 0xc0", // movq xmm0, rax
+        "  mov $0xf0, %eax",
+        "  int $0x80",
+        "  .byte 0x66, 0x48, 0x0f, 0x7e, 0xc0", // movq rax, xmm0
+        "  cmp %r12, %rax",
+        "  jne 3f",
+        "  xor %edi, %edi",
+        "  jmp 4f",
+        "3:",
+        "  mov $1, %edi",
+        "4:",
+        "  mov $0xf1, %eax",
+        "  int $0x80",
+        "5: hlt",
+        "  jmp 5b",
+        "fpsimd_payload_end:",
         // Save the suspended kernel flow and build the five-word privilege-return frame.
         ".section .text",
         ".globl kumo_enter_ring3",
@@ -193,6 +221,12 @@ mod metal {
         let end = core::ptr::addr_of!(ring3_payload_end) as usize;
         unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
     }
+
+    pub fn fpsimd_payload() -> &'static [u8] {
+        let start = core::ptr::addr_of!(fpsimd_payload_start) as usize;
+        let end = core::ptr::addr_of!(fpsimd_payload_end) as usize;
+        unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -208,6 +242,11 @@ pub(crate) fn resume(code: u64) -> ! {
 #[cfg(target_os = "none")]
 pub(crate) fn payload() -> &'static [u8] {
     metal::payload()
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn fpsimd_payload() -> &'static [u8] {
+    metal::fpsimd_payload()
 }
 
 #[cfg(test)]
