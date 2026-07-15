@@ -1,8 +1,8 @@
-//j452
 //j453
 //j454
 //j455
 //j456
+//j457
 
 use std::env;
 use std::fmt;
@@ -1861,7 +1861,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             "-initrd",
             path_arg(&initrd)?,
             "-cpu",
-            "qemu64,+x2apic",
+            "max,+x2apic",
             "-m",
             "1088",
             "-display",
@@ -1926,10 +1926,12 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             // FP/SIMD boundary (j455): CR0/CR4 values are CPU-dependent; match the OK-only
             // "SSE on" prefix (the FAIL branch has no such text). — KESTREL
             b"FPSIMD / SSE       Check     SSE on",
+            b"FPSIMD / XSAVE     Check     AVX on  XCR0 0x7  standard 832b image   OK",
             b"RING3 / FRAMES     Check",
             b"RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
             b"RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
-            b"FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80",
+            b"FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3",
+            b"distinct ymm[255:128] survived   OK",
             b"PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
             b"x2APIC / TIMER    Check",
             b"20 Hz tick  vec 48  hb 3t   OK",
@@ -1964,7 +1966,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
     })?;
 
     println!(
-        "KUMO x86 QEMU smoke green: full Multiboot physical map + kernel-owned CR3/high-RAM probe, shared frame allocation + initrd native ELF on shared SyscallEngine, scheduled CPL3/int80, real cooperative/timer-preempted contexts, private process CR3, eager FXSAVE/FXRSTOR ownership across two CPL3 contexts, int3 + interrupt-transparent FP/SIMD state, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
+        "KUMO x86 QEMU smoke green: full Multiboot physical map + kernel-owned CR3/high-RAM probe, shared frame allocation + initrd native ELF on shared SyscallEngine, scheduled CPL3/int80, real cooperative/timer-preempted contexts, private process CR3, CPUID-gated AVX/XCR0 plus eager XSAVE ownership across two CPL3 contexts, int3 + interrupt-transparent FP/SIMD state, and the PIC/PIT/x2APIC/I/O APIC chain all proven"
     );
     Ok(())
 }
@@ -2010,18 +2012,22 @@ fn run_x86_uefi_smoke(root: &Path) -> Result<(), String> {
         ovmf_code.display()
     );
     let vars_drive = format!("if=pflash,unit=1,format=raw,file={}", ovmf_vars.display());
+    let cdrom_drive = format!(
+        "media=cdrom,format=raw,readonly=on,file.locking=off,file.filename={}",
+        iso.display()
+    );
     let mut child = Command::new("qemu-system-x86_64")
         .args(["-machine", "q35", "-drive"])
         .arg(&code_drive)
         .args(["-drive"])
         .arg(&vars_drive)
-        .args(["-cdrom"])
-        .arg(&iso)
+        .args(["-drive"])
+        .arg(&cdrom_drive)
         .args([
             "-boot",
             "d",
             "-cpu",
-            "qemu64,+x2apic",
+            "max,+x2apic",
             "-m",
             "1088",
             "-display",
@@ -2201,10 +2207,12 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK",
         "IDT / TOWER        Check     int3 caught + resumed",
         "FPSIMD / SSE       Check     SSE on",
+        "FPSIMD / XSAVE     Check     AVX on  XCR0 0x7  standard 832b image   OK",
         "RING3 / FRAMES     Check",
         "RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK",
         "RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK",
-        "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80",
+        "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3",
+        "distinct ymm[255:128] survived   OK",
         "PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK",
         "x2APIC / TIMER    Check",
         "20 Hz tick  vec 48  hb 3t   OK",
@@ -2443,10 +2451,11 @@ IOAPIC PLAN        Check     GSI 2 pin 2  vec 0x31 fixed physical dest 0  high e
 IOAPIC WRITE       Check     GSI 2 pin 2  wrote 0x00000000:0x00010031  readback 0x00000000:0x00010031 masked   OK\n\
 IDT / TOWER        Check     int3 caught + resumed  seen 1   OK\n\
 FPSIMD / SSE       Check     SSE on (CR0 0x80000013 CR4 0x620)  xmm 0xf00d5555aaaac0de survived int3 ISR   OK\n\
+FPSIMD / XSAVE     Check     AVX on  XCR0 0x7  standard 832b image   OK\n\
 RING3 / FRAMES     Check     8 BootInfo frames  first 0x937000  last 0x941000  monotonic  kernel+initrd excluded   OK\n\
 RING3 / PAGING     Check     private CR3  RX code 0x8000000000  NX stack 0x10000000000  4K guard   OK\n\
 RING3 / INT80      Check     CPL3 entered  2 calls  ping 0x4b554d4fc0decafe  exit 0   OK\n\
-FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 0x942000/0x94a000  distinct xmm survived   OK\n\
+FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 0x942000/0x94a000  distinct ymm[255:128] survived   OK\n\
 PIC / PIT          Check     1193182 Hz input  20 Hz tick  IRQ 0  hb 3t   OK\n\
 x2APIC / TIMER    Check     50000000 Hz calibrated  20 Hz tick  vec 48  hb 3t   OK\n\
 IOAPIC DISPATCH    Check     vec 0x31 software probe counted + EOI  seen 1   OK\n\
@@ -2477,6 +2486,12 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
         assert!(validate_x86_smoke_transcript(
             GREEN
                 .replace("FPSIMD / SWITCH   Check", "FPSIMD / SHARED   Check")
+                .as_bytes()
+        )
+        .is_err());
+        assert!(validate_x86_smoke_transcript(
+            GREEN
+                .replace("distinct ymm[255:128] survived", "distinct xmm survived")
                 .as_bytes()
         )
         .is_err());

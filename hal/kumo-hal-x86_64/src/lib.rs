@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j451
 //j452
 //j454
 //j455
 //j456
+//j457
 
 mod fpsimd;
 mod gdt;
@@ -41,17 +41,19 @@ pub fn arch_name() -> &'static str {
     ARCH
 }
 
-/// Architectural x87/SSE state saved by `FXSAVE64`. The initial image is the architectural
-/// reset contract used for a fresh thread: x87 exceptions masked and MXCSR `0x1f80`.
+const XSTATE_BYTES: usize = 832;
+
+/// Standard-format x87/SSE/AVX state. The first 512 bytes remain a valid `FXRSTOR64` image for
+/// processors without AVX, while the full area covers the AVX component ending at byte 832.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C, align(16))]
-struct FxState {
-    bytes: [u8; 512],
+#[repr(C, align(64))]
+struct XState {
+    bytes: [u8; XSTATE_BYTES],
 }
 
-impl FxState {
+impl XState {
     const fn initial() -> Self {
-        let mut bytes = [0; 512];
+        let mut bytes = [0; XSTATE_BYTES];
         bytes[0] = 0x7f;
         bytes[1] = 0x03;
         bytes[24] = 0x80;
@@ -62,9 +64,10 @@ impl FxState {
 
 /// x86_64 thread context. `r12_entry` and `r13_arg` seed a fresh thread; after first entry they
 /// are ordinary callee-saved registers. Every switch also eagerly saves/restores the complete
-/// legacy x87/SSE image, so two user threads cannot inherit one another's XMM state. — KESTREL
+/// enabled x87/SSE/AVX image, so user threads cannot inherit one another's vector state. CPUs
+/// without AVX retain the architectural `FXSAVE64` fallback. — KESTREL
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 pub struct ThreadContext {
     r12_entry: u64,
     r13_arg: u64,
@@ -74,7 +77,7 @@ pub struct ThreadContext {
     rbp: u64,
     rip: u64,
     rsp: u64,
-    fx_state: FxState,
+    xstate: XState,
     user: bool,
 }
 
@@ -89,9 +92,24 @@ impl Default for ThreadContext {
             rbp: 0,
             rip: 0,
             rsp: 0,
-            fx_state: FxState::initial(),
+            xstate: XState::initial(),
             user: false,
         }
+    }
+}
+
+// Written once during single-core first light, before the first context switch. Assembly reads
+// these symbols to select the AVX-capable XSAVE path without imposing AVX on baseline x86_64 CPUs.
+// — KESTREL
+#[no_mangle]
+static mut KUMO_XSTATE_MASK: u64 = 0;
+#[no_mangle]
+static mut KUMO_XSAVE_ENABLED: u8 = 0;
+
+pub(crate) unsafe fn configure_xsave(mask: u64) {
+    unsafe {
+        core::ptr::addr_of_mut!(KUMO_XSTATE_MASK).write_volatile(mask);
+        core::ptr::addr_of_mut!(KUMO_XSAVE_ENABLED).write_volatile(1);
     }
 }
 
@@ -157,10 +175,23 @@ core::arch::global_asm!(
     "  mov %rax, 48(%rdi)",
     "  lea 8(%rsp), %rax",
     "  mov %rax, 56(%rdi)",
-    // Eager FP ownership: the kernel is soft-float, but user XMM/x87 state belongs to the
-    // thread and must cross scheduler switches. Both context slots are 16-byte aligned.
+    // Eager FP ownership. Use standard-format XSAVE when first light enabled AVX; retain
+    // FXSAVE for baseline x86_64 CPUs. Every state slot is 64-byte aligned.
+    "  cmpb $0, KUMO_XSAVE_ENABLED(%rip)",
+    "  je 8f",
+    "  mov KUMO_XSTATE_MASK(%rip), %rax",
+    "  mov %rax, %rdx",
+    "  shr $32, %rdx",
+    "  xsave64 64(%rdi)",
+    "  mov KUMO_XSTATE_MASK(%rip), %rax",
+    "  mov %rax, %rdx",
+    "  shr $32, %rdx",
+    "  xrstor64 64(%rsi)",
+    "  jmp 9f",
+    "8:",
     "  fxsave64 64(%rdi)",
     "  fxrstor64 64(%rsi)",
+    "9:",
     // Load the next context. RSI remains the context pointer until the final indirect jump.
     "  mov 0(%rsi), %r12",
     "  mov 8(%rsi), %r13",
@@ -1064,18 +1095,18 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ThreadContext, rbp), 40);
         assert_eq!(core::mem::offset_of!(ThreadContext, rip), 48);
         assert_eq!(core::mem::offset_of!(ThreadContext, rsp), 56);
-        assert_eq!(core::mem::offset_of!(ThreadContext, fx_state), 64);
-        assert_eq!(core::mem::offset_of!(ThreadContext, user), 576);
-        assert_eq!(core::mem::align_of::<ThreadContext>(), 16);
-        assert_eq!(core::mem::size_of::<ThreadContext>(), 592);
+        assert_eq!(core::mem::offset_of!(ThreadContext, xstate), 64);
+        assert_eq!(core::mem::offset_of!(ThreadContext, user), 896);
+        assert_eq!(core::mem::align_of::<ThreadContext>(), 64);
+        assert_eq!(core::mem::size_of::<ThreadContext>(), 960);
     }
 
     #[test]
-    fn fresh_thread_fx_state_uses_architectural_defaults() {
+    fn fresh_thread_xstate_supports_fx_fallback_and_xsave_init() {
         let context = ThreadContext::default();
-        assert_eq!(&context.fx_state.bytes[..2], &0x037fu16.to_le_bytes());
-        assert_eq!(&context.fx_state.bytes[24..28], &0x1f80u32.to_le_bytes());
-        assert!(context.fx_state.bytes[28..].iter().all(|&byte| byte == 0));
+        assert_eq!(&context.xstate.bytes[..2], &0x037fu16.to_le_bytes());
+        assert_eq!(&context.xstate.bytes[24..28], &0x1f80u32.to_le_bytes());
+        assert!(context.xstate.bytes[28..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

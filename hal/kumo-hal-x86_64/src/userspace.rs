@@ -1,4 +1,5 @@
 //j456
+//j457
 
 //! General frame-backed x86_64 userspace image construction and synchronous entry.
 
@@ -289,10 +290,11 @@ pub fn prepare_scheduled_smoke(
     }
 }
 
-/// Build the private address space for one side of the two-context CPL3 FP/SIMD ownership proof.
-/// The payload loads `sentinel` into XMM0, yields through `int 0x80`, and checks it after resume.
+/// Build one side of the two-context CPL3 FP/SIMD ownership proof. AVX-capable systems keep the
+/// sentinel in YMM0's upper half; baseline systems retain the XMM0 proof.
 pub fn prepare_scheduled_fpsimd_smoke(
     sentinel: u64,
+    avx: bool,
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<crate::UserState, UserImageError> {
     #[cfg(target_os = "none")]
@@ -312,11 +314,13 @@ pub fn prepare_scheduled_fpsimd_smoke(
             segments: core::slice::from_ref(&segment),
             extra_mappings: &[],
         };
-        prepare_scheduled_user_image(&image, alloc)
+        let mut state = prepare_scheduled_user_image(&image, alloc)?;
+        state.x[1] = u64::from(avx);
+        Ok(state)
     }
     #[cfg(not(target_os = "none"))]
     {
-        let _ = (sentinel, alloc);
+        let _ = (sentinel, avx, alloc);
         Err(UserImageError::Unsupported)
     }
 }

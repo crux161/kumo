@@ -1,4 +1,5 @@
 //j456
+//j457
 
 //! x86_64 ring-3 transition and `int 0x80` dispatch mechanics.
 //!
@@ -138,29 +139,45 @@ mod metal {
         "2: hlt",
         "  jmp 2b",
         "ring3_payload_end:",
-        // Two-context FP ownership probe. RDI supplies this context's sentinel. Yield once
-        // through the test hook (op 0xf0), then report whether XMM0 still holds it (op 0xf1,
-        // RDI=0 success / 1 failure). Raw bytes keep the kernel target itself `-sse`. — KESTREL
+        // Two-context FP ownership probe. RDI supplies this context's sentinel; RSI selects the
+        // AVX upper-YMM path or the baseline XMM path. Yield once through op 0xf0, then report
+        // survival through op 0xf1. Raw bytes keep the kernel target soft-float. — KESTREL
         ".globl fpsimd_payload_start",
         ".globl fpsimd_payload_end",
         "fpsimd_payload_start:",
         "  mov %rdi, %r12",
+        "  test %rsi, %rsi",
+        "  jz 3f",
         "  mov %rdi, %rax",
         "  .byte 0x66, 0x48, 0x0f, 0x6e, 0xc0", // movq xmm0, rax
-        "  mov $0xf0, %eax",
-        "  int $0x80",
-        "  .byte 0x66, 0x48, 0x0f, 0x7e, 0xc0", // movq rax, xmm0
-        "  cmp %r12, %rax",
-        "  jne 3f",
-        "  xor %edi, %edi",
+        "  .byte 0x66, 0x48, 0x0f, 0x6e, 0xc8", // movq xmm1, rax
+        "  .byte 0xc4, 0xe3, 0x7d, 0x18, 0xc1, 0x01", // vinsertf128 ymm0, ymm0, xmm1, 1
         "  jmp 4f",
         "3:",
-        "  mov $1, %edi",
+        "  mov %rdi, %rax",
+        "  .byte 0x66, 0x48, 0x0f, 0x6e, 0xc0", // movq xmm0, rax
         "4:",
+        "  mov $0xf0, %eax",
+        "  int $0x80",
+        "  test %rsi, %rsi",
+        "  jz 5f",
+        "  .byte 0xc4, 0xe3, 0x7d, 0x19, 0xc1, 0x01", // vextractf128 xmm1, ymm0, 1
+        "  .byte 0x66, 0x48, 0x0f, 0x7e, 0xc8",       // movq rax, xmm1
+        "  jmp 6f",
+        "5:",
+        "  .byte 0x66, 0x48, 0x0f, 0x7e, 0xc0", // movq rax, xmm0
+        "6:",
+        "  cmp %r12, %rax",
+        "  jne 7f",
+        "  xor %edi, %edi",
+        "  jmp 8f",
+        "7:",
+        "  mov $1, %edi",
+        "8:",
         "  mov $0xf1, %eax",
         "  int $0x80",
-        "5: hlt",
-        "  jmp 5b",
+        "9: hlt",
+        "  jmp 9b",
         "fpsimd_payload_end:",
         // Save the suspended kernel flow and build the five-word privilege-return frame.
         ".section .text",

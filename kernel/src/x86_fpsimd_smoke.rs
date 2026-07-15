@@ -1,10 +1,11 @@
 //j456
+//j457
 
 //! Two-context CPL3 proof for eager x86 FP/SIMD ownership.
 //!
-//! Each private address space runs the same tiny payload with a different XMM0 sentinel. The first
-//! `int 0x80` switches to its peer; the second reports whether the original value survived after
-//! the peer used XMM0. This deliberately rides the real `ThreadContext` switch primitive. — KESTREL
+//! Each private address space runs the same tiny payload with a different vector sentinel. On AVX
+//! systems it lives in YMM0's upper half; otherwise the legacy XMM0 proof remains available. The
+//! first `int 0x80` switches to the peer and the second reports survival after resume. — KESTREL
 
 use core::cell::UnsafeCell;
 
@@ -22,6 +23,7 @@ const KERNEL_STACK_BYTES: usize = 0x4000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Report {
     pub calls: u32,
+    pub avx: bool,
     pub yielded: [bool; CONTEXTS],
     pub survived: [bool; CONTEXTS],
     pub roots: [u64; CONTEXTS],
@@ -144,12 +146,12 @@ extern "C" fn syscall_hook(regs: *mut u64) {
     }
 }
 
-pub fn run(boot: &BootInfo) -> Result<Report, UserImageError> {
+pub fn run(boot: &BootInfo, avx: bool) -> Result<Report, UserImageError> {
     let kernel_root = kumo_hal::active::read_user_aspace_root();
     let mut alloc = || unsafe { mm::alloc_zeroed_frame(boot) };
     let states = [
-        kumo_hal::active::prepare_scheduled_fpsimd_smoke(SENTINELS[0], &mut alloc)?,
-        kumo_hal::active::prepare_scheduled_fpsimd_smoke(SENTINELS[1], &mut alloc)?,
+        kumo_hal::active::prepare_scheduled_fpsimd_smoke(SENTINELS[0], avx, &mut alloc)?,
+        kumo_hal::active::prepare_scheduled_fpsimd_smoke(SENTINELS[1], avx, &mut alloc)?,
     ];
 
     unsafe {
@@ -188,6 +190,7 @@ pub fn run(boot: &BootInfo) -> Result<Report, UserImageError> {
     Ok(unsafe {
         Report {
             calls: kumo_hal::active::syscall_count(),
+            avx,
             yielded: (*state).yielded,
             survived: (*state).survived,
             roots: [(*state).user_state[0].ttbr0, (*state).user_state[1].ttbr0],

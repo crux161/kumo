@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j452
 //j453
 //j454
 //j455
 //j456
+//j457
 
 extern crate alloc;
 
@@ -1548,10 +1548,9 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         );
     }
 
-    // DEFERRED/000 (j455): first FP/SIMD boundary-parity gate. The x86 kernel is built soft-float,
-    // so its interrupt path does not touch xmm. Enable SSE in hardware, then prove an xmm sentinel
-    // survives int3 through isr_common unchanged. Per-user-thread FP ownership remains deferred.
-    // — KESTREL
+    // DEFERRED/000 (j455/j457): the soft-float kernel does not touch user vector registers. Keep
+    // the int3 XMM boundary proof, then expose AVX only when CPUID supplies KUMO's bounded standard
+    // XSAVE layout. Baseline x86_64 CPUs retain the FXSAVE path. — KESTREL
     let fpsimd = kumo_hal::active::prove_fpsimd_boundary(0xf00d_5555_aaaa_c0de);
     if fpsimd.is_transparent() {
         klog!(
@@ -1569,6 +1568,15 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             fpsimd.xmm_after_isr
         );
         kumo_hal::active::halt();
+    }
+    if fpsimd.avx_enabled() {
+        klog!(
+            "FPSIMD / XSAVE     Check     AVX on  XCR0 {:#x}  standard {}b image   OK\n",
+            fpsimd.xcr0,
+            fpsimd.xsave_size
+        );
+    } else {
+        klog!("FPSIMD / XSAVE     Check     AVX unavailable  FXSAVE fallback   OK\n");
     }
 
     // First CPL3 proof: an RX user page pings through the DPL3 int80 gate, receives its value
@@ -1622,16 +1630,24 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         }
     }
 
-    // j456: prove eager FXSAVE/FXRSTOR ownership with two actual CPL3 contexts. Each private CR3
-    // loads a distinct XMM0 sentinel, yields to its peer through int80, then resumes and validates
-    // its own value. This catches both a missing save and a restore from the wrong thread. — KESTREL
-    match x86_fpsimd_smoke::run(&boot) {
+    // j456/j457: prove eager vector ownership with two actual CPL3 contexts. AVX systems keep the
+    // distinct sentinel in YMM0[255:128], so legacy FXSAVE would fail this exact resume check.
+    // Baseline CPUs retain the prior XMM proof. — KESTREL
+    match x86_fpsimd_smoke::run(&boot, fpsimd.avx_enabled()) {
         Ok(report) if report.is_live() => {
-            klog!(
-                "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 {:#x}/{:#x}  distinct xmm survived   OK\n",
-                report.roots[0],
-                report.roots[1]
-            );
+            if report.avx {
+                klog!(
+                    "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 {:#x}/{:#x}  distinct ymm[255:128] survived   OK\n",
+                    report.roots[0],
+                    report.roots[1]
+                );
+            } else {
+                klog!(
+                    "FPSIMD / SWITCH   Check     CPL3 2 contexts  4 int80  private CR3 {:#x}/{:#x}  distinct xmm survived   OK\n",
+                    report.roots[0],
+                    report.roots[1]
+                );
+            }
         }
         Ok(report) => {
             klog!("FPSIMD / SWITCH   Check     {:?}   FAIL\n", report);
