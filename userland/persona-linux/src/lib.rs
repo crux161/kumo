@@ -1,5 +1,7 @@
 #![no_std]
 
+//j459
+
 /// ARM64 Linux syscall numbers used by the M10 MVP.
 ///
 /// This crate is intentionally tiny: it names only the syscall surface needed
@@ -26,11 +28,29 @@ pub mod elf {
     pub const ELF_HEADER_LEN: usize = 64;
     pub const ELF_PHDR_LEN: usize = 56;
     pub const ET_EXEC: u16 = 2;
+    pub const EM_X86_64: u16 = 0x3e;
     pub const EM_AARCH64: u16 = 0xb7;
     pub const PT_LOAD: u32 = 1;
     pub const PF_X: u32 = 1 << 0;
     pub const PF_W: u32 = 1 << 1;
     pub const PF_R: u32 = 1 << 2;
+
+    /// ELF machine accepted by the persona loader. Callers select this explicitly so an
+    /// architecture-specific runner cannot accidentally launch another architecture's image.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Machine {
+        X86_64,
+        Aarch64,
+    }
+
+    impl Machine {
+        const fn elf_id(self) -> u16 {
+            match self {
+                Self::X86_64 => EM_X86_64,
+                Self::Aarch64 => EM_AARCH64,
+            }
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum ElfError {
@@ -62,7 +82,16 @@ pub mod elf {
         pub mem_size: u64,
     }
 
+    /// Parse the established M10 ARM64 ELF contract.
+    ///
+    /// This compatibility entry point remains ARM64-only. AMD64 runners must opt in through
+    /// [`parse_header_for_machine`] so extending the parser does not widen existing callers.
     pub fn parse_header(bytes: &[u8]) -> Result<ElfHeader, ElfError> {
+        parse_header_for_machine(bytes, Machine::Aarch64)
+    }
+
+    /// Parse an executable ELF64 header for exactly `machine`.
+    pub fn parse_header_for_machine(bytes: &[u8], machine: Machine) -> Result<ElfHeader, ElfError> {
         if bytes.len() < ELF_HEADER_LEN {
             return Err(ElfError::TooSmall);
         }
@@ -78,7 +107,7 @@ pub mod elf {
         if read_u16(bytes, 16)? != ET_EXEC {
             return Err(ElfError::NotExecutable);
         }
-        if read_u16(bytes, 18)? != EM_AARCH64 {
+        if read_u16(bytes, 18)? != machine.elf_id() {
             return Err(ElfError::WrongMachine);
         }
         let phentsize = read_u16(bytes, 54)?;
@@ -168,18 +197,23 @@ pub mod elf {
             buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
 
-        #[test]
-        fn parses_aarch64_exec_header_and_load_segment() {
+        fn exec_header(machine: u16, entry: u64) -> [u8; ELF_HEADER_LEN] {
             let mut header = [0u8; ELF_HEADER_LEN];
             header[0..4].copy_from_slice(b"\x7fELF");
             header[4] = 2;
             header[5] = 1;
             put_u16(&mut header, 16, ET_EXEC);
-            put_u16(&mut header, 18, EM_AARCH64);
-            put_u64(&mut header, 24, 0x1000_1000);
+            put_u16(&mut header, 18, machine);
+            put_u64(&mut header, 24, entry);
             put_u64(&mut header, 32, ELF_HEADER_LEN as u64);
             put_u16(&mut header, 54, ELF_PHDR_LEN as u16);
             put_u16(&mut header, 56, 1);
+            header
+        }
+
+        #[test]
+        fn parses_aarch64_exec_header_and_load_segment() {
+            let header = exec_header(EM_AARCH64, 0x1000_1000);
 
             let parsed = parse_header(&header).unwrap();
             assert_eq!(parsed.entry, 0x1000_1000);
@@ -196,6 +230,31 @@ pub mod elf {
             assert_eq!(segment.kind, PT_LOAD);
             assert_eq!(segment.flags, PF_R | PF_X);
             assert_eq!(segment.file_offset, 0x1000);
+        }
+
+        #[test]
+        fn parses_x86_64_exec_header_only_when_requested() {
+            let header = exec_header(EM_X86_64, 0x0040_1000);
+
+            assert_eq!(parse_header(&header), Err(ElfError::WrongMachine));
+            let parsed = parse_header_for_machine(&header, Machine::X86_64).unwrap();
+            assert_eq!(parsed.entry, 0x0040_1000);
+            assert_eq!(parsed.phnum, 1);
+        }
+
+        #[test]
+        fn explicit_machine_rejects_cross_arch_images() {
+            let arm64 = exec_header(EM_AARCH64, 0x1000_1000);
+            let x86_64 = exec_header(EM_X86_64, 0x0040_1000);
+
+            assert_eq!(
+                parse_header_for_machine(&arm64, Machine::X86_64),
+                Err(ElfError::WrongMachine)
+            );
+            assert_eq!(
+                parse_header_for_machine(&x86_64, Machine::Aarch64),
+                Err(ElfError::WrongMachine)
+            );
         }
     }
 }
