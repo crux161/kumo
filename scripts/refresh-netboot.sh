@@ -76,6 +76,15 @@ if [ -z "$MKNETDIR" ]; then
   exit 1
 fi
 
+# Legacy BIOS PXE clients (e.g. Intel Boot Agent, DHCP option 93 arch 0x0000) cannot
+# run the UEFI PE, so we also stage a GRUB i386-pc network boot program when a BIOS
+# grub is available. This is optional: without it the tree is UEFI-only.
+MKNETDIR_BIOS="$(command -v i686-elf-grub-mknetdir || command -v i386-elf-grub-mknetdir || true)"
+if [ -z "$MKNETDIR_BIOS" ] && [ -n "$MKNETDIR" ]; then
+  # A native grub-mknetdir can emit i386-pc if that platform's modules are installed.
+  case "$MKNETDIR" in */grub-mknetdir) MKNETDIR_BIOS="$MKNETDIR" ;; esac
+fi
+
 if [ "$BUILD" -eq 1 ]; then
   echo "==> Building AMD64 Multiboot2 kernel and initrd"
   (cd "$ROOT" && ./scripts/x86-multiboot.sh build)
@@ -122,6 +131,26 @@ if [ ! -s "$CORE" ]; then
   exit 1
 fi
 
+# Stage the i386-pc BIOS network boot program alongside the UEFI loader (shared grub.cfg).
+CORE_BIOS=""
+if [ -n "$MKNETDIR_BIOS" ]; then
+  echo "==> Generating GRUB i386-pc BIOS network loader ($MKNETDIR_BIOS)"
+  "$MKNETDIR_BIOS" \
+    --net-directory="$STAGE" \
+    --subdir=/boot/grub \
+    --install-modules="normal configfile serial terminal multiboot2 mmap net tftp pxe echo boot" \
+    --modules="pxe tftp net normal" \
+    --locales= --themes= --fonts= >/dev/null
+  CORE_BIOS="$STAGE/boot/grub/i386-pc/core.0"
+  if [ ! -s "$CORE_BIOS" ]; then
+    echo "error: BIOS GRUB did not produce $CORE_BIOS" >&2
+    exit 1
+  fi
+else
+  echo "==> No i386-pc grub found; tree will be UEFI-only" >&2
+  echo "    (legacy BIOS PXE clients need: brew install i686-elf-grub)" >&2
+fi
+
 mkdir -p "$STAGE/amd64" "$STAGE/EFI/BOOT" "$STAGE/config"
 cp "$KERNEL" "$STAGE/amd64/kumo-kernel"
 cp "$INITRD" "$STAGE/amd64/kumo-initrd.img"
@@ -157,37 +186,45 @@ if [ -n "$GRUB_CHECK" ]; then
   "$GRUB_CHECK" "$STAGE/boot/grub/grub.cfg"
 fi
 
+BIOS_BOOTFILE=""
+[ -n "$CORE_BIOS" ] && BIOS_BOOTFILE="boot/grub/i386-pc/core.0"
+
 cat > "$STAGE/config/pxehost.env.example" <<EOF
 # KUMO's pxehost overlay consumes these settings. The run-pxehost.sh wrapper exports
 # them automatically; they are recorded here so the generated tree is self-describing.
 PXEHOST_TFTP_ROOT="$OUTPUT"
 PXEHOST_BOOTFILE="bootx64.efi"
+# Legacy BIOS PXE clients (option 93 arch 0x0000) are served this i386-pc NBP when present.
+PXEHOST_BIOS_BOOTFILE="${BIOS_BOOTFILE:-boot/grub/i386-pc/core.0}"
 # PXEHOST_ADVERTISED_IP="192.168.0.107"
 EOF
 
 cat > "$STAGE/README.txt" <<EOF
-KUMO AMD64 UEFI netboot tree
-============================
+KUMO AMD64 netboot tree (UEFI + legacy BIOS PXE)
+================================================
 
-TFTP root:     $OUTPUT
-DHCP bootfile: bootx64.efi
-Firmware:      x86-64 UEFI with the network stack enabled
-Secure Boot:   disable it for this unsigned development loader
+TFTP root:      $OUTPUT
+UEFI bootfile:  bootx64.efi                    (x86-64 UEFI firmware)
+BIOS bootfile:  ${BIOS_BOOTFILE:-<none: UEFI-only tree>}   (legacy x86 BIOS PXE, e.g. Intel Boot Agent)
+Secure Boot:    disable it for this unsigned development loader
 
-The pxehost proxyDHCP service advertises bootx64.efi to x86-64 UEFI clients. Its TFTP
-service provides the GRUB loader, boot/grub/grub.cfg, required GRUB modules, KUMO's
-Multiboot2 kernel, and the KUMORD01 initrd. The pxehost environment is under config/.
+The pxehost proxyDHCP service picks the bootfile by DHCP option 93 (client architecture):
+x86-64 UEFI clients (0x0007/0x0009) get bootx64.efi; legacy BIOS clients (0x0000) get the
+i386-pc core.0. Both GRUB flavors source the same boot/grub/grub.cfg and Multiboot2-boot
+KUMO's kernel + KUMORD01 initrd. The pxehost environment is under config/.
 
 Run scripts/run-pxehost.sh to refresh this tree and start proxyDHCP/TFTP. Rerun it
-whenever the kernel or initrd changes.
+whenever the kernel or initrd changes. BIOS support needs a GRUB i386-pc toolchain
+(macOS: brew install i686-elf-grub).
 EOF
 
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cat > "$STAGE/BUILD-INFO.txt" <<EOF
 architecture=x86_64
-firmware=uefi
+firmware=uefi+bios
 boot_protocol=grub-multiboot2-over-tftp
-dhcp_bootfile=bootx64.efi
+dhcp_bootfile_uefi=bootx64.efi
+dhcp_bootfile_bios=${BIOS_BOOTFILE:-none}
 source_commit=$COMMIT
 EOF
 
@@ -224,6 +261,7 @@ fi
 
 trap - EXIT INT TERM
 echo "wrote $OUTPUT"
-echo "  DHCP bootfile: bootx64.efi"
+echo "  UEFI bootfile: bootx64.efi"
+echo "  BIOS bootfile: ${BIOS_BOOTFILE:-<none: UEFI-only tree>}"
 echo "  payloads:      amd64/kumo-kernel + amd64/kumo-initrd.img"
 echo "  manifest:      MANIFEST.sha256"
