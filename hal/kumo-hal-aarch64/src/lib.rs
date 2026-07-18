@@ -8,6 +8,7 @@
 //j467
 //j468
 //j469
+//j470
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -1350,11 +1351,18 @@ pub fn console_set_cursor(col: u32, row: u32) {
     }
 }
 
-/// Non-blocking read of one byte of console input. Only the PL011 path has an input
-/// device (QEMU serial); a framebuffer console (e.g. the X13s) has no keyboard yet,
-/// so this returns `None` there rather than touching a nonexistent UART.
+/// Whether the serial input half is live. Framebuffer presence is deliberately irrelevant: a Pi 5
+/// has GOP and a selected PL011 at the same time. `UART_READY` can become true only after a board
+/// injects a nonzero base and the first TX initializes it, so it remains the safe MMIO gate.
+const fn pl011_input_enabled(_framebuffer_present: bool, uart_ready: bool) -> bool {
+    uart_ready
+}
+
+/// Non-blocking read of one byte from the selected PL011. A framebuffer-only machine such as the
+/// X13s never raises `UART_READY` and remains inert, while a dual-sink Pi can keep shell RX on
+/// uart10 or RP1 after the framebuffer handoff. — KESTREL 2026-07-18
 pub fn console_read_byte() -> Option<u8> {
-    if FB_PRESENT.load(ORD) || !UART_READY.load(ORD) {
+    if !pl011_input_enabled(FB_PRESENT.load(ORD), UART_READY.load(ORD)) {
         return None;
     }
     let flags = unsafe { pl011_reg(UARTFR).read_volatile() };
@@ -4861,6 +4869,14 @@ mod tests {
         assert!(framebuffer_console_writes_enabled(true, true));
         assert!(!framebuffer_console_writes_enabled(true, false));
         assert!(!framebuffer_console_writes_enabled(false, true));
+    }
+
+    #[test]
+    fn framebuffer_does_not_veto_an_initialized_pl011_input() {
+        assert!(pl011_input_enabled(false, true));
+        assert!(pl011_input_enabled(true, true));
+        assert!(!pl011_input_enabled(false, false));
+        assert!(!pl011_input_enabled(true, false));
     }
 
     #[test]

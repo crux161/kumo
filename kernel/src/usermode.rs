@@ -14,6 +14,7 @@
 //j396
 //j408
 //j422
+//j470
 
 use core::cell::UnsafeCell;
 
@@ -386,31 +387,32 @@ fn queue_framebuffer_console(sora: &mut SoraState, bytes: &[u8]) -> bool {
     true
 }
 
-/// Direct diagnostics use the HAL only during its ownership epoch. Once drv-fb has
-/// claimed the framebuffer, enqueue to its console instead; never touch the dormant
-/// HAL cursor. If delivery fails, `early_console_write` intentionally drops framebuffer
-/// output until a fatal path explicitly reclaims ownership.
+/// Direct diagnostics always retain the HAL's selected serial sink. Once drv-fb has claimed the
+/// framebuffer, enqueue to its console as well; [`early_console_write`] already suppresses only
+/// its dormant framebuffer cursor while continuing an injected PL011. This keeps Pi uart10/RP1
+/// diagnostics alive without letting two painters touch the glass. — KESTREL 2026-07-18
 fn console_write_in_state(sora: &mut SoraState, bytes: &[u8]) {
-    if !kumo_hal::active::framebuffer_console_owned_by_kernel()
-        && queue_framebuffer_console(sora, bytes)
-    {
-        return;
+    let kernel_owns_fb = kumo_hal::active::framebuffer_console_owned_by_kernel();
+    let queued_to_owner = !kernel_owns_fb && queue_framebuffer_console(sora, bytes);
+    let (_, write_hal) = console_delivery_plan(kernel_owns_fb, queued_to_owner);
+    if write_hal {
+        kumo_hal::active::early_console_write(bytes);
     }
-    kumo_hal::active::early_console_write(bytes);
 }
 
-/// Pure routing policy for [`console_write_without_switch`] (host-tested). Returns true
-/// when the fragment was handed to the framebuffer owner's queue and must therefore NOT
-/// also go to the HAL; false means the caller falls back to `early_console_write`. The
-/// kernel-owned epoch always paints via the HAL; only after handoff is the queue consulted.
-fn console_routed_to_owner(kernel_owns_fb: bool, queued_to_owner: bool) -> bool {
-    !kernel_owns_fb && queued_to_owner
+/// Pure dual-sink policy for [`console_write_without_switch`] (host-tested).
+///
+/// The first result says the userspace framebuffer owner receives the fragment. The second says
+/// the HAL is also called. That HAL call is not a second framebuffer paint: its ownership latch
+/// suppresses the dormant cursor and leaves only a selected UART active. — KESTREL 2026-07-18
+fn console_delivery_plan(kernel_owns_fb: bool, queued_to_owner: bool) -> (bool, bool) {
+    (!kernel_owns_fb && queued_to_owner, true)
 }
 
 /// Write a kernel console fragment without switching threads, honouring the framebuffer
 /// ownership epoch (J246). While the kernel owns the glass it paints via the HAL; once
-/// drv-fb has claimed the framebuffer the HAL cursor is dormant, so the fragment is queued
-/// to the owner's console channel instead of being dropped by `early_console_write`. This
+/// drv-fb has claimed the framebuffer the HAL cursor is dormant, so the fragment is queued to the
+/// owner's console channel while the HAL call continues only a selected serial sink. This
 /// is the path every kernel `klog!` falls back to (via `bootstrap::console::write`) when
 /// routing through the Sora console server is not active. Re-entrancy safe: if the
 /// `SoraState` borrow is unavailable (or Sora does not yet exist) the fragment falls back
@@ -422,7 +424,8 @@ pub(crate) fn console_write_without_switch(bytes: &[u8]) {
     } else {
         try_with_sora_mut(|sora| queue_framebuffer_console(sora, bytes)).unwrap_or(false)
     };
-    if !console_routed_to_owner(kernel_owns, queued) {
+    let (_, write_hal) = console_delivery_plan(kernel_owns, queued);
+    if write_hal {
         kumo_hal::active::early_console_write(bytes);
     }
 }
@@ -2519,7 +2522,7 @@ pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeEr
 
 #[cfg(test)]
 mod tests {
-    use super::{console_routed_to_owner, dtb_backing_range, MAX_DTB_BYTES};
+    use super::{console_delivery_plan, dtb_backing_range, MAX_DTB_BYTES};
 
     #[test]
     fn dtb_capability_span_is_page_bounded_and_finite() {
@@ -2532,33 +2535,32 @@ mod tests {
         assert_eq!(dtb_backing_range(0x4080_0000, MAX_DTB_BYTES + 1), None);
     }
 
-    // J247: the post-handoff console fallback routing policy. The kernel-owned epoch must
-    // always paint via the HAL (the `early_console_write` fallback); only after drv-fb has
-    // claimed the framebuffer is a *successful* queue allowed to suppress the HAL write.
-    // This is the framebuffer-class behaviour qemu-smoke cannot prove (it has no FB), so it
-    // is pinned here per GUIDANCE/006 §4.
+    // J247/J470: framebuffer ownership and serial ownership are independent. The kernel-owned
+    // epoch paints through the HAL. After drv-fb claims glass, its queue gets the framebuffer
+    // copy and the HAL still receives the fragment so its selected UART remains live; the HAL's
+    // own ownership latch prevents a second framebuffer paint.
 
     #[test]
     fn kernel_owned_always_falls_back_to_hal() {
         // While the kernel owns the glass, never route — even if a queue somehow reported
         // success, ownership dominates so the HAL stays the single painter.
-        assert!(!console_routed_to_owner(true, false));
-        assert!(!console_routed_to_owner(true, true));
+        assert_eq!(console_delivery_plan(true, false), (false, true));
+        assert_eq!(console_delivery_plan(true, true), (false, true));
     }
 
     #[test]
-    fn after_handoff_successful_queue_suppresses_hal() {
-        // drv-fb owns the framebuffer and accepted the fragment: do not also touch the
-        // dormant HAL cursor.
-        assert!(console_routed_to_owner(false, true));
+    fn after_handoff_successful_queue_keeps_selected_uart_live() {
+        // drv-fb owns the framebuffer and accepted the fragment. The HAL is still called for its
+        // UART half; its framebuffer half self-suppresses on the ownership latch.
+        assert_eq!(console_delivery_plan(false, true), (true, true));
     }
 
     #[test]
     fn after_handoff_failed_queue_falls_back_to_hal() {
         // drv-fb owns the framebuffer but the queue was refused — a full channel, or the
-        // re-entrancy guard declining the borrow. Fall back to the HAL path (which itself
-        // drops on an owned framebuffer) rather than losing the bytes to a panic.
-        assert!(!console_routed_to_owner(false, false));
+        // re-entrancy guard declining the borrow. The HAL drops its owned framebuffer half but
+        // still carries the bytes on a selected UART rather than losing them to a panic.
+        assert_eq!(console_delivery_plan(false, false), (false, true));
     }
 
     // The shared `dispatch_object_syscall` is the unification of the two SVC dispatch

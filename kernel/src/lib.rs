@@ -7,6 +7,7 @@
 //j465
 //j467
 //j468
+//j470
 
 extern crate alloc;
 
@@ -108,6 +109,20 @@ fn board_console_pl011_base(boot: &BootInfo) -> Option<u64> {
 
 const fn plausible_pl011_base(base: u64) -> bool {
     base != 0 && base < (1u64 << 48) && base & 0xfff == 0
+}
+
+/// Whether Stage-A should keep servicing the interactive serial floor after POST.
+///
+/// A framebuffer is a second output sink, not evidence that serial is absent. The Pi 5 has both:
+/// GOP plus either BSP uart10 or an explicit RP1 PL011 route. Preserve the historical headless
+/// serial attempt when there is no framebuffer, but when glass is present require a resolved UART
+/// before polling MMIO. This leaves the X13s on its safe framebuffer-only idle floor while a Pi
+/// continues on the exact PL011 selected before the first log line. — KESTREL 2026-07-18
+const fn stage_a_uses_serial_floor(
+    has_framebuffer: bool,
+    selected_pl011_base: Option<u64>,
+) -> bool {
+    selected_pl011_base.is_some() || !has_framebuffer
 }
 
 /// Where this board's GIC lives when firmware publishes no device tree, or `None` when the boot
@@ -805,9 +820,9 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         }
     }
 
-    if report.has_framebuffer {
-        // Framebuffer console (e.g. the X13s): no kernel keyboard yet, so idle here.
-        // The screen keeps the boot report; a pre-handoff pause lives in the loader.
+    if !stage_a_uses_serial_floor(report.has_framebuffer, selected_pl011_base) {
+        // Framebuffer-only console (the X13s): no resolved UART and no kernel keyboard yet, so
+        // idle here. The screen keeps the boot report; a pre-handoff pause lives in the loader.
         klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
         klog!("\nMUREX core online -- all subsystems nominal.\n");
         klog!("KUMO MUREX core Stage-A online; awaiting userspace.  HALT.\n");
@@ -816,11 +831,13 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             kumo_hal::active::spin_once();
         }
     } else {
-        // P8-b: serial console (QEMU PL011) — forward keystrokes to Sora via the
-        // keyboard channel. Sora buffers keystrokes (minimal line editing: backspace),
-        // echoes via DebugWrite, and sends completed lines to the kernel via the root
-        // channel. The kernel runs shell::run_command on each line. This is scaffold
-        // under DESIGN/006 §b — the line-edit loop is IPC, not a TTY.
+        // P8-b: selected PL011 console (QEMU, Pi uart10, or explicit RP1) — forward polled
+        // keystrokes to Sora via the keyboard channel. Polling deliberately avoids inventing an
+        // IRQ for the PCIe-hosted RP1 UART. Sora buffers keystrokes (minimal line editing:
+        // backspace), echoes via DebugWrite, and sends completed lines to the kernel via the root
+        // channel. The framebuffer remains an independent sink; its presence no longer suppresses
+        // this serial floor. The kernel runs shell::run_command on each line. This is scaffold
+        // under DESIGN/006 §b — the line-edit loop is IPC, not a TTY. — KESTREL 2026-07-18
         kdemo::install_preemption_probe();
         let mut env = shell::ShellEnv {
             arch: report.arch,
@@ -2210,6 +2227,19 @@ mod tests {
         assert_eq!(board_console_pl011_base(&boot), Some(0x10_7D00_1000));
         boot.set_board_id("");
         assert_eq!(board_console_pl011_base(&boot), None);
+    }
+
+    /// Console-floor selection must follow the resolved UART, not the unrelated presence of GOP.
+    /// This is the Pi 5 metal regression: it reached the end of POST with RP1 serial alive, then
+    /// entered the framebuffer-only idle branch and appeared to stop forever.
+    #[test]
+    fn dual_sink_pi_keeps_serial_floor_while_x13s_idles_on_glass() {
+        assert!(stage_a_uses_serial_floor(true, Some(0x1c_0003_0000)));
+        assert!(stage_a_uses_serial_floor(true, Some(0x10_7d00_1000)));
+        assert!(!stage_a_uses_serial_floor(true, None));
+        assert!(stage_a_uses_serial_floor(false, Some(0x0900_0000)));
+        // Preserve the old headless attempt for an unstamped no-GOP boot.
+        assert!(stage_a_uses_serial_floor(false, None));
     }
 
     #[test]

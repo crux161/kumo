@@ -6,6 +6,7 @@
 //j417
 //j424
 //j426
+//j470
 
 extern crate alloc;
 
@@ -798,20 +799,20 @@ extern "C" fn sora_main(
         }
     }
 
-    // Spawn drv-serial — but ONLY on the serial-console path (no framebuffer).
+    // Spawn drv-serial only on QEMU's no-framebuffer serial path.
     //
     // drv-serial is the QEMU PL011 input driver: it owns the UART at 0x0900_0000 /
-    // IRQ 33 and forwards RX bytes to the console channel so the kernel's serial shell
-    // has a keyboard. On the framebuffer console path (the X13s) there is no PL011 at
-    // that address. The mint+map still SUCCEED (the root Resource spans all of phys, so
+    // IRQ 33 and forwards RX bytes to the console channel. It is not the owner of the kernel's
+    // selected early console route. On a framebuffer path, the target may be the X13s with no
+    // PL011 or a dual-sink Pi 5 using uart10/RP1; in either case the QEMU base/IRQ pair is wrong.
+    // The mint+map still SUCCEED (the root Resource spans all of phys, so
     // resource_create_child/ResourceMintMmio range-checks pass), but drv-serial's first
     // MMIO access — the RXIM unmask write at drv-serial/main.rs — stalls the interconnect
     // on the absent/unclocked peripheral and hard-hangs the core. That is the boot freeze
     // whose last visible line is "drv-serial starting" (printed just before that write).
-    // The kernel takes its own serial-shell branch exactly when there is no framebuffer
-    // (kernel/src/lib.rs: `if report.has_framebuffer { halt } else { serial shell }`), so
-    // gate the PL011 driver on the same signal: `fb_va == 0` ⇔ serial path. On the X13s
-    // there is no kernel keyboard anyway (the fb path halts), so skipping it loses nothing.
+    // Keep this IRQ-driven driver gated on `fb_va == 0`. On a dual-sink Pi the kernel retains and
+    // polls the already-selected PL011 directly, which needs no guessed RP1 interrupt and keeps
+    // both TX diagnostics and shell RX alive after POST. — KESTREL 2026-07-18
     if fb_va == 0 {
         let serial_res_h = resource_create_child(
             res,
@@ -835,7 +836,7 @@ extern "C" fn sora_main(
             log(b"drv-serial: run fail\n");
         }
     } else {
-        log(b"drv-serial: skipped (framebuffer console, no PL011)\n");
+        log(b"drv-serial: skipped (QEMU PL011 driver not applicable)\n");
     }
 
     // J160/J161: spawn drv-blk — the ramdisk block driver (M6/P7).
