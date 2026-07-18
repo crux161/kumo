@@ -9,6 +9,7 @@
 //j468
 //j469
 //j470
+//j471
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -646,62 +647,82 @@ pub fn clean_dcache_to_poc(addr: usize, len: usize) {
     if len == 0 {
         return;
     }
-    // A-class D-cache line (X13s is Cortex-X1/A78, 64-byte lines). Over-stepping a larger
-    // line merely issues a redundant clean; it never skips one at this granule.
-    const LINE: usize = 64;
-    let mut line = addr & !(LINE - 1);
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, nomem));
+    }
+    let line_size = ctr_line_bytes(ctr, 16); // DminLine
+    let mut line = addr & !(line_size - 1);
     let end = addr.saturating_add(len);
     while line < end {
         // SAFETY: `dc cvac` cleans the line containing a normal-memory VA; it never faults.
         unsafe {
             core::arch::asm!("dc cvac, {a}", a = in(reg) line, options(nostack, preserves_flags));
         }
-        line += LINE;
+        line += line_size;
     }
-    // Ensure the cleans have completed before the frame is observed elsewhere.
+    // The consumer uses a different translation regime. Use the full-system completion scope
+    // proven by the UEFI metal handoff rather than assuming its observer stays inside this PE's
+    // current inner-shareable domain.
     unsafe {
-        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
 
 #[cfg(not(target_os = "none"))]
 pub fn clean_dcache_to_poc(_addr: usize, _len: usize) {}
 
-/// Make freshly-written **code** bytes fetchable at the same physical address: clean the
-/// D-cache to PoC (so the writes reach unified memory) then invalidate the I-cache to PoU
-/// over the range. Required whenever the kernel populates a page that EL0 will *execute*
-/// but wrote through a *data* mapping — notably [`VmarMap`]-loaded child images (drv-fb &c).
-/// Without it, on a core with no I/D coherency (X13s) EL0 fetches stale instructions and
-/// runs garbage — a register holds a value no instruction wrote (the J… double-TOWER).
-/// EL0 cannot do this itself: `SCTLR_EL1.UCI=0` traps `dc cvac`/`ic ivau` at EL0 on X13s.
-/// No-op on the host; harmless on QEMU and on already-coherent memory.
+/// Decode one cache-line size from `CTR_EL0`. The architectural fields are log2(words), so a
+/// value of 4 means 64 bytes. Keep this pure so host tests can pin the stride independently of
+/// the build machine's cache geometry.
+#[cfg(any(target_os = "none", test))]
+const fn ctr_line_bytes(ctr: u64, shift: u32) -> usize {
+    4usize << (((ctr >> shift) & 0xf) as usize)
+}
+
+/// Make freshly-written **code** bytes fetchable at the same physical address: clean and
+/// invalidate the D-cache to PoC, then invalidate the local PE's entire I-cache. Required
+/// whenever the kernel populates a page that EL0 will execute but wrote through a data alias —
+/// notably the initial Sora ELF and [`VmarMap`]-loaded child images.
+///
+/// The stride comes from `CTR_EL0.DminLine`, not a board assumption. `IC IALLU` is deliberate:
+/// the kernel cleans through the identity/physmap VA while EL0 fetches through a different VA,
+/// so a by-VA I-cache invalidate can miss a synonym. This is the same sequence that made the
+/// UEFI kernel handoff reliable on metal (J030). EL0 cannot do this itself: `SCTLR_EL1.UCI=0`
+/// traps cache maintenance on affected firmware. No-op on the host; harmless on QEMU and on
+/// already-coherent memory. — KESTREL 2026-07-18
 #[cfg(target_os = "none")]
 pub fn sync_icache_to_pou(addr: usize, len: usize) {
     if len == 0 {
         return;
     }
-    const LINE: usize = 64;
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, nomem));
+    }
+    let line_size = ctr_line_bytes(ctr, 16); // DminLine
     let end = addr.saturating_add(len);
-    // 1) Clean D-cache to PoC so the written bytes are visible to the I-side refill.
-    let mut line = addr & !(LINE - 1);
+    // 1) Clean + invalidate D-cache to PoC so the written bytes are visible to every possible
+    // instruction-side refill point. This matches the current UEFI metal handoff.
+    let mut line = addr & !(line_size - 1);
     while line < end {
-        // SAFETY: `dc cvac` cleans the line containing a normal-memory VA; it never faults.
+        // SAFETY: the caller supplies a mapped Normal-memory range. CIVAC changes only cache
+        // residency; it does not change the mapping or its contents.
         unsafe {
-            core::arch::asm!("dc cvac, {a}", a = in(reg) line, options(nostack, preserves_flags));
+            core::arch::asm!("dc civac, {a}", a = in(reg) line, options(nostack, preserves_flags));
         }
-        line += LINE;
+        line += line_size;
     }
-    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
-    // 2) Invalidate I-cache to PoU over the range, then sync the fetch stream.
-    let mut line = addr & !(LINE - 1);
-    while line < end {
-        // SAFETY: `ic ivau` invalidates the I-cache line for a normal-memory VA; never faults.
-        unsafe {
-            core::arch::asm!("ic ivau, {a}", a = in(reg) line, options(nostack, preserves_flags));
-        }
-        line += LINE;
-    }
-    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    // 2) Invalidate all local instruction-cache aliases, then synchronize the fetch stream.
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
 }
 
 #[cfg(not(target_os = "none"))]
@@ -2349,20 +2370,6 @@ pub mod el0 {
         // No hook installed: return to the vector, which branches to the Tower.
     }
 
-    /// Clean the written user code to PoC + invalidate the I-cache over it, so EL0 fetches
-    /// the real instructions (same handshake the loader does for the kernel image).
-    unsafe fn flush_for_exec(base: u64, len: usize) {
-        let mut a = base & !63;
-        let end = base + len as u64;
-        while a < end {
-            unsafe {
-                core::arch::asm!("dc civac, {a}", a = in(reg) a, options(nostack, preserves_flags))
-            };
-            a += 64;
-        }
-        unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack)) };
-    }
-
     fn align_down_4k(value: u64) -> u64 {
         value & !(PAGE_4K - 1)
     }
@@ -2440,9 +2447,9 @@ pub mod el0 {
                 unsafe { super::mmu::map_user_page(root, page, frame, desc, alloc, &mut tables) }
                     .map_err(|()| UserImageError::OutOfFrames)?;
                 if segment.executable {
-                    // SAFETY: clean this code frame to PoC + drop the I-cache so EL0 fetches
-                    // the bytes we just wrote (the loader does the same for the kernel image).
-                    unsafe { flush_for_exec(frame, PAGE_4K as usize) };
+                    // Clean this code frame to PoC + drop every local I-cache synonym so EL0
+                    // fetches the bytes we just wrote through the identity alias.
+                    super::sync_icache_to_pou(frame as usize, PAGE_4K as usize);
                 } else {
                     // Non-executable segments (.rodata / .data / .bss) need the SAME clean to
                     // PoC, just without the I-cache drop. We copied (or zeroed) these bytes
@@ -2506,9 +2513,9 @@ pub mod el0 {
                         .map_err(|()| UserImageError::OutOfFrames)?;
                     if mapping.executable {
                         // The code bytes were written through the TTBR1 physmap (D-cache);
-                        // clean to PoC + drop the I-cache so EL0 fetches them. `pa` is
-                        // reachable now via the active kernel identity map.
-                        unsafe { flush_for_exec(pa, PAGE_4K as usize) };
+                        // clean to PoC + drop every local I-cache synonym so EL0 fetches them.
+                        // `pa` is reachable now via the active kernel identity map.
+                        super::sync_icache_to_pou(pa as usize, PAGE_4K as usize);
                     }
                     i += 1;
                 }
@@ -4877,6 +4884,18 @@ mod tests {
         assert!(pl011_input_enabled(true, true));
         assert!(!pl011_input_enabled(false, false));
         assert!(!pl011_input_enabled(true, false));
+    }
+
+    #[test]
+    fn ctr_cache_line_decoder_uses_architectural_word_exponents() {
+        // Cortex-A76 (Pi 5) reports DminLine=4: 4 words * 2^4 = 64 bytes.
+        assert_eq!(ctr_line_bytes(4 << 16, 16), 64);
+        // Keep the loader portable rather than silently baking in the Pi/X13s geometry.
+        assert_eq!(ctr_line_bytes(3 << 16, 16), 32);
+        assert_eq!(ctr_line_bytes(5 << 16, 16), 128);
+        // The helper can decode IminLine (bits 3:0) too, even though IALLU makes an
+        // instruction-line stride unnecessary for the synonym-safe EL0 handoff.
+        assert_eq!(ctr_line_bytes(4, 0), 64);
     }
 
     #[test]

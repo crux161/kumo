@@ -29,6 +29,8 @@
 //! supplied `emit: fn(&[u8])` so the caller can pick the framebuffer-epoch-correct console
 //! path (a faulting renderer's glass must be reclaimed *before* emitting).
 
+//j471
+
 use core::cell::UnsafeCell;
 use kumo_abi::KoId;
 
@@ -57,6 +59,12 @@ pub enum Cause {
         x1: u64,
         x19: u64,
         x29: u64,
+        /// Active TTBR0 leaf descriptor, resolved physical faulting address, and the little-endian
+        /// instruction word observed there from the TTBR1 physmap. These distinguish stale I-side
+        /// fetch from a bad loader copy without perturbing the TLB under diagnosis.
+        pte: u64,
+        phys: u64,
+        insn: u64,
     },
     /// An abnormal process exit: a `ProcessExit` / `exit_group` with a non-zero code.
     /// A clean `exit(0)` is *not* a disaster and never reaches here.
@@ -195,6 +203,9 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
             x1,
             x19,
             x29,
+            pte,
+            phys,
+            insn,
         } => {
             emit(b"  cause=FAULT  ESR=");
             emit(&hex64(esr));
@@ -214,6 +225,12 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
             emit(&hex64(x19));
             emit(b" x29=");
             emit(&hex64(x29));
+            emit(b"\r\n  PTE=");
+            emit(&hex64(pte));
+            emit(b" PA=");
+            emit(&hex64(phys));
+            emit(b" INSN=");
+            emit(&hex64(insn));
             emit(b"\r\n");
         }
         Cause::Abend { exit_code } => {
@@ -239,8 +256,8 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
     }
 }
 
-/// Max bytes of the QR diagnostic payload. The largest event (a `Fault` with all 9 registers)
-/// is ~260 bytes of `label=0x…hex`; 512 leaves generous headroom. Stack-only — no alloc, in
+/// Max bytes of the QR diagnostic payload. The largest event (a `Fault` with registers plus the
+/// non-mutating page-table probe) remains below 512 bytes. Stack-only — no alloc, in
 /// keeping with the fault-context discipline (the QR encoder itself runs in the HAL, off this
 /// frame).
 const QR_PAYLOAD_CAP: usize = 512;
@@ -314,6 +331,9 @@ fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
             x1,
             x19,
             x29,
+            pte,
+            phys,
+            insn,
         } => {
             b.push(b"FAULT\nesr=");
             b.push(&hex64(esr));
@@ -333,6 +353,13 @@ fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
             b.push(&hex64(x19));
             b.push(b" x29=");
             b.push(&hex64(x29));
+            b.push(b"\n");
+            b.push(b"pte=");
+            b.push(&hex64(pte));
+            b.push(b" pa=");
+            b.push(&hex64(phys));
+            b.push(b" insn=");
+            b.push(&hex64(insn));
             b.push(b"\n");
         }
         Cause::Abend { exit_code } => {
@@ -485,6 +512,9 @@ mod tests {
                 x1: 8,
                 x19: 9,
                 x29: 10,
+                pte: 11,
+                phys: 12,
+                insn: 13,
             },
             Some(KoId(2)),
             true,

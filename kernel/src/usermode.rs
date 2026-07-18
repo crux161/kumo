@@ -15,6 +15,7 @@
 //j408
 //j422
 //j470
+//j471
 
 use core::cell::UnsafeCell;
 
@@ -959,6 +960,93 @@ fn raise_tower_on_abend(exit_code: u64) {
     );
 }
 
+/// A non-mutating snapshot of the active AArch64 EL0 leaf and the instruction bytes it names.
+/// Kept stack-only for the fault path. Zeroes mean the walk could not prove a valid leaf.
+#[derive(Clone, Copy, Default)]
+struct UserFaultProbe {
+    pte: u64,
+    phys: u64,
+    insn: u64,
+}
+
+#[cfg(feature = "arch_aarch64")]
+const AARCH64_PA_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+#[cfg(feature = "arch_aarch64")]
+fn read_phys_u64(phys: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    kumo_hal::active::read_phys(phys, &mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+#[cfg(feature = "arch_aarch64")]
+fn aarch64_table_base(desc: u64) -> Option<u64> {
+    (desc & 0b11 == 0b11).then_some(desc & AARCH64_PA_MASK)
+}
+
+#[cfg(feature = "arch_aarch64")]
+fn aarch64_leaf_phys(desc: u64, va: u64, level: u8) -> Option<u64> {
+    let shift = match level {
+        1 => 30, // 1 GiB block
+        2 => 21, // 2 MiB block
+        3 => 12, // 4 KiB page
+        _ => return None,
+    };
+    let expected_type = if level == 3 { 0b11 } else { 0b01 };
+    if desc & 0b11 != expected_type {
+        return None;
+    }
+    let offset_mask = (1u64 << shift) - 1;
+    Some((desc & AARCH64_PA_MASK & !offset_mask) | (va & offset_mask))
+}
+
+/// Walk the current four-level 4 KiB TTBR0 tree through the permanent TTBR1 physmap. This does
+/// not execute `AT`, fill a TLB, change address spaces, allocate, or take a lock, so observing a
+/// first-fetch failure cannot make it disappear. It supports the L3 pages used by Sora plus the
+/// L1/L2 block forms for completeness. — KESTREL 2026-07-18
+#[cfg(feature = "arch_aarch64")]
+fn probe_active_user_instruction(va: u64) -> UserFaultProbe {
+    let root = kumo_hal::active::read_user_aspace_root() & AARCH64_PA_MASK;
+    if root == 0 {
+        return UserFaultProbe::default();
+    }
+    let indices = [
+        ((va >> 39) & 0x1ff) as u64,
+        ((va >> 30) & 0x1ff) as u64,
+        ((va >> 21) & 0x1ff) as u64,
+        ((va >> 12) & 0x1ff) as u64,
+    ];
+    let mut table = root;
+    for (level, index) in indices.into_iter().enumerate() {
+        let desc = read_phys_u64(table + index * 8);
+        let level = level as u8;
+        if level >= 1 {
+            if let Some(phys) = aarch64_leaf_phys(desc, va, level) {
+                let mut bytes = [0u8; 4];
+                kumo_hal::active::read_phys(phys, &mut bytes);
+                return UserFaultProbe {
+                    pte: desc,
+                    phys,
+                    insn: u32::from_le_bytes(bytes) as u64,
+                };
+            }
+        }
+        let Some(next) = aarch64_table_base(desc) else {
+            return UserFaultProbe {
+                pte: desc,
+                ..UserFaultProbe::default()
+            };
+        };
+        table = next;
+    }
+    UserFaultProbe::default()
+}
+
+#[cfg(not(feature = "arch_aarch64"))]
+fn probe_active_user_instruction(_va: u64) -> UserFaultProbe {
+    UserFaultProbe::default()
+}
+
 /// HAL fault hook (registered via `set_fault_hook`): an EL0 thread took a non-SVC sync
 /// exception — a *user* fault (bad access / illegal instruction). Contain it: terminate just
 /// that thread and switch to the scheduler, so one server's crash never halts the kernel
@@ -974,6 +1062,7 @@ extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: 
         unsafe { (*frame.add(0), *frame.add(1), *frame.add(19), *frame.add(29)) }
     };
     let victim = crate::user_thread::current_process_koid();
+    let probe = probe_active_user_instruction(elr);
     // Identify the supervisor + framebuffer ownership without risking a double-borrow
     // panic: a fault can land mid-SVC while `SoraState` is already borrowed, so use the
     // non-panicking accessor. A borrowed/uninitialised cell yields `(None, false)` → the
@@ -1011,6 +1100,9 @@ extern "C" fn fault_hook(esr: u64, elr: u64, far: u64, lr: u64, sp: u64, frame: 
             x1: rx1,
             x19: rx19,
             x29: rx29,
+            pte: probe.pte,
+            phys: probe.phys,
+            insn: probe.insn,
         },
         victim,
         fb_owner,
@@ -2522,7 +2614,28 @@ pub fn run_sora(boot: &BootInfo, initrd: &[u8]) -> Result<UserReport, UsermodeEr
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "arch_aarch64")]
+    use super::{aarch64_leaf_phys, aarch64_table_base};
     use super::{console_delivery_plan, dtb_backing_range, MAX_DTB_BYTES};
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn fault_probe_decodes_tables_blocks_and_pages_without_a_translation() {
+        assert_eq!(aarch64_table_base(0x0000_0000_8123_4003), Some(0x8123_4000));
+        assert_eq!(aarch64_table_base(0x0000_0000_8123_4001), None);
+
+        let va = 0x0000_0000_0021_3020;
+        assert_eq!(
+            aarch64_leaf_phys(0x0000_0000_9123_4c03, va, 3),
+            Some(0x9123_4020)
+        );
+        assert_eq!(
+            aarch64_leaf_phys(0x0000_0000_8800_0401, va, 2),
+            Some(0x8801_3020)
+        );
+        assert_eq!(aarch64_leaf_phys(0x0000_0000_9123_4c03, va, 2), None);
+        assert_eq!(aarch64_leaf_phys(0, va, 3), None);
+    }
 
     #[test]
     fn dtb_capability_span_is_page_bounded_and_finite() {
