@@ -1,6 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j460
+//j467
+
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
 };
@@ -122,6 +125,65 @@ pub fn fdt_total_size(bytes: &[u8]) -> Option<u32> {
     }
 }
 
+/// Whether a firmware-owned pointer is structurally safe enough to dereference while UEFI's
+/// mappings are still active. This cannot prove that the pages are mapped, but it rejects the
+/// corruption shapes that must never reach `from_raw_parts`: null/all-ones sentinels, arithmetic
+/// wrap, misalignment, and addresses outside KUMO's lower 48-bit physical-address contract.
+/// — KESTREL 2026-07-17
+pub const fn is_plausible_firmware_pointer(address: u64, byte_len: u64, alignment: u64) -> bool {
+    if address == 0
+        || address == u64::MAX
+        || byte_len == 0
+        || alignment == 0
+        || !alignment.is_power_of_two()
+        || address & (alignment - 1) != 0
+    {
+        return false;
+    }
+    let Some(last) = address.checked_add(byte_len - 1) else {
+        return false;
+    };
+    address < (1u64 << 48) && last < (1u64 << 48)
+}
+
+/// Whether an EFI descriptor type denotes storage currently owned by firmware or the loader and
+/// therefore safe to inspect before `ExitBootServices`. Conventional/free memory is deliberately
+/// excluded: merely being RAM does not prove that a configuration-table pointer owns those bytes,
+/// and a subsequent pool allocation could reuse them. — KESTREL 2026-07-17
+pub const fn efi_memory_type_is_firmware_owned(efi_type: u32) -> bool {
+    use efi_memory_type as t;
+    matches!(
+        efi_type,
+        t::LOADER_CODE
+            | t::LOADER_DATA
+            | t::BOOT_SERVICES_CODE
+            | t::BOOT_SERVICES_DATA
+            | t::RUNTIME_SERVICES_CODE
+            | t::RUNTIME_SERVICES_DATA
+            | t::ACPI_RECLAIM
+            | t::ACPI_NVS
+    )
+}
+
+/// Parse the explicit serial-route form accepted by `nijigumo.conf`:
+/// `console-uart = pl011@0x<physical-base>`. The base must be a nonzero, page-aligned address
+/// inside KUMO's 48-bit aarch64 physical-address contract. A malformed or sentinel value is
+/// rejected rather than becoming an MMIO write. — KESTREL 2026-07-17
+pub fn parse_pl011_console(value: &str) -> Option<u64> {
+    let (kind, address) = value.trim().split_once('@')?;
+    if !kind.eq_ignore_ascii_case("pl011") {
+        return None;
+    }
+    let digits = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))?;
+    let base = u64::from_str_radix(digits, 16).ok()?;
+    if base == 0 || base >= (1u64 << 48) || base & 0xfff != 0 {
+        return None;
+    }
+    Some(base)
+}
+
 /// The raw values Nijigumo gathers from UEFI before assembling a [`BootInfo`].
 ///
 /// Pointers are captured as `u64` so this stays a plain, `Copy` description of the
@@ -208,6 +270,9 @@ pub struct BootConfig<'a> {
     /// runtime (DESIGN/017 §3). `None` when the key is absent — the kernel then reports the
     /// board as unstamped instead of guessing.
     pub board: Option<&'a str>,
+    /// Optional explicit serial route. Kept as source text so the loader can diagnose an invalid
+    /// value loudly; [`parse_pl011_console`] performs the typed conversion.
+    pub console_uart: Option<&'a str>,
 }
 
 impl<'a> BootConfig<'a> {
@@ -218,6 +283,7 @@ impl<'a> BootConfig<'a> {
         let mut kernel: Option<&'a str> = None;
         let mut initrd: Option<&'a str> = None;
         let mut board: Option<&'a str> = None;
+        let mut console_uart: Option<&'a str> = None;
         let mut dtb = DtbSource::Firmware;
         for raw in text.lines() {
             let line = match raw.split_once('#') {
@@ -236,6 +302,7 @@ impl<'a> BootConfig<'a> {
                 "kernel" => kernel = Some(value),
                 "initrd" => initrd = Some(value),
                 "board" => board = Some(value),
+                "console-uart" | "console_uart" => console_uart = Some(value),
                 "dtb" => {
                     dtb = if value.eq_ignore_ascii_case("firmware") {
                         DtbSource::Firmware
@@ -253,6 +320,7 @@ impl<'a> BootConfig<'a> {
             initrd,
             dtb,
             board,
+            console_uart,
         })
     }
 }
@@ -306,6 +374,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.board, Some("raspberry-pi-5"));
+    }
+
+    #[test]
+    fn parses_an_explicit_rp1_pl011_console_route() {
+        let cfg =
+            BootConfig::parse("kernel = k\nconsole-uart = pl011@0x0000001c00030000\n").unwrap();
+        assert_eq!(cfg.console_uart, Some("pl011@0x0000001c00030000"));
+        assert_eq!(
+            cfg.console_uart.and_then(parse_pl011_console),
+            Some(0x1c_0003_0000)
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_or_malformed_console_routes() {
+        assert_eq!(parse_pl011_console("dw8250@0x1c00030000"), None);
+        assert_eq!(parse_pl011_console("pl011@0xffffffffffffffff"), None);
+        assert_eq!(parse_pl011_console("pl011@0x1c00030001"), None);
+        assert_eq!(parse_pl011_console("pl011@1c00030000"), None);
     }
 
     #[test]
@@ -436,6 +523,38 @@ mod tests {
     }
 
     #[test]
+    fn firmware_pointer_guard_rejects_sentinels_wrap_and_noncanonical_values() {
+        assert!(is_plausible_firmware_pointer(0x4080_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0, 8, 8));
+        assert!(!is_plausible_firmware_pointer(u64::MAX, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0x4080_0001, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0x0001_0000_0000_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0xffff_0000_0000_0000, 8, 8));
+        assert!(!is_plausible_firmware_pointer(0xffff_ffff_ffff_fff8, 16, 8));
+    }
+
+    #[test]
+    fn firmware_owned_memory_types_exclude_free_unusable_and_mmio_ranges() {
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::BOOT_SERVICES_DATA
+        ));
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::RUNTIME_SERVICES_DATA
+        ));
+        assert!(efi_memory_type_is_firmware_owned(
+            efi_memory_type::ACPI_RECLAIM
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(
+            efi_memory_type::CONVENTIONAL
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(
+            efi_memory_type::UNUSABLE
+        ));
+        assert!(!efi_memory_type_is_firmware_owned(efi_memory_type::MMIO));
+        assert!(!efi_memory_type_is_firmware_owned(u32::MAX));
+    }
+
+    #[test]
     fn build_boot_info_records_framebuffer_and_flag() {
         let mut seed = UefiHandoffSeed::empty();
         seed.dtb = 0x4000_0000;
@@ -457,5 +576,6 @@ mod tests {
     fn build_boot_info_without_framebuffer_leaves_flag_clear() {
         let boot = build_boot_info(UefiHandoffSeed::empty());
         assert!(!boot.has_framebuffer());
+        assert_eq!(boot.platform.pl011_console_base, 0);
     }
 }

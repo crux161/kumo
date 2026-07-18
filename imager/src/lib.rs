@@ -1,4 +1,7 @@
+//j419
 //j434
+//j464
+//j467
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -96,14 +99,16 @@ impl HardwareTarget {
                 soc: "Broadcom BCM2712 (Cortex-A76)",
                 firmware: "UEFI (EDK2 for Raspberry Pi)",
                 interrupt_controller: "GIC-400 (GICv2)",
-                early_console: "UEFI GOP/console first; PL011 on the 40-pin header",
+                early_console:
+                    "UEFI GOP plus SoC uart10 PL011 by default; RP1 PL011 via explicit override",
                 dtb_source_path: None,
                 dtb_path: None,
                 dtb_compatibles: &[],
                 firmware_notes: &[
                     "needs the EDK2 UEFI firmware (RPi5) on the boot media, not the stock Pi loader",
-                    "second aarch64 board for cross-checking the boot ladder vs the X13s",
-                    "full boot past the ladder needs GIC-400/GICv2 support (kernel is GICv3 today)",
+                    "40-pin RP1 UART0 needs --console-uart pl011@<firmware-reported RP1_UART base>",
+                    "the RP1 host address is firmware-selected and must not be a fixed BSP constant",
+                    "GIC-400/GICv2 support exists; full Pi 5 metal confirmation remains owed",
                 ],
             },
             Self::OrangePi5Plus => HardwareProfile {

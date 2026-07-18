@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j453
-//j454
-//j455
-//j456
 //j457
+//j461
+//j462
+//j465
+//j467
 
 extern crate alloc;
 
@@ -26,9 +26,9 @@ pub mod usermode;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod x86_fpsimd_smoke;
 
-use kumo_abi::{BootInfo, Errno, Rights, Signals, ABI_VERSION};
+use kumo_abi::{BootInfo, Errno, MemRegion, MemRegionKind, Rights, Signals, ABI_VERSION};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-use kumo_abi::{MemRegion, MemRegionKind, Range, RawSlice};
+use kumo_abi::{Range, RawSlice};
 use kumo_ipc::Message;
 use niji_loader::{validate_boot_info, HandoffError, HandoffSummary};
 
@@ -80,18 +80,33 @@ pub fn stage_a_console_banner() {
     bootstrap::console::write_str("\n");
 }
 
-/// The PL011 base this board's BSP entry names, or `None` when the board has no PL011 at a
-/// fixed base (the X13s, the Pi 5), or its identity is unstamped or unrecognized.
+/// The explicitly selected PL011 base, the board BSP's default when there is no override, or
+/// `None` when neither source names a safe base.
 ///
-/// This is the whole of DESIGN/017 §4.3's policy — board identity in, console base out — lifted
-/// out of `stage_a` so it is provable in `cargo test` rather than only on a booted machine.
-/// `None` is not a failure: it means "this backend has no UART to write to", which the HAL
-/// honours by staying inert.
+/// The override is a fixed-size BootInfo field rather than a pointer-backed command line so it can
+/// be resolved before the first `klog!`. This matters for the Pi 5: uart10 is a stable BSP fact,
+/// while RP1 UART0's host address is a firmware-selected PCIe window (the current firmware reports
+/// `0x1c00030000`, older releases used another window). A malformed nonzero override falls back to
+/// the BSP rather than becoming a blind MMIO write. — KESTREL 2026-07-17
 fn board_console_pl011_base(boot: &BootInfo) -> Option<u64> {
+    // Only the leading version word is safe to interpret across ABI revisions. In v2 the new v3
+    // console field aliases the old cmdline pointer, so reading it before this gate could turn a
+    // stale loader into blind MMIO. — KESTREL 2026-07-17
+    if boot.version != ABI_VERSION {
+        return None;
+    }
+    let override_base = boot.platform.pl011_console_base;
+    if plausible_pl011_base(override_base) {
+        return Some(override_base);
+    }
     kumo_bsp::Board::from_id(boot.board_id())?
         .spec()
         .console
         .pl011_base()
+}
+
+const fn plausible_pl011_base(base: u64) -> bool {
+    base != 0 && base < (1u64 << 48) && base & 0xfff == 0
 }
 
 /// Where this board's GIC lives when the firmware publishes no device tree, or `None` when the
@@ -100,9 +115,96 @@ fn board_console_pl011_base(boot: &BootInfo) -> Option<u64> {
 /// Carries addresses only — never a version. See `kumo_bsp::GicVersion` for why the version is
 /// probed from the distributor instead (DESIGN/017 §4.4).
 fn board_gic_no_dtb_fallback(boot: &BootInfo) -> Option<kumo_bsp::GicFallback> {
+    if boot.version != ABI_VERSION {
+        return None;
+    }
     kumo_bsp::Board::from_id(boot.board_id())?
         .spec()
         .gic_fallback
+}
+
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const FDT_HEADER_BYTES: u64 = 40;
+const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
+const AARCH64_PHYS_LIMIT: u64 = 1u64 << 48;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DtbHandoffError {
+    AllOnes,
+    NonPhysical,
+    Misaligned,
+    HeaderOutsideMemoryMap,
+    BadMagic(u32),
+    BadSize(u32),
+    BlobOutsideMemoryMap,
+}
+
+fn dtb_ram_kind(kind: MemRegionKind) -> bool {
+    // Nijigumo accepts staged DTBs only from LoaderData and copies firmware-table DTBs into the
+    // same type. Requiring Bootloader here asserts that ownership/lifetime contract and keeps the
+    // lossy Reserved bucket (which includes EFI Unusable memory) out of raw reads.
+    // — KESTREL 2026-07-17
+    kind == MemRegionKind::Bootloader
+}
+
+fn dtb_range_is_backed(address: u64, byte_len: u64, regions: &[MemRegion]) -> bool {
+    let Some(end) = address.checked_add(byte_len) else {
+        return false;
+    };
+    regions.iter().any(|region| {
+        let Some(region_end) = region.range.start.checked_add(region.range.len) else {
+            return false;
+        };
+        dtb_ram_kind(region.kind)
+            && region.range.start <= address
+            && end <= region_end
+            && address < end
+    })
+}
+
+/// Validate the loader's DTB address while the firmware identity map is still live. Pointer shape
+/// and the complete declared blob are checked against the UEFI memory map before any dereference;
+/// a rejected handoff is replaced with an absent DTB for every later Stage-A consumer.
+///
+/// # Safety
+/// `boot.mem_regions` must already have passed the handoff validator and remain readable. A range
+/// accepted by that memory map must still be identity-mapped at this pre-MMU point.
+unsafe fn validate_dtb_handoff(boot: &BootInfo) -> Result<Option<(u64, u32)>, DtbHandoffError> {
+    let address = boot.platform.dtb;
+    if address == 0 {
+        return Ok(None);
+    }
+    if address == u64::MAX {
+        return Err(DtbHandoffError::AllOnes);
+    }
+    if address >= AARCH64_PHYS_LIMIT
+        || address
+            .checked_add(FDT_HEADER_BYTES)
+            .is_none_or(|end| end > AARCH64_PHYS_LIMIT)
+    {
+        return Err(DtbHandoffError::NonPhysical);
+    }
+    if address & 7 != 0 {
+        return Err(DtbHandoffError::Misaligned);
+    }
+
+    let regions = unsafe { boot.mem_regions.as_slice() };
+    if !dtb_range_is_backed(address, FDT_HEADER_BYTES, regions) {
+        return Err(DtbHandoffError::HeaderOutsideMemoryMap);
+    }
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 8) };
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != FDT_MAGIC {
+        return Err(DtbHandoffError::BadMagic(magic));
+    }
+    let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    if !(FDT_HEADER_BYTES as u32..=MAX_DTB_BYTES as u32).contains(&total_size) {
+        return Err(DtbHandoffError::BadSize(total_size));
+    }
+    if !dtb_range_is_backed(address, total_size as u64, regions) {
+        return Err(DtbHandoffError::BlobOutsideMemoryMap);
+    }
+    Ok(Some((address, total_size)))
 }
 
 pub fn stage_a(boot: &BootInfo) -> ! {
@@ -114,11 +216,13 @@ pub fn stage_a(boot: &BootInfo) -> ! {
 
     // Tell the console where this board's UART is, from the BSP, before any `klog!` (DESIGN/017
     // §4.3). The HAL ships with no base and its UART sink inert, so a board whose BSP entry names
-    // no PL011 — the X13s, the Pi 5 — cannot write to one. That is what retired J182: the HAL
-    // used to fall back to QEMU's 0x09000000 and HARD-HANG those boards on the first line of
-    // output. An unstamped or unknown board also injects nothing, which costs early serial on
-    // QEMU but can no longer wedge a machine.
-    if let Some(base) = board_console_pl011_base(boot) {
+    // no PL011 (the X13s) cannot write to one. The Pi 5 BSP names its SoC uart10, while an
+    // explicit boot override can instead select firmware's current RP1 UART0 PCIe window. This
+    // is what retired J182: the HAL used to fall back to QEMU's 0x09000000 and HARD-HANG another
+    // board on the first line of output. An unstamped or unknown board also injects nothing,
+    // which costs early serial on QEMU but can no longer wedge a machine.
+    let selected_pl011_base = board_console_pl011_base(boot);
+    if let Some(base) = selected_pl011_base {
         kumo_hal::active::console_set_pl011_base(base);
     }
 
@@ -135,10 +239,11 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         );
     }
 
-    // Bring up the framebuffer console BEFORE any `klog!`. The X13s and Pi 5 have no PL011, so
-    // until the framebuffer owns the console there is no sink and early lines are dropped. This
-    // is now a visibility constraint, not a safety one (J182 is fixed above) — but it must still
-    // stay ahead of every `klog!` in `stage_a` or the boot's first lines are lost on those boards.
+    // Bring up the framebuffer console BEFORE any `klog!`. The X13s has no PL011; on the Pi 5,
+    // uart10 or an explicit RP1 route may not be connected to the operator. Until the framebuffer
+    // owns its half of the dual-sink console, early lines are dropped on glass. This is now a
+    // visibility constraint, not a safety one (J182 is fixed above) — but it must stay ahead of
+    // every `klog!` in `stage_a` or the boot's first lines are lost on those boards.
     if boot.has_framebuffer() {
         let fb = boot.framebuffer;
         kumo_hal::active::set_framebuffer(fb.phys, fb.len, fb.width, fb.height, fb.stride);
@@ -157,6 +262,46 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         Ok(report) => report,
         Err(err) => tower_halt_ascii("nijigumo->MUREX handoff invalid", Some(err)),
     };
+
+    if plausible_pl011_base(boot.platform.pl011_console_base) {
+        klog!(
+            "SERIAL ROUTE       Check     explicit PL011 {:#x}   OK\n",
+            boot.platform.pl011_console_base
+        );
+    } else if boot.platform.pl011_console_base != 0 {
+        klog!(
+            "SERIAL ROUTE       Check     rejected override {:#x}; BSP {:?}   --\n",
+            boot.platform.pl011_console_base,
+            selected_pl011_base
+        );
+    } else {
+        klog!(
+            "SERIAL ROUTE       Check     BSP PL011 {:?}          --\n",
+            selected_pl011_base
+        );
+    }
+
+    // Sanitize once, then make every downstream DTB consumer (timer, pinctrl, SMMU, userland
+    // capability publication) see the same result. The original BootInfo stays untouched for the
+    // diagnostic above; the local copy lives for the non-returning Stage-A call.
+    let mut sanitized_boot = *boot;
+    match unsafe { validate_dtb_handoff(boot) } {
+        Ok(Some((address, size))) => klog!(
+            "DEVICE TREE       Check     {:#x}  {} bytes   OK\n",
+            address,
+            size
+        ),
+        Ok(None) => klog!("DEVICE TREE       Check     absent                  --\n"),
+        Err(error) => {
+            klog!(
+                "DEVICE TREE       Check     rejected {:#x}: {:?}   FAIL\n",
+                boot.platform.dtb,
+                error
+            );
+            sanitized_boot.platform.dtb = 0;
+        }
+    }
+    let boot = &sanitized_boot;
 
     // Boot banner in the idiom of the Jet Alone OS POST screen (Evangelion): green
     // phosphor, a RE-BOOT header, then a column of subsystem self-checks each ending in
@@ -2043,6 +2188,30 @@ mod tests {
         assert_eq!(board_console_pl011_base(&boot), Some(0x10_7D00_1000));
     }
 
+    #[test]
+    fn explicit_pl011_route_overrides_the_pi5_bsp_default() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("raspberry-pi-5");
+        boot.platform.pl011_console_base = 0x1c_0003_0000;
+        assert_eq!(board_console_pl011_base(&boot), Some(0x1c_0003_0000));
+
+        // Sentinel/misaligned values never become blind MMIO. A stamped board retains its safe
+        // BSP default; an unstamped board remains inert.
+        boot.platform.pl011_console_base = u64::MAX;
+        assert_eq!(board_console_pl011_base(&boot), Some(0x10_7D00_1000));
+        boot.set_board_id("");
+        assert_eq!(board_console_pl011_base(&boot), None);
+    }
+
+    #[test]
+    fn pre_validation_board_reads_are_inert_for_a_stale_abi() {
+        let mut boot = BootInfo::empty(ABI_VERSION - 1);
+        boot.set_board_id("raspberry-pi-5");
+        boot.platform.pl011_console_base = 0x1c_0003_0000;
+        assert_eq!(board_console_pl011_base(&boot), None);
+        assert_eq!(board_gic_no_dtb_fallback(&boot), None);
+    }
+
     /// An unstamped or unrecognized board injects nothing. Guessing QEMU's base here is exactly
     /// the old fallback that J182 traced the X13s hang to, so "unknown" must mean inert — the
     /// cost is early serial on an unstamped QEMU image, which is recoverable; a hang is not.
@@ -2055,6 +2224,75 @@ mod tests {
         let mut unknown = BootInfo::empty(ABI_VERSION);
         unknown.set_board_id("some-board-we-have-never-heard-of");
         assert_eq!(board_console_pl011_base(&unknown), None);
+    }
+
+    #[repr(align(8))]
+    struct AlignedDtb([u8; 40]);
+
+    fn boot_with_test_dtb(blob: &AlignedDtb, mapped_len: u64) -> (BootInfo, [MemRegion; 1]) {
+        let regions = [MemRegion {
+            range: Range::new(blob.0.as_ptr() as u64, mapped_len),
+            kind: MemRegionKind::Bootloader,
+            _reserved: 0,
+        }];
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.platform.dtb = blob.0.as_ptr() as u64;
+        (boot, regions)
+    }
+
+    #[test]
+    fn dtb_handoff_accepts_a_bounded_blob_inside_the_memory_map() {
+        let mut blob = AlignedDtb([0; 40]);
+        blob.0[..4].copy_from_slice(&FDT_MAGIC.to_be_bytes());
+        blob.0[4..8].copy_from_slice(&40u32.to_be_bytes());
+        let (mut boot, mut regions) = boot_with_test_dtb(&blob, 40);
+        boot.mem_regions = RawSlice::from_slice(&regions);
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Ok(Some((blob.0.as_ptr() as u64, 40)))
+        );
+
+        // A valid-looking blob in free RAM still violates Nijigumo's LoaderData ownership
+        // contract and must be rejected before a raw read.
+        regions[0].kind = MemRegionKind::Usable;
+        boot.mem_regions = RawSlice::from_slice(&regions);
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Err(DtbHandoffError::HeaderOutsideMemoryMap)
+        );
+    }
+
+    #[test]
+    fn dtb_handoff_rejects_sentinels_holes_and_unbacked_sizes_before_deref() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.mem_regions = RawSlice::from_slice(&TEST_REGIONS);
+
+        assert_eq!(unsafe { validate_dtb_handoff(&boot) }, Ok(None));
+        boot.platform.dtb = u64::MAX;
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Err(DtbHandoffError::AllOnes)
+        );
+        boot.platform.dtb = AARCH64_PHYS_LIMIT;
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Err(DtbHandoffError::NonPhysical)
+        );
+        boot.platform.dtb = 0x8000;
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Err(DtbHandoffError::HeaderOutsideMemoryMap)
+        );
+
+        let mut blob = AlignedDtb([0; 40]);
+        blob.0[..4].copy_from_slice(&FDT_MAGIC.to_be_bytes());
+        blob.0[4..8].copy_from_slice(&0x1000u32.to_be_bytes());
+        let (mut boot, regions) = boot_with_test_dtb(&blob, 40);
+        boot.mem_regions = RawSlice::from_slice(&regions);
+        assert_eq!(
+            unsafe { validate_dtb_handoff(&boot) },
+            Err(DtbHandoffError::BlobOutsideMemoryMap)
+        );
     }
 
     static TEST_REGIONS: [MemRegion; 2] = [

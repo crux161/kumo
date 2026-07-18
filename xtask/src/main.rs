@@ -1,8 +1,8 @@
-//j453
-//j454
 //j455
 //j456
 //j457
+//j460
+//j467
 
 use std::env;
 use std::fmt;
@@ -81,6 +81,7 @@ struct Args {
     command: String,
     arch: Arch,
     hardware: Option<HardwareTarget>,
+    pl011_console_base: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -107,6 +108,12 @@ fn run() -> Result<(), String> {
             args.arch
         ));
     }
+    if args.pl011_console_base.is_some() && args.command != "image" {
+        return Err("--console-uart is valid only for `cargo xtask image`".to_owned());
+    }
+    if args.pl011_console_base.is_some() && args.arch != Arch::Aarch64 {
+        return Err("--console-uart currently supports only aarch64 PL011 routes".to_owned());
+    }
 
     match args.command.as_str() {
         "build" => build(&root, args.arch),
@@ -129,7 +136,7 @@ fn run() -> Result<(), String> {
             println!("{}", initrd.display());
             Ok(())
         }
-        "image" => image(&root, args.arch, hardware),
+        "image" => image(&root, args.arch, hardware, args.pl011_console_base),
         "product" => {
             let products = build_products(&root)?;
             println!("{}", products.host_stage.display());
@@ -151,6 +158,7 @@ fn parse_args() -> Result<Args, String> {
     let command = iter.next().unwrap_or_else(|| "help".to_owned());
     let mut arch = Arch::Aarch64;
     let mut hardware = None;
+    let mut pl011_console_base = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -166,11 +174,18 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| format!("{arg} requires a value"))?;
                 hardware = Some(parse_hardware_target(&value)?);
             }
+            "--console-uart" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--console-uart requires a value".to_owned())?;
+                pl011_console_base = Some(parse_pl011_console_arg(&value)?);
+            }
             "-h" | "--help" => {
                 return Ok(Args {
                     command: "help".to_owned(),
                     arch,
                     hardware,
+                    pl011_console_base,
                 });
             }
             other => return Err(format!("unexpected argument '{other}'")),
@@ -181,7 +196,30 @@ fn parse_args() -> Result<Args, String> {
         command,
         arch,
         hardware,
+        pl011_console_base,
     })
+}
+
+fn parse_pl011_console_arg(value: &str) -> Result<u64, String> {
+    let (kind, address) = value
+        .trim()
+        .split_once('@')
+        .ok_or_else(|| "--console-uart expects pl011@0x<physical-base>".to_owned())?;
+    if !kind.eq_ignore_ascii_case("pl011") {
+        return Err("--console-uart currently supports only the pl011 kind".to_owned());
+    }
+    let digits = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .ok_or_else(|| "--console-uart address must start with 0x".to_owned())?;
+    let base = u64::from_str_radix(digits, 16)
+        .map_err(|_| "--console-uart address is not valid hexadecimal".to_owned())?;
+    if base == 0 || base >= (1u64 << 48) || base & 0xfff != 0 {
+        return Err(
+            "--console-uart address must be nonzero, 4 KiB-aligned, and below 2^48".to_owned(),
+        );
+    }
+    Ok(base)
 }
 
 fn parse_hardware_target(value: &str) -> Result<HardwareTarget, String> {
@@ -247,7 +285,12 @@ fn test(root: &Path, arch: Arch) -> Result<(), String> {
     Ok(())
 }
 
-fn image(root: &Path, arch: Arch, hardware: HardwareTarget) -> Result<(), String> {
+fn image(
+    root: &Path,
+    arch: Arch,
+    hardware: HardwareTarget,
+    pl011_console_base: Option<u64>,
+) -> Result<(), String> {
     let out_dir = root.join("build/images");
     fs::create_dir_all(&out_dir).map_err(|err| format!("create {}: {err}", out_dir.display()))?;
 
@@ -256,7 +299,7 @@ fn image(root: &Path, arch: Arch, hardware: HardwareTarget) -> Result<(), String
     let staged = stage_image_assets(root, &out_dir, &plan)?;
     let kernel = stage_kernel(root, &out_dir, &plan)?;
     let initrd = stage_initrd(&out_dir, &plan)?;
-    let boot_manifest_path = stage_boot_manifest(&out_dir, &plan)?;
+    let boot_manifest_path = stage_boot_manifest(&out_dir, &plan, pl011_console_base)?;
     let mut manifest = image_manifest(&plan, bootloader.as_ref(), &staged);
     manifest.push_str(&format!(
         "boot_manifest_esp_path={BOOT_MANIFEST_ESP_PATH}\nboot_manifest_staged_path={}\n",
@@ -266,6 +309,9 @@ fn image(root: &Path, arch: Arch, hardware: HardwareTarget) -> Result<(), String
         "board_id={}\n",
         plan.hardware.board().map(|b| b.id()).unwrap_or("")
     ));
+    if let Some(base) = pl011_console_base {
+        manifest.push_str(&format!("pl011_console_base=0x{base:016x}\n"));
+    }
     if let Some(asset) = &kernel {
         manifest.push_str(&format!(
             "kernel_source_path={}\n",
@@ -412,10 +458,11 @@ fn esp_uefi_path(path: &str) -> String {
 /// (DESIGN/017 §3); the loader forwards it into `BootInfo` and the kernel resolves it with
 /// `kumo_bsp::Board::from_id`.
 ///
-/// The manifest already describes the kernel/initrd/DTB the loader should take. Nijigumo
-/// still reads those from its own constants and consumes only `board` — migrating those
-/// reads onto the manifest is a later slice, and the parser ignores keys it does not use.
-fn render_boot_manifest(plan: &ImagePlan) -> String {
+/// The manifest already describes the kernel/initrd/DTB the loader should take. Nijigumo still
+/// reads those paths from its own constants and consumes only the fixed-size `board` and optional
+/// `console-uart` policy — migrating the path reads onto the manifest is a later slice, and the
+/// parser ignores keys it does not use.
+fn render_boot_manifest(plan: &ImagePlan, pl011_console_base: Option<u64>) -> String {
     let mut out =
         String::from("# KUMO boot manifest - generated by `cargo xtask image`. Do not edit.\n");
     out.push_str(&format!("kernel = {}\n", esp_uefi_path(KERNEL_ESP_PATH)));
@@ -432,18 +479,25 @@ fn render_boot_manifest(plan: &ImagePlan) -> String {
     if let Some(board) = plan.hardware.board() {
         out.push_str(&format!("board = {}\n", board.id()));
     }
+    if let Some(base) = pl011_console_base {
+        out.push_str(&format!("console-uart = pl011@0x{base:016x}\n"));
+    }
     out
 }
 
 /// Write the boot manifest into the staged ESP tree. Returns its staged path.
-fn stage_boot_manifest(out_dir: &Path, plan: &ImagePlan) -> Result<PathBuf, String> {
+fn stage_boot_manifest(
+    out_dir: &Path,
+    plan: &ImagePlan,
+    pl011_console_base: Option<u64>,
+) -> Result<PathBuf, String> {
     let staged_path = out_dir
         .join(plan.hardware.to_string())
         .join(BOOT_MANIFEST_ESP_PATH);
     if let Some(parent) = staged_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
-    fs::write(&staged_path, render_boot_manifest(plan))
+    fs::write(&staged_path, render_boot_manifest(plan, pl011_console_base))
         .map_err(|err| format!("write {}: {err}", staged_path.display()))?;
     Ok(staged_path)
 }
@@ -1542,6 +1596,7 @@ fn run_smoke(root: &Path, arch: Arch) -> Result<(), String> {
         root,
         arch,
         HardwareTarget::default_for_arch(arch.image_arch()),
+        None,
     )?;
     let products = build_products(root)?;
     run_product_self_test(&products.host_stage)?;
@@ -1968,7 +2023,7 @@ fn run_x86_qemu_smoke(root: &Path) -> Result<(), String> {
             b"[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
             b"MULTIBOOT INITRD   Check     1 module  KUMORD01",
             b"bin/hello",
-            b"MULTIBOOT BOOTINFO Check     ABIv2",
+            b"MULTIBOOT BOOTINFO Check     ABIv3",
             b"phys<512G   OK",
             b"M1 MEMORY PLAN     Check",
             b"kernel+initrd excluded",
@@ -2251,7 +2306,7 @@ fn validate_x86_smoke_transcript(transcript: &[u8]) -> Result<(), String> {
         "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)",
         "MULTIBOOT INITRD   Check     1 module  KUMORD01",
         "bin/hello",
-        "MULTIBOOT BOOTINFO Check     ABIv2",
+        "MULTIBOOT BOOTINFO Check     ABIv3",
         "phys<512G   OK",
         "M1 MEMORY PLAN     Check",
         "kernel+initrd excluded",
@@ -2442,12 +2497,14 @@ Expected serial transcript is in:\n\
 
 #[cfg(test)]
 mod boot_manifest_tests {
-    use super::{esp_uefi_path, render_boot_manifest, BOOT_MANIFEST_ESP_PATH};
+    use super::{
+        esp_uefi_path, parse_pl011_console_arg, render_boot_manifest, BOOT_MANIFEST_ESP_PATH,
+    };
     use imager::{HardwareTarget, ImagePlan};
     use niji_uefi::{BootConfig, DtbSource};
 
     fn manifest_for(hardware: HardwareTarget) -> String {
-        render_boot_manifest(&ImagePlan::new("", hardware))
+        render_boot_manifest(&ImagePlan::new("", hardware), None)
     }
 
     /// The whole point of the manifest: what xtask writes, Nijigumo's own parser reads back,
@@ -2511,6 +2568,27 @@ mod boot_manifest_tests {
         let pi5 = manifest_for(HardwareTarget::RaspberryPi5);
         assert_eq!(BootConfig::parse(&pi5).unwrap().dtb, DtbSource::Firmware);
     }
+
+    #[test]
+    fn explicit_rp1_uart_route_round_trips_into_the_loader_parser() {
+        let base = parse_pl011_console_arg("pl011@0x1c00030000").unwrap();
+        let text = render_boot_manifest(
+            &ImagePlan::new("", HardwareTarget::RaspberryPi5),
+            Some(base),
+        );
+        let cfg = BootConfig::parse(&text).unwrap();
+        assert_eq!(
+            cfg.console_uart.and_then(niji_uefi::parse_pl011_console),
+            Some(0x1c_0003_0000)
+        );
+    }
+
+    #[test]
+    fn console_uart_cli_rejects_sentinels_and_misalignment() {
+        assert!(parse_pl011_console_arg("dw8250@0x1c00030000").is_err());
+        assert!(parse_pl011_console_arg("pl011@0xffffffffffffffff").is_err());
+        assert!(parse_pl011_console_arg("pl011@0x1c00030001").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2571,7 +2649,7 @@ mod x86_smoke_tests {
 
     const GREEN: &str = "[MUREX] KUMO x86_64 first light (Multiboot/GRUB)\n\
 MULTIBOOT INITRD   Check     1 module  KUMORD01 9000b  bin/hello 8904b  phys 0x938000   OK\n\
-MULTIBOOT BOOTINFO Check     ABIv2  4 regions  1086 MiB usable / 1087 MiB mapped  kernel 0x100000+8411 KiB  initrd 0x938000+9000b  phys<512G   OK\n\
+MULTIBOOT BOOTINFO Check     ABIv3  4 regions  1086 MiB usable / 1087 MiB mapped  kernel 0x100000+8411 KiB  initrd 0x938000+9000b  phys<512G   OK\n\
 M1 MEMORY PLAN     Check     276134 frames / 1078 MiB  kernel+initrd excluded  samples 0x937000 0x93b000 0x93c000   OK\n\
 KERNEL CR3 / PHYSMAP Check     old 0x930000 new 0x937000  6 tables  4 GiB  6 low BootInfo frames  RAM WB  holes UC/NX  high RAM yes 0x40000000   OK\n\
 GDT / TSS          Check     kernel 0x08/0x10  user 0x23/0x1b  TR 0x28  rsp0 0x132000   OK\n\
@@ -2684,9 +2762,10 @@ x86_64 MUREX core online, first light reached; HALTING.\n";
 
 fn print_help() {
     println!(
-        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|generic-uefi-x86_64]"
+        "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
     );
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
+    println!("--console-uart: image-only explicit PL011 route; use firmware's reported MMIO base");
     println!("x86-uefi-smoke: exact OVMF -> GRUB -> Multiboot2 ISO path; KUMO_OVMF_CODE/KUMO_OVMF_VARS override firmware discovery");
     println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
 }

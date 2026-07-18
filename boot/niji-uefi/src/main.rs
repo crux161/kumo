@@ -2,6 +2,8 @@
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j434
+//j460
+//j467
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -33,8 +35,9 @@ use kumo_abi::{BootInfo, Framebuffer, FramebufferFormat, MemRegion, Range, RawSl
 use niji_loader::elf::{parse_elf64, EM_AARCH64};
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
-    build_boot_info, efi_memory_type, efi_pixel_format, fdt_total_size, framebuffer_from_gop,
-    is_fdt_magic, mem_region_kind_from_efi, BootConfig, UefiHandoffSeed,
+    build_boot_info, efi_memory_type, efi_memory_type_is_firmware_owned, efi_pixel_format,
+    fdt_total_size, framebuffer_from_gop, is_fdt_magic, is_plausible_firmware_pointer,
+    mem_region_kind_from_efi, parse_pl011_console, BootConfig, UefiHandoffSeed,
 };
 
 pub type EfiHandle = *mut c_void;
@@ -44,6 +47,7 @@ const EFI_SUCCESS: EfiStatus = 0;
 const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
 const EFI_PAGE_SIZE: u64 = 4096;
 const EFI_ALLOCATE_ANY_PAGES: u32 = 0;
+const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Staged asset paths on the ESP (backslash-separated, as UEFI expects).
 /// One image stages at most one DTB; the loader probes each known board path in order and
@@ -54,10 +58,10 @@ const DTB_ESP_PATHS: &[&str] = &[
 ];
 const KERNEL_ESP_PATH: &str = "\\EFI\\KUMO\\kernel\\kumo-kernel.elf";
 const INITRD_ESP_PATH: &str = "\\EFI\\KUMO\\initrd.img";
-/// The staged boot manifest ([`BootConfig`]). The imager writes one per target image; the
-/// loader currently consumes only its `board` key (DESIGN/017 §4 step 2) and still resolves
-/// the kernel/initrd/DTB from the constants above — migrating those reads to the manifest is
-/// a later slice. — CORVUS
+/// The staged boot manifest ([`BootConfig`]). The imager writes one per target image; the loader
+/// consumes its fixed-size `board` and optional `console-uart` policy, but still resolves the
+/// kernel/initrd/DTB from the constants above. Migrating those path reads to the manifest is a
+/// later slice. — KESTREL 2026-07-17
 const BOOT_CONFIG_ESP_PATH: &str = "\\EFI\\KUMO\\nijigumo.conf";
 
 // === EFI GUIDs ===============================================================
@@ -541,14 +545,14 @@ unsafe fn boot_and_jump(
     };
     unsafe { boot_ptr.write(build_boot_info(seed)) };
 
-    // Stamp the board identity from the staged manifest. The image is built for exactly one
-    // board, so identity is a build-time fact we carry across the handoff rather than one the
-    // kernel sniffs (DESIGN/017 §3). An absent/unparseable manifest, or one naming no board,
-    // leaves the field empty and the kernel reports "unstamped" — the prior behaviour.
-    unsafe { stamp_board_id(boot_services, root, con_out, boot_ptr) };
+    // Stamp fixed-size boot policy from the staged manifest: board identity plus an optional,
+    // explicit PL011 route. The latter is how a Pi 5 image can follow firmware's current RP1
+    // PCIe window without pretending that a movable BAR address is a stable BSP fact.
+    unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
 
     // Pre-exit summary + validation, using a provisional memory snapshot.
-    if let Some((regions_ptr, regions_len, _key)) = unsafe { snapshot_memory(boot_services, &bufs) }
+    if let Some((regions_ptr, regions_len, _key, _raw_map)) =
+        unsafe { snapshot_memory(boot_services, &bufs) }
     {
         unsafe { (*boot_ptr).mem_regions = RawSlice::from_raw_parts(regions_ptr, regions_len) };
     }
@@ -579,6 +583,19 @@ unsafe fn boot_and_jump(
             "absent"
         }
     );
+    kprint!(con_out, "handoff DTB  : {:#018x}\r\n", unsafe {
+        (*boot_ptr).platform.dtb
+    });
+    kprint!(
+        con_out,
+        "handoff UART : {:#018x}{}\r\n",
+        unsafe { (*boot_ptr).platform.pl011_console_base },
+        if unsafe { (*boot_ptr).platform.pl011_console_base } == 0 {
+            " (BSP default)"
+        } else {
+            " (PL011 override)"
+        }
+    );
     match validate_boot_info(unsafe { &*boot_ptr }) {
         Ok(_) => kprint!(con_out, "handoff      : VALID\r\n"),
         Err(err) => {
@@ -606,7 +623,7 @@ unsafe fn boot_and_jump(
     // that map produced. Retry if the map shifts under us.
     let mut exited = false;
     for _ in 0..8 {
-        let (regions_ptr, regions_len, map_key) =
+        let (regions_ptr, regions_len, map_key, _raw_map) =
             match unsafe { snapshot_memory(boot_services, &bufs) } {
                 Some(snap) => snap,
                 None => break,
@@ -790,22 +807,16 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
     Some(u64::from_le_bytes(file_size))
 }
 
-/// Resolve the DTB, returning `(phys_addr, len)` or `(0, 0)` if none is found.
-///
-/// Preference order: (1) a DTB staged on the ESP at one of [`DTB_ESP_PATHS`] — the X13s and
-/// the Orange Pi 5 Plus ship their own, newer than the firmware's; (2) the firmware-provided
-/// DTB from the UEFI configuration table ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and
-/// other generic-UEFI boards supply their device tree, since they stage none on the ESP. The
-/// Read the staged boot manifest and stamp the board id it names into `BootInfo`, so the
-/// kernel can resolve its `kumo_bsp::Board` instead of guessing from present hardware
-/// (DESIGN/017 §4 step 2). Prints what was stamped, since an unstamped board silently
-/// degrades every BSP-driven decision downstream.
+/// Read the staged boot manifest and stamp its fixed-size policy into `BootInfo`: the board id
+/// and, when present, an explicit `console-uart = pl011@0x...` route. The image is built for one
+/// board, but RP1's host address is a firmware-selected PCIe window rather than a stable board
+/// constant, so that route must remain an explicit per-image override. — KESTREL 2026-07-17
 ///
 /// Absent manifest, non-UTF-8 text, unparseable config, or no `board` key all leave the
 /// field empty — the kernel reports "unstamped", which is the pre-existing behaviour. This
 /// is deliberately not fatal: the board id is not yet load-bearing, and a boot that reaches
 /// the kernel is worth more than one refused over a missing manifest.
-unsafe fn stamp_board_id(
+unsafe fn stamp_boot_config(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
     con_out: *mut EfiSimpleTextOutputProtocol,
@@ -817,10 +828,8 @@ unsafe fn stamp_board_id(
         return;
     };
     let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
-    let board = core::str::from_utf8(bytes)
-        .ok()
-        .and_then(BootConfig::parse)
-        .and_then(|cfg| cfg.board);
+    let config = core::str::from_utf8(bytes).ok().and_then(BootConfig::parse);
+    let board = config.and_then(|cfg| cfg.board);
     match board {
         // `set_board_id` copies into BootInfo's fixed array, so the pool buffer need not
         // outlive this call.
@@ -833,9 +842,37 @@ unsafe fn stamp_board_id(
             "board        : unstamped (manifest names no board)\r\n"
         ),
     }
+
+    match config.and_then(|cfg| cfg.console_uart) {
+        Some(value) => match parse_pl011_console(value) {
+            Some(base) => {
+                unsafe { (*boot_ptr).platform.pl011_console_base = base };
+                kprint!(
+                    con_out,
+                    "console UART : PL011 override @ {:#018x}\r\n",
+                    base
+                );
+            }
+            None => kprint!(
+                con_out,
+                "console UART : rejected '{}' (using BSP default)\r\n",
+                value
+            ),
+        },
+        None => kprint!(con_out, "console UART : BSP default\r\n"),
+    }
+    unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
-/// kept pool buffer / firmware blob is handed to the kernel via BootInfo.
+/// Resolve the DTB, returning `(phys_addr, len)` or `(0, 0)` if none is found.
+///
+/// Preference order: (1) a DTB staged on the ESP at one of [`DTB_ESP_PATHS`] — the X13s and
+/// the Orange Pi 5 Plus ship their own, newer than the firmware's; (2) the firmware-provided
+/// DTB from the UEFI configuration table ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and
+/// other generic-UEFI boards supply their device tree, since they stage none on the ESP. The
+/// kept pool buffer is handed to the kernel via BootInfo. A firmware-table blob is first copied
+/// into `LoaderData`, so reclaiming firmware-owned pages after `ExitBootServices` cannot invalidate
+/// the handoff before the kernel parses it. — KESTREL 2026-07-17
 unsafe fn load_dtb(
     boot_services: *mut EfiBootServices,
     root: *mut EfiFileProtocol,
@@ -848,27 +885,91 @@ unsafe fn load_dtb(
             continue;
         };
         let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
-        if is_fdt_magic(bytes) {
+        let declared_len = fdt_total_size(bytes).unwrap_or(0) as u64;
+        if is_fdt_magic(bytes)
+            && (40..=MAX_DTB_BYTES).contains(&declared_len)
+            && declared_len <= len as u64
+            && len as u64 <= MAX_DTB_BYTES
+        {
             kprint!(
                 con_out,
-                "device tree  : {} @ {:#x} ({} bytes)\r\n",
+                "device tree  : {} @ {:#x} ({} declared / {} file bytes)\r\n",
                 path,
                 buffer as u64,
+                declared_len,
                 len
             );
-            return (buffer as u64, len as u64);
+            return (buffer as u64, declared_len);
         }
         kprint!(
             con_out,
-            "device tree  : ESP FDT magic missing - trying next source\r\n"
+            "device tree  : ESP FDT rejected (magic={} declared={} file={}) - trying next source\r\n",
+            is_fdt_magic(bytes),
+            declared_len,
+            len
         );
         unsafe { ((*boot_services).free_pool)(buffer) };
     }
 
     // (2) Firmware configuration table (Pi 5 / generic UEFI).
-    if let Some((addr, len)) = unsafe { firmware_dtb(system_table, con_out) } {
-        return (addr, len);
+    let probe_bufs = match unsafe { prepare_memory_buffers(boot_services) } {
+        Some(bufs) => bufs,
+        None => {
+            kprint!(
+                con_out,
+                "device tree  : memory map unavailable; firmware DTB not dereferenced\r\n"
+            );
+            return (0, 0);
+        }
+    };
+    let firmware_dtb = match unsafe { snapshot_memory(boot_services, &probe_bufs) } {
+        Some((_regions_ptr, _regions_len, _, raw_map)) => unsafe {
+            firmware_dtb(system_table, con_out, raw_map)
+        },
+        None => {
+            kprint!(
+                con_out,
+                "device tree  : memory map snapshot failed; firmware DTB not dereferenced\r\n"
+            );
+            None
+        }
+    };
+    if let Some((addr, len)) = firmware_dtb {
+        let mut owned: *mut c_void = ptr::null_mut();
+        let status = unsafe {
+            ((*boot_services).allocate_pool)(efi_memory_type::LOADER_DATA, len as usize, &mut owned)
+        };
+        if status != EFI_SUCCESS || owned.is_null() {
+            kprint!(
+                con_out,
+                "device tree  : firmware DTB copy failed; rejecting handoff\r\n"
+            );
+            unsafe { release_memory_buffers(boot_services, probe_bufs) };
+            return (0, 0);
+        }
+        if !is_plausible_firmware_pointer(owned as u64, len, 8)
+            || ranges_overlap(addr, len, owned as u64, len)
+        {
+            kprint!(
+                con_out,
+                "device tree  : firmware DTB copy destination rejected\r\n"
+            );
+            unsafe { ((*boot_services).free_pool)(owned) };
+            unsafe { release_memory_buffers(boot_services, probe_bufs) };
+            return (0, 0);
+        }
+        unsafe { ptr::copy_nonoverlapping(addr as *const u8, owned as *mut u8, len as usize) };
+        unsafe { release_memory_buffers(boot_services, probe_bufs) };
+        kprint!(
+            con_out,
+            "device tree  : copied firmware DTB {:#x} -> LoaderData {:#x} ({} bytes)\r\n",
+            addr,
+            owned as u64,
+            len
+        );
+        return (owned as u64, len);
     }
+    unsafe { release_memory_buffers(boot_services, probe_bufs) };
 
     kprint!(con_out, "device tree  : absent\r\n");
     (0, 0)
@@ -876,17 +977,42 @@ unsafe fn load_dtb(
 
 /// Scan the UEFI configuration table for [`EFI_DTB_TABLE_GUID`] and, if its blob carries valid
 /// FDT magic, return `(phys_addr, totalsize)` read from the FDT header. The firmware owns this
-/// memory; it stays mapped through ExitBootServices, so the pointer is valid for the kernel.
+/// memory; the caller must copy it into loader-owned storage before `ExitBootServices`.
 unsafe fn firmware_dtb(
     system_table: *mut EfiSystemTable,
     con_out: *mut EfiSimpleTextOutputProtocol,
+    memory_map: EfiMemoryMapView,
 ) -> Option<(u64, u64)> {
+    const MAX_CONFIG_TABLES: usize = 1024;
+
     if system_table.is_null() {
+        kprint!(con_out, "EFI tables   : system table is null\r\n");
         return None;
     }
     let count = unsafe { (*system_table).number_of_table_entries };
     let tables = unsafe { (*system_table).configuration_table } as *const EfiConfigurationTable;
-    if tables.is_null() {
+    kprint!(
+        con_out,
+        "EFI tables   : count={} base={:#018x}\r\n",
+        count,
+        tables as u64
+    );
+    let table_bytes = count.checked_mul(size_of::<EfiConfigurationTable>());
+    if count > MAX_CONFIG_TABLES
+        || table_bytes.is_none()
+        || !is_plausible_firmware_pointer(
+            tables as u64,
+            table_bytes.unwrap_or(0) as u64,
+            core::mem::align_of::<EfiConfigurationTable>() as u64,
+        )
+        || !unsafe {
+            memory_map.contains_firmware_owned_range(tables as u64, table_bytes.unwrap_or(0) as u64)
+        }
+    {
+        kprint!(
+            con_out,
+            "EFI tables   : rejected count/base before scan\r\n"
+        );
         return None;
     }
     for index in 0..count {
@@ -895,15 +1021,60 @@ unsafe fn firmware_dtb(
             continue;
         }
         let ptr = entry.vendor_table as *const u8;
-        if ptr.is_null() {
-            return None;
+        kprint!(
+            con_out,
+            "EFI DTB match: index={} vendor_table={:#018x}\r\n",
+            index,
+            ptr as u64
+        );
+        if !is_plausible_firmware_pointer(ptr as u64, 8, 8)
+            || !unsafe { memory_map.contains_firmware_owned_range(ptr as u64, 8) }
+        {
+            kprint!(
+                con_out,
+                "EFI DTB hdr : pointer rejected before dereference\r\n"
+            );
+            continue;
         }
         // Read the 8-byte FDT header (magic + totalsize) to validate and size the blob.
         let head = unsafe { core::slice::from_raw_parts(ptr, 8) };
+        let magic = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+        let len = fdt_total_size(head).unwrap_or(0) as u64;
+        kprint!(
+            con_out,
+            "EFI DTB hdr : {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  magic={:#010x} size={}\r\n",
+            head[0],
+            head[1],
+            head[2],
+            head[3],
+            head[4],
+            head[5],
+            head[6],
+            head[7],
+            magic,
+            len
+        );
         if !is_fdt_magic(head) {
-            return None;
+            kprint!(con_out, "EFI DTB hdr : bad FDT magic; rejected\r\n");
+            continue;
         }
-        let len = fdt_total_size(head)? as u64;
+        if !(40..=MAX_DTB_BYTES).contains(&len) {
+            kprint!(
+                con_out,
+                "EFI DTB hdr : implausible totalsize {}; rejected\r\n",
+                len
+            );
+            continue;
+        }
+        if !is_plausible_firmware_pointer(ptr as u64, len, 8)
+            || !unsafe { memory_map.contains_firmware_owned_range(ptr as u64, len) }
+        {
+            kprint!(
+                con_out,
+                "EFI DTB blob: complete range is outside readable memory; rejected\r\n"
+            );
+            continue;
+        }
         kprint!(
             con_out,
             "device tree  : firmware table @ {:#x} ({} bytes)\r\n",
@@ -1215,6 +1386,65 @@ struct MemBufs {
     region_cap: usize,
 }
 
+#[derive(Clone, Copy)]
+struct EfiMemoryMapView {
+    descriptors: *const u8,
+    count: usize,
+    descriptor_size: usize,
+}
+
+impl EfiMemoryMapView {
+    /// Check a range against raw EFI types before the lossy `MemRegionKind` conversion. This keeps
+    /// Conventional and Unusable pages distinct and rejects both before any raw read.
+    /// — KESTREL 2026-07-17
+    ///
+    /// # Safety
+    /// The descriptor buffer must remain live and contain `count` entries of `descriptor_size`.
+    unsafe fn contains_firmware_owned_range(self, address: u64, byte_len: u64) -> bool {
+        let Some(end) = address.checked_add(byte_len) else {
+            return false;
+        };
+        if address >= end || self.descriptor_size < 32 {
+            return false;
+        }
+        for index in 0..self.count {
+            let descriptor = unsafe { self.descriptors.add(index * self.descriptor_size) };
+            let efi_type = unsafe { ptr::read_unaligned(descriptor as *const u32) };
+            if !efi_memory_type_is_firmware_owned(efi_type) {
+                continue;
+            }
+            let start = unsafe { ptr::read_unaligned(descriptor.add(8) as *const u64) };
+            let pages = unsafe { ptr::read_unaligned(descriptor.add(24) as *const u64) };
+            let Some(region_len) = pages.checked_mul(EFI_PAGE_SIZE) else {
+                continue;
+            };
+            let Some(region_end) = start.checked_add(region_len) else {
+                continue;
+            };
+            if start <= address && end <= region_end {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+const fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    let Some(a_end) = a_start.checked_add(a_len) else {
+        return true;
+    };
+    let Some(b_end) = b_start.checked_add(b_len) else {
+        return true;
+    };
+    a_start < b_end && b_start < a_end
+}
+
+/// Release a temporary memory-map snapshot before the final handoff buffers are prepared.
+unsafe fn release_memory_buffers(boot_services: *mut EfiBootServices, bufs: MemBufs) {
+    unsafe { ((*boot_services).free_pool)(bufs.regions as *mut c_void) };
+    unsafe { ((*boot_services).free_pool)(bufs.desc) };
+}
+
 /// Pre-allocate the descriptor + `MemRegion` buffers used to snapshot the memory
 /// map. Must run *before* ExitBootServices, since no allocation is possible after.
 unsafe fn prepare_memory_buffers(boot_services: *mut EfiBootServices) -> Option<MemBufs> {
@@ -1268,12 +1498,13 @@ unsafe fn prepare_memory_buffers(boot_services: *mut EfiBootServices) -> Option<
 }
 
 /// Snapshot the current memory map into the prepared buffers, converting each
-/// descriptor into a `MemRegion`. Returns `(regions_ptr, count, map_key)`; the
-/// `map_key` is what ExitBootServices must be called with.
+/// descriptor into a `MemRegion`. Returns `(regions_ptr, count, map_key, raw_map)`; the `map_key`
+/// is what ExitBootServices must be called with, while `raw_map` preserves EFI memory types for
+/// pre-dereference ownership checks.
 unsafe fn snapshot_memory(
     boot_services: *mut EfiBootServices,
     bufs: &MemBufs,
-) -> Option<(u64, u64, usize)> {
+) -> Option<(u64, u64, usize, EfiMemoryMapView)> {
     let mut map_size = bufs.desc_cap;
     let mut map_key: usize = 0;
     let mut desc_size: usize = 0;
@@ -1309,7 +1540,16 @@ unsafe fn snapshot_memory(
         i += 1;
     }
 
-    Some((bufs.regions as u64, written as u64, map_key))
+    Some((
+        bufs.regions as u64,
+        written as u64,
+        map_key,
+        EfiMemoryMapView {
+            descriptors: bufs.desc as *const u8,
+            count,
+            descriptor_size: desc_size,
+        },
+    ))
 }
 
 /// Locate the active GOP and read its framebuffer. Only a usable *linear* buffer
@@ -1715,5 +1955,48 @@ mod tests {
         let decoded = std::string::String::from_utf16(&path[..len]).unwrap();
         assert_eq!(decoded, KERNEL_ESP_PATH);
         assert_eq!(path[len], 0);
+    }
+
+    #[test]
+    fn efi_configuration_table_layout_matches_the_uefi_abi() {
+        assert_eq!(size_of::<EfiGuid>(), 16);
+        assert_eq!(size_of::<EfiConfigurationTable>(), 24);
+        assert_eq!(
+            core::mem::offset_of!(EfiConfigurationTable, vendor_table),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(EfiSystemTable, number_of_table_entries),
+            104
+        );
+        assert_eq!(
+            core::mem::offset_of!(EfiSystemTable, configuration_table),
+            112
+        );
+    }
+
+    #[test]
+    fn raw_efi_map_requires_owned_storage_for_the_complete_range() {
+        let mut descriptor = [0u8; 40];
+        descriptor[..4].copy_from_slice(&efi_memory_type::BOOT_SERVICES_DATA.to_le_bytes());
+        descriptor[8..16].copy_from_slice(&0x4000u64.to_le_bytes());
+        descriptor[24..32].copy_from_slice(&2u64.to_le_bytes());
+        let view = EfiMemoryMapView {
+            descriptors: descriptor.as_ptr(),
+            count: 1,
+            descriptor_size: descriptor.len(),
+        };
+        assert!(unsafe { view.contains_firmware_owned_range(0x4080, 0x1000) });
+        assert!(!unsafe { view.contains_firmware_owned_range(0x5f00, 0x200) });
+
+        descriptor[..4].copy_from_slice(&efi_memory_type::CONVENTIONAL.to_le_bytes());
+        assert!(!unsafe { view.contains_firmware_owned_range(0x4080, 8) });
+    }
+
+    #[test]
+    fn firmware_dtb_copy_ranges_must_be_disjoint() {
+        assert!(!ranges_overlap(0x1000, 0x100, 0x2000, 0x100));
+        assert!(ranges_overlap(0x1000, 0x100, 0x1080, 0x100));
+        assert!(ranges_overlap(u64::MAX - 3, 8, 0x1000, 8));
     }
 }

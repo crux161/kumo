@@ -1,4 +1,8 @@
 #!/bin/sh
+#j213
+#j330
+#j467
+
 # build.sh — quick staging, deploy, and boot-media entry point.
 #
 # Boot-media products:
@@ -16,12 +20,14 @@
 #   ./build.sh all          -> stage every existing architecture/hardware profile
 #
 # KUMO_ESP=/Volumes/ESP ./build.sh x13s copies the staged X13s EFI tree to a mounted ESP.
+# KUMO_PI5_CONSOLE_UART=pl011@0x1c00030000 ./build.sh all explicitly routes the Pi 5 serial sink.
 # KUMO_NO_OPEN=1 suppresses opening the output directory on macOS.
 set -eu
 
 MODE="${1:-x13s}"
 PRODUCT="${2:-}"
 ESP="${KUMO_ESP:-}"
+PI5_CONSOLE_UART="${KUMO_PI5_CONSOLE_UART:-}"
 OPEN_DIR=""
 DEPLOY_DIR=""
 
@@ -36,6 +42,7 @@ usage:
 examples:
   ./build.sh arm64 img
   ./build.sh amd64 iso
+  KUMO_PI5_CONSOLE_UART=pl011@0x1c00030000 ./build.sh all
 USAGE
 }
 
@@ -51,7 +58,12 @@ build_x13s() {
 
 build_pi5() {
     echo "==> Building aarch64 (Raspberry Pi 5)..."
-    cargo xtask image --arch aarch64 --hardware rpi5
+    if [ -n "$PI5_CONSOLE_UART" ]; then
+        echo "    explicit serial route: $PI5_CONSOLE_UART"
+        cargo xtask image --arch aarch64 --hardware rpi5 --console-uart "$PI5_CONSOLE_UART"
+    else
+        cargo xtask image --arch aarch64 --hardware rpi5
+    fi
     if [ -x "scripts/mk-pi5-img.sh" ]; then
         ./scripts/mk-pi5-img.sh
     fi

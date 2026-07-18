@@ -1,12 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j397
-//j422
-//j423
-//j425
-//j427
-//j428
+//j462
+//j463
+//j465
+//j466
+//j467
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -198,9 +197,8 @@ pub fn irq_unmask() {}
 //
 // Two sinks, chosen at runtime by what the board actually has:
 //   * A linear framebuffer (from the UEFI GOP, handed over in BootInfo) — used on
-//     real hardware like the ThinkPad X13s and the Pi 5, which expose no UART at a
-//     fixed base. `set_framebuffer` (called from stage_a when BootInfo carries one)
-//     switches the console to it.
+//     real hardware like the ThinkPad X13s and the Pi 5. `set_framebuffer` (called
+//     from stage_a when BootInfo carries one) enables that sink.
 //   * A PL011 UART0, at a base this backend does NOT know. The board's BSP entry names
 //     it and the kernel injects it with `console_set_pl011_base`; until then the UART
 //     sink is inert. This backend names no board address (DESIGN/017 §4.3).
@@ -226,14 +224,9 @@ const BLOCK_2M: u64 = 1 << 21;
 static PL011_BASE: AtomicU64 = AtomicU64::new(0);
 const UARTDR: usize = 0x00;
 const UARTFR: usize = 0x18;
-const UARTIBRD: usize = 0x24;
-const UARTFBRD: usize = 0x28;
-const UARTLCR_H: usize = 0x2c;
 const UARTCR: usize = 0x30;
 const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFF: u32 = 1 << 5;
-const UARTLCR_H_FEN: u32 = 1 << 4;
-const UARTLCR_H_WLEN_8: u32 = 3 << 5;
 const UARTCR_UARTEN: u32 = 1 << 0;
 const UARTCR_TXE: u32 = 1 << 8;
 const UARTCR_RXE: u32 = 1 << 9;
@@ -268,10 +261,9 @@ pub fn read_phys(phys: u64, dest: &mut [u8]) {
 #[cfg(not(target_os = "none"))]
 pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
 
-/// Tell the console where this board's PL011 UART0 lives, from the board's BSP entry. The
-/// kernel resolves its board and calls this before the first console write; a board whose BSP
-/// entry names no PL011 (the X13s, the Pi 5) simply never calls it, leaving the UART sink
-/// inert. Passing 0 returns the sink to inert.
+/// Tell the console where the selected PL011 lives, from the board's BSP entry or a typed boot
+/// override. The kernel resolves this before the first console write; a board whose sources name
+/// no PL011 (the X13s) leaves the UART sink inert. Passing 0 returns the sink to inert.
 ///
 /// This is the injection direction of DESIGN/017 §4.3: the board knows the layout and hands it
 /// to the driver, so the driver names no board address and cannot be wrong about one.
@@ -295,9 +287,9 @@ fn pl011_present() -> bool {
 /// The 2 MiB block a board's console MMIO needs mapped when it sits at or above the dense
 /// identity/physmap `top`. `mmu::enable_kernel` maps `[0, top)` — RAM, rounded up a GiB —
 /// into both TTBR0 and TTBR1; a PL011 above that range is mapped by neither, so the first
-/// console write after [`console_use_physmap`] faults. The Pi 5's SoC PL011 (`uart10`,
-/// injected via [`console_set_pl011_base`]) is at `0x10_7D00_1000` — ~66 GiB, far above any
-/// RAM — and is exactly this case.
+/// console write after [`console_use_physmap`] faults. Both Pi 5 routes are examples: SoC
+/// `uart10` is at `0x10_7D00_1000`, while the current firmware reports RP1 UART0's PCIe window
+/// at `0x1c_0003_0000`; either can be injected and both sit far above RAM.
 ///
 /// `Some(block)` means a targeted device mapping is owed; `None` means it is not — either no
 /// board named a PL011 (`base == 0`, inert: the X13s) or the base already lies inside
@@ -323,24 +315,18 @@ fn pl011_reg(offset: usize) -> *mut u32 {
     (PL011_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
 }
 
-/// Bring the PL011 up for 8N1 with FIFOs, **inheriting the baud rate the firmware set**.
+/// Preserve the firmware's complete PL011 configuration and only ensure the UART and TX/RX paths
+/// remain enabled.
 ///
-/// Deliberately does not touch `UARTIBRD`/`UARTFBRD`. The divisor is `uartclk / (16 * baud)`, and
-/// `uartclk` is a per-board fact this backend cannot know: the Pi 5's DTB puts `clk_uart` at
-/// 9.216 MHz, other boards differ, and nothing here is told which. The old code wrote
-/// `IBRD = 1, FBRD = 0` — a divisor of 1, i.e. `uartclk / 16` — which is not 115200 on any real
-/// clock. It survived only because **this driver had never met real hardware**: QEMU ignores the
-/// baud registers entirely, and the X13s (the only metal that runs this code) has no PL011 at all.
-///
-/// Whoever owns the UART before us — EDK2 on the Pi 5, AAVMF on QEMU — has already programmed a
-/// working baud for its own console, so inheriting it is both correct and the only thing we can
-/// honestly do (`DESIGN/017` §5: never a guess). Writing `UARTLCR_H` re-latches the existing
-/// divisor unchanged, which is why the disable/configure/enable sequence is still safe.
+/// Nijigumo selects only a UART firmware has already used: AAVMF's QEMU PL011, Pi 5 uart10, or the
+/// firmware-reported RP1 PL011. RP1's DTB explicitly carries `skip-init`, and its clock/divisor,
+/// FIFO, flow-control, and pinmux state are firmware facts KUMO cannot reconstruct here. A
+/// read-modify-write of `UARTCR` is therefore the narrow handoff: no disable window and no write to
+/// the divisor or line-control latches. — KESTREL 2026-07-17
 fn pl011_init() {
     unsafe {
-        pl011_reg(UARTCR).write_volatile(0);
-        pl011_reg(UARTLCR_H).write_volatile(UARTLCR_H_FEN | UARTLCR_H_WLEN_8);
-        pl011_reg(UARTCR).write_volatile(UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
+        let control = pl011_reg(UARTCR).read_volatile();
+        pl011_reg(UARTCR).write_volatile(control | UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
     }
 }
 
@@ -1553,10 +1539,10 @@ pub mod mmu {
             gi += 1;
         }
 
-        // A board's console MMIO can sit far above RAM, outside the dense `[0, top)` map
-        // built above. The Pi 5's SoC PL011 (uart10, injected via `console_set_pl011_base`)
-        // is at 0x10_7D00_1000 — ~66 GiB — so without this the first `klog!` after
-        // `console_use_physmap` faults on an unmapped address. Map just its 2 MiB block, as
+        // A selected console MMIO block can sit far above RAM, outside the dense `[0, top)` map
+        // built above. Both Pi 5 choices do: fixed SoC uart10 at 0x10_7D00_1000 and the current
+        // firmware's explicit RP1 UART0 route at 0x1c_0003_0000. Without this the first `klog!`
+        // after `console_use_physmap` faults on an unmapped address. Map just its 2 MiB block, as
         // Device, into both trees: TTBR0 identity for the window before the physmap moves,
         // TTBR1 physmap (`PHYSMAP_BASE + block`) for after. Inert when no board named a
         // PL011 (the X13s), and skipped when the base already fell inside `[0, top)` (QEMU's
@@ -2927,12 +2913,27 @@ pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
     None
 }
 
-#[cfg(target_os = "none")]
+const DTB_PHYS_LIMIT: u64 = 1u64 << 48;
+
+/// Structural precondition for any raw DTB dereference in this backend. The kernel performs the
+/// stronger memory-map containment proof; this defense-in-depth guard keeps sentinels,
+/// non-physical values, and misalignment out of every discoverer even when called directly.
+const fn plausible_dtb_pointer(dtb: u64) -> bool {
+    dtb != 0
+        && dtb != u64::MAX
+        && dtb & 7 == 0
+        && dtb < DTB_PHYS_LIMIT
+        && match dtb.checked_add(40) {
+            Some(end) => end <= DTB_PHYS_LIMIT,
+            None => false,
+        }
+}
+
 unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
     const FDT_MAGIC: u32 = 0xd00d_feed;
     const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
 
-    if dtb == 0 {
+    if !plausible_dtb_pointer(dtb) {
         return None;
     }
     let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
@@ -2941,6 +2942,12 @@ unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
     }
     let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
     if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    if dtb
+        .checked_add(total as u64)
+        .is_none_or(|end| end > DTB_PHYS_LIMIT)
+    {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(dtb as *const u8, total) })
@@ -3062,6 +3069,9 @@ pub enum TimerIrqError {
     /// No interrupt controller found in the DTB (neither GICv3 nor GICv2) — also the
     /// `dtb == 0` case (no device tree was delivered to the kernel).
     NoGic,
+    /// A nonzero DTB address failed the architectural sentinel/canonicality/alignment guard
+    /// before any header read.
+    BadDtbPointer,
     BadTimerFrequency,
     BadPeriod,
 }
@@ -3123,6 +3133,9 @@ fn pe_has_gicv3_sysreg_interface() -> bool {
 pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
     if period_hz == 0 {
         return Err(TimerIrqError::BadPeriod);
+    }
+    if dtb != 0 && !plausible_dtb_pointer(dtb) {
+        return Err(TimerIrqError::BadDtbPointer);
     }
 
     let freq = timer_frequency();
@@ -3290,33 +3303,14 @@ unsafe fn discover_gicv3(dtb: u64) -> Option<Gicv3Config> {
     // fallback plus a GICD_PIDR2 probe, in `init_timer_interrupts` (J462). This is what the
     // "both discoverers return None when dtb == 0" comment there always claimed and this arm
     // used to quietly contradict.
-    if dtb == 0 {
-        return None;
-    }
-
-    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
-    let total_size = read_be_u32(header, 4)? as usize;
-    if !(40..=16 * 1024 * 1024).contains(&total_size) {
-        return None;
-    }
-
-    let bytes = unsafe { core::slice::from_raw_parts(dtb as *const u8, total_size) };
+    let bytes = unsafe { dtb_bytes(dtb)? };
     gicv3_from_dtb_bytes(bytes)
 }
 
 unsafe fn discover_pdc(dtb: u64) {
-    if dtb == 0 {
-        return;
-    }
-
-    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
-    if let Some(total_size) = read_be_u32(header, 4) {
-        if (40..=16 * 1024 * 1024).contains(&(total_size as usize)) {
-            let bytes =
-                unsafe { core::slice::from_raw_parts(dtb as *const u8, total_size as usize) };
-            unsafe {
-                PDC_CONFIG_GLOBAL = kumo_pdc::pdc_from_dtb_bytes(bytes);
-            }
+    if let Some(bytes) = unsafe { dtb_bytes(dtb) } {
+        unsafe {
+            PDC_CONFIG_GLOBAL = kumo_pdc::pdc_from_dtb_bytes(bytes);
         }
     }
 }
@@ -3583,15 +3577,7 @@ const GICD_CTLR_ENABLE_GRP0: u32 = 1;
 /// Parse a GICv2 node from DTB. The reg property has two tuples: (GICD, GICC).
 #[cfg(target_os = "none")]
 unsafe fn discover_gicv2(dtb: u64) -> Option<Gicv2Config> {
-    if dtb == 0 {
-        return None;
-    }
-    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };
-    if &header[0..4] != b"\xd0\x0d\xfe\xed" {
-        return None;
-    }
-    let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    let bytes = unsafe { core::slice::from_raw_parts(dtb as *const u8, total_size) };
+    let bytes = unsafe { dtb_bytes(dtb)? };
     gicv2_from_dtb_bytes(bytes)
 }
 
@@ -4547,6 +4533,11 @@ mod tests {
             console_mmio_block_above_top(0x10_7D00_1000, ram_top),
             Some(0x10_7D00_0000)
         );
+        // Explicit current-firmware RP1 UART0 route: same mapper, different selected block.
+        assert_eq!(
+            console_mmio_block_above_top(0x1c_0003_0000, ram_top),
+            Some(0x1c_0000_0000)
+        );
         // QEMU's low PL011 already lies inside [0, top); the dense loop covered it.
         assert_eq!(console_mmio_block_above_top(0x0900_0000, ram_top), None);
         // No board named a PL011 (the X13s): nothing to map.
@@ -4555,6 +4546,19 @@ mod tests {
         assert_eq!(
             console_mmio_block_above_top(ram_top, ram_top),
             Some(ram_top)
+        );
+    }
+
+    #[test]
+    fn raw_dtb_guard_rejects_sentinels_before_timer_discovery() {
+        assert!(!plausible_dtb_pointer(0));
+        assert!(!plausible_dtb_pointer(u64::MAX));
+        assert!(!plausible_dtb_pointer(DTB_PHYS_LIMIT));
+        assert!(!plausible_dtb_pointer(0x4080_0001));
+        assert!(plausible_dtb_pointer(0x4080_0000));
+        assert_eq!(
+            init_timer_interrupts(u64::MAX, 20),
+            Err(TimerIrqError::BadDtbPointer)
         );
     }
 

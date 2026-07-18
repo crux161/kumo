@@ -1,5 +1,8 @@
 use core::marker::PhantomData;
 
+//j421
+//j467
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawSlice<T> {
@@ -147,6 +150,11 @@ impl Framebuffer {
 pub struct PlatformTable {
     pub acpi_rsdp: u64,
     pub dtb: u64,
+    /// Optional loader-selected PL011 console base. Zero preserves the board BSP's default;
+    /// nonzero explicitly redirects the serial half of the dual-sink console. This is a boot-time
+    /// override because PCIe-hosted UART addresses (notably Raspberry Pi 5 RP1 UART0) can move
+    /// between firmware revisions and therefore are not stable BSP facts. — KESTREL 2026-07-17
+    pub pl011_console_base: u64,
 }
 
 #[repr(C)]
@@ -195,6 +203,7 @@ impl BootInfo {
             platform: PlatformTable {
                 acpi_rsdp: 0,
                 dtb: 0,
+                pl011_console_base: 0,
             },
             cmdline: RawSlice::empty(),
             verified_boot_sig: [0; 64],

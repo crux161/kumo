@@ -1,3 +1,7 @@
+//j003
+//j013
+//j467
+
 use std::env;
 use std::process::ExitCode;
 
@@ -89,14 +93,18 @@ fn render_transcript(boot: &BootInfo) -> Result<String, String> {
 }
 
 fn assert_transcript(transcript: &str) -> Result<(), String> {
+    let abi_marker = format!("[NIJIGUMO] HANDOFF COMPLETE abi=v{ABI_VERSION} arch=aarch64");
+    if !transcript.contains(&abi_marker) {
+        return Err(format!("transcript missing '{abi_marker}'"));
+    }
+
     let expected = [
-        "[NIJIGUMO] HANDOFF COMPLETE abi=v1 arch=aarch64",
         "CPU MODE: Executive (EL1/Ring0)",
         "AETHER:",
         "frames  OK",
         "HEAP: bump",
         "vec self-test sum=204  OK",
-        "KUMO Ziwei Stage-A core only; halting",
+        kernel::stage_a_banner(),
     ];
 
     for needle in expected {

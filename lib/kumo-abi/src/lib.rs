@@ -1,7 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j421
 //j426
+//j467
 
 pub mod argv;
 pub mod boot;
@@ -27,4 +29,5 @@ pub use sys::{
 };
 
 // v2: BootInfo carries `board_id` (the baked board identity — DESIGN/017 §4 step 2).
-pub const ABI_VERSION: u32 = 2;
+// v3: PlatformTable carries an explicit loader-selected PL011 console override.
+pub const ABI_VERSION: u32 = 3;
