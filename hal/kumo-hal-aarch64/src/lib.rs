@@ -6,6 +6,7 @@
 //j465
 //j466
 //j467
+//j468
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -284,31 +285,72 @@ fn pl011_present() -> bool {
     PL011_BASE.load(ORD) != 0
 }
 
-/// The 2 MiB block a board's console MMIO needs mapped when it sits at or above the dense
-/// identity/physmap `top`. `mmu::enable_kernel` maps `[0, top)` — RAM, rounded up a GiB —
-/// into both TTBR0 and TTBR1; a PL011 above that range is mapped by neither, so the first
-/// console write after [`console_use_physmap`] faults. Both Pi 5 routes are examples: SoC
-/// `uart10` is at `0x10_7D00_1000`, while the current firmware reports RP1 UART0's PCIe window
-/// at `0x1c_0003_0000`; either can be injected and both sit far above RAM.
-///
-/// `Some(block)` means a targeted device mapping is owed; `None` means it is not — either no
-/// board named a PL011 (`base == 0`, inert: the X13s) or the base already lies inside
-/// `[0, top)`, mapped by the dense loop (QEMU's low PL011 at `0x0900_0000`). Growing `top` to
-/// reach a ~66 GiB peripheral is not the fix: it would densely map tens of GiB of empty gap
-/// as device memory. `top` is GiB-aligned, so blocks never straddle it and this partitions
-/// every block with the dense loop, each mapped exactly once. Pure and host-tested — the
-/// mapper (`mmu`, `target_os = "none"`) is not, which is why this lives out here.
+/// The 2 MiB block containing `base` when it lies outside the dense identity/physmap `[0, top)`
+/// mapping. Zero means an uninjected optional device and is never mapped. Pure so the targeted
+/// console/GIC plan can be proved on the host before the bare-metal mapper consumes it.
 #[cfg(any(target_os = "none", test))]
-const fn console_mmio_block_above_top(pl011_base: u64, top: u64) -> Option<u64> {
-    if pl011_base == 0 {
+const fn mmio_block_above_top(base: u64, top: u64) -> Option<u64> {
+    if base == 0 {
         return None;
     }
-    let block = pl011_base & !(BLOCK_2M - 1);
+    let block = base & !(BLOCK_2M - 1);
     if block >= top {
         Some(block)
     } else {
         None
     }
+}
+
+/// The compact targeted-MMIO plan for the selected console plus injected GICD, GICR, and GICC.
+/// Zero/low bases are removed and shared 2 MiB blocks are deduplicated. The Pi 5's GICD
+/// (`0x10_7fff9000`) and GICC (`0x10_7fffa000`) therefore produce one `0x10_7fe00000` mapping,
+/// independent of the selected uart10/RP1 console block. Each result is mapped once into TTBR0
+/// identity and once into the TTBR1 physmap. — KESTREL 2026-07-17
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetedMmioBlocks {
+    blocks: [u64; 4],
+    len: usize,
+}
+
+#[cfg(any(target_os = "none", test))]
+impl TargetedMmioBlocks {
+    const fn empty() -> Self {
+        Self {
+            blocks: [0; 4],
+            len: 0,
+        }
+    }
+
+    fn push_base_above_top(&mut self, base: u64, top: u64) {
+        let Some(block) = mmio_block_above_top(base, top) else {
+            return;
+        };
+        if self.blocks[..self.len].contains(&block) {
+            return;
+        }
+        self.blocks[self.len] = block;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        &self.blocks[..self.len]
+    }
+}
+
+#[cfg(any(target_os = "none", test))]
+fn targeted_mmio_blocks_above_top(
+    top: u64,
+    console_base: u64,
+    gicd_base: u64,
+    gicr_base: u64,
+    gicc_base: u64,
+) -> TargetedMmioBlocks {
+    let mut plan = TargetedMmioBlocks::empty();
+    for base in [console_base, gicd_base, gicr_base, gicc_base] {
+        plan.push_base_above_top(base, top);
+    }
+    plan
 }
 
 fn pl011_reg(offset: usize) -> *mut u32 {
@@ -1539,19 +1581,20 @@ pub mod mmu {
             gi += 1;
         }
 
-        // A selected console MMIO block can sit far above RAM, outside the dense `[0, top)` map
-        // built above. Both Pi 5 choices do: fixed SoC uart10 at 0x10_7D00_1000 and the current
-        // firmware's explicit RP1 UART0 route at 0x1c_0003_0000. Without this the first `klog!`
-        // after `console_use_physmap` faults on an unmapped address. Map just its 2 MiB block, as
-        // Device, into both trees: TTBR0 identity for the window before the physmap moves,
-        // TTBR1 physmap (`PHYSMAP_BASE + block`) for after. Inert when no board named a
-        // PL011 (the X13s), and skipped when the base already fell inside `[0, top)` (QEMU's
-        // low PL011, mapped by the loop). Injection, not a table — the HAL maps the base it
-        // was handed. Mirrors the loop's device mapping (`block_desc` already sets PXN|UXN;
-        // the physmap `| PXN | UXN` is kept for symmetry).
-        if let Some(block) =
-            super::console_mmio_block_above_top(super::PL011_BASE.load(super::ORD), top)
-        {
+        // Injected MMIO can sit far above RAM, outside the dense `[0, top)` map. On the Pi 5 this
+        // includes the selected uart10/RP1 console and the GIC-400 block. Build one deduplicated
+        // plan across console, GICD, GICR, and GICC; map each owed block as Device into both
+        // trees: TTBR0 identity for bring-up and TTBR1 physmap for access after a user TTBR0 is
+        // installed. Low QEMU devices were covered by the dense loop and are omitted. Injection,
+        // not a board table: this mapper names no device address itself.
+        let targeted = super::targeted_mmio_blocks_above_top(
+            top,
+            super::PL011_BASE.load(super::ORD),
+            super::GIC_FALLBACK_GICD.load(super::ORD),
+            super::GIC_FALLBACK_GICR.load(super::ORD),
+            super::GIC_FALLBACK_GICC.load(super::ORD),
+        );
+        for &block in targeted.as_slice() {
             let desc = block_desc(block, MAIR_DEVICE, true);
             map_block(ttbr0, block, block, desc, alloc, &mut tables)?;
             map_block(
@@ -2739,8 +2782,9 @@ const DEFAULT_GICR_STRIDE: u64 = 0x0002_0000;
 // OVMF publishes none), this backend used to *assume* "you are QEMU, with a GICv3 at
 // 0x0800_0000/0x080a_0000". That guess is wrong whenever QEMU is launched `-machine
 // virt,gic-version=2`, and writing a redistributor the machine never created takes an external
-// abort at GIC init. So: the board says WHERE its GIC is (these, injected from its BSP entry),
-// and the GIC itself says WHAT it is (`GICD_PIDR2`). This backend names no board address. — J462
+// abort at GIC init. So: the board says WHERE its GIC is and which secondary interfaces exist;
+// only an ambiguous both-interface shape asks the PE (`ID_AA64PFR0_EL1.GIC`). This backend names
+// no board address. — J462/J468
 
 /// Injected GIC distributor base for the no-DTB path; 0 = the board named none.
 static GIC_FALLBACK_GICD: AtomicU64 = AtomicU64::new(0);
@@ -3091,14 +3135,42 @@ pub struct Gicv2Config {
     pub timer_irq: u32,
 }
 
+/// The secondary interface selected for an injected no-DTB GIC. A board that exposes only one
+/// architecture fixes the answer by construction (Pi 5 has GICC and no GICR); a board exposing
+/// both lets the PE capability choose (QEMU `gic-version=2|3`). Pure and host-tested so a Pi 5
+/// cannot be rejected merely because a modern PE advertises system-register capability.
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoDtbGicInterface {
+    V2 { cpu_base: u64 },
+    V3 { redistributor_base: u64 },
+}
+
+#[cfg(any(target_os = "none", test))]
+const fn select_no_dtb_gic_interface(
+    pe_has_gicv3_sysregs: bool,
+    redistributor_base: u64,
+    cpu_base: u64,
+) -> Option<NoDtbGicInterface> {
+    match (redistributor_base != 0, cpu_base != 0) {
+        // A single board-scoped secondary is authoritative about the attached controller.
+        (false, true) => Some(NoDtbGicInterface::V2 { cpu_base }),
+        (true, false) if pe_has_gicv3_sysregs => Some(NoDtbGicInterface::V3 { redistributor_base }),
+        // QEMU exposes addresses for both launch-time alternatives; the PE resolves it safely.
+        (true, true) if pe_has_gicv3_sysregs => Some(NoDtbGicInterface::V3 { redistributor_base }),
+        (true, true) => Some(NoDtbGicInterface::V2 { cpu_base }),
+        (false, false) | (true, false) => None,
+    }
+}
+
 /// Tell this backend where the board's GIC is, for the case where the firmware publishes no
 /// device tree. Pass 0 for a base the board does not expose. The kernel calls this from the
 /// board's BSP entry before [`init_timer_interrupts`]; a board that supplies nothing (or never
 /// calls this) and has no DTB gets [`TimerIrqError::NoGic`] rather than a guessed address.
 ///
-/// Only the *addresses* come from the board. Which GIC architecture lives there is read from the
-/// distributor's own `GICD_PIDR2`, because on QEMU the version is a launch-time property that no
-/// board table can know (DESIGN/017 §4.4, J462).
+/// Only addresses and interface presence come from the board. A single GICC/GICR fixes the
+/// architecture; when both are present, the PE's `ID_AA64PFR0_EL1.GIC` resolves QEMU's
+/// launch-time choice (DESIGN/017 §4.4, J462/J468).
 pub fn gic_set_no_dtb_fallback(distributor_base: u64, redistributor_base: u64, cpu_base: u64) {
     GIC_FALLBACK_GICD.store(distributor_base, ORD);
     GIC_FALLBACK_GICR.store(redistributor_base, ORD);
@@ -3106,8 +3178,9 @@ pub fn gic_set_no_dtb_fallback(distributor_base: u64, redistributor_base: u64, c
 }
 
 /// Whether this PE implements the GICv3/v4 CPU-interface **system registers**, from
-/// `ID_AA64PFR0_EL1.GIC` (bits [27:24]; 0 = none, nonzero = GICv3+ sysreg interface). This is the
-/// GIC-architecture discriminator for the no-DTB path.
+/// `ID_AA64PFR0_EL1.GIC` (bits [27:24]; 0 = none, nonzero = GICv3+ sysreg interface). This
+/// disambiguates a no-DTB board that injected both GICC and GICR (QEMU); a single injected
+/// secondary is already authoritative about the wired controller (Pi 5 supplies only GICC).
 ///
 /// Why not read the distributor's `GICD_PIDR2` ArchRev, the obvious choice? Because it cannot be
 /// read blind: GICv2 places PIDR2 at `0xFE8` inside a 4 KiB distributor, GICv3 places it at
@@ -3192,14 +3265,21 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
         });
     }
 
-    // No device tree. The board's BSP entry named where its GIC is; ask the distributor itself
-    // which architecture it implements rather than assuming (J462). On QEMU the answer depends on
-    // `-machine virt,gic-version=`, which no board table can know.
+    // A nonzero DTB remains authoritative even when it contains no supported GIC node: do not
+    // silently replace a firmware description with lower-authority board constants. Only an
+    // actually absent handoff may use the injected BSP fallback.
+    if dtb != 0 {
+        return Err(TimerIrqError::NoGic);
+    }
+
+    // No device tree. The BSP named its available interfaces. A single secondary is decisive
+    // (Pi 5 supplies only GICC); when both exist, the PE resolves QEMU's launch-time
+    // `-machine virt,gic-version=` choice.
     unsafe { init_timer_interrupts_probed(period_ticks, freq, period_hz) }
 }
 
-/// The no-DTB path: probe `GICD_PIDR2` at the injected distributor base and bring up whichever
-/// GIC is actually there.
+/// The no-DTB path: select from the injected interface shape, consulting the PE capability only
+/// when both GICC and GICR were supplied, then bring up that interface.
 ///
 /// # Safety
 /// Must run with the injected GIC bases mapped, at EL1, during Stage-A bring-up.
@@ -3215,60 +3295,58 @@ unsafe fn init_timer_interrupts_probed(
         return Err(TimerIrqError::NoGic);
     }
 
+    let interface = select_no_dtb_gic_interface(
+        pe_has_gicv3_sysreg_interface(),
+        GIC_FALLBACK_GICR.load(ORD),
+        GIC_FALLBACK_GICC.load(ORD),
+    )
+    .ok_or(TimerIrqError::NoGic)?;
+
     TIMER_PERIOD_TICKS.store(period_ticks, ORD);
     TIMER_IRQ_ID.store(TIMER_VIRTUAL_PPI, ORD);
     TIMER_IRQ_COUNT.store(0, ORD);
 
-    if pe_has_gicv3_sysreg_interface() {
-        // GICv3/v4: EOI rides the system registers, and the PPI lives in a redistributor.
-        let redistributor_base = GIC_FALLBACK_GICR.load(ORD);
-        if redistributor_base == 0 {
-            // The PE speaks GICv3 but the board named no redistributor: refuse rather than
-            // invent one.
-            return Err(TimerIrqError::NoGic);
+    match interface {
+        NoDtbGicInterface::V3 { redistributor_base } => {
+            let config = Gicv3Config {
+                distributor_base: gicd,
+                redistributor_base,
+                redistributor_stride: DEFAULT_GICR_STRIDE,
+                timer_irq: TIMER_VIRTUAL_PPI,
+            };
+            unsafe {
+                gicv3_init(&config);
+                virtual_timer_program(period_ticks);
+                enable_irq();
+            }
+            Ok(TimerIrqReport {
+                counter_hz: freq,
+                period_hz,
+                irq: config.timer_irq,
+                distributor_base: gicd,
+                redistributor_base,
+            })
         }
-        let config = Gicv3Config {
-            distributor_base: gicd,
-            redistributor_base,
-            redistributor_stride: DEFAULT_GICR_STRIDE,
-            timer_irq: TIMER_VIRTUAL_PPI,
-        };
-        unsafe {
-            gicv3_init(&config);
-            virtual_timer_program(period_ticks);
-            enable_irq();
+        NoDtbGicInterface::V2 { cpu_base } => {
+            let config = Gicv2Config {
+                distributor_base: gicd,
+                cpu_base,
+                timer_irq: TIMER_VIRTUAL_PPI,
+            };
+            unsafe {
+                gicv2_init(&config);
+                virtual_timer_program(period_ticks);
+                enable_irq();
+            }
+            Ok(TimerIrqReport {
+                counter_hz: freq,
+                period_hz,
+                irq: config.timer_irq,
+                distributor_base: gicd,
+                redistributor_base: 0,
+            })
         }
-        return Ok(TimerIrqReport {
-            counter_hz: freq,
-            period_hz,
-            irq: config.timer_irq,
-            distributor_base: gicd,
-            redistributor_base,
-        });
     }
-
-    // No GICv3 sysreg interface: a GICv2, which acks/EOIs through its MMIO CPU interface.
-    let cpu_base = GIC_FALLBACK_GICC.load(ORD);
-    if cpu_base == 0 {
-        return Err(TimerIrqError::NoGic);
-    }
-    let config = Gicv2Config {
-        distributor_base: gicd,
-        cpu_base,
-        timer_irq: TIMER_VIRTUAL_PPI,
-    };
-    unsafe {
-        gicv2_init(&config);
-        virtual_timer_program(period_ticks);
-        enable_irq();
-    }
-    Ok(TimerIrqReport {
-        counter_hz: freq,
-        period_hz,
-        irq: config.timer_irq,
-        distributor_base: gicd,
-        redistributor_base: 0,
-    })
 }
 
 #[cfg(not(target_os = "none"))]
@@ -3300,7 +3378,7 @@ pub fn wait_for_timer_irqs(start: u64, needed: u64, timeout_ns: u64) -> u64 {
 
 unsafe fn discover_gicv3(dtb: u64) -> Option<Gicv3Config> {
     // No device tree means no discovery — NOT "assume QEMU". The no-DTB case is the injected BSP
-    // fallback plus a GICD_PIDR2 probe, in `init_timer_interrupts` (J462). This is what the
+    // fallback plus a PE capability probe, in `init_timer_interrupts` (J462). This is what the
     // "both discoverers return None when dtb == 0" comment there always claimed and this arm
     // used to quietly contradict.
     let bytes = unsafe { dtb_bytes(dtb)? };
@@ -3757,19 +3835,25 @@ fn parse_gicv2_reg(data: &[u8], address_cells: u32, size_cells: u32) -> Option<G
 #[cfg(target_os = "none")]
 unsafe fn gicv2_init(config: &Gicv2Config) {
     GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
+    // Timer bring-up runs after KUMO installs its split tables. Address GIC MMIO through the
+    // permanent TTBR1 physmap, not a physical/TTBR0 identity alias that disappears as soon as a
+    // userspace address space becomes active. Keep the atomics physical and translate only at
+    // dereference sites, matching the rest of the HAL's injected-MMIO convention. — KESTREL
+    let distributor = mmio_phys(config.distributor_base);
+    let cpu = mmio_phys(config.cpu_base);
     let timer_bit = 1u32 << (config.timer_irq % 32);
     let bank = (config.timer_irq / 32) as u64 * 4;
 
     // Disable distributor, then enable with Group0 + Group1NS.
-    unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
-    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe { mmio_write32(distributor + GICD_CTLR, 0) };
+    unsafe { gicd_wait_rwp(distributor) };
     unsafe {
         mmio_write32(
-            config.distributor_base + GICD_CTLR,
+            distributor + GICD_CTLR,
             GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1NS,
         )
     };
-    unsafe { gicd_wait_rwp(config.distributor_base) };
+    unsafe { gicd_wait_rwp(distributor) };
 
     // Store GICv2 CPU base so the IRQ vector acks (GICC_IAR) and the handler EOIs
     // (GICC_EOIR) via MMIO rather than the GICv3 system registers.
@@ -3793,24 +3877,19 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
     // Linux's GICv2 driver does, and for the same reason.
     unsafe {
         mmio_write8(
-            config.distributor_base + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
+            distributor + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
             0x80,
         )
     };
 
     // CPU interface: allow every priority through, then enable. See above for why bit 0 is the
     // right bit in both configurations.
-    unsafe { mmio_write32(config.cpu_base + GICV2_GICC_PMR, 0xFF) };
-    unsafe { mmio_write32(config.cpu_base + GICV2_GICC_CTLR, GICV2_GICC_CTLR_ENABLE) };
+    unsafe { mmio_write32(cpu + GICV2_GICC_PMR, 0xFF) };
+    unsafe { mmio_write32(cpu + GICV2_GICC_CTLR, GICV2_GICC_CTLR_ENABLE) };
 
     // Enable the timer IRQ in the distributor: GICD_ISENABLER0 at 0x100, not the GICv3
     // redistributor's GICR_ISENABLER0 (0x10100).
-    unsafe {
-        mmio_write32(
-            config.distributor_base + GICV2_GICD_ISENABLER0 + bank,
-            timer_bit,
-        )
-    };
+    unsafe { mmio_write32(distributor + GICV2_GICD_ISENABLER0 + bank, timer_bit) };
 }
 
 #[cfg(not(target_os = "none"))]
@@ -3944,7 +4023,7 @@ pub fn clear_preempt_hook() {
 unsafe fn eoi(intid: u32) {
     let gicv2_cpu = GICV2_CPU_BASE.load(ORD);
     if gicv2_cpu != 0 {
-        unsafe { mmio_write32(gicv2_cpu + GICV2_GICC_EOIR, intid) };
+        unsafe { mmio_write32(mmio_phys(gicv2_cpu) + GICV2_GICC_EOIR, intid) };
     } else {
         unsafe {
             core::arch::asm!(
@@ -4439,7 +4518,9 @@ mod traps {
     extern "C" fn irq_ack() -> u64 {
         let gicv2_cpu = super::GICV2_CPU_BASE.load(super::ORD);
         if gicv2_cpu != 0 {
-            unsafe { super::mmio_read32(gicv2_cpu + super::GICV2_GICC_IAR) as u64 }
+            unsafe {
+                super::mmio_read32(super::mmio_phys(gicv2_cpu) + super::GICV2_GICC_IAR) as u64
+            }
         } else {
             let iar: u64;
             unsafe {
@@ -4518,35 +4599,105 @@ mod tests {
         early_console_write(b"dropped: no board has named a PL011\n");
     }
 
-    /// The mapping half of the J182 discipline: the console base is injected, and the
-    /// Stage-A tables follow it instead of assuming RAM reaches it. A board whose console
-    /// MMIO sits above the dense `[0, top)` map — the Pi 5's SoC PL011 at 0x10_7D00_1000,
-    /// ~66 GiB — is owed a targeted 2 MiB device block, aligned down. A low PL011 already
-    /// inside the map (QEMU's 0x0900_0000) is owed none; an un-named PL011 (base 0 — the
-    /// X13s) is owed none. Invisible on QEMU, whose UART is low — the same blind spot that
-    /// hid the dead baud (J465) and the dropped GICv2 interrupt (J463).
+    /// Single-base classification is the primitive for the deduplicated plan. A high Pi 5
+    /// device is aligned down; a low QEMU device and an uninjected zero are already covered or
+    /// inert. A base exactly at aligned `top` is outside the dense map and must be targeted.
     #[test]
-    fn console_mmio_above_top_maps_its_own_block() {
+    fn mmio_above_top_maps_its_own_block() {
         let ram_top = 8 * (1 << 30); // 8 GiB — a plausible Pi 5 RAM top
-                                     // Pi 5 uart10: above RAM, so its 2 MiB block (aligned down) is mapped on its own.
+                                     // Pi 5 uart10: above RAM, align down to its 2 MiB block.
         assert_eq!(
-            console_mmio_block_above_top(0x10_7D00_1000, ram_top),
+            mmio_block_above_top(0x10_7D00_1000, ram_top),
             Some(0x10_7D00_0000)
         );
-        // Explicit current-firmware RP1 UART0 route: same mapper, different selected block.
+        // Explicit current-firmware RP1 UART0 route: same classifier, different block.
         assert_eq!(
-            console_mmio_block_above_top(0x1c_0003_0000, ram_top),
+            mmio_block_above_top(0x1c_0003_0000, ram_top),
             Some(0x1c_0000_0000)
         );
-        // QEMU's low PL011 already lies inside [0, top); the dense loop covered it.
-        assert_eq!(console_mmio_block_above_top(0x0900_0000, ram_top), None);
-        // No board named a PL011 (the X13s): nothing to map.
-        assert_eq!(console_mmio_block_above_top(0, ram_top), None);
+        assert_eq!(mmio_block_above_top(0x0900_0000, ram_top), None);
+        assert_eq!(mmio_block_above_top(0, ram_top), None);
         // Boundary: a base exactly at `top` is outside the half-open `[0, top)` and owed.
-        assert_eq!(
-            console_mmio_block_above_top(ram_top, ram_top),
-            Some(ram_top)
+        assert_eq!(mmio_block_above_top(ram_top, ram_top), Some(ram_top));
+    }
+
+    /// Pi 5's two GIC-400 interfaces occupy one high 2 MiB block. Prove both console choices
+    /// remain independent and the GICD/GICC duplicate never causes a second descriptor write.
+    #[test]
+    fn pi5_targeted_mmio_plan_maps_console_and_one_deduplicated_gic_block() {
+        let ram_top = 8 * (1 << 30);
+        let uart10 = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x10_7D00_1000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
         );
+        assert_eq!(uart10.as_slice(), &[0x10_7D00_0000, 0x10_7fe0_0000]);
+
+        let rp1 = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x1c_0003_0000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
+        );
+        assert_eq!(rp1.as_slice(), &[0x1c_0000_0000, 0x10_7fe0_0000]);
+    }
+
+    /// Deduplication is source-agnostic: even a console in the same block as GICD/GICC is mapped
+    /// once. Conversely all low QEMU fallback interfaces are supplied by the dense map.
+    #[test]
+    fn targeted_mmio_plan_deduplicates_console_collisions_and_omits_low_devices() {
+        let ram_top = 8 * (1 << 30);
+        let collision = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x10_7fff_a000,
+            0x10_7fff_9000,
+            0,
+            0x10_7fff_a000,
+        );
+        assert_eq!(collision.as_slice(), &[0x10_7fe0_0000]);
+
+        let qemu = targeted_mmio_blocks_above_top(
+            ram_top,
+            0x0900_0000,
+            0x0800_0000,
+            0x080a_0000,
+            0x0801_0000,
+        );
+        assert!(qemu.as_slice().is_empty());
+    }
+
+    /// A board-scoped single secondary is decisive: Pi 5's GICC-only fallback is GICv2 even on
+    /// a modern PE. QEMU names both possible secondaries, so its launch-time PE capability picks
+    /// the matching interface. Missing/incompatible shapes fail rather than inventing a base.
+    #[test]
+    fn no_dtb_gic_interface_selection_respects_board_shape_then_pe_capability() {
+        let pi_gicc = 0x10_7fff_a000;
+        assert_eq!(
+            select_no_dtb_gic_interface(false, 0, pi_gicc),
+            Some(NoDtbGicInterface::V2 { cpu_base: pi_gicc })
+        );
+        assert_eq!(
+            select_no_dtb_gic_interface(true, 0, pi_gicc),
+            Some(NoDtbGicInterface::V2 { cpu_base: pi_gicc })
+        );
+
+        assert_eq!(
+            select_no_dtb_gic_interface(false, 0x080a_0000, 0x0801_0000),
+            Some(NoDtbGicInterface::V2 {
+                cpu_base: 0x0801_0000
+            })
+        );
+        assert_eq!(
+            select_no_dtb_gic_interface(true, 0x080a_0000, 0x0801_0000),
+            Some(NoDtbGicInterface::V3 {
+                redistributor_base: 0x080a_0000
+            })
+        );
+        assert_eq!(select_no_dtb_gic_interface(false, 0, 0), None);
+        assert_eq!(select_no_dtb_gic_interface(false, 0x080a_0000, 0), None);
     }
 
     #[test]

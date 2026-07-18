@@ -6,6 +6,7 @@
 //j462
 //j465
 //j467
+//j468
 
 extern crate alloc;
 
@@ -109,11 +110,13 @@ const fn plausible_pl011_base(base: u64) -> bool {
     base != 0 && base < (1u64 << 48) && base & 0xfff == 0
 }
 
-/// Where this board's GIC lives when the firmware publishes no device tree, or `None` when the
-/// board's firmware always provides one (every board but QEMU) or its identity is unstamped.
+/// Where this board's GIC lives when firmware publishes no device tree, or `None` when the boot
+/// path guarantees a DT or the board identity is unstamped. QEMU/OVMF publishes none; Pi 5 UEFI
+/// can deliberately publish ACPI only even though Raspberry Pi firmware loaded a DTB first.
 ///
-/// Carries addresses only — never a version. See `kumo_bsp::GicVersion` for why the version is
-/// probed from the distributor instead (DESIGN/017 §4.4).
+/// Carries addresses only — never a version. A single injected secondary interface fixes the
+/// architecture; if both GICC and GICR are present (QEMU), the HAL uses the PE capability to
+/// select the launch-time controller (DESIGN/017 §4.4).
 fn board_gic_no_dtb_fallback(boot: &BootInfo) -> Option<kumo_bsp::GicFallback> {
     if boot.version != ABI_VERSION {
         return None;
@@ -226,11 +229,11 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         kumo_hal::active::console_set_pl011_base(base);
     }
 
-    // Same shape for the interrupt controller (DESIGN/017 §4.4). A device tree, when the firmware
-    // publishes one, names the GIC better than any table can and the HAL prefers it; this only
-    // covers the board that has none (QEMU virt under OVMF). The board says WHERE its GIC is —
-    // the HAL asks the distributor itself WHAT it is, because on QEMU the version is chosen at
-    // launch (`-machine virt,gic-version=`) and no board table can know it.
+    // Same shape for the interrupt controller (DESIGN/017 §4.4). A device tree, when firmware
+    // publishes one, names the GIC better than any table can and the HAL prefers it. The injected
+    // fallback covers genuine no-DT paths: QEMU/OVMF and Pi 5 UEFI in its default ACPI-only mode.
+    // A board with one secondary interface fixes the architecture; QEMU supplies both, so the PE
+    // capability selects its launch-time `-machine virt,gic-version=` controller.
     if let Some(gic) = board_gic_no_dtb_fallback(boot) {
         kumo_hal::active::gic_set_no_dtb_fallback(
             gic.distributor_base,
@@ -399,7 +402,13 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 p.tables
             )
         }
-        None => klog!("ROOTING TABLES     Check     no usable memory map      --\n"),
+        None => {
+            // Every permanent device path below (including GICv2 IAR/EOIR) uses TTBR1's
+            // physmap so a userspace TTBR0 cannot cut the kernel off from MMIO. Continuing
+            // without those tables would turn the first access into a second-stage fault.
+            klog!("ROOTING TABLES     Check     no usable memory map   FAIL\n");
+            kumo_hal::active::halt();
+        }
     }
 
     match kumo_hal::active::init_timer_interrupts(boot.platform.dtb, 20) {
@@ -2210,6 +2219,19 @@ mod tests {
         boot.platform.pl011_console_base = 0x1c_0003_0000;
         assert_eq!(board_console_pl011_base(&boot), None);
         assert_eq!(board_gic_no_dtb_fallback(&boot), None);
+    }
+
+    /// Pi 5 UEFI defaults to ACPI-only system tables, so the stamped board must still inject the
+    /// fixed BCM2712 GIC-400 pair when no DT reaches KUMO. These are addresses, not a guessed
+    /// architecture selector; DT remains authoritative when one is present.
+    #[test]
+    fn pi5_yields_its_gic400_no_dtb_fallback() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("raspberry-pi-5");
+        let fallback = board_gic_no_dtb_fallback(&boot).unwrap();
+        assert_eq!(fallback.distributor_base, 0x10_7fff_9000);
+        assert_eq!(fallback.redistributor_base, None);
+        assert_eq!(fallback.cpu_base, Some(0x10_7fff_a000));
     }
 
     /// An unstamped or unrecognized board injects nothing. Guessing QEMU's base here is exactly

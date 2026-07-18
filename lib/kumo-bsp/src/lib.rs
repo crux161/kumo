@@ -1,5 +1,6 @@
 #![no_std]
 //j434
+//j468
 
 //! `kumo-bsp` — the Board Support Package: the **runtime** board-specific parameters the
 //! generic arm64 kernel and HAL must not hardcode.
@@ -24,7 +25,7 @@
 //! few fixed facts needed before or instead of DTB parsing (`DESIGN/017` §5).
 //!
 //! See `DESIGN/017-board-support-package.md` for the roadmap, what has actually landed, and what
-//! remains owed on metal (§6 — none of this is confirmed on a Pi 5 or an X13s).
+//! remains owed on metal (§6).
 
 /// A board KUMO's aarch64 build can run on. Mirrors the aarch64 variants of
 /// `imager::HardwareTarget`; [`Board::id`] matches that target's `id` string so build-time and
@@ -79,11 +80,10 @@ impl Console {
 ///
 /// **This is the board's documented version, not the authority.** When the firmware publishes a
 /// device tree, the GIC node's `compatible` names the version and wins — it knows more than this
-/// table does. When there is no device tree, the HAL reads the distributor's own `GICD_PIDR2`
-/// ArchRev field rather than trusting this field, because on QEMU the GIC version is a *launch*
-/// property (`-machine virt,gic-version=`), not a board property: the same `qemu-virt-aarch64`
-/// image legitimately runs on either. Treat this as documentation and as a cross-check, never as
-/// the selector (J462).
+/// table does. Without a DT, a board that names only GICC or only GICR fixes its interface by
+/// construction. If it names both, the HAL reads `ID_AA64PFR0_EL1.GIC` rather than trusting this
+/// field: QEMU's version is a *launch* property (`-machine virt,gic-version=`), not a board
+/// property. Treat this as documentation and as a cross-check, never as the selector (J462).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GicVersion {
     V2,
@@ -94,12 +94,12 @@ pub enum GicVersion {
 /// the BSP must carry MMIO bases, because there is no richer source to read them from
 /// (DESIGN/017 §5: "the few fixed parameters needed before/instead of DTB parsing").
 ///
-/// Which of the two secondary bases is live depends on the GIC architecture the distributor
-/// actually reports, which the HAL probes; a board may legitimately populate both.
+/// A board may populate one secondary when its controller is fixed, or both when the runtime
+/// environment chooses between architectures (QEMU). The HAL resolves the latter from the PE.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GicFallback {
-    /// GIC distributor base. Same address for GICv2 and GICv3 on every board here, which is why
-    /// it is safe to probe `GICD_PIDR2` before knowing the version.
+    /// GIC distributor base. Architecture selection comes from the available secondary-interface
+    /// shape, with the PE capability resolving only a board that supplies both GICC and GICR.
     pub distributor_base: u64,
     /// GICv3 redistributor base; `None` if this board never exposes a GICv3.
     pub redistributor_base: Option<u64>,
@@ -120,8 +120,8 @@ pub struct BoardSpec {
     /// [`GicVersion`].
     pub gic: GicVersion,
     /// Where the GIC lives when the firmware publishes no device tree. `None` for boards whose
-    /// firmware always provides one (the X13s stages its own; EDK2 publishes the Pi 5's), which
-    /// is the normal case — the DTB is richer and stays authoritative (DESIGN/017 §5).
+    /// boot path guarantees one. A present DTB is richer and stays authoritative
+    /// (DESIGN/017 §5); this is only the board-scoped escape hatch when the handoff omits it.
     pub gic_fallback: Option<GicFallback>,
 }
 
@@ -139,7 +139,7 @@ impl Board {
                 // is the one board that must name its GIC here. Addresses are QEMU's fixed virt
                 // memmap: VIRT_GIC_DIST, VIRT_GIC_CPU, VIRT_GIC_REDIST. Both secondaries are
                 // populated because `-machine virt,gic-version=2|3` picks which exists at run
-                // time; the HAL probes GICD_PIDR2 to find out (J462).
+                // time; the HAL reads the PE's GIC system-register capability to find out (J462).
                 gic_fallback: Some(GicFallback {
                     distributor_base: 0x0800_0000,
                     redistributor_base: Some(0x080a_0000),
@@ -178,9 +178,17 @@ impl Board {
                 },
                 // BCM2712 uses GIC-400 (GICv2), implemented since J107/J176/J212.
                 gic: GicVersion::V2,
-                // EDK2 for the Pi 5 publishes a device tree via the firmware handoff, which names
-                // the GIC-400 and its bases (J212 parses them for real).
-                gic_fallback: None,
+                // Raspberry Pi firmware loads bcm2712-rpi-5-b.dtb, but RPi5 UEFI can boot in an
+                // ACPI-only table mode and then publish no EFI DT configuration table to KUMO.
+                // Keep the DT authoritative whenever it is handed off; otherwise use the fixed
+                // BCM2712 GIC-400 bases from the official board DT: distributor
+                // 0x10_7fff9000 and CPU interface 0x10_7fffa000. There is no GICv3
+                // redistributor on this board. — KESTREL 2026-07-17
+                gic_fallback: Some(GicFallback {
+                    distributor_base: 0x10_7fff_9000,
+                    redistributor_base: None,
+                    cpu_base: Some(0x10_7fff_a000),
+                }),
             },
             Board::OrangePi5Plus => BoardSpec {
                 id: "orange-pi-5-plus",
@@ -257,21 +265,23 @@ mod tests {
         assert_ne!(spec.console.pl011_base(), Some(0x0900_0000));
     }
 
-    /// QEMU is the only board with no firmware device tree, so it is the only one that must name
-    /// its GIC here. Both secondaries are populated because `gic-version=` decides which exists.
+    /// QEMU and Pi 5 can both reach KUMO without an EFI DT configuration table. QEMU names both
+    /// secondary interfaces because `gic-version=` decides which exists; the Pi 5 names only its
+    /// documented GIC-400 CPU interface. Boards with guaranteed DT handoff stay empty.
     #[test]
-    fn only_the_dtb_less_board_carries_a_gic_fallback() {
+    fn only_boards_with_a_real_no_dtb_path_carry_gic_fallbacks() {
         let qemu = Board::QemuVirtAarch64.spec().gic_fallback.unwrap();
         assert_eq!(qemu.distributor_base, 0x0800_0000);
         assert_eq!(qemu.redistributor_base, Some(0x080a_0000));
         assert_eq!(qemu.cpu_base, Some(0x0801_0000));
 
-        // Every board whose firmware publishes a device tree defers to it.
-        for board in [
-            Board::ThinkPadX13sGen1,
-            Board::RaspberryPi5,
-            Board::OrangePi5Plus,
-        ] {
+        let pi5 = Board::RaspberryPi5.spec().gic_fallback.unwrap();
+        assert_eq!(pi5.distributor_base, 0x10_7fff_9000);
+        assert_eq!(pi5.redistributor_base, None);
+        assert_eq!(pi5.cpu_base, Some(0x10_7fff_a000));
+
+        // These boot paths guarantee a DT and therefore need no lower-authority fallback.
+        for board in [Board::ThinkPadX13sGen1, Board::OrangePi5Plus] {
             assert_eq!(board.spec().gic_fallback, None, "board {}", board.id());
         }
     }

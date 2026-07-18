@@ -2,6 +2,7 @@
 #j213
 #j330
 #j467
+#j468
 
 # build.sh — quick staging, deploy, and boot-media entry point.
 #
@@ -62,6 +63,8 @@ build_pi5() {
         echo "    explicit serial route: $PI5_CONSOLE_UART"
         cargo xtask image --arch aarch64 --hardware rpi5 --console-uart "$PI5_CONSOLE_UART"
     else
+        echo "    serial route: BSP uart10 (3-pin debug connector)"
+        echo "    RP1 40-pin route requires KUMO_PI5_CONSOLE_UART=pl011@<firmware RP1_UART base>"
         cargo xtask image --arch aarch64 --hardware rpi5
     fi
     if [ -x "scripts/mk-pi5-img.sh" ]; then
