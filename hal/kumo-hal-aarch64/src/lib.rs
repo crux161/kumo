@@ -7,6 +7,7 @@
 //j466
 //j467
 //j468
+//j469
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2066,6 +2067,11 @@ pub mod el0 {
         "  ldr  x10, [x9, #264]", // sp_el0
         "  msr  sp_el0, x10",
         "  ldr  x10, [x9, #272]", // ttbr0 (process page tables)
+        // Publish every page-table write before the new root becomes visible to the walker.
+        // `set_ttbr0` already begins with this barrier; fresh scheduler entry must obey the same
+        // contract. Without it a real core may observe the L3 table before its leaf descriptor,
+        // even though QEMU reaches EL0. — KESTREL 2026-07-17
+        "  dsb  ish",
         "  msr  ttbr0_el1, x10",
         "  isb",
         "  tlbi vmalle1",

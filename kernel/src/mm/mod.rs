@@ -3,6 +3,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range};
 use kumo_hal::PageFlags;
 
+//j469
+
 pub mod heap;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -30,9 +32,23 @@ pub unsafe fn alloc_zeroed_frame(boot: &BootInfo) -> Option<u64> {
     let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
     let mut frames = plan.frame_allocator();
     let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
+    #[cfg(feature = "arch_aarch64")]
+    let framebuffer = boot_framebuffer_range(boot);
     loop {
         let frame = frames.next_frame()?.start;
         if frame < watermark {
+            continue;
+        }
+        // The AArch64 permanent identity/physmap is built from 2 MiB blocks. Do not hand a
+        // page-table or userspace backing frame to code that will access it as Normal-WB when
+        // its identity alias is Device or framebuffer Normal-NC. A firmware map may split DRAM
+        // at boundaries that are not 2 MiB aligned; accepting an arbitrary Usable page from a
+        // conservatively typed boundary block creates incompatible Normal/Device aliases. QEMU is
+        // permissive; Cortex-A76 can then observe a zero L3 leaf on the first EL0 fetch. The
+        // generic boot allocator remains an accounting primitive; only fresh AArch64 frames
+        // carry this current coarse-mapper constraint. — KESTREL 2026-07-17
+        #[cfg(feature = "arch_aarch64")]
+        if !normal_identity_block(plan.regions(), framebuffer, frame & !(BLOCK_2M - 1)) {
             continue;
         }
         FRAME_WATERMARK.store(frame.saturating_add(PAGE_SIZE), Ordering::Relaxed);
@@ -60,6 +76,33 @@ fn is_ram_kind(kind: MemRegionKind) -> bool {
     )
 }
 
+fn boot_framebuffer_range(boot: &BootInfo) -> Range {
+    if boot.has_framebuffer() {
+        Range::new(boot.framebuffer.phys, boot.framebuffer.len)
+    } else {
+        Range::empty()
+    }
+}
+
+/// Whether the permanent AArch64 coarse map will give this aligned 2 MiB block one unambiguous
+/// Normal-WB identity/physmap alias. The current conservative policy requires one RAM descriptor
+/// to contain the whole block; adjacent fragments are not treated as proof that every byte has
+/// the same memory type without a page-granular mapper.
+/// A framebuffer overlap wins and makes the whole block Normal-NC in the HAL, so it is not a safe
+/// source for page tables or ordinary user RAM even outside the exact scanout bytes.
+fn normal_identity_block(regions: &[MemRegion], framebuffer: Range, block: u64) -> bool {
+    if block & (BLOCK_2M - 1) != 0 || overlaps(block, BLOCK_2M, framebuffer.start, framebuffer.len)
+    {
+        return false;
+    }
+    let Some(end) = block.checked_add(BLOCK_2M) else {
+        return false;
+    };
+    regions.iter().any(|region| {
+        is_ram_kind(region.kind) && region.range.start <= block && end <= region.range.end()
+    })
+}
+
 /// Build KUMO-owned page tables with frames supplied by `alloc`, then switch to them.
 /// RAM becomes cacheable, while unlisted/MMIO ranges and the framebuffer receive the
 /// architecture's conservative device policy.
@@ -82,25 +125,18 @@ pub unsafe fn enable_paging_with_allocator(
     for region in regions {
         top = top.max(region.range.end());
     }
-    let (fb_phys, fb_len) = if boot.has_framebuffer() {
-        (boot.framebuffer.phys, boot.framebuffer.len)
-    } else {
-        (0, 0)
-    };
+    let framebuffer = boot_framebuffer_range(boot);
+    let (fb_phys, fb_len) = (framebuffer.start, framebuffer.len);
     top = top.max(fb_phys.saturating_add(fb_len));
     top = top.div_ceil(GIB).saturating_mul(GIB);
     if top == 0 {
         return None;
     }
 
-    let is_ram = |pa: u64| {
-        let Some(end) = pa.checked_add(BLOCK_2M) else {
-            return false;
-        };
-        regions.iter().any(|region| {
-            is_ram_kind(region.kind) && region.range.start <= pa && end <= region.range.end()
-        })
-    };
+    // Share the exact block predicate with AArch64 fresh-frame allocation. If these two policies
+    // drift, a frame can acquire a Device/Normal or NC/Normal alias when it becomes a page table
+    // or user page — architecturally invalid even when QEMU happens to accept it.
+    let is_ram = |pa: u64| normal_identity_block(regions, framebuffer, pa);
 
     let kernel = boot.kernel_phys;
     let kernel_virt = boot.kernel_virt;
@@ -641,6 +677,56 @@ mod tests {
         assert_eq!(report.sample_frames[0], 0x1000);
         assert_eq!(report.sample_frames[1], 0x3000); // 0x2000 excluded (kernel)
         assert_eq!(report.sample_frames[2], 0x4000);
+    }
+
+    /// Pi-style UEFI fragmentation must never let the fresh-frame path choose a page whose
+    /// containing coarse identity block is Device/NC while TTBR walks and user mappings call the
+    /// same PA Normal-WB. Keep this predicate identical to `enable_paging`'s block classifier.
+    #[test]
+    fn normal_identity_blocks_reject_fragments_and_framebuffer_aliases() {
+        let regions = [
+            // A usable boundary fragment: candidate pages exist, but block 0 is not wholly RAM.
+            MemRegion {
+                range: Range::new(0x1000, BLOCK_2M - 0x1000),
+                kind: MemRegionKind::Usable,
+                _reserved: 0,
+            },
+            // One complete aligned block: the first safe source for fresh AArch64 frames.
+            MemRegion {
+                range: Range::new(BLOCK_2M, BLOCK_2M),
+                kind: MemRegionKind::Usable,
+                _reserved: 0,
+            },
+            // Two adjacent RAM descriptors are not one conservatively proven L2 RAM block.
+            MemRegion {
+                range: Range::new(2 * BLOCK_2M, BLOCK_2M / 2),
+                kind: MemRegionKind::Usable,
+                _reserved: 0,
+            },
+            MemRegion {
+                range: Range::new(2 * BLOCK_2M + BLOCK_2M / 2, BLOCK_2M / 2),
+                kind: MemRegionKind::Bootloader,
+                _reserved: 0,
+            },
+        ];
+
+        assert!(!normal_identity_block(&regions, Range::empty(), 0));
+        assert!(normal_identity_block(&regions, Range::empty(), BLOCK_2M));
+        assert!(!normal_identity_block(
+            &regions,
+            Range::empty(),
+            2 * BLOCK_2M
+        ));
+        assert!(!normal_identity_block(
+            &regions,
+            Range::new(BLOCK_2M + 0x1f_0000, PAGE_SIZE),
+            BLOCK_2M
+        ));
+        assert!(!normal_identity_block(
+            &regions,
+            Range::empty(),
+            BLOCK_2M + PAGE_SIZE
+        ));
     }
 
     #[test]
