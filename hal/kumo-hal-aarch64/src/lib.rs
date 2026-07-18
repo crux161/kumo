@@ -3476,12 +3476,18 @@ unsafe fn gicv3_init(_config: &Gicv3Config) {}
 // GICv2 GICC (CPU interface) registers, relative to the GICC base.
 const GICV2_GICC_CTLR: u64 = 0x0000;
 const GICV2_GICC_PMR: u64 = 0x0004;
-const GICV2_GICC_CTLR_ENABLE_GRP1NS: u32 = 1;
+/// `GICC_CTLR` bit 0. Deliberately **not** named for a group: which group it enables depends on
+/// the GIC's configuration, and misnaming it is what cost J463 an interrupt.
+///
+///  * Without Security Extensions (QEMU virt): bit 0 = `EnableGrp0`, bit 1 = `EnableGrp1`.
+///  * With Security Extensions, Non-secure view (GIC-400 behind ATF): bit 0 = `EnableGrp1`.
+///
+/// Both configurations agree that bit 0 enables *the group non-secure interrupts land in*, so
+/// long as nobody re-groups them behind the CPU interface's back — see `gicv2_init`.
+const GICV2_GICC_CTLR_ENABLE: u32 = 1;
 
 // GICv2 GICD (distributor) registers, relative to the GICD base. These are the
 // *distributor* banks — distinct from the GICv3 redistributor (GICR_*) offsets.
-#[cfg(target_os = "none")]
-const GICV2_GICD_IGROUPR0: u64 = 0x0080;
 #[cfg(target_os = "none")]
 const GICV2_GICD_ISENABLER0: u64 = 0x0100;
 #[cfg(target_os = "none")]
@@ -3699,12 +3705,22 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
     // (GICC_EOIR) via MMIO rather than the GICv3 system registers.
     GICV2_CPU_BASE.store(config.cpu_base, ORD);
 
-    // Configure the timer PPI explicitly rather than trusting firmware state: put it in
-    // Group1NS and give it a mid priority. These are distributor banks (GICD_*), NOT the
-    // GICv3 redistributor (GICR_*) banks — those don't exist on a GIC-400.
-    let group =
-        unsafe { mmio_read32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank) } | timer_bit;
-    unsafe { mmio_write32(config.distributor_base + GICV2_GICD_IGROUPR0 + bank, group) };
+    // Do NOT touch GICD_IGROUPR here. Moving the PPI to Group 1 is a GICv3 habit (there,
+    // GICR_IGROUPR0 must name Group1NS) and it is actively wrong on a GICv2, because the meaning
+    // of `GICC_CTLR` bit 0 is not fixed across the two configurations:
+    //
+    //   * GICv2 WITHOUT Security Extensions (QEMU virt): bit 0 = EnableGrp0, bit 1 = EnableGrp1,
+    //     and GICD_IGROUPR is writable. Putting the PPI in Group 1 while enabling only bit 0
+    //     leaves it forwarded by the distributor and dropped by the CPU interface — J463's
+    //     "IRQ 27 heartbeat timeout (0t)", observed with IGROUPR0=0x08000000, GICC_CTLR=0x1.
+    //   * GICv2 WITH Security Extensions, Non-secure view (GIC-400 behind ATF, the Pi 5): bit 0
+    //     = EnableGrp1, and GICD_IGROUPR is Secure-only (RAZ/WI from here), so this write never
+    //     did anything on that path regardless.
+    //
+    // Leaving the group alone makes bit 0 mean "enable the group my interrupt is actually in" in
+    // both configurations — Group 0 where there are no Security Extensions (the reset state), and
+    // Group 1 where secure firmware has already placed the non-secure interrupts. This is what
+    // Linux's GICv2 driver does, and for the same reason.
     unsafe {
         mmio_write8(
             config.distributor_base + GICV2_GICD_IPRIORITYR + config.timer_irq as u64,
@@ -3712,14 +3728,10 @@ unsafe fn gicv2_init(config: &Gicv2Config) {
         )
     };
 
-    // CPU interface: set priority mask to allow all, enable Group1NS.
+    // CPU interface: allow every priority through, then enable. See above for why bit 0 is the
+    // right bit in both configurations.
     unsafe { mmio_write32(config.cpu_base + GICV2_GICC_PMR, 0xFF) };
-    unsafe {
-        mmio_write32(
-            config.cpu_base + GICV2_GICC_CTLR,
-            GICV2_GICC_CTLR_ENABLE_GRP1NS,
-        )
-    };
+    unsafe { mmio_write32(config.cpu_base + GICV2_GICC_CTLR, GICV2_GICC_CTLR_ENABLE) };
 
     // Enable the timer IRQ in the distributor: GICD_ISENABLER0 at 0x100, not the GICv3
     // redistributor's GICR_ISENABLER0 (0x10100).
