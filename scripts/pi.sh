@@ -1,0 +1,3 @@
+#!/bin/sh
+
+KUMO_PI5_CONSOLE_UART=pl011@0x1c00030000 KUMO_NO_OPEN=1 ./build.sh all
