@@ -2660,9 +2660,24 @@ pub unsafe fn enable_kernel_mmu(
 // ---- GICv3 + ARM virtual timer IRQs ---------------------------------
 
 const TIMER_VIRTUAL_PPI: u32 = 27;
-const QEMU_GICD_BASE: u64 = 0x0800_0000;
-const QEMU_GICR_BASE: u64 = 0x080a_0000;
 const DEFAULT_GICR_STRIDE: u64 = 0x0002_0000;
+
+// ---- No-DTB GIC fallback (injected from the BSP) ---------------------
+//
+// When the firmware publishes a device tree, it names both the GIC's version (its `compatible`)
+// and its bases, and it wins — see `init_timer_interrupts`. When it does not (QEMU virt under
+// OVMF publishes none), this backend used to *assume* "you are QEMU, with a GICv3 at
+// 0x0800_0000/0x080a_0000". That guess is wrong whenever QEMU is launched `-machine
+// virt,gic-version=2`, and writing a redistributor the machine never created takes an external
+// abort at GIC init. So: the board says WHERE its GIC is (these, injected from its BSP entry),
+// and the GIC itself says WHAT it is (`GICD_PIDR2`). This backend names no board address. — J462
+
+/// Injected GIC distributor base for the no-DTB path; 0 = the board named none.
+static GIC_FALLBACK_GICD: AtomicU64 = AtomicU64::new(0);
+/// Injected GICv3 redistributor base for the no-DTB path; 0 = this board exposes no GICv3.
+static GIC_FALLBACK_GICR: AtomicU64 = AtomicU64::new(0);
+/// Injected GICv2 CPU-interface base for the no-DTB path; 0 = this board exposes no GICv2.
+static GIC_FALLBACK_GICC: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "none")]
 const GICD_CTLR: u64 = 0x0000;
@@ -2982,12 +2997,44 @@ pub struct Gicv2Config {
     pub timer_irq: u32,
 }
 
-const QEMU_GICV3: Gicv3Config = Gicv3Config {
-    distributor_base: QEMU_GICD_BASE,
-    redistributor_base: QEMU_GICR_BASE,
-    redistributor_stride: DEFAULT_GICR_STRIDE,
-    timer_irq: TIMER_VIRTUAL_PPI,
-};
+/// Tell this backend where the board's GIC is, for the case where the firmware publishes no
+/// device tree. Pass 0 for a base the board does not expose. The kernel calls this from the
+/// board's BSP entry before [`init_timer_interrupts`]; a board that supplies nothing (or never
+/// calls this) and has no DTB gets [`TimerIrqError::NoGic`] rather than a guessed address.
+///
+/// Only the *addresses* come from the board. Which GIC architecture lives there is read from the
+/// distributor's own `GICD_PIDR2`, because on QEMU the version is a launch-time property that no
+/// board table can know (DESIGN/017 §4.4, J462).
+pub fn gic_set_no_dtb_fallback(distributor_base: u64, redistributor_base: u64, cpu_base: u64) {
+    GIC_FALLBACK_GICD.store(distributor_base, ORD);
+    GIC_FALLBACK_GICR.store(redistributor_base, ORD);
+    GIC_FALLBACK_GICC.store(cpu_base, ORD);
+}
+
+/// Whether this PE implements the GICv3/v4 CPU-interface **system registers**, from
+/// `ID_AA64PFR0_EL1.GIC` (bits [27:24]; 0 = none, nonzero = GICv3+ sysreg interface). This is the
+/// GIC-architecture discriminator for the no-DTB path.
+///
+/// Why not read the distributor's `GICD_PIDR2` ArchRev, the obvious choice? Because it cannot be
+/// read blind: GICv2 places PIDR2 at `0xFE8` inside a 4 KiB distributor, GICv3 places it at
+/// `0xFFE8` inside a 64 KiB one. You must already know the architecture to know where its
+/// identity register is, and guessing wrong is an external abort, not a wrong answer — proved on
+/// QEMU `-machine virt,gic-version=2`, which aborts on the `0xFFE8` read (FAR=0x0800ffe8).
+///
+/// This register needs no MMIO, is always readable at EL1, cannot fault, and is precisely what
+/// QEMU toggles for `-machine virt,gic-version=`. It is also the same fact that makes
+/// `icc_iar1_el1` legal or UNDEFINED (see `GICV2_GICC_IAR`), so the probe and the EOI path agree
+/// by construction.
+///
+/// Limitation: a PE with a memory-mapped-only GICv3 reports 0 here and would be driven as GICv2.
+/// No board we support is built that way, and every board that could be has a device tree, which
+/// wins before this code runs.
+#[cfg(target_os = "none")]
+fn pe_has_gicv3_sysreg_interface() -> bool {
+    let pfr0: u64;
+    unsafe { core::arch::asm!("mrs {}, ID_AA64PFR0_EL1", out(reg) pfr0, options(nostack, nomem)) };
+    (pfr0 >> 24) & 0xf != 0
+}
 
 pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport, TimerIrqError> {
     if period_hz == 0 {
@@ -3001,7 +3048,12 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
 
     let period_ticks = core::cmp::max(freq / period_hz, 1);
 
-    // GICv3 first (x13s, QEMU virt). Both discoverers return `None` when `dtb == 0`.
+    // A device tree is the best source there is: its GIC node names the architecture (its
+    // `compatible`) AND the bases. Try it first and let it win. Both discoverers return `None`
+    // when `dtb == 0`, which drops through to the probe path below.
+    //
+    // GICv3 first (x13s), then GICv2 (Pi 5 / GIC-400) — the `compatible` strings are disjoint, so
+    // the order is a formality, not a guess.
     if let Some(config) = unsafe { discover_gicv3(dtb) } {
         // Also discover PDC.
         unsafe { discover_pdc(dtb) };
@@ -3043,6 +3095,91 @@ pub fn init_timer_interrupts(dtb: u64, period_hz: u64) -> Result<TimerIrqReport,
         });
     }
 
+    // No device tree. The board's BSP entry named where its GIC is; ask the distributor itself
+    // which architecture it implements rather than assuming (J462). On QEMU the answer depends on
+    // `-machine virt,gic-version=`, which no board table can know.
+    unsafe { init_timer_interrupts_probed(period_ticks, freq, period_hz) }
+}
+
+/// The no-DTB path: probe `GICD_PIDR2` at the injected distributor base and bring up whichever
+/// GIC is actually there.
+///
+/// # Safety
+/// Must run with the injected GIC bases mapped, at EL1, during Stage-A bring-up.
+#[cfg(target_os = "none")]
+unsafe fn init_timer_interrupts_probed(
+    period_ticks: u64,
+    freq: u64,
+    period_hz: u64,
+) -> Result<TimerIrqReport, TimerIrqError> {
+    let gicd = GIC_FALLBACK_GICD.load(ORD);
+    if gicd == 0 {
+        // No DTB and no board fallback: we do not know where a GIC is, and will not guess.
+        return Err(TimerIrqError::NoGic);
+    }
+
+    TIMER_PERIOD_TICKS.store(period_ticks, ORD);
+    TIMER_IRQ_ID.store(TIMER_VIRTUAL_PPI, ORD);
+    TIMER_IRQ_COUNT.store(0, ORD);
+
+    if pe_has_gicv3_sysreg_interface() {
+        // GICv3/v4: EOI rides the system registers, and the PPI lives in a redistributor.
+        let redistributor_base = GIC_FALLBACK_GICR.load(ORD);
+        if redistributor_base == 0 {
+            // The PE speaks GICv3 but the board named no redistributor: refuse rather than
+            // invent one.
+            return Err(TimerIrqError::NoGic);
+        }
+        let config = Gicv3Config {
+            distributor_base: gicd,
+            redistributor_base,
+            redistributor_stride: DEFAULT_GICR_STRIDE,
+            timer_irq: TIMER_VIRTUAL_PPI,
+        };
+        unsafe {
+            gicv3_init(&config);
+            virtual_timer_program(period_ticks);
+            enable_irq();
+        }
+        return Ok(TimerIrqReport {
+            counter_hz: freq,
+            period_hz,
+            irq: config.timer_irq,
+            distributor_base: gicd,
+            redistributor_base,
+        });
+    }
+
+    // No GICv3 sysreg interface: a GICv2, which acks/EOIs through its MMIO CPU interface.
+    let cpu_base = GIC_FALLBACK_GICC.load(ORD);
+    if cpu_base == 0 {
+        return Err(TimerIrqError::NoGic);
+    }
+    let config = Gicv2Config {
+        distributor_base: gicd,
+        cpu_base,
+        timer_irq: TIMER_VIRTUAL_PPI,
+    };
+    unsafe {
+        gicv2_init(&config);
+        virtual_timer_program(period_ticks);
+        enable_irq();
+    }
+    Ok(TimerIrqReport {
+        counter_hz: freq,
+        period_hz,
+        irq: config.timer_irq,
+        distributor_base: gicd,
+        redistributor_base: 0,
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+unsafe fn init_timer_interrupts_probed(
+    _period_ticks: u64,
+    _freq: u64,
+    _period_hz: u64,
+) -> Result<TimerIrqReport, TimerIrqError> {
     Err(TimerIrqError::NoGic)
 }
 
@@ -3065,8 +3202,12 @@ pub fn wait_for_timer_irqs(start: u64, needed: u64, timeout_ns: u64) -> u64 {
 }
 
 unsafe fn discover_gicv3(dtb: u64) -> Option<Gicv3Config> {
+    // No device tree means no discovery — NOT "assume QEMU". The no-DTB case is the injected BSP
+    // fallback plus a GICD_PIDR2 probe, in `init_timer_interrupts` (J462). This is what the
+    // "both discoverers return None when dtb == 0" comment there always claimed and this arm
+    // used to quietly contradict.
     if dtb == 0 {
-        return Some(QEMU_GICV3);
+        return None;
     }
 
     let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 40) };

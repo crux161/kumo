@@ -450,6 +450,12 @@ pub fn console_read_byte() -> Option<u8> {
 /// the shared `stage_a` can inject a board's console base unconditionally (DESIGN/017 §4.3).
 pub fn console_set_pl011_base(_base: u64) {}
 
+/// Accepted and ignored: the GIC is an ARM interrupt controller. This backend routes interrupts
+/// through the APIC/IO-APIC chain it discovers from ACPI, which needs no board fallback.
+/// Mirrored from the aarch64 backend so the shared `stage_a` can inject unconditionally
+/// (DESIGN/017 §4.4).
+pub fn gic_set_no_dtb_fallback(_distributor_base: u64, _redistributor_base: u64, _cpu_base: u64) {}
+
 /// Diagnostic one-way latch mirroring the aarch64 backend: once set, [`early_console_write`]
 /// drops output. Set via [`freeze_console`].
 static CONSOLE_FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

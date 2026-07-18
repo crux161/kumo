@@ -94,6 +94,17 @@ fn board_console_pl011_base(boot: &BootInfo) -> Option<u64> {
         .pl011_base()
 }
 
+/// Where this board's GIC lives when the firmware publishes no device tree, or `None` when the
+/// board's firmware always provides one (every board but QEMU) or its identity is unstamped.
+///
+/// Carries addresses only — never a version. See `kumo_bsp::GicVersion` for why the version is
+/// probed from the distributor instead (DESIGN/017 §4.4).
+fn board_gic_no_dtb_fallback(boot: &BootInfo) -> Option<kumo_bsp::GicFallback> {
+    kumo_bsp::Board::from_id(boot.board_id())?
+        .spec()
+        .gic_fallback
+}
+
 pub fn stage_a(boot: &BootInfo) -> ! {
     // Own the fault path and the console before any fallible work: install our exception
     // vectors ("The Tower") so faults are caught and visible, then bring up the
@@ -109,6 +120,19 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // QEMU but can no longer wedge a machine.
     if let Some(base) = board_console_pl011_base(boot) {
         kumo_hal::active::console_set_pl011_base(base);
+    }
+
+    // Same shape for the interrupt controller (DESIGN/017 §4.4). A device tree, when the firmware
+    // publishes one, names the GIC better than any table can and the HAL prefers it; this only
+    // covers the board that has none (QEMU virt under OVMF). The board says WHERE its GIC is —
+    // the HAL asks the distributor itself WHAT it is, because on QEMU the version is chosen at
+    // launch (`-machine virt,gic-version=`) and no board table can know it.
+    if let Some(gic) = board_gic_no_dtb_fallback(boot) {
+        kumo_hal::active::gic_set_no_dtb_fallback(
+            gic.distributor_base,
+            gic.redistributor_base.unwrap_or(0),
+            gic.cpu_base.unwrap_or(0),
+        );
     }
 
     // Bring up the framebuffer console BEFORE any `klog!`. The X13s and Pi 5 have no PL011, so

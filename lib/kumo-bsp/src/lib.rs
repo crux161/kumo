@@ -67,13 +67,37 @@ impl Console {
     }
 }
 
-/// The GIC major version a board's interrupt controller speaks. The kernel currently
-/// implements GICv3 only; [`GicVersion::V2`] boards (Pi 5 / GIC-400) are recorded here so the
-/// gap is explicit rather than an assumption.
+/// The GIC major version a board's interrupt controller speaks. Both are implemented: GICv3 for
+/// the X13s/QEMU and GICv2 (GIC-400) for the Pi 5, since J107/J176/J212.
+///
+/// **This is the board's documented version, not the authority.** When the firmware publishes a
+/// device tree, the GIC node's `compatible` names the version and wins — it knows more than this
+/// table does. When there is no device tree, the HAL reads the distributor's own `GICD_PIDR2`
+/// ArchRev field rather than trusting this field, because on QEMU the GIC version is a *launch*
+/// property (`-machine virt,gic-version=`), not a board property: the same `qemu-virt-aarch64`
+/// image legitimately runs on either. Treat this as documentation and as a cross-check, never as
+/// the selector (J462).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GicVersion {
     V2,
     V3,
+}
+
+/// Where a board's GIC lives when the firmware publishes **no** device tree — the one case where
+/// the BSP must carry MMIO bases, because there is no richer source to read them from
+/// (DESIGN/017 §5: "the few fixed parameters needed before/instead of DTB parsing").
+///
+/// Which of the two secondary bases is live depends on the GIC architecture the distributor
+/// actually reports, which the HAL probes; a board may legitimately populate both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GicFallback {
+    /// GIC distributor base. Same address for GICv2 and GICv3 on every board here, which is why
+    /// it is safe to probe `GICD_PIDR2` before knowing the version.
+    pub distributor_base: u64,
+    /// GICv3 redistributor base; `None` if this board never exposes a GICv3.
+    pub redistributor_base: Option<u64>,
+    /// GICv2 CPU-interface base; `None` if this board never exposes a GICv2.
+    pub cpu_base: Option<u64>,
 }
 
 /// The runtime board-specific parameters the generic arm64 kernel/HAL consumes instead of
@@ -85,8 +109,13 @@ pub struct BoardSpec {
     pub id: &'static str,
     /// Early/boot console.
     pub console: Console,
-    /// Interrupt-controller major version.
+    /// Interrupt-controller major version, as documented for this board. Not the selector — see
+    /// [`GicVersion`].
     pub gic: GicVersion,
+    /// Where the GIC lives when the firmware publishes no device tree. `None` for boards whose
+    /// firmware always provides one (the X13s stages its own; EDK2 publishes the Pi 5's), which
+    /// is the normal case — the DTB is richer and stays authoritative (DESIGN/017 §5).
+    pub gic_fallback: Option<GicFallback>,
 }
 
 impl Board {
@@ -99,6 +128,16 @@ impl Board {
                 // hardcode this table supersedes).
                 console: Console::Pl011 { base: 0x0900_0000 },
                 gic: GicVersion::V3,
+                // QEMU virt under OVMF publishes NO device tree ("device tree : absent"), so this
+                // is the one board that must name its GIC here. Addresses are QEMU's fixed virt
+                // memmap: VIRT_GIC_DIST, VIRT_GIC_CPU, VIRT_GIC_REDIST. Both secondaries are
+                // populated because `-machine virt,gic-version=2|3` picks which exists at run
+                // time; the HAL probes GICD_PIDR2 to find out (J462).
+                gic_fallback: Some(GicFallback {
+                    distributor_base: 0x0800_0000,
+                    redistributor_base: Some(0x080a_0000),
+                    cpu_base: Some(0x0801_0000),
+                }),
             },
             Board::ThinkPadX13sGen1 => BoardSpec {
                 id: "thinkpad-x13s-gen1",
@@ -106,14 +145,19 @@ impl Board {
                 // framebuffer (the console history that drove the framebuffer path).
                 console: Console::Framebuffer,
                 gic: GicVersion::V3,
+                // Nijigumo stages the X13s DTB on the ESP, so a device tree is always present.
+                gic_fallback: None,
             },
             Board::RaspberryPi5 => BoardSpec {
                 id: "raspberry-pi-5",
                 // UEFI GOP is the reliable early console; the 40-pin PL011 lives behind the
                 // RP1 southbridge and is not a fixed-base early UART, so boot uses the glass.
                 console: Console::Framebuffer,
-                // BCM2712 uses GIC-400 (GICv2) — the known divergence from the GICv3 kernel.
+                // BCM2712 uses GIC-400 (GICv2), implemented since J107/J176/J212.
                 gic: GicVersion::V2,
+                // EDK2 for the Pi 5 publishes a device tree via the firmware handoff, which names
+                // the GIC-400 and its bases (J212 parses them for real).
+                gic_fallback: None,
             },
             Board::OrangePi5Plus => BoardSpec {
                 id: "orange-pi-5-plus",
@@ -123,6 +167,8 @@ impl Board {
                 console: Console::Dw8250 { base: 0xfeb5_0000 },
                 // GIC600 (GICv3): GICD 0xfe600000, GICR 0xfe680000.
                 gic: GicVersion::V3,
+                // EDK2-rk3588 / U-Boot publish a device tree; PLAN_VII R1 bundles one besides.
+                gic_fallback: None,
             },
         }
     }
@@ -163,6 +209,25 @@ mod tests {
             let spec = board.spec();
             assert_eq!(spec.console, Console::Framebuffer);
             assert_eq!(spec.console.pl011_base(), None);
+        }
+    }
+
+    /// QEMU is the only board with no firmware device tree, so it is the only one that must name
+    /// its GIC here. Both secondaries are populated because `gic-version=` decides which exists.
+    #[test]
+    fn only_the_dtb_less_board_carries_a_gic_fallback() {
+        let qemu = Board::QemuVirtAarch64.spec().gic_fallback.unwrap();
+        assert_eq!(qemu.distributor_base, 0x0800_0000);
+        assert_eq!(qemu.redistributor_base, Some(0x080a_0000));
+        assert_eq!(qemu.cpu_base, Some(0x0801_0000));
+
+        // Every board whose firmware publishes a device tree defers to it.
+        for board in [
+            Board::ThinkPadX13sGen1,
+            Board::RaspberryPi5,
+            Board::OrangePi5Plus,
+        ] {
+            assert_eq!(board.spec().gic_fallback, None, "board {}", board.id());
         }
     }
 
