@@ -198,17 +198,25 @@ pub fn irq_unmask() {}
 //
 // Two sinks, chosen at runtime by what the board actually has:
 //   * A linear framebuffer (from the UEFI GOP, handed over in BootInfo) — used on
-//     real hardware like the ThinkPad X13s, which has no UART at the PL011 address.
-//   * The PL011 UART0 at 0x09000000 — used on QEMU `virt` and boards that expose it.
-// `set_framebuffer` (called from kmain when BootInfo carries one) switches the
-// console to the framebuffer; otherwise output goes to PL011.
+//     real hardware like the ThinkPad X13s and the Pi 5, which expose no UART at a
+//     fixed base. `set_framebuffer` (called from stage_a when BootInfo carries one)
+//     switches the console to it.
+//   * A PL011 UART0, at a base this backend does NOT know. The board's BSP entry names
+//     it and the kernel injects it with `console_set_pl011_base`; until then the UART
+//     sink is inert. This backend names no board address (DESIGN/017 §4.3).
+//
+// The inert default is load-bearing, not defensive: guessing QEMU's 0x09000000 on a
+// board that has no PL011 there is what hard-hung the X13s (J182).
 // =====================================================================
 
 const ORD: Ordering = Ordering::Relaxed;
 
 // ---- PL011 UART0 ----------------------------------------------------
 
-const PL011_BASE: usize = 0x0900_0000;
+/// MMIO physical base of this board's PL011 UART0, injected via [`console_set_pl011_base`].
+/// **0 means no board has named one**, and the UART sink stays inert: no init, no writes, no
+/// reads. Only a board knows whether a PL011 exists and where; this backend must not guess.
+static PL011_BASE: AtomicU64 = AtomicU64::new(0);
 const UARTDR: usize = 0x00;
 const UARTFR: usize = 0x18;
 const UARTIBRD: usize = 0x24;
@@ -253,8 +261,32 @@ pub fn read_phys(phys: u64, dest: &mut [u8]) {
 #[cfg(not(target_os = "none"))]
 pub fn read_phys(_phys: u64, _dest: &mut [u8]) {}
 
+/// Tell the console where this board's PL011 UART0 lives, from the board's BSP entry. The
+/// kernel resolves its board and calls this before the first console write; a board whose BSP
+/// entry names no PL011 (the X13s, the Pi 5) simply never calls it, leaving the UART sink
+/// inert. Passing 0 returns the sink to inert.
+///
+/// This is the injection direction of DESIGN/017 §4.3: the board knows the layout and hands it
+/// to the driver, so the driver names no board address and cannot be wrong about one.
+pub fn console_set_pl011_base(base: u64) {
+    PL011_BASE.store(base, ORD);
+}
+
+/// The injected PL011 base, or `None` when no board has named one (the sink is inert).
+pub fn console_pl011_base() -> Option<u64> {
+    match PL011_BASE.load(ORD) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// Whether a board has named a PL011. The UART sink does no MMIO until one has.
+fn pl011_present() -> bool {
+    PL011_BASE.load(ORD) != 0
+}
+
 fn pl011_reg(offset: usize) -> *mut u32 {
-    (PL011_BASE as u64 + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
+    (PL011_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
 }
 
 fn pl011_init() {
@@ -1186,6 +1218,17 @@ pub fn early_console_write(bytes: &[u8]) {
         // explicitly does not expose it). After handoff, dropping an unroutable
         // diagnostic is safer than either touching absent UART MMIO or corrupting the
         // userspace console's pixels. Fatal paths reclaim the framebuffer first.
+        return;
+    }
+
+    // No base means no board named a PL011, so there is nothing to write to and we drop the
+    // bytes. Dereferencing a guessed base is precisely the J182 hard-hang, and it points at
+    // every framebuffer board (X13s, Pi 5) — so inert is the only safe answer, not a fallback.
+    //
+    // This guard sits ahead of the `UART_READY` latch, which makes `UART_READY == true` imply a
+    // nonzero base; `console_set_cursor` and `console_read_byte` rely on that to gate their own
+    // MMIO on the latch alone.
+    if !pl011_present() {
         return;
     }
 
@@ -4234,6 +4277,22 @@ mod tests {
     #[test]
     fn reports_arch_name() {
         assert_eq!(arch_name(), "aarch64");
+    }
+
+    /// The console must ship inert: no base until a board names one. The old default was
+    /// QEMU's 0x09000000, which is why the first `klog!` hard-hung the X13s (J182) — and it
+    /// would equally hang the Pi 5. This test also exercises the drop path: with no base,
+    /// `early_console_write` must not dereference anything. If it regresses to a write, this
+    /// faults on the host, which is the point.
+    ///
+    /// Deliberately does not inject a base: `PL011_BASE` is process-global, and a later write
+    /// here would make a sibling test's `early_console_write` deref real MMIO. The injected
+    /// case is proven end-to-end by the live UEFI boot instead.
+    #[test]
+    fn console_ships_inert_until_a_board_names_a_pl011() {
+        assert_eq!(console_pl011_base(), None);
+        assert!(!pl011_present());
+        early_console_write(b"dropped: no board has named a PL011\n");
     }
 
     #[test]

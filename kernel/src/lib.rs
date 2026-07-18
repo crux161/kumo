@@ -80,6 +80,20 @@ pub fn stage_a_console_banner() {
     bootstrap::console::write_str("\n");
 }
 
+/// The PL011 base this board's BSP entry names, or `None` when the board has no PL011 at a
+/// fixed base (the X13s, the Pi 5), or its identity is unstamped or unrecognized.
+///
+/// This is the whole of DESIGN/017 §4.3's policy — board identity in, console base out — lifted
+/// out of `stage_a` so it is provable in `cargo test` rather than only on a booted machine.
+/// `None` is not a failure: it means "this backend has no UART to write to", which the HAL
+/// honours by staying inert.
+fn board_console_pl011_base(boot: &BootInfo) -> Option<u64> {
+    kumo_bsp::Board::from_id(boot.board_id())?
+        .spec()
+        .console
+        .pl011_base()
+}
+
 pub fn stage_a(boot: &BootInfo) -> ! {
     // Own the fault path and the console before any fallible work: install our exception
     // vectors ("The Tower") so faults are caught and visible, then bring up the
@@ -87,11 +101,20 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // phosphor backdrop. Interrupts stay masked (see `_start`) until we own the GIC.
     kumo_hal::active::install_exception_vectors();
 
-    // Bring up the framebuffer console BEFORE any `klog!`. The X13s has no PL011, and the HAL
-    // console's pre-`set_framebuffer` fallback writes to 0x09000000, which HARD-HANGS the core
-    // (J182). So the framebuffer must own the console before the first line of output — otherwise
-    // the very first `klog!` wedges the board with a blank screen ("stuck at the bootloader, no
-    // handoff to MUREX"). This must stay ahead of every `klog!` in `stage_a`.
+    // Tell the console where this board's UART is, from the BSP, before any `klog!` (DESIGN/017
+    // §4.3). The HAL ships with no base and its UART sink inert, so a board whose BSP entry names
+    // no PL011 — the X13s, the Pi 5 — cannot write to one. That is what retired J182: the HAL
+    // used to fall back to QEMU's 0x09000000 and HARD-HANG those boards on the first line of
+    // output. An unstamped or unknown board also injects nothing, which costs early serial on
+    // QEMU but can no longer wedge a machine.
+    if let Some(base) = board_console_pl011_base(boot) {
+        kumo_hal::active::console_set_pl011_base(base);
+    }
+
+    // Bring up the framebuffer console BEFORE any `klog!`. The X13s and Pi 5 have no PL011, so
+    // until the framebuffer owns the console there is no sink and early lines are dropped. This
+    // is now a visibility constraint, not a safety one (J182 is fixed above) — but it must still
+    // stay ahead of every `klog!` in `stage_a` or the boot's first lines are lost on those boards.
     if boot.has_framebuffer() {
         let fb = boot.framebuffer;
         kumo_hal::active::set_framebuffer(fb.phys, fb.len, fb.width, fb.height, fb.stride);
@@ -1964,6 +1987,40 @@ mod tests {
         assert_eq!(report.arch, "x86_64");
         assert_eq!(report.mem_region_count, 2);
         assert_eq!(report.usable_bytes, 0x5000);
+    }
+
+    /// The board that has a PL011 gets its base from the BSP — no longer from a HAL hardcode.
+    #[test]
+    fn stamped_pl011_board_yields_its_bsp_console_base() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("qemu-virt-aarch64");
+        assert_eq!(board_console_pl011_base(&boot), Some(0x0900_0000));
+    }
+
+    /// The J182 regression, as a test: the framebuffer boards must yield NO base, so the HAL's
+    /// UART sink stays inert instead of writing to an address they do not have. If either ever
+    /// starts reporting a base, that write hard-hangs the machine.
+    #[test]
+    fn framebuffer_boards_yield_no_console_base() {
+        for id in ["thinkpad-x13s-gen1", "raspberry-pi-5"] {
+            let mut boot = BootInfo::empty(ABI_VERSION);
+            boot.set_board_id(id);
+            assert_eq!(board_console_pl011_base(&boot), None, "board {id}");
+        }
+    }
+
+    /// An unstamped or unrecognized board injects nothing. Guessing QEMU's base here is exactly
+    /// the old fallback that J182 traced the X13s hang to, so "unknown" must mean inert — the
+    /// cost is early serial on an unstamped QEMU image, which is recoverable; a hang is not.
+    #[test]
+    fn unstamped_or_unknown_board_yields_no_console_base() {
+        let unstamped = BootInfo::empty(ABI_VERSION);
+        assert_eq!(unstamped.board_id(), "");
+        assert_eq!(board_console_pl011_base(&unstamped), None);
+
+        let mut unknown = BootInfo::empty(ABI_VERSION);
+        unknown.set_board_id("some-board-we-have-never-heard-of");
+        assert_eq!(board_console_pl011_base(&unknown), None);
     }
 
     static TEST_REGIONS: [MemRegion; 2] = [

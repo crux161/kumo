@@ -445,6 +445,11 @@ pub fn console_read_byte() -> Option<u8> {
     None
 }
 
+/// Accepted and ignored: a PL011 is an ARM peripheral and no x86_64 board has one — this
+/// backend's console is the 16550 COM1 it already owns. Mirrored from the aarch64 backend so
+/// the shared `stage_a` can inject a board's console base unconditionally (DESIGN/017 §4.3).
+pub fn console_set_pl011_base(_base: u64) {}
+
 /// Diagnostic one-way latch mirroring the aarch64 backend: once set, [`early_console_write`]
 /// drops output. Set via [`freeze_console`].
 static CONSOLE_FROZEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
