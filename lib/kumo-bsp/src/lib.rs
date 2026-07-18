@@ -5,19 +5,26 @@
 //! generic arm64 kernel and HAL must not hardcode.
 //!
 //! KUMO builds one aarch64 kernel/HAL that runs on several boards (QEMU `virt`, the ThinkPad
-//! X13s, the Raspberry Pi 5). Today those boards differ by scattered hardcodes and feature
-//! sniffing — `PL011_BASE = 0x0900_0000` baked into the HAL (only true on QEMU), the
-//! console chosen by "is a framebuffer present?", the GIC version assumed to be v3. This crate
-//! makes each board's parameters a single typed, host-testable [`BoardSpec`], keyed by a
-//! [`Board`] identity, so the generic code asks the BSP instead of guessing.
+//! X13s, the Raspberry Pi 5, the Orange Pi 5 Plus). Those boards used to differ by scattered
+//! hardcodes and feature sniffing; this crate makes each board's parameters a single typed,
+//! host-testable [`BoardSpec`], keyed by a [`Board`] identity, so the generic code asks the BSP
+//! instead of guessing.
 //!
-//! The board set mirrors `imager::HardwareTarget`'s aarch64 targets: an image is built for one
-//! board and (in a later slice) bakes its [`Board`] identity into `BootInfo`, from which the
-//! kernel selects the matching [`BoardSpec`]. This crate is `no_std` and allocation-free so
-//! both the kernel and the HAL can depend on it.
+//! The board set mirrors `imager::HardwareTarget`'s aarch64 targets. An image is built for one
+//! board and bakes its [`Board`] id into `BootInfo` — the imager writes `board = <id>` into the
+//! staged `nijigumo.conf`, the loader stamps it, and the kernel resolves it with
+//! [`Board::from_id`] (J460). This crate is `no_std` and allocation-free.
 //!
-//! See `DESIGN/017-board-support-package.md` for the decoupling roadmap (which hardcodes move
-//! here, in what order) and the board-identity mechanism.
+//! **This crate is a table, not a consumer, and the HAL does not depend on it.** The kernel
+//! resolves the board and *injects* what the HAL needs (`console_set_pl011_base`,
+//! `gic_set_no_dtb_fallback`), so the HAL names no board address — see `DESIGN/017` §2.1 for why
+//! that direction, and not the reverse, is the point.
+//!
+//! Where a device tree exists it is richer than this table and **wins**; the BSP carries only the
+//! few fixed facts needed before or instead of DTB parsing (`DESIGN/017` §5).
+//!
+//! See `DESIGN/017-board-support-package.md` for the roadmap, what has actually landed, and what
+//! remains owed on metal (§6 — none of this is confirmed on a Pi 5 or an X13s).
 
 /// A board KUMO's aarch64 build can run on. Mirrors the aarch64 variants of
 /// `imager::HardwareTarget`; [`Board::id`] matches that target's `id` string so build-time and

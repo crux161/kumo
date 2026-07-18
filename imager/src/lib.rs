@@ -142,9 +142,10 @@ impl HardwareTarget {
     /// The runtime [`kumo_bsp::Board`] this build-time target corresponds to, or `None` for
     /// targets with no aarch64 Board Support Package entry (the x86_64 target). This is the
     /// build-time → runtime identity bridge of `DESIGN/017` §3: an image is built for one
-    /// `HardwareTarget`, and (in a later slice) bakes the matching `Board` id into `BootInfo`
-    /// so the kernel resolves the same board with `Board::from_id`. The `id` strings on both
-    /// sides are asserted equal by the tests, so the two board models cannot drift.
+    /// `HardwareTarget`, and `xtask` bakes the matching `Board` id into the staged
+    /// `nijigumo.conf` (`board = <id>`), which the loader stamps into `BootInfo` and the kernel
+    /// resolves with `Board::from_id` (J460). The `id` strings on both sides are asserted equal
+    /// by the tests, so the two board models cannot drift.
     pub fn board(self) -> Option<kumo_bsp::Board> {
         match self {
             Self::ThinkPadX13sGen1 => Some(kumo_bsp::Board::ThinkPadX13sGen1),
