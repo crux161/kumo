@@ -157,9 +157,25 @@ impl Board {
             },
             Board::RaspberryPi5 => BoardSpec {
                 id: "raspberry-pi-5",
-                // UEFI GOP is the reliable early console; the 40-pin PL011 lives behind the
-                // RP1 southbridge and is not a fixed-base early UART, so boot uses the glass.
-                console: Console::Framebuffer,
+                // The Pi 5 has TWO UARTs and this entry used to know only the wrong one. It said
+                // "the 40-pin PL011 lives behind the RP1 southbridge and is not a fixed-base
+                // early UART, so boot uses the glass" — true of `uart0`, and it misses `uart10`.
+                //
+                // Per the official `bcm2712-rpi-5-b.dtb` (resources/TARTLET):
+                //   console = "/soc/serial@7d001000";                       <- uart10, SoC
+                //   uart0   = "/axi/pcie@120000/rp1/serial@30000";          <- 40-pin, behind RP1
+                // and uart10 is `compatible = "arm,pl011"`, `status = "okay"`, `reg =
+                // <0x7d001000 0x200>`. The soc node's `ranges = <0x7c000000 0x10 0x7c000000
+                // 0x4000000>` translates that to CPU-physical 0x10_7D00_1000. It is the SoC's own
+                // PL011 on the dedicated 3-pin debug connector — a fixed base, reachable with no
+                // PCIe and no RP1, and the board's *designated* console.
+                //
+                // EDK2 owns it as its console before we do, so the HAL inherits its baud rather
+                // than reprogramming a clock it cannot know (see `pl011_init`). The GOP is still
+                // published and still painted — the console writes to both sinks (J465).
+                console: Console::Pl011 {
+                    base: 0x10_7D00_1000,
+                },
                 // BCM2712 uses GIC-400 (GICv2), implemented since J107/J176/J212.
                 gic: GicVersion::V2,
                 // EDK2 for the Pi 5 publishes a device tree via the firmware handoff, which names
@@ -212,11 +228,33 @@ mod tests {
 
     #[test]
     fn framebuffer_console_boards_have_no_pl011_base() {
-        for board in [Board::ThinkPadX13sGen1, Board::RaspberryPi5] {
-            let spec = board.spec();
-            assert_eq!(spec.console, Console::Framebuffer);
-            assert_eq!(spec.console.pl011_base(), None);
-        }
+        // The X13s is the only board with no UART at any fixed base, and so the reason the HAL's
+        // UART sink must be inert by default: it is the board J182 actually hard-hung. Sentinel.
+        let spec = Board::ThinkPadX13sGen1.spec();
+        assert_eq!(spec.console, Console::Framebuffer);
+        assert_eq!(spec.console.pl011_base(), None);
+    }
+
+    /// The Pi 5's designated console is its **SoC** PL011 (`uart10`), not the 40-pin UART behind
+    /// RP1. Per the official `bcm2712-rpi-5-b.dtb`: `console = "/soc/serial@7d001000"`, while
+    /// `uart0 = "/axi/pcie@120000/rp1/serial@30000"`; the soc node's
+    /// `ranges = <0x7c000000 0x10 0x7c000000 0x4000000>` puts uart10 at CPU-physical
+    /// 0x10_7D00_1000.
+    ///
+    /// This entry claimed `Framebuffer` until J465 — the comment described `uart0` and never knew
+    /// `uart10` existed — which cost the Pi 5 a serial console it has had all along.
+    #[test]
+    fn pi5_boots_on_its_soc_debug_pl011_not_the_rp1_uart() {
+        let spec = Board::RaspberryPi5.spec();
+        assert_eq!(
+            spec.console,
+            Console::Pl011 {
+                base: 0x10_7D00_1000
+            }
+        );
+        assert_eq!(spec.console.pl011_base(), Some(0x10_7D00_1000));
+        // Not QEMU's base, and not an RP1 offset.
+        assert_ne!(spec.console.pl011_base(), Some(0x0900_0000));
     }
 
     /// QEMU is the only board with no firmware device tree, so it is the only one that must name

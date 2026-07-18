@@ -2021,16 +2021,26 @@ mod tests {
         assert_eq!(board_console_pl011_base(&boot), Some(0x0900_0000));
     }
 
-    /// The J182 regression, as a test: the framebuffer boards must yield NO base, so the HAL's
-    /// UART sink stays inert instead of writing to an address they do not have. If either ever
-    /// starts reporting a base, that write hard-hangs the machine.
+    /// The J182 regression, as a test: a board with no PL011 must yield NO base, so the HAL's
+    /// UART sink stays inert instead of writing to an address it does not have. The X13s is the
+    /// sentinel — it is the board J182 actually hard-hung. If it ever starts reporting a base,
+    /// that write wedges the machine.
     #[test]
     fn framebuffer_boards_yield_no_console_base() {
-        for id in ["thinkpad-x13s-gen1", "raspberry-pi-5"] {
-            let mut boot = BootInfo::empty(ABI_VERSION);
-            boot.set_board_id(id);
-            assert_eq!(board_console_pl011_base(&boot), None, "board {id}");
-        }
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("thinkpad-x13s-gen1");
+        assert_eq!(board_console_pl011_base(&boot), None);
+    }
+
+    /// And a board that *does* have one yields it. The Pi 5's console is its SoC debug PL011
+    /// (`uart10` @ 0x10_7D00_1000, the 3-pin connector), per the official DTB's `console` alias —
+    /// not the 40-pin UART behind RP1. This read `None` until J465, so the Pi 5 was pinned to the
+    /// framebuffer for want of a fact.
+    #[test]
+    fn pi5_yields_its_soc_debug_pl011_base() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("raspberry-pi-5");
+        assert_eq!(board_console_pl011_base(&boot), Some(0x10_7D00_1000));
     }
 
     /// An unstamped or unrecognized board injects nothing. Guessing QEMU's base here is exactly

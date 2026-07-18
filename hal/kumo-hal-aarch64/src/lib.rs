@@ -289,11 +289,22 @@ fn pl011_reg(offset: usize) -> *mut u32 {
     (PL011_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
 }
 
+/// Bring the PL011 up for 8N1 with FIFOs, **inheriting the baud rate the firmware set**.
+///
+/// Deliberately does not touch `UARTIBRD`/`UARTFBRD`. The divisor is `uartclk / (16 * baud)`, and
+/// `uartclk` is a per-board fact this backend cannot know: the Pi 5's DTB puts `clk_uart` at
+/// 9.216 MHz, other boards differ, and nothing here is told which. The old code wrote
+/// `IBRD = 1, FBRD = 0` — a divisor of 1, i.e. `uartclk / 16` — which is not 115200 on any real
+/// clock. It survived only because **this driver had never met real hardware**: QEMU ignores the
+/// baud registers entirely, and the X13s (the only metal that runs this code) has no PL011 at all.
+///
+/// Whoever owns the UART before us — EDK2 on the Pi 5, AAVMF on QEMU — has already programmed a
+/// working baud for its own console, so inheriting it is both correct and the only thing we can
+/// honestly do (`DESIGN/017` §5: never a guess). Writing `UARTLCR_H` re-latches the existing
+/// divisor unchanged, which is why the disable/configure/enable sequence is still safe.
 fn pl011_init() {
     unsafe {
         pl011_reg(UARTCR).write_volatile(0);
-        pl011_reg(UARTIBRD).write_volatile(1);
-        pl011_reg(UARTFBRD).write_volatile(0);
         pl011_reg(UARTLCR_H).write_volatile(UARTLCR_H_FEN | UARTLCR_H_WLEN_8);
         pl011_reg(UARTCR).write_volatile(UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
     }
@@ -1205,6 +1216,21 @@ pub fn early_console_write(bytes: &[u8]) {
     if CONSOLE_FROZEN.load(ORD) {
         return;
     }
+    // Write to every sink this board actually has — the two are not in competition.
+    //
+    // Before J465 a framebuffer machine returned here without ever reaching the UART, because a
+    // *guessed* PL011 base could hard-hang a board that has none (J182, the X13s). J461 removed
+    // the guess: an un-named PL011 is inert, so there is no longer anything to protect against,
+    // and a board with both sinks can have both.
+    //
+    // Per board this means: the X13s names no PL011 and stays framebuffer-only; QEMU virt under
+    // OVMF has no GOP and stays serial-only; the **Pi 5 has both and now gets both** — its DTB
+    // `console` alias is the SoC PL011 (`uart10` @ 0x10_7D00_1000) and EDK2 also publishes a GOP.
+    // During bring-up a serial log you can scroll beats a panel you have to photograph.
+    //
+    // This settles `DESIGN/017` §4.3's open question ("does the console kind key on `Console` or
+    // on `has_framebuffer`?") by dissolving it: neither sink wins, both are written, and each
+    // self-gates on whether it exists.
     if FB_PRESENT.load(ORD) {
         let kernel_owner = FB_KERNEL_OWNER.load(ORD);
         if framebuffer_console_writes_enabled(true, kernel_owner) {
@@ -1214,16 +1240,13 @@ pub fn early_console_write(bytes: &[u8]) {
         if qr_emissary_replays_after_console_write(true, kernel_owner) {
             repaint_qr_emissary();
         }
-        // A framebuffer machine does not imply that the QEMU PL011 exists (the X13s
-        // explicitly does not expose it). After handoff, dropping an unroutable
-        // diagnostic is safer than either touching absent UART MMIO or corrupting the
-        // userspace console's pixels. Fatal paths reclaim the framebuffer first.
-        return;
+        // Once userspace owns the glass the framebuffer half goes quiet, but the UART below keeps
+        // carrying kernel diagnostics — strictly better than the drop this used to do.
     }
 
     // No base means no board named a PL011, so there is nothing to write to and we drop the
-    // bytes. Dereferencing a guessed base is precisely the J182 hard-hang, and it points at
-    // every framebuffer board (X13s, Pi 5) — so inert is the only safe answer, not a fallback.
+    // bytes. Dereferencing a guessed base is precisely the J182 hard-hang — so inert is the only
+    // safe answer, not a fallback.
     //
     // This guard sits ahead of the `UART_READY` latch, which makes `UART_READY == true` imply a
     // nonzero base; `console_set_cursor` and `console_read_byte` rely on that to gate their own
