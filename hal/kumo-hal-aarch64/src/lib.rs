@@ -211,6 +211,13 @@ pub fn irq_unmask() {}
 
 const ORD: Ordering = Ordering::Relaxed;
 
+/// 2 MiB — the ARM stage-1 block granule the Stage-A MMU maps `[0, top)` with
+/// (`mmu::enable_kernel`). Crate-level so the host-testable [`console_mmio_block_above_top`]
+/// and the bare-metal mapper share one definition and cannot disagree on block boundaries.
+/// Reachable only where one of those two lives: the mapper (`target_os = "none"`) or tests.
+#[cfg(any(target_os = "none", test))]
+const BLOCK_2M: u64 = 1 << 21;
+
 // ---- PL011 UART0 ----------------------------------------------------
 
 /// MMIO physical base of this board's PL011 UART0, injected via [`console_set_pl011_base`].
@@ -283,6 +290,33 @@ pub fn console_pl011_base() -> Option<u64> {
 /// Whether a board has named a PL011. The UART sink does no MMIO until one has.
 fn pl011_present() -> bool {
     PL011_BASE.load(ORD) != 0
+}
+
+/// The 2 MiB block a board's console MMIO needs mapped when it sits at or above the dense
+/// identity/physmap `top`. `mmu::enable_kernel` maps `[0, top)` — RAM, rounded up a GiB —
+/// into both TTBR0 and TTBR1; a PL011 above that range is mapped by neither, so the first
+/// console write after [`console_use_physmap`] faults. The Pi 5's SoC PL011 (`uart10`,
+/// injected via [`console_set_pl011_base`]) is at `0x10_7D00_1000` — ~66 GiB, far above any
+/// RAM — and is exactly this case.
+///
+/// `Some(block)` means a targeted device mapping is owed; `None` means it is not — either no
+/// board named a PL011 (`base == 0`, inert: the X13s) or the base already lies inside
+/// `[0, top)`, mapped by the dense loop (QEMU's low PL011 at `0x0900_0000`). Growing `top` to
+/// reach a ~66 GiB peripheral is not the fix: it would densely map tens of GiB of empty gap
+/// as device memory. `top` is GiB-aligned, so blocks never straddle it and this partitions
+/// every block with the dense loop, each mapped exactly once. Pure and host-tested — the
+/// mapper (`mmu`, `target_os = "none"`) is not, which is why this lives out here.
+#[cfg(any(target_os = "none", test))]
+const fn console_mmio_block_above_top(pl011_base: u64, top: u64) -> Option<u64> {
+    if pl011_base == 0 {
+        return None;
+    }
+    let block = pl011_base & !(BLOCK_2M - 1);
+    if block >= top {
+        Some(block)
+    } else {
+        None
+    }
 }
 
 fn pl011_reg(offset: usize) -> *mut u32 {
@@ -1352,9 +1386,11 @@ pub fn monotonic_nanos() -> u64 {
 #[cfg(target_os = "none")]
 pub mod mmu {
     use core::sync::atomic::{AtomicU64, Ordering};
+    // 2 MiB block granule, shared with the crate-root `console_mmio_block_above_top` so the
+    // host-testable pre-check computes the same block this module's mapper writes.
+    use super::BLOCK_2M;
 
     const GB: u64 = 1 << 30;
-    const BLOCK_2M: u64 = 1 << 21;
     const PAGE_4K: u64 = 1 << 12;
     pub const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
 
@@ -1515,6 +1551,31 @@ pub mod mmu {
                 bi += 1;
             }
             gi += 1;
+        }
+
+        // A board's console MMIO can sit far above RAM, outside the dense `[0, top)` map
+        // built above. The Pi 5's SoC PL011 (uart10, injected via `console_set_pl011_base`)
+        // is at 0x10_7D00_1000 — ~66 GiB — so without this the first `klog!` after
+        // `console_use_physmap` faults on an unmapped address. Map just its 2 MiB block, as
+        // Device, into both trees: TTBR0 identity for the window before the physmap moves,
+        // TTBR1 physmap (`PHYSMAP_BASE + block`) for after. Inert when no board named a
+        // PL011 (the X13s), and skipped when the base already fell inside `[0, top)` (QEMU's
+        // low PL011, mapped by the loop). Injection, not a table — the HAL maps the base it
+        // was handed. Mirrors the loop's device mapping (`block_desc` already sets PXN|UXN;
+        // the physmap `| PXN | UXN` is kept for symmetry).
+        if let Some(block) =
+            super::console_mmio_block_above_top(super::PL011_BASE.load(super::ORD), top)
+        {
+            let desc = block_desc(block, MAIR_DEVICE, true);
+            map_block(ttbr0, block, block, desc, alloc, &mut tables)?;
+            map_block(
+                ttbr1,
+                PHYSMAP_BASE + block,
+                block,
+                desc | PXN | UXN,
+                alloc,
+                &mut tables,
+            )?;
         }
 
         let kernel_pages = kernel_len.div_ceil(PAGE_4K);
@@ -4469,6 +4530,32 @@ mod tests {
         assert_eq!(console_pl011_base(), None);
         assert!(!pl011_present());
         early_console_write(b"dropped: no board has named a PL011\n");
+    }
+
+    /// The mapping half of the J182 discipline: the console base is injected, and the
+    /// Stage-A tables follow it instead of assuming RAM reaches it. A board whose console
+    /// MMIO sits above the dense `[0, top)` map — the Pi 5's SoC PL011 at 0x10_7D00_1000,
+    /// ~66 GiB — is owed a targeted 2 MiB device block, aligned down. A low PL011 already
+    /// inside the map (QEMU's 0x0900_0000) is owed none; an un-named PL011 (base 0 — the
+    /// X13s) is owed none. Invisible on QEMU, whose UART is low — the same blind spot that
+    /// hid the dead baud (J465) and the dropped GICv2 interrupt (J463).
+    #[test]
+    fn console_mmio_above_top_maps_its_own_block() {
+        let ram_top = 8 * (1 << 30); // 8 GiB — a plausible Pi 5 RAM top
+                                     // Pi 5 uart10: above RAM, so its 2 MiB block (aligned down) is mapped on its own.
+        assert_eq!(
+            console_mmio_block_above_top(0x10_7D00_1000, ram_top),
+            Some(0x10_7D00_0000)
+        );
+        // QEMU's low PL011 already lies inside [0, top); the dense loop covered it.
+        assert_eq!(console_mmio_block_above_top(0x0900_0000, ram_top), None);
+        // No board named a PL011 (the X13s): nothing to map.
+        assert_eq!(console_mmio_block_above_top(0, ram_top), None);
+        // Boundary: a base exactly at `top` is outside the half-open `[0, top)` and owed.
+        assert_eq!(
+            console_mmio_block_above_top(ram_top, ram_top),
+            Some(ram_top)
+        );
     }
 
     #[test]
