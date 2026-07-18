@@ -34,7 +34,7 @@ use niji_loader::elf::{parse_elf64, EM_AARCH64};
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
     build_boot_info, efi_memory_type, efi_pixel_format, fdt_total_size, framebuffer_from_gop,
-    is_fdt_magic, mem_region_kind_from_efi, UefiHandoffSeed,
+    is_fdt_magic, mem_region_kind_from_efi, BootConfig, UefiHandoffSeed,
 };
 
 pub type EfiHandle = *mut c_void;
@@ -54,6 +54,11 @@ const DTB_ESP_PATHS: &[&str] = &[
 ];
 const KERNEL_ESP_PATH: &str = "\\EFI\\KUMO\\kernel\\kumo-kernel.elf";
 const INITRD_ESP_PATH: &str = "\\EFI\\KUMO\\initrd.img";
+/// The staged boot manifest ([`BootConfig`]). The imager writes one per target image; the
+/// loader currently consumes only its `board` key (DESIGN/017 §4 step 2) and still resolves
+/// the kernel/initrd/DTB from the constants above — migrating those reads to the manifest is
+/// a later slice. — CORVUS
+const BOOT_CONFIG_ESP_PATH: &str = "\\EFI\\KUMO\\nijigumo.conf";
 
 // === EFI GUIDs ===============================================================
 
@@ -536,6 +541,12 @@ unsafe fn boot_and_jump(
     };
     unsafe { boot_ptr.write(build_boot_info(seed)) };
 
+    // Stamp the board identity from the staged manifest. The image is built for exactly one
+    // board, so identity is a build-time fact we carry across the handoff rather than one the
+    // kernel sniffs (DESIGN/017 §3). An absent/unparseable manifest, or one naming no board,
+    // leaves the field empty and the kernel reports "unstamped" — the prior behaviour.
+    unsafe { stamp_board_id(boot_services, root, con_out, boot_ptr) };
+
     // Pre-exit summary + validation, using a provisional memory snapshot.
     if let Some((regions_ptr, regions_len, _key)) = unsafe { snapshot_memory(boot_services, &bufs) }
     {
@@ -785,6 +796,45 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
 /// the Orange Pi 5 Plus ship their own, newer than the firmware's; (2) the firmware-provided
 /// DTB from the UEFI configuration table ([`EFI_DTB_TABLE_GUID`]) — how the Raspberry Pi 5 and
 /// other generic-UEFI boards supply their device tree, since they stage none on the ESP. The
+/// Read the staged boot manifest and stamp the board id it names into `BootInfo`, so the
+/// kernel can resolve its `kumo_bsp::Board` instead of guessing from present hardware
+/// (DESIGN/017 §4 step 2). Prints what was stamped, since an unstamped board silently
+/// degrades every BSP-driven decision downstream.
+///
+/// Absent manifest, non-UTF-8 text, unparseable config, or no `board` key all leave the
+/// field empty — the kernel reports "unstamped", which is the pre-existing behaviour. This
+/// is deliberately not fatal: the board id is not yet load-bearing, and a boot that reaches
+/// the kernel is worth more than one refused over a missing manifest.
+unsafe fn stamp_board_id(
+    boot_services: *mut EfiBootServices,
+    root: *mut EfiFileProtocol,
+    con_out: *mut EfiSimpleTextOutputProtocol,
+    boot_ptr: *mut BootInfo,
+) {
+    let Some((buffer, len)) = (unsafe { read_esp_file(boot_services, root, BOOT_CONFIG_ESP_PATH) })
+    else {
+        kprint!(con_out, "board        : unstamped (no manifest)\r\n");
+        return;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
+    let board = core::str::from_utf8(bytes)
+        .ok()
+        .and_then(BootConfig::parse)
+        .and_then(|cfg| cfg.board);
+    match board {
+        // `set_board_id` copies into BootInfo's fixed array, so the pool buffer need not
+        // outlive this call.
+        Some(board) => {
+            unsafe { (*boot_ptr).set_board_id(board) };
+            kprint!(con_out, "board        : {}\r\n", board);
+        }
+        None => kprint!(
+            con_out,
+            "board        : unstamped (manifest names no board)\r\n"
+        ),
+    }
+}
+
 /// kept pool buffer / firmware blob is handed to the kernel via BootInfo.
 unsafe fn load_dtb(
     boot_services: *mut EfiBootServices,

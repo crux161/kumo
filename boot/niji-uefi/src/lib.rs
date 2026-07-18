@@ -202,6 +202,12 @@ pub struct BootConfig<'a> {
     pub kernel: &'a str,
     pub initrd: Option<&'a str>,
     pub dtb: DtbSource<'a>,
+    /// The board this image was built for (a `kumo_bsp::Board` / `imager::HardwareTarget`
+    /// id, e.g. `raspberry-pi-5`). The image is built for exactly one board, so identity is
+    /// a build-time fact the imager bakes here rather than something the kernel sniffs at
+    /// runtime (DESIGN/017 §3). `None` when the key is absent — the kernel then reports the
+    /// board as unstamped instead of guessing.
+    pub board: Option<&'a str>,
 }
 
 impl<'a> BootConfig<'a> {
@@ -211,6 +217,7 @@ impl<'a> BootConfig<'a> {
     pub fn parse(text: &'a str) -> Option<Self> {
         let mut kernel: Option<&'a str> = None;
         let mut initrd: Option<&'a str> = None;
+        let mut board: Option<&'a str> = None;
         let mut dtb = DtbSource::Firmware;
         for raw in text.lines() {
             let line = match raw.split_once('#') {
@@ -228,6 +235,7 @@ impl<'a> BootConfig<'a> {
             match key {
                 "kernel" => kernel = Some(value),
                 "initrd" => initrd = Some(value),
+                "board" => board = Some(value),
                 "dtb" => {
                     dtb = if value.eq_ignore_ascii_case("firmware") {
                         DtbSource::Firmware
@@ -244,6 +252,7 @@ impl<'a> BootConfig<'a> {
             kernel: kernel?,
             initrd,
             dtb,
+            board,
         })
     }
 }
@@ -288,6 +297,23 @@ mod tests {
     #[test]
     fn missing_kernel_is_rejected() {
         assert_eq!(BootConfig::parse("dtb = firmware\n"), None);
+    }
+
+    #[test]
+    fn parses_the_board_identity_the_imager_bakes() {
+        let cfg = BootConfig::parse(
+            "kernel = \\EFI\\KUMO\\kernel\\kumo-kernel.elf\nboard = raspberry-pi-5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.board, Some("raspberry-pi-5"));
+    }
+
+    #[test]
+    fn board_is_absent_when_the_manifest_names_none() {
+        // Pre-DESIGN/017 manifests carry no `board` key; they must still parse, leaving the
+        // kernel to report the board unstamped rather than guessing one.
+        let cfg = BootConfig::parse("kernel = k\ndtb = firmware\n").unwrap();
+        assert_eq!(cfg.board, None);
     }
 
     #[test]

@@ -12,6 +12,10 @@ kumo-abi.workspace = true
 [dev-dependencies]
 # Host-test the generated bin/fat32.img with the same reader that runs on target.
 kumo-fatfs = { path = "../lib/kumo-fatfs" }
+# Host-test the staged boot manifest with the same parser Nijigumo runs on target, so the
+# producer (xtask) and consumer (the loader) cannot drift.
+niji-uefi = { path = "../boot/niji-uefi" }
+kumo-bsp.workspace = true
 
 [[bin]]
 name = "xtask"
