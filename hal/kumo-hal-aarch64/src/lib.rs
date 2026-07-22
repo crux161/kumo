@@ -10,6 +10,7 @@
 //j469
 //j470
 //j471
+//j472
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3613,6 +3614,11 @@ fn read_string(strings: &[u8], offset: usize) -> Option<&str> {
 unsafe fn gicv3_init(config: &Gicv3Config) {
     GIC_DISTRIBUTOR_BASE.store(config.distributor_base, ORD);
     let redist = unsafe { current_redistributor(config) };
+    // Remember the exact frame the scan picked: the heartbeat-failure probe must read back
+    // the same redistributor init programmed (a rescan would mask a scan bug), and a nonzero
+    // base doubles as "the GICv3 path ran", which licenses the probe's ICC system-register
+    // reads (UNDEFINED on a GICv2-only PE — the Pi 5 / GIC-400). — PLOVER 2026-07-22
+    GICR_ACTIVE_BASE.store(redist, ORD);
     let timer_bit = 1u32 << config.timer_irq;
 
     unsafe { mmio_write32(config.distributor_base + GICD_CTLR, 0) };
@@ -3647,6 +3653,291 @@ unsafe fn gicv3_init(config: &Gicv3Config) {
 
 #[cfg(not(target_os = "none"))]
 unsafe fn gicv3_init(_config: &Gicv3Config) {}
+
+// ---- Heartbeat-failure probe (the GIC/TIMER gate's Tower-probe, J472) ---------
+//
+// When Stage-A's `GIC / TIMER` check times out, the kernel used to halt with only
+// "IRQ 27 heartbeat timeout (0t)" — five failure classes share that one line, and the
+// first Orange Pi 5 Plus metal boot (RK3588 / GIC600, CRUX 2026-07-22) stopped there.
+// This probe is the gate's equivalent of J471's Tower instruction probe: a bounded,
+// read-only snapshot of the whole delivery chain — virtual counter → timer compare →
+// redistributor pending → CPU-interface signalling → PE mask — followed by a pure
+// classification that names exactly one stage. It NEVER writes a register and never
+// reads ICC_IAR1_EL1 (an acknowledge would consume the very interrupt under diagnosis;
+// ICC_HPPIR1_EL1 is the non-perturbing window into the same CPU interface).
+//
+// One subtlety the probe exists to discriminate: the check's own deadline runs on
+// `monotonic_nanos()` = CNTPCT (the *physical* counter), while the heartbeat arms
+// CNTV_TVAL (the *virtual* counter). A printed timeout therefore proves only that the
+// physical counter ticks — the virtual timebase (CNTPCT + CNTVOFF_EL2, firmware-owned)
+// is exactly the kind of board-state divergence that is silent without observation.
+
+/// The redistributor frame `gicv3_init` selected for this PE; 0 = the GICv3 path never
+/// ran, so the probe must not touch ICC system registers (a GICv2-only PE raises
+/// UNDEFINED on them). Nonzero also pins *which* frame to read — the same one init
+/// programmed, never a rescan. — PLOVER 2026-07-22
+#[cfg(target_os = "none")]
+static GICR_ACTIVE_BASE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+const GICR_ISPENDR0: u64 = GICR_SGI_BASE + 0x0200;
+
+/// A raw, read-only snapshot of the virtual-timer delivery chain, taken at the moment
+/// the heartbeat gate fails. Plain data with no behaviour so host tests synthesise
+/// every failure class without hardware. Deltas are taken across a bounded spin by the
+/// reader; classification and rendering are pure functions over this struct.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GicTimerGateProbe {
+    /// Heartbeats the handler actually counted before the gate gave up.
+    pub seen: u64,
+    /// The timer PPI the gate armed (from the DTB or the architectural default).
+    pub irq_id: u32,
+    /// `CNTFRQ_EL0` — the frequency the arming arithmetic trusted.
+    pub cntfrq: u64,
+    /// Physical-counter (CNTPCT) advance across the probe's bounded spin.
+    pub cntpct_delta: u64,
+    /// Virtual-counter (CNTVCT) advance across the same spin — the arming timebase.
+    pub cntvct_delta: u64,
+    /// `CNTV_CTL_EL0` readback: bit 0 ENABLE, bit 1 IMASK, bit 2 ISTATUS.
+    pub cntv_ctl: u64,
+    pub gicd_ctlr: u32,
+    pub gicr_waker: u32,
+    pub gicr_igroupr0: u32,
+    pub gicr_isenabler0: u32,
+    pub gicr_ispendr0: u32,
+    pub icc_pmr: u64,
+    pub icc_bpr1: u64,
+    pub icc_igrpen1: u64,
+    /// Highest-priority pending interrupt at the CPU interface (1023 = none). Read-only,
+    /// never an acknowledge.
+    pub icc_hppir1: u64,
+    /// DAIF.I at probe time: the PE's own IRQ mask.
+    pub irq_masked: bool,
+}
+
+/// The single stage the probe holds responsible. Order in [`classify_gic_timer_gate`]
+/// is the delivery order: each class is only reachable when every earlier stage is
+/// proven healthy, so the verdict is never ambiguous between two stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GicTimerGateClass {
+    /// CNTPCT itself did not advance — even the check's deadline source is suspect.
+    PhysCounterFrozen,
+    /// CNTVCT did not advance: the virtual timebase is still (firmware counter/CNTVOFF
+    /// state), so the compare can never trip.
+    VirtCounterFrozen,
+    /// `CNTV_CTL.ENABLE` read back clear: the arming write was lost.
+    TimerNotArmed,
+    /// The virtual counter ticks but `ISTATUS` stayed 0 through a full failed window:
+    /// the compare never tripped (a bogus CNTFRQ makes the programmed TVAL unreachable).
+    CompareNeverTrips,
+    /// The compare tripped (`ISTATUS=1`) yet `ISPENDR0[irq]` never set: the redistributor
+    /// never presented the PPI (sleep state / group routing / the scanned frame was not
+    /// this PE's).
+    RedistSilent,
+    /// Pending at the redistributor, but `HPPIR1` does not name the timer PPI: the CPU
+    /// interface refuses to signal (group / enable / priority gating — the raw fields
+    /// in the line name which).
+    CpuInterfaceGated,
+    /// `HPPIR1` names the timer PPI yet DAIF.I is set: something re-masked IRQs at the PE
+    /// after `enable_irq`.
+    PeMasked,
+    /// The CPU interface is signalling and the PE is unmasked, but the count is still 0:
+    /// the IRQ vector / VBAR side, not the GIC.
+    DeliveredNotTaken,
+}
+
+/// Classify one snapshot. Pure: no MMIO, no system registers, host-testable.
+pub fn classify_gic_timer_gate(p: &GicTimerGateProbe) -> GicTimerGateClass {
+    const CNTV_CTL_ENABLE: u64 = 1;
+    const CNTV_CTL_ISTATUS: u64 = 1 << 2;
+    if p.cntpct_delta == 0 {
+        return GicTimerGateClass::PhysCounterFrozen;
+    }
+    if p.cntvct_delta == 0 {
+        return GicTimerGateClass::VirtCounterFrozen;
+    }
+    if p.cntv_ctl & CNTV_CTL_ENABLE == 0 {
+        return GicTimerGateClass::TimerNotArmed;
+    }
+    if p.cntv_ctl & CNTV_CTL_ISTATUS == 0 {
+        return GicTimerGateClass::CompareNeverTrips;
+    }
+    let timer_bit = if p.irq_id < 32 { 1u32 << p.irq_id } else { 0 };
+    if p.gicr_ispendr0 & timer_bit == 0 {
+        return GicTimerGateClass::RedistSilent;
+    }
+    // HPPIR1's INTID field is bits [23:0]; 1023 means "nothing pending".
+    if p.icc_hppir1 & 0x00ff_ffff != p.irq_id as u64 {
+        return GicTimerGateClass::CpuInterfaceGated;
+    }
+    if p.irq_masked {
+        return GicTimerGateClass::PeMasked;
+    }
+    GicTimerGateClass::DeliveredNotTaken
+}
+
+/// A formatted, NUL-free, single-line probe report with a bounded stack buffer — the
+/// same discipline as the Tower's QR payload (no alloc in a failure path). The kernel
+/// emits it verbatim; register names stay inside the HAL, out of `kernel/src`.
+pub struct GicTimerGateReport {
+    buf: [u8; Self::CAP],
+    len: usize,
+}
+
+impl GicTimerGateReport {
+    /// POST lines elsewhere run long; 256 covers the full field set with headroom.
+    const CAP: usize = 256;
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for GicTimerGateReport {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        let take = room.min(s.len());
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        // A fault path never propagates a formatting error; truncation is bounded by CAP.
+        Ok(())
+    }
+}
+
+/// Render the probe line. Pure formatting over the snapshot + verdict, host-tested for
+/// content and for the CAP bound. A `None` probe (the GICv3 path never ran — GICv2
+/// boards, or discovery failed before init) renders an explicit not-applicable line
+/// rather than zeros that could be misread as hardware state.
+pub fn render_gic_timer_gate(
+    probe: Option<&GicTimerGateProbe>,
+    class: Option<GicTimerGateClass>,
+) -> GicTimerGateReport {
+    use core::fmt::Write;
+    let mut report = GicTimerGateReport {
+        buf: [0; GicTimerGateReport::CAP],
+        len: 0,
+    };
+    match (probe, class) {
+        (Some(p), Some(c)) => {
+            let _ = write!(
+                report,
+                "GIC / TIMER        Probe      irq {} seen {}t  frq {}Hz pct +{} vct +{} ctl {:#x}  \
+                 gicd {:#010x} wake {:#010x} grp0 {:#010x} en0 {:#010x} pend0 {:#010x}  \
+                 pmr {:#04x} bpr1 {:#x} grpen1 {:#x} hppir1 {} daif.i {}  class {:?}\n",
+                p.irq_id,
+                p.seen,
+                p.cntfrq,
+                p.cntpct_delta,
+                p.cntvct_delta,
+                p.cntv_ctl,
+                p.gicd_ctlr,
+                p.gicr_waker,
+                p.gicr_igroupr0,
+                p.gicr_isenabler0,
+                p.gicr_ispendr0,
+                p.icc_pmr,
+                p.icc_bpr1,
+                p.icc_igrpen1,
+                p.icc_hppir1,
+                p.irq_masked as u8,
+                c
+            );
+        }
+        _ => {
+            let _ = write!(
+                report,
+                "GIC / TIMER        Probe      n/a (GICv3 path never ran this boot)\n"
+            );
+        }
+    }
+    report
+}
+
+/// Take the snapshot on metal and render the one-line verdict the kernel emits before
+/// halting at the GIC/TIMER gate. Read-only by construction; safe to call from the
+/// failure path. Host builds render the not-applicable line (unit tests drive
+/// `classify`/`render` directly with synthetic snapshots).
+pub fn gic_timer_gate_report(seen: u64) -> GicTimerGateReport {
+    #[cfg(target_os = "none")]
+    {
+        match unsafe { read_gic_timer_gate(seen) } {
+            Some(probe) => {
+                let class = classify_gic_timer_gate(&probe);
+                render_gic_timer_gate(Some(&probe), Some(class))
+            }
+            None => render_gic_timer_gate(None, None),
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = seen;
+        render_gic_timer_gate(None, None)
+    }
+}
+
+/// The bounded, read-only metal snapshot. Gated on `GICR_ACTIVE_BASE` so the ICC
+/// system-register reads only ever execute where they are defined. The spin between
+/// counter samples is fixed and short (a few ms at worst) — long enough for a 24 MHz
+/// counter to advance thousands of ticks, far too short to trip a live compare.
+#[cfg(target_os = "none")]
+unsafe fn read_gic_timer_gate(seen: u64) -> Option<GicTimerGateProbe> {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    let redist = GICR_ACTIVE_BASE.load(ORD);
+    if gicd == 0 || redist == 0 {
+        return None;
+    }
+    let irq_id = TIMER_IRQ_ID.load(ORD);
+    let mut probe = GicTimerGateProbe {
+        seen,
+        irq_id,
+        ..GicTimerGateProbe::default()
+    };
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) probe.cntfrq, options(nostack, nomem));
+    }
+    let pct0: u64;
+    let vct0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) pct0, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) vct0, options(nostack, nomem));
+    }
+    // Bounded observation window: pure spin, no MMIO, no register writes.
+    let mut spin = 0u32;
+    while spin < 2_000_000 {
+        core::hint::spin_loop();
+        spin += 1;
+    }
+    let pct1: u64;
+    let vct1: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) pct1, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) vct1, options(nostack, nomem));
+        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) probe.cntv_ctl, options(nostack, nomem));
+        core::arch::asm!("mrs {}, icc_pmr_el1", out(reg) probe.icc_pmr, options(nostack, nomem));
+        core::arch::asm!("mrs {}, icc_bpr1_el1", out(reg) probe.icc_bpr1, options(nostack, nomem));
+        core::arch::asm!(
+            "mrs {}, icc_igrpen1_el1",
+            out(reg) probe.icc_igrpen1,
+            options(nostack, nomem)
+        );
+        core::arch::asm!(
+            "mrs {}, icc_hppir1_el1",
+            out(reg) probe.icc_hppir1,
+            options(nostack, nomem)
+        );
+    }
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nostack, nomem)) };
+    probe.cntpct_delta = pct1.saturating_sub(pct0);
+    probe.cntvct_delta = vct1.saturating_sub(vct0);
+    probe.irq_masked = daif & 0x80 != 0; // DAIF.I
+    probe.gicd_ctlr = unsafe { mmio_read32(gicd + GICD_CTLR) };
+    probe.gicr_waker = unsafe { mmio_read32(redist + GICR_WAKER) };
+    probe.gicr_igroupr0 = unsafe { mmio_read32(redist + GICR_IGROUPR0) };
+    probe.gicr_isenabler0 = unsafe { mmio_read32(redist + GICR_ISENABLER0) };
+    probe.gicr_ispendr0 = unsafe { mmio_read32(redist + GICR_ISPENDR0) };
+    Some(probe)
+}
 
 // ---- GICv2 (GIC-400, Pi 5) ------------------------------------------------
 
@@ -5248,5 +5539,158 @@ mod tests {
             parse_timer_virtual_irq(&interrupts),
             Some(TIMER_VIRTUAL_PPI)
         );
+    }
+
+    // ---- J472 heartbeat-failure probe: the classification tree ---------------------
+
+    /// A snapshot in which the whole chain is healthy except that no heartbeat was ever
+    /// counted — each test then breaks exactly one stage and expects exactly one verdict.
+    fn gate_probe_healthy_but_silent() -> GicTimerGateProbe {
+        GicTimerGateProbe {
+            seen: 0,
+            irq_id: TIMER_VIRTUAL_PPI,
+            cntfrq: 24_000_000,
+            cntpct_delta: 90_000,
+            cntvct_delta: 90_000,
+            cntv_ctl: 0b101, // ENABLE set, IMASK clear, ISTATUS set (compare tripped)
+            gicd_ctlr: 0x12, // ARE_NS | EnableGrp1NS
+            gicr_waker: 0,
+            gicr_igroupr0: 1 << TIMER_VIRTUAL_PPI,
+            gicr_isenabler0: 1 << TIMER_VIRTUAL_PPI,
+            gicr_ispendr0: 1 << TIMER_VIRTUAL_PPI,
+            icc_pmr: 0xff,
+            icc_bpr1: 0,
+            icc_igrpen1: 1,
+            icc_hppir1: TIMER_VIRTUAL_PPI as u64,
+            irq_masked: false,
+        }
+    }
+
+    #[test]
+    fn gate_probe_names_a_frozen_virtual_counter() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntvct_delta = 0;
+        probe.cntv_ctl = 0b001; // ISTATUS cannot trip when the timebase never advances
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::VirtCounterFrozen
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_frozen_physical_counter_first() {
+        // The physical counter is the check's own deadline source; its freeze is the
+        // earliest stage and must win over every downstream symptom.
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntpct_delta = 0;
+        probe.cntvct_delta = 0;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::PhysCounterFrozen
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_lost_arming() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntv_ctl = 0; // ENABLE read back clear
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::TimerNotArmed
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_compare_that_never_trips() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.cntv_ctl = 0b001; // ticking, armed, but ISTATUS stayed 0
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::CompareNeverTrips
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_silent_redistributor() {
+        // The Orange Pi 5 Plus hypothesis class: compare tripped, GIC never saw it.
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.gicr_ispendr0 = 0;
+        probe.icc_hppir1 = 1023;
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::RedistSilent
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_gated_cpu_interface() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.icc_hppir1 = 1023; // pending at the redistributor, invisible to the PE
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::CpuInterfaceGated
+        );
+    }
+
+    #[test]
+    fn gate_probe_names_a_masked_pe() {
+        let mut probe = gate_probe_healthy_but_silent();
+        probe.irq_masked = true;
+        assert_eq!(classify_gic_timer_gate(&probe), GicTimerGateClass::PeMasked);
+    }
+
+    #[test]
+    fn gate_probe_names_delivery_without_acceptance() {
+        // Everything signalling, nothing counted: the vector/VBAR side.
+        let probe = gate_probe_healthy_but_silent();
+        assert_eq!(
+            classify_gic_timer_gate(&probe),
+            GicTimerGateClass::DeliveredNotTaken
+        );
+    }
+
+    #[test]
+    fn gate_probe_render_carries_the_verdict_and_the_evidence() {
+        let probe = gate_probe_healthy_but_silent();
+        let class = classify_gic_timer_gate(&probe);
+        let report = render_gic_timer_gate(Some(&probe), Some(class));
+        let line = report.as_str();
+        assert!(line.starts_with("GIC / TIMER        Probe      "));
+        assert!(line.contains("irq 27 seen 0t"));
+        assert!(line.contains("frq 24000000Hz"));
+        assert!(line.contains("pend0 0x08000000"));
+        assert!(line.contains("hppir1 27"));
+        assert!(line.contains("class DeliveredNotTaken"));
+        assert!(line.ends_with('\n'));
+        assert!(line.len() <= 256);
+    }
+
+    #[test]
+    fn gate_probe_render_without_a_probe_never_invents_state() {
+        // A GICv2 board (Pi 5) or a pre-init failure must not print zeros that read as
+        // hardware facts.
+        let report = render_gic_timer_gate(None, None);
+        let line = report.as_str();
+        assert!(line.contains("n/a (GICv3 path never ran this boot)"));
+        assert!(!line.contains("pend0"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn gate_probe_report_truncates_instead_of_overflowing() {
+        use core::fmt::Write;
+        let mut report = GicTimerGateReport {
+            buf: [0; GicTimerGateReport::CAP],
+            len: 0,
+        };
+        let huge = [b'x'; 1024];
+        let text = core::str::from_utf8(&huge).unwrap();
+        report.write_str(text).unwrap();
+        report.write_str(text).unwrap();
+        assert_eq!(report.as_str().len(), GicTimerGateReport::CAP);
     }
 }

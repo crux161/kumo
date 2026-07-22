@@ -6,6 +6,7 @@
 //j455
 //j456
 //j457
+//j472
 
 mod fpsimd;
 mod gdt;
@@ -854,6 +855,27 @@ pub fn init_timer_interrupts(_dtb: u64, period_hz: u64) -> Result<TimerIrqReport
 
 pub fn timer_irq_count() -> u64 {
     legacy_irq::count()
+}
+
+/// Parity stub for the aarch64 GIC/TIMER heartbeat-failure probe (J472). The x86 timer
+/// gate is PIC/PIT → IO APIC → local APIC; there is no GICv3 virtual-timer delivery
+/// chain to snapshot, so the report is a fixed not-applicable line. The shared Stage-A
+/// text only calls it on the aarch64 path; the symbol exists so `kumo_hal::active`
+/// resolves identically under either backend. — PLOVER 2026-07-22
+pub struct GicTimerGateReport {
+    text: &'static str,
+}
+
+impl GicTimerGateReport {
+    pub fn as_str(&self) -> &str {
+        self.text
+    }
+}
+
+pub fn gic_timer_gate_report(_seen: u64) -> GicTimerGateReport {
+    GicTimerGateReport {
+        text: "GIC / TIMER        Probe      n/a (x86_64 timer gate is PIC/APIC)\n",
+    }
 }
 
 pub fn wait_for_timer_irqs(_start: u64, needed: u64, _timeout_ns: u64) -> u64 {

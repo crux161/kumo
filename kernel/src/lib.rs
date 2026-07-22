@@ -8,6 +8,7 @@
 //j467
 //j468
 //j470
+//j472
 
 extern crate alloc;
 
@@ -443,6 +444,11 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     timer.irq,
                     seen
                 );
+                // J472: before halting, emit the non-perturbing probe's one-line verdict
+                // (counter → compare → redistributor → CPU interface → PE mask) so a
+                // metal boot names the failing stage instead of stopping blind — the
+                // Orange Pi 5 Plus (RK3588/GIC600) halted here 2026-07-22 with 0 ticks.
+                klog!("{}", kumo_hal::active::gic_timer_gate_report(seen).as_str());
                 kumo_hal::active::halt();
             }
         }
