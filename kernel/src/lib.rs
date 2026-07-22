@@ -9,6 +9,7 @@
 //j468
 //j470
 //j472
+//j473
 
 extern crate alloc;
 
@@ -2268,6 +2269,22 @@ mod tests {
         assert_eq!(fallback.distributor_base, 0x10_7fff_9000);
         assert_eq!(fallback.redistributor_base, None);
         assert_eq!(fallback.cpu_base, Some(0x10_7fff_a000));
+    }
+
+    /// The Orange Pi 5 Plus's "the boot chain always publishes a device tree" bet died on
+    /// metal 2026-07-22: Stage-A's GIC/TIMER gate halted `unavailable: NoGic` with no usable
+    /// tree in hand. The RK3588's GIC600 bases are silicon-fixed (TRM part1 ch01:
+    /// `GIC600 FE600000 4MB`; ch11: GICv3, eight 0x20000 GICR frames at 0xFE680000), so the
+    /// stamped board now injects them exactly like QEMU and the Pi 5 do — GICR-only, which
+    /// fixes the architecture by construction. A handed-off DT stays authoritative.
+    #[test]
+    fn opi5_yields_its_gic600_no_dtb_fallback() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("orange-pi-5-plus");
+        let fallback = board_gic_no_dtb_fallback(&boot).unwrap();
+        assert_eq!(fallback.distributor_base, 0xfe60_0000);
+        assert_eq!(fallback.redistributor_base, Some(0xfe68_0000));
+        assert_eq!(fallback.cpu_base, None);
     }
 
     /// An unstamped or unrecognized board injects nothing. Guessing QEMU's base here is exactly

@@ -1,6 +1,7 @@
 #![no_std]
 //j434
 //j468
+//j473
 
 //! `kumo-bsp` — the Board Support Package: the **runtime** board-specific parameters the
 //! generic arm64 kernel and HAL must not hardcode.
@@ -198,8 +199,22 @@ impl Board {
                 console: Console::Dw8250 { base: 0xfeb5_0000 },
                 // GIC600 (GICv3): GICD 0xfe600000, GICR 0xfe680000.
                 gic: GicVersion::V3,
-                // EDK2-rk3588 / U-Boot publish a device tree; PLAN_VII R1 bundles one besides.
-                gic_fallback: None,
+                // This entry used to bet that EDK2-rk3588 / U-Boot plus the R1-bundled
+                // ESP tree guarantee a device tree, and carried no fallback. Metal
+                // falsified that 2026-07-22: Stage-A's GIC/TIMER gate halted
+                // `unavailable: NoGic` — no usable tree arrived. The RK3588 TRM makes
+                // the fallback honest because these addresses are silicon, not board
+                // choice: part1 ch01's memory map gives "GIC600 FE600000 4MB", and
+                // ch11 pins GICv3 (r1p6, 8 CPUs in one cluster — eight 0x20000 GICR
+                // frames, the 1 MB at 0xFE680000 the staged DTB's reg tuple names).
+                // GICR-only fixes the architecture by construction (GIC600 has no
+                // GICC). A handed-off DT stays authoritative; the HAL prefers it and
+                // reads this only when none arrived. — TIMBERDOODLE 2026-07-22
+                gic_fallback: Some(GicFallback {
+                    distributor_base: 0xfe60_0000,
+                    redistributor_base: Some(0xfe68_0000),
+                    cpu_base: None,
+                }),
             },
         }
     }
@@ -267,7 +282,10 @@ mod tests {
 
     /// QEMU and Pi 5 can both reach KUMO without an EFI DT configuration table. QEMU names both
     /// secondary interfaces because `gic-version=` decides which exists; the Pi 5 names only its
-    /// documented GIC-400 CPU interface. Boards with guaranteed DT handoff stay empty.
+    /// documented GIC-400 CPU interface. The Orange Pi 5 Plus joins them from metal evidence:
+    /// its 2026-07-22 boot reached the GIC/TIMER gate with no usable tree and halted `NoGic`,
+    /// so the board carries its silicon-fixed GIC600 pair (TRM part1 ch01/ch11). Only the X13s,
+    /// whose ESP-staged DTB is its one proven boot path, stays empty.
     #[test]
     fn only_boards_with_a_real_no_dtb_path_carry_gic_fallbacks() {
         let qemu = Board::QemuVirtAarch64.spec().gic_fallback.unwrap();
@@ -280,10 +298,13 @@ mod tests {
         assert_eq!(pi5.redistributor_base, None);
         assert_eq!(pi5.cpu_base, Some(0x10_7fff_a000));
 
-        // These boot paths guarantee a DT and therefore need no lower-authority fallback.
-        for board in [Board::ThinkPadX13sGen1, Board::OrangePi5Plus] {
-            assert_eq!(board.spec().gic_fallback, None, "board {}", board.id());
-        }
+        let opi5 = Board::OrangePi5Plus.spec().gic_fallback.unwrap();
+        assert_eq!(opi5.distributor_base, 0xfe60_0000);
+        assert_eq!(opi5.redistributor_base, Some(0xfe68_0000));
+        assert_eq!(opi5.cpu_base, None);
+
+        // The X13s boot path stages its DTB on the ESP and has never missed it.
+        assert_eq!(Board::ThinkPadX13sGen1.spec().gic_fallback, None);
     }
 
     #[test]
