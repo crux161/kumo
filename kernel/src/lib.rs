@@ -11,6 +11,7 @@
 //j472
 //j473
 //j474
+//j476
 
 extern crate alloc;
 
@@ -347,11 +348,22 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // diagnostic above; the local copy lives for the non-returning Stage-A call.
     let mut sanitized_boot = *boot;
     match unsafe { validate_dtb_handoff(boot) } {
-        Ok(Some((address, size))) => klog!(
-            "DEVICE TREE       Check     {:#x}  {} bytes   OK\n",
-            address,
-            size
-        ),
+        Ok(Some((address, size))) => {
+            klog!(
+                "DEVICE TREE       Check     {:#x}  {} bytes   OK\n",
+                address,
+                size
+            );
+            // Flush the firmware-written DTB to the Point of Coherency before `enable_paging`
+            // rebuilds the tables. The kernel's identity map can cover this DTB's 2 MiB block as
+            // Device-nGnRnE (the block straddles a region boundary, so `normal_identity_block`
+            // declines Normal), while firmware wrote the blob into *cacheable* memory whose dirty
+            // lines may not have reached DRAM. Every post-paging DTB consumer (GIC, PDC, SMMU,
+            // i2c pinctrl) then reads it non-cacheably and sees stale DRAM — on the Orange Pi 5
+            // Plus that read back 0xffffffff and produced a spurious `NoGic`. Clean it now, while
+            // it is still mapped Normal, so those consumers see the real bytes. — TIMBERDOODLE
+            kumo_hal::active::clean_dcache_to_poc(address as usize, size as usize);
+        }
         Ok(None) => klog!("DEVICE TREE       Check     absent                  --\n"),
         Err(error) => {
             klog!(
@@ -469,6 +481,12 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         }
     }
 
+    // R4 diagnostic (opi5 NoGic hunt): the DTB validated OK pre-paging (DEVICE TREE line above),
+    // but `init_timer_interrupts` re-reads it via the SAME raw physical pointer *after* the MMU
+    // switch. On the opi5 the GIC parser is proven on these exact bytes yet returns NoGic, so the
+    // bytes at `dtb` must differ post-paging. Re-read the FDT magic here, through whatever mapping
+    // is now active — the value distinguishes intact (0xd00dfeed) from zeroed (0x0, an overwrite)
+    // from garbage (a stale/attribute read). Only fires when a DTB was handed off. — TIMBERDOODLE
     match kumo_hal::active::init_timer_interrupts(boot.platform.dtb, 20) {
         Ok(timer) => {
             let start = kumo_hal::active::timer_irq_count();
