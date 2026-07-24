@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j402
-//j414
 //j417
 //j424
 //j426
 //j470
+//j480
 
 extern crate alloc;
 
@@ -1041,10 +1040,14 @@ extern "C" fn sora_main(
                 // Refuse to mint an MMIO Resource over implausibly-shaped geometry: a corrupt
                 // snapshot read must fail here as a clear diagnostic, not reach the kernel's
                 // range check disguised as a rights problem.
-                let fb_res_h = if fb.is_plausible() {
-                    resource_create_child(res, fb.phys, fb.len, 0, 0)
-                } else {
-                    u64::MAX
+                let fb_res_h = match (fb.is_plausible(), fb.mapping_len()) {
+                    (true, Some(mapping_len)) => {
+                        // VMAR mappings are page-granular. Grant the final partial page while
+                        // keeping `fb.len` as the exact scanout/ownership extent; the opi5's
+                        // 1600×900×4 GOP length is not page-aligned. — KESTREL 2026-07-24
+                        resource_create_child(res, fb.phys, mapping_len, 0, 0)
+                    }
+                    _ => u64::MAX,
                 };
                 if fb_res_h != u64::MAX {
                     let (server_chan, client_chan) = channel_create_pair();

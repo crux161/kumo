@@ -2,6 +2,12 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//j160
+//j231
+//j246
+//j249
+//j480
+
 use drv_fb::{Console, BG};
 use kumo_abi::{BootInfo, Handle, VmarFlags};
 use kumo_rt::{
@@ -90,6 +96,13 @@ extern "C" fn main(
     let width = bootinfo.framebuffer.width as usize;
     let height = bootinfo.framebuffer.height as usize;
     let stride = bootinfo.framebuffer.stride as usize;
+    let fb_map_len = match bootinfo.framebuffer.mapping_len() {
+        Some(len) => len,
+        None => {
+            debug_write(b"drv-fb: fb map length overflow\n".as_ptr(), 31);
+            kumo_rt::process_exit(1);
+        }
+    };
 
     // J231 diagnostic: dump the framebuffer geometry drv-fb reads from the BootInfo VMO, so the
     // X13s scroll/overwrite bug can be pinned from serial. The scroll math is host-proven; if the
@@ -101,7 +114,9 @@ extern "C" fn main(
     dbg_kv(b"drv-fb fb.len=", fb_len);
 
     // Mint and map the actual framebuffer.
-    let fb_vmo_h = resource_mint_mmio(res, fb_phys, fb_len);
+    // Map the page-granular backing span, but retain `fb_len` for framebuffer ownership and
+    // visible-pixel bounds. This includes only the unavoidable tail of the final page.
+    let fb_vmo_h = resource_mint_mmio(res, fb_phys, fb_map_len);
     if fb_vmo_h == u64::MAX {
         debug_write(b"drv-fb: fb vmo mint failed\n".as_ptr(), 27);
         kumo_rt::process_exit(1);
@@ -117,7 +132,7 @@ extern "C" fn main(
         Handle(fb_vmo_h as u32),
         0,
         fb_va,
-        fb_len,
+        fb_map_len,
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     ) != 0
     {

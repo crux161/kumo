@@ -2,6 +2,7 @@ use core::marker::PhantomData;
 
 //j421
 //j467
+//j480
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +124,20 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
+    /// Page span needed to map the framebuffer while preserving [`Self::len`] as the exact
+    /// scanout extent. VMAR mappings are page-granular even when GOP reports a visible byte
+    /// length that is not (for example, 1600 × 900 × 4 on the Orange Pi 5 Plus).
+    pub const fn mapping_len(&self) -> Option<u64> {
+        const PAGE_MASK: u64 = 4095;
+        if self.len == 0 {
+            return None;
+        }
+        match self.len.checked_add(PAGE_MASK) {
+            Some(end) => Some(end & !PAGE_MASK),
+            None => None,
+        }
+    }
+
     /// Whether the geometry is self-consistent and within sane bounds — a guard against
     /// acting on a corrupt `BootInfo` read (e.g. a stale snapshot page on real hardware).
     /// It cannot prove the values are *correct*, only that they are plausible: a non-zero
@@ -312,6 +327,29 @@ mod tests {
             format: FramebufferFormat::Bgr,
         };
         assert!(real.is_plausible());
+        assert_eq!(real.mapping_len(), Some(real.len));
+
+        // The opi5's 1600×900 GOP span ends one quarter into its final page. Mapping must
+        // cover that page, while Framebuffer::len continues to describe visible scanout bytes.
+        let opi5 = Framebuffer {
+            len: 1600 * 900 * 4,
+            width: 1600,
+            height: 900,
+            stride: 1600,
+            ..real
+        };
+        assert!(opi5.is_plausible());
+        assert_eq!(opi5.len, 5_760_000);
+        assert_eq!(opi5.mapping_len(), Some(5_763_072));
+        assert_eq!(Framebuffer::default().mapping_len(), None);
+        assert_eq!(
+            Framebuffer {
+                len: u64::MAX,
+                ..real
+            }
+            .mapping_len(),
+            None
+        );
 
         // Each invariant rejects on its own: a non-page-aligned base, an over-large
         // dimension, a stride narrower than the width, and a length too small for
