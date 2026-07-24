@@ -9,13 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j368
-//j393
-//j396
 //j408
 //j422
 //j470
 //j471
+//j477
 
 use core::cell::UnsafeCell;
 
@@ -316,6 +314,8 @@ pub enum UsermodeError {
     MissingSora,
     Bootstrap(UserBootstrapError),
     Image(UserImageError),
+    BootInfoFrameAllocation,
+    UserThreadInit(crate::user_thread::UserSchedError),
     BadSegmentRange,
     ChannelSetup,
     /// Sora exited non-zero after all restart attempts were exhausted.
@@ -1975,7 +1975,7 @@ fn attempt_sora(
     // and backed by a physical-range VMO (identity-mapped, J153 invariant).
     let bootinfo_vmo_handle = {
         let bootinfo_frame = unsafe { crate::mm::alloc_zeroed_frame(boot) }
-            .ok_or(UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
+            .ok_or(UsermodeError::BootInfoFrameAllocation)?;
         // Write BootInfo into the identity-mapped frame (J153: identity, not physmap).
         unsafe { (bootinfo_frame as *mut BootInfo).write(*boot) };
         // The struct was written through this CPU's cacheable mapping; clean the page to
@@ -2139,7 +2139,7 @@ fn attempt_sora(
         process.root_vmar(),
         kernel_ttbr0,
     )
-    .map_err(|_| UsermodeError::Bootstrap(UserBootstrapError::EmptyImage))?;
+    .map_err(UsermodeError::UserThreadInit)?;
 
     // Koids of Sora's own channel ends — the koids Sora binds to its serve-loop port.
     // Resolved from the handle table before `process` is moved into `SoraState`.
