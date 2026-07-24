@@ -1,17 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j462
-//j463
-//j465
-//j466
-//j467
-//j468
-//j469
 //j470
 //j471
 //j472
 //j474
+//j482
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -20,8 +14,11 @@ pub mod smmuv2;
 pub mod smmuv3;
 pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
 pub use smmuv3::{
-    decode_smmuv3_fault_event, iommu_create_device_context, iommu_destroy_device_context,
-    iommu_init, iommu_map_device_page, iommu_unmap_device_range, SmmuFaultEvent,
+    decode_smmuv3_fault_event, discover_rk3588_mmu600_pcie, iommu_create_device_context,
+    iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
+    Mmu600PciePowerStatus, Mmu600PcieStatusReport, Mmu600PcieTopology, SmmuFaultEvent,
+    RK3588_MMU600_PCIE_BASE, RK3588_MMU600_PCIE_LENGTH, RK3588_PMU_PWR_GATE_STS0,
+    RK3588_PMU_QCHANNEL_PWR_STS, RK3588_PMU_SUBMEM_PWR_GATE_STS,
 };
 
 pub const ARCH: &str = "aarch64";
@@ -3076,6 +3073,30 @@ pub fn smmu_apps_discover_from_dtb(dtb: u64) -> Option<AppsSmmuTopology> {
 
 #[cfg(not(target_os = "none"))]
 pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
+    None
+}
+
+/// Discover the enabled RK3588 `MMU600_PCIE` and sample only its TRM-defined PMU integration
+/// status: PD_PHP, PCIe-MMU submemory, and TCU/TBU Q-channel state.
+///
+/// The MMU aperture is not dereferenced: power bits are advisory prerequisites, not proof that its
+/// clock/reset/APB path is abort-safe. There are no writes, and this report confers no DMA
+/// authority on USB3OTG_0 (which has no DT IOMMU binding). — KESTREL
+#[cfg(target_os = "none")]
+pub fn mmu600_pcie_status_from_dtb(dtb: u64) -> Option<Mmu600PcieStatusReport> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let topology = smmuv3::discover_rk3588_mmu600_pcie(bytes)?;
+    let power = Mmu600PciePowerStatus {
+        pwr_gate_sts0: unsafe { mmio_read32(mmio_phys(RK3588_PMU_PWR_GATE_STS0)) },
+        submem_pwr_gate_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_SUBMEM_PWR_GATE_STS)) },
+        qchannel_pwr_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_QCHANNEL_PWR_STS)) },
+    };
+
+    Some(Mmu600PcieStatusReport { topology, power })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mmu600_pcie_status_from_dtb(_dtb: u64) -> Option<Mmu600PcieStatusReport> {
     None
 }
 

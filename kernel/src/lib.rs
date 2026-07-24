@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j473
 //j474
 //j476
 //j478
 //j479
+//j482
 
 extern crate alloc;
 
@@ -557,6 +557,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             smmu.length
         ),
         None => klog!("APPS SMMU          Check     no MMU-500 in DTB      --\n"),
+    }
+
+    // RK3588 Road C preflight: select only the enabled PCIe MMU600 and observe its PD_PHP,
+    // submemory, and Q-channel status through TRM-defined read-only PMU fields. The MMU aperture
+    // remains untouched because these power observations do not prove its clock/reset/APB path
+    // abort-safe. No DeviceCtx exists; j481 USB3OTG_0 remains DMA-ineligible. — KESTREL
+    #[cfg(feature = "arch_aarch64")]
+    {
+        match kumo_hal::active::mmu600_pcie_status_from_dtb(boot.platform.dtb) {
+            Some(report) => klog!("{}", report),
+            None => klog!("MMU600 PCIE       Check     no enabled RK3588 MMU600  --\n"),
+        }
     }
 
     // M3 (opening): run more than one thread of control. A couple of kernel threads
