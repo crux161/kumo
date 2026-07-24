@@ -3,14 +3,22 @@
 #j330
 #j467
 #j468
+#j475
 
 # build.sh — quick staging, deploy, and boot-media entry point.
 #
 # Boot-media products:
-#   ./build.sh arm64 iso    -> build/kumo-arm64.iso
-#   ./build.sh arm64 img    -> build/kumo-arm64.img
+#   ./build.sh arm64 iso    -> build/kumo-arm64.iso   (ThinkPad X13s tree)
+#   ./build.sh arm64 img    -> build/kumo-arm64.img   (ThinkPad X13s tree)
+#   ./build.sh opi5  iso    -> build/kumo-opi5.iso    (Orange Pi 5 Plus tree)
+#   ./build.sh opi5  img    -> build/kumo-opi5.img    (Orange Pi 5 Plus tree)
 #   ./build.sh amd64 iso    -> build/kumo-amd64.iso
 #   ./build.sh amd64 img    -> build/kumo-amd64.img
+#
+# NOTE: `arm64` media stages the **ThinkPad X13s** profile — it is not board-generic. Flashing
+# an `arm64` image onto a different board boots that board with the X13s BSP entry (framebuffer
+# console, no serial, no GIC fallback), which looks like a hang on serial. Use the board-specific
+# target (`opi5`) for the Orange Pi 5 Plus.
 #
 # `.iso` selects UEFI optical media. `.img` selects disk-writeable media: a raw MBR/FAT32
 # ESP on ARM64 and GRUB's USB-bootable ISO-hybrid layout on AMD64.
@@ -33,15 +41,17 @@ OPEN_DIR=""
 DEPLOY_DIR=""
 
 X13S_DIR="build/images/thinkpad-x13s-gen1"
+OPI5_DIR="build/images/orange-pi-5-plus"
 
 usage() {
     cat >&2 <<'USAGE'
 usage:
-  ./build.sh <arm64|amd64> <iso|img>
-  ./build.sh [x13s|all]
+  ./build.sh <arm64|opi5|amd64> <iso|img>
+  ./build.sh [x13s|opi5|all]
 
 examples:
-  ./build.sh arm64 img
+  ./build.sh arm64 img          # ThinkPad X13s boot media
+  ./build.sh opi5 img           # Orange Pi 5 Plus boot media
   ./build.sh amd64 iso
   KUMO_PI5_CONSOLE_UART=pl011@0x1c00030000 ./build.sh all
 USAGE
@@ -70,6 +80,11 @@ build_pi5() {
     if [ -x "scripts/mk-pi5-img.sh" ]; then
         ./scripts/mk-pi5-img.sh
     fi
+}
+
+build_opi5() {
+    echo "==> Building aarch64 (Orange Pi 5 Plus)..."
+    cargo xtask image --arch aarch64 --hardware orange-pi-5-plus
 }
 
 build_x86() {
@@ -133,6 +148,18 @@ build_media() {
             fi
             DEPLOY_DIR="$X13S_DIR"
             ;;
+        opi5|opi5plus|orange-pi-5-plus)
+            artifact="build/kumo-opi5.${format}"
+            build_opi5
+            if [ "$format" = "iso" ]; then
+                echo "==> Building Orange Pi 5 Plus UEFI ISO: $artifact"
+                ./scripts/mkiso.sh aarch64 "$artifact" "$OPI5_DIR"
+            else
+                echo "==> Building Orange Pi 5 Plus raw MBR/FAT32 image: $artifact"
+                ./scripts/mkimg.sh arm64 "$artifact" "$OPI5_DIR"
+            fi
+            DEPLOY_DIR="$OPI5_DIR"
+            ;;
         amd64|x86_64|x86-64)
             artifact="build/kumo-amd64.${format}"
             if [ "$format" = "iso" ]; then
@@ -168,6 +195,17 @@ case "$MODE" in
         fi
         build_media "$MODE" "$PRODUCT"
         ;;
+    opi5|opi5plus|orange-pi-5-plus)
+        if [ -n "$PRODUCT" ]; then
+            build_media "$MODE" "$PRODUCT"
+        else
+            echo "==> Quick build: Orange Pi 5 Plus staging tree only (add 'img' to write boot media)"
+            build_opi5
+            report "$OPI5_DIR" "orange-pi-5-plus"
+            OPEN_DIR="$OPI5_DIR"
+            DEPLOY_DIR="$OPI5_DIR"
+        fi
+        ;;
     x13s)
         if [ -n "$PRODUCT" ]; then
             usage
@@ -184,12 +222,14 @@ case "$MODE" in
             usage
             exit 2
         fi
-        echo "==> Full sweep: X13s + Pi5 + x86_64 + QEMU"
+        echo "==> Full sweep: X13s + opi5 + Pi5 + x86_64 + QEMU"
         build_x13s
+        build_opi5
         build_pi5
         build_x86
         build_qemu
         report "$X13S_DIR" "thinkpad-x13s-gen1"
+        report "$OPI5_DIR" "orange-pi-5-plus"
         report "build/images/generic-uefi-x86_64" "generic-uefi-x86_64"
         report "build/images/qemu-virt-aarch64" "qemu-virt-aarch64"
         OPEN_DIR="build/images"
