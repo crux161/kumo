@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j417
 //j424
 //j426
 //j470
 //j480
+//j481
 
 extern crate alloc;
 
@@ -214,12 +214,12 @@ fn xhci_usb0_probe_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<kumo_xhci:
     }
     let bytes =
         unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
-    kumo_xhci::discover_x13s_usb0_xhci(bytes)?.probe_config()
+    kumo_xhci::discover_primary_xhci(bytes)?.probe_config()
 }
 
 fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handle, dtb_phys: u64) {
     let Some(config) = xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) else {
-        log(b"drv-xhci: no x13s usb0 xhci\n");
+        log(b"drv-xhci: no supported usb0 xhci\n");
         return;
     };
 
@@ -230,7 +230,11 @@ fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handl
     log(b" irq=");
     log_hex(config.irq as u64);
     log(b" stream=");
-    log_hex(config.stream_id as u64);
+    if config.stream_id == kumo_xhci::XHCI_NO_STREAM_ID {
+        log(b"none");
+    } else {
+        log_hex(config.stream_id as u64);
+    }
     log(b"\n");
 
     let device_resource =

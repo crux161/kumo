@@ -1,7 +1,8 @@
 //j426
 //j430
+//j481
 
-use crate::XhciProbeConfig;
+use crate::{XhciProbeConfig, XHCI_NO_STREAM_ID};
 
 const PAGE_SIZE: u64 = 0x1000;
 const FDT_MAGIC: u32 = 0xd00d_feed;
@@ -17,6 +18,10 @@ pub const X13S_USB0_XHCI_MMIO_MIN_LEN: u64 = 0x800;
 pub const X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN: u64 = 0x1000;
 pub const X13S_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0xd000;
 pub const X13S_USB0_XHCI_STREAM_ID: u32 = 0x820;
+pub const RK3588_USB0_XHCI_MMIO_BASE: u64 = 0xfc00_0000;
+pub const RK3588_USB0_XHCI_MMIO_LEN: u64 = 0x40_0000;
+pub const RK3588_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0x8000;
+pub const RK3588_USB0_XHCI_IRQ: u32 = 252;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GicInterrupt {
@@ -39,6 +44,7 @@ impl GicInterrupt {
 pub struct XhciControllerTopology {
     pub mmio_base: u64,
     pub mmio_length: u64,
+    pub register_length: u64,
     pub interrupt: GicInterrupt,
     pub stream_id: u32,
 }
@@ -46,7 +52,10 @@ pub struct XhciControllerTopology {
 impl XhciControllerTopology {
     pub fn probe_config(self) -> Option<XhciProbeConfig> {
         let irq = self.interrupt.global_id()?;
-        let grant_len = align_up(self.mmio_length, PAGE_SIZE)?;
+        let grant_len = align_up(self.register_length, PAGE_SIZE)?;
+        if grant_len > align_up(self.mmio_length, PAGE_SIZE)? {
+            return None;
+        }
         Some(XhciProbeConfig::new(
             self.mmio_base,
             grant_len,
@@ -58,7 +67,8 @@ impl XhciControllerTopology {
 
 #[derive(Clone, Copy, Default)]
 struct Node {
-    is_usb0_node: bool,
+    is_x13s_usb0_node: bool,
+    is_rk3588_usb0_node: bool,
     compatible_dwc3: bool,
     reg: [u32; 4],
     reg_len: u8,
@@ -71,13 +81,35 @@ struct Node {
 #[derive(Clone, Copy, Default)]
 struct ParseResult {
     root_sc8280xp: bool,
-    usb0: Option<XhciControllerTopology>,
+    root_rk3588: bool,
+    x13s_usb0: Option<XhciControllerTopology>,
+    rk3588_usb0: Option<XhciControllerTopology>,
+}
+
+pub fn discover_primary_xhci(dtb: &[u8]) -> Option<XhciControllerTopology> {
+    let parsed = parse(dtb)?;
+    if parsed.root_sc8280xp {
+        parsed.x13s_usb0
+    } else if parsed.root_rk3588 {
+        parsed.rk3588_usb0
+    } else {
+        None
+    }
 }
 
 pub fn discover_x13s_usb0_xhci(dtb: &[u8]) -> Option<XhciControllerTopology> {
     let parsed = parse(dtb)?;
     if parsed.root_sc8280xp {
-        parsed.usb0
+        parsed.x13s_usb0
+    } else {
+        None
+    }
+}
+
+pub fn discover_rk3588_usb0_xhci(dtb: &[u8]) -> Option<XhciControllerTopology> {
+    let parsed = parse(dtb)?;
+    if parsed.root_rk3588 {
+        parsed.rk3588_usb0
     } else {
         None
     }
@@ -114,7 +146,8 @@ fn parse(dtb: &[u8]) -> Option<ParseResult> {
                     + cursor;
                 let name = structures.get(cursor..end)?;
                 stack[depth] = Node {
-                    is_usb0_node: name == b"usb@a600000",
+                    is_x13s_usb0_node: name == b"usb@a600000",
+                    is_rk3588_usb0_node: name == b"usb@fc000000",
                     ..Node::default()
                 };
                 depth += 1;
@@ -125,9 +158,15 @@ fn parse(dtb: &[u8]) -> Option<ParseResult> {
                     return None;
                 }
                 let node = stack[depth - 1];
-                if node.is_usb0_node && node.compatible_dwc3 {
-                    if let Some(topology) = xhci_topology(&node) {
-                        parsed.usb0 = Some(topology);
+                if node.compatible_dwc3 {
+                    if node.is_x13s_usb0_node {
+                        if let Some(topology) = x13s_xhci_topology(&node) {
+                            parsed.x13s_usb0 = Some(topology);
+                        }
+                    } else if node.is_rk3588_usb0_node {
+                        if let Some(topology) = rk3588_xhci_topology(&node) {
+                            parsed.rk3588_usb0 = Some(topology);
+                        }
                     }
                 }
                 depth -= 1;
@@ -144,6 +183,7 @@ fn parse(dtb: &[u8]) -> Option<ParseResult> {
                 let name = property_name(strings, name_off)?;
                 if depth == 1 && name == b"compatible" {
                     parsed.root_sc8280xp = string_list_contains(value, b"qcom,sc8280xp");
+                    parsed.root_rk3588 = string_list_contains(value, b"rockchip,rk3588");
                 }
                 apply_property(&mut stack[depth - 1], name, value);
             }
@@ -155,7 +195,7 @@ fn parse(dtb: &[u8]) -> Option<ParseResult> {
     Some(parsed)
 }
 
-fn xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
+fn x13s_xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
     if node.reg_len < 4 || node.interrupts_len < 3 || node.iommus_len < 3 {
         return None;
     }
@@ -174,12 +214,42 @@ fn xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
     Some(XhciControllerTopology {
         mmio_base,
         mmio_length,
+        register_length: mmio_length,
         interrupt: GicInterrupt {
             kind: node.interrupts[0],
             number: node.interrupts[1],
             flags: node.interrupts[2],
         },
         stream_id,
+    })
+}
+
+fn rk3588_xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
+    if node.reg_len < 4 || node.interrupts_len < 3 {
+        return None;
+    }
+    let mmio_base = cells64(node.reg[0], node.reg[1]);
+    let mmio_length = cells64(node.reg[2], node.reg[3]);
+    if mmio_base != RK3588_USB0_XHCI_MMIO_BASE || mmio_length != RK3588_USB0_XHCI_MMIO_LEN {
+        return None;
+    }
+    let interrupt = GicInterrupt {
+        kind: node.interrupts[0],
+        number: node.interrupts[1],
+        flags: node.interrupts[2],
+    };
+    if interrupt.global_id() != Some(RK3588_USB0_XHCI_IRQ) || interrupt.flags != 4 {
+        return None;
+    }
+    Some(XhciControllerTopology {
+        mmio_base,
+        mmio_length,
+        // RK3588 TRM Part 2 chapter 13 limits xHCI registers to 0x0000..0x7fff.
+        // USB3OTG_0 has no DT `iommus` binding; this first-light probe performs no DMA.
+        // — KESTREL 2026-07-24
+        register_length: RK3588_USB0_XHCI_REGISTER_MMIO_LEN,
+        interrupt,
+        stream_id: XHCI_NO_STREAM_ID,
     })
 }
 
@@ -233,6 +303,7 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
+    const RK3588_DTB: &[u8] = include_bytes!("../../../rk3588-orangepi-5-plus.dtb");
     const X13S_DTB: &[u8] = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
 
     #[test]
@@ -240,6 +311,7 @@ mod tests {
         let topology = discover_x13s_usb0_xhci(X13S_DTB).expect("usb_0 xhci");
         assert_eq!(topology.mmio_base, X13S_USB0_XHCI_MMIO_BASE);
         assert_eq!(topology.mmio_length, 0xcd00);
+        assert_eq!(topology.register_length, topology.mmio_length);
         assert!(topology.mmio_length >= X13S_USB0_XHCI_MMIO_MIN_LEN);
         assert!(topology.mmio_length >= X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN);
         assert_eq!(
@@ -265,11 +337,45 @@ mod tests {
                 X13S_USB0_XHCI_STREAM_ID
             ))
         );
+        assert_eq!(discover_primary_xhci(X13S_DTB), Some(topology));
+        assert_eq!(discover_rk3588_usb0_xhci(X13S_DTB), None);
+    }
+
+    #[test]
+    fn discovers_the_rk3588_usb3otg0_xhci_controller() {
+        let topology = discover_rk3588_usb0_xhci(RK3588_DTB).expect("USB3OTG_0 xHCI");
+        assert_eq!(topology.mmio_base, RK3588_USB0_XHCI_MMIO_BASE);
+        assert_eq!(topology.mmio_length, RK3588_USB0_XHCI_MMIO_LEN);
+        assert_eq!(topology.register_length, RK3588_USB0_XHCI_REGISTER_MMIO_LEN);
+        assert_eq!(
+            topology.interrupt,
+            GicInterrupt {
+                kind: 0,
+                number: 220,
+                flags: 4
+            }
+        );
+        assert_eq!(topology.interrupt.global_id(), Some(RK3588_USB0_XHCI_IRQ));
+        assert_eq!(topology.stream_id, XHCI_NO_STREAM_ID);
+        assert_eq!(
+            topology.probe_config(),
+            Some(XhciProbeConfig::new(
+                RK3588_USB0_XHCI_MMIO_BASE,
+                RK3588_USB0_XHCI_REGISTER_MMIO_LEN,
+                RK3588_USB0_XHCI_IRQ,
+                XHCI_NO_STREAM_ID
+            ))
+        );
+        assert_eq!(discover_primary_xhci(RK3588_DTB), Some(topology));
+        assert_eq!(discover_x13s_usb0_xhci(RK3588_DTB), None);
     }
 
     #[test]
     fn rejects_non_dtb_or_truncated_inputs() {
+        assert_eq!(discover_primary_xhci(b"not a dtb"), None);
         assert_eq!(discover_x13s_usb0_xhci(b"not a dtb"), None);
+        assert_eq!(discover_rk3588_usb0_xhci(b"not a dtb"), None);
         assert_eq!(discover_x13s_usb0_xhci(&X13S_DTB[..32]), None);
+        assert_eq!(discover_rk3588_usb0_xhci(&RK3588_DTB[..32]), None);
     }
 }

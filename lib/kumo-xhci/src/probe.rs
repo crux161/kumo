@@ -1,6 +1,8 @@
 //j426
+//j481
 
 pub const XHCI_PROBE_CONFIG_LEN: usize = 32;
+pub const XHCI_NO_STREAM_ID: u32 = u32::MAX;
 const XHCI_PROBE_MAGIC: [u8; 4] = *b"XHCI";
 
 /// Bootstrap payload Sora sends to the first-light xHCI driver.

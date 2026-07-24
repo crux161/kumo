@@ -4,12 +4,13 @@
 //j426
 //j430
 //j431
+//j481
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_rt::{channel_read_with_handle, debug_write, process_exit, resource_mint_mmio, vmar_map};
 use kumo_xhci::{
     portsc_offset, CapabilityRegisters, ControllerStatus, PortStatus, RegisterLayout,
-    XhciProbeConfig, XHCI_PROBE_CONFIG_LEN,
+    XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -55,7 +56,11 @@ extern "C" fn main(
     log(b" irq=");
     log_hex(config.irq as u64);
     log(b" stream=");
-    log_hex(config.stream_id as u64);
+    if config.stream_id == XHCI_NO_STREAM_ID {
+        log(b"none");
+    } else {
+        log_hex(config.stream_id as u64);
+    }
     log(b"\n");
 
     let Some(map_len) = align_up(config.mmio_length, PAGE_SIZE) else {
