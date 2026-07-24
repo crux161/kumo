@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j472
 //j473
 //j474
 //j476
 //j478
+//j479
 
 extern crate alloc;
 
@@ -308,6 +308,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         Ok(report) => report,
         Err(err) => tower_halt_ascii("nijigumo->MUREX handoff invalid", Some(err)),
     };
+
+    // Preserve the final UEFI memory-map snapshot across the paging attribute switch. Nijigumo's
+    // `MemRegion` array lives in a small LoaderData allocation; its enclosing 2 MiB block can
+    // therefore become Device-nGnRnE in KUMO's conservative identity map. A stale post-switch
+    // descriptor made `alloc_zeroed_frame` select 0x0000100000001000 on the Orange Pi 5 Plus,
+    // where zeroing it faulted in `memset`. Clean the already-validated slice while firmware's
+    // cacheable map is still active. — KESTREL 2026-07-24
+    let memory_regions = unsafe { boot.mem_regions.as_slice() };
+    kumo_hal::active::clean_dcache_to_poc(
+        memory_regions.as_ptr() as usize,
+        core::mem::size_of_val(memory_regions),
+    );
 
     if report.has_initrd {
         // Flush the UEFI-loaded initrd to PoC before `enable_paging` replaces firmware's
