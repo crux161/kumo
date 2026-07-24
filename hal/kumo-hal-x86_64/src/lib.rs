@@ -7,6 +7,7 @@
 //j456
 //j457
 //j472
+//j474
 
 mod fpsimd;
 mod gdt;
@@ -450,6 +451,11 @@ pub fn console_read_byte() -> Option<u8> {
 /// backend's console is the 16550 COM1 it already owns. Mirrored from the aarch64 backend so
 /// the shared `stage_a` can inject a board's console base unconditionally (DESIGN/017 §4.3).
 pub fn console_set_pl011_base(_base: u64) {}
+
+/// Accepted and ignored: a Synopsys DW-APB UART is an ARM SoC peripheral (the RK3588 debug UART).
+/// This backend's console is COM1 at a fixed port, so it needs no injected MMIO base. Mirrored
+/// from the aarch64 backend so the shared `stage_a` can inject unconditionally (DESIGN/017 §4.3).
+pub fn console_set_dw8250_base(_base: u64) {}
 
 /// Accepted and ignored: the GIC is an ARM interrupt controller. This backend routes interrupts
 /// through the APIC/IO-APIC chain it discovers from ACPI, which needs no board fallback.

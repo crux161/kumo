@@ -10,6 +10,7 @@
 //j470
 //j472
 //j473
+//j474
 
 extern crate alloc;
 
@@ -113,6 +114,24 @@ const fn plausible_pl011_base(base: u64) -> bool {
     base != 0 && base < (1u64 << 48) && base & 0xfff == 0
 }
 
+/// The DW-APB (16550-class) console base for this board, resolved from the BSP, or `None`.
+///
+/// This is [`board_console_pl011_base`]'s sibling for the RK3588 debug UART (the Orange Pi 5 Plus,
+/// PLAN_VII R3) — a `snps,dw-apb-uart`, not a PL011, so it takes its own HAL sink. There is no boot
+/// override here: unlike the Pi 5's RP1 UART, whose host address is a firmware-selected PCIe window,
+/// uart2 @ 0xfeb50000 is a fixed silicon base, so the BSP entry is the single source. Version-gated
+/// for the same reason the PL011 path is — a stale loader's aliased v3 fields must never become a
+/// blind MMIO write.
+fn board_console_dw8250_base(boot: &BootInfo) -> Option<u64> {
+    if boot.version != ABI_VERSION {
+        return None;
+    }
+    kumo_bsp::Board::from_id(boot.board_id())?
+        .spec()
+        .console
+        .dw8250_base()
+}
+
 /// Whether Stage-A should keep servicing the interactive serial floor after POST.
 ///
 /// A framebuffer is a second output sink, not evidence that serial is absent. The Pi 5 has both:
@@ -123,8 +142,9 @@ const fn plausible_pl011_base(base: u64) -> bool {
 const fn stage_a_uses_serial_floor(
     has_framebuffer: bool,
     selected_pl011_base: Option<u64>,
+    selected_dw8250_base: Option<u64>,
 ) -> bool {
-    selected_pl011_base.is_some() || !has_framebuffer
+    selected_pl011_base.is_some() || selected_dw8250_base.is_some() || !has_framebuffer
 }
 
 /// Where this board's GIC lives when firmware publishes no device tree, or `None` when the boot
@@ -246,6 +266,17 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         kumo_hal::active::console_set_pl011_base(base);
     }
 
+    // The RK3588 debug UART is a Synopsys DW-APB (16550-class), not a PL011, so it has its own
+    // injection point and HAL sink (PLAN_VII R3). Same discipline as above: the board names the
+    // base, the HAL drives it, and every board without a DW-APB UART injects nothing and leaves
+    // that sink inert. This is what finally gives the Orange Pi 5 Plus a kernel console — until now
+    // it *selected* a DW-APB board in the BSP but had no backend, so the resolver found no PL011
+    // and every Stage-A POST line was dropped on the wire the operator is actually watching.
+    let selected_dw8250_base = board_console_dw8250_base(boot);
+    if let Some(base) = selected_dw8250_base {
+        kumo_hal::active::console_set_dw8250_base(base);
+    }
+
     // Same shape for the interrupt controller (DESIGN/017 §4.4). A device tree, when firmware
     // publishes one, names the GIC better than any table can and the HAL prefers it. The injected
     // fallback covers genuine no-DT paths: QEMU/OVMF and Pi 5 UEFI in its default ACPI-only mode.
@@ -298,6 +329,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!(
             "SERIAL ROUTE       Check     BSP PL011 {:?}          --\n",
             selected_pl011_base
+        );
+    }
+
+    // The DW-APB console (the Orange Pi 5 Plus) is a distinct sink from the PL011 above, so it gets
+    // its own route line. On that board this is the first Stage-A output the operator sees over
+    // uart2, and its appearance is itself the proof R3's backend reached the wire (PLAN_VII R3).
+    if let Some(base) = selected_dw8250_base {
+        klog!(
+            "CONSOLE ROUTE      Check     BSP DW-APB {:#x}       OK\n",
+            base
         );
     }
 
@@ -827,7 +868,11 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         }
     }
 
-    if !stage_a_uses_serial_floor(report.has_framebuffer, selected_pl011_base) {
+    if !stage_a_uses_serial_floor(
+        report.has_framebuffer,
+        selected_pl011_base,
+        selected_dw8250_base,
+    ) {
         // Framebuffer-only console (the X13s): no resolved UART and no kernel keyboard yet, so
         // idle here. The screen keeps the boot report; a pre-handoff pause lives in the loader.
         klog!("\nFRAMEBUFFER   Check     GREEN                    OK\n");
@@ -2236,17 +2281,56 @@ mod tests {
         assert_eq!(board_console_pl011_base(&boot), None);
     }
 
+    /// The Orange Pi 5 Plus selects the RK3588 debug UART — a DW-APB 16550-class device, not a
+    /// PL011 — so it resolves through the DW-APB path and reports no PL011 base. Before R3 the
+    /// kernel only asked `board_console_pl011_base`, found `None`, and booted the board mute; this
+    /// is the fact that gives it a console.
+    #[test]
+    fn opi5_yields_its_dw8250_console_base() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("orange-pi-5-plus");
+        assert_eq!(board_console_dw8250_base(&boot), Some(0xfeb5_0000));
+        assert_eq!(board_console_pl011_base(&boot), None);
+    }
+
+    /// The PL011 boards report no DW-APB base, so the two console paths are mutually exclusive and
+    /// a board can never light both UART sinks. Unstamped/unknown resolves to nothing on either.
+    #[test]
+    fn pl011_boards_yield_no_dw8250_base() {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.set_board_id("qemu-virt-aarch64");
+        assert_eq!(board_console_dw8250_base(&boot), None);
+        boot.set_board_id("raspberry-pi-5");
+        assert_eq!(board_console_dw8250_base(&boot), None);
+        boot.set_board_id("thinkpad-x13s-gen1");
+        assert_eq!(board_console_dw8250_base(&boot), None);
+        boot.set_board_id("");
+        assert_eq!(board_console_dw8250_base(&boot), None);
+    }
+
+    /// Stale-ABI safety mirrors the PL011 path: the aliased v3 fields must not be interpreted, so a
+    /// down-rev loader yields no DW-APB base and cannot turn a stale field into a blind MMIO write.
+    #[test]
+    fn dw8250_base_is_inert_for_a_stale_abi() {
+        let mut boot = BootInfo::empty(ABI_VERSION - 1);
+        boot.set_board_id("orange-pi-5-plus");
+        assert_eq!(board_console_dw8250_base(&boot), None);
+    }
+
     /// Console-floor selection must follow the resolved UART, not the unrelated presence of GOP.
     /// This is the Pi 5 metal regression: it reached the end of POST with RP1 serial alive, then
     /// entered the framebuffer-only idle branch and appeared to stop forever.
     #[test]
     fn dual_sink_pi_keeps_serial_floor_while_x13s_idles_on_glass() {
-        assert!(stage_a_uses_serial_floor(true, Some(0x1c_0003_0000)));
-        assert!(stage_a_uses_serial_floor(true, Some(0x10_7d00_1000)));
-        assert!(!stage_a_uses_serial_floor(true, None));
-        assert!(stage_a_uses_serial_floor(false, Some(0x0900_0000)));
+        assert!(stage_a_uses_serial_floor(true, Some(0x1c_0003_0000), None));
+        assert!(stage_a_uses_serial_floor(true, Some(0x10_7d00_1000), None));
+        assert!(!stage_a_uses_serial_floor(true, None, None));
+        assert!(stage_a_uses_serial_floor(false, Some(0x0900_0000), None));
         // Preserve the old headless attempt for an unstamped no-GOP boot.
-        assert!(stage_a_uses_serial_floor(false, None));
+        assert!(stage_a_uses_serial_floor(false, None, None));
+        // A DW-APB console keeps the serial floor even when a GOP is present — the opi5 must not
+        // fall into the framebuffer-only idle branch and appear to stop with a live uart2 shell.
+        assert!(stage_a_uses_serial_floor(true, None, Some(0xfeb5_0000)));
     }
 
     #[test]

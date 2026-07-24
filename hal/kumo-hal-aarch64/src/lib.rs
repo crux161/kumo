@@ -11,6 +11,7 @@
 //j470
 //j471
 //j472
+//j474
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -382,6 +383,79 @@ fn pl011_putc(byte: u8) {
             core::hint::spin_loop();
         }
         pl011_reg(UARTDR).write_volatile(byte as u32);
+    }
+}
+
+// ---- Synopsys DW-APB UART (16550-class) -----------------------------
+//
+// The RK3588 debug UART (uart2 @ 0xfeb50000, PLAN_VII) is a `snps,dw-apb-uart`, not a PL011. It
+// is a second console sink with the exact injection discipline the PL011 above follows (J461,
+// DESIGN/017 §4.3): the base is **0 until a board names one**, the sink stays inert until then,
+// and this backend names no board address. The Orange Pi 5 Plus is the only DW-APB board today,
+// so in practice a board lights up exactly one of the two UART sinks.
+//
+// Register shape is the RK3588 DTB's `reg-io-width = <4>`, `reg-shift = <2>`: the 16550 register
+// file at 32-bit stride, so register N lives at byte offset `N << 2`. We only need the two the
+// transmitter and receiver poll on:
+//   * THR/RBR — register 0 (offset 0x00): write to transmit, read to receive.
+//   * LSR     — register 5 (offset 0x14): THRE (bit 5) = holding register empty; DR (bit 0) =
+//               a received byte is waiting.
+//
+// Baud is firmware's: the RK3588 boot chain configures uart2 at 1_500_000 before handoff, and the
+// reference clock needed to recompute a divisor is contested and unknowable here (DESIGN/017 §5,
+// "don't guess" — the same lesson `pl011_init` learned at J465). So this backend never touches the
+// divisor or line-control latches; it only polls LSR and moves bytes.
+
+/// MMIO physical base of this board's DW-APB UART, injected via [`console_set_dw8250_base`].
+/// **0 means no board has named one**, and the sink stays inert: no init, no writes, no reads.
+static DW8250_BASE: AtomicU64 = AtomicU64::new(0);
+const DW_THR: usize = 0x00; // transmit holding / receive buffer (register 0, stride 4)
+const DW_LSR: usize = 0x14; // line status (register 5, stride 4)
+const DW_LSR_DR: u32 = 1 << 0; // data ready — a received byte is waiting
+const DW_LSR_THRE: u32 = 1 << 5; // transmit holding register empty — ready for a byte
+
+/// Set once the first byte initializes the DW-APB sink. Mirrors [`UART_READY`] for the PL011: it
+/// can become true only after a board injects a nonzero base, so it is the safe MMIO gate for the
+/// input and cursor paths.
+static DW8250_READY: AtomicBool = AtomicBool::new(false);
+
+/// Tell the console where this board's DW-APB UART lives, from its BSP entry. The kernel resolves
+/// this before the first console write; a board whose sources name no DW-APB UART (everything but
+/// the Orange Pi 5 Plus) leaves the sink inert. Passing 0 returns the sink to inert. This is the
+/// injection direction of DESIGN/017 §4.3 (as [`console_set_pl011_base`], for the RK3588 UART).
+pub fn console_set_dw8250_base(base: u64) {
+    DW8250_BASE.store(base, ORD);
+}
+
+/// The injected DW-APB base, or `None` when no board has named one (the sink is inert).
+pub fn console_dw8250_base() -> Option<u64> {
+    match DW8250_BASE.load(ORD) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// Whether a board has named a DW-APB UART. The sink does no MMIO until one has.
+fn dw8250_present() -> bool {
+    DW8250_BASE.load(ORD) != 0
+}
+
+fn dw8250_reg(offset: usize) -> *mut u32 {
+    (DW8250_BASE.load(ORD) + CONSOLE_VA_OFFSET.load(ORD) + offset as u64) as *mut u32
+}
+
+/// Firmware already configured this UART (baud, FIFO, line control) before handoff and KUMO cannot
+/// reconstruct that state, so bring-up is a deliberate no-op: touching FCR/LCR here would disturb a
+/// working console for no gain. Kept as the mirror of `pl011_init` so the sink's first-write latch
+/// reads the same on both backends.
+fn dw8250_init() {}
+
+fn dw8250_putc(byte: u8) {
+    unsafe {
+        while dw8250_reg(DW_LSR).read_volatile() & DW_LSR_THRE == 0 {
+            core::hint::spin_loop();
+        }
+        dw8250_reg(DW_THR).write_volatile(byte as u32);
     }
 }
 
@@ -1330,6 +1404,22 @@ pub fn early_console_write(bytes: &[u8]) {
         // carrying kernel diagnostics — strictly better than the drop this used to do.
     }
 
+    // DW-APB (16550-class) sink — the RK3588 debug UART (uart2, the Orange Pi 5 Plus). Same
+    // self-gating discipline as the PL011 below, but it must sit *ahead* of that block's early
+    // return: a DW-APB board names no PL011, so `pl011_present()` is false there and would drop
+    // these bytes before ever reaching this sink. Inert until a board injects a base (J461).
+    if dw8250_present() {
+        if !DW8250_READY.swap(true, ORD) {
+            dw8250_init();
+        }
+        for &byte in bytes {
+            if byte == b'\n' {
+                dw8250_putc(b'\r');
+            }
+            dw8250_putc(byte);
+        }
+    }
+
     // No base means no board named a PL011, so there is nothing to write to and we drop the
     // bytes. Dereferencing a guessed base is precisely the J182 hard-hang — so inert is the only
     // safe answer, not a fallback.
@@ -1370,6 +1460,8 @@ pub fn console_set_cursor(col: u32, row: u32) {
         FB_ROW.store(row, ORD);
     } else if UART_READY.load(ORD) {
         pl011_putc(b'\r');
+    } else if DW8250_READY.load(ORD) {
+        dw8250_putc(b'\r');
     }
 }
 
@@ -1384,15 +1476,23 @@ const fn pl011_input_enabled(_framebuffer_present: bool, uart_ready: bool) -> bo
 /// X13s never raises `UART_READY` and remains inert, while a dual-sink Pi can keep shell RX on
 /// uart10 or RP1 after the framebuffer handoff. — KESTREL 2026-07-18
 pub fn console_read_byte() -> Option<u8> {
-    if !pl011_input_enabled(FB_PRESENT.load(ORD), UART_READY.load(ORD)) {
-        return None;
+    if pl011_input_enabled(FB_PRESENT.load(ORD), UART_READY.load(ORD)) {
+        let flags = unsafe { pl011_reg(UARTFR).read_volatile() };
+        return if flags & UARTFR_RXFE != 0 {
+            None
+        } else {
+            Some((unsafe { pl011_reg(UARTDR).read_volatile() } & 0xff) as u8)
+        };
     }
-    let flags = unsafe { pl011_reg(UARTFR).read_volatile() };
-    if flags & UARTFR_RXFE != 0 {
-        None
-    } else {
-        Some((unsafe { pl011_reg(UARTDR).read_volatile() } & 0xff) as u8)
+    // DW-APB receive (the opi5): the READY latch gates MMIO exactly as `UART_READY` does for the
+    // PL011 — true only after a board injected a base and the first byte initialized the sink.
+    if DW8250_READY.load(ORD) {
+        let status = unsafe { dw8250_reg(DW_LSR).read_volatile() };
+        if status & DW_LSR_DR != 0 {
+            return Some((unsafe { dw8250_reg(DW_THR).read_volatile() } & 0xff) as u8);
+        }
     }
+    None
 }
 
 // ---- ARM generic timer (monotonic clock) ----------------------------
@@ -4909,6 +5009,18 @@ mod tests {
         assert_eq!(console_pl011_base(), None);
         assert!(!pl011_present());
         early_console_write(b"dropped: no board has named a PL011\n");
+    }
+
+    /// The DW-APB sink ships inert on the same terms as the PL011 above: no base until a board
+    /// names one, and `early_console_write` must not dereference anything on the drop path. Like
+    /// its sibling this deliberately injects no base — `DW8250_BASE` is process-global and a write
+    /// here would make another test's `early_console_write` touch real MMIO; the injected case is
+    /// proven by the live opi5 boot (PLAN_VII R3), not on the host.
+    #[test]
+    fn console_ships_inert_until_a_board_names_a_dw8250() {
+        assert_eq!(console_dw8250_base(), None);
+        assert!(!dw8250_present());
+        early_console_write(b"dropped: no board has named a DW-APB UART\n");
     }
 
     /// Single-base classification is the primitive for the deduplicated plan. A high Pi 5
