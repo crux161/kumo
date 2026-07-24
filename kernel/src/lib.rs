@@ -1,17 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j457
-//j461
-//j462
-//j465
-//j467
-//j468
-//j470
 //j472
 //j473
 //j474
 //j476
+//j478
 
 extern crate alloc;
 
@@ -314,6 +308,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         Ok(report) => report,
         Err(err) => tower_halt_ascii("nijigumo->MUREX handoff invalid", Some(err)),
     };
+
+    if report.has_initrd {
+        // Flush the UEFI-loaded initrd to PoC before `enable_paging` replaces firmware's
+        // cacheable map. `LoaderData` commonly occupies only part of its enclosing 2 MiB block,
+        // so the conservative kernel identity map makes that whole block Device-nGnRnE. Without
+        // this clean, the post-paging ELF parser bypasses dirty cache lines and can read corrupt
+        // program-header sizes (observed on the Orange Pi 5 Plus as `Memory(InvalidRange)`).
+        // — KESTREL 2026-07-24
+        kumo_hal::active::clean_dcache_to_poc(boot.initrd.start as usize, boot.initrd.len as usize);
+    }
 
     if plausible_pl011_base(boot.platform.pl011_console_base) {
         klog!(
