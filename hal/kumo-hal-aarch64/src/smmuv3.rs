@@ -1,10 +1,11 @@
 //j482
+//j483
 
 //! ARM SMMUv3 scaffolding and RK3588 MMU600 integration-status discovery.
 //!
-//! RK3588 integration facts come from the vendored RK3588 TRM Part 1, chapters 1, 7, and 8.
-//! This slice reads only the PMU's documented power, submemory, and Q-channel status. It does not
-//! dereference either MMU600 aperture, enable an SMMU, configure queues, bind streams, or imply
+//! RK3588 integration facts come from the vendored RK3588 TRM Part 1, chapters 1, 2, 7, and 8.
+//! This slice reads only documented PMU status and CRU clock-gate/software-reset controls. It does
+//! not dereference either MMU600 aperture, enable an SMMU, configure queues, bind streams, or imply
 //! that a `DeviceCtx` exists.
 
 use core::fmt;
@@ -58,6 +59,20 @@ pub const RK3588_PMU_QCHANNEL_PWR_STS: u64 = 0xfd8d_81d8;
 const RK3588_PD_PHP_DOWN: u32 = 1 << 21;
 const RK3588_PCIEMMU_MEMORY_DOWN: u32 = 1 << 7;
 
+/// RK3588 always-on CRU controls observed without changing firmware state.
+///
+/// Chapter 2 defines `CRU_GATE_CON34` bits 9/7 as the MMU-BIU/PCIe-MMU software gates
+/// (high disables the clock), and `CRU_SOFTRST_CON34` bits 9/7 as their software reset
+/// requests (high asserts reset). A read reports only these controls: it cannot prove that
+/// a clock is toggling, that every reset source is inactive, or that the MMU APB path admits
+/// accesses. — KESTREL
+pub const RK3588_CRU_GATE_CON34: u64 = 0xfd7c_0888;
+pub const RK3588_CRU_SOFTRST_CON34: u64 = 0xfd7c_0a88;
+const RK3588_ACLK_MMU_PCIE_DISABLED: u32 = 1 << 7;
+const RK3588_ACLK_MMU_BIU_DISABLED: u32 = 1 << 9;
+const RK3588_MMU_PCIE_SOFTWARE_RESET: u32 = 1 << 7;
+const RK3588_MMU_BIU_SOFTWARE_RESET: u32 = 1 << 9;
+
 /// The enabled RK3588 PCIe SMMU register window selected from the board DTB.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mmu600PcieTopology {
@@ -109,11 +124,38 @@ impl Mmu600PciePowerStatus {
     }
 }
 
-/// Result of the target wrapper's PMU-only integration-status observation.
+/// Snapshot produced by read-only observation of the RK3588 CRU controls associated with
+/// `MMU600_PCIE`; the underlying control fields remain read/write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mmu600PcieControlStatus {
+    pub gate_con34: u32,
+    pub softrst_con34: u32,
+}
+
+impl Mmu600PcieControlStatus {
+    pub const fn pcie_clock_gate_open(self) -> bool {
+        self.gate_con34 & RK3588_ACLK_MMU_PCIE_DISABLED == 0
+    }
+
+    pub const fn biu_clock_gate_open(self) -> bool {
+        self.gate_con34 & RK3588_ACLK_MMU_BIU_DISABLED == 0
+    }
+
+    pub const fn pcie_software_reset_clear(self) -> bool {
+        self.softrst_con34 & RK3588_MMU_PCIE_SOFTWARE_RESET == 0
+    }
+
+    pub const fn biu_software_reset_clear(self) -> bool {
+        self.softrst_con34 & RK3588_MMU_BIU_SOFTWARE_RESET == 0
+    }
+}
+
+/// Result of the target wrapper's PMU/CRU integration-status observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mmu600PcieStatusReport {
     pub topology: Mmu600PcieTopology,
     pub power: Mmu600PciePowerStatus,
+    pub control: Mmu600PcieControlStatus,
 }
 
 impl fmt::Display for Mmu600PcieStatusReport {
@@ -136,6 +178,33 @@ impl fmt::Display for Mmu600PcieStatusReport {
             self.power.pcie_mmu_qchannel_deny(),
             self.power.pcie_mmu_qchannel_accept(),
             observed
+        )?;
+        write!(
+            formatter,
+            "MMU600 CONTROL    Check     gate={:#x} softrst={:#x} pcie-gate={} biu-gate={} \
+             pcie-rst-req={} biu-rst-req={} control-only   OK\n",
+            self.control.gate_con34,
+            self.control.softrst_con34,
+            if self.control.pcie_clock_gate_open() {
+                "open"
+            } else {
+                "closed"
+            },
+            if self.control.biu_clock_gate_open() {
+                "open"
+            } else {
+                "closed"
+            },
+            if self.control.pcie_software_reset_clear() {
+                "clear"
+            } else {
+                "asserted"
+            },
+            if self.control.biu_software_reset_clear() {
+                "clear"
+            } else {
+                "asserted"
+            },
         )
     }
 }
@@ -448,7 +517,37 @@ mod tests {
     }
 
     #[test]
-    fn status_report_renders_raw_power_and_qchannel_evidence() {
+    fn rk3588_control_status_decodes_only_software_gate_and_reset_bits() {
+        let open = Mmu600PcieControlStatus {
+            gate_con34: 0,
+            softrst_con34: 0,
+        };
+        assert!(open.pcie_clock_gate_open());
+        assert!(open.biu_clock_gate_open());
+        assert!(open.pcie_software_reset_clear());
+        assert!(open.biu_software_reset_clear());
+
+        let pcie_only = Mmu600PcieControlStatus {
+            gate_con34: RK3588_ACLK_MMU_PCIE_DISABLED,
+            softrst_con34: RK3588_MMU_PCIE_SOFTWARE_RESET,
+        };
+        assert!(!pcie_only.pcie_clock_gate_open());
+        assert!(pcie_only.biu_clock_gate_open());
+        assert!(!pcie_only.pcie_software_reset_clear());
+        assert!(pcie_only.biu_software_reset_clear());
+
+        let biu_only = Mmu600PcieControlStatus {
+            gate_con34: RK3588_ACLK_MMU_BIU_DISABLED,
+            softrst_con34: RK3588_MMU_BIU_SOFTWARE_RESET,
+        };
+        assert!(biu_only.pcie_clock_gate_open());
+        assert!(!biu_only.biu_clock_gate_open());
+        assert!(biu_only.pcie_software_reset_clear());
+        assert!(!biu_only.biu_software_reset_clear());
+    }
+
+    #[test]
+    fn status_report_renders_raw_power_qchannel_and_control_evidence() {
         let topology = Mmu600PcieTopology {
             base: RK3588_MMU600_PCIE_BASE,
             length: RK3588_MMU600_PCIE_LENGTH,
@@ -458,10 +557,25 @@ mod tests {
             submem_pwr_gate_sts: 0,
             qchannel_pwr_sts: 0,
         };
-        let line = format!("{}", Mmu600PcieStatusReport { topology, power });
+        let control = Mmu600PcieControlStatus {
+            gate_con34: 0,
+            softrst_con34: 0,
+        };
+        let line = format!(
+            "{}",
+            Mmu600PcieStatusReport {
+                topology,
+                power,
+                control,
+            }
+        );
         assert!(line.contains("pwr=0x0 mem=0x0 qch=0x0"));
         assert!(line.contains("req=0x0 act=0x0 deny=0x0 accept=0x0"));
-        assert!(line.ends_with("observed=up status-only   OK\n"));
+        assert!(line.contains("observed=up status-only   OK\n"));
+        assert!(line.ends_with(
+            "gate=0x0 softrst=0x0 pcie-gate=open biu-gate=open \
+             pcie-rst-req=clear biu-rst-req=clear control-only   OK\n"
+        ));
 
         let gated = format!(
             "{}",
@@ -472,10 +586,18 @@ mod tests {
                     submem_pwr_gate_sts: RK3588_PCIEMMU_MEMORY_DOWN,
                     qchannel_pwr_sts: 0,
                 },
+                control: Mmu600PcieControlStatus {
+                    gate_con34: RK3588_ACLK_MMU_PCIE_DISABLED | RK3588_ACLK_MMU_BIU_DISABLED,
+                    softrst_con34: RK3588_MMU_PCIE_SOFTWARE_RESET | RK3588_MMU_BIU_SOFTWARE_RESET,
+                },
             }
         );
         assert!(gated.contains("pwr=0x200000 mem=0x80 qch=0x0"));
-        assert!(gated.ends_with("observed=gated status-only   OK\n"));
+        assert!(gated.contains("observed=gated status-only   OK\n"));
+        assert!(gated.ends_with(
+            "gate=0x280 softrst=0x280 pcie-gate=closed biu-gate=closed \
+             pcie-rst-req=asserted biu-rst-req=asserted control-only   OK\n"
+        ));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j470
 //j471
 //j472
 //j474
 //j482
+//j483
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -16,9 +16,10 @@ pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
 pub use smmuv3::{
     decode_smmuv3_fault_event, discover_rk3588_mmu600_pcie, iommu_create_device_context,
     iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
-    Mmu600PciePowerStatus, Mmu600PcieStatusReport, Mmu600PcieTopology, SmmuFaultEvent,
-    RK3588_MMU600_PCIE_BASE, RK3588_MMU600_PCIE_LENGTH, RK3588_PMU_PWR_GATE_STS0,
-    RK3588_PMU_QCHANNEL_PWR_STS, RK3588_PMU_SUBMEM_PWR_GATE_STS,
+    Mmu600PcieControlStatus, Mmu600PciePowerStatus, Mmu600PcieStatusReport, Mmu600PcieTopology,
+    SmmuFaultEvent, RK3588_CRU_GATE_CON34, RK3588_CRU_SOFTRST_CON34, RK3588_MMU600_PCIE_BASE,
+    RK3588_MMU600_PCIE_LENGTH, RK3588_PMU_PWR_GATE_STS0, RK3588_PMU_QCHANNEL_PWR_STS,
+    RK3588_PMU_SUBMEM_PWR_GATE_STS,
 };
 
 pub const ARCH: &str = "aarch64";
@@ -3076,12 +3077,13 @@ pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
     None
 }
 
-/// Discover the enabled RK3588 `MMU600_PCIE` and sample only its TRM-defined PMU integration
-/// status: PD_PHP, PCIe-MMU submemory, and TCU/TBU Q-channel state.
+/// Discover the enabled RK3588 `MMU600_PCIE` and sample only its TRM-defined integration
+/// observations: PMU power/Q-channel status and CRU software clock-gate/reset controls.
 ///
-/// The MMU aperture is not dereferenced: power bits are advisory prerequisites, not proof that its
-/// clock/reset/APB path is abort-safe. There are no writes, and this report confers no DMA
-/// authority on USB3OTG_0 (which has no DT IOMMU binding). — KESTREL
+/// The MMU aperture is not dereferenced: neither the power status nor CRU controls prove a clock is
+/// physically toggling, every reset source is inactive, or the APB path is abort-safe. There are no
+/// writes, and this report confers no DMA authority on USB3OTG_0 (which has no DT IOMMU binding).
+/// — KESTREL
 #[cfg(target_os = "none")]
 pub fn mmu600_pcie_status_from_dtb(dtb: u64) -> Option<Mmu600PcieStatusReport> {
     let bytes = unsafe { dtb_bytes(dtb)? };
@@ -3091,8 +3093,16 @@ pub fn mmu600_pcie_status_from_dtb(dtb: u64) -> Option<Mmu600PcieStatusReport> {
         submem_pwr_gate_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_SUBMEM_PWR_GATE_STS)) },
         qchannel_pwr_sts: unsafe { mmio_read32(mmio_phys(RK3588_PMU_QCHANNEL_PWR_STS)) },
     };
+    let control = Mmu600PcieControlStatus {
+        gate_con34: unsafe { mmio_read32(mmio_phys(RK3588_CRU_GATE_CON34)) },
+        softrst_con34: unsafe { mmio_read32(mmio_phys(RK3588_CRU_SOFTRST_CON34)) },
+    };
 
-    Some(Mmu600PcieStatusReport { topology, power })
+    Some(Mmu600PcieStatusReport {
+        topology,
+        power,
+        control,
+    })
 }
 
 #[cfg(not(target_os = "none"))]
