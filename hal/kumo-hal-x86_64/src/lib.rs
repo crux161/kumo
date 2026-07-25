@@ -1044,6 +1044,26 @@ pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> b
     false
 }
 
+/// x86 has no GIC; device interrupt routing here is IOAPIC-based and configured elsewhere, so this
+/// is a no-op success (the interrupt binding still registers). Exists so the arch-generic kernel
+/// can name one `configure_spi_interrupt`.
+/// No PSCI on x86; a reset here would go through the 0xcf9 reset control register or ACPI.
+/// Exists so arch-generic kernel code can name one `system_reset`.
+pub fn system_reset() {}
+
+pub fn configure_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+/// No GIC on x86; device-line masking is IOAPIC-side and handled elsewhere.
+pub fn mask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+pub fn unmask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
 pub fn configure_i2c21_tlmm_pinctrl_from_dtb(_dtb: u64) -> Option<usize> {
     None
 }

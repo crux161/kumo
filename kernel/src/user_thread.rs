@@ -33,11 +33,15 @@ const CHILD_PRIORITY: Priority = Priority(63);
 /// of boot, and the `svc-health` pair smoke needs two *more* concurrent residents on top
 /// (2 drivers + 2 servers = 4). With only two slots both drivers saturated the table, so
 /// every later child spawn — the blocking `M10` runs and the async `svc-health` smokes alike
-/// — returned `ShouldWait` and "failed" (it was the slot gate, not frames). Sized to that
-/// peak; `children` reserves this capacity up front (no realloc while a child awaits first
-/// entry — the J169 invariant). Raise again only when a real case needs more (`GUIDANCE/006
-/// §6`): e.g. once `drv-fb` also spawns it becomes a third persistent driver → 5.
-const MAX_RESIDENT_CHILDREN: usize = 4;
+/// — returned `ShouldWait` and "failed" (it was the slot gate, not frames). `children`
+/// reserves this capacity up front (no realloc while a child awaits first entry — the J169
+/// invariant). Raised to 12 for the RK3588 USB bring-up: sora spawns one async `drv-xhci` per
+/// xHCI controller (usb0/usb1/host2) to find which port has the keyboard, and at 4 those
+/// briefly-concurrent enumeration children saturated the table on top of drv-blk/drv-fb — the
+/// third spawn and every later blocking `M10` then failed the slot gate, and the pending async
+/// children never got a yield to run. 12 covers the persistent drivers + a per-controller
+/// enumeration fan-out + the svc-health/M10 transients with headroom.
+const MAX_RESIDENT_CHILDREN: usize = 12;
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
 /// Same priority as the blocking child — more urgent than Sora (64).
 const CHILD_ASYNC_PRIORITY: Priority = Priority(63);

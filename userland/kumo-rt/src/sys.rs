@@ -395,6 +395,54 @@ pub fn vmo_create(_size: u64) -> u64 {
     u64::MAX
 }
 
+/// Allocate a physically-contiguous, zeroed DMA VMO of `size` bytes (page-rounded) and
+/// return `(handle, phys_base)`. The handle maps like an ordinary VMO — pass
+/// `VmarFlags::UNCACHED` for a Normal-NC (coherency-free) DMA mapping — while `phys_base` is
+/// the device-visible address to program into a DMA engine. On failure `handle == u64::MAX`
+/// and `phys_base == 0`. Mirrors `channel_read_with_handle`'s two-register return.
+#[cfg(target_arch = "aarch64")]
+pub fn vmo_create_contiguous(size: u64) -> (u64, u64) {
+    let handle: u64;
+    let phys: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::VmoCreateContiguous as u64,
+            in("x0") size,
+            lateout("x0") handle,
+            lateout("x1") phys,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (handle, phys)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn vmo_create_contiguous(size: u64) -> (u64, u64) {
+    let mut handle = Syscall::VmoCreateContiguous as u64;
+    let mut phys: u64 = 0;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") handle,
+            in("rdi") size,
+            inlateout("rdx") phys,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (handle, phys)
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
+pub fn vmo_create_contiguous(_size: u64) -> (u64, u64) {
+    (u64::MAX, 0)
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn vmo_read(vmo: Handle, offset: u64, buf: *mut u8, len: usize) -> u64 {
     syscall(

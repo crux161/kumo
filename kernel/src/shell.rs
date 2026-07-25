@@ -43,7 +43,8 @@ const HELP: &str = "commands:\r\n\
      ticks           timer scheduler ticks\r\n\
      uptime          time since boot\r\n\
      echo <text>     print text\r\n\
-     clear           clear the screen\r\n";
+     clear           clear the screen\r\n\
+     reboot          reset the machine (PSCI)\r\n";
 
 /// Run one command line, writing any output through `out`. An empty/whitespace line
 /// produces nothing.
@@ -105,6 +106,14 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
             // ANSI clear + home (this REPL runs on a serial terminal).
             let _ = out.write_str("\x1b[2J\x1b[H");
         }
+        "reboot" => {
+            // Netboot dev loop: restage the TFTP tree, then reboot from this prompt instead of
+            // reaching for the power switch. PSCI SYSTEM_RESET is the firmware interface EDK2
+            // implements on this board; if it declines we fall through and say so.
+            let _ = out.write_str("rebooting via PSCI SYSTEM_RESET...\r\n");
+            kumo_hal::active::system_reset();
+            let _ = out.write_str("reboot refused by firmware\r\n");
+        }
         other => {
             let _ = write!(out, "unknown command: {} (try 'help')\r\n", other);
         }
@@ -155,7 +164,7 @@ mod tests {
     fn help_lists_builtins() {
         let out = run("help");
         for cmd in [
-            "help", "ver", "mem", "ps", "ticks", "uptime", "echo", "clear",
+            "help", "ver", "mem", "ps", "ticks", "uptime", "echo", "clear", "reboot",
         ] {
             assert!(out.contains(cmd), "help missing '{cmd}'");
         }

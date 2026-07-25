@@ -40,6 +40,9 @@ fi
 
 export PXEHOST_TFTP_ROOT="$ROOT/netboot/tftp"
 export PXEHOST_BOOTFILE=bootx64.efi
+# ARM64 UEFI clients (option 93 arch 0x000b) boot Nijigumo directly. Left unset the
+# sidecar auto-detects bootaa64.efi in the tree; naming it here keeps the intent visible.
+export PXEHOST_ARM64_BOOTFILE=bootaa64.efi
 if [ -n "${KUMO_PXE_IP:-}" ]; then
   export PXEHOST_ADVERTISED_IP="$KUMO_PXE_IP"
 fi
@@ -47,6 +50,9 @@ fi
 echo "==> Starting KUMO PXE host"
 echo "    TFTP root: $PXEHOST_TFTP_ROOT"
 echo "    bootfile:  $PXEHOST_BOOTFILE"
+if [ -s "$PXEHOST_TFTP_ROOT/$PXEHOST_ARM64_BOOTFILE" ]; then
+  echo "    arm64:     $PXEHOST_ARM64_BOOTFILE (aarch64 UEFI / opi5)"
+fi
 echo "    ports:     UDP 67 (proxyDHCP), 69 (TFTP), 4011 (PXE)"
 echo "    Stop PumpKIN or any other DHCP/TFTP service before continuing."
 exec "$PXEHOST"

@@ -375,6 +375,169 @@ fn ctrl_ascii(usage: u8, shifted: bool) -> Option<u8> {
     }
 }
 
+/// USB base class for Human Interface Devices.
+pub const USB_CLASS_HID: u8 = 3;
+/// USB base class for hubs (device descriptor bDeviceClass, and the hub interface class).
+pub const USB_CLASS_HUB: u8 = 9;
+/// HID subclass indicating the device supports the boot protocol.
+pub const HID_SUBCLASS_BOOT: u8 = 1;
+/// HID boot-protocol interface protocols.
+pub const HID_PROTOCOL_KEYBOARD: u8 = 1;
+pub const HID_PROTOCOL_MOUSE: u8 = 2;
+
+const DESC_INTERFACE: u8 = 4;
+const DESC_ENDPOINT: u8 = 5;
+const ENDPOINT_XFER_INTERRUPT: u8 = 3;
+const ENDPOINT_DIR_IN: u8 = 0x80;
+
+/// A boot-protocol HID interface and its interrupt-IN endpoint, located inside a USB
+/// configuration descriptor. This is the target for setting up periodic report transfers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HidBootInterface {
+    pub interface_number: u8,
+    pub alternate_setting: u8,
+    /// [`HID_PROTOCOL_KEYBOARD`] or [`HID_PROTOCOL_MOUSE`] (or another value for a boot device
+    /// that is neither).
+    pub protocol: u8,
+    /// bEndpointAddress of the interrupt-IN endpoint (bit 7 set = IN).
+    pub in_endpoint_address: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+}
+
+impl HidBootInterface {
+    pub const fn is_keyboard(&self) -> bool {
+        self.protocol == HID_PROTOCOL_KEYBOARD
+    }
+
+    pub const fn is_mouse(&self) -> bool {
+        self.protocol == HID_PROTOCOL_MOUSE
+    }
+
+    /// USB endpoint number (low nibble of the address), for the Device Context Index.
+    pub const fn endpoint_number(&self) -> u8 {
+        self.in_endpoint_address & 0x0f
+    }
+}
+
+/// Walk a USB configuration descriptor blob and return the first boot-protocol HID interface
+/// (class 3, subclass 1) paired with its first interrupt-IN endpoint. Allocation-free and
+/// bounds-checked: a truncated or malformed blob yields `None` rather than panicking, so it is
+/// safe to run directly over a DMA buffer the device filled.
+pub fn find_hid_boot_interface(config: &[u8]) -> Option<HidBootInterface> {
+    let mut index = 0usize;
+    // The interface whose endpoints we are currently scanning, if it is a boot HID interface.
+    let mut current: Option<(u8, u8, u8)> = None; // (interface_number, alternate_setting, protocol)
+    while index + 2 <= config.len() {
+        let length = config[index] as usize;
+        let descriptor_type = config[index + 1];
+        if length < 2 || index + length > config.len() {
+            break;
+        }
+        match descriptor_type {
+            DESC_INTERFACE if length >= 9 => {
+                let class = config[index + 5];
+                let subclass = config[index + 6];
+                let protocol = config[index + 7];
+                current = if class == USB_CLASS_HID && subclass == HID_SUBCLASS_BOOT {
+                    Some((config[index + 2], config[index + 3], protocol))
+                } else {
+                    None
+                };
+            }
+            DESC_ENDPOINT if length >= 7 => {
+                if let Some((interface_number, alternate_setting, protocol)) = current {
+                    let address = config[index + 2];
+                    let attributes = config[index + 3];
+                    if attributes & 0x3 == ENDPOINT_XFER_INTERRUPT && address & ENDPOINT_DIR_IN != 0
+                    {
+                        return Some(HidBootInterface {
+                            interface_number,
+                            alternate_setting,
+                            protocol,
+                            in_endpoint_address: address,
+                            max_packet_size: u16::from_le_bytes([
+                                config[index + 4],
+                                config[index + 5],
+                            ]),
+                            interval: config[index + 6],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += length;
+    }
+    None
+}
+
+/// An interrupt-IN endpoint and the interface it belongs to, located in a configuration
+/// descriptor. Used for a hub's status-change endpoint or any periodic-IN endpoint whose
+/// interface is not a boot-HID one (so [`find_hid_boot_interface`] would skip it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptInEndpoint {
+    pub interface_number: u8,
+    pub interface_class: u8,
+    pub in_endpoint_address: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+}
+
+impl InterruptInEndpoint {
+    pub const fn endpoint_number(&self) -> u8 {
+        self.in_endpoint_address & 0x0f
+    }
+}
+
+/// Find the first interrupt-IN endpoint that belongs to an interface of `interface_class`. Walks
+/// the configuration descriptor allocation-free and bounds-checked, so it is safe over a raw DMA
+/// buffer. (For a boot keyboard/mouse prefer [`find_hid_boot_interface`], which also checks the
+/// boot subclass/protocol.)
+pub fn find_interrupt_in_endpoint(config: &[u8], interface_class: u8) -> Option<InterruptInEndpoint> {
+    let mut index = 0usize;
+    let mut current: Option<(u8, u8)> = None; // (interface_number, class) while class matches
+    while index + 2 <= config.len() {
+        let length = config[index] as usize;
+        let descriptor_type = config[index + 1];
+        if length < 2 || index + length > config.len() {
+            break;
+        }
+        match descriptor_type {
+            DESC_INTERFACE if length >= 9 => {
+                let class = config[index + 5];
+                current = if class == interface_class {
+                    Some((config[index + 2], class))
+                } else {
+                    None
+                };
+            }
+            DESC_ENDPOINT if length >= 7 => {
+                if let Some((interface_number, class)) = current {
+                    let address = config[index + 2];
+                    let attributes = config[index + 3];
+                    if attributes & 0x3 == ENDPOINT_XFER_INTERRUPT && address & ENDPOINT_DIR_IN != 0
+                    {
+                        return Some(InterruptInEndpoint {
+                            interface_number,
+                            interface_class: class,
+                            in_endpoint_address: address,
+                            max_packet_size: u16::from_le_bytes([
+                                config[index + 4],
+                                config[index + 5],
+                            ]),
+                            interval: config[index + 6],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += length;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +673,105 @@ mod tests {
     #[test]
     fn unknown_usage_is_preserved_as_a_keysym() {
         assert_eq!(key_sym(0xfe, Modifiers::default()), KeySym::Unknown(0xfe));
+    }
+
+    // Config(9) + Interface(9) + HID(9) + Endpoint(7) for one boot HID interface.
+    fn boot_hid_config(protocol: u8, endpoint_address: u8, attributes: u8, mps: u16) -> [u8; 34] {
+        let mps = mps.to_le_bytes();
+        [
+            // Configuration descriptor
+            0x09, 0x02, 34, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+            // Interface descriptor: class 3 (HID), subclass 1 (boot), given protocol
+            0x09, 0x04, 0x00, 0x00, 0x01, USB_CLASS_HID, HID_SUBCLASS_BOOT, protocol, 0x00,
+            // HID descriptor (skipped by the walker)
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x3f, 0x00,
+            // Endpoint descriptor
+            0x07, 0x05, endpoint_address, attributes, mps[0], mps[1], 0x0a,
+        ]
+    }
+
+    #[test]
+    fn finds_a_boot_keyboards_interrupt_in_endpoint() {
+        let config = boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x03, 8);
+        let found = find_hid_boot_interface(&config).expect("keyboard interface");
+        assert_eq!(found.protocol, HID_PROTOCOL_KEYBOARD);
+        assert!(found.is_keyboard());
+        assert_eq!(found.in_endpoint_address, 0x81);
+        assert_eq!(found.endpoint_number(), 1);
+        assert_eq!(found.max_packet_size, 8);
+        assert_eq!(found.interval, 0x0a);
+        assert_eq!(found.interface_number, 0);
+    }
+
+    #[test]
+    fn finds_a_boot_mouse_and_reports_its_protocol() {
+        let config = boot_hid_config(HID_PROTOCOL_MOUSE, 0x82, 0x03, 4);
+        let found = find_hid_boot_interface(&config).expect("mouse interface");
+        assert!(found.is_mouse());
+        assert_eq!(found.endpoint_number(), 2);
+    }
+
+    #[test]
+    fn ignores_non_interrupt_or_out_endpoints() {
+        // A boot HID interface whose only endpoint is bulk, or is OUT, is not a match.
+        assert_eq!(
+            find_hid_boot_interface(&boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x02, 8)),
+            None
+        );
+        assert_eq!(
+            find_hid_boot_interface(&boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x01, 0x03, 8)),
+            None
+        );
+    }
+
+    #[test]
+    fn mass_storage_config_has_no_boot_hid_interface() {
+        // Config + Interface(class 8, mass storage) + two bulk endpoints.
+        let config = [
+            0x09, 0x02, 32, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32, //
+            0x09, 0x04, 0x00, 0x00, 0x02, 0x08, 0x06, 0x50, 0x00, // class 8 mass storage
+            0x07, 0x05, 0x81, 0x02, 0x00, 0x02, 0x00, // bulk IN
+            0x07, 0x05, 0x02, 0x02, 0x00, 0x02, 0x00, // bulk OUT
+        ];
+        assert_eq!(find_hid_boot_interface(&config), None);
+    }
+
+    #[test]
+    fn truncated_descriptor_yields_none_without_panicking() {
+        let full = boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x03, 8);
+        // Cut off inside the endpoint descriptor: the endpoint must not be reported.
+        assert_eq!(find_hid_boot_interface(&full[..full.len() - 3]), None);
+        // A zero-length descriptor must not loop forever.
+        assert_eq!(find_hid_boot_interface(&[0x00, 0x02, 0x00, 0x00]), None);
+        assert_eq!(find_hid_boot_interface(&[]), None);
+    }
+
+    #[test]
+    fn finds_a_hubs_interrupt_in_status_endpoint() {
+        // Config + Interface(class 9 hub) + Endpoint(interrupt IN).
+        let config = [
+            0x09, 0x02, 25, 0x00, 0x01, 0x01, 0x00, 0xe0, 0x00, //
+            0x09, 0x04, 0x00, 0x00, 0x01, USB_CLASS_HUB, 0x00, 0x00, 0x00, //
+            0x07, 0x05, 0x81, 0x03, 0x01, 0x00, 0x0c, // interrupt IN, mps 1, interval 12
+        ];
+        let found = find_interrupt_in_endpoint(&config, USB_CLASS_HUB).expect("hub status endpoint");
+        assert_eq!(found.interface_class, USB_CLASS_HUB);
+        assert_eq!(found.in_endpoint_address, 0x81);
+        assert_eq!(found.max_packet_size, 1);
+        assert_eq!(found.interval, 12);
+        // A boot keyboard config has no hub-class interface.
+        assert_eq!(
+            find_interrupt_in_endpoint(
+                &boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x03, 8),
+                USB_CLASS_HUB
+            ),
+            None
+        );
+        // But it does have a HID-class interrupt endpoint.
+        assert!(find_interrupt_in_endpoint(
+            &boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x03, 8),
+            USB_CLASS_HID
+        )
+        .is_some());
     }
 }

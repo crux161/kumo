@@ -217,13 +217,102 @@ fn xhci_usb0_probe_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<kumo_xhci:
     kumo_xhci::discover_primary_xhci(bytes)?.probe_config()
 }
 
-fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handle, dtb_phys: u64) {
-    let Some(config) = xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) else {
-        log(b"drv-xhci: no supported usb0 xhci\n");
-        return;
+/// RK3588 has three xHCI controllers. usb0 @ 0xfc000000 is the USB-C role-switch port; usb1 and
+/// host2 front the USB-A ports where a keyboard is likely attached. A USB-A device is invisible to
+/// a driver bound only to usb0, so spawn a drv-xhci per controller and let each enumerate its own.
+/// The register window is 0x8000; enumeration polls, so a placeholder IRQ is fine for usb1/host2.
+const RK3588_USB1_XHCI_MMIO_BASE: u64 = 0xfc40_0000;
+const RK3588_HOST2_XHCI_MMIO_BASE: u64 = 0xfcd0_0000;
+const RK3588_XHCI_REGISTER_MMIO_LEN: u64 = 0x8000;
+/// GIC INTIDs for the other two xHCI controllers. `rk3588-base.dtsi`/`rk3588-extra.dtsi` list
+/// usb_host0/1/2 as GIC_SPI 220/221/222, and an SPI's INTID is its number + 32 (usb0's 220 → 252
+/// matches the DTB-derived config). Without a real IRQ a driver has to busy-poll for reports, and
+/// at driver priority that starves the whole system — every controller gets its line.
+const RK3588_USB1_XHCI_IRQ: u32 = 253;
+const RK3588_HOST2_XHCI_IRQ: u32 = 254;
+
+/// U5: bootstrap tag preceding the keyboard-channel writer handed to a drv-xhci instance.
+const XHCI_KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
+
+/// Spawn a drv-xhci per xHCI controller and return the keyboard-channel reader (bound to the serve
+/// port → shell). The writer goes to the usb0 driver — where the keyboard enumerates on a root port
+/// today; usb1/host2 get none yet (they reach a keyboard via the hub path, U2).
+fn launch_xhci_first_light(
+    initrd: Handle,
+    root_resource: Handle,
+    dtb_vmo: Handle,
+    dtb_phys: u64,
+) -> Option<Handle> {
+    let (kbd_reader, kbd_writer) = channel_create_pair();
+    let have_channel = kbd_reader != u64::MAX && kbd_writer != u64::MAX;
+    if !have_channel {
+        if kbd_reader != u64::MAX {
+            let _ = handle_close(Handle(kbd_reader as u32));
+        }
+        if kbd_writer != u64::MAX {
+            let _ = handle_close(Handle(kbd_writer as u32));
+        }
+    }
+
+    // Every controller gets its own writer for the one keyboard channel: a keyboard may enumerate
+    // on any root port OR behind a hub on any controller, and whichever driver finds it delivers
+    // to the same reader Sora keeps. Each spawn needs a distinct handle, so duplicate per child
+    // (the engine requires Rights::TRANSFER on a transferred handle).
+    let writer_for = |have: bool| -> u64 {
+        if !have {
+            return u64::MAX;
+        }
+        handle_duplicate(
+            Handle(kbd_writer as u32),
+            Rights::READ | Rights::WRITE | Rights::TRANSFER,
+        )
     };
 
-    log(b"drv-xhci: topology usb0 mmio=");
+    match xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) {
+        Some(config) => spawn_xhci(initrd, root_resource, config, writer_for(have_channel)),
+        None => log(b"drv-xhci: no supported usb0 xhci\n"),
+    }
+    spawn_xhci(
+        initrd,
+        root_resource,
+        kumo_xhci::XhciProbeConfig::new(
+            RK3588_USB1_XHCI_MMIO_BASE,
+            RK3588_XHCI_REGISTER_MMIO_LEN,
+            RK3588_USB1_XHCI_IRQ,
+            kumo_xhci::XHCI_NO_STREAM_ID,
+        ),
+        writer_for(have_channel),
+    );
+    spawn_xhci(
+        initrd,
+        root_resource,
+        kumo_xhci::XhciProbeConfig::new(
+            RK3588_HOST2_XHCI_MMIO_BASE,
+            RK3588_XHCI_REGISTER_MMIO_LEN,
+            RK3588_HOST2_XHCI_IRQ,
+            kumo_xhci::XHCI_NO_STREAM_ID,
+        ),
+        writer_for(have_channel),
+    );
+    // The original writer stays with Sora only as the duplication source; close it.
+    if have_channel {
+        let _ = handle_close(Handle(kbd_writer as u32));
+    }
+
+    if have_channel {
+        Some(Handle(kbd_reader as u32))
+    } else {
+        None
+    }
+}
+
+fn spawn_xhci(
+    initrd: Handle,
+    root_resource: Handle,
+    config: kumo_xhci::XhciProbeConfig,
+    keyboard_writer: u64,
+) {
+    log(b"drv-xhci: topology mmio=");
     log_hex(config.mmio_base);
     log(b" len=");
     log_hex(config.mmio_length);
@@ -237,8 +326,16 @@ fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handl
     }
     log(b"\n");
 
-    let device_resource =
-        resource_create_child(root_resource, config.mmio_base, config.mmio_length, 0, 0);
+    // Grant the controller's IRQ alongside its MMIO so the driver can bind it (interrupt-driven
+    // HID). usb0 carries a real IRQ from the DTB; usb1/host2 are placeholders (0) and stay polled.
+    let irq_count = if config.irq != 0 { 1 } else { 0 };
+    let device_resource = resource_create_child(
+        root_resource,
+        config.mmio_base,
+        config.mmio_length,
+        config.irq,
+        irq_count,
+    );
     if device_resource == u64::MAX {
         log(b"drv-xhci: resource fail\n");
         return;
@@ -267,7 +364,23 @@ fn launch_xhci_first_light(initrd: Handle, root_resource: Handle, dtb_vmo: Handl
         let _ = handle_close(Handle(device_resource as u32));
         let _ = handle_close(Handle(sender as u32));
         let _ = handle_close(Handle(bootstrap as u32));
-    } else if run_elf(
+        if keyboard_writer != u64::MAX {
+            let _ = handle_close(Handle(keyboard_writer as u32));
+        }
+        return;
+    }
+    // Hand the keyboard-channel writer to the driver as a tagged second bootstrap message. The
+    // driver writes decoded key bytes here; the reader Sora kept feeds the shell.
+    if keyboard_writer != u64::MAX {
+        let tag = [XHCI_KEYBOARD_BOOTSTRAP_TAG];
+        let _ = channel_write_with_handle(
+            Handle(sender as u32),
+            tag.as_ptr(),
+            1,
+            Handle(keyboard_writer as u32),
+        );
+    }
+    if run_elf(
         initrd,
         DRV_XHCI_PATH.as_bytes(),
         0,
@@ -1091,7 +1204,10 @@ extern "C" fn sora_main(
                     log_fb_geometry(&fb);
                 }
 
-                launch_xhci_first_light(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
+                // The xHCI keyboard reader feeds the shell like the i2c-hid one; the i2c-hid path
+                // below only overrides it on a board that actually has an i2c-hid keyboard.
+                hid_keyboard_input =
+                    launch_xhci_first_light(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
 
                 // Match HID children from the read-only DTB capability before granting hardware
                 // authority. QEMU and unrelated framebuffer boards stop here without ever mapping
@@ -1860,6 +1976,31 @@ extern "C" fn sora_main(
         // without one there is no line editor to receive the command the prompt would solicit.
         if interactive_ttyd.is_some() {
             debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+        }
+        // Drain keystrokes that arrived BEFORE the port was bound. A driver may deliver keys as
+        // soon as it enumerates (well before Sora's serve setup), but `port_bind` only wakes on
+        // NEW signals — it does not replay an already-queued message. Without this drain those
+        // bytes are stranded in the channel forever and the first keys a user types during boot
+        // are silently lost. Live keys after this point each signal the port on write.
+        if let Some(hid_kbd) = hid_keyboard_input {
+            if interactive_ttyd.is_some() {
+                let mut backlog = [0u8; 256];
+                let n = channel_read(hid_kbd, backlog.as_mut_ptr(), backlog.len()) as usize;
+                if n > 0 {
+                    let tty = interactive_ttyd.unwrap().instance;
+                    let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
+                    for byte in backlog.iter().take(n) {
+                        dispatch_ttyd_key(
+                            tty.client,
+                            *byte,
+                            &mut tty_reply,
+                            initrd,
+                            prog_initrd,
+                            root,
+                        );
+                    }
+                }
+            }
         }
         loop {
             let source = Handle(port_wait(port) as u32);

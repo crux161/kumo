@@ -88,7 +88,16 @@ fi
 if [ "$BUILD" -eq 1 ]; then
   echo "==> Building AMD64 Multiboot2 kernel and initrd"
   (cd "$ROOT" && ./scripts/x86-multiboot.sh build)
+  # ARM64: stage the Orange Pi 5 Plus ESP tree (Nijigumo + kernel + initrd + DTB). The
+  # same layout the SD image uses, so a netbooted loader finds its payloads at the very
+  # paths it already knows.
+  echo "==> Building ARM64 (Orange Pi 5 Plus) boot assets"
+  (cd "$ROOT" && cargo xtask image --arch aarch64 --hardware opi5plus >/dev/null)
 fi
+
+# The opi5 image staging directory produced by `cargo xtask image`.
+ARM64_ESP="$ROOT/build/images/orange-pi-5-plus"
+ARM64_LOADER="$ARM64_ESP/EFI/BOOT/BOOTAA64.EFI"
 
 KERNEL="$ROOT/target/x86_64-unknown-none/release/kumo-kernel.bin"
 INITRD="$ROOT/target/x86_64-unknown-none/release/kumo-initrd.img"
@@ -159,6 +168,23 @@ cp "$INITRD" "$STAGE/amd64/kumo-initrd.img"
 cp "$CORE" "$STAGE/bootx64.efi"
 cp "$CORE" "$STAGE/EFI/BOOT/BOOTX64.EFI"
 
+# ARM64 UEFI clients (option 93 arch 0x000b) boot Nijigumo directly — there is no GRUB
+# stage. bootaa64.efi is the concise DHCP filename; the removable-media path is kept so
+# the same tree stays inspectable. EFI/KUMO carries the payloads Nijigumo fetches.
+ARM64_STAGED=0
+if [ -s "$ARM64_LOADER" ]; then
+  cp "$ARM64_LOADER" "$STAGE/bootaa64.efi"
+  cp "$ARM64_LOADER" "$STAGE/EFI/BOOT/BOOTAA64.EFI"
+  if [ -d "$ARM64_ESP/EFI/KUMO" ]; then
+    mkdir -p "$STAGE/EFI/KUMO"
+    (cd "$ARM64_ESP/EFI/KUMO" && tar cf - .) | (cd "$STAGE/EFI/KUMO" && tar xf -)
+  fi
+  ARM64_STAGED=1
+else
+  echo "==> No ARM64 loader staged; tree will not serve aarch64 clients" >&2
+  echo "    (rerun without --no-build, or run: cargo xtask image --arch aarch64 --hardware opi5plus)" >&2
+fi
+
 cat > "$STAGE/boot/grub/grub.cfg" <<'CFG'
 set timeout=3
 set default=0
@@ -194,6 +220,7 @@ cat > "$STAGE/config/pxehost.env.example" <<EOF
 # them automatically; they are recorded here so the generated tree is self-describing.
 PXEHOST_TFTP_ROOT="$OUTPUT"
 PXEHOST_BOOTFILE="bootx64.efi"
+PXEHOST_ARM64_BOOTFILE="bootaa64.efi"
 # Legacy BIOS PXE clients (option 93 arch 0x0000) are served this i386-pc NBP when present.
 PXEHOST_BIOS_BOOTFILE="${BIOS_BOOTFILE:-boot/grub/i386-pc/core.0}"
 # PXEHOST_ADVERTISED_IP="192.168.0.107"
@@ -224,6 +251,7 @@ architecture=x86_64
 firmware=uefi+bios
 boot_protocol=grub-multiboot2-over-tftp
 dhcp_bootfile_uefi=bootx64.efi
+dhcp_bootfile_arm64=bootaa64.efi
 dhcp_bootfile_bios=${BIOS_BOOTFILE:-none}
 source_commit=$COMMIT
 EOF
@@ -262,6 +290,9 @@ fi
 trap - EXIT INT TERM
 echo "wrote $OUTPUT"
 echo "  UEFI bootfile: bootx64.efi"
+if [ "$ARM64_STAGED" -eq 1 ]; then
+  echo "  ARM64 bootfile: bootaa64.efi (aarch64 UEFI, option 93 arch 0x000b)"
+fi
 echo "  BIOS bootfile: ${BIOS_BOOTFILE:-<none: UEFI-only tree>}"
 echo "  payloads:      amd64/kumo-kernel + amd64/kumo-initrd.img"
 echo "  manifest:      MANIFEST.sha256"

@@ -58,6 +58,68 @@ pub unsafe fn alloc_zeroed_frame(boot: &BootInfo) -> Option<u64> {
     }
 }
 
+/// Allocate `count` physically-contiguous, zeroed frames from usable RAM and return the
+/// physical base of the run, advancing [`FRAME_WATERMARK`] past it so the run is never
+/// reissued. Applies the *same* per-frame filters as [`alloc_zeroed_frame`] (watermark, and
+/// on AArch64 the whole-2 MiB-block Normal-WB constraint), tracking a run of adjacent frames.
+/// A frame rejected by those filters breaks the current run.
+///
+/// The run is cleaned to the Point of Coherency after zeroing: a DMA VMO built over it is
+/// typically mapped Normal-NC by its driver, so the device and that uncached alias must see
+/// DRAM, not dirty write-back lines left by the zeroing store (the j476 hazard class).
+///
+/// Frames scanned below the returned base are leaked for the rest of boot; DMA allocations
+/// are few and small, so the forward bump loss is acceptable.
+///
+/// # Safety
+/// Same contract as [`alloc_zeroed_frame`]: the kernel identity map must be active in TTBR0
+/// so the run can be zeroed and cache-maintained by physical address.
+pub unsafe fn alloc_contiguous_frames(boot: &BootInfo, count: u64) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    let bytes = count.checked_mul(PAGE_SIZE)?;
+    let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
+    let mut frames = plan.frame_allocator();
+    let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
+    #[cfg(feature = "arch_aarch64")]
+    let framebuffer = boot_framebuffer_range(boot);
+
+    let mut base: Option<u64> = None;
+    let mut have: u64 = 0;
+    let mut prev: u64 = 0;
+    loop {
+        let frame = frames.next_frame()?.start;
+        if frame < watermark {
+            base = None;
+            have = 0;
+            continue;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        if !normal_identity_block(plan.regions(), framebuffer, frame & !(BLOCK_2M - 1)) {
+            base = None;
+            have = 0;
+            continue;
+        }
+        match base {
+            Some(_) if frame == prev.saturating_add(PAGE_SIZE) => have += 1,
+            _ => {
+                base = Some(frame);
+                have = 1;
+            }
+        }
+        prev = frame;
+        if have == count {
+            let start = base.expect("run base set once have > 0");
+            FRAME_WATERMARK.store(start.saturating_add(bytes), Ordering::Relaxed);
+            // SAFETY: usable RAM, mapped Normal-WB now; zero then push to PoC (see doc).
+            unsafe { core::ptr::write_bytes(start as *mut u8, 0, bytes as usize) };
+            kumo_hal::active::clean_dcache_to_poc(start as usize, bytes as usize);
+            return Some(start);
+        }
+    }
+}
+
 /// What kernel paging brought up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagingReport {
@@ -281,10 +343,16 @@ pub enum VmoBacking {
     /// Anonymous memory: fresh zeroed frames allocated on map.
     Anonymous,
     /// Ordinary physical RAM at a fixed address (initrd, boot-info snapshot).
+    /// Always mapped Normal-WB to match the kernel physmap alias.
     PhysicalRam { phys_base: u64 },
     /// Resource-minted MMIO. Maps Device-nGnRnE unless the caller explicitly
     /// requests the framebuffer-specific Normal-NC policy.
     Mmio { phys_base: u64 },
+    /// Physically-contiguous RAM allocated for device DMA (xHCI rings/DCBAA/buffers).
+    /// Unlike [`Self::PhysicalRam`] it *may* be mapped Normal-NC (uncached) so a driver
+    /// gets coherency-free DMA without cache maintenance; the frames are cleaned to PoC at
+    /// allocation so the NC alias and the device see the zeroed contents, not stale WB lines.
+    Dma { phys_base: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -327,6 +395,19 @@ impl Vmo {
         Ok(Self {
             len: align_up(len).ok_or(MemoryError::InvalidRange)?,
             backing: VmoBacking::Mmio { phys_base },
+        })
+    }
+
+    pub fn from_dma_range(phys_base: u64, len: u64) -> Result<Self, MemoryError> {
+        if len == 0 {
+            return Err(MemoryError::Empty);
+        }
+        if !is_page_aligned(phys_base) {
+            return Err(MemoryError::Unaligned);
+        }
+        Ok(Self {
+            len: align_up(len).ok_or(MemoryError::InvalidRange)?,
+            backing: VmoBacking::Dma { phys_base },
         })
     }
 
@@ -500,6 +581,38 @@ impl<'a> BootFrameAllocator<'a> {
         count
     }
 
+    /// Return the base of the next run of `count` frames whose physical addresses are
+    /// adjacent (no exclusion or region gap between them), consuming every frame up to and
+    /// including the run. Frames scanned before a run breaks are discarded — this is a
+    /// forward bump allocator, so a rejected prefix is simply skipped, never revisited.
+    ///
+    /// `count == 0` yields `None`. The returned base is the first frame of the run; the
+    /// caller owns `[base, base + count * PAGE_SIZE)`.
+    pub fn next_run(&mut self, count: u64) -> Option<PhysFrame> {
+        if count == 0 {
+            return None;
+        }
+        let mut base: Option<u64> = None;
+        let mut have: u64 = 0;
+        let mut prev: u64 = 0;
+        loop {
+            let frame = self.next_frame()?.start;
+            match base {
+                Some(_) if frame == prev.saturating_add(PAGE_SIZE) => have += 1,
+                _ => {
+                    base = Some(frame);
+                    have = 1;
+                }
+            }
+            prev = frame;
+            if have == count {
+                return Some(PhysFrame {
+                    start: base.expect("run base set once have > 0"),
+                });
+            }
+        }
+    }
+
     fn advance_to_usable_region(&mut self) {
         while let Some(region) = self.regions.get(self.region_index) {
             if region.kind != MemRegionKind::Usable {
@@ -615,6 +728,59 @@ mod tests {
         assert_eq!(allocator.next_frame(), Some(PhysFrame { start: 0x6000 }));
         assert_eq!(allocator.next_frame(), Some(PhysFrame { start: 0x8000 }));
         assert_eq!(allocator.next_frame(), None);
+    }
+
+    #[test]
+    fn next_run_finds_a_contiguous_span_and_skips_gaps() {
+        // One usable region with a hole punched by an exclusion at 0x3000. The first two
+        // frames (0x1000,0x2000) are adjacent; 0x3000 is excluded; then 0x4000..0x6000 form
+        // a three-frame run.
+        let regions = [MemRegion {
+            range: Range::new(0x1000, 0x6000),
+            kind: MemRegionKind::Usable,
+            _reserved: 0,
+        }];
+        let exclusions = [Range::new(0x3000, 0x1000)];
+
+        // A run of 3 cannot start at 0x1000 (only two before the hole); it lands at 0x4000.
+        let mut allocator = BootFrameAllocator::new(&regions, &exclusions);
+        assert_eq!(allocator.next_run(3), Some(PhysFrame { start: 0x4000 }));
+
+        // A run of 2 is satisfied by the very first adjacent pair.
+        let mut allocator = BootFrameAllocator::new(&regions, &exclusions);
+        assert_eq!(allocator.next_run(2), Some(PhysFrame { start: 0x1000 }));
+
+        // A run longer than any adjacent span is unsatisfiable.
+        let mut allocator = BootFrameAllocator::new(&regions, &exclusions);
+        assert_eq!(allocator.next_run(4), None);
+
+        // count == 0 is rejected.
+        let mut allocator = BootFrameAllocator::new(&regions, &exclusions);
+        assert_eq!(allocator.next_run(0), None);
+    }
+
+    #[test]
+    fn next_run_of_one_matches_next_frame() {
+        let regions = [MemRegion {
+            range: Range::new(0x1000, 0x2000),
+            kind: MemRegionKind::Usable,
+            _reserved: 0,
+        }];
+        let mut allocator = BootFrameAllocator::new(&regions, &[]);
+        assert_eq!(allocator.next_run(1), Some(PhysFrame { start: 0x1000 }));
+        assert_eq!(allocator.next_run(1), Some(PhysFrame { start: 0x2000 }));
+        assert_eq!(allocator.next_run(1), None);
+    }
+
+    #[test]
+    fn dma_backing_is_a_contiguous_physical_range() {
+        let vmo = Vmo::from_dma_range(0xc000, PAGE_SIZE * 3).unwrap();
+        assert_eq!(vmo.backing(), VmoBacking::Dma { phys_base: 0xc000 });
+        assert_eq!(vmo.frame_count(), 3);
+        assert_eq!(
+            Vmo::from_dma_range(0xc001, PAGE_SIZE),
+            Err(MemoryError::Unaligned)
+        );
     }
 
     #[test]

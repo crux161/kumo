@@ -4569,6 +4569,69 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
     true
 }
 
+/// Enable a plain shared-peripheral interrupt (SPI) in the GIC distributor so a userspace driver
+/// holding the matching Resource can wait on it via `interrupt_create`. Unlike the TLMM GPIO path,
+/// this is a direct device SPI (e.g. the RK3588 xHCI controller). Delivery is already generic:
+/// `on_irq` signals the kernel hook with any non-timer/non-GPIO intid. Returns false if the GIC
+/// distributor base is not yet known.
+#[cfg(target_os = "none")]
+pub fn configure_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 {
+        return false;
+    }
+    unsafe { gic_configure_spi(gicd, irq) };
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn configure_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+/// Mask a device SPI in the GIC distributor. A level-triggered device line (the xHCI controller)
+/// stays asserted until its driver services the device, so leaving it enabled after EOI re-fires
+/// it immediately and storms — starving the very driver child that would ack it. The TLMM GPIO
+/// path already masks-then-unmasks for exactly this reason; this is the same contract for a plain
+/// SPI, paired with [`unmask_spi_interrupt`] on `InterruptComplete`.
+#[cfg(target_os = "none")]
+pub fn mask_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 {
+        return false;
+    }
+    let base = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(base + GICD_ICENABLER0 + bank, bit) };
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
+/// Re-enable a device SPI masked by [`mask_spi_interrupt`], once its driver has serviced the
+/// device and cleared the condition that asserted the line.
+#[cfg(target_os = "none")]
+pub fn unmask_spi_interrupt(irq: u32) -> bool {
+    let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
+    if gicd == 0 {
+        return false;
+    }
+    let base = mmio_phys(gicd);
+    let bit = 1u32 << (irq % 32);
+    let bank = (irq / 32) as u64 * 4;
+    unsafe { mmio_write32(base + GICD_ISENABLER0 + bank, bit) };
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn unmask_spi_interrupt(_irq: u32) -> bool {
+    true
+}
+
 #[cfg(target_os = "none")]
 fn tlmm_wake_slot_for_pin(pin: u32) -> Option<usize> {
     let mut empty = None;
@@ -5006,6 +5069,25 @@ pub use traps::install_exception_vectors;
 /// is nothing to install (and EL1 system registers are not accessible).
 #[cfg(not(target_os = "none"))]
 pub fn install_exception_vectors() {}
+
+/// Reset the machine through PSCI `SYSTEM_RESET` (function id 0x8400_0009), the standard
+/// ARM firmware interface EDK2 implements on this board. Used by the shell's `reboot` so a
+/// netbooted development loop never needs the power switch. Returns only if firmware refuses,
+/// in which case the caller keeps running.
+#[cfg(target_os = "none")]
+pub fn system_reset() {
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            in("x0") PSCI_SYSTEM_RESET,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn system_reset() {}
 
 pub fn halt() -> ! {
     loop {

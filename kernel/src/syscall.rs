@@ -137,6 +137,9 @@ pub enum KernelCall<'a> {
     VmoCreate {
         size: u64,
     },
+    VmoCreateContiguous {
+        size: u64,
+    },
     IoMmuFromResource {
         resource: Handle,
         kind: u32,
@@ -215,6 +218,9 @@ pub enum KernelCallResult {
     Status(Status),
     Handles { first: Handle, second: Handle },
     Handle(Handle),
+    /// A new handle plus a scalar returned in the secondary register — used by
+    /// `VmoCreateContiguous` to report the DMA VMO handle and its physical base together.
+    HandleAndValue { handle: Handle, value: u64 },
     Message(KernelMessage),
     PortPacket(PortPacket),
 }
@@ -338,13 +344,23 @@ fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
         if !kumo_hal::active::configure_tlmm_gpio_interrupt(gpio.pin, gpio.flags, key) {
             return Err(Errno::NotSupported);
         }
+    } else if !kumo_hal::active::configure_spi_interrupt(irq) {
+        // A plain device SPI (e.g. the xHCI controller) — enable it in the GIC so the bound
+        // driver's InterruptWait can actually receive it.
+        return Err(Errno::NotSupported);
     }
     Ok(key)
 }
 
 fn complete_interrupt_source(irq: u32) -> Result<(), Errno> {
-    if decode_tlmm_gpio_irq(irq).is_some() && !kumo_hal::active::complete_tlmm_gpio_interrupt(irq) {
-        return Err(Errno::NotSupported);
+    if decode_tlmm_gpio_irq(irq).is_some() {
+        if !kumo_hal::active::complete_tlmm_gpio_interrupt(irq) {
+            return Err(Errno::NotSupported);
+        }
+    } else if irq >= 32 {
+        // Re-enable the device SPI masked when it fired; the driver has now serviced the device
+        // and cleared the condition holding the line asserted.
+        kumo_hal::active::unmask_spi_interrupt(irq);
     }
     Ok(())
 }
@@ -377,6 +393,25 @@ fn alloc_anonymous_frame(boot: &BootInfo) -> Result<u64, Errno> {
     #[cfg(not(target_os = "none"))]
     {
         unsafe { crate::mm::alloc_zeroed_frame(boot) }.ok_or(Errno::NoMemory)
+    }
+}
+
+/// Allocate a physically-contiguous, zeroed run of `count` frames for device DMA, returning
+/// its physical base. Runs with the kernel identity map active in TTBR0 (like
+/// [`alloc_anonymous_frame`]) so the run can be zeroed and cleaned to PoC by physical address.
+fn alloc_contiguous(boot: &BootInfo, count: u64) -> Result<u64, Errno> {
+    #[cfg(target_os = "none")]
+    {
+        let saved_ttbr0 = kumo_hal::active::read_user_aspace_root();
+        unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+        let base = unsafe { crate::mm::alloc_contiguous_frames(boot, count) };
+        unsafe { kumo_hal::active::set_user_aspace_root(saved_ttbr0) };
+        base.ok_or(Errno::NoMemory)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    {
+        unsafe { crate::mm::alloc_contiguous_frames(boot, count) }.ok_or(Errno::NoMemory)
     }
 }
 
@@ -779,7 +814,8 @@ impl SyscallEngine {
         };
         match vmo_entry.vmo.backing() {
             crate::mm::VmoBacking::PhysicalRam { phys_base }
-            | crate::mm::VmoBacking::Mmio { phys_base } => {
+            | crate::mm::VmoBacking::Mmio { phys_base }
+            | crate::mm::VmoBacking::Dma { phys_base } => {
                 phys_base.checked_add(vmo_offset).ok_or(Errno::InvalidArgs)
             }
             crate::mm::VmoBacking::Anonymous => {
@@ -932,6 +968,20 @@ impl SyscallEngine {
                 };
                 needs_frame_alloc = false;
             }
+            crate::mm::VmoBacking::Dma { .. } => {
+                // DMA RAM is Normal memory, never Device, and never executable. Uncached
+                // (Normal-NC) is the coherency-free default a driver asks for; a cacheable
+                // request stays Normal-WB for the future coherent-DMA path.
+                if device || executable {
+                    return Err(Errno::InvalidArgs);
+                }
+                desc = if uncached {
+                    kumo_hal::active::user_nc_page_desc(writable)
+                } else {
+                    kumo_hal::active::user_page_desc(false, writable)
+                };
+                needs_frame_alloc = false;
+            }
             crate::mm::VmoBacking::Anonymous => {
                 if device || uncached {
                     return Err(Errno::InvalidArgs);
@@ -947,7 +997,8 @@ impl SyscallEngine {
         let pages = mapping.len / crate::mm::PAGE_SIZE;
         let phys_base = match vmo_entry.vmo.backing() {
             crate::mm::VmoBacking::PhysicalRam { phys_base }
-            | crate::mm::VmoBacking::Mmio { phys_base } => phys_base,
+            | crate::mm::VmoBacking::Mmio { phys_base }
+            | crate::mm::VmoBacking::Dma { phys_base } => phys_base,
             crate::mm::VmoBacking::Anonymous => 0,
         };
 
@@ -1204,7 +1255,8 @@ impl SyscallEngine {
                                     unsafe { core::slice::from_raw_parts_mut(dest, len) };
                                 match vmo_entry.vmo.backing() {
                                     crate::mm::VmoBacking::PhysicalRam { phys_base }
-                                    | crate::mm::VmoBacking::Mmio { phys_base } => {
+                                    | crate::mm::VmoBacking::Mmio { phys_base }
+                                    | crate::mm::VmoBacking::Dma { phys_base } => {
                                         kumo_hal::active::read_phys(phys_base + offset, dest_slice);
                                         Errno::Ok.status()
                                     }
@@ -1262,7 +1314,8 @@ impl SyscallEngine {
                             let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
                             match backing {
                                 crate::mm::VmoBacking::PhysicalRam { phys_base }
-                                | crate::mm::VmoBacking::Mmio { phys_base } => {
+                                | crate::mm::VmoBacking::Mmio { phys_base }
+                                | crate::mm::VmoBacking::Dma { phys_base } => {
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
                                             src_slice.as_ptr(),
@@ -1606,6 +1659,22 @@ impl SyscallEngine {
                                 executable: false,
                             });
                         }
+                        crate::mm::VmoBacking::Dma { phys_base } => {
+                            // Contiguous DMA RAM: Normal memory (never Device), page-granular at
+                            // the driver's chosen VA. Uncached → Normal-NC for coherency-free DMA.
+                            if executable {
+                                return KernelCallResult::Status(Errno::InvalidArgs.status());
+                            }
+                            user_mappings.push(kumo_hal::active::UserMapping {
+                                phys_base: phys_base + mapping.vmo_offset,
+                                virt_addr: mapping.virt,
+                                len: mapping.len,
+                                writable,
+                                device: false,
+                                uncached,
+                                executable: false,
+                            });
+                        }
                         crate::mm::VmoBacking::Anonymous => {
                             if device || uncached {
                                 return KernelCallResult::Status(Errno::InvalidArgs.status());
@@ -1865,6 +1934,15 @@ impl SyscallEngine {
                     };
                 for binding in &mut self.interrupts {
                     if binding.koid == entry.koid {
+                        // Releasing a masked device line must NOT depend on `outstanding`.
+                        // `signal_irq` masks every device SPI it sees — including a fire that
+                        // raced ahead of this binding, which leaves `outstanding` false with the
+                        // line still masked. Gating the unmask on it strands the interrupt
+                        // forever (metal: driver armed, not one interrupt for the whole boot).
+                        // Unmasking an already-enabled line is a no-op, so this is safe to repeat.
+                        if binding.irq >= 32 && decode_tlmm_gpio_irq(binding.irq).is_none() {
+                            kumo_hal::active::unmask_spi_interrupt(binding.irq);
+                        }
                         if !binding.outstanding {
                             return KernelCallResult::Status(Errno::Ok.status());
                         }
@@ -2009,6 +2087,32 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
+            KernelCall::VmoCreateContiguous { size } => {
+                let Some(boot) = self.boot_info else {
+                    return KernelCallResult::Status(Errno::Internal.status());
+                };
+                // A DMA VMO is whole frames; page-round the request and reject 0 / overflow.
+                let Some(len) = crate::mm::align_up(size).filter(|&len| len != 0) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+                let count = len / crate::mm::PAGE_SIZE;
+                let phys = match alloc_contiguous(&boot, count) {
+                    Ok(phys) => phys,
+                    Err(e) => return KernelCallResult::Status(e.status()),
+                };
+                let vmo = match crate::mm::Vmo::from_dma_range(phys, len) {
+                    Ok(vmo) => vmo,
+                    Err(_) => return KernelCallResult::Status(Errno::Internal.status()),
+                };
+                match self.root_vmo_create(
+                    process,
+                    vmo,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(handle) => KernelCallResult::HandleAndValue { handle, value: phys },
+                    Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
+                }
+            }
             KernelCall::IoMmuFromResource {
                 resource,
                 kind: _kind,

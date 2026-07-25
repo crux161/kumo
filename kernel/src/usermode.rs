@@ -220,11 +220,25 @@ where
     Some(f(&mut *state))
 }
 
+
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer/device IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora after the IRQ epilogue when the boot
 /// floor is current.
 extern "C" fn signal_irq(irq: u32) {
     let now_ns = kumo_hal::active::monotonic_nanos();
+    // Bounded device-IRQ probe: prove whether a device interrupt (e.g. the xHCI keyboard, SPI 252)
+    // actually reaches the kernel while the system sits idle at the shell prompt. Keystrokes are
+    // serviced during boot but not at idle, and that difference is only explainable by either the
+    // IRQ not arriving or the woken child never being dispatched — this separates the two. Timer
+    // IRQs are excluded so the probe cannot flood. Remove once idle input is proven. — TIMBERDOODLE
+    // A device SPI is level-triggered: the line stays asserted until its driver services the
+    // device, so re-enabling it at EOI re-fires immediately and storms — which starves the very
+    // driver child that would ack it. Mask here, unmask in `complete_interrupt_source` when the
+    // driver calls `InterruptComplete`. Mirrors the TLMM GPIO mask/unmask contract. Timer is a
+    // PPI (< 32).
+    if irq >= 32 {
+        kumo_hal::active::mask_spi_interrupt(irq);
+    }
     with_sora_mut(|sora| {
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);
@@ -1178,6 +1192,20 @@ fn dispatch_object_syscall(
         match engine.dispatch(target, KernelCall::VmoCreate { size }) {
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreateContiguous as u64 {
+        // Two-register return: x0 = DMA VMO handle, x1 = physical base. On failure x0 is the
+        // sentinel and x1 is cleared so a caller reading the pair never sees a stale phys.
+        let size = r[0];
+        match engine.dispatch(target, KernelCall::VmoCreateContiguous { size }) {
+            KernelCallResult::HandleAndValue { handle, value } => {
+                r[0] = handle.0 as u64;
+                r[1] = value;
+            }
+            _ => {
+                r[0] = u64::MAX;
+                r[1] = 0;
+            }
         }
     } else if num == Syscall::VmoRead as u64 {
         // A process reading a VMO it was handed (J186 capability-passing). Validate the

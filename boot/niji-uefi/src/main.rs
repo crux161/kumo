@@ -112,6 +112,15 @@ const EFI_DTB_TABLE_GUID: EfiGuid = guid(
     0x41a5,
     [0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0],
 );
+/// `EFI_PXE_BASE_CODE_PROTOCOL_GUID` — present on the device handle of an image the firmware
+/// downloaded over PXE. It is how a netbooted loader reaches the TFTP server it came from, which
+/// is the only way to fetch the remaining payloads: a PXE-booted image has no ESP filesystem.
+const PXE_BASE_CODE_GUID: EfiGuid = guid(
+    0x03c4_e603,
+    0xac28,
+    0x11d3,
+    [0x9a, 0x2d, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+);
 const FILE_INFO_GUID: EfiGuid = guid(
     0x0957_6e92,
     0x6d3f,
@@ -271,6 +280,82 @@ struct EfiSimpleFileSystemProtocol {
     revision: u64,
     open_volume: extern "efiapi" fn(*mut Self, *mut *mut EfiFileProtocol) -> EfiStatus,
 }
+
+/// `EFI_PXE_BASE_CODE_MTFTP`. `server_ip` is an `EFI_IP_ADDRESS` (16-byte union) and `filename`
+/// is NUL-terminated ASCII. Optional pointers may be null.
+type EfiPxeBaseCodeMtftp = extern "efiapi" fn(
+    this: *mut EfiPxeBaseCodeProtocol,
+    operation: u32,
+    buffer: *mut c_void,
+    overwrite: bool,
+    buffer_size: *mut u64,
+    block_size: *mut usize,
+    server_ip: *const [u8; 16],
+    filename: *const u8,
+    info: *const c_void,
+    dont_use_buffer: bool,
+) -> EfiStatus;
+
+const EFI_PXE_TFTP_GET_FILE_SIZE: u32 = 1;
+const EFI_PXE_TFTP_READ_FILE: u32 = 2;
+
+/// `EFI_PXE_BASE_CODE_PROTOCOL`, laid out through `Mode` (the last member we read). Unused
+/// entries stay opaque so every member we do touch keeps its spec-defined offset.
+#[repr(C)]
+struct EfiPxeBaseCodeProtocol {
+    revision: u64,
+    start: *const c_void,
+    stop: *const c_void,
+    dhcp: *const c_void,
+    discover: *const c_void,
+    mtftp: EfiPxeBaseCodeMtftp,
+    udp_write: *const c_void,
+    udp_read: *const c_void,
+    set_ip_filter: *const c_void,
+    arp: *const c_void,
+    set_parameters: *const c_void,
+    set_station_ip: *const c_void,
+    set_packets: *const c_void,
+    mode: *mut EfiPxeBaseCodeMode,
+}
+
+/// Prefix of `EFI_PXE_BASE_CODE_MODE` up to the DHCP packets we read the TFTP server address
+/// from. The IP fields are `[u32; 4]` so the struct carries `EFI_IP_ADDRESS`'s 4-byte alignment
+/// and the explicit pad reproduces the C layout (17 BOOLEANs + TTL + ToS = 19 bytes, padded to
+/// 20). Trailing members are omitted: nothing after `proxy_offer` is read.
+#[repr(C)]
+struct EfiPxeBaseCodeMode {
+    started: bool,
+    ipv6_available: bool,
+    ipv6_supported: bool,
+    using_ipv6: bool,
+    bis_supported: bool,
+    bis_detected: bool,
+    auto_arp: bool,
+    send_guid: bool,
+    dhcp_discover_valid: bool,
+    dhcp_ack_received: bool,
+    proxy_offer_received: bool,
+    pxe_discover_valid: bool,
+    pxe_reply_received: bool,
+    pxe_bis_reply_received: bool,
+    icmp_error_received: bool,
+    tftp_error_received: bool,
+    make_callbacks: bool,
+    ttl: u8,
+    tos: u8,
+    _pad: u8,
+    station_ip: [u32; 4],
+    subnet_mask: [u32; 4],
+    dhcp_discover: [u8; 1472],
+    dhcp_ack: [u8; 1472],
+    proxy_offer: [u8; 1472],
+}
+
+/// Byte offset of `BootpSiAddr` (the "next server" address) inside an
+/// `EFI_PXE_BASE_CODE_DHCPV4_PACKET`: opcode/hwtype/hwaddrlen/gatehops (4) + ident (4) +
+/// seconds/flags (4) + ciaddr (4) + yiaddr (4).
+const DHCPV4_SIADDR_OFFSET: usize = 20;
 
 #[repr(C)]
 struct EfiFileProtocol {
@@ -486,12 +571,25 @@ unsafe fn boot_and_jump(
 
     kprint!(con_out, "\r\n--- platform discovery ---\r\n");
 
-    let root = match unsafe { open_boot_volume(image_handle, boot_services) } {
-        Some(root) => root,
+    let root = match unsafe { open_payload_source(image_handle, boot_services) } {
+        Some(source) => {
+            match source {
+                PayloadSource::Esp(_) => kprint!(con_out, "payloads     : ESP filesystem\r\n"),
+                PayloadSource::Tftp { server_ip, .. } => kprint!(
+                    con_out,
+                    "payloads     : TFTP from {}.{}.{}.{}\r\n",
+                    server_ip[0],
+                    server_ip[1],
+                    server_ip[2],
+                    server_ip[3]
+                ),
+            }
+            source
+        }
         None => {
             kprint!(
                 con_out,
-                "boot volume  : UNAVAILABLE - no ESP filesystem\r\n"
+                "boot volume  : UNAVAILABLE - no ESP filesystem and no PXE TFTP source\r\n"
             );
             return;
         }
@@ -657,11 +755,25 @@ unsafe fn boot_and_jump(
     }
 }
 
-/// Open the boot device's volume root (`LoadedImage -> SimpleFileSystem`).
-unsafe fn open_boot_volume(
+/// Where Nijigumo reads its kernel, initrd, and DTB from. A disk boot exposes an ESP through
+/// `SimpleFileSystem`; a PXE boot has no filesystem at all — its device handle carries
+/// `PXE_BASE_CODE` instead, and the payloads come back over TFTP from the server that just sent
+/// us. Both are addressed with the same `\EFI\KUMO\...` paths.
+#[derive(Clone, Copy)]
+enum PayloadSource {
+    Esp(*mut EfiFileProtocol),
+    Tftp {
+        pxe: *mut EfiPxeBaseCodeProtocol,
+        server_ip: [u8; 16],
+    },
+}
+
+/// Open the boot device's volume root (`LoadedImage -> SimpleFileSystem`), or fall back to the
+/// PXE Base Code protocol on the same device handle when the image was netbooted.
+unsafe fn open_payload_source(
     image_handle: EfiHandle,
     boot_services: *mut EfiBootServices,
-) -> Option<*mut EfiFileProtocol> {
+) -> Option<PayloadSource> {
     let mut loaded_image: *mut EfiLoadedImageProtocol = ptr::null_mut();
     let status = unsafe {
         ((*boot_services).handle_protocol)(
@@ -683,25 +795,197 @@ unsafe fn open_boot_volume(
             &mut fs as *mut _ as *mut *mut c_void,
         )
     };
-    if status != EFI_SUCCESS || fs.is_null() {
+    if status == EFI_SUCCESS && !fs.is_null() {
+        let mut root: *mut EfiFileProtocol = ptr::null_mut();
+        let status = unsafe { ((*fs).open_volume)(fs, &mut root) };
+        if status == EFI_SUCCESS && !root.is_null() {
+            return Some(PayloadSource::Esp(root));
+        }
+    }
+
+    unsafe { open_tftp_source(device_handle, boot_services) }
+}
+
+/// Build a TFTP payload source from the PXE Base Code protocol on `device_handle`.
+///
+/// The server address is taken from the DHCP exchange the firmware already completed: `DhcpAck`'s
+/// `BootpSiAddr` names the boot server, and under proxyDHCP (the KUMO pxehost setup) it is the
+/// `ProxyOffer` that carries it instead — so fall through to that when the ack's field is zero.
+unsafe fn open_tftp_source(
+    device_handle: EfiHandle,
+    boot_services: *mut EfiBootServices,
+) -> Option<PayloadSource> {
+    let mut pxe: *mut EfiPxeBaseCodeProtocol = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).handle_protocol)(
+            device_handle,
+            &PXE_BASE_CODE_GUID,
+            &mut pxe as *mut _ as *mut *mut c_void,
+        )
+    };
+    if status != EFI_SUCCESS || pxe.is_null() {
+        return None;
+    }
+    let mode = unsafe { (*pxe).mode };
+    if mode.is_null() {
         return None;
     }
 
-    let mut root: *mut EfiFileProtocol = ptr::null_mut();
-    let status = unsafe { ((*fs).open_volume)(fs, &mut root) };
-    if status != EFI_SUCCESS || root.is_null() {
+    // Order matters under proxyDHCP, which is how the KUMO pxehost setup works: the network's
+    // real DHCP server answers the lease (and puts ITS OWN address in the ack's `siaddr`), while a
+    // separate proxy names the boot server. Observed on this board: ack said 192.168.0.1 (the
+    // router) but the firmware booted from 192.168.0.108 (pxehost). So the proxy offer wins
+    // whenever the firmware recorded one; the ack is only the fallback for a plain DHCP+TFTP
+    // server that serves both roles.
+    let mut server_ip = [0u8; 16];
+    let mut found = false;
+    let proxy_received = unsafe { (*mode).proxy_offer_received };
+    let mut candidates: [*const u8; 2] = [ptr::null(), ptr::null()];
+    if proxy_received {
+        candidates[0] = unsafe { ptr::addr_of!((*mode).proxy_offer) } as *const u8;
+        candidates[1] = unsafe { ptr::addr_of!((*mode).dhcp_ack) } as *const u8;
+    } else {
+        candidates[0] = unsafe { ptr::addr_of!((*mode).dhcp_ack) } as *const u8;
+        candidates[1] = unsafe { ptr::addr_of!((*mode).proxy_offer) } as *const u8;
+    }
+    for bytes in candidates {
+        if bytes.is_null() {
+            continue;
+        }
+        let mut candidate = [0u8; 4];
+        for (index, slot) in candidate.iter_mut().enumerate() {
+            *slot = unsafe { *bytes.add(DHCPV4_SIADDR_OFFSET + index) };
+        }
+        if candidate != [0, 0, 0, 0] {
+            server_ip[..4].copy_from_slice(&candidate);
+            found = true;
+            break;
+        }
+    }
+    if !found {
         return None;
     }
-    Some(root)
+    Some(PayloadSource::Tftp { pxe, server_ip })
+}
+
+/// Rewrite an ESP path (`\EFI\KUMO\initrd.img`) as the TFTP filename the server expects
+/// (`EFI/KUMO/initrd.img`): drop the leading separator and use forward slashes. Returns a
+/// NUL-terminated ASCII buffer; a path that does not fit is rejected rather than truncated.
+fn tftp_filename<const N: usize>(path: &str) -> Option<[u8; N]> {
+    let mut out = [0u8; N];
+    let mut len = 0usize;
+    for byte in path.bytes() {
+        let byte = if byte == b'\\' { b'/' } else { byte };
+        if len == 0 && byte == b'/' {
+            continue;
+        }
+        if len + 1 >= N {
+            return None;
+        }
+        out[len] = byte;
+        len += 1;
+    }
+    (len > 0).then_some(out)
+}
+
+/// Read a whole file over TFTP into a caller-chosen allocation. `pages` selects `AllocatePages`
+/// (page-aligned, for the initrd) over `AllocatePool`. Returns `(buffer, len)`.
+unsafe fn read_tftp_file(
+    boot_services: *mut EfiBootServices,
+    pxe: *mut EfiPxeBaseCodeProtocol,
+    server_ip: &[u8; 16],
+    path: &str,
+    pages: bool,
+) -> Option<(*mut c_void, usize)> {
+    let name = tftp_filename::<128>(path)?;
+
+    // Ask the server for the size first: the read needs a buffer big enough for the whole file,
+    // and a short buffer is a failed transfer rather than a partial one.
+    let mut size: u64 = 0;
+    let status = unsafe {
+        ((*pxe).mtftp)(
+            pxe,
+            EFI_PXE_TFTP_GET_FILE_SIZE,
+            ptr::null_mut(),
+            false,
+            &mut size,
+            ptr::null_mut(),
+            server_ip,
+            name.as_ptr(),
+            ptr::null(),
+            false,
+        )
+    };
+    if status != EFI_SUCCESS || size == 0 {
+        return None;
+    }
+
+    let mut buffer: *mut c_void = ptr::null_mut();
+    if pages {
+        let mut address: u64 = 0;
+        let page_count = size.div_ceil(EFI_PAGE_SIZE).max(1) as usize;
+        let status = unsafe {
+            ((*boot_services).allocate_pages)(
+                EFI_ALLOCATE_ANY_PAGES,
+                efi_memory_type::LOADER_DATA,
+                page_count,
+                &mut address,
+            )
+        };
+        if status != EFI_SUCCESS || address == 0 {
+            return None;
+        }
+        buffer = address as *mut c_void;
+    } else {
+        let status = unsafe {
+            ((*boot_services).allocate_pool)(
+                efi_memory_type::LOADER_DATA,
+                size as usize,
+                &mut buffer,
+            )
+        };
+        if status != EFI_SUCCESS || buffer.is_null() {
+            return None;
+        }
+    }
+
+    let mut read_size = size;
+    let status = unsafe {
+        ((*pxe).mtftp)(
+            pxe,
+            EFI_PXE_TFTP_READ_FILE,
+            buffer,
+            false,
+            &mut read_size,
+            ptr::null_mut(),
+            server_ip,
+            name.as_ptr(),
+            ptr::null(),
+            false,
+        )
+    };
+    if status != EFI_SUCCESS {
+        if !pages {
+            unsafe { ((*boot_services).free_pool)(buffer) };
+        }
+        return None;
+    }
+    Some((buffer, read_size as usize))
 }
 
 /// Open `path` on `root`, allocate a `LoaderData` pool, and read the whole file
 /// into it. Returns `(buffer, len)`; the caller owns the pool allocation.
 unsafe fn read_esp_file(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     path: &str,
 ) -> Option<(*mut c_void, usize)> {
+    let root = match root {
+        PayloadSource::Esp(root) => root,
+        PayloadSource::Tftp { pxe, server_ip } => {
+            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, path, false) };
+        }
+    };
     let path16 = ascii_to_utf16::<96>(path);
     let mut file: *mut EfiFileProtocol = ptr::null_mut();
     let status = unsafe { ((*root).open)(root, &mut file, path16.as_ptr(), EFI_FILE_MODE_READ, 0) };
@@ -742,9 +1026,15 @@ unsafe fn read_esp_file(
 /// memory plan excludes the range from the frame allocator.
 unsafe fn read_esp_file_pages(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     path: &str,
 ) -> Option<(*mut c_void, usize)> {
+    let root = match root {
+        PayloadSource::Esp(root) => root,
+        PayloadSource::Tftp { pxe, server_ip } => {
+            return unsafe { read_tftp_file(boot_services, pxe, &server_ip, path, true) };
+        }
+    };
     let path16 = ascii_to_utf16::<96>(path);
     let mut file: *mut EfiFileProtocol = ptr::null_mut();
     let status = unsafe { ((*root).open)(root, &mut file, path16.as_ptr(), EFI_FILE_MODE_READ, 0) };
@@ -818,7 +1108,7 @@ unsafe fn file_size_bytes(file: *mut EfiFileProtocol) -> Option<u64> {
 /// the kernel is worth more than one refused over a missing manifest.
 unsafe fn stamp_boot_config(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
     boot_ptr: *mut BootInfo,
 ) {
@@ -875,7 +1165,7 @@ unsafe fn stamp_boot_config(
 /// the handoff before the kernel parses it. — KESTREL 2026-07-17
 unsafe fn load_dtb(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
     system_table: *mut EfiSystemTable,
 ) -> (u64, u64) {
@@ -1193,7 +1483,7 @@ unsafe fn build_boot_ttbr1(
 /// segment (zeroing BSS), and construct the temporary TTBR1 map used for entry.
 unsafe fn load_kernel(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
 ) -> Option<KernelLoad> {
     let (buffer, len) = match unsafe { read_esp_file(boot_services, root, KERNEL_ESP_PATH) } {
@@ -1337,7 +1627,7 @@ unsafe fn load_kernel(
 /// honest, not fatal.
 unsafe fn load_initrd(
     boot_services: *mut EfiBootServices,
-    root: *mut EfiFileProtocol,
+    root: PayloadSource,
     con_out: *mut EfiSimpleTextOutputProtocol,
 ) -> (Range, *mut c_void) {
     match unsafe { read_esp_file_pages(boot_services, root, INITRD_ESP_PATH) } {

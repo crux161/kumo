@@ -51,6 +51,12 @@ pub enum Syscall {
     DeviceVmarUnmap = 42,
     DeviceCtxWaitFault = 43,
     DeviceCtxInfo = 44,
+    /// Allocate a physically-contiguous, zeroed VMO and report its physical base, so a
+    /// userspace driver can hand device-visible addresses to a DMA engine (xHCI rings,
+    /// DCBAA, transfer buffers). Distinct from [`Syscall::VmoCreate`], whose anonymous
+    /// backing is per-page and non-contiguous. Returns the handle in the primary result
+    /// and the physical base in the secondary register (like `ChannelRead`'s handle).
+    VmoCreateContiguous = 45,
 }
 
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
@@ -193,6 +199,12 @@ mod tests {
     fn interrupt_complete_occupies_the_designated_syscall_slot() {
         assert_eq!(Syscall::InterruptComplete as usize, 25);
         assert_eq!(Syscall::TimerCreate as usize, 27);
+    }
+
+    #[test]
+    fn contiguous_dma_vmo_occupies_the_next_syscall_slot() {
+        assert_eq!(Syscall::DeviceCtxInfo as usize, 44);
+        assert_eq!(Syscall::VmoCreateContiguous as usize, 45);
     }
 }
 
