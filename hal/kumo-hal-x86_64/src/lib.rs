@@ -1051,6 +1051,32 @@ pub fn configure_tlmm_gpio_interrupt(_pin: u32, _flags: u32, _irq_key: u32) -> b
 /// Exists so arch-generic kernel code can name one `system_reset`.
 pub fn system_reset() {}
 
+/// Wait for the console transmitter to drain. The x86 console is the 16550 debug port driven by
+/// the same polled `putc`; nothing here yet distinguishes "queued" from "sent", so this is the
+/// honest no-op until it does.
+pub fn console_drain() {}
+
+/// No PSCI on x86; power-off would go through ACPI. Returns so the caller falls back to a halt.
+pub fn system_off() {}
+
+/// Stop this CPU: mask interrupts, then park in `hlt`.
+#[cfg(target_os = "none")]
+pub fn halt_cpu() -> ! {
+    unsafe {
+        core::arch::asm!("cli", options(nostack, nomem));
+        loop {
+            core::arch::asm!("hlt", options(nostack, nomem));
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn halt_cpu() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn configure_spi_interrupt(_irq: u32) -> bool {
     true
 }

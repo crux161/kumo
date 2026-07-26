@@ -216,11 +216,17 @@ pub(crate) fn commit_process_grants(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelCallResult {
     Status(Status),
-    Handles { first: Handle, second: Handle },
+    Handles {
+        first: Handle,
+        second: Handle,
+    },
     Handle(Handle),
     /// A new handle plus a scalar returned in the secondary register — used by
     /// `VmoCreateContiguous` to report the DMA VMO handle and its physical base together.
-    HandleAndValue { handle: Handle, value: u64 },
+    HandleAndValue {
+        handle: Handle,
+        value: u64,
+    },
     Message(KernelMessage),
     PortPacket(PortPacket),
 }
@@ -554,6 +560,30 @@ impl SyscallEngine {
         let before = self.interrupts.len();
         self.interrupts.retain(|binding| binding.koid != koid);
         self.interrupts.len() != before
+    }
+
+    /// Collect the distinct IRQ lines that currently have a live interrupt binding into
+    /// `out`, returning how many were written. Used by the power path to mask every device
+    /// line a driver owns before the machine is brought down: once masked, an IRQ-driven
+    /// driver child can no longer be woken, which is how userspace is quiesced without a
+    /// shutdown protocol it would have to honour.
+    ///
+    /// Fills a caller-supplied slice rather than returning a `Vec` on purpose — the caller
+    /// runs inside the `SoraState` borrow, and allocating there is what froze the machine
+    /// when `poll_root_command` still built a `String`.
+    pub fn bound_interrupt_irqs(&self, out: &mut [u32]) -> usize {
+        let mut len = 0;
+        for binding in &self.interrupts {
+            if len == out.len() {
+                break;
+            }
+            if out[..len].contains(&binding.irq) {
+                continue;
+            }
+            out[len] = binding.irq;
+            len += 1;
+        }
+        len
     }
 
     /// Cancel a pending one-shot timer. Timer handles are intentionally not
@@ -2109,7 +2139,10 @@ impl SyscallEngine {
                     vmo,
                     Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
                 ) {
-                    Ok(handle) => KernelCallResult::HandleAndValue { handle, value: phys },
+                    Ok(handle) => KernelCallResult::HandleAndValue {
+                        handle,
+                        value: phys,
+                    },
                     Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
                 }
             }
@@ -3597,6 +3630,36 @@ mod tests {
         // Idempotent: a second reclamation finds nothing left to remove.
         assert!(!engine.release_interrupt(irq_koid));
         assert!(!engine.release_resource(resource_koid));
+    }
+
+    #[test]
+    fn bound_interrupt_irqs_reports_each_line_once_within_the_caller_slice() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 252, 3)
+            .unwrap();
+        // Two drivers on one line plus a second line: the power path wants distinct lines,
+        // since masking the same SPI twice is pointless and the caller's slice is finite.
+        for irq in [252, 252, 253] {
+            match engine.dispatch(&mut process, KernelCall::InterruptCreate { resource, irq }) {
+                KernelCallResult::Handle(_) => {}
+                other => panic!("expected interrupt handle for {irq}, got {other:?}"),
+            }
+        }
+        assert_eq!(engine.interrupts.len(), 3);
+
+        let mut irqs = [0u32; 8];
+        assert_eq!(engine.bound_interrupt_irqs(&mut irqs), 2);
+        assert_eq!(&irqs[..2], &[252, 253]);
+
+        // A slice too small truncates rather than overruns.
+        let mut one = [0u32; 1];
+        assert_eq!(engine.bound_interrupt_irqs(&mut one), 1);
+        assert_eq!(one, [252]);
+
+        // Nothing bound, nothing to mask.
+        assert_eq!(SyscallEngine::new().bound_interrupt_irqs(&mut irqs), 0);
     }
 
     #[test]

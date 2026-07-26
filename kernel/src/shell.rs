@@ -44,7 +44,9 @@ const HELP: &str = "commands:\r\n\
      uptime          time since boot\r\n\
      echo <text>     print text\r\n\
      clear           clear the screen\r\n\
-     reboot          reset the machine (PSCI)\r\n";
+     reboot          quiesce, then reset the machine (PSCI)\r\n\
+     shutdown        quiesce, then power off (PSCI)\r\n\
+     halt            quiesce, then stop this CPU\r\n";
 
 /// Run one command line, writing any output through `out`. An empty/whitespace line
 /// produces nothing.
@@ -54,6 +56,15 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
     let Some(cmd) = parts.next() else {
         return;
     };
+
+    // `shutdown` / `poweroff` / `halt` / `reboot` / `reset` all run the same ordered
+    // bring-down: detach the console, mask every driver-held device line, then call
+    // firmware. A reset can tolerate being rude about it and a power-off cannot, so there is
+    // no reason for them to take different paths. See `crate::power`.
+    if let Some(action) = crate::power::PowerAction::from_command(cmd) {
+        crate::power::execute(action, out);
+        return;
+    }
 
     match cmd {
         "help" => {
@@ -106,14 +117,6 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
             // ANSI clear + home (this REPL runs on a serial terminal).
             let _ = out.write_str("\x1b[2J\x1b[H");
         }
-        "reboot" => {
-            // Netboot dev loop: restage the TFTP tree, then reboot from this prompt instead of
-            // reaching for the power switch. PSCI SYSTEM_RESET is the firmware interface EDK2
-            // implements on this board; if it declines we fall through and say so.
-            let _ = out.write_str("rebooting via PSCI SYSTEM_RESET...\r\n");
-            kumo_hal::active::system_reset();
-            let _ = out.write_str("reboot refused by firmware\r\n");
-        }
         other => {
             let _ = write!(out, "unknown command: {} (try 'help')\r\n", other);
         }
@@ -164,7 +167,8 @@ mod tests {
     fn help_lists_builtins() {
         let out = run("help");
         for cmd in [
-            "help", "ver", "mem", "ps", "ticks", "uptime", "echo", "clear", "reboot",
+            "help", "ver", "mem", "ps", "ticks", "uptime", "echo", "clear", "reboot", "shutdown",
+            "halt",
         ] {
             assert!(out.contains(cmd), "help missing '{cmd}'");
         }
@@ -212,6 +216,35 @@ mod tests {
     fn echo_repeats_the_rest() {
         assert_eq!(run("echo hi there").trim_end(), "hi there");
         assert_eq!(run("echo").trim_end(), "");
+    }
+
+    #[test]
+    fn power_commands_announce_and_quiesce_before_firmware() {
+        // The HAL's power calls are no-ops off-target, so each of these runs the whole
+        // bring-down and comes back — which is exactly the sequence worth asserting on.
+        let out = run("shutdown");
+        assert!(out.contains("SYSTEM_OFF"), "{out}");
+        let quiesce = out.find("quiesced:").expect("quiesce step");
+        let firmware = out.find("declined SYSTEM_OFF").expect("firmware step");
+        assert!(quiesce < firmware, "quiesce must precede firmware: {out}");
+        assert!(out.contains("system halted"), "{out}");
+
+        assert!(run("poweroff").contains("SYSTEM_OFF"));
+        assert!(run("halt").contains("halting"));
+        assert!(run("reboot").contains("SYSTEM_RESET"));
+        assert!(run("reset").contains("SYSTEM_RESET"));
+    }
+
+    #[test]
+    fn a_refused_reset_returns_to_the_prompt_and_puts_quiesce_back() {
+        // Off-target `system_reset` returns, standing in for a firmware that declines.
+        let out = run("reboot");
+        assert!(out.contains("declined SYSTEM_RESET"), "{out}");
+        assert!(out.contains("resumed:"), "{out}");
+        assert!(
+            !out.contains("system halted"),
+            "reset must not strand the shell: {out}"
+        );
     }
 
     #[test]

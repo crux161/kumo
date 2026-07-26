@@ -220,7 +220,6 @@ where
     Some(f(&mut *state))
 }
 
-
 /// Longest command line the kernel shell accepts from Sora's root channel.
 const MAX_ROOT_COMMAND_BYTES: usize = 256;
 
@@ -229,11 +228,6 @@ const MAX_ROOT_COMMAND_BYTES: usize = 256;
 /// floor is current.
 extern "C" fn signal_irq(irq: u32) {
     let now_ns = kumo_hal::active::monotonic_nanos();
-    // Bounded device-IRQ probe: prove whether a device interrupt (e.g. the xHCI keyboard, SPI 252)
-    // actually reaches the kernel while the system sits idle at the shell prompt. Keystrokes are
-    // serviced during boot but not at idle, and that difference is only explainable by either the
-    // IRQ not arriving or the woken child never being dispatched — this separates the two. Timer
-    // IRQs are excluded so the probe cannot flood. Remove once idle input is proven. — TIMBERDOODLE
     // A device SPI is level-triggered: the line stays asserted until its driver services the
     // device, so re-enabling it at EOI re-fires immediately and storms — which starves the very
     // driver child that would ack it. Mask here, unmask in `complete_interrupt_source` when the
@@ -2200,11 +2194,16 @@ fn attempt_sora(
         .get(net_handle)
         .map(|e| e.koid)
         .unwrap_or(KoId(0));
+    // One-shot: the kernel's view of the serial keyboard channel. Pairs with Sora's
+    // `serial kbd koid=` line — `kbd_forward` writes into THIS channel, and its write fails
+    // (PeerClosed) if the end Sora holds is not the peer of `kbd_kernel_end`.
+    crate::klog!("SORA kbd idx={} handle={}\n", kbd_channel_idx, kbd_handle.0);
     let keyboard_koid = process
         .handles()
         .get(kbd_handle)
         .map(|e| e.koid)
         .unwrap_or(KoId(0));
+    crate::klog!("SORA kbd koid={}\n", keyboard_koid.0);
 
     // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
     // restart loop — the hook never needs it.)
@@ -2325,6 +2324,52 @@ pub fn enable_console_route() {
 
 pub fn disable_console_route() {
     CONSOLE_ROUTE.store(false, core::sync::atomic::Ordering::Release);
+}
+
+pub fn console_route_enabled() -> bool {
+    CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Largest number of distinct device lines the power path masks in one pass. Every IRQ a
+/// driver can hold is a `Resource`-carved grant, and the resident set is far smaller than this.
+const MAX_QUIESCE_IRQS: usize = 32;
+
+/// Mask every device SPI that a live interrupt binding owns; returns how many lines were
+/// masked. This is how [`crate::power`] quiesces userspace: the resident drivers are
+/// IRQ-driven, so a masked line is a driver that can never be woken again — no shutdown
+/// protocol for servers to honour, and no DMA engine left poking the GIC while firmware
+/// takes the machine down. Paired with [`restore_device_interrupts`] for the one case that
+/// is recoverable (a firmware that declines a reset).
+pub fn quiesce_device_interrupts() -> usize {
+    set_device_interrupt_mask(true)
+}
+
+/// Undo [`quiesce_device_interrupts`], re-enabling each bound device line.
+pub fn restore_device_interrupts() -> usize {
+    set_device_interrupt_mask(false)
+}
+
+fn set_device_interrupt_mask(masked: bool) -> usize {
+    let mut irqs = [0u32; MAX_QUIESCE_IRQS];
+    // Snapshot inside the borrow, touch the GIC only after it is released. Calling out while
+    // `SoraState` is borrowed is the reentrancy hazard that has frozen this machine twice
+    // (a `klog!` inside `with_sora_mut`, and `poll_root_command`'s allocating `to_string`).
+    let len = try_with_sora_mut(|sora| sora.engine.bound_interrupt_irqs(&mut irqs)).unwrap_or(0);
+    let mut touched = 0;
+    for &irq in &irqs[..len] {
+        // PPIs (< 32) are the kernel's own — the scheduler timer lives there and must keep
+        // ticking until the final SMC. TLMM GPIO lines mask through their own controller.
+        if irq < 32 || kumo_abi::decode_tlmm_gpio_irq(irq).is_some() {
+            continue;
+        }
+        if masked {
+            kumo_hal::active::mask_spi_interrupt(irq);
+        } else {
+            kumo_hal::active::unmask_spi_interrupt(irq);
+        }
+        touched += 1;
+    }
+    touched
 }
 
 /// Largest routed fragment: must fit Sora's 256-byte read buffer with margin.

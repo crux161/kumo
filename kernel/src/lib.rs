@@ -16,6 +16,7 @@ pub mod ipcdemo;
 pub mod kdemo;
 pub mod mm;
 pub mod object;
+pub mod power;
 pub mod sched;
 pub mod shell;
 pub mod syscall;

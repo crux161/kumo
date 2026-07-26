@@ -231,6 +231,8 @@ const UARTFR: usize = 0x18;
 const UARTCR: usize = 0x30;
 const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFF: u32 = 1 << 5;
+/// Transmitter busy: set while the PL011 still has a byte in the FIFO or the shift register.
+const UARTFR_BUSY: u32 = 1 << 3;
 const UARTCR_UARTEN: u32 = 1 << 0;
 const UARTCR_TXE: u32 = 1 << 8;
 const UARTCR_RXE: u32 = 1 << 9;
@@ -411,6 +413,7 @@ const DW_THR: usize = 0x00; // transmit holding / receive buffer (register 0, st
 const DW_LSR: usize = 0x14; // line status (register 5, stride 4)
 const DW_LSR_DR: u32 = 1 << 0; // data ready — a received byte is waiting
 const DW_LSR_THRE: u32 = 1 << 5; // transmit holding register empty — ready for a byte
+const DW_LSR_TEMT: u32 = 1 << 6; // transmitter empty — FIFO *and* shift register drained
 
 /// Set once the first byte initializes the DW-APB sink. Mirrors [`UART_READY`] for the PL011: it
 /// can become true only after a board injects a nonzero base, so it is the safe MMIO gate for the
@@ -5088,6 +5091,80 @@ pub fn system_reset() {
 
 #[cfg(not(target_os = "none"))]
 pub fn system_reset() {}
+
+/// Power the machine off through PSCI `SYSTEM_OFF` (function id 0x8400_0008). Returns only if
+/// firmware declines or does not implement it, in which case the caller should fall back to
+/// [`halt_cpu`] — a board that cannot cut its own power can still be brought to a full stop.
+#[cfg(target_os = "none")]
+pub fn system_off() {
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            in("x0") PSCI_SYSTEM_OFF,
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn system_off() {}
+
+/// Wait until every byte already handed to the console UART has left the wire.
+///
+/// `putc` on both sinks waits for *room* before writing, not for the write to finish, so the last
+/// line of a shutdown is still in the FIFO (or the shift register) when the caller issues its SMC.
+/// Firmware cutting power there truncates the very message that says what happened. Bounded by a
+/// spin budget so a wedged or absent transmitter cannot turn a shutdown into a hang.
+#[cfg(target_os = "none")]
+pub fn console_drain() {
+    // ~1M spins is far beyond the tens of microseconds a FIFO needs at any real baud, and is
+    // reached only if the transmitter has stopped making progress.
+    const BUDGET: u32 = 1_000_000;
+    if UART_READY.load(ORD) {
+        let mut spins = 0;
+        while spins < BUDGET {
+            if unsafe { pl011_reg(UARTFR).read_volatile() } & UARTFR_BUSY == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+    if DW8250_READY.load(ORD) {
+        let mut spins = 0;
+        while spins < BUDGET {
+            if unsafe { dw8250_reg(DW_LSR).read_volatile() } & DW_LSR_TEMT != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn console_drain() {}
+
+/// Stop this CPU for good: mask interrupts, then park in `wfi`. Unlike [`halt`]'s spin loop this
+/// leaves the core in a low-power wait rather than burning cycles, and masking first means no
+/// interrupt can drag it back out into a half-torn-down system.
+#[cfg(target_os = "none")]
+pub fn halt_cpu() -> ! {
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nostack, nomem));
+        loop {
+            core::arch::asm!("wfi", options(nostack, nomem));
+        }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn halt_cpu() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 pub fn halt() -> ! {
     loop {
