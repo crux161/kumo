@@ -2,6 +2,7 @@
 //j486
 //j487
 //j488
+//j489
 #![no_std]
 #![no_main]
 
@@ -55,7 +56,7 @@ extern "C" fn main(
         process_exit(1);
     }
 
-    match lua_repl::evaluate_line(&input[..len]) {
+    match lua_repl::evaluate_line_with_print(&input[..len], move |line| emit(stdout, line)) {
         Ok(evaluation) => {
             emit(stdout, b"lua-repl: ");
             if evaluation.output.is_empty() {

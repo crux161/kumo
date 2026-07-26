@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j470
 //j480
 //j481
 //j487
 //j488
+//j489
 
 extern crate alloc;
 
@@ -3805,14 +3805,14 @@ fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
 fn launch_lua_repl(initrd: Handle) {
     debug_write(b"Launching Lua REPL...\n".as_ptr(), 22);
 
-    // Exercise the same finite stdin transfer used by `run lua-repl <expression>` while preserving
-    // the fixed `42` boot acceptance gate. — KESTREL
+    // Exercise `print` through the same finite stdin transfer used by the interactive command,
+    // while preserving the fixed returned `42` acceptance gate. — KESTREL
     run_with_startup_input(
         initrd,
         b"bin/lua-repl",
         b"lua-repl",
         None,
         false,
-        Some(b"math.floor(41.75) + 1\n"),
+        Some(b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n"),
     );
 }
