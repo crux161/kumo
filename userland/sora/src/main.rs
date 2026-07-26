@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j424
 //j426
 //j470
 //j480
 //j481
+//j487
 
 extern crate alloc;
 
@@ -1772,6 +1772,13 @@ extern "C" fn sora_main(
         None => log(b"autoexec: no manifest\n"),
     }
 
+    // Run the fixed Piccolo evaluator before the console-backlog flush. The serial-only QEMU
+    // vertical can park in that legacy flush on an empty console channel, while the evaluator's
+    // finite stdout channel is independently pumpable and must remain an observable boot gate.
+    // — KESTREL
+    launch_lua_repl(initrd);
+    log(b"sora: lua returned\n");
+
     // Flush the kernel console backlog accumulated during autoexec into drv-fb, so boot
     // progress is visible immediately rather than trickling through the serve loop where it
     // must compete with keyboard and other port sources.
@@ -1940,9 +1947,6 @@ extern "C" fn sora_main(
         let mut mouse_events_seen: u32 = 0;
         let mut malformed_mouse_events_seen: u32 = 0;
 
-        // Launch Piccolo Lua REPL directly before falling back to the basic shell loop.
-        launch_lua_repl(initrd, kbd, console);
-        log(b"sora: lua returned\n");
         let ttyd_recipe = sora::ServerRecipe {
             name: "ttyd",
             image_path: TTYD_PATH,
@@ -3708,20 +3712,11 @@ fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
     serve_file_read_at(initrd, path, 0, out.len() as u64, out)
 }
 
-fn launch_lua_repl(initrd: Handle, kbd: Handle, console: Handle) {
+fn launch_lua_repl(initrd: Handle) {
     debug_write(b"Launching Lua REPL...\n".as_ptr(), 22);
 
-    // 2. Launch the ELF binary from the initrd, passing kbd as stdin and console as stdout
-    if run_elf(
-        initrd,
-        b"bin/lua-repl",
-        kbd.0 as u64,
-        console.0 as u64,
-        0, // synchronous run
-        b"lua-repl",
-    ) {
-        debug_write(b"Lua REPL exited normally.\n".as_ptr(), 26);
-    } else {
-        debug_write(b"Lua REPL failed to run.\n".as_ptr(), 24);
-    }
+    // This fixed evaluator does not consume stdin yet. Give it the same finite bootstrap message
+    // and freshly transferred stdout capability as every ordinary child, then pump that endpoint
+    // to the console after exit.
+    run_with_startup(initrd, b"bin/lua-repl", b"lua-repl", None, false);
 }
