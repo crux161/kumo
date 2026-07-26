@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `NotCollect: Collect` is not satisfied
+ --> tests/ui/bad_collect_bound.rs:8:5
+  |
+5 | #[derive(Collect)]
+  |          ------- in this derive macro expansion
+...
+8 |     field: NotCollect
+  |     ^^^^^ the trait `Collect` is not implemented for `NotCollect`
+  |
+  = help: the following other types implement trait `Collect`:
+            bool
+            char
+            isize
+            i8
+            i16
+            i32
+            i64
+            usize
+          and $N others
+  = note: this error originates in the derive macro `Collect` (in Nightly builds, run with -Z macro-backtrace for more info)

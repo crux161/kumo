@@ -1,12 +1,14 @@
+#j485
 [package]
 name = "lua-repl"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+piccolo-vm = ["dep:piccolo"]
+
 [dependencies]
 kumo-abi = { path = "../../lib/kumo-abi" }
 kumo-rt = { path = "../kumo-rt" }
-
-# Piccolo (pure-Rust Lua 5.4) is deferred until vendored for offline builds.
-# See DEFERRED/003-LUA-REPL-PACKAGING-DEFERRAL.md for the full plan.
-# This placeholder prints a status message and exits cleanly.
+piccolo = { version = "0.3.3", optional = true }
