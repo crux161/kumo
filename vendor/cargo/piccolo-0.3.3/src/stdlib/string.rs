@@ -1,3 +1,6 @@
+use alloc::{string::ToString, vec::Vec};
+use core::num::TryFromIntError;
+
 use crate::{Callback, CallbackReturn, Context, IntoValue, String, Table, TypeError, Value};
 
 pub fn load_string<'gc>(ctx: Context<'gc>) {
@@ -33,7 +36,7 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
                     string: &[u8],
                     i: i64,
                     j: Option<i64>,
-                ) -> Result<&[u8], std::num::TryFromIntError> {
+                ) -> Result<&[u8], TryFromIntError> {
                     let i = match i {
                         i if i > 0 => i.saturating_sub(1).try_into()?,
                         0 => 0,

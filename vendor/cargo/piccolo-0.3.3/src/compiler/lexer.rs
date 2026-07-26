@@ -1,11 +1,10 @@
-use std::{
-    char, fmt, i32, i64,
-    io::{self, Read},
-    str,
-};
+use alloc::{string::String, vec::Vec};
+use core::{char, fmt, i32, i64, str};
 
 use gc_arena::Collect;
 use thiserror::Error;
+
+use crate::io::{self, Read};
 
 use super::StringInterner;
 
@@ -1006,7 +1005,7 @@ pub fn read_hex_float(s: &[u8]) -> Option<f64> {
         base = -base;
     }
 
-    Some(base * (exp as f64).exp2())
+    Some(base * libm::exp2(exp as f64))
 }
 
 fn read_neg(s: &[u8]) -> (bool, &[u8]) {

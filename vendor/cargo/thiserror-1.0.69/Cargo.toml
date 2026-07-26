@@ -33,6 +33,10 @@ categories = ["rust-patterns"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dtolnay/thiserror"
 
+[features]
+default = ["std"]
+std = []
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--generate-link-to-definition"]
 targets = ["x86_64-unknown-linux-gnu"]
@@ -94,6 +98,7 @@ name = "test_transparent"
 path = "tests/test_transparent.rs"
 
 [dependencies.thiserror-impl]
+path = "../thiserror-impl-1.0.69"
 version = "=1.0.69"
 
 [dev-dependencies.anyhow]

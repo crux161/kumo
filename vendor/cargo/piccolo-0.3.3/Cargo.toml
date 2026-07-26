@@ -19,32 +19,61 @@ readme = "README.md"
 license = "MIT"
 repository = "https://github.com/kyren/piccolo"
 
+[features]
+default = ["std"]
+std = [
+    "ahash/std",
+    "allocator-api2/std",
+    "anyhow/std",
+    "gc-arena/std",
+    "rand/std",
+    "rand/std_rng",
+    "thiserror/std",
+]
+
 [dependencies.ahash]
 version = "0.8"
+features = ["no-rng"]
+default-features = false
 
 [dependencies.allocator-api2]
 version = "0.2"
+features = ["alloc"]
+default-features = false
 
 [dependencies.anyhow]
 version = "1.0"
+default-features = false
 
 [dependencies.gc-arena]
-version = "0.5.3"
+path = "../gc-arena-0.5.3"
 features = [
     "allocator-api2",
     "hashbrown",
 ]
+default-features = false
 
 [dependencies.hashbrown]
 version = "0.14"
-features = ["raw"]
+features = [
+    "ahash",
+    "raw",
+]
+default-features = false
+
+[dependencies.libm]
+path = "../libm-0.2.16"
+version = "0.2.16"
 
 [dependencies.rand]
 version = "0.8"
 features = ["small_rng"]
+default-features = false
 
 [dependencies.thiserror]
+path = "../thiserror-1.0.69"
 version = "1.0"
+default-features = false
 
 [dev-dependencies.clap]
 version = "4.5"

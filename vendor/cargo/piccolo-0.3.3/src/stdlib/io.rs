@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use std::io::{self, Write};
 
 use gc_arena::Collect;

@@ -1,14 +1,15 @@
 #j485
+#j486
 [package]
 name = "lua-repl"
 version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["piccolo-vm"]
 piccolo-vm = ["dep:piccolo"]
 
 [dependencies]
 kumo-abi = { path = "../../lib/kumo-abi" }
 kumo-rt = { path = "../kumo-rt" }
-piccolo = { version = "0.3.3", optional = true }
+piccolo = { path = "../../vendor/cargo/piccolo-0.3.3", optional = true, default-features = false }

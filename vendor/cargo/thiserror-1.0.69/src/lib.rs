@@ -259,6 +259,7 @@
 //!   [`anyhow`]: https://github.com/dtolnay/anyhow
 
 #![doc(html_root_url = "https://docs.rs/thiserror/1.0.69")]
+#![no_std]
 #![allow(
     clippy::module_name_repetitions,
     clippy::needless_lifetimes,
@@ -266,6 +267,9 @@
     clippy::wildcard_imports
 )]
 #![cfg_attr(error_generic_member_access, feature(error_generic_member_access))]
+
+#[cfg(feature = "std")]
+extern crate std;
 
 #[cfg(all(thiserror_nightly_testing, not(error_generic_member_access)))]
 compile_error!("Build script probe failed to compile.");

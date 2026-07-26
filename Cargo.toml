@@ -1,6 +1,7 @@
 #j415
 #j426
 #j485
+#j486
 [workspace]
 members = [
     "boot/niji-loader",
@@ -44,7 +45,13 @@ members = [
     "xtask",
 ]
 resolver = "2"
-exclude = ["vendor/cargo/piccolo-0.3.3"]
+exclude = [
+    "vendor/cargo/gc-arena-0.5.3",
+    "vendor/cargo/libm-0.2.16",
+    "vendor/cargo/piccolo-0.3.3",
+    "vendor/cargo/thiserror-1.0.69",
+    "vendor/cargo/thiserror-impl-1.0.69",
+]
 
 [workspace.package]
 authors = ["KUMO contributors"]

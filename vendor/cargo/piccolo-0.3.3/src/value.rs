@@ -1,8 +1,9 @@
-use std::{f64, fmt, i64, io, string::String as StdString};
+use alloc::{string::String as StdString, vec::Vec};
+use core::{f64, fmt, i64};
 
 use gc_arena::{Collect, Gc};
 
-use crate::{Callback, Closure, Constant, Function, String, Table, Thread, UserData};
+use crate::{io, Callback, Closure, Constant, Function, String, Table, Thread, UserData};
 
 #[derive(Debug, Copy, Clone, Collect)]
 #[collect(no_drop)]
@@ -97,7 +98,7 @@ impl<'gc> Value<'gc> {
 }
 
 impl<'gc> fmt::Display for Value<'gc> {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut buf = Vec::new();
         self.display(&mut buf).unwrap();
         let s = StdString::from_utf8_lossy(&buf);

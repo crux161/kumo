@@ -1,4 +1,4 @@
-use std::{
+use core::{
     cell::RefMut,
     hash::{Hash, Hasher},
 };

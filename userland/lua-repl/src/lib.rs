@@ -1,12 +1,24 @@
 //j485
+//j486
 #![no_std]
 
 //! Build seam between KUMO's freestanding REPL process and the vendored Piccolo VM.
 //!
-//! The upstream 0.3.3 release still requires `std`. Keeping it behind an opt-in feature lets
-//! normal target images retain the honest placeholder while host checks prove that the vendored
-//! dependency closure is complete. The next slice can port that seam to `core` + `alloc` without
-//! making network availability part of the work.
+//! KUMO carries a small `core` + `alloc` port of Piccolo 0.3.3. The `piccolo-vm` feature is enabled
+//! by default so normal metal-image builds prove the freestanding VM graph before the binary starts
+//! constructing a Lua state or exposing channel-backed host functions.
 
 #[cfg(feature = "piccolo-vm")]
 pub use piccolo as vm;
+
+#[cfg(all(test, feature = "piccolo-vm"))]
+mod tests {
+    use super::vm::{Lua, Value};
+
+    #[test]
+    fn freestanding_vm_constructs_core_math_library() {
+        let mut lua = Lua::core();
+        assert!(lua.total_memory() > 0);
+        lua.enter(|ctx| assert!(matches!(ctx.get_global("math"), Value::Table(_))));
+    }
+}

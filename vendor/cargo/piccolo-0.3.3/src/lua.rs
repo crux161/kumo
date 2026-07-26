@@ -1,11 +1,11 @@
-use std::ops;
+use core::ops;
 
 use gc_arena::{metrics::Metrics, Arena, Collect, CollectionPhase, Mutation, Root, Rootable};
 
 use crate::{
     finalizers::Finalizers,
     registry::{Fetchable, Stashable},
-    stdlib::{load_base, load_coroutine, load_io, load_math, load_string, load_table},
+    stdlib::{load_base, load_coroutine, load_math, load_string, load_table},
     string::InternedStringSet,
     Error, FromMultiValue, Fuel, IntoValue, InvalidTableKey, Registry, Singleton, StashedExecutor,
     StaticError, String, Table, Value,
@@ -112,6 +112,7 @@ impl Lua {
     }
 
     /// Create a new `Lua` instance with all of the stdlib loaded.
+    #[cfg(feature = "std")]
     pub fn full() -> Self {
         let mut lua = Lua::core();
         lua.load_io();
@@ -137,9 +138,10 @@ impl Lua {
     }
 
     /// Load the parts of the stdlib that allow I/O.
+    #[cfg(feature = "std")]
     pub fn load_io(&mut self) {
         self.enter(|ctx| {
-            load_io(ctx);
+            crate::stdlib::load_io(ctx);
         })
     }
 

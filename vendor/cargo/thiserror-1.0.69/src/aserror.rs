@@ -1,5 +1,8 @@
-use core::panic::UnwindSafe;
-use std::error::Error;
+use core::{
+    error::Error,
+    marker::{Send, Sync},
+    panic::UnwindSafe,
+};
 
 #[doc(hidden)]
 pub trait AsDynError<'a>: Sealed {

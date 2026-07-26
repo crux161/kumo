@@ -1,3 +1,5 @@
+use alloc::string::ToString;
+
 use gc_arena::Collect;
 
 use crate::{

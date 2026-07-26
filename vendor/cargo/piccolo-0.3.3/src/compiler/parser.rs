@@ -1,6 +1,9 @@
-use std::{io::Read, ops, rc::Rc};
+use alloc::{borrow::ToOwned, boxed::Box, rc::Rc, string::String, vec::Vec};
+use core::ops;
 
 use thiserror::Error;
+
+use crate::io::Read;
 
 use super::{
     lexer::{LexError, Lexer, LineNumber, Token},

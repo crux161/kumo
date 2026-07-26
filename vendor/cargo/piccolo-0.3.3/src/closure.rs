@@ -1,7 +1,4 @@
-use std::{
-    hash::{Hash, Hasher},
-    io::Read,
-};
+use core::hash::{Hash, Hasher};
 
 use allocator_api2::{boxed, vec, SliceExt};
 use gc_arena::{allocator_api::MetricsAlloc, lock::Lock, Collect, Gc, Mutation};
@@ -9,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     compiler::{self, CompiledPrototype, FunctionRef, LineNumber},
+    io::Read,
     opcode::OpCode,
     thread::OpenUpValue,
     types::UpValueDescriptor,

@@ -1,4 +1,5 @@
-use std::{cell::RefCell, f64, rc::Rc};
+use alloc::{rc::Rc, vec::Vec};
+use core::{cell::RefCell, f64};
 
 use gc_arena::Mutation;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -9,6 +10,19 @@ use crate::{
 };
 
 pub fn load_math<'gc>(ctx: Context<'gc>) {
+    fn new_rng() -> SmallRng {
+        #[cfg(feature = "std")]
+        {
+            SmallRng::from_entropy()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // Freestanding KUMO has no ambient entropy source. Explicit `randomseed` remains
+            // available, while the initial stream is reproducible. — KESTREL
+            SmallRng::seed_from_u64(0x4b55_4d4f_5049_4343)
+        }
+    }
+
     fn callback<'gc, F, A, R>(name: &'static str, mc: &Mutation<'gc>, f: F) -> Callback<'gc>
     where
         F: Fn(Context<'gc>, A) -> Option<R> + 'static,
@@ -34,7 +48,7 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
     }
 
     let math = Table::new(&ctx);
-    let seeded_rng: Rc<RefCell<SmallRng>> = Rc::new(RefCell::new(SmallRng::from_entropy()));
+    let seeded_rng: Rc<RefCell<SmallRng>> = Rc::new(RefCell::new(new_rng()));
 
     math.set(
         ctx,
@@ -52,14 +66,14 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
     math.set(
         ctx,
         "acos",
-        callback("acos", &ctx, |_, v: f64| Some(v.acos())),
+        callback("acos", &ctx, |_, v: f64| Some(libm::acos(v))),
     )
     .unwrap();
 
     math.set(
         ctx,
         "asin",
-        callback("asin", &ctx, |_, v: f64| Some(v.asin())),
+        callback("asin", &ctx, |_, v: f64| Some(libm::asin(v))),
     )
     .unwrap();
 
@@ -68,9 +82,9 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
         "atan",
         callback("atan", &ctx, |_, (a, b): (f64, Option<f64>)| {
             Some(if let Some(b) = b {
-                a.atan2(b)
+                libm::atan2(a, b)
             } else {
-                a.atan()
+                libm::atan(a)
             })
         }),
     )
@@ -79,12 +93,16 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
     math.set(
         ctx,
         "ceil",
-        callback("ceil", &ctx, |_, v: f64| Some(to_int(v.ceil().into()))),
+        callback("ceil", &ctx, |_, v: f64| Some(to_int(libm::ceil(v).into()))),
     )
     .unwrap();
 
-    math.set(ctx, "cos", callback("cos", &ctx, |_, v: f64| Some(v.cos())))
-        .unwrap();
+    math.set(
+        ctx,
+        "cos",
+        callback("cos", &ctx, |_, v: f64| Some(libm::cos(v))),
+    )
+    .unwrap();
 
     math.set(
         ctx,
@@ -96,14 +114,16 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
     math.set(
         ctx,
         "exp",
-        callback("exp", &ctx, |_, v: f64| Some(f64::consts::E.powf(v))),
+        callback("exp", &ctx, |_, v: f64| Some(libm::exp(v))),
     )
     .unwrap();
 
     math.set(
         ctx,
         "floor",
-        callback("floor", &ctx, |_, v: f64| Some(to_int(v.floor().into()))),
+        callback("floor", &ctx, |_, v: f64| {
+            Some(to_int(libm::floor(v).into()))
+        }),
     )
     .unwrap();
 
@@ -123,8 +143,8 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
         ctx,
         "log",
         callback("log", &ctx, |_, (v, base): (f64, Option<f64>)| match base {
-            None => Some(v.ln()),
-            Some(base) => Some(v.log(base)),
+            None => Some(libm::log(v)),
+            Some(base) => Some(libm::log(v) / libm::log(base)),
         }),
     )
     .unwrap();
@@ -224,7 +244,7 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
                 let rng = &randomseed_rng;
                 match (u, l) {
                     (None, None) => {
-                        *rng.borrow_mut() = SmallRng::from_entropy();
+                        *rng.borrow_mut() = new_rng();
                         Some(())
                     }
                     (Some(seed), None) | (Some(seed), Some(0)) => {
@@ -234,7 +254,7 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
                     (Some(high), Some(low)) => {
                         let high_bytes = high.to_ne_bytes();
                         let low_bytes = low.to_ne_bytes();
-                        let seed = std::array::from_fn(|idx| {
+                        let seed = core::array::from_fn(|idx| {
                             let idx_mod_16 = idx % 16;
                             if idx_mod_16 >= 8 {
                                 high_bytes[idx_mod_16 - 8]
@@ -252,18 +272,26 @@ pub fn load_math<'gc>(ctx: Context<'gc>) {
     )
     .unwrap();
 
-    math.set(ctx, "sin", callback("sin", &ctx, |_, v: f64| Some(v.sin())))
-        .unwrap();
+    math.set(
+        ctx,
+        "sin",
+        callback("sin", &ctx, |_, v: f64| Some(libm::sin(v))),
+    )
+    .unwrap();
 
     math.set(
         ctx,
         "sqrt",
-        callback("sqrt", &ctx, |_, v: f64| Some(v.sqrt())),
+        callback("sqrt", &ctx, |_, v: f64| Some(libm::sqrt(v))),
     )
     .unwrap();
 
-    math.set(ctx, "tan", callback("tan", &ctx, |_, v: f64| Some(v.tan())))
-        .unwrap();
+    math.set(
+        ctx,
+        "tan",
+        callback("tan", &ctx, |_, v: f64| Some(libm::tan(v))),
+    )
+    .unwrap();
 
     math.set(
         ctx,

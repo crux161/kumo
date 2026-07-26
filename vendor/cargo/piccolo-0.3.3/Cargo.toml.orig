@@ -37,14 +37,27 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["std"]
+std = [
+    "ahash/std",
+    "allocator-api2/std",
+    "anyhow/std",
+    "gc-arena/std",
+    "rand/std",
+    "rand/std_rng",
+    "thiserror/std",
+]
+
 [dependencies]
-ahash.workspace = true
-allocator-api2.workspace = true
-anyhow.workspace = true
-gc-arena.workspace = true
-hashbrown.workspace = true
-rand.workspace = true
-thiserror.workspace = true
+ahash = { workspace = true, default-features = false, features = ["no-rng"] }
+allocator-api2 = { workspace = true, default-features = false, features = ["alloc"] }
+anyhow = { workspace = true, default-features = false }
+gc-arena = { workspace = true, default-features = false }
+hashbrown = { workspace = true, default-features = false, features = ["ahash", "raw"] }
+libm = { version = "0.2.16", default-features = false }
+rand = { workspace = true, default-features = false }
+thiserror = { path = "../thiserror-1.0.69", version = "1.0", default-features = false }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["cargo"] }

@@ -1,12 +1,9 @@
-use std::{
-    alloc,
-    borrow::Cow,
-    fmt,
+use alloc::{borrow::Cow, boxed::Box, string::String as StdString, vec::Vec};
+use core::{
+    alloc as core_alloc, fmt,
     hash::{BuildHasherDefault, Hash, Hasher},
-    io::Write,
     ops, slice,
     str::{self, Utf8Error},
-    string::String as StdString,
 };
 
 use ahash::AHasher;
@@ -16,6 +13,8 @@ use gc_arena::{
 };
 use hashbrown::{hash_map, raw::RawTable, HashMap};
 use thiserror::Error;
+
+use crate::io::Write;
 
 use crate::{Context, Value};
 
@@ -52,7 +51,7 @@ impl<'gc> String<'gc> {
             fn drop(&mut self) {
                 match self.header.buffer {
                     Buffer::Indirect(ptr) => unsafe {
-                        self.metrics.mark_external_deallocation((*ptr).len());
+                        self.metrics.mark_external_deallocation((&*ptr).len());
                         drop(Box::from_raw(ptr as *mut [u8]));
                     },
                     Buffer::Inline(_) => unreachable!(),
@@ -146,9 +145,9 @@ impl<'gc> String<'gc> {
             match self.0.buffer {
                 Buffer::Indirect(p) => &(*p),
                 Buffer::Inline(len) => {
-                    let layout = alloc::Layout::new::<StringInner>();
+                    let layout = core_alloc::Layout::new::<StringInner>();
                     let (_, offset) = layout
-                        .extend(alloc::Layout::array::<u8>(len).unwrap())
+                        .extend(core_alloc::Layout::array::<u8>(len).unwrap())
                         .unwrap();
                     let data =
                         (Gc::as_ptr(self.0) as *const u8).offset(offset as isize) as *const u8;
