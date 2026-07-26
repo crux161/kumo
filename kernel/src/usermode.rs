@@ -221,6 +221,9 @@ where
 }
 
 
+/// Longest command line the kernel shell accepts from Sora's root channel.
+const MAX_ROOT_COMMAND_BYTES: usize = 256;
+
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer/device IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora after the IRQ epilogue when the boot
 /// floor is current.
@@ -239,10 +242,21 @@ extern "C" fn signal_irq(irq: u32) {
     if irq >= 32 {
         kumo_hal::active::mask_spi_interrupt(irq);
     }
-    with_sora_mut(|sora| {
+    // NEVER take the panicking borrow from IRQ context: an interrupt can land while ordinary
+    // kernel code holds `SoraState` (e.g. the shell draining a command), and `with_sora_mut` would
+    // double-borrow and panic. If the state is busy, unmask the device line so the controller
+    // re-asserts and we service it on the next delivery instead of losing it.
+    if try_with_sora_mut(|sora| {
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);
-    });
+    })
+    .is_none()
+    {
+        if irq >= 32 {
+            kumo_hal::active::unmask_spi_interrupt(irq);
+        }
+        return;
+    }
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
     // Wake Sora if parked — InterruptWait uses park_current_user().
     if crate::user_thread::is_started()
@@ -2546,31 +2560,37 @@ pub fn kbd_forward(byte: u8) -> bool {
 /// waiting, run it through the kernel shell and return the byte count. Returns 0 if
 /// no line is available. The caller should emit the prompt after the command output.
 pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
-    let line = with_sora_mut(|sora| {
+    // Copy into a stack buffer and do nothing else inside the borrow. Allocating (the old
+    // `to_string()`) kept the `SoraState` borrow live across a heap call, and an interrupt landing
+    // in that window took `signal_irq` into `with_sora_mut` — a double borrow, i.e. a kernel panic.
+    // Pressing Enter both submits the line and produces a key-release interrupt, so the collision
+    // was reliable: any command routed to the kernel shell froze the machine.
+    let mut buf = [0u8; MAX_ROOT_COMMAND_BYTES];
+    let len = with_sora_mut(|sora| {
         let Some(channel) = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel) else {
-            return None;
+            return 0;
         };
         let Ok(message) = channel.read(sora.kernel_end) else {
-            return None;
+            return 0;
         };
         let bytes = message.bytes();
-        if bytes.is_empty() {
-            return None;
-        }
-        Some(core::str::from_utf8(bytes).unwrap_or("").to_string()) // We must copy to string to escape closure
+        let len = bytes.len().min(buf.len());
+        buf[..len].copy_from_slice(&bytes[..len]);
+        len
     });
 
-    let Some(line) = line else {
+    if len == 0 {
         return 0;
-    };
+    }
+    let line = core::str::from_utf8(&buf[..len]).unwrap_or("");
     env.uptime_ns = kumo_hal::active::monotonic_nanos();
     let preempt = crate::kdemo::preempt_stats();
     env.preempt_ticks = preempt.ticks;
     env.preempt_switches = preempt.switches;
     let tasks = crate::kdemo::tasks();
     let mut out = crate::bootstrap::console::Writer;
-    crate::shell::run_command(&line, env, &tasks, &mut out);
-    line.len()
+    crate::shell::run_command(line, env, &tasks, &mut out);
+    len
 }
 
 /// Offer a console fragment to the live Sora server. Returns true if Sora rendered it
