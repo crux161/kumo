@@ -2194,16 +2194,11 @@ fn attempt_sora(
         .get(net_handle)
         .map(|e| e.koid)
         .unwrap_or(KoId(0));
-    // One-shot: the kernel's view of the serial keyboard channel. Pairs with Sora's
-    // `serial kbd koid=` line — `kbd_forward` writes into THIS channel, and its write fails
-    // (PeerClosed) if the end Sora holds is not the peer of `kbd_kernel_end`.
-    crate::klog!("SORA kbd idx={} handle={}\n", kbd_channel_idx, kbd_handle.0);
     let keyboard_koid = process
         .handles()
         .get(kbd_handle)
         .map(|e| e.koid)
         .unwrap_or(KoId(0));
-    crate::klog!("SORA kbd koid={}\n", keyboard_koid.0);
 
     // Install Sora state for the SVC hook. (The relaunch recipe stays with `run_sora`'s
     // restart loop — the hook never needs it.)

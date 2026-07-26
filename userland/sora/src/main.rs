@@ -1939,10 +1939,6 @@ extern "C" fn sora_main(
     }
     if kbd_koid == u64::MAX {
         log(b"sora: kbd koid fail\n");
-    } else {
-        log(b"sora: serial kbd koid=");
-        log_hex(kbd_koid);
-        log(b"\n");
     }
     if hid_keyboard_input.is_some() && hid_kbd_koid == u64::MAX {
         log(b"sora: hid kbd koid fail\n");
@@ -2369,6 +2365,18 @@ fn eval_command(
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
         return true;
+    } else if cmd.name == "lua" {
+        // Bare `lua` opens an interactive session; every following line goes to the child until it
+        // exits. `lua <expression>` stays the one-shot form.
+        if cmd.args.is_empty() {
+            start_lua_session(initrd);
+        } else {
+            let mut argv = alloc::vec::Vec::with_capacity(cmd.args.len() + 1);
+            argv.push(alloc::string::String::from("lua-repl"));
+            argv.extend(cmd.args.iter().cloned());
+            run_program(initrd, &argv);
+        }
+        return true;
     } else if cmd.name == "cat" {
         // cat receives stdout, argv, and read-only initrd in one finite bootstrap message.
         // Only this explicit shell launcher grants the filesystem image; plain `run cat ...`
@@ -2452,25 +2460,36 @@ fn run_with_startup(
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
 ) {
-    run_with_startup_input(initrd, path, name, argv, grant_initrd, None);
+    run_with_startup_input(initrd, path, name, argv, grant_initrd, StdinMode::None);
 }
 
-/// `run_with_startup` plus an optional finite stdin message. The writer is closed before launch,
-/// so the one-shot child can read its submitted line and then observe peer-closed without parking.
-/// — KESTREL
+/// How a spawned child gets its standard input.
+enum StdinMode<'a> {
+    /// No stdin at all — the child is granted no input capability.
+    None,
+    /// One finite message, with the writer closed before launch, so a one-shot child reads its
+    /// submitted line and then observes peer-closed without parking. — KESTREL
+    Finite(&'a [u8]),
+    /// Sora keeps the writer and the child's stdout reader, and does **not** drain to EOF. The
+    /// child parks on its first read; the caller drives it line by line for as long as it lives.
+    Interactive,
+}
+
+/// `run_with_startup` plus stdin. Returns `Some((stdin_write, stdout_read))` only for
+/// [`StdinMode::Interactive`], where the caller owns the running child's two ends.
 fn run_with_startup_input(
     initrd: Handle,
     path: &[u8],
     name: &[u8],
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
-    input: Option<&[u8]>,
-) {
+    stdin: StdinMode<'_>,
+) -> Option<(Handle, Handle)> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
         log(name);
         log(b": stdout unavailable\n");
-        return;
+        return None;
     }
     let stdout_read = Handle(stdout_read_raw as u32);
     let stdout_write = Handle(stdout_write_raw as u32);
@@ -2481,45 +2500,62 @@ fn run_with_startup_input(
         let _ = handle_close(stdout_write);
         log(name);
         log(b": bootstrap unavailable\n");
-        return;
+        return None;
     }
     let bootstrap_send = Handle(bootstrap_send_raw as u32);
     let bootstrap_child = Handle(bootstrap_child_raw as u32);
 
-    let stdin_read = if let Some(bytes) = input {
-        if bytes.is_empty() || bytes.len() > 256 {
-            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
-                let _ = handle_close(handle);
+    // `stdin_writer` is retained only for an interactive session; the finite form closes its
+    // writer here so the child sees peer-closed after its one line.
+    let mut stdin_writer: Option<Handle> = None;
+    let stdin_read = match stdin {
+        StdinMode::None => None,
+        StdinMode::Finite(bytes) => {
+            if bytes.is_empty() || bytes.len() > 256 {
+                for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                    let _ = handle_close(handle);
+                }
+                log(name);
+                log(b": stdin too long\n");
+                return None;
             }
-            log(name);
-            log(b": stdin too long\n");
-            return;
-        }
-        let (read_raw, write_raw) = channel_create_pair();
-        if read_raw == u64::MAX || write_raw == u64::MAX {
-            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
-                let _ = handle_close(handle);
+            let (read_raw, write_raw) = channel_create_pair();
+            if read_raw == u64::MAX || write_raw == u64::MAX {
+                for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                    let _ = handle_close(handle);
+                }
+                log(name);
+                log(b": stdin unavailable\n");
+                return None;
             }
-            log(name);
-            log(b": stdin unavailable\n");
-            return;
-        }
-        let read = Handle(read_raw as u32);
-        let write = Handle(write_raw as u32);
-        let written = channel_write(write, bytes.as_ptr(), bytes.len()) == Errno::Ok.status();
-        let writer_closed = handle_close(write) == Errno::Ok.status();
-        if !written || !writer_closed {
-            let _ = handle_close(read);
-            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
-                let _ = handle_close(handle);
+            let read = Handle(read_raw as u32);
+            let write = Handle(write_raw as u32);
+            let written = channel_write(write, bytes.as_ptr(), bytes.len()) == Errno::Ok.status();
+            let writer_closed = handle_close(write) == Errno::Ok.status();
+            if !written || !writer_closed {
+                let _ = handle_close(read);
+                for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                    let _ = handle_close(handle);
+                }
+                log(name);
+                log(b": stdin queue failed\n");
+                return None;
             }
-            log(name);
-            log(b": stdin queue failed\n");
-            return;
+            Some(read)
         }
-        Some(read)
-    } else {
-        None
+        StdinMode::Interactive => {
+            let (read_raw, write_raw) = channel_create_pair();
+            if read_raw == u64::MAX || write_raw == u64::MAX {
+                for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                    let _ = handle_close(handle);
+                }
+                log(name);
+                log(b": stdin unavailable\n");
+                return None;
+            }
+            stdin_writer = Some(Handle(write_raw as u32));
+            Some(Handle(read_raw as u32))
+        }
     };
 
     // Mint the requested per-child capabilities: a one-shot read-only argv VMO when the program
@@ -2548,9 +2584,12 @@ fn run_with_startup_input(
         if grant_initrd && !initrd_bad {
             let _ = handle_close(Handle(initrd_child_raw as u32));
         }
+        if let Some(writer) = stdin_writer {
+            let _ = handle_close(writer);
+        }
         log(name);
         log(b": startup grant unavailable\n");
-        return;
+        return None;
     }
 
     // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd]. Order is immaterial — the
@@ -2586,23 +2625,36 @@ fn run_with_startup_input(
         reclaim_startup_handles(bootstrap_child, Some(queued));
         let _ = handle_close(bootstrap_child);
         let _ = handle_close(stdout_read);
+        if let Some(writer) = stdin_writer {
+            let _ = handle_close(writer);
+        }
         log(name);
         log(b": startup queue failed\n");
-        return;
+        return None;
     }
 
     let flags = ProcessRunFlags::TRANSFER_ARG.bits();
     let _ = run_elf(initrd, path, bootstrap_child_raw, 0, flags, name);
 
     if handle_koid(bootstrap_child) == u64::MAX {
+        // The child is admitted. An interactive session hands both ends back and returns *without
+        // draining: the child is parked on its first stdin read, and pumping to EOF here would
+        // wait for a child that is waiting for us.
+        if let Some(writer) = stdin_writer {
+            return Some((writer, stdout_read));
+        }
         pump_to_console(stdout_read);
     } else {
         // Admission failed before the bootstrap transfer committed. Recover and close
         // every capability queued in its message so no authority is stranded.
         reclaim_startup_handles(bootstrap_child, None);
         let _ = handle_close(bootstrap_child);
+        if let Some(writer) = stdin_writer {
+            let _ = handle_close(writer);
+        }
     }
     let _ = handle_close(stdout_read);
+    None
 }
 
 /// Recover handles from a startup message that could not be delivered. `Some(n)` drains
@@ -2631,6 +2683,86 @@ fn pump_to_console(read_end: Handle) {
         }
         debug_write(buf.as_ptr(), n as usize);
     }
+}
+
+/// The live interactive Lua session's two ends, or 0 when none is running.
+///
+/// Globals for the same reason the boot VMO handles are: the shell's line dispatch runs several
+/// frames below where the session is created, and Sora is single-threaded.
+static LUA_STDIN_WRITE: AtomicU64 = AtomicU64::new(0);
+static LUA_STDOUT_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Largest reply Sora will relay from the Lua child in one read. The child's own bounds (print
+/// budget + displayed value + prompt) sit comfortably inside this.
+const LUA_REPLY_BYTES: usize = 1024;
+
+fn lua_session_active() -> bool {
+    LUA_STDIN_WRITE.load(Ordering::Relaxed) != 0
+}
+
+/// Close and forget the live session's ends.
+fn end_lua_session() {
+    let stdin = LUA_STDIN_WRITE.swap(0, Ordering::Relaxed);
+    let stdout = LUA_STDOUT_READ.swap(0, Ordering::Relaxed);
+    if stdin != 0 {
+        let _ = handle_close(Handle(stdin as u32));
+    }
+    if stdout != 0 {
+        let _ = handle_close(Handle(stdout as u32));
+    }
+}
+
+/// Read one reply from the Lua child and render it. Returns false once the child is gone — its
+/// stdout closing is the only end-of-session signal, which is why `exit` needs no reply.
+fn lua_relay_reply(stdout: Handle) -> bool {
+    let mut buf = [0u8; LUA_REPLY_BYTES];
+    let n = channel_read(stdout, buf.as_mut_ptr(), buf.len());
+    if n == 0 || n == u64::MAX {
+        end_lua_session();
+        return false;
+    }
+    debug_write(buf.as_ptr(), n as usize);
+    true
+}
+
+/// Start an interactive Lua session: spawn the child holding both ends, then relay its greeting.
+fn start_lua_session(initrd: Handle) -> bool {
+    if lua_session_active() {
+        debug_write(b"lua: already running\n".as_ptr(), 21);
+        return true;
+    }
+    let slots: [&[u8]; 2] = [b"lua-repl", b"-i"];
+    let Some((stdin_write, stdout_read)) = run_with_startup_input(
+        initrd,
+        b"bin/lua-repl",
+        b"lua-repl",
+        Some(&slots),
+        false,
+        StdinMode::Interactive,
+    ) else {
+        debug_write(b"lua: session unavailable\n".as_ptr(), 25);
+        return false;
+    };
+    LUA_STDIN_WRITE.store(stdin_write.0 as u64, Ordering::Relaxed);
+    LUA_STDOUT_READ.store(stdout_read.0 as u64, Ordering::Relaxed);
+    // The child writes its banner and prompt before its first read, so this relay both renders the
+    // greeting and proves the session is actually serving.
+    lua_relay_reply(stdout_read)
+}
+
+/// Hand one submitted line to the live session and render its single reply. Returns false when the
+/// session has ended, so the caller restores the shell prompt.
+fn lua_session_submit(line: &[u8]) -> bool {
+    let stdin = Handle(LUA_STDIN_WRITE.load(Ordering::Relaxed) as u32);
+    let stdout = Handle(LUA_STDOUT_READ.load(Ordering::Relaxed) as u32);
+    if stdin.0 == 0 || stdout.0 == 0 {
+        return false;
+    }
+    if channel_write(stdin, line.as_ptr(), line.len()) != Errno::Ok.status() {
+        end_lua_session();
+        return false;
+    }
+    lua_relay_reply(stdout)
 }
 
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
@@ -2743,7 +2875,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             full,
             Some(&slots[..count]),
             false,
-            Some(&input[..input_len]),
+            StdinMode::Finite(&input[..input_len]),
         );
     } else {
         run_with_startup(initrd, full, full, Some(&slots[..count]), false);
@@ -3232,6 +3364,16 @@ fn dispatch_ttyd_key(
     let Some(line) = parsed.line else {
         return true;
     };
+    // While a Lua session is live it owns every submitted line — including ones that look like
+    // shell commands, which in Lua they are not. Its reply carries its own prompt, so the shell
+    // prompt returns only once the child is gone.
+    if lua_session_active() {
+        if lua_session_submit(line) {
+            return true;
+        }
+        debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+        return true;
+    }
     if let Ok(ls) = core::str::from_utf8(line) {
         if let Some(stmt) = parse(ls) {
             run_statement(&stmt, line, initrd, prog_initrd, root);
@@ -3240,7 +3382,10 @@ fn dispatch_ttyd_key(
     // A line was submitted (Enter): the command (if any) has finished writing its output, so render
     // the next prompt. Command output ends in a newline, so the prompt lands on a fresh line; an
     // empty line just re-prompts after ttyd's CRLF echo. This is the loop that makes it a shell.
-    debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+    // A `lua` that opened a session skips this: the child already printed `lua> `.
+    if !lua_session_active() {
+        debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+    }
     true
 }
 
@@ -3859,6 +4004,6 @@ fn launch_lua_repl(initrd: Handle) {
         b"lua-repl",
         None,
         false,
-        Some(b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n"),
+        StdinMode::Finite(b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n"),
     );
 }
