@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j426
 //j470
 //j480
 //j481
 //j487
+//j488
 
 extern crate alloc;
 
@@ -23,7 +23,7 @@ use kumo_rt::{
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
     thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
-    STARTUP_TAG_CAP0, STARTUP_TAG_STDOUT,
+    STARTUP_TAG_CAP0, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -2406,6 +2406,20 @@ fn run_with_startup(
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
 ) {
+    run_with_startup_input(initrd, path, name, argv, grant_initrd, None);
+}
+
+/// `run_with_startup` plus an optional finite stdin message. The writer is closed before launch,
+/// so the one-shot child can read its submitted line and then observe peer-closed without parking.
+/// — KESTREL
+fn run_with_startup_input(
+    initrd: Handle,
+    path: &[u8],
+    name: &[u8],
+    argv: Option<&[&[u8]]>,
+    grant_initrd: bool,
+    input: Option<&[u8]>,
+) {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
         log(name);
@@ -2426,6 +2440,42 @@ fn run_with_startup(
     let bootstrap_send = Handle(bootstrap_send_raw as u32);
     let bootstrap_child = Handle(bootstrap_child_raw as u32);
 
+    let stdin_read = if let Some(bytes) = input {
+        if bytes.is_empty() || bytes.len() > 256 {
+            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                let _ = handle_close(handle);
+            }
+            log(name);
+            log(b": stdin too long\n");
+            return;
+        }
+        let (read_raw, write_raw) = channel_create_pair();
+        if read_raw == u64::MAX || write_raw == u64::MAX {
+            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                let _ = handle_close(handle);
+            }
+            log(name);
+            log(b": stdin unavailable\n");
+            return;
+        }
+        let read = Handle(read_raw as u32);
+        let write = Handle(write_raw as u32);
+        let written = channel_write(write, bytes.as_ptr(), bytes.len()) == Errno::Ok.status();
+        let writer_closed = handle_close(write) == Errno::Ok.status();
+        if !written || !writer_closed {
+            let _ = handle_close(read);
+            for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
+                let _ = handle_close(handle);
+            }
+            log(name);
+            log(b": stdin queue failed\n");
+            return;
+        }
+        Some(read)
+    } else {
+        None
+    };
+
     // Mint the requested per-child capabilities: a one-shot read-only argv VMO when the program
     // takes arguments, and a fresh read-only initrd alias only when the caller grants it.
     let argv_child_raw = match argv {
@@ -2443,6 +2493,9 @@ fn run_with_startup(
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
+        if let Some(stdin_read) = stdin_read {
+            let _ = handle_close(stdin_read);
+        }
         if argv.is_some() && !argv_bad {
             let _ = handle_close(Handle(argv_child_raw as u32));
         }
@@ -2454,10 +2507,14 @@ fn run_with_startup(
         return;
     }
 
-    // Assemble the tagged set: stdout, [argv], [cap0=initrd]. Order is immaterial — the child
-    // installs by tag — but kept as `cat`'s for continuity.
-    let mut tags: [(u8, Handle); 3] = [(0, Handle(0)); 3];
+    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd]. Order is immaterial — the
+    // child installs by tag — but kept deterministic for serial diagnosis.
+    let mut tags: [(u8, Handle); 4] = [(0, Handle(0)); 4];
     let mut expected = 0usize;
+    if let Some(stdin_read) = stdin_read {
+        tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
+        expected += 1;
+    }
     tags[expected] = (STARTUP_TAG_STDOUT, stdout_write);
     expected += 1;
     if argv.is_some() {
@@ -2611,7 +2668,40 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
     let full = &path[..PREFIX.len() + name.len()];
     let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
     let count = string_argv_slots(argv, &mut slots);
-    run_with_startup(initrd, full, full, Some(&slots[..count]), false);
+    if name == b"lua-repl" {
+        if argv.len() == 1 {
+            debug_write(b"usage: run lua-repl <expression>\n".as_ptr(), 33);
+            return false;
+        }
+        let mut input = [0u8; 256];
+        let mut input_len = 0usize;
+        for arg in &argv[1..] {
+            let bytes = arg.as_bytes();
+            let separator = usize::from(input_len != 0);
+            if input_len + separator + bytes.len() + 1 > input.len() {
+                debug_write(b"lua-repl: input too long\n".as_ptr(), 25);
+                return false;
+            }
+            if separator != 0 {
+                input[input_len] = b' ';
+                input_len += 1;
+            }
+            input[input_len..input_len + bytes.len()].copy_from_slice(bytes);
+            input_len += bytes.len();
+        }
+        input[input_len] = b'\n';
+        input_len += 1;
+        run_with_startup_input(
+            initrd,
+            full,
+            full,
+            Some(&slots[..count]),
+            false,
+            Some(&input[..input_len]),
+        );
+    } else {
+        run_with_startup(initrd, full, full, Some(&slots[..count]), false);
+    }
     true
 }
 
@@ -3715,8 +3805,14 @@ fn serve_file_read(initrd: Handle, path: &[u8], out: &mut [u8; 512]) -> usize {
 fn launch_lua_repl(initrd: Handle) {
     debug_write(b"Launching Lua REPL...\n".as_ptr(), 22);
 
-    // This fixed evaluator does not consume stdin yet. Give it the same finite bootstrap message
-    // and freshly transferred stdout capability as every ordinary child, then pump that endpoint
-    // to the console after exit.
-    run_with_startup(initrd, b"bin/lua-repl", b"lua-repl", None, false);
+    // Exercise the same finite stdin transfer used by `run lua-repl <expression>` while preserving
+    // the fixed `42` boot acceptance gate. — KESTREL
+    run_with_startup_input(
+        initrd,
+        b"bin/lua-repl",
+        b"lua-repl",
+        None,
+        false,
+        Some(b"math.floor(41.75) + 1\n"),
+    );
 }
