@@ -472,6 +472,187 @@ pub fn find_hid_boot_interface(config: &[u8]) -> Option<HidBootInterface> {
     None
 }
 
+// === Boot-protocol mouse ======================================================
+//
+// The USB HID boot mouse (HID 1.11 appendix B.2) reports `[buttons, dx, dy]` with signed 8-bit
+// deltas, optionally followed by a wheel byte. That is byte-for-byte the wire format the
+// i2c-hid path already carries to Sora (`drv_i2c_hid::encode_mouse_event`), so a USB mouse can
+// feed the existing pointer pipeline unchanged — no second contract.
+
+/// Bytes in the mandatory part of a boot-mouse report.
+pub const MOUSE_REPORT_BYTES: usize = 3;
+
+/// Button bits in byte 0 of a boot-mouse report. Same assignment as the i2c-hid path.
+pub const MOUSE_BUTTON_LEFT: u8 = 1 << 0;
+pub const MOUSE_BUTTON_RIGHT: u8 = 1 << 1;
+pub const MOUSE_BUTTON_MIDDLE: u8 = 1 << 2;
+const MOUSE_BUTTON_MASK: u8 = MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT | MOUSE_BUTTON_MIDDLE;
+
+/// One decoded boot-mouse report. Deltas are relative and signed; `wheel` is zero on devices
+/// whose boot report carries no scroll byte.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseMotion {
+    pub buttons: u8,
+    pub dx: i8,
+    pub dy: i8,
+    pub wheel: i8,
+}
+
+impl MouseMotion {
+    pub const fn left(&self) -> bool {
+        self.buttons & MOUSE_BUTTON_LEFT != 0
+    }
+
+    pub const fn right(&self) -> bool {
+        self.buttons & MOUSE_BUTTON_RIGHT != 0
+    }
+
+    pub const fn middle(&self) -> bool {
+        self.buttons & MOUSE_BUTTON_MIDDLE != 0
+    }
+
+    /// Whether this report carries anything worth forwarding. A mouse repeats idle reports at its
+    /// polling interval; suppressing them keeps the channel (and the log) quiet.
+    pub const fn is_idle(&self) -> bool {
+        self.buttons == 0 && self.dx == 0 && self.dy == 0 && self.wheel == 0
+    }
+
+    /// The 3-byte wire encoding Sora's pointer pipeline already consumes.
+    pub const fn to_wire(&self) -> [u8; MOUSE_REPORT_BYTES] {
+        [self.buttons, self.dx as u8, self.dy as u8]
+    }
+}
+
+/// Decode a boot-protocol mouse report.
+///
+/// Accepts the mandatory 3 bytes and an optional 4th wheel byte. A device configured with report
+/// IDs prefixes an extra byte; pass `report_id` to strip it. Returns `None` for a report too short
+/// to be meaningful rather than fabricating motion from a truncated buffer.
+pub fn decode_boot_mouse(report: &[u8], report_id: Option<u8>) -> Option<MouseMotion> {
+    let body = match report_id {
+        Some(id) => {
+            let (first, rest) = report.split_first()?;
+            if *first != id {
+                return None;
+            }
+            rest
+        }
+        None => report,
+    };
+    if body.len() < MOUSE_REPORT_BYTES {
+        return None;
+    }
+    Some(MouseMotion {
+        buttons: body[0] & MOUSE_BUTTON_MASK,
+        dx: body[1] as i8,
+        dy: body[2] as i8,
+        wheel: body.get(3).map(|w| *w as i8).unwrap_or(0),
+    })
+}
+
+/// A button transition. Motion is relative and needs no edge detection, but clicks do: a held
+/// button repeats in every report, and a consumer wants the press once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MouseButtonEvent {
+    pub button: u8,
+    pub state: KeyState,
+}
+
+/// Stateful boot-mouse decoder. Emits button edges against the previous report the same way
+/// [`Decoder`] does for keys, so press/release are reported once each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseDecoder {
+    buttons: u8,
+}
+
+impl MouseDecoder {
+    pub const fn new() -> Self {
+        Self { buttons: 0 }
+    }
+
+    /// Decode one report, returning the motion plus up to three button edges (releases first,
+    /// mirroring [`Decoder::decode`]).
+    pub fn decode(
+        &mut self,
+        report: &[u8],
+        report_id: Option<u8>,
+    ) -> Option<(MouseMotion, MouseButtonEvents)> {
+        let motion = decode_boot_mouse(report, report_id)?;
+        let mut events = MouseButtonEvents::new();
+        for button in [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_MIDDLE,
+        ] {
+            let was = self.buttons & button != 0;
+            let now = motion.buttons & button != 0;
+            if was && !now {
+                events.push(MouseButtonEvent {
+                    button,
+                    state: KeyState::Released,
+                });
+            }
+        }
+        for button in [
+            MOUSE_BUTTON_LEFT,
+            MOUSE_BUTTON_RIGHT,
+            MOUSE_BUTTON_MIDDLE,
+        ] {
+            let was = self.buttons & button != 0;
+            let now = motion.buttons & button != 0;
+            if !was && now {
+                events.push(MouseButtonEvent {
+                    button,
+                    state: KeyState::Pressed,
+                });
+            }
+        }
+        self.buttons = motion.buttons;
+        Some((motion, events))
+    }
+}
+
+const MAX_MOUSE_BUTTON_EVENTS: usize = 6;
+
+const EMPTY_MOUSE_EVENT: MouseButtonEvent = MouseButtonEvent {
+    button: 0,
+    state: KeyState::Released,
+};
+
+/// Fixed-capacity button-edge output from one report transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MouseButtonEvents {
+    entries: [MouseButtonEvent; MAX_MOUSE_BUTTON_EVENTS],
+    len: u8,
+}
+
+impl MouseButtonEvents {
+    const fn new() -> Self {
+        Self {
+            entries: [EMPTY_MOUSE_EVENT; MAX_MOUSE_BUTTON_EVENTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, event: MouseButtonEvent) {
+        debug_assert!((self.len as usize) < MAX_MOUSE_BUTTON_EVENTS);
+        self.entries[self.len as usize] = event;
+        self.len += 1;
+    }
+
+    pub fn as_slice(&self) -> &[MouseButtonEvent] {
+        &self.entries[..self.len as usize]
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// An interrupt-IN endpoint and the interface it belongs to, located in a configuration
 /// descriptor. Used for a hub's status-change endpoint or any periodic-IN endpoint whose
 /// interface is not a boot-HID one (so [`find_hid_boot_interface`] would skip it).
@@ -744,6 +925,111 @@ mod tests {
         // A zero-length descriptor must not loop forever.
         assert_eq!(find_hid_boot_interface(&[0x00, 0x02, 0x00, 0x00]), None);
         assert_eq!(find_hid_boot_interface(&[]), None);
+    }
+
+    #[test]
+    fn decodes_a_boot_mouse_report_with_signed_deltas() {
+        // Right 5, up 3 (negative Y is up in HID), left button held.
+        let motion = decode_boot_mouse(&[MOUSE_BUTTON_LEFT, 5, 0xfd], None).expect("motion");
+        assert_eq!(motion.dx, 5);
+        assert_eq!(motion.dy, -3);
+        assert!(motion.left());
+        assert!(!motion.right());
+        assert!(!motion.middle());
+        assert_eq!(motion.wheel, 0);
+        assert!(!motion.is_idle());
+        // Full negative range round-trips through the u8 wire form.
+        let motion = decode_boot_mouse(&[0, 0x80, 0x7f], None).expect("motion");
+        assert_eq!(motion.dx, -128);
+        assert_eq!(motion.dy, 127);
+        assert_eq!(motion.to_wire(), [0, 0x80, 0x7f]);
+    }
+
+    #[test]
+    fn decodes_the_optional_wheel_byte_and_ignores_unknown_button_bits() {
+        let motion = decode_boot_mouse(&[0xff, 0, 0, 0xff], None).expect("motion");
+        // Only the three boot buttons are meaningful; higher bits must not leak through.
+        assert_eq!(
+            motion.buttons,
+            MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT | MOUSE_BUTTON_MIDDLE
+        );
+        assert_eq!(motion.wheel, -1);
+    }
+
+    #[test]
+    fn strips_a_report_id_prefix_and_rejects_a_foreign_one() {
+        let framed = [0x02, MOUSE_BUTTON_RIGHT, 1, 2];
+        let motion = decode_boot_mouse(&framed, Some(0x02)).expect("motion");
+        assert!(motion.right());
+        assert_eq!((motion.dx, motion.dy), (1, 2));
+        // A report belonging to a different collection is not ours to interpret.
+        assert_eq!(decode_boot_mouse(&framed, Some(0x03)), None);
+    }
+
+    #[test]
+    fn short_mouse_reports_are_rejected_rather_than_padded() {
+        assert_eq!(decode_boot_mouse(&[], None), None);
+        assert_eq!(decode_boot_mouse(&[0, 1], None), None);
+        // Report-id framing that leaves too little body is also rejected.
+        assert_eq!(decode_boot_mouse(&[0x02, 0, 1], Some(0x02)), None);
+    }
+
+    #[test]
+    fn idle_reports_are_recognised_so_they_can_be_suppressed() {
+        assert!(decode_boot_mouse(&[0, 0, 0], None).unwrap().is_idle());
+        assert!(!decode_boot_mouse(&[0, 1, 0], None).unwrap().is_idle());
+        assert!(!decode_boot_mouse(&[MOUSE_BUTTON_LEFT, 0, 0], None)
+            .unwrap()
+            .is_idle());
+        assert!(!decode_boot_mouse(&[0, 0, 0, 1], None).unwrap().is_idle());
+    }
+
+    #[test]
+    fn mouse_decoder_emits_each_button_edge_once() {
+        let mut decoder = MouseDecoder::new();
+
+        let (_, events) = decoder.decode(&[MOUSE_BUTTON_LEFT, 0, 0], None).unwrap();
+        assert_eq!(
+            events.as_slice(),
+            &[MouseButtonEvent {
+                button: MOUSE_BUTTON_LEFT,
+                state: KeyState::Pressed,
+            }]
+        );
+
+        // Held across reports: motion still flows, but no repeated press.
+        let (motion, events) = decoder.decode(&[MOUSE_BUTTON_LEFT, 4, 0], None).unwrap();
+        assert_eq!(motion.dx, 4);
+        assert!(events.is_empty());
+
+        // Release one, press another in the same transition: releases come first.
+        let (_, events) = decoder.decode(&[MOUSE_BUTTON_RIGHT, 0, 0], None).unwrap();
+        assert_eq!(
+            events.as_slice(),
+            &[
+                MouseButtonEvent {
+                    button: MOUSE_BUTTON_LEFT,
+                    state: KeyState::Released,
+                },
+                MouseButtonEvent {
+                    button: MOUSE_BUTTON_RIGHT,
+                    state: KeyState::Pressed,
+                },
+            ]
+        );
+
+        let (_, events) = decoder.decode(&[0, 0, 0], None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.as_slice()[0].state, KeyState::Released);
+    }
+
+    #[test]
+    fn mouse_wire_form_matches_the_i2c_hid_pipeline_encoding() {
+        // Sora already decodes `[buttons, dx, dy]` from the i2c-hid path; a USB mouse must put
+        // the same bytes on the wire or it would need a second, divergent contract.
+        let motion = decode_boot_mouse(&[MOUSE_BUTTON_MIDDLE, 0xfe, 7], None).unwrap();
+        assert_eq!(motion.to_wire(), [MOUSE_BUTTON_MIDDLE, 0xfe, 7]);
+        assert_eq!(motion.to_wire().len(), MOUSE_REPORT_BYTES);
     }
 
     #[test]

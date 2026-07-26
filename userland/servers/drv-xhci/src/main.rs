@@ -97,6 +97,11 @@ static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_CHANNEL: AtomicU32 = AtomicU32::new(0);
 /// Sora's tag byte preceding the keyboard-channel writer in the bootstrap.
 const KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
+/// The mouse-channel writer Sora may hand us; 0 = none. Carries the same 3-byte
+/// `[buttons, dx, dy]` wire format the i2c-hid pointer path already uses, so a USB mouse feeds
+/// Sora's existing `PointerState` without a second contract.
+static MOUSE_CHANNEL: AtomicU32 = AtomicU32::new(0);
+const MOUSE_BOOTSTRAP_TAG: u8 = b'm';
 
 #[no_mangle]
 extern "C" fn main(
@@ -139,6 +144,16 @@ extern "C" fn main(
         channel_read_with_handle(bootstrap, kbd_tag.as_mut_ptr(), kbd_tag.len());
     if tag_len == 1 && kbd_tag[0] == KEYBOARD_BOOTSTRAP_TAG && kbd_raw != 0 && kbd_raw != u64::MAX {
         KEYBOARD_CHANNEL.store(kbd_raw as u32, Ordering::Relaxed);
+    }
+    let mut mouse_tag = [0u8; 1];
+    let (mouse_len, mouse_raw) =
+        channel_read_with_handle(bootstrap, mouse_tag.as_mut_ptr(), mouse_tag.len());
+    if mouse_len == 1
+        && mouse_tag[0] == MOUSE_BOOTSTRAP_TAG
+        && mouse_raw != 0
+        && mouse_raw != u64::MAX
+    {
+        MOUSE_CHANNEL.store(mouse_raw as u32, Ordering::Relaxed);
     }
 
     log(b"drv-xhci: usb0 mmio=");
@@ -838,7 +853,7 @@ fn enumerate(
             log(b" interval=");
             log_hex(hid.interval as u64);
             log(b"\n");
-            if hid.is_keyboard() {
+            if hid.is_keyboard() || hid.is_mouse() {
                 configure_and_read_keyboard(
                     &mut io,
                     layout,
@@ -933,6 +948,7 @@ fn configure_and_read_keyboard(
         unsafe { core::slice::from_raw_parts_mut((base_va as usize + OFF_REPORT) as *mut u8, 8) };
 
     let mut decoder = kumo_hid::Decoder::new();
+    let mut mouse_decoder = kumo_hid::MouseDecoder::new();
 
     // U4: IRQ-driven persistent path. A busy-poll at our priority (63) would starve Sora (64), so
     // if this controller was granted its IRQ, enable the controller interrupter and block on the
@@ -971,7 +987,11 @@ fn configure_and_read_keyboard(
             clear_interrupt_pending(io, layout);
             enable_interrupter(io, layout);
             interrupt_complete(interrupt);
-            log(b"drv-xhci: keyboard irq-driven port=");
+            log(if hid.is_mouse() {
+                b"drv-xhci: mouse irq-driven port=" as &[u8]
+            } else {
+                b"drv-xhci: keyboard irq-driven port=" as &[u8]
+            });
             log_hex(irq_port.is_some() as u64);
             log(b"; type at the shell\n");
             // Exactly ONE transfer may be outstanding at a time. The previous shape enqueued a
@@ -1041,7 +1061,24 @@ fn configure_and_read_keyboard(
                         report_buf[6],
                         report_buf[7],
                     ];
-                    if let Ok(events) = decoder.decode(report) {
+                    if hid.is_mouse() {
+                        // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
+                        // pointer pipeline already consumes. Idle reports repeat at the polling
+                        // interval, so drop them rather than waking Sora for nothing.
+                        if let Some((motion, _edges)) =
+                            mouse_decoder.decode(&report_buf[..mps.min(8) as usize], None)
+                        {
+                            let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
+                            if mouse != 0 && !motion.is_idle() {
+                                let wire = motion.to_wire();
+                                let _ = channel_write(
+                                    Handle(mouse),
+                                    wire.as_ptr(),
+                                    wire.len(),
+                                );
+                            }
+                        }
+                    } else if let Ok(events) = decoder.decode(report) {
                         let keyboard = KEYBOARD_CHANNEL.load(Ordering::Relaxed);
                         for event in events.as_slice() {
                             if event.state == kumo_hid::KeyState::Pressed {

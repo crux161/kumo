@@ -233,6 +233,9 @@ const RK3588_HOST2_XHCI_IRQ: u32 = 254;
 
 /// U5: bootstrap tag preceding the keyboard-channel writer handed to a drv-xhci instance.
 const XHCI_KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
+/// ...and the pointer channel. A USB boot mouse emits the same 3-byte `[buttons, dx, dy]` frame
+/// the i2c-hid path does, so it joins the existing `PointerState` pipeline unchanged.
+const XHCI_MOUSE_BOOTSTRAP_TAG: u8 = b'm';
 
 /// Spawn a drv-xhci per xHCI controller and return the keyboard-channel reader (bound to the serve
 /// port → shell). The writer goes to the usb0 driver — where the keyboard enumerates on a root port
@@ -242,7 +245,7 @@ fn launch_xhci_first_light(
     root_resource: Handle,
     dtb_vmo: Handle,
     dtb_phys: u64,
-) -> Option<Handle> {
+) -> (Option<Handle>, Option<Handle>) {
     let (kbd_reader, kbd_writer) = channel_create_pair();
     let have_channel = kbd_reader != u64::MAX && kbd_writer != u64::MAX;
     if !have_channel {
@@ -253,23 +256,41 @@ fn launch_xhci_first_light(
             let _ = handle_close(Handle(kbd_writer as u32));
         }
     }
+    let (mouse_reader, mouse_writer) = channel_create_pair();
+    let have_mouse = mouse_reader != u64::MAX && mouse_writer != u64::MAX;
+    if !have_mouse {
+        if mouse_reader != u64::MAX {
+            let _ = handle_close(Handle(mouse_reader as u32));
+        }
+        if mouse_writer != u64::MAX {
+            let _ = handle_close(Handle(mouse_writer as u32));
+        }
+    }
 
     // Every controller gets its own writer for the one keyboard channel: a keyboard may enumerate
     // on any root port OR behind a hub on any controller, and whichever driver finds it delivers
     // to the same reader Sora keeps. Each spawn needs a distinct handle, so duplicate per child
     // (the engine requires Rights::TRANSFER on a transferred handle).
-    let writer_for = |have: bool| -> u64 {
+    let dup_writer = |have: bool, writer: u64| -> u64 {
         if !have {
             return u64::MAX;
         }
         handle_duplicate(
-            Handle(kbd_writer as u32),
+            Handle(writer as u32),
             Rights::READ | Rights::WRITE | Rights::TRANSFER,
         )
     };
+    let writer_for = |have: bool| -> u64 { dup_writer(have, kbd_writer) };
+    let mouse_for = |have: bool| -> u64 { dup_writer(have, mouse_writer) };
 
     match xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) {
-        Some(config) => spawn_xhci(initrd, root_resource, config, writer_for(have_channel)),
+        Some(config) => spawn_xhci(
+            initrd,
+            root_resource,
+            config,
+            writer_for(have_channel),
+            mouse_for(have_mouse),
+        ),
         None => log(b"drv-xhci: no supported usb0 xhci\n"),
     }
     spawn_xhci(
@@ -282,6 +303,7 @@ fn launch_xhci_first_light(
             kumo_xhci::XHCI_NO_STREAM_ID,
         ),
         writer_for(have_channel),
+        mouse_for(have_mouse),
     );
     spawn_xhci(
         initrd,
@@ -293,17 +315,20 @@ fn launch_xhci_first_light(
             kumo_xhci::XHCI_NO_STREAM_ID,
         ),
         writer_for(have_channel),
+        mouse_for(have_mouse),
     );
-    // The original writer stays with Sora only as the duplication source; close it.
+    // The originals stay with Sora only as duplication sources; close them.
     if have_channel {
         let _ = handle_close(Handle(kbd_writer as u32));
     }
-
-    if have_channel {
-        Some(Handle(kbd_reader as u32))
-    } else {
-        None
+    if have_mouse {
+        let _ = handle_close(Handle(mouse_writer as u32));
     }
+
+    (
+        have_channel.then(|| Handle(kbd_reader as u32)),
+        have_mouse.then(|| Handle(mouse_reader as u32)),
+    )
 }
 
 fn spawn_xhci(
@@ -311,6 +336,7 @@ fn spawn_xhci(
     root_resource: Handle,
     config: kumo_xhci::XhciProbeConfig,
     keyboard_writer: u64,
+    mouse_writer: u64,
 ) {
     log(b"drv-xhci: topology mmio=");
     log_hex(config.mmio_base);
@@ -367,6 +393,9 @@ fn spawn_xhci(
         if keyboard_writer != u64::MAX {
             let _ = handle_close(Handle(keyboard_writer as u32));
         }
+        if mouse_writer != u64::MAX {
+            let _ = handle_close(Handle(mouse_writer as u32));
+        }
         return;
     }
     // Hand the keyboard-channel writer to the driver as a tagged second bootstrap message. The
@@ -378,6 +407,15 @@ fn spawn_xhci(
             tag.as_ptr(),
             1,
             Handle(keyboard_writer as u32),
+        );
+    }
+    if mouse_writer != u64::MAX {
+        let tag = [XHCI_MOUSE_BOOTSTRAP_TAG];
+        let _ = channel_write_with_handle(
+            Handle(sender as u32),
+            tag.as_ptr(),
+            1,
+            Handle(mouse_writer as u32),
         );
     }
     if run_elf(
@@ -1206,8 +1244,12 @@ extern "C" fn sora_main(
 
                 // The xHCI keyboard reader feeds the shell like the i2c-hid one; the i2c-hid path
                 // below only overrides it on a board that actually has an i2c-hid keyboard.
-                hid_keyboard_input =
+                let (xhci_kbd, xhci_mouse) =
                     launch_xhci_first_light(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
+                hid_keyboard_input = xhci_kbd;
+                if xhci_mouse.is_some() {
+                    mouse_input = xhci_mouse;
+                }
 
                 // Match HID children from the read-only DTB capability before granting hardware
                 // authority. QEMU and unrelated framebuffer boards stop here without ever mapping
@@ -1897,6 +1939,10 @@ extern "C" fn sora_main(
     }
     if kbd_koid == u64::MAX {
         log(b"sora: kbd koid fail\n");
+    } else {
+        log(b"sora: serial kbd koid=");
+        log_hex(kbd_koid);
+        log(b"\n");
     }
     if hid_keyboard_input.is_some() && hid_kbd_koid == u64::MAX {
         log(b"sora: hid kbd koid fail\n");
