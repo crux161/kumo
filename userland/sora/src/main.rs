@@ -1840,28 +1840,37 @@ extern "C" fn sora_main(
     // nothing is re-queued and no line is doubled), then emit the staged bytes once in
     // DebugWrite-sized (<=256B) chunks. The fixed buffer bounds the work absolutely: a backlog
     // larger than it — or a stalled drv-fb — costs a truncated or late flush that the serve
-    // loop still drains one message per wake, never a boot hang. On the serial path the inbox
-    // is empty (klog goes straight to the HAL), so this is a clean no-op. — CORVUS
-    const CONSOLE_FLUSH_STAGE_BYTES: usize = 1024;
-    const CONSOLE_CHUNK_BYTES: usize = 256;
-    let mut flush_stage = [0u8; CONSOLE_FLUSH_STAGE_BYTES];
-    let mut staged = 0usize;
-    while staged + CONSOLE_CHUNK_BYTES <= flush_stage.len() {
-        let n = channel_read(
-            console,
-            flush_stage[staged..].as_mut_ptr(),
-            CONSOLE_CHUNK_BYTES,
-        ) as usize;
-        if n == 0 || n == usize::MAX {
-            break;
+    // loop still drains one message per wake, never a boot hang. — CORVUS
+    //
+    // J510: gated on a claimed framebuffer, because "on the serial path the inbox is empty,
+    // so this is a clean no-op" was not true. An empty inbox is not a zero-length read: for
+    // Sora, `channel_read` parks the user thread once and waits for `wake_user`, and on a
+    // framebuffer-less serial console nothing ever calls it — `klog!` goes straight to the
+    // HAL rather than through `deliver_to_sora`. Boot stalled here, before the serve loop,
+    // so the shell was unreachable on exactly the configuration QEMU presents. There is no
+    // backlog to flush without drv-fb, so the honest fix is not to ask. — TIMBERDOODLE
+    if fb_va != 0 {
+        const CONSOLE_FLUSH_STAGE_BYTES: usize = 1024;
+        const CONSOLE_CHUNK_BYTES: usize = 256;
+        let mut flush_stage = [0u8; CONSOLE_FLUSH_STAGE_BYTES];
+        let mut staged = 0usize;
+        while staged + CONSOLE_CHUNK_BYTES <= flush_stage.len() {
+            let n = channel_read(
+                console,
+                flush_stage[staged..].as_mut_ptr(),
+                CONSOLE_CHUNK_BYTES,
+            ) as usize;
+            if n == 0 || n == usize::MAX {
+                break;
+            }
+            staged += n;
         }
-        staged += n;
-    }
-    let mut emitted = 0usize;
-    while emitted < staged {
-        let end = (emitted + CONSOLE_CHUNK_BYTES).min(staged);
-        debug_write(flush_stage[emitted..end].as_ptr(), end - emitted);
-        emitted = end;
+        let mut emitted = 0usize;
+        while emitted < staged {
+            let end = (emitted + CONSOLE_CHUNK_BYTES).min(staged);
+            debug_write(flush_stage[emitted..end].as_ptr(), end - emitted);
+            emitted = end;
+        }
     }
 
     if run_ttyd_smoke(initrd) {
