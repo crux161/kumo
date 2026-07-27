@@ -1173,7 +1173,10 @@ fn build_threads_image(root: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn build_relibc_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
-    run_tool(root, "sh", &["scripts/relibc-check.sh"])?;
+    // j511: the smoke `#include`s KUMO's own headers now, so the sysroot must be built
+    // before it can be compiled. `relibc-headers.sh` runs `relibc-check.sh` itself, so
+    // every source and toolchain identity check still gates this.
+    run_tool(root, "sh", &["scripts/relibc-headers.sh"])?;
     let source_path = root.join("target/relibc-smoke/relibc-smoke");
     let bytes =
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;

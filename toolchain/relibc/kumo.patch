@@ -39,6 +39,18 @@ index f352ebf..3d00d71 100644
  [patch.crates-io]
  cc-11 = { git = "https://github.com/tea/cc-rs", branch = "riscv-abi-arch-fix", package = "cc" }
 +rand_jitter = { path = "kumo-deps/rand_jitter" }
+diff --git a/cbindgen.globdefs.toml b/cbindgen.globdefs.toml
+index 1111111..2222222 100644
+--- a/cbindgen.globdefs.toml
++++ b/cbindgen.globdefs.toml
+@@ -1,6 +1,7 @@
+ 
+ # needs a leading newline
+ [defines]
++"target_os=kumo" = "__kumo__"
+ "target_os=redox" = "__redox__"
+ "target_os=linux" = "__linux__"
+ "target_pointer_width=64" = "__LP64__"
 diff --git a/src/header/_paths/mod.rs b/src/header/_paths/mod.rs
 index 7c391b4..60e874e 100644
 --- a/src/header/_paths/mod.rs

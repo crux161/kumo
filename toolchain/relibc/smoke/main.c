@@ -1,30 +1,21 @@
 /* j506 */
 /* j507 */
+/* j511 */
 /*
- * Header-free on purpose: I-a2 proves relibc's startup boundary, not its
- * installed header set. I-a3 closes the public C header/filesystem gate.
- * — KESTREL / TIMBERDOODLE
+ * Every declaration below now comes from KUMO's own installed headers, generated from
+ * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
+ * this file hand-declared each prototype, because there were no headers to include.
+ * That was the last thing standing between KUMO and an unmodified third-party C
+ * program. — TIMBERDOODLE
  */
 
-typedef __SIZE_TYPE__ size_t;
-typedef __INTPTR_TYPE__ ssize_t;
-typedef __UINTPTR_TYPE__ uintptr_t;
-
-/* Opaque on purpose: I-a3 proves the file boundary, not <stdio.h>'s layout. */
-typedef struct _kumo_file FILE;
-
-int printf(const char *format, ...);
-void *calloc(size_t count, size_t size);
-void free(void *pointer);
-ssize_t write(int fd, const void *buffer, size_t length);
-ssize_t read(int fd, void *buffer, size_t length);
-int *__errno_location(void);
-FILE *fopen(const char *path, const char *mode);
-size_t fread(void *buffer, size_t size, size_t count, FILE *stream);
-int fclose(FILE *stream);
-
-#define errno (*__errno_location())
-#define EBADF 9
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /*
  * Thread-local storage, resolved through the local-exec model against `tpidr_el0`.

@@ -63,9 +63,22 @@ method_count="$(grep -Ec '^    (unsafe )?fn ' \
     fail "KUMO backend has $method_count methods; expected 129"
 
 mkdir -p "$ROOT/target"
-stage="$(mktemp -d "$ROOT/target/relibc-source.XXXXXX")"
+# `KUMO_RELIBC_STAGE_OUT` names an exact staging directory and keeps it, so a caller that
+# needs the patched tree afterwards — `relibc-headers.sh` generates the C headers from it —
+# gets one without re-implementing the staging, and without parsing a path out of a log.
+if [ -n "${KUMO_RELIBC_STAGE_OUT:-}" ]; then
+    stage="$KUMO_RELIBC_STAGE_OUT"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+else
+    stage="$(mktemp -d "$ROOT/target/relibc-source.XXXXXX")"
+fi
 vendor_union="$(mktemp -d "$ROOT/target/relibc-vendor.XXXXXX")"
 cleanup() {
+    if [ -n "${KUMO_RELIBC_STAGE_OUT:-}" ]; then
+        rm -rf "$vendor_union"
+        return
+    fi
     if [ "${KUMO_RELIBC_KEEP_STAGE:-0}" = "1" ]; then
         printf 'relibc-check: kept stage %s and vendor union %s\n' \
             "$stage" "$vendor_union" >&2
@@ -146,23 +159,5 @@ fi
     --features no_trace \
     --lib
 
-smoke_dir="$ROOT/target/relibc-smoke"
-smoke_elf="$smoke_dir/relibc-smoke"
-relibc_lib="$ROOT/target/relibc-kumo/aarch64-unknown-kumo/release/librelibc.a"
-[ -f "$relibc_lib" ] || fail "relibc static archive was not produced"
-mkdir -p "$smoke_dir"
-"$cc_bin" --target=aarch64-unknown-none -O2 -ffreestanding \
-    -fno-pic -fno-pie -fno-stack-protector -ffunction-sections -fdata-sections \
-    -c "$TOOL/smoke/crt0.S" -o "$smoke_dir/crt0.o"
-"$cc_bin" --target=aarch64-unknown-none -O2 -ffreestanding \
-    -fno-pic -fno-pie -fno-stack-protector -ffunction-sections -fdata-sections \
-    -c "$TOOL/smoke/main.c" -o "$smoke_dir/main.o"
-"$ld_bin" -static --gc-sections -z noexecstack \
-    -T "$TOOL/smoke/link.ld" \
-    -o "$smoke_elf" \
-    "$smoke_dir/crt0.o" "$smoke_dir/main.o" "$relibc_lib"
-[ -s "$smoke_elf" ] || fail "relibc smoke ELF is empty"
-
 printf 'KUMO relibc scaffold green: %s methods, target_os=kumo, source %s\n' \
     "$method_count" "$RELIBC_REV"
-printf 'KUMO relibc I-a3 image: %s\n' "$smoke_elf"

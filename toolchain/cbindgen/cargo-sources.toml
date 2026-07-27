@@ -1,0 +1,7 @@
+# j511
+# Points cargo at the vendored closure. The directory itself is supplied as an absolute
+# path on the command line, because cargo resolves a relative `directory` against the
+# parent of the config file's own directory -- the same reason `scripts/relibc-check.sh`
+# passes its vendor union that way.
+[source.crates-io]
+replace-with = "vendored-sources"

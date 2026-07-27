@@ -1,0 +1,23 @@
+# j511
+# A vendoring driver, not KUMO code and not a build target.
+#
+# relibc generates most of its C headers from Rust with cbindgen. This manifest exists
+# only so `cargo vendor` can resolve that tool's dependency closure into `vendor/`,
+# after which `scripts/relibc-headers.sh` builds the tool offline with `cargo install`.
+#
+# Deliberately outside the workspace: this resolves for the HOST, while every workspace
+# member builds for a KUMO target, and its versions must not collide with
+# `toolchain/relibc/vendor`, which is relibc's own target-side closure.
+[package]
+name = "kumo-cbindgen-vendor"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cbindgen = "=0.29.2"
