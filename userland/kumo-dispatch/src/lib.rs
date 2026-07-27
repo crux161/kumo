@@ -4,13 +4,14 @@
 //j496
 //j497
 //j498
+//j499
 
 //! In-process work queues for KUMO userland.
 //!
 //! Submitters enqueue function-pointer work without crossing a process boundary. A bounded serial
 //! queue has one claimed worker; a bounded concurrent queue permits multiple workers to drain the
 //! same FIFO. Both disciplines support asynchronous and synchronous submission. Empty workers park
-//! on a futex. [`Once`] provides the first small composition gate.
+//! on a futex. [`Once`] and [`Group`] provide small composition gates.
 
 use core::cell::{Cell, UnsafeCell};
 use core::hint::spin_loop;
@@ -124,6 +125,110 @@ impl Default for Once {
 // The state word permits one result writer and release-publishes that write before any reader.
 // — KESTREL 2026-07-26
 unsafe impl Sync for Once {}
+
+/// Misuse or exhaustion reported by a [`Group`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupError {
+    /// The pending-member counter cannot represent another entry.
+    Overflow,
+    /// `leave` was called without a matching pending entry.
+    UnbalancedLeave,
+}
+
+/// A reusable, allocation-free set of work whose completion can be awaited.
+///
+/// Register every member with [`Group::enter`] before making that work visible. Each registered
+/// member must call [`Group::leave`] exactly once. Waiters park until all members in their captured
+/// completion cycle have left.
+pub struct Group {
+    gate: AtomicBool,
+    pending: AtomicU32,
+    generation: AtomicU32,
+}
+
+impl Group {
+    pub const fn new() -> Self {
+        Self {
+            gate: AtomicBool::new(false),
+            pending: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
+        }
+    }
+
+    /// Register one member in the current completion cycle.
+    pub fn enter(&self) -> Result<(), GroupError> {
+        let _guard = self.lock();
+        let next = self
+            .pending
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or(GroupError::Overflow)?;
+        self.pending.store(next, Ordering::Release);
+        Ok(())
+    }
+
+    /// Complete one registered member.
+    pub fn leave(&self) -> Result<(), GroupError> {
+        let _guard = self.lock();
+        let observed = self.pending.load(Ordering::Relaxed);
+        if observed == 0 {
+            return Err(GroupError::UnbalancedLeave);
+        }
+        let next = observed - 1;
+        self.pending.store(next, Ordering::Release);
+        if next == 0 {
+            // Holding `gate` keeps a new completion cycle from entering between the zero transition
+            // and generation publication. — KESTREL 2026-07-26
+            self.generation.fetch_add(1, Ordering::Release);
+            wake_all_word(self.generation.as_ptr());
+        }
+        Ok(())
+    }
+
+    /// Park until every member in the completion cycle visible to this call has left.
+    pub fn wait(&self) {
+        let target_generation = self.generation.load(Ordering::Acquire);
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        let mut waited = false;
+        loop {
+            let observed = self.generation.load(Ordering::Acquire);
+            if observed != target_generation {
+                if waited {
+                    // Continue J498's bounded-wake cohort drain for groups with many waiters.
+                    // — KESTREL 2026-07-26
+                    wake_all_word(self.generation.as_ptr());
+                }
+                return;
+            }
+            waited = true;
+            wait_word(self.generation.as_ptr(), observed);
+        }
+    }
+
+    pub fn pending(&self) -> u32 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    fn lock(&self) -> GateGuard<'_> {
+        while self
+            .gate
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        GateGuard { gate: &self.gate }
+    }
+}
+
+impl Default for Group {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitError {
@@ -555,6 +660,44 @@ mod tests {
         let once = Once::new();
         assert_eq!(once.call_once(double, 21), 42);
         assert_eq!(once.call_once(double, 99), 42);
+    }
+
+    #[test]
+    fn group_waits_until_every_registered_member_leaves() {
+        let group = Arc::new(Group::new());
+        group.enter().unwrap();
+        group.enter().unwrap();
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let waiter_group = Arc::clone(&group);
+        let waiter_returned = Arc::clone(&returned);
+        let waiter = thread::spawn(move || {
+            waiter_group.wait();
+            waiter_returned.store(true, Ordering::Release);
+        });
+
+        thread::yield_now();
+        group.leave().unwrap();
+        thread::yield_now();
+        assert!(!returned.load(Ordering::Acquire));
+        group.leave().unwrap();
+        waiter.join().unwrap();
+        assert!(returned.load(Ordering::Acquire));
+        assert_eq!(group.pending(), 0);
+    }
+
+    #[test]
+    fn group_rejects_unbalanced_leave_and_reuses_after_completion() {
+        let group = Group::new();
+        assert_eq!(group.leave(), Err(GroupError::UnbalancedLeave));
+        group.enter().unwrap();
+        group.leave().unwrap();
+        group.wait();
+        group.enter().unwrap();
+        assert_eq!(group.pending(), 1);
+        group.leave().unwrap();
+        group.wait();
+        assert_eq!(group.pending(), 0);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j494
 //j495
 //j496
 //j497
 //j498
+//j499
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -40,9 +40,10 @@
 //! Both residents then become workers for one concurrent queue and each drains one of its two jobs.
 //! Thread 0 finally submits synchronously to that queue and resumes only after thread 1 completes it.
 //! The residents finish by contending on one once gate and observing the same initialized result.
+//! A final group wait resumes only after its peer drains both registered jobs.
 
 use kumo_abi::Handle;
-use kumo_dispatch::{ConcurrentQueue, Once, SerialQueue};
+use kumo_dispatch::{ConcurrentQueue, Group, Once, SerialQueue};
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
 
 extern crate alloc;
@@ -157,6 +158,24 @@ static ONCE_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 /// The first finisher remains alive until the acceptance line is emitted.
 static ONCE_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// D4e's finite set of registered queue work.
+static GROUP: Group = Group::new();
+
+/// Number of group jobs successfully queued for the peer worker.
+static GROUP_QUEUED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Sum published by group members before they leave.
+static GROUP_SUM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Registration, submission, or leave failures.
+static GROUP_FAILURES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Producer publishes the complete registered set before the peer drains it.
+static GROUP_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Peer remains alive until the waiting producer emits the acceptance line.
+static GROUP_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
 const CANARY: usize = 64;
@@ -192,6 +211,14 @@ fn initialize_once(value: usize) -> usize {
         futex_wait(ONCE_CONTENDER.as_ptr(), observed);
     }
     value * 2
+}
+
+fn record_group_job(value: usize) -> usize {
+    GROUP_SUM.fetch_add(value as u32, core::sync::atomic::Ordering::AcqRel);
+    if GROUP.leave().is_err() {
+        GROUP_FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    value
 }
 
 fn emit(stdout: Handle, bytes: &[u8]) {
@@ -563,6 +590,76 @@ extern "C" fn main(
                 break;
             }
             futex_wait(ONCE_REPORTED.as_ptr(), observed);
+        }
+    }
+
+    // D4e: thread 0 registers two jobs before publishing them, then parks in Group::wait. Thread 1
+    // drains both queue items; only its second leave completes the generation and wakes thread 0.
+    // — KESTREL 2026-07-26
+    if me == 0 {
+        let mut queued = 0u32;
+        for value in [10usize, 20] {
+            if GROUP.enter().is_err() {
+                GROUP_FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if CONCURRENT_QUEUE
+                .submit_async(record_group_job, value)
+                .is_err()
+            {
+                GROUP_FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let _ = GROUP.leave();
+            } else {
+                queued += 1;
+            }
+        }
+        GROUP_QUEUED.store(queued, core::sync::atomic::Ordering::Release);
+        GROUP_READY.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(GROUP_READY.as_ptr(), 1);
+
+        GROUP.wait();
+        let sum = GROUP_SUM.load(core::sync::atomic::Ordering::Acquire);
+        let pending = GROUP.pending();
+        let failures = GROUP_FAILURES.load(core::sync::atomic::Ordering::Acquire);
+        let passed = queued == 2
+            && sum == 30
+            && pending == 0
+            && failures == 0
+            && CONCURRENT_QUEUE.is_empty();
+        emit(stdout, b"threads: group jobs=");
+        emit_u32(stdout, queued);
+        emit(stdout, b" sum=");
+        emit_u32(stdout, sum);
+        emit(stdout, b" pending=");
+        emit_u32(stdout, pending);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: wait resumed after all work\n"
+            } else {
+                b" -> FAIL: group completion\n"
+            },
+        );
+        GROUP_REPORTED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(GROUP_REPORTED.as_ptr(), 1);
+    } else {
+        loop {
+            let observed = GROUP_READY.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(GROUP_READY.as_ptr(), observed);
+        }
+        let queued = GROUP_QUEUED.load(core::sync::atomic::Ordering::Acquire);
+        for _ in 0..queued {
+            worker.run_one();
+        }
+        loop {
+            let observed = GROUP_REPORTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(GROUP_REPORTED.as_ptr(), observed);
         }
     }
 
