@@ -976,8 +976,7 @@ fn build_autoexec() -> Vec<u8> {
       run hello\n\
       run args alpha beta\n\
       cat etc/autoexec\n\
-      wc etc/autoexec\n\
-      threads\n"
+      wc etc/autoexec\n"
         .to_vec()
 }
 

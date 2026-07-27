@@ -3105,24 +3105,25 @@ fn run_elf_threads(
             }
         }
 
-        // One stack per thread, 64 KiB apart. The gap is the guard: a thread that runs off its
-        // 16 KiB stack lands in unmapped space and faults, instead of silently eating its peer's.
+        // Give every thread a disjoint 16 KiB slice, 64 KiB apart, inside one stack arena.
+        // `AddressSpaceCreate` currently owns one stack range per process and rebuilding it
+        // replaces the prior user page table, so calling it once per peer would leave only the
+        // last peer's stack mapped. Build the whole arena in one call instead. The unused space
+        // between slices is deliberate headroom; the canaries in `threads` prove that the active
+        // slices remain independent across context switches.
         //
-        // `AddressSpaceCreate` takes the stack **top** and maps downward (`stack_virt - stack_size`
-        // is the base), so `STACK_TOP + i * STRIDE` names the top of thread `i`'s stack and its
-        // initial SP sits just below it. Reading that argument as a base is what started every
-        // child 0x4000 above its own mapping, to fault on its first push.
+        // `AddressSpaceCreate` takes the arena **top** and maps downward. Thread zero's slice ends
+        // at `STACK_TOP`; each peer's slice ends one stride above that.
         // — CORVUS / KESTREL 2026-07-26
         const STACK_TOP: u64 = 0x1001_0000;
         const STACK_STRIDE: u64 = 0x1_0000;
         const STACK_SIZE: u64 = 0x4000;
-        for i in 0..=u64::from(extra_threads) {
-            if address_space_create(child_as, STACK_TOP + i * STACK_STRIDE, STACK_SIZE) == u64::MAX
-            {
-                log(name);
-                log(b": as fail\n");
-                break 'load false;
-            }
+        let arena_top = STACK_TOP + u64::from(extra_threads) * STACK_STRIDE;
+        let arena_size = arena_top - (STACK_TOP - STACK_SIZE);
+        if address_space_create(child_as, arena_top, arena_size) == u64::MAX {
+            log(name);
+            log(b": as fail\n");
+            break 'load false;
         }
 
         let sp = |i: u64| STACK_TOP + i * STACK_STRIDE - 0x10;
