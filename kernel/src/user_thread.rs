@@ -8,13 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j368
-//j392
-//j393
 //j408
-//j493
 //j422
 //j425
+//j493
+//j494
 
 use core::cell::UnsafeCell;
 
@@ -532,9 +530,9 @@ pub fn spawn_child_async(
 /// Install the live Sora/resident-child scheduler tick.
 ///
 /// Ordinary timer/device wakes remain deferred to [`pump_idle_floor`] or the next SVC
-/// boundary. The runaway watchdog is the narrow exception: it may switch only when the
-/// interrupted context was EL0 and the architecture trap frame has preserved the complete
-/// per-thread user state.
+/// boundary. Equal-priority peer rotation and the runaway fallback may switch only when
+/// the interrupted context was EL0 and the architecture trap frame has preserved the
+/// complete per-thread user state.
 #[cfg(target_os = "none")]
 pub fn install_preemption_hook() {
     kumo_hal::active::set_preempt_hook(preempt_tick);
@@ -791,7 +789,7 @@ fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
 /// machine.
 const RUNAWAY_TICK_BUDGET: u32 = 8;
 
-/// Take the CPU back from a child that will not give it up.
+/// Charge one timer tick to a running child and schedule an equal-priority peer.
 ///
 /// `irq_handoff_allowed` deliberately refuses to switch out of a child's IRQ frame, and that
 /// refusal is why a spinning EL0 child takes the whole machine: Sora never runs, the boot floor
@@ -810,14 +808,15 @@ const RUNAWAY_TICK_BUDGET: u32 = 8;
 /// 2. **the `SoraState` borrow is free** — belt and braces for (1);
 /// 3. **the current thread is a child**, not Sora and not the idle floor, both of which already
 ///    have working paths;
-/// 4. **it has held the CPU for [`RUNAWAY_TICK_BUDGET`] consecutive timer ticks** — this is a
-///    watchdog, not round-robin. A child that yields promptly is never touched, so every path that
-///    works today is untouched by construction.
+/// 4. **the dispatcher makes the policy decision** — its one-tick quantum rotates only to a ready
+///    thread at the same priority; less-urgent work never preempts a child. With no peer, the
+///    existing [`RUNAWAY_TICK_BUDGET`] fallback remains in force.
 ///
-/// The child is not killed or stopped: `yield_current` puts it at the tail of its priority FIFO, so
-/// it keeps running in slices while the rest of the system breathes. A runaway program becomes a
-/// slow program instead of a dead machine.
-pub fn preempt_runaway_child_if_safe() {
+/// The IRQ frame stays on the displaced thread's own kernel stack. `dispatch_context` changes the
+/// active userspace root and kernel-entry stack, then the ordinary context switch resumes the
+/// peer; when this thread returns, the IRQ epilogue restores its complete saved EL0 frame.
+/// — KESTREL 2026-07-26
+pub fn preempt_child_on_timer_tick_if_safe() {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     if !unsafe { (&*opt).is_some() } {
         return;
@@ -835,28 +834,47 @@ pub fn preempt_runaway_child_if_safe() {
         let Some(current) = s.dispatcher.current() else {
             return;
         };
-        if current == s.user_thread.koid() || current == s.idle.koid() {
+        if current == s.user_thread.koid()
+            || current == s.idle.koid()
+            || !s
+                .children
+                .iter()
+                .any(|child| child.thread.koid() == current)
+        {
             s.runaway_ticks = 0;
             s.runaway_koid = None;
             return;
         }
-        if s.runaway_koid != Some(current) {
-            s.runaway_koid = Some(current);
-            s.runaway_ticks = 0;
-        }
-        s.runaway_ticks = s.runaway_ticks.saturating_add(1);
-        if s.runaway_ticks < RUNAWAY_TICK_BUDGET {
-            return;
-        }
-        // Checked last, and outside the borrow it is testing: if kernel state is busy this tick,
-        // simply try again on the next one rather than forcing an unsafe switch.
+        // Checked outside the RefCell borrow it is testing: if kernel state is busy this tick,
+        // leave dispatcher accounting unchanged and try again on the next one.
         if !crate::usermode::sora_state_is_free() {
             return;
         }
-        s.runaway_ticks = 0;
-        s.preempted_runaways = s.preempted_runaways.saturating_add(1);
-        let decision = s.dispatcher.yield_current();
-        dispatch_context(s, decision)
+
+        let decision = s.dispatcher.on_timer_tick();
+        if matches!(decision, Decision::Switch { .. }) {
+            s.runaway_ticks = 0;
+            s.runaway_koid = None;
+            dispatch_context(s, decision)
+        } else {
+            // No equal or more-urgent peer was ready. Preserve the bounded watchdog used by
+            // D1/D2; it is separate from the ordinary one-tick peer rotation above.
+            if s.runaway_koid != Some(current) {
+                s.runaway_koid = Some(current);
+                s.runaway_ticks = 0;
+            }
+            s.runaway_ticks = s.runaway_ticks.saturating_add(1);
+            if s.runaway_ticks < RUNAWAY_TICK_BUDGET {
+                return;
+            }
+            s.runaway_ticks = 0;
+            let decision = s.dispatcher.yield_current();
+            let switch = dispatch_context(s, decision);
+            if switch.is_some() {
+                s.preempted_runaways = s.preempted_runaways.saturating_add(1);
+            }
+            switch
+        }
     };
     if let Some((prev, next)) = switch {
         unsafe { switch_context(prev, next) };

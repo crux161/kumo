@@ -9,12 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j408
-//j422
 //j470
-//j493
 //j471
 //j477
+//j493
+//j494
 
 use core::cell::UnsafeCell;
 
@@ -279,10 +278,10 @@ extern "C" fn signal_irq(irq: u32) {
         return;
     }
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
-    // Timer ticks only: a busy device stream must not inflate the runaway budget, or a driver
-    // servicing a fast controller would be preempted for doing its job well.
+    // Timer ticks only: a busy device stream must not drive peer rotation or inflate the runaway
+    // budget, or a driver servicing a fast controller would be preempted for doing its job well.
     if irq < 32 {
-        crate::user_thread::preempt_runaway_child_if_safe();
+        crate::user_thread::preempt_child_on_timer_tick_if_safe();
     }
     // Wake Sora if parked — InterruptWait uses park_current_user().
     if crate::user_thread::is_started()

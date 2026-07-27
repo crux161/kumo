@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
 //j493
+//j494
 
-//! `threads` — the D2 proof: two threads, one address space, handing off through a futex.
+//! `threads` — the D2/D3 proof: futex handoff, then timer-sliced compute peers.
 //!
 //! Run it from the shell with `threads`. Sora loads this one ELF, maps it once, gives each thread
 //! its **own** stack, and starts two residents in the same process — so both threads execute the
@@ -12,9 +13,9 @@
 //!
 //! - **Two threads really run.** The output interleaves. One thread printing twice in a row would
 //!   mean the other never started.
-//! - **They share an address space.** `TURN` and `LOG` are ordinary statics in this image's `.bss`.
-//!   The image is mapped once; if the two residents did not share it, they would be incrementing
-//!   different words and the handshake could never complete.
+//! - **They share an address space.** `TURN` and `WROTE` are ordinary statics in this image's
+//!   `.bss`. The image is mapped once; if the two residents did not share it, they would be
+//!   incrementing different words and the handshake could never complete.
 //! - **The futex works.** The alternation is not a spin — a thread whose turn it is not calls
 //!   `futex_wait` and stops running entirely until its peer calls `futex_wake`. If the futex were
 //!   broken this either deadlocks (wake lost) or burns the watchdog budget spinning, and both are
@@ -25,7 +26,10 @@
 //! - **Their registers are independent.** A value kept in a local across every sleep is verified at
 //!   the end. If contexts were not saved per thread, it would not survive.
 //!
-//! The exit line reports every check, so a partial failure is legible rather than a hang.
+//! After the futex proof, both residents enter a syscall-free compute loop. Each counts its own
+//! work and how many distinct peer runs it observed. The last thread reports both counters and
+//! rejects a ratio worse than 2:1, proving the live timer path schedules equal-priority peers
+//! fairly instead of waiting for a syscall or voluntary yield.
 
 use kumo_abi::Handle;
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
@@ -52,6 +56,27 @@ static WROTE: [core::sync::atomic::AtomicU32; 2] = [
     core::sync::atomic::AtomicU32::new(0),
     core::sync::atomic::AtomicU32::new(0),
 ];
+
+/// Both threads must enter the compute phase before either begins measuring.
+static COMPUTE_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Syscall-free work completed by each resident.
+static COMPUTE_WORK: [core::sync::atomic::AtomicU32; 2] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+/// How many distinct runs of its peer each resident observed.
+static PEER_EPOCHS: [core::sync::atomic::AtomicU32; 2] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+/// Number of compute residents that reached the final report barrier.
+static COMPUTE_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Requiring several observed peer runs proves repeated timer handoff, not just one lucky switch.
+const FAIR_EPOCHS: u32 = 8;
 
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
@@ -145,8 +170,29 @@ extern "C" fn main(
         futex_wake(TURN.as_ptr(), 1);
     }
 
-    // Thread 1 finishes last in a correct run; whichever thread sees the full count reports.
-    if COMPLETED.load(core::sync::atomic::Ordering::Acquire) >= ROUNDS * 2 {
+    // Both residents now enter a syscall-free compute phase. The first one here can make no
+    // progress until a timer IRQ dispatches its peer, which is the integration edge D3 adds.
+    // — KESTREL 2026-07-26
+    COMPUTE_READY.fetch_or(1 << me, core::sync::atomic::Ordering::Release);
+    while COMPUTE_READY.load(core::sync::atomic::Ordering::Acquire) != 0b11 {
+        core::hint::spin_loop();
+    }
+
+    let mut last_peer_work =
+        COMPUTE_WORK[peer as usize].load(core::sync::atomic::Ordering::Acquire);
+    while PEER_EPOCHS[0].load(core::sync::atomic::Ordering::Acquire) < FAIR_EPOCHS
+        || PEER_EPOCHS[1].load(core::sync::atomic::Ordering::Acquire) < FAIR_EPOCHS
+    {
+        COMPUTE_WORK[me as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let peer_work = COMPUTE_WORK[peer as usize].load(core::sync::atomic::Ordering::Acquire);
+        if peer_work != last_peer_work {
+            PEER_EPOCHS[me as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            last_peer_work = peer_work;
+        }
+    }
+
+    // The second resident out reports both the blocking D2 proof and compute-bound D3 proof.
+    if COMPUTE_DONE.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1 == 2 {
         let faults = FAULTS.load(core::sync::atomic::Ordering::Acquire);
         let a = WROTE[0].load(core::sync::atomic::Ordering::Acquire);
         let b = WROTE[1].load(core::sync::atomic::Ordering::Acquire);
@@ -169,6 +215,33 @@ extern "C" fn main(
         } else {
             emit(stdout, b" -> FAIL\n");
         }
+
+        let work_a = COMPUTE_WORK[0].load(core::sync::atomic::Ordering::Acquire);
+        let work_b = COMPUTE_WORK[1].load(core::sync::atomic::Ordering::Acquire);
+        let epochs_a = PEER_EPOCHS[0].load(core::sync::atomic::Ordering::Acquire);
+        let epochs_b = PEER_EPOCHS[1].load(core::sync::atomic::Ordering::Acquire);
+        let min_work = work_a.min(work_b);
+        let max_work = work_a.max(work_b);
+        let balanced = min_work > 0
+            && max_work <= min_work.saturating_mul(2)
+            && epochs_a >= FAIR_EPOCHS
+            && epochs_b >= FAIR_EPOCHS;
+        emit(stdout, b"threads: fair epochs A=");
+        emit_u32(stdout, epochs_a);
+        emit(stdout, b" B=");
+        emit_u32(stdout, epochs_b);
+        emit(stdout, b" work A=");
+        emit_u32(stdout, work_a);
+        emit(stdout, b" B=");
+        emit_u32(stdout, work_b);
+        emit(
+            stdout,
+            if balanced {
+                b" -> OK: equal-priority compute peers made even progress\n"
+            } else {
+                b" -> FAIL: unfair compute progress\n"
+            },
+        );
     }
 
     process_exit(0)
