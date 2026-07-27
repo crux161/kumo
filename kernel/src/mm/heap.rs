@@ -18,6 +18,22 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
+/// The heap's live address span, for the fault path's region map. `(0, 0)` before `init`.
+#[cfg(target_os = "none")]
+pub fn range() -> (u64, u64) {
+    let base = global::backing_base();
+    if base == 0 {
+        (0, 0)
+    } else {
+        (base, base + HEAP_SIZE as u64)
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn range() -> (u64, u64) {
+    (0, 0)
+}
+
 #[cfg(target_os = "none")]
 mod global {
     use super::HEAP_SIZE;
@@ -30,6 +46,12 @@ mod global {
     struct Backing(UnsafeCell<[u8; HEAP_SIZE]>);
     unsafe impl Sync for Backing {}
     static BACKING: Backing = Backing(UnsafeCell::new([0u8; HEAP_SIZE]));
+
+    /// The backing array's address, for [`super::range`]. Always valid — the array is a static, so
+    /// this is a link-time constant and safe to read from a fault path.
+    pub fn backing_base() -> u64 {
+        BACKING.0.get() as u64
+    }
 
     pub struct KumoHeap {
         inner: UnsafeCell<LinkedListHeap>,

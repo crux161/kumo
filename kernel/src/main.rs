@@ -47,6 +47,10 @@ mod boot {
     );
 
     extern "C" fn kernel_entry(boot: *const kumo_abi::BootInfo) -> ! {
+        // `_start` is the only code that knows where the boot stack is; publish it before anything
+        // can fault, so the Tower can tell a boot-stack address from a heap one.
+        let lo = core::ptr::addr_of!(KERNEL_STACK) as u64;
+        kernel::diag::set_boot_stack(lo, lo + 0x1_0000);
         kernel::kmain(boot)
     }
 

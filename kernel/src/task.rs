@@ -12,6 +12,9 @@ pub const DEFAULT_KERNEL_STACK_SIZE: usize = 16 * 1024;
 pub enum TaskError {
     EmptyStack,
     StackTooSmall,
+    /// The allocator returned a block outside the heap it owns. Never a caller error — this is the
+    /// allocator's free list having been corrupted, caught before a thread runs on the result.
+    StackOutsideHeap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +166,19 @@ impl KernelStack {
         let size = align_up_usize(size, 16).ok_or(TaskError::StackTooSmall)?;
         let mut bytes = Vec::new();
         bytes.resize(size, 0);
+        // A kernel thread runs on this, and an IRQ pushes 0x110 bytes onto it at any moment. If the
+        // allocator ever hands back a block outside its own arena — a torn free list, the failure
+        // this allocator has a history of — the result is a stack pointer into unmapped memory and a
+        // kernel fault later, somewhere else, with nothing to connect it back here. Refuse it at the
+        // point of issue instead, where the cause is still in scope.
+        let (heap_lo, heap_hi) = crate::mm::heap::range();
+        if heap_lo != heap_hi {
+            let lo = bytes.as_ptr() as u64;
+            let hi = lo.saturating_add(size as u64);
+            if lo < heap_lo || hi > heap_hi {
+                return Err(TaskError::StackOutsideHeap);
+            }
+        }
         Ok(Self { bytes })
     }
 
@@ -417,6 +433,10 @@ mod tests {
 
     #[test]
     fn rejects_unusable_kernel_stacks() {
+        // On the host the heap range is (0, 0) — "unknown" — and the guard stands down rather
+        // than rejecting every stack. The check is live only where the arena is real.
+        assert_eq!(crate::mm::heap::range(), (0, 0));
+        assert!(KernelStack::new(PAGE_SIZE as usize).is_ok());
         assert_eq!(KernelStack::new(0), Err(TaskError::EmptyStack));
         assert_eq!(
             KernelStack::new(PAGE_SIZE as usize - 1),

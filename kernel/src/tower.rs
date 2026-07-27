@@ -232,6 +232,7 @@ fn emit_banner(ev: &Event, pass: Option<u64>, emit: fn(&[u8])) {
             emit(b" INSN=");
             emit(&hex64(insn));
             emit(b"\r\n");
+            emit_diagnosis(esr, elr, far, sp, emit);
         }
         Cause::Abend { exit_code } => {
             emit(b"  cause=ABEND  exit=");
@@ -268,6 +269,59 @@ const QR_PAYLOAD_CAP: usize = 512;
 /// blurry green zeros (the X13s has no usable serial). No-op where there is no framebuffer
 /// (the HAL gates on that). Best-effort: the payload is silently truncated if it ever overflows,
 /// and the text banner — emitted first — is always the reliable channel.
+/// The syndrome in English, then where each address actually lives.
+///
+/// Everything here is a pure function over values already in hand plus link-time constants, so it
+/// cannot fault while reporting a fault — the one bug a diagnostic must never have.
+fn emit_diagnosis(esr: u64, elr: u64, far: u64, sp: u64, emit: fn(&[u8])) {
+    let syndrome = crate::diag::decode_esr(esr);
+    emit(b"  what: ");
+    emit(syndrome.class.as_bytes());
+    if !syndrome.detail.is_empty() {
+        emit(b" - ");
+        emit(syndrome.detail.as_bytes());
+    }
+    if let Some(write) = syndrome.write {
+        emit(if write { b" on write" } else { b" on read" });
+    }
+    emit(b"\r\n");
+
+    let map = crate::diag::current_map();
+    for (label, addr) in [(b"  ELR " as &[u8], elr), (b"  FAR ", far), (b"  SP  ", sp)] {
+        emit(label);
+        emit_placement(&map, addr, emit);
+        emit(b"\r\n");
+    }
+    // `place` reports geography; only this path knows SP is meant to be a stack. Kernel thread
+    // stacks are heap-allocated, so an SP outside the heap and the boot stack means the allocator
+    // handed out a block it does not own — a named finding rather than an address to go decode.
+    if !crate::diag::kernel_stack_is_sane(&map, sp) {
+        emit(b"  !!! kernel SP is outside the heap and the boot stack !!!\r\n");
+        emit(b"  !!! a thread stack was allocated out of range - suspect the free list !!!\r\n");
+    }
+}
+
+fn emit_placement(map: &crate::diag::RegionMap, addr: u64, emit: fn(&[u8])) {
+    use crate::diag::Placement;
+    emit(&hex64(addr));
+    match crate::diag::place(map, addr) {
+        Placement::Inside { region, offset } => {
+            emit(b" in ");
+            emit(region.name().as_bytes());
+            emit(b" +");
+            emit(&hex64(offset));
+        }
+        Placement::Past { region, distance } => {
+            emit(b" UNMAPPED - ");
+            emit(&hex64(distance));
+            emit(b" past ");
+            emit(region.name().as_bytes());
+            emit(b" end");
+        }
+        Placement::Nowhere => emit(b" UNMAPPED - below every known region"),
+    }
+}
+
 fn emit_qr(ev: &Event, emit: fn(&[u8]), sticky: bool) {
     struct Buf {
         bytes: [u8; QR_PAYLOAD_CAP],

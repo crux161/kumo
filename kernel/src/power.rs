@@ -72,11 +72,17 @@ pub fn execute(action: PowerAction, out: &mut dyn Write) {
 
     let was_routed = crate::usermode::console_route_enabled();
     crate::usermode::disable_console_route();
-    let masked = crate::usermode::quiesce_device_interrupts();
-    let _ = write!(
-        out,
-        "quiesced: {masked} device interrupt line(s) masked\r\n"
-    );
+    match crate::usermode::quiesce_device_interrupts() {
+        crate::usermode::Quiesce::Masked(n) => {
+            let _ = write!(out, "quiesced: {n} device interrupt line(s) masked\r\n");
+        }
+        crate::usermode::Quiesce::Unavailable => {
+            // Say it plainly: the machine is going down without the device quiesce, and anything
+            // mid-DMA is still mid-DMA. Silence would look identical to a clean pass.
+            let _ =
+                out.write_str("quiesce SKIPPED: kernel state busy - device lines left live\r\n");
+        }
+    }
 
     // Both sinks' `putc` waits for room, not for completion, so everything above may still be
     // in a FIFO. Drain before handing control to firmware — a power-off that truncates its own
@@ -100,10 +106,14 @@ pub fn execute(action: PowerAction, out: &mut dyn Write) {
         if was_routed {
             crate::usermode::enable_console_route();
         }
-        let _ = write!(
-            out,
-            "resumed: {restored} device interrupt line(s) unmasked\r\n"
-        );
+        match restored {
+            crate::usermode::Quiesce::Masked(n) => {
+                let _ = write!(out, "resumed: {n} device interrupt line(s) unmasked\r\n");
+            }
+            crate::usermode::Quiesce::Unavailable => {
+                let _ = out.write_str("resume SKIPPED: kernel state busy\r\n");
+            }
+        }
         return;
     }
 

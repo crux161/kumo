@@ -13,6 +13,7 @@ SECTIONS {
   KERNEL_VIRT_BASE = 0xffff800048000000;
   KERNEL_PHYS_BASE = 0x48000000;
   . = KERNEL_VIRT_BASE;
+  __image_start = .;
 
   .text ALIGN(0x1000) : AT(KERNEL_PHYS_BASE + (ADDR(.text) - KERNEL_VIRT_BASE)) {
     KEEP(*(.text._start))
@@ -32,6 +33,8 @@ SECTIONS {
     *(.bss .bss.*)
     *(COMMON)
   }
+
+  __image_end = .;
 
   /DISCARD/ : {
     *(.comment)

@@ -11,8 +11,11 @@ extern crate alloc;
 
 pub mod bootstrap;
 pub mod cap;
+pub mod conin;
+pub mod diag;
 pub mod ipc;
 pub mod ipcdemo;
+pub mod ipcstat;
 pub mod kdemo;
 pub mod mm;
 pub mod object;
@@ -20,6 +23,7 @@ pub mod power;
 pub mod sched;
 pub mod shell;
 pub mod syscall;
+pub mod sysrq;
 pub mod task;
 pub mod tower;
 pub mod user_thread;
@@ -949,25 +953,73 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             preempt_ticks: 0,
             preempt_switches: 0,
         };
+        let mut sysrq_out = bootstrap::console::Writer;
         klog!("\nKUMO MUREX core Stage-A serial shell. Type 'help'.\n");
+        klog!("escape hatch: ctrl-\\ or ~~~ then '?' (works even if userland wedges).\n");
         klog!("{}", shell::PROMPT);
         loop {
-            match kumo_hal::active::console_read_byte() {
-                Some(byte @ 0x08)
-                | Some(byte @ 0x7f)
-                | Some(byte @ b'\r')
-                | Some(byte @ b'\n')
-                | Some(byte @ 0x20..=0x7e) => {
+            // The UART now has exactly one reader — the IRQ handler in `conin` — because the
+            // boot floor stops running whenever a child spins at EL0, which is the very case the
+            // escape hatch exists for. What arrives here is what that handler judged ordinary
+            // input. TAB drives ttyd's completion and ESC opens its escape-sequence state machine
+            // (arrow keys arrive as `ESC [ A`/`B`); both used to be dropped, which left history
+            // and completion written, tested, and unreachable over serial.
+            if let Some(byte) = conin::next_byte() {
+                if matches!(
+                    byte,
+                    0x08 | 0x09 | 0x1b | 0x7f | b'\r' | b'\n' | 0x20..=0x7e
+                ) {
                     usermode::kbd_forward(byte);
                 }
-                Some(_) => {}
-                None => {}
+            }
+            if let Some(action) = conin::take_deferred_action() {
+                run_sysrq(action, &env, &mut sysrq_out);
             }
             // Check for a completed command line from Sora via the root channel.
             if usermode::poll_root_command(&mut env) > 0 {
                 klog!("{}", shell::PROMPT);
             }
             user_thread::pump_idle_floor();
+        }
+    }
+}
+
+/// Act on a completed console escape sequence.
+///
+/// Every arm reaches something that does not need Sora: `power::execute` quiesces through the
+/// non-panicking borrow and writes through the console fallback, and the task table is kernel
+/// state. That independence is the whole reason this exists.
+fn run_sysrq(action: sysrq::Action, env: &shell::ShellEnv, out: &mut dyn core::fmt::Write) {
+    use core::fmt::Write;
+    match action {
+        sysrq::Action::Armed => {
+            let _ = out.write_str(sysrq::ARMED);
+        }
+        sysrq::Action::Reboot => {
+            let _ = out.write_str("\r\nsysrq: reboot\r\n");
+            power::execute(power::PowerAction::Reset, out);
+        }
+        sysrq::Action::Shutdown => {
+            let _ = out.write_str("\r\nsysrq: shutdown\r\n");
+            power::execute(power::PowerAction::PowerOff, out);
+        }
+        sysrq::Action::Halt => {
+            let _ = out.write_str("\r\nsysrq: halt\r\n");
+            power::execute(power::PowerAction::Halt, out);
+        }
+        sysrq::Action::Tasks => {
+            let _ = out.write_str("\r\nsysrq: tasks\r\n");
+            shell::run_command("ps", env, &kdemo::tasks(), out);
+        }
+        sysrq::Action::Help => {
+            let _ = out.write_str(sysrq::HELP);
+        }
+        sysrq::Action::Unknown(byte) => {
+            let _ = write!(
+                out,
+                "\r\nsysrq: no command for {:#04x}; ctrl-\\ ? for the list\r\n",
+                byte
+            );
         }
     }
 }

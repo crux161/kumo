@@ -228,6 +228,12 @@ const MAX_ROOT_COMMAND_BYTES: usize = 256;
 /// floor is current.
 extern "C" fn signal_irq(irq: u32) {
     let now_ns = kumo_hal::active::monotonic_nanos();
+    // Drain the console here, not only on the boot floor: a child spinning at EL0 is never
+    // preempted (`irq_handoff_allowed` = current == Sora), so this handler is the last code still
+    // running and therefore the only place an escape sequence can still be noticed.
+    if let Some(action) = crate::conin::poll_from_irq() {
+        crate::conin::run_action_in_irq(action);
+    }
     // A device SPI is level-triggered: the line stays asserted until its driver services the
     // device, so re-enabling it at EOI re-fires immediately and storms — which starves the very
     // driver child that would ack it. Mask here, unmask in `complete_interrupt_source` when the
@@ -240,12 +246,18 @@ extern "C" fn signal_irq(irq: u32) {
     // kernel code holds `SoraState` (e.g. the shell draining a command), and `with_sora_mut` would
     // double-borrow and panic. If the state is busy, unmask the device line so the controller
     // re-asserts and we service it on the next delivery instead of losing it.
-    if try_with_sora_mut(|sora| {
+    let delivered = try_with_sora_mut(|sora| {
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);
     })
-    .is_none()
-    {
+    .is_some();
+    if irq >= 32 && delivered {
+        // S0: counted on delivery, not on entry — the busy-borrow path below unmasks and lets the
+        // controller re-assert, and scoring that retry would inflate the denominator every later
+        // measurement divides by.
+        crate::ipcstat::note_device_irq();
+    }
+    if !delivered {
         if irq >= 32 {
             kumo_hal::active::unmask_spi_interrupt(irq);
         }
@@ -2335,21 +2347,37 @@ const MAX_QUIESCE_IRQS: usize = 32;
 /// protocol for servers to honour, and no DMA engine left poking the GIC while firmware
 /// takes the machine down. Paired with [`restore_device_interrupts`] for the one case that
 /// is recoverable (a firmware that declines a reset).
-pub fn quiesce_device_interrupts() -> usize {
+pub fn quiesce_device_interrupts() -> Quiesce {
     set_device_interrupt_mask(true)
 }
 
 /// Undo [`quiesce_device_interrupts`], re-enabling each bound device line.
-pub fn restore_device_interrupts() -> usize {
+pub fn restore_device_interrupts() -> Quiesce {
     set_device_interrupt_mask(false)
 }
 
-fn set_device_interrupt_mask(masked: bool) -> usize {
+/// What a quiesce pass actually managed to do.
+///
+/// The distinction is not pedantry. `Masked(0)` means the binding table was read and held no device
+/// lines; `Unavailable` means it could not be read at all, so lines that *are* live were left live.
+/// Collapsing both to "0" — which is what `.unwrap_or(0)` used to do — reports a machine going down
+/// with a DMA-active controller still asserting exactly as if there had been nothing to stop, and
+/// that is the one hazard this whole ordered bring-down exists to prevent. The escape-hatch path
+/// made it matter: an IRQ-context quiesce is precisely where the borrow is most likely contended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quiesce {
+    Masked(usize),
+    Unavailable,
+}
+
+fn set_device_interrupt_mask(masked: bool) -> Quiesce {
     let mut irqs = [0u32; MAX_QUIESCE_IRQS];
     // Snapshot inside the borrow, touch the GIC only after it is released. Calling out while
     // `SoraState` is borrowed is the reentrancy hazard that has frozen this machine twice
     // (a `klog!` inside `with_sora_mut`, and `poll_root_command`'s allocating `to_string`).
-    let len = try_with_sora_mut(|sora| sora.engine.bound_interrupt_irqs(&mut irqs)).unwrap_or(0);
+    let Some(len) = try_with_sora_mut(|sora| sora.engine.bound_interrupt_irqs(&mut irqs)) else {
+        return Quiesce::Unavailable;
+    };
     let mut touched = 0;
     for &irq in &irqs[..len] {
         // PPIs (< 32) are the kernel's own — the scheduler timer lives there and must keep
@@ -2364,7 +2392,7 @@ fn set_device_interrupt_mask(masked: bool) -> usize {
         }
         touched += 1;
     }
-    touched
+    Quiesce::Masked(touched)
 }
 
 /// Largest routed fragment: must fit Sora's 256-byte read buffer with margin.
@@ -2571,6 +2599,9 @@ pub fn kbd_forward(byte: u8) -> bool {
     {
         return false;
     }
+    // S0's serial denominator. This path is polled by the shell's REPL and raises no interrupt, so
+    // a session driven over serial registers as zero input unless it is counted here.
+    crate::ipcstat::note_serial_key();
     with_sora_mut(|sora| {
         let payload = [byte];
         let Ok(message) = Message::new(5, &payload, &[]) else {
