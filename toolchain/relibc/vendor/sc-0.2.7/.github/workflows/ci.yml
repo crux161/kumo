@@ -1,0 +1,76 @@
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+name: Continuous integration
+
+jobs:
+   test :
+    name: Test Suite
+    strategy:
+      matrix:
+        target:
+          # Linux
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - i686-unknown-linux-gnu
+          - mips-unknown-linux-gnu
+          - mips64-unknown-linux-gnuabi64
+          - mips64el-unknown-linux-gnuabi64
+          - mipsel-unknown-linux-gnu
+          - powerpc-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu
+          - powerpc64le-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+
+          # *BSD
+          - x86_64-unknown-freebsd
+        os:
+          - ubuntu-latest
+
+        include:
+          # macOS
+          - target: x86_64-apple-darwin
+            os: macOS-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          # asm! is stable and llvm_asm! still exists
+          toolchain: nightly-2022-01-14
+          target: ${{ matrix.target }}
+          override: true
+
+      # omit tests on BSD
+      - uses: actions-rs/cargo@v1
+        if: matrix.target == 'x86_64-unknown-freebsd'
+        with:
+          use-cross: true
+          command: check
+          args: --target ${{ matrix.target }}
+
+      - uses: actions-rs/cargo@v1
+        if: matrix.target != 'x86_64-unknown-freebsd'
+        with:
+          use-cross: true
+          command: test
+          args: --target ${{ matrix.target }}
+      - uses: actions-rs/cargo@v1
+        if: matrix.target != 'x86_64-unknown-freebsd'
+        with:
+          use-cross: true
+          command: run
+          args: --target ${{ matrix.target }} --release --example hello
+      - uses: actions-rs/cargo@v1
+        if: matrix.target != 'x86_64-unknown-freebsd'
+        with:
+          use-cross: true
+          command: test
+          args: --target ${{ matrix.target }} --release

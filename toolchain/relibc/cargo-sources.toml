@@ -1,0 +1,12 @@
+#j505
+# Cargo.lock pins both git revisions. These replacements make the check consume
+# KUMO's audited vendor directory instead of contacting either remote.
+[source."git+https://github.com/tea/cc-rs?branch=riscv-abi-arch-fix"]
+git = "https://github.com/tea/cc-rs"
+branch = "riscv-abi-arch-fix"
+replace-with = "vendored-sources"
+
+[source."git+https://gitlab.redox-os.org/andypython/object?branch=new"]
+git = "https://gitlab.redox-os.org/andypython/object"
+branch = "new"
+replace-with = "vendored-sources"

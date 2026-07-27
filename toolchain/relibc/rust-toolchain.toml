@@ -1,0 +1,5 @@
+#j505
+[toolchain]
+channel = "nightly-2026-06-22"
+profile = "minimal"
+components = ["rust-src", "rustfmt"]

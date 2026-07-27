@@ -1,0 +1,536 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f352ebf..3d00d71 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,14 +10,9 @@ crate-type = ["staticlib"]
+ 
+ [workspace]
+ members = [
+-    "src/crt0",
+-    "src/crti",
+-    "src/crtn",
+-    "redox-rt",
+-    "ld_so",
+     "generic-rt",
+ ]
+-exclude = ["tests", "dlmalloc-rs"]
++exclude = ["tests", "dlmalloc-rs", "src/crt0", "src/crti", "src/crtn", "redox-rt", "ld_so"]
+ 
+ [workspace.lints.clippy]
+ borrow_as_ptr = "deny"
+@@ -124,15 +119,6 @@ features = ["elf", "read_core"]
+ [target.'cfg(target_os = "linux")'.dependencies]
+ sc = "0.2.7"
+ 
+-[target.'cfg(target_os = "redox")'.dependencies]
+-redox_syscall.workspace = true
+-redox-rt = { path = "redox-rt" }
+-redox-path.workspace = true
+-redox_event = { version = "0.4.8", default-features = false, features = ["redox_syscall"] }
+-ioslice.workspace = true
+-redox-ioctl = { path = "redox-ioctl" }
+-redox_protocols.workspace = true
+-
+ [features]
+ # to enable trace level, take out this `no_trace`
+ default = ["check_against_libc_crate", "no_trace"]
+@@ -150,3 +136,4 @@ panic = "abort"
+ 
+ [patch.crates-io]
+ cc-11 = { git = "https://github.com/tea/cc-rs", branch = "riscv-abi-arch-fix", package = "cc" }
++rand_jitter = { path = "kumo-deps/rand_jitter" }
+diff --git a/src/header/_paths/mod.rs b/src/header/_paths/mod.rs
+index 7c391b4..60e874e 100644
+--- a/src/header/_paths/mod.rs
++++ b/src/header/_paths/mod.rs
+@@ -1,6 +1,6 @@
+ //! Implementation specific, non-standard path aliases
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ mod sys;
+ 
+diff --git a/src/header/bits_mode-t/mod.rs b/src/header/bits_mode-t/mod.rs
+index f2d48ba..052fc3f 100644
+--- a/src/header/bits_mode-t/mod.rs
++++ b/src/header/bits_mode-t/mod.rs
+@@ -1,14 +1,14 @@
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ use crate::platform::types::c_uint;
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "kumo")))]
+ use crate::platform::types::c_int;
+ 
+ /// Used for some file attributes.
+ #[allow(non_camel_case_types)]
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub type mode_t = c_uint;
+ /// Used for some file attributes.
+ #[allow(non_camel_case_types)]
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "kumo")))]
+ pub type mode_t = c_int;
+diff --git a/src/header/bits_open-flags/mod.rs b/src/header/bits_open-flags/mod.rs
+index a1459bc..fe4c8e9 100644
+--- a/src/header/bits_open-flags/mod.rs
++++ b/src/header/bits_open-flags/mod.rs
+@@ -1,6 +1,6 @@
+ pub use self::sys::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/bits_suseconds-t/mod.rs b/src/header/bits_suseconds-t/mod.rs
+index 3896498..94a19b7 100644
+--- a/src/header/bits_suseconds-t/mod.rs
++++ b/src/header/bits_suseconds-t/mod.rs
+@@ -1,14 +1,14 @@
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ use crate::platform::types::c_long;
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "kumo")))]
+ use crate::platform::types::c_int;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[allow(non_camel_case_types)]
+ /// Used for time in microseconds.
+ pub type suseconds_t = c_long;
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "kumo")))]
+ #[allow(non_camel_case_types)]
+ /// Used for time in microseconds.
+ pub type suseconds_t = c_int;
+diff --git a/src/header/fcntl/mod.rs b/src/header/fcntl/mod.rs
+index 4abdb6b..fdb34b9 100644
+--- a/src/header/fcntl/mod.rs
++++ b/src/header/fcntl/mod.rs
+@@ -18,7 +18,7 @@ pub use crate::header::bits_open_flags::*;
+ 
+ use super::errno::EINVAL;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/grp/mod.rs b/src/header/grp/mod.rs
+index e54116c..9f1cba7 100644
+--- a/src/header/grp/mod.rs
++++ b/src/header/grp/mod.rs
+@@ -31,7 +31,7 @@ use super::{
+ };
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ const SEPARATOR: char = ':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/limits/mod.rs b/src/header/limits/mod.rs
+index cfc5a32..934fc46 100644
+--- a/src/header/limits/mod.rs
++++ b/src/header/limits/mod.rs
+@@ -77,7 +77,7 @@ pub const LLONG_MIN: c_longlong = -LLONG_MAX - 1;
+ 
+ // TODO: 4096 for most architectures as determined by a quick grep of musl's source; need a better
+ // way to determine it for other archs or to hard code a value.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub const PAGE_SIZE: usize = 4096;
+ 
+ // These POSIX symbols must have these values regardless of OS
+diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
+index 3668161..dd96b25 100644
+--- a/src/header/netdb/mod.rs
++++ b/src/header/netdb/mod.rs
+@@ -33,7 +33,7 @@ use crate::{
+ 
+ use crate::header::netinet_in::sockaddr_in6;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/poll/mod.rs b/src/header/poll/mod.rs
+index 18132c6..f064d67 100644
+--- a/src/header/poll/mod.rs
++++ b/src/header/poll/mod.rs
+@@ -103,7 +103,7 @@ pub unsafe fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sig
+             data: epoll_data { u64: i as u64 },
+             ..Default::default()
+         };
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "kumo"))]
+         let mut event = epoll_event {
+             events: 0,
+             data: epoll_data { u64: i as u64 },
+diff --git a/src/header/pwd/mod.rs b/src/header/pwd/mod.rs
+index 3546e56..40ceaeb 100644
+--- a/src/header/pwd/mod.rs
++++ b/src/header/pwd/mod.rs
+@@ -20,18 +20,18 @@ use crate::{
+     raw_cell::RawCell,
+ };
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ mod linux;
+ #[cfg(target_os = "redox")]
+ mod redox;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ use self::linux as sys;
+ #[cfg(target_os = "redox")]
+ use self::redox as sys;
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ const SEPARATOR: u8 = b':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/shadow/mod.rs b/src/header/shadow/mod.rs
+index 6d7b21f..a94868d 100644
+--- a/src/header/shadow/mod.rs
++++ b/src/header/shadow/mod.rs
+@@ -24,7 +24,7 @@ use crate::{
+ use super::errno::*;
+ 
+ /// cbindgen:ignore
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ const SEPARATOR: char = ':';
+ 
+ /// cbindgen:ignore
+diff --git a/src/header/signal/mod.rs b/src/header/signal/mod.rs
+index 660fadc..e0a8afd 100644
+--- a/src/header/signal/mod.rs
++++ b/src/header/signal/mod.rs
+@@ -26,7 +26,7 @@ use super::{
+     stdio::{fprintf, stderr},
+ };
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+@@ -108,7 +108,7 @@ pub struct sigaltstack {
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html>.
+ #[repr(C)]
+ #[derive(Clone)]
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "kumo")))]
+ pub struct sigevent {
+     /// Signal value.
+     pub sigev_value: sigval,
+@@ -129,7 +129,7 @@ pub struct sigevent {
+ /// See <https://docs.rs/libc/0.2.186/src/libc/unix/linux_like/mod.rs.html#300-322>.
+ #[repr(C)]
+ #[derive(Clone)]
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub struct sigevent {
+     /// Signal value.
+     pub sigev_value: sigval,
+diff --git a/src/header/stdio/constants.rs b/src/header/stdio/constants.rs
+index 834c18c..d48c08f 100644
+--- a/src/header/stdio/constants.rs
++++ b/src/header/stdio/constants.rs
+@@ -27,9 +27,9 @@ pub const _IONBF: c_int = 2;
+ /// Rename but don't replace the target if it exists.
+ pub const RENAME_NOREPLACE: c_uint = 0x01;
+ /// Atomically swap two files.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub const RENAME_EXCHANGE: c_uint = 0x02;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub const RENAME_WHITEOUT: c_uint = 0x04;
+ 
+ // /dev/tty + nul
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+index e304210..ae45793 100644
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -927,7 +927,7 @@ pub unsafe extern "C" fn posix_memalign(
+ pub unsafe extern "C" fn posix_openpt(flags: c_int) -> c_int {
+     #[cfg(target_os = "redox")]
+     let r = unsafe { open(c"/scheme/pty/ptmx".as_ptr(), flags) };
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "kumo"))]
+     let r = unsafe { open(c"/dev/ptmx".as_ptr(), flags) };
+ 
+     if r < 0 && platform::ERRNO.get() == ENOSPC {
+@@ -983,7 +983,7 @@ pub unsafe extern "C" fn ptsname_r(fildes: c_int, name: *mut c_char, namesize: s
+ 
+         if unsafe { ioctl(fildes, TIOCGPTN, ptr::from_mut(&mut pty).cast::<c_void>()) } == 0 {
+             // Linux and Redox use different resource names for PTS's.
+-            #[cfg(target_os = "linux")]
++            #[cfg(any(target_os = "linux", target_os = "kumo"))]
+             let inner_name = format!("/dev/pts/{}", pty);
+             #[cfg(target_os = "redox")]
+             let inner_name = format!("/scheme/pty/{}", pty);
+diff --git a/src/header/sys_epoll/mod.rs b/src/header/sys_epoll/mod.rs
+index ea914bc..dcd69a0 100644
+--- a/src/header/sys_epoll/mod.rs
++++ b/src/header/sys_epoll/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+ };
+ 
+ /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub const EPOLL_CLOEXEC: c_int = 0x8_0000;
+ 
+ /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.
+diff --git a/src/header/sys_ioctl/mod.rs b/src/header/sys_ioctl/mod.rs
+index 7f53d5f..44df273 100644
+--- a/src/header/sys_ioctl/mod.rs
++++ b/src/header/sys_ioctl/mod.rs
+@@ -31,7 +31,7 @@ pub struct sgttyb {
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int {
+     // TODO: Somehow support varargs to syscall??
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "kumo"))]
+     unsafe {
+         crate::platform::Sys::ioctl(fd, request, out).or_minus_one_errno()
+     }
+@@ -39,10 +39,10 @@ pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) ->
+     unsafe { self::redox::ioctl_inner(fd, request, out) }.or_minus_one_errno()
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub use self::linux::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub mod linux;
+ 
+ #[cfg(target_os = "redox")]
+diff --git a/src/header/sys_mman/mod.rs b/src/header/sys_mman/mod.rs
+index 555ea94..5d1defb 100644
+--- a/src/header/sys_mman/mod.rs
++++ b/src/header/sys_mman/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+ 
+ pub use self::sys::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+@@ -154,7 +154,7 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, len: size_t) -> c_int {
+         .or_minus_one_errno()
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ static SHM_PATH: &[u8] = b"/dev/shm/";
+ 
+ #[cfg(target_os = "redox")]
+diff --git a/src/header/sys_select/mod.rs b/src/header/sys_select/mod.rs
+index 37286a6..2b3b060 100644
+--- a/src/header/sys_select/mod.rs
++++ b/src/header/sys_select/mod.rs
+@@ -93,7 +93,7 @@ pub unsafe fn select_epoll(
+                 data: epoll_data { fd },
+                 ..Default::default()
+             };
+-            #[cfg(target_os = "linux")]
++            #[cfg(any(target_os = "linux", target_os = "kumo"))]
+             let mut event = epoll_event {
+                 events,
+                 data: epoll_data { fd },
+diff --git a/src/header/sys_syscall/mod.rs b/src/header/sys_syscall/mod.rs
+index e0b811b..b06a3f2 100644
+--- a/src/header/sys_syscall/mod.rs
++++ b/src/header/sys_syscall/mod.rs
+@@ -3,7 +3,7 @@
+ //! Non-POSIX, see <https://www.man7.org/linux/man-pages/man2/syscall.2.html>.
+ 
+ // copied from sc crate
+-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
++#[cfg(all(any(target_os = "linux", target_os = "kumo"), target_arch = "aarch64"))]
+ pub mod aarch64;
+-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++#[cfg(all(any(target_os = "linux", target_os = "kumo"), target_arch = "x86_64"))]
+ pub mod x86_64;
+diff --git a/src/header/sys_syslog/mod.rs b/src/header/sys_syslog/mod.rs
+index daed58f..efdeb07 100644
+--- a/src/header/sys_syslog/mod.rs
++++ b/src/header/sys_syslog/mod.rs
+@@ -8,7 +8,7 @@
+ #[path = "redox.rs"]
+ pub mod sys;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/termios/mod.rs b/src/header/termios/mod.rs
+index 9ec23f7..d765937 100644
+--- a/src/header/termios/mod.rs
++++ b/src/header/termios/mod.rs
+@@ -17,7 +17,7 @@ pub use self::sys::*;
+ pub mod constants;
+ pub use constants::*;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+@@ -56,7 +56,7 @@ pub const TCSADRAIN: c_int = 1;
+ pub const TCSAFLUSH: c_int = 2;
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/termios.h.html>.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[repr(C)]
+ #[derive(Default, Clone)]
+ pub struct termios {
+@@ -165,7 +165,7 @@ pub unsafe extern "C" fn tcgetsid(fildes: c_int) -> pid_t {
+ /// Infallible. Always returns a value.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "kumo"))]
+     {
+         unsafe { (*termios_p).__c_ispeed }
+     }
+@@ -187,7 +187,7 @@ pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
+ /// Infallible. Always returns a value.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "kumo"))]
+     {
+         unsafe { (*termios_p).__c_ospeed }
+     }
+@@ -209,7 +209,7 @@ pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
+ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+     match speed as usize {
+         // TODO redox impl
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "kumo"))]
+         B0..=B38400 | B57600..=B4000000 => {
+             unsafe { (*termios_p).__c_ispeed = speed };
+             0
+@@ -232,7 +232,7 @@ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) ->
+ pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) -> c_int {
+     match speed as usize {
+         // TODO redox impl
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "kumo"))]
+         B0..=B38400 | B57600..=B4000000 => {
+             unsafe { (*termios_p).__c_ospeed = speed };
+             0
+diff --git a/src/header/time/constants.rs b/src/header/time/constants.rs
+index b44b411..37daf0a 100644
+--- a/src/header/time/constants.rs
++++ b/src/header/time/constants.rs
+@@ -1,6 +1,6 @@
+ use crate::platform::types::{c_char, c_int, c_long, clockid_t};
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "linux.rs"]
+ pub mod sys;
+ 
+diff --git a/src/header/unistd/sysconf.rs b/src/header/unistd/sysconf.rs
+index 50a40fe..587f23b 100644
+--- a/src/header/unistd/sysconf.rs
++++ b/src/header/unistd/sysconf.rs
+@@ -6,7 +6,7 @@
+ #[path = "sysconf/redox.rs"]
+ mod sys;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ #[path = "sysconf/linux.rs"]
+ mod sys;
+ 
+diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
+index 0bf42bf..2051e7f 100644
+--- a/src/ld_so/mod.rs
++++ b/src/ld_so/mod.rs
+@@ -128,7 +128,7 @@ fn static_init(
+     }
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "redox"))]
++#[cfg(any(target_os = "linux", target_os = "redox", target_os = "kumo"))]
+ pub unsafe fn init(
+     sp: &'static Stack,
+     #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
+diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
+index 7bffec7..08a1943 100644
+--- a/src/ld_so/tcb.rs
++++ b/src/ld_so/tcb.rs
+@@ -40,6 +40,9 @@ impl Master {
+ #[cfg(target_os = "linux")]
+ pub type OsSpecific = ();
+ 
++#[cfg(target_os = "kumo")]
++pub type OsSpecific = ();
++
+ #[cfg(target_os = "redox")]
+ pub type OsSpecific = redox_rt::signal::RtSigarea;
+ 
+@@ -321,7 +324,7 @@ impl Tcb {
+     /// ```
+     ///
+     /// For x86_64, the ABI page is not used.
+-    #[cfg(any(target_os = "linux", target_os = "redox"))]
++    #[cfg(any(target_os = "linux", target_os = "redox", target_os = "kumo"))]
+     unsafe fn os_new(
+         size: usize,
+     ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
+@@ -354,6 +357,11 @@ impl Tcb {
+         }
+     }
+ 
++    #[cfg(all(target_os = "kumo", target_arch = "aarch64"))]
++    unsafe fn os_arch_activate(_os: &(), _tls_end: usize, _tls_len: usize) {
++        panic!("relibc KUMO TLS activation is not implemented")
++    }
++
+     #[cfg(target_os = "redox")]
+     unsafe fn os_arch_activate(
+         os: &OsSpecific,
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index 60d6993..217684c 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -28,10 +28,14 @@ pub(crate) mod sys;
+ #[path = "redox/mod.rs"]
+ pub(crate) mod sys;
+ 
++#[cfg(target_os = "kumo")]
++#[path = "kumo.rs"]
++pub(crate) mod sys;
++
+ pub use self::rlb::{Line, RawLineBuffer};
+ pub mod rlb;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "kumo"))]
+ pub mod auxv_defs;
+ 
+ #[cfg(target_os = "redox")]

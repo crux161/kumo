@@ -1,0 +1,4 @@
+#j505
+[submodule "vendor/relibc"]
+	path = vendor/relibc
+	url = https://gitlab.redox-os.org/redox-os/relibc.git

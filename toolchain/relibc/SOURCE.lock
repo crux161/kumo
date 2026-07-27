@@ -1,0 +1,28 @@
+#j505
+# Source identities consumed by scripts/relibc-check.sh.
+
+[relibc]
+url = "https://gitlab.redox-os.org/redox-os/relibc.git"
+revision = "5f6afb52692e62dae79154f4dbec2d0e79a07602"
+cargo_lock_sha256 = "3702686153d3152537524a1c89d41bfd44de33a5149c195b2ada2f160a406f56"
+kumo_cargo_lock_sha256 = "15797bdbab1fd89a4dc821300663620e1a2712a8213b7b10beff19faf55f3da4"
+
+[dlmalloc]
+url = "https://gitlab.redox-os.org/redox-os/dlmalloc-rs.git"
+revision = "40c10f6182cb1d2a78b29f85492936dfbeded02e"
+
+[openlibm]
+url = "https://gitlab.redox-os.org/redox-os/openlibm.git"
+revision = "f5ed774593458e116e69731a3ffa59e2a6408d4e"
+
+[cargo_git.cc]
+url = "https://github.com/tea/cc-rs"
+revision = "588ceacb084af41415690c57688e338a32a1f1b4"
+
+[cargo_git.object]
+url = "https://gitlab.redox-os.org/andypython/object"
+revision = "da781336d847df0deb897ed1162785f6c2057c56"
+
+[toolchain]
+channel = "nightly-2026-06-22"
+rustc_commit = "91fe22da8084a1c9e993d78d4a56f22ab8396236"
