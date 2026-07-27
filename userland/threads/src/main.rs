@@ -3,8 +3,9 @@
 //j493
 //j494
 //j495
+//j496
 
-//! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then a serial work queue.
+//! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
 //! Run it from the shell with `threads`. Sora loads this one ELF, maps it once, gives each thread
 //! its **own** stack, and starts two residents in the same process — so both threads execute the
@@ -35,9 +36,10 @@
 //! Finally, thread 0 submits three asynchronous jobs and one synchronous job to an in-process
 //! serial queue while thread 1 is its sole worker. FIFO output `1234` plus the synchronous result
 //! proves callers submit work to a queue rather than coordinating the worker thread directly.
+//! Both residents then become workers for one concurrent queue and each drains one of its two jobs.
 
 use kumo_abi::Handle;
-use kumo_dispatch::SerialQueue;
+use kumo_dispatch::{ConcurrentQueue, SerialQueue};
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
 
 extern crate alloc;
@@ -93,6 +95,30 @@ static SERIAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 /// Producer sets this only after validating and reporting; the worker waits before exiting.
 static DISPATCH_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// D4b's shared queue: both residents own worker tokens and drain one item each.
+static CONCURRENT_QUEUE: ConcurrentQueue<2> = ConcurrentQueue::new();
+
+/// Both concurrent workers must be ready before either begins draining.
+static CONCURRENT_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Worker-index bits observed after each resident executes one item.
+static CONCURRENT_WORKERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Number of concurrent jobs that actually executed.
+static CONCURRENT_JOBS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Sum of distinct job return values; 10 + 20 proves both queued items were consumed.
+static CONCURRENT_SUM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Submission failures, shared so either worker can produce the final report.
+static CONCURRENT_FAILURES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Number of workers that finished one item.
+static CONCURRENT_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The first finisher waits here until the second has emitted the acceptance result.
+static CONCURRENT_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
 const CANARY: usize = 64;
@@ -105,6 +131,11 @@ fn record_serial_digit(digit: usize) -> usize {
         |old| Some(old.saturating_mul(10).saturating_add(digit)),
     );
     digit as usize * 10
+}
+
+fn record_concurrent_job(value: usize) -> usize {
+    CONCURRENT_JOBS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    value
 }
 
 fn emit(stdout: Handle, bytes: &[u8]) {
@@ -318,6 +349,65 @@ extern "C" fn main(
         );
         DISPATCH_DONE.store(1, core::sync::atomic::Ordering::Release);
         futex_wake(DISPATCH_DONE.as_ptr(), 1);
+    }
+
+    // D4b: both resident threads hold independent worker tokens for the same queue. Each executes
+    // exactly one item; the worker mask and result sum make a single-worker imitation observable.
+    // — KESTREL 2026-07-26
+    if me == 0 {
+        for value in [10usize, 20] {
+            if CONCURRENT_QUEUE
+                .submit_async(record_concurrent_job, value)
+                .is_err()
+            {
+                CONCURRENT_FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let worker = CONCURRENT_QUEUE.worker();
+    CONCURRENT_READY.fetch_or(1 << me, core::sync::atomic::Ordering::Release);
+    while CONCURRENT_READY.load(core::sync::atomic::Ordering::Acquire) != 0b11 {
+        core::hint::spin_loop();
+    }
+
+    let result = worker.run_one() as u32;
+    CONCURRENT_SUM.fetch_add(result, core::sync::atomic::Ordering::AcqRel);
+    CONCURRENT_WORKERS.fetch_or(1 << me, core::sync::atomic::Ordering::Release);
+
+    if CONCURRENT_DONE.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1 == 2 {
+        let workers = CONCURRENT_WORKERS.load(core::sync::atomic::Ordering::Acquire);
+        let jobs = CONCURRENT_JOBS.load(core::sync::atomic::Ordering::Acquire);
+        let sum = CONCURRENT_SUM.load(core::sync::atomic::Ordering::Acquire);
+        let failures = CONCURRENT_FAILURES.load(core::sync::atomic::Ordering::Acquire);
+        let passed = failures == 0
+            && workers == 0b11
+            && jobs == 2
+            && sum == 30
+            && CONCURRENT_QUEUE.is_empty();
+        emit(stdout, b"threads: concurrent workers=");
+        emit_u32(stdout, workers.count_ones());
+        emit(stdout, b" jobs=");
+        emit_u32(stdout, jobs);
+        emit(stdout, b" sum=");
+        emit_u32(stdout, sum);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: two worker contexts drained one queue\n"
+            } else {
+                b" -> FAIL: concurrent queue\n"
+            },
+        );
+        CONCURRENT_REPORTED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(CONCURRENT_REPORTED.as_ptr(), 1);
+    } else {
+        loop {
+            let observed = CONCURRENT_REPORTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(CONCURRENT_REPORTED.as_ptr(), observed);
+        }
     }
 
     process_exit(0)

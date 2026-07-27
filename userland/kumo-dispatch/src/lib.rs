@@ -1,13 +1,14 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j495
+//j496
 
 //! In-process work queues for KUMO userland.
 //!
-//! This first footing is deliberately one discipline: a bounded serial queue. Submitters enqueue
-//! function-pointer work without crossing a process boundary; one claimed worker drains the FIFO.
-//! Empty workers park on a futex, and synchronous submission parks the submitter on a private
-//! completion word. Concurrent queues and composition primitives belong to later slices.
+//! Submitters enqueue function-pointer work without crossing a process boundary. A bounded serial
+//! queue has one claimed worker and supports asynchronous and synchronous submission; a bounded
+//! concurrent queue permits multiple workers to drain asynchronous work from the same FIFO. Empty
+//! workers park on a futex. Composition primitives belong to later slices.
 
 use core::cell::{Cell, UnsafeCell};
 use core::hint::spin_loop;
@@ -142,25 +143,91 @@ impl Drop for GateGuard<'_> {
     }
 }
 
-/// A bounded in-process queue with exactly one active worker.
+/// Shared bounded-ring mechanism beneath the public queue disciplines.
 ///
-/// Submission is multi-producer safe. The short spin gate protects only ring metadata and slot
-/// moves; work executes after the gate is released. On today's single core, a submitter preempted
-/// inside that small critical section is resumed by D3's timer fairness, so a peer cannot strand
-/// the gate permanently. — KESTREL 2026-07-26
-pub struct SerialQueue<const N: usize> {
+/// The short spin gate protects only ring metadata and slot moves; work executes after the gate is
+/// released. On today's single core, a thread preempted inside that small critical section is
+/// resumed by D3's timer fairness, so a peer cannot strand the gate permanently.
+/// — KESTREL 2026-07-26
+struct QueueCore<const N: usize> {
     gate: AtomicBool,
     state: UnsafeCell<QueueState<N>>,
     sequence: AtomicU32,
+}
+
+impl<const N: usize> QueueCore<N> {
+    const fn new() -> Self {
+        Self {
+            gate: AtomicBool::new(false),
+            state: UnsafeCell::new(QueueState::new()),
+            sequence: AtomicU32::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.with_state(|state| state.len)
+    }
+
+    fn push(&self, work: Work) -> Result<(), SubmitError> {
+        self.with_state(|state| state.push(work))?;
+        self.sequence.fetch_add(1, Ordering::Release);
+        wake_word(self.sequence.as_ptr());
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Work> {
+        self.with_state(QueueState::pop)
+    }
+
+    fn try_run_one(&self) -> Option<usize> {
+        let work = self.pop()?;
+        Some(execute(work))
+    }
+
+    fn run_one(&self) -> usize {
+        loop {
+            let observed = self.sequence.load(Ordering::Acquire);
+            if let Some(result) = self.try_run_one() {
+                return result;
+            }
+            // A producer publishes by incrementing `sequence` before waking. If it races between
+            // the empty check and this syscall, FutexWait observes the mismatch and does not park.
+            wait_word(self.sequence.as_ptr(), observed);
+        }
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&mut QueueState<N>) -> R) -> R {
+        while self
+            .gate
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        let _guard = GateGuard { gate: &self.gate };
+        // `gate` serializes every access to the state and remains held through `f`.
+        f(unsafe { &mut *self.state.get() })
+    }
+}
+
+// Every state access is serialized by `gate`; work executes after the state borrow and gate guard
+// are gone. Function/context validity never depends on the queue core's internal memory.
+// — KESTREL 2026-07-26
+unsafe impl<const N: usize> Send for QueueCore<N> {}
+unsafe impl<const N: usize> Sync for QueueCore<N> {}
+
+/// A bounded in-process queue with exactly one active worker.
+///
+/// Submission is multi-producer safe. Work executes outside the queue's metadata gate.
+pub struct SerialQueue<const N: usize> {
+    core: QueueCore<N>,
     worker_claimed: AtomicBool,
 }
 
 impl<const N: usize> SerialQueue<N> {
     pub const fn new() -> Self {
         Self {
-            gate: AtomicBool::new(false),
-            state: UnsafeCell::new(QueueState::new()),
-            sequence: AtomicU32::new(0),
+            core: QueueCore::new(),
             worker_claimed: AtomicBool::new(false),
         }
     }
@@ -170,7 +237,7 @@ impl<const N: usize> SerialQueue<N> {
     }
 
     pub fn len(&self) -> usize {
-        self.with_state(|state| state.len)
+        self.core.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -190,7 +257,7 @@ impl<const N: usize> SerialQueue<N> {
 
     /// Enqueue work and return immediately.
     pub fn submit_async(&self, function: WorkFn, context: usize) -> Result<(), SubmitError> {
-        self.push(Work {
+        self.core.push(Work {
             function,
             context,
             completion: core::ptr::null(),
@@ -203,36 +270,12 @@ impl<const N: usize> SerialQueue<N> {
     /// synchronous submission outside work executed by this same serial queue.
     pub fn submit_sync(&self, function: WorkFn, context: usize) -> Result<usize, SubmitError> {
         let completion = Completion::new();
-        self.push(Work {
+        self.core.push(Work {
             function,
             context,
             completion: &completion,
         })?;
         Ok(completion.wait())
-    }
-
-    fn push(&self, work: Work) -> Result<(), SubmitError> {
-        self.with_state(|state| state.push(work))?;
-        self.sequence.fetch_add(1, Ordering::Release);
-        wake_word(self.sequence.as_ptr());
-        Ok(())
-    }
-
-    fn pop(&self) -> Option<Work> {
-        self.with_state(QueueState::pop)
-    }
-
-    fn with_state<R>(&self, f: impl FnOnce(&mut QueueState<N>) -> R) -> R {
-        while self
-            .gate
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            spin_loop();
-        }
-        let _guard = GateGuard { gate: &self.gate };
-        // `gate` serializes every access to the state and remains held through `f`.
-        f(unsafe { &mut *self.state.get() })
     }
 }
 
@@ -241,11 +284,6 @@ impl<const N: usize> Default for SerialQueue<N> {
         Self::new()
     }
 }
-
-// Every state access is serialized by `gate`; work executes after the state borrow and gate guard
-// are gone. Function/context validity never depends on the queue's internal memory.
-unsafe impl<const N: usize> Send for SerialQueue<N> {}
-unsafe impl<const N: usize> Sync for SerialQueue<N> {}
 
 /// Exclusive drain authority for a [`SerialQueue`].
 pub struct SerialWorker<'a, const N: usize> {
@@ -258,21 +296,12 @@ pub struct SerialWorker<'a, const N: usize> {
 impl<const N: usize> SerialWorker<'_, N> {
     /// Execute one queued item, or report that the queue is empty.
     pub fn try_run_one(&self) -> Option<usize> {
-        let work = self.queue.pop()?;
-        Some(execute(work))
+        self.queue.core.try_run_one()
     }
 
     /// Park until one item is available, then execute it.
     pub fn run_one(&self) -> usize {
-        loop {
-            let observed = self.queue.sequence.load(Ordering::Acquire);
-            if let Some(result) = self.try_run_one() {
-                return result;
-            }
-            // A producer publishes by incrementing `sequence` before waking. If it races between
-            // the empty check and this syscall, FutexWait observes the mismatch and does not park.
-            wait_word(self.queue.sequence.as_ptr(), observed);
-        }
+        self.queue.core.run_one()
     }
 
     /// Execute exactly `count` items, parking whenever the queue becomes empty.
@@ -286,6 +315,76 @@ impl<const N: usize> SerialWorker<'_, N> {
 impl<const N: usize> Drop for SerialWorker<'_, N> {
     fn drop(&mut self) {
         self.queue.worker_claimed.store(false, Ordering::Release);
+    }
+}
+
+/// A bounded in-process queue that permits multiple active workers.
+///
+/// Submission is multi-producer safe. Workers atomically claim distinct FIFO items, then execute
+/// them outside the metadata gate; completion order is therefore intentionally unspecified.
+pub struct ConcurrentQueue<const N: usize> {
+    core: QueueCore<N>,
+}
+
+impl<const N: usize> ConcurrentQueue<N> {
+    pub const fn new() -> Self {
+        Self {
+            core: QueueCore::new(),
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    pub fn len(&self) -> usize {
+        self.core.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Create one worker token. Any number of tokens may drain this concurrent queue.
+    pub fn worker(&self) -> ConcurrentWorker<'_, N> {
+        ConcurrentWorker {
+            queue: self,
+            _not_sync: core::marker::PhantomData,
+        }
+    }
+
+    /// Enqueue work and return immediately.
+    pub fn submit_async(&self, function: WorkFn, context: usize) -> Result<(), SubmitError> {
+        self.core.push(Work {
+            function,
+            context,
+            completion: core::ptr::null(),
+        })
+    }
+}
+
+impl<const N: usize> Default for ConcurrentQueue<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One drain context for a [`ConcurrentQueue`].
+pub struct ConcurrentWorker<'a, const N: usize> {
+    queue: &'a ConcurrentQueue<N>,
+    // Multiple tokens are allowed, but one token still represents exactly one execution context.
+    _not_sync: core::marker::PhantomData<Cell<()>>,
+}
+
+impl<const N: usize> ConcurrentWorker<'_, N> {
+    /// Execute one queued item, or report that the queue is empty.
+    pub fn try_run_one(&self) -> Option<usize> {
+        self.queue.core.try_run_one()
+    }
+
+    /// Park until one item is available, then execute it.
+    pub fn run_one(&self) -> usize {
+        self.queue.core.run_one()
     }
 }
 
@@ -304,7 +403,7 @@ extern crate std;
 mod tests {
     use super::*;
     use core::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     fn double(value: usize) -> usize {
@@ -372,6 +471,39 @@ mod tests {
         assert!(matches!(queue.worker(), Err(WorkerError::AlreadyClaimed)));
         drop(worker);
         assert!(queue.worker().is_ok());
+    }
+
+    #[test]
+    fn concurrent_workers_execute_jobs_together() {
+        fn rendezvous(context: usize) -> usize {
+            let barrier = unsafe { &*(context as *const Barrier) };
+            barrier.wait();
+            1
+        }
+
+        let queue = Arc::new(ConcurrentQueue::<2>::new());
+        let barrier = Barrier::new(2);
+        let context = &barrier as *const Barrier as usize;
+        queue.submit_async(rendezvous, context).unwrap();
+        queue.submit_async(rendezvous, context).unwrap();
+
+        let first_queue = Arc::clone(&queue);
+        let first = thread::spawn(move || first_queue.worker().run_one());
+        let second_queue = Arc::clone(&queue);
+        let second = thread::spawn(move || second_queue.worker().run_one());
+
+        assert_eq!(first.join().unwrap(), 1);
+        assert_eq!(second.join().unwrap(), 1);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn concurrent_queue_preserves_bounded_backpressure() {
+        let queue = ConcurrentQueue::<1>::new();
+        queue.submit_async(double, 5).unwrap();
+        assert_eq!(queue.submit_async(double, 6), Err(SubmitError::Full));
+        assert_eq!(queue.worker().try_run_one(), Some(10));
+        assert!(queue.is_empty());
     }
 
     #[test]
