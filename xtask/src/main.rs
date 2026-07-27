@@ -1,8 +1,8 @@
-//j456
 //j457
 //j460
 //j467
 //j493
+//j506
 
 use std::env;
 use std::fmt;
@@ -21,7 +21,7 @@ use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
     DRV_SERIAL_PATH, DRV_XHCI_PATH, HELLO_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC,
     INITRD_PATH_MAX, INITRD_VERSION, LS_PATH, LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH,
-    SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -838,6 +838,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let wc = build_wc_image(&workspace_root()?)?;
             let lua_repl = build_lua_repl_image(&workspace_root()?)?;
             let threads = build_threads_image(&workspace_root()?)?;
+            let relibc_smoke = build_relibc_smoke_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
@@ -857,6 +858,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (WC_PATH, wc.as_slice()),
                 (LUA_REPL_PATH, lua_repl.as_slice()),
                 (THREADS_PATH, threads.as_slice()),
+                (RELIBC_SMOKE_PATH, relibc_smoke.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
             ])?
         }
@@ -1162,6 +1164,20 @@ fn build_threads_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as threads ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_relibc_smoke_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_tool(root, "sh", &["scripts/relibc-check.sh"])?;
+    let source_path = root.join("target/relibc-smoke/relibc-smoke");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as relibc smoke ELF: {err}",
+            source_path.display()
+        )
+    })?;
     Ok(bytes)
 }
 

@@ -1,7 +1,8 @@
 #!/bin/sh
 #j505
-# Compile KUMO's out-of-tree relibc platform scaffold without touching the
-# pinned upstream checkout. Runtime syscall/TLS behavior is deliberately absent.
+#j506
+# Build KUMO's out-of-tree relibc platform and its I-a1 C smoke without
+# touching the pinned upstream checkout. Full SysV/TLS startup remains absent.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -98,6 +99,24 @@ ar_bin="${AR_aarch64_unknown_kumo:-}"
 if [ -z "$ar_bin" ] && command -v llvm-ar >/dev/null 2>&1; then
     ar_bin="$(command -v llvm-ar)"
 fi
+if [ -z "$ar_bin" ] && [ -x "$(dirname "$cc_bin")/llvm-ar" ]; then
+    ar_bin="$(dirname "$cc_bin")/llvm-ar"
+fi
+ranlib_bin="${RANLIB_aarch64_unknown_kumo:-}"
+if [ -z "$ranlib_bin" ] && command -v llvm-ranlib >/dev/null 2>&1; then
+    ranlib_bin="$(command -v llvm-ranlib)"
+fi
+if [ -z "$ranlib_bin" ] && [ -x "$(dirname "$cc_bin")/llvm-ranlib" ]; then
+    ranlib_bin="$(dirname "$cc_bin")/llvm-ranlib"
+fi
+ld_bin="${LD_aarch64_unknown_kumo:-}"
+if [ -z "$ld_bin" ] && command -v ld.lld >/dev/null 2>&1; then
+    ld_bin="$(command -v ld.lld)"
+fi
+if [ -z "$ld_bin" ] && [ -x "$(dirname "$cc_bin")/ld.lld" ]; then
+    ld_bin="$(dirname "$cc_bin")/ld.lld"
+fi
+[ -n "$ld_bin" ] || fail "ld.lld is required"
 
 set -- env \
     CC_aarch64_unknown_kumo="$cc_bin" \
@@ -106,11 +125,15 @@ set -- env \
 if [ -n "$ar_bin" ]; then
     set -- "$@" AR_aarch64_unknown_kumo="$ar_bin"
 fi
+if [ -n "$ranlib_bin" ]; then
+    set -- "$@" RANLIB_aarch64_unknown_kumo="$ranlib_bin"
+fi
 
 "$@" cargo +"$TOOLCHAIN" \
     --config "$TOOL/cargo-sources.toml" \
     --config "source.vendored-sources.directory=\"$vendor_union\"" \
-    check \
+    build \
+    --release \
     --locked \
     --offline \
     -Z json-target-spec \
@@ -121,5 +144,23 @@ fi
     --features no_trace \
     --lib
 
+smoke_dir="$ROOT/target/relibc-smoke"
+smoke_elf="$smoke_dir/relibc-smoke"
+relibc_lib="$ROOT/target/relibc-kumo/aarch64-unknown-kumo/release/librelibc.a"
+[ -f "$relibc_lib" ] || fail "relibc static archive was not produced"
+mkdir -p "$smoke_dir"
+"$cc_bin" --target=aarch64-unknown-none -O2 -ffreestanding \
+    -fno-pic -fno-pie -fno-stack-protector -ffunction-sections -fdata-sections \
+    -c "$TOOL/smoke/crt0.S" -o "$smoke_dir/crt0.o"
+"$cc_bin" --target=aarch64-unknown-none -O2 -ffreestanding \
+    -fno-pic -fno-pie -fno-stack-protector -ffunction-sections -fdata-sections \
+    -c "$TOOL/smoke/main.c" -o "$smoke_dir/main.o"
+"$ld_bin" -static --gc-sections -z noexecstack \
+    -T "$TOOL/smoke/link.ld" \
+    -o "$smoke_elf" \
+    "$smoke_dir/crt0.o" "$smoke_dir/main.o" "$relibc_lib"
+[ -s "$smoke_elf" ] || fail "relibc smoke ELF is empty"
+
 printf 'KUMO relibc scaffold green: %s methods, target_os=kumo, source %s\n' \
     "$method_count" "$RELIBC_REV"
+printf 'KUMO relibc I-a1 image: %s\n' "$smoke_elf"

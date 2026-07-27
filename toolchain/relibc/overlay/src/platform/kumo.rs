@@ -1,10 +1,14 @@
 //j505
-// Generated from relibc's Pal traits at the revision pinned by KUMO.
-// Every method is deliberately explicit: runtime support lands in later slices. — KESTREL
+//j506
+// Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 makes only
+// startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live. — KESTREL
 
 #![allow(deprecated)]
 
-use core::num::NonZeroU64;
+use core::{
+    num::NonZeroU64,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use super::{types::*, Pal, PalEpoll, PalPtrace, PalSignal, PalSocket};
 use crate::{
@@ -30,6 +34,131 @@ use crate::{
 };
 
 pub struct Sys;
+
+const SYSCALL_HANDLE_CLOSE: u64 = 0;
+const SYSCALL_CHANNEL_WRITE: u64 = 4;
+const SYSCALL_CHANNEL_READ: u64 = 5;
+const SYSCALL_VMO_CREATE: u64 = 12;
+const SYSCALL_VMAR_MAP: u64 = 15;
+const SYSCALL_PROCESS_EXIT: u64 = 21;
+
+const STARTUP_TAG_STDOUT: u8 = b'o';
+const STARTUP_TAG_STDERR: u8 = b'e';
+
+const VMAR_READ: u64 = 1 << 0;
+const VMAR_WRITE: u64 = 1 << 1;
+const PAGE_SIZE: usize = 4096;
+
+static STDOUT_HANDLE: AtomicU32 = AtomicU32::new(0);
+static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
+
+fn syscall4(number: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+    let result;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") number,
+            in("x0") x0,
+            in("x1") x1,
+            in("x2") x2,
+            in("x3") x3,
+            lateout("x0") result,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    result
+}
+
+fn channel_read_with_handle(channel: u32, tag: &mut u8) -> (u64, u64) {
+    let count;
+    let handle;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_CHANNEL_READ,
+            in("x0") u64::from(channel),
+            in("x1") core::ptr::from_mut(tag) as u64,
+            in("x2") 1_u64,
+            lateout("x0") count,
+            lateout("x1") handle,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (count, handle)
+}
+
+fn vmar_map_anywhere(vmo: u32, len: usize) -> (u64, u64) {
+    let status;
+    let address;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYSCALL_VMAR_MAP,
+            in("x0") 0_u64,
+            in("x1") u64::from(vmo),
+            in("x2") 0_u64,
+            in("x3") 0_u64,
+            in("x4") len as u64,
+            in("x5") VMAR_READ | VMAR_WRITE,
+            lateout("x0") status,
+            lateout("x1") address,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, address)
+}
+
+fn close_handle(handle: u32) {
+    if handle != 0 {
+        let _ = syscall4(SYSCALL_HANDLE_CLOSE, u64::from(handle), 0, 0, 0);
+    }
+}
+
+fn install_startup_handle(slot: &AtomicU32, handle: u32) {
+    let old = slot.swap(handle, Ordering::Relaxed);
+    if old != 0 && old != handle {
+        close_handle(old);
+    }
+}
+
+/// Drain KUMO's finite bootstrap capability set before entering the I-a1 C smoke.
+///
+/// Full argc/argv/env/TLS construction belongs to I-a2. Unknown capabilities are
+/// closed instead of becoming ambient authority. — KESTREL
+#[unsafe(no_mangle)]
+pub extern "C" fn __relibc_kumo_init(bootstrap: u64) {
+    let bootstrap = bootstrap as u32;
+    let mut tag = 0_u8;
+    loop {
+        let (count, raw_handle) = channel_read_with_handle(bootstrap, &mut tag);
+        if count == 0 || count == u64::MAX {
+            break;
+        }
+        let handle = raw_handle as u32;
+        if handle == 0 {
+            continue;
+        }
+        match tag {
+            STARTUP_TAG_STDOUT => install_startup_handle(&STDOUT_HANDLE, handle),
+            STARTUP_TAG_STDERR => install_startup_handle(&STDERR_HANDLE, handle),
+            _ => close_handle(handle),
+        }
+    }
+    close_handle(bootstrap);
+
+    // Today's launcher grants one output channel. Treat it as both POSIX output
+    // streams until distinct stderr authority is supplied. — KESTREL
+    let stdout = STDOUT_HANDLE.load(Ordering::Relaxed);
+    let stderr = STDERR_HANDLE.load(Ordering::Relaxed);
+    if stderr == 0 {
+        STDERR_HANDLE.store(stdout, Ordering::Relaxed);
+    } else if stdout == 0 {
+        STDOUT_HANDLE.store(stderr, Ordering::Relaxed);
+    }
+}
 
 impl Sys {
     pub unsafe fn ioctl(_fd: c_int, _request: c_ulong, _out: *mut c_void) -> Result<c_int> {
@@ -87,10 +216,13 @@ impl Pal for Sys {
     }
 
     fn exit(status: c_int) -> ! {
-        panic!("relibc KUMO stub called: exit")
+        let _ = syscall4(SYSCALL_PROCESS_EXIT, status as u64, 0, 0, 0);
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
-    unsafe fn exit_thread(stack_base: *mut (), stack_size: usize) -> ! {
+    unsafe fn exit_thread(_stack_base: *mut (), _stack_size: usize) -> ! {
         panic!("relibc KUMO stub called: exit_thread")
     }
 
@@ -192,7 +324,7 @@ impl Pal for Sys {
     }
 
     fn getpagesize() -> usize {
-        0
+        PAGE_SIZE
     }
 
     fn getpgid(pid: pid_t) -> Result<pid_t> {
@@ -295,7 +427,37 @@ impl Pal for Sys {
         fildes: c_int,
         off: off_t,
     ) -> Result<*mut c_void> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EINVAL, ENOMEM},
+            sys_mman::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE},
+        };
+
+        let valid = addr.is_null()
+            && len != 0
+            && fildes == -1
+            && off == 0
+            && flags == MAP_ANON | MAP_PRIVATE
+            && prot & !(PROT_READ | PROT_WRITE) == 0;
+        if !valid {
+            return Err(Errno(EINVAL));
+        }
+        let Some(len) = len
+            .checked_add(PAGE_SIZE - 1)
+            .map(|len| len & !(PAGE_SIZE - 1))
+        else {
+            return Err(Errno(ENOMEM));
+        };
+        let raw_vmo = syscall4(SYSCALL_VMO_CREATE, len as u64, 0, 0, 0);
+        if raw_vmo == 0 || raw_vmo == u64::MAX {
+            return Err(Errno(ENOMEM));
+        }
+        let vmo = raw_vmo as u32;
+        let (status, address) = vmar_map_anywhere(vmo, len);
+        close_handle(vmo);
+        if status != 0 || address == 0 {
+            return Err(Errno(ENOMEM));
+        }
+        Ok(address as *mut c_void)
     }
 
     unsafe fn mremap(
@@ -473,7 +635,31 @@ impl Pal for Sys {
     }
 
     fn write(fildes: c_int, buf: &[u8]) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EIO};
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let handle = match fildes {
+            1 => STDOUT_HANDLE.load(Ordering::Relaxed),
+            2 => STDERR_HANDLE.load(Ordering::Relaxed),
+            _ => return Err(Errno(EBADF)),
+        };
+        if handle == 0 {
+            return Err(Errno(EBADF));
+        }
+        let status = syscall4(
+            SYSCALL_CHANNEL_WRITE,
+            u64::from(handle),
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        ) as i32;
+        if status == 0 {
+            Ok(buf.len())
+        } else {
+            Err(Errno(EIO))
+        }
     }
 
     fn pwrite(fildes: c_int, buf: &[u8], offset: off_t) -> Result<usize> {
@@ -481,7 +667,7 @@ impl Pal for Sys {
     }
 
     fn verify() -> bool {
-        false
+        true
     }
 }
 

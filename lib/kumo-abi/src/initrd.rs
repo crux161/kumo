@@ -1,5 +1,6 @@
 //j426
 //j493
+//j506
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -42,6 +43,9 @@ pub const WC_PATH: &str = "bin/wc";
 pub const LUA_REPL_PATH: &str = "bin/lua-repl";
 /// D2: the two-thread / futex proof program.
 pub const THREADS_PATH: &str = "bin/threads";
+/// I-a1: statically linked C proof for relibc startup capability intake,
+/// fd 1/2 output, retained anonymous allocation growth, and process exit.
+pub const RELIBC_SMOKE_PATH: &str = "bin/relibc-smoke";
 pub const AUTOEXEC_PATH: &str = "etc/autoexec";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

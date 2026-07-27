@@ -1,19 +1,19 @@
 #![no_std]
 #![no_main]
 
-//j481
 //j487
 //j488
 //j489
 //j493
+//j506
 
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, SVC_HEALTH_PATH,
-    TTYD_PATH, WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH,
+    SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -2403,6 +2403,12 @@ fn eval_command(
         } else {
             debug_write(b" -> FAIL: no growth\n".as_ptr(), 21);
         }
+        return true;
+    } else if cmd.name == "relibc" {
+        // I-a1: run the static C smoke with one finite stdout capability. Its
+        // crt0 drains x0, then relibc itself proves write/exit/malloc/free. — KESTREL
+        debug_write(b"relibc: C runtime smoke\n".as_ptr(), 24);
+        run_with_startup(initrd, RELIBC_SMOKE_PATH.as_bytes(), b"relibc", None, false);
         return true;
     } else if cmd.name == "threads" {
         // D2: two threads in one address space, handing off through a futex. Launched on demand

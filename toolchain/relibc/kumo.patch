@@ -534,3 +534,23 @@ index 60d6993..217684c 100644
  pub mod auxv_defs;
  
  #[cfg(target_os = "redox")]
+diff --git a/src/platform/allocator/sys.rs b/src/platform/allocator/sys.rs
+index 401910d..bd010b4 100644
+--- a/src/platform/allocator/sys.rs
++++ b/src/platform/allocator/sys.rs
+@@ -63,8 +63,14 @@ unsafe impl Allocator for System {
+         unsafe { Sys::munmap(ptr.cast(), size).is_ok() }
+     }
+ 
++    #[cfg(not(target_os = "kumo"))]
+     fn can_release_part(&self, _flags: u32) -> bool {
+         true
+     }
++
++    #[cfg(target_os = "kumo")]
++    fn can_release_part(&self, _flags: u32) -> bool {
++        false
++    }
+ 
+     fn allocates_zeros(&self) -> bool {
+         true
