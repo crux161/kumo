@@ -59,6 +59,7 @@ const KUMO_OK: i32 = 0;
 const KUMO_SHOULD_WAIT: i32 = -5;
 const KUMO_NOT_SUPPORTED: i32 = -8;
 
+const STARTUP_TAG_STDIN: u8 = b'i';
 const STARTUP_TAG_STDOUT: u8 = b'o';
 const STARTUP_TAG_STDERR: u8 = b'e';
 const STARTUP_TAG_ARGV: u8 = b'a';
@@ -94,6 +95,7 @@ const STARTUP_WORDS: usize = 1 + (ARGV_MAX + 1) + 1 + 10;
 /// silent abort can never be mistaken for a run that reached `main`.
 const STARTUP_FAILURE_STATUS: c_int = 70;
 
+static STDIN_HANDLE: AtomicU32 = AtomicU32::new(0);
 static STDOUT_HANDLE: AtomicU32 = AtomicU32::new(0);
 static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The client end of a filesystem server's `kumo-vfs` channel, or `0` when the launcher
@@ -103,11 +105,14 @@ static FS_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// What a POSIX `int fd` denotes in this process.
 ///
 /// `DESIGN/008 §1.2`: there is no kernel fd. This is the one per-process table, and every
-/// descriptor in it is a capability the launcher granted — an output channel, or a file the
-/// filesystem server opened on our behalf. Nothing here can be forged from an integer.
+/// descriptor in it is a capability the launcher granted — an input or output channel, or a
+/// file the filesystem server opened on our behalf. Nothing here can be forged from an integer.
 #[derive(Clone, Copy)]
 enum FdSlot {
     Closed,
+    /// A granted channel this descriptor reads from. Whether a tty, a pipe, or a one-shot
+    /// message sits on the far end is the launcher's business, not this program's.
+    Input(u32),
     /// A granted channel this descriptor writes to.
     Output(u32),
     /// A file open on the filesystem server, plus this side's read cursor.
@@ -320,6 +325,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
             continue;
         }
         match tag {
+            STARTUP_TAG_STDIN => install_startup_handle(&STDIN_HANDLE, handle),
             STARTUP_TAG_STDOUT => install_startup_handle(&STDOUT_HANDLE, handle),
             STARTUP_TAG_STDERR => install_startup_handle(&STDERR_HANDLE, handle),
             STARTUP_TAG_ARGV => {
@@ -341,11 +347,17 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
         STDOUT_HANDLE.store(stderr, Ordering::Relaxed);
     }
 
-    // Seat the granted output channels as the descriptors C expects them at. fd 0 stays
-    // closed: no input capability is granted yet, and an fd that reads nothing is a
-    // better answer than one that silently reads somewhere else. — TIMBERDOODLE
+    // Seat the granted channels as the descriptors C expects them at. A stream that was not
+    // granted leaves its descriptor closed rather than aliased onto one that was: a program
+    // reading fd 0 it never received must fail, not quietly read somewhere else.
+    let stdin = STDIN_HANDLE.load(Ordering::Relaxed);
     let stdout = STDOUT_HANDLE.load(Ordering::Relaxed);
     let stderr = STDERR_HANDLE.load(Ordering::Relaxed);
+    if stdin != 0 {
+        if let Some(slot) = fd_slot(0) {
+            *slot = FdSlot::Input(stdin);
+        }
+    }
     for (fildes, handle) in [(1, stdout), (2, stderr)] {
         if handle == 0 {
             continue;
@@ -913,9 +925,10 @@ impl Pal for Sys {
         pthread::OsTid::default()
     }
 
-    /// Read from an open file. The server answers at most [`VFS_READ_MAX`] bytes per
-    /// exchange, so a short read is normal here and the caller loops — which is what
-    /// stdio already does. End of file is a zero-length read, not an error.
+    /// Read from an input channel or an open file. Short reads are normal on both — the
+    /// channel delivers one message at a time and the file server answers at most
+    /// [`VFS_READ_MAX`] bytes per exchange — so callers loop, which is what stdio does.
+    /// End of input is a zero-length read, not an error.
     fn read(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
         use crate::header::errno::EBADF;
 
@@ -923,13 +936,23 @@ impl Pal for Sys {
             return Ok(0);
         }
         let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
-        let FdSlot::File {
-            handle,
-            offset,
-            size,
-        } = *slot
-        else {
-            return Err(Errno(EBADF));
+        let (handle, offset, size) = match *slot {
+            // A channel read parks until a message arrives, and answers 0 once the writer
+            // is gone — which is exactly POSIX end-of-file, so it needs no translation.
+            FdSlot::Input(handle) => {
+                let n = channel_read_bytes(handle, buf);
+                return if n == u64::MAX {
+                    Err(Errno(EBADF))
+                } else {
+                    Ok((n as usize).min(buf.len()))
+                };
+            }
+            FdSlot::File {
+                handle,
+                offset,
+                size,
+            } => (handle, offset, size),
+            _ => return Err(Errno(EBADF)),
         };
         if offset >= size {
             return Ok(0);

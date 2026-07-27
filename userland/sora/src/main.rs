@@ -2415,6 +2415,9 @@ fn eval_command(
         debug_write(b"relibc: C runtime smoke\n".as_ptr(), 24);
         let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
         let count = command_argv_slots(cmd, &mut slots);
+        // The finite stdin form closes its writer before launch, so the child reads its one
+        // line and then observes end-of-input without parking on a peer that will never
+        // write again — the bounded shape a boot proof needs. — TIMBERDOODLE
         run_with_startup_input(
             initrd,
             RELIBC_SMOKE_PATH.as_bytes(),
@@ -2422,7 +2425,7 @@ fn eval_command(
             Some(&slots[..count]),
             false,
             true,
-            StdinMode::None,
+            StdinMode::Finite(b"a line from sora\n"),
         );
         return true;
     } else if cmd.name == "threads" {

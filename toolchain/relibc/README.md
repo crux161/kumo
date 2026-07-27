@@ -2,6 +2,7 @@
 <!-- j506 -->
 <!-- j507 -->
 <!-- j508 -->
+<!-- j509 -->
 # KUMO relibc overlay
 
 KUMO keeps the audited upstream tree pristine at `vendor/relibc` and applies
@@ -24,15 +25,21 @@ copies the granted argv VMO, and lays it out as the SysV initial-process image �
 header. Upstream `relibc_start_v1` then owns TLS activation, stdio, the init
 arrays, `main`, and exit. I-a3 adds the per-process FD table and file I/O: a
 granted `kumo-vfs` channel backs `openat`/`read`/`close`, so C `fopen`/`fread`
-name real files. Live paths are startup, the FD table, channel writes, file
-reads, process exit, anonymous allocation over kernel-placed VMOs, and the futex
-pair; every other required `Pal`, `PalEpoll`, `PalPtrace`, `PalSignal`, and
-`PalSocket` method remains an explicit `ENOSYS`, inert value, or diverging trap.
+name real files. Gate I-a is closed; expansion since then is demand-driven, one
+failing libc call at a time (`DESIGN/008 §1.4`), and `read` on a granted input
+channel was the first — a channel answers zero once its writer is gone, which is
+end of file with no translation. Live paths are startup, the FD table, channel
+reads and writes, file reads, process exit, anonymous allocation over
+kernel-placed VMOs, and the futex pair; every other required `Pal`, `PalEpoll`,
+`PalPtrace`, `PalSignal`, and `PalSocket` method remains an explicit `ENOSYS`,
+inert value, or diverging trap.
 
-Two absences are deliberate rather than stubbed. `envp` is empty: KUMO grants no
-environment capability, and synthesising one would be ambient authority wearing a
-POSIX name. fd 0 is closed: no input capability is granted yet, and a descriptor
-that reads nothing is a better answer than one that reads somewhere else.
+`envp` is empty on purpose rather than stubbed: KUMO grants no environment
+capability, and synthesising one would be ambient authority wearing a POSIX name.
+
+A stream that was not granted leaves its descriptor **closed**, never aliased onto
+one that was. A program that reads an fd 0 it never received fails, rather than
+quietly reading somewhere else.
 
 The check produces a static AArch64 smoke image at
 `target/relibc-smoke/relibc-smoke`. `cargo xtask image` packages it as
@@ -51,7 +58,8 @@ relibc: tls=17 errno=9 tls@0x10011000 image@0x220000
 relibc: stderr channel -> OK
 relibc: fopen+fread /HELLO.TXT (6 bytes) -> hello!
 relibc: absent path refused errno=2
-relibc: startup+printf+argv+tls+calloc+file -> OK
+relibc: stdin read 17 bytes -> "a line from sora" then EOF
+relibc: startup+printf+argv+tls+calloc+file+stdin -> OK
 ```
 
 The `tls@`/`image@` pair is the point of that line: the thread-local lives in the

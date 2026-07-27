@@ -17,6 +17,7 @@ int printf(const char *format, ...);
 void *calloc(size_t count, size_t size);
 void free(void *pointer);
 ssize_t write(int fd, const void *buffer, size_t length);
+ssize_t read(int fd, void *buffer, size_t length);
 int *__errno_location(void);
 FILE *fopen(const char *path, const char *mode);
 size_t fread(void *buffer, size_t size, size_t count, FILE *stream);
@@ -136,6 +137,27 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: absent path refused errno=%d\n", errno);
 
-    printf("relibc: startup+printf+argv+tls+calloc+file -> OK\n");
+    /*
+     * Standard input, read the way an editor reads it: raw bytes off the descriptor, not
+     * a line through stdio. A granted channel delivers one message per read and answers
+     * zero once its writer is gone, which is exactly end of file.
+     */
+    char line[64];
+    const ssize_t got_in = read(0, line, sizeof(line) - 1);
+    if (got_in < 0) {
+        printf("relibc: stdin read failed errno=%d\n", errno);
+        return 40;
+    }
+    line[got_in] = '\0';
+    /* Trim one trailing newline so the echo stays on one line. */
+    if (got_in > 0 && line[got_in - 1] == '\n') {
+        line[got_in - 1] = '\0';
+    }
+    if (read(0, line + got_in, 1) != 0) {
+        return 41; /* the writer was closed before launch: the next read must be EOF */
+    }
+    printf("relibc: stdin read %zd bytes -> \"%s\" then EOF\n", got_in, line);
+
+    printf("relibc: startup+printf+argv+tls+calloc+file+stdin -> OK\n");
     return 0;
 }
