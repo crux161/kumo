@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j493
 //j494
 //j495
 //j496
 //j497
+//j498
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -39,9 +39,10 @@
 //! proves callers submit work to a queue rather than coordinating the worker thread directly.
 //! Both residents then become workers for one concurrent queue and each drains one of its two jobs.
 //! Thread 0 finally submits synchronously to that queue and resumes only after thread 1 completes it.
+//! The residents finish by contending on one once gate and observing the same initialized result.
 
 use kumo_abi::Handle;
-use kumo_dispatch::{ConcurrentQueue, SerialQueue};
+use kumo_dispatch::{ConcurrentQueue, Once, SerialQueue};
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
 
 extern crate alloc;
@@ -132,6 +133,30 @@ static CONCURRENT_SYNC_WORKER_RESULT: core::sync::atomic::AtomicU32 =
 static CONCURRENT_SYNC_REPORTED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// D4d's one shared initialization gate.
+static ONCE: Once = Once::new();
+
+/// Number of times the winning initializer actually ran.
+static ONCE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The winner publishes this while still inside the initializer so its peer can contend.
+static ONCE_INIT_STARTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Thread 1 sets this immediately before entering the already-running once gate.
+static ONCE_CONTENDER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Result each caller received from the shared gate.
+static ONCE_RESULTS: [core::sync::atomic::AtomicU32; 2] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+/// Number of callers that returned from the once gate.
+static ONCE_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The first finisher remains alive until the acceptance line is emitted.
+static ONCE_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
 const CANARY: usize = 64;
@@ -153,6 +178,20 @@ fn record_concurrent_job(value: usize) -> usize {
 
 fn triple(value: usize) -> usize {
     value * 3
+}
+
+fn initialize_once(value: usize) -> usize {
+    ONCE_CALLS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    ONCE_INIT_STARTED.store(1, core::sync::atomic::Ordering::Release);
+    futex_wake(ONCE_INIT_STARTED.as_ptr(), 1);
+    loop {
+        let observed = ONCE_CONTENDER.load(core::sync::atomic::Ordering::Acquire);
+        if observed != 0 {
+            break;
+        }
+        futex_wait(ONCE_CONTENDER.as_ptr(), observed);
+    }
+    value * 2
 }
 
 fn emit(stdout: Handle, bytes: &[u8]) {
@@ -475,6 +514,56 @@ extern "C" fn main(
         );
         CONCURRENT_SYNC_REPORTED.store(1, core::sync::atomic::Ordering::Release);
         futex_wake(CONCURRENT_SYNC_REPORTED.as_ptr(), 1);
+    }
+
+    // D4d: thread 0 holds the initializer open until thread 1 announces its contention. Thread 1's
+    // different context must be ignored; both callers return the first initializer's 42.
+    // — KESTREL 2026-07-26
+    let once_result = if me == 0 {
+        ONCE.call_once(initialize_once, 21)
+    } else {
+        loop {
+            let observed = ONCE_INIT_STARTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(ONCE_INIT_STARTED.as_ptr(), observed);
+        }
+        ONCE_CONTENDER.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(ONCE_CONTENDER.as_ptr(), 1);
+        ONCE.call_once(initialize_once, 999)
+    } as u32;
+    ONCE_RESULTS[me as usize].store(once_result, core::sync::atomic::Ordering::Release);
+
+    if ONCE_DONE.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1 == 2 {
+        let calls = ONCE_CALLS.load(core::sync::atomic::Ordering::Acquire);
+        let result_a = ONCE_RESULTS[0].load(core::sync::atomic::Ordering::Acquire);
+        let result_b = ONCE_RESULTS[1].load(core::sync::atomic::Ordering::Acquire);
+        let passed = calls == 1 && result_a == 42 && result_b == 42 && ONCE.is_completed();
+        emit(stdout, b"threads: once calls=");
+        emit_u32(stdout, calls);
+        emit(stdout, b" A=");
+        emit_u32(stdout, result_a);
+        emit(stdout, b" B=");
+        emit_u32(stdout, result_b);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: one initializer, shared result\n"
+            } else {
+                b" -> FAIL: once gate\n"
+            },
+        );
+        ONCE_REPORTED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(ONCE_REPORTED.as_ptr(), 1);
+    } else {
+        loop {
+            let observed = ONCE_REPORTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(ONCE_REPORTED.as_ptr(), observed);
+        }
     }
 
     process_exit(0)

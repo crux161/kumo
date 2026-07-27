@@ -3,13 +3,14 @@
 //j495
 //j496
 //j497
+//j498
 
 //! In-process work queues for KUMO userland.
 //!
 //! Submitters enqueue function-pointer work without crossing a process boundary. A bounded serial
 //! queue has one claimed worker; a bounded concurrent queue permits multiple workers to drain the
 //! same FIFO. Both disciplines support asynchronous and synchronous submission. Empty workers park
-//! on a futex. Composition primitives belong to later slices.
+//! on a futex. [`Once`] provides the first small composition gate.
 
 use core::cell::{Cell, UnsafeCell};
 use core::hint::spin_loop;
@@ -39,8 +40,90 @@ fn wake_word(addr: *const u32) {
 #[cfg(not(target_os = "none"))]
 fn wake_word(_addr: *const u32) {}
 
+#[cfg(target_os = "none")]
+fn wake_all_word(addr: *const u32) {
+    let _ = futex_wake(addr, u32::MAX);
+}
+
+#[cfg(not(target_os = "none"))]
+fn wake_all_word(_addr: *const u32) {}
+
 /// A work item function: it receives one opaque context word and returns one word.
 pub type WorkFn = fn(usize) -> usize;
+
+const ONCE_UNSTARTED: u32 = 0;
+const ONCE_RUNNING: u32 = 1;
+const ONCE_COMPLETE: u32 = 2;
+
+/// An allocation-free gate that runs one initializer and publishes its result to every caller.
+///
+/// The first caller supplies the function and context that execute. Contending and later callers
+/// ignore their own supplied function and context, park while initialization is in progress, and
+/// return the first caller's result.
+pub struct Once {
+    state: AtomicU32,
+    result: UnsafeCell<usize>,
+}
+
+impl Once {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(ONCE_UNSTARTED),
+            result: UnsafeCell::new(0),
+        }
+    }
+
+    /// Run the first initializer exactly once and return its cached result.
+    pub fn call_once(&self, function: WorkFn, context: usize) -> usize {
+        if self
+            .state
+            .compare_exchange(
+                ONCE_UNSTARTED,
+                ONCE_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let result = function(context);
+            // The successful caller is the only writer; the release-store publishes this value.
+            unsafe { *self.result.get() = result };
+            self.state.store(ONCE_COMPLETE, Ordering::Release);
+            wake_all_word(self.state.as_ptr());
+            return result;
+        }
+
+        let mut waited = false;
+        loop {
+            let observed = self.state.load(Ordering::Acquire);
+            if observed == ONCE_COMPLETE {
+                if waited {
+                    // KUMO bounds one wake syscall. A resumed cohort wakes any remaining cohort so
+                    // more contenders than that bound cannot remain stranded. — KESTREL 2026-07-26
+                    wake_all_word(self.state.as_ptr());
+                }
+                // The acquire-load pairs with the initializer's release-store.
+                return unsafe { *self.result.get() };
+            }
+            waited = true;
+            wait_word(self.state.as_ptr(), observed);
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ONCE_COMPLETE
+    }
+}
+
+impl Default for Once {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// The state word permits one result writer and release-publishes that write before any reader.
+// — KESTREL 2026-07-26
+unsafe impl Sync for Once {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitError {
@@ -423,6 +506,55 @@ mod tests {
 
     fn double(value: usize) -> usize {
         value * 2
+    }
+
+    #[test]
+    fn once_runs_one_initializer_for_competing_callers() {
+        struct Probe {
+            calls: AtomicUsize,
+            initializer_entered: AtomicBool,
+            release_initializer: AtomicBool,
+        }
+
+        fn controlled_initializer(context: usize) -> usize {
+            let probe = unsafe { &*(context as *const Probe) };
+            probe.calls.fetch_add(1, Ordering::AcqRel);
+            probe.initializer_entered.store(true, Ordering::Release);
+            while !probe.release_initializer.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            42
+        }
+
+        let once = Arc::new(Once::new());
+        let probe = Probe {
+            calls: AtomicUsize::new(0),
+            initializer_entered: AtomicBool::new(false),
+            release_initializer: AtomicBool::new(false),
+        };
+        let context = &probe as *const Probe as usize;
+
+        let first_once = Arc::clone(&once);
+        let first = thread::spawn(move || first_once.call_once(controlled_initializer, context));
+        while !probe.initializer_entered.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let second_once = Arc::clone(&once);
+        let second = thread::spawn(move || second_once.call_once(double, 999));
+        thread::yield_now();
+        probe.release_initializer.store(true, Ordering::Release);
+
+        assert_eq!(first.join().unwrap(), 42);
+        assert_eq!(second.join().unwrap(), 42);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert!(once.is_completed());
+    }
+
+    #[test]
+    fn once_returns_the_first_result_to_later_callers() {
+        let once = Once::new();
+        assert_eq!(once.call_once(double, 21), 42);
+        assert_eq!(once.call_once(double, 99), 42);
     }
 
     #[test]
