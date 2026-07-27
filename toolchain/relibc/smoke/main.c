@@ -2,6 +2,7 @@
 /* j507 */
 /* j511 */
 /* j512 */
+/* j513 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
@@ -157,6 +159,15 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: tty cooked -> raw -> cooked via ttyd -> OK\n");
 
+    struct winsize window;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) != 0 || window.ws_row == 0 ||
+        window.ws_col == 0) {
+        printf("relibc: TIOCGWINSZ failed errno=%d\n", errno);
+        return 38;
+    }
+    printf("relibc: tty window %ux%u via ttyd -> OK\n", window.ws_col,
+           window.ws_row);
+
     /*
      * Standard input, read the way an editor reads it: raw bytes off the descriptor, not
      * a line through stdio. A granted channel delivers one message per read and answers
@@ -178,6 +189,6 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: stdin read %zd bytes -> \"%s\" then EOF\n", got_in, line);
 
-    printf("relibc: startup+printf+argv+tls+calloc+file+tty+stdin -> OK\n");
+    printf("relibc: startup+printf+argv+tls+calloc+file+tty+winsize+stdin -> OK\n");
     return 0;
 }

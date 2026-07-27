@@ -2,6 +2,7 @@
 //j506
 //j507
 //j512
+//j513
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -91,9 +92,21 @@ const TTY_OP_GET_MODE: u8 = 0x04;
 const TTY_OP_SET_MODE: u8 = 0x05;
 const TTY_OK: u8 = 0x00;
 const TTY_EVENT_MODE: u8 = 0x02;
+const TTY_OP_GET_WINDOW_SIZE: u8 = 0x06;
+const TTY_EVENT_WINDOW_SIZE: u8 = 0x03;
 const TTY_MODE_CANONICAL: u8 = 1 << 0;
 const TTY_MODE_ECHO: u8 = 1 << 1;
 const TTY_REPLY_HEADER_BYTES: usize = 6;
+
+/// Wire-compatible view of relibc's C `struct winsize`. Its upstream Rust fields are
+/// intentionally private, while the PAL must fill the caller-owned C object.
+#[repr(C)]
+struct KumoWinsize {
+    rows: u16,
+    columns: u16,
+    x_pixels: u16,
+    y_pixels: u16,
+}
 
 const VMAR_READ: u64 = 1 << 0;
 const VMAR_WRITE: u64 = 1 << 1;
@@ -510,7 +523,7 @@ impl Sys {
     pub unsafe fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> Result<c_int> {
         use crate::header::{
             errno::{EBADF, EFAULT, EIO, ENOTTY},
-            sys_ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW},
+            sys_ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ},
         };
 
         match fd_slot(fd).map(|slot| *slot) {
@@ -564,6 +577,38 @@ impl Sys {
                 if n != reply.len() || reply[0] != TTY_OK {
                     return Err(Errno(EIO));
                 }
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                let mut reply = [0u8; TTY_REPLY_HEADER_BYTES + 4];
+                let n = tty_call(&[TTY_OP_GET_WINDOW_SIZE], &mut reply)?;
+                if n != reply.len()
+                    || reply[0] != TTY_OK
+                    || reply[1] != TTY_EVENT_WINDOW_SIZE
+                    || u16::from_le_bytes([reply[2], reply[3]]) != 0
+                    || u16::from_le_bytes([reply[4], reply[5]]) != 4
+                {
+                    return Err(Errno(EIO));
+                }
+                let rows = u16::from_le_bytes([
+                    reply[TTY_REPLY_HEADER_BYTES],
+                    reply[TTY_REPLY_HEADER_BYTES + 1],
+                ]);
+                let columns = u16::from_le_bytes([
+                    reply[TTY_REPLY_HEADER_BYTES + 2],
+                    reply[TTY_REPLY_HEADER_BYTES + 3],
+                ]);
+                if rows == 0 || columns == 0 {
+                    return Err(Errno(EIO));
+                }
+                unsafe {
+                    out.cast::<KumoWinsize>().write(KumoWinsize {
+                        rows,
+                        columns,
+                        x_pixels: 0,
+                        y_pixels: 0,
+                    })
+                };
                 Ok(0)
             }
             _ => Err(unsupported()),

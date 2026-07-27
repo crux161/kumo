@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j512
+//j513
 
 //! `ttyd` - the P8 TTY line-discipline core.
 //!
@@ -30,6 +31,8 @@ pub const OP_READ: u8 = 0x03;
 pub const OP_GET_MODE: u8 = 0x04;
 /// Three-byte request: set mode and application timing (`[OP_SET_MODE, flags, action]`).
 pub const OP_SET_MODE: u8 = 0x05;
+/// One-byte request: read the terminal's dimensions in character cells.
+pub const OP_GET_WINDOW_SIZE: u8 = 0x06;
 /// One-byte request: terminate the serve loop without a reply.
 pub const OP_SHUTDOWN: u8 = 0xff;
 
@@ -46,6 +49,8 @@ pub const EVENT_NONE: u8 = 0x00;
 pub const EVENT_LINE: u8 = 0x01;
 /// Reply event: the reply carries one encoded [`TerminalMode`].
 pub const EVENT_MODE: u8 = 0x02;
+/// Reply event: the reply carries one encoded [`WindowSize`].
+pub const EVENT_WINDOW_SIZE: u8 = 0x03;
 
 /// Request buffer size for the current protocol.
 pub const REQUEST_BUF_BYTES: usize = 3;
@@ -120,6 +125,30 @@ impl Default for TerminalMode {
     }
 }
 
+/// Terminal dimensions in character cells, independent of libc's `winsize` layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowSize {
+    pub rows: u16,
+    pub columns: u16,
+}
+
+impl WindowSize {
+    /// The current text console geometry. A later display-owner capability may replace
+    /// this fixed value without changing the ttyd or libc protocols.
+    pub const fn text_console() -> WindowSize {
+        WindowSize {
+            rows: 24,
+            columns: 80,
+        }
+    }
+}
+
+impl Default for WindowSize {
+    fn default() -> Self {
+        Self::text_console()
+    }
+}
+
 /// When a mode change becomes visible, matching POSIX's three `tcsetattr` actions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetModeAction {
@@ -165,6 +194,8 @@ pub enum Request {
         mode: TerminalMode,
         action: SetModeAction,
     },
+    /// Read the current terminal dimensions.
+    GetWindowSize,
     /// Gracefully stop the server.
     Shutdown,
 }
@@ -194,18 +225,27 @@ impl Request {
         Request::SetMode { mode, action }
     }
 
+    pub const fn get_window_size() -> Request {
+        Request::GetWindowSize
+    }
+
     pub const fn shutdown() -> Request {
         Request::Shutdown
     }
 
     pub fn encode_into(&self, out: &mut [u8]) -> Option<usize> {
         match *self {
-            Request::Clear | Request::Read | Request::GetMode | Request::Shutdown => {
+            Request::Clear
+            | Request::Read
+            | Request::GetMode
+            | Request::GetWindowSize
+            | Request::Shutdown => {
                 let frame = out.get_mut(..1)?;
                 frame[0] = match *self {
                     Request::Clear => OP_CLEAR,
                     Request::Read => OP_READ,
                     Request::GetMode => OP_GET_MODE,
+                    Request::GetWindowSize => OP_GET_WINDOW_SIZE,
                     Request::Shutdown => OP_SHUTDOWN,
                     Request::Input(_) | Request::Write(_) | Request::SetMode { .. } => {
                         unreachable!()
@@ -221,6 +261,7 @@ impl Request {
                     Request::Clear
                     | Request::Read
                     | Request::GetMode
+                    | Request::GetWindowSize
                     | Request::SetMode { .. }
                     | Request::Shutdown => {
                         unreachable!()
@@ -250,6 +291,7 @@ impl Request {
                 mode: TerminalMode::decode(*flags)?,
                 action: SetModeAction::decode(*action)?,
             }),
+            [OP_GET_WINDOW_SIZE] => Some(Request::GetWindowSize),
             [OP_SHUTDOWN] => Some(Request::Shutdown),
             _ => None,
         }
@@ -263,6 +305,7 @@ pub struct Reply<'a> {
     pub echo: &'a [u8],
     pub line: Option<&'a [u8]>,
     pub mode: Option<TerminalMode>,
+    pub window_size: Option<WindowSize>,
 }
 
 impl<'a> Reply<'a> {
@@ -277,10 +320,18 @@ impl<'a> Reply<'a> {
         let line_end = line_start.checked_add(line_len)?;
         let echo = raw.get(echo_start..line_start)?;
         let line_bytes = raw.get(line_start..line_end)?;
-        let (line, mode) = match event {
-            EVENT_NONE if line_len == 0 => (None, None),
-            EVENT_LINE => (Some(line_bytes), None),
-            EVENT_MODE if line_len == 1 => (None, Some(TerminalMode::decode(line_bytes[0])?)),
+        let (line, mode, window_size) = match event {
+            EVENT_NONE if line_len == 0 => (None, None, None),
+            EVENT_LINE => (Some(line_bytes), None, None),
+            EVENT_MODE if line_len == 1 => (None, Some(TerminalMode::decode(line_bytes[0])?), None),
+            EVENT_WINDOW_SIZE if line_len == 4 => (
+                None,
+                None,
+                Some(WindowSize {
+                    rows: u16::from_le_bytes([line_bytes[0], line_bytes[1]]),
+                    columns: u16::from_le_bytes([line_bytes[2], line_bytes[3]]),
+                }),
+            ),
             _ => return None,
         };
         Some(Reply {
@@ -288,6 +339,7 @@ impl<'a> Reply<'a> {
             echo,
             line,
             mode,
+            window_size,
         })
     }
 }
@@ -832,6 +884,7 @@ pub trait Transport {
 pub struct TtyServer<const N: usize = DEFAULT_LINE_BYTES> {
     line: LineDiscipline<N>,
     mode: TerminalMode,
+    window_size: WindowSize,
     submitted: [u8; N],
     submitted_len: usize,
     submitted_ready: bool,
@@ -842,6 +895,7 @@ impl<const N: usize> TtyServer<N> {
         TtyServer {
             line: LineDiscipline::new(),
             mode: TerminalMode::cooked(),
+            window_size: WindowSize::text_console(),
             submitted: [0; N],
             submitted_len: 0,
             submitted_ready: false,
@@ -854,6 +908,10 @@ impl<const N: usize> TtyServer<N> {
 
     pub const fn mode(&self) -> TerminalMode {
         self.mode
+    }
+
+    pub const fn window_size(&self) -> WindowSize {
+        self.window_size
     }
 
     /// Handle one request frame, writing a reply frame.
@@ -869,6 +927,7 @@ impl<const N: usize> TtyServer<N> {
             Request::Shutdown => 0,
             Request::Write(byte) => write_reply(reply, TTY_OK, Echo::byte(byte), None),
             Request::GetMode => write_mode_reply(reply, self.mode),
+            Request::GetWindowSize => write_window_size_reply(reply, self.window_size),
             Request::SetMode { mode, action } => {
                 self.mode = mode;
                 if action == SetModeAction::Flush {
@@ -997,6 +1056,21 @@ fn write_mode_reply(reply: &mut [u8], mode: TerminalMode) -> usize {
     out[4..6].copy_from_slice(&1u16.to_le_bytes());
     out[REPLY_HEADER_BYTES] = mode.encode();
     REPLY_HEADER_BYTES + 1
+}
+
+fn write_window_size_reply(reply: &mut [u8], window_size: WindowSize) -> usize {
+    let Some(out) = reply.get_mut(..REPLY_HEADER_BYTES + 4) else {
+        return 0;
+    };
+    out[0] = TTY_OK;
+    out[1] = EVENT_WINDOW_SIZE;
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());
+    out[4..6].copy_from_slice(&4u16.to_le_bytes());
+    out[REPLY_HEADER_BYTES..REPLY_HEADER_BYTES + 2]
+        .copy_from_slice(&window_size.rows.to_le_bytes());
+    out[REPLY_HEADER_BYTES + 2..REPLY_HEADER_BYTES + 4]
+        .copy_from_slice(&window_size.columns.to_le_bytes());
+    REPLY_HEADER_BYTES + 4
 }
 
 #[cfg(test)]
@@ -1201,6 +1275,8 @@ mod tests {
         let set = Request::set_mode(TerminalMode::raw(), SetModeAction::Flush);
         let n = set.encode_into(&mut buf).unwrap();
         assert_eq!(Request::decode(&buf[..n]), Some(set));
+        let n = Request::get_window_size().encode_into(&mut buf).unwrap();
+        assert_eq!(Request::decode(&buf[..n]), Some(Request::GetWindowSize));
         let n = Request::shutdown().encode_into(&mut buf).unwrap();
         assert_eq!(Request::decode(&buf[..n]), Some(Request::Shutdown));
         assert_eq!(Request::decode(&[OP_INPUT]), None);
@@ -1208,6 +1284,21 @@ mod tests {
         assert_eq!(Request::decode(&[OP_SET_MODE, 0, 3]), None);
         let malformed_mode = [TTY_OK, EVENT_MODE, 0, 0, 1, 0, 0x80];
         assert!(Reply::parse(&malformed_mode).is_none());
+    }
+
+    #[test]
+    fn window_size_reports_text_console_geometry() {
+        let mut server = TtyServer::<8>::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+
+        let n = server.dispatch(&encode_request(Request::get_window_size()), &mut reply);
+        let parsed = Reply::parse(&reply[..n]).unwrap();
+
+        assert_eq!(server.window_size(), WindowSize::text_console());
+        assert_eq!(parsed.status, TTY_OK);
+        assert_eq!(parsed.window_size, Some(WindowSize::text_console()));
+        assert_eq!(parsed.line, None);
+        assert_eq!(parsed.mode, None);
     }
 
     #[test]
