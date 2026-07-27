@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j495
 //j496
 //j497
 //j498
 //j499
+//j500
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -41,9 +41,10 @@
 //! Thread 0 finally submits synchronously to that queue and resumes only after thread 1 completes it.
 //! The residents finish by contending on one once gate and observing the same initialized result.
 //! A final group wait resumes only after its peer drains both registered jobs.
+//! The last waiter consumes one retained semaphore permit from its peer.
 
 use kumo_abi::Handle;
-use kumo_dispatch::{ConcurrentQueue, Group, Once, SerialQueue};
+use kumo_dispatch::{ConcurrentQueue, Group, Once, Semaphore, SerialQueue};
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
 
 extern crate alloc;
@@ -175,6 +176,18 @@ static GROUP_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 
 /// Peer remains alive until the waiting producer emits the acceptance line.
 static GROUP_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// D4f's initially empty counting semaphore.
+static SEMAPHORE: Semaphore = Semaphore::new(0);
+
+/// The waiter advertises that it is about to consume a permit.
+static SEMAPHORE_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Set only after the waiter returns from `Semaphore::wait`.
+static SEMAPHORE_ACQUIRED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The waiter remains alive until its peer emits the acceptance line.
+static SEMAPHORE_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
@@ -661,6 +674,59 @@ extern "C" fn main(
             }
             futex_wait(GROUP_REPORTED.as_ptr(), observed);
         }
+    }
+
+    // D4f: thread 0 announces its imminent zero-permit wait and parks. Thread 1 observes that no
+    // acquisition happened early, signals exactly once, and requires the resumed waiter to consume
+    // that sole retained permit. — KESTREL 2026-07-26
+    if me == 0 {
+        SEMAPHORE_READY.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(SEMAPHORE_READY.as_ptr(), 1);
+        SEMAPHORE.wait();
+        SEMAPHORE_ACQUIRED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(SEMAPHORE_ACQUIRED.as_ptr(), 1);
+        loop {
+            let observed = SEMAPHORE_REPORTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(SEMAPHORE_REPORTED.as_ptr(), observed);
+        }
+    } else {
+        loop {
+            let observed = SEMAPHORE_READY.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(SEMAPHORE_READY.as_ptr(), observed);
+        }
+        let before = SEMAPHORE_ACQUIRED.load(core::sync::atomic::Ordering::Acquire);
+        let signaled = SEMAPHORE.signal().is_ok();
+        let acquired = loop {
+            let observed = SEMAPHORE_ACQUIRED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break observed;
+            }
+            futex_wait(SEMAPHORE_ACQUIRED.as_ptr(), observed);
+        };
+        let permits = SEMAPHORE.available();
+        let passed = before == 0 && signaled && acquired == 1 && permits == 0;
+        emit(stdout, b"threads: semaphore before=");
+        emit_u32(stdout, before);
+        emit(stdout, b" acquired=");
+        emit_u32(stdout, acquired);
+        emit(stdout, b" permits=");
+        emit_u32(stdout, permits);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: one signal released one waiter\n"
+            } else {
+                b" -> FAIL: semaphore handoff\n"
+            },
+        );
+        SEMAPHORE_REPORTED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(SEMAPHORE_REPORTED.as_ptr(), 1);
     }
 
     process_exit(0)

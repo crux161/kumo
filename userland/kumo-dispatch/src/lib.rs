@@ -1,17 +1,17 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j495
 //j496
 //j497
 //j498
 //j499
+//j500
 
 //! In-process work queues for KUMO userland.
 //!
 //! Submitters enqueue function-pointer work without crossing a process boundary. A bounded serial
 //! queue has one claimed worker; a bounded concurrent queue permits multiple workers to drain the
 //! same FIFO. Both disciplines support asynchronous and synchronous submission. Empty workers park
-//! on a futex. [`Once`] and [`Group`] provide small composition gates.
+//! on a futex. [`Once`], [`Group`], and [`Semaphore`] provide small composition gates.
 
 use core::cell::{Cell, UnsafeCell};
 use core::hint::spin_loop;
@@ -227,6 +227,79 @@ impl Group {
 impl Default for Group {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Exhaustion reported by a [`Semaphore`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemaphoreError {
+    /// The permit counter cannot represent another signal.
+    Overflow,
+}
+
+/// An allocation-free counting semaphore.
+///
+/// A signal adds one retained permit and wakes one waiter. A wait consumes exactly one permit,
+/// parking on the permit word while none are available.
+pub struct Semaphore {
+    permits: AtomicU32,
+}
+
+impl Semaphore {
+    pub const fn new(permits: u32) -> Self {
+        Self {
+            permits: AtomicU32::new(permits),
+        }
+    }
+
+    /// Consume one permit, parking until a signal makes one available.
+    pub fn wait(&self) {
+        loop {
+            let observed = self.permits.load(Ordering::Acquire);
+            if observed == 0 {
+                // A signal racing between this load and the syscall changes the word, so FutexWait
+                // returns without parking and the loop consumes the retained permit.
+                wait_word(self.permits.as_ptr(), observed);
+                continue;
+            }
+            if self
+                .permits
+                .compare_exchange_weak(observed, observed - 1, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Add one retained permit and wake one waiter.
+    pub fn signal(&self) -> Result<(), SemaphoreError> {
+        let mut observed = self.permits.load(Ordering::Acquire);
+        loop {
+            let next = observed.checked_add(1).ok_or(SemaphoreError::Overflow)?;
+            match self.permits.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    wake_word(self.permits.as_ptr());
+                    return Ok(());
+                }
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    pub fn available(&self) -> u32 {
+        self.permits.load(Ordering::Acquire)
+    }
+}
+
+impl Default for Semaphore {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -698,6 +771,40 @@ mod tests {
         group.leave().unwrap();
         group.wait();
         assert_eq!(group.pending(), 0);
+    }
+
+    #[test]
+    fn semaphore_wait_blocks_until_one_signal_and_consumes_it() {
+        let semaphore = Arc::new(Semaphore::new(0));
+        let returned = Arc::new(AtomicBool::new(false));
+        let waiter_semaphore = Arc::clone(&semaphore);
+        let waiter_returned = Arc::clone(&returned);
+        let waiter = thread::spawn(move || {
+            waiter_semaphore.wait();
+            waiter_returned.store(true, Ordering::Release);
+        });
+
+        thread::yield_now();
+        assert!(!returned.load(Ordering::Acquire));
+        semaphore.signal().unwrap();
+        waiter.join().unwrap();
+        assert!(returned.load(Ordering::Acquire));
+        assert_eq!(semaphore.available(), 0);
+    }
+
+    #[test]
+    fn semaphore_retains_early_signals_and_rejects_overflow() {
+        let semaphore = Semaphore::new(0);
+        semaphore.signal().unwrap();
+        semaphore.signal().unwrap();
+        assert_eq!(semaphore.available(), 2);
+        semaphore.wait();
+        semaphore.wait();
+        assert_eq!(semaphore.available(), 0);
+
+        let full = Semaphore::new(u32::MAX);
+        assert_eq!(full.signal(), Err(SemaphoreError::Overflow));
+        assert_eq!(full.available(), u32::MAX);
     }
 
     #[test]
