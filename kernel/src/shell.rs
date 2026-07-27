@@ -7,6 +7,8 @@
 //! already has — and runs in-kernel over the serial console for now. It is the
 //! ancestor of Kumoza, which takes over once userspace + a `ttyd` server exist.
 
+//j493
+
 use core::fmt::Write;
 
 /// A snapshot of kernel state the built-in commands report on. `uptime_ns` is
@@ -22,6 +24,8 @@ pub struct ShellEnv {
     pub uptime_ns: u64,
     pub preempt_ticks: u64,
     pub preempt_switches: u64,
+    /// Children preempted for monopolising the CPU — a rising count is a misbehaving program.
+    pub preempted_runaways: u64,
 }
 
 /// One row of the `ps` table — a kernel object from the task substrate.
@@ -101,8 +105,8 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
         "ticks" => {
             let _ = write!(
                 out,
-                "timer scheduler ticks={} switches={}\r\n",
-                env.preempt_ticks, env.preempt_switches
+                "timer scheduler ticks={} switches={} runaways-preempted={}\r\n",
+                env.preempt_ticks, env.preempt_switches, env.preempted_runaways
             );
         }
         "uptime" => {
@@ -148,6 +152,7 @@ mod tests {
             uptime_ns: 1_234_000_000,
             preempt_ticks: 7,
             preempt_switches: 3,
+            preempted_runaways: 5,
         }
     }
 
@@ -219,6 +224,7 @@ mod tests {
         let out = run("ticks");
         assert!(out.contains("ticks=7"));
         assert!(out.contains("switches=3"));
+        assert!(out.contains("runaways-preempted=5"));
     }
 
     #[test]

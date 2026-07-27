@@ -1,13 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j452
-//j454
-//j455
-//j456
 //j457
 //j472
 //j474
+//j493
 
 mod fpsimd;
 mod gdt;
@@ -1055,6 +1052,11 @@ pub fn system_reset() {}
 /// the same polled `putc`; nothing here yet distinguishes "queued" from "sent", so this is the
 /// honest no-op until it does.
 pub fn console_drain() {}
+
+/// Ring of the interrupted context. Not yet wired on this backend, so preemption stays off.
+pub fn interrupted_at_el0() -> bool {
+    false
+}
 
 /// No PSCI on x86; power-off would go through ACPI. Returns so the caller falls back to a halt.
 pub fn system_off() {}

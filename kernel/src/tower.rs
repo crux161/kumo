@@ -30,6 +30,7 @@
 //! path (a faulting renderer's glass must be reclaimed *before* emitting).
 
 //j471
+//j493
 
 use core::cell::UnsafeCell;
 use kumo_abi::KoId;
@@ -285,6 +286,24 @@ fn emit_diagnosis(esr: u64, elr: u64, far: u64, sp: u64, emit: fn(&[u8])) {
         emit(if write { b" on write" } else { b" on read" });
     }
     emit(b"\r\n");
+
+    // The region map describes the *kernel's* address space. Running an EL0 fault through it
+    // reports three addresses as "below every known region" — true, useless, and actively
+    // misleading once the out-of-arena stack warning fires at a user stack pointer and blames the
+    // allocator. Userspace faults get told what they are instead.
+    if crate::diag::is_from_el0(esr) {
+        emit(b"  where: userspace (EL0) - the kernel region map does not describe these\r\n");
+        emit(b"  ELR ");
+        emit(&hex64(elr));
+        emit(b"  FAR ");
+        emit(&hex64(far));
+        emit(b"  SP  ");
+        emit(&hex64(sp));
+        emit(
+            b"\r\n  hint: an EL0 SP just above its own mapping is a stack laid out upside down\r\n",
+        );
+        return;
+    }
 
     let map = crate::diag::current_map();
     for (label, addr) in [(b"  ELR " as &[u8], elr), (b"  FAR ", far), (b"  SP  ", sp)] {

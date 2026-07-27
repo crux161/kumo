@@ -1,7 +1,7 @@
-#j415
 #j426
 #j485
 #j486
+#j493
 [workspace]
 members = [
     "boot/niji-loader",
@@ -28,6 +28,7 @@ members = [
     "userland/hello",
     "userland/ls",
     "userland/lua-repl",
+    "userland/threads",
     "userland/kumo-rt",
     "userland/kumoza",
     "userland/persona-linux",

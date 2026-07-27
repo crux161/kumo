@@ -12,6 +12,7 @@
 //j408
 //j422
 //j470
+//j493
 //j471
 //j477
 
@@ -220,6 +221,21 @@ where
     Some(f(&mut *state))
 }
 
+/// Whether the `SoraState` borrow is free at this instant.
+///
+/// Preemption's second safety condition. Taking the borrow and dropping it immediately proves
+/// nobody holds it; on a single core inside an IRQ handler (interrupts masked) nothing can take it
+/// between that proof and the context switch that follows. If it *were* held, switching away would
+/// strand the borrow across threads and the next `with_sora_mut` anywhere would panic — the j484
+/// freeze, arrived at from a different direction.
+pub fn sora_state_is_free() -> bool {
+    let opt: *mut Option<RefCell<SoraState>> = SORA.0.get();
+    let Some(refcell) = (unsafe { (&mut *opt).as_mut() }) else {
+        return false;
+    };
+    refcell.try_borrow_mut().is_ok()
+}
+
 /// Longest command line the kernel shell accepts from Sora's root channel.
 const MAX_ROOT_COMMAND_BYTES: usize = 256;
 
@@ -228,9 +244,8 @@ const MAX_ROOT_COMMAND_BYTES: usize = 256;
 /// floor is current.
 extern "C" fn signal_irq(irq: u32) {
     let now_ns = kumo_hal::active::monotonic_nanos();
-    // Drain the console here, not only on the boot floor: a child spinning at EL0 is never
-    // preempted (`irq_handoff_allowed` = current == Sora), so this handler is the last code still
-    // running and therefore the only place an escape sequence can still be noticed.
+    // Drain the console here, not only on the boot floor. Even with bounded runaway preemption,
+    // the IRQ handler is the lowest-latency place to notice an escape sequence from a busy child.
     if let Some(action) = crate::conin::poll_from_irq() {
         crate::conin::run_action_in_irq(action);
     }
@@ -264,6 +279,11 @@ extern "C" fn signal_irq(irq: u32) {
         return;
     }
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
+    // Timer ticks only: a busy device stream must not inflate the runaway budget, or a driver
+    // servicing a fast controller would be preempted for doing its job well.
+    if irq < 32 {
+        crate::user_thread::preempt_runaway_child_if_safe();
+    }
     // Wake Sora if parked — InterruptWait uses park_current_user().
     if crate::user_thread::is_started()
         && !crate::user_thread::is_done()
@@ -728,6 +748,45 @@ enum ChildDeviceCtxWaitOutcome {
     Status(u64),
     ShouldWait(KoId),
     Done,
+}
+
+/// `FutexWait`: compare the user word against `expected`, and park only if they match.
+///
+/// Returns `Ok` when the thread was woken by a `FutexWake`, and `ShouldWait` when the value had
+/// already changed — the caller's cue to re-read and loop rather than sleep. That "already
+/// changed" answer is what closes the lost-wakeup race from userspace's side: a waker that updates
+/// the word before waking is never missed, because a waiter arriving late simply finds the new
+/// value and does not sleep at all.
+fn futex_wait(process_koid: KoId, addr: u64, expected: u32) -> u64 {
+    // A futex word is a `u32` and must be aligned: an unaligned or null address is a caller bug,
+    // not a value that happens not to match.
+    if addr == 0 || addr % 4 != 0 {
+        return Errno::InvalidArgs.status() as u32 as u64;
+    }
+
+    let matched = with_sora_mut(|sora| {
+        let Some(process) = sora.engine.process_by_koid_mut(process_koid) else {
+            return None;
+        };
+        if !user_range_ok(process, addr, 4) {
+            return None;
+        }
+        // The calling process's TTBR0 is active for the duration of its own syscall, so its user
+        // memory is directly readable here — the same access the persona bridge makes.
+        let observed = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        Some(observed == expected)
+    });
+
+    match matched {
+        None => Errno::InvalidArgs.status() as u32 as u64,
+        // Value already moved on: do not sleep, and say why, so the caller re-checks.
+        Some(false) => Errno::ShouldWait.status() as u32 as u64,
+        Some(true) => {
+            crate::user_thread::park_current_child_on_futex(process_koid, addr);
+            // Control returns here only once a `FutexWake` released this thread.
+            Errno::Ok.status() as u32 as u64
+        }
+    }
 }
 
 fn read_child_channel_without_borrow(
@@ -1594,6 +1653,50 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
+        }
+    }
+
+    // ---- futex (D1) ------------------------------------------------------------------
+    //
+    // The compare and the park must be one indivisible step, or a wake landing between them is
+    // lost and the waiter sleeps forever. On this machine that atomicity is **structural** rather
+    // than enforced: one core, so no true concurrency; a syscall runs to completion because
+    // preemption is permitted only from EL0 (today's watchdog predicate); and the only other way
+    // to reach `FutexWake` is another thread's syscall, which cannot run while this one is
+    // mid-flight. Nothing can change the word or issue a wake between the load and the park.
+    //
+    // If either of those ever stops being true — SMP, or preemption inside the kernel — this needs
+    // a real lock, and this comment is the record of why it did not need one first.
+    // — CORVUS / KESTREL 2026-07-26
+    // Both arms are for **resident children**. Sora is the supervisor pump: parking it on a futex
+    // would block the thread that dispatches every other thread, and it is not a peer that another
+    // worker could wake. The existing wait arms draw the same line, and for the same reason.
+    if num == Syscall::FutexWait as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            r[0] = if cp_koid == sora_koid {
+                Errno::NotSupported.status() as u32 as u64
+            } else {
+                futex_wait(cp_koid, r[0], r[1] as u32)
+            };
+            crate::user_thread::reschedule_if_pending_after_svc();
+            return;
+        }
+    }
+
+    if num == Syscall::FutexWake as u64 {
+        if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            let (addr, count) = (r[0], r[1] as u32);
+            r[0] = if cp_koid == sora_koid {
+                Errno::NotSupported.status() as u32 as u64
+            } else if addr == 0 || addr % 4 != 0 {
+                Errno::InvalidArgs.status() as u32 as u64
+            } else {
+                crate::user_thread::wake_children_waiting_on_futex(cp_koid, addr, count) as u64
+            };
+            crate::user_thread::reschedule_if_pending_after_svc();
+            return;
         }
     }
 
@@ -2658,6 +2761,7 @@ pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
     let preempt = crate::kdemo::preempt_stats();
     env.preempt_ticks = preempt.ticks;
     env.preempt_switches = preempt.switches;
+    env.preempted_runaways = crate::user_thread::preempted_runaways();
     let tasks = crate::kdemo::tasks();
     let mut out = crate::bootstrap::console::Writer;
     crate::shell::run_command(line, env, &tasks, &mut out);

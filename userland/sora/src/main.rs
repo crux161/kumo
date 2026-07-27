@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j480
 //j481
 //j487
 //j488
 //j489
+//j493
 
 extern crate alloc;
 
@@ -1244,8 +1244,12 @@ extern "C" fn sora_main(
 
                 // The xHCI keyboard reader feeds the shell like the i2c-hid one; the i2c-hid path
                 // below only overrides it on a board that actually has an i2c-hid keyboard.
-                let (xhci_kbd, xhci_mouse) =
-                    launch_xhci_first_light(initrd, res, Handle(dtb_vmo as u32), bootinfo.platform.dtb);
+                let (xhci_kbd, xhci_mouse) = launch_xhci_first_light(
+                    initrd,
+                    res,
+                    Handle(dtb_vmo as u32),
+                    bootinfo.platform.dtb,
+                );
                 hid_keyboard_input = xhci_kbd;
                 if xhci_mouse.is_some() {
                     mouse_input = xhci_mouse;
@@ -2365,6 +2369,23 @@ fn eval_command(
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
         return true;
+    } else if cmd.name == "threads" {
+        // D2: two threads in one address space, handing off through a futex. Launched on demand
+        // from the shell rather than at boot — a proof you can re-run is worth more than one that
+        // scrolls past once during startup.
+        debug_write(b"threads: two threads, one address space\n".as_ptr(), 40);
+        if !run_elf_threads(
+            initrd,
+            b"bin/threads",
+            0,
+            0,
+            ProcessRunFlags::ASYNC.bits(),
+            b"threads",
+            1,
+        ) {
+            debug_write(b"threads: launch failed\n".as_ptr(), 23);
+        }
+        return true;
     } else if cmd.name == "lua" {
         // Bare `lua` opens an interactive session; every following line goes to the child until it
         // exits. `lua <expression>` stays the one-shot form.
@@ -2883,7 +2904,23 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
     true
 }
 
-fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {
+/// Load an ELF into a fresh address space and start it.
+///
+/// `extra_threads` starts additional residents **in the same process**: each gets its own stack and
+/// receives its index in `x0`, while sharing one image, one `ttbr0` and one set of statics. That is
+/// what makes them threads rather than processes — `ResidentChild` already keeps `process` separate
+/// from its thread, so two residents naming the same process koid *are* two threads, and
+/// `ProcessRun`'s ASYNC arm resolves that identity from the handle. No kernel change was needed.
+/// Every existing caller passes 0 and is unaffected.
+fn run_elf_threads(
+    initrd: Handle,
+    path: &[u8],
+    arg: u64,
+    arg2: u64,
+    flags: u64,
+    name: &[u8],
+    extra_threads: u32,
+) -> bool {
     const PAGE_SIZE: u64 = 4096;
     const MAX_SEGMENTS: usize = 8;
 
@@ -3068,13 +3105,50 @@ fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &
             }
         }
 
-        if address_space_create(child_as, 0x10010000, 0x4000) == u64::MAX {
-            log(name);
-            log(b": as fail\n");
-            break 'load false;
+        // One stack per thread, 64 KiB apart. The gap is the guard: a thread that runs off its
+        // 16 KiB stack lands in unmapped space and faults, instead of silently eating its peer's.
+        //
+        // `AddressSpaceCreate` takes the stack **top** and maps downward (`stack_virt - stack_size`
+        // is the base), so `STACK_TOP + i * STRIDE` names the top of thread `i`'s stack and its
+        // initial SP sits just below it. Reading that argument as a base is what started every
+        // child 0x4000 above its own mapping, to fault on its first push.
+        // — CORVUS / KESTREL 2026-07-26
+        const STACK_TOP: u64 = 0x1001_0000;
+        const STACK_STRIDE: u64 = 0x1_0000;
+        const STACK_SIZE: u64 = 0x4000;
+        for i in 0..=u64::from(extra_threads) {
+            if address_space_create(child_as, STACK_TOP + i * STACK_STRIDE, STACK_SIZE) == u64::MAX
+            {
+                log(name);
+                log(b": as fail\n");
+                break 'load false;
+            }
         }
 
-        process_run(child_as, elf.entry, 0x1000FFF0, arg, arg2, flags) == 0
+        let sp = |i: u64| STACK_TOP + i * STACK_STRIDE - 0x10;
+        if process_run(child_as, elf.entry, sp(0), arg, arg2, flags) != 0 {
+            break 'load false;
+        }
+        // Peers enter the same code with their index in x0. ASYNC because a second thread that
+        // blocked its launcher would defeat the point.
+        let mut ok = true;
+        for i in 1..=u64::from(extra_threads) {
+            if process_run(
+                child_as,
+                elf.entry,
+                sp(i),
+                i,
+                0,
+                ProcessRunFlags::ASYNC.bits(),
+            ) != 0
+            {
+                log(name);
+                log(b": peer thread fail\n");
+                ok = false;
+                break;
+            }
+        }
+        ok
     };
 
     // `VmarMap`/`AddressSpaceCreate` copied everything an admitted child needs
@@ -3086,6 +3160,10 @@ fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &
         log(b": handle cleanup fail\n");
     }
     loaded && cleanup_ok
+}
+
+fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {
+    run_elf_threads(initrd, path, arg, arg2, flags, name, 0)
 }
 
 /// Stage-C milestone (Journal 134): two `svc-health` servers run as **independent**
@@ -4004,6 +4082,8 @@ fn launch_lua_repl(initrd: Handle) {
         b"lua-repl",
         None,
         false,
-        StdinMode::Finite(b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n"),
+        StdinMode::Finite(
+            b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n",
+        ),
     );
 }

@@ -1,0 +1,19 @@
+#j493
+
+[package]
+name = "threads"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+kumo-rt = { path = "../kumo-rt" }
+kumo-abi.workspace = true
+
+[[bin]]
+name = "threads"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

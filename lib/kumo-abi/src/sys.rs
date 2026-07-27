@@ -1,5 +1,6 @@
 //j397
 //j427
+//j493
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +206,10 @@ mod tests {
     fn contiguous_dma_vmo_occupies_the_next_syscall_slot() {
         assert_eq!(Syscall::DeviceCtxInfo as usize, 44);
         assert_eq!(Syscall::VmoCreateContiguous as usize, 45);
+        // D1: the futex pair had been reserved numbers with no implementation since the ABI was
+        // laid out; pinning them here keeps the now-live syscalls where userland expects them.
+        assert_eq!(Syscall::FutexWait as usize, 28);
+        assert_eq!(Syscall::FutexWake as usize, 29);
     }
 }
 

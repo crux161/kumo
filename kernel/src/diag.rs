@@ -14,6 +14,8 @@
 //! Symbolisation and the frame-pointer walk are the other two lessons and are planned separately;
 //! they need build-side support this does not.
 
+//j493
+
 /// The exception class and, for aborts, what actually went wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Syndrome {
@@ -90,6 +92,19 @@ fn fault_status(dfsc: u64) -> &'static str {
         0x30 => "TLB conflict",
         _ => "unrecognised fault status",
     }
+}
+
+/// Whether the fault came from EL0 (userspace) rather than from kernel code.
+///
+/// Load-bearing for how a fault is *described*. The kernel's region map covers the kernel image,
+/// its heap and its stacks — none of which say anything about a user address. Applying it to an EL0
+/// fault produces three confident "UNMAPPED - below every known region" lines and, worse, fires the
+/// out-of-arena stack warning at a *user* stack pointer, blaming the allocator for what is usually
+/// a userspace bug. That is exactly what happened on the first `threads` boot: the shout said
+/// "suspect the free list" when the real fault was a stack top computed as a base.
+pub const fn is_from_el0(esr: u64) -> bool {
+    // 0x20 = instruction abort from a lower EL, 0x24 = data abort from a lower EL.
+    matches!((esr >> 26) & 0x3f, 0x20 | 0x24)
 }
 
 /// A named span of the kernel's address space.
@@ -381,6 +396,15 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn el0_and_el1_aborts_are_distinguished() {
+        // The values from the two real faults this system has produced.
+        assert!(is_from_el0(0x9200_0047)); // threads: user stack below its mapping
+        assert!(!is_from_el0(0x9600_0007)); // the IRQ-stack fault: kernel side
+        assert!(is_from_el0(0x8200_0007)); // instruction abort from EL0
+        assert!(!is_from_el0(0x8600_0007)); // instruction abort from EL1
     }
 
     #[test]

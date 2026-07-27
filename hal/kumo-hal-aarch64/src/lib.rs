@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j471
 //j472
 //j474
 //j482
 //j483
+//j493
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -70,6 +70,39 @@ fn spsr_mode_name(spsr: u64) -> &'static str {
 fn spsr_is_illegal(spsr: u64) -> bool {
     spsr & SPSR_IL_BIT != 0
 }
+
+/// Assembly layout shared by the EL0 SVC and IRQ entry paths.
+///
+/// The IRQ path must carry every per-CPU register that belongs to the interrupted
+/// user thread across an in-handler context switch. Compile-time offsets make changes
+/// to this Rust description fail next to the numeric assembly layout they describe.
+#[cfg(any(target_os = "none", test))]
+#[repr(C, align(16))]
+#[allow(dead_code)]
+struct El0TrapFrameLayout {
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    sp_el0: u64,
+    fpsr: u64,
+    fpcr: u64,
+    q: [[u64; 2]; 32],
+}
+
+#[cfg(any(target_os = "none", test))]
+const EL0_TRAP_FRAME_SIZE: usize = 800;
+
+#[cfg(any(target_os = "none", test))]
+const _: () = {
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, elr) == 248);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, spsr) == 256);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, sp_el0) == 264);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, fpsr) == 272);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, fpcr) == 280);
+    assert!(core::mem::offset_of!(El0TrapFrameLayout, q) == 288);
+    assert!(core::mem::size_of::<El0TrapFrameLayout>() == EL0_TRAP_FRAME_SIZE);
+    assert!(EL0_TRAP_FRAME_SIZE % 16 == 0);
+};
 
 // ---- Thread contexts -------------------------------------------------
 
@@ -2304,7 +2337,7 @@ pub mod el0 {
         ".global kumo_svc_common",
         ".balign 4",
         "kumo_svc_common:",
-        "  sub  sp, sp, #800",
+        "  sub  sp, sp, #{trap_frame_size}",
         "  stp  x0,  x1,  [sp, #0]",
         "  stp  x2,  x3,  [sp, #16]",
         "  stp  x4,  x5,  [sp, #32]",
@@ -2392,7 +2425,7 @@ pub mod el0 {
         "  ldp  x26, x27, [sp, #208]",
         "  ldp  x28, x29, [sp, #224]",
         "  ldr  x30,      [sp, #240]",
-        "  add  sp, sp, #800",
+        "  add  sp, sp, #{trap_frame_size}",
         "  eret",
         "8:", // not SVC: an EL0 fault. Try the kernel's fault hook (contain it to this
         // process); it terminates the thread and never returns. Only if no hook is
@@ -2410,6 +2443,7 @@ pub mod el0 {
         "  mrs  x3, far_el1",
         "  mov  x0, #8",
         "  b    kumo_exception_entry",
+        trap_frame_size = const super::EL0_TRAP_FRAME_SIZE,
     );
 
     /// The saved EL0 register frame `kumo_svc_common` hands to the dispatcher.
@@ -4887,12 +4921,15 @@ mod traps {
         "  mrs x2, elr_el1",
         "  mrs x3, far_el1",
         "  b   kumo_exception_entry",
-        // IRQ entry: save the FULL interrupted state (x0-x30 + ELR + SPSR) on the
-        // current stack, so the timer handler may context-switch to another thread
-        // (which has its own such frame). EOI happens inside `on_irq`, before any
-        // switch. Frame is 272 bytes (16-aligned).
+        // IRQ entry: save the full interrupted state on the current thread's kernel
+        // stack. Saving only x0-x30 + ELR/SPSR is not enough for an EL0 context switch:
+        // SP_EL0 is a per-CPU register, so the next user thread overwrites it and the
+        // preempted thread otherwise resumes on the wrong user stack. FP/SIMD state is
+        // per-CPU too and Rust reached from the handler may use it. Keep this layout in
+        // lockstep with the SVC frame above: 800 bytes, 16-byte aligned.
+        // — KESTREL 2026-07-26
         "kumo_irq_common:",
-        "  sub sp, sp, #272",
+        "  sub sp, sp, #{trap_frame_size}",
         "  stp x0,  x1,  [sp, #0]",
         "  stp x2,  x3,  [sp, #16]",
         "  stp x4,  x5,  [sp, #32]",
@@ -4912,6 +4949,27 @@ mod traps {
         "  mrs x0, elr_el1",
         "  mrs x1, spsr_el1",
         "  stp x0,  x1,  [sp, #248]",
+        "  mrs x0, sp_el0",
+        "  str x0,       [sp, #264]",
+        "  mrs x0, fpsr",
+        "  mrs x1, fpcr",
+        "  stp x0,  x1,  [sp, #272]",
+        "  stp q0,  q1,  [sp, #288]",
+        "  stp q2,  q3,  [sp, #320]",
+        "  stp q4,  q5,  [sp, #352]",
+        "  stp q6,  q7,  [sp, #384]",
+        "  stp q8,  q9,  [sp, #416]",
+        "  stp q10, q11, [sp, #448]",
+        "  stp q12, q13, [sp, #480]",
+        "  stp q14, q15, [sp, #512]",
+        "  stp q16, q17, [sp, #544]",
+        "  stp q18, q19, [sp, #576]",
+        "  stp q20, q21, [sp, #608]",
+        "  stp q22, q23, [sp, #640]",
+        "  stp q24, q25, [sp, #672]",
+        "  stp q26, q27, [sp, #704]",
+        "  stp q28, q29, [sp, #736]",
+        "  stp q30, q31, [sp, #768]",
         "  bl  irq_ack",
         "  cmp x0, #1020",
         "  b.hs 1f",
@@ -4925,6 +4983,27 @@ mod traps {
         "2:",
         "  msr elr_el1, x0",
         "  msr spsr_el1, x1",
+        "  ldr x0,       [sp, #264]",
+        "  msr sp_el0, x0",
+        "  ldp x0,  x1,  [sp, #272]",
+        "  msr fpsr, x0",
+        "  msr fpcr, x1",
+        "  ldp q0,  q1,  [sp, #288]",
+        "  ldp q2,  q3,  [sp, #320]",
+        "  ldp q4,  q5,  [sp, #352]",
+        "  ldp q6,  q7,  [sp, #384]",
+        "  ldp q8,  q9,  [sp, #416]",
+        "  ldp q10, q11, [sp, #448]",
+        "  ldp q12, q13, [sp, #480]",
+        "  ldp q14, q15, [sp, #512]",
+        "  ldp q16, q17, [sp, #544]",
+        "  ldp q18, q19, [sp, #576]",
+        "  ldp q20, q21, [sp, #608]",
+        "  ldp q22, q23, [sp, #640]",
+        "  ldp q24, q25, [sp, #672]",
+        "  ldp q26, q27, [sp, #704]",
+        "  ldp q28, q29, [sp, #736]",
+        "  ldp q30, q31, [sp, #768]",
         "  ldp x0,  x1,  [sp, #0]",
         "  ldp x2,  x3,  [sp, #16]",
         "  ldp x4,  x5,  [sp, #32]",
@@ -4941,8 +5020,9 @@ mod traps {
         "  ldp x26, x27, [sp, #208]",
         "  ldp x28, x29, [sp, #224]",
         "  ldr x30,      [sp, #240]",
-        "  add sp, sp, #272",
+        "  add sp, sp, #{trap_frame_size}",
         "  eret",
+        trap_frame_size = const super::EL0_TRAP_FRAME_SIZE,
     );
 
     extern "C" {
@@ -5109,6 +5189,27 @@ pub fn system_off() {
 
 #[cfg(not(target_os = "none"))]
 pub fn system_off() {}
+
+/// Whether the context this exception interrupted was running at EL0.
+///
+/// `SPSR_EL1` still holds the interrupted PSTATE for as long as the handler takes no further
+/// exception, and `M[3:0] == 0b0000` is EL0t. This is the safety predicate for preemption: a thread
+/// interrupted in **userspace** holds no kernel borrow and no raw pointer into kernel structures,
+/// so switching away from it cannot tear anything. A thread interrupted inside the kernel may hold
+/// both, which is the window J288 named.
+#[cfg(target_os = "none")]
+pub fn interrupted_at_el0() -> bool {
+    let spsr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr, options(nostack, nomem));
+    }
+    spsr & 0xf == 0
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn interrupted_at_el0() -> bool {
+    false
+}
 
 /// Wait until every byte already handed to the console UART has left the wire.
 ///

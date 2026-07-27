@@ -1,4 +1,5 @@
 //j426
+//j493
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -39,6 +40,8 @@ pub const WC_PATH: &str = "bin/wc";
 /// Placeholder Lua REPL — prints a status message and exits. Piccolo is deferred
 /// until vendored for offline builds (DEFERRED/003).
 pub const LUA_REPL_PATH: &str = "bin/lua-repl";
+/// D2: the two-thread / futex proof program.
+pub const THREADS_PATH: &str = "bin/threads";
 pub const AUTOEXEC_PATH: &str = "etc/autoexec";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

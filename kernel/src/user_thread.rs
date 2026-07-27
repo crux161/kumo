@@ -12,6 +12,7 @@
 //j392
 //j393
 //j408
+//j493
 //j422
 //j425
 
@@ -60,6 +61,17 @@ enum WaitTarget {
     Port(KoId),
     Interrupt(KoId),
     DeviceCtx(KoId),
+    /// A futex word, keyed by the address space it lives in and its user virtual address.
+    ///
+    /// Keyed on the *process* rather than a koid because a futex is not a kernel object — it is a
+    /// plain `u32` in userspace, and its identity is where it lives. Two processes with the same
+    /// virtual address are different futexes, which is correct for the private (in-process) form a
+    /// worker pool needs. A shared futex over a VMO would key on the physical address instead; that
+    /// is a later extension and deliberately not this slice.
+    Futex {
+        process: KoId,
+        addr: u64,
+    },
 }
 
 /// One parked thread and the typed object it blocked on.
@@ -110,6 +122,25 @@ impl WaitQueue {
     }
 
     /// Remove any entry for `thread` (woken, exited, or being torn down).
+    /// Fill `out` with the threads parked on `target`, in park order, and return how many.
+    ///
+    /// `waiter_for` returns only the first, which suits a channel (one reader) but not a futex,
+    /// where waking N is the whole operation. Fills a caller slice rather than allocating: this
+    /// runs inside the `SoraState` borrow, where allocating is the hazard j484 was.
+    fn waiters_for(&self, target: WaitTarget, out: &mut [KoId]) -> usize {
+        let mut len = 0;
+        for entry in &self.entries {
+            if len == out.len() {
+                break;
+            }
+            if entry.target == target {
+                out[len] = entry.thread;
+                len += 1;
+            }
+        }
+        len
+    }
+
     fn remove_thread(&mut self, thread: KoId) {
         self.entries.retain(|e| e.thread != thread);
     }
@@ -165,6 +196,9 @@ pub struct UserSched {
     pub started: bool,
     /// Accumulated context-switch count.
     pub switches: u64,
+    runaway_koid: Option<KoId>,
+    runaway_ticks: u32,
+    preempted_runaways: u64,
     /// The user process exit code.
     pub exit_code: u64,
     /// True once the user thread has terminated.
@@ -295,6 +329,9 @@ pub fn init(
             user_wake_pending: false,
             started: false,
             switches: 0,
+            runaway_koid: None,
+            runaway_ticks: 0,
+            preempted_runaways: 0,
             exit_code: 0,
             done: false,
         });
@@ -492,12 +529,12 @@ pub fn spawn_child_async(
     Errno::Ok.status()
 }
 
-/// Install the live Sora/resident-child scheduler tick. Async children can become
-/// runnable from IRQ context (timers and device interrupts), but this hook must not
-/// switch from `kumo_irq_common`: the saved Current-EL frame belongs to the interrupted
-/// context and is restored by the vector epilogue. Timer/device work is paid by
-/// [`pump_idle_floor`] after exception return, or by the next SVC boundary for active EL0.
-/// — KESTREL
+/// Install the live Sora/resident-child scheduler tick.
+///
+/// Ordinary timer/device wakes remain deferred to [`pump_idle_floor`] or the next SVC
+/// boundary. The runaway watchdog is the narrow exception: it may switch only when the
+/// interrupted context was EL0 and the architecture trap frame has preserved the complete
+/// per-thread user state.
 #[cfg(target_os = "none")]
 pub fn install_preemption_hook() {
     kumo_hal::active::set_preempt_hook(preempt_tick);
@@ -683,6 +720,62 @@ pub fn wake_child_waiting_on_device_ctx_fault(ctx_koid: KoId) {
     wake_child_waiting_on(WaitTarget::DeviceCtx(ctx_koid));
 }
 
+/// Largest number of threads one `FutexWake` will release in a single call.
+pub const MAX_FUTEX_WAKE: usize = 32;
+
+pub fn park_current_child_on_futex(process: KoId, addr: u64) {
+    park_current_child_on(WaitTarget::Futex { process, addr });
+}
+
+/// Wake up to `count` threads parked on a futex word; returns how many were woken.
+///
+/// Waking nothing is not an error and is not remembered — a futex is not a counting semaphore, so a
+/// wake that races ahead of its waiter is simply lost. That is why the *caller* must re-check the
+/// word after `FutexWait` returns, and why the value compare lives inside the wait syscall rather
+/// than in userspace.
+pub fn wake_children_waiting_on_futex(process: KoId, addr: u64, count: u32) -> usize {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return 0;
+    }
+    let limit = (count as usize).min(MAX_FUTEX_WAKE);
+    if limit == 0 {
+        return 0;
+    }
+    let target = WaitTarget::Futex { process, addr };
+    let mut woken = [KoId(0); MAX_FUTEX_WAKE];
+
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        let n = s.wait_queue.waiters_for(target, &mut woken[..limit]);
+        let mut released = 0;
+        for waiter in &woken[..n] {
+            let Some(child) = s
+                .children
+                .iter_mut()
+                .find(|c| c.thread.koid() == *waiter)
+                .map(|c| &mut c.thread)
+            else {
+                continue;
+            };
+            if !matches!(child.state(), ThreadState::Blocked) {
+                continue;
+            }
+            s.wait_queue.remove_thread(*waiter);
+            child.ready();
+            s.dispatcher.admit(child.koid(), CHILD_PRIORITY);
+            released += 1;
+        }
+        if released > 0 {
+            // The waker is mid-syscall, so the woken threads are dispatched at its SVC boundary —
+            // the same deterministic resume point the timer/port wakes use.
+            s.safe_reschedule_pending = true;
+        }
+        released
+    }
+}
+
 fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
     matches!(
         target,
@@ -690,13 +783,99 @@ fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
     )
 }
 
+/// Consecutive timer ticks one child may hold the CPU before the scheduler takes it back.
+///
+/// At the current tick rate this is on the order of tens of milliseconds — far beyond any
+/// well-behaved driver's service time, so nothing that works today changes behaviour, and far
+/// below a human's perception, so a runaway program looks like a slow program rather than a dead
+/// machine.
+const RUNAWAY_TICK_BUDGET: u32 = 8;
+
+/// Take the CPU back from a child that will not give it up.
+///
+/// `irq_handoff_allowed` deliberately refuses to switch out of a child's IRQ frame, and that
+/// refusal is why a spinning EL0 child takes the whole machine: Sora never runs, the boot floor
+/// never runs, and nothing is left that could stop it. J288 named the blocker as the missing
+/// full-register save/restore boundary. That boundary now exists — `kumo_irq_common` saves x0-x30,
+/// `ELR_EL1`, `SPSR_EL1`, `SP_EL0`, and FP/SIMD state into a frame on the interrupted thread's
+/// **own** kernel stack, and its epilogue restores all of it — and `on_irq` issues EOI *before*
+/// calling any hook, precisely so a preempting switch cannot leave an interrupt active across
+/// threads.
+///
+/// So this is allowed only under conditions that make the original hazard unreachable:
+///
+/// 1. **the interrupted context was EL0** — a thread in userspace holds no `SoraState` borrow and
+///    no raw pointer into the process table, which is what made switching from a *kernel* frame
+///    unsafe;
+/// 2. **the `SoraState` borrow is free** — belt and braces for (1);
+/// 3. **the current thread is a child**, not Sora and not the idle floor, both of which already
+///    have working paths;
+/// 4. **it has held the CPU for [`RUNAWAY_TICK_BUDGET`] consecutive timer ticks** — this is a
+///    watchdog, not round-robin. A child that yields promptly is never touched, so every path that
+///    works today is untouched by construction.
+///
+/// The child is not killed or stopped: `yield_current` puts it at the tail of its priority FIFO, so
+/// it keeps running in slices while the rest of the system breathes. A runaway program becomes a
+/// slow program instead of a dead machine.
+pub fn preempt_runaway_child_if_safe() {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return;
+    }
+    if !kumo_hal::active::interrupted_at_el0() {
+        return;
+    }
+
+    let p = sched_ptr();
+    let switch = unsafe {
+        let s = &mut *p;
+        if s.done {
+            return;
+        }
+        let Some(current) = s.dispatcher.current() else {
+            return;
+        };
+        if current == s.user_thread.koid() || current == s.idle.koid() {
+            s.runaway_ticks = 0;
+            s.runaway_koid = None;
+            return;
+        }
+        if s.runaway_koid != Some(current) {
+            s.runaway_koid = Some(current);
+            s.runaway_ticks = 0;
+        }
+        s.runaway_ticks = s.runaway_ticks.saturating_add(1);
+        if s.runaway_ticks < RUNAWAY_TICK_BUDGET {
+            return;
+        }
+        // Checked last, and outside the borrow it is testing: if kernel state is busy this tick,
+        // simply try again on the next one rather than forcing an unsafe switch.
+        if !crate::usermode::sora_state_is_free() {
+            return;
+        }
+        s.runaway_ticks = 0;
+        s.preempted_runaways = s.preempted_runaways.saturating_add(1);
+        let decision = s.dispatcher.yield_current();
+        dispatch_context(s, decision)
+    };
+    if let Some((prev, next)) = switch {
+        unsafe { switch_context(prev, next) };
+    }
+}
+
+/// How many times a child has been preempted for monopolising the CPU. A rising count is a
+/// misbehaving program, and it should be visible rather than silently absorbed.
+pub fn preempted_runaways() -> u64 {
+    let p = sched_ptr();
+    unsafe { (&*p).preempted_runaways }
+}
+
 /// IRQ-context handoff gate. A device/timer IRQ can make a resident child or Sora runnable, but
-/// switching context out of `kumo_irq_common` is only safe when the interrupted context is Sora —
-/// the supervisor pump that lent the child its resident slot. Switching from a driver child's frame
-/// is the J288 corruption window; a child made runnable waits for its own SVC/park boundary, and the
-/// idle floor is paid by [`pump_idle_floor`] after `eret`. Restored from the SANITARY
-/// IRQ/scheduler-invariant reference after the j422 over-defer stranded the Sora-context wake and
-/// halted keypress serving once input was mid-flight. — CORVUS
+/// ordinary device-wake handoff is permitted only when the interrupted context is Sora — the
+/// supervisor pump that lent the child its resident slot. Active children keep deterministic
+/// device-delivery ordering by paying the wake at their next SVC/park boundary; the separate
+/// runaway watchdog has its own EL0/full-frame safety gate. The idle floor is paid by
+/// [`pump_idle_floor`] after `eret`.
 fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
     let _ = idle;
     current == user
@@ -1035,6 +1214,92 @@ mod tests {
         assert_eq!(q.waiter_for(WaitTarget::Channel(KoId(1))), None);
         assert_eq!(q.waiter_for(WaitTarget::Port(KoId(2))), Some(KoId(7)));
         assert_eq!(q.entries.len(), 1);
+    }
+
+    #[test]
+    fn futex_waiters_are_keyed_by_address_space_and_address() {
+        let mut q = WaitQueue::new();
+        let a = WaitTarget::Futex {
+            process: KoId(1),
+            addr: 0x1000,
+        };
+        // Same address, different process: a different futex. The private form must not alias.
+        let b = WaitTarget::Futex {
+            process: KoId(2),
+            addr: 0x1000,
+        };
+        // Same process, different address: also different.
+        let c = WaitTarget::Futex {
+            process: KoId(1),
+            addr: 0x1008,
+        };
+        q.park(KoId(10), a);
+        q.park(KoId(11), b);
+        q.park(KoId(12), c);
+
+        let mut out = [KoId(0); 4];
+        assert_eq!(q.waiters_for(a, &mut out), 1);
+        assert_eq!(out[0], KoId(10));
+        assert_eq!(q.waiters_for(b, &mut out), 1);
+        assert_eq!(out[0], KoId(11));
+        assert_eq!(q.waiters_for(c, &mut out), 1);
+        assert_eq!(out[0], KoId(12));
+    }
+
+    #[test]
+    fn waiters_are_returned_in_park_order_and_bounded_by_the_caller_slice() {
+        let mut q = WaitQueue::new();
+        let target = WaitTarget::Futex {
+            process: KoId(1),
+            addr: 0x2000,
+        };
+        for id in 20..25 {
+            q.park(KoId(id), target);
+        }
+        let mut all = [KoId(0); 8];
+        assert_eq!(q.waiters_for(target, &mut all), 5);
+        assert_eq!(
+            &all[..5],
+            &[KoId(20), KoId(21), KoId(22), KoId(23), KoId(24)]
+        );
+
+        // Waking two must take the two that have waited longest, not an arbitrary pair.
+        let mut two = [KoId(0); 2];
+        assert_eq!(q.waiters_for(target, &mut two), 2);
+        assert_eq!(two, [KoId(20), KoId(21)]);
+    }
+
+    #[test]
+    fn a_wake_with_no_waiters_finds_nothing_and_is_not_remembered() {
+        // A futex is not a counting semaphore: a wake that races ahead of its waiter is lost, which
+        // is exactly why the caller must re-check the word after `FutexWait` returns.
+        let q = WaitQueue::new();
+        let mut out = [KoId(0); 4];
+        assert_eq!(
+            q.waiters_for(
+                WaitTarget::Futex {
+                    process: KoId(1),
+                    addr: 0x3000
+                },
+                &mut out
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_dying_thread_leaves_no_futex_entry_behind() {
+        let mut q = WaitQueue::new();
+        let target = WaitTarget::Futex {
+            process: KoId(1),
+            addr: 0x4000,
+        };
+        q.park(KoId(30), target);
+        q.park(KoId(31), target);
+        q.remove_thread(KoId(30));
+        let mut out = [KoId(0); 4];
+        assert_eq!(q.waiters_for(target, &mut out), 1);
+        assert_eq!(out[0], KoId(31));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j476
 //j478
 //j479
 //j482
 //j483
+//j493
 
 extern crate alloc;
 
@@ -952,6 +952,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             uptime_ns: 0,
             preempt_ticks: 0,
             preempt_switches: 0,
+            preempted_runaways: 0,
         };
         let mut sysrq_out = bootstrap::console::Writer;
         klog!("\nKUMO MUREX core Stage-A serial shell. Type 'help'.\n");

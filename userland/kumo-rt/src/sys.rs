@@ -1,3 +1,5 @@
+//j493
+
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
 /// Execute a raw syscall: `x8` = number, `x0`-`x3` = args, returns `x0`.
@@ -224,6 +226,40 @@ pub fn channel_write_with_handle(
     _handle: Handle,
 ) -> Status {
     kumo_abi::Errno::NotSupported.status()
+}
+
+/// Sleep until woken, but only if `*addr` still equals `expected`.
+///
+/// Returns `Ok` when a [`futex_wake`] released this thread, and `ShouldWait` when the word had
+/// already changed and no sleep happened. Callers must treat a return as a *hint* and re-check
+/// their own condition — a futex remembers nothing, so the loop is the contract:
+///
+/// ```ignore
+/// while state.load(Acquire) != WANTED {
+///     futex_wait(state.as_ptr(), OBSERVED);
+/// }
+/// ```
+#[cfg(target_arch = "aarch64")]
+pub fn futex_wait(addr: *const u32, expected: u32) -> Status {
+    syscall(Syscall::FutexWait, addr as u64, u64::from(expected), 0, 0) as Status
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn futex_wait(_addr: *const u32, _expected: u32) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
+/// Wake up to `count` threads parked on `addr`. Returns how many were woken — waking none is
+/// normal, not an error: it means nobody had arrived yet, and that waiter will find the updated
+/// word instead of sleeping.
+#[cfg(target_arch = "aarch64")]
+pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    syscall(Syscall::FutexWake, addr as u64, u64::from(count), 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn futex_wake(_addr: *const u32, _count: u32) -> u64 {
+    0
 }
 
 #[cfg(target_arch = "aarch64")]
