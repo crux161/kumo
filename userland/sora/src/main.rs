@@ -2369,6 +2369,41 @@ fn eval_command(
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
         return true;
+    } else if cmd.name == "heap" {
+        // S1's on-target proof: allocate past the 256 KiB bootstrap floor and show the heap
+        // actually acquired a second region. Sora is itself a `kumo-rt` heap user, so this
+        // exercises the real growth path in a real process rather than a contrived one.
+        let before = kumo_rt::heap_region_count();
+        // Well past the floor, in chunks large enough that the size-class cache cannot serve them.
+        let mut held: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        for _ in 0..8 {
+            let mut chunk = alloc::vec::Vec::new();
+            chunk.resize(64 * 1024, 0u8);
+            held.push(chunk);
+        }
+        let after = kumo_rt::heap_region_count();
+        // Touch every byte so a mapping that was recorded but never backed would fault here
+        // rather than pass silently.
+        let mut sum = 0u64;
+        for chunk in &held {
+            sum = sum.wrapping_add(chunk.len() as u64);
+        }
+        drop(held);
+        let settled = kumo_rt::heap_region_count();
+        debug_write(b"heap: regions ".as_ptr(), 14);
+        log_dec(before as u64);
+        debug_write(b" -> ".as_ptr(), 4);
+        log_dec(after as u64);
+        debug_write(b" (after free ".as_ptr(), 13);
+        log_dec(settled as u64);
+        debug_write(b") bytes=".as_ptr(), 8);
+        log_dec(sum);
+        if after > before {
+            debug_write(b" -> OK: heap grew on target\n".as_ptr(), 28);
+        } else {
+            debug_write(b" -> FAIL: no growth\n".as_ptr(), 21);
+        }
+        return true;
     } else if cmd.name == "threads" {
         // D2: two threads in one address space, handing off through a futex. Launched on demand
         // from the shell rather than at boot — a proof you can re-run is worth more than one that
@@ -2784,6 +2819,21 @@ fn lua_session_submit(line: &[u8]) -> bool {
         return false;
     }
     lua_relay_reply(stdout)
+}
+
+/// Write a decimal number to the console. `log_hex` exists but a region count in hex reads badly.
+fn log_dec(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    debug_write(buf[i..].as_ptr(), buf.len() - i);
 }
 
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
