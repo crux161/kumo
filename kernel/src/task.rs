@@ -120,6 +120,50 @@ impl Process {
                 .is_some_and(|(stack_start, stack_len)| overlaps(stack_start, stack_len))
     }
 
+    /// Find a free, page-aligned span of `len` bytes inside this process's root VMAR.
+    ///
+    /// The kernel places heap growth because it is the only party that can. `kumo-rt` cannot pick a
+    /// base: a child's VMAR is 512 MiB from 0 and already carries its image, its stacks and any
+    /// device mappings, while Sora's is 2 GiB from a different base — there is no constant that is
+    /// safe in both, which is exactly why the previous sub-slice declined to guess one.
+    ///
+    /// Searches upward from the highest existing mapping so growth lands away from the image and
+    /// stacks rather than in the gaps between them; a gap large enough for one growth is usually a
+    /// gap somebody else is about to want. Skips the first page so a null dereference stays a
+    /// fault, and never returns a span touching the user stack.
+    pub fn find_free_span(&self, len: u64, align: u64) -> Option<u64> {
+        if len == 0 || align == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let vmar_base = self.root_vmar.base();
+        let vmar_end = vmar_base.checked_add(self.root_vmar.len())?;
+
+        // Never hand out the first page of the address space: a null pointer must keep faulting.
+        let floor = vmar_base.max(align);
+        let mut candidate = floor;
+        for (mapping, _) in &self.mappings {
+            let end = mapping.virt.checked_add(mapping.len)?;
+            candidate = candidate.max(end);
+        }
+        if let Some((stack_start, stack_len)) = self.user_stack {
+            candidate = candidate.max(stack_start.checked_add(stack_len)?);
+        }
+
+        // Round up, then walk forward past anything the scan above did not dominate.
+        let mask = align - 1;
+        candidate = candidate.checked_add(mask)? & !mask;
+        while candidate
+            .checked_add(len)
+            .is_some_and(|end| end <= vmar_end)
+        {
+            if self.user_range_is_free(candidate, len) {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_add(align)?;
+        }
+        None
+    }
+
     pub fn set_user_stack(&mut self, start: u64, len: u64) {
         self.user_stack = Some((start, len));
     }
@@ -409,6 +453,91 @@ mod tests {
         assert!(!process.user_range_is_free(base + PAGE_SIZE, PAGE_SIZE));
         assert!(!process.user_range_is_free(base + PAGE_SIZE * 7, PAGE_SIZE * 2));
         assert!(process.user_range_is_free(base + PAGE_SIZE * 3, PAGE_SIZE));
+    }
+
+    #[test]
+    fn placement_lands_above_every_existing_mapping_and_the_stack() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let base = test_vmar().base();
+        process.add_mapping(
+            Mapping {
+                virt: base,
+                len: PAGE_SIZE * 2,
+                vmo_offset: 0,
+                flags: PageFlags::READ,
+            },
+            KoId(99),
+        );
+        process.set_user_stack(base + PAGE_SIZE * 8, PAGE_SIZE * 4);
+
+        // Above the stack (the highest claim), not in the gap between the image and the stack —
+        // a gap big enough for one growth is a gap something else is about to want.
+        let span = process.find_free_span(PAGE_SIZE, PAGE_SIZE).expect("span");
+        assert_eq!(span, base + PAGE_SIZE * 12);
+        assert!(process.user_range_is_free(span, PAGE_SIZE));
+    }
+
+    #[test]
+    fn placement_never_returns_the_first_page() {
+        // A VMAR based at 0 (every child has one) must still keep a null dereference faulting.
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let process = Process::new(
+            &mut objects,
+            &root,
+            Vmar::new(0, PAGE_SIZE * 16).expect("vmar"),
+        );
+        let span = process.find_free_span(PAGE_SIZE, PAGE_SIZE).expect("span");
+        assert!(span >= PAGE_SIZE, "handed out the null page: {span:#x}");
+    }
+
+    #[test]
+    fn placement_refuses_when_the_vmar_cannot_hold_the_request() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let process = Process::new(
+            &mut objects,
+            &root,
+            Vmar::new(PAGE_SIZE, PAGE_SIZE * 4).expect("vmar"),
+        );
+        // Larger than the whole VMAR: no span, rather than an out-of-range address.
+        assert_eq!(process.find_free_span(PAGE_SIZE * 8, PAGE_SIZE), None);
+        // And a zero-length or non-power-of-two alignment is a caller bug, not a placement.
+        assert_eq!(process.find_free_span(0, PAGE_SIZE), None);
+        assert_eq!(process.find_free_span(PAGE_SIZE, 3), None);
+    }
+
+    #[test]
+    fn repeated_placements_do_not_overlap_each_other() {
+        // The growth path calls this once per new region; two regions sharing an address would
+        // corrupt the heap in a way that looks like anything but placement.
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let mut previous: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+        for i in 0..4 {
+            let span = process
+                .find_free_span(PAGE_SIZE * 2, PAGE_SIZE)
+                .expect("span");
+            for (start, len) in &previous {
+                assert!(
+                    span >= start + len || span + PAGE_SIZE * 2 <= *start,
+                    "placement {i} at {span:#x} overlaps {start:#x}"
+                );
+            }
+            process.add_mapping(
+                Mapping {
+                    virt: span,
+                    len: PAGE_SIZE * 2,
+                    vmo_offset: 0,
+                    flags: PageFlags::READ | PageFlags::WRITE,
+                },
+                KoId(100 + i),
+            );
+            previous.push((span, PAGE_SIZE * 2));
+        }
     }
 
     #[test]

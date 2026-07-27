@@ -227,6 +227,12 @@ pub enum KernelCallResult {
         handle: Handle,
         value: u64,
     },
+    /// A status plus a scalar in the secondary register — used by `VmarMap` to report the address
+    /// the kernel chose when the caller passed `virt == 0`.
+    StatusAndValue {
+        status: Status,
+        value: u64,
+    },
     Message(KernelMessage),
     PortPacket(PortPacket),
 }
@@ -1431,6 +1437,20 @@ impl SyscallEngine {
                 };
                 if process_handle == kumo_abi::INVALID_HANDLE {
                     // Self-map: map into the calling process's own VMAR.
+                    //
+                    // `virt == 0` asks the kernel to place the mapping. Userland cannot choose a
+                    // base safely — a child's VMAR is 512 MiB from 0 carrying its image, stacks and
+                    // device maps, Sora's is 2 GiB from another base — and the kernel is the only
+                    // party that knows every existing mapping. Address 0 is a safe sentinel because
+                    // the first page is never handed out: a null dereference must keep faulting.
+                    let virt = if virt == 0 {
+                        match process.find_free_span(len, crate::mm::PAGE_SIZE) {
+                            Some(chosen) => chosen,
+                            None => return KernelCallResult::Status(Errno::NoMemory.status()),
+                        }
+                    } else {
+                        virt
+                    };
                     let status = match process.root_vmar().map(vmo, vmo_offset, virt, len, flags) {
                         Ok(mapping) => {
                             if !process.user_range_is_free(mapping.virt, mapping.len) {
@@ -1466,7 +1486,12 @@ impl SyscallEngine {
                         }
                         Err(_) => Errno::InvalidArgs.status(),
                     };
-                    return KernelCallResult::Status(status);
+                    // The caller needs the address when it asked the kernel to choose, so report it
+                    // alongside the status rather than making userland guess or re-query.
+                    return KernelCallResult::StatusAndValue {
+                        status,
+                        value: virt,
+                    };
                 }
 
                 // Target-child: map into a different process's VMAR.

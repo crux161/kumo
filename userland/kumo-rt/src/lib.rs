@@ -62,6 +62,13 @@ macro_rules! entry {
 #[global_allocator]
 static ALLOC: heap::KumoHeap = heap::KumoHeap::empty();
 
+/// How many regions back this process's heap. `1` is the bootstrap floor alone; anything more means
+/// the growth path ran, which is the only thing that distinguishes a heap that *can* grow from one
+/// that merely says so.
+pub fn heap_region_count() -> usize {
+    ALLOC.region_count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

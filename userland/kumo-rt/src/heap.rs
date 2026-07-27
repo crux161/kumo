@@ -18,12 +18,13 @@
 //! cap without any target syscalls. The source carries its own state, so parallel tests do
 //! not share a growth budget.
 //!
-//! On the freestanding target, growth beyond the floor is **not yet wired** (the
-//! [`TargetRegionSource`] returns `None`): it needs a per-process heap-growth VA window, and
-//! there is no single safe hardcoded base (Sora's root VMAR is 2 GiB from 0x0020_0000; child
-//! VMARs are 512 MiB from 0 and already carry framebuffer/bootinfo maps). That window is
-//! designed in the next S1 sub-slice rather than guessed here. Until then the raised floor
-//! is the ceiling.
+//! On the freestanding target, growth is **wired**: [`TargetRegionSource`] creates a VMO and maps
+//! it with `virt == 0`, which asks the **kernel** to place it. That is the answer to the question
+//! this comment used to leave open — there is no single safe hardcoded base (Sora's root VMAR is
+//! 2 GiB from 0x0020_0000; child VMARs are 512 MiB from 0 and already carry image, stacks and
+//! device maps), and the kernel is the only party that knows every existing mapping. So it picks,
+//! and reports the address back. The first page is never handed out, which is what makes 0 a safe
+//! "you choose" sentinel.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -176,8 +177,7 @@ impl<S: RegionSource> MultiRegionHeap<S> {
         debug_assert!(false, "dealloc of pointer owned by no heap region");
     }
 
-    /// Number of admitted regions (floor + grown). Test/observability only.
-    #[cfg(test)]
+    /// Number of admitted regions (floor + grown).
     fn region_count(&self) -> usize {
         self.count
     }
@@ -314,8 +314,8 @@ impl<S: RegionSource> HeapCore<S> {
         self.classes[index].len
     }
 
-    /// Number of backing regions (floor + grown). Test/observability only.
-    #[cfg(test)]
+    /// Number of backing regions (floor + grown). The one observable that distinguishes a heap
+    /// which *can* grow from one that only claims to, so it is available on target too.
     fn region_count(&self) -> usize {
         self.backing.region_count()
     }
@@ -389,8 +389,28 @@ mod sync {
 struct TargetRegionSource;
 
 impl RegionSource for TargetRegionSource {
-    fn grow(&mut self, _min: usize) -> Option<(*mut u8, usize)> {
-        None
+    fn grow(&mut self, min: usize) -> Option<(*mut u8, usize)> {
+        // Round the request up to whole pages and to a sensible minimum: one syscall pair per
+        // allocation would make growth cost more than the allocation it serves.
+        const PAGE: usize = 4096;
+        const GROWTH_MIN: usize = 256 * 1024;
+        let want = min.max(GROWTH_MIN).checked_add(PAGE - 1)? & !(PAGE - 1);
+
+        let vmo = crate::sys::vmo_create(want as u64);
+        if vmo == u64::MAX || vmo == 0 {
+            return None;
+        }
+        // The kernel chooses the address: this process cannot know what is already mapped in its
+        // own VMAR, and the previous sub-slice declined — correctly — to hardcode a base.
+        let (status, addr) = crate::sys::vmar_map_anywhere(
+            kumo_abi::Handle(vmo as u32),
+            want as u64,
+            (kumo_abi::VmarFlags::READ | kumo_abi::VmarFlags::WRITE).0,
+        );
+        if status != 0 || addr == 0 {
+            return None;
+        }
+        Some((addr as *mut u8, want))
     }
 }
 
@@ -413,6 +433,14 @@ impl KumoHeap {
             initialized: AtomicBool::new(false),
             lock: sync::SpinLock::new(),
         }
+    }
+
+    /// How many regions back this heap: 1 is the bootstrap floor alone, more means growth
+    /// actually happened. The only observable proof that the target growth path ran.
+    pub fn region_count(&self) -> usize {
+        self.ensure_init();
+        let _guard = self.lock.lock();
+        unsafe { (*self.inner.get()).region_count() }
     }
 
     fn ensure_init(&self) {

@@ -1384,6 +1384,13 @@ fn dispatch_object_syscall(
                 flags,
             },
         ) {
+            // Two-register return: x0 = status, x1 = the mapped address. x1 is only meaningful when
+            // the caller asked the kernel to place the mapping, and is the address it passed
+            // otherwise, so a caller that ignores it is unaffected.
+            KernelCallResult::StatusAndValue { status, value } => {
+                r[0] = status as u32 as u64;
+                r[1] = value;
+            }
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }

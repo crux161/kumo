@@ -527,6 +527,40 @@ pub fn vmar_map(
     )
 }
 
+/// Map `vmo` into this process at an address the **kernel** chooses. Returns `(status, addr)`.
+///
+/// Userland cannot pick a base safely: a child's VMAR is 512 MiB from 0 already carrying its image,
+/// its stacks and any device mappings, while Sora's is 2 GiB from a different base — no constant is
+/// correct in both. The kernel knows every existing mapping, so it places this and reports where.
+/// Address 0 is the "you choose" sentinel precisely because the first page is never handed out.
+#[cfg(target_arch = "aarch64")]
+pub fn vmar_map_anywhere(vmo: Handle, len: u64, flags: u64) -> (u64, u64) {
+    let status: u64;
+    let addr: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::VmarMap as u64,
+            in("x0") 0u64,           // process: self
+            in("x1") vmo.0 as u64,
+            in("x2") 0u64,           // vmo_offset
+            in("x3") 0u64,           // virt: 0 asks the kernel to place it
+            in("x4") len,
+            in("x5") flags,
+            lateout("x0") status,
+            lateout("x1") addr,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, addr)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmar_map_anywhere(_vmo: Handle, _len: u64, _flags: u64) -> (u64, u64) {
+    (u64::MAX, 0)
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 pub fn vmar_map(
     _process: Handle,
