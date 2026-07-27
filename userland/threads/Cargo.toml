@@ -1,4 +1,5 @@
 #j493
+#j495
 
 [package]
 name = "threads"
@@ -8,6 +9,7 @@ license.workspace = true
 version.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
+kumo-dispatch = { path = "../kumo-dispatch" }
 kumo-rt = { path = "../kumo-rt" }
 kumo-abi.workspace = true
 

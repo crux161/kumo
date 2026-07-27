@@ -1,0 +1,11 @@
+#j495
+
+[package]
+name = "kumo-dispatch"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-rt = { path = "../kumo-rt" }

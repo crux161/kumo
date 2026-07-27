@@ -2,8 +2,9 @@
 #![no_main]
 //j493
 //j494
+//j495
 
-//! `threads` — the D2/D3 proof: futex handoff, then timer-sliced compute peers.
+//! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then a serial work queue.
 //!
 //! Run it from the shell with `threads`. Sora loads this one ELF, maps it once, gives each thread
 //! its **own** stack, and starts two residents in the same process — so both threads execute the
@@ -30,8 +31,13 @@
 //! work and how many distinct peer runs it observed. The last thread reports both counters and
 //! rejects a ratio worse than 2:1, proving the live timer path schedules equal-priority peers
 //! fairly instead of waiting for a syscall or voluntary yield.
+//!
+//! Finally, thread 0 submits three asynchronous jobs and one synchronous job to an in-process
+//! serial queue while thread 1 is its sole worker. FIFO output `1234` plus the synchronous result
+//! proves callers submit work to a queue rather than coordinating the worker thread directly.
 
 use kumo_abi::Handle;
+use kumo_dispatch::SerialQueue;
 use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
 
 extern crate alloc;
@@ -78,9 +84,28 @@ static COMPUTE_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// Requiring several observed peer runs proves repeated timer handoff, not just one lucky switch.
 const FAIR_EPOCHS: u32 = 8;
 
+/// D4a's one in-process serial queue: four bounded slots and one claimed worker.
+static SERIAL_QUEUE: SerialQueue<4> = SerialQueue::new();
+
+/// Decimal digits appended by the serial worker; `1234` proves FIFO execution.
+static SERIAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Producer sets this only after validating and reporting; the worker waits before exiting.
+static DISPATCH_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
 const CANARY: usize = 64;
+
+fn record_serial_digit(digit: usize) -> usize {
+    let digit = digit as u32;
+    let _ = SERIAL_LOG.fetch_update(
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+        |old| Some(old.saturating_mul(10).saturating_add(digit)),
+    );
+    digit as usize * 10
+}
 
 fn emit(stdout: Handle, bytes: &[u8]) {
     if bytes.is_empty() {
@@ -242,6 +267,57 @@ extern "C" fn main(
                 b" -> FAIL: unfair compute progress\n"
             },
         );
+    }
+
+    // D4a: the caller knows only the queue; the sole worker owns execution. The worker parks on
+    // the empty queue, and submit_sync parks the producer until job 4 publishes its result.
+    // — KESTREL 2026-07-26
+    if me == 1 {
+        let worker = match SERIAL_QUEUE.worker() {
+            Ok(worker) => worker,
+            Err(_) => process_exit(1),
+        };
+        worker.run_n(4);
+        loop {
+            let observed = DISPATCH_DONE.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(DISPATCH_DONE.as_ptr(), observed);
+        }
+    } else {
+        let mut failures = 0u32;
+        for digit in 1..=3 {
+            if SERIAL_QUEUE
+                .submit_async(record_serial_digit, digit)
+                .is_err()
+            {
+                failures += 1;
+            }
+        }
+        let sync_result = match SERIAL_QUEUE.submit_sync(record_serial_digit, 4) {
+            Ok(result) => result as u32,
+            Err(_) => {
+                failures += 1;
+                0
+            }
+        };
+        let log = SERIAL_LOG.load(core::sync::atomic::Ordering::Acquire);
+        let passed = failures == 0 && log == 1234 && sync_result == 40 && SERIAL_QUEUE.is_empty();
+        emit(stdout, b"threads: serial async log=");
+        emit_u32(stdout, log);
+        emit(stdout, b" sync=");
+        emit_u32(stdout, sync_result);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: FIFO queue and synchronous completion\n"
+            } else {
+                b" -> FAIL: serial queue\n"
+            },
+        );
+        DISPATCH_DONE.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(DISPATCH_DONE.as_ptr(), 1);
     }
 
     process_exit(0)
