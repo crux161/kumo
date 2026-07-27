@@ -933,3 +933,285 @@ mod tests {
         assert!(queue.is_empty());
     }
 }
+
+// ---- deferred submission -------------------------------------------------------------------
+//
+// D4e, the last of the composition set `PLAN/011` named. `Once`, `Group` and `Semaphore` gate work
+// against *other work*; this one gates it against *time*, which is the only kind of readiness the
+// other three cannot express.
+
+/// One registered job and the monotonic instant it becomes runnable.
+#[derive(Clone, Copy)]
+struct TimedWork {
+    due_ns: u64,
+    work: Work,
+}
+
+/// The pure part of [`Timeline`]: bounded storage plus earliest-deadline selection.
+///
+/// Kept free of atomics and syscalls so the ordering rules — which is where deferred work goes
+/// wrong — are decided by host tests rather than by a board.
+struct TimelineState<const N: usize> {
+    slots: [MaybeUninit<TimedWork>; N],
+    len: usize,
+}
+
+impl<const N: usize> TimelineState<N> {
+    const fn new() -> Self {
+        Self {
+            slots: [MaybeUninit::uninit(); N],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, entry: TimedWork) -> Result<(), SubmitError> {
+        if self.len == N || N == 0 {
+            return Err(SubmitError::Full);
+        }
+        self.slots[self.len] = MaybeUninit::new(entry);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Index of the earliest deadline, or `None` when empty. Ties go to the earlier submission,
+    /// which keeps two jobs due at the same instant in FIFO order.
+    fn earliest(&self) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for i in 0..self.len {
+            let due = unsafe { self.slots[i].assume_init_ref() }.due_ns;
+            if best.map(|(_, b)| due < b).unwrap_or(true) {
+                best = Some((i, due));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.earliest()
+            .map(|i| unsafe { self.slots[i].assume_init_ref() }.due_ns)
+    }
+
+    /// Remove and return the earliest entry if it is due at `now_ns`.
+    fn take_due(&mut self, now_ns: u64) -> Option<TimedWork> {
+        let index = self.earliest()?;
+        let entry = unsafe { self.slots[index].assume_init_read() };
+        if entry.due_ns > now_ns {
+            return None;
+        }
+        // Shift down rather than swapping the last entry into the hole. Insertion order is the
+        // tiebreak for equal deadlines, so this array is a *sequence*, not a set: swapping is O(1)
+        // but reorders the survivors, and two jobs registered for the same instant would then run
+        // in an order nobody chose. N is small and bounded; the shift costs nothing that matters.
+        self.len -= 1;
+        for i in index..self.len {
+            self.slots[i] = MaybeUninit::new(unsafe { self.slots[i + 1].assume_init_read() });
+        }
+        Some(entry)
+    }
+}
+
+/// A bounded set of jobs that become runnable at a monotonic deadline.
+///
+/// GCD's `dispatch_after`. Submission never blocks: the caller registers work and walks away, and a
+/// worker runs it once its deadline passes. Deadlines are absolute and computed **once**, at
+/// submission, from the caller's clock reading — so a later, slower clock read cannot drag a job
+/// forward or push it back.
+pub struct Timeline<const N: usize> {
+    gate: AtomicBool,
+    state: UnsafeCell<TimelineState<N>>,
+    sequence: AtomicU32,
+}
+
+// The gate serializes every state access; work executes after the borrow and guard are gone.
+unsafe impl<const N: usize> Send for Timeline<N> {}
+unsafe impl<const N: usize> Sync for Timeline<N> {}
+
+impl<const N: usize> Timeline<N> {
+    pub const fn new() -> Self {
+        Self {
+            gate: AtomicBool::new(false),
+            state: UnsafeCell::new(TimelineState::new()),
+            sequence: AtomicU32::new(0),
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    pub fn len(&self) -> usize {
+        self.with_state(|state| state.len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Register `function` to become runnable `delay_ns` after `now_ns`. Returns immediately.
+    ///
+    /// The deadline saturates: an enormous delay means *never*, not — through a wrapped `u64` —
+    /// *immediately*, which is the failure that turns a long timeout into a busy loop.
+    pub fn submit_after(
+        &self,
+        now_ns: u64,
+        delay_ns: u64,
+        function: WorkFn,
+        context: usize,
+    ) -> Result<(), SubmitError> {
+        let entry = TimedWork {
+            due_ns: now_ns.saturating_add(delay_ns),
+            work: Work {
+                function,
+                context,
+                completion: core::ptr::null(),
+            },
+        };
+        self.with_state(|state| state.push(entry))?;
+        self.sequence.fetch_add(1, Ordering::Release);
+        wake_word(self.sequence.as_ptr());
+        Ok(())
+    }
+
+    /// The earliest pending deadline, for a worker deciding how long to sleep.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.with_state(|state| state.next_deadline())
+    }
+
+    /// Run one job whose deadline has passed, earliest first.
+    ///
+    /// `None` means nothing is due *yet* — which is not the same as nothing being pending, so a
+    /// worker must consult [`next_deadline`](Self::next_deadline) before concluding it is idle.
+    pub fn try_run_due(&self, now_ns: u64) -> Option<usize> {
+        let entry = self.with_state(|state| state.take_due(now_ns))?;
+        Some(execute(entry.work))
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&mut TimelineState<N>) -> R) -> R {
+        while self
+            .gate
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        let _guard = GateGuard { gate: &self.gate };
+        f(unsafe { &mut *self.state.get() })
+    }
+}
+
+impl<const N: usize> Default for Timeline<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::{SubmitError, Timeline};
+    extern crate std;
+
+    std::thread_local! {
+        static ORDER: std::cell::RefCell<std::vec::Vec<usize>> =
+            std::cell::RefCell::new(std::vec::Vec::new());
+    }
+
+    fn note(context: usize) -> usize {
+        ORDER.with(|o| o.borrow_mut().push(context));
+        context
+    }
+
+    fn drain_order() -> std::vec::Vec<usize> {
+        ORDER.with(|o| core::mem::take(&mut *o.borrow_mut()))
+    }
+
+    #[test]
+    fn deferred_work_runs_in_deadline_order_not_submission_order() {
+        let _ = drain_order();
+        let timeline: Timeline<4> = Timeline::new();
+        // Submitted 3, 1, 2 — due 30, 10, 20. Ordered by time, not by arrival.
+        timeline.submit_after(0, 30, note, 3).unwrap();
+        timeline.submit_after(0, 10, note, 1).unwrap();
+        timeline.submit_after(0, 20, note, 2).unwrap();
+        for _ in 0..3 {
+            assert!(timeline.try_run_due(100).is_some());
+        }
+        assert_eq!(drain_order(), std::vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn nothing_runs_before_its_deadline_and_it_runs_at_it() {
+        let _ = drain_order();
+        let timeline: Timeline<2> = Timeline::new();
+        timeline.submit_after(100, 50, note, 7).unwrap();
+        // One nanosecond early is still early — and must not consume the job.
+        assert!(timeline.try_run_due(149).is_none());
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.try_run_due(150), Some(7));
+        assert!(timeline.is_empty());
+        assert_eq!(drain_order(), std::vec![7]);
+    }
+
+    #[test]
+    fn an_enormous_delay_means_never_rather_than_immediately() {
+        // The wrap this guards against turns a long timeout into a busy loop: the deadline lands
+        // in the past, so the job is due at once and stays due.
+        let timeline: Timeline<1> = Timeline::new();
+        timeline
+            .submit_after(u64::MAX - 5, u64::MAX, note, 1)
+            .unwrap();
+        assert_eq!(timeline.next_deadline(), Some(u64::MAX));
+        assert!(timeline.try_run_due(u64::MAX - 1).is_none());
+    }
+
+    #[test]
+    fn next_deadline_reports_the_earliest_and_tracks_removal() {
+        let timeline: Timeline<4> = Timeline::new();
+        assert_eq!(timeline.next_deadline(), None);
+        timeline.submit_after(0, 40, note, 4).unwrap();
+        timeline.submit_after(0, 10, note, 1).unwrap();
+        timeline.submit_after(0, 25, note, 2).unwrap();
+        assert_eq!(timeline.next_deadline(), Some(10));
+        timeline.try_run_due(10).unwrap();
+        assert_eq!(timeline.next_deadline(), Some(25));
+        timeline.try_run_due(25).unwrap();
+        assert_eq!(timeline.next_deadline(), Some(40));
+    }
+
+    #[test]
+    fn removing_the_earliest_leaves_every_other_entry_intact() {
+        // Compaction moves the last slot into the hole; a bug there silently drops or duplicates
+        // work, so run the whole set and check what actually came out.
+        let _ = drain_order();
+        let timeline: Timeline<4> = Timeline::new();
+        for (delay, ctx) in [(40, 4), (10, 1), (30, 3), (20, 2)] {
+            timeline.submit_after(0, delay, note, ctx).unwrap();
+        }
+        for _ in 0..4 {
+            assert!(timeline.try_run_due(1000).is_some());
+        }
+        assert_eq!(drain_order(), std::vec![1, 2, 3, 4]);
+        assert!(timeline.is_empty());
+    }
+
+    #[test]
+    fn a_full_timeline_rejects_rather_than_overwrites() {
+        let timeline: Timeline<2> = Timeline::new();
+        timeline.submit_after(0, 1, note, 1).unwrap();
+        timeline.submit_after(0, 2, note, 2).unwrap();
+        assert_eq!(timeline.submit_after(0, 3, note, 3), Err(SubmitError::Full));
+        assert_eq!(timeline.len(), 2);
+    }
+
+    #[test]
+    fn equal_deadlines_keep_submission_order() {
+        let _ = drain_order();
+        let timeline: Timeline<3> = Timeline::new();
+        timeline.submit_after(0, 5, note, 1).unwrap();
+        timeline.submit_after(0, 5, note, 2).unwrap();
+        timeline.submit_after(0, 5, note, 3).unwrap();
+        for _ in 0..3 {
+            timeline.try_run_due(5).unwrap();
+        }
+        assert_eq!(drain_order(), std::vec![1, 2, 3]);
+    }
+}

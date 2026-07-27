@@ -44,8 +44,10 @@
 //! The last waiter consumes one retained semaphore permit from its peer.
 
 use kumo_abi::Handle;
-use kumo_dispatch::{ConcurrentQueue, Group, Once, Semaphore, SerialQueue};
-use kumo_rt::{channel_write, debug_write, futex_wait, futex_wake, process_exit, startup};
+use kumo_dispatch::{ConcurrentQueue, Group, Once, Semaphore, SerialQueue, Timeline};
+use kumo_rt::{
+    channel_write, clock_get, debug_write, futex_wait, futex_wake, process_exit, sleep_ns, startup,
+};
 
 extern crate alloc;
 
@@ -178,6 +180,12 @@ static GROUP_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 static GROUP_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// D4f's initially empty counting semaphore.
+/// D4e's deferred queue: jobs that become runnable at a monotonic deadline.
+static TIMELINE: Timeline<4> = Timeline::new();
+
+/// Order in which deferred jobs actually ran, one decimal digit each.
+static TIMELINE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 static SEMAPHORE: Semaphore = Semaphore::new(0);
 
 /// The waiter advertises that it is about to consume a permit.
@@ -257,6 +265,23 @@ fn emit_u32(stdout: Handle, mut v: u32) {
         }
     }
     emit(stdout, &buf[i..]);
+}
+
+/// Append this job's digit to the observed run order.
+fn timeline_job(context: usize) -> usize {
+    let mut prev = TIMELINE_LOG.load(core::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = prev * 10 + context as u32;
+        match TIMELINE_LOG.compare_exchange(
+            prev,
+            next,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return context,
+            Err(observed) => prev = observed,
+        }
+    }
 }
 
 #[no_mangle]
@@ -727,6 +752,60 @@ extern "C" fn main(
         );
         SEMAPHORE_REPORTED.store(1, core::sync::atomic::Ordering::Release);
         futex_wake(SEMAPHORE_REPORTED.as_ptr(), 1);
+    }
+
+    // ---- D4e: deferred submission --------------------------------------------------------
+    //
+    // One thread is enough here: `after` gates work against *time*, not against a peer, so the
+    // proof is that deadlines order the jobs and that none runs early — neither of which needs a
+    // second resident. Thread 1 has already reported and is on its way out.
+    if me == 0 {
+        let start = clock_get();
+        // Submitted 3, 1, 2 — due last, first, middle. If `after` were a plain queue the log would
+        // read 312; deadline order makes it 123.
+        let queued = TIMELINE
+            .submit_after(start, 60_000_000, timeline_job, 3)
+            .is_ok()
+            && TIMELINE
+                .submit_after(start, 20_000_000, timeline_job, 1)
+                .is_ok()
+            && TIMELINE
+                .submit_after(start, 40_000_000, timeline_job, 2)
+                .is_ok();
+
+        // Nothing may be due yet: every deadline is milliseconds away.
+        let early = TIMELINE.try_run_due(clock_get()).is_none();
+
+        // Drain by deadline, sleeping until each one rather than spinning.
+        let mut ran = 0u32;
+        while let Some(due) = TIMELINE.next_deadline() {
+            let now = clock_get();
+            if now < due {
+                sleep_ns(due - now);
+                continue;
+            }
+            if TIMELINE.try_run_due(clock_get()).is_some() {
+                ran += 1;
+            }
+        }
+
+        let order = TIMELINE_LOG.load(core::sync::atomic::Ordering::Acquire);
+        let elapsed = clock_get().saturating_sub(start);
+        let passed = queued && early && ran == 3 && order == 123 && elapsed >= 60_000_000;
+        emit(stdout, b"threads: after order=");
+        emit_u32(stdout, order);
+        emit(stdout, b" ran=");
+        emit_u32(stdout, ran);
+        emit(stdout, b" elapsed_ms=");
+        emit_u32(stdout, (elapsed / 1_000_000) as u32);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: deferred work ran in deadline order, none early\n"
+            } else {
+                b" -> FAIL: deferred submission\n"
+            },
+        );
     }
 
     process_exit(0)

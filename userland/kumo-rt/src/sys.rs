@@ -648,6 +648,35 @@ pub fn clock_get() -> u64 {
     0
 }
 
+/// Sleep for `delay_ns` of monotonic time, returning false if the wait could not be set up.
+///
+/// A one-shot timer bound to a private port, which is the only way a process blocks on time here.
+/// `drv-i2c-hid` has hand-rolled this since its bring-up; hoisting it means a caller who wants to
+/// wait until a deadline does not have to know that timers are delivered through ports.
+#[cfg(target_arch = "aarch64")]
+pub fn sleep_ns(delay_ns: u64) -> bool {
+    let port_raw = port_create();
+    if port_raw == u64::MAX {
+        return false;
+    }
+    let port = Handle(port_raw as u32);
+    let timer_raw = timer_create(delay_ns);
+    if timer_raw == u64::MAX {
+        let _ = handle_close(port);
+        return false;
+    }
+    let timer = Handle(timer_raw as u32);
+    let ok = port_bind(port, timer) == 0 && port_wait(port) != 0;
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    ok
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn sleep_ns(_delay_ns: u64) -> bool {
+    false
+}
+
 /// Create a one-shot timer that signals after `delay_ns` of monotonic time.
 /// The returned handle is waitable and can be bound to a `Port`.
 #[cfg(target_arch = "aarch64")]
