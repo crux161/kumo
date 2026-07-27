@@ -2,6 +2,7 @@
 //j415
 //j416
 //j515
+//j516
 //! Pure virtio constants and helpers shared by future transport drivers.
 
 pub mod mmio {
@@ -118,6 +119,14 @@ pub enum Error {
     ReadOnlyDevice,
     FeaturesRejected,
     DeviceNeedsReset,
+    QueueUnavailable,
+    QueueAlreadyReady,
+    QueueMemoryMisaligned,
+    QueueMemoryTooSmall,
+    QueueAddressOverflow,
+    QueueRejected,
+    DriverStatusInvalid,
+    DriverRejected,
 }
 
 /// A dword register port for the modern virtio-MMIO register window. A live
@@ -141,6 +150,28 @@ impl NegotiatedFeatures {
         self.accepted & block::FEATURE_FLUSH != 0
     }
 }
+
+/// A contiguous, zeroed, device-visible span reserved for one split virtqueue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SplitQueueMemory {
+    pub device_addr: u64,
+    pub len: u64,
+    pub preferred_size: u16,
+}
+
+/// The addresses accepted for an active split virtqueue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveSplitQueue {
+    pub index: u16,
+    pub layout: SplitQueueLayout,
+    pub descriptor: u64,
+    pub available: u64,
+    pub used: u64,
+}
+
+/// Keep the device-written used ring on its own page in the first block
+/// transport. Caller-supplied queue memory uses this alignment too.
+pub const SPLIT_QUEUE_ALIGN: u64 = 4096;
 
 /// Maximum status reads allowed while a device completes reset. The live
 /// driver can retry the whole probe later; an absent or wedged device cannot
@@ -214,6 +245,133 @@ pub fn negotiate_writable_block<IO: RegisterIo>(io: &mut IO) -> Result<Negotiate
         offered,
         accepted,
     })
+}
+
+/// Program one modern split queue and make the negotiated block device live.
+///
+/// Queue memory must already be zeroed, device-visible, and
+/// [`SPLIT_QUEUE_ALIGN`] aligned. The requested queue size is a power-of-two
+/// ceiling; a smaller power of two is selected when required by `QueueNumMax`.
+/// `DRIVER_OK` is written only after `QueueReady` reads back as one.
+pub fn activate_block_queue<IO: RegisterIo>(
+    io: &mut IO,
+    negotiated: NegotiatedFeatures,
+    queue_index: u16,
+    memory: SplitQueueMemory,
+) -> Result<ActiveSplitQueue, Error> {
+    if negotiated.accepted & device_features::VERSION_1 == 0 {
+        return Err(Error::MissingVersion1);
+    }
+    if memory.preferred_size == 0 {
+        return Err(Error::QueueSizeZero);
+    }
+    if !memory.preferred_size.is_power_of_two() {
+        return Err(Error::QueueSizeNotPowerOfTwo);
+    }
+    if memory.device_addr & (SPLIT_QUEUE_ALIGN - 1) != 0 {
+        return Err(Error::QueueMemoryMisaligned);
+    }
+
+    let ready_status =
+        device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK;
+    let observed = io.read32(mmio::STATUS);
+    if observed & device_status::DEVICE_NEEDS_RESET != 0 {
+        return Err(Error::DeviceNeedsReset);
+    }
+    if observed != ready_status {
+        return Err(Error::DriverStatusInvalid);
+    }
+
+    io.write32(mmio::QUEUE_SEL, u32::from(queue_index));
+    if io.read32(mmio::QUEUE_READY) != 0 {
+        return fail_activation(io, ready_status, Error::QueueAlreadyReady);
+    }
+
+    let queue_size = match bounded_queue_size(io.read32(mmio::QUEUE_NUM_MAX), memory.preferred_size)
+    {
+        Ok(queue_size) => queue_size,
+        Err(error) => return fail_activation(io, ready_status, error),
+    };
+    let layout = match SplitQueueLayout::new(queue_size, SPLIT_QUEUE_ALIGN) {
+        Ok(layout) => layout,
+        Err(error) => return fail_activation(io, ready_status, error),
+    };
+    if layout.total_len > memory.len {
+        return fail_activation(io, ready_status, Error::QueueMemoryTooSmall);
+    }
+    if memory.device_addr.checked_add(layout.total_len).is_none() {
+        return fail_activation(io, ready_status, Error::QueueAddressOverflow);
+    }
+
+    let descriptor = match memory.device_addr.checked_add(layout.desc_offset) {
+        Some(address) => address,
+        None => return fail_activation(io, ready_status, Error::QueueAddressOverflow),
+    };
+    let available = match memory.device_addr.checked_add(layout.avail_offset) {
+        Some(address) => address,
+        None => return fail_activation(io, ready_status, Error::QueueAddressOverflow),
+    };
+    let used = match memory.device_addr.checked_add(layout.used_offset) {
+        Some(address) => address,
+        None => return fail_activation(io, ready_status, Error::QueueAddressOverflow),
+    };
+
+    io.write32(mmio::QUEUE_NUM, u32::from(queue_size));
+    write_address(io, mmio::QUEUE_DESC_LOW, descriptor);
+    write_address(io, mmio::QUEUE_AVAIL_LOW, available);
+    write_address(io, mmio::QUEUE_USED_LOW, used);
+    io.write32(mmio::QUEUE_READY, 1);
+    if io.read32(mmio::QUEUE_READY) != 1 {
+        return fail_activation(io, ready_status, Error::QueueRejected);
+    }
+
+    let observed = io.read32(mmio::STATUS);
+    if observed & device_status::DEVICE_NEEDS_RESET != 0 {
+        return fail_activation(io, ready_status, Error::DeviceNeedsReset);
+    }
+    if observed != ready_status {
+        return fail_activation(io, ready_status, Error::DriverStatusInvalid);
+    }
+
+    io.write32(mmio::STATUS, ready_status | device_status::DRIVER_OK);
+    let observed = io.read32(mmio::STATUS);
+    if observed & device_status::DEVICE_NEEDS_RESET != 0 {
+        return fail_activation(io, ready_status, Error::DeviceNeedsReset);
+    }
+    if observed != (ready_status | device_status::DRIVER_OK) {
+        return fail_activation(io, ready_status, Error::DriverRejected);
+    }
+
+    Ok(ActiveSplitQueue {
+        index: queue_index,
+        layout,
+        descriptor,
+        available,
+        used,
+    })
+}
+
+fn bounded_queue_size(maximum: u32, preferred: u16) -> Result<u16, Error> {
+    let limit = maximum.min(u32::from(preferred));
+    if limit == 0 {
+        return Err(Error::QueueUnavailable);
+    }
+    let queue_size = 1 << (u32::BITS - 1 - limit.leading_zeros());
+    Ok(queue_size as u16)
+}
+
+fn write_address<IO: RegisterIo>(io: &mut IO, low_offset: u32, address: u64) {
+    io.write32(low_offset, address as u32);
+    io.write32(low_offset + 4, (address >> 32) as u32);
+}
+
+fn fail_activation<IO: RegisterIo, T>(
+    io: &mut IO,
+    ready_status: u32,
+    error: Error,
+) -> Result<T, Error> {
+    io.write32(mmio::STATUS, ready_status | device_status::FAILED);
+    Err(error)
 }
 
 fn read_device_features<IO: RegisterIo>(io: &mut IO) -> u64 {
@@ -473,9 +631,9 @@ fn align_up(value: u64, align: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        block, device_features, device_status, ids, mmio, negotiate_writable_block, split_ring,
-        BlockConfig, BlockRequestHeader, Error, MmioIdentity, RegisterIo, SplitDescriptor,
-        SplitQueueLayout, RESET_POLL_LIMIT,
+        activate_block_queue, block, device_features, device_status, ids, mmio,
+        negotiate_writable_block, split_ring, BlockConfig, BlockRequestHeader, Error, MmioIdentity,
+        RegisterIo, SplitDescriptor, SplitQueueLayout, SplitQueueMemory, RESET_POLL_LIMIT,
     };
 
     struct FakeRegisters {
@@ -492,7 +650,17 @@ mod tests {
         reset_pending: bool,
         reject_features: bool,
         needs_reset: bool,
-        writes: [(u32, u32); 16],
+        queue_sel: u32,
+        queue_num_max: u32,
+        queue_num: u32,
+        queue_ready: u32,
+        descriptor: u64,
+        available: u64,
+        used: u64,
+        reject_queue: bool,
+        reject_driver: bool,
+        needs_reset_on_queue: bool,
+        writes: [(u32, u32); 32],
         write_len: usize,
     }
 
@@ -512,7 +680,17 @@ mod tests {
                 reset_pending: false,
                 reject_features: false,
                 needs_reset: false,
-                writes: [(0, 0); 16],
+                queue_sel: 0,
+                queue_num_max: 8,
+                queue_num: 0,
+                queue_ready: 0,
+                descriptor: 0,
+                available: 0,
+                used: 0,
+                reject_queue: false,
+                reject_driver: false,
+                needs_reset_on_queue: false,
+                writes: [(0, 0); 32],
                 write_len: 0,
             }
         }
@@ -541,6 +719,8 @@ mod tests {
                         (self.offered >> 32) as u32
                     }
                 }
+                mmio::QUEUE_NUM_MAX => self.queue_num_max,
+                mmio::QUEUE_READY => self.queue_ready,
                 mmio::STATUS => {
                     if self.reset_pending {
                         if self.reset_reads != 0 {
@@ -571,6 +751,36 @@ mod tests {
                             (self.driver_features & u32::MAX as u64) | (u64::from(value) << 32);
                     }
                 }
+                mmio::QUEUE_SEL => self.queue_sel = value,
+                mmio::QUEUE_NUM => self.queue_num = value,
+                mmio::QUEUE_DESC_LOW => {
+                    self.descriptor = (self.descriptor & !u64::from(u32::MAX)) | u64::from(value);
+                }
+                mmio::QUEUE_DESC_HIGH => {
+                    self.descriptor =
+                        (self.descriptor & u64::from(u32::MAX)) | (u64::from(value) << 32);
+                }
+                mmio::QUEUE_AVAIL_LOW => {
+                    self.available = (self.available & !u64::from(u32::MAX)) | u64::from(value);
+                }
+                mmio::QUEUE_AVAIL_HIGH => {
+                    self.available =
+                        (self.available & u64::from(u32::MAX)) | (u64::from(value) << 32);
+                }
+                mmio::QUEUE_USED_LOW => {
+                    self.used = (self.used & !u64::from(u32::MAX)) | u64::from(value);
+                }
+                mmio::QUEUE_USED_HIGH => {
+                    self.used = (self.used & u64::from(u32::MAX)) | (u64::from(value) << 32);
+                }
+                mmio::QUEUE_READY => {
+                    if !self.reject_queue {
+                        self.queue_ready = value;
+                    }
+                    if self.needs_reset_on_queue {
+                        self.status |= device_status::DEVICE_NEEDS_RESET;
+                    }
+                }
                 mmio::STATUS if value == 0 => {
                     self.reset_pending = true;
                     if self.reset_reads == 0 {
@@ -579,8 +789,9 @@ mod tests {
                     }
                 }
                 mmio::STATUS => {
-                    self.status = if value & device_status::FEATURES_OK != 0 && self.reject_features
-                    {
+                    self.status = if value & device_status::DRIVER_OK != 0 && self.reject_driver {
+                        value & !device_status::DRIVER_OK
+                    } else if value & device_status::FEATURES_OK != 0 && self.reject_features {
                         value & !device_status::FEATURES_OK
                     } else if value & device_status::FEATURES_OK != 0 && self.needs_reset {
                         value | device_status::DEVICE_NEEDS_RESET
@@ -788,6 +999,242 @@ mod tests {
             Err(Error::ResetTimedOut)
         );
         assert_eq!(&wedged.writes[..wedged.write_len], &[(mmio::STATUS, 0)]);
+    }
+
+    #[test]
+    fn activation_programs_one_queue_before_driver_ok() {
+        let mut io = FakeRegisters::modern(device_features::VERSION_1 | block::FEATURE_FLUSH);
+        let negotiated = negotiate_writable_block(&mut io).unwrap();
+        let first_activation_write = io.write_len;
+
+        let queue = activate_block_queue(
+            &mut io,
+            negotiated,
+            0,
+            SplitQueueMemory {
+                device_addr: 0x1234_5678_0000,
+                len: 8192,
+                preferred_size: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(queue.index, 0);
+        assert_eq!(queue.layout.queue_size, 8);
+        assert_eq!(queue.descriptor, 0x1234_5678_0000);
+        assert_eq!(queue.available, 0x1234_5678_0080);
+        assert_eq!(queue.used, 0x1234_5678_1000);
+        assert_eq!(io.queue_num, 8);
+        assert_eq!(io.descriptor, queue.descriptor);
+        assert_eq!(io.available, queue.available);
+        assert_eq!(io.used, queue.used);
+        assert_eq!(io.queue_ready, 1);
+        assert_eq!(
+            &io.writes[first_activation_write..io.write_len],
+            &[
+                (mmio::QUEUE_SEL, 0),
+                (mmio::QUEUE_NUM, 8),
+                (mmio::QUEUE_DESC_LOW, 0x5678_0000),
+                (mmio::QUEUE_DESC_HIGH, 0x1234),
+                (mmio::QUEUE_AVAIL_LOW, 0x5678_0080),
+                (mmio::QUEUE_AVAIL_HIGH, 0x1234),
+                (mmio::QUEUE_USED_LOW, 0x5678_1000),
+                (mmio::QUEUE_USED_HIGH, 0x1234),
+                (mmio::QUEUE_READY, 1),
+                (
+                    mmio::STATUS,
+                    device_status::ACKNOWLEDGE
+                        | device_status::DRIVER
+                        | device_status::FEATURES_OK
+                        | device_status::DRIVER_OK,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_bounds_queue_size_to_device_maximum() {
+        let mut io = FakeRegisters::modern(device_features::VERSION_1);
+        io.queue_num_max = 6;
+        let negotiated = negotiate_writable_block(&mut io).unwrap();
+
+        let queue = activate_block_queue(
+            &mut io,
+            negotiated,
+            3,
+            SplitQueueMemory {
+                device_addr: 0x2000,
+                len: 8192,
+                preferred_size: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(io.queue_sel, 3);
+        assert_eq!(queue.layout.queue_size, 4);
+        assert_eq!(io.queue_num, 4);
+    }
+
+    #[test]
+    fn activation_rejects_unusable_queue_memory() {
+        let mut io = FakeRegisters::modern(device_features::VERSION_1);
+        let negotiated = negotiate_writable_block(&mut io).unwrap();
+        let before = io.write_len;
+
+        assert_eq!(
+            activate_block_queue(
+                &mut io,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1008,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueMemoryMisaligned)
+        );
+        assert_eq!(io.write_len, before);
+
+        assert_eq!(
+            activate_block_queue(
+                &mut io,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 4096,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueMemoryTooSmall)
+        );
+        assert_eq!(io.last_write().0, mmio::STATUS);
+        assert_ne!(io.status & device_status::FAILED, 0);
+
+        let mut overflow = FakeRegisters::modern(device_features::VERSION_1);
+        let negotiated = negotiate_writable_block(&mut overflow).unwrap();
+        assert_eq!(
+            activate_block_queue(
+                &mut overflow,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: u64::MAX - 4095,
+                    len: u64::MAX,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueAddressOverflow)
+        );
+    }
+
+    #[test]
+    fn activation_never_sets_driver_ok_for_a_refused_queue() {
+        let failed = device_status::ACKNOWLEDGE
+            | device_status::DRIVER
+            | device_status::FEATURES_OK
+            | device_status::FAILED;
+
+        let mut already_ready = FakeRegisters::modern(device_features::VERSION_1);
+        let negotiated = negotiate_writable_block(&mut already_ready).unwrap();
+        already_ready.queue_ready = 1;
+        assert_eq!(
+            activate_block_queue(
+                &mut already_ready,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueAlreadyReady)
+        );
+        assert_eq!(already_ready.last_write(), (mmio::STATUS, failed));
+
+        let mut unavailable = FakeRegisters::modern(device_features::VERSION_1);
+        unavailable.queue_num_max = 0;
+        let negotiated = negotiate_writable_block(&mut unavailable).unwrap();
+        assert_eq!(
+            activate_block_queue(
+                &mut unavailable,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueUnavailable)
+        );
+        assert_eq!(unavailable.last_write(), (mmio::STATUS, failed));
+
+        let mut rejected = FakeRegisters::modern(device_features::VERSION_1);
+        rejected.reject_queue = true;
+        let negotiated = negotiate_writable_block(&mut rejected).unwrap();
+        assert_eq!(
+            activate_block_queue(
+                &mut rejected,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::QueueRejected)
+        );
+        assert_eq!(rejected.last_write(), (mmio::STATUS, failed));
+        assert_eq!(rejected.status & device_status::DRIVER_OK, 0);
+        assert!(!rejected.writes[..rejected.write_len]
+            .iter()
+            .any(
+                |&(offset, value)| offset == mmio::STATUS && value & device_status::DRIVER_OK != 0
+            ));
+    }
+
+    #[test]
+    fn activation_fails_if_driver_ok_or_device_health_is_refused() {
+        let mut rejected = FakeRegisters::modern(device_features::VERSION_1);
+        rejected.reject_driver = true;
+        let negotiated = negotiate_writable_block(&mut rejected).unwrap();
+        assert_eq!(
+            activate_block_queue(
+                &mut rejected,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::DriverRejected)
+        );
+        assert_eq!(rejected.status & device_status::DRIVER_OK, 0);
+        assert_ne!(rejected.status & device_status::FAILED, 0);
+
+        let mut needs_reset = FakeRegisters::modern(device_features::VERSION_1);
+        needs_reset.needs_reset_on_queue = true;
+        let negotiated = negotiate_writable_block(&mut needs_reset).unwrap();
+        assert_eq!(
+            activate_block_queue(
+                &mut needs_reset,
+                negotiated,
+                0,
+                SplitQueueMemory {
+                    device_addr: 0x1000,
+                    len: 8192,
+                    preferred_size: 8,
+                },
+            ),
+            Err(Error::DeviceNeedsReset)
+        );
+        assert_eq!(needs_reset.status & device_status::DRIVER_OK, 0);
     }
 
     #[test]
