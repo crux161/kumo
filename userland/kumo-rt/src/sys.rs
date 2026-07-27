@@ -1,4 +1,5 @@
 //j493
+//j508
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -332,6 +333,9 @@ pub const STARTUP_TAG_STDOUT: u8 = b'o';
 pub const STARTUP_TAG_STDERR: u8 = b'e';
 pub const STARTUP_TAG_ARGV: u8 = b'a';
 pub const STARTUP_TAG_CAP0: u8 = b'c';
+/// j508: a client channel to a filesystem server speaking `kumo-vfs`. A program that
+/// receives one can name files; a program that does not cannot, whatever it asks for.
+pub const STARTUP_TAG_FS: u8 = b'f';
 
 /// Explicit capabilities supplied to a newly started program. Each present field came
 /// from one transferred handle on the bootstrap channel; absent fields grant no authority.
@@ -342,6 +346,7 @@ pub struct Startup {
     pub stderr: Option<Handle>,
     pub argv: Option<Handle>,
     pub cap0: Option<Handle>,
+    pub fs: Option<Handle>,
 }
 
 impl Startup {
@@ -354,6 +359,7 @@ impl Startup {
             STARTUP_TAG_STDERR => &mut self.stderr,
             STARTUP_TAG_ARGV => &mut self.argv,
             STARTUP_TAG_CAP0 => &mut self.cap0,
+            STARTUP_TAG_FS => &mut self.fs,
             _ => return Some(handle),
         };
         slot.replace(handle)

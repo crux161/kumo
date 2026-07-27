@@ -20,9 +20,10 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
-    DRV_SERIAL_PATH, DRV_XHCI_PATH, HELLO_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC,
-    INITRD_PATH_MAX, INITRD_VERSION, LS_PATH, LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, HELLO_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN,
+    INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION, LS_PATH, LUA_REPL_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
+    TTYD_PATH, WC_PATH,
 };
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
@@ -830,6 +831,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
+            let fatfs = build_fatfs_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
@@ -850,6 +852,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_I2C_HID_PATH, drv_i2c_hid.as_slice()),
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
+                (FATFS_PATH, fatfs.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
@@ -980,7 +983,7 @@ fn build_autoexec() -> Vec<u8> {
       run args alpha beta\n\
       cat etc/autoexec\n\
       wc etc/autoexec\n\
-      relibc i-a2\n"
+      relibc i-a3\n"
         .to_vec()
 }
 
@@ -1338,6 +1341,31 @@ fn build_drv_blk_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as drv-blk ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_fatfs_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "fatfs",
+            "--bin",
+            "fatfs",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("fatfs");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as fatfs ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 

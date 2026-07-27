@@ -10,11 +10,17 @@ typedef __SIZE_TYPE__ size_t;
 typedef __INTPTR_TYPE__ ssize_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
 
+/* Opaque on purpose: I-a3 proves the file boundary, not <stdio.h>'s layout. */
+typedef struct _kumo_file FILE;
+
 int printf(const char *format, ...);
 void *calloc(size_t count, size_t size);
 void free(void *pointer);
 ssize_t write(int fd, const void *buffer, size_t length);
 int *__errno_location(void);
+FILE *fopen(const char *path, const char *mode);
+size_t fread(void *buffer, size_t size, size_t count, FILE *stream);
+int fclose(FILE *stream);
 
 #define errno (*__errno_location())
 #define EBADF 9
@@ -101,6 +107,35 @@ int main(int argc, char **argv, char **envp) {
     if (write(2, "relibc: stderr channel -> OK\n", 29) != 29) {
         return 13;
     }
-    printf("relibc: startup+printf+argv+tls+calloc 384KiB -> OK\n");
+
+    /*
+     * I-a3: a real file, opened by name through the granted filesystem capability and
+     * read by stdio. Nothing here knows the file is FAT, is served by another process, or
+     * arrives over a channel — which is the point of the gate.
+     */
+    FILE *stream = fopen("/HELLO.TXT", "r");
+    if (stream == (FILE *)0) {
+        printf("relibc: fopen failed errno=%d\n", errno);
+        return 30;
+    }
+    char contents[32];
+    const size_t got = fread(contents, 1, sizeof(contents) - 1, stream);
+    contents[got] = '\0';
+    if (fclose(stream) != 0) {
+        return 31;
+    }
+    if (got == 0) {
+        return 32;
+    }
+    printf("relibc: fopen+fread /HELLO.TXT (%zu bytes) -> %s\n", got, contents);
+
+    /* A path the volume does not have must fail, not resolve to something else. */
+    errno = 0;
+    if (fopen("/NOSUCH.TXT", "r") != (FILE *)0) {
+        return 33;
+    }
+    printf("relibc: absent path refused errno=%d\n", errno);
+
+    printf("relibc: startup+printf+argv+tls+calloc+file -> OK\n");
     return 0;
 }

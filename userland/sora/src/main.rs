@@ -13,8 +13,8 @@ extern crate alloc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH,
-    SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH,
+    RELIBC_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -24,7 +24,7 @@ use kumo_rt::{
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
     thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
-    STARTUP_TAG_CAP0, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
+    STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -2415,12 +2415,14 @@ fn eval_command(
         debug_write(b"relibc: C runtime smoke\n".as_ptr(), 24);
         let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
         let count = command_argv_slots(cmd, &mut slots);
-        run_with_startup(
+        run_with_startup_input(
             initrd,
             RELIBC_SMOKE_PATH.as_bytes(),
             b"relibc",
             Some(&slots[..count]),
             false,
+            true,
+            StdinMode::None,
         );
         return true;
     } else if cmd.name == "threads" {
@@ -2535,7 +2537,80 @@ fn run_with_startup(
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
 ) {
-    run_with_startup_input(initrd, path, name, argv, grant_initrd, StdinMode::None);
+    run_with_startup_input(
+        initrd,
+        path,
+        name,
+        argv,
+        grant_initrd,
+        false,
+        StdinMode::None,
+    );
+}
+
+/// Spawn a private `fatfs` instance and return the client end of its `kumo-vfs` channel.
+///
+/// One server per launch, deliberately. The instance's whole authority is a read-only alias
+/// of the initrd VMO and the byte offset of the FAT image inside it; its lifetime is the
+/// channel, so it exits when its one client goes away, and no two programs ever share an
+/// open-file table. The bootstrap message rides the same channel that afterwards carries vfs
+/// frames — the shape `drv-blk` established — so the child needs exactly one handle.
+fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
+    let Some((image_base, image_len)) = initrd_find(initrd, FAT32_IMG_PATH.as_bytes()) else {
+        log(b"fatfs: image not found\n");
+        return None;
+    };
+    // The server maps from the VMO's start, so the mapping must reach the end of the image.
+    // Rounding up to a page is `vmar_map`'s requirement, not a guess about the content.
+    let map_len = image_base.saturating_add(image_len).saturating_add(0xFFF) & !0xFFF;
+
+    let (client_raw, server_raw) = channel_create_pair();
+    if client_raw == u64::MAX || server_raw == u64::MAX {
+        log(b"fatfs: channel unavailable\n");
+        return None;
+    }
+    let client = Handle(client_raw as u32);
+    let server = Handle(server_raw as u32);
+
+    let image_vmo = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
+    if image_vmo == 0 || image_vmo == u64::MAX {
+        let _ = handle_close(client);
+        let _ = handle_close(server);
+        log(b"fatfs: image grant unavailable\n");
+        return None;
+    }
+
+    let mut header = [0u8; 16];
+    header[..8].copy_from_slice(&image_base.to_le_bytes());
+    header[8..].copy_from_slice(&map_len.to_le_bytes());
+    if channel_write_with_handle(
+        client,
+        header.as_ptr(),
+        header.len(),
+        Handle(image_vmo as u32),
+    ) != Errno::Ok.status()
+    {
+        let _ = handle_close(Handle(image_vmo as u32));
+        let _ = handle_close(client);
+        let _ = handle_close(server);
+        log(b"fatfs: bootstrap queue failed\n");
+        return None;
+    }
+
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    if !run_elf(
+        initrd,
+        FATFS_PATH.as_bytes(),
+        0,
+        server_raw,
+        flags,
+        b"fatfs",
+    ) {
+        let _ = handle_close(client);
+        let _ = handle_close(server);
+        return None;
+    }
+    Some(client)
 }
 
 /// How a spawned child gets its standard input.
@@ -2550,14 +2625,20 @@ enum StdinMode<'a> {
     Interactive,
 }
 
-/// `run_with_startup` plus stdin. Returns `Some((stdin_write, stdout_read))` only for
-/// [`StdinMode::Interactive`], where the caller owns the running child's two ends.
+/// `run_with_startup` plus stdin and an optional filesystem grant. Returns
+/// `Some((stdin_write, stdout_read))` only for [`StdinMode::Interactive`], where the
+/// caller owns the running child's two ends.
+///
+/// `grant_fs` spawns a private `fatfs` instance for this launch and hands the child the
+/// client end of its `kumo-vfs` channel. Like `grant_initrd`, only an explicit launcher
+/// grants it: a program that was not given the channel cannot name a file at all.
 fn run_with_startup_input(
     initrd: Handle,
     path: &[u8],
     name: &[u8],
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
+    grant_fs: bool,
     stdin: StdinMode<'_>,
 ) -> Option<(Handle, Handle)> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
@@ -2644,9 +2725,13 @@ fn run_with_startup_input(
     } else {
         0
     };
+    // The filesystem grant is a whole server, not a handle duplicate: spawn it before the
+    // child so the vfs channel is live the moment the child's first request lands.
+    let fs_child = if grant_fs { spawn_fatfs(initrd) } else { None };
     let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
     let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
-    if argv_bad || initrd_bad {
+    let fs_bad = grant_fs && fs_child.is_none();
+    if argv_bad || initrd_bad || fs_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
@@ -2659,6 +2744,9 @@ fn run_with_startup_input(
         if grant_initrd && !initrd_bad {
             let _ = handle_close(Handle(initrd_child_raw as u32));
         }
+        if let Some(fs) = fs_child {
+            let _ = handle_close(fs);
+        }
         if let Some(writer) = stdin_writer {
             let _ = handle_close(writer);
         }
@@ -2667,9 +2755,9 @@ fn run_with_startup_input(
         return None;
     }
 
-    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd]. Order is immaterial — the
-    // child installs by tag — but kept deterministic for serial diagnosis.
-    let mut tags: [(u8, Handle); 4] = [(0, Handle(0)); 4];
+    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs]. Order is
+    // immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
+    let mut tags: [(u8, Handle); 5] = [(0, Handle(0)); 5];
     let mut expected = 0usize;
     if let Some(stdin_read) = stdin_read {
         tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
@@ -2683,6 +2771,10 @@ fn run_with_startup_input(
     }
     if grant_initrd {
         tags[expected] = (STARTUP_TAG_CAP0, Handle(initrd_child_raw as u32));
+        expected += 1;
+    }
+    if let Some(fs) = fs_child {
+        tags[expected] = (STARTUP_TAG_FS, fs);
         expected += 1;
     }
 
@@ -2812,6 +2904,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         b"bin/lua-repl",
         b"lua-repl",
         Some(&slots),
+        false,
         false,
         StdinMode::Interactive,
     ) else {
@@ -2964,6 +3057,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             full,
             full,
             Some(&slots[..count]),
+            false,
             false,
             StdinMode::Finite(&input[..input_len]),
         );
@@ -4151,6 +4245,7 @@ fn launch_lua_repl(initrd: Handle) {
         b"bin/lua-repl",
         b"lua-repl",
         None,
+        false,
         false,
         StdinMode::Finite(
             b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n",

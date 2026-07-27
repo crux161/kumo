@@ -1,6 +1,7 @@
 <!-- j505 -->
 <!-- j506 -->
 <!-- j507 -->
+<!-- j508 -->
 # KUMO relibc overlay
 
 KUMO keeps the audited upstream tree pristine at `vendor/relibc` and applies
@@ -21,13 +22,17 @@ copies the granted argv VMO, and lays it out as the SysV initial-process image â
 `argc`, `argv`, an empty `envp`, and an auxiliary vector whose
 `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` come from the running image's own mapped ELF
 header. Upstream `relibc_start_v1` then owns TLS activation, stdio, the init
-arrays, `main`, and exit. Live paths are startup, fd 1/2 channel writes, process
-exit, anonymous allocation over kernel-placed VMOs, and the futex pair; every
-other required `Pal`, `PalEpoll`, `PalPtrace`, `PalSignal`, and `PalSocket`
-method remains an explicit `ENOSYS`, inert value, or diverging trap.
+arrays, `main`, and exit. I-a3 adds the per-process FD table and file I/O: a
+granted `kumo-vfs` channel backs `openat`/`read`/`close`, so C `fopen`/`fread`
+name real files. Live paths are startup, the FD table, channel writes, file
+reads, process exit, anonymous allocation over kernel-placed VMOs, and the futex
+pair; every other required `Pal`, `PalEpoll`, `PalPtrace`, `PalSignal`, and
+`PalSocket` method remains an explicit `ENOSYS`, inert value, or diverging trap.
 
-`envp` is empty on purpose. KUMO grants no environment capability, and
-synthesising one here would be ambient authority wearing a POSIX name.
+Two absences are deliberate rather than stubbed. `envp` is empty: KUMO grants no
+environment capability, and synthesising one would be ambient authority wearing a
+POSIX name. fd 0 is closed: no input capability is granted yet, and a descriptor
+that reads nothing is a better answer than one that reads somewhere else.
 
 The check produces a static AArch64 smoke image at
 `target/relibc-smoke/relibc-smoke`. `cargo xtask image` packages it as
@@ -35,22 +40,31 @@ The check produces a static AArch64 smoke image at
 it with arguments:
 
 ```text
-[MUREX> relibc i-a2
+[MUREX> relibc i-a3
 relibc: C runtime smoke
+fatfs starting
+fatfs: serving
 relibc: argc=2
 relibc: argv[0]=relibc
-relibc: argv[1]=i-a2
-relibc: tls=17 errno=9 tls@0x10011000 image@0x21c000
+relibc: argv[1]=i-a3
+relibc: tls=17 errno=9 tls@0x10011000 image@0x220000
 relibc: stderr channel -> OK
-relibc: startup+printf+argv+tls+calloc 384KiB -> OK
+relibc: fopen+fread /HELLO.TXT (6 bytes) -> hello!
+relibc: absent path refused errno=2
+relibc: startup+printf+argv+tls+calloc+file -> OK
 ```
 
 The `tls@`/`image@` pair is the point of that line: the thread-local lives in the
 mapped TLS block reached through `tpidr_el0`, not in the program image, and
 `errno=9` is `EBADF` arriving through relibc's own `#[thread_local]` storage.
 
-That program uses a header-free C entry point deliberately. Installed headers and
-`fopen`/`fread` over Houtu belong to I-a3.
+The `fatfs` lines are a private filesystem server, spawned for this launch alone:
+its whole authority is a read-only alias of the backing VMO, and it exits when
+its one client's channel closes.
+
+That program is still header-free deliberately. Gate I-a is closed, but a C
+program that `#include`s `<stdio.h>` needs the installed header set and a
+`--sysroot`, which belong to the SDK (gate I-d), not here.
 
 The overlay temporarily selects relibc's Linux AArch64 C data layouts and
 numeric header constants. It does not select the Linux platform module or issue

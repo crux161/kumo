@@ -62,6 +62,22 @@ const KUMO_NOT_SUPPORTED: i32 = -8;
 const STARTUP_TAG_STDOUT: u8 = b'o';
 const STARTUP_TAG_STDERR: u8 = b'e';
 const STARTUP_TAG_ARGV: u8 = b'a';
+const STARTUP_TAG_FS: u8 = b'f';
+
+// The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
+// separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
+// are the second copy of that protocol and must move with it. The acceptance transcript
+// is what proves the two ends still agree. — TIMBERDOODLE
+const VFS_OP_OPEN: u8 = 0x00;
+const VFS_OP_READ: u8 = 0x01;
+const VFS_OK: u8 = 0x00;
+const VFS_NOT_FOUND: u8 = 0x01;
+const VFS_IS_DIR: u8 = 0x03;
+const VFS_MAX_PATH: usize = 255;
+const VFS_READ_REQUEST_LEN: usize = 17;
+const VFS_OPEN_REPLY_LEN: usize = 13;
+/// The server's inline read payload ceiling, so one reply always fits one buffer.
+const VFS_READ_MAX: usize = 256;
 
 const VMAR_READ: u64 = 1 << 0;
 const VMAR_WRITE: u64 = 1 << 1;
@@ -80,6 +96,36 @@ const STARTUP_FAILURE_STATUS: c_int = 70;
 
 static STDOUT_HANDLE: AtomicU32 = AtomicU32::new(0);
 static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// The client end of a filesystem server's `kumo-vfs` channel, or `0` when the launcher
+/// granted none — in which case this process cannot name a file at all.
+static FS_HANDLE: AtomicU32 = AtomicU32::new(0);
+
+/// What a POSIX `int fd` denotes in this process.
+///
+/// `DESIGN/008 §1.2`: there is no kernel fd. This is the one per-process table, and every
+/// descriptor in it is a capability the launcher granted — an output channel, or a file the
+/// filesystem server opened on our behalf. Nothing here can be forged from an integer.
+#[derive(Clone, Copy)]
+enum FdSlot {
+    Closed,
+    /// A granted channel this descriptor writes to.
+    Output(u32),
+    /// A file open on the filesystem server, plus this side's read cursor.
+    File {
+        handle: u32,
+        offset: u64,
+        size: u64,
+    },
+}
+
+/// Descriptors this backend can hold. POSIX programs expect 0/1/2 to be stdio, so the table
+/// is indexed directly by the descriptor number.
+const FD_SLOTS: usize = 16;
+
+/// Written by the startup thread before `main`, then only by the calling thread's own
+/// `open`/`read`/`close`. A second thread sharing descriptors needs the kernel to own the
+/// thread pointer first (J507), so this is not yet a lock's worth of contention.
+static mut FD_TABLE: [FdSlot; FD_SLOTS] = [FdSlot::Closed; FD_SLOTS];
 
 /// The packed argv page as delivered, kept for the lifetime of the process because the
 /// `argv` pointers relibc publishes borrow the strings in place.
@@ -158,6 +204,75 @@ fn vmo_read(vmo: u32, offset: u64, dest: *mut u8, len: usize) -> u64 {
     )
 }
 
+fn channel_write_bytes(channel: u32, bytes: &[u8]) -> u64 {
+    syscall4(
+        SYSCALL_CHANNEL_WRITE,
+        u64::from(channel),
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+        0,
+    )
+}
+
+fn channel_read_bytes(channel: u32, buf: &mut [u8]) -> u64 {
+    syscall4(
+        SYSCALL_CHANNEL_READ,
+        u64::from(channel),
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+    )
+}
+
+/// One `kumo-vfs` request/reply exchange. The read blocks until the server answers, which
+/// is the whole reason the launcher spawns the server before the client.
+fn vfs_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
+    use crate::header::errno::{EBADF, EIO};
+
+    let channel = FS_HANDLE.load(Ordering::Relaxed);
+    if channel == 0 {
+        return Err(Errno(EBADF));
+    }
+    if channel_write_bytes(channel, request) != 0 {
+        return Err(Errno(EIO));
+    }
+    let n = channel_read_bytes(channel, reply);
+    if n == 0 || n == u64::MAX {
+        return Err(Errno(EIO));
+    }
+    Ok(n as usize)
+}
+
+/// Map a vfs status byte onto the closest honest errno.
+fn vfs_errno(status: u8) -> Errno {
+    use crate::header::errno::{EIO, EISDIR, ENOENT};
+
+    match status {
+        VFS_NOT_FOUND => Errno(ENOENT),
+        VFS_IS_DIR => Errno(EISDIR),
+        _ => Errno(EIO),
+    }
+}
+
+fn fd_slot(fildes: c_int) -> Option<&'static mut FdSlot> {
+    let index = usize::try_from(fildes).ok()?;
+    if index >= FD_SLOTS {
+        return None;
+    }
+    // One table, one writer; see `FD_TABLE`.
+    unsafe { (&raw mut FD_TABLE).cast::<FdSlot>().add(index).as_mut() }
+}
+
+/// Claim the lowest free descriptor at or above 3, as POSIX requires of `open`.
+fn fd_alloc() -> Option<c_int> {
+    for index in 3..FD_SLOTS {
+        if let Some(FdSlot::Closed) = fd_slot(index as c_int) {
+            return Some(index as c_int);
+        }
+    }
+    None
+}
+
 fn close_handle(handle: u32) {
     if handle != 0 {
         let _ = syscall4(SYSCALL_HANDLE_CLOSE, u64::from(handle), 0, 0, 0);
@@ -210,6 +325,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
             STARTUP_TAG_ARGV => {
                 close_handle(core::mem::replace(&mut argv_vmo, handle));
             }
+            STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
             _ => close_handle(handle),
         }
     }
@@ -223,6 +339,20 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
         STDERR_HANDLE.store(stdout, Ordering::Relaxed);
     } else if stdout == 0 {
         STDOUT_HANDLE.store(stderr, Ordering::Relaxed);
+    }
+
+    // Seat the granted output channels as the descriptors C expects them at. fd 0 stays
+    // closed: no input capability is granted yet, and an fd that reads nothing is a
+    // better answer than one that silently reads somewhere else. — TIMBERDOODLE
+    let stdout = STDOUT_HANDLE.load(Ordering::Relaxed);
+    let stderr = STDERR_HANDLE.load(Ordering::Relaxed);
+    for (fildes, handle) in [(1, stdout), (2, stderr)] {
+        if handle == 0 {
+            continue;
+        }
+        if let Some(slot) = fd_slot(fildes) {
+            *slot = FdSlot::Output(handle);
+        }
     }
     argv_vmo
 }
@@ -364,8 +494,21 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// Release a descriptor.
+    ///
+    /// `kumo-vfs` has no close op yet: the server's open table is freed when its channel
+    /// does, and the launcher gives each program its own server instance, so a leaked
+    /// server-side entry cannot outlive the program that made it. Closing an output
+    /// descriptor does not close the underlying channel, which other descriptors alias.
     fn close(fildes: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::EBADF;
+
+        let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
+        if matches!(slot, FdSlot::Closed) {
+            return Err(Errno(EBADF));
+        }
+        *slot = FdSlot::Closed;
+        Ok(())
     }
 
     fn dup2(fildes: c_int, fildes2: c_int) -> Result<c_int> {
@@ -691,8 +834,56 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// Open a file through the granted filesystem server.
+    ///
+    /// The backing volume is read-only, so a write mode is refused with `EROFS` rather
+    /// than accepted and then failed at the first `write`. Relative paths have nowhere to
+    /// resolve against until a working-directory capability exists, so only `AT_FDCWD`
+    /// with an absolute path is accepted. — TIMBERDOODLE
     fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
-        Err(unsupported())
+        use crate::header::{
+            errno::{EINVAL, EMFILE, ENAMETOOLONG, EROFS},
+            fcntl::{AT_FDCWD, O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY},
+        };
+
+        if dirfd != AT_FDCWD {
+            return Err(Errno(EINVAL));
+        }
+        if oflag & O_ACCMODE != O_RDONLY || oflag & (O_CREAT | O_TRUNC | O_WRONLY) != 0 {
+            return Err(Errno(EROFS));
+        }
+        let path = path.to_bytes();
+        if path.is_empty() || path.len() > VFS_MAX_PATH {
+            return Err(Errno(ENAMETOOLONG));
+        }
+        if path[0] != b'/' {
+            return Err(Errno(EINVAL));
+        }
+        let fildes = fd_alloc().ok_or(Errno(EMFILE))?;
+
+        let mut request = [0u8; 3 + VFS_MAX_PATH];
+        request[0] = VFS_OP_OPEN;
+        request[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        request[3..3 + path.len()].copy_from_slice(path);
+        let mut reply = [0u8; VFS_OPEN_REPLY_LEN];
+        let n = vfs_call(&request[..3 + path.len()], &mut reply)?;
+
+        if reply[0] != VFS_OK {
+            return Err(vfs_errno(reply[0]));
+        }
+        if n < VFS_OPEN_REPLY_LEN {
+            return Err(vfs_errno(u8::MAX));
+        }
+        let handle = u32::from_le_bytes(reply[1..5].try_into().unwrap());
+        let size = u64::from_le_bytes(reply[5..13].try_into().unwrap());
+        if let Some(slot) = fd_slot(fildes) {
+            *slot = FdSlot::File {
+                handle,
+                offset: 0,
+                size,
+            };
+        }
+        Ok(fildes)
     }
 
     fn pipe2(fildes: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
@@ -722,8 +913,51 @@ impl Pal for Sys {
         pthread::OsTid::default()
     }
 
+    /// Read from an open file. The server answers at most [`VFS_READ_MAX`] bytes per
+    /// exchange, so a short read is normal here and the caller loops — which is what
+    /// stdio already does. End of file is a zero-length read, not an error.
     fn read(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
-        Err(unsupported())
+        use crate::header::errno::EBADF;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let slot = fd_slot(fildes).ok_or(Errno(EBADF))?;
+        let FdSlot::File {
+            handle,
+            offset,
+            size,
+        } = *slot
+        else {
+            return Err(Errno(EBADF));
+        };
+        if offset >= size {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(VFS_READ_MAX)
+            .min((size - offset).try_into().unwrap_or(usize::MAX));
+
+        let mut request = [0u8; VFS_READ_REQUEST_LEN];
+        request[0] = VFS_OP_READ;
+        request[1..5].copy_from_slice(&handle.to_le_bytes());
+        request[5..13].copy_from_slice(&offset.to_le_bytes());
+        request[13..17].copy_from_slice(&(want as u32).to_le_bytes());
+        let mut reply = [0u8; 1 + VFS_READ_MAX];
+        let n = vfs_call(&request, &mut reply)?;
+
+        if reply[0] != VFS_OK {
+            return Err(vfs_errno(reply[0]));
+        }
+        let got = (n - 1).min(want);
+        buf[..got].copy_from_slice(&reply[1..1 + got]);
+        // Re-fetch the slot: the borrow above ended with the request, and this keeps the
+        // cursor update in one obvious place.
+        if let Some(FdSlot::File { offset, .. }) = fd_slot(fildes) {
+            *offset += got as u64;
+        }
+        Ok(got)
     }
 
     fn pread(fildes: c_int, buf: &mut [u8], offset: off_t) -> Result<usize> {
@@ -827,28 +1061,22 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// Write through the channel this descriptor names. Since J508 that lookup is the one
+    /// FD table rather than a pair of special cases, so a file descriptor is refused here
+    /// for the same reason an unopened one is: the table says it is not an output.
     fn write(fildes: c_int, buf: &[u8]) -> Result<usize> {
         use crate::header::errno::{EBADF, EIO};
 
         if buf.is_empty() {
             return Ok(0);
         }
-        let handle = match fildes {
-            1 => STDOUT_HANDLE.load(Ordering::Relaxed),
-            2 => STDERR_HANDLE.load(Ordering::Relaxed),
-            _ => return Err(Errno(EBADF)),
+        let Some(FdSlot::Output(handle)) = fd_slot(fildes).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
         };
         if handle == 0 {
             return Err(Errno(EBADF));
         }
-        let status = syscall4(
-            SYSCALL_CHANNEL_WRITE,
-            u64::from(handle),
-            buf.as_ptr() as u64,
-            buf.len() as u64,
-            0,
-        ) as i32;
-        if status == 0 {
+        if channel_write_bytes(handle, buf) == 0 {
             Ok(buf.len())
         } else {
             Err(Errno(EIO))

@@ -1,6 +1,7 @@
 //j426
 //j493
 //j506
+//j508
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -15,6 +16,10 @@ pub const DRV_FB_PATH: &str = "bin/drv-fb";
 pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
 pub const DRV_XHCI_PATH: &str = "bin/drv-xhci";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
+/// The resident filesystem server. It is handed a read-only backing VMO and the
+/// byte offset of a FAT image inside it, then answers `kumo-vfs` Open/Read frames
+/// on the same channel — the storage domain's first live server.
+pub const FATFS_PATH: &str = "bin/fatfs";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
