@@ -1,8 +1,8 @@
-//j505
 //j506
 //j507
 //j512
 //j513
+//j514
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -75,12 +75,24 @@ const STARTUP_TAG_TTY: u8 = b't';
 // is what proves the two ends still agree. — TIMBERDOODLE
 const VFS_OP_OPEN: u8 = 0x00;
 const VFS_OP_READ: u8 = 0x01;
+const VFS_OP_OPEN_OPTIONS: u8 = 0x02;
+const VFS_OP_WRITE: u8 = 0x03;
+const VFS_OP_SET_LEN: u8 = 0x04;
+const VFS_OP_FLUSH: u8 = 0x05;
+const VFS_OPEN_READ: u8 = 1 << 0;
+const VFS_OPEN_WRITE: u8 = 1 << 1;
+const VFS_OPEN_CREATE: u8 = 1 << 2;
 const VFS_OK: u8 = 0x00;
 const VFS_NOT_FOUND: u8 = 0x01;
+const VFS_BAD_HANDLE: u8 = 0x02;
 const VFS_IS_DIR: u8 = 0x03;
+const VFS_NO_SPACE: u8 = 0x05;
+const VFS_ACCESS_DENIED: u8 = 0x06;
 const VFS_MAX_PATH: usize = 255;
 const VFS_READ_REQUEST_LEN: usize = 17;
 const VFS_OPEN_REPLY_LEN: usize = 13;
+const VFS_WRITE_HEADER_LEN: usize = 15;
+const VFS_WRITE_REPLY_LEN: usize = 5;
 /// The server's inline read payload ceiling, so one reply always fits one buffer.
 const VFS_READ_MAX: usize = 256;
 
@@ -297,11 +309,14 @@ fn tty_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
 
 /// Map a vfs status byte onto the closest honest errno.
 fn vfs_errno(status: u8) -> Errno {
-    use crate::header::errno::{EIO, EISDIR, ENOENT};
+    use crate::header::errno::{EACCES, EBADF, EIO, EISDIR, ENOENT, ENOSPC};
 
     match status {
         VFS_NOT_FOUND => Errno(ENOENT),
+        VFS_BAD_HANDLE => Errno(EBADF),
         VFS_IS_DIR => Errno(EISDIR),
+        VFS_NO_SPACE => Errno(ENOSPC),
+        VFS_ACCESS_DENIED => Errno(EACCES),
         _ => Errno(EIO),
     }
 }
@@ -730,11 +745,50 @@ impl Pal for Sys {
     }
 
     fn fsync(fildes: c_int) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EIO};
+
+        let Some(FdSlot::File { handle, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
+        };
+        let mut request = [0u8; 5];
+        request[0] = VFS_OP_FLUSH;
+        request[1..5].copy_from_slice(&handle.to_le_bytes());
+        let mut reply = [0u8; 1];
+        let n = vfs_call(&request, &mut reply)?;
+        if n != 1 || reply[0] != VFS_OK {
+            return Err(if n == 0 {
+                Errno(EIO)
+            } else {
+                vfs_errno(reply[0])
+            });
+        }
+        Ok(())
     }
 
     fn ftruncate(fildes: c_int, length: off_t) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::{EBADF, EINVAL, EIO};
+
+        let length = u64::try_from(length).map_err(|_| Errno(EINVAL))?;
+        let Some(FdSlot::File { handle, .. }) = fd_slot(fildes).map(|slot| *slot) else {
+            return Err(Errno(EBADF));
+        };
+        let mut request = [0u8; 13];
+        request[0] = VFS_OP_SET_LEN;
+        request[1..5].copy_from_slice(&handle.to_le_bytes());
+        request[5..13].copy_from_slice(&length.to_le_bytes());
+        let mut reply = [0u8; 1];
+        let n = vfs_call(&request, &mut reply)?;
+        if n != 1 || reply[0] != VFS_OK {
+            return Err(if n == 0 {
+                Errno(EIO)
+            } else {
+                vfs_errno(reply[0])
+            });
+        }
+        if let Some(FdSlot::File { size, .. }) = fd_slot(fildes) {
+            *size = length;
+        }
+        Ok(())
     }
 
     /// KUMO's `FutexWait` compares the word and parks only on a match, reporting
@@ -987,22 +1041,33 @@ impl Pal for Sys {
 
     /// Open a file through the granted filesystem server.
     ///
-    /// The backing volume is read-only, so a write mode is refused with `EROFS` rather
-    /// than accepted and then failed at the first `write`. Relative paths have nowhere to
-    /// resolve against until a working-directory capability exists, so only `AT_FDCWD`
-    /// with an absolute path is accepted. — TIMBERDOODLE
+    /// Relative paths have nowhere to resolve against until a working-directory capability
+    /// exists, so only `AT_FDCWD` with an absolute path is accepted. Access and create intent
+    /// cross the vfs wire; no ambient write authority is inferred from an integer fd.
     fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
         use crate::header::{
-            errno::{EINVAL, EMFILE, ENAMETOOLONG, EROFS},
-            fcntl::{AT_FDCWD, O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY},
+            errno::{EINVAL, EMFILE, ENAMETOOLONG},
+            fcntl::{AT_FDCWD, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY},
         };
 
         if dirfd != AT_FDCWD {
             return Err(Errno(EINVAL));
         }
-        if oflag & O_ACCMODE != O_RDONLY || oflag & (O_CREAT | O_TRUNC | O_WRONLY) != 0 {
-            return Err(Errno(EROFS));
+        let access = match oflag & O_ACCMODE {
+            O_RDONLY => VFS_OPEN_READ,
+            O_WRONLY => VFS_OPEN_WRITE,
+            O_RDWR => VFS_OPEN_READ | VFS_OPEN_WRITE,
+            _ => return Err(Errno(EINVAL)),
+        };
+        if oflag & O_TRUNC != 0 && access & VFS_OPEN_WRITE == 0 {
+            return Err(Errno(EINVAL));
         }
+        let options = access
+            | if oflag & O_CREAT != 0 {
+                VFS_OPEN_CREATE
+            } else {
+                0
+            };
         let path = path.to_bytes();
         if path.is_empty() || path.len() > VFS_MAX_PATH {
             return Err(Errno(ENAMETOOLONG));
@@ -1012,12 +1077,13 @@ impl Pal for Sys {
         }
         let fildes = fd_alloc().ok_or(Errno(EMFILE))?;
 
-        let mut request = [0u8; 3 + VFS_MAX_PATH];
-        request[0] = VFS_OP_OPEN;
-        request[1..3].copy_from_slice(&(path.len() as u16).to_le_bytes());
-        request[3..3 + path.len()].copy_from_slice(path);
+        let mut request = [0u8; 4 + VFS_MAX_PATH];
+        request[0] = VFS_OP_OPEN_OPTIONS;
+        request[1] = options;
+        request[2..4].copy_from_slice(&(path.len() as u16).to_le_bytes());
+        request[4..4 + path.len()].copy_from_slice(path);
         let mut reply = [0u8; VFS_OPEN_REPLY_LEN];
-        let n = vfs_call(&request[..3 + path.len()], &mut reply)?;
+        let n = vfs_call(&request[..4 + path.len()], &mut reply)?;
 
         if reply[0] != VFS_OK {
             return Err(vfs_errno(reply[0]));
@@ -1033,6 +1099,14 @@ impl Pal for Sys {
                 offset: 0,
                 size,
             };
+        }
+        if oflag & O_TRUNC != 0 {
+            if let Err(error) = Self::ftruncate(fildes, 0) {
+                if let Some(slot) = fd_slot(fildes) {
+                    *slot = FdSlot::Closed;
+                }
+                return Err(error);
+            }
         }
         Ok(fildes)
     }
@@ -1223,25 +1297,83 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
-    /// Write through the channel this descriptor names. Since J508 that lookup is the one
-    /// FD table rather than a pair of special cases, so a file descriptor is refused here
-    /// for the same reason an unopened one is: the table says it is not an output.
+    /// Write through the channel or file capability this descriptor names. File writes are
+    /// split into bounded inline vfs frames; one POSIX call still reports the accumulated
+    /// result, and the per-process cursor advances only by acknowledged bytes.
     fn write(fildes: c_int, buf: &[u8]) -> Result<usize> {
         use crate::header::errno::{EBADF, EIO};
 
         if buf.is_empty() {
             return Ok(0);
         }
-        let Some(FdSlot::Output(handle)) = fd_slot(fildes).map(|slot| *slot) else {
-            return Err(Errno(EBADF));
-        };
-        if handle == 0 {
-            return Err(Errno(EBADF));
-        }
-        if channel_write_bytes(handle, buf) == 0 {
-            Ok(buf.len())
-        } else {
-            Err(Errno(EIO))
+        match fd_slot(fildes).map(|slot| *slot) {
+            Some(FdSlot::Output(handle)) if handle != 0 => {
+                if channel_write_bytes(handle, buf) == 0 {
+                    Ok(buf.len())
+                } else {
+                    Err(Errno(EIO))
+                }
+            }
+            Some(FdSlot::File {
+                handle,
+                mut offset,
+                mut size,
+            }) => {
+                let mut total = 0usize;
+                while total < buf.len() {
+                    let take = (buf.len() - total).min(VFS_READ_MAX);
+                    let mut request = [0u8; VFS_WRITE_HEADER_LEN + VFS_READ_MAX];
+                    request[0] = VFS_OP_WRITE;
+                    request[1..5].copy_from_slice(&handle.to_le_bytes());
+                    request[5..13].copy_from_slice(&offset.to_le_bytes());
+                    request[13..15].copy_from_slice(&(take as u16).to_le_bytes());
+                    request[VFS_WRITE_HEADER_LEN..VFS_WRITE_HEADER_LEN + take]
+                        .copy_from_slice(&buf[total..total + take]);
+                    let mut reply = [0u8; VFS_WRITE_REPLY_LEN];
+                    let result = vfs_call(
+                        &request[..VFS_WRITE_HEADER_LEN + take],
+                        &mut reply,
+                    );
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(error) if total == 0 => return Err(error),
+                        Err(_) => break,
+                    };
+                    if n != VFS_WRITE_REPLY_LEN || reply[0] != VFS_OK {
+                        if total == 0 {
+                            return Err(if n == 0 {
+                                Errno(EIO)
+                            } else {
+                                vfs_errno(reply[0])
+                            });
+                        }
+                        break;
+                    }
+                    let written =
+                        u32::from_le_bytes(reply[1..5].try_into().unwrap()) as usize;
+                    if written == 0 || written > take {
+                        if total == 0 {
+                            return Err(Errno(EIO));
+                        }
+                        break;
+                    }
+                    total += written;
+                    offset += written as u64;
+                    size = size.max(offset);
+                    if written < take {
+                        break;
+                    }
+                }
+                if let Some(slot) = fd_slot(fildes) {
+                    *slot = FdSlot::File {
+                        handle,
+                        offset,
+                        size,
+                    };
+                }
+                Ok(total)
+            }
+            _ => Err(Errno(EBADF)),
         }
     }
 

@@ -1,7 +1,8 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+//j514
 
-//! `kumo-fatfs` — a read-only FAT32 parser for the ESP / interop role.
+//! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
 //! Per `DESIGN/010` and `PLAN_IV §5`, FAT32 is **not** KUMO's root filesystem
 //! (RedoxFS is); FAT is relegated to the EFI System Partition and removable
@@ -18,7 +19,8 @@
 //!   * mount a volume and read a file by 8.3 name through a [`SectorReader`],
 //!     including positioned reads for the vfs `Read { offset, len }` protocol,
 //!   * find an entry in any directory (not just the root), and resolve a
-//!     `/`-separated, case-insensitive ESP path (`/EFI/BOOT/BOOTAA64.EFI`).
+//!     `/`-separated, case-insensitive ESP path (`/EFI/BOOT/BOOTAA64.EFI`),
+//!   * create an 8.3 file, resize it, and write through a [`SectorWriter`].
 //!
 //! It owns no device and performs no I/O itself — every read goes through a
 //! [`SectorReader`] the caller supplies (over `drv-blk` in the server, over a
@@ -160,6 +162,16 @@ pub struct DirEntry {
     pub first_cluster: u32,
     /// File size in bytes (0 for directories).
     pub size: u32,
+    /// On-disk short-entry slot. Parsed standalone entries have no location;
+    /// entries resolved through a mounted volume always do.
+    pub location: Option<DirLocation>,
+}
+
+/// Location of one 32-byte short entry in its directory sector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirLocation {
+    pub sector: u32,
+    pub offset: u16,
 }
 
 impl DirEntry {
@@ -211,6 +223,7 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
         attr,
         first_cluster,
         size: u32_le(raw, 0x1C),
+        location: None,
     })
 }
 
@@ -335,6 +348,27 @@ pub trait SectorReader {
     fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool;
 }
 
+/// Mutable half of a FAT backing capability. Writes are whole-sector so every
+/// metadata/data update remains bounded and allocation-free in the engine.
+pub trait SectorWriter {
+    fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool;
+
+    /// Commit preceding sector writes. RAM-backed stores may acknowledge this
+    /// immediately; hardware-backed implementations forward it to `drv-blk`.
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
+/// Failure classes for FAT mutation. The vfs server maps these onto its stable
+/// wire statuses rather than leaking FAT details to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatWriteError {
+    Invalid,
+    NoSpace,
+    Io,
+}
+
 /// A mounted FAT32 volume: the parsed geometry plus read helpers that drive a
 /// [`SectorReader`]. Holds no buffers — each call reads one sector at a time, so
 /// a large FAT never has to be resident.
@@ -404,7 +438,13 @@ impl FatVolume {
                 while off + DIR_ENTRY_SIZE <= SECTOR_SIZE {
                     match parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]) {
                         DirSlot::End => return None,
-                        DirSlot::File(e) if &e.name == name => return Some(e),
+                        DirSlot::File(mut e) if &e.name == name => {
+                            e.location = Some(DirLocation {
+                                sector: first + s,
+                                offset: off as u16,
+                            });
+                            return Some(e);
+                        }
                         _ => {}
                     }
                     off += DIR_ENTRY_SIZE;
@@ -512,6 +552,341 @@ impl FatVolume {
                 Some(FatEntry::Next(n)) => cluster = n,
                 _ => return written,
             }
+        }
+    }
+
+    fn cluster_limit(&self) -> u32 {
+        let data_sectors = self
+            .bpb
+            .total_sectors
+            .saturating_sub(self.bpb.data_start_sector());
+        2 + data_sectors / self.bpb.sectors_per_cluster as u32
+    }
+
+    fn chain_len_last<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        start: u32,
+    ) -> Result<(u32, Option<u32>), FatWriteError> {
+        if start < 2 {
+            return Ok((0, None));
+        }
+        let limit = self.cluster_limit();
+        let mut cluster = start;
+        let mut count = 0u32;
+        loop {
+            if cluster < 2 || cluster >= limit || count >= limit.saturating_sub(2) {
+                return Err(FatWriteError::Invalid);
+            }
+            count += 1;
+            match self.next_link(reader, cluster) {
+                Some(FatEntry::Next(next)) => cluster = next,
+                Some(FatEntry::End) => return Ok((count, Some(cluster))),
+                Some(FatEntry::Free | FatEntry::Bad) => return Err(FatWriteError::Invalid),
+                None => return Err(FatWriteError::Io),
+            }
+        }
+    }
+
+    fn write_fat_entry<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        cluster: u32,
+        value: u32,
+    ) -> Result<(), FatWriteError> {
+        let index = cluster % FAT_ENTRIES_PER_SECTOR;
+        let relative_sector = cluster / FAT_ENTRIES_PER_SECTOR;
+        if relative_sector >= self.bpb.sectors_per_fat {
+            return Err(FatWriteError::Invalid);
+        }
+        for fat_index in 0..self.bpb.num_fats as u32 {
+            let lba = self.bpb.fat_start_sector()
+                + fat_index * self.bpb.sectors_per_fat
+                + relative_sector;
+            let mut sector = [0u8; SECTOR_SIZE];
+            if !io.read_sector(lba, &mut sector) {
+                return Err(FatWriteError::Io);
+            }
+            let offset = index as usize * 4;
+            let old = u32_le(&sector, offset);
+            let raw = (old & !FAT32_ENTRY_MASK) | (value & FAT32_ENTRY_MASK);
+            sector[offset..offset + 4].copy_from_slice(&raw.to_le_bytes());
+            if !io.write_sector(lba, &sector) {
+                return Err(FatWriteError::Io);
+            }
+        }
+        Ok(())
+    }
+
+    fn find_free_cluster<R: SectorReader>(&self, reader: &mut R) -> Result<u32, FatWriteError> {
+        for cluster in 2..self.cluster_limit() {
+            match self.next_link(reader, cluster) {
+                Some(FatEntry::Free) => return Ok(cluster),
+                Some(_) => {}
+                None => return Err(FatWriteError::Io),
+            }
+        }
+        Err(FatWriteError::NoSpace)
+    }
+
+    fn zero_cluster<R: SectorWriter>(
+        &self,
+        writer: &mut R,
+        cluster: u32,
+    ) -> Result<(), FatWriteError> {
+        let zero = [0u8; SECTOR_SIZE];
+        let first = self.bpb.cluster_to_sector(cluster);
+        for sector in 0..self.bpb.sectors_per_cluster as u32 {
+            if !writer.write_sector(first + sector, &zero) {
+                return Err(FatWriteError::Io);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        entry: &mut DirEntry,
+        len: u32,
+    ) -> Result<(), FatWriteError> {
+        let cluster_bytes = self.bpb.cluster_size_bytes();
+        let needed = len.saturating_add(cluster_bytes - 1) / cluster_bytes;
+        let (mut count, mut last) = self.chain_len_last(io, entry.first_cluster)?;
+        while count < needed {
+            let cluster = self.find_free_cluster(io)?;
+            // Make the new cluster self-contained before linking it into the file.
+            self.write_fat_entry(io, cluster, FAT32_EOF_MIN)?;
+            self.zero_cluster(io, cluster)?;
+            if let Some(previous) = last {
+                self.write_fat_entry(io, previous, cluster)?;
+            } else {
+                entry.first_cluster = cluster;
+            }
+            last = Some(cluster);
+            count += 1;
+        }
+        Ok(())
+    }
+
+    fn update_dir_entry<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        entry: &DirEntry,
+    ) -> Result<(), FatWriteError> {
+        let location = entry.location.ok_or(FatWriteError::Invalid)?;
+        let offset = location.offset as usize;
+        if offset + DIR_ENTRY_SIZE > SECTOR_SIZE {
+            return Err(FatWriteError::Invalid);
+        }
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !io.read_sector(location.sector, &mut sector) {
+            return Err(FatWriteError::Io);
+        }
+        sector[offset + 20..offset + 22]
+            .copy_from_slice(&((entry.first_cluster >> 16) as u16).to_le_bytes());
+        sector[offset + 26..offset + 28]
+            .copy_from_slice(&(entry.first_cluster as u16).to_le_bytes());
+        sector[offset + 28..offset + 32].copy_from_slice(&entry.size.to_le_bytes());
+        if !io.write_sector(location.sector, &sector) {
+            return Err(FatWriteError::Io);
+        }
+        Ok(())
+    }
+
+    fn write_storage<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        entry: &DirEntry,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, FatWriteError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if entry.first_cluster < 2 {
+            return Err(FatWriteError::Invalid);
+        }
+        let cluster_bytes = self.bpb.cluster_size_bytes() as u64;
+        let mut cluster = entry.first_cluster;
+        let mut skip_clusters = offset / cluster_bytes;
+        let mut in_cluster = offset % cluster_bytes;
+        while skip_clusters != 0 {
+            cluster = match self.next_link(io, cluster) {
+                Some(FatEntry::Next(next)) => next,
+                _ => return Err(FatWriteError::Invalid),
+            };
+            skip_clusters -= 1;
+        }
+
+        let mut written = 0usize;
+        loop {
+            let first = self.bpb.cluster_to_sector(cluster);
+            for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
+                if written == data.len() {
+                    return Ok(written);
+                }
+                if in_cluster >= SECTOR_SIZE as u64 {
+                    in_cluster -= SECTOR_SIZE as u64;
+                    continue;
+                }
+                let start = in_cluster as usize;
+                in_cluster = 0;
+                let take = (data.len() - written).min(SECTOR_SIZE - start);
+                let lba = first + sector_index;
+                let mut sector = [0u8; SECTOR_SIZE];
+                if (start != 0 || take != SECTOR_SIZE) && !io.read_sector(lba, &mut sector) {
+                    return Err(FatWriteError::Io);
+                }
+                sector[start..start + take].copy_from_slice(&data[written..written + take]);
+                if !io.write_sector(lba, &sector) {
+                    return Err(FatWriteError::Io);
+                }
+                written += take;
+            }
+            cluster = match self.next_link(io, cluster) {
+                Some(FatEntry::Next(next)) => next,
+                Some(FatEntry::End) if written == data.len() => return Ok(written),
+                _ => return Err(FatWriteError::Invalid),
+            };
+        }
+    }
+
+    /// Create one missing 8.3 regular file. Parent directories must already
+    /// exist; a full directory returns [`FatWriteError::NoSpace`].
+    pub fn create_file<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        path: &[u8],
+    ) -> Result<DirEntry, FatWriteError> {
+        let mut components = path
+            .split(|&byte| byte == b'/')
+            .filter(|component| !component.is_empty())
+            .peekable();
+        let mut directory = self.bpb.root_cluster;
+        let name = loop {
+            let component = components.next().ok_or(FatWriteError::Invalid)?;
+            let name = name_to_83(component).ok_or(FatWriteError::Invalid)?;
+            if components.peek().is_none() {
+                break name;
+            }
+            let parent = self
+                .find_in_dir(io, directory, &name)
+                .ok_or(FatWriteError::Invalid)?;
+            if !parent.is_dir() {
+                return Err(FatWriteError::Invalid);
+            }
+            directory = parent.first_cluster;
+        };
+        if self.find_in_dir(io, directory, &name).is_some() {
+            return Err(FatWriteError::Invalid);
+        }
+
+        let mut cluster = directory;
+        let location = loop {
+            let first = self.bpb.cluster_to_sector(cluster);
+            let mut found = None;
+            for sector_index in 0..self.bpb.sectors_per_cluster as u32 {
+                let lba = first + sector_index;
+                let mut sector = [0u8; SECTOR_SIZE];
+                if !io.read_sector(lba, &mut sector) {
+                    return Err(FatWriteError::Io);
+                }
+                for offset in (0..SECTOR_SIZE).step_by(DIR_ENTRY_SIZE) {
+                    if sector[offset] == 0 || sector[offset] == 0xE5 {
+                        found = Some(DirLocation {
+                            sector: lba,
+                            offset: offset as u16,
+                        });
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if let Some(location) = found {
+                break location;
+            }
+            cluster = match self.next_link(io, cluster) {
+                Some(FatEntry::Next(next)) => next,
+                Some(FatEntry::End) => return Err(FatWriteError::NoSpace),
+                _ => return Err(FatWriteError::Io),
+            };
+        };
+
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !io.read_sector(location.sector, &mut sector) {
+            return Err(FatWriteError::Io);
+        }
+        let offset = location.offset as usize;
+        sector[offset..offset + 11].copy_from_slice(&name);
+        sector[offset + 11] = attr::ARCHIVE;
+        sector[offset + 12..offset + DIR_ENTRY_SIZE].fill(0);
+        if !io.write_sector(location.sector, &sector) {
+            return Err(FatWriteError::Io);
+        }
+        Ok(DirEntry {
+            name,
+            attr: attr::ARCHIVE,
+            first_cluster: 0,
+            size: 0,
+            location: Some(location),
+        })
+    }
+
+    /// Change a file's logical length. Growth allocates and zeroes clusters;
+    /// shrink retains the existing chain for bounded implementation and fast
+    /// re-growth, while the on-disk size immediately hides the truncated tail.
+    pub fn set_file_len<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        entry: &mut DirEntry,
+        len: u64,
+    ) -> Result<(), FatWriteError> {
+        let len = u32::try_from(len).map_err(|_| FatWriteError::Invalid)?;
+        let old_len = entry.size;
+        self.ensure_capacity(io, entry, len)?;
+        if len > old_len {
+            let zero = [0u8; SECTOR_SIZE];
+            let mut offset = old_len as u64;
+            let mut remaining = (len - old_len) as usize;
+            while remaining != 0 {
+                let take = remaining.min(zero.len());
+                self.write_storage(io, entry, offset, &zero[..take])?;
+                offset += take as u64;
+                remaining -= take;
+            }
+        }
+        entry.size = len;
+        self.update_dir_entry(io, entry)
+    }
+
+    /// Write bytes at an explicit offset, growing the file when necessary.
+    pub fn write_file_at<R: SectorReader + SectorWriter>(
+        &self,
+        io: &mut R,
+        entry: &mut DirEntry,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, FatWriteError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FatWriteError::Invalid)?;
+        if end > entry.size as u64 {
+            self.set_file_len(io, entry, end)?;
+        }
+        self.write_storage(io, entry, offset, data)
+    }
+
+    pub fn flush<R: SectorWriter>(&self, writer: &mut R) -> Result<(), FatWriteError> {
+        if writer.flush() {
+            Ok(())
+        } else {
+            Err(FatWriteError::Io)
         }
     }
 }
@@ -1019,6 +1394,95 @@ mod tests {
         assert_eq!(entry.first_cluster, 0);
         let mut out = [0u8; 16];
         assert_eq!(vol.read_file(&mut FixtureDisk, &entry, &mut out), 0);
+    }
+
+    struct WritableDisk {
+        sectors: [[u8; SECTOR_SIZE]; 128],
+        flushed: bool,
+    }
+
+    impl WritableDisk {
+        fn fixture() -> WritableDisk {
+            let mut disk = WritableDisk {
+                sectors: [[0u8; SECTOR_SIZE]; 128],
+                flushed: false,
+            };
+            let mut source = FixtureDisk;
+            for lba in 0..disk.sectors.len() {
+                source.read_sector(lba as u32, &mut disk.sectors[lba]);
+            }
+            disk
+        }
+    }
+
+    impl SectorReader for WritableDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            let Some(sector) = self.sectors.get(lba as usize) else {
+                return false;
+            };
+            *buf = *sector;
+            true
+        }
+    }
+
+    impl SectorWriter for WritableDisk {
+        fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool {
+            let Some(sector) = self.sectors.get_mut(lba as usize) else {
+                return false;
+            };
+            *sector = *buf;
+            true
+        }
+
+        fn flush(&mut self) -> bool {
+            self.flushed = true;
+            true
+        }
+    }
+
+    #[test]
+    fn creates_resizes_writes_flushes_and_reopens() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut entry = volume.create_file(&mut disk, b"/KILO.TXT").unwrap();
+        assert_eq!(entry.size, 0);
+        assert_eq!(entry.first_cluster, 0);
+
+        let mut data = [0u8; 700];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        volume
+            .set_file_len(&mut disk, &mut entry, data.len() as u64)
+            .unwrap();
+        assert_eq!(
+            volume.write_file_at(&mut disk, &mut entry, 0, &data),
+            Ok(700)
+        );
+        volume.flush(&mut disk).unwrap();
+        assert!(disk.flushed);
+
+        let reopened = volume.resolve_path(&mut disk, b"/KILO.TXT").unwrap();
+        assert_eq!(reopened.size, 700);
+        assert!(reopened.first_cluster >= 2);
+        let mut out = [0u8; 700];
+        assert_eq!(volume.read_file(&mut disk, &reopened, &mut out), 700);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn truncate_then_regrow_zeroes_the_hidden_tail() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut entry = volume.resolve_path(&mut disk, b"/HELLO.TXT").unwrap();
+        volume.set_file_len(&mut disk, &mut entry, 2).unwrap();
+        volume.set_file_len(&mut disk, &mut entry, 6).unwrap();
+
+        let reopened = volume.resolve_path(&mut disk, b"/HELLO.TXT").unwrap();
+        let mut out = [0xFFu8; 6];
+        assert_eq!(volume.read_file(&mut disk, &reopened, &mut out), 6);
+        assert_eq!(&out[..2], b"he");
+        assert_eq!(&out[2..], &[0, 0, 0, 0]);
     }
 
     #[test]

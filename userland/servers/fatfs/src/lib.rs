@@ -1,32 +1,34 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+//j514
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
 //! FAT is not KUMO's root filesystem (`DESIGN/010`); it remains the ESP /
 //! removable-media filesystem. This crate is the host-testable server logic that
-//! maps `kumo-vfs` Open/Read requests onto `kumo-fatfs`. It owns no device and
-//! has no runtime dependency: a resident binary will later wrap this handler with
-//! a `Channel` transport and a `SectorReader` over `drv-blk`.
+//! maps `kumo-vfs` open/read/create/resize/write/flush requests onto `kumo-fatfs`.
+//! It owns no device and has no runtime dependency: the resident binary wraps
+//! this handler with a `Channel` transport and a narrowed backing-store VMO.
 //!
-//! The durable truth is still the mounted FAT volume. The per-server open table is
+//! The mounted FAT volume's bytes are authoritative. The per-server open table is
 //! reconnectable soft state, so a supervised restart can rebuild it by reopening
 //! paths rather than recovering private RAM.
 
 #[cfg(test)]
 extern crate alloc;
 
-use kumo_fatfs::{DirEntry, FatVolume, SectorReader};
+use kumo_fatfs::{DirEntry, FatVolume, FatWriteError, SectorReader, SectorWriter};
 use kumo_vfs::{
-    encode_open_ok, encode_status, Request, MAX_PATH, VFS_BAD_HANDLE, VFS_BAD_REQUEST, VFS_IS_DIR,
-    VFS_NOT_FOUND, VFS_OK,
+    encode_open_ok, encode_status, encode_write_ok, Request, MAX_WRITE_DATA, OPEN_CREATE,
+    OPEN_READ, OPEN_WRITE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST, VFS_IO_ERROR,
+    VFS_IS_DIR, VFS_NOT_FOUND, VFS_NO_SPACE, VFS_OK, WRITE_HEADER_LEN,
 };
 
 /// Maximum number of open file handles in this first fixed table.
 pub const MAX_OPEN_FILES: usize = 8;
 
 /// Largest `Open` request frame accepted by `kumo-vfs`.
-pub const REQUEST_BUF_BYTES: usize = 3 + MAX_PATH;
+pub const REQUEST_BUF_BYTES: usize = WRITE_HEADER_LEN + MAX_WRITE_DATA;
 
 /// Inline read payload cap for this first userspace loop, plus one status byte.
 pub const REPLY_BUF_BYTES: usize = 1 + 256;
@@ -35,7 +37,14 @@ pub const REPLY_BUF_BYTES: usize = 1 + 256;
 /// deliberately invalid so protocol bugs are easy to spot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenTable {
-    slots: [Option<DirEntry>; MAX_OPEN_FILES],
+    slots: [Option<OpenFile>; MAX_OPEN_FILES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenFile {
+    entry: DirEntry,
+    readable: bool,
+    writable: bool,
 }
 
 impl OpenTable {
@@ -45,19 +54,28 @@ impl OpenTable {
         }
     }
 
-    pub fn insert(&mut self, entry: DirEntry) -> Option<u32> {
+    pub fn insert(&mut self, entry: DirEntry, options: u8) -> Option<u32> {
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(entry);
+                *slot = Some(OpenFile {
+                    entry,
+                    readable: options & OPEN_READ != 0,
+                    writable: options & OPEN_WRITE != 0,
+                });
                 return Some((index + 1) as u32);
             }
         }
         None
     }
 
-    pub fn get(&self, handle: u32) -> Option<DirEntry> {
+    pub fn get(&self, handle: u32) -> Option<OpenFile> {
         let index = usize::try_from(handle).ok()?.checked_sub(1)?;
         self.slots.get(index).copied().flatten()
+    }
+
+    pub fn get_mut(&mut self, handle: u32) -> Option<&mut OpenFile> {
+        let index = usize::try_from(handle).ok()?.checked_sub(1)?;
+        self.slots.get_mut(index)?.as_mut()
     }
 }
 
@@ -95,7 +113,7 @@ impl FatServer {
 
     /// Handle exactly one transport request/reply exchange. Returns `false` when
     /// the transport closes before yielding a request.
-    pub fn serve_once<R: SectorReader, T: Transport>(
+    pub fn serve_once<R: SectorReader + SectorWriter, T: Transport>(
         &mut self,
         volume: &FatVolume,
         reader: &mut R,
@@ -120,7 +138,7 @@ impl FatServer {
     }
 
     /// Run request/reply exchanges until the transport closes.
-    pub fn serve<R: SectorReader, T: Transport>(
+    pub fn serve<R: SectorReader + SectorWriter, T: Transport>(
         &mut self,
         volume: &FatVolume,
         reader: &mut R,
@@ -141,7 +159,7 @@ impl Default for FatServer {
 /// Handle one vfs request frame, writing the reply into `reply` and returning
 /// the number of reply bytes. Malformed frames and too-small reply buffers return
 /// a one-byte [`VFS_BAD_REQUEST`] status when possible.
-pub fn dispatch<R: SectorReader>(
+pub fn dispatch<R: SectorReader + SectorWriter>(
     volume: &FatVolume,
     reader: &mut R,
     open_files: &mut OpenTable,
@@ -149,30 +167,48 @@ pub fn dispatch<R: SectorReader>(
     reply: &mut [u8],
 ) -> usize {
     match Request::decode(request) {
-        Some(Request::Open { path }) => open(volume, reader, open_files, path, reply),
+        Some(Request::Open { path }) => open(volume, reader, open_files, path, OPEN_READ, reply),
+        Some(Request::OpenOptions { path, options }) => {
+            open(volume, reader, open_files, path, options, reply)
+        }
         Some(Request::Read {
             handle,
             offset,
             len,
         }) => read(volume, reader, open_files, handle, offset, len, reply),
+        Some(Request::Write {
+            handle,
+            offset,
+            data,
+        }) => write(volume, reader, open_files, handle, offset, data, reply),
+        Some(Request::SetLen { handle, len }) => {
+            set_len(volume, reader, open_files, handle, len, reply)
+        }
+        Some(Request::Flush { handle }) => flush(volume, reader, open_files, handle, reply),
         None => write_status(reply, VFS_BAD_REQUEST),
     }
 }
 
-fn open<R: SectorReader>(
+fn open<R: SectorReader + SectorWriter>(
     volume: &FatVolume,
     reader: &mut R,
     open_files: &mut OpenTable,
     path: &[u8],
+    options: u8,
     reply: &mut [u8],
 ) -> usize {
-    let Some(entry) = volume.resolve_path(reader, path) else {
-        return write_status(reply, VFS_NOT_FOUND);
+    let entry = match volume.resolve_path(reader, path) {
+        Some(entry) => entry,
+        None if options & OPEN_CREATE != 0 => match volume.create_file(reader, path) {
+            Ok(entry) => entry,
+            Err(error) => return write_status(reply, mutation_status(error)),
+        },
+        None => return write_status(reply, VFS_NOT_FOUND),
     };
     if entry.is_dir() {
         return write_status(reply, VFS_IS_DIR);
     }
-    let Some(handle) = open_files.insert(entry) else {
+    let Some(handle) = open_files.insert(entry, options) else {
         return write_status(reply, VFS_BAD_HANDLE);
     };
     write_frame(reply, &encode_open_ok(handle, entry.size as u64))
@@ -190,14 +226,82 @@ fn read<R: SectorReader>(
     if reply.is_empty() {
         return 0;
     }
-    let Some(entry) = open_files.get(handle) else {
+    let Some(file) = open_files.get(handle) else {
         return write_status(reply, VFS_BAD_HANDLE);
     };
+    if !file.readable {
+        return write_status(reply, VFS_ACCESS_DENIED);
+    }
 
     reply[0] = VFS_OK;
     let cap = (len as usize).min(reply.len() - 1);
-    let n = volume.read_file_at(reader, &entry, offset, &mut reply[1..1 + cap]);
+    let n = volume.read_file_at(reader, &file.entry, offset, &mut reply[1..1 + cap]);
     1 + n
+}
+
+fn write<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    open_files: &mut OpenTable,
+    handle: u32,
+    offset: u64,
+    data: &[u8],
+    reply: &mut [u8],
+) -> usize {
+    let Some(file) = open_files.get_mut(handle) else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    if !file.writable {
+        return write_status(reply, VFS_ACCESS_DENIED);
+    }
+    match volume.write_file_at(io, &mut file.entry, offset, data) {
+        Ok(written) => write_frame(reply, &encode_write_ok(written as u32)),
+        Err(error) => write_status(reply, mutation_status(error)),
+    }
+}
+
+fn set_len<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    open_files: &mut OpenTable,
+    handle: u32,
+    len: u64,
+    reply: &mut [u8],
+) -> usize {
+    let Some(file) = open_files.get_mut(handle) else {
+        return write_status(reply, VFS_BAD_HANDLE);
+    };
+    if !file.writable {
+        return write_status(reply, VFS_ACCESS_DENIED);
+    }
+    match volume.set_file_len(io, &mut file.entry, len) {
+        Ok(()) => write_status(reply, VFS_OK),
+        Err(error) => write_status(reply, mutation_status(error)),
+    }
+}
+
+fn flush<R: SectorReader + SectorWriter>(
+    volume: &FatVolume,
+    io: &mut R,
+    open_files: &OpenTable,
+    handle: u32,
+    reply: &mut [u8],
+) -> usize {
+    if open_files.get(handle).is_none() {
+        return write_status(reply, VFS_BAD_HANDLE);
+    }
+    match volume.flush(io) {
+        Ok(()) => write_status(reply, VFS_OK),
+        Err(error) => write_status(reply, mutation_status(error)),
+    }
+}
+
+const fn mutation_status(error: FatWriteError) -> u8 {
+    match error {
+        FatWriteError::NoSpace => VFS_NO_SPACE,
+        FatWriteError::Invalid => VFS_BAD_REQUEST,
+        FatWriteError::Io => VFS_IO_ERROR,
+    }
 }
 
 fn write_status(reply: &mut [u8], status: u8) -> usize {
@@ -216,7 +320,10 @@ mod tests {
     use alloc::collections::VecDeque;
     use alloc::vec::Vec;
     use kumo_fatfs::{attr, FatError, SECTOR_SIZE};
-    use kumo_vfs::{parse_open_reply, read_payload, VFS_BAD_REQUEST};
+    use kumo_vfs::{
+        parse_open_reply, parse_write_reply, read_payload, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
+        VFS_BAD_REQUEST,
+    };
 
     const SEC: u16 = 512;
     const RESERVED: u16 = 32;
@@ -284,6 +391,12 @@ mod tests {
                 _ => {}
             }
             true
+        }
+    }
+
+    impl SectorWriter for FixtureDisk {
+        fn write_sector(&mut self, _lba: u32, _buf: &[u8; SECTOR_SIZE]) -> bool {
+            false
         }
     }
 
@@ -475,6 +588,128 @@ mod tests {
         assert_eq!(transport.sent.len(), 2);
         assert_eq!(parse_open_reply(&transport.sent[0]), Ok((1, 6)));
         assert_eq!(read_payload(&transport.sent[1]), Ok(&b"ello"[..]));
+    }
+
+    struct WritableDisk {
+        sectors: [[u8; SECTOR_SIZE]; 128],
+    }
+
+    impl WritableDisk {
+        fn fixture() -> WritableDisk {
+            let mut disk = WritableDisk {
+                sectors: [[0u8; SECTOR_SIZE]; 128],
+            };
+            let mut source = FixtureDisk;
+            for lba in 0..disk.sectors.len() {
+                source.read_sector(lba as u32, &mut disk.sectors[lba]);
+            }
+            disk
+        }
+    }
+
+    impl SectorReader for WritableDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            let Some(sector) = self.sectors.get(lba as usize) else {
+                return false;
+            };
+            *buf = *sector;
+            true
+        }
+    }
+
+    impl SectorWriter for WritableDisk {
+        fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool {
+            let Some(sector) = self.sectors.get_mut(lba as usize) else {
+                return false;
+            };
+            *sector = *buf;
+            true
+        }
+    }
+
+    #[test]
+    fn create_resize_write_flush_and_reopen_cross_the_vfs_handler() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut request = [0u8; REQUEST_BUF_BYTES];
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let options = OPEN_READ | OPEN_WRITE | OPEN_CREATE;
+
+        let n = Request::open_options(b"/KILO.TXT", options)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        let (handle, size) = parse_open_reply(&reply[..reply_len]).unwrap();
+        assert_eq!(size, 0);
+
+        let n = Request::set_len(handle, 6)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_OK]);
+
+        let n = Request::write(handle, 0, b"cloud!")
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(parse_write_reply(&reply[..reply_len]), Ok(6));
+
+        let n = Request::flush(handle).encode_into(&mut request).unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_OK]);
+
+        let mut reopened = OpenTable::new();
+        let n = Request::open(b"/KILO.TXT")
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut reopened, &request[..n], &mut reply);
+        let (reopened_handle, reopened_size) = parse_open_reply(&reply[..reply_len]).unwrap();
+        assert_eq!(reopened_size, 6);
+        let n = Request::read(reopened_handle, 0, 6)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut reopened, &request[..n], &mut reply);
+        assert_eq!(read_payload(&reply[..reply_len]), Ok(&b"cloud!"[..]));
+    }
+
+    #[test]
+    fn open_access_options_gate_reads_writes_and_resize() {
+        let mut disk = WritableDisk::fixture();
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut request = [0u8; REQUEST_BUF_BYTES];
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+
+        let n = Request::open_options(b"/HELLO.TXT", OPEN_READ)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        let (read_handle, _) = parse_open_reply(&reply[..reply_len]).unwrap();
+
+        let n = Request::write(read_handle, 0, b"no")
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_ACCESS_DENIED]);
+
+        let n = Request::set_len(read_handle, 1)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_ACCESS_DENIED]);
+
+        let n = Request::open_options(b"/HELLO.TXT", OPEN_WRITE)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        let (write_handle, _) = parse_open_reply(&reply[..reply_len]).unwrap();
+
+        let n = Request::read(write_handle, 0, 1)
+            .encode_into(&mut request)
+            .unwrap();
+        let reply_len = dispatch(&volume, &mut disk, &mut table, &request[..n], &mut reply);
+        assert_eq!(&reply[..reply_len], &[VFS_ACCESS_DENIED]);
     }
 
     #[test]

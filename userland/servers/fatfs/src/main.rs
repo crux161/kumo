@@ -1,18 +1,19 @@
 #![no_std]
 #![no_main]
 //j508
+//j514
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
 //! Bootstrap mirrors `drv-blk`'s: one channel carries a first message of
-//! `[image_base: u64 LE][map_len: u64 LE]` plus a read-only VMO handle, and then
+//! `[image_base: u64 LE][map_len: u64 LE]` plus a read-write VMO handle, and then
 //! becomes the `kumo-vfs` request channel. The server owns no device and no
-//! ambient authority — it can read exactly the VMO it was handed, and answer
-//! exactly the peer that holds the other end.
+//! ambient authority — it can mutate exactly the interop-volume VMO it was
+//! handed, and answer exactly the peer that holds the other end.
 
 use fatfs::{FatServer, Transport};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_fatfs::{FatVolume, SectorReader, SECTOR_SIZE};
+use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
 use kumo_rt::{channel_read, channel_read_with_handle, channel_write, debug_write, vmar_map};
 
 kumo_rt::entry!(main);
@@ -59,6 +60,25 @@ impl SectorReader for MappedSectors {
                 buf.as_mut_ptr(),
                 SECTOR_SIZE,
             );
+        }
+        true
+    }
+}
+
+impl SectorWriter for MappedSectors {
+    fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool {
+        let sector = SECTOR_SIZE as u64;
+        let Some(offset) = (lba as u64)
+            .checked_mul(sector)
+            .and_then(|value| value.checked_add(self.base))
+        else {
+            return false;
+        };
+        if offset.checked_add(sector).is_none_or(|end| end > self.len) {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), (VMO_VA + offset) as *mut u8, SECTOR_SIZE);
         }
         true
     }
@@ -118,7 +138,7 @@ extern "C" fn main(
         0,
         VMO_VA,
         map_len,
-        (VmarFlags::READ).0,
+        (VmarFlags::READ | VmarFlags::WRITE).0,
     ) != 0
     {
         fail(b"fatfs: image map failed\n");

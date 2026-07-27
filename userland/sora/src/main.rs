@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j489
 //j493
 //j506
 //j507
 //j512
+//j514
 
 extern crate alloc;
 
@@ -50,6 +50,14 @@ static DTB_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
 /// synchronous, so one buffer is safe to reuse. The static avoids threading the handle
 /// through the shell dispatcher.
 static ARGV_VMO: AtomicU64 = AtomicU64::new(0);
+
+/// Supervisor-owned writable copy of `bin/fat32.img`. A `fatfs` instance receives
+/// only a narrowed duplicate, so its restart drops open-table soft state while the
+/// interop-volume bytes survive for the rest of this boot. The immutable initrd is
+/// never writable. This is the RAM-backed bridge before PLAN/008 S3 supplies a
+/// persistent block device, not the DESIGN/010 RedoxFS root. — KESTREL
+static FAT_IMAGE_VMO: AtomicU64 = AtomicU64::new(0);
+static FAT_IMAGE_LEN: AtomicU64 = AtomicU64::new(0);
 
 // Sora's entry. Mirrors `kumo_rt::entry!` (a bare `bl sora_main`) but first stashes x8 into
 // `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
@@ -2563,20 +2571,12 @@ fn run_with_startup(
 
 /// Spawn a private `fatfs` instance and return the client end of its `kumo-vfs` channel.
 ///
-/// One server per launch, deliberately. The instance's whole authority is a read-only alias
-/// of the initrd VMO and the byte offset of the FAT image inside it; its lifetime is the
-/// channel, so it exits when its one client goes away, and no two programs ever share an
-/// open-file table. The bootstrap message rides the same channel that afterwards carries vfs
-/// frames — the shape `drv-blk` established — so the child needs exactly one handle.
+/// One server per launch, deliberately. Its whole storage authority is a read-write alias of
+/// Sora's FAT-image VMO, not the initrd. The VMO persists across launches while each server's
+/// open-file table remains disposable soft state. The bootstrap message rides the same channel
+/// that afterwards carries vfs frames — the shape `drv-blk` established — so the child needs
+/// exactly one handle.
 fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
-    let Some((image_base, image_len)) = initrd_find(initrd, FAT32_IMG_PATH.as_bytes()) else {
-        log(b"fatfs: image not found\n");
-        return None;
-    };
-    // The server maps from the VMO's start, so the mapping must reach the end of the image.
-    // Rounding up to a page is `vmar_map`'s requirement, not a guess about the content.
-    let map_len = image_base.saturating_add(image_len).saturating_add(0xFFF) & !0xFFF;
-
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
         log(b"fatfs: channel unavailable\n");
@@ -2584,17 +2584,14 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
     }
     let client = Handle(client_raw as u32);
     let server = Handle(server_raw as u32);
-
-    let image_vmo = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
-    if image_vmo == 0 || image_vmo == u64::MAX {
+    let Some((image_vmo, map_len)) = fat_image_alias(initrd) else {
         let _ = handle_close(client);
         let _ = handle_close(server);
-        log(b"fatfs: image grant unavailable\n");
         return None;
-    }
+    };
 
     let mut header = [0u8; 16];
-    header[..8].copy_from_slice(&image_base.to_le_bytes());
+    header[..8].copy_from_slice(&0u64.to_le_bytes());
     header[8..].copy_from_slice(&map_len.to_le_bytes());
     if channel_write_with_handle(
         client,
@@ -2624,6 +2621,53 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
         return None;
     }
     Some(client)
+}
+
+fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {
+    let mut backing = FAT_IMAGE_VMO.load(Ordering::Acquire);
+    let mut map_len = FAT_IMAGE_LEN.load(Ordering::Relaxed);
+    if backing == 0 {
+        let Some((image_base, image_len)) = initrd_find(initrd, FAT32_IMG_PATH.as_bytes()) else {
+            log(b"fatfs: image not found\n");
+            return None;
+        };
+        map_len = image_len.saturating_add(0xFFF) & !0xFFF;
+        backing = vmo_create(map_len);
+        if backing == 0 || backing == u64::MAX {
+            log(b"fatfs: backing vmo unavailable\n");
+            return None;
+        }
+
+        // Child VMO copy syscalls are deliberately capped at 256 bytes (J166), so copy
+        // the exact FAT payload in bounded pieces. Padding stays zero from VmoCreate.
+        let backing_handle = Handle(backing as u32);
+        let mut offset = 0u64;
+        let mut chunk = [0u8; 256];
+        while offset < image_len {
+            let n = (image_len - offset).min(chunk.len() as u64) as usize;
+            if vmo_read(initrd, image_base + offset, chunk.as_mut_ptr(), n) != 0
+                || vmo_write(backing_handle, offset, chunk.as_ptr(), n) != 0
+            {
+                let _ = handle_close(backing_handle);
+                log(b"fatfs: backing copy failed\n");
+                return None;
+            }
+            offset += n as u64;
+        }
+        FAT_IMAGE_LEN.store(map_len, Ordering::Relaxed);
+        FAT_IMAGE_VMO.store(backing, Ordering::Release);
+    }
+
+    let alias = handle_duplicate(
+        Handle(backing as u32),
+        Rights::READ | Rights::WRITE | Rights::TRANSFER,
+    );
+    if alias == 0 || alias == u64::MAX {
+        log(b"fatfs: image grant unavailable\n");
+        None
+    } else {
+        Some((alias, map_len))
+    }
 }
 
 /// Spawn one private `ttyd` control service for a child and return its client channel.

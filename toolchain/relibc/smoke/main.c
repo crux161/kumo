@@ -1,8 +1,8 @@
-/* j506 */
 /* j507 */
 /* j511 */
 /* j512 */
 /* j513 */
+/* j514 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -12,6 +12,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +133,44 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: absent path refused errno=%d\n", errno);
 
+    static const char saved[] = "clouds over kumo\n";
+
+    if (argc > 1 && strcmp(argv[1], "persisted") == 0) {
+        stream = fopen("/KILO.TXT", "r");
+        if (stream == (FILE *)0) {
+            printf("relibc: persisted file missing errno=%d\n", errno);
+            return 44;
+        }
+        char prior[32];
+        const size_t prior_got = fread(prior, 1, sizeof(prior), stream);
+        if (fclose(stream) != 0 || prior_got != sizeof(saved) - 1 ||
+            memcmp(prior, saved, sizeof(saved) - 1) != 0) {
+            return 45;
+        }
+        printf("relibc: KILO.TXT survived fatfs replacement -> OK\n");
+    }
+
+    /* Kilo's complete save sequence: create/open read-write, resize, one write, close. */
+    int saved_fd = open("/KILO.TXT", O_RDWR | O_CREAT, 0644);
+    if (saved_fd < 0 || ftruncate(saved_fd, sizeof(saved) - 1) != 0 ||
+        write(saved_fd, saved, sizeof(saved) - 1) != (ssize_t)(sizeof(saved) - 1) ||
+        fsync(saved_fd) != 0 || close(saved_fd) != 0) {
+        printf("relibc: kilo save sequence failed errno=%d\n", errno);
+        return 41;
+    }
+    stream = fopen("/KILO.TXT", "r");
+    if (stream == (FILE *)0) {
+        return 42;
+    }
+    char saved_back[sizeof(saved)];
+    const size_t saved_got = fread(saved_back, 1, sizeof(saved_back) - 1, stream);
+    saved_back[saved_got] = '\0';
+    if (fclose(stream) != 0 || saved_got != sizeof(saved) - 1 ||
+        memcmp(saved_back, saved, sizeof(saved) - 1) != 0) {
+        return 43;
+    }
+    printf("relibc: kilo create+truncate+write+flush+reopen -> OK\n");
+
     /*
      * `ttyd`, not libc, owns echo and line editing. Enter raw mode through its
      * explicitly granted control channel, read the state back, then restore it before
@@ -189,6 +228,6 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: stdin read %zd bytes -> \"%s\" then EOF\n", got_in, line);
 
-    printf("relibc: startup+printf+argv+tls+calloc+file+tty+winsize+stdin -> OK\n");
+    printf("relibc: startup+printf+argv+tls+calloc+file+write+tty+winsize+stdin -> OK\n");
     return 0;
 }
