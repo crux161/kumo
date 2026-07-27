@@ -1,39 +1,87 @@
 /* j506 */
+/* j507 */
 /*
- * Header-free on purpose: I-a1 proves relibc's runtime boundary, not its
- * installed header set. I-a3 closes the public C header/filesystem gate. — KESTREL
+ * Header-free on purpose: I-a2 proves relibc's startup boundary, not its
+ * installed header set. I-a3 closes the public C header/filesystem gate.
+ * — KESTREL / TIMBERDOODLE
  */
 
 typedef __SIZE_TYPE__ size_t;
 typedef __INTPTR_TYPE__ ssize_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
 
-void *malloc(size_t size);
+int printf(const char *format, ...);
+void *calloc(size_t count, size_t size);
 void free(void *pointer);
 ssize_t write(int fd, const void *buffer, size_t length);
+int *__errno_location(void);
 
-static size_t string_length(const char *string) {
-    size_t length = 0;
-    while (string[length] != '\0') {
-        ++length;
-    }
-    return length;
-}
+#define errno (*__errno_location())
+#define EBADF 9
 
-static int write_all(int fd, const char *message) {
-    const size_t length = string_length(message);
-    return write(fd, message, length) == (ssize_t)length;
-}
+/*
+ * Thread-local storage, resolved through the local-exec model against `tpidr_el0`.
+ * Without relibc's TLS activation this would not be addressable at all.
+ */
+static __thread unsigned tls_counter;
 
-int main(void) {
+/* A plain static, for contrast: it lives in the image, not in the mapped TLS block. */
+static unsigned image_counter;
+
+int main(int argc, char **argv, char **envp) {
     enum { ALLOCATION_BYTES = 384 * 1024, PAGE_BYTES = 4096 };
-    volatile unsigned char *allocation = malloc(ALLOCATION_BYTES);
+
+    /* argv reached C through KUMO's argv VMO, not through an inherited POSIX stack. */
+    printf("relibc: argc=%d\n", argc);
+    for (int index = 0; index < argc; ++index) {
+        printf("relibc: argv[%d]=%s\n", index, argv[index]);
+    }
+
+    /*
+     * KUMO grants no environment capability yet, so the startup view carries an empty
+     * environment. Check that, rather than let a stray pointer read as inherited state.
+     */
+    if (envp == (char **)0 || envp[0] != (char *)0) {
+        return 20;
+    }
+
+    /* TLS round-trip: fresh storage starts zero, then holds a value derived at runtime. */
+    if (tls_counter != 0) {
+        return 21;
+    }
+    tls_counter = (unsigned)argc * 7u + 3u;
+    image_counter = tls_counter;
+    if (tls_counter != image_counter || (uintptr_t)&tls_counter == (uintptr_t)&image_counter) {
+        return 22;
+    }
+
+    /*
+     * relibc's own `errno` is thread-local, so a failing libc call proves the same
+     * activation from inside the library. fd 9 was never granted: the write must be
+     * refused rather than reach some other capability.
+     */
+    errno = 0;
+    if (write(9, "", 1) != -1 || errno != EBADF) {
+        return 23;
+    }
+    printf("relibc: tls=%u errno=%d tls@%p image@%p\n", tls_counter, errno,
+           (void *)&tls_counter, (void *)&image_counter);
+
+    /*
+     * `calloc`, not `malloc`: by this point relibc's own startup and stdio have already
+     * used the arena, so a `malloc` span may legitimately carry allocator bookkeeping.
+     * `calloc` is the allocation whose zeroing C actually guarantees — and dlmalloc keeps
+     * that guarantee cheaply here only because it is told KUMO's anonymous VMOs arrive
+     * zeroed, so a dirty VMO would surface as a non-zero byte below.
+     */
+    volatile unsigned char *allocation = calloc(ALLOCATION_BYTES, 1);
     if (allocation == (void *)0) {
         return 10;
     }
-
-    /* Fresh anonymous VMO pages must be zero before the allocator user touches them. */
     for (size_t offset = 0; offset < ALLOCATION_BYTES; offset += PAGE_BYTES) {
         if (allocation[offset] != 0) {
+            printf("relibc: nonzero at +%zu = 0x%02x base=%p\n", offset,
+                   (unsigned)allocation[offset], (void *)allocation);
             return 11;
         }
     }
@@ -47,13 +95,12 @@ int main(void) {
             return 12;
         }
     }
-
     free((void *)allocation);
-    if (!write_all(2, "relibc: stderr channel -> OK\n")) {
+
+    /* Direct `write` still works beside buffered stdio; both land on the one channel. */
+    if (write(2, "relibc: stderr channel -> OK\n", 29) != 29) {
         return 13;
     }
-    if (!write_all(1, "relibc: write+exit+malloc 384KiB -> OK\n")) {
-        return 14;
-    }
+    printf("relibc: startup+printf+argv+tls+calloc 384KiB -> OK\n");
     return 0;
 }

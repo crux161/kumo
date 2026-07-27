@@ -1,7 +1,10 @@
 //j505
 //j506
-// Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 makes only
-// startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live. — KESTREL
+//j507
+// Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
+// startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
+// I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
+// expects. — KESTREL / TIMBERDOODLE
 
 #![allow(deprecated)]
 
@@ -10,7 +13,11 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use super::{types::*, Pal, PalEpoll, PalPtrace, PalSignal, PalSocket};
+use super::{
+    auxv_defs::{AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM},
+    types::*,
+    Pal, PalEpoll, PalPtrace, PalSignal, PalSocket,
+};
 use crate::{
     c_str::CStr,
     error::{Errno, Result},
@@ -31,6 +38,7 @@ use crate::{
     ld_so::tcb::OsSpecific,
     out::Out,
     pthread,
+    start::Stack,
 };
 
 pub struct Sys;
@@ -39,18 +47,47 @@ const SYSCALL_HANDLE_CLOSE: u64 = 0;
 const SYSCALL_CHANNEL_WRITE: u64 = 4;
 const SYSCALL_CHANNEL_READ: u64 = 5;
 const SYSCALL_VMO_CREATE: u64 = 12;
+const SYSCALL_VMO_READ: u64 = 13;
 const SYSCALL_VMAR_MAP: u64 = 15;
 const SYSCALL_PROCESS_EXIT: u64 = 21;
+const SYSCALL_FUTEX_WAIT: u64 = 28;
+const SYSCALL_FUTEX_WAKE: u64 = 29;
+
+/// KUMO statuses this backend distinguishes. The whole error space is negative, which is
+/// what lets `FutexWake` return a woken count in the same register.
+const KUMO_OK: i32 = 0;
+const KUMO_SHOULD_WAIT: i32 = -5;
+const KUMO_NOT_SUPPORTED: i32 = -8;
 
 const STARTUP_TAG_STDOUT: u8 = b'o';
 const STARTUP_TAG_STDERR: u8 = b'e';
+const STARTUP_TAG_ARGV: u8 = b'a';
 
 const VMAR_READ: u64 = 1 << 0;
 const VMAR_WRITE: u64 = 1 << 1;
 const PAGE_SIZE: usize = 4096;
 
+/// Bytes of packed argv KUMO can deliver. `VmoRead` copies at most 256 bytes per call and
+/// the launcher packs into a 256-byte buffer, so one read is always the whole vector.
+const ARGV_BYTES: usize = 256;
+/// Arguments the startup image has room for, matching the launcher's own argv ceiling.
+const ARGV_MAX: usize = 16;
+/// `argc`, `argv` and its terminator, an empty `envp`, then five auxiliary-vector pairs.
+const STARTUP_WORDS: usize = 1 + (ARGV_MAX + 1) + 1 + 10;
+/// Exit status for a startup precondition that failed before stdio existed. Distinct so a
+/// silent abort can never be mistaken for a run that reached `main`.
+const STARTUP_FAILURE_STATUS: c_int = 70;
+
 static STDOUT_HANDLE: AtomicU32 = AtomicU32::new(0);
 static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
+
+/// The packed argv page as delivered, kept for the lifetime of the process because the
+/// `argv` pointers relibc publishes borrow the strings in place.
+static mut ARGV_IMAGE: [u8; ARGV_BYTES] = [0; ARGV_BYTES];
+
+/// The SysV initial-process image relibc reads through [`Stack`]. Both statics are written
+/// exactly once, by the startup thread, before any other thread can exist.
+static mut STARTUP_IMAGE: [usize; STARTUP_WORDS] = [0; STARTUP_WORDS];
 
 fn syscall4(number: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
     let result;
@@ -111,6 +148,16 @@ fn vmar_map_anywhere(vmo: u32, len: usize) -> (u64, u64) {
     (status, address)
 }
 
+fn vmo_read(vmo: u32, offset: u64, dest: *mut u8, len: usize) -> u64 {
+    syscall4(
+        SYSCALL_VMO_READ,
+        u64::from(vmo),
+        offset,
+        dest as u64,
+        len as u64,
+    )
+}
+
 fn close_handle(handle: u32) {
     if handle != 0 {
         let _ = syscall4(SYSCALL_HANDLE_CLOSE, u64::from(handle), 0, 0, 0);
@@ -124,13 +171,29 @@ fn install_startup_handle(slot: &AtomicU32, handle: u32) {
     }
 }
 
-/// Drain KUMO's finite bootstrap capability set before entering the I-a1 C smoke.
+/// A startup precondition failed before stdio existed. Report through the granted output
+/// channel — the only authority held this early — and exit with a distinct status, so a
+/// program that never reached `main` can never be read as one that ran. — TIMBERDOODLE
+fn startup_fail(message: &[u8]) -> ! {
+    let handle = STDERR_HANDLE.load(Ordering::Relaxed);
+    if handle != 0 {
+        let _ = syscall4(
+            SYSCALL_CHANNEL_WRITE,
+            u64::from(handle),
+            message.as_ptr() as u64,
+            message.len() as u64,
+            0,
+        );
+    }
+    <Sys as Pal>::exit(STARTUP_FAILURE_STATUS)
+}
+
+/// Drain KUMO's finite bootstrap capability set, keeping only what this slice can honour.
 ///
-/// Full argc/argv/env/TLS construction belongs to I-a2. Unknown capabilities are
-/// closed instead of becoming ambient authority. — KESTREL
-#[unsafe(no_mangle)]
-pub extern "C" fn __relibc_kumo_init(bootstrap: u64) {
-    let bootstrap = bootstrap as u32;
+/// Unknown capabilities are closed rather than becoming ambient authority. Returns the
+/// granted argv VMO, or `0` when the launcher granted none. — KESTREL / TIMBERDOODLE
+fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
+    let mut argv_vmo = 0_u32;
     let mut tag = 0_u8;
     loop {
         let (count, raw_handle) = channel_read_with_handle(bootstrap, &mut tag);
@@ -144,6 +207,9 @@ pub extern "C" fn __relibc_kumo_init(bootstrap: u64) {
         match tag {
             STARTUP_TAG_STDOUT => install_startup_handle(&STDOUT_HANDLE, handle),
             STARTUP_TAG_STDERR => install_startup_handle(&STDERR_HANDLE, handle),
+            STARTUP_TAG_ARGV => {
+                close_handle(core::mem::replace(&mut argv_vmo, handle));
+            }
             _ => close_handle(handle),
         }
     }
@@ -158,6 +224,109 @@ pub extern "C" fn __relibc_kumo_init(bootstrap: u64) {
     } else if stdout == 0 {
         STDOUT_HANDLE.store(stderr, Ordering::Relaxed);
     }
+    argv_vmo
+}
+
+/// Lay KUMO's granted capabilities out as the SysV initial-process image.
+///
+/// KUMO packs argv as `[argc: u32 LE][arg0]\0[arg1]\0 …` into one read-only VMO, so the
+/// copied page can back the `argv` pointers directly. `envp` is deliberately a lone
+/// terminator: KUMO grants no environment capability yet, and inventing one here would be
+/// ambient authority wearing a POSIX name. `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` are read from
+/// this image's own mapped ELF header, which is how relibc's static TLS setup finds
+/// `PT_TLS` without the kernel loader growing a POSIX opinion. — TIMBERDOODLE
+unsafe fn build_startup_image(argv_vmo: u32) -> &'static Stack {
+    unsafe extern "C" {
+        /// Defined by the linker when the ELF header is covered by a `PT_LOAD` segment.
+        static __ehdr_start: [u8; 64];
+    }
+
+    let image = (&raw mut STARTUP_IMAGE).cast::<usize>();
+    let argv_bytes = (&raw mut ARGV_IMAGE).cast::<u8>();
+
+    let mut argc = 0_usize;
+    if argv_vmo != 0 && vmo_read(argv_vmo, 0, argv_bytes, ARGV_BYTES) == 0 {
+        let header = unsafe { core::ptr::read_unaligned(argv_bytes.cast::<[u8; 4]>()) };
+        let packed = u32::from_le_bytes(header) as usize;
+        let mut pos = header.len();
+        while argc < packed.min(ARGV_MAX) && pos < ARGV_BYTES {
+            let start = pos;
+            while pos < ARGV_BYTES && unsafe { *argv_bytes.add(pos) } != 0 {
+                pos += 1;
+            }
+            if pos == ARGV_BYTES {
+                // A truncated tail is dropped rather than published unterminated.
+                break;
+            }
+            unsafe { image.add(1 + argc).write(argv_bytes.add(start) as usize) };
+            argc += 1;
+            pos += 1;
+        }
+    }
+
+    unsafe {
+        image.write(argc);
+        image.add(1 + argc).write(0);
+        image.add(2 + argc).write(0);
+    }
+
+    let ehdr = (&raw const __ehdr_start).cast::<u8>();
+    if unsafe { core::ptr::read_unaligned(ehdr.cast::<[u8; 4]>()) } != *b"\x7fELF" {
+        startup_fail(b"relibc: no mapped ELF header for KUMO startup\n");
+    }
+    let phoff = unsafe { core::ptr::read_unaligned(ehdr.add(32).cast::<u64>()) } as usize;
+    let phentsize = unsafe { core::ptr::read_unaligned(ehdr.add(54).cast::<u16>()) } as usize;
+    let phnum = unsafe { core::ptr::read_unaligned(ehdr.add(56).cast::<u16>()) } as usize;
+
+    let auxv = 3 + argc;
+    let vector = [
+        AT_PHDR,
+        ehdr as usize + phoff,
+        AT_PHENT,
+        phentsize,
+        AT_PHNUM,
+        phnum,
+        AT_PAGESZ,
+        PAGE_SIZE,
+        AT_NULL,
+        0,
+    ];
+    for (index, entry) in vector.into_iter().enumerate() {
+        unsafe { image.add(auxv + index).write(entry) };
+    }
+
+    unsafe { &*image.cast::<Stack>() }
+}
+
+/// KUMO's C startup entry. `_start` hands over the finite bootstrap channel and the
+/// address of `main`; everything after the SysV image is built — TLS activation, stdio,
+/// the init arrays, `main`, and exit — is upstream relibc's own start path. — TIMBERDOODLE
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __relibc_kumo_start(
+    bootstrap: u64,
+    main: unsafe extern "C" fn(
+        argc: isize,
+        argv: *mut *mut c_char,
+        envp: *mut *mut c_char,
+    ) -> c_int,
+) -> ! {
+    // KUMO does not yet define `tpidr_el0` for a fresh EL0 thread, and firmware leaves a
+    // stale value in it. relibc reads a non-zero thread pointer as "TLS is already
+    // active", skips its static setup, and then dereferences that stale value. Claiming
+    // the register here is the crt0's job — it is this thread's own state, and a later
+    // kernel slice that owns the thread pointer makes this a no-op rather than a
+    // conflict. — TIMBERDOODLE
+    unsafe {
+        core::arch::asm!(
+            "msr tpidr_el0, xzr",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+
+    let argv_vmo = take_bootstrap_capabilities(bootstrap as u32);
+    let stack = unsafe { build_startup_image(argv_vmo) };
+    close_handle(argv_vmo);
+    unsafe { crate::start::relibc_start_v1(stack, main) }
 }
 
 impl Sys {
@@ -274,12 +443,36 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    /// KUMO's `FutexWait` compares the word and parks only on a match, reporting
+    /// `ShouldWait` when the value had already moved on. It carries no deadline, so a
+    /// timed wait is refused rather than silently waited forever. — TIMBERDOODLE
     unsafe fn futex_wait(addr: *mut u32, val: u32, deadline: Option<&timespec>) -> Result<()> {
-        Err(unsupported())
+        use crate::header::errno::{EAGAIN, EINVAL};
+
+        if deadline.is_some() {
+            return Err(unsupported());
+        }
+        let status = syscall4(SYSCALL_FUTEX_WAIT, addr as u64, u64::from(val), 0, 0) as i32;
+        match status {
+            KUMO_OK => Ok(()),
+            KUMO_SHOULD_WAIT => Err(Errno(EAGAIN)),
+            KUMO_NOT_SUPPORTED => Err(unsupported()),
+            _ => Err(Errno(EINVAL)),
+        }
     }
 
+    /// `FutexWake` answers with the number of threads released; waking none is the normal
+    /// uncontended case, not a failure. Negative KUMO statuses are the error space, and a
+    /// woken count can never reach them. — TIMBERDOODLE
     unsafe fn futex_wake(addr: *mut u32, num: u32) -> Result<u32> {
-        Err(unsupported())
+        use crate::header::errno::EINVAL;
+
+        let woken = syscall4(SYSCALL_FUTEX_WAKE, addr as u64, u64::from(num), 0, 0);
+        match woken as i32 {
+            KUMO_NOT_SUPPORTED => Err(unsupported()),
+            status if status < 0 => Err(Errno(EINVAL)),
+            _ => Ok(woken as u32),
+        }
     }
 
     unsafe fn utimensat(

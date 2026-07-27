@@ -1,8 +1,9 @@
 #!/bin/sh
 #j505
 #j506
-# Build KUMO's out-of-tree relibc platform and its I-a1 C smoke without
-# touching the pinned upstream checkout. Full SysV/TLS startup remains absent.
+#j507
+# Build KUMO's out-of-tree relibc platform and its I-a2 C smoke without touching the
+# pinned upstream checkout. Installed headers and file I/O remain absent.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -163,4 +164,4 @@ mkdir -p "$smoke_dir"
 
 printf 'KUMO relibc scaffold green: %s methods, target_os=kumo, source %s\n' \
     "$method_count" "$RELIBC_REV"
-printf 'KUMO relibc I-a1 image: %s\n' "$smoke_elf"
+printf 'KUMO relibc I-a2 image: %s\n' "$smoke_elf"

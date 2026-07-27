@@ -502,13 +502,25 @@ index 7bffec7..08a1943 100644
      unsafe fn os_new(
          size: usize,
      ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
-@@ -354,6 +357,11 @@ impl Tcb {
+@@ -354,6 +357,23 @@ impl Tcb {
          }
      }
  
++    /// KUMO AArch64 TLS activation. Identical in shape to the Linux AArch64 path above:
++    /// the ABI page's last 16 bytes hold a pointer to the TLS end, and `tpidr_el0` names
++    /// that ABI slot so variant-I local-exec offsets resolve from it. `tpidr_el0` is
++    /// architecturally writable at EL0, so this costs no KUMO syscall and the kernel
++    /// gains no thread-local policy. — TIMBERDOODLE
 +    #[cfg(all(target_os = "kumo", target_arch = "aarch64"))]
-+    unsafe fn os_arch_activate(_os: &(), _tls_end: usize, _tls_len: usize) {
-+        panic!("relibc KUMO TLS activation is not implemented")
++    unsafe fn os_arch_activate(_os: &(), tls_end: usize, tls_len: usize) {
++        let abi_ptr = tls_end - tls_len - 16;
++        unsafe {
++            core::ptr::write(abi_ptr as *mut usize, tls_end);
++            core::arch::asm!(
++                "msr tpidr_el0, {}",
++                in(reg) abi_ptr,
++            );
++        }
 +    }
 +
      #[cfg(target_os = "redox")]

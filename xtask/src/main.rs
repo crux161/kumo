@@ -3,6 +3,7 @@
 //j467
 //j493
 //j506
+//j507
 
 use std::env;
 use std::fmt;
@@ -978,7 +979,8 @@ fn build_autoexec() -> Vec<u8> {
       run hello\n\
       run args alpha beta\n\
       cat etc/autoexec\n\
-      wc etc/autoexec\n"
+      wc etc/autoexec\n\
+      relibc i-a2\n"
         .to_vec()
 }
 

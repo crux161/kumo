@@ -6,6 +6,7 @@
 //j489
 //j493
 //j506
+//j507
 
 extern crate alloc;
 
@@ -2405,10 +2406,22 @@ fn eval_command(
         }
         return true;
     } else if cmd.name == "relibc" {
-        // I-a1: run the static C smoke with one finite stdout capability. Its
-        // crt0 drains x0, then relibc itself proves write/exit/malloc/free. — KESTREL
+        // I-a2: run the static C smoke with one finite stdout capability and its own argv
+        // VMO — the same two grants any other argv-taking program gets. `_start` hands both
+        // to relibc, which builds the SysV startup view from them, activates TLS, and only
+        // then proves printf/argv/malloc/exit. Anything the user types after `relibc`
+        // arrives as C `argv`, so the bridge carries real input rather than a fixed
+        // string. — TIMBERDOODLE
         debug_write(b"relibc: C runtime smoke\n".as_ptr(), 24);
-        run_with_startup(initrd, RELIBC_SMOKE_PATH.as_bytes(), b"relibc", None, false);
+        let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+        let count = command_argv_slots(cmd, &mut slots);
+        run_with_startup(
+            initrd,
+            RELIBC_SMOKE_PATH.as_bytes(),
+            b"relibc",
+            Some(&slots[..count]),
+            false,
+        );
         return true;
     } else if cmd.name == "threads" {
         // D2: two threads in one address space, handing off through a futex. Launched on demand
