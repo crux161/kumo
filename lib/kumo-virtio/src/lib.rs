@@ -1,6 +1,7 @@
 #![no_std]
 //j415
 //j416
+//j515
 //! Pure virtio constants and helpers shared by future transport drivers.
 
 pub mod mmio {
@@ -61,6 +62,21 @@ pub mod block {
     pub const STATUS_UNSUPP: u8 = 2;
 }
 
+/// Device-status bits shared by every modern virtio transport.
+pub mod device_status {
+    pub const ACKNOWLEDGE: u32 = 1 << 0;
+    pub const DRIVER: u32 = 1 << 1;
+    pub const DRIVER_OK: u32 = 1 << 2;
+    pub const FEATURES_OK: u32 = 1 << 3;
+    pub const DEVICE_NEEDS_RESET: u32 = 1 << 6;
+    pub const FAILED: u32 = 1 << 7;
+}
+
+/// Transport feature bits understood by KUMO's first modern virtio driver.
+pub mod device_features {
+    pub const VERSION_1: u64 = 1 << 32;
+}
+
 pub mod split_ring {
     pub const DESC_ALIGN: u64 = 16;
     pub const AVAIL_ALIGN: u64 = 2;
@@ -97,6 +113,131 @@ pub enum Error {
     QueueLayoutOverflow,
     BlockCountZero,
     BlockDataLenOverflow,
+    ResetTimedOut,
+    MissingVersion1,
+    ReadOnlyDevice,
+    FeaturesRejected,
+    DeviceNeedsReset,
+}
+
+/// A dword register port for the modern virtio-MMIO register window. A live
+/// implementation performs volatile accesses; tests use a replayable fake.
+pub trait RegisterIo {
+    fn read32(&mut self, offset: u32) -> u32;
+    fn write32(&mut self, offset: u32, value: u32);
+}
+
+/// Result of the feature-negotiation phase. Queue memory is deliberately not
+/// configured yet, so [`device_status::DRIVER_OK`] must still be clear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NegotiatedFeatures {
+    pub identity: MmioIdentity,
+    pub offered: u64,
+    pub accepted: u64,
+}
+
+impl NegotiatedFeatures {
+    pub const fn supports_flush(self) -> bool {
+        self.accepted & block::FEATURE_FLUSH != 0
+    }
+}
+
+/// Maximum status reads allowed while a device completes reset. The live
+/// driver can retry the whole probe later; an absent or wedged device cannot
+/// hold its server forever.
+pub const RESET_POLL_LIMIT: usize = 1024;
+
+/// Reset and negotiate the minimal feature set for KUMO's first writable
+/// virtio-MMIO block backend.
+///
+/// The driver requires the modern VERSION_1 contract and refuses a read-only
+/// disk. It accepts FLUSH when offered and ignores all other optional features.
+/// Queue selection, address programming, and DRIVER_OK belong to the next
+/// phase, after the caller has allocated device-visible ring memory.
+pub fn negotiate_writable_block<IO: RegisterIo>(io: &mut IO) -> Result<NegotiatedFeatures, Error> {
+    let identity = MmioIdentity::new(
+        io.read32(mmio::MAGIC_VALUE),
+        io.read32(mmio::VERSION),
+        io.read32(mmio::DEVICE_ID),
+        io.read32(mmio::VENDOR_ID),
+    )
+    .require_modern_block()?;
+
+    io.write32(mmio::STATUS, 0);
+    let mut reset = false;
+    for _ in 0..RESET_POLL_LIMIT {
+        if io.read32(mmio::STATUS) == 0 {
+            reset = true;
+            break;
+        }
+    }
+    if !reset {
+        return Err(Error::ResetTimedOut);
+    }
+
+    let mut progress = device_status::ACKNOWLEDGE;
+    io.write32(mmio::STATUS, progress);
+    progress |= device_status::DRIVER;
+    io.write32(mmio::STATUS, progress);
+
+    let offered = read_device_features(io);
+    if offered & device_features::VERSION_1 == 0 {
+        return fail_negotiation(io, progress, Error::MissingVersion1);
+    }
+    if BlockConfig::is_read_only(offered) {
+        return fail_negotiation(io, progress, Error::ReadOnlyDevice);
+    }
+
+    let accepted = device_features::VERSION_1 | (offered & block::FEATURE_FLUSH);
+    write_driver_features(io, accepted);
+
+    progress |= device_status::FEATURES_OK;
+    io.write32(mmio::STATUS, progress);
+    let observed = io.read32(mmio::STATUS);
+    if observed & device_status::DEVICE_NEEDS_RESET != 0 {
+        return fail_negotiation(
+            io,
+            progress & !device_status::FEATURES_OK,
+            Error::DeviceNeedsReset,
+        );
+    }
+    if observed & device_status::FEATURES_OK == 0 {
+        return fail_negotiation(
+            io,
+            progress & !device_status::FEATURES_OK,
+            Error::FeaturesRejected,
+        );
+    }
+
+    Ok(NegotiatedFeatures {
+        identity,
+        offered,
+        accepted,
+    })
+}
+
+fn read_device_features<IO: RegisterIo>(io: &mut IO) -> u64 {
+    io.write32(mmio::DEVICE_FEATURES_SEL, 0);
+    let low = io.read32(mmio::DEVICE_FEATURES) as u64;
+    io.write32(mmio::DEVICE_FEATURES_SEL, 1);
+    let high = io.read32(mmio::DEVICE_FEATURES) as u64;
+    low | high << 32
+}
+
+fn write_driver_features<IO: RegisterIo>(io: &mut IO, features: u64) {
+    io.write32(mmio::DRIVER_FEATURES_SEL, 0);
+    io.write32(mmio::DRIVER_FEATURES, features as u32);
+    io.write32(mmio::DRIVER_FEATURES_SEL, 1);
+    io.write32(mmio::DRIVER_FEATURES, (features >> 32) as u32);
+}
+
+fn fail_negotiation<IO: RegisterIo, T>(
+    io: &mut IO,
+    progress: u32,
+    error: Error,
+) -> Result<T, Error> {
+    io.write32(mmio::STATUS, progress | device_status::FAILED);
+    Err(error)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,9 +473,125 @@ fn align_up(value: u64, align: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        block, ids, mmio, split_ring, BlockConfig, BlockRequestHeader, Error, MmioIdentity,
-        SplitDescriptor, SplitQueueLayout,
+        block, device_features, device_status, ids, mmio, negotiate_writable_block, split_ring,
+        BlockConfig, BlockRequestHeader, Error, MmioIdentity, RegisterIo, SplitDescriptor,
+        SplitQueueLayout, RESET_POLL_LIMIT,
     };
+
+    struct FakeRegisters {
+        magic: u32,
+        version: u32,
+        device_id: u32,
+        vendor_id: u32,
+        offered: u64,
+        status: u32,
+        device_features_sel: u32,
+        driver_features_sel: u32,
+        driver_features: u64,
+        reset_reads: usize,
+        reset_pending: bool,
+        reject_features: bool,
+        needs_reset: bool,
+        writes: [(u32, u32); 16],
+        write_len: usize,
+    }
+
+    impl FakeRegisters {
+        fn modern(offered: u64) -> Self {
+            Self {
+                magic: mmio::MAGIC,
+                version: mmio::VERSION_MODERN,
+                device_id: ids::BLOCK,
+                vendor_id: 0x4b55_4d4f,
+                offered,
+                status: device_status::DRIVER_OK,
+                device_features_sel: 0,
+                driver_features_sel: 0,
+                driver_features: 0,
+                reset_reads: 0,
+                reset_pending: false,
+                reject_features: false,
+                needs_reset: false,
+                writes: [(0, 0); 16],
+                write_len: 0,
+            }
+        }
+
+        fn record(&mut self, offset: u32, value: u32) {
+            self.writes[self.write_len] = (offset, value);
+            self.write_len += 1;
+        }
+
+        fn last_write(&self) -> (u32, u32) {
+            self.writes[self.write_len - 1]
+        }
+    }
+
+    impl RegisterIo for FakeRegisters {
+        fn read32(&mut self, offset: u32) -> u32 {
+            match offset {
+                mmio::MAGIC_VALUE => self.magic,
+                mmio::VERSION => self.version,
+                mmio::DEVICE_ID => self.device_id,
+                mmio::VENDOR_ID => self.vendor_id,
+                mmio::DEVICE_FEATURES => {
+                    if self.device_features_sel == 0 {
+                        self.offered as u32
+                    } else {
+                        (self.offered >> 32) as u32
+                    }
+                }
+                mmio::STATUS => {
+                    if self.reset_pending {
+                        if self.reset_reads != 0 {
+                            self.reset_reads -= 1;
+                        }
+                        if self.reset_reads == 0 {
+                            self.status = 0;
+                            self.reset_pending = false;
+                        }
+                    }
+                    self.status
+                }
+                _ => 0,
+            }
+        }
+
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.record(offset, value);
+            match offset {
+                mmio::DEVICE_FEATURES_SEL => self.device_features_sel = value,
+                mmio::DRIVER_FEATURES_SEL => self.driver_features_sel = value,
+                mmio::DRIVER_FEATURES => {
+                    if self.driver_features_sel == 0 {
+                        self.driver_features =
+                            (self.driver_features & !(u32::MAX as u64)) | u64::from(value);
+                    } else {
+                        self.driver_features =
+                            (self.driver_features & u32::MAX as u64) | (u64::from(value) << 32);
+                    }
+                }
+                mmio::STATUS if value == 0 => {
+                    self.reset_pending = true;
+                    if self.reset_reads == 0 {
+                        self.status = 0;
+                        self.reset_pending = false;
+                    }
+                }
+                mmio::STATUS => {
+                    self.status = if value & device_status::FEATURES_OK != 0 && self.reject_features
+                    {
+                        value & !device_status::FEATURES_OK
+                    } else if value & device_status::FEATURES_OK != 0 && self.needs_reset {
+                        value | device_status::DEVICE_NEEDS_RESET
+                    } else {
+                        value
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn mmio_offsets_match_modern_transport_layout() {
@@ -426,6 +683,111 @@ mod tests {
         assert_eq!(block::STATUS_OK, 0);
         assert_eq!(block::STATUS_IOERR, 1);
         assert_eq!(block::STATUS_UNSUPP, 2);
+    }
+
+    #[test]
+    fn writable_negotiation_accepts_only_version_one_and_optional_flush() {
+        let offered =
+            device_features::VERSION_1 | block::FEATURE_FLUSH | block::FEATURE_BLK_SIZE | (1 << 35);
+        let mut io = FakeRegisters::modern(offered);
+
+        let negotiated = negotiate_writable_block(&mut io).unwrap();
+
+        assert_eq!(negotiated.identity.vendor_id, 0x4b55_4d4f);
+        assert_eq!(negotiated.offered, offered);
+        assert_eq!(
+            negotiated.accepted,
+            device_features::VERSION_1 | block::FEATURE_FLUSH
+        );
+        assert!(negotiated.supports_flush());
+        assert_eq!(io.driver_features, negotiated.accepted);
+        assert_eq!(
+            &io.writes[..io.write_len],
+            &[
+                (mmio::STATUS, 0),
+                (mmio::STATUS, device_status::ACKNOWLEDGE),
+                (
+                    mmio::STATUS,
+                    device_status::ACKNOWLEDGE | device_status::DRIVER,
+                ),
+                (mmio::DEVICE_FEATURES_SEL, 0),
+                (mmio::DEVICE_FEATURES_SEL, 1),
+                (mmio::DRIVER_FEATURES_SEL, 0),
+                (mmio::DRIVER_FEATURES, block::FEATURE_FLUSH as u32),
+                (mmio::DRIVER_FEATURES_SEL, 1),
+                (mmio::DRIVER_FEATURES, 1),
+                (
+                    mmio::STATUS,
+                    device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+                ),
+            ]
+        );
+        assert_eq!(io.status & device_status::DRIVER_OK, 0);
+    }
+
+    #[test]
+    fn negotiation_waits_for_reset_and_leaves_flush_optional() {
+        let mut io = FakeRegisters::modern(device_features::VERSION_1);
+        io.reset_reads = 3;
+
+        let negotiated = negotiate_writable_block(&mut io).unwrap();
+
+        assert!(!negotiated.supports_flush());
+        assert_eq!(negotiated.accepted, device_features::VERSION_1);
+    }
+
+    #[test]
+    fn negotiation_rejects_incompatible_or_refused_features() {
+        let failed = device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FAILED;
+
+        let mut missing_version = FakeRegisters::modern(block::FEATURE_FLUSH);
+        assert_eq!(
+            negotiate_writable_block(&mut missing_version),
+            Err(Error::MissingVersion1)
+        );
+        assert_eq!(missing_version.last_write(), (mmio::STATUS, failed));
+
+        let mut read_only = FakeRegisters::modern(device_features::VERSION_1 | block::FEATURE_RO);
+        assert_eq!(
+            negotiate_writable_block(&mut read_only),
+            Err(Error::ReadOnlyDevice)
+        );
+        assert_eq!(read_only.last_write(), (mmio::STATUS, failed));
+
+        let mut rejected = FakeRegisters::modern(device_features::VERSION_1);
+        rejected.reject_features = true;
+        assert_eq!(
+            negotiate_writable_block(&mut rejected),
+            Err(Error::FeaturesRejected)
+        );
+        assert_eq!(rejected.last_write(), (mmio::STATUS, failed));
+
+        let mut needs_reset = FakeRegisters::modern(device_features::VERSION_1);
+        needs_reset.needs_reset = true;
+        assert_eq!(
+            negotiate_writable_block(&mut needs_reset),
+            Err(Error::DeviceNeedsReset)
+        );
+        assert_eq!(needs_reset.last_write(), (mmio::STATUS, failed));
+    }
+
+    #[test]
+    fn negotiation_rejects_bad_identity_and_bounded_reset_timeout() {
+        let mut wrong_device = FakeRegisters::modern(device_features::VERSION_1);
+        wrong_device.device_id = 3;
+        assert_eq!(
+            negotiate_writable_block(&mut wrong_device),
+            Err(Error::UnsupportedDevice)
+        );
+        assert_eq!(wrong_device.write_len, 0);
+
+        let mut wedged = FakeRegisters::modern(device_features::VERSION_1);
+        wedged.reset_reads = RESET_POLL_LIMIT + 1;
+        assert_eq!(
+            negotiate_writable_block(&mut wedged),
+            Err(Error::ResetTimedOut)
+        );
+        assert_eq!(&wedged.writes[..wedged.write_len], &[(mmio::STATUS, 0)]);
     }
 
     #[test]
