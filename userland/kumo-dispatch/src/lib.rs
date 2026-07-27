@@ -2,13 +2,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //j495
 //j496
+//j497
 
 //! In-process work queues for KUMO userland.
 //!
 //! Submitters enqueue function-pointer work without crossing a process boundary. A bounded serial
-//! queue has one claimed worker and supports asynchronous and synchronous submission; a bounded
-//! concurrent queue permits multiple workers to drain asynchronous work from the same FIFO. Empty
-//! workers park on a futex. Composition primitives belong to later slices.
+//! queue has one claimed worker; a bounded concurrent queue permits multiple workers to drain the
+//! same FIFO. Both disciplines support asynchronous and synchronous submission. Empty workers park
+//! on a futex. Composition primitives belong to later slices.
 
 use core::cell::{Cell, UnsafeCell};
 use core::hint::spin_loop;
@@ -361,6 +362,20 @@ impl<const N: usize> ConcurrentQueue<N> {
             completion: core::ptr::null(),
         })
     }
+
+    /// Enqueue work and park until one concurrent worker completes it.
+    ///
+    /// A caller that is itself the last available worker would wait on its own queue; synchronous
+    /// submission requires another worker execution context to remain available.
+    pub fn submit_sync(&self, function: WorkFn, context: usize) -> Result<usize, SubmitError> {
+        let completion = Completion::new();
+        self.core.push(Work {
+            function,
+            context,
+            completion: &completion,
+        })?;
+        Ok(completion.wait())
+    }
 }
 
 impl<const N: usize> Default for ConcurrentQueue<N> {
@@ -502,8 +517,18 @@ mod tests {
         let queue = ConcurrentQueue::<1>::new();
         queue.submit_async(double, 5).unwrap();
         assert_eq!(queue.submit_async(double, 6), Err(SubmitError::Full));
+        assert_eq!(queue.submit_sync(double, 6), Err(SubmitError::Full));
         assert_eq!(queue.worker().try_run_one(), Some(10));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn concurrent_sync_returns_a_peer_workers_result() {
+        let queue = Arc::new(ConcurrentQueue::<1>::new());
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || worker_queue.worker().run_one());
+        assert_eq!(queue.submit_sync(double, 21), Ok(42));
+        assert_eq!(worker.join().unwrap(), 42);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //j494
 //j495
 //j496
+//j497
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -37,6 +38,7 @@
 //! serial queue while thread 1 is its sole worker. FIFO output `1234` plus the synchronous result
 //! proves callers submit work to a queue rather than coordinating the worker thread directly.
 //! Both residents then become workers for one concurrent queue and each drains one of its two jobs.
+//! Thread 0 finally submits synchronously to that queue and resumes only after thread 1 completes it.
 
 use kumo_abi::Handle;
 use kumo_dispatch::{ConcurrentQueue, SerialQueue};
@@ -119,6 +121,17 @@ static CONCURRENT_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// The first finisher waits here until the second has emitted the acceptance result.
 static CONCURRENT_REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The peer advertises that it is about to park as D4c's concurrent worker.
+static CONCURRENT_SYNC_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Result returned from the work function through the peer worker's `run_one`.
+static CONCURRENT_SYNC_WORKER_RESULT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// The peer remains alive until the synchronous caller validates and reports.
+static CONCURRENT_SYNC_REPORTED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Size of the on-stack canary. Large enough to span more than one cache line and to be obviously
 /// wrong if two threads shared a stack.
 const CANARY: usize = 64;
@@ -136,6 +149,10 @@ fn record_serial_digit(digit: usize) -> usize {
 fn record_concurrent_job(value: usize) -> usize {
     CONCURRENT_JOBS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     value
+}
+
+fn triple(value: usize) -> usize {
+    value * 3
 }
 
 fn emit(stdout: Handle, bytes: &[u8]) {
@@ -408,6 +425,56 @@ extern "C" fn main(
             }
             futex_wait(CONCURRENT_REPORTED.as_ptr(), observed);
         }
+    }
+
+    // D4c: thread 0 knows only the concurrent queue. Thread 1 is the remaining execution context;
+    // it runs the submitted function, publishes 42 through the shared completion, and wakes the
+    // parked caller. — KESTREL 2026-07-26
+    if me == 1 {
+        CONCURRENT_SYNC_READY.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(CONCURRENT_SYNC_READY.as_ptr(), 1);
+        let worker_result = worker.run_one() as u32;
+        CONCURRENT_SYNC_WORKER_RESULT.store(worker_result, core::sync::atomic::Ordering::Release);
+        futex_wake(CONCURRENT_SYNC_WORKER_RESULT.as_ptr(), 1);
+        loop {
+            let observed = CONCURRENT_SYNC_REPORTED.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(CONCURRENT_SYNC_REPORTED.as_ptr(), observed);
+        }
+    } else {
+        loop {
+            let observed = CONCURRENT_SYNC_READY.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break;
+            }
+            futex_wait(CONCURRENT_SYNC_READY.as_ptr(), observed);
+        }
+        let sync_result = CONCURRENT_QUEUE.submit_sync(triple, 14).unwrap_or(0) as u32;
+        let worker_result = loop {
+            let observed =
+                CONCURRENT_SYNC_WORKER_RESULT.load(core::sync::atomic::Ordering::Acquire);
+            if observed != 0 {
+                break observed;
+            }
+            futex_wait(CONCURRENT_SYNC_WORKER_RESULT.as_ptr(), observed);
+        };
+        let passed = sync_result == 42 && worker_result == 42 && CONCURRENT_QUEUE.is_empty();
+        emit(stdout, b"threads: concurrent sync caller=");
+        emit_u32(stdout, sync_result);
+        emit(stdout, b" worker=");
+        emit_u32(stdout, worker_result);
+        emit(
+            stdout,
+            if passed {
+                b" -> OK: synchronous completion via peer worker\n"
+            } else {
+                b" -> FAIL: concurrent synchronous submission\n"
+            },
+        );
+        CONCURRENT_SYNC_REPORTED.store(1, core::sync::atomic::Ordering::Release);
+        futex_wake(CONCURRENT_SYNC_REPORTED.as_ptr(), 1);
     }
 
     process_exit(0)
