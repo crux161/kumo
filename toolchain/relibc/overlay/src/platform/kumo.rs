@@ -1,6 +1,7 @@
 //j505
 //j506
 //j507
+//j512
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -14,9 +15,9 @@ use core::{
 };
 
 use super::{
+    Pal, PalEpoll, PalPtrace, PalSignal, PalSocket,
     auxv_defs::{AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM},
     types::*,
-    Pal, PalEpoll, PalPtrace, PalSignal, PalSocket,
 };
 use crate::{
     c_str::CStr,
@@ -32,6 +33,7 @@ use crate::{
         sys_statvfs::statvfs,
         sys_time::{itimerval, timezone},
         sys_utsname::utsname,
+        termios::{ECHO, ICANON, VMIN, termios},
         time::{itimerspec, timespec},
     },
     iter::NulTerminated,
@@ -64,6 +66,7 @@ const STARTUP_TAG_STDOUT: u8 = b'o';
 const STARTUP_TAG_STDERR: u8 = b'e';
 const STARTUP_TAG_ARGV: u8 = b'a';
 const STARTUP_TAG_FS: u8 = b'f';
+const STARTUP_TAG_TTY: u8 = b't';
 
 // The `kumo-vfs` wire protocol. relibc is built from its own vendored source tree by a
 // separate cargo invocation, so it cannot depend on the `kumo-vfs` crate; these constants
@@ -79,6 +82,18 @@ const VFS_READ_REQUEST_LEN: usize = 17;
 const VFS_OPEN_REPLY_LEN: usize = 13;
 /// The server's inline read payload ceiling, so one reply always fits one buffer.
 const VFS_READ_MAX: usize = 256;
+
+// The small `ttyd` control protocol. Stream bytes stay on the separately granted
+// stdin/stdout channels; only terminal-owned state crosses this channel. relibc is built
+// separately from the workspace, so these values intentionally mirror the `ttyd` crate.
+// — KESTREL
+const TTY_OP_GET_MODE: u8 = 0x04;
+const TTY_OP_SET_MODE: u8 = 0x05;
+const TTY_OK: u8 = 0x00;
+const TTY_EVENT_MODE: u8 = 0x02;
+const TTY_MODE_CANONICAL: u8 = 1 << 0;
+const TTY_MODE_ECHO: u8 = 1 << 1;
+const TTY_REPLY_HEADER_BYTES: usize = 6;
 
 const VMAR_READ: u64 = 1 << 0;
 const VMAR_WRITE: u64 = 1 << 1;
@@ -101,6 +116,8 @@ static STDERR_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// The client end of a filesystem server's `kumo-vfs` channel, or `0` when the launcher
 /// granted none — in which case this process cannot name a file at all.
 static FS_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// The explicitly granted client end of this process's `ttyd` control channel.
+static TTY_HANDLE: AtomicU32 = AtomicU32::new(0);
 
 /// What a POSIX `int fd` denotes in this process.
 ///
@@ -248,6 +265,23 @@ fn vfs_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
     Ok(n as usize)
 }
 
+fn tty_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
+    use crate::header::errno::{EIO, ENOTTY};
+
+    let channel = TTY_HANDLE.load(Ordering::Relaxed);
+    if channel == 0 {
+        return Err(Errno(ENOTTY));
+    }
+    if channel_write_bytes(channel, request) != 0 {
+        return Err(Errno(EIO));
+    }
+    let n = channel_read_bytes(channel, reply);
+    if n == 0 || n == u64::MAX {
+        return Err(Errno(EIO));
+    }
+    Ok(n as usize)
+}
+
 /// Map a vfs status byte onto the closest honest errno.
 fn vfs_errno(status: u8) -> Errno {
     use crate::header::errno::{EIO, EISDIR, ENOENT};
@@ -332,6 +366,7 @@ fn take_bootstrap_capabilities(bootstrap: u32) -> u32 {
                 close_handle(core::mem::replace(&mut argv_vmo, handle));
             }
             STARTUP_TAG_FS => install_startup_handle(&FS_HANDLE, handle),
+            STARTUP_TAG_TTY => install_startup_handle(&TTY_HANDLE, handle),
             _ => close_handle(handle),
         }
     }
@@ -472,8 +507,67 @@ pub unsafe extern "C" fn __relibc_kumo_start(
 }
 
 impl Sys {
-    pub unsafe fn ioctl(_fd: c_int, _request: c_ulong, _out: *mut c_void) -> Result<c_int> {
-        Err(unsupported())
+    pub unsafe fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> Result<c_int> {
+        use crate::header::{
+            errno::{EBADF, EFAULT, EIO, ENOTTY},
+            sys_ioctl::{TCGETS, TCSETS, TCSETSF, TCSETSW},
+        };
+
+        match fd_slot(fd).map(|slot| *slot) {
+            None | Some(FdSlot::Closed) => return Err(Errno(EBADF)),
+            Some(FdSlot::File { .. }) => return Err(Errno(ENOTTY)),
+            Some(FdSlot::Input(_)) | Some(FdSlot::Output(_)) => {}
+        }
+        if out.is_null() {
+            return Err(Errno(EFAULT));
+        }
+
+        match request {
+            TCGETS => {
+                let mut reply = [0u8; TTY_REPLY_HEADER_BYTES + 1];
+                let n = tty_call(&[TTY_OP_GET_MODE], &mut reply)?;
+                if n != reply.len()
+                    || reply[0] != TTY_OK
+                    || reply[1] != TTY_EVENT_MODE
+                    || u16::from_le_bytes([reply[2], reply[3]]) != 0
+                    || u16::from_le_bytes([reply[4], reply[5]]) != 1
+                {
+                    return Err(Errno(EIO));
+                }
+
+                let mode = reply[TTY_REPLY_HEADER_BYTES];
+                let mut value = termios::default();
+                if mode & TTY_MODE_CANONICAL != 0 {
+                    value.c_lflag |= ICANON as u32;
+                }
+                if mode & TTY_MODE_ECHO != 0 {
+                    value.c_lflag |= ECHO as u32;
+                }
+                value.c_cc[VMIN] = 1;
+                unsafe { out.cast::<termios>().write(value) };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let value = unsafe { &*out.cast::<termios>() };
+                let mode = (if value.c_lflag & ICANON as u32 != 0 {
+                    TTY_MODE_CANONICAL
+                } else {
+                    0
+                }) | (if value.c_lflag & ECHO as u32 != 0 {
+                    TTY_MODE_ECHO
+                } else {
+                    0
+                });
+                let action = (request - TCSETS) as u8;
+                let mut reply = [0u8; TTY_REPLY_HEADER_BYTES];
+                let n = tty_call(&[TTY_OP_SET_MODE, mode, action], &mut reply)?;
+                if n != reply.len() || reply[0] != TTY_OK {
+                    return Err(Errno(EIO));
+                }
+                Ok(0)
+            }
+            _ => Err(unsupported()),
+        }
     }
 }
 

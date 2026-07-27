@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j487
-//j488
 //j489
 //j493
 //j506
 //j507
+//j512
 
 extern crate alloc;
 
@@ -24,7 +23,7 @@ use kumo_rt::{
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
     thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
-    STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
+    STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -2434,6 +2433,7 @@ fn eval_command(
             Some(&slots[..count]),
             false,
             true,
+            true,
             StdinMode::Finite(b"a line from sora\n"),
         );
         return true;
@@ -2556,6 +2556,7 @@ fn run_with_startup(
         argv,
         grant_initrd,
         false,
+        false,
         StdinMode::None,
     );
 }
@@ -2625,6 +2626,28 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
     Some(client)
 }
 
+/// Spawn one private `ttyd` control service for a child and return its client channel.
+/// Stream bytes remain on the child's separately granted stdin/stdout channels; keeping
+/// this RPC channel distinct prevents a mode reply from ever being consumed as input.
+fn spawn_ttyd_control(initrd: Handle) -> Option<Handle> {
+    let recipe = SvcRecipe {
+        initrd,
+        path: TTYD_PATH,
+    };
+    let instance = spawn_from_recipe(&recipe)?;
+    if !child_parked(process_wait()) {
+        let _ = handle_close(instance.client);
+        let _ = handle_close(instance.process);
+        log(b"ttyd: control park fail\n");
+        return None;
+    }
+    // Closing Sora's process handle does not terminate the admitted resident. Its client
+    // channel is the lifetime authority; once the launched child exits, peer-closed lets
+    // `ttyd` leave its serve loop and exit too. — KESTREL
+    let _ = handle_close(instance.process);
+    Some(instance.client)
+}
+
 /// How a spawned child gets its standard input.
 enum StdinMode<'a> {
     /// No stdin at all — the child is granted no input capability.
@@ -2637,13 +2660,15 @@ enum StdinMode<'a> {
     Interactive,
 }
 
-/// `run_with_startup` plus stdin and an optional filesystem grant. Returns
+/// `run_with_startup` plus stdin and optional filesystem/terminal-control grants. Returns
 /// `Some((stdin_write, stdout_read))` only for [`StdinMode::Interactive`], where the
 /// caller owns the running child's two ends.
 ///
 /// `grant_fs` spawns a private `fatfs` instance for this launch and hands the child the
 /// client end of its `kumo-vfs` channel. Like `grant_initrd`, only an explicit launcher
 /// grants it: a program that was not given the channel cannot name a file at all.
+/// `grant_tty` similarly spawns a private `ttyd` control endpoint, kept separate from
+/// the child's byte-stream handles so terminal replies cannot be consumed as input.
 fn run_with_startup_input(
     initrd: Handle,
     path: &[u8],
@@ -2651,6 +2676,7 @@ fn run_with_startup_input(
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
     grant_fs: bool,
+    grant_tty: bool,
     stdin: StdinMode<'_>,
 ) -> Option<(Handle, Handle)> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
@@ -2740,10 +2766,16 @@ fn run_with_startup_input(
     // The filesystem grant is a whole server, not a handle duplicate: spawn it before the
     // child so the vfs channel is live the moment the child's first request lands.
     let fs_child = if grant_fs { spawn_fatfs(initrd) } else { None };
+    let tty_child = if grant_tty {
+        spawn_ttyd_control(initrd)
+    } else {
+        None
+    };
     let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
     let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
     let fs_bad = grant_fs && fs_child.is_none();
-    if argv_bad || initrd_bad || fs_bad {
+    let tty_bad = grant_tty && tty_child.is_none();
+    if argv_bad || initrd_bad || fs_bad || tty_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
@@ -2759,6 +2791,9 @@ fn run_with_startup_input(
         if let Some(fs) = fs_child {
             let _ = handle_close(fs);
         }
+        if let Some(tty) = tty_child {
+            let _ = handle_close(tty);
+        }
         if let Some(writer) = stdin_writer {
             let _ = handle_close(writer);
         }
@@ -2767,9 +2802,9 @@ fn run_with_startup_input(
         return None;
     }
 
-    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs]. Order is
+    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty]. Order is
     // immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
-    let mut tags: [(u8, Handle); 5] = [(0, Handle(0)); 5];
+    let mut tags: [(u8, Handle); 6] = [(0, Handle(0)); 6];
     let mut expected = 0usize;
     if let Some(stdin_read) = stdin_read {
         tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
@@ -2787,6 +2822,10 @@ fn run_with_startup_input(
     }
     if let Some(fs) = fs_child {
         tags[expected] = (STARTUP_TAG_FS, fs);
+        expected += 1;
+    }
+    if let Some(tty) = tty_child {
+        tags[expected] = (STARTUP_TAG_TTY, tty);
         expected += 1;
     }
 
@@ -2916,6 +2955,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         b"bin/lua-repl",
         b"lua-repl",
         Some(&slots),
+        false,
         false,
         false,
         StdinMode::Interactive,
@@ -3069,6 +3109,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             full,
             full,
             Some(&slots[..count]),
+            false,
             false,
             false,
             StdinMode::Finite(&input[..input_len]),
@@ -4257,6 +4298,7 @@ fn launch_lua_repl(initrd: Handle) {
         b"bin/lua-repl",
         b"lua-repl",
         None,
+        false,
         false,
         false,
         StdinMode::Finite(

@@ -1,5 +1,6 @@
 //j493
 //j508
+//j512
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -336,6 +337,10 @@ pub const STARTUP_TAG_CAP0: u8 = b'c';
 /// j508: a client channel to a filesystem server speaking `kumo-vfs`. A program that
 /// receives one can name files; a program that does not cannot, whatever it asks for.
 pub const STARTUP_TAG_FS: u8 = b'f';
+/// A client channel to the process's terminal line-discipline service. This is
+/// separate from stdin/stdout data channels so control RPC replies cannot be
+/// mistaken for stream bytes.
+pub const STARTUP_TAG_TTY: u8 = b't';
 
 /// Explicit capabilities supplied to a newly started program. Each present field came
 /// from one transferred handle on the bootstrap channel; absent fields grant no authority.
@@ -347,6 +352,7 @@ pub struct Startup {
     pub argv: Option<Handle>,
     pub cap0: Option<Handle>,
     pub fs: Option<Handle>,
+    pub tty: Option<Handle>,
 }
 
 impl Startup {
@@ -360,6 +366,7 @@ impl Startup {
             STARTUP_TAG_ARGV => &mut self.argv,
             STARTUP_TAG_CAP0 => &mut self.cap0,
             STARTUP_TAG_FS => &mut self.fs,
+            STARTUP_TAG_TTY => &mut self.tty,
             _ => return Some(handle),
         };
         slot.replace(handle)
@@ -865,8 +872,10 @@ mod tests {
         let mut startup = Startup::default();
         assert_eq!(startup.install(STARTUP_TAG_STDOUT, Handle(7)), None);
         assert_eq!(startup.install(STARTUP_TAG_CAP0, Handle(9)), None);
+        assert_eq!(startup.install(STARTUP_TAG_TTY, Handle(13)), None);
         assert_eq!(startup.stdout, Some(Handle(7)));
         assert_eq!(startup.cap0, Some(Handle(9)));
+        assert_eq!(startup.tty, Some(Handle(13)));
         assert_eq!(startup.install(b'?', Handle(11)), Some(Handle(11)));
     }
 

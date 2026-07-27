@@ -1,6 +1,7 @@
 /* j506 */
 /* j507 */
 /* j511 */
+/* j512 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
 
 /*
@@ -129,6 +131,33 @@ int main(int argc, char **argv, char **envp) {
     printf("relibc: absent path refused errno=%d\n", errno);
 
     /*
+     * `ttyd`, not libc, owns echo and line editing. Enter raw mode through its
+     * explicitly granted control channel, read the state back, then restore it before
+     * continuing. This is the exact tcgetattr/cfmakeraw/tcsetattr sequence kilo uses.
+     */
+    struct termios cooked;
+    if (tcgetattr(STDIN_FILENO, &cooked) != 0 ||
+        (cooked.c_lflag & (ICANON | ECHO)) != (ICANON | ECHO)) {
+        printf("relibc: tcgetattr cooked failed errno=%d\n", errno);
+        return 34;
+    }
+    struct termios raw = cooked;
+    cfmakeraw(&raw);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
+        printf("relibc: tcsetattr raw failed errno=%d\n", errno);
+        return 35;
+    }
+    struct termios observed;
+    if (tcgetattr(STDIN_FILENO, &observed) != 0 ||
+        (observed.c_lflag & (ICANON | ECHO)) != 0) {
+        return 36;
+    }
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked) != 0) {
+        return 37;
+    }
+    printf("relibc: tty cooked -> raw -> cooked via ttyd -> OK\n");
+
+    /*
      * Standard input, read the way an editor reads it: raw bytes off the descriptor, not
      * a line through stdio. A granted channel delivers one message per read and answers
      * zero once its writer is gone, which is exactly end of file.
@@ -149,6 +178,6 @@ int main(int argc, char **argv, char **envp) {
     }
     printf("relibc: stdin read %zd bytes -> \"%s\" then EOF\n", got_in, line);
 
-    printf("relibc: startup+printf+argv+tls+calloc+file+stdin -> OK\n");
+    printf("relibc: startup+printf+argv+tls+calloc+file+tty+stdin -> OK\n");
     return 0;
 }
