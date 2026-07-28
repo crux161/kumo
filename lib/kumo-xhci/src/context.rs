@@ -1,4 +1,5 @@
 //j521
+//j523
 
 use crate::Error;
 
@@ -45,6 +46,36 @@ pub enum UsbSpeed {
     High = 3,
     Super = 4,
     SuperPlus = 5,
+}
+
+impl UsbSpeed {
+    /// EP0 size used before the first device-descriptor read at this negotiated speed.
+    pub const fn initial_ep0_max_packet_size(self) -> u16 {
+        match self {
+            Self::Low | Self::Full => 8,
+            Self::High => 64,
+            Self::Super | Self::SuperPlus => 512,
+        }
+    }
+
+    /// Decode `bMaxPacketSize0` from a device descriptor for this negotiated speed.
+    pub const fn decode_ep0_max_packet_size(self, encoded: u8) -> Result<u16, Error> {
+        let valid = match self {
+            Self::Low => encoded == 8,
+            Self::Full => matches!(encoded, 8 | 16 | 32 | 64),
+            Self::High => encoded == 64,
+            // USB 3.x encodes EP0's fixed 512-byte size as exponent 9, unlike the byte-valued
+            // USB 2 descriptor field. Passing raw 9 to xHCI yields Parameter Error. — KESTREL
+            Self::Super | Self::SuperPlus => encoded == 9,
+        };
+        if !valid {
+            return Err(Error::InvalidField);
+        }
+        Ok(match self {
+            Self::Super | Self::SuperPlus => 512,
+            _ => encoded as u16,
+        })
+    }
 }
 
 /// Software-owned first 32 bytes of a Slot Context.
@@ -251,6 +282,40 @@ mod tests {
         assert_eq!((words[2] >> 22) & 0x3ff, 2);
         assert_eq!(size_of::<SlotContext>(), 32);
         assert_eq!(align_of::<SlotContext>(), 32);
+    }
+
+    #[test]
+    fn usb2_ep0_packet_sizes_are_byte_valued_and_speed_checked() {
+        assert_eq!(UsbSpeed::Low.initial_ep0_max_packet_size(), 8);
+        assert_eq!(UsbSpeed::High.initial_ep0_max_packet_size(), 64);
+        assert_eq!(UsbSpeed::Low.decode_ep0_max_packet_size(8), Ok(8));
+        assert_eq!(
+            UsbSpeed::Low.decode_ep0_max_packet_size(16),
+            Err(Error::InvalidField)
+        );
+        for size in [8, 16, 32, 64] {
+            assert_eq!(
+                UsbSpeed::Full.decode_ep0_max_packet_size(size),
+                Ok(size as u16)
+            );
+        }
+        assert_eq!(UsbSpeed::High.decode_ep0_max_packet_size(64), Ok(64));
+        assert_eq!(
+            UsbSpeed::High.decode_ep0_max_packet_size(9),
+            Err(Error::InvalidField)
+        );
+    }
+
+    #[test]
+    fn superspeed_ep0_exponent_decodes_to_512_bytes() {
+        for speed in [UsbSpeed::Super, UsbSpeed::SuperPlus] {
+            assert_eq!(speed.initial_ep0_max_packet_size(), 512);
+            assert_eq!(speed.decode_ep0_max_packet_size(9), Ok(512));
+            assert_eq!(
+                speed.decode_ep0_max_packet_size(64),
+                Err(Error::InvalidField)
+            );
+        }
     }
 
     #[test]

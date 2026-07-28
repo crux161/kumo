@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j430
 //j431
 //j481
 //j521
 //j522
+//j523
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -589,7 +589,7 @@ fn enumerate(
 
     // --- Build the Input Context, EP0 control ring, and DCBAA entry ---
     let speed = usb_speed(speed_raw);
-    let mps0 = ep0_max_packet(speed_raw);
+    let mps0 = speed.initial_ep0_max_packet_size();
     let ep0_ring_phys = enum_phys + OFF_EP0_RING as u64;
     let input_ctx_phys = enum_phys + OFF_INPUT_CTX as u64;
     let output_ctx_phys = enum_phys + OFF_OUTPUT_CTX as u64;
@@ -666,9 +666,9 @@ fn enumerate(
         core::slice::from_raw_parts_mut((ENUM_VA as usize + OFF_DATA) as *mut u8, DATA_BUF_LEN)
     };
 
-    // --- GET_DESCRIPTOR(Device) over EP0, two-phase for the Full-speed bMaxPacketSize0 ---
-    // Phase 1: read the first 8 bytes at the default EP0 mps (8). A single 8-byte packet cannot
-    // babble regardless of the device's real EP0 size; byte 7 is bMaxPacketSize0.
+    // --- GET_DESCRIPTOR(Device) over EP0, two-phase for bMaxPacketSize0 ---
+    // Phase 1 requests only the first 8 bytes at this speed's initial EP0 size; byte 7 carries the
+    // speed-dependent bMaxPacketSize0 encoding.
     data_buf.fill(0);
     dsb();
     let dev8_setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
@@ -689,9 +689,25 @@ fn enumerate(
         }
     }
     dsb();
-    let real_mps0 = data_buf[7] as u16;
+    let encoded_mps0 = data_buf[7];
+    let real_mps0 = match speed.decode_ep0_max_packet_size(encoded_mps0) {
+        Ok(size) => size,
+        Err(_) => {
+            log(b"drv-xhci: invalid ep0 mps0 raw=");
+            log_hex(encoded_mps0 as u64);
+            log(b" speed=");
+            log_hex(speed_raw as u64);
+            log(b"\n");
+            return;
+        }
+    };
+    log(b"drv-xhci: ep0 mps0 raw=");
+    log_hex(encoded_mps0 as u64);
+    log(b" decoded=");
+    log_hex(real_mps0 as u64);
+    log(b"\n");
 
-    // Phase 2: if EP0's real max packet size differs from the default 8, Evaluate Context to
+    // Phase 2: if EP0's real max packet size differs from the initial value, Evaluate Context to
     // update it — otherwise a full 18-byte read babbles (metal: cc=0x3) on a 64-byte EP0.
     if real_mps0 != 0 && real_mps0 != mps0 {
         let mut eval_icc = InputControlContext::default();
@@ -1838,8 +1854,8 @@ fn log_cc(prefix: &[u8], cc: u8) {
 }
 
 /// Read a device's descriptors over its EP0 and locate a boot-HID interface. Handles the
-/// Full-speed `bMaxPacketSize0` dance (8-byte probe → Evaluate Context → full read), then walks
-/// the configuration descriptor. Returns `(bConfigurationValue, interface)`. Shared by the
+/// speed-aware `bMaxPacketSize0` dance (8-byte probe → optional Evaluate Context → full read), then
+/// walks the configuration descriptor. Returns `(bConfigurationValue, interface)`. Shared by the
 /// root-port and hub-downstream paths, which differ only in which DMA page they operate on.
 #[allow(clippy::too_many_arguments)]
 fn read_descriptors_and_find_hid(
@@ -1853,14 +1869,16 @@ fn read_descriptors_and_find_hid(
     slot_id: u8,
     base_va: u64,
     base_phys: u64,
-    mps0: u16,
+    speed: UsbSpeed,
     data_buf: &mut [u8],
 ) -> Option<(u8, kumo_hid::HidBootInterface)> {
     let data_phys = base_phys + OFF_DATA as u64;
     let ep0_ring_phys = base_phys + OFF_EP0_RING as u64;
     let input_ctx_phys = base_phys + OFF_INPUT_CTX as u64;
 
-    // Phase 1: 8-byte device descriptor at the default EP0 packet size.
+    let mps0 = speed.initial_ep0_max_packet_size();
+
+    // Phase 1: 8-byte device descriptor at this speed's initial EP0 packet size.
     data_buf.fill(0);
     dsb();
     let dev8 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
@@ -1876,7 +1894,21 @@ fn read_descriptors_and_find_hid(
         }
     }
     dsb();
-    let real_mps0 = data_buf[7] as u16;
+    let encoded_mps0 = data_buf[7];
+    let real_mps0 = match speed.decode_ep0_max_packet_size(encoded_mps0) {
+        Ok(size) => size,
+        Err(_) => {
+            log(b"drv-xhci: dev invalid ep0 mps0 raw=");
+            log_hex(encoded_mps0 as u64);
+            log(b"\n");
+            return None;
+        }
+    };
+    log(b"drv-xhci: dev ep0 mps0 raw=");
+    log_hex(encoded_mps0 as u64);
+    log(b" decoded=");
+    log_hex(real_mps0 as u64);
+    log(b"\n");
 
     // Phase 2: correct EP0's max packet size if the device disagrees with our default.
     if real_mps0 != 0 && real_mps0 != mps0 {
@@ -2401,7 +2433,8 @@ fn enumerate_hub_downstream(
         if needs_tt { hub_slot_id } else { 0 },
         if needs_tt { down_port } else { 0 },
     );
-    let mps0 = ep0_max_packet(down_speed);
+    let speed = usb_speed(down_speed);
+    let mps0 = speed.initial_ep0_max_packet_size();
     let Ok(ep0_ctx) = EndpointContext::control(mps0, ep0_ring_phys) else {
         return log(b"drv-xhci: hub dev ep0 ctx fail\n");
     };
@@ -2448,7 +2481,7 @@ fn enumerate_hub_downstream(
         dev_slot,
         DEV2_VA,
         dev_phys,
-        mps0,
+        speed,
         data_buf,
     ) else {
         return;
@@ -2811,15 +2844,6 @@ fn usb_speed(raw: u8) -> UsbSpeed {
         3 => UsbSpeed::High,
         5 => UsbSpeed::SuperPlus,
         _ => UsbSpeed::Super,
-    }
-}
-
-/// Default bMaxPacketSize0 for the initial descriptor read, by PORTSC speed.
-fn ep0_max_packet(raw: u8) -> u16 {
-    match raw {
-        1 | 2 => 8,  // Full / Low: 8 until bMaxPacketSize0 is known
-        3 => 64,     // High
-        _ => 512,    // Super / SuperPlus (fixed)
     }
 }
 
