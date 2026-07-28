@@ -2,14 +2,14 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j160
 //j231
 //j246
 //j249
 //j480
+//j519
 
-use drv_fb::{Console, BG};
-use kumo_abi::{BootInfo, Handle, VmarFlags};
+use drv_fb::{Console, PixelOrder, BG};
+use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_rt::{
     channel_read, channel_read_with_handle, debug_write, framebuffer_claim, handle_koid, port_bind,
     port_create, port_wait, resource_mint_mmio, vmar_map,
@@ -96,6 +96,12 @@ extern "C" fn main(
     let width = bootinfo.framebuffer.width as usize;
     let height = bootinfo.framebuffer.height as usize;
     let stride = bootinfo.framebuffer.stride as usize;
+    let pixel_order = match bootinfo.framebuffer.format {
+        FramebufferFormat::Rgb => PixelOrder::Rgb,
+        // Live GOP paths declare an order. Preserve BGR as the legacy best effort for an
+        // unknown tag; the default green remains order-independent either way. — KESTREL
+        FramebufferFormat::Bgr | FramebufferFormat::Unknown => PixelOrder::Bgr,
+    };
     let fb_map_len = match bootinfo.framebuffer.mapping_len() {
         Some(len) => len,
         None => {
@@ -188,7 +194,9 @@ extern "C" fn main(
 
     // Build the text console over the framebuffer (clears the screen) and show first
     // light.
-    let mut con = unsafe { Console::new(fb_va as *mut u32, width, height, stride) };
+    let mut con = unsafe {
+        Console::new_with_pixel_order(fb_va as *mut u32, width, height, stride, pixel_order)
+    };
     con.write(b"KUMO drv-fb console ready\n");
 
     debug_write(b"drv-fb: initialized\n".as_ptr(), 20);
