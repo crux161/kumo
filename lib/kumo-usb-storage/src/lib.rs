@@ -1,6 +1,7 @@
 #![no_std]
 //j520
 //j521
+//j522
 
 //! Allocation-free USB Mass Storage Bulk-Only Transport and SCSI command framing.
 //!
@@ -433,6 +434,90 @@ impl MediaCapacity {
     }
 }
 
+/// A bounded READ(10) operation whose byte count is guaranteed to fit the adapter's DMA window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Read10Plan {
+    pub command: ScsiCommand,
+    pub byte_length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockReadError {
+    DmaWindowTooSmall,
+    EmptyTransfer,
+    TransferExceedsWindow,
+    LogicalBlockOutOfRange,
+    CommandRejected,
+}
+
+/// Read-only block geometry translated into bounded SCSI READ(10) commands.
+///
+/// The adapter owns no transport or buffer. Its DMA-window bound makes every returned plan safe
+/// for a caller to execute in one allocation-free BOT transaction. — KESTREL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Read10BlockAdapter {
+    capacity: MediaCapacity,
+    max_blocks_per_transfer: u16,
+}
+
+impl Read10BlockAdapter {
+    pub fn new(capacity: MediaCapacity, dma_window_bytes: usize) -> Result<Self, BlockReadError> {
+        let block_size = capacity.logical_block_size as usize;
+        if block_size == 0 || dma_window_bytes < block_size {
+            return Err(BlockReadError::DmaWindowTooSmall);
+        }
+
+        let dma_limit = dma_window_bytes / block_size;
+        let command_limit = (u32::MAX / capacity.logical_block_size) as usize;
+        let max_blocks = dma_limit.min(command_limit).min(u16::MAX as usize);
+        if max_blocks == 0 {
+            return Err(BlockReadError::DmaWindowTooSmall);
+        }
+        Ok(Self {
+            capacity,
+            max_blocks_per_transfer: max_blocks as u16,
+        })
+    }
+
+    pub const fn capacity(self) -> MediaCapacity {
+        self.capacity
+    }
+
+    pub const fn max_blocks_per_transfer(self) -> u16 {
+        self.max_blocks_per_transfer
+    }
+
+    pub fn plan_read(
+        self,
+        logical_block_address: u64,
+        block_count: u16,
+    ) -> Result<Read10Plan, BlockReadError> {
+        if block_count == 0 {
+            return Err(BlockReadError::EmptyTransfer);
+        }
+        if block_count > self.max_blocks_per_transfer {
+            return Err(BlockReadError::TransferExceedsWindow);
+        }
+        let end = logical_block_address
+            .checked_add(block_count as u64)
+            .ok_or(BlockReadError::LogicalBlockOutOfRange)?;
+        if end > self.capacity.block_count() || logical_block_address > u32::MAX as u64 {
+            return Err(BlockReadError::LogicalBlockOutOfRange);
+        }
+
+        let command = ScsiCommand::read_10(
+            logical_block_address as u32,
+            block_count,
+            self.capacity.logical_block_size,
+        )
+        .map_err(|_| BlockReadError::CommandRejected)?;
+        Ok(Read10Plan {
+            byte_length: command.transfer_length() as usize,
+            command,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BotError {
     InvalidLogicalUnit,
@@ -787,6 +872,50 @@ mod tests {
         assert_eq!(
             MediaCapacity::decode_read_capacity_10(&[0xff, 0xff, 0xff, 0xff, 0, 0, 2, 0]),
             Err(ScsiError::CapacityRequiresReadCapacity16)
+        );
+    }
+
+    #[test]
+    fn read_10_adapter_bounds_plans_by_media_and_dma_window() {
+        let capacity = MediaCapacity {
+            last_logical_block_address: 4095,
+            logical_block_size: 512,
+        };
+        let adapter = Read10BlockAdapter::new(capacity, 4096).unwrap();
+        assert_eq!(adapter.capacity(), capacity);
+        assert_eq!(adapter.max_blocks_per_transfer(), 8);
+
+        let first = adapter.plan_read(0, 1).unwrap();
+        assert_eq!(first.byte_length, 512);
+        assert_eq!(first.command.cdb(), &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(adapter.plan_read(4088, 8).unwrap().byte_length, 4096);
+        assert_eq!(
+            adapter.plan_read(4095, 2),
+            Err(BlockReadError::LogicalBlockOutOfRange)
+        );
+        assert_eq!(
+            adapter.plan_read(0, 9),
+            Err(BlockReadError::TransferExceedsWindow)
+        );
+        assert_eq!(adapter.plan_read(0, 0), Err(BlockReadError::EmptyTransfer));
+    }
+
+    #[test]
+    fn read_10_adapter_accepts_one_native_4k_block() {
+        let capacity = MediaCapacity {
+            last_logical_block_address: 7,
+            logical_block_size: 4096,
+        };
+        let adapter = Read10BlockAdapter::new(capacity, 4096).unwrap();
+        assert_eq!(adapter.max_blocks_per_transfer(), 1);
+        assert_eq!(adapter.plan_read(7, 1).unwrap().byte_length, 4096);
+        assert_eq!(
+            adapter.plan_read(8, 1),
+            Err(BlockReadError::LogicalBlockOutOfRange)
+        );
+        assert_eq!(
+            Read10BlockAdapter::new(capacity, 4095),
+            Err(BlockReadError::DmaWindowTooSmall)
         );
     }
 }

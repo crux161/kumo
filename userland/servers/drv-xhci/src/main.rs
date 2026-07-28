@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j426
 //j430
 //j431
 //j481
 //j521
+//j522
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -17,8 +17,8 @@ use kumo_rt::{
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
-    MediaCapacity, ScsiCommand, StandardInquiryData, COMMAND_BLOCK_WRAPPER_BYTES,
-    COMMAND_STATUS_WRAPPER_BYTES, STANDARD_INQUIRY_BYTES,
+    MediaCapacity, Read10BlockAdapter, ScsiCommand, StandardInquiryData,
+    COMMAND_BLOCK_WRAPPER_BYTES, COMMAND_STATUS_WRAPPER_BYTES, STANDARD_INQUIRY_BYTES,
 };
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
@@ -87,6 +87,11 @@ const BOT_CSW_OFFSET: usize = 192;
 const BOT_DATA_LEN: usize = BOT_CSW_OFFSET - BOT_DATA_OFFSET;
 const BOT_TAG_INQUIRY: u32 = 0x4b55_0001;
 const BOT_TAG_READ_CAPACITY: u32 = 0x4b55_0002;
+const BOT_TAG_READ_10: u32 = 0x4b55_0003;
+// J522: a separate page lets one native logical block reach 4 KiB without colliding with the
+// enumeration page's CBW/CSW and bulk rings. phys is again the IOVA under SMMU bypass. — KESTREL
+const STORAGE_DATA_VA: u64 = 0x0000_0000_1500_0000;
+const STORAGE_DATA_LEN: u64 = PAGE_SIZE;
 /// Bounded spins waiting for the reset device's port to re-link and enable after HCRST.
 const PORT_POLL_LIMIT: u32 = 4_000_000;
 
@@ -927,9 +932,8 @@ fn enumerate(
     }
 }
 
-/// J521: select a root-attached SCSI/BOT interface, add both bulk endpoint contexts, and execute
-/// the first serialized BOT commands. This is deliberately a one-shot identification probe: no
-/// block service or filesystem is published until a later slice supplies recovery and READ(10).
+/// J522: select a root-attached SCSI/BOT interface, identify its geometry, and issue one bounded
+/// READ(10) for LBA0. This remains a one-shot proof: no block service or filesystem is published.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_probe_storage(
     io: &mut Mmio,
@@ -1156,6 +1160,77 @@ fn configure_and_probe_storage(
     log_hex(capacity.logical_block_size as u64);
     log(b" bytes=");
     log_hex(capacity.byte_length());
+    log(b"\n");
+
+    let adapter = match Read10BlockAdapter::new(capacity, STORAGE_DATA_LEN as usize) {
+        Ok(adapter) => adapter,
+        Err(_) => return log(b"drv-xhci: storage block geometry exceeds DMA window\n"),
+    };
+    let plan = match adapter.plan_read(0, 1) {
+        Ok(plan) => plan,
+        Err(_) => return log(b"drv-xhci: storage LBA0 plan fail\n"),
+    };
+    let (read_raw, read_phys) = vmo_create_contiguous(STORAGE_DATA_LEN);
+    if read_raw == u64::MAX || read_phys == 0 {
+        return log(b"drv-xhci: storage read vmo fail\n");
+    }
+    if vmar_map(
+        Handle(0),
+        Handle(read_raw as u32),
+        0,
+        STORAGE_DATA_VA,
+        STORAGE_DATA_LEN,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+    ) != 0
+    {
+        return log(b"drv-xhci: storage read map fail\n");
+    }
+    let read_buf = unsafe {
+        core::slice::from_raw_parts_mut(STORAGE_DATA_VA as usize as *mut u8, plan.byte_length)
+    };
+    log(b"drv-xhci: storage read-window phys=");
+    log_hex(read_phys);
+    log(b" bytes=");
+    log_hex(plan.byte_length as u64);
+    log(b"\n");
+    let Some(read_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        read_buf,
+        read_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_READ_10,
+        &plan.command,
+        b"read10-lba0",
+    ) else {
+        return;
+    };
+    if read_len != plan.byte_length {
+        return log(b"drv-xhci: storage short LBA0\n");
+    }
+    log(b"drv-xhci: storage lba0 prefix=");
+    for byte in &read_buf[..read_len.min(16)] {
+        log(b" ");
+        log_hex(*byte as u64);
+    }
+    if read_len >= 512 {
+        log(b" tail510=");
+        log_hex(read_buf[510] as u64);
+        log(b" tail511=");
+        log_hex(read_buf[511] as u64);
+    }
     log(b"\n");
     log_storage_phase(b"probe", b"complete");
 }
