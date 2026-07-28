@@ -2470,6 +2470,7 @@ fn eval_command(
             false,
             true,
             true,
+            false,
             StdinMode::Finite(b"a line from sora\n"),
         );
         return true;
@@ -2591,6 +2592,7 @@ fn run_with_startup(
         name,
         argv,
         grant_initrd,
+        false,
         false,
         false,
         StdinMode::None,
@@ -2749,6 +2751,7 @@ fn run_with_startup_input(
     grant_initrd: bool,
     grant_fs: bool,
     grant_tty: bool,
+    bind_stdout: bool,
     stdin: StdinMode<'_>,
 ) -> Option<(Handle, Handle)> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
@@ -2923,6 +2926,29 @@ fn run_with_startup_input(
         return None;
     }
 
+    // Bind the child's stdout to the serve port BEFORE admitting it. `port_bind` only wakes
+    // on NEW signals, so a child that writes and exits between admission and a later bind
+    // strands its output in a channel nobody is listening to — and, worse, leaves a session
+    // that captured the keyboard with nothing left to ever release it. On a fast board the
+    // child reliably wins that race. Bound first, neither the output nor the closure can be
+    // missed. — TIMBERDOODLE
+    if bind_stdout {
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let koid = handle_koid(stdout_read);
+        if port.0 == 0 || koid == u64::MAX || port_bind(port, stdout_read) != 0 {
+            for handle in [stdout_read, stdout_write, bootstrap_child] {
+                let _ = handle_close(handle);
+            }
+            if let Some(writer) = stdin_writer {
+                let _ = handle_close(writer);
+            }
+            log(name);
+            log(b": stdout bind failed\n");
+            return None;
+        }
+        KILO_STDOUT_KOID.store(koid, Ordering::Relaxed);
+    }
+
     let flags = ProcessRunFlags::TRANSFER_ARG.bits();
     let _ = run_elf(initrd, path, bootstrap_child_raw, 0, flags, name);
 
@@ -3011,6 +3037,7 @@ fn lua_relay_reply(stdout: Handle) -> bool {
         end_lua_session();
         return false;
     }
+    KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
     debug_write(buf.as_ptr(), n as usize);
     true
 }
@@ -3027,6 +3054,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         b"bin/lua-repl",
         b"lua-repl",
         Some(&slots),
+        false,
         false,
         false,
         false,
@@ -3055,6 +3083,7 @@ fn end_kilo_session() {
     let stdin = KILO_STDIN_WRITE.swap(0, Ordering::Relaxed);
     let stdout = KILO_STDOUT_READ.swap(0, Ordering::Relaxed);
     KILO_STDOUT_KOID.store(0, Ordering::Relaxed);
+    KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
     let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
     if port.0 != 0 && stdout != 0 {
         let _ = port_unbind(port, Handle(stdout as u32));
@@ -3077,23 +3106,15 @@ static SERVE_PORT: AtomicU64 = AtomicU64::new(0);
 /// The koid of the live editor's stdout, matched against the serve port's packet source.
 static KILO_STDOUT_KOID: AtomicU64 = AtomicU64::new(0);
 
-/// Bind the editor's stdout to the serve port so its repaints wake Sora the ordinary way.
-fn kilo_bind_stdout(stdout: Handle) -> bool {
-    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
-    if port.0 == 0 {
-        debug_write(b"kilo: no serve port\n".as_ptr(), 20);
-        end_kilo_session();
-        return false;
-    }
-    let koid = handle_koid(stdout);
-    if koid == u64::MAX || port_bind(port, stdout) != 0 {
-        debug_write(b"kilo: stdout bind failed\n".as_ptr(), 25);
-        end_kilo_session();
-        return false;
-    }
-    KILO_STDOUT_KOID.store(koid, Ordering::Relaxed);
-    true
-}
+/// Keystrokes forwarded since the editor last painted anything.
+static KILO_SILENT_KEYS: AtomicU64 = AtomicU64::new(0);
+
+/// How many keys a live editor may swallow without drawing before Sora takes the keyboard
+/// back. Kilo repaints on every key, so any run this long means the far end is gone or
+/// wedged. The bound exists because a session owns the keyboard: without it, one dead child
+/// locks the console, and the kernel's `~~~` escape hatch watches only the serial UART — so
+/// a user typing on USB has no way out at all. — TIMBERDOODLE
+const KILO_SILENT_KEY_LIMIT: u64 = 64;
 
 /// Relay one repaint. The serve port fires once per child write, so this reads exactly
 /// once: a second read would find the channel empty and park Sora with nothing left to
@@ -3126,6 +3147,11 @@ fn kilo_session_key(byte: u8) -> bool {
         end_kilo_session();
         return false;
     }
+    if KILO_SILENT_KEYS.fetch_add(1, Ordering::Relaxed) + 1 >= KILO_SILENT_KEY_LIMIT {
+        debug_write(b"\nkilo: not responding; keyboard released\n".as_ptr(), 40);
+        end_kilo_session();
+        return false;
+    }
     true
 }
 
@@ -3149,19 +3175,22 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         false,
         true,
         true,
+        true,
         StdinMode::Interactive,
     ) else {
         debug_write(b"kilo: session unavailable\n".as_ptr(), 26);
         return false;
     };
+    KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
     KILO_STDIN_WRITE.store(stdin_write.0 as u64, Ordering::Relaxed);
     KILO_STDOUT_READ.store(stdout_read.0 as u64, Ordering::Relaxed);
     // The editor queries the window size and paints its first screen before reading a key,
     // so this relay both renders the opening frame and proves the child is serving.
-    // The editor's first screen arrives through the serve port like every other source.
-    // Sora must NOT block-read it here: `channel_read` parks the user thread, and a child's
-    // write signals the port but never calls `wake_user` — the J510 hazard, one layer up.
-    kilo_bind_stdout(stdout_read)
+    // Stdout was bound to the serve port before the child was admitted, so its first screen
+    // — or its exit — arrives as an ordinary port event. Sora must NOT block-read it here:
+    // `channel_read` parks the user thread, and a child's write signals the port but never
+    // calls `wake_user`, which is the J510 hazard one layer up.
+    true
 }
 
 /// Hand one submitted line to the live session and render its single reply. Returns false when the
@@ -3303,6 +3332,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             full,
             full,
             Some(&slots[..count]),
+            false,
             false,
             false,
             false,
@@ -4492,6 +4522,7 @@ fn launch_lua_repl(initrd: Handle) {
         b"bin/lua-repl",
         b"lua-repl",
         None,
+        false,
         false,
         false,
         false,
