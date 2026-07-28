@@ -2,6 +2,7 @@
 //j493
 //j506
 //j508
+//j517
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -51,6 +52,9 @@ pub const THREADS_PATH: &str = "bin/threads";
 /// I-a1: statically linked C proof for relibc startup capability intake,
 /// fd 1/2 output, retained anonymous allocation growth, and process exit.
 pub const RELIBC_SMOKE_PATH: &str = "bin/relibc-smoke";
+/// The first third-party C program ported to KUMO: antirez's `kilo` editor,
+/// byte-identical to upstream, built against KUMO's own C sysroot.
+pub const KILO_PATH: &str = "bin/kilo";
 pub const AUTOEXEC_PATH: &str = "etc/autoexec";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

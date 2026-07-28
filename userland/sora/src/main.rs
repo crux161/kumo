@@ -4,6 +4,7 @@
 //j493
 //j506
 //j507
+//j517
 //j512
 //j514
 
@@ -12,8 +13,8 @@ extern crate alloc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, LS_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, KILO_PATH, LS_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -1998,6 +1999,7 @@ extern "C" fn sora_main(
                 port_bind(port, mouse);
             }
         }
+        SERVE_PORT.store(u64::from(port.0), Ordering::Relaxed);
         log(b"sora: ports bound\n");
         let cons_koid = Handle(console_koid as u32);
         let blk_koid = Handle(block_koid as u32);
@@ -2241,6 +2243,16 @@ extern "C" fn sora_main(
                     }
                 }
             }
+            // editor repaint handler — a live full-screen program's stdout is just another
+            // port source, so its output reaches the console without Sora ever blocking on it.
+            if kilo_session_active() && source.0 as u64 == KILO_STDOUT_KOID.load(Ordering::Relaxed)
+            {
+                let stdout = Handle(KILO_STDOUT_READ.load(Ordering::Relaxed) as u32);
+                if stdout.0 != 0 && !kilo_relay_paint(stdout) {
+                    debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+                }
+                continue;
+            }
             // keyboard handler — input only (keystrokes → ttyd → parsed command line)
             if source == kbd_k || (hid_kbd_koid != u64::MAX && source == hid_kbd_k) {
                 let input = if source == kbd_k {
@@ -2252,7 +2264,17 @@ extern "C" fn sora_main(
                     }
                 };
                 let n = channel_read(input, serve_buf.as_mut_ptr(), 256) as usize;
-                if n > 0 && interactive_ttyd.is_some() {
+                if n > 0 && kilo_session_active() {
+                    // A full-screen editor owns the keyboard while it runs: each byte goes
+                    // straight through, unedited and unechoed. When the session ends the
+                    // shell prompt returns.
+                    for i in 0..n {
+                        if !kilo_session_key(serve_buf[i]) {
+                            debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+                            break;
+                        }
+                    }
+                } else if n > 0 && interactive_ttyd.is_some() {
                     let tty = interactive_ttyd.unwrap().instance;
                     let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
                     for i in 0..n {
@@ -2420,6 +2442,12 @@ fn eval_command(
         } else {
             debug_write(b" -> FAIL: no growth\n".as_ptr(), 21);
         }
+        return true;
+    } else if cmd.name == "kilo" {
+        // The first third-party C program on KUMO, byte-identical to antirez's upstream
+        // source. Everything it needs was built by J509/J511-J514 for its own reasons; this
+        // launcher only grants and gets out of the way. — TIMBERDOODLE
+        start_kilo_session(initrd, cmd);
         return true;
     } else if cmd.name == "relibc" {
         // I-a2: run the static C smoke with one finite stdout capability and its own argv
@@ -3012,6 +3040,128 @@ fn start_lua_session(initrd: Handle) -> bool {
     // The child writes its banner and prompt before its first read, so this relay both renders the
     // greeting and proves the session is actually serving.
     lua_relay_reply(stdout_read)
+}
+
+/// The live `kilo` session's two ends, or 0 when none is running. Globals for the same
+/// reason the Lua session's are: the session outlives the shell frame that created it.
+static KILO_STDIN_WRITE: AtomicU64 = AtomicU64::new(0);
+static KILO_STDOUT_READ: AtomicU64 = AtomicU64::new(0);
+
+fn kilo_session_active() -> bool {
+    KILO_STDIN_WRITE.load(Ordering::Relaxed) != 0
+}
+
+fn end_kilo_session() {
+    let stdin = KILO_STDIN_WRITE.swap(0, Ordering::Relaxed);
+    let stdout = KILO_STDOUT_READ.swap(0, Ordering::Relaxed);
+    KILO_STDOUT_KOID.store(0, Ordering::Relaxed);
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    if port.0 != 0 && stdout != 0 {
+        let _ = port_unbind(port, Handle(stdout as u32));
+    }
+    if stdin != 0 {
+        let _ = handle_close(Handle(stdin as u32));
+    }
+    if stdout != 0 {
+        let _ = handle_close(Handle(stdout as u32));
+    }
+    // Kilo leaves the terminal in raw mode's visual state; put the cursor somewhere sane
+    // and re-show it so the shell prompt that follows is readable.
+    debug_write(b"\x1b[?25h\r\n".as_ptr(), 8);
+}
+
+/// Sora's serve port, published so a session started deep in the shell can bind its
+/// child's stdout to the same loop that already multiplexes console, block, net and keys.
+static SERVE_PORT: AtomicU64 = AtomicU64::new(0);
+
+/// The koid of the live editor's stdout, matched against the serve port's packet source.
+static KILO_STDOUT_KOID: AtomicU64 = AtomicU64::new(0);
+
+/// Bind the editor's stdout to the serve port so its repaints wake Sora the ordinary way.
+fn kilo_bind_stdout(stdout: Handle) -> bool {
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    if port.0 == 0 {
+        debug_write(b"kilo: no serve port\n".as_ptr(), 20);
+        end_kilo_session();
+        return false;
+    }
+    let koid = handle_koid(stdout);
+    if koid == u64::MAX || port_bind(port, stdout) != 0 {
+        debug_write(b"kilo: stdout bind failed\n".as_ptr(), 25);
+        end_kilo_session();
+        return false;
+    }
+    KILO_STDOUT_KOID.store(koid, Ordering::Relaxed);
+    true
+}
+
+/// Relay one repaint. The serve port fires once per child write, so this reads exactly
+/// once: a second read would find the channel empty and park Sora with nothing left to
+/// wake it — the same hazard J510 fixed one layer down. Returns false when the editor's
+/// stdout is gone, which is the only end-of-session signal an editor gives.
+fn kilo_relay_paint(stdout: Handle) -> bool {
+    let mut buf = [0u8; ttyd::REPLY_BUF_BYTES];
+    let n = channel_read(stdout, buf.as_mut_ptr(), buf.len());
+    if n == 0 || n == u64::MAX {
+        end_kilo_session();
+        return false;
+    }
+    debug_write(buf.as_ptr(), n as usize);
+    true
+}
+
+/// Forward one raw keystroke to the editor and render what it draws in response.
+///
+/// Deliberately byte-at-a-time and unedited: `kilo` put its terminal in noncanonical mode
+/// through its own ttyd control capability (J512), so the shell's line editor must not
+/// stand between the key and the program. Returns false when the session has ended.
+fn kilo_session_key(byte: u8) -> bool {
+    let stdin = Handle(KILO_STDIN_WRITE.load(Ordering::Relaxed) as u32);
+    let stdout = Handle(KILO_STDOUT_READ.load(Ordering::Relaxed) as u32);
+    if stdin.0 == 0 || stdout.0 == 0 {
+        return false;
+    }
+    let _ = stdout;
+    if channel_write(stdin, &byte, 1) != Errno::Ok.status() {
+        end_kilo_session();
+        return false;
+    }
+    true
+}
+
+/// Start `kilo` on an optional file.
+///
+/// It receives stdin, stdout, its argv, a filesystem channel, and a private ttyd control
+/// endpoint — and nothing else. No initrd handle, no resource, no device: a text editor
+/// has no business with any of them.
+fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
+    if kilo_session_active() {
+        debug_write(b"kilo: already running\n".as_ptr(), 22);
+        return true;
+    }
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    let count = command_argv_slots(cmd, &mut slots);
+    let Some((stdin_write, stdout_read)) = run_with_startup_input(
+        initrd,
+        KILO_PATH.as_bytes(),
+        b"kilo",
+        Some(&slots[..count]),
+        false,
+        true,
+        true,
+        StdinMode::Interactive,
+    ) else {
+        debug_write(b"kilo: session unavailable\n".as_ptr(), 26);
+        return false;
+    };
+    KILO_STDIN_WRITE.store(stdin_write.0 as u64, Ordering::Relaxed);
+    KILO_STDOUT_READ.store(stdout_read.0 as u64, Ordering::Relaxed);
+    // The editor queries the window size and paints its first screen before reading a key,
+    // so this relay both renders the opening frame and proves the child is serving.
+    // The editor's first screen arrives through the serve port like every other source.
+    // Sora must NOT block-read it here: `channel_read` parks the user thread, and a child's
+    // write signals the port but never calls `wake_user` — the J510 hazard, one layer up.
+    kilo_bind_stdout(stdout_read)
 }
 
 /// Hand one submitted line to the live session and render its single reply. Returns false when the
