@@ -918,7 +918,7 @@ fn enumerate(
         Ok(None) => {}
     }
 
-    match kumo_hid::find_hid_boot_interface(&data_buf[..read_len as usize]) {
+    match kumo_hid::find_hid_boot_keyboard(&data_buf[..read_len as usize]) {
         Some(hid) => {
             log(b"drv-xhci: hid if=");
             log_hex(hid.interface_number as u64);
@@ -2184,7 +2184,7 @@ fn read_descriptors_and_find_hid(
     control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, cfg, data_phys, total)?;
     dsb();
     let config_value = data_buf[5];
-    match kumo_hid::find_hid_boot_interface(&data_buf[..total as usize]) {
+    match kumo_hid::find_hid_boot_keyboard(&data_buf[..total as usize]) {
         Some(hid) => {
             log(b"drv-xhci: dev hid if=");
             log_hex(hid.interface_number as u64);
