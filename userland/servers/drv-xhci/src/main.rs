@@ -5,6 +5,7 @@
 //j430
 //j431
 //j481
+//j521
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -13,6 +14,11 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
     interrupt_create, interrupt_wait, port_bind, port_create, port_wait, process_exit,
     resource_mint_mmio, vmar_map, vmo_create_contiguous,
+};
+use kumo_usb_storage::{
+    CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
+    MediaCapacity, ScsiCommand, StandardInquiryData, COMMAND_BLOCK_WRAPPER_BYTES,
+    COMMAND_STATUS_WRAPPER_BYTES, STANDARD_INQUIRY_BYTES,
 };
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
@@ -70,6 +76,17 @@ const KEYBOARD_REPORT_LIMIT: u32 = 24;
 const REPORT_WAIT_ROUNDS: u32 = 240;
 const DEVICE_DESCRIPTOR_LEN: u32 = 18;
 const DATA_BUF_LEN: usize = 256; // control-transfer buffer (holds a full config descriptor)
+
+// J521: once descriptor reads finish, reuse the two spare 16-TRB regions as BOT bulk OUT/IN
+// rings. Keep CBW, data, and CSW in disjoint parts of the old control buffer so the CSW cannot
+// overwrite a response before it is decoded. — KESTREL
+const BULK_RING_TRBS: usize = 16;
+const BOT_CBW_OFFSET: usize = 0;
+const BOT_DATA_OFFSET: usize = 64;
+const BOT_CSW_OFFSET: usize = 192;
+const BOT_DATA_LEN: usize = BOT_CSW_OFFSET - BOT_DATA_OFFSET;
+const BOT_TAG_INQUIRY: u32 = 0x4b55_0001;
+const BOT_TAG_READ_CAPACITY: u32 = 0x4b55_0002;
 /// Bounded spins waiting for the reset device's port to re-link and enable after HCRST.
 const PORT_POLL_LIMIT: u32 = 4_000_000;
 
@@ -840,6 +857,40 @@ fn enumerate(
         return;
     }
 
+    match kumo_usb_storage::find_bulk_only_scsi_interface(&data_buf[..read_len as usize]) {
+        Ok(Some(storage)) => {
+            log(b"drv-xhci: storage if=");
+            log_hex(storage.interface_number as u64);
+            log(b" out=");
+            log_hex(storage.bulk_out.address as u64);
+            log(b" in=");
+            log_hex(storage.bulk_in.address as u64);
+            log(b" burst=");
+            log_hex(storage.bulk_out.max_burst as u64);
+            log(b"/");
+            log_hex(storage.bulk_in.max_burst as u64);
+            log(b"\n");
+            configure_and_probe_storage(
+                &mut io,
+                layout,
+                &mut *image,
+                &mut *cmd,
+                &*evt,
+                &mut ep0_ring,
+                &mut *ep0_seg,
+                slot_id,
+                ENUM_VA,
+                enum_phys,
+                slot_context_words(0, speed_raw, 1, port_number, 0, 0),
+                storage,
+                data_buf,
+            );
+            return;
+        }
+        Err(_) => log(b"drv-xhci: malformed storage interface\n"),
+        Ok(None) => {}
+    }
+
     match kumo_hid::find_hid_boot_interface(&data_buf[..read_len as usize]) {
         Some(hid) => {
             log(b"drv-xhci: hid if=");
@@ -874,6 +925,471 @@ fn enumerate(
         }
         None => log(b"drv-xhci: no hid boot iface\n"),
     }
+}
+
+/// J521: select a root-attached SCSI/BOT interface, add both bulk endpoint contexts, and execute
+/// the first serialized BOT commands. This is deliberately a one-shot identification probe: no
+/// block service or filesystem is published until a later slice supplies recovery and READ(10).
+#[allow(clippy::too_many_arguments)]
+fn configure_and_probe_storage(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut [Trb],
+    evt: &[Trb],
+    ep0_ring: &mut TransferRing,
+    ep0_seg: &mut [Trb],
+    slot_id: u8,
+    base_va: u64,
+    enum_phys: u64,
+    slot_words: [u32; 8],
+    storage: MassStorageInterface,
+    storage_buf: &mut [u8],
+) {
+    log_storage_phase(b"set-config", b"begin");
+    let set_config = [0x00, 0x09, storage.configuration_value, 0, 0, 0, 0, 0];
+    match control_no_data(
+        io, layout, image, evt, ep0_ring, ep0_seg, slot_id, set_config,
+    ) {
+        Some((1, _)) => log_storage_phase(b"set-config", b"ok"),
+        Some((cc, _)) => return log_storage_cc(b"set-config", cc, 0),
+        None => return log_storage_phase(b"set-config", b"timeout"),
+    }
+
+    // Configuration selection activates alternate setting zero. Select a nonzero BOT alternate
+    // before configuring its endpoint contexts.
+    if storage.alternate_setting != 0 {
+        log_storage_phase(b"set-interface", b"begin");
+        let set_interface = [
+            0x01,
+            0x0b,
+            storage.alternate_setting,
+            0,
+            storage.interface_number,
+            0,
+            0,
+            0,
+        ];
+        match control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            ep0_ring,
+            ep0_seg,
+            slot_id,
+            set_interface,
+        ) {
+            Some((1, _)) => log_storage_phase(b"set-interface", b"ok"),
+            Some((cc, _)) => return log_storage_cc(b"set-interface", cc, 0),
+            None => return log_storage_phase(b"set-interface", b"timeout"),
+        }
+    }
+
+    let Some(out_dci) = endpoint_context_index(storage.bulk_out.endpoint_number(), false) else {
+        return log(b"drv-xhci: storage invalid OUT DCI\n");
+    };
+    let Some(in_dci) = endpoint_context_index(storage.bulk_in.endpoint_number(), true) else {
+        return log(b"drv-xhci: storage invalid IN DCI\n");
+    };
+    if out_dci == in_dci {
+        return log(b"drv-xhci: storage duplicate DCI\n");
+    }
+
+    let bulk_out_phys = enum_phys + OFF_INT_RING as u64;
+    let bulk_in_phys = enum_phys + OFF_REPORT as u64;
+    let out_seg = unsafe {
+        core::slice::from_raw_parts_mut(
+            (base_va as usize + OFF_INT_RING) as *mut Trb,
+            BULK_RING_TRBS,
+        )
+    };
+    let in_seg = unsafe {
+        core::slice::from_raw_parts_mut((base_va as usize + OFF_REPORT) as *mut Trb, BULK_RING_TRBS)
+    };
+    let Ok(mut out_ring) = TransferRing::new(&mut *out_seg, bulk_out_phys) else {
+        return log(b"drv-xhci: storage OUT ring fail\n");
+    };
+    let Ok(mut in_ring) = TransferRing::new(&mut *in_seg, bulk_in_phys) else {
+        return log(b"drv-xhci: storage IN ring fail\n");
+    };
+
+    let stride = ContextSize::Bytes64;
+    let (Some(slot_off), Some(out_off), Some(in_off)) = (
+        stride.input_offset(0),
+        stride.input_offset(out_dci),
+        stride.input_offset(in_dci),
+    ) else {
+        return log(b"drv-xhci: storage context offset fail\n");
+    };
+    // The enumeration page reserves [0x000, 0x400) for its input context. A high-numbered USB
+    // endpoint would otherwise overwrite the controller-owned output context at 0x400. — KESTREL
+    if out_off + 32 > OFF_OUTPUT_CTX || in_off + 32 > OFF_OUTPUT_CTX {
+        return log(b"drv-xhci: storage endpoint DCI exceeds input window\n");
+    }
+
+    let mut icc = InputControlContext::default();
+    if icc.add(0).is_err() || icc.add(out_dci).is_err() || icc.add(in_dci).is_err() {
+        return log(b"drv-xhci: storage input flags fail\n");
+    }
+    let mut slot = slot_words;
+    let context_entries = out_dci.max(in_dci);
+    slot[0] = (slot[0] & !(0x1f << 27)) | ((context_entries as u32) << 27);
+    let Ok(out_ctx) = EndpointContext::bulk_out(
+        storage.bulk_out.max_packet_size,
+        storage.bulk_out.max_burst,
+        bulk_out_phys,
+    ) else {
+        return log(b"drv-xhci: storage OUT context fail\n");
+    };
+    let Ok(in_ctx) = EndpointContext::bulk_in(
+        storage.bulk_in.max_packet_size,
+        storage.bulk_in.max_burst,
+        bulk_in_phys,
+    ) else {
+        return log(b"drv-xhci: storage IN context fail\n");
+    };
+
+    write_ctx(base_va + OFF_INPUT_CTX as u64, icc.words());
+    write_ctx(base_va + OFF_INPUT_CTX as u64 + slot_off as u64, slot);
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + out_off as u64,
+        out_ctx.words(),
+    );
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + in_off as u64,
+        in_ctx.words(),
+    );
+    dsb();
+    log_storage_phase(b"configure-endpoints", b"begin");
+    let input_ctx_phys = enum_phys + OFF_INPUT_CTX as u64;
+    let Ok(configure) = Trb::configure_endpoint(input_ctx_phys, slot_id) else {
+        return log(b"drv-xhci: storage configure TRB fail\n");
+    };
+    match submit_command(io, layout, image, cmd, evt, configure) {
+        Some((1, _, _)) => log_storage_phase(b"configure-endpoints", b"ok"),
+        Some((cc, _, _)) => return log_storage_cc(b"configure-endpoints", cc, 0),
+        None => return log_storage_phase(b"configure-endpoints", b"timeout"),
+    }
+
+    if storage_buf.len() < DATA_BUF_LEN {
+        return log(b"drv-xhci: storage buffer too short\n");
+    }
+    let (cbw_region, after_cbw) = storage_buf.split_at_mut(BOT_DATA_OFFSET);
+    let (data_region, csw_region) = after_cbw.split_at_mut(BOT_DATA_LEN);
+    let cbw_buf = &mut cbw_region[BOT_CBW_OFFSET..BOT_CBW_OFFSET + COMMAND_BLOCK_WRAPPER_BYTES];
+    let data_buf = &mut data_region[..BOT_DATA_LEN];
+    let csw_buf = &mut csw_region[..COMMAND_STATUS_WRAPPER_BYTES];
+    let cbw_phys = enum_phys + OFF_DATA as u64 + BOT_CBW_OFFSET as u64;
+    let data_phys = enum_phys + OFF_DATA as u64 + BOT_DATA_OFFSET as u64;
+    let csw_phys = enum_phys + OFF_DATA as u64 + BOT_CSW_OFFSET as u64;
+
+    let inquiry = ScsiCommand::inquiry(STANDARD_INQUIRY_BYTES);
+    let Some(inquiry_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        data_buf,
+        data_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_INQUIRY,
+        &inquiry,
+        b"inquiry",
+    ) else {
+        return;
+    };
+    let Ok(inquiry_data) = StandardInquiryData::decode(&data_buf[..inquiry_len]) else {
+        return log(b"drv-xhci: storage inquiry decode fail\n");
+    };
+    log(b"drv-xhci: storage inquiry type=");
+    log_hex(inquiry_data.peripheral_device_type as u64);
+    log(b" removable=");
+    log_hex(inquiry_data.removable_media as u64);
+    log(b" vendor=");
+    log_ascii(&inquiry_data.vendor_identification);
+    log(b" product=");
+    log_ascii(&inquiry_data.product_identification);
+    log(b"\n");
+
+    let capacity_command = ScsiCommand::read_capacity_10();
+    let Some(capacity_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        data_buf,
+        data_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_READ_CAPACITY,
+        &capacity_command,
+        b"read-capacity",
+    ) else {
+        return;
+    };
+    let Ok(capacity) = MediaCapacity::decode_read_capacity_10(&data_buf[..capacity_len]) else {
+        return log(b"drv-xhci: storage capacity decode fail\n");
+    };
+    log(b"drv-xhci: storage capacity blocks=");
+    log_hex(capacity.block_count());
+    log(b" block-size=");
+    log_hex(capacity.logical_block_size as u64);
+    log(b" bytes=");
+    log_hex(capacity.byte_length());
+    log(b"\n");
+    log_storage_phase(b"probe", b"complete");
+}
+
+/// Execute exactly one BOT transaction. The CBW, optional data-IN TD, and CSW are submitted and
+/// completed serially; there is never more than one outstanding TRB on either bulk ring.
+#[allow(clippy::too_many_arguments)]
+fn bot_command(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &[Trb],
+    out_ring: &mut TransferRing,
+    out_seg: &mut [Trb],
+    out_dci: u8,
+    in_ring: &mut TransferRing,
+    in_seg: &mut [Trb],
+    in_dci: u8,
+    slot_id: u8,
+    cbw_buf: &mut [u8],
+    cbw_phys: u64,
+    data_buf: &mut [u8],
+    data_phys: u64,
+    csw_buf: &mut [u8],
+    csw_phys: u64,
+    tag: u32,
+    command: &ScsiCommand,
+    command_name: &[u8],
+) -> Option<usize> {
+    let cbw = CommandBlockWrapper::for_scsi(tag, 0, command).ok()?;
+    cbw_buf.copy_from_slice(cbw.as_bytes());
+    dsb();
+    let cbw_len = bulk_transfer(
+        io,
+        layout,
+        image,
+        evt,
+        out_ring,
+        out_seg,
+        slot_id,
+        out_dci,
+        cbw_phys,
+        COMMAND_BLOCK_WRAPPER_BYTES as u32,
+        false,
+        command_name,
+        b"cbw",
+    )?;
+    if cbw_len != COMMAND_BLOCK_WRAPPER_BYTES as u32 {
+        log(b"drv-xhci: storage short CBW\n");
+        return None;
+    }
+
+    let expected = command.transfer_length();
+    let transferred = match command.direction() {
+        DataDirection::None => 0,
+        DataDirection::FromDevice => {
+            if expected as usize > data_buf.len() {
+                log(b"drv-xhci: storage data buffer too short\n");
+                return None;
+            }
+            data_buf[..expected as usize].fill(0);
+            dsb();
+            bulk_transfer(
+                io,
+                layout,
+                image,
+                evt,
+                in_ring,
+                in_seg,
+                slot_id,
+                in_dci,
+                data_phys,
+                expected,
+                true,
+                command_name,
+                b"data-in",
+            )?
+        }
+        DataDirection::ToDevice => {
+            log(b"drv-xhci: storage data-OUT unsupported\n");
+            return None;
+        }
+    };
+
+    csw_buf.fill(0);
+    dsb();
+    let csw_len = bulk_transfer(
+        io,
+        layout,
+        image,
+        evt,
+        in_ring,
+        in_seg,
+        slot_id,
+        in_dci,
+        csw_phys,
+        COMMAND_STATUS_WRAPPER_BYTES as u32,
+        true,
+        command_name,
+        b"csw",
+    )?;
+    if csw_len != COMMAND_STATUS_WRAPPER_BYTES as u32 {
+        log(b"drv-xhci: storage short CSW\n");
+        return None;
+    }
+    let csw = match CommandStatusWrapper::decode(csw_buf, tag, expected) {
+        Ok(csw) => csw,
+        Err(_) => {
+            log(b"drv-xhci: storage invalid CSW\n");
+            return None;
+        }
+    };
+    if csw.transferred_bytes != transferred {
+        log(b"drv-xhci: storage residue mismatch xhci=");
+        log_hex(transferred as u64);
+        log(b" csw=");
+        log_hex(csw.transferred_bytes as u64);
+        log(b"\n");
+        return None;
+    }
+    match csw.status {
+        CommandStatus::Passed => Some(transferred as usize),
+        CommandStatus::Failed => {
+            log_storage_phase(command_name, b"command-failed");
+            None
+        }
+        CommandStatus::PhaseError => {
+            log_storage_phase(command_name, b"phase-error");
+            None
+        }
+    }
+}
+
+/// Submit one single-TRB bulk TD and return its actual byte count. A Data-IN short packet is a
+/// normal BOT termination, while CBW OUT must complete exactly.
+#[allow(clippy::too_many_arguments)]
+fn bulk_transfer(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &[Trb],
+    ring: &mut TransferRing,
+    segment: &mut [Trb],
+    slot_id: u8,
+    dci: u8,
+    buffer_phys: u64,
+    length: u32,
+    direction_in: bool,
+    command_name: &[u8],
+    phase: &[u8],
+) -> Option<u32> {
+    let config = if direction_in {
+        NormalTransfer::bulk_in(buffer_phys, length)
+    } else {
+        NormalTransfer::bulk_out(buffer_phys, length)
+    };
+    let trb = Trb::normal_transfer(config).ok()?;
+    if ring.enqueue(segment, trb).is_err() {
+        log_storage_phase(command_name, b"ring-full");
+        return None;
+    }
+    dsb();
+    log_storage_phase_pair(command_name, phase, b"begin");
+    ring_slot_doorbell(io, layout, slot_id, dci);
+    let Some((cc, remaining, trb_iova)) = poll_transfer_event(io, layout, image, evt, slot_id)
+    else {
+        log_storage_phase_pair(command_name, phase, b"timeout");
+        return None;
+    };
+    let _ = ring.reclaim_through(trb_iova);
+    dsb();
+    log_storage_cc_pair(command_name, phase, cc, remaining);
+    if remaining > length {
+        return None;
+    }
+    if direction_in {
+        if cc != 1 && cc != 13 {
+            return None;
+        }
+    } else if cc != 1 || remaining != 0 {
+        return None;
+    }
+    Some(length - remaining)
+}
+
+fn log_storage_phase(phase: &[u8], state: &[u8]) {
+    log(b"drv-xhci: storage phase=");
+    log(phase);
+    log(b" ");
+    log(state);
+    log(b"\n");
+}
+
+fn log_storage_phase_pair(command: &[u8], phase: &[u8], state: &[u8]) {
+    log(b"drv-xhci: storage phase=");
+    log(command);
+    log(b"-");
+    log(phase);
+    log(b" ");
+    log(state);
+    log(b"\n");
+}
+
+fn log_storage_cc(phase: &[u8], cc: u8, remaining: u32) {
+    log(b"drv-xhci: storage phase=");
+    log(phase);
+    log(b" cc=");
+    log_hex(cc as u64);
+    log(b" rem=");
+    log_hex(remaining as u64);
+    log(b"\n");
+}
+
+fn log_storage_cc_pair(command: &[u8], phase: &[u8], cc: u8, remaining: u32) {
+    log(b"drv-xhci: storage phase=");
+    log(command);
+    log(b"-");
+    log(phase);
+    log(b" cc=");
+    log_hex(cc as u64);
+    log(b" rem=");
+    log_hex(remaining as u64);
+    log(b"\n");
+}
+
+fn log_ascii(bytes: &[u8]) {
+    let mut safe = [b'.'; 16];
+    let length = bytes.len().min(safe.len());
+    for (destination, source) in safe[..length].iter_mut().zip(bytes.iter()) {
+        if source.is_ascii_graphic() || *source == b' ' {
+            *destination = *source;
+        }
+    }
+    log(&safe[..length]);
 }
 
 /// Slice D2: bring a boot keyboard online — SET_CONFIGURATION, Configure Endpoint for its
@@ -2032,8 +2548,14 @@ fn submit_command(
     let token = image.command_ring.enqueue(cmd, command).ok()?;
     dsb();
     layout.ring_command_doorbell(io).ok()?;
-    for _ in 0..EVENT_POLL_LIMIT {
+    for spin in 0..EVENT_POLL_LIMIT {
         dsb();
+        // Command completions can take the same metal-scale budget as transfer completions. Keep
+        // the scheduler/re-entry probe alive here too, especially while storage endpoint setup is
+        // the last printed sysrq-visible phase marker. — KESTREL
+        if spin % YIELD_INTERVAL == 0 && spin != 0 {
+            cooperative_yield();
+        }
         let popped = match image.event_ring.pop(evt) {
             Ok(popped) => popped,
             Err(_) => return None,

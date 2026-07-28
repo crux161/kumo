@@ -1,3 +1,5 @@
+//j521
+
 use crate::Error;
 
 /// Context stride selected by HCCPARAMS1.CSZ.
@@ -149,6 +151,40 @@ impl EndpointContext {
         Ok(context)
     }
 
+    pub fn bulk_out(max_packet_size: u16, max_burst: u8, dequeue_iova: u64) -> Result<Self, Error> {
+        Self::bulk(
+            EndpointType::BulkOut,
+            max_packet_size,
+            max_burst,
+            dequeue_iova,
+        )
+    }
+
+    pub fn bulk_in(max_packet_size: u16, max_burst: u8, dequeue_iova: u64) -> Result<Self, Error> {
+        Self::bulk(
+            EndpointType::BulkIn,
+            max_packet_size,
+            max_burst,
+            dequeue_iova,
+        )
+    }
+
+    fn bulk(
+        endpoint_type: EndpointType,
+        max_packet_size: u16,
+        max_burst: u8,
+        dequeue_iova: u64,
+    ) -> Result<Self, Error> {
+        if max_burst > 15 {
+            return Err(Error::InvalidField);
+        }
+        let mut context = Self::new(endpoint_type, max_packet_size, dequeue_iova)?;
+        context.words[1] |= (max_burst as u32) << 8;
+        // xHCI 1.2 recommends 3 KiB as the initial Average TRB Length for bulk endpoints.
+        context.words[4] = 3072;
+        Ok(context)
+    }
+
     pub const fn words(self) -> [u32; 8] {
         self.words
     }
@@ -234,6 +270,23 @@ mod tests {
         assert_eq!(interrupt.words()[4] & 0xffff, 8);
         assert_eq!(size_of::<EndpointContext>(), 32);
         assert_eq!(align_of::<EndpointContext>(), 32);
+    }
+
+    #[test]
+    fn bulk_contexts_encode_direction_burst_and_average_length() {
+        let bulk_out = EndpointContext::bulk_out(1024, 3, 0x3_0000).unwrap();
+        assert_eq!((bulk_out.words()[1] >> 3) & 7, EndpointType::BulkOut as u32);
+        assert_eq!((bulk_out.words()[1] >> 8) & 0xff, 3);
+        assert_eq!((bulk_out.words()[1] >> 16) & 0xffff, 1024);
+        assert_eq!(bulk_out.words()[4] & 0xffff, 3072);
+
+        let bulk_in = EndpointContext::bulk_in(512, 0, 0x4_0000).unwrap();
+        assert_eq!((bulk_in.words()[1] >> 3) & 7, EndpointType::BulkIn as u32);
+        assert_eq!(bulk_in.dequeue_iova(), 0x4_0000);
+        assert_eq!(
+            EndpointContext::bulk_in(512, 16, 0x4_0000),
+            Err(Error::InvalidField)
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![no_std]
 //j520
+//j521
 
 //! Allocation-free USB Mass Storage Bulk-Only Transport and SCSI command framing.
 //!
@@ -10,6 +11,7 @@
 const DESCRIPTOR_CONFIGURATION: u8 = 0x02;
 const DESCRIPTOR_INTERFACE: u8 = 0x04;
 const DESCRIPTOR_ENDPOINT: u8 = 0x05;
+const DESCRIPTOR_SUPERSPEED_ENDPOINT_COMPANION: u8 = 0x30;
 const ENDPOINT_TRANSFER_BULK: u8 = 0x02;
 const ENDPOINT_DIRECTION_IN: u8 = 0x80;
 
@@ -30,6 +32,8 @@ const COMMAND_STATUS_WRAPPER_SIGNATURE: u32 = 0x5342_5355;
 pub struct BulkEndpoint {
     pub address: u8,
     pub max_packet_size: u16,
+    /// SuperSpeed Endpoint Companion `bMaxBurst`; zero for USB 2 endpoints.
+    pub max_burst: u8,
 }
 
 impl BulkEndpoint {
@@ -92,6 +96,20 @@ impl InterfaceCandidate {
         *slot = Some(endpoint);
         Ok(())
     }
+
+    fn set_max_burst(&mut self, direction_in: bool, max_burst: u8) -> Result<(), DescriptorError> {
+        if max_burst > 15 {
+            return Err(DescriptorError::InvalidEndpoint);
+        }
+        let endpoint = if direction_in {
+            self.bulk_in.as_mut()
+        } else {
+            self.bulk_out.as_mut()
+        }
+        .ok_or(DescriptorError::InvalidEndpoint)?;
+        endpoint.max_burst = max_burst;
+        Ok(())
+    }
 }
 
 /// Find the first complete SCSI-transparent Bulk-Only interface in `config`.
@@ -119,6 +137,7 @@ pub fn find_bulk_only_scsi_interface(
     let mut index = first_length;
     let mut candidate: Option<InterfaceCandidate> = None;
     let mut saw_incomplete_match = false;
+    let mut companion_target = None;
 
     while index < total_length {
         if index + 2 > total_length {
@@ -130,6 +149,7 @@ pub fn find_bulk_only_scsi_interface(
             return Err(DescriptorError::Malformed);
         }
 
+        let previous_endpoint = companion_target.take();
         match descriptor_type {
             DESCRIPTOR_INTERFACE => {
                 if length < 9 {
@@ -174,8 +194,19 @@ pub fn find_bulk_only_scsi_interface(
                         current.add_bulk_endpoint(BulkEndpoint {
                             address,
                             max_packet_size: packet_size,
+                            max_burst: 0,
                         })?;
+                        companion_target = Some(address & ENDPOINT_DIRECTION_IN != 0);
                     }
+                }
+            }
+            DESCRIPTOR_SUPERSPEED_ENDPOINT_COMPANION => {
+                if length < 6 {
+                    return Err(DescriptorError::Malformed);
+                }
+                if let (Some(current), Some(direction_in)) = (candidate.as_mut(), previous_endpoint)
+                {
+                    current.set_max_burst(direction_in, config[index + 2])?;
                 }
             }
             _ => {}
@@ -542,6 +573,31 @@ mod tests {
         assert_eq!(found.bulk_out.endpoint_number(), 2);
         assert_eq!(found.bulk_in.endpoint_number(), 3);
         assert_eq!(found.bulk_in.max_packet_size, 512);
+        assert_eq!(found.bulk_in.max_burst, 0);
+    }
+
+    #[test]
+    fn superspeed_companions_supply_each_endpoint_max_burst() {
+        let config = [
+            9, 2, 44, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 2, 8, 6, 0x50, 0, // SCSI transparent BOT
+            7, 5, 2, 2, 0, 4, 0, // bulk OUT, 1024 bytes
+            6, 0x30, 3, 0, 0, 0, // four packets per burst
+            7, 5, 0x83, 2, 0, 4, 0, // bulk IN, 1024 bytes
+            6, 0x30, 7, 0, 0, 0, // eight packets per burst
+        ];
+        let found = find_bulk_only_scsi_interface(&config)
+            .unwrap()
+            .expect("mass storage interface");
+        assert_eq!(found.bulk_out.max_burst, 3);
+        assert_eq!(found.bulk_in.max_burst, 7);
+
+        let mut invalid = config;
+        invalid[27] = 16;
+        assert_eq!(
+            find_bulk_only_scsi_interface(&invalid),
+            Err(DescriptorError::InvalidEndpoint)
+        );
     }
 
     #[test]

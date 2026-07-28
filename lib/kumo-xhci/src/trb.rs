@@ -1,3 +1,5 @@
+//j521
+
 use crate::Error;
 
 const CYCLE: u32 = 1;
@@ -289,7 +291,7 @@ impl Trb {
     }
 }
 
-/// Parameters for one Normal TRB, used by the HID interrupt-IN transfer ring.
+/// Parameters for one Normal TRB, used by interrupt and bulk transfer rings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NormalTransfer {
     pub buffer_iova: u64,
@@ -311,6 +313,25 @@ impl NormalTransfer {
             interrupt_on_short_packet: true,
             interrupt_on_completion: true,
             chain: false,
+        }
+    }
+
+    pub const fn bulk_out(buffer_iova: u64, length: u32) -> Self {
+        Self {
+            buffer_iova,
+            length,
+            td_size: 0,
+            interrupter_target: 0,
+            interrupt_on_short_packet: false,
+            interrupt_on_completion: true,
+            chain: false,
+        }
+    }
+
+    pub const fn bulk_in(buffer_iova: u64, length: u32) -> Self {
+        Self {
+            interrupt_on_short_packet: true,
+            ..Self::bulk_out(buffer_iova, length)
         }
     }
 }
@@ -420,6 +441,15 @@ mod tests {
         assert_eq!(normal.words()[2] & 0x1ffff, 8);
         assert_eq!(normal.words()[3] & INTERRUPT_ON_SHORT_PACKET, 1 << 2);
         assert_eq!(normal.words()[3] & INTERRUPT_ON_COMPLETION, 1 << 5);
+
+        let bulk_out = Trb::normal_transfer(NormalTransfer::bulk_out(0x1234_9000, 31)).unwrap();
+        assert_eq!(bulk_out.pointer(), 0x1234_9000);
+        assert_eq!(bulk_out.words()[2] & 0x1ffff, 31);
+        assert_eq!(bulk_out.words()[3] & INTERRUPT_ON_SHORT_PACKET, 0);
+        assert_eq!(bulk_out.words()[3] & INTERRUPT_ON_COMPLETION, 1 << 5);
+
+        let bulk_in = Trb::normal_transfer(NormalTransfer::bulk_in(0x1234_a000, 36)).unwrap();
+        assert_eq!(bulk_in.words()[3] & INTERRUPT_ON_SHORT_PACKET, 1 << 2);
     }
 
     #[test]
