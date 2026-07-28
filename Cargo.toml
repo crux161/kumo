@@ -1,8 +1,8 @@
-#j426
 #j485
 #j486
 #j493
 #j495
+#j520
 [workspace]
 members = [
     "boot/niji-loader",
@@ -19,6 +19,7 @@ members = [
     "lib/kumo-i2c-hid",
     "lib/kumo-ipc",
     "lib/kumo-pdc",
+    "lib/kumo-usb-storage",
     "lib/kumo-virtio",
     "lib/kumo-vfs",
     "lib/kumo-xhci",
