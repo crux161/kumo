@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-//j431
 //j481
 //j521
 //j522
 //j523
+//j525
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use kumo_abi::{Handle, VmarFlags};
+use kumo_gpt::{validate_protective_mbr, GptError, GptHeader, Guid};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
     interrupt_create, interrupt_wait, port_bind, port_create, port_wait, process_exit,
@@ -87,11 +88,16 @@ const BOT_CSW_OFFSET: usize = 192;
 const BOT_DATA_LEN: usize = BOT_CSW_OFFSET - BOT_DATA_OFFSET;
 const BOT_TAG_INQUIRY: u32 = 0x4b55_0001;
 const BOT_TAG_READ_CAPACITY: u32 = 0x4b55_0002;
-const BOT_TAG_READ_10: u32 = 0x4b55_0003;
-// J522: a separate page lets one native logical block reach 4 KiB without colliding with the
-// enumeration page's CBW/CSW and bulk rings. phys is again the IOVA under SMMU bypass. — KESTREL
+const BOT_TAG_READ_LBA0: u32 = 0x4b55_0003;
+const BOT_TAG_READ_GPT_HEADER: u32 = 0x4b55_0004;
+const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
+// J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
+// guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
+// phys is again the IOVA under SMMU bypass. — KESTREL
 const STORAGE_DATA_VA: u64 = 0x0000_0000_1500_0000;
-const STORAGE_DATA_LEN: u64 = PAGE_SIZE;
+const STORAGE_DATA_LEN: u64 = 4 * PAGE_SIZE;
+const STORAGE_ALLOCATION_LEN: u64 = 2 * STORAGE_DATA_LEN;
+const XHCI_DATA_BOUNDARY: u64 = 0x1_0000;
 /// Bounded spins waiting for the reset device's port to re-link and enable after HCRST.
 const PORT_POLL_LIMIT: u32 = 4_000_000;
 
@@ -948,8 +954,8 @@ fn enumerate(
     }
 }
 
-/// J522: select a root-attached SCSI/BOT interface, identify its geometry, and issue one bounded
-/// READ(10) for LBA0. This remains a one-shot proof: no block service or filesystem is published.
+/// J525: select a root-attached SCSI/BOT interface, identify its geometry, and discover a GPT ESP
+/// through bounded READ(10)s. This remains a one-shot proof: no block service or filesystem exists.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_probe_storage(
     io: &mut Mmio,
@@ -1182,12 +1188,12 @@ fn configure_and_probe_storage(
         Ok(adapter) => adapter,
         Err(_) => return log(b"drv-xhci: storage block geometry exceeds DMA window\n"),
     };
-    let plan = match adapter.plan_read(0, 1) {
+    let lba0_plan = match adapter.plan_read(0, 1) {
         Ok(plan) => plan,
         Err(_) => return log(b"drv-xhci: storage LBA0 plan fail\n"),
     };
-    let (read_raw, read_phys) = vmo_create_contiguous(STORAGE_DATA_LEN);
-    if read_raw == u64::MAX || read_phys == 0 {
+    let (read_raw, read_allocation_phys) = vmo_create_contiguous(STORAGE_ALLOCATION_LEN);
+    if read_raw == u64::MAX || read_allocation_phys == 0 {
         return log(b"drv-xhci: storage read vmo fail\n");
     }
     if vmar_map(
@@ -1195,19 +1201,37 @@ fn configure_and_probe_storage(
         Handle(read_raw as u32),
         0,
         STORAGE_DATA_VA,
-        STORAGE_DATA_LEN,
+        STORAGE_ALLOCATION_LEN,
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     ) != 0
     {
         return log(b"drv-xhci: storage read map fail\n");
     }
-    let read_buf = unsafe {
-        core::slice::from_raw_parts_mut(STORAGE_DATA_VA as usize as *mut u8, plan.byte_length)
+    let boundary_remaining = XHCI_DATA_BOUNDARY - (read_allocation_phys & (XHCI_DATA_BOUNDARY - 1));
+    let read_offset = if boundary_remaining >= STORAGE_DATA_LEN {
+        0
+    } else {
+        boundary_remaining
     };
-    log(b"drv-xhci: storage read-window phys=");
+    let Some(read_end) = read_offset.checked_add(STORAGE_DATA_LEN) else {
+        return log(b"drv-xhci: storage read window overflow\n");
+    };
+    if read_end > STORAGE_ALLOCATION_LEN {
+        return log(b"drv-xhci: storage read window does not fit backing\n");
+    }
+    let read_phys = read_allocation_phys + read_offset;
+    let read_window = unsafe {
+        core::slice::from_raw_parts_mut(
+            (STORAGE_DATA_VA + read_offset) as usize as *mut u8,
+            STORAGE_DATA_LEN as usize,
+        )
+    };
+    log(b"drv-xhci: storage read-window backing-phys=");
+    log_hex(read_allocation_phys);
+    log(b" data-phys=");
     log_hex(read_phys);
     log(b" bytes=");
-    log_hex(plan.byte_length as u64);
+    log_hex(STORAGE_DATA_LEN);
     log(b"\n");
     let Some(read_len) = bot_command(
         io,
@@ -1223,30 +1247,142 @@ fn configure_and_probe_storage(
         slot_id,
         cbw_buf,
         cbw_phys,
-        read_buf,
+        &mut read_window[..lba0_plan.byte_length],
         read_phys,
         csw_buf,
         csw_phys,
-        BOT_TAG_READ_10,
-        &plan.command,
+        BOT_TAG_READ_LBA0,
+        &lba0_plan.command,
         b"read10-lba0",
     ) else {
         return;
     };
-    if read_len != plan.byte_length {
+    if read_len != lba0_plan.byte_length {
         return log(b"drv-xhci: storage short LBA0\n");
     }
     log(b"drv-xhci: storage lba0 prefix=");
-    for byte in &read_buf[..read_len.min(16)] {
+    for byte in &read_window[..read_len.min(16)] {
         log(b" ");
         log_hex(*byte as u64);
     }
     if read_len >= 512 {
         log(b" tail510=");
-        log_hex(read_buf[510] as u64);
+        log_hex(read_window[510] as u64);
         log(b" tail511=");
-        log_hex(read_buf[511] as u64);
+        log_hex(read_window[511] as u64);
     }
+    log(b"\n");
+
+    let logical_block_size = capacity.logical_block_size as usize;
+    if let Err(error) = validate_protective_mbr(
+        &read_window[..read_len],
+        logical_block_size,
+        capacity.block_count(),
+    ) {
+        return log_gpt_error(b"mbr", error);
+    }
+    log_storage_phase(b"gpt-mbr", b"ok");
+
+    let header_plan = match adapter.plan_read(1, 1) {
+        Ok(plan) => plan,
+        Err(_) => return log(b"drv-xhci: storage GPT header plan fail\n"),
+    };
+    let Some(header_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        &mut read_window[..header_plan.byte_length],
+        read_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_READ_GPT_HEADER,
+        &header_plan.command,
+        b"read10-gpt-header",
+    ) else {
+        return;
+    };
+    if header_len != header_plan.byte_length {
+        return log(b"drv-xhci: storage short GPT header\n");
+    }
+    let header = match GptHeader::parse_primary(
+        &read_window[..header_len],
+        logical_block_size,
+        capacity.block_count(),
+    ) {
+        Ok(header) => header,
+        Err(error) => return log_gpt_error(b"header", error),
+    };
+    log_storage_phase(b"gpt-header", b"ok");
+    log(b"drv-xhci: storage gpt disk-guid=");
+    log_guid(header.disk_guid);
+    log(b" entries-lba=");
+    log_hex(header.partition_entry_lba);
+    log(b" entries-bytes=");
+    log_hex(header.partition_entry_array_byte_len() as u64);
+    log(b"\n");
+
+    let Ok(entry_block_count) = u16::try_from(header.partition_entry_array_block_count()) else {
+        return log(b"drv-xhci: storage GPT table exceeds READ(10) count\n");
+    };
+    let entries_plan = match adapter.plan_read(header.partition_entry_lba, entry_block_count) {
+        Ok(plan) => plan,
+        Err(_) => return log(b"drv-xhci: storage GPT table exceeds DMA window\n"),
+    };
+    let Some(entries_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        &mut read_window[..entries_plan.byte_length],
+        read_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_READ_GPT_ENTRIES,
+        &entries_plan.command,
+        b"read10-gpt-entries",
+    ) else {
+        return;
+    };
+    if entries_len != entries_plan.byte_length {
+        return log(b"drv-xhci: storage short GPT table\n");
+    }
+    let table = match header.parse_partition_table(&read_window[..entries_len]) {
+        Ok(table) => table,
+        Err(error) => return log_gpt_error(b"entries", error),
+    };
+    log_storage_phase(b"gpt-entries", b"ok");
+    let Some(esp) = table.efi_system_partition() else {
+        return log_storage_phase(b"gpt-esp", b"not-found");
+    };
+    log(b"drv-xhci: storage esp index=");
+    log_hex(esp.index as u64);
+    log(b" guid=");
+    log_guid(esp.unique_guid);
+    log(b" first-lba=");
+    log_hex(esp.first_lba);
+    log(b" last-lba=");
+    log_hex(esp.last_lba);
+    log(b" blocks=");
+    log_hex(esp.block_count());
     log(b"\n");
     log_storage_phase(b"probe", b"complete");
 }
@@ -1470,6 +1606,55 @@ fn log_storage_cc_pair(command: &[u8], phase: &[u8], cc: u8, remaining: u32) {
     log(b" rem=");
     log_hex(remaining as u64);
     log(b"\n");
+}
+
+fn log_gpt_error(stage: &[u8], error: GptError) {
+    let name = match error {
+        GptError::BufferTooShort => b"buffer-too-short" as &[u8],
+        GptError::InvalidLogicalBlockSize => b"invalid-logical-block-size",
+        GptError::InvalidMediaSize => b"invalid-media-size",
+        GptError::BadMbrSignature => b"bad-mbr-signature",
+        GptError::BadProtectiveMbr => b"bad-protective-mbr",
+        GptError::BadHeaderSignature => b"bad-header-signature",
+        GptError::UnsupportedRevision => b"unsupported-revision",
+        GptError::BadHeaderSize => b"bad-header-size",
+        GptError::BadHeaderCrc => b"bad-header-crc",
+        GptError::NonzeroReservedBytes => b"nonzero-reserved-bytes",
+        GptError::BadHeaderLocation => b"bad-header-location",
+        GptError::BadUsableRange => b"bad-usable-range",
+        GptError::BadDiskGuid => b"bad-disk-guid",
+        GptError::BadEntryGeometry => b"bad-entry-geometry",
+        GptError::EntryArrayOutOfBounds => b"entry-array-out-of-bounds",
+        GptError::EntryArrayTooShort => b"entry-array-too-short",
+        GptError::BadEntryArrayCrc => b"bad-entry-array-crc",
+        GptError::BadPartitionEntry => b"bad-partition-entry",
+        GptError::OverlappingPartitions => b"overlapping-partitions",
+    };
+    log(b"drv-xhci: storage gpt ");
+    log(stage);
+    log(b" error=");
+    log(name);
+    log(b"\n");
+}
+
+/// Print a GPT's on-disk mixed-endian GUID bytes in canonical textual order.
+fn log_guid(guid: Guid) {
+    const ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+    for (position, byte_index) in ORDER.into_iter().enumerate() {
+        if matches!(position, 4 | 6 | 8 | 10) {
+            log(b"-");
+        }
+        log_hex_byte(guid.0[byte_index]);
+    }
+}
+
+fn log_hex_byte(value: u8) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let bytes = [
+        DIGITS[(value >> 4) as usize],
+        DIGITS[(value & 0x0f) as usize],
+    ];
+    log(&bytes);
 }
 
 fn log_ascii(bytes: &[u8]) {

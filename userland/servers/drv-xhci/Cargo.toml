@@ -1,5 +1,6 @@
 #j426
 #j521
+#j525
 
 [package]
 name = "drv-xhci"
@@ -17,6 +18,7 @@ doctest = false
 
 [dependencies]
 kumo-abi.workspace = true
+kumo-gpt = { path = "../../../lib/kumo-gpt" }
 kumo-xhci = { path = "../../../lib/kumo-xhci" }
 kumo-hid = { path = "../../../lib/kumo-hid" }
 kumo-usb-storage = { path = "../../../lib/kumo-usb-storage" }
