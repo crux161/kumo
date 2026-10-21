@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j521
 //j522
 //j523
 //j525
 //j529
+//j530
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -503,6 +503,10 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
             log(b" param=");
             log_hex(done.parameter as u64);
             log(b"\n");
+            // `poll_completion` advances the software dequeue cursor. Publish that cursor before
+            // issuing any more commands; otherwise the controller still accounts the No-Op event
+            // as live while software starts consuming later entries.
+            write_erdp(&mut io, layout, image.event_ring.dequeue_iova());
             if done.completion_code == 1 {
                 enumerate(layout, caplength, max_ports, &mut image, cmd, evt);
             }
@@ -1798,6 +1802,7 @@ fn configure_and_read_keyboard(
             // the observed "window": input works for a while, then stops accepting keystrokes
             // entirely. Re-arm only once the outstanding transfer has actually completed.
             let mut pending = false;
+            let mut first_transfer_logged = false;
             loop {
                 if !pending {
                     report_buf.fill(0);
@@ -1807,15 +1812,26 @@ fn configure_and_read_keyboard(
                     else {
                         return log(b"drv-xhci: normal trb fail\n");
                     };
-                    if int_ring.enqueue(&mut *int_seg, normal).is_err() {
-                        // Never exit on a full ring: exiting quiesces the controller and the
-                        // keyboard never comes back. Drain what the controller has finished and
-                        // retry on the next interrupt instead.
-                        log(b"drv-xhci: int ring full; draining\n");
-                    } else {
-                        pending = true;
-                        dsb();
-                        ring_slot_doorbell(io, layout, slot_id, dci);
+                    match int_ring.enqueue(&mut *int_seg, normal) {
+                        Err(_) => {
+                            // Never exit on a full ring: exiting quiesces the controller and the
+                            // keyboard never comes back. Drain what the controller has finished
+                            // and retry on the next interrupt instead.
+                            log(b"drv-xhci: int ring full; draining\n");
+                        }
+                        Ok(token) => {
+                            pending = true;
+                            dsb();
+                            ring_slot_doorbell(io, layout, slot_id, dci);
+                            if !first_transfer_logged {
+                                log(b"drv-xhci: hid transfer armed trb=");
+                                log_hex(token.iova);
+                                log(b" erdp=");
+                                log_hex(image.event_ring.dequeue_iova());
+                                log(b"\n");
+                                first_transfer_logged = true;
+                            }
+                        }
                     }
                 }
                 // Block until the controller raises its interrupt (a report completed).
@@ -2871,16 +2887,21 @@ fn submit_command(
             Err(_) => return None,
         };
         if let Some(trb) = popped {
+            let event = trb.decode_event();
+            // Every successful pop advances the software dequeue cursor, including port-change
+            // and transfer events unrelated to this command. Mirror every such advance to ERDP;
+            // publishing only the matching completion leaves hardware and software disagreeing
+            // about the ring head whenever boot traffic is interleaved.
+            write_erdp(io, layout, image.event_ring.dequeue_iova());
             if let Some(Event::CommandCompletion {
                 command_iova,
                 parameter,
                 completion_code,
                 slot_id,
-            }) = trb.decode_event()
+            }) = event
             {
                 if command_iova == token.iova {
                     let _ = image.command_ring.reclaim_through(command_iova);
-                    write_erdp(io, layout, image.event_ring.dequeue_iova());
                     return Some((completion_code, slot_id, parameter));
                 }
             }
@@ -2928,16 +2949,21 @@ fn poll_transfer_event_limited(
             Err(_) => return None,
         };
         if let Some(trb) = popped {
+            let event = trb.decode_event();
+            // A consumed event is no longer owned by the controller regardless of whether it is
+            // the transfer this caller wants. In particular, acknowledge boot-time Port Status
+            // Change events immediately; deferring ERDP until a later keyboard completion can
+            // leave EHB asserted and make the first HID interrupt nondeterministic after reboot.
+            write_erdp(io, layout, image.event_ring.dequeue_iova());
             if let Some(Event::Transfer {
                 completion_code,
                 remaining,
                 slot_id: event_slot,
                 trb_iova,
                 ..
-            }) = trb.decode_event()
+            }) = event
             {
                 if event_slot == slot_id {
-                    write_erdp(io, layout, image.event_ring.dequeue_iova());
                     return Some((completion_code, remaining, trb_iova));
                 }
             }
