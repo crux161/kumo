@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j493
-//j506
 //j507
 //j517
 //j512
 //j514
+//j527
 
 extern crate alloc;
 
@@ -2046,31 +2045,10 @@ extern "C" fn sora_main(
         if interactive_ttyd.is_some() {
             debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
         }
-        // Drain keystrokes that arrived BEFORE the port was bound. A driver may deliver keys as
-        // soon as it enumerates (well before Sora's serve setup), but `port_bind` only wakes on
-        // NEW signals — it does not replay an already-queued message. Without this drain those
-        // bytes are stranded in the channel forever and the first keys a user types during boot
-        // are silently lost. Live keys after this point each signal the port on write.
-        if let Some(hid_kbd) = hid_keyboard_input {
-            if interactive_ttyd.is_some() {
-                let mut backlog = [0u8; 256];
-                let n = channel_read(hid_kbd, backlog.as_mut_ptr(), backlog.len()) as usize;
-                if n > 0 {
-                    let tty = interactive_ttyd.unwrap().instance;
-                    let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
-                    for byte in backlog.iter().take(n) {
-                        dispatch_ttyd_key(
-                            tty.client,
-                            *byte,
-                            &mut tty_reply,
-                            initrd,
-                            prog_initrd,
-                            root,
-                        );
-                    }
-                }
-            }
-        }
+        // `PortBind` replays an endpoint's current READABLE state, so keys queued before setup
+        // arrive through the ordinary loop below. Do not probe the channel with blocking
+        // `channel_read`: an empty HID channel would park Sora inside the syscall's SoraState
+        // borrow, leaving the boot floor alive but unable to forward any ordinary console input.
         loop {
             let source = Handle(port_wait(port) as u32);
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {

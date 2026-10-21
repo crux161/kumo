@@ -1,10 +1,8 @@
-//j366
-//j367
-//j368
 //j392
 //j406
 //j409
 //j410
+//j527
 use alloc::vec::Vec;
 use core::mem;
 
@@ -713,6 +711,25 @@ impl SyscallEngine {
     /// the port is signalled with the corresponding signals and the object koid as source.
     pub fn port_bind(&mut self, port_koid: KoId, object_koid: KoId) {
         self.port_bindings.push((port_koid, object_koid));
+        // Binding is level-triggered for channel state, just like the timer/fault cases below.
+        // A message may have arrived before the receiver created and bound its serve port. If we
+        // only remember future transitions, that already-readable inbox is stranded until an
+        // unrelated write happens. Sora used to compensate with a blocking "backlog drain";
+        // when the HID channel was empty that parked Sora while its RefCell borrow was live and
+        // wedged every ordinary console key (IRQ-side sysrq remained alive). Replay only states
+        // useful to a channel reader -- WRITABLE is normally always set and would busy-loop.
+        if let Ok(signals) = self.ipc.channel_signals_by_koid(object_koid) {
+            let mut pending = kumo_abi::Signals::empty();
+            if signals.contains(kumo_abi::Signals::READABLE) {
+                pending |= kumo_abi::Signals::READABLE;
+            }
+            if signals.contains(kumo_abi::Signals::PEER_CLOSED) {
+                pending |= kumo_abi::Signals::PEER_CLOSED;
+            }
+            if pending.bits() != 0 {
+                self.signal_ports(object_koid, pending);
+            }
+        }
         if self
             .timers
             .iter()
@@ -3864,6 +3881,47 @@ mod tests {
             panic!("expected peer endpoint port packet");
         };
         let right_koid = process.handles().get(right).unwrap().koid;
+        assert_eq!(packet.source, right_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::READABLE));
+    }
+
+    #[test]
+    fn channel_bind_replays_existing_readability() {
+        // A serve port is commonly created after producers are already live. Binding the
+        // receiver must preserve a message written in that window; otherwise the consumer parks
+        // forever waiting for a transition that already happened.
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let reader_port = create_port(&mut engine, &mut process);
+        let (left, right) = create_channel(&mut engine, &mut process);
+        let right_koid = process.handles().get(right).unwrap().koid;
+
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::ChannelWrite {
+                    channel: left,
+                    message: Message::new(1, b"early", &[]).unwrap(),
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port: reader_port,
+                    object: right,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut process, KernelCall::PortWait { port: reader_port })
+        else {
+            panic!("late bind must replay the channel's readable state");
+        };
         assert_eq!(packet.source, right_koid);
         assert!(packet.signals.contains(kumo_abi::Signals::READABLE));
     }
