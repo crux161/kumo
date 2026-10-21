@@ -9,13 +9,14 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j471
 //j477
 //j493
 //j494
 //j528
+//j532
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -238,6 +239,57 @@ pub fn sora_state_is_free() -> bool {
 /// Longest command line the kernel shell accepts from Sora's root channel.
 const MAX_ROOT_COMMAND_BYTES: usize = 256;
 
+/// Distinct device lines that can wait at once for a busy `SoraState`. A board has a handful of
+/// device lines (three xHCI controllers on the Orange Pi 5 Plus), so this never fills in practice.
+const DEFERRED_INTERRUPT_SLOTS: usize = 16;
+
+/// Device interrupt keys that fired while `SoraState` was borrowed, kept masked until an IRQ
+/// that can take the borrow delivers them. Key 0 is never a device key (those are `>= 32`), so
+/// a zero slot is empty.
+struct DeferredInterrupts {
+    slots: [AtomicU32; DEFERRED_INTERRUPT_SLOTS],
+}
+
+impl DeferredInterrupts {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU32::new(0) }; DEFERRED_INTERRUPT_SLOTS],
+        }
+    }
+
+    /// Remember `key` until the borrow is free. A key already waiting is not stored twice: a
+    /// masked line has at most one delivery outstanding. Returns false only when every slot
+    /// holds some other key.
+    fn defer(&self, key: u32) -> bool {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == key)
+        {
+            return true;
+        }
+        self.slots.iter().any(|slot| {
+            slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        })
+    }
+
+    /// Hand every waiting key to `deliver` and forget it. Returns how many were delivered.
+    fn drain(&self, mut deliver: impl FnMut(u32)) -> usize {
+        let mut delivered = 0;
+        for slot in &self.slots {
+            let key = slot.swap(0, Ordering::Relaxed);
+            if key != 0 {
+                deliver(key);
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+}
+
+static DEFERRED_INTERRUPTS: DeferredInterrupts = DeferredInterrupts::new();
+
 /// P9-a: signal all interrupt objects bound to `irq`. Called from the timer/device IRQ
 /// handler via `set_interrupt_hook`. Wakes Sora after the IRQ epilogue when the boot
 /// floor is current.
@@ -258,24 +310,33 @@ extern "C" fn signal_irq(irq: u32) {
     }
     // NEVER take the panicking borrow from IRQ context: an interrupt can land while ordinary
     // kernel code holds `SoraState` (e.g. the shell draining a command), and `with_sora_mut` would
-    // double-borrow and panic. If the state is busy, unmask the device line so the controller
-    // re-asserts and we service it on the next delivery instead of losing it.
+    // double-borrow and panic. If the state is busy, keep the device line MASKED and defer the
+    // delivery to the next IRQ that can take the borrow — the periodic timer tick at the latest.
+    // Unmasking instead was a livelock: the line is still asserted and EOI has already happened,
+    // so the GIC re-delivers before the interrupted holder executes one more instruction, the
+    // holder never releases the borrow, and only the UART poll above stays alive. That was the
+    // Orange Pi wedge whenever a USB keyboard was armed (sysrq `?`/`r` answer, `t` and quiesce
+    // do not). DESIGN/016: a level line stays masked until `InterruptComplete`. — TIMBERDOODLE
     let delivered = try_with_sora_mut(|sora| {
+        let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);
-    })
-    .is_some();
-    if irq >= 32 && delivered {
-        // S0: counted on delivery, not on entry — the busy-borrow path below unmasks and lets the
-        // controller re-assert, and scoring that retry would inflate the denominator every later
-        // measurement divides by.
-        crate::ipcstat::note_device_irq();
-    }
-    if !delivered {
+        late
+    });
+    let Some(late) = delivered else {
+        // A full deferral set would lose this line rather than storm the machine; with
+        // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
         if irq >= 32 {
-            kumo_hal::active::unmask_spi_interrupt(irq);
+            let _ = DEFERRED_INTERRUPTS.defer(irq);
         }
         return;
+    };
+    // S0: counted on delivery, not on entry, so a deferred line is scored once, when it lands.
+    for _ in 0..late {
+        crate::ipcstat::note_device_irq();
+    }
+    if irq >= 32 {
+        crate::ipcstat::note_device_irq();
     }
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
     // Timer ticks only: a busy device stream must not drive peer rotation or inflate the runaway
@@ -2859,6 +2920,7 @@ mod tests {
     #[cfg(feature = "arch_aarch64")]
     use super::{aarch64_leaf_phys, aarch64_table_base};
     use super::{console_delivery_plan, dtb_backing_range, MAX_DTB_BYTES};
+    use super::{DeferredInterrupts, DEFERRED_INTERRUPT_SLOTS};
 
     #[cfg(feature = "arch_aarch64")]
     #[test]
@@ -3071,5 +3133,52 @@ mod tests {
             u64::MAX,
             "duplicating a handle the process lacks fails"
         );
+    }
+
+    // xHCI SPIs on the Orange Pi 5 Plus.
+    const XHCI_A: u32 = 0xfc;
+    const XHCI_B: u32 = 0xfd;
+
+    fn drained(set: &DeferredInterrupts) -> alloc::vec::Vec<u32> {
+        let mut keys = alloc::vec::Vec::new();
+        let count = set.drain(|key| keys.push(key));
+        assert_eq!(count, keys.len());
+        keys
+    }
+
+    #[test]
+    fn a_busy_line_is_remembered_and_delivered_once() {
+        let set = DeferredInterrupts::new();
+        assert!(set.defer(XHCI_A));
+        assert_eq!(drained(&set), [XHCI_A]);
+        assert!(drained(&set).is_empty(), "drain forgets what it delivered");
+    }
+
+    #[test]
+    fn a_line_that_fires_again_while_waiting_is_stored_once() {
+        let set = DeferredInterrupts::new();
+        assert!(set.defer(XHCI_A));
+        assert!(set.defer(XHCI_B));
+        assert!(set.defer(XHCI_A));
+        assert_eq!(drained(&set), [XHCI_A, XHCI_B]);
+    }
+
+    #[test]
+    fn a_tlmm_gpio_key_defers_like_any_device_line() {
+        let set = DeferredInterrupts::new();
+        let key = kumo_abi::sys::tlmm_gpio_irq(104, 1);
+        assert!(set.defer(key));
+        assert_eq!(drained(&set), [key]);
+    }
+
+    #[test]
+    fn a_full_set_refuses_a_new_line_but_keeps_the_waiting_ones() {
+        let set = DeferredInterrupts::new();
+        for key in 0..DEFERRED_INTERRUPT_SLOTS as u32 {
+            assert!(set.defer(32 + key));
+        }
+        assert!(!set.defer(0x200));
+        assert!(set.defer(32), "a key already waiting is still accepted");
+        assert_eq!(drained(&set).len(), DEFERRED_INTERRUPT_SLOTS);
     }
 }
