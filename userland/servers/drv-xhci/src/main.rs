@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j522
 //j523
 //j525
 //j529
 //j530
+//j531
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -72,9 +72,6 @@ const OFF_INT_RING: usize = 0xe00; // 16-TRB interrupt-IN transfer ring (256 B)
 const OFF_REPORT: usize = 0xf00; // HID report buffer (256 B)
 const EP0_RING_TRBS: usize = 16;
 const INT_RING_TRBS: usize = 16;
-/// Reports to log in the Slice-D2 read window, and how long to wait for each before giving up.
-const KEYBOARD_REPORT_LIMIT: u32 = 24;
-const REPORT_WAIT_ROUNDS: u32 = 240;
 const DEVICE_DESCRIPTOR_LEN: u32 = 18;
 const DATA_BUF_LEN: usize = 256; // control-transfer buffer (holds a full config descriptor)
 
@@ -1910,95 +1907,15 @@ fn configure_and_read_keyboard(
                 interrupt_complete(interrupt);
             }
         }
-        log(b"drv-xhci: interrupt create fail; polling\n");
+        // This child runs above Sora. Falling back to the old busy-poll here monopolises the CPU
+        // for tens of millions of MMIO/barrier iterations, making a local IRQ-creation failure
+        // look like a system-wide lock (serial IRQ-side sysrq remains the only live path). Keep
+        // the failure contained and leave the other controllers and serial shell operational.
+        return log(b"drv-xhci: interrupt create fail; not serving\n");
     }
 
-    // No usable interrupt: refuse to serve rather than busy-poll. This driver runs ABOVE Sora, so
-    // the polling loop below spins hard enough to starve the whole system — including a sibling
-    // controller's working keyboard (observed: enabling more device slots let a hub-downstream
-    // keyboard reach this path on an IRQ-less controller, and every port went dead). Every
-    // controller is granted its GIC line now, so reaching here means the grant or bind failed, and
-    // saying so is far more useful than freezing the machine.
-    if DEVICE_IRQ.load(Ordering::Relaxed) == 0 {
-        return log(b"drv-xhci: keyboard found but no irq granted; not serving\n");
-    }
-
-    // Bounded busy-poll fallback (interrupt object present but unusable).
-    log(b"drv-xhci: keyboard armed; press keys\n");
-    let mut received = 0u32;
-    while received < KEYBOARD_REPORT_LIMIT {
-        report_buf.fill(0);
-        dsb();
-        let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, mps as u32))
-        else {
-            return log(b"drv-xhci: normal trb fail\n");
-        };
-        if int_ring.enqueue(&mut *int_seg, normal).is_err() {
-            return log(b"drv-xhci: int enqueue fail\n");
-        }
-        dsb();
-        ring_slot_doorbell(io, layout, slot_id, dci);
-
-        let mut got = None;
-        for _ in 0..REPORT_WAIT_ROUNDS {
-            if let Some(result) = poll_transfer_event_limited(
-                io,
-                layout,
-                &mut *image,
-                evt,
-                slot_id,
-                IRQ_EVENT_DRAIN_LIMIT,
-            ) {
-                got = Some(result);
-                break;
-            }
-        }
-        match got {
-            Some((cc, _, trb_iova)) => {
-                let _ = int_ring.reclaim_through(trb_iova);
-                dsb();
-                log(b"drv-xhci: report cc=");
-                log_hex(cc as u64);
-                log(b" ");
-                for &byte in report_buf.iter() {
-                    log_hex(byte as u64);
-                    log(b" ");
-                }
-                // Decode the 8-byte boot report into key edges and print each pressed key's
-                // character — the same kumo-hid decoder that will feed the shell in U5.
-                let report: [u8; kumo_hid::REPORT_BYTES] = [
-                    report_buf[0],
-                    report_buf[1],
-                    report_buf[2],
-                    report_buf[3],
-                    report_buf[4],
-                    report_buf[5],
-                    report_buf[6],
-                    report_buf[7],
-                ];
-                if let Ok(events) = decoder.decode(report) {
-                    for event in events.as_slice() {
-                        if event.state == kumo_hid::KeyState::Pressed {
-                            for &byte in event.symbol.terminal_bytes().as_slice() {
-                                if (0x20..0x7f).contains(&byte) {
-                                    log(b" '");
-                                    debug_write(&byte as *const u8, 1);
-                                    log(b"'");
-                                }
-                            }
-                        }
-                    }
-                }
-                log(b"\n");
-                received += 1;
-            }
-            None => {
-                log(b"drv-xhci: report idle\n");
-                break;
-            }
-        }
-    }
-    log(b"drv-xhci: keyboard read done\n");
+    // A resident keyboard without an interrupt cannot be served safely at this priority.
+    log(b"drv-xhci: keyboard found but no irq granted; not serving\n");
 }
 
 /// Issue a no-data control transfer over EP0 (Setup + IN Status), for SET_CONFIGURATION and
