@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j470
 //j471
 //j477
 //j493
 //j494
+//j528
 
 use core::cell::UnsafeCell;
 
@@ -731,6 +731,12 @@ enum ChildReadOutcome {
     Done,
 }
 
+enum SoraReadOutcome {
+    Message { len: u64, handle: u64 },
+    ShouldWait,
+    Done,
+}
+
 enum ChildPortWaitOutcome {
     Packet(KoId),
     ShouldWait(KoId),
@@ -841,6 +847,53 @@ fn read_child_channel_without_borrow(
                 crate::user_thread::park_current_child_on_channel(wait_koid);
             }
             ChildReadOutcome::Done => return (0, 0),
+        }
+    }
+}
+
+/// Read one message for Sora without carrying its `RefMut` across a scheduler switch.
+///
+/// Sora multiplexes several channels on one thread, so an unrelated kernel wake must also be
+/// allowed to release this read. Preserve the original contract: park once, retry once, and
+/// return an empty read if the wake belonged to another channel.
+fn read_sora_channel_without_borrow(channel: Handle, user_buf: u64, cap: usize) -> (u64, u64) {
+    let mut parked_once = false;
+    loop {
+        let outcome = with_sora_mut(|sora| {
+            if !user_range_ok(&sora.process, user_buf, cap as u64) {
+                return SoraReadOutcome::Done;
+            }
+
+            match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::ChannelRead { channel })
+            {
+                KernelCallResult::Message(message) => {
+                    let bytes = message.bytes();
+                    let n = bytes.len().min(cap);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
+                    };
+                    let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
+                    SoraReadOutcome::Message {
+                        len: n as u64,
+                        handle,
+                    }
+                }
+                KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
+                    SoraReadOutcome::ShouldWait
+                }
+                _ => SoraReadOutcome::Done,
+            }
+        });
+
+        match outcome {
+            SoraReadOutcome::Message { len, handle } => return (len, handle),
+            SoraReadOutcome::ShouldWait if !parked_once && crate::user_thread::is_started() => {
+                parked_once = true;
+                crate::user_thread::park_current_user();
+            }
+            SoraReadOutcome::ShouldWait | SoraReadOutcome::Done => return (0, 0),
         }
     }
 }
@@ -1646,12 +1699,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
     }
 
     if num == Syscall::ChannelRead as u64 {
+        let channel = Handle(r[0] as u32);
+        let user_buf = r[1];
+        let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
         if let Some(cp_koid) = crate::user_thread::current_process_koid() {
             let sora_koid = with_sora(|sora| sora.process.koid());
             if cp_koid != sora_koid {
-                let channel = Handle(r[0] as u32);
-                let user_buf = r[1];
-                let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
                 let (n, handle) =
                     read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
                 r[0] = n;
@@ -1660,6 +1713,11 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 return;
             }
         }
+        let (n, handle) = read_sora_channel_without_borrow(channel, user_buf, cap);
+        r[0] = n;
+        r[1] = handle;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
     }
 
     // ---- futex (D1) ------------------------------------------------------------------
@@ -1937,51 +1995,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 Err(_) => -1,
             };
             r[0] = status as u32 as u64;
-        } else if num == Syscall::ChannelRead as u64 {
-            let channel = Handle(r[0] as u32);
-            let user_buf = r[1];
-            let cap = (r[2] as usize).min(MAX_CHANNEL_BYTES);
-            if !user_range_ok(&sora.process, user_buf, cap as u64) {
-                r[0] = 0;
-                return;
-            }
-            // Blocking read with multiplex-friendly wakes: an empty inbox parks the user
-            // thread **once** (the boot flow resumes); the next kernel-side wake retries
-            // this channel exactly once. If it is still empty the syscall returns 0 —
-            // "woken, but not for this channel" — so a server waiting on several channels
-            // can poll its others and come back. (P7-g: Sora serves console + block.)
-            let should_wait = kumo_abi::sys::Errno::ShouldWait.status();
-            let mut parked_once = false;
-            loop {
-                match sora
-                    .engine
-                    .dispatch(&mut sora.process, KernelCall::ChannelRead { channel })
-                {
-                    KernelCallResult::Message(message) => {
-                        let bytes = message.bytes();
-                        let n = bytes.len().min(cap);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
-                        };
-                        let handles = message.handles();
-                        r[0] = n as u64;
-                        r[1] = handles.first().map(|h| h.0 as u64).unwrap_or(0);
-                        break;
-                    }
-                    KernelCallResult::Status(status)
-                        if status == should_wait
-                            && !parked_once
-                            && crate::user_thread::is_started() =>
-                    {
-                        parked_once = true;
-                        crate::user_thread::park_current_user();
-                    }
-                    _ => {
-                        r[0] = 0; // error, or woken for a different channel
-                        break;
-                    }
-                }
-            }
         } else {
             r[0] = u64::MAX;
         }
