@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j481
 //j521
 //j522
 //j523
 //j525
+//j529
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -25,8 +25,8 @@ use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
     ContextSize, ControllerStatus, EndpointContext, Event, EventRingSegmentTableEntry,
     InputControlContext, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer,
-    PortStatus, RegisterIo, RegisterLayout, SetupTransferType, SlotContext, TransferRing, Trb,
-    UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    PortStatus, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
+    TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -100,6 +100,10 @@ const STORAGE_ALLOCATION_LEN: u64 = 2 * STORAGE_DATA_LEN;
 const XHCI_DATA_BOUNDARY: u64 = 0x1_0000;
 /// Bounded spins waiting for the reset device's port to re-link and enable after HCRST.
 const PORT_POLL_LIMIT: u32 = 4_000_000;
+/// A failed warm-reboot relink must not leave this higher-priority child monopolising the system.
+/// Normal USB2 port reset completes well inside this budget; the iteration cap remains a second
+/// guard for platforms whose monotonic clock is unavailable or unexpectedly coarse.
+const PORT_POLL_BUDGET_NS: u64 = 250_000_000;
 
 // U2: a hub-downstream device gets its own page, laid out exactly like the root device's so the
 // same enumeration/HID helpers serve both (they take `base_va` + phys).
@@ -2791,8 +2795,8 @@ fn read_ctx_word(va: u64, word_index: usize) -> u32 {
     unsafe { core::ptr::read_volatile((va as usize + word_index * 4) as *const u32) }
 }
 
-/// Poll PORTSC for the first connected + enabled port after HCRST re-links it. Returns
-/// `(port_number, speed)` (port number is 1-based).
+/// Poll PORTSC after HCRST re-links the root ports until [`RootPortScan::choice`] picks one.
+/// Returns `(port_number, speed)` (port number is 1-based).
 fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
     // PORTSC bits. PED (1) reads enabled; writing 1 disables, so mask it out of a modify-write.
     // The change bits (17..=23, RW1C) must also be written 0 so a modify-write doesn't clear them.
@@ -2800,17 +2804,21 @@ fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
     const PORTSC_PR: u32 = 1 << 4;
     const PORTSC_CHANGE_BITS: u32 = 0x7f << 17;
     let mut reset_issued = [false; MAX_LOGGED_PORTS as usize];
-    for _ in 0..PORT_POLL_LIMIT {
+    let mut fallback_ready = None;
+    let deadline = Deadline::after(PORT_POLL_BUDGET_NS);
+    for spin in 0..PORT_POLL_LIMIT {
         dsb();
+        if spin != 0 && spin % YIELD_INTERVAL == 0 && deadline.expired() {
+            break;
+        }
+        let mut scan = RootPortScan::new();
         let mut port = 0u8;
         while port < max_ports {
             if let Some(offset) = portsc_offset(caplength, port) {
                 let raw = read32(offset);
                 let status = PortStatus::new(raw);
-                if status.connected() {
-                    if status.enabled() {
-                        return Some((port + 1, status.speed()));
-                    }
+                scan.observe(port + 1, status);
+                if status.connected() && !status.enabled() {
                     // Connected but not enabled: a USB2 (Full/Low/High) device needs a software
                     // Port Reset to reach Enabled; SuperSpeed ports auto-enable after link
                     // training. Issue the reset once per port, then keep polling for PED.
@@ -2824,8 +2832,17 @@ fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
             }
             port += 1;
         }
+        if scan.first_ready().is_some() {
+            fallback_ready = scan.first_ready();
+        }
+        // `RootPortScan::choice` prefers a ready USB2 companion over its SuperSpeed sibling. If
+        // a reset never settles, the poll budget bounds the wait and the last known-good ready
+        // port is used instead.
+        if let Some(ready) = scan.choice() {
+            return Some(ready);
+        }
     }
-    None
+    fallback_ready
 }
 
 /// Enqueue one command, ring the command doorbell, and poll the event ring for its Command

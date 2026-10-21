@@ -1,9 +1,9 @@
 #![no_std]
-//j431
 //j432
 //j433
 //j481
 //j521
+//j529
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -36,7 +36,7 @@ pub use noop::{
     prepare_noop_command_image, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas,
 };
 pub use probe::{XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN};
-pub use registers::{portsc_offset, CapabilityRegisters, PortStatus};
+pub use registers::{portsc_offset, CapabilityRegisters, PortStatus, RootPortScan};
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
 };
