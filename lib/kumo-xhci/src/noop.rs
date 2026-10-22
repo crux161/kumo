@@ -1,10 +1,11 @@
 //j432
 //j433
 //j539
+//j540
 
 use crate::{
     CommandRing, Error, Event, EventRing, EventRingSegmentTableEntry, NoOpRegisterConfig,
-    RingToken, Trb, TrbSource,
+    QwordSink, RingToken, Trb, TrbSink, TrbSource,
 };
 
 const DCBAA_ALIGNMENT: u64 = 64;
@@ -76,22 +77,35 @@ impl NoOpCommandImage {
 ///
 /// The buffers must already be mapped into the driver's `DeviceCtx`; this helper only shapes the
 /// hardware-visible contents and returns the register values that name those IOVAs.
-pub fn prepare_noop_command_image(
+/// Each region is a sink, so the driver writes device memory volatile while tests pass arrays.
+pub fn prepare_noop_command_image<D, C, E, R>(
     max_slots_enabled: u8,
-    dcbaa_entries: &mut [u64],
-    command_segment: &mut [Trb],
-    event_segment: &mut [Trb],
-    erst_entry: &mut EventRingSegmentTableEntry,
+    dcbaa_entries: &mut D,
+    command_segment: &mut C,
+    event_segment: &mut E,
+    erst_entry: &mut R,
     iovas: NoOpCommandIovas,
-) -> Result<NoOpCommandImage, Error> {
-    validate_dcbaa(max_slots_enabled, dcbaa_entries.len(), iovas.dcbaa)?;
+) -> Result<NoOpCommandImage, Error>
+where
+    D: QwordSink + ?Sized,
+    C: TrbSink + ?Sized,
+    E: TrbSink + ?Sized,
+    R: QwordSink + ?Sized,
+{
+    validate_dcbaa(max_slots_enabled, dcbaa_entries.qword_count(), iovas.dcbaa)?;
     validate_single_erst(iovas.event_ring_segment_table)?;
+    if erst_entry.qword_count() != 2 {
+        return Err(Error::InvalidField);
+    }
 
-    dcbaa_entries.fill(0);
+    for index in 0..dcbaa_entries.qword_count() {
+        dcbaa_entries.write_qword(index, 0);
+    }
     let mut command_ring = CommandRing::new(command_segment, iovas.command_ring)?;
     let command_token = command_ring.enqueue(command_segment, Trb::no_op_command())?;
     let event_ring = EventRing::new(event_segment, iovas.event_ring)?;
-    *erst_entry = EventRingSegmentTableEntry::new(iovas.event_ring, event_segment.len())?;
+    EventRingSegmentTableEntry::new(iovas.event_ring, event_segment.trb_slots())?
+        .write_to(erst_entry);
 
     Ok(NoOpCommandImage {
         registers: NoOpRegisterConfig::single_segment(

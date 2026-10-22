@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j531
 //j533
 //j537
 //j538
 //j539
+//j540
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -24,10 +24,10 @@ use kumo_usb_storage::{
 };
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
-    ContextSize, ControllerStatus, DmaBuf, DmaTrbs, EndpointContext, Event,
-    EventRingSegmentTableEntry, HubConnectDebounce, HubConnectVerdict, HubDescriptor,
-    InputControlContext, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer,
-    PortStatus, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
+    ContextSize, ControllerStatus, DmaBuf, DmaQwords, DmaTrbs, EndpointContext, Event,
+    HubConnectDebounce, HubConnectVerdict, HubDescriptor, InputControlContext,
+    NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
+    QwordSink, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
     TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
@@ -414,16 +414,14 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
     log_hex(DMA_VA);
     log(b"\n");
 
-    // Slices/refs into the uncached DMA page. Stores land in DRAM for the controller to fetch.
-    let dcbaa = unsafe {
-        core::slice::from_raw_parts_mut((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES)
-    };
-    let cmd =
-        unsafe { core::slice::from_raw_parts_mut((DMA_VA as usize + OFF_CMD) as *mut Trb, RING_TRBS) };
-    let evt =
-        unsafe { core::slice::from_raw_parts_mut((DMA_VA as usize + OFF_EVT) as *mut Trb, RING_TRBS) };
-    let erst =
-        unsafe { &mut *((DMA_VA as usize + OFF_ERST) as *mut EventRingSegmentTableEntry) };
+    // Views of the uncached DMA page. Everything here is reached only through volatile accesses
+    // (J539/J540): no Rust reference to memory the controller reads or writes ever exists.
+    // SAFETY: the page is mapped above for the driver's lifetime.
+    let dcbaa =
+        &mut unsafe { DmaQwords::new((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES) };
+    let cmd = &mut unsafe { DmaTrbs::new((DMA_VA as usize + OFF_CMD) as *mut Trb, RING_TRBS) };
+    let events = unsafe { DmaTrbs::new((DMA_VA as usize + OFF_EVT) as *mut Trb, RING_TRBS) };
+    let erst = &mut unsafe { DmaQwords::new((DMA_VA as usize + OFF_ERST) as *mut u64, 2) };
 
     let iovas = NoOpCommandIovas {
         dcbaa: phys + OFF_DCBAA as u64,
@@ -436,7 +434,7 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
         NOOP_MAX_SLOTS,
         &mut *dcbaa,
         &mut *cmd,
-        evt,
+        &mut events.clone(),
         &mut *erst,
         iovas,
     ) {
@@ -503,9 +501,6 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
         return;
     }
 
-    // From here on the controller owns the event ring, so it is only ever read through volatile
-    // loads; the `evt` slice above existed only for the zero-fill before the controller ran.
-    let events = unsafe { DmaTrbs::new((DMA_VA as usize + OFF_EVT) as *const Trb, RING_TRBS) };
     let mut completion: Option<NoOpCommandCompletion> = None;
     let mut decode_error = false;
     for _ in 0..EVENT_POLL_LIMIT {
@@ -553,7 +548,7 @@ fn enumerate(
     caplength: u8,
     max_ports: u8,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
 ) {
     // A second contiguous DMA page for the input/output device contexts, the EP0 control ring,
@@ -643,7 +638,7 @@ fn enumerate_root_device(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     port_number: u8,
     speed_raw: u8,
@@ -687,12 +682,8 @@ fn enumerate_root_device(
     let input_ctx_phys = page_phys + OFF_INPUT_CTX as u64;
     let output_ctx_phys = page_phys + OFF_OUTPUT_CTX as u64;
 
-    let ep0_seg = unsafe {
-        core::slice::from_raw_parts_mut(
-            (page_va as usize + OFF_EP0_RING) as *mut Trb,
-            EP0_RING_TRBS,
-        )
-    };
+    let ep0_seg =
+        &mut unsafe { DmaTrbs::new((page_va as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS) };
     let mut ep0_ring = match TransferRing::new(&mut *ep0_seg, ep0_ring_phys) {
         Ok(ring) => ring,
         Err(_) => {
@@ -735,10 +726,10 @@ fn enumerate_root_device(
     );
 
     // DCBAA[slot_id] → output device context (in the first DMA page's DCBAA array).
-    let dcbaa = unsafe {
-        core::slice::from_raw_parts_mut((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES)
-    };
-    dcbaa[slot_id as usize] = output_ctx_phys;
+    // SAFETY: the DCBAA sits inside the mapped DMA page.
+    let mut dcbaa =
+        unsafe { DmaQwords::new((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES) };
+    dcbaa.write_qword(slot_id as usize, output_ctx_phys);
     dsb();
 
     // --- Address Device ---
@@ -1097,10 +1088,10 @@ fn configure_and_probe_storage(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     base_va: u64,
     enum_phys: u64,
@@ -1160,15 +1151,14 @@ fn configure_and_probe_storage(
 
     let bulk_out_phys = enum_phys + OFF_INT_RING as u64;
     let bulk_in_phys = enum_phys + OFF_REPORT as u64;
-    let out_seg = unsafe {
-        core::slice::from_raw_parts_mut(
+    let out_seg = &mut unsafe {
+        DmaTrbs::new(
             (base_va as usize + OFF_INT_RING) as *mut Trb,
             BULK_RING_TRBS,
         )
     };
-    let in_seg = unsafe {
-        core::slice::from_raw_parts_mut((base_va as usize + OFF_REPORT) as *mut Trb, BULK_RING_TRBS)
-    };
+    let in_seg =
+        &mut unsafe { DmaTrbs::new((base_va as usize + OFF_REPORT) as *mut Trb, BULK_RING_TRBS) };
     let Ok(mut out_ring) = TransferRing::new(&mut *out_seg, bulk_out_phys) else {
         return log(b"drv-xhci: storage OUT ring fail\n");
     };
@@ -1634,10 +1624,10 @@ fn bot_command(
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
     out_ring: &mut TransferRing,
-    out_seg: &mut [Trb],
+    out_seg: &mut DmaTrbs,
     out_dci: u8,
     in_ring: &mut TransferRing,
-    in_seg: &mut [Trb],
+    in_seg: &mut DmaTrbs,
     in_dci: u8,
     slot_id: u8,
     cbw_buf: DmaBuf,
@@ -1764,7 +1754,7 @@ fn bulk_transfer(
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
     ring: &mut TransferRing,
-    segment: &mut [Trb],
+    segment: &mut DmaTrbs,
     slot_id: u8,
     dci: u8,
     buffer_phys: u64,
@@ -1915,10 +1905,10 @@ fn configure_and_read_keyboard(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     base_va: u64,
     enum_phys: u64,
@@ -1969,9 +1959,8 @@ fn configure_and_read_keyboard(
     }
 
     // --- Interrupt transfer ring + bounded report-read window ---
-    let int_seg = unsafe {
-        core::slice::from_raw_parts_mut((base_va as usize + OFF_INT_RING) as *mut Trb, INT_RING_TRBS)
-    };
+    let int_seg =
+        &mut unsafe { DmaTrbs::new((base_va as usize + OFF_INT_RING) as *mut Trb, INT_RING_TRBS) };
     let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_phys) else {
         return log(b"drv-xhci: int ring fail\n");
     };
@@ -2153,7 +2142,7 @@ fn control_no_data(
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     setup_packet: [u8; 8],
 ) -> Option<(u8, u32)> {
@@ -2244,10 +2233,10 @@ fn read_descriptors_and_find_hid(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     base_va: u64,
     base_phys: u64,
@@ -2409,7 +2398,7 @@ fn configure_interrupt_endpoint(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     slot_id: u8,
     base_va: u64,
@@ -2465,10 +2454,10 @@ fn configure_and_read_hub(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     page_va: u64,
     enum_phys: u64,
@@ -2586,11 +2575,8 @@ fn configure_and_read_hub(
     if let Some(dci) = hub_dci {
         let report_phys = enum_phys + OFF_REPORT as u64;
         let int_ring_base = enum_phys + OFF_INT_RING as u64;
-        let int_seg = unsafe {
-            core::slice::from_raw_parts_mut(
-                (page_va as usize + OFF_INT_RING) as *mut Trb,
-                INT_RING_TRBS,
-            )
+        let int_seg = &mut unsafe {
+            DmaTrbs::new((page_va as usize + OFF_INT_RING) as *mut Trb, INT_RING_TRBS)
         };
         if let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_base) {
             // SAFETY: inside this hub's mapped page, and only reached through `DmaBuf`.
@@ -2737,10 +2723,10 @@ fn enumerate_hub_downstream(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     hub_ep0_ring: &mut TransferRing,
-    hub_ep0_seg: &mut [Trb],
+    hub_ep0_seg: &mut DmaTrbs,
     hub_slot_id: u8,
     hub_root_port: u8,
     hub_speed_raw: u8,
@@ -2873,9 +2859,8 @@ fn enumerate_hub_downstream(
     let ep0_ring_phys = dev_phys + OFF_EP0_RING as u64;
     let input_ctx_phys = dev_phys + OFF_INPUT_CTX as u64;
     let output_ctx_phys = dev_phys + OFF_OUTPUT_CTX as u64;
-    let ep0_seg = unsafe {
-        core::slice::from_raw_parts_mut((DEV2_VA as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS)
-    };
+    let ep0_seg =
+        &mut unsafe { DmaTrbs::new((DEV2_VA as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS) };
     let Ok(mut ep0_ring) = TransferRing::new(&mut *ep0_seg, ep0_ring_phys) else {
         return log(b"drv-xhci: hub dev ep0 ring fail\n");
     };
@@ -2905,10 +2890,10 @@ fn enumerate_hub_downstream(
     write_ctx(DEV2_VA + OFF_INPUT_CTX as u64, icc.words());
     write_ctx(DEV2_VA + OFF_INPUT_CTX as u64 + slot_off as u64, slot_words);
     write_ctx(DEV2_VA + OFF_INPUT_CTX as u64 + ep0_off as u64, ep0_ctx.words());
-    let dcbaa = unsafe {
-        core::slice::from_raw_parts_mut((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES)
-    };
-    dcbaa[dev_slot as usize] = output_ctx_phys;
+    // SAFETY: the DCBAA sits inside the mapped DMA page.
+    let mut dcbaa =
+        unsafe { DmaQwords::new((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES) };
+    dcbaa.write_qword(dev_slot as usize, output_ctx_phys);
     dsb();
 
     // --- Address Device (through the hub) ---
@@ -3044,7 +3029,7 @@ fn control_in(
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
-    ep0_seg: &mut [Trb],
+    ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     setup_packet: [u8; 8],
     data_phys: u64,
@@ -3179,7 +3164,7 @@ fn submit_command(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    cmd: &mut [Trb],
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     command: Trb,
 ) -> Option<(u8, u8, u32)> {
@@ -3293,7 +3278,7 @@ fn ring_slot_doorbell(io: &mut Mmio, layout: RegisterLayout, slot_id: u8, dci: u
 /// allocate `count` page-sized buffers, publish their physical bases in a scratchpad buffer array
 /// in the first DMA page, and point DCBAA[0] at that array. Must run before the controller starts
 /// (xHCI 4.20). The buffers are controller-only (never CPU-mapped). Returns false on alloc failure.
-fn setup_scratchpad(dma_va: u64, dma_phys: u64, dcbaa: &mut [u64], count: u32) -> bool {
+fn setup_scratchpad(dma_va: u64, dma_phys: u64, dcbaa: &mut DmaQwords, count: u32) -> bool {
     if count == 0 {
         return true;
     }
@@ -3302,16 +3287,17 @@ fn setup_scratchpad(dma_va: u64, dma_phys: u64, dcbaa: &mut [u64], count: u32) -
     if buffers_raw == u64::MAX || buffers_phys == 0 {
         return false;
     }
-    let array = unsafe {
-        core::slice::from_raw_parts_mut(
+    // SAFETY: the scratchpad array sits inside the mapped DMA page.
+    let mut array = unsafe {
+        DmaQwords::new(
             (dma_va as usize + OFF_SCRATCH_ARRAY) as *mut u64,
             count as usize,
         )
     };
-    for (index, entry) in array.iter_mut().enumerate() {
-        *entry = buffers_phys + index as u64 * PAGE_SIZE;
+    for index in 0..count as usize {
+        array.write_qword(index, buffers_phys + index as u64 * PAGE_SIZE);
     }
-    dcbaa[0] = dma_phys + OFF_SCRATCH_ARRAY as u64;
+    dcbaa.write_qword(0, dma_phys + OFF_SCRATCH_ARRAY as u64);
     dsb();
     true
 }

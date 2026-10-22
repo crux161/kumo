@@ -1,6 +1,7 @@
 //j539
+//j540
 
-use crate::{Error, Trb, TrbSource};
+use crate::{Error, QwordSink, Trb, TrbSink, TrbSource};
 
 const TRB_BYTES: u64 = 16;
 const RING_ALIGNMENT: u64 = 64;
@@ -52,14 +53,16 @@ struct ProducerRing {
 }
 
 impl ProducerRing {
-    fn initialize(segment: &mut [Trb], base_iova: u64) -> Result<Self, Error> {
-        validate_producer_segment(segment.len(), base_iova)?;
-        segment.fill(Trb::zero());
-        let link = segment.len() - 1;
-        segment[link] = Trb::link(base_iova, false);
+    fn initialize<S: TrbSink + ?Sized>(segment: &mut S, base_iova: u64) -> Result<Self, Error> {
+        let len = segment.trb_slots();
+        validate_producer_segment(len, base_iova)?;
+        for index in 0..len - 1 {
+            segment.write_trb(index, Trb::zero());
+        }
+        segment.write_trb(len - 1, Trb::link(base_iova, false));
         Ok(Self {
             base_iova,
-            segment_len: segment.len(),
+            segment_len: len,
             enqueue: 0,
             dequeue: 0,
             queued: 0,
@@ -67,21 +70,25 @@ impl ProducerRing {
         })
     }
 
-    fn enqueue(&mut self, segment: &mut [Trb], trb: Trb) -> Result<RingToken, Error> {
-        self.check_memory(segment.len())?;
+    fn enqueue<S: TrbSink + ?Sized>(
+        &mut self,
+        segment: &mut S,
+        trb: Trb,
+    ) -> Result<RingToken, Error> {
+        self.check_memory(segment.trb_slots())?;
         if self.queued == self.capacity() {
             return Err(Error::RingFull);
         }
 
         let index = self.enqueue;
-        segment[index] = trb.with_cycle(self.producer_cycle);
+        segment.write_trb(index, trb.with_cycle(self.producer_cycle));
         let token = RingToken {
             iova: self.base_iova + index as u64 * TRB_BYTES,
         };
         self.enqueue += 1;
         if self.enqueue == self.segment_len - 1 {
             let link = self.enqueue;
-            segment[link] = Trb::link(self.base_iova, self.producer_cycle);
+            segment.write_trb(link, Trb::link(self.base_iova, self.producer_cycle));
             self.enqueue = 0;
             self.producer_cycle = !self.producer_cycle;
         }
@@ -140,11 +147,15 @@ impl ProducerRing {
 pub struct CommandRing(ProducerRing);
 
 impl CommandRing {
-    pub fn new(segment: &mut [Trb], base_iova: u64) -> Result<Self, Error> {
+    pub fn new<S: TrbSink + ?Sized>(segment: &mut S, base_iova: u64) -> Result<Self, Error> {
         ProducerRing::initialize(segment, base_iova).map(Self)
     }
 
-    pub fn enqueue(&mut self, segment: &mut [Trb], trb: Trb) -> Result<RingToken, Error> {
+    pub fn enqueue<S: TrbSink + ?Sized>(
+        &mut self,
+        segment: &mut S,
+        trb: Trb,
+    ) -> Result<RingToken, Error> {
         if !trb.trb_type().is_some_and(|kind| kind.is_command()) {
             return Err(Error::WrongRingType);
         }
@@ -173,11 +184,15 @@ impl CommandRing {
 pub struct TransferRing(ProducerRing);
 
 impl TransferRing {
-    pub fn new(segment: &mut [Trb], base_iova: u64) -> Result<Self, Error> {
+    pub fn new<S: TrbSink + ?Sized>(segment: &mut S, base_iova: u64) -> Result<Self, Error> {
         ProducerRing::initialize(segment, base_iova).map(Self)
     }
 
-    pub fn enqueue(&mut self, segment: &mut [Trb], trb: Trb) -> Result<RingToken, Error> {
+    pub fn enqueue<S: TrbSink + ?Sized>(
+        &mut self,
+        segment: &mut S,
+        trb: Trb,
+    ) -> Result<RingToken, Error> {
         if !trb.trb_type().is_some_and(|kind| kind.is_transfer()) {
             return Err(Error::WrongRingType);
         }
@@ -211,12 +226,15 @@ pub struct EventRing {
 }
 
 impl EventRing {
-    pub fn new(segment: &mut [Trb], base_iova: u64) -> Result<Self, Error> {
-        validate_event_segment(segment.len(), base_iova)?;
-        segment.fill(Trb::zero());
+    pub fn new<S: TrbSink + ?Sized>(segment: &mut S, base_iova: u64) -> Result<Self, Error> {
+        let len = segment.trb_slots();
+        validate_event_segment(len, base_iova)?;
+        for index in 0..len {
+            segment.write_trb(index, Trb::zero());
+        }
         Ok(Self {
             base_iova,
-            segment_len: segment.len(),
+            segment_len: len,
             dequeue: 0,
             consumer_cycle: true,
         })
@@ -272,6 +290,27 @@ impl EventRingSegmentTableEntry {
 
     pub const fn words(self) -> [u32; 4] {
         self.words
+    }
+
+    /// The entry as the two qwords the controller reads: the segment base, then the size word
+    /// with its reserved upper half.
+    pub const fn qwords(self) -> [u64; 2] {
+        [
+            self.words[0] as u64 | (self.words[1] as u64) << 32,
+            self.words[2] as u64 | (self.words[3] as u64) << 32,
+        ]
+    }
+
+    pub(crate) fn set_qword(&mut self, index: usize, value: u64) {
+        self.words[index * 2] = value as u32;
+        self.words[index * 2 + 1] = (value >> 32) as u32;
+    }
+
+    /// Write this entry where the controller reads it.
+    pub fn write_to<S: QwordSink + ?Sized>(self, sink: &mut S) {
+        let [base, size] = self.qwords();
+        sink.write_qword(0, base);
+        sink.write_qword(1, size);
     }
 }
 

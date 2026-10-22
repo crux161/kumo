@@ -1,9 +1,9 @@
 #![no_std]
-//j481
 //j521
 //j529
 //j533
 //j539
+//j540
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -27,7 +27,7 @@ pub use context::{
     SlotContext, UsbSpeed,
 };
 pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
-pub use dma::{DmaBuf, DmaTrbs, TrbSource};
+pub use dma::{DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource};
 pub use fdt::{
     discover_primary_xhci, discover_rk3588_usb0_xhci, discover_x13s_usb0_xhci, GicInterrupt,
     XhciControllerTopology, RK3588_USB0_XHCI_IRQ, RK3588_USB0_XHCI_MMIO_BASE,
