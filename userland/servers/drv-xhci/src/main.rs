@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j529
 //j530
 //j531
 //j533
 //j537
+//j538
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -65,6 +65,8 @@ const IRQ_EVENT_DRAIN_LIMIT: u32 = 4096;
 // Slice C: a second contiguous DMA page holds the enumeration structures for the device on the
 // first connected+enabled port. 64-byte context stride (caps ctx=0x40).
 const ENUM_VA: u64 = 0x0000_0000_1300_0000;
+/// J538: the page of a SuperSpeed side device (see `RootRole`), laid out exactly like `ENUM_VA`'s.
+const SS_ENUM_VA: u64 = 0x0000_0000_1600_0000;
 const ENUM_LEN: u64 = PAGE_SIZE;
 const OFF_INPUT_CTX: usize = 0x000; // input-control(64) + slot(64) + EP0(64) = 192 B
 const OFF_OUTPUT_CTX: usize = 0x400; // controller-written output device context (2 KiB window)
@@ -361,6 +363,28 @@ fn dsb() {
     }
 }
 
+/// Zero a buffer the controller is about to DMA into, with volatile stores. A plain `fill(0)` on
+/// a `&mut` slice is a store the optimizer may sink past the doorbell, so it lands after the
+/// device's bytes and erases them.
+fn dma_zero(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+}
+
+/// Copy the first `N` bytes the controller wrote into `buf` out with volatile loads. `buf` is a
+/// `&mut` slice, which Rust lets the optimizer treat as unaliased: the device's DMA is invisible to
+/// it, so between `fill(0)` and a parse it may hand back the zeros it stored instead of loading
+/// memory. J538's first boots read 16 zero bytes from both GL3523 hubs while Short Packet events
+/// showed 12 and 9 bytes transferred, which is exactly that. — TIMBERDOODLE
+fn dma_copy<const N: usize>(buf: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile(buf.as_ptr().add(index)) };
+    }
+    out
+}
+
 /// Slice B: allocate the no-op DMA image, take the controller through reset → run, ring the
 /// command doorbell, and poll the event ring for the No-Op Command Completion. On success it
 /// continues into Slice C enumeration reusing the running command/event rings.
@@ -535,26 +559,9 @@ fn enumerate(
 ) {
     // A second contiguous DMA page for the input/output device contexts, the EP0 control ring,
     // and the descriptor buffer. phys == IOVA under SMMU bypass.
-    let (enum_raw, enum_phys) = vmo_create_contiguous(ENUM_LEN);
-    if enum_raw == u64::MAX || enum_phys == 0 {
-        log(b"drv-xhci: enum vmo fail\n");
+    let Some(enum_phys) = map_device_page(ENUM_VA) else {
         return;
-    }
-    if vmar_map(
-        Handle(0),
-        Handle(enum_raw as u32),
-        0,
-        ENUM_VA,
-        ENUM_LEN,
-        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
-    ) != 0
-    {
-        log(b"drv-xhci: enum map fail\n");
-        return;
-    }
-    log(b"drv-xhci: enum phys=");
-    log_hex(enum_phys);
-    log(b"\n");
+    };
 
     let mut io = Mmio;
 
@@ -578,6 +585,73 @@ fn enumerate(
     log_hex(speed_raw as u64);
     log(b"\n");
 
+    // J538: a SuperSpeed device ready on another root port of this controller is the USB3 half of
+    // a blue front-panel connector, whose USB2 companion the choice above prefers. It is the half
+    // a USB3 stick links on. Bring it up first, on its own page and slot: the primary device may
+    // be a keyboard whose interrupt loop never returns. — TIMBERDOODLE
+    if let Some((ss_port, ss_speed)) = ready_superspeed_port(caplength, max_ports, port_number) {
+        log(b"drv-xhci: ss side port=");
+        log_hex(ss_port as u64);
+        log(b" speed=");
+        log_hex(ss_speed as u64);
+        log(b"\n");
+        match map_device_page(SS_ENUM_VA) {
+            Some(ss_phys) => enumerate_root_device(
+                &mut io,
+                layout,
+                &mut *image,
+                &mut *cmd,
+                &mut *evt,
+                ss_port,
+                ss_speed,
+                SS_ENUM_VA,
+                ss_phys,
+                RootRole::SuperSpeedSide,
+            ),
+            None => log(b"drv-xhci: ss side page fail\n"),
+        }
+    }
+
+    enumerate_root_device(
+        &mut io,
+        layout,
+        &mut *image,
+        &mut *cmd,
+        &mut *evt,
+        port_number,
+        speed_raw,
+        ENUM_VA,
+        enum_phys,
+        RootRole::Primary,
+    );
+}
+
+/// What a root-port device may become on this controller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootRole {
+    /// The port `wait_for_device_port` chose. Any device class, including a keyboard whose
+    /// interrupt loop never returns.
+    Primary,
+    /// A SuperSpeed port beside the primary. Only one-shot paths (hub bring-up, storage probe)
+    /// run here, so the primary always gets its turn.
+    SuperSpeedSide,
+}
+
+/// Bring up one root-port device: Enable Slot, Address Device, descriptors, and the class path,
+/// all on the DMA page at `page_va`/`page_phys`. Every root device gets its own page and slot.
+#[allow(clippy::too_many_arguments)]
+fn enumerate_root_device(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut [Trb],
+    evt: &mut [Trb],
+    port_number: u8,
+    speed_raw: u8,
+    page_va: u64,
+    page_phys: u64,
+    role: RootRole,
+) {
     // --- Enable Slot ---
     let enable = match Trb::enable_slot(0) {
         Ok(trb) => trb,
@@ -586,7 +660,7 @@ fn enumerate(
             return;
         }
     };
-    let slot_id = match submit_command(&mut io, layout, &mut *image, &mut *cmd, &*evt, enable) {
+    let slot_id = match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, enable) {
         Some((1, slot, _)) => slot,
         Some((cc, _, _)) => {
             log(b"drv-xhci: enable slot cc=");
@@ -610,12 +684,15 @@ fn enumerate(
     // --- Build the Input Context, EP0 control ring, and DCBAA entry ---
     let speed = usb_speed(speed_raw);
     let mps0 = speed.initial_ep0_max_packet_size();
-    let ep0_ring_phys = enum_phys + OFF_EP0_RING as u64;
-    let input_ctx_phys = enum_phys + OFF_INPUT_CTX as u64;
-    let output_ctx_phys = enum_phys + OFF_OUTPUT_CTX as u64;
+    let ep0_ring_phys = page_phys + OFF_EP0_RING as u64;
+    let input_ctx_phys = page_phys + OFF_INPUT_CTX as u64;
+    let output_ctx_phys = page_phys + OFF_OUTPUT_CTX as u64;
 
     let ep0_seg = unsafe {
-        core::slice::from_raw_parts_mut((ENUM_VA as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS)
+        core::slice::from_raw_parts_mut(
+            (page_va as usize + OFF_EP0_RING) as *mut Trb,
+            EP0_RING_TRBS,
+        )
     };
     let mut ep0_ring = match TransferRing::new(&mut *ep0_seg, ep0_ring_phys) {
         Ok(ring) => ring,
@@ -648,9 +725,15 @@ fn enumerate(
         log(b"drv-xhci: ctx offset fail\n");
         return;
     };
-    write_ctx(ENUM_VA + OFF_INPUT_CTX as u64, icc.words());
-    write_ctx(ENUM_VA + OFF_INPUT_CTX as u64 + slot_off as u64, slot_ctx.words());
-    write_ctx(ENUM_VA + OFF_INPUT_CTX as u64 + ep0_off as u64, ep0_ctx.words());
+    write_ctx(page_va + OFF_INPUT_CTX as u64, icc.words());
+    write_ctx(
+        page_va + OFF_INPUT_CTX as u64 + slot_off as u64,
+        slot_ctx.words(),
+    );
+    write_ctx(
+        page_va + OFF_INPUT_CTX as u64 + ep0_off as u64,
+        ep0_ctx.words(),
+    );
 
     // DCBAA[slot_id] → output device context (in the first DMA page's DCBAA array).
     let dcbaa = unsafe {
@@ -667,7 +750,7 @@ fn enumerate(
             return;
         }
     };
-    match submit_command(&mut io, layout, &mut *image, &mut *cmd, &*evt, addr) {
+    match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, addr) {
         Some((1, _, _)) => log(b"drv-xhci: addr dev cc=0x1 ok\n"),
         Some((cc, _, _)) => {
             log(b"drv-xhci: addr dev cc=");
@@ -681,9 +764,9 @@ fn enumerate(
         }
     }
 
-    let data_phys = enum_phys + OFF_DATA as u64;
+    let data_phys = page_phys + OFF_DATA as u64;
     let data_buf = unsafe {
-        core::slice::from_raw_parts_mut((ENUM_VA as usize + OFF_DATA) as *mut u8, DATA_BUF_LEN)
+        core::slice::from_raw_parts_mut((page_va as usize + OFF_DATA) as *mut u8, DATA_BUF_LEN)
     };
 
     // --- GET_DESCRIPTOR(Device) over EP0, two-phase for bMaxPacketSize0 ---
@@ -693,8 +776,16 @@ fn enumerate(
     dsb();
     let dev8_setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
     match control_in(
-        &mut io, layout, &mut *image, &*evt, &mut ep0_ring, &mut *ep0_seg, slot_id, dev8_setup,
-        data_phys, 8,
+        io,
+        layout,
+        &mut *image,
+        &*evt,
+        &mut ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        dev8_setup,
+        data_phys,
+        8,
     ) {
         Some((1, _)) => {}
         Some((cc, _)) => {
@@ -736,8 +827,11 @@ fn enumerate(
             log(b"drv-xhci: eval ep0 ctx fail\n");
             return;
         };
-        write_ctx(ENUM_VA + OFF_INPUT_CTX as u64, eval_icc.words());
-        write_ctx(ENUM_VA + OFF_INPUT_CTX as u64 + ep0_off as u64, eval_ep0.words());
+        write_ctx(page_va + OFF_INPUT_CTX as u64, eval_icc.words());
+        write_ctx(
+            page_va + OFF_INPUT_CTX as u64 + ep0_off as u64,
+            eval_ep0.words(),
+        );
         dsb();
         const TRB_TYPE_EVALUATE_CONTEXT: u32 = 13;
         let eval = Trb::from_words([
@@ -746,7 +840,7 @@ fn enumerate(
             0,
             (TRB_TYPE_EVALUATE_CONTEXT << 10) | ((slot_id as u32) << 24),
         ]);
-        match submit_command(&mut io, layout, &mut *image, &mut *cmd, &*evt, eval) {
+        match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, eval) {
             Some((1, _, _)) => {
                 log(b"drv-xhci: eval ctx cc=0x1 mps0=");
                 log_hex(real_mps0 as u64);
@@ -768,10 +862,27 @@ fn enumerate(
     // Phase 3: the full 18-byte device descriptor at the corrected EP0 max packet size.
     data_buf.fill(0);
     dsb();
-    let dev_setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, DEVICE_DESCRIPTOR_LEN as u8, 0x00];
+    let dev_setup = [
+        0x80,
+        0x06,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        DEVICE_DESCRIPTOR_LEN as u8,
+        0x00,
+    ];
     match control_in(
-        &mut io, layout, &mut *image, &*evt, &mut ep0_ring, &mut *ep0_seg, slot_id, dev_setup,
-        data_phys, DEVICE_DESCRIPTOR_LEN as u16,
+        io,
+        layout,
+        &mut *image,
+        &*evt,
+        &mut ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        dev_setup,
+        data_phys,
+        DEVICE_DESCRIPTOR_LEN as u16,
     ) {
         Some((cc, remaining)) => {
             dsb();
@@ -809,7 +920,7 @@ fn enumerate(
     dsb();
     let cfg_header_setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
     if control_in(
-        &mut io,
+        io,
         layout,
         &mut *image,
         &*evt,
@@ -849,7 +960,7 @@ fn enumerate(
         (read_len >> 8) as u8,
     ];
     if control_in(
-        &mut io,
+        io,
         layout,
         &mut *image,
         &*evt,
@@ -879,7 +990,7 @@ fn enumerate(
             kumo_hid::USB_CLASS_HUB,
         );
         configure_and_read_hub(
-            &mut io,
+            io,
             layout,
             &mut *image,
             &mut *cmd,
@@ -887,7 +998,8 @@ fn enumerate(
             &mut ep0_ring,
             &mut *ep0_seg,
             slot_id,
-            enum_phys,
+            page_va,
+            page_phys,
             speed_raw,
             port_number,
             config_value,
@@ -912,7 +1024,7 @@ fn enumerate(
             log_hex(storage.bulk_in.max_burst as u64);
             log(b"\n");
             configure_and_probe_storage(
-                &mut io,
+                io,
                 layout,
                 &mut *image,
                 &mut *cmd,
@@ -920,8 +1032,8 @@ fn enumerate(
                 &mut ep0_ring,
                 &mut *ep0_seg,
                 slot_id,
-                ENUM_VA,
-                enum_phys,
+                page_va,
+                page_phys,
                 slot_context_words(0, speed_raw, 1, port_number, 0, 0),
                 storage,
                 data_buf,
@@ -932,6 +1044,9 @@ fn enumerate(
         Ok(None) => {}
     }
 
+    if role == RootRole::SuperSpeedSide {
+        return log(b"drv-xhci: ss side device is neither hub nor storage; left alone\n");
+    }
     match kumo_hid::find_hid_boot_keyboard(&data_buf[..read_len as usize]) {
         Some(hid) => {
             log(b"drv-xhci: hid if=");
@@ -947,7 +1062,7 @@ fn enumerate(
             log(b"\n");
             if hid.is_keyboard() || hid.is_mouse() {
                 configure_and_read_keyboard(
-                    &mut io,
+                    io,
                     layout,
                     &mut *image,
                     &mut *cmd,
@@ -955,8 +1070,8 @@ fn enumerate(
                     &mut ep0_ring,
                     &mut *ep0_seg,
                     slot_id,
-                    ENUM_VA,
-                    enum_phys,
+                    page_va,
+                    page_phys,
                     speed_raw,
                     slot_context_words(0, speed_raw, 1, port_number, 0, 0),
                     config_value,
@@ -2025,11 +2140,8 @@ fn control_no_data(
     let setup = Trb::setup_stage(setup_packet, SetupTransferType::NoData, 0).ok()?;
     // A no-data control transfer's Status stage is IN, with IOC.
     let status = Trb::status_stage(0, true, true).ok()?;
-    if ep0_ring.enqueue(&mut *ep0_seg, setup).is_err()
-        || ep0_ring.enqueue(&mut *ep0_seg, status).is_err()
-    {
-        return None;
-    }
+    ep0_ring.enqueue(&mut *ep0_seg, setup).ok()?;
+    let status_token = ep0_ring.enqueue(&mut *ep0_seg, status).ok()?;
     dsb();
     ring_slot_doorbell(
         io,
@@ -2037,9 +2149,46 @@ fn control_no_data(
         slot_id,
         endpoint_context_index(0, false).unwrap_or(1),
     );
-    let (cc, remaining, trb_iova) = poll_transfer_event(io, layout, image, evt, slot_id)?;
+    let (cc, remaining, trb_iova) =
+        wait_ep0_status(io, layout, image, evt, slot_id, status_token.iova)?;
     let _ = ep0_ring.reclaim_through(trb_iova);
     Some((cc, remaining))
+}
+
+/// Transfer events a control transfer may skip before giving up on its own Status stage.
+const EP0_STALE_EVENT_LIMIT: u32 = 8;
+
+/// Wait for the Transfer Event that completes *this* control transfer: the one naming its Status
+/// TRB. Matching on the slot alone let an event left over from an earlier transfer complete the
+/// next one before its data arrived. J538's first boot read a hub descriptor of 16 zero bytes on
+/// both hubs that way. Any other event for the slot is logged and skipped. — TIMBERDOODLE
+fn wait_ep0_status(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &[Trb],
+    slot_id: u8,
+    status_iova: u64,
+) -> Option<(u8, u32, u64)> {
+    for _ in 0..EP0_STALE_EVENT_LIMIT {
+        let (cc, remaining, trb_iova) = poll_transfer_event(io, layout, image, evt, slot_id)?;
+        if trb_iova == status_iova {
+            return Some((cc, remaining, trb_iova));
+        }
+        log(b"drv-xhci: ep0 skipped event slot=");
+        log_hex(slot_id as u64);
+        log(b" trb=");
+        log_hex(trb_iova);
+        log(b" cc=");
+        log_hex(cc as u64);
+        log(b" rem=");
+        log_hex(remaining as u64);
+        log(b" want=");
+        log_hex(status_iova);
+        log(b"\n");
+    }
+    log(b"drv-xhci: ep0 status event never arrived\n");
+    None
 }
 
 /// The xHCI Interval field for an interrupt endpoint, from PORTSC speed + bInterval. Full/Low speed
@@ -2299,6 +2448,7 @@ fn configure_and_read_hub(
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
+    page_va: u64,
     enum_phys: u64,
     speed_raw: u8,
     port_number: u8,
@@ -2307,10 +2457,19 @@ fn configure_and_read_hub(
     data_phys: u64,
     hub_int: Option<kumo_hid::InterruptInEndpoint>,
 ) {
+    // --- SET_CONFIGURATION, before any hub-class request ---
+    // The Linux hub driver reads the hub descriptor only once the hub is configured; follow it.
+    let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
+    match control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_config) {
+        Some((1, _)) => log(b"drv-xhci: hub set config cc=0x1\n"),
+        Some((cc, _)) => return log_cc(b"drv-xhci: hub set config cc=", cc),
+        None => return log(b"drv-xhci: hub set config timeout\n"),
+    }
+
     // --- GET_DESCRIPTOR(Hub) --- class request; descriptor type 0x2A for SuperSpeed hubs, else
     // 0x29. bNbrPorts is byte 2.
     let hub_desc_type = if speed_raw >= 4 { 0x2a } else { 0x29 };
-    data_buf.fill(0);
+    dma_zero(data_buf);
     dsb();
     let hub_setup = [0xa0, 0x06, 0x00, hub_desc_type, 0x00, 0x00, 16, 0x00];
     match control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, hub_setup, data_phys, 16)
@@ -2320,8 +2479,14 @@ fn configure_and_read_hub(
         None => return log(b"drv-xhci: hub desc timeout\n"),
     }
     dsb();
-    let Ok(hub) = HubDescriptor::parse(&data_buf[..16]) else {
-        return log(b"drv-xhci: hub desc invalid\n");
+    let reply: [u8; 16] = dma_copy(data_buf);
+    let Ok(hub) = HubDescriptor::parse(&reply) else {
+        log(b"drv-xhci: hub desc invalid bytes=");
+        for byte in &reply[..8] {
+            log(b" ");
+            log_hex(*byte as u64);
+        }
+        return log(b"\n");
     };
     let nbr_ports = hub.port_count();
     log(b"drv-xhci: hub ports=");
@@ -2333,12 +2498,24 @@ fn configure_and_read_hub(
     // must promise an upper bound on how long it holds the CPU away from a live keyboard driver.
     let pass = Deadline::after(HUB_PASS_BUDGET_NS);
 
-    // --- SET_CONFIGURATION ---
-    let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
-    match control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_config) {
-        Some((1, _)) => log(b"drv-xhci: hub set config cc=0x1\n"),
-        Some((cc, _)) => return log_cc(b"drv-xhci: hub set config cc=", cc),
-        None => return log(b"drv-xhci: hub set config timeout\n"),
+    // A SuperSpeed hub routes by the Route String, indexed by its own tier: SET_HUB_DEPTH (USB 3.2
+    // §10.16.2.9) tells it which nibble is its own. A hub on a root port is depth 0.
+    if speed_raw >= 4 {
+        let set_depth = [0x20, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        match control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            ep0_ring,
+            &mut *ep0_seg,
+            slot_id,
+            set_depth,
+        ) {
+            Some((1, _)) => log(b"drv-xhci: hub depth=0 cc=0x1\n"),
+            Some((cc, _)) => return log_cc(b"drv-xhci: hub depth cc=", cc),
+            None => return log(b"drv-xhci: hub depth timeout\n"),
+        }
     }
 
     // --- Configure the hub's status-change interrupt endpoint ---
@@ -2350,7 +2527,7 @@ fn configure_and_read_hub(
             cmd,
             evt,
             slot_id,
-            ENUM_VA,
+            page_va,
             enum_phys,
             slot_context_words(0, speed_raw, 1, port_number, 0, 0),
             ep.in_endpoint_address,
@@ -2389,13 +2566,13 @@ fn configure_and_read_hub(
         let int_ring_base = enum_phys + OFF_INT_RING as u64;
         let int_seg = unsafe {
             core::slice::from_raw_parts_mut(
-                (ENUM_VA as usize + OFF_INT_RING) as *mut Trb,
+                (page_va as usize + OFF_INT_RING) as *mut Trb,
                 INT_RING_TRBS,
             )
         };
         if let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_base) {
             let report_buf = unsafe {
-                core::slice::from_raw_parts_mut((ENUM_VA as usize + OFF_REPORT) as *mut u8, 4)
+                core::slice::from_raw_parts_mut((page_va as usize + OFF_REPORT) as *mut u8, 4)
             };
             report_buf.fill(0);
             dsb();
@@ -2452,7 +2629,7 @@ fn configure_and_read_hub(
     let connected_port = loop {
         let mut port = 1u8;
         while port <= polled_ports {
-            data_buf.fill(0);
+            dma_zero(data_buf);
             dsb();
             let get_status = [0xa3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
             if let Some((1, _)) = control_in(
@@ -2468,7 +2645,8 @@ fn configure_and_read_hub(
                 4,
             ) {
                 dsb();
-                let status = u16::from_le_bytes([data_buf[0], data_buf[1]]);
+                let reply: [u8; 2] = dma_copy(data_buf);
+                let status = u16::from_le_bytes(reply);
                 last_status[port as usize - 1] = Some(status);
                 debounce.observe(port, status & 1 != 0, clock_get());
             }
@@ -2506,6 +2684,15 @@ fn configure_and_read_hub(
     // U2: reach through the hub to the device on that port. The attach wait above slept rather
     // than held the CPU, so the downstream pass gets a full budget of its own.
     let pass = Deadline::after(HUB_PASS_BUDGET_NS);
+    if let (Some(down_port), true) = (connected_port, speed_raw >= 4) {
+        // A device behind a SuperSpeed hub needs a SuperSpeed slot context (Route String, no
+        // Transaction Translator) and SS port-status decoding that `enumerate_hub_downstream` does
+        // not have yet. Name what is there; enumerating it is the next slice. — TIMBERDOODLE
+        log(b"drv-xhci: ss hub dev port=");
+        log_hex(down_port as u64);
+        log(b" (downstream enumeration pending)\n");
+        return;
+    }
     if let Some(down_port) = connected_port {
         if pass.expired() {
             log(b"drv-xhci: hub pass budget spent; downstream deferred\n");
@@ -2569,7 +2756,7 @@ fn enumerate_hub_downstream(
         // Keep each settle short: this driver preempts Sora, so a long spin here stalls the
         // whole system (and a sibling controller's live keyboard) while a port comes up.
         spin_delay(200_000);
-        hub_data_buf.fill(0);
+        dma_zero(hub_data_buf);
         dsb();
         let get_status = [0xa3, 0x00, 0x00, 0x00, down_port, 0x00, 0x04, 0x00];
         if control_in(
@@ -2589,7 +2776,8 @@ fn enumerate_hub_downstream(
             continue;
         }
         dsb();
-        let status = u16::from_le_bytes([hub_data_buf[0], hub_data_buf[1]]);
+        let reply: [u8; 2] = dma_copy(hub_data_buf);
+        let status = u16::from_le_bytes(reply);
         if status & HUB_PORT_STATUS_ENABLE != 0 {
             down_speed = if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
                 2
@@ -2844,12 +3032,9 @@ fn control_in(
         (TRB_TYPE_DATA_STAGE << 10) | (1 << 16),
     ]);
     let status = Trb::status_stage(0, false, true).ok()?;
-    if ep0_ring.enqueue(&mut *ep0_seg, setup).is_err()
-        || ep0_ring.enqueue(&mut *ep0_seg, data).is_err()
-        || ep0_ring.enqueue(&mut *ep0_seg, status).is_err()
-    {
-        return None;
-    }
+    ep0_ring.enqueue(&mut *ep0_seg, setup).ok()?;
+    ep0_ring.enqueue(&mut *ep0_seg, data).ok()?;
+    let status_token = ep0_ring.enqueue(&mut *ep0_seg, status).ok()?;
     dsb();
     ring_slot_doorbell(
         io,
@@ -2857,7 +3042,8 @@ fn control_in(
         slot_id,
         endpoint_context_index(0, false).unwrap_or(1),
     );
-    let (cc, remaining, trb_iova) = poll_transfer_event(io, layout, image, evt, slot_id)?;
+    let (cc, remaining, trb_iova) =
+        wait_ep0_status(io, layout, image, evt, slot_id, status_token.iova)?;
     // Reclaim the setup/data/status TRBs so the EP0 ring doesn't fill across many transfers.
     let _ = ep0_ring.reclaim_through(trb_iova);
     Some((cc, remaining))
@@ -2866,6 +3052,47 @@ fn control_in(
 /// Read one 32-bit word from an xHCI context in DMA memory (word index, not byte offset).
 fn read_ctx_word(va: u64, word_index: usize) -> u32 {
     unsafe { core::ptr::read_volatile((va as usize + word_index * 4) as *const u32) }
+}
+
+/// Allocate and map one zeroed, uncached, contiguous device page at `va`; returns its physical
+/// address (the IOVA under SMMU bypass).
+fn map_device_page(va: u64) -> Option<u64> {
+    let (raw, phys) = vmo_create_contiguous(ENUM_LEN);
+    if raw == u64::MAX || phys == 0 {
+        log(b"drv-xhci: enum vmo fail\n");
+        return None;
+    }
+    if vmar_map(
+        Handle(0),
+        Handle(raw as u32),
+        0,
+        va,
+        ENUM_LEN,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+    ) != 0
+    {
+        log(b"drv-xhci: enum map fail\n");
+        return None;
+    }
+    log(b"drv-xhci: enum phys=");
+    log_hex(phys);
+    log(b"\n");
+    Some(phys)
+}
+
+/// One PORTSC pass for a ready SuperSpeed port other than `primary`.
+fn ready_superspeed_port(caplength: u8, max_ports: u8, primary: u8) -> Option<(u8, u8)> {
+    let mut scan = RootPortScan::new();
+    let mut port = 0u8;
+    while port < max_ports {
+        if port + 1 != primary {
+            if let Some(offset) = portsc_offset(caplength, port) {
+                scan.observe(port + 1, PortStatus::new(read32(offset)));
+            }
+        }
+        port += 1;
+    }
+    scan.first_superspeed_ready()
 }
 
 /// Poll PORTSC after HCRST re-links the root ports until [`RootPortScan::choice`] picks one.

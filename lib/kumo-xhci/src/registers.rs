@@ -1,5 +1,6 @@
 //j426
 //j529
+//j538
 
 use crate::{ContextSize, Error};
 
@@ -124,6 +125,7 @@ impl PortStatus {
 pub struct RootPortScan {
     first_ready: Option<(u8, u8)>,
     first_usb2_ready: Option<(u8, u8)>,
+    first_superspeed_ready: Option<(u8, u8)>,
     reset_pending: bool,
 }
 
@@ -132,6 +134,7 @@ impl RootPortScan {
         Self {
             first_ready: None,
             first_usb2_ready: None,
+            first_superspeed_ready: None,
             reset_pending: false,
         }
     }
@@ -152,11 +155,21 @@ impl RootPortScan {
         if status.usb2_ready() && self.first_usb2_ready.is_none() {
             self.first_usb2_ready = Some(ready);
         }
+        if status.speed() >= 4 && self.first_superspeed_ready.is_none() {
+            self.first_superspeed_ready = Some(ready);
+        }
     }
 
     /// Lowest-numbered connected + enabled port, as `(port_number, speed)`, of any speed.
     pub const fn first_ready(&self) -> Option<(u8, u8)> {
         self.first_ready
+    }
+
+    /// Lowest-numbered connected + enabled SuperSpeed (or faster) port. When [`Self::choice`] has
+    /// taken a USB2 companion, this is the other half of the same blue connector: on the Orange Pi
+    /// 5 Plus front panel, the hub port a USB3 stick links on.
+    pub const fn first_superspeed_ready(&self) -> Option<(u8, u8)> {
+        self.first_superspeed_ready
     }
 
     /// The port to enumerate now, or `None` to keep polling.
@@ -257,6 +270,21 @@ mod tests {
     #[test]
     fn a_lone_superspeed_device_is_chosen_when_nothing_is_resetting() {
         assert_eq!(scan(&[0, SS_HUB_ENABLED]).choice(), Some((2, 4)));
+    }
+
+    #[test]
+    fn the_superspeed_half_is_reported_beside_the_usb2_choice() {
+        let front = scan(&[HS_HUB_ENABLED, SS_HUB_ENABLED]);
+        assert_eq!(front.choice(), Some((1, 3)));
+        assert_eq!(front.first_superspeed_ready(), Some((2, 4)));
+        assert_eq!(
+            scan(&[HS_HUB_ENABLED, 0x2a0]).first_superspeed_ready(),
+            None
+        );
+        assert_eq!(
+            scan(&[0, HS_HUB_RESETTING, SS_HUB_ENABLED]).first_superspeed_ready(),
+            Some((3, 4))
+        );
     }
 
     #[test]
