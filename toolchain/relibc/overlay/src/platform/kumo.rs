@@ -1,8 +1,8 @@
-//j506
 //j507
 //j512
 //j513
 //j514
+//j535
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -305,6 +305,40 @@ fn tty_call(request: &[u8], reply: &mut [u8]) -> Result<usize> {
         return Err(Errno(EIO));
     }
     Ok(n as usize)
+}
+
+/// Resolve an `open` path for the vfs wire, writing a relative one into `buf`.
+///
+/// A process's only directory is the root of the filesystem capability it was granted, so a
+/// relative path names an entry under that root: `new.txt` and `./new.txt` are `/new.txt`.
+/// Refusing relative paths with `EINVAL` made every relative `fopen` fail in a way no POSIX
+/// program reads as "absent": kilo's `kilo new.txt` died on "Opening file: Invalid argument"
+/// instead of starting an empty buffer. `.` alone is the root itself, which is not a file.
+/// — TIMBERDOODLE
+fn vfs_path<'a>(path: &'a [u8], buf: &'a mut [u8; VFS_MAX_PATH]) -> Result<&'a [u8]> {
+    use crate::header::errno::{EISDIR, ENAMETOOLONG};
+
+    if path.first() == Some(&b'/') {
+        return if path.len() > VFS_MAX_PATH {
+            Err(Errno(ENAMETOOLONG))
+        } else {
+            Ok(path)
+        };
+    }
+    let mut rest = path;
+    while let Some(tail) = rest.strip_prefix(b"./") {
+        rest = tail;
+    }
+    if rest.is_empty() || rest == b"." {
+        return Err(Errno(EISDIR));
+    }
+    let len = rest.len() + 1;
+    if len > VFS_MAX_PATH {
+        return Err(Errno(ENAMETOOLONG));
+    }
+    buf[0] = b'/';
+    buf[1..len].copy_from_slice(rest);
+    Ok(&buf[..len])
 }
 
 /// Map a vfs status byte onto the closest honest errno.
@@ -1041,9 +1075,10 @@ impl Pal for Sys {
 
     /// Open a file through the granted filesystem server.
     ///
-    /// Relative paths have nowhere to resolve against until a working-directory capability
-    /// exists, so only `AT_FDCWD` with an absolute path is accepted. Access and create intent
-    /// cross the vfs wire; no ambient write authority is inferred from an integer fd.
+    /// Only `AT_FDCWD` is accepted, and a relative path resolves against the root of the
+    /// granted filesystem (see `vfs_path`) until a working-directory capability exists. Access
+    /// and create intent cross the vfs wire; no ambient write authority is inferred from an
+    /// integer fd.
     fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
         use crate::header::{
             errno::{EINVAL, EMFILE, ENAMETOOLONG},
@@ -1069,12 +1104,11 @@ impl Pal for Sys {
                 0
             };
         let path = path.to_bytes();
-        if path.is_empty() || path.len() > VFS_MAX_PATH {
+        if path.is_empty() {
             return Err(Errno(ENAMETOOLONG));
         }
-        if path[0] != b'/' {
-            return Err(Errno(EINVAL));
-        }
+        let mut resolved = [0u8; VFS_MAX_PATH];
+        let path = vfs_path(path, &mut resolved)?;
         let fildes = fd_alloc().ok_or(Errno(EMFILE))?;
 
         let mut request = [0u8; 4 + VFS_MAX_PATH];

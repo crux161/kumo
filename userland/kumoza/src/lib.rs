@@ -5,6 +5,7 @@
 //j506
 //j507
 //j517
+//j535
 
 extern crate alloc;
 
@@ -51,7 +52,7 @@ pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
     builtins: cat <path>, echo [-n], false, help, ls, lua [expr], run <program>, true,\n\
               wc <path>\n\
     power: halt, reboot, shutdown\n\
-    editor: kilo [path]\n\
+    editor: kilo <path>\n\
     diag: heap, ipcstat, relibc [args], threads\n\
     other commands run via kernel shell\n";
 

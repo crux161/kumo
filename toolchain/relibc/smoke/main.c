@@ -1,8 +1,8 @@
-/* j507 */
 /* j511 */
 /* j512 */
 /* j513 */
 /* j514 */
+/* j535 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -132,6 +132,32 @@ int main(int argc, char **argv, char **envp) {
         return 33;
     }
     printf("relibc: absent path refused errno=%d\n", errno);
+
+    /*
+     * J535: a relative name resolves against the root of the granted filesystem, so a
+     * missing one is ENOENT - the answer kilo's `kilo new.txt` relies on to start an empty
+     * buffer - and an existing one opens the same file as its absolute spelling.
+     */
+    stream = fopen("./HELLO.TXT", "r");
+    if (stream == (FILE *)0) {
+        printf("relibc: relative fopen failed errno=%d\n", errno);
+        return 46;
+    }
+    char relative[32];
+    const size_t relative_got = fread(relative, 1, sizeof(relative) - 1, stream);
+    relative[relative_got] = '\0';
+    if (fclose(stream) != 0) {
+        return 47;
+    }
+    if (relative_got != got || strcmp(relative, contents) != 0) {
+        return 48;
+    }
+    errno = 0;
+    if (fopen("NOSUCH.TXT", "r") != (FILE *)0 || errno != ENOENT) {
+        printf("relibc: relative absent path errno=%d\n", errno);
+        return 49;
+    }
+    printf("relibc: relative ./HELLO.TXT -> %s, relative absent errno=%d\n", relative, errno);
 
     static const char saved[] = "clouds over kumo\n";
 
