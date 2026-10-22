@@ -7,12 +7,16 @@
 //j539
 //j540
 //j541
+//j542
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{Bpb, FatError, PartitionFitError};
-use kumo_gpt::{validate_protective_mbr, GptError, GptHeader, Guid};
+use kumo_gpt::{
+    validate_protective_mbr, GptError, GptHeader, Guid, MbrError, MbrPartition, MbrPartitionTable,
+    Partition,
+};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
     interrupt_create, interrupt_wait, port_bind, port_create, port_wait, process_exit,
@@ -93,7 +97,8 @@ const BOT_TAG_READ_CAPACITY: u32 = 0x4b55_0002;
 const BOT_TAG_READ_LBA0: u32 = 0x4b55_0003;
 const BOT_TAG_READ_GPT_HEADER: u32 = 0x4b55_0004;
 const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
-const BOT_TAG_READ_ESP_BOOT: u32 = 0x4b55_0006;
+/// The boot sector of the FAT32 volume found, a GPT ESP or a classic MBR record (J542).
+const BOT_TAG_READ_FAT_BOOT: u32 = 0x4b55_0006;
 // J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
@@ -1324,10 +1329,6 @@ fn configure_and_probe_storage(
         Ok(adapter) => adapter,
         Err(_) => return log(b"drv-xhci: storage block geometry exceeds DMA window\n"),
     };
-    let lba0_plan = match adapter.plan_read(0, 1) {
-        Ok(plan) => plan,
-        Err(_) => return log(b"drv-xhci: storage LBA0 plan fail\n"),
-    };
     let (read_raw, read_allocation_phys) = vmo_create_contiguous(STORAGE_ALLOCATION_LEN);
     if read_raw == u64::MAX || read_allocation_phys == 0 {
         return log(b"drv-xhci: storage read vmo fail\n");
@@ -1371,43 +1372,36 @@ fn configure_and_probe_storage(
     log(b" bytes=");
     log_hex(STORAGE_DATA_LEN);
     log(b"\n");
-    let Some(lba0_window) = read_window.window(0, lba0_plan.byte_length) else {
-        return log(b"drv-xhci: storage read plan exceeds window\n");
-    };
-    let Some(read_len) = bot_command(
+
+    let mut disk = BotDisk {
         io,
         layout,
         image,
         evt,
-        &mut out_ring,
+        slot_id,
+        out_ring,
         out_seg,
         out_dci,
-        &mut in_ring,
+        in_ring,
         in_seg,
         in_dci,
-        slot_id,
         cbw_buf,
         cbw_phys,
-        lba0_window,
-        read_phys,
         csw_buf,
         csw_phys,
-        BOT_TAG_READ_LBA0,
-        &lba0_plan.command,
-        b"read10-lba0",
-    ) else {
+        adapter,
+        read_window,
+        read_phys,
+    };
+    let Some(lba0) = disk.read_blocks(0, 1, BOT_TAG_READ_LBA0, b"read10-lba0") else {
         return;
     };
-    if read_len != lba0_plan.byte_length {
-        return log(b"drv-xhci: storage short LBA0\n");
-    }
-    let lba0 = storage_snapshot(lba0_window, read_len);
     log(b"drv-xhci: storage lba0 prefix=");
-    for byte in &lba0[..read_len.min(16)] {
+    for byte in &lba0[..lba0.len().min(16)] {
         log(b" ");
         log_hex(*byte as u64);
     }
-    if read_len >= 512 {
+    if lba0.len() >= 512 {
         log(b" tail510=");
         log_hex(lba0[510] as u64);
         log(b" tail511=");
@@ -1416,52 +1410,121 @@ fn configure_and_probe_storage(
     log(b"\n");
 
     let logical_block_size = capacity.logical_block_size as usize;
-    if let Err(error) = validate_protective_mbr(lba0, logical_block_size, capacity.block_count()) {
-        return log_gpt_error(b"mbr", error);
-    }
-    log_storage_phase(b"gpt-mbr", b"ok");
-
-    let header_plan = match adapter.plan_read(1, 1) {
-        Ok(plan) => plan,
-        Err(_) => return log(b"drv-xhci: storage GPT header plan fail\n"),
-    };
-    let Some(header_window) = read_window.window(0, header_plan.byte_length) else {
-        return log(b"drv-xhci: storage read plan exceeds window\n");
-    };
-    let Some(header_len) = bot_command(
-        io,
-        layout,
-        image,
-        evt,
-        &mut out_ring,
-        out_seg,
-        out_dci,
-        &mut in_ring,
-        in_seg,
-        in_dci,
-        slot_id,
-        cbw_buf,
-        cbw_phys,
-        header_window,
-        read_phys,
-        csw_buf,
-        csw_phys,
-        BOT_TAG_READ_GPT_HEADER,
-        &header_plan.command,
-        b"read10-gpt-header",
-    ) else {
-        return;
-    };
-    if header_len != header_plan.byte_length {
-        return log(b"drv-xhci: storage short GPT header\n");
-    }
-    let header = match GptHeader::parse_primary(
-        storage_snapshot(header_window, header_len),
+    let media_blocks = capacity.block_count();
+    let (volume, first_lba, block_count): (&[u8], u64, u64) =
+        match validate_protective_mbr(lba0, logical_block_size, media_blocks) {
+            Ok(()) => {
+                log_storage_phase(b"gpt-mbr", b"ok");
+                let Some(esp) = find_gpt_esp(&mut disk, logical_block_size, media_blocks) else {
+                    return;
+                };
+                (b"esp", esp.first_lba, esp.block_count())
+            }
+            // J542: a stick formatted elsewhere carries a classic MBR, not a GPT: CRUX's did at
+            // J541. Its FAT32 record is judged the same way as a GPT's ESP. — TIMBERDOODLE
+            Err(GptError::BadProtectiveMbr) => {
+                log_storage_phase(b"gpt-mbr", b"classic");
+                let Some(partition) = find_mbr_fat32(lba0, logical_block_size, media_blocks) else {
+                    return;
+                };
+                (b"mbr", partition.first_lba, partition.block_count)
+            }
+            Err(error) => return log_gpt_error(b"mbr", error),
+        };
+    probe_fat32_volume(
+        &mut disk,
+        volume,
+        first_lba,
+        block_count,
         logical_block_size,
-        capacity.block_count(),
-    ) {
+    );
+}
+
+/// A configured Bulk-Only Transport interface and its READ(10) window: everything one block read
+/// needs once INQUIRY and READ CAPACITY have run (J542).
+struct BotDisk<'a> {
+    io: &'a mut Mmio,
+    layout: RegisterLayout,
+    image: &'a mut NoOpCommandImage,
+    evt: &'a DmaTrbs,
+    slot_id: u8,
+    out_ring: TransferRing,
+    out_seg: &'a mut DmaTrbs,
+    out_dci: u8,
+    in_ring: TransferRing,
+    in_seg: &'a mut DmaTrbs,
+    in_dci: u8,
+    cbw_buf: DmaBuf,
+    cbw_phys: u64,
+    csw_buf: DmaBuf,
+    csw_phys: u64,
+    adapter: Read10BlockAdapter,
+    read_window: DmaBuf,
+    read_phys: u64,
+}
+
+impl BotDisk<'_> {
+    /// READ(10) `count` blocks from `lba`. Returns exactly the bytes that arrived, copied out of
+    /// device memory by [`storage_snapshot`], so the slice is valid only until the next read.
+    fn read_blocks(
+        &mut self,
+        lba: u64,
+        count: u16,
+        tag: u32,
+        name: &[u8],
+    ) -> Option<&'static [u8]> {
+        let Ok(plan) = self.adapter.plan_read(lba, count) else {
+            log_storage_phase(name, b"plan-fail");
+            return None;
+        };
+        let Some(window) = self.read_window.window(0, plan.byte_length) else {
+            log(b"drv-xhci: storage read plan exceeds window\n");
+            return None;
+        };
+        let len = bot_command(
+            self.io,
+            self.layout,
+            self.image,
+            self.evt,
+            &mut self.out_ring,
+            self.out_seg,
+            self.out_dci,
+            &mut self.in_ring,
+            self.in_seg,
+            self.in_dci,
+            self.slot_id,
+            self.cbw_buf,
+            self.cbw_phys,
+            window,
+            self.read_phys,
+            self.csw_buf,
+            self.csw_phys,
+            tag,
+            &plan.command,
+            name,
+        )?;
+        if len != plan.byte_length {
+            log_storage_phase(name, b"short");
+            return None;
+        }
+        Some(storage_snapshot(window, len))
+    }
+}
+
+/// J525: the primary GPT behind a protective MBR (header at LBA1, then its entry array) and the
+/// EFI System Partition it lists.
+fn find_gpt_esp(
+    disk: &mut BotDisk,
+    logical_block_size: usize,
+    media_blocks: u64,
+) -> Option<Partition> {
+    let header_block = disk.read_blocks(1, 1, BOT_TAG_READ_GPT_HEADER, b"read10-gpt-header")?;
+    let header = match GptHeader::parse_primary(header_block, logical_block_size, media_blocks) {
         Ok(header) => header,
-        Err(error) => return log_gpt_error(b"header", error),
+        Err(error) => {
+            log_gpt_error(b"header", error);
+            return None;
+        }
     };
     log_storage_phase(b"gpt-header", b"ok");
     log(b"drv-xhci: storage gpt disk-guid=");
@@ -1473,49 +1536,26 @@ fn configure_and_probe_storage(
     log(b"\n");
 
     let Ok(entry_block_count) = u16::try_from(header.partition_entry_array_block_count()) else {
-        return log(b"drv-xhci: storage GPT table exceeds READ(10) count\n");
+        log(b"drv-xhci: storage GPT table exceeds READ(10) count\n");
+        return None;
     };
-    let entries_plan = match adapter.plan_read(header.partition_entry_lba, entry_block_count) {
-        Ok(plan) => plan,
-        Err(_) => return log(b"drv-xhci: storage GPT table exceeds DMA window\n"),
-    };
-    let Some(entries_window) = read_window.window(0, entries_plan.byte_length) else {
-        return log(b"drv-xhci: storage read plan exceeds window\n");
-    };
-    let Some(entries_len) = bot_command(
-        io,
-        layout,
-        image,
-        evt,
-        &mut out_ring,
-        out_seg,
-        out_dci,
-        &mut in_ring,
-        in_seg,
-        in_dci,
-        slot_id,
-        cbw_buf,
-        cbw_phys,
-        entries_window,
-        read_phys,
-        csw_buf,
-        csw_phys,
+    let entries = disk.read_blocks(
+        header.partition_entry_lba,
+        entry_block_count,
         BOT_TAG_READ_GPT_ENTRIES,
-        &entries_plan.command,
         b"read10-gpt-entries",
-    ) else {
-        return;
-    };
-    if entries_len != entries_plan.byte_length {
-        return log(b"drv-xhci: storage short GPT table\n");
-    }
-    let table = match header.parse_partition_table(storage_snapshot(entries_window, entries_len)) {
+    )?;
+    let table = match header.parse_partition_table(entries) {
         Ok(table) => table,
-        Err(error) => return log_gpt_error(b"entries", error),
+        Err(error) => {
+            log_gpt_error(b"entries", error);
+            return None;
+        }
     };
     log_storage_phase(b"gpt-entries", b"ok");
     let Some(esp) = table.efi_system_partition() else {
-        return log_storage_phase(b"gpt-esp", b"not-found");
+        log_storage_phase(b"gpt-esp", b"not-found");
+        return None;
     };
     log(b"drv-xhci: storage esp index=");
     log_hex(esp.index as u64);
@@ -1528,56 +1568,68 @@ fn configure_and_probe_storage(
     log(b" blocks=");
     log_hex(esp.block_count());
     log(b"\n");
+    Some(esp)
+}
 
-    // J537: the ESP's own first block is its FAT32 boot sector. Read and judge it in place; a
-    // partition-relative mount is the next gate, so nothing here is exposed or written.
-    let boot_plan = match adapter.plan_read(esp.first_lba, 1) {
-        Ok(plan) => plan,
-        Err(_) => return log(b"drv-xhci: storage ESP boot sector plan fail\n"),
+/// J542: the classic partition table in LBA0, and the first record filed under a FAT32 type.
+fn find_mbr_fat32(
+    lba0: &[u8],
+    logical_block_size: usize,
+    media_blocks: u64,
+) -> Option<MbrPartition> {
+    let table = match MbrPartitionTable::parse(lba0, logical_block_size, media_blocks) {
+        Ok(table) => table,
+        Err(error) => {
+            log_mbr_error(error);
+            return None;
+        }
     };
-    let Some(boot_window) = read_window.window(0, boot_plan.byte_length) else {
-        return log(b"drv-xhci: storage read plan exceeds window\n");
-    };
-    let Some(boot_len) = bot_command(
-        io,
-        layout,
-        image,
-        evt,
-        &mut out_ring,
-        out_seg,
-        out_dci,
-        &mut in_ring,
-        in_seg,
-        in_dci,
-        slot_id,
-        cbw_buf,
-        cbw_phys,
-        boot_window,
-        read_phys,
-        csw_buf,
-        csw_phys,
-        BOT_TAG_READ_ESP_BOOT,
-        &boot_plan.command,
-        b"read10-esp-boot",
-    ) else {
+    log_storage_phase(b"mbr-table", b"ok");
+    for partition in table.partitions() {
+        log(b"drv-xhci: storage mbr part=");
+        log_hex(partition.index as u64);
+        log(b" type=");
+        log_hex(partition.partition_type as u64);
+        log(b" boot=");
+        log_hex(partition.bootable as u64);
+        log(b" first-lba=");
+        log_hex(partition.first_lba);
+        log(b" blocks=");
+        log_hex(partition.block_count);
+        log(b"\n");
+    }
+    let partition = table.fat32_partition();
+    if partition.is_none() {
+        log_storage_phase(b"mbr-fat32", b"not-found");
+    }
+    partition
+}
+
+/// J537/J542: a FAT32 volume's first block is its boot sector. Read it and judge it against the
+/// partition that holds it; `volume` says which kind (`esp` or `mbr`). A partition-relative mount
+/// is the next gate, so nothing here is exposed or written.
+fn probe_fat32_volume(
+    disk: &mut BotDisk,
+    volume: &[u8],
+    first_lba: u64,
+    block_count: u64,
+    logical_block_size: usize,
+) {
+    let Some(boot) = disk.read_blocks(first_lba, 1, BOT_TAG_READ_FAT_BOOT, b"read10-fat-boot")
+    else {
         return;
     };
-    if boot_len != boot_plan.byte_length {
-        return log(b"drv-xhci: storage short ESP boot sector\n");
-    }
-    // The partition table still borrows the snapshot, so the boot sector gets its own copy.
-    let mut boot_sector = [0u8; 512];
-    let boot_copy = boot_len.min(boot_sector.len());
-    boot_window.read_into(0, &mut boot_sector[..boot_copy]);
-    let bpb = match Bpb::parse(&boot_sector[..boot_copy]) {
+    let bpb = match Bpb::parse(boot) {
         Ok(bpb) => bpb,
-        Err(error) => return log_fat_error(error),
+        Err(error) => return log_fat_error(volume, error),
     };
-    if let Err(error) = bpb.fits_partition(esp.block_count(), logical_block_size) {
-        return log_fit_error(error);
+    if let Err(error) = bpb.fits_partition(block_count, logical_block_size) {
+        return log_fit_error(volume, error);
     }
-    log_storage_phase(b"esp-fat32", b"ok");
-    log(b"drv-xhci: storage esp fat32 serial=");
+    log_storage_phase_pair(volume, b"fat32", b"ok");
+    log(b"drv-xhci: storage ");
+    log(volume);
+    log(b" fat32 serial=");
     log_hex(bpb.volume_serial as u64);
     log(b" sectors=");
     log_hex(bpb.total_sectors as u64);
@@ -1595,7 +1647,23 @@ fn configure_and_probe_storage(
     log_storage_phase(b"probe", b"complete");
 }
 
-fn log_fat_error(error: FatError) {
+fn log_mbr_error(error: MbrError) {
+    let name = match error {
+        MbrError::BufferTooShort => b"buffer-too-short" as &[u8],
+        MbrError::InvalidLogicalBlockSize => b"invalid-logical-block-size",
+        MbrError::InvalidMediaSize => b"invalid-media-size",
+        MbrError::BadSignature => b"bad-signature",
+        MbrError::BadBootIndicator => b"bad-boot-indicator",
+        MbrError::ProtectiveRecord => b"protective-record",
+        MbrError::BadPartitionEntry => b"bad-partition-entry",
+        MbrError::OverlappingPartitions => b"overlapping-partitions",
+    };
+    log(b"drv-xhci: storage mbr error=");
+    log(name);
+    log(b"\n");
+}
+
+fn log_fat_error(volume: &[u8], error: FatError) {
     let name = match error {
         FatError::TooShort => b"too-short" as &[u8],
         FatError::BadSignature => b"bad-signature",
@@ -1603,19 +1671,23 @@ fn log_fat_error(error: FatError) {
         FatError::BadGeometry => b"bad-geometry",
         FatError::ReadFailed => b"read-failed",
     };
-    log(b"drv-xhci: storage esp fat32 error=");
+    log(b"drv-xhci: storage ");
+    log(volume);
+    log(b" fat32 error=");
     log(name);
     log(b"\n");
 }
 
-fn log_fit_error(error: PartitionFitError) {
+fn log_fit_error(volume: &[u8], error: PartitionFitError) {
     let name = match error {
         PartitionFitError::BlockSize => b"block-size" as &[u8],
         PartitionFitError::SectorSize => b"sector-size",
         PartitionFitError::VolumeTooLarge => b"volume-too-large",
         PartitionFitError::RegionsPastEnd => b"regions-past-end",
     };
-    log(b"drv-xhci: storage esp fat32 fit error=");
+    log(b"drv-xhci: storage ");
+    log(volume);
+    log(b" fat32 fit error=");
     log(name);
     log(b"\n");
 }

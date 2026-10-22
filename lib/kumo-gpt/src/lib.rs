@@ -1,5 +1,6 @@
 #![no_std]
 //j524
+//j542
 
 //! Allocation-free validation and discovery for GUID Partition Tables.
 //!
@@ -8,6 +9,10 @@
 //! partition-entry bytes described by the resulting header to
 //! [`GptHeader::parse_partition_table`]. This crate performs no I/O and owns no
 //! storage, so a USB/SCSI driver and host tests use the same parser.
+//!
+//! Removable media formatted elsewhere usually carry a classic MBR instead of a
+//! GPT. When LBA0 is not a protective MBR, [`MbrPartitionTable::parse`] reads
+//! its four primary records from the same block.
 
 const MBR_SIZE: usize = 512;
 const MBR_PARTITIONS_OFFSET: usize = 446;
@@ -117,6 +122,148 @@ pub fn validate_protective_mbr(
         return Err(GptError::BadProtectiveMbr);
     }
     Ok(())
+}
+
+/// Classic MBR partition type: FAT32, CHS-addressed (its LBA fields are still authoritative).
+pub const MBR_TYPE_FAT32_CHS: u8 = 0x0b;
+/// Classic MBR partition type: FAT32, LBA-addressed.
+pub const MBR_TYPE_FAT32_LBA: u8 = 0x0c;
+/// Classic MBR partition type: the GPT protective record.
+pub const MBR_TYPE_GPT_PROTECTIVE: u8 = 0xee;
+/// Classic MBR partition type: an EFI System Partition (FAT) on MBR media.
+pub const MBR_TYPE_EFI_SYSTEM: u8 = 0xef;
+
+const MBR_BOOT_INDICATOR_INACTIVE: u8 = 0x00;
+const MBR_BOOT_INDICATOR_ACTIVE: u8 = 0x80;
+
+/// Why logical block zero is not a usable classic MBR partition table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MbrError {
+    BufferTooShort,
+    InvalidLogicalBlockSize,
+    InvalidMediaSize,
+    BadSignature,
+    /// A boot indicator other than 0x00 or 0x80: LBA0 is most likely a volume boot sector (a
+    /// "superfloppy" with no partition table), whose boot code overlaps the records.
+    BadBootIndicator,
+    /// A 0xEE record: the medium is GPT (or a hybrid MBR), so the GPT path owns it.
+    ProtectiveRecord,
+    /// A used record that starts at LBA0, has no blocks, or runs past the end of the medium.
+    BadPartitionEntry,
+    OverlappingPartitions,
+}
+
+/// A validated primary record from a classic MBR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MbrPartition {
+    /// Zero-based record slot (0..4) in the MBR.
+    pub index: u8,
+    pub partition_type: u8,
+    pub bootable: bool,
+    pub first_lba: u64,
+    pub block_count: u64,
+}
+
+impl MbrPartition {
+    pub const fn last_lba(self) -> u64 {
+        self.first_lba + self.block_count - 1
+    }
+
+    /// Whether the record's type is one a FAT32 volume is filed under: FAT32 (CHS or LBA) or an
+    /// EFI System Partition. The volume's own boot sector still has to prove it.
+    pub const fn may_hold_fat32(self) -> bool {
+        matches!(
+            self.partition_type,
+            MBR_TYPE_FAT32_CHS | MBR_TYPE_FAT32_LBA | MBR_TYPE_EFI_SYSTEM
+        )
+    }
+}
+
+/// The four primary records of a classic MBR, each checked against the medium. Extended
+/// partitions are reported as records but their logical partitions are not followed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MbrPartitionTable {
+    partitions: [Option<MbrPartition>; 4],
+}
+
+impl MbrPartitionTable {
+    /// Parse and validate the classic partition table in logical block zero.
+    ///
+    /// A record whose type byte is zero is unused. Every record, used or not, must carry a boot
+    /// indicator of 0x00 or 0x80, the test that tells a partition table from boot code.
+    pub fn parse(
+        logical_block: &[u8],
+        logical_block_size: usize,
+        media_block_count: u64,
+    ) -> Result<Self, MbrError> {
+        validate_media(logical_block, logical_block_size, media_block_count).map_err(|error| {
+            match error {
+                GptError::InvalidLogicalBlockSize => MbrError::InvalidLogicalBlockSize,
+                GptError::InvalidMediaSize => MbrError::InvalidMediaSize,
+                _ => MbrError::BufferTooShort,
+            }
+        })?;
+        if logical_block[510..512] != [0x55, 0xaa] {
+            return Err(MbrError::BadSignature);
+        }
+
+        let mut partitions = [None; 4];
+        for (index, slot) in partitions.iter_mut().enumerate() {
+            let offset = MBR_PARTITIONS_OFFSET + index * MBR_PARTITION_SIZE;
+            let record = &logical_block[offset..offset + MBR_PARTITION_SIZE];
+            let boot_indicator = record[0];
+            if boot_indicator != MBR_BOOT_INDICATOR_INACTIVE
+                && boot_indicator != MBR_BOOT_INDICATOR_ACTIVE
+            {
+                return Err(MbrError::BadBootIndicator);
+            }
+            let partition_type = record[4];
+            if partition_type == 0 {
+                continue;
+            }
+            if partition_type == MBR_TYPE_GPT_PROTECTIVE {
+                return Err(MbrError::ProtectiveRecord);
+            }
+            let first_lba = u32_le(record, 8) as u64;
+            let block_count = u32_le(record, 12) as u64;
+            if first_lba == 0 || block_count == 0 || first_lba + block_count > media_block_count {
+                return Err(MbrError::BadPartitionEntry);
+            }
+            *slot = Some(MbrPartition {
+                index: index as u8,
+                partition_type,
+                bootable: boot_indicator == MBR_BOOT_INDICATOR_ACTIVE,
+                first_lba,
+                block_count,
+            });
+        }
+
+        for (left_index, left) in partitions.iter().enumerate() {
+            let Some(left) = left else { continue };
+            for right in partitions[left_index + 1..].iter().flatten() {
+                if left.first_lba <= right.last_lba() && right.first_lba <= left.last_lba() {
+                    return Err(MbrError::OverlappingPartitions);
+                }
+            }
+        }
+        Ok(Self { partitions })
+    }
+
+    /// The record in slot `index` (0..4), if used.
+    pub fn partition(&self, index: usize) -> Option<MbrPartition> {
+        self.partitions.get(index).copied().flatten()
+    }
+
+    /// The used records, in slot order.
+    pub fn partitions(&self) -> impl Iterator<Item = MbrPartition> + '_ {
+        self.partitions.iter().flatten().copied()
+    }
+
+    /// The first record, in slot order, whose type may hold a FAT32 volume.
+    pub fn fat32_partition(&self) -> Option<MbrPartition> {
+        self.partitions()
+            .find(|partition| partition.may_hold_fat32())
+    }
 }
 
 /// Validated geometry and identity from a primary GPT header at LBA1.
@@ -641,6 +788,155 @@ mod tests {
                 .err(),
             Some(GptError::OverlappingPartitions)
         );
+    }
+
+    /// A classic MBR the way retail sticks ship it: boot code zeroed, a disk signature at 440,
+    /// and one FAT32-LBA record. 0x7388800 blocks is CRUX's 62 GB "USB DISK 3.0" (J541).
+    const STICK_BLOCKS: u64 = 0x738_8800;
+
+    fn classic_mbr(records: &[(usize, u8, u8, u32, u32)]) -> Vec<u8> {
+        let mut mbr = vec![0; 512];
+        mbr[440..444].copy_from_slice(&0x1234_abcdu32.to_le_bytes());
+        mbr[510] = 0x55;
+        mbr[511] = 0xaa;
+        for &(index, boot_indicator, partition_type, first_lba, block_count) in records {
+            let record = &mut mbr[MBR_PARTITIONS_OFFSET + index * MBR_PARTITION_SIZE..]
+                [..MBR_PARTITION_SIZE];
+            record[0] = boot_indicator;
+            record[1..4].copy_from_slice(&[0xfe, 0xff, 0xff]);
+            record[4] = partition_type;
+            record[5..8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+            record[8..12].copy_from_slice(&first_lba.to_le_bytes());
+            record[12..16].copy_from_slice(&block_count.to_le_bytes());
+        }
+        mbr
+    }
+
+    #[test]
+    fn a_retail_stick_is_not_gpt_but_its_fat32_partition_is_found() {
+        let mbr = classic_mbr(&[(
+            0,
+            0x00,
+            MBR_TYPE_FAT32_LBA,
+            2048,
+            STICK_BLOCKS as u32 - 2048,
+        )]);
+        assert_eq!(
+            validate_protective_mbr(&mbr, 512, STICK_BLOCKS),
+            Err(GptError::BadProtectiveMbr)
+        );
+        let table = MbrPartitionTable::parse(&mbr, 512, STICK_BLOCKS).unwrap();
+        let fat = table.fat32_partition().unwrap();
+        assert_eq!(fat.index, 0);
+        assert_eq!(fat.partition_type, MBR_TYPE_FAT32_LBA);
+        assert!(!fat.bootable);
+        assert_eq!(fat.first_lba, 2048);
+        assert_eq!(fat.last_lba(), STICK_BLOCKS - 1);
+        assert_eq!(table.partitions().count(), 1);
+        assert_eq!(table.partition(1), None);
+        assert_eq!(table.partition(4), None);
+    }
+
+    #[test]
+    fn the_first_fat32_typed_record_wins_in_slot_order() {
+        let mbr = classic_mbr(&[
+            (0, 0x80, 0x83, 2048, 4096),
+            (1, 0x00, MBR_TYPE_EFI_SYSTEM, 8192, 1024),
+            (3, 0x00, MBR_TYPE_FAT32_CHS, 10240, 1024),
+        ]);
+        let table = MbrPartitionTable::parse(&mbr, 512, 1 << 20).unwrap();
+        assert!(table.partition(0).unwrap().bootable);
+        assert!(!table.partition(0).unwrap().may_hold_fat32());
+        assert_eq!(table.fat32_partition().unwrap().index, 1);
+        assert!(table.partitions().map(|p| p.index).eq([0, 1, 3]));
+    }
+
+    #[test]
+    fn a_table_with_no_fat32_record_finds_none() {
+        let empty = classic_mbr(&[]);
+        assert_eq!(
+            MbrPartitionTable::parse(&empty, 512, STICK_BLOCKS)
+                .unwrap()
+                .fat32_partition(),
+            None
+        );
+        let exfat = classic_mbr(&[(0, 0x00, 0x07, 2048, 4096)]);
+        assert_eq!(
+            MbrPartitionTable::parse(&exfat, 512, STICK_BLOCKS)
+                .unwrap()
+                .fat32_partition(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_volume_boot_sector_is_not_mistaken_for_a_partition_table() {
+        // A FAT32 "superfloppy": LBA0 is the volume's own boot sector, whose boot code runs
+        // through the record area.
+        let mut vbr = vec![0x90; 512];
+        vbr[0..3].copy_from_slice(&[0xeb, 0x58, 0x90]);
+        vbr[510] = 0x55;
+        vbr[511] = 0xaa;
+        assert_eq!(
+            MbrPartitionTable::parse(&vbr, 512, STICK_BLOCKS),
+            Err(MbrError::BadBootIndicator)
+        );
+    }
+
+    #[test]
+    fn gpt_media_are_left_to_the_gpt_path() {
+        let fixture = Fixture::new(512);
+        assert_eq!(
+            MbrPartitionTable::parse(&fixture.mbr, 512, fixture.media_blocks),
+            Err(MbrError::ProtectiveRecord)
+        );
+        let hybrid = classic_mbr(&[(0, 0x00, 0xee, 1, 2047), (1, 0x00, 0x0c, 2048, 4096)]);
+        assert_eq!(
+            MbrPartitionTable::parse(&hybrid, 512, STICK_BLOCKS),
+            Err(MbrError::ProtectiveRecord)
+        );
+    }
+
+    #[test]
+    fn rejects_records_outside_the_medium_and_overlaps() {
+        let parse = |mbr: &[u8]| MbrPartitionTable::parse(mbr, 512, 8192);
+        let mut unsigned = classic_mbr(&[]);
+        unsigned[511] = 0;
+        assert_eq!(parse(&unsigned), Err(MbrError::BadSignature));
+        for record in [
+            (0, 0, 0x0c, 0, 64),
+            (0, 0, 0x0c, 64, 0),
+            (0, 0, 0x0c, 8000, 193),
+        ] {
+            assert_eq!(
+                parse(&classic_mbr(&[record])),
+                Err(MbrError::BadPartitionEntry)
+            );
+        }
+        assert!(parse(&classic_mbr(&[(0, 0, 0x0c, 8000, 192)])).is_ok());
+        assert_eq!(
+            parse(&classic_mbr(&[(0, 0, 0x0c, 64, 128), (2, 0, 0x83, 191, 8)])),
+            Err(MbrError::OverlappingPartitions)
+        );
+        assert_eq!(
+            MbrPartitionTable::parse(&classic_mbr(&[])[..511], 512, 8192),
+            Err(MbrError::BufferTooShort)
+        );
+        assert_eq!(
+            MbrPartitionTable::parse(&classic_mbr(&[]), 256, 8192),
+            Err(MbrError::InvalidLogicalBlockSize)
+        );
+    }
+
+    #[test]
+    fn native_4096_byte_blocks_count_lbas_in_device_blocks() {
+        let mut mbr = classic_mbr(&[(0, 0, MBR_TYPE_FAT32_LBA, 256, 1024)]);
+        mbr.resize(4096, 0);
+        let fat = MbrPartitionTable::parse(&mbr, 4096, 2048)
+            .unwrap()
+            .fat32_partition()
+            .unwrap();
+        assert_eq!((fat.first_lba, fat.block_count), (256, 1024));
     }
 
     #[test]
