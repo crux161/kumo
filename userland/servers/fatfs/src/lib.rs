@@ -3,6 +3,7 @@
 //j514
 //j547
 //j548
+//j549
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -18,6 +19,8 @@
 
 #[cfg(test)]
 extern crate alloc;
+
+pub mod block;
 
 use kumo_fatfs::{DirEntry, FatVolume, FatWriteError, SectorReader, SectorWriter};
 use kumo_vfs::{
@@ -211,7 +214,12 @@ fn open<R: SectorReader + SectorWriter>(
     let entry = match volume.resolve_path(reader, path) {
         Some(entry) => entry,
         None if options & OPEN_CREATE != 0 => match volume.create_file(reader, path) {
-            Ok(entry) => entry,
+            Ok(entry) => {
+                if let Err(error) = volume.flush(reader) {
+                    return write_status(reply, mutation_status(error));
+                }
+                entry
+            }
             Err(error) => return write_status(reply, mutation_status(error)),
         },
         None => return write_status(reply, VFS_NOT_FOUND),
@@ -266,7 +274,13 @@ fn write<R: SectorReader + SectorWriter>(
         return write_status(reply, VFS_ACCESS_DENIED);
     }
     match volume.write_file_at(io, &mut file.entry, offset, data) {
-        Ok(written) => write_frame(reply, &encode_write_ok(written as u32)),
+        // Upstream Kilo saves with write+close, without fsync. A successful mutation is
+        // synchronous here, so "written on disk" cannot precede a failed device flush.
+        // — KESTREL
+        Ok(written) => match volume.flush(io) {
+            Ok(()) => write_frame(reply, &encode_write_ok(written as u32)),
+            Err(error) => write_status(reply, mutation_status(error)),
+        },
         Err(error) => write_status(reply, mutation_status(error)),
     }
 }
@@ -285,7 +299,10 @@ fn set_len<R: SectorReader + SectorWriter>(
     if !file.writable {
         return write_status(reply, VFS_ACCESS_DENIED);
     }
-    match volume.set_file_len(io, &mut file.entry, len) {
+    match volume
+        .set_file_len(io, &mut file.entry, len)
+        .and_then(|()| volume.flush(io))
+    {
         Ok(()) => write_status(reply, VFS_OK),
         Err(error) => write_status(reply, mutation_status(error)),
     }
@@ -709,6 +726,56 @@ mod tests {
             *sector = *buf;
             true
         }
+    }
+
+    #[test]
+    fn mutations_wait_for_flush_and_surface_its_failure() {
+        struct FlushDisk(WritableDisk, usize, bool);
+        impl SectorReader for FlushDisk {
+            fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+                self.0.read_sector(lba, buf)
+            }
+        }
+        impl SectorWriter for FlushDisk {
+            fn write_sector(&mut self, lba: u32, buf: &[u8; SECTOR_SIZE]) -> bool {
+                self.0.write_sector(lba, buf)
+            }
+            fn flush(&mut self) -> bool {
+                self.1 += 1;
+                !self.2
+            }
+        }
+        let mut disk = FlushDisk(WritableDisk::fixture(), 0, false);
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let request = encode_request(Request::open_options(
+            b"/SAVE.TXT",
+            OPEN_READ | OPEN_WRITE | OPEN_CREATE,
+        ));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        let (handle, _) = parse_open_reply(&reply[..n]).unwrap();
+        assert_eq!(disk.1, 1);
+        let request = encode_request(Request::set_len(handle, 6));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(&reply[..n], &[VFS_OK]);
+        assert_eq!(disk.1, 2);
+        let request = encode_request(Request::write(handle, 0, b"saved!"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(parse_write_reply(&reply[..n]), Ok(6));
+        assert_eq!(disk.1, 3);
+        disk.2 = true;
+        for request in [
+            Request::write(handle, 0, b"unsure"),
+            Request::set_len(handle, 4),
+            Request::flush(handle),
+            Request::open_options(b"/FAIL.TXT", OPEN_WRITE | OPEN_CREATE),
+        ] {
+            let request = encode_request(request);
+            let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+            assert_eq!(&reply[..n], &[VFS_IO_ERROR]);
+        }
+        assert_eq!(disk.1, 7);
     }
 
     #[test]

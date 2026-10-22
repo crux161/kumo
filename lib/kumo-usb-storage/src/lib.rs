@@ -2,12 +2,13 @@
 //j520
 //j521
 //j522
+//j549
 
 //! Allocation-free USB Mass Storage Bulk-Only Transport and SCSI command framing.
 //!
 //! This crate owns no controller, DMA, or filesystem state. It turns configuration descriptor
 //! bytes into a checked bulk endpoint pair and turns the small SCSI command set needed to identify
-//! and read a disk into checked BOT wire packets.
+//! and read/write a disk into checked BOT wire packets.
 
 const DESCRIPTOR_CONFIGURATION: u8 = 0x02;
 const DESCRIPTOR_INTERFACE: u8 = 0x04;
@@ -346,6 +347,28 @@ impl ScsiCommand {
 
     pub fn cdb(&self) -> &[u8] {
         &self.cdb[..self.cdb_length as usize]
+    }
+
+    /// WRITE(10), with the same checked range and byte count as READ(10).
+    pub fn write_10(lba: u32, blocks: u16, block_size: u32) -> Result<Self, ScsiError> {
+        let mut command = Self::read_10(lba, blocks, block_size)?;
+        command.cdb[0] = 0x2A;
+        if command.transfer_length != 0 {
+            command.direction = DataDirection::ToDevice;
+        }
+        Ok(command)
+    }
+
+    /// Synchronously commit all preceding writes on this logical unit.
+    pub const fn synchronize_cache_10() -> Self {
+        let mut cdb = [0; 16];
+        cdb[0] = 0x35;
+        Self {
+            cdb,
+            cdb_length: 10,
+            direction: DataDirection::None,
+            transfer_length: 0,
+        }
     }
 
     pub const fn direction(&self) -> DataDirection {
@@ -806,6 +829,33 @@ mod tests {
             ScsiCommand::read_10(0, 1, 0),
             Err(ScsiError::InvalidBlockSize)
         );
+    }
+
+    #[test]
+    fn write_and_sync_commands_encode_outbound_data_and_a_synchronous_barrier() {
+        let write = ScsiCommand::write_10(0x1234_5678, 2, 512).unwrap();
+        assert_eq!(write.cdb(), &[0x2A, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 2, 0]);
+        assert_eq!(write.transfer_length(), 1024);
+        assert_eq!(write.direction(), DataDirection::ToDevice);
+        let cbw = CommandBlockWrapper::for_scsi(7, 0, &write).unwrap();
+        assert_eq!(&cbw.as_bytes()[8..15], &[0, 4, 0, 0, 0, 0, 10]);
+        assert_eq!(
+            ScsiCommand::write_10(u32::MAX, 2, 512),
+            Err(ScsiError::AddressRangeOverflow)
+        );
+        assert_eq!(
+            ScsiCommand::write_10(0, 2, u32::MAX),
+            Err(ScsiError::TransferLengthOverflow)
+        );
+        assert_eq!(
+            ScsiCommand::write_10(0, 1, 0),
+            Err(ScsiError::InvalidBlockSize)
+        );
+        let sync = ScsiCommand::synchronize_cache_10();
+        assert_eq!(sync.cdb(), &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sync.direction(), DataDirection::None);
+        assert_eq!(sync.transfer_length(), 0);
+        assert!(CommandBlockWrapper::for_scsi(8, 0, &sync).is_ok());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //j508
 //j514
 //j545
+//j549
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -17,6 +18,7 @@
 //! driver has already narrowed that channel to the volume, so block 0 is the volume's boot
 //! sector and nothing outside the partition can be named.
 
+use fatfs::block::{BlockSectors, BlockTransport};
 use fatfs::{FatServer, Transport};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
@@ -90,51 +92,24 @@ impl SectorWriter for MappedSectors {
     }
 }
 
-/// A volume read block by block over a `drv-blk`-protocol channel (J545). The serving driver
-/// narrowed the channel to the volume, so a sector number is a block number on it.
-struct BlockSectors {
+/// The block channel's syscall boundary; sector framing lives in the tested library.
+struct ChannelBlocks {
     channel: Handle,
-    block_count: u64,
 }
 
-impl SectorReader for BlockSectors {
-    fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
-        if lba as u64 >= self.block_count {
-            return false;
-        }
-        let request = drv_blk::Request::read(lba as u64, 1).encode();
+impl BlockTransport for ChannelBlocks {
+    fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Option<usize> {
         if channel_write(self.channel, request.as_ptr(), request.len()) != 0 {
-            return false;
+            return None;
         }
-        let mut reply = [0u8; 1 + SECTOR_SIZE];
         let n = channel_read(self.channel, reply.as_mut_ptr(), reply.len());
-        if n == 0 || n == u64::MAX {
-            return false;
-        }
-        match drv_blk::read_payload(&reply[..n as usize]) {
-            Ok(data) if data.len() >= SECTOR_SIZE => {
-                buf.copy_from_slice(&data[..SECTOR_SIZE]);
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-impl SectorWriter for BlockSectors {
-    /// Refused here, before any IPC: the USB driver serves reads only until WRITE(10) and
-    /// SYNCHRONIZE CACHE land, so a mutation fails as an I/O error instead of half-applying.
-    fn write_sector(&mut self, _lba: u32, _buf: &[u8; SECTOR_SIZE]) -> bool {
-        false
+        (n != 0 && n != u64::MAX && n <= reply.len() as u64).then_some(n as usize)
     }
 }
 
 /// Serve a block-backed volume until the vfs peer closes (J545).
 fn serve_blocks(channel: Handle, blocks: Handle, block_count: u64) -> ! {
-    let mut disk = BlockSectors {
-        channel: blocks,
-        block_count,
-    };
+    let mut disk = BlockSectors::new(ChannelBlocks { channel: blocks }, block_count);
     let Ok(volume) = FatVolume::mount(&mut disk) else {
         fail(b"fatfs: block mount failed\n");
     };

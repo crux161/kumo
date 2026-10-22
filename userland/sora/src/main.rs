@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j514
 //j527
 //j545
 //j547
 //j548
+//j549
 
 extern crate alloc;
 
@@ -2978,7 +2978,7 @@ enum FsGrant {
     None,
     /// Over Sora's RAM FAT image (J508): what kilo and the relibc smoke write to.
     Image,
-    /// Over the USB volume mounted at `/media/<name>` (J547), read-only for now.
+    /// Over the USB volume mounted at `/media/<name>` (J547/J549).
     Media,
 }
 
@@ -3429,15 +3429,43 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         debug_write(b"kilo: already running\n".as_ptr(), 22);
         return true;
     }
+    if cmd.args.len() > 1 {
+        log(b"usage: kilo [path]\n");
+        return true;
+    }
     let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
     let count = command_argv_slots(cmd, &mut slots);
+    let mut fs = FsGrant::Image;
+    if let Some(path) = cmd.args.first() {
+        match sora::media_route(path.as_bytes()) {
+            sora::MediaRoute::Elsewhere => {}
+            sora::MediaRoute::Root | sora::MediaRoute::Volume { path: b"/", .. } => {
+                log(b"kilo: is a directory\n");
+                return true;
+            }
+            sora::MediaRoute::Volume { name, path } => {
+                let Some(volume) = media().filter(|volume| volume.name.as_bytes() == name) else {
+                    log(b"kilo: no such volume\n");
+                    return true;
+                };
+                if volume.ready.read_only {
+                    log(b"kilo: volume is read-only\n");
+                    return true;
+                }
+                // The editor sees only its granted volume and a path from that volume's root.
+                // — KESTREL
+                slots[1] = path;
+                fs = FsGrant::Media;
+            }
+        }
+    }
     let Some((stdin_write, stdout_read)) = run_with_startup_input(
         initrd,
         KILO_PATH.as_bytes(),
         b"kilo",
         Some(&slots[..count]),
         false,
-        FsGrant::Image,
+        fs,
         true,
         true,
         StdinMode::Interactive,

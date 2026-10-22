@@ -1,19 +1,18 @@
 #![no_std]
 #![no_main]
 
-//j541
 //j542
 //j543
 //j545
 //j548
+//j549
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use drv_blk::{
-    MediaReady, Request as BlockRequest, CMD_FLUSH, CMD_READ, CMD_WRITE, CONTROL_CONNECT,
-    REQUEST_LEN as BLOCK_REQUEST_LEN, STATUS_BAD_LBA, STATUS_BAD_LEN, STATUS_IO_ERROR, STATUS_OK,
-    STATUS_READ_ONLY,
+    MediaReady, CONTROL_CONNECT, REQUEST_LEN as BLOCK_REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK,
 };
+use drv_xhci::{storage_request, StorageRequest};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{
     BlockReader, Bpb, FatError, FatVolume, PartitionFitError, PartitionReader, SECTOR_SIZE,
@@ -108,6 +107,8 @@ const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
 const BOT_TAG_READ_FAT_BOOT: u32 = 0x4b55_0006;
 /// Sectors of the mounted FAT32 volume (J543), and the blocks served to clients (J545).
 const BOT_TAG_READ_VOLUME: u32 = 0x4b55_0007;
+const BOT_TAG_WRITE_VOLUME: u32 = 0x4b55_0008;
+const BOT_TAG_SYNC: u32 = 0x4b55_0009;
 // J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
@@ -1525,6 +1526,52 @@ struct BotDisk<'a> {
 }
 
 impl BotDisk<'_> {
+    /// Reuse the read window's checked geometry and volatile stores for one sector OUT.
+    /// No new DMA reach or buffer ownership is introduced. — KESTREL
+    fn write_block(&mut self, lba: u64, data: &[u8]) -> bool {
+        if data.len() != SECTOR_SIZE || self.adapter.plan_read(lba, 1).is_err() {
+            return false;
+        }
+        let Ok(command) = ScsiCommand::write_10(lba as u32, 1, SECTOR_SIZE as u32) else {
+            return false;
+        };
+        self.read_window.write_from(0, data);
+        self.write_or_flush(&command, BOT_TAG_WRITE_VOLUME, b"write10-volume") == Some(SECTOR_SIZE)
+    }
+
+    fn flush(&mut self) -> bool {
+        self.write_or_flush(
+            &ScsiCommand::synchronize_cache_10(),
+            BOT_TAG_SYNC,
+            b"sync-cache",
+        ) == Some(0)
+    }
+
+    fn write_or_flush(&mut self, command: &ScsiCommand, tag: u32, name: &[u8]) -> Option<usize> {
+        bot_command(
+            self.io,
+            self.layout,
+            self.image,
+            self.evt,
+            &mut self.out_ring,
+            self.out_seg,
+            self.out_dci,
+            &mut self.in_ring,
+            self.in_seg,
+            self.in_dci,
+            self.slot_id,
+            self.cbw_buf,
+            self.cbw_phys,
+            self.read_window,
+            self.read_phys,
+            self.csw_buf,
+            self.csw_phys,
+            tag,
+            command,
+            name,
+        )
+    }
+
     /// READ(10) `count` blocks from `lba`. Returns exactly the bytes that arrived, copied out of
     /// device memory by [`storage_snapshot`], so the slice is valid only until the next read.
     fn read_blocks(
@@ -1766,8 +1813,7 @@ fn keep_volume(disk: &mut BotDisk, page_va: u64, volume: &[u8], first_lba: u64, 
         block_count,
         serial: fat.bpb().volume_serial,
         label,
-        // Reads only until WRITE(10) and SYNCHRONIZE CACHE land.
-        read_only: true,
+        read_only: false,
     };
     log(b"drv-xhci: storage ");
     log(volume);
@@ -1813,6 +1859,8 @@ struct BlockClient {
     handle: u32,
     koid: u64,
     served: u32,
+    writes: u32,
+    flushes: u32,
 }
 
 impl StorageService {
@@ -1913,7 +1961,7 @@ fn offer_storage(port: Handle) -> Option<u64> {
     }
     log(b"drv-xhci: storage offered blocks=");
     log_hex(service.ready.block_count);
-    log(b" read-only\n");
+    log(b" read-write\n");
     Some(koid)
 }
 
@@ -1978,6 +2026,8 @@ fn accept_block_client(service: &mut StorageService, port: Handle) {
         handle: client.0,
         koid,
         served: 0,
+        writes: 0,
+        flushes: 0,
     };
     log(b"drv-xhci: block client connected slot=");
     log_hex(slot as u64);
@@ -1985,8 +2035,8 @@ fn accept_block_client(service: &mut StorageService, port: Handle) {
 }
 
 /// Answer one request from client `index` in the `drv-blk` protocol. LBAs are the volume's: a
-/// client can name no block outside it. Reads go one block at a time, which is how
-/// `kumo-fatfs` asks; writes are refused until WRITE(10) lands.
+/// client can name no block outside it. Reads and writes go one block at a time;
+/// a flush completes only after SYNCHRONIZE CACHE's successful CSW. — KESTREL
 #[allow(clippy::too_many_arguments)]
 fn serve_block_client(
     service: &mut StorageService,
@@ -1998,7 +2048,9 @@ fn serve_block_client(
     port: Handle,
 ) {
     let client = Handle(service.clients[index].handle);
-    let mut frame = [0u8; BLOCK_REQUEST_LEN + SECTOR_SIZE];
+    // One extra byte exposes oversized frames instead of accepting their truncated prefix.
+    // — KESTREL
+    let mut frame = [0u8; BLOCK_REQUEST_LEN + SECTOR_SIZE + 1];
     let n = channel_read(client, frame.as_mut_ptr(), frame.len());
     if n == 0 || n == u64::MAX {
         // The client's `fatfs` exited: drop the channel and free the slot.
@@ -2008,42 +2060,58 @@ fn serve_block_client(
         log_hex(index as u64);
         log(b" served=");
         log_hex(service.clients[index].served as u64);
+        log(b" writes=");
+        log_hex(service.clients[index].writes as u64);
+        log(b" flushes=");
+        log_hex(service.clients[index].flushes as u64);
         log(b"\n");
         service.clients[index] = BlockClient::default();
         return;
     }
     let mut reply = [0u8; 1 + SECTOR_SIZE];
     let mut reply_len = 1;
-    reply[0] = match BlockRequest::decode(&frame[..n as usize]) {
-        Some(request) if request.cmd == CMD_READ => {
-            if request.count != 1 {
-                STATUS_BAD_LEN
-            } else if request.lba >= service.ready.block_count {
-                STATUS_BAD_LBA
-            } else {
-                let lba = service.first_lba + request.lba;
-                let read = service.with_disk(io, layout, image, evt, |disk| {
-                    match disk.read_blocks(lba, 1, BOT_TAG_READ_VOLUME, b"read10-volume") {
-                        Some(block) if block.len() >= SECTOR_SIZE => {
-                            reply[1..].copy_from_slice(&block[..SECTOR_SIZE]);
-                            true
-                        }
-                        _ => false,
+    reply[0] = match storage_request(
+        &frame[..n as usize],
+        service.first_lba,
+        service.ready.block_count,
+        service.ready.read_only,
+    ) {
+        Ok(StorageRequest::Read(lba)) => {
+            let read = service.with_disk(io, layout, image, evt, |disk| {
+                match disk.read_blocks(lba, 1, BOT_TAG_READ_VOLUME, b"read10-volume") {
+                    Some(block) if block.len() >= SECTOR_SIZE => {
+                        reply[1..].copy_from_slice(&block[..SECTOR_SIZE]);
+                        true
                     }
-                });
-                if read {
-                    reply_len = reply.len();
-                    service.clients[index].served += 1;
-                    STATUS_OK
-                } else {
-                    STATUS_IO_ERROR
+                    _ => false,
                 }
+            });
+            if read {
+                reply_len = reply.len();
+                service.clients[index].served += 1;
+                STATUS_OK
+            } else {
+                STATUS_IO_ERROR
             }
         }
-        Some(request) if request.cmd == CMD_WRITE => STATUS_READ_ONLY,
-        // Nothing is buffered here: every read went to the stick.
-        Some(request) if request.cmd == CMD_FLUSH => STATUS_OK,
-        _ => STATUS_BAD_LEN,
+        Ok(StorageRequest::Write(lba, data)) => {
+            if service.with_disk(io, layout, image, evt, |disk| disk.write_block(lba, data)) {
+                service.clients[index].served += 1;
+                service.clients[index].writes += 1;
+                STATUS_OK
+            } else {
+                STATUS_IO_ERROR
+            }
+        }
+        Ok(StorageRequest::Flush) => {
+            if service.with_disk(io, layout, image, evt, |disk| disk.flush()) {
+                service.clients[index].flushes += 1;
+                STATUS_OK
+            } else {
+                STATUS_IO_ERROR
+            }
+        }
+        Err(status) => status,
     };
     let _ = channel_write(client, reply.as_ptr(), reply_len);
 }
@@ -2093,7 +2161,7 @@ fn log_fit_error(volume: &[u8], error: PartitionFitError) {
     log(b"\n");
 }
 
-/// Execute exactly one BOT transaction. The CBW, optional data-IN TD, and CSW are submitted and
+/// Execute exactly one BOT transaction. The CBW, optional data TD, and CSW are submitted and
 /// completed serially; there is never more than one outstanding TRB on either bulk ring.
 #[allow(clippy::too_many_arguments)]
 fn bot_command(
@@ -2118,6 +2186,9 @@ fn bot_command(
     command: &ScsiCommand,
     command_name: &[u8],
 ) -> Option<usize> {
+    if command.transfer_length() as usize > data_buf.len() {
+        return None;
+    }
     let cbw = CommandBlockWrapper::for_scsi(tag, 0, command).ok()?;
     cbw_buf.write_from(0, cbw.as_bytes());
     dsb();
@@ -2168,8 +2239,22 @@ fn bot_command(
             )?
         }
         DataDirection::ToDevice => {
-            log(b"drv-xhci: storage data-OUT unsupported\n");
-            return None;
+            dsb();
+            bulk_transfer(
+                io,
+                layout,
+                image,
+                evt,
+                out_ring,
+                out_seg,
+                slot_id,
+                out_dci,
+                data_phys,
+                expected,
+                false,
+                command_name,
+                b"data-out",
+            )?
         }
     };
 
