@@ -1,6 +1,7 @@
 #![no_std]
 //j524
 //j542
+//j543
 
 //! Allocation-free validation and discovery for GUID Partition Tables.
 //!
@@ -26,6 +27,12 @@ const GPT_REVISION_1_0: u32 = 0x0001_0000;
 /// EFI System Partition type GUID in the byte order stored in a GPT entry.
 pub const EFI_SYSTEM_PARTITION_TYPE_GUID: Guid = Guid([
     0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
+]);
+
+/// Microsoft Basic Data partition type GUID (EBD0A0A2-B9E5-4433-87C0-68B6B72699C7) in GPT entry
+/// byte order: what macOS, Windows and Linux formatters give a FAT32 (or exFAT/NTFS) data volume.
+pub const MICROSOFT_BASIC_DATA_TYPE_GUID: Guid = Guid([
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ]);
 
 /// A GUID in the mixed-endian byte order used directly by GPT structures.
@@ -503,6 +510,20 @@ impl PartitionTable<'_> {
     pub fn efi_system_partition(&self) -> Option<Partition> {
         self.find_by_type_guid(EFI_SYSTEM_PARTITION_TYPE_GUID)
     }
+
+    /// The partitions in use, in table order.
+    pub fn partitions(&self) -> impl Iterator<Item = Partition> + '_ {
+        (0..self.header.partition_entry_count).filter_map(|index| self.partition(index))
+    }
+
+    /// The volume a removable medium keeps its data on: the first Microsoft Basic Data
+    /// partition, else the EFI System Partition. `diskutil` and Windows put a small ESP ahead of
+    /// the data volume, so taking the ESP first would mount the empty one. The volume's own boot
+    /// sector still has to prove it is FAT32 (J543).
+    pub fn data_volume(&self) -> Option<Partition> {
+        self.find_by_type_guid(MICROSOFT_BASIC_DATA_TYPE_GUID)
+            .or_else(|| self.efi_system_partition())
+    }
 }
 
 fn validate_media(
@@ -937,6 +958,52 @@ mod tests {
             .fat32_partition()
             .unwrap();
         assert_eq!((fat.first_lba, fat.block_count), (256, 1024));
+    }
+
+    #[test]
+    fn a_formatted_sticks_data_volume_wins_over_its_esp() {
+        // `diskutil eraseDisk FAT32 … GPT`, as on CRUX's stick at J543: a 200 MiB ESP at LBA 40,
+        // then the Basic Data volume.
+        let mut fixture = Fixture::new(512);
+        Fixture::write_partition(
+            &mut fixture.entries,
+            2,
+            MICROSOFT_BASIC_DATA_TYPE_GUID,
+            Guid([0x66; 16]),
+            fixture.first_usable + 200,
+            fixture.first_usable + 999,
+            0,
+        );
+        fixture.reseal_entries();
+        let header = fixture.parse_header().unwrap();
+        let table = header.parse_partition_table(&fixture.entries).unwrap();
+        assert!(table.partitions().map(|p| p.index).eq([1, 2, 3]));
+        assert_eq!(table.efi_system_partition().unwrap().index, 1);
+        let data = table.data_volume().unwrap();
+        assert_eq!(data.index, 2);
+        assert_eq!(data.type_guid, MICROSOFT_BASIC_DATA_TYPE_GUID);
+        assert_eq!(data.block_count(), 800);
+    }
+
+    #[test]
+    fn without_a_data_volume_the_esp_is_the_volume() {
+        let fixture = Fixture::new(512);
+        let header = fixture.parse_header().unwrap();
+        let table = header.parse_partition_table(&fixture.entries).unwrap();
+        assert_eq!(table.data_volume().unwrap().index, 1);
+    }
+
+    #[test]
+    fn basic_data_guid_is_stored_mixed_endian() {
+        // EBD0A0A2-B9E5-4433-87C0-68B6B72699C7: the first three fields little-endian.
+        let bytes = MICROSOFT_BASIC_DATA_TYPE_GUID.0;
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            0xebd0_a0a2
+        );
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 0xb9e5);
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 0x4433);
+        assert_eq!(bytes[8..], [0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7]);
     }
 
     #[test]

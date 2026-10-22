@@ -8,14 +8,17 @@
 //j540
 //j541
 //j542
+//j543
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use kumo_abi::{Handle, VmarFlags};
-use kumo_fatfs::{Bpb, FatError, PartitionFitError};
+use kumo_fatfs::{
+    BlockReader, Bpb, FatError, FatVolume, PartitionFitError, PartitionReader, SECTOR_SIZE,
+};
 use kumo_gpt::{
     validate_protective_mbr, GptError, GptHeader, Guid, MbrError, MbrPartition, MbrPartitionTable,
-    Partition,
+    Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
@@ -99,6 +102,13 @@ const BOT_TAG_READ_GPT_HEADER: u32 = 0x4b55_0004;
 const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
 /// The boot sector of the FAT32 volume found, a GPT ESP or a classic MBR record (J542).
 const BOT_TAG_READ_FAT_BOOT: u32 = 0x4b55_0006;
+/// Sectors of the mounted FAT32 volume (J543).
+const BOT_TAG_READ_VOLUME: u32 = 0x4b55_0007;
+/// Root entries the J543 volume read lists; a stick's root rarely holds more.
+const ROOT_LISTING_MAX: usize = 32;
+/// Bytes of the sample file read back, and the lines of it shown.
+const SAMPLE_READ_LEN: usize = 512;
+const SAMPLE_SHOW_LINES: usize = 8;
 // J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
@@ -146,6 +156,9 @@ static DOWNSTREAM_PAGES_USED: AtomicU32 = AtomicU32::new(0);
 /// The storage probe runs once per driver: it maps one fixed read window and fills one static
 /// snapshot. A second mass-storage device is named and left alone (J541).
 static STORAGE_PROBED: AtomicBool = AtomicBool::new(false);
+/// Log every BOT phase's begin and success. The probe keeps this on; the volume reads after it
+/// turn it off and log only failures (J543).
+static STORAGE_TRACE: AtomicBool = AtomicBool::new(true);
 static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 /// The keyboard-channel writer Sora handed us (U5); 0 = none (this controller delivers to the
 /// serial log instead). Decoded key bytes are written here → Sora → the shell.
@@ -1392,6 +1405,7 @@ fn configure_and_probe_storage(
         adapter,
         read_window,
         read_phys,
+        blocks_read: 0,
     };
     let Some(lba0) = disk.read_blocks(0, 1, BOT_TAG_READ_LBA0, b"read10-lba0") else {
         return;
@@ -1415,10 +1429,12 @@ fn configure_and_probe_storage(
         match validate_protective_mbr(lba0, logical_block_size, media_blocks) {
             Ok(()) => {
                 log_storage_phase(b"gpt-mbr", b"ok");
-                let Some(esp) = find_gpt_esp(&mut disk, logical_block_size, media_blocks) else {
+                let Some((kind, partition)) =
+                    find_gpt_volume(&mut disk, logical_block_size, media_blocks)
+                else {
                     return;
                 };
-                (b"esp", esp.first_lba, esp.block_count())
+                (kind, partition.first_lba, partition.block_count())
             }
             // J542: a stick formatted elsewhere carries a classic MBR, not a GPT: CRUX's did at
             // J541. Its FAT32 record is judged the same way as a GPT's ESP. — TIMBERDOODLE
@@ -1431,13 +1447,15 @@ fn configure_and_probe_storage(
             }
             Err(error) => return log_gpt_error(b"mbr", error),
         };
-    probe_fat32_volume(
+    if probe_fat32_volume(
         &mut disk,
         volume,
         first_lba,
         block_count,
         logical_block_size,
-    );
+    ) {
+        read_volume_sample(&mut disk, volume, first_lba, block_count);
+    }
 }
 
 /// A configured Bulk-Only Transport interface and its READ(10) window: everything one block read
@@ -1461,6 +1479,8 @@ struct BotDisk<'a> {
     adapter: Read10BlockAdapter,
     read_window: DmaBuf,
     read_phys: u64,
+    /// Device blocks read so far.
+    blocks_read: u64,
 }
 
 impl BotDisk<'_> {
@@ -1507,17 +1527,33 @@ impl BotDisk<'_> {
             log_storage_phase(name, b"short");
             return None;
         }
+        self.blocks_read += count as u64;
         Some(storage_snapshot(window, len))
     }
 }
 
-/// J525: the primary GPT behind a protective MBR (header at LBA1, then its entry array) and the
-/// EFI System Partition it lists.
-fn find_gpt_esp(
+/// The stick as `kumo-fatfs` sees it: one READ(10) per 512-byte block (J543). The probe has
+/// already refused any other block size through `Bpb::fits_partition`.
+impl BlockReader for BotDisk<'_> {
+    fn read_block(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+        match self.read_blocks(lba, 1, BOT_TAG_READ_VOLUME, b"read10-volume") {
+            Some(block) if block.len() >= SECTOR_SIZE => {
+                buf.copy_from_slice(&block[..SECTOR_SIZE]);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// J525/J543: the primary GPT behind a protective MBR (header at LBA1, then its entry array), and
+/// the volume a removable medium keeps its data on: its Basic Data partition, else its ESP.
+/// Returns that volume and which kind it is (`data` or `esp`).
+fn find_gpt_volume(
     disk: &mut BotDisk,
     logical_block_size: usize,
     media_blocks: u64,
-) -> Option<Partition> {
+) -> Option<(&'static [u8], Partition)> {
     let header_block = disk.read_blocks(1, 1, BOT_TAG_READ_GPT_HEADER, b"read10-gpt-header")?;
     let header = match GptHeader::parse_primary(header_block, logical_block_size, media_blocks) {
         Ok(header) => header,
@@ -1553,22 +1589,40 @@ fn find_gpt_esp(
         }
     };
     log_storage_phase(b"gpt-entries", b"ok");
-    let Some(esp) = table.efi_system_partition() else {
-        log_storage_phase(b"gpt-esp", b"not-found");
+    for partition in table.partitions() {
+        log(b"drv-xhci: storage gpt part=");
+        log_hex(partition.index as u64);
+        log(b" type=");
+        log_guid(partition.type_guid);
+        log(b" first-lba=");
+        log_hex(partition.first_lba);
+        log(b" blocks=");
+        log_hex(partition.block_count());
+        log(b"\n");
+    }
+    let Some(volume) = table.data_volume() else {
+        log_storage_phase(b"gpt-volume", b"not-found");
         return None;
     };
-    log(b"drv-xhci: storage esp index=");
-    log_hex(esp.index as u64);
+    let kind: &'static [u8] = if volume.type_guid == EFI_SYSTEM_PARTITION_TYPE_GUID {
+        b"esp"
+    } else {
+        b"data"
+    };
+    log(b"drv-xhci: storage ");
+    log(kind);
+    log(b" index=");
+    log_hex(volume.index as u64);
     log(b" guid=");
-    log_guid(esp.unique_guid);
+    log_guid(volume.unique_guid);
     log(b" first-lba=");
-    log_hex(esp.first_lba);
+    log_hex(volume.first_lba);
     log(b" last-lba=");
-    log_hex(esp.last_lba);
+    log_hex(volume.last_lba);
     log(b" blocks=");
-    log_hex(esp.block_count());
+    log_hex(volume.block_count());
     log(b"\n");
-    Some(esp)
+    Some((kind, volume))
 }
 
 /// J542: the classic partition table in LBA0, and the first record filed under a FAT32 type.
@@ -1606,25 +1660,29 @@ fn find_mbr_fat32(
 }
 
 /// J537/J542: a FAT32 volume's first block is its boot sector. Read it and judge it against the
-/// partition that holds it; `volume` says which kind (`esp` or `mbr`). A partition-relative mount
-/// is the next gate, so nothing here is exposed or written.
+/// partition that holds it; `volume` says which kind (`esp`, `data` or `mbr`). True when the
+/// volume may be mounted.
 fn probe_fat32_volume(
     disk: &mut BotDisk,
     volume: &[u8],
     first_lba: u64,
     block_count: u64,
     logical_block_size: usize,
-) {
+) -> bool {
     let Some(boot) = disk.read_blocks(first_lba, 1, BOT_TAG_READ_FAT_BOOT, b"read10-fat-boot")
     else {
-        return;
+        return false;
     };
     let bpb = match Bpb::parse(boot) {
         Ok(bpb) => bpb,
-        Err(error) => return log_fat_error(volume, error),
+        Err(error) => {
+            log_fat_error(volume, error);
+            return false;
+        }
     };
     if let Err(error) = bpb.fits_partition(block_count, logical_block_size) {
-        return log_fit_error(volume, error);
+        log_fit_error(volume, error);
+        return false;
     }
     log_storage_phase_pair(volume, b"fat32", b"ok");
     log(b"drv-xhci: storage ");
@@ -1645,6 +1703,120 @@ fn probe_fat32_volume(
     log_hex(bpb.root_cluster as u64);
     log(b"\n");
     log_storage_phase(b"probe", b"complete");
+    true
+}
+
+/// J543: mount the judged volume through a partition-relative reader, list its root directory,
+/// and read back its first non-empty `.TXT` file (else its first non-empty file). Nothing is
+/// exposed to other processes or written yet.
+fn read_volume_sample(disk: &mut BotDisk, volume: &[u8], first_lba: u64, block_count: u64) {
+    // The probe traced every BOT phase. The volume reads are many more, so from here on only a
+    // failure or an unexpected completion code is logged. — TIMBERDOODLE
+    STORAGE_TRACE.store(false, Ordering::Relaxed);
+    log_storage_phase(b"trace", b"quiet");
+    let reads_before = disk.blocks_read;
+    let mut sectors = PartitionReader::new(&mut *disk, first_lba, block_count);
+    let fat = match FatVolume::mount(&mut sectors) {
+        Ok(fat) => fat,
+        Err(error) => return log_fat_error(volume, error),
+    };
+    log_storage_phase_pair(volume, b"mount", b"ok");
+
+    let mut first_file = None;
+    let mut first_text = None;
+    let mut listed = 0usize;
+    let walked = fat.for_each_in_dir(&mut sectors, fat.bpb().root_cluster, |entry| {
+        log(b"drv-xhci: storage ");
+        log(volume);
+        log(b" root ");
+        log_short_name(&entry.name);
+        log(if entry.is_dir() { b" dir" } else { b" file" });
+        log(b" size=");
+        log_hex(entry.size as u64);
+        log(b" cluster=");
+        log_hex(entry.first_cluster as u64);
+        log(b"\n");
+        if !entry.is_dir() && entry.size > 0 {
+            first_file = first_file.or(Some(*entry));
+            if entry.name[8..] == *b"TXT" {
+                first_text = first_text.or(Some(*entry));
+            }
+        }
+        listed += 1;
+        listed < ROOT_LISTING_MAX
+    });
+    if !walked {
+        return log_storage_phase_pair(volume, b"root", b"read-fail");
+    }
+    log_storage_phase_pair(volume, b"root", b"listed");
+
+    let Some(entry) = first_text.or(first_file) else {
+        return log_storage_phase_pair(volume, b"sample", b"none");
+    };
+    let mut bytes = [0u8; SAMPLE_READ_LEN];
+    let read = fat.read_file(&mut sectors, &entry, &mut bytes);
+    log(b"drv-xhci: storage ");
+    log(volume);
+    log(b" read ");
+    log_short_name(&entry.name);
+    log(b" bytes=");
+    log_hex(read as u64);
+    log(b" of size=");
+    log_hex(entry.size as u64);
+    log(b"\n");
+    log_text_lines(&bytes[..read]);
+    log(b"drv-xhci: storage ");
+    log(volume);
+    log(b" blocks-read=");
+    log_hex(disk.blocks_read - reads_before);
+    log(b"\n");
+    if read == (entry.size as usize).min(SAMPLE_READ_LEN) {
+        log_storage_phase(b"volume-read", b"complete");
+    } else {
+        log_storage_phase(b"volume-read", b"short");
+    }
+}
+
+/// Print a raw 8.3 name the way a listing shows it: `NAME.EXT`, padding dropped.
+fn log_short_name(name: &[u8; 11]) {
+    let mut text = [b'.'; 12];
+    let mut len = 0;
+    let base = name[..8].trim_ascii_end();
+    let ext = name[8..].trim_ascii_end();
+    for (part, separator) in [(base, false), (ext, true)] {
+        if part.is_empty() {
+            continue;
+        }
+        if separator {
+            len += 1;
+        }
+        for byte in part {
+            if byte.is_ascii_graphic() {
+                text[len] = *byte;
+            }
+            len += 1;
+        }
+    }
+    log(&text[..len]);
+}
+
+/// Show text read from a medium: up to [`SAMPLE_SHOW_LINES`] lines of at most 96 bytes, each
+/// prefixed, with anything outside printable ASCII shown as `.`.
+fn log_text_lines(bytes: &[u8]) {
+    let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    for line in text.split(|byte| *byte == b'\n').take(SAMPLE_SHOW_LINES) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut safe = [b'.'; 96];
+        let len = line.len().min(safe.len());
+        for (shown, byte) in safe[..len].iter_mut().zip(line) {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                *shown = *byte;
+            }
+        }
+        log(b"drv-xhci: storage | ");
+        log(&safe[..len]);
+        log(b"\n");
+    }
 }
 
 fn log_mbr_error(error: MbrError) {
@@ -1851,7 +2023,10 @@ fn bulk_transfer(
         return None;
     }
     dsb();
-    log_storage_phase_pair(command_name, phase, b"begin");
+    let trace = STORAGE_TRACE.load(Ordering::Relaxed);
+    if trace {
+        log_storage_phase_pair(command_name, phase, b"begin");
+    }
     ring_slot_doorbell(io, layout, slot_id, dci);
     let Some((cc, remaining, trb_iova)) = poll_transfer_event(io, layout, image, evt, slot_id)
     else {
@@ -1860,7 +2035,9 @@ fn bulk_transfer(
     };
     let _ = ring.reclaim_through(trb_iova);
     dsb();
-    log_storage_cc_pair(command_name, phase, cc, remaining);
+    if trace || cc != 1 {
+        log_storage_cc_pair(command_name, phase, cc, remaining);
+    }
     if remaining > length {
         return None;
     }

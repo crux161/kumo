@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //j514
 //j537
+//j543
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -194,6 +195,14 @@ impl Bpb {
     /// 2 (clusters 0 and 1 are reserved); callers must pass `cluster >= 2`.
     pub const fn cluster_to_sector(&self, cluster: u32) -> u32 {
         self.data_start_sector() + (cluster - 2) * self.sectors_per_cluster as u32
+    }
+
+    /// One past the highest cluster number the volume can hold: its data-region cluster count
+    /// plus the two reserved numbers. A chain link at or past this is corrupt.
+    pub const fn cluster_limit(&self) -> u32 {
+        self.total_sectors.saturating_sub(self.data_start_sector())
+            / self.sectors_per_cluster as u32
+            + 2
     }
 
     /// Sector index of the first sector of the root directory.
@@ -416,6 +425,52 @@ pub trait SectorWriter {
     }
 }
 
+/// A device read in whole logical blocks of [`SECTOR_SIZE`] bytes by 64-bit LBA: what a block
+/// driver offers before anything knows about partitions.
+pub trait BlockReader {
+    /// Read device block `lba` into `buf`. Returns `false` on failure.
+    fn read_block(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool;
+}
+
+impl<D: BlockReader + ?Sized> BlockReader for &mut D {
+    fn read_block(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+        (**self).read_block(lba, buf)
+    }
+}
+
+/// The [`SectorReader`] for one partition of a [`BlockReader`]: volume sector `n` is device block
+/// `first_lba + n`, so [`FatVolume::mount`] reads the partition's own boot sector. Sectors at or
+/// past `sector_count` are refused, so a corrupt FAT cannot steer a read out of the partition
+/// (J543).
+pub struct PartitionReader<D> {
+    device: D,
+    first_lba: u64,
+    sector_count: u64,
+}
+
+impl<D> PartitionReader<D> {
+    pub const fn new(device: D, first_lba: u64, sector_count: u64) -> Self {
+        Self {
+            device,
+            first_lba,
+            sector_count,
+        }
+    }
+}
+
+impl<D: BlockReader> SectorReader for PartitionReader<D> {
+    fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+        let lba = lba as u64;
+        if lba >= self.sector_count {
+            return false;
+        }
+        match self.first_lba.checked_add(lba) {
+            Some(device_lba) => self.device.read_block(device_lba, buf),
+            None => false,
+        }
+    }
+}
+
 /// Failure classes for FAT mutation. The vfs server maps these onto its stable
 /// wire statuses rather than leaking FAT details to clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +516,58 @@ impl FatVolume {
         fat_entry(&buf, index)
     }
 
+    /// Visit every file and subdirectory entry of the directory whose data begins at
+    /// `dir_cluster`, in on-disk order, until `visit` returns `false` or the directory ends.
+    /// Deleted slots, long-name components and the volume label are skipped; each visited entry
+    /// carries its [`DirLocation`]. Returns `false` if a sector read failed, or the chain left
+    /// the volume or looped, before the directory ended (J543).
+    pub fn for_each_in_dir<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        dir_cluster: u32,
+        mut visit: impl FnMut(&DirEntry) -> bool,
+    ) -> bool {
+        let spc = self.bpb.sectors_per_cluster as u32;
+        let limit = self.bpb.cluster_limit();
+        let mut cluster = dir_cluster;
+        let mut buf = [0u8; SECTOR_SIZE];
+        // A directory has fewer clusters than the volume; more hops than that is a cycle.
+        for _ in 0..limit {
+            if cluster < 2 || cluster >= limit {
+                return false;
+            }
+            let first = self.bpb.cluster_to_sector(cluster);
+            for s in 0..spc {
+                if !reader.read_sector(first + s, &mut buf) {
+                    return false;
+                }
+                let mut off = 0;
+                while off + DIR_ENTRY_SIZE <= SECTOR_SIZE {
+                    match parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]) {
+                        DirSlot::End => return true,
+                        DirSlot::File(mut e) => {
+                            e.location = Some(DirLocation {
+                                sector: first + s,
+                                offset: off as u16,
+                            });
+                            if !visit(&e) {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    off += DIR_ENTRY_SIZE;
+                }
+            }
+            match self.next_link(reader, cluster) {
+                Some(FatEntry::Next(n)) => cluster = n,
+                Some(FatEntry::End) => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Find a file or subdirectory by raw 8.3 name (space-padded, e.g.
     /// `b"HELLO   TXT"`) inside the directory whose data begins at `dir_cluster`.
     /// Walks that directory's own cluster chain sector by sector and returns the
@@ -478,39 +585,14 @@ impl FatVolume {
         dir_cluster: u32,
         name: &[u8; 11],
     ) -> Option<DirEntry> {
-        if dir_cluster < 2 {
-            return None;
-        }
-        let spc = self.bpb.sectors_per_cluster as u32;
-        let mut cluster = dir_cluster;
-        let mut buf = [0u8; SECTOR_SIZE];
-        loop {
-            let first = self.bpb.cluster_to_sector(cluster);
-            for s in 0..spc {
-                if !reader.read_sector(first + s, &mut buf) {
-                    return None;
-                }
-                let mut off = 0;
-                while off + DIR_ENTRY_SIZE <= SECTOR_SIZE {
-                    match parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]) {
-                        DirSlot::End => return None,
-                        DirSlot::File(mut e) if &e.name == name => {
-                            e.location = Some(DirLocation {
-                                sector: first + s,
-                                offset: off as u16,
-                            });
-                            return Some(e);
-                        }
-                        _ => {}
-                    }
-                    off += DIR_ENTRY_SIZE;
-                }
+        let mut found = None;
+        self.for_each_in_dir(reader, dir_cluster, |entry| {
+            if &entry.name == name {
+                found = Some(*entry);
             }
-            match self.next_link(reader, cluster) {
-                Some(FatEntry::Next(n)) => cluster = n,
-                _ => return None,
-            }
-        }
+            found.is_none()
+        });
+        found
     }
 
     /// Find a file or subdirectory by raw 8.3 name in the **root** directory — a
@@ -1624,5 +1706,135 @@ mod tests {
             FatVolume::mount(&mut DeadDisk),
             Err(FatError::ReadFailed)
         ));
+    }
+
+    /// A whole device with the fixture volume at block `at`, as a stick carries its FAT32
+    /// partition behind a partition table. Blocks before it read as 0xEE filler, so a reader that
+    /// forgot the offset would mount garbage. Counts the device reads it serves.
+    struct ShiftedDevice {
+        at: u64,
+        reads: u32,
+    }
+
+    impl BlockReader for ShiftedDevice {
+        fn read_block(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            self.reads += 1;
+            if lba < self.at {
+                *buf = [0xEE; SECTOR_SIZE];
+                return true;
+            }
+            FixtureDisk.read_sector((lba - self.at) as u32, buf)
+        }
+    }
+
+    #[test]
+    fn a_partition_reader_mounts_the_volume_at_its_own_offset() {
+        // The J542 MBR stick's volume starts at LBA 2048.
+        let mut device = ShiftedDevice { at: 2048, reads: 0 };
+        let mut volume = PartitionReader::new(&mut device, 2048, TOTAL as u64);
+        let fat = FatVolume::mount(&mut volume).unwrap();
+        assert_eq!(fat.bpb().root_cluster, ROOT_CLUSTER);
+        let hello = fat.resolve_path(&mut volume, b"/HELLO.TXT").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(fat.read_file(&mut volume, &hello, &mut out), 6);
+        assert_eq!(&out[..6], b"hello!");
+        let boot = fat
+            .resolve_path(&mut volume, b"/EFI/BOOT/BOOTAA64.EFI")
+            .unwrap();
+        assert_eq!(boot.size, 512);
+    }
+
+    #[test]
+    fn a_partition_reader_never_reads_past_its_partition() {
+        let mut device = ShiftedDevice { at: 40, reads: 0 };
+        // A partition too short to reach the root directory at volume sector 96.
+        let mut volume = PartitionReader::new(&mut device, 40, 96);
+        let fat = FatVolume::mount(&mut volume).unwrap();
+        let mut buf = [0u8; SECTOR_SIZE];
+        assert!(!volume.read_sector(96, &mut buf));
+        assert!(!volume.read_sector(u32::MAX, &mut buf));
+        assert!(!fat.for_each_in_dir(&mut volume, ROOT_CLUSTER, |_| true));
+        assert_eq!(fat.find_in_root(&mut volume, b"HELLO   TXT"), None);
+        // Only the boot sector reached the device; every refused sector stopped short of it.
+        assert_eq!(device.reads, 1);
+
+        let mut device = ShiftedDevice { at: 0, reads: 0 };
+        let mut near_the_end = PartitionReader::new(&mut device, u64::MAX - 1, 4);
+        assert!(!near_the_end.read_sector(2, &mut buf));
+        assert_eq!(device.reads, 0);
+    }
+
+    #[test]
+    fn for_each_in_dir_lists_files_and_dirs_in_disk_order() {
+        let fat = FatVolume::mount(&mut FixtureDisk).unwrap();
+        let mut names = [[0u8; 11]; 8];
+        let mut count = 0;
+        assert!(
+            fat.for_each_in_dir(&mut FixtureDisk, ROOT_CLUSTER, |entry| {
+                names[count] = entry.name;
+                count += 1;
+                assert_eq!(entry.location.unwrap().sector, 96);
+                true
+            })
+        );
+        // The volume label is skipped; the listing stops at the 0x00 end marker.
+        assert_eq!(
+            &names[..count],
+            &[
+                *b"README  TXT",
+                *b"HELLO   TXT",
+                *b"BIG     BIN",
+                *b"EFI        "
+            ]
+        );
+
+        let mut subdir = 0;
+        assert!(fat.for_each_in_dir(&mut FixtureDisk, 6, |entry| {
+            subdir += 1;
+            entry.name != *b"..         "
+        }));
+        assert_eq!(subdir, 2, "visit returning false stops the walk at `..`");
+    }
+
+    /// The fixture, with the root directory's sector packed full (no end marker) and its FAT
+    /// entry pointing back at itself.
+    struct LoopingRoot;
+
+    impl SectorReader for LoopingRoot {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            match lba {
+                32 => {
+                    FixtureDisk.read_sector(32, buf);
+                    buf[8..12].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
+                    true
+                }
+                96 => {
+                    for slot in buf.chunks_exact_mut(DIR_ENTRY_SIZE) {
+                        slot.copy_from_slice(&dir_entry(b"LOOP    TXT", attr::ARCHIVE, 3, 1));
+                    }
+                    true
+                }
+                _ => FixtureDisk.read_sector(lba, buf),
+            }
+        }
+    }
+
+    #[test]
+    fn a_directory_chain_that_loops_or_leaves_the_volume_is_refused() {
+        let fat = FatVolume::mount(&mut LoopingRoot).unwrap();
+        assert_eq!(fat.bpb().cluster_limit(), 4002);
+        let mut visits = 0u32;
+        assert!(!fat.for_each_in_dir(&mut LoopingRoot, ROOT_CLUSTER, |_| {
+            visits += 1;
+            true
+        }));
+        assert_eq!(
+            visits,
+            4002 * 16,
+            "bounded by one pass per possible cluster"
+        );
+        assert_eq!(fat.find_in_root(&mut LoopingRoot, b"MISSING TXT"), None);
+        assert!(!fat.for_each_in_dir(&mut FixtureDisk, 4002, |_| true));
+        assert!(!fat.for_each_in_dir(&mut FixtureDisk, 1, |_| true));
     }
 }
