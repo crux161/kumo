@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //j514
 //j547
+//j548
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -32,7 +33,15 @@ pub const MAX_OPEN_FILES: usize = 8;
 pub const REQUEST_BUF_BYTES: usize = WRITE_HEADER_LEN + MAX_WRITE_DATA;
 
 /// Inline read payload cap for this first userspace loop, plus one status byte.
-pub const REPLY_BUF_BYTES: usize = 1 + 256;
+pub const READ_REPLY_BYTES: usize = 1 + 256;
+
+/// The serve loop's reply buffer. A read still answers at most [`READ_REPLY_BYTES`]; the rest
+/// is for directory pages, which must always hold at least one record with the longest name
+/// a record carries (`2 + 10 + 255` bytes). If one did not fit, a page with no records would
+/// read as the end of the directory (J548).
+/// — KESTREL
+pub const REPLY_BUF_BYTES: usize = 1024;
+const _: () = assert!(REPLY_BUF_BYTES >= 2 + 10 + u8::MAX as usize);
 
 /// Per-server open file table. Handles are small positive integers; `0` is
 /// deliberately invalid so protocol bugs are easy to spot.
@@ -236,7 +245,7 @@ fn read<R: SectorReader>(
     }
 
     reply[0] = VFS_OK;
-    let cap = (len as usize).min(reply.len() - 1);
+    let cap = (len as usize).min(reply.len().min(READ_REPLY_BYTES) - 1);
     let n = volume.read_file_at(reader, &file.entry, offset, &mut reply[1..1 + cap]);
     1 + n
 }
@@ -300,7 +309,7 @@ fn flush<R: SectorReader + SectorWriter>(
 
 /// List the directory at `path` from its `start`-th entry, as many entries as the reply holds
 /// (J547). `.` and `..` are left out, as `ls` leaves them out, and do not count toward
-/// `start`.
+/// `start`. Each entry carries its long name when it has one (J548).
 fn read_dir<R: SectorReader>(
     volume: &FatVolume,
     reader: &mut R,
@@ -316,7 +325,7 @@ fn read_dir<R: SectorReader>(
         return 0;
     };
     let mut index = 0u32;
-    let walked = volume.for_each_in_dir(reader, cluster, |entry| {
+    let walked = volume.for_each_named_in_dir(reader, cluster, |entry, name| {
         if entry.name[0] == b'.' {
             return true;
         }
@@ -324,8 +333,18 @@ fn read_dir<R: SectorReader>(
             index += 1;
             return true;
         }
-        let name = entry.short_name();
-        if !listing.push(entry.is_dir(), entry.size as u64, name.as_bytes()) {
+        // Preserve a usable name when UTF-8 exceeds the wire/path limit. A truncated long
+        // name would display successfully but name no file on the volume. — KESTREL
+        let short = entry.short_name();
+        let prefix_len = path.len() + usize::from(!path.ends_with(b"/"));
+        let listed_name = if name.as_bytes().len() <= u8::MAX as usize
+            && prefix_len + name.as_bytes().len() <= kumo_vfs::MAX_PATH
+        {
+            name.as_bytes()
+        } else {
+            short.as_bytes()
+        };
+        if !listing.push(entry.is_dir(), entry.size as u64, listed_name) {
             return false;
         }
         index += 1;
@@ -871,5 +890,168 @@ mod tests {
     fn listing_a_file_or_a_missing_path_reports_why() {
         assert_eq!(list(b"/HELLO.TXT", 0, REPLY_BUF_BYTES), Err(VFS_NOT_DIR));
         assert_eq!(list(b"/NOPE", 0, REPLY_BUF_BYTES), Err(VFS_NOT_FOUND));
+    }
+
+    /// The fixture with its root directory holding long-named entries (J548): `Hello there.txt`
+    /// on `HELLO.TXT`'s data, the `EFI` directory, and a `._Hello there.txt` AppleDouble twin.
+    struct LongNameDisk<'a>(&'a str);
+
+    fn long_name_slots(long: &str, short: &[u8; 11], out: &mut [[u8; 32]]) -> usize {
+        let mut units = [0xFFFFu16; 260];
+        let mut n = 0;
+        for unit in long.encode_utf16() {
+            units[n] = unit;
+            n += 1;
+        }
+        if n % 13 != 0 {
+            units[n] = 0;
+        }
+        let slots = n.div_ceil(13);
+        for (index, order) in (1..=slots).rev().enumerate() {
+            let slot = &mut out[index];
+            slot[0] = order as u8 | if order == slots { 0x40 } else { 0 };
+            slot[11] = attr::LONG_NAME;
+            slot[13] = kumo_fatfs::short_name_checksum(short);
+            let offsets = (1..11)
+                .step_by(2)
+                .chain((14..26).step_by(2))
+                .chain((28..32).step_by(2));
+            for (unit, at) in units[(order - 1) * 13..order * 13].iter().zip(offsets) {
+                slot[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+        }
+        slots
+    }
+
+    impl SectorReader for LongNameDisk<'_> {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            if lba != 96 {
+                return FixtureDisk.read_sector(lba, buf);
+            }
+            *buf = [0u8; SECTOR_SIZE];
+            let mut slots = [[0u8; 32]; 16];
+            let mut at = long_name_slots(self.0, b"HELLOT~1TXT", &mut slots);
+            slots[at] = dir_entry(b"HELLOT~1TXT", attr::ARCHIVE, 3, 6);
+            at += 1;
+            slots[at] = dir_entry(b"EFI        ", attr::DIRECTORY, 4, 0);
+            at += 1;
+            at += long_name_slots("._Hello there.txt", b"_HELLO~1TXT", &mut slots[at..]);
+            slots[at] = dir_entry(b"_HELLO~1TXT", attr::ARCHIVE, 3, 6);
+            for (raw, slot) in buf.chunks_exact_mut(32).zip(&slots) {
+                raw.copy_from_slice(slot);
+            }
+            true
+        }
+    }
+
+    impl SectorWriter for LongNameDisk<'_> {
+        fn write_sector(&mut self, _lba: u32, _buf: &[u8; SECTOR_SIZE]) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn listings_carry_long_names_and_opens_take_them() {
+        let mut disk = LongNameDisk("Hello there.txt");
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let request = encode_request(Request::ReadDir {
+            path: b"/",
+            start: 0,
+        });
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        let (count, records) = parse_dir_reply(&reply[..n]).unwrap();
+        assert_eq!(count, 3);
+        let names: Vec<Vec<u8>> = records.map(|record| record.name.to_vec()).collect();
+        assert_eq!(
+            names,
+            [
+                b"Hello there.txt".to_vec(),
+                b"EFI".to_vec(),
+                b"._Hello there.txt".to_vec()
+            ]
+        );
+
+        // The listed name opens the file, without regard to ASCII case.
+        let request = encode_request(Request::open(b"/hello THERE.txt"));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(parse_open_reply(&reply[..n]), Ok((1, 6)));
+        let request = encode_request(Request::read(1, 0, 256));
+        let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+        assert_eq!(read_payload(&reply[..n]), Ok(b"hello!".as_slice()));
+    }
+
+    #[test]
+    fn an_oversized_name_lists_an_alias_that_opens_the_file() {
+        for len in [84, 85, 100] {
+            let long = "語".repeat(len);
+            let mut disk = LongNameDisk(&long);
+            let volume = FatVolume::mount(&mut disk).unwrap();
+            let mut table = OpenTable::new();
+            let request = encode_request(Request::ReadDir {
+                path: b"/",
+                start: 0,
+            });
+            let mut reply = [0u8; REPLY_BUF_BYTES];
+            let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+            let (_, mut records) = parse_dir_reply(&reply[..n]).unwrap();
+            let name = records.next().unwrap().name;
+            assert_eq!(
+                name,
+                if len < 85 {
+                    long.as_bytes()
+                } else {
+                    b"HELLOT~1.TXT"
+                }
+            );
+            let mut path = alloc::vec![b'/'];
+            path.extend_from_slice(name);
+            let request = encode_request(Request::open(&path));
+            let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+            assert_eq!(parse_open_reply(&reply[..n]), Ok((1, 6)));
+        }
+    }
+
+    #[test]
+    fn long_name_pages_advance_past_hidden_entries_until_empty() {
+        let mut disk = LongNameDisk("Hello there.txt");
+        let volume = FatVolume::mount(&mut disk).unwrap();
+        let mut table = OpenTable::new();
+        let mut names = Vec::new();
+        for start in 0..=3 {
+            let request = encode_request(Request::ReadDir { path: b"/", start });
+            let mut reply = [0u8; 30];
+            let n = dispatch(&volume, &mut disk, &mut table, &request, &mut reply);
+            let (count, records) = parse_dir_reply(&reply[..n]).unwrap();
+            assert_eq!(count, u8::from(start < 3));
+            names.extend(records.map(|record| record.name.to_vec()));
+        }
+        assert_eq!(
+            names,
+            [
+                b"Hello there.txt".to_vec(),
+                b"EFI".to_vec(),
+                b"._Hello there.txt".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_stay_capped_at_the_inline_payload() {
+        let volume = mounted();
+        let mut table = OpenTable::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let mut entry = volume
+            .resolve_path(&mut FixtureDisk, b"/HELLO.TXT")
+            .unwrap();
+        entry.size = SECTOR_SIZE as u32;
+        let handle = table.insert(entry, OPEN_READ).unwrap();
+        let request = encode_request(Request::read(handle, 0, 4096));
+        let n = dispatch(&volume, &mut FixtureDisk, &mut table, &request, &mut reply);
+        assert_eq!(n, READ_REPLY_BYTES);
+        let payload = read_payload(&reply[..n]).unwrap();
+        assert_eq!(&payload[..6], b"hello!");
+        assert!(payload[6..].iter().all(|byte| *byte == 0));
     }
 }

@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j514
 //j537
 //j543
 //j545
 //j547
+//j548
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -301,8 +301,9 @@ pub enum DirSlot {
     End,
     /// First byte 0xE5 — a deleted/free entry; skip it but keep scanning.
     Free,
-    /// A long-filename (LFN) component; skip it (this slice ignores LFNs).
-    LongName,
+    /// One VFAT long-name slot. A run of them spells the long name of the short entry that
+    /// follows ([`FatVolume::for_each_named_in_dir`], J548).
+    LongName(LongNameSlot),
     /// The volume-label entry and its space-padded 11-byte name; not a file, skip it for
     /// listings.
     VolumeLabel([u8; 11]),
@@ -323,7 +324,25 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
     }
     let attr = raw[11];
     if attr & attr::LONG_NAME == attr::LONG_NAME {
-        return DirSlot::LongName;
+        if attr != attr::LONG_NAME || raw[0] & 0xA0 != 0 || raw[12] != 0 || u16_le(raw, 26) != 0 {
+            return DirSlot::Free;
+        }
+        let mut units = [0u16; LFN_UNITS_PER_SLOT];
+        // The 13 UTF-16LE units sit in three runs: bytes 1..11, 14..26 and 28..32.
+        for (unit, at) in units.iter_mut().zip(
+            (1..11)
+                .step_by(2)
+                .chain((14..26).step_by(2))
+                .chain((28..32).step_by(2)),
+        ) {
+            *unit = u16_le(raw, at);
+        }
+        return DirSlot::LongName(LongNameSlot {
+            order: raw[0] & LFN_ORDER_MASK,
+            last: raw[0] & LFN_LAST_SLOT != 0,
+            checksum: raw[13],
+            units,
+        });
     }
     if attr & attr::VOLUME_ID != 0 {
         return DirSlot::VolumeLabel(raw[0..11].try_into().unwrap());
@@ -344,6 +363,152 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
 /// placeholder formatters write for an unnamed volume.
 fn label_is_named(label: &[u8; 11]) -> bool {
     label != b"NO NAME    " && label.iter().any(|byte| *byte != b' ' && *byte != 0)
+}
+
+/// UTF-16 code units in the longest VFAT long name.
+pub const LONG_NAME_UNITS: usize = 255;
+/// Bytes in the longest VFAT long name once it is UTF-8: three per unit at worst (a
+/// surrogate pair is two units and four bytes).
+pub const LONG_NAME_UTF8_MAX: usize = 3 * LONG_NAME_UNITS;
+const LFN_UNITS_PER_SLOT: usize = 13;
+/// A long name spans at most 20 slots (260 units, of which 255 may be used).
+const LFN_MAX_SLOTS: usize = 20;
+const LFN_ORDER_MASK: u8 = 0x1F;
+const LFN_LAST_SLOT: u8 = 0x40;
+
+/// One VFAT long-name slot, decoded (J548).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongNameSlot {
+    /// 1-based position of this slot's 13 units within the name.
+    pub order: u8,
+    /// Set on the physically first slot of a run, which holds the end of the name.
+    pub last: bool,
+    /// Checksum of the 8.3 name of the short entry this slot belongs to.
+    pub checksum: u8,
+    pub units: [u16; LFN_UNITS_PER_SLOT],
+}
+
+/// The checksum a long-name slot carries of its short entry's raw 8.3 name.
+pub fn short_name_checksum(name: &[u8; 11]) -> u8 {
+    name.iter()
+        .fold(0u8, |sum, byte| sum.rotate_right(1).wrapping_add(*byte))
+}
+
+/// Assembles a long name from the slots before its short entry. A run opens with the slot
+/// marked `last`, holding the name's end, and counts down to order 1 with one checksum
+/// throughout. A broken run, or a checksum that does not match the short entry, abandons the
+/// long name: the entry then shows its 8.3 name, which is what every VFAT reader does with a
+/// name another system's 8.3-only writer left stale.
+/// — KESTREL
+#[derive(Clone)]
+struct LongNameBuilder {
+    units: [u16; LFN_MAX_SLOTS * LFN_UNITS_PER_SLOT],
+    /// Slots in the run being built; 0 when none is.
+    slots: u8,
+    /// The order the next slot must carry; 0 once the run is complete.
+    expected: u8,
+    checksum: u8,
+}
+
+impl LongNameBuilder {
+    const fn new() -> Self {
+        Self {
+            units: [0; LFN_MAX_SLOTS * LFN_UNITS_PER_SLOT],
+            slots: 0,
+            expected: 0,
+            checksum: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.slots = 0;
+        self.expected = 0;
+    }
+
+    fn push(&mut self, slot: &LongNameSlot) {
+        if slot.last {
+            if slot.order == 0 || slot.order as usize > LFN_MAX_SLOTS {
+                return self.reset();
+            }
+            self.slots = slot.order;
+            self.checksum = slot.checksum;
+        } else if self.expected == 0
+            || slot.order != self.expected
+            || slot.checksum != self.checksum
+        {
+            return self.reset();
+        }
+        let at = (slot.order as usize - 1) * LFN_UNITS_PER_SLOT;
+        self.units[at..at + LFN_UNITS_PER_SLOT].copy_from_slice(&slot.units);
+        self.expected = slot.order - 1;
+    }
+
+    /// The long name for the short entry `short`, if a complete run with its checksum came
+    /// just before it. Either way the builder is ready for the next entry.
+    fn finish(&mut self, short: &[u8; 11]) -> Option<&[u16]> {
+        let slots = self.slots as usize;
+        let complete =
+            slots != 0 && self.expected == 0 && self.checksum == short_name_checksum(short);
+        self.reset();
+        if !complete {
+            return None;
+        }
+        let units = &self.units[..slots * LFN_UNITS_PER_SLOT];
+        // The name ends at a 0x0000 unit, unless it fills its last slot exactly.
+        let len = units
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(units.len());
+        if !(1..=LONG_NAME_UNITS).contains(&len)
+            || units[..len].contains(&0xFFFF)
+            || (len < units.len() && units[len + 1..].iter().any(|unit| *unit != 0xFFFF))
+        {
+            return None;
+        }
+        Some(&units[..len])
+    }
+}
+
+/// An entry's name as people see it: its VFAT long name, as UTF-8, when its slots are intact,
+/// else its 8.3 name `NAME.EXT` (J548). Units that are not valid UTF-16 become U+FFFD.
+#[derive(Clone)]
+pub struct EntryName {
+    bytes: [u8; LONG_NAME_UTF8_MAX],
+    len: usize,
+    long: bool,
+}
+
+impl EntryName {
+    fn new(entry: &DirEntry, long: Option<&[u16]>) -> Self {
+        let mut name = Self {
+            bytes: [0; LONG_NAME_UTF8_MAX],
+            len: 0,
+            long: long.is_some(),
+        };
+        match long {
+            Some(units) => {
+                for decoded in char::decode_utf16(units.iter().copied()) {
+                    let c = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+                    name.len += c.encode_utf8(&mut name.bytes[name.len..]).len();
+                }
+            }
+            None => {
+                let short = entry.short_name();
+                name.bytes[..short.as_bytes().len()].copy_from_slice(short.as_bytes());
+                name.len = short.as_bytes().len();
+            }
+        }
+        name
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    /// Whether this is a long name rather than the 8.3 fallback.
+    pub fn is_long(&self) -> bool {
+        self.long
+    }
 }
 
 /// Encode one path component into the raw 8.3 name field a [`DirEntry`] stores
@@ -590,6 +755,57 @@ impl FatVolume {
         })
     }
 
+    /// [`Self::for_each_in_dir`] with each entry's [`EntryName`]: the VFAT long name its preceding
+    /// slots spell, when they are intact and their checksum matches, else its 8.3 name (J548).
+    pub fn for_each_named_in_dir<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        dir_cluster: u32,
+        mut visit: impl FnMut(&DirEntry, &EntryName) -> bool,
+    ) -> bool {
+        let mut long = LongNameBuilder::new();
+        self.walk_dir_slots(reader, dir_cluster, |slot, location| match slot {
+            DirSlot::LongName(slot) => {
+                long.push(&slot);
+                true
+            }
+            DirSlot::File(mut entry) => {
+                entry.location = Some(location);
+                let name = EntryName::new(&entry, long.finish(&entry.name));
+                visit(&entry, &name)
+            }
+            // A deleted slot or the label between a run and its short entry breaks the run.
+            _ => {
+                long.reset();
+                true
+            }
+        })
+    }
+
+    /// Find an entry by the name a person types: its long name, comparing ASCII letters
+    /// without case as FAT does, or its 8.3 name (J548). `.` and `..` match nothing.
+    pub fn find_named_in_dir<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        dir_cluster: u32,
+        component: &[u8],
+    ) -> Option<DirEntry> {
+        if component.is_empty() || component == b"." || component == b".." {
+            return None;
+        }
+        let short = name_to_83(component);
+        let mut found = None;
+        self.for_each_named_in_dir(reader, dir_cluster, |entry, name| {
+            if short == Some(entry.name)
+                || (name.is_long() && name.as_bytes().eq_ignore_ascii_case(component))
+            {
+                found = Some(*entry);
+            }
+            found.is_none()
+        });
+        found
+    }
+
     /// The volume's label: the root directory's label entry, which a rename updates, else the
     /// boot sector's `BS_VolLab`. `None` when neither holds a name: blank, or the `NO NAME`
     /// formatters write for an unnamed volume (J545).
@@ -695,12 +911,13 @@ impl FatVolume {
     /// Resolve a `/`-separated path from the root to the [`DirEntry`] it names —
     /// the ESP lookup `DESIGN/010 §4` needs (`/EFI/BOOT/BOOTAA64.EFI`). Splits
     /// the path on `/` (a leading slash and empty components are ignored, so
-    /// `/EFI/BOOT/X`, `EFI/BOOT/X`, and `EFI//BOOT/X` are equivalent), encodes
-    /// each component with [`name_to_83`], and descends with [`find_in_dir`].
+    /// `/EFI/BOOT/X`, `EFI/BOOT/X`, and `EFI//BOOT/X` are equivalent), and
+    /// descends with [`find_named_in_dir`]: a component matches an entry's long
+    /// name or its 8.3 name (J548).
     ///
     /// Every component except the last must resolve to a subdirectory; otherwise
-    /// — or if any component is missing, is not a valid 8.3 name, or the path has
-    /// no components — returns `None`. Allocation-free.
+    /// — or if any component is missing, or the path has no components — returns
+    /// `None`. Allocation-free.
     pub fn resolve_path<R: SectorReader>(&self, reader: &mut R, path: &[u8]) -> Option<DirEntry> {
         let mut comps = path
             .split(|&b| b == b'/')
@@ -708,8 +925,7 @@ impl FatVolume {
             .peekable();
         let mut cluster = self.bpb.root_cluster;
         while let Some(comp) = comps.next() {
-            let name = name_to_83(comp)?;
-            let entry = self.find_in_dir(reader, cluster, &name)?;
+            let entry = self.find_named_in_dir(reader, cluster, comp)?;
             if comps.peek().is_none() {
                 return Some(entry); // last component: the target itself
             }
@@ -1343,7 +1559,14 @@ mod tests {
         let mut lfn = [0u8; DIR_ENTRY_SIZE];
         lfn[0] = 0x41; // LFN sequence byte (non-zero, non-0xE5)
         lfn[11] = attr::LONG_NAME;
-        assert_eq!(parse_dir_entry(&lfn), DirSlot::LongName);
+        lfn[13] = 0x5a;
+        lfn[1] = b'h';
+        lfn[30] = b'z';
+        let DirSlot::LongName(slot) = parse_dir_entry(&lfn) else {
+            panic!("not a long-name slot");
+        };
+        assert_eq!((slot.order, slot.last, slot.checksum), (1, true, 0x5a));
+        assert_eq!((slot.units[0], slot.units[12]), (b'h' as u16, b'z' as u16));
     }
 
     #[test]
@@ -2005,5 +2228,312 @@ mod tests {
             name(b"\x05BC     TXT", attr::ARCHIVE).as_bytes(),
             b"\xE5BC.TXT"
         );
+    }
+
+    /// The checksum's reference values, from the spec's own formula
+    /// (`sum = ((sum & 1) << 7) + (sum >> 1) + byte`), computed outside this crate.
+    #[test]
+    fn short_name_checksums_match_the_spec() {
+        assert_eq!(short_name_checksum(b"LOVESP~2MP4"), 0xbf);
+        assert_eq!(short_name_checksum(b"HELLO   TXT"), 0xf1);
+        assert_eq!(short_name_checksum(b"LOREM_JPTXT"), 0xca);
+    }
+
+    /// Write `long`'s VFAT slots (disk order: the `last` slot first) and then its short entry
+    /// into `out`; returns how many slots were written.
+    fn named_entry(
+        long: &str,
+        short: &[u8; 11],
+        attr: u8,
+        cluster: u32,
+        size: u32,
+        out: &mut [[u8; DIR_ENTRY_SIZE]],
+    ) -> usize {
+        let mut units = [0xFFFFu16; LFN_MAX_SLOTS * LFN_UNITS_PER_SLOT];
+        let mut n = 0;
+        for unit in long.encode_utf16() {
+            units[n] = unit;
+            n += 1;
+        }
+        if n % LFN_UNITS_PER_SLOT != 0 {
+            units[n] = 0;
+        }
+        let slots = n.div_ceil(LFN_UNITS_PER_SLOT);
+        let checksum = short_name_checksum(short);
+        for (index, order) in (1..=slots).rev().enumerate() {
+            let slot = &mut out[index];
+            *slot = [0; DIR_ENTRY_SIZE];
+            slot[0] = order as u8 | if order == slots { LFN_LAST_SLOT } else { 0 };
+            slot[11] = attr::LONG_NAME;
+            slot[13] = checksum;
+            let chunk = &units[(order - 1) * LFN_UNITS_PER_SLOT..order * LFN_UNITS_PER_SLOT];
+            let offsets = (1..11)
+                .step_by(2)
+                .chain((14..26).step_by(2))
+                .chain((28..32).step_by(2));
+            for (unit, at) in chunk.iter().zip(offsets) {
+                slot[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+        }
+        out[slots] = dir_entry(short, attr, cluster, size);
+        slots + 1
+    }
+
+    /// The fixture with its root directory replaced by `root` (sector 96), optionally chained
+    /// into a second cluster (10, sector 104) holding `more`.
+    struct NamedDisk {
+        root: [[u8; DIR_ENTRY_SIZE]; 16],
+        more: Option<[[u8; DIR_ENTRY_SIZE]; 16]>,
+    }
+
+    impl SectorReader for NamedDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            match lba {
+                96 => {
+                    for (slot, raw) in buf.chunks_exact_mut(DIR_ENTRY_SIZE).zip(&self.root) {
+                        slot.copy_from_slice(raw);
+                    }
+                    true
+                }
+                104 => {
+                    *buf = [0; SECTOR_SIZE];
+                    if let Some(more) = &self.more {
+                        for (slot, raw) in buf.chunks_exact_mut(DIR_ENTRY_SIZE).zip(more) {
+                            slot.copy_from_slice(raw);
+                        }
+                    }
+                    true
+                }
+                32 if self.more.is_some() => {
+                    FixtureDisk.read_sector(32, buf);
+                    // The root's cluster 2 continues in cluster 10, which ends the chain.
+                    buf[8..12].copy_from_slice(&10u32.to_le_bytes());
+                    buf[40..44].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+                    true
+                }
+                _ => FixtureDisk.read_sector(lba, buf),
+            }
+        }
+    }
+
+    /// The names a named walk of the root reports, and whether each is long.
+    fn walked_names(disk: &mut NamedDisk) -> ([[u8; 64]; 8], [usize; 8], [bool; 8], usize) {
+        let fat = FatVolume::mount(disk).unwrap();
+        let (mut names, mut lens, mut long, mut count) = ([[0u8; 64]; 8], [0; 8], [false; 8], 0);
+        assert!(fat.for_each_named_in_dir(disk, ROOT_CLUSTER, |_, name| {
+            names[count][..name.as_bytes().len()].copy_from_slice(name.as_bytes());
+            lens[count] = name.as_bytes().len();
+            long[count] = name.is_long();
+            count += 1;
+            true
+        }));
+        (names, lens, long, count)
+    }
+
+    #[test]
+    fn long_names_decode_to_utf8() {
+        let mut root = [[0u8; DIR_ENTRY_SIZE]; 16];
+        let mut at = 0;
+        at += named_entry(
+            "Love Spell (Remix).mp4",
+            b"LOVESP~2MP4",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root[at..],
+        );
+        at += named_entry(
+            "日本語のテキスト.txt",
+            b"___~1   TXT",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root[at..],
+        );
+        at += named_entry(
+            "\u{1F3B5} song.txt",
+            b"SONG~1  TXT",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root[at..],
+        );
+        root[at] = dir_entry(b"HELLO   TXT", attr::ARCHIVE, 3, 6);
+        let mut disk = NamedDisk { root, more: None };
+        let (names, lens, long, count) = walked_names(&mut disk);
+        assert_eq!(count, 4);
+        assert_eq!(&names[0][..lens[0]], "Love Spell (Remix).mp4".as_bytes());
+        assert_eq!(&names[1][..lens[1]], "日本語のテキスト.txt".as_bytes());
+        assert_eq!(&names[2][..lens[2]], "\u{1F3B5} song.txt".as_bytes());
+        assert_eq!(&names[3][..lens[3]], b"HELLO.TXT");
+        assert_eq!(long, [true, true, true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn a_stale_or_broken_run_falls_back_to_the_short_name() {
+        let mut root = [[0u8; DIR_ENTRY_SIZE]; 16];
+        // A run whose checksum belongs to another short name: an 8.3-only writer renamed it.
+        let n = named_entry(
+            "Stale long name.txt",
+            b"OTHER   TXT",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root,
+        );
+        root[n - 1] = dir_entry(b"RENAMED TXT", attr::ARCHIVE, 3, 6);
+        // A run missing its middle slot.
+        let at = n;
+        let m = named_entry(
+            "A name long enough for three slots.txt",
+            b"ANAME~1 TXT",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root[at..],
+        );
+        assert_eq!(m, 4);
+        root.copy_within(at + 2..at + 4, at + 1);
+        // A deleted slot between a run and its short entry.
+        let at = at + 3;
+        let k = named_entry(
+            "Deleted between.txt",
+            b"DELETE~1TXT",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root[at..],
+        );
+        root.copy_within(at + k - 1..at + k, at + k);
+        root[at + k - 1][0] = 0xE5;
+        let mut disk = NamedDisk { root, more: None };
+        let (names, lens, long, count) = walked_names(&mut disk);
+        assert_eq!(count, 3);
+        assert_eq!(&names[0][..lens[0]], b"RENAMED.TXT");
+        assert_eq!(&names[1][..lens[1]], b"ANAME~1.TXT");
+        assert_eq!(&names[2][..lens[2]], b"DELETE~1.TXT");
+        assert_eq!(&long[..3], &[false; 3]);
+    }
+
+    #[test]
+    fn malformed_slot_metadata_and_padding_fall_back_to_the_short_name() {
+        for (byte, value) in [
+            (0, 0x61),
+            (0, 0x41 | 0x80),
+            (0, 0x40),
+            (11, 0x1F),
+            (12, 1),
+            (26, 1),
+            (31, 0),
+        ] {
+            let mut root = [[0u8; DIR_ENTRY_SIZE]; 16];
+            assert_eq!(
+                named_entry("Long.txt", b"LONG~1  TXT", attr::ARCHIVE, 3, 6, &mut root),
+                2
+            );
+            root[0][byte] = value;
+            let mut disk = NamedDisk { root, more: None };
+            let (names, lens, long, count) = walked_names(&mut disk);
+            assert_eq!(count, 1);
+            assert_eq!(&names[0][..lens[0]], b"LONG~1.TXT", "byte {byte}");
+            assert!(!long[0]);
+        }
+    }
+
+    #[test]
+    fn long_name_boundaries_are_bounded_in_utf16_and_utf8() {
+        for len in [13, LONG_NAME_UNITS, LONG_NAME_UNITS + 1] {
+            let mut slots = [[0u8; DIR_ENTRY_SIZE]; LFN_MAX_SLOTS + 1];
+            let text = "語".repeat(len);
+            let count = named_entry(&text, b"LONG~1  TXT", attr::ARCHIVE, 3, 6, &mut slots);
+            let mut builder = LongNameBuilder::new();
+            for raw in &slots[..count - 1] {
+                let DirSlot::LongName(slot) = parse_dir_entry(raw) else {
+                    panic!("invalid fixture")
+                };
+                builder.push(&slot);
+            }
+            let units = builder.finish(b"LONG~1  TXT");
+            if len > LONG_NAME_UNITS {
+                assert!(units.is_none());
+            } else {
+                let entry = match parse_dir_entry(&slots[count - 1]) {
+                    DirSlot::File(entry) => entry,
+                    _ => panic!("invalid fixture"),
+                };
+                let name = EntryName::new(&entry, units);
+                assert_eq!(name.as_bytes(), text.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_spanning_two_clusters_still_assembles() {
+        let mut slots = [[0u8; DIR_ENTRY_SIZE]; 16];
+        let n = named_entry(
+            "Larimar pendant photo.jpg",
+            b"LARIMA~1JPG",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut slots,
+        );
+        assert_eq!(n, 3);
+        // Fourteen plain entries leave two slots; the short entry follows in the next cluster.
+        let mut root = [[0u8; DIR_ENTRY_SIZE]; 16];
+        for (index, slot) in root.iter_mut().take(14).enumerate() {
+            *slot = dir_entry(b"FILLER  BIN", attr::ARCHIVE, 3, index as u32);
+        }
+        root[14] = slots[0];
+        root[15] = slots[1];
+        let mut more = [[0u8; DIR_ENTRY_SIZE]; 16];
+        more[0] = slots[2];
+        let mut disk = NamedDisk {
+            root,
+            more: Some(more),
+        };
+        let fat = FatVolume::mount(&mut disk).unwrap();
+        let entry = fat
+            .find_named_in_dir(&mut disk, ROOT_CLUSTER, b"larimar pendant PHOTO.JPG")
+            .expect("found across the cluster boundary");
+        assert_eq!(entry.name, *b"LARIMA~1JPG");
+        assert_eq!(entry.location.unwrap().sector, 104);
+    }
+
+    #[test]
+    fn paths_resolve_by_long_or_short_name() {
+        let mut root = [[0u8; DIR_ENTRY_SIZE]; 16];
+        let mut at = named_entry(
+            "Love Spell (Remix).mp4",
+            b"LOVESP~2MP4",
+            attr::ARCHIVE,
+            3,
+            6,
+            &mut root,
+        );
+        // A long-named directory whose contents live in the fixture's EFI cluster (6).
+        at += named_entry(
+            "Boot Files",
+            b"BOOTFI~1   ",
+            attr::DIRECTORY,
+            6,
+            0,
+            &mut root[at..],
+        );
+        root[at] = dir_entry(b"HELLO   TXT", attr::ARCHIVE, 3, 6);
+        let mut disk = NamedDisk { root, more: None };
+        let fat = FatVolume::mount(&mut disk).unwrap();
+        let by_long = fat
+            .resolve_path(&mut disk, b"/love spell (REMIX).mp4")
+            .unwrap();
+        let by_short = fat.resolve_path(&mut disk, b"/LOVESP~2.MP4").unwrap();
+        assert_eq!(by_long.name, *b"LOVESP~2MP4");
+        assert_eq!(by_long, by_short);
+        // Into the long-named directory: the fixture's EFI holds `BOOT`.
+        let boot = fat.resolve_path(&mut disk, b"/Boot Files/BOOT").unwrap();
+        assert!(boot.is_dir());
+        assert_eq!(fat.resolve_path(&mut disk, b"/hello.txt").unwrap().size, 6);
+        assert_eq!(fat.resolve_path(&mut disk, b"/Love Spell"), None);
+        assert_eq!(fat.resolve_path(&mut disk, b"/Boot Files/.."), None);
     }
 }

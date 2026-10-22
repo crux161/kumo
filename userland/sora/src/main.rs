@@ -1,13 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j507
-//j517
-//j512
 //j514
 //j527
 //j545
 //j547
+//j548
 
 extern crate alloc;
 
@@ -2570,7 +2568,7 @@ fn eval_command(
         // remains authority-free.
         if cmd.args.len() != 1 {
             debug_write(b"usage: cat <path>\n".as_ptr(), 18);
-        } else if run_on_media(initrd, b"cat", CAT_PATH, cmd.args[0].as_bytes()) {
+        } else if run_on_media(initrd, b"cat", CAT_PATH, &[], cmd.args[0].as_bytes()) {
             // J547: a `/media` path; served from the USB volume instead of the initrd.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"cat: no initrd handle\n".as_ptr(), 22);
@@ -2607,16 +2605,28 @@ fn eval_command(
     } else if cmd.name == "ls" {
         // ls: one bootstrap channel is moved into x0. Its finite startup message carries
         // the read-only initrd and stdout capabilities; no authority is inherited.
-        if cmd
-            .args
-            .first()
-            .is_some_and(|path| run_on_media(initrd, b"ls", LS_PATH, path.as_bytes()))
-        {
+        // Parse once with the child's rules so routing grants the filesystem it will read.
+        // — KESTREL
+        let Some(options) = ls::Options::parse(cmd.args.iter().map(|arg| arg.as_bytes())) else {
+            log(b"usage: ls [-a] [path]\n");
+            return true;
+        };
+        let all: [&[u8]; 1] = [b"-a"];
+        let flags: &[&[u8]] = if options.show_all { &all } else { &[] };
+        if run_on_media(initrd, b"ls", LS_PATH, flags, options.path) {
             // J547: a `/media` path; listed from the USB volume instead of the initrd.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
         } else {
-            run_with_startup(initrd, LS_PATH.as_bytes(), b"ls", None, true);
+            let slots: [&[u8]; 2] = [b"ls", b"-a"];
+            let count = if options.show_all { 2 } else { 1 };
+            run_with_startup(
+                initrd,
+                LS_PATH.as_bytes(),
+                b"ls",
+                Some(&slots[..count]),
+                true,
+            );
         }
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
@@ -2774,7 +2784,8 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
 /// on the stick the way it names them anywhere: through the one filesystem it holds. Returns
 /// `false` for a path outside `/media`, which the caller serves from the initrd as before.
 /// — TIMBERDOODLE
-fn run_on_media(initrd: Handle, program: &[u8], image: &str, path: &[u8]) -> bool {
+/// `flags` go to the child ahead of the path (J548). — KESTREL
+fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], path: &[u8]) -> bool {
     let (name, path) = match sora::media_route(path) {
         sora::MediaRoute::Elsewhere => return false,
         sora::MediaRoute::Root => {
@@ -2802,7 +2813,10 @@ fn run_on_media(initrd: Handle, program: &[u8], image: &str, path: &[u8]) -> boo
         log(b": no such volume\n");
         return true;
     }
-    let slots: [&[u8]; 2] = [program, path];
+    let mut slots: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(flags.len() + 2);
+    slots.push(program);
+    slots.extend_from_slice(flags);
+    slots.push(path);
     run_with_startup_input(
         initrd,
         image.as_bytes(),

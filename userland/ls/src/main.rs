@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j547
+//j548
 
 //! `ls` — the first KUMO program that *uses a capability*.
 //!
@@ -20,10 +21,13 @@
 //!
 //! J547: when Sora grants a filesystem instead (`ls /media/<name>[/dir]`), `ls` lists the
 //! directory its argument names on that filesystem, through `kumo-vfs`, in the same columns.
+//! J548: names come back long, and those starting with `.` are hidden unless `-a` is given,
+//! as `ls` does elsewhere.
 
 use kumo_abi::{entries, entry_table_bytes, unpack_argv, Handle, INITRD_HEADER_LEN};
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 use kumo_vfs::{parse_dir_reply, Request, VfsError, MAX_PATH, VFS_NOT_DIR, VFS_NOT_FOUND};
+use ls::Options;
 
 kumo_rt::entry!(main);
 
@@ -59,15 +63,20 @@ fn fail(message: &[u8]) -> ! {
     process_exit(1)
 }
 
-/// J547: list the directory `path` on the filesystem behind `fs`, a `kumo-vfs` channel, page by
+/// J547: list `options.path` on the filesystem behind `fs`, a `kumo-vfs` channel, page by
 /// page until the server answers with no more entries. Files show their size and directories
-/// `<dir>` and a trailing `/`.
-fn list_volume(fs: Handle, stdout: Handle, path: &[u8]) -> ! {
+/// `<dir>` and a trailing `/`. Dot-files are skipped unless `options.show_all` (J548).
+fn list_volume(fs: Handle, stdout: Handle, options: Options<'_>) -> ! {
     let mut request = [0u8; 7 + MAX_PATH];
-    let mut reply = [0u8; 512];
+    // Room for a whole `fatfs` directory page (1024 bytes since J548's long names).
+    let mut reply = [0u8; 1024];
     let mut start = 0u32;
     loop {
-        let Some(len) = (Request::ReadDir { path, start }).encode_into(&mut request) else {
+        let Some(len) = (Request::ReadDir {
+            path: options.path,
+            start,
+        })
+        .encode_into(&mut request) else {
             fail(b"ls: path too long\n");
         };
         if channel_write(fs, request.as_ptr(), len) != 0 {
@@ -87,6 +96,9 @@ fn list_volume(fs: Handle, stdout: Handle, path: &[u8]) -> ! {
             process_exit(0);
         }
         for record in records {
+            if !options.includes(record.name) {
+                continue;
+            }
             let mut column = [b' '; 10];
             if record.is_dir {
                 column[5..].copy_from_slice(b"<dir>");
@@ -114,15 +126,17 @@ extern "C" fn main(
     _a8: u64,
 ) -> ! {
     let startup = startup(Handle(bootstrap_handle as u32));
+    let mut argv_buf = [0u8; 256];
+    if let Some(argv) = startup.argv {
+        if vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) != 0 {
+            fail(b"ls: argv read fail\n");
+        }
+    }
+    let Some(options) = Options::parse(unpack_argv(&argv_buf).skip(1)) else {
+        fail(b"usage: ls [-a] [path]\n");
+    };
     if let Some(fs) = startup.fs {
-        let mut argv_buf = [0u8; 256];
-        let path: &[u8] = match startup.argv {
-            Some(argv) if vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0 => {
-                unpack_argv(&argv_buf).nth(1).unwrap_or(b"/")
-            }
-            _ => b"/",
-        };
-        list_volume(fs, startup.stdout.unwrap_or(Handle(0)), path);
+        list_volume(fs, startup.stdout.unwrap_or(Handle(0)), options);
     }
     let initrd = match startup.cap0 {
         Some(handle) => handle,
@@ -169,6 +183,9 @@ extern "C" fn main(
 
     // `<size right-aligned in 10>  <path>` per entry — an ls -l-style listing.
     for (path, size) in entries(&table[..table_len]) {
+        if !options.includes(path.as_bytes()) {
+            continue;
+        }
         let mut sizebuf = [b' '; 10];
         fmt_dec_right(size, &mut sizebuf);
         emit(stdout, &sizebuf);

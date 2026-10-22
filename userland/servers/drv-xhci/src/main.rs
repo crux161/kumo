@@ -1,15 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j533
-//j537
-//j538
-//j539
-//j540
 //j541
 //j542
 //j543
 //j545
+//j548
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -2424,7 +2420,16 @@ fn configure_and_read_keyboard(
 
     // --- SET_CONFIGURATION(config_value) --- bmRequestType=0, bRequest=9, wValue=config, no data.
     let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
-    match control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_config) {
+    match control_no_data(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        set_config,
+    ) {
         Some((1, _)) => log(b"drv-xhci: set config cc=0x1\n"),
         Some((cc, _)) => return log_cc(b"drv-xhci: set config cc=", cc),
         None => return log(b"drv-xhci: set config timeout\n"),
@@ -2452,8 +2457,26 @@ fn configure_and_read_keyboard(
 
     // --- SET_PROTOCOL(boot) --- HID class request to the interface: bmRequestType=0x21,
     // bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data.
-    let set_proto = [0x21, 0x0b, 0x00, 0x00, hid.interface_number, 0x00, 0x00, 0x00];
-    match control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_proto) {
+    let set_proto = [
+        0x21,
+        0x0b,
+        0x00,
+        0x00,
+        hid.interface_number,
+        0x00,
+        0x00,
+        0x00,
+    ];
+    match control_no_data(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        set_proto,
+    ) {
         Some((1, _)) => log(b"drv-xhci: set proto cc=0x1\n"),
         Some((cc, _)) => return log_cc(b"drv-xhci: set proto cc=", cc),
         None => return log(b"drv-xhci: set proto timeout\n"),
@@ -2617,11 +2640,7 @@ fn configure_and_read_keyboard(
                             let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
                             if mouse != 0 && !motion.is_idle() {
                                 let wire = motion.to_wire();
-                                let _ = channel_write(
-                                    Handle(mouse),
-                                    wire.as_ptr(),
-                                    wire.len(),
-                                );
+                                let _ = channel_write(Handle(mouse), wire.as_ptr(), wire.len());
                             }
                         }
                     } else if let Ok(events) = decoder.decode(report) {
@@ -2789,7 +2808,18 @@ fn read_device_config(
     data_buf.zero();
     dsb();
     let dev8 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
-    match control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, dev8, data_phys, 8) {
+    match control_in(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        dev8,
+        data_phys,
+        8,
+    ) {
         Some((1, _)) => {}
         Some((cc, _)) => {
             log_cc(b"drv-xhci: dev desc8 cc=", cc);
@@ -2824,7 +2854,10 @@ fn read_device_config(
         let eval_ep0 = EndpointContext::control(real_mps0, ep0_ring_phys).ok()?;
         let ep0_off = ContextSize::Bytes64.input_offset(1)?;
         write_ctx(base_va + OFF_INPUT_CTX as u64, eval_icc.words());
-        write_ctx(base_va + OFF_INPUT_CTX as u64 + ep0_off as u64, eval_ep0.words());
+        write_ctx(
+            base_va + OFF_INPUT_CTX as u64 + ep0_off as u64,
+            eval_ep0.words(),
+        );
         dsb();
         const TRB_TYPE_EVALUATE_CONTEXT: u32 = 13;
         let eval = Trb::from_words([
@@ -2853,7 +2886,16 @@ fn read_device_config(
     // Phase 3: the full device descriptor.
     data_buf.zero();
     dsb();
-    let dev_full = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, DEVICE_DESCRIPTOR_LEN as u8, 0x00];
+    let dev_full = [
+        0x80,
+        0x06,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        DEVICE_DESCRIPTOR_LEN as u8,
+        0x00,
+    ];
     match control_in(
         io,
         layout,
@@ -2891,7 +2933,18 @@ fn read_device_config(
     data_buf.zero();
     dsb();
     let cfg_head = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
-    control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, cfg_head, data_phys, 9)?;
+    control_in(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        cfg_head,
+        data_phys,
+        9,
+    )?;
     dsb();
     let total = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]).min(DATA_BUF_LEN as u16);
     data_buf.zero();
@@ -2906,7 +2959,18 @@ fn read_device_config(
         total as u8,
         (total >> 8) as u8,
     ];
-    control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, cfg, data_phys, total)?;
+    control_in(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        cfg,
+        data_phys,
+        total,
+    )?;
     dsb();
     let mut config = [0u8; DATA_BUF_LEN];
     data_buf.read_into(0, &mut config[..total as usize]);
@@ -2944,20 +3008,27 @@ fn configure_interrupt_endpoint(
     let mut icc = InputControlContext::default();
     icc.add(0).ok()?; // slot (to raise Context Entries)
     icc.add(dci).ok()?; // the interrupt endpoint
-    // The caller supplies the slot context so a hub-downstream device keeps its route string and
-    // TT fields; only Context Entries is raised here to cover the new endpoint's DCI.
+                        // The caller supplies the slot context so a hub-downstream device keeps its route string and
+                        // TT fields; only Context Entries is raised here to cover the new endpoint's DCI.
     let mut slot = slot_words;
     slot[0] = (slot[0] & !(0x1f << 27)) | ((dci as u32) << 27);
     let interval = xhci_interval(speed_raw, b_interval);
-    let int_ctx =
-        EndpointContext::interrupt_in(max_packet_size, interval, int_ring_phys, max_packet_size.max(1))
-            .ok()?;
+    let int_ctx = EndpointContext::interrupt_in(
+        max_packet_size,
+        interval,
+        int_ring_phys,
+        max_packet_size.max(1),
+    )
+    .ok()?;
     let stride = ContextSize::Bytes64;
     let slot_off = stride.input_offset(0)?;
     let ep_off = stride.input_offset(dci)?;
     write_ctx(base_va + OFF_INPUT_CTX as u64, icc.words());
     write_ctx(base_va + OFF_INPUT_CTX as u64 + slot_off as u64, slot);
-    write_ctx(base_va + OFF_INPUT_CTX as u64 + ep_off as u64, int_ctx.words());
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + ep_off as u64,
+        int_ctx.words(),
+    );
     dsb();
     let configure = Trb::configure_endpoint(input_ctx_phys, slot_id).ok()?;
     match submit_command(io, layout, image, cmd, evt, configure) {
@@ -2999,7 +3070,16 @@ fn configure_and_read_hub(
     // --- SET_CONFIGURATION, before any hub-class request ---
     // The Linux hub driver reads the hub descriptor only once the hub is configured; follow it.
     let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
-    match control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_config) {
+    match control_no_data(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        set_config,
+    ) {
         Some((1, _)) => log(b"drv-xhci: hub set config cc=0x1\n"),
         Some((cc, _)) => return log_cc(b"drv-xhci: hub set config cc=", cc),
         None => return log(b"drv-xhci: hub set config timeout\n"),
@@ -3011,8 +3091,18 @@ fn configure_and_read_hub(
     data_buf.zero();
     dsb();
     let hub_setup = [0xa0, 0x06, 0x00, hub_desc_type, 0x00, 0x00, 16, 0x00];
-    match control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, hub_setup, data_phys, 16)
-    {
+    match control_in(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        hub_setup,
+        data_phys,
+        16,
+    ) {
         Some((1, _)) => {}
         Some((cc, _)) => return log_cc(b"drv-xhci: hub desc cc=", cc),
         None => return log(b"drv-xhci: hub desc timeout\n"),
@@ -3090,7 +3180,16 @@ fn configure_and_read_hub(
             return log(b"drv-xhci: hub pass budget spent (power)\n");
         }
         let set_power = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
-        let _ = control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_power);
+        let _ = control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            ep0_ring,
+            &mut *ep0_seg,
+            slot_id,
+            set_power,
+        );
         port += 1;
     }
     // A port's VBUS is not good until bPwrOn2PwrGood after PORT_POWER, and only then can its
@@ -3522,7 +3621,14 @@ fn reset_and_address_downstream(
         0x00,
     ];
     match control_no_data(
-        io, layout, image, evt, hub_ep0_ring, &mut *hub_ep0_seg, hub_slot_id, set_reset,
+        io,
+        layout,
+        image,
+        evt,
+        hub_ep0_ring,
+        &mut *hub_ep0_seg,
+        hub_slot_id,
+        set_reset,
     ) {
         Some((1, _)) => {}
         Some((cc, _)) => return skipped_cc(b"drv-xhci: hub port reset cc=", cc),
@@ -3594,7 +3700,14 @@ fn reset_and_address_downstream(
         0x00,
     ];
     let _ = control_no_data(
-        io, layout, image, evt, hub_ep0_ring, &mut *hub_ep0_seg, hub_slot_id, clear_change,
+        io,
+        layout,
+        image,
+        evt,
+        hub_ep0_ring,
+        &mut *hub_ep0_seg,
+        hub_slot_id,
+        clear_change,
     );
 
     // --- A private DMA page for this device's contexts, EP0 ring and buffers ---
@@ -3650,7 +3763,10 @@ fn reset_and_address_downstream(
     };
     write_ctx(dev_va + OFF_INPUT_CTX as u64, icc.words());
     write_ctx(dev_va + OFF_INPUT_CTX as u64 + slot_off as u64, slot_words);
-    write_ctx(dev_va + OFF_INPUT_CTX as u64 + ep0_off as u64, ep0_ctx.words());
+    write_ctx(
+        dev_va + OFF_INPUT_CTX as u64 + ep0_off as u64,
+        ep0_ctx.words(),
+    );
     // SAFETY: the DCBAA sits inside the mapped DMA page.
     let mut dcbaa =
         unsafe { DmaQwords::new((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES) };
