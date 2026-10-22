@@ -4,6 +4,7 @@
 //j382
 //j389
 //j545
+//j547
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -270,6 +271,42 @@ impl MediaName {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
+    }
+}
+
+/// Where a shell path lands in the `/media` tree (DESIGN/012 §2.1, J547).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaRoute<'a> {
+    /// Not under `/media`: the path means what it meant before.
+    Elsewhere,
+    /// `/media` itself: the mounted volumes.
+    Root,
+    /// Inside the volume mounted as `name`, at `path` from its root; `path` starts with `/`.
+    Volume { name: &'a [u8], path: &'a [u8] },
+}
+
+/// Split a shell path into its `/media` route. Only absolute paths reach `/media`; the shell
+/// has no working directory yet.
+pub fn media_route(path: &[u8]) -> MediaRoute<'_> {
+    let Some(rest) = path.strip_prefix(b"/media") else {
+        return MediaRoute::Elsewhere;
+    };
+    if rest.is_empty() || rest == b"/" {
+        return MediaRoute::Root;
+    }
+    let Some(rest) = rest.strip_prefix(b"/") else {
+        // `/mediafoo` is not under `/media`.
+        return MediaRoute::Elsewhere;
+    };
+    match rest.iter().position(|byte| *byte == b'/') {
+        None => MediaRoute::Volume {
+            name: rest,
+            path: b"/",
+        },
+        Some(slash) => MediaRoute::Volume {
+            name: &rest[..slash],
+            path: &rest[slash..],
+        },
     }
 }
 
@@ -597,5 +634,47 @@ mod tests {
             MediaName::new(Some(*b"\xc9T\xc9        "), 0).as_bytes(),
             b"_T_"
         );
+    }
+
+    #[test]
+    fn media_paths_route_to_their_volume_and_path() {
+        assert_eq!(media_route(b"/media"), MediaRoute::Root);
+        assert_eq!(media_route(b"/media/"), MediaRoute::Root);
+        assert_eq!(
+            media_route(b"/media/KUMO"),
+            MediaRoute::Volume {
+                name: b"KUMO",
+                path: b"/"
+            }
+        );
+        assert_eq!(
+            media_route(b"/media/KUMO/"),
+            MediaRoute::Volume {
+                name: b"KUMO",
+                path: b"/"
+            }
+        );
+        assert_eq!(
+            media_route(b"/media/KUMO/LOREM_JP.TXT"),
+            MediaRoute::Volume {
+                name: b"KUMO",
+                path: b"/LOREM_JP.TXT"
+            }
+        );
+        assert_eq!(
+            media_route(b"/media/4567-13F4/EFI/BOOT"),
+            MediaRoute::Volume {
+                name: b"4567-13F4",
+                path: b"/EFI/BOOT"
+            }
+        );
+    }
+
+    #[test]
+    fn other_paths_are_not_media() {
+        assert_eq!(media_route(b"etc/autoexec"), MediaRoute::Elsewhere);
+        assert_eq!(media_route(b"/mediafoo"), MediaRoute::Elsewhere);
+        assert_eq!(media_route(b"media/KUMO"), MediaRoute::Elsewhere);
+        assert_eq!(media_route(b""), MediaRoute::Elsewhere);
     }
 }

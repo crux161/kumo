@@ -1,5 +1,6 @@
 #![no_std]
 //j514
+//j547
 
 //! `kumo-vfs` — the wire protocol for KUMO's filesystem servers.
 //!
@@ -18,7 +19,7 @@
 //!
 //! Scope (grown one provable slice at a time, `GUIDANCE/006 §6`): resolve/open,
 //! read, create, resize, write, and flush — the bounded surface Kilo's save path
-//! needs. Namespace mutation beyond create remains a later storage slice.
+//! needs — and, since J547, listing a directory for `ls`. Namespace mutation beyond create remains a later storage slice.
 //! Larger reads currently return their bytes inline in the reply (bounded by the
 //! IPC inline ceiling, J174); `DESIGN/001`'s zero-copy `Vmo` file-data transfer
 //! is the throughput follow-up, not this gate.
@@ -35,6 +36,9 @@ pub const OP_WRITE: u8 = 0x03;
 pub const OP_SET_LEN: u8 = 0x04;
 /// Op code: make preceding writes visible to the backing store.
 pub const OP_FLUSH: u8 = 0x05;
+/// Op code: list a directory from one of its entries on (J547). Reply: a [`DirReplyWriter`]
+/// frame, `[VFS_OK][count]` then `count` records; a count of zero means the listing is done.
+pub const OP_READ_DIR: u8 = 0x06;
 
 /// Open option: the returned handle may read.
 pub const OPEN_READ: u8 = 1 << 0;
@@ -60,6 +64,13 @@ pub const VFS_NO_SPACE: u8 = 0x05;
 pub const VFS_ACCESS_DENIED: u8 = 0x06;
 /// Reply status: the backing store failed an I/O operation.
 pub const VFS_IO_ERROR: u8 = 0x07;
+/// Reply status: a directory was asked for, and the path names a file (J547).
+pub const VFS_NOT_DIR: u8 = 0x08;
+
+/// Directory-record flag: the entry is itself a directory.
+pub const DIR_RECORD_DIRECTORY: u8 = 1 << 0;
+/// Fixed bytes of one directory record: `flags(1) + size(8) + name_len(1)`.
+const DIR_RECORD_HEADER: usize = 10;
 
 /// Maximum path length accepted on the wire. ESP paths are short; this keeps an
 /// `Open` frame bounded and well within the IPC inline ceiling.
@@ -100,6 +111,8 @@ pub enum Request<'a> {
     SetLen { handle: u32, len: u64 },
     /// Flush preceding mutations for `handle`.
     Flush { handle: u32 },
+    /// List the directory at `path`, skipping its first `start` entries (J547).
+    ReadDir { path: &'a [u8], start: u32 },
 }
 
 impl<'a> Request<'a> {
@@ -206,6 +219,18 @@ impl<'a> Request<'a> {
                 out[1..5].copy_from_slice(&handle.to_le_bytes());
                 Some(FLUSH_REQUEST_LEN)
             }
+            Request::ReadDir { path, start } => {
+                if path.len() > MAX_PATH {
+                    return None;
+                }
+                let n = 7 + path.len();
+                let out = buf.get_mut(..n)?;
+                out[0] = OP_READ_DIR;
+                out[1..5].copy_from_slice(&start.to_le_bytes());
+                out[5..7].copy_from_slice(&(path.len() as u16).to_le_bytes());
+                out[7..].copy_from_slice(path);
+                Some(n)
+            }
         }
     }
 
@@ -260,6 +285,17 @@ impl<'a> Request<'a> {
                     handle: u32::from_le_bytes(b[1..5].try_into().ok()?),
                 })
             }
+            OP_READ_DIR => {
+                let start = u32::from_le_bytes(raw.get(1..5)?.try_into().ok()?);
+                let plen = u16::from_le_bytes(raw.get(5..7)?.try_into().ok()?) as usize;
+                if plen > MAX_PATH {
+                    return None;
+                }
+                Some(Request::ReadDir {
+                    path: raw.get(7..7 + plen)?,
+                    start,
+                })
+            }
             _ => None,
         }
     }
@@ -286,6 +322,110 @@ pub fn encode_write_ok(written: u32) -> [u8; WRITE_REPLY_LEN] {
     b[0] = VFS_OK;
     b[1..5].copy_from_slice(&written.to_le_bytes());
     b
+}
+
+/// Builds a `ReadDir` reply in place: `[VFS_OK][count]`, then one record per entry,
+/// `[flags][size: u64 LE][name_len][name]`, for as many entries as fit (J547).
+pub struct DirReplyWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> DirReplyWriter<'a> {
+    /// Start an empty listing in `buf`; `None` if it cannot hold even the header.
+    pub fn new(buf: &'a mut [u8]) -> Option<DirReplyWriter<'a>> {
+        let header = buf.get_mut(..2)?;
+        header[0] = VFS_OK;
+        header[1] = 0;
+        Some(DirReplyWriter { buf, len: 2 })
+    }
+
+    /// Append one entry. Returns `false`, writing nothing, when it does not fit or the
+    /// reply already holds 255 entries; the client then asks again from the next entry.
+    pub fn push(&mut self, is_dir: bool, size: u64, name: &[u8]) -> bool {
+        let n = DIR_RECORD_HEADER + name.len();
+        if name.len() > u8::MAX as usize || self.buf[1] == u8::MAX {
+            return false;
+        }
+        let Some(record) = self.buf.get_mut(self.len..self.len + n) else {
+            return false;
+        };
+        record[0] = if is_dir { DIR_RECORD_DIRECTORY } else { 0 };
+        record[1..9].copy_from_slice(&size.to_le_bytes());
+        record[9] = name.len() as u8;
+        record[DIR_RECORD_HEADER..].copy_from_slice(name);
+        self.len += n;
+        self.buf[1] += 1;
+        true
+    }
+
+    /// Entries written so far.
+    pub fn count(&self) -> u8 {
+        self.buf[1]
+    }
+
+    /// The reply's length in bytes.
+    pub fn finish(self) -> usize {
+        self.len
+    }
+}
+
+/// One entry of a `ReadDir` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirRecord<'a> {
+    pub is_dir: bool,
+    pub size: u64,
+    pub name: &'a [u8],
+}
+
+/// The records of a `ReadDir` reply, in order. Iteration stops early at a truncated
+/// record rather than reading past the frame.
+#[derive(Debug, Clone)]
+pub struct DirRecords<'a> {
+    rest: &'a [u8],
+    remaining: u8,
+}
+
+impl<'a> Iterator for DirRecords<'a> {
+    type Item = DirRecord<'a>;
+
+    fn next(&mut self) -> Option<DirRecord<'a>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let header = self.rest.get(..DIR_RECORD_HEADER)?;
+        let name_len = header[9] as usize;
+        let name = self
+            .rest
+            .get(DIR_RECORD_HEADER..DIR_RECORD_HEADER + name_len)?;
+        let record = DirRecord {
+            is_dir: header[0] & DIR_RECORD_DIRECTORY != 0,
+            size: u64::from_le_bytes(header[1..9].try_into().ok()?),
+            name,
+        };
+        self.rest = &self.rest[DIR_RECORD_HEADER + name_len..];
+        self.remaining -= 1;
+        Some(record)
+    }
+}
+
+/// Parse a `ReadDir` reply: its entry count and records on [`VFS_OK`], else the error
+/// status. A count of zero means the directory has no entries from the requested start.
+pub fn parse_dir_reply(resp: &[u8]) -> Result<(u8, DirRecords<'_>), VfsError> {
+    match resp.first() {
+        None => Err(VfsError::Empty),
+        Some(&VFS_OK) => {
+            let count = *resp.get(1).ok_or(VfsError::Malformed)?;
+            Ok((
+                count,
+                DirRecords {
+                    rest: &resp[2..],
+                    remaining: count,
+                },
+            ))
+        }
+        Some(&status) => Err(VfsError::Status(status)),
+    }
 }
 
 /// Why a reply could not be interpreted.
@@ -472,5 +612,73 @@ mod tests {
             Err(VfsError::Status(VFS_NO_SPACE))
         );
         assert_eq!(parse_write_reply(&[VFS_OK, 1]), Err(VfsError::Malformed));
+    }
+
+    #[test]
+    fn read_dir_request_round_trips() {
+        let req = Request::ReadDir {
+            path: b"/EFI/BOOT",
+            start: 14,
+        };
+        let mut buf = [0u8; 64];
+        let n = req.encode_into(&mut buf).expect("encode");
+        assert_eq!(n, 7 + 9);
+        assert_eq!(Request::decode(&buf[..n]), Some(req));
+        let root = Request::ReadDir {
+            path: b"/",
+            start: 0,
+        };
+        let n = root.encode_into(&mut buf).expect("encode");
+        assert_eq!(Request::decode(&buf[..n]), Some(root));
+        assert_eq!(Request::decode(&buf[..6]), None);
+    }
+
+    #[test]
+    fn a_dir_reply_carries_what_fits_and_reads_back() {
+        let mut reply = [0u8; 2 + 2 * (DIR_RECORD_HEADER + 8) + 5];
+        let mut writer = DirReplyWriter::new(&mut reply).unwrap();
+        assert!(writer.push(true, 0, b"EFI"));
+        assert!(writer.push(false, 0x36d, b"LOREM_JP.TXT"));
+        // A third record does not fit: nothing is written and the count holds.
+        assert!(!writer.push(false, 6, b"HELLO.TXT"));
+        assert_eq!(writer.count(), 2);
+        let len = writer.finish();
+        assert_eq!(len, 2 + (DIR_RECORD_HEADER + 3) + (DIR_RECORD_HEADER + 12));
+
+        let (count, mut records) = parse_dir_reply(&reply[..len]).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            records.next(),
+            Some(DirRecord {
+                is_dir: true,
+                size: 0,
+                name: b"EFI"
+            })
+        );
+        assert_eq!(
+            records.next(),
+            Some(DirRecord {
+                is_dir: false,
+                size: 0x36d,
+                name: b"LOREM_JP.TXT"
+            })
+        );
+        assert_eq!(records.next(), None);
+    }
+
+    #[test]
+    fn an_empty_or_failed_dir_reply_is_recognised() {
+        let (count, mut records) = parse_dir_reply(&[VFS_OK, 0]).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(records.next(), None);
+        assert_eq!(
+            parse_dir_reply(&[VFS_NOT_DIR]).err(),
+            Some(VfsError::Status(VFS_NOT_DIR))
+        );
+        assert_eq!(parse_dir_reply(&[VFS_OK]).err(), Some(VfsError::Malformed));
+        // A count that claims more than the frame holds stops at the frame's end.
+        let (_, records) =
+            parse_dir_reply(&[VFS_OK, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, b'A']).unwrap();
+        assert_eq!(records.count(), 1);
     }
 }

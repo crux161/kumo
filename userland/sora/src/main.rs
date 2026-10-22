@@ -7,6 +7,7 @@
 //j514
 //j527
 //j545
+//j547
 
 extern crate alloc;
 
@@ -256,6 +257,8 @@ static XHCI_STORAGE_CONTROLS: [AtomicU32; 3] =
 /// The removable volume Sora knows, mounted at `/media/<name>` (DESIGN/012 §2.1, J545).
 #[derive(Clone, Copy)]
 struct Media {
+    /// The `/media/<name>` component the shell reaches it by.
+    name: sora::MediaName,
     ready: drv_blk::MediaReady,
     /// The offering driver's control channel: where a new client's block channel goes.
     control: Handle,
@@ -2526,7 +2529,7 @@ fn eval_command(
             b"relibc",
             Some(&slots[..count]),
             false,
-            true,
+            FsGrant::Image,
             true,
             false,
             StdinMode::Finite(b"a line from sora\n"),
@@ -2567,6 +2570,8 @@ fn eval_command(
         // remains authority-free.
         if cmd.args.len() != 1 {
             debug_write(b"usage: cat <path>\n".as_ptr(), 18);
+        } else if run_on_media(initrd, b"cat", CAT_PATH, cmd.args[0].as_bytes()) {
+            // J547: a `/media` path; served from the USB volume instead of the initrd.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"cat: no initrd handle\n".as_ptr(), 22);
         } else {
@@ -2602,7 +2607,13 @@ fn eval_command(
     } else if cmd.name == "ls" {
         // ls: one bootstrap channel is moved into x0. Its finite startup message carries
         // the read-only initrd and stdout capabilities; no authority is inherited.
-        if prog_initrd == 0 || prog_initrd == u64::MAX {
+        if cmd
+            .args
+            .first()
+            .is_some_and(|path| run_on_media(initrd, b"ls", LS_PATH, path.as_bytes()))
+        {
+            // J547: a `/media` path; listed from the USB volume instead of the initrd.
+        } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
         } else {
             run_with_startup(initrd, LS_PATH.as_bytes(), b"ls", None, true);
@@ -2650,7 +2661,7 @@ fn run_with_startup(
         name,
         argv,
         grant_initrd,
-        false,
+        FsGrant::None,
         false,
         false,
         StdinMode::None,
@@ -2730,7 +2741,11 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
         return log(b"media: bad offer\n");
     };
     let name = sora::MediaName::new(ready.label, ready.serial);
-    set_media(Some(Media { ready, control }));
+    set_media(Some(Media {
+        name,
+        ready,
+        control,
+    }));
     log(b"media: /media/");
     log(name.as_bytes());
     log(b" usb fat32 blocks=");
@@ -2752,6 +2767,54 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
         }
         None => log(b"media: mount check spawn fail\n"),
     }
+}
+
+/// J547: run `program` (`ls` or `cat`, from `image`) on a `/media` path. The child is granted a
+/// private `fatfs` over the USB volume and the path from that volume's root, so it names files
+/// on the stick the way it names them anywhere: through the one filesystem it holds. Returns
+/// `false` for a path outside `/media`, which the caller serves from the initrd as before.
+/// — TIMBERDOODLE
+fn run_on_media(initrd: Handle, program: &[u8], image: &str, path: &[u8]) -> bool {
+    let (name, path) = match sora::media_route(path) {
+        sora::MediaRoute::Elsewhere => return false,
+        sora::MediaRoute::Root => {
+            // `/media` is Sora's own namespace: the volumes it has mounted.
+            match (program, media()) {
+                (b"ls", Some(media)) => {
+                    log(b"     <dir>  ");
+                    log(media.name.as_bytes());
+                    log(b"/\n");
+                }
+                (b"ls", None) => log(b"ls: nothing is mounted under /media\n"),
+                _ => {
+                    log(program);
+                    log(b": /media: is a directory\n");
+                }
+            }
+            return true;
+        }
+        sora::MediaRoute::Volume { name, path } => (name, path),
+    };
+    if !media().is_some_and(|media| media.name.as_bytes() == name) {
+        log(program);
+        log(b": /media/");
+        log(name);
+        log(b": no such volume\n");
+        return true;
+    }
+    let slots: [&[u8]; 2] = [program, path];
+    run_with_startup_input(
+        initrd,
+        image.as_bytes(),
+        program,
+        Some(&slots),
+        false,
+        FsGrant::Media,
+        false,
+        false,
+        StdinMode::None,
+    );
+    true
 }
 
 /// J545: start a `fatfs` instance over the registered stick and return its vfs client channel.
@@ -2894,6 +2957,17 @@ fn spawn_ttyd_control(initrd: Handle) -> Option<Handle> {
     Some(instance.client)
 }
 
+/// Which filesystem, if any, a launch is granted as its `STARTUP_TAG_FS` channel. Each grant is
+/// a private `fatfs` instance started for that launch alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FsGrant {
+    None,
+    /// Over Sora's RAM FAT image (J508): what kilo and the relibc smoke write to.
+    Image,
+    /// Over the USB volume mounted at `/media/<name>` (J547), read-only for now.
+    Media,
+}
+
 /// How a spawned child gets its standard input.
 enum StdinMode<'a> {
     /// No stdin at all — the child is granted no input capability.
@@ -2910,7 +2984,7 @@ enum StdinMode<'a> {
 /// `Some((stdin_write, stdout_read))` only for [`StdinMode::Interactive`], where the
 /// caller owns the running child's two ends.
 ///
-/// `grant_fs` spawns a private `fatfs` instance for this launch and hands the child the
+/// `fs` spawns a private `fatfs` instance for this launch and hands the child the
 /// client end of its `kumo-vfs` channel. Like `grant_initrd`, only an explicit launcher
 /// grants it: a program that was not given the channel cannot name a file at all.
 /// `grant_tty` similarly spawns a private `ttyd` control endpoint, kept separate from
@@ -2921,7 +2995,7 @@ fn run_with_startup_input(
     name: &[u8],
     argv: Option<&[&[u8]]>,
     grant_initrd: bool,
-    grant_fs: bool,
+    fs: FsGrant,
     grant_tty: bool,
     bind_stdout: bool,
     stdin: StdinMode<'_>,
@@ -3012,7 +3086,11 @@ fn run_with_startup_input(
     };
     // The filesystem grant is a whole server, not a handle duplicate: spawn it before the
     // child so the vfs channel is live the moment the child's first request lands.
-    let fs_child = if grant_fs { spawn_fatfs(initrd) } else { None };
+    let fs_child = match fs {
+        FsGrant::None => None,
+        FsGrant::Image => spawn_fatfs(initrd),
+        FsGrant::Media => spawn_media_fatfs(initrd),
+    };
     let tty_child = if grant_tty {
         spawn_ttyd_control(initrd)
     } else {
@@ -3020,7 +3098,7 @@ fn run_with_startup_input(
     };
     let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
     let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
-    let fs_bad = grant_fs && fs_child.is_none();
+    let fs_bad = fs != FsGrant::None && fs_child.is_none();
     let tty_bad = grant_tty && tty_child.is_none();
     if argv_bad || initrd_bad || fs_bad || tty_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
@@ -3227,7 +3305,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         b"lua-repl",
         Some(&slots),
         false,
-        false,
+        FsGrant::None,
         false,
         false,
         StdinMode::Interactive,
@@ -3345,7 +3423,7 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         b"kilo",
         Some(&slots[..count]),
         false,
-        true,
+        FsGrant::Image,
         true,
         true,
         StdinMode::Interactive,
@@ -3505,7 +3583,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             full,
             Some(&slots[..count]),
             false,
-            false,
+            FsGrant::None,
             false,
             false,
             StdinMode::Finite(&input[..input_len]),
@@ -4695,7 +4773,7 @@ fn launch_lua_repl(initrd: Handle) {
         b"lua-repl",
         None,
         false,
-        false,
+        FsGrant::None,
         false,
         false,
         StdinMode::Finite(

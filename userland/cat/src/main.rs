@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+//j547
 
 //! `cat` — stream one initrd file through explicit capabilities.
 //!
@@ -8,9 +9,18 @@
 //! `cat` reads only the initrd table into its stack, locates the requested path, and
 //! streams the payload to stdout in 256-byte chunks. It has no ambient filesystem
 //! authority and cannot mutate either input VMO.
+//!
+//! J547: when Sora grants a filesystem instead (`cat /media/<name>/<path>`), `cat` opens the
+//! path on that filesystem through `kumo-vfs` and streams it the same way.
 
 use kumo_abi::{entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN};
-use kumo_rt::{channel_write, debug_write, process_exit, startup, vmo_read};
+use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
+use kumo_vfs::{
+    parse_open_reply, read_payload, Request, VfsError, MAX_PATH, VFS_IS_DIR, VFS_NOT_FOUND,
+};
+
+/// Bytes asked for per `Read`: what `fatfs` answers inline.
+const READ_CHUNK: usize = 256;
 
 kumo_rt::entry!(main);
 
@@ -27,6 +37,46 @@ fn emit(stdout: Handle, bytes: &[u8]) {
     }
 }
 
+/// One `kumo-vfs` request and its reply over `fs`.
+fn vfs_call<'a>(fs: Handle, request: &[u8], reply: &'a mut [u8]) -> &'a [u8] {
+    if channel_write(fs, request.as_ptr(), request.len()) != 0 {
+        fail(b"cat: filesystem gone\n");
+    }
+    let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
+    if n == 0 || n == u64::MAX {
+        fail(b"cat: filesystem gone\n");
+    }
+    &reply[..n as usize]
+}
+
+/// J547: stream `path` from the filesystem behind `fs`, a `kumo-vfs` channel, to stdout.
+fn cat_volume(fs: Handle, stdout: Handle, path: &[u8]) -> ! {
+    let mut request = [0u8; 4 + MAX_PATH];
+    let mut reply = [0u8; 1 + READ_CHUNK];
+    let Some(len) = Request::open(path).encode_into(&mut request) else {
+        fail(b"cat: path too long\n");
+    };
+    let (handle, size) = match parse_open_reply(vfs_call(fs, &request[..len], &mut reply)) {
+        Ok(open) => open,
+        Err(VfsError::Status(VFS_NOT_FOUND)) => fail(b"cat: not found\n"),
+        Err(VfsError::Status(VFS_IS_DIR)) => fail(b"cat: is a directory\n"),
+        Err(_) => fail(b"cat: open failed\n"),
+    };
+    let mut offset = 0u64;
+    while offset < size {
+        let len = Request::read(handle, offset, READ_CHUNK as u32)
+            .encode_into(&mut request)
+            .unwrap_or_else(|| fail(b"cat: read request\n"));
+        let data = match read_payload(vfs_call(fs, &request[..len], &mut reply)) {
+            Ok(data) if !data.is_empty() => data,
+            _ => fail(b"cat: read failed\n"),
+        };
+        emit(stdout, data);
+        offset += data.len() as u64;
+    }
+    process_exit(0)
+}
+
 #[no_mangle]
 extern "C" fn main(
     bootstrap_handle: u64,
@@ -39,9 +89,6 @@ extern "C" fn main(
     _a8: u64,
 ) -> ! {
     let startup = startup(Handle(bootstrap_handle as u32));
-    let initrd = startup
-        .cap0
-        .unwrap_or_else(|| fail(b"cat: no initrd handle\n"));
     let argv_handle = startup
         .argv
         .unwrap_or_else(|| fail(b"cat: no argv handle\n"));
@@ -57,6 +104,12 @@ extern "C" fn main(
         (Some(path), None) => path,
         _ => fail(b"usage: cat <path>\n"),
     };
+    if let Some(fs) = startup.fs {
+        cat_volume(fs, stdout, path_bytes);
+    }
+    let initrd = startup
+        .cap0
+        .unwrap_or_else(|| fail(b"cat: no initrd handle\n"));
     let path = match core::str::from_utf8(path_bytes) {
         Ok(path) => path,
         Err(_) => fail(b"cat: bad path\n"),

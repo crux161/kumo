@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j514
+//j547
 
 //! `fatfs` — the FAT-backed vfs handler core.
 //!
@@ -19,9 +20,9 @@ extern crate alloc;
 
 use kumo_fatfs::{DirEntry, FatVolume, FatWriteError, SectorReader, SectorWriter};
 use kumo_vfs::{
-    encode_open_ok, encode_status, encode_write_ok, Request, MAX_WRITE_DATA, OPEN_CREATE,
-    OPEN_READ, OPEN_WRITE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST, VFS_IO_ERROR,
-    VFS_IS_DIR, VFS_NOT_FOUND, VFS_NO_SPACE, VFS_OK, WRITE_HEADER_LEN,
+    encode_open_ok, encode_status, encode_write_ok, DirReplyWriter, Request, MAX_WRITE_DATA,
+    OPEN_CREATE, OPEN_READ, OPEN_WRITE, VFS_ACCESS_DENIED, VFS_BAD_HANDLE, VFS_BAD_REQUEST,
+    VFS_IO_ERROR, VFS_IS_DIR, VFS_NOT_DIR, VFS_NOT_FOUND, VFS_NO_SPACE, VFS_OK, WRITE_HEADER_LEN,
 };
 
 /// Maximum number of open file handles in this first fixed table.
@@ -185,6 +186,7 @@ pub fn dispatch<R: SectorReader + SectorWriter>(
             set_len(volume, reader, open_files, handle, len, reply)
         }
         Some(Request::Flush { handle }) => flush(volume, reader, open_files, handle, reply),
+        Some(Request::ReadDir { path, start }) => read_dir(volume, reader, path, start, reply),
         None => write_status(reply, VFS_BAD_REQUEST),
     }
 }
@@ -296,6 +298,69 @@ fn flush<R: SectorReader + SectorWriter>(
     }
 }
 
+/// List the directory at `path` from its `start`-th entry, as many entries as the reply holds
+/// (J547). `.` and `..` are left out, as `ls` leaves them out, and do not count toward
+/// `start`.
+fn read_dir<R: SectorReader>(
+    volume: &FatVolume,
+    reader: &mut R,
+    path: &[u8],
+    start: u32,
+    reply: &mut [u8],
+) -> usize {
+    let cluster = match directory_cluster(volume, reader, path) {
+        Ok(cluster) => cluster,
+        Err(status) => return write_status(reply, status),
+    };
+    let Some(mut listing) = DirReplyWriter::new(reply) else {
+        return 0;
+    };
+    let mut index = 0u32;
+    let walked = volume.for_each_in_dir(reader, cluster, |entry| {
+        if entry.name[0] == b'.' {
+            return true;
+        }
+        if index < start {
+            index += 1;
+            return true;
+        }
+        let name = entry.short_name();
+        if !listing.push(entry.is_dir(), entry.size as u64, name.as_bytes()) {
+            return false;
+        }
+        index += 1;
+        true
+    });
+    let len = listing.finish();
+    if walked {
+        len
+    } else {
+        write_status(reply, VFS_IO_ERROR)
+    }
+}
+
+/// The first cluster of the directory `path` names. The root is `/` (or an empty path); a
+/// `..` entry that points at the root records cluster 0.
+fn directory_cluster<R: SectorReader>(
+    volume: &FatVolume,
+    reader: &mut R,
+    path: &[u8],
+) -> Result<u32, u8> {
+    let root = volume.bpb().root_cluster;
+    if path.split(|byte| *byte == b'/').all(<[u8]>::is_empty) {
+        return Ok(root);
+    }
+    match volume.resolve_path(reader, path) {
+        Some(entry) if entry.is_dir() => Ok(if entry.first_cluster == 0 {
+            root
+        } else {
+            entry.first_cluster
+        }),
+        Some(_) => Err(VFS_NOT_DIR),
+        None => Err(VFS_NOT_FOUND),
+    }
+}
+
 const fn mutation_status(error: FatWriteError) -> u8 {
     match error {
         FatWriteError::NoSpace => VFS_NO_SPACE,
@@ -321,8 +386,8 @@ mod tests {
     use alloc::vec::Vec;
     use kumo_fatfs::{attr, FatError, SECTOR_SIZE};
     use kumo_vfs::{
-        parse_open_reply, parse_write_reply, read_payload, OPEN_CREATE, OPEN_READ, OPEN_WRITE,
-        VFS_BAD_REQUEST,
+        parse_dir_reply, parse_open_reply, parse_write_reply, read_payload, DirRecord, OPEN_CREATE,
+        OPEN_READ, OPEN_WRITE, VFS_BAD_REQUEST,
     };
 
     const SEC: u16 = 512;
@@ -746,5 +811,65 @@ mod tests {
             FatVolume::mount(&mut DeadDisk),
             Err(FatError::ReadFailed)
         ));
+    }
+
+    /// List `path` from `start` through `dispatch`, with a reply of `reply_len` bytes.
+    fn list(path: &[u8], start: u32, reply_len: usize) -> Result<Vec<(bool, u64, Vec<u8>)>, u8> {
+        let volume = mounted();
+        let mut table = OpenTable::new();
+        let request = encode_request(Request::ReadDir { path, start });
+        let mut reply = alloc::vec![0u8; reply_len];
+        let n = dispatch(&volume, &mut FixtureDisk, &mut table, &request, &mut reply);
+        match parse_dir_reply(&reply[..n]) {
+            Ok((count, records)) => {
+                let records: Vec<_> = records
+                    .map(|DirRecord { is_dir, size, name }| (is_dir, size, name.to_vec()))
+                    .collect();
+                assert_eq!(records.len(), count as usize);
+                Ok(records)
+            }
+            Err(kumo_vfs::VfsError::Status(status)) => Err(status),
+            Err(other) => panic!("malformed reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_root_lists_its_files_and_directories() {
+        assert_eq!(
+            list(b"/", 0, REPLY_BUF_BYTES),
+            Ok(alloc::vec![
+                (false, 6, b"HELLO.TXT".to_vec()),
+                (true, 0, b"EFI".to_vec())
+            ])
+        );
+        assert_eq!(
+            list(b"", 0, REPLY_BUF_BYTES),
+            list(b"/", 0, REPLY_BUF_BYTES)
+        );
+        assert_eq!(
+            list(b"/EFI", 0, REPLY_BUF_BYTES),
+            Ok(alloc::vec![(true, 0, b"BOOT".to_vec())])
+        );
+    }
+
+    #[test]
+    fn a_listing_pages_from_its_start_until_empty() {
+        // Room for one record: the client asks again from the next entry.
+        let one = 2 + 10 + 9;
+        assert_eq!(
+            list(b"/", 0, one),
+            Ok(alloc::vec![(false, 6, b"HELLO.TXT".to_vec())])
+        );
+        assert_eq!(
+            list(b"/", 1, one),
+            Ok(alloc::vec![(true, 0, b"EFI".to_vec())])
+        );
+        assert_eq!(list(b"/", 2, one), Ok(alloc::vec![]));
+    }
+
+    #[test]
+    fn listing_a_file_or_a_missing_path_reports_why() {
+        assert_eq!(list(b"/HELLO.TXT", 0, REPLY_BUF_BYTES), Err(VFS_NOT_DIR));
+        assert_eq!(list(b"/NOPE", 0, REPLY_BUF_BYTES), Err(VFS_NOT_FOUND));
     }
 }

@@ -3,6 +3,7 @@
 //j409
 //j410
 //j527
+//j547
 use alloc::vec::Vec;
 use core::mem;
 
@@ -1201,6 +1202,12 @@ impl SyscallEngine {
                         if entry.kind == ObjectKind::Channel {
                             if let Ok(Some(peer_koid)) = self.ipc.close_by_koid(entry.koid) {
                                 self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                                // J547: a child parked in `ChannelRead` on the surviving end
+                                // waits on its endpoint, not a port. Wake it as a write would, so
+                                // its retried read sees `PeerClosed` instead of sleeping forever.
+                                // — TIMBERDOODLE
+                                #[cfg(target_os = "none")]
+                                crate::user_thread::wake_child_waiting_on_channel(peer_koid);
                             }
                         }
                         if entry.kind == ObjectKind::Timer {

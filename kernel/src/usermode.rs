@@ -14,6 +14,7 @@
 //j494
 //j528
 //j532
+//j547
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1078,6 +1079,9 @@ fn teardown_current_process_and_signal() {
     let Some(koid) = crate::user_thread::current_process_koid() else {
         return;
     };
+    // Surviving channel ends whose peer this exit closes. Their readers are woken after the
+    // Sora borrow below ends (GUIDANCE/006 §2.1).
+    let mut closed_peers = Vec::new();
     let reclaim_framebuffer = with_sora_mut(|sora| {
         let reclaim_framebuffer = sora.framebuffer_owner == Some(koid);
         if reclaim_framebuffer {
@@ -1098,6 +1102,7 @@ fn teardown_current_process_and_signal() {
                     if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
                         sora.engine
                             .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                        closed_peers.push(peer_koid);
                     }
                 }
                 // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
@@ -1126,6 +1131,14 @@ fn teardown_current_process_and_signal() {
             .signal_ports(koid, kumo_abi::Signals::TERMINATED);
         reclaim_framebuffer
     });
+    // J547: a child parked in `ChannelRead` on a surviving end waits on that endpoint, not on
+    // a port, so `signal_ports` alone left it asleep forever. Every per-launch `fatfs` sat
+    // like that after its client exited, and on the opi5 each one kept a USB block-client
+    // slot until the stick refused the fifth `ls`. Its retried read now sees `PeerClosed`.
+    // — TIMBERDOODLE
+    for peer in closed_peers {
+        crate::user_thread::wake_child_waiting_on_channel(peer);
+    }
     if reclaim_framebuffer {
         kumo_hal::active::reclaim_framebuffer_console();
     }

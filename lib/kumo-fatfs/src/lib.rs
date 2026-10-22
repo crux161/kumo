@@ -4,6 +4,7 @@
 //j537
 //j543
 //j545
+//j547
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -249,6 +250,46 @@ impl DirEntry {
     /// Is this entry a subdirectory?
     pub const fn is_dir(&self) -> bool {
         self.attr & attr::DIRECTORY != 0
+    }
+
+    /// The entry's short name as a listing shows it: `NAME.EXT`, padding dropped (J547).
+    pub fn short_name(&self) -> ShortName {
+        let mut name = ShortName {
+            bytes: [0; 12],
+            len: 0,
+        };
+        let base = self.name[..8].trim_ascii_end();
+        let ext = self.name[8..].trim_ascii_end();
+        for byte in base {
+            name.bytes[name.len] = *byte;
+            name.len += 1;
+        }
+        // 0x05 in the first byte stands for a real 0xE5, which would read as a deleted slot.
+        if name.bytes[0] == 0x05 {
+            name.bytes[0] = 0xE5;
+        }
+        if !ext.is_empty() {
+            name.bytes[name.len] = b'.';
+            name.len += 1;
+            for byte in ext {
+                name.bytes[name.len] = *byte;
+                name.len += 1;
+            }
+        }
+        name
+    }
+}
+
+/// A short (8.3) name rendered for display: at most 12 bytes, `NAME.EXT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortName {
+    bytes: [u8; 12],
+    len: usize,
+}
+
+impl ShortName {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 
@@ -1945,5 +1986,24 @@ mod tests {
             boot_label: *b"           ",
         };
         assert_eq!(fat.volume_label(&mut blank), None);
+    }
+
+    #[test]
+    fn short_names_render_as_a_listing_shows_them() {
+        let name = |raw: &[u8; 11], attr: u8| match parse_dir_entry(&dir_entry(raw, attr, 3, 1)) {
+            DirSlot::File(entry) => entry.short_name(),
+            other => panic!("not a file slot: {other:?}"),
+        };
+        assert_eq!(name(b"HELLO   TXT", attr::ARCHIVE).as_bytes(), b"HELLO.TXT");
+        assert_eq!(name(b"EFI        ", attr::DIRECTORY).as_bytes(), b"EFI");
+        assert_eq!(
+            name(b"LOREM_JPTXT", attr::ARCHIVE).as_bytes(),
+            b"LOREM_JP.TXT"
+        );
+        assert_eq!(name(b"A       B  ", attr::ARCHIVE).as_bytes(), b"A.B");
+        assert_eq!(
+            name(b"\x05BC     TXT", attr::ARCHIVE).as_bytes(),
+            b"\xE5BC.TXT"
+        );
     }
 }
