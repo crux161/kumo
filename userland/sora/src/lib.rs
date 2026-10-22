@@ -5,6 +5,7 @@
 //j389
 //j545
 //j547
+//j551
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -13,6 +14,25 @@ use kumo_i2c_hid::{
     HidDeviceKind, I2cHidBusTopology, TlmmPinctrlPlan,
 };
 use kumo_ipc::{Message, MessageError};
+
+/// Relay one stdout message through the bounded DebugWrite sink. Short writes
+/// consume only their acknowledged prefix; a failed sink ends this relay.
+pub fn relay_console_output(bytes: &[u8], mut write: impl FnMut(&[u8]) -> u64) -> bool {
+    // Channel messages grew to 4096 bytes in J545, but DebugWrite still accepts
+    // at most 256. A successful syscall does not acknowledge the tail. — KESTREL
+    const DEBUG_WRITE_MAX: usize = 256;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + DEBUG_WRITE_MAX).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        let written = write(chunk);
+        if written == 0 || written > chunk.len() as u64 {
+            return false;
+        }
+        offset += written as usize;
+    }
+    true
+}
 
 pub const SORA_NAME: &str = "Sora";
 pub const ROOT_SERVER_ORDINAL_ECHO: u32 = 1;
@@ -406,8 +426,107 @@ pub fn select_i2c_hid_optional_attention_irq(discovery: &I2cHidRuntimeTopology) 
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    extern crate std;
+
     use super::*;
+    use alloc::vec::Vec;
+    use drv_fb::{Console, BG, GLYPH_H, GLYPH_W};
     use kumo_i2c_hid::{BootMouseReport, MouseButtons};
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    struct TestFramebuffer {
+        pixels: *mut u32,
+        layout: Layout,
+        len: usize,
+    }
+
+    impl TestFramebuffer {
+        fn new(len: usize) -> Self {
+            let layout = Layout::array::<u32>(len).unwrap();
+            // The linked KUMO runtime installs a 256 KiB bootstrap allocator;
+            // host framebuffers must not invoke its target growth SVC. — KESTREL
+            let pixels = unsafe { System.alloc_zeroed(layout) as *mut u32 };
+            assert!(!pixels.is_null());
+            Self {
+                pixels,
+                layout,
+                len,
+            }
+        }
+
+        fn pixels(&self) -> &[u32] {
+            unsafe { core::slice::from_raw_parts(self.pixels, self.len) }
+        }
+    }
+
+    impl Drop for TestFramebuffer {
+        fn drop(&mut self) {
+            unsafe { System.dealloc(self.pixels as *mut u8, self.layout) };
+        }
+    }
+
+    #[test]
+    fn full_kilo_repaint_reaches_pixels_and_final_cursor_through_short_writes() {
+        const COLS: usize = 80;
+        const ROWS: usize = 24;
+        const WIDTH: usize = COLS * GLYPH_W;
+        const HEIGHT: usize = ROWS * GLYPH_H;
+
+        // Upstream editorRefreshScreen's 80x24 shape, with full content rows so
+        // the status and cursor lie beyond both old truncation points. — KESTREL
+        let mut repaint = Vec::from(b"\x1b[?25l\x1b[H".as_slice());
+        for row in 0..ROWS - 2 {
+            repaint.extend_from_slice(&[b'A' + row as u8; COLS]);
+            repaint.extend_from_slice(b"\x1b[39m\x1b[0K\r\n");
+        }
+        repaint.extend_from_slice(b"\x1b[0K\x1b[7m");
+        repaint.extend_from_slice(&[b'S'; COLS]);
+        repaint.extend_from_slice(
+            b"\x1b[0m\r\n\x1b[0KHELP: Ctrl-S = save | Ctrl-Q = quit\x1b[2;3H\x1b[?25h",
+        );
+        assert!(repaint.len() > ttyd::REPLY_BUF_BYTES);
+
+        let message = Message::new(1, &repaint, &[]).unwrap();
+        let mut receive = [0u8; kumo_ipc::MAX_INLINE_BYTES];
+        receive[..message.bytes.len()].copy_from_slice(message.bytes);
+        let bytes = &receive[..message.bytes.len()];
+        let actual = TestFramebuffer::new(WIDTH * HEIGHT);
+        let mut console = unsafe { Console::new(actual.pixels, WIDTH, HEIGHT, WIDTH) };
+        let mut relayed = Vec::new();
+        assert!(relay_console_output(bytes, |chunk| {
+            assert!(chunk.len() <= 256);
+            // Exercise a short acknowledgement, including split CSI sequences.
+            let accepted = chunk.len().min(73);
+            console.write(&chunk[..accepted]);
+            relayed.extend_from_slice(&chunk[..accepted]);
+            accepted as u64
+        }));
+        assert_eq!(relayed, repaint);
+
+        let expected = TestFramebuffer::new(WIDTH * HEIGHT);
+        let mut reference = unsafe { Console::new(expected.pixels, WIDTH, HEIGHT, WIDTH) };
+        reference.write(&repaint);
+        assert!(actual.pixels().iter().eq(expected.pixels()));
+        // The final show-cursor command must invert the blank pixel at (2,1),
+        // proving that the tail moved and showed it rather than stopping at SGR. — KESTREL
+        assert_eq!(actual.pixels()[GLYPH_H * WIDTH + 2 * GLYPH_W], 0x00ff_ffff);
+        assert!(actual.pixels()[(ROWS - 1) * GLYPH_H * WIDTH..]
+            .iter()
+            .any(|&p| p != BG));
+    }
+
+    #[test]
+    fn console_relay_stops_on_zero_error_or_invalid_acknowledgement() {
+        for result in [0, u64::MAX, 5] {
+            let mut calls = 0;
+            assert!(!relay_console_output(b"tail", |_| {
+                calls += 1;
+                result
+            }));
+            assert_eq!(calls, 1);
+        }
+    }
 
     #[test]
     fn root_logic_is_host_testable() {

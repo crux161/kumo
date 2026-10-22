@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j545
 //j547
 //j548
 //j549
 //j550
+//j551
 
 extern crate alloc;
 
@@ -3302,7 +3302,6 @@ fn lua_relay_reply(stdout: Handle) -> bool {
         end_lua_session();
         return false;
     }
-    KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
     debug_write(buf.as_ptr(), n as usize);
     true
 }
@@ -3386,14 +3385,25 @@ const KILO_SILENT_KEY_LIMIT: u64 = 64;
 /// wake it — the same hazard J510 fixed one layer down. Returns false when the editor's
 /// stdout is gone, which is the only end-of-session signal an editor gives.
 fn kilo_relay_paint(stdout: Handle) -> bool {
-    let mut buf = [0u8; ttyd::REPLY_BUF_BYTES];
+    // ChannelRead consumes one whole message, discarding any bytes that do not
+    // fit. A TTY control-reply buffer is not a stdout-message bound. — KESTREL
+    let mut buf = [0u8; kumo_ipc::MAX_INLINE_BYTES];
     let n = channel_read(stdout, buf.as_mut_ptr(), buf.len());
     if n == 0 || n == u64::MAX {
         end_kilo_session();
         return false;
     }
-    debug_write(buf.as_ptr(), n as usize);
-    true
+    if sora::relay_console_output(&buf[..n as usize], |chunk| {
+        debug_write(chunk.as_ptr(), chunk.len())
+    }) {
+        // A complete repaint is editor progress, not a lifetime key budget.
+        // Lua output must not reset this editor's liveness counter. — KESTREL
+        KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
+        true
+    } else {
+        end_kilo_session();
+        false
+    }
 }
 
 /// Forward one raw keystroke to the editor and render what it draws in response.

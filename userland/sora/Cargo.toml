@@ -1,5 +1,6 @@
 #j426
 #j548
+#j551
 
 [package]
 name = "sora"
@@ -24,6 +25,9 @@ persona-linux = { path = "../persona-linux" }
 persona-posix = { path = "../persona-posix" }
 svc-health = { path = "../servers/svc-health" }
 ttyd = { path = "../servers/ttyd" }
+
+[dev-dependencies]
+drv-fb = { path = "../servers/drv-fb" }
 
 [lib]
 path = "src/lib.rs"
