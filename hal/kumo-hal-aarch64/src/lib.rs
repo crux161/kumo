@@ -6,6 +6,7 @@
 //j483
 //j493
 //j534
+//j546
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -2380,6 +2381,11 @@ pub mod el0 {
         // register (x9) loaded dead last. The previous version loaded the GP file first
         // and then pulled elr/spsr/sp_el0/ttbr0 through x2/x3 — handing EL0 the TTBR0
         // physical address in x2 instead of its third bootstrap argument.
+        // J546: mask DAIF before the first system register. A thread can reach here through a
+        // switch made with IRQs on (`kumo_context_switch` does not carry DAIF), and an IRQ taken
+        // after `elr_el1`/`spsr_el1` are written overwrites them before the `eret`. The `eret`
+        // takes PSTATE from SPSR, so EL0 still runs unmasked. — TIMBERDOODLE
+        "  msr  daifset, #0xf",
         "  mov  x9, x19",              // x9 = &UserState (base)
         "  ldp  x10, x11, [x9, #248]", // elr, spsr
         "  msr  elr_el1, x10",
@@ -2447,6 +2453,7 @@ pub mod el0 {
         ".global kumo_enter_el0",
         ".balign 4",
         "kumo_enter_el0:", // x0=entry, x1=user_sp, x2=arg0 (-> EL0 x0, the bootstrap handle)
+        "  msr  daifset, #0xf", // J546: no IRQ between writing elr_el1/spsr_el1 and the eret
         "  mov  x9, x2",   // stash arg0 before x2 is reused as the save base
         "  adrp x2, KERNEL_RESUME",
         "  add  x2, x2, :lo12:KERNEL_RESUME",
@@ -2541,6 +2548,11 @@ pub mod el0 {
         "  b.ne 8f",
         "  mov  x0, sp", // dispatch(frame*)
         "  bl   kumo_svc_dispatch",
+        // J546: the dispatch may have switched threads and come back with IRQs on (a context
+        // switch does not carry DAIF). From here to the `eret` an IRQ would overwrite
+        // elr_el1/spsr_el1 after they are restored, so mask first; the `eret` restores EL0's
+        // own mask from SPSR. Linux's `kernel_exit` does the same. — TIMBERDOODLE
+        "  msr  daifset, #0xf",
         "  ldp  x0,  x1,  [sp, #248]", // restore EL0 return state (x0/x1 scratch)
         "  msr  elr_el1, x0",
         "  msr  spsr_el1, x1",
@@ -5139,6 +5151,13 @@ mod traps {
         "  b.hs 1f",
         "  bl  kumo_irq_entry",
         "1:",
+        // J546: `kumo_irq_entry` may preempt this thread, and the thread may later be resumed
+        // by a switch made with IRQs on, since `kumo_context_switch` does not carry DAIF. The
+        // exit below then ran unmasked: a nested IRQ between `msr elr_el1` and `eret` replaced
+        // the return state, and on 2026-10-22 an opi5 died with a data abort in this very
+        // restore (TOWER: SPSR I=0, ELR on `ldp q20, q21`). Mask before touching the frame;
+        // the `eret` restores the interrupted context's own mask from SPSR. — TIMBERDOODLE
+        "  msr daifset, #0xf",
         "  ldp x0,  x1,  [sp, #248]",
         "  tbz x1, #20, 2f",
         "  bl  kumo_irq_il_seen",
