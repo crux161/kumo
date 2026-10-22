@@ -1,9 +1,9 @@
 #![no_std]
-//j161
 //j166
 //j413
 //j414
 //j545
+//j550
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -228,6 +228,38 @@ pub fn read_payload(resp: &[u8]) -> Result<&[u8], ResponseError> {
 pub const CONTROL_MEDIA_READY: u8 = b'V';
 /// Control message, Sora to driver: the one transferred handle is a new client's channel.
 pub const CONTROL_CONNECT: u8 = b'C';
+/// Wire length of a connect request, excluding its transferred channel handle.
+pub const CONTROL_CONNECT_LEN: usize = 2;
+
+/// Authority fixed on one block channel when Sora connects it to the driver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlockAccess {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Attach the requested authority to a newly transferred block channel.
+pub const fn encode_connect(access: BlockAccess) -> [u8; CONTROL_CONNECT_LEN] {
+    [
+        CONTROL_CONNECT,
+        match access {
+            BlockAccess::ReadOnly => 0,
+            BlockAccess::ReadWrite => 1,
+        },
+    ]
+}
+
+/// Decode only known access modes. The old one-byte connect grants read access only;
+/// write authority must be explicit, never inferred from a writable volume. — KESTREL
+pub fn decode_connect(raw: &[u8]) -> Option<BlockAccess> {
+    match raw {
+        [CONTROL_CONNECT] | [CONTROL_CONNECT, 0] => Some(BlockAccess::ReadOnly),
+        [CONTROL_CONNECT, 1] => Some(BlockAccess::ReadWrite),
+        _ => None,
+    }
+}
+
 /// Wire length of [`MediaReady`]: `[tag][flags][blocks: u64][serial: u32][label: 11]`.
 pub const MEDIA_READY_LEN: usize = 25;
 const MEDIA_HAS_LABEL: u8 = 1 << 0;
@@ -304,6 +336,29 @@ pub fn decode_client_bootstrap(raw: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connect_grants_only_its_explicit_access() {
+        assert_eq!(BlockAccess::default(), BlockAccess::ReadOnly);
+        assert_eq!(encode_connect(BlockAccess::ReadOnly), [CONTROL_CONNECT, 0]);
+        assert_eq!(encode_connect(BlockAccess::ReadWrite), [CONTROL_CONNECT, 1]);
+        for access in [BlockAccess::ReadOnly, BlockAccess::ReadWrite] {
+            assert_eq!(decode_connect(&encode_connect(access)), Some(access));
+        }
+        assert_eq!(
+            decode_connect(&[CONTROL_CONNECT]),
+            Some(BlockAccess::ReadOnly)
+        );
+        for raw in [
+            &[][..],
+            &[CONTROL_CONNECT, 2],
+            &[CONTROL_CONNECT, 0xFF],
+            &[CONTROL_CONNECT, 1, 0],
+            &[b'X', 1],
+        ] {
+            assert_eq!(decode_connect(raw), None);
+        }
+    }
 
     #[test]
     fn a_client_bootstrap_round_trips_and_is_told_from_the_image_header() {

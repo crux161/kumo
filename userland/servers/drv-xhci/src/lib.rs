@@ -1,5 +1,6 @@
 #![no_std]
 //j549
+//j550
 
 use drv_blk::{
     Request, BLOCK_SIZE, CMD_FLUSH, CMD_READ, CMD_WRITE, REQUEST_LEN, STATUS_BAD_LBA,
@@ -48,6 +49,43 @@ pub fn storage_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_channel_cannot_upgrade_itself_by_sending_a_write() {
+        use drv_blk::{decode_connect, encode_connect, BlockAccess, CONTROL_CONNECT};
+
+        let mut frame = [0xA5; REQUEST_LEN + BLOCK_SIZE as usize];
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(0, 1).encode());
+        for wire in [
+            &[CONTROL_CONNECT][..],
+            &encode_connect(BlockAccess::ReadOnly),
+        ] {
+            let access = decode_connect(wire).unwrap();
+            assert_eq!(
+                storage_request(&frame, 2048, 4, access == BlockAccess::ReadOnly),
+                Err(STATUS_READ_ONLY)
+            );
+            assert_eq!(
+                storage_request(
+                    &Request::read(0, 1).encode(),
+                    2048,
+                    4,
+                    access == BlockAccess::ReadOnly
+                ),
+                Ok(StorageRequest::Read(2048))
+            );
+        }
+        let access = decode_connect(&encode_connect(BlockAccess::ReadWrite)).unwrap();
+        assert_eq!(
+            storage_request(&frame, 2048, 4, access == BlockAccess::ReadOnly),
+            Ok(StorageRequest::Write(2048, &frame[REQUEST_LEN..]))
+        );
+        // A volume's read-only policy still overrides an explicit writer. — KESTREL
+        assert_eq!(
+            storage_request(&frame, 2048, 4, true),
+            Err(STATUS_READ_ONLY)
+        );
+    }
 
     #[test]
     fn writes_are_exactly_one_sector_inside_the_partition() {

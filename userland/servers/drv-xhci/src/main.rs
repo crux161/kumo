@@ -1,16 +1,17 @@
 #![no_std]
 #![no_main]
 
-//j542
 //j543
 //j545
 //j548
 //j549
+//j550
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use drv_blk::{
-    MediaReady, CONTROL_CONNECT, REQUEST_LEN as BLOCK_REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK,
+    decode_connect, BlockAccess, MediaReady, CONTROL_CONNECT_LEN, REQUEST_LEN as BLOCK_REQUEST_LEN,
+    STATUS_IO_ERROR, STATUS_OK,
 };
 use drv_xhci::{storage_request, StorageRequest};
 use kumo_abi::{Handle, VmarFlags};
@@ -1858,6 +1859,7 @@ struct StorageService {
 struct BlockClient {
     handle: u32,
     koid: u64,
+    access: BlockAccess,
     served: u32,
     writes: u32,
     flushes: u32,
@@ -1995,10 +1997,12 @@ fn serve_storage_wake(
     true
 }
 
-/// Take one control message: `CONTROL_CONNECT` and a client channel, which joins the port.
+/// Bind the transferred block channel with the authority in Sora's connect request.
 fn accept_block_client(service: &mut StorageService, port: Handle) {
     let control = Handle(STORAGE_CONTROL.load(Ordering::Relaxed));
-    let mut tag = [0u8; 1];
+    // An extra byte makes an oversized control frame fail decoding instead of being truncated
+    // to a valid write grant. — KESTREL
+    let mut tag = [0u8; CONTROL_CONNECT_LEN + 1];
     let (len, raw) = channel_read_with_handle(control, tag.as_mut_ptr(), tag.len());
     if len == 0 {
         // Sora closed its end: no client will come again, so stop watching it.
@@ -2009,10 +2013,10 @@ fn accept_block_client(service: &mut StorageService, port: Handle) {
         return log(b"drv-xhci: storage control message without a channel\n");
     }
     let client = Handle(raw as u32);
-    if tag[0] != CONTROL_CONNECT {
+    let Some(access) = decode_connect(&tag[..len.min(tag.len())]) else {
         let _ = handle_close(client);
         return log(b"drv-xhci: storage control unknown message\n");
-    }
+    };
     let Some(slot) = service.clients.iter().position(|client| client.handle == 0) else {
         let _ = handle_close(client);
         return log(b"drv-xhci: block clients full; client refused\n");
@@ -2025,13 +2029,18 @@ fn accept_block_client(service: &mut StorageService, port: Handle) {
     service.clients[slot] = BlockClient {
         handle: client.0,
         koid,
+        access,
         served: 0,
         writes: 0,
         flushes: 0,
     };
     log(b"drv-xhci: block client connected slot=");
     log_hex(slot as u64);
-    log(b"\n");
+    log(if access == BlockAccess::ReadOnly {
+        b" read-only\n"
+    } else {
+        b" read-write\n"
+    });
 }
 
 /// Answer one request from client `index` in the `drv-blk` protocol. LBAs are the volume's: a
@@ -2074,7 +2083,7 @@ fn serve_block_client(
         &frame[..n as usize],
         service.first_lba,
         service.ready.block_count,
-        service.ready.read_only,
+        service.ready.read_only || service.clients[index].access == BlockAccess::ReadOnly,
     ) {
         Ok(StorageRequest::Read(lba)) => {
             let read = service.with_disk(io, layout, image, evt, |disk| {

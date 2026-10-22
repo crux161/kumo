@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-//j527
 //j545
 //j547
 //j548
 //j549
+//j550
 
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, KILO_PATH, LS_PATH,
@@ -2770,7 +2771,7 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
     // J545's end-to-end check: mount the volume once through a block-backed `fatfs`, then let
     // that instance go. Its mount crosses every new hop (Sora's connect, the driver's resident
     // loop, the block protocol), and its exit returns the driver's client slot. — TIMBERDOODLE
-    match spawn_media_fatfs(initrd) {
+    match spawn_media_fatfs(initrd, BlockAccess::ReadOnly) {
         Some(vfs) => {
             let _ = handle_close(vfs);
             log(b"media: mount check started\n");
@@ -2823,7 +2824,7 @@ fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], pa
         program,
         Some(&slots),
         false,
-        FsGrant::Media,
+        FsGrant::Media(BlockAccess::ReadOnly),
         false,
         false,
         StdinMode::None,
@@ -2834,7 +2835,7 @@ fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], pa
 /// J545: start a `fatfs` instance over the registered stick and return its vfs client channel.
 /// The instance gets its own block channel, whose other end goes to the stick's driver first;
 /// when the instance exits, the driver sees that channel close and frees the client slot.
-fn spawn_media_fatfs(initrd: Handle) -> Option<Handle> {
+fn spawn_media_fatfs(initrd: Handle, access: BlockAccess) -> Option<Handle> {
     let media = media()?;
     let (block_client_raw, block_server_raw) = channel_create_pair();
     if block_client_raw == u64::MAX || block_server_raw == u64::MAX {
@@ -2848,8 +2849,8 @@ fn spawn_media_fatfs(initrd: Handle) -> Option<Handle> {
     }
     let block_client = Handle(block_client_raw as u32);
     let block_server = Handle(block_server_raw as u32);
-    let connect = [drv_blk::CONTROL_CONNECT];
-    if channel_write_with_handle(media.control, connect.as_ptr(), 1, block_server)
+    let connect = drv_blk::encode_connect(access);
+    if channel_write_with_handle(media.control, connect.as_ptr(), connect.len(), block_server)
         != Errno::Ok.status()
     {
         let _ = handle_close(block_client);
@@ -2978,8 +2979,8 @@ enum FsGrant {
     None,
     /// Over Sora's RAM FAT image (J508): what kilo and the relibc smoke write to.
     Image,
-    /// Over the USB volume mounted at `/media/<name>` (J547/J549).
-    Media,
+    /// Over the USB volume with only the access this launch needs (J550). — KESTREL
+    Media(BlockAccess),
 }
 
 /// How a spawned child gets its standard input.
@@ -3103,7 +3104,7 @@ fn run_with_startup_input(
     let fs_child = match fs {
         FsGrant::None => None,
         FsGrant::Image => spawn_fatfs(initrd),
-        FsGrant::Media => spawn_media_fatfs(initrd),
+        FsGrant::Media(access) => spawn_media_fatfs(initrd, access),
     };
     let tty_child = if grant_tty {
         spawn_ttyd_control(initrd)
@@ -3455,7 +3456,7 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
                 // The editor sees only its granted volume and a path from that volume's root.
                 // — KESTREL
                 slots[1] = path;
-                fs = FsGrant::Media;
+                fs = FsGrant::Media(BlockAccess::ReadWrite);
             }
         }
     }
