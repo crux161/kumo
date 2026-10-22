@@ -1,9 +1,9 @@
 #![no_std]
-//j432
 //j433
 //j481
 //j521
 //j529
+//j533
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -14,6 +14,7 @@
 mod context;
 mod controller;
 mod fdt;
+mod hub;
 mod noop;
 mod probe;
 mod registers;
@@ -31,6 +32,10 @@ pub use fdt::{
     RK3588_USB0_XHCI_MMIO_LEN, RK3588_USB0_XHCI_REGISTER_MMIO_LEN,
     X13S_USB0_XHCI_FIRST_LIGHT_MMIO_LEN, X13S_USB0_XHCI_MMIO_BASE, X13S_USB0_XHCI_MMIO_MIN_LEN,
     X13S_USB0_XHCI_REGISTER_MMIO_LEN, X13S_USB0_XHCI_STREAM_ID,
+};
+pub use hub::{
+    HubConnectDebounce, HubConnectVerdict, HubDescriptor, HUB_CONNECT_WINDOW_NS,
+    HUB_DEBOUNCE_STABLE_NS, HUB_DEBOUNCE_STEP_NS, HUB_DEBOUNCE_TIMEOUT_NS, MAX_HUB_PORTS,
 };
 pub use noop::{
     prepare_noop_command_image, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas,

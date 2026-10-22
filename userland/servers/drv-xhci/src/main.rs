@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j523
 //j525
 //j529
 //j530
 //j531
+//j533
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -14,7 +14,7 @@ use kumo_gpt::{validate_protective_mbr, GptError, GptHeader, Guid};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
     interrupt_create, interrupt_wait, port_bind, port_create, port_wait, process_exit,
-    resource_mint_mmio, vmar_map, vmo_create_contiguous,
+    resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -24,9 +24,10 @@ use kumo_usb_storage::{
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
     ContextSize, ControllerStatus, EndpointContext, Event, EventRingSegmentTableEntry,
-    InputControlContext, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer,
-    PortStatus, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
-    TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    HubConnectDebounce, HubConnectVerdict, HubDescriptor, InputControlContext,
+    NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
+    RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext, TransferRing, Trb,
+    UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -116,6 +117,12 @@ const HUB_RESET_POLL_ROUNDS: u32 = 64;
 /// Rounds to wait for the hub's status-change report before moving on to explicit per-port
 /// GET_STATUS (which is what actually drives the scan).
 const HUB_STATUS_WAIT_ROUNDS: u32 = 16;
+/// Second guard on the attach-debounce loop, which normally ends on the wall clock: the debounce
+/// timeout in poll steps, plus one.
+const HUB_ATTACH_MAX_ROUNDS: u32 =
+    (kumo_xhci::HUB_DEBOUNCE_TIMEOUT_NS / kumo_xhci::HUB_DEBOUNCE_STEP_NS) as u32 + 1;
+/// Second guard on `settle`'s spin fallback, for a monotonic clock that never advances.
+const SETTLE_SPIN_ROUNDS: u32 = 4096;
 
 /// The device Resource handle and GIC IRQ this controller was granted, stashed from the bootstrap
 /// so the keyboard path can bind the interrupt (single-threaded driver — plain atomics suffice).
@@ -2229,9 +2236,14 @@ fn configure_and_read_hub(
         None => return log(b"drv-xhci: hub desc timeout\n"),
     }
     dsb();
-    let nbr_ports = data_buf[2];
+    let Ok(hub) = HubDescriptor::parse(&data_buf[..16]) else {
+        return log(b"drv-xhci: hub desc invalid\n");
+    };
+    let nbr_ports = hub.port_count();
     log(b"drv-xhci: hub ports=");
     log_hex(nbr_ports as u64);
+    log(b" power-good ms=");
+    log_hex(hub.power_good_delay_ns() / 1_000_000);
     log(b"\n");
     // Everything below is one bounded pass: a driver child cannot be preempted, so the hub work
     // must promise an upper bound on how long it holds the CPU away from a live keyboard driver.
@@ -2281,9 +2293,11 @@ fn configure_and_read_hub(
         let _ = control_no_data(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, set_power);
         port += 1;
     }
-    // Give the ports their power-on-to-power-good settle time before reading status. Kept short
-    // for the same non-preemptible reason as the polls above.
-    spin_delay(500_000);
+    // A port's VBUS is not good until bPwrOn2PwrGood after PORT_POWER, and only then can its
+    // device begin to attach. The old fixed spin was ~4 ms on metal, so a keyboard behind a
+    // freshly powered hub was never seen on a cold boot. Sleep, rather than spin: this wait is
+    // tens to hundreds of milliseconds and must not hold the CPU. — TIMBERDOODLE
+    settle(hub.power_good_delay_ns());
 
     // --- Read one status-change report from the hub's interrupt endpoint ---
     if let Some(dci) = hub_dci {
@@ -2345,42 +2359,69 @@ fn configure_and_read_hub(
         }
     }
 
-    // --- GET_STATUS each downstream port; enumerate through the first that holds a device ---
-    let mut port = 1u8;
-    let mut connected_port = None;
-    while port <= nbr_ports {
-        if pass.expired() {
-            log(b"drv-xhci: hub pass budget spent (scan)\n");
-            break;
-        }
-        data_buf.fill(0);
-        dsb();
-        let get_status = [0xa3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
-        match control_in(
-            io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, get_status, data_phys, 4,
-        ) {
-            Some((1, _)) => {
+    // --- Wait for a device to attach and hold still (USB 2.0 §7.1.7.3), then pick its port ---
+    let attach_start = clock_get();
+    let polled_ports = nbr_ports.min(kumo_xhci::MAX_HUB_PORTS as u8);
+    let mut debounce = HubConnectDebounce::new(polled_ports, attach_start);
+    let mut last_status = [None::<u16>; kumo_xhci::MAX_HUB_PORTS];
+    let mut rounds = 0u32;
+    let connected_port = loop {
+        let mut port = 1u8;
+        while port <= polled_ports {
+            data_buf.fill(0);
+            dsb();
+            let get_status = [0xa3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
+            if let Some((1, _)) = control_in(
+                io,
+                layout,
+                image,
+                evt,
+                ep0_ring,
+                &mut *ep0_seg,
+                slot_id,
+                get_status,
+                data_phys,
+                4,
+            ) {
                 dsb();
                 let status = u16::from_le_bytes([data_buf[0], data_buf[1]]);
-                log(b"drv-xhci: hub port");
-                log_hex(port as u64);
+                last_status[port as usize - 1] = Some(status);
+                debounce.observe(port, status & 1 != 0, clock_get());
+            }
+            port += 1;
+        }
+        match debounce.verdict(clock_get()) {
+            HubConnectVerdict::Stable(port) => break Some(port),
+            HubConnectVerdict::Empty => break None,
+            HubConnectVerdict::Waiting if rounds < HUB_ATTACH_MAX_ROUNDS => {
+                rounds += 1;
+                settle(kumo_xhci::HUB_DEBOUNCE_STEP_NS);
+            }
+            HubConnectVerdict::Waiting => break None,
+        }
+    };
+    for (index, status) in last_status[..polled_ports as usize].iter().enumerate() {
+        log(b"drv-xhci: hub port");
+        log_hex(index as u64 + 1);
+        match status {
+            Some(status) => {
                 log(b" status=");
-                log_hex(status as u64);
+                log_hex(*status as u64);
                 log(b" conn=");
                 log_hex((status & 1) as u64);
-                log(b"\n");
-                if status & 1 != 0 && connected_port.is_none() {
-                    connected_port = Some(port);
-                }
             }
-            Some((cc, _)) => log_cc(b"drv-xhci: hub port status cc=", cc),
-            None => log(b"drv-xhci: hub port status timeout\n"),
+            None => log(b" status unread"),
         }
-        port += 1;
+        log(b"\n");
     }
+    log(b"drv-xhci: hub attach ms=");
+    log_hex(clock_get().saturating_sub(attach_start) / 1_000_000);
+    log(b"\n");
     log(b"drv-xhci: hub scan done\n");
 
-    // U2: reach through the hub to the device on that port.
+    // U2: reach through the hub to the device on that port. The attach wait above slept rather
+    // than held the CPU, so the downstream pass gets a full budget of its own.
+    let pass = Deadline::after(HUB_PASS_BUDGET_NS);
     if let Some(down_port) = connected_port {
         if pass.expired() {
             log(b"drv-xhci: hub pass budget spent; downstream deferred\n");
@@ -2665,6 +2706,21 @@ impl Deadline {
 #[inline]
 fn cooperative_yield() {
     let _ = clock_get();
+}
+
+/// Wait `delay_ns` without holding the CPU: block on a one-shot timer, and fall back to a
+/// deadline-bounded, yielding spin only when the timer cannot be set up.
+fn settle(delay_ns: u64) {
+    if sleep_ns(delay_ns) {
+        return;
+    }
+    let until = Deadline::after(delay_ns);
+    for _ in 0..SETTLE_SPIN_ROUNDS {
+        if until.expired() {
+            break;
+        }
+        spin_delay(YIELD_INTERVAL);
+    }
 }
 
 /// Bounded busy-wait for power-on and reset settle times, yielding periodically so the wait does
