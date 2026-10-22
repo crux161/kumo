@@ -1,4 +1,6 @@
-use crate::{Error, Trb};
+//j539
+
+use crate::{Error, Trb, TrbSource};
 
 const TRB_BYTES: u64 = 16;
 const RING_ALIGNMENT: u64 = 64;
@@ -221,11 +223,12 @@ impl EventRing {
     }
 
     /// Pop the next controller-owned event. A cycle mismatch means the ring is presently empty.
-    pub fn pop(&mut self, segment: &[Trb]) -> Result<Option<Trb>, Error> {
-        if segment.len() != self.segment_len {
+    /// `segment` is a slice in tests and a volatile [`crate::DmaTrbs`] over device memory.
+    pub fn pop<S: TrbSource + ?Sized>(&mut self, segment: &S) -> Result<Option<Trb>, Error> {
+        if segment.trb_count() != self.segment_len {
             return Err(Error::RingMemoryLength);
         }
-        let trb = segment[self.dequeue];
+        let trb = segment.read_trb(self.dequeue);
         if trb.cycle() != self.consumer_cycle {
             return Ok(None);
         }

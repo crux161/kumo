@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j530
 //j531
 //j533
 //j537
 //j538
+//j539
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -24,11 +24,11 @@ use kumo_usb_storage::{
 };
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
-    ContextSize, ControllerStatus, EndpointContext, Event, EventRingSegmentTableEntry,
-    HubConnectDebounce, HubConnectVerdict, HubDescriptor, InputControlContext,
-    NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
-    RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext, TransferRing, Trb,
-    UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    ContextSize, ControllerStatus, DmaBuf, DmaTrbs, EndpointContext, Event,
+    EventRingSegmentTableEntry, HubConnectDebounce, HubConnectVerdict, HubDescriptor,
+    InputControlContext, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer,
+    PortStatus, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
+    TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -363,26 +363,23 @@ fn dsb() {
     }
 }
 
-/// Zero a buffer the controller is about to DMA into, with volatile stores. A plain `fill(0)` on
-/// a `&mut` slice is a store the optimizer may sink past the doorbell, so it lands after the
-/// device's bytes and erases them.
-fn dma_zero(buf: &mut [u8]) {
-    for byte in buf.iter_mut() {
-        unsafe { core::ptr::write_volatile(byte, 0) };
-    }
-}
+/// Ordinary memory storage reads are copied into for parsing: up to the 16-KiB DMA window, too
+/// large for a driver's 16-KiB stack. Never device-visible, so plain slices into it are sound.
+struct StorageSnapshot(core::cell::UnsafeCell<[u8; STORAGE_DATA_LEN as usize]>);
 
-/// Copy the first `N` bytes the controller wrote into `buf` out with volatile loads. `buf` is a
-/// `&mut` slice, which Rust lets the optimizer treat as unaliased: the device's DMA is invisible to
-/// it, so between `fill(0)` and a parse it may hand back the zeros it stored instead of loading
-/// memory. J538's first boots read 16 zero bytes from both GL3523 hubs while Short Packet events
-/// showed 12 and 9 bytes transferred, which is exactly that. — TIMBERDOODLE
-fn dma_copy<const N: usize>(buf: &[u8]) -> [u8; N] {
-    let mut out = [0u8; N];
-    for (index, byte) in out.iter_mut().enumerate() {
-        *byte = unsafe { core::ptr::read_volatile(buf.as_ptr().add(index)) };
-    }
-    out
+// SAFETY: drv-xhci is single-threaded, and `storage_snapshot` is the only way in.
+unsafe impl Sync for StorageSnapshot {}
+
+static STORAGE_SNAPSHOT: StorageSnapshot =
+    StorageSnapshot(core::cell::UnsafeCell::new([0; STORAGE_DATA_LEN as usize]));
+
+/// Copy the first `len` bytes of a completed storage read out of device memory for parsing. The
+/// slice is valid until the next call, and every caller finishes with one before taking another.
+fn storage_snapshot(window: DmaBuf, len: usize) -> &'static [u8] {
+    // SAFETY: single-threaded; no earlier snapshot slice is still in use when this runs.
+    let snapshot = unsafe { &mut *STORAGE_SNAPSHOT.0.get() };
+    window.read_into(0, &mut snapshot[..len]);
+    &snapshot[..len]
 }
 
 /// Slice B: allocate the no-op DMA image, take the controller through reset → run, ring the
@@ -439,7 +436,7 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
         NOOP_MAX_SLOTS,
         &mut *dcbaa,
         &mut *cmd,
-        &mut *evt,
+        evt,
         &mut *erst,
         iovas,
     ) {
@@ -506,12 +503,14 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
         return;
     }
 
-    let evt_view: &[Trb] = evt;
+    // From here on the controller owns the event ring, so it is only ever read through volatile
+    // loads; the `evt` slice above existed only for the zero-fill before the controller ran.
+    let events = unsafe { DmaTrbs::new((DMA_VA as usize + OFF_EVT) as *const Trb, RING_TRBS) };
     let mut completion: Option<NoOpCommandCompletion> = None;
     let mut decode_error = false;
     for _ in 0..EVENT_POLL_LIMIT {
         dsb();
-        match image.poll_completion(evt_view) {
+        match image.poll_completion(&events) {
             Ok(Some(done)) => {
                 completion = Some(done);
                 break;
@@ -538,7 +537,7 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
             // as live while software starts consuming later entries.
             write_erdp(&mut io, layout, image.event_ring.dequeue_iova());
             if done.completion_code == 1 {
-                enumerate(layout, caplength, max_ports, &mut image, cmd, evt);
+                enumerate(layout, caplength, max_ports, &mut image, cmd, &events);
             }
         }
         None if decode_error => log(b"drv-xhci: noop event decode error\n"),
@@ -555,7 +554,7 @@ fn enumerate(
     max_ports: u8,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &mut [Trb],
+    evt: &DmaTrbs,
 ) {
     // A second contiguous DMA page for the input/output device contexts, the EP0 control ring,
     // and the descriptor buffer. phys == IOVA under SMMU bypass.
@@ -601,7 +600,7 @@ fn enumerate(
                 layout,
                 &mut *image,
                 &mut *cmd,
-                &mut *evt,
+                evt,
                 ss_port,
                 ss_speed,
                 SS_ENUM_VA,
@@ -617,7 +616,7 @@ fn enumerate(
         layout,
         &mut *image,
         &mut *cmd,
-        &mut *evt,
+        evt,
         port_number,
         speed_raw,
         ENUM_VA,
@@ -645,7 +644,7 @@ fn enumerate_root_device(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &mut [Trb],
+    evt: &DmaTrbs,
     port_number: u8,
     speed_raw: u8,
     page_va: u64,
@@ -660,7 +659,7 @@ fn enumerate_root_device(
             return;
         }
     };
-    let slot_id = match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, enable) {
+    let slot_id = match submit_command(io, layout, &mut *image, &mut *cmd, evt, enable) {
         Some((1, slot, _)) => slot,
         Some((cc, _, _)) => {
             log(b"drv-xhci: enable slot cc=");
@@ -750,7 +749,7 @@ fn enumerate_root_device(
             return;
         }
     };
-    match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, addr) {
+    match submit_command(io, layout, &mut *image, &mut *cmd, evt, addr) {
         Some((1, _, _)) => log(b"drv-xhci: addr dev cc=0x1 ok\n"),
         Some((cc, _, _)) => {
             log(b"drv-xhci: addr dev cc=");
@@ -765,21 +764,26 @@ fn enumerate_root_device(
     }
 
     let data_phys = page_phys + OFF_DATA as u64;
+    // SAFETY: the page is mapped for this driver's lifetime and only reached through `DmaBuf`.
     let data_buf = unsafe {
-        core::slice::from_raw_parts_mut((page_va as usize + OFF_DATA) as *mut u8, DATA_BUF_LEN)
+        DmaBuf::new(
+            (page_va as usize + OFF_DATA) as *mut u8,
+            data_phys,
+            DATA_BUF_LEN,
+        )
     };
 
     // --- GET_DESCRIPTOR(Device) over EP0, two-phase for bMaxPacketSize0 ---
     // Phase 1 requests only the first 8 bytes at this speed's initial EP0 size; byte 7 carries the
     // speed-dependent bMaxPacketSize0 encoding.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let dev8_setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
     match control_in(
         io,
         layout,
         &mut *image,
-        &*evt,
+        evt,
         &mut ep0_ring,
         &mut *ep0_seg,
         slot_id,
@@ -800,7 +804,7 @@ fn enumerate_root_device(
         }
     }
     dsb();
-    let encoded_mps0 = data_buf[7];
+    let encoded_mps0 = data_buf.byte(7);
     let real_mps0 = match speed.decode_ep0_max_packet_size(encoded_mps0) {
         Ok(size) => size,
         Err(_) => {
@@ -840,7 +844,7 @@ fn enumerate_root_device(
             0,
             (TRB_TYPE_EVALUATE_CONTEXT << 10) | ((slot_id as u32) << 24),
         ]);
-        match submit_command(io, layout, &mut *image, &mut *cmd, &*evt, eval) {
+        match submit_command(io, layout, &mut *image, &mut *cmd, evt, eval) {
             Some((1, _, _)) => {
                 log(b"drv-xhci: eval ctx cc=0x1 mps0=");
                 log_hex(real_mps0 as u64);
@@ -860,7 +864,7 @@ fn enumerate_root_device(
     }
 
     // Phase 3: the full 18-byte device descriptor at the corrected EP0 max packet size.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let dev_setup = [
         0x80,
@@ -876,7 +880,7 @@ fn enumerate_root_device(
         io,
         layout,
         &mut *image,
-        &*evt,
+        evt,
         &mut ep0_ring,
         &mut *ep0_seg,
         slot_id,
@@ -891,17 +895,17 @@ fn enumerate_root_device(
             log(b" rem=");
             log_hex(remaining as u64);
             log(b" len=");
-            log_hex(data_buf[0] as u64);
+            log_hex(data_buf.byte(0) as u64);
             log(b" type=");
-            log_hex(data_buf[1] as u64);
+            log_hex(data_buf.byte(1) as u64);
             log(b" class=");
-            log_hex(data_buf[4] as u64);
+            log_hex(data_buf.byte(4) as u64);
             log(b" mps0=");
-            log_hex(data_buf[7] as u64);
+            log_hex(data_buf.byte(7) as u64);
             log(b" vid=");
-            log_hex(u16::from_le_bytes([data_buf[8], data_buf[9]]) as u64);
+            log_hex(u16::from_le_bytes([data_buf.byte(8), data_buf.byte(9)]) as u64);
             log(b" pid=");
-            log_hex(u16::from_le_bytes([data_buf[10], data_buf[11]]) as u64);
+            log_hex(u16::from_le_bytes([data_buf.byte(10), data_buf.byte(11)]) as u64);
             log(b"\n");
         }
         None => {
@@ -912,18 +916,18 @@ fn enumerate_root_device(
         }
     }
     // bDeviceClass, captured from the device descriptor before data_buf is reused.
-    let device_class = data_buf[4];
+    let device_class = data_buf.byte(4);
 
     // --- Slice D: read the configuration descriptor and find the boot-HID interface ---
     // First read the 9-byte header to learn wTotalLength.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let cfg_header_setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
     if control_in(
         io,
         layout,
         &mut *image,
-        &*evt,
+        evt,
         &mut ep0_ring,
         &mut *ep0_seg,
         slot_id,
@@ -937,8 +941,8 @@ fn enumerate_root_device(
         return;
     }
     dsb();
-    let total_length = u16::from_le_bytes([data_buf[2], data_buf[3]]);
-    let num_interfaces = data_buf[4];
+    let total_length = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]);
+    let num_interfaces = data_buf.byte(4);
     log(b"drv-xhci: cfg total=");
     log_hex(total_length as u64);
     log(b" numif=");
@@ -947,7 +951,7 @@ fn enumerate_root_device(
 
     // Then read the full configuration (interfaces + endpoints), capped to the buffer.
     let read_len = total_length.min(DATA_BUF_LEN as u16);
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let cfg_setup = [
         0x80,
@@ -963,7 +967,7 @@ fn enumerate_root_device(
         io,
         layout,
         &mut *image,
-        &*evt,
+        evt,
         &mut ep0_ring,
         &mut *ep0_seg,
         slot_id,
@@ -977,16 +981,19 @@ fn enumerate_root_device(
         return;
     }
     dsb();
+    // The configuration descriptor's interfaces and endpoints are parsed from a copy: a parser
+    // holding a slice of device memory is exactly what `DmaBuf` exists to prevent.
+    let mut config = [0u8; DATA_BUF_LEN];
+    data_buf.read_into(0, &mut config[..read_len as usize]);
 
-    // bConfigurationValue is byte 5 of the configuration descriptor — capture before data_buf is
-    // reused by later control transfers.
-    let config_value = data_buf[5];
+    // bConfigurationValue is byte 5 of the configuration descriptor.
+    let config_value = config[5];
 
     // A hub (bDeviceClass 9) gets the hub bring-up path (U1); anything else is checked for a boot
     // HID interface.
     if device_class == kumo_hid::USB_CLASS_HUB {
         let hub_int = kumo_hid::find_interrupt_in_endpoint(
-            &data_buf[..read_len as usize],
+            &config[..read_len as usize],
             kumo_hid::USB_CLASS_HUB,
         );
         configure_and_read_hub(
@@ -994,7 +1001,7 @@ fn enumerate_root_device(
             layout,
             &mut *image,
             &mut *cmd,
-            &*evt,
+            evt,
             &mut ep0_ring,
             &mut *ep0_seg,
             slot_id,
@@ -1010,7 +1017,7 @@ fn enumerate_root_device(
         return;
     }
 
-    match kumo_usb_storage::find_bulk_only_scsi_interface(&data_buf[..read_len as usize]) {
+    match kumo_usb_storage::find_bulk_only_scsi_interface(&config[..read_len as usize]) {
         Ok(Some(storage)) => {
             log(b"drv-xhci: storage if=");
             log_hex(storage.interface_number as u64);
@@ -1028,7 +1035,7 @@ fn enumerate_root_device(
                 layout,
                 &mut *image,
                 &mut *cmd,
-                &*evt,
+                evt,
                 &mut ep0_ring,
                 &mut *ep0_seg,
                 slot_id,
@@ -1047,7 +1054,7 @@ fn enumerate_root_device(
     if role == RootRole::SuperSpeedSide {
         return log(b"drv-xhci: ss side device is neither hub nor storage; left alone\n");
     }
-    match kumo_hid::find_hid_boot_keyboard(&data_buf[..read_len as usize]) {
+    match kumo_hid::find_hid_boot_keyboard(&config[..read_len as usize]) {
         Some(hid) => {
             log(b"drv-xhci: hid if=");
             log_hex(hid.interface_number as u64);
@@ -1066,7 +1073,7 @@ fn enumerate_root_device(
                     layout,
                     &mut *image,
                     &mut *cmd,
-                    &*evt,
+                    evt,
                     &mut ep0_ring,
                     &mut *ep0_seg,
                     slot_id,
@@ -1091,7 +1098,7 @@ fn configure_and_probe_storage(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
@@ -1099,7 +1106,7 @@ fn configure_and_probe_storage(
     enum_phys: u64,
     slot_words: [u32; 8],
     storage: MassStorageInterface,
-    storage_buf: &mut [u8],
+    storage_buf: DmaBuf,
 ) {
     log_storage_phase(b"set-config", b"begin");
     let set_config = [0x00, 0x09, storage.configuration_value, 0, 0, 0, 0, 0];
@@ -1230,11 +1237,13 @@ fn configure_and_probe_storage(
     if storage_buf.len() < DATA_BUF_LEN {
         return log(b"drv-xhci: storage buffer too short\n");
     }
-    let (cbw_region, after_cbw) = storage_buf.split_at_mut(BOT_DATA_OFFSET);
-    let (data_region, csw_region) = after_cbw.split_at_mut(BOT_DATA_LEN);
-    let cbw_buf = &mut cbw_region[BOT_CBW_OFFSET..BOT_CBW_OFFSET + COMMAND_BLOCK_WRAPPER_BYTES];
-    let data_buf = &mut data_region[..BOT_DATA_LEN];
-    let csw_buf = &mut csw_region[..COMMAND_STATUS_WRAPPER_BYTES];
+    let (Some(cbw_buf), Some(data_buf), Some(csw_buf)) = (
+        storage_buf.window(BOT_CBW_OFFSET, COMMAND_BLOCK_WRAPPER_BYTES),
+        storage_buf.window(BOT_DATA_OFFSET, BOT_DATA_LEN),
+        storage_buf.window(BOT_DATA_OFFSET + BOT_DATA_LEN, COMMAND_STATUS_WRAPPER_BYTES),
+    ) else {
+        return log(b"drv-xhci: storage buffer layout\n");
+    };
     let cbw_phys = enum_phys + OFF_DATA as u64 + BOT_CBW_OFFSET as u64;
     let data_phys = enum_phys + OFF_DATA as u64 + BOT_DATA_OFFSET as u64;
     let csw_phys = enum_phys + OFF_DATA as u64 + BOT_CSW_OFFSET as u64;
@@ -1264,7 +1273,9 @@ fn configure_and_probe_storage(
     ) else {
         return;
     };
-    let Ok(inquiry_data) = StandardInquiryData::decode(&data_buf[..inquiry_len]) else {
+    let mut reply = [0u8; BOT_DATA_LEN];
+    data_buf.read_into(0, &mut reply[..inquiry_len]);
+    let Ok(inquiry_data) = StandardInquiryData::decode(&reply[..inquiry_len]) else {
         return log(b"drv-xhci: storage inquiry decode fail\n");
     };
     log(b"drv-xhci: storage inquiry type=");
@@ -1302,7 +1313,8 @@ fn configure_and_probe_storage(
     ) else {
         return;
     };
-    let Ok(capacity) = MediaCapacity::decode_read_capacity_10(&data_buf[..capacity_len]) else {
+    data_buf.read_into(0, &mut reply[..capacity_len]);
+    let Ok(capacity) = MediaCapacity::decode_read_capacity_10(&reply[..capacity_len]) else {
         return log(b"drv-xhci: storage capacity decode fail\n");
     };
     log(b"drv-xhci: storage capacity blocks=");
@@ -1349,9 +1361,11 @@ fn configure_and_probe_storage(
         return log(b"drv-xhci: storage read window does not fit backing\n");
     }
     let read_phys = read_allocation_phys + read_offset;
+    // SAFETY: mapped above for the driver's lifetime and only reached through `DmaBuf`.
     let read_window = unsafe {
-        core::slice::from_raw_parts_mut(
+        DmaBuf::new(
             (STORAGE_DATA_VA + read_offset) as usize as *mut u8,
+            read_phys,
             STORAGE_DATA_LEN as usize,
         )
     };
@@ -1362,6 +1376,9 @@ fn configure_and_probe_storage(
     log(b" bytes=");
     log_hex(STORAGE_DATA_LEN);
     log(b"\n");
+    let Some(lba0_window) = read_window.window(0, lba0_plan.byte_length) else {
+        return log(b"drv-xhci: storage read plan exceeds window\n");
+    };
     let Some(read_len) = bot_command(
         io,
         layout,
@@ -1376,7 +1393,7 @@ fn configure_and_probe_storage(
         slot_id,
         cbw_buf,
         cbw_phys,
-        &mut read_window[..lba0_plan.byte_length],
+        lba0_window,
         read_phys,
         csw_buf,
         csw_phys,
@@ -1389,25 +1406,22 @@ fn configure_and_probe_storage(
     if read_len != lba0_plan.byte_length {
         return log(b"drv-xhci: storage short LBA0\n");
     }
+    let lba0 = storage_snapshot(lba0_window, read_len);
     log(b"drv-xhci: storage lba0 prefix=");
-    for byte in &read_window[..read_len.min(16)] {
+    for byte in &lba0[..read_len.min(16)] {
         log(b" ");
         log_hex(*byte as u64);
     }
     if read_len >= 512 {
         log(b" tail510=");
-        log_hex(read_window[510] as u64);
+        log_hex(lba0[510] as u64);
         log(b" tail511=");
-        log_hex(read_window[511] as u64);
+        log_hex(lba0[511] as u64);
     }
     log(b"\n");
 
     let logical_block_size = capacity.logical_block_size as usize;
-    if let Err(error) = validate_protective_mbr(
-        &read_window[..read_len],
-        logical_block_size,
-        capacity.block_count(),
-    ) {
+    if let Err(error) = validate_protective_mbr(lba0, logical_block_size, capacity.block_count()) {
         return log_gpt_error(b"mbr", error);
     }
     log_storage_phase(b"gpt-mbr", b"ok");
@@ -1415,6 +1429,9 @@ fn configure_and_probe_storage(
     let header_plan = match adapter.plan_read(1, 1) {
         Ok(plan) => plan,
         Err(_) => return log(b"drv-xhci: storage GPT header plan fail\n"),
+    };
+    let Some(header_window) = read_window.window(0, header_plan.byte_length) else {
+        return log(b"drv-xhci: storage read plan exceeds window\n");
     };
     let Some(header_len) = bot_command(
         io,
@@ -1430,7 +1447,7 @@ fn configure_and_probe_storage(
         slot_id,
         cbw_buf,
         cbw_phys,
-        &mut read_window[..header_plan.byte_length],
+        header_window,
         read_phys,
         csw_buf,
         csw_phys,
@@ -1444,7 +1461,7 @@ fn configure_and_probe_storage(
         return log(b"drv-xhci: storage short GPT header\n");
     }
     let header = match GptHeader::parse_primary(
-        &read_window[..header_len],
+        storage_snapshot(header_window, header_len),
         logical_block_size,
         capacity.block_count(),
     ) {
@@ -1467,6 +1484,9 @@ fn configure_and_probe_storage(
         Ok(plan) => plan,
         Err(_) => return log(b"drv-xhci: storage GPT table exceeds DMA window\n"),
     };
+    let Some(entries_window) = read_window.window(0, entries_plan.byte_length) else {
+        return log(b"drv-xhci: storage read plan exceeds window\n");
+    };
     let Some(entries_len) = bot_command(
         io,
         layout,
@@ -1481,7 +1501,7 @@ fn configure_and_probe_storage(
         slot_id,
         cbw_buf,
         cbw_phys,
-        &mut read_window[..entries_plan.byte_length],
+        entries_window,
         read_phys,
         csw_buf,
         csw_phys,
@@ -1494,7 +1514,7 @@ fn configure_and_probe_storage(
     if entries_len != entries_plan.byte_length {
         return log(b"drv-xhci: storage short GPT table\n");
     }
-    let table = match header.parse_partition_table(&read_window[..entries_len]) {
+    let table = match header.parse_partition_table(storage_snapshot(entries_window, entries_len)) {
         Ok(table) => table,
         Err(error) => return log_gpt_error(b"entries", error),
     };
@@ -1520,6 +1540,9 @@ fn configure_and_probe_storage(
         Ok(plan) => plan,
         Err(_) => return log(b"drv-xhci: storage ESP boot sector plan fail\n"),
     };
+    let Some(boot_window) = read_window.window(0, boot_plan.byte_length) else {
+        return log(b"drv-xhci: storage read plan exceeds window\n");
+    };
     let Some(boot_len) = bot_command(
         io,
         layout,
@@ -1534,7 +1557,7 @@ fn configure_and_probe_storage(
         slot_id,
         cbw_buf,
         cbw_phys,
-        &mut read_window[..boot_plan.byte_length],
+        boot_window,
         read_phys,
         csw_buf,
         csw_phys,
@@ -1547,7 +1570,11 @@ fn configure_and_probe_storage(
     if boot_len != boot_plan.byte_length {
         return log(b"drv-xhci: storage short ESP boot sector\n");
     }
-    let bpb = match Bpb::parse(&read_window[..boot_len]) {
+    // The partition table still borrows the snapshot, so the boot sector gets its own copy.
+    let mut boot_sector = [0u8; 512];
+    let boot_copy = boot_len.min(boot_sector.len());
+    boot_window.read_into(0, &mut boot_sector[..boot_copy]);
+    let bpb = match Bpb::parse(&boot_sector[..boot_copy]) {
         Ok(bpb) => bpb,
         Err(error) => return log_fat_error(error),
     };
@@ -1605,7 +1632,7 @@ fn bot_command(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     out_ring: &mut TransferRing,
     out_seg: &mut [Trb],
     out_dci: u8,
@@ -1613,18 +1640,18 @@ fn bot_command(
     in_seg: &mut [Trb],
     in_dci: u8,
     slot_id: u8,
-    cbw_buf: &mut [u8],
+    cbw_buf: DmaBuf,
     cbw_phys: u64,
-    data_buf: &mut [u8],
+    data_buf: DmaBuf,
     data_phys: u64,
-    csw_buf: &mut [u8],
+    csw_buf: DmaBuf,
     csw_phys: u64,
     tag: u32,
     command: &ScsiCommand,
     command_name: &[u8],
 ) -> Option<usize> {
     let cbw = CommandBlockWrapper::for_scsi(tag, 0, command).ok()?;
-    cbw_buf.copy_from_slice(cbw.as_bytes());
+    cbw_buf.write_from(0, cbw.as_bytes());
     dsb();
     let cbw_len = bulk_transfer(
         io,
@@ -1654,7 +1681,7 @@ fn bot_command(
                 log(b"drv-xhci: storage data buffer too short\n");
                 return None;
             }
-            data_buf[..expected as usize].fill(0);
+            data_buf.window(0, expected as usize)?.zero();
             dsb();
             bulk_transfer(
                 io,
@@ -1678,7 +1705,7 @@ fn bot_command(
         }
     };
 
-    csw_buf.fill(0);
+    csw_buf.zero();
     dsb();
     let csw_len = bulk_transfer(
         io,
@@ -1699,7 +1726,8 @@ fn bot_command(
         log(b"drv-xhci: storage short CSW\n");
         return None;
     }
-    let csw = match CommandStatusWrapper::decode(csw_buf, tag, expected) {
+    let csw_bytes: [u8; COMMAND_STATUS_WRAPPER_BYTES] = csw_buf.read(0);
+    let csw = match CommandStatusWrapper::decode(&csw_bytes, tag, expected) {
         Ok(csw) => csw,
         Err(_) => {
             log(b"drv-xhci: storage invalid CSW\n");
@@ -1734,7 +1762,7 @@ fn bulk_transfer(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ring: &mut TransferRing,
     segment: &mut [Trb],
     slot_id: u8,
@@ -1888,7 +1916,7 @@ fn configure_and_read_keyboard(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
@@ -1947,8 +1975,9 @@ fn configure_and_read_keyboard(
     let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_phys) else {
         return log(b"drv-xhci: int ring fail\n");
     };
+    // SAFETY: inside this device's mapped page, and only reached through `DmaBuf`.
     let report_buf =
-        unsafe { core::slice::from_raw_parts_mut((base_va as usize + OFF_REPORT) as *mut u8, 8) };
+        unsafe { DmaBuf::new((base_va as usize + OFF_REPORT) as *mut u8, report_phys, 8) };
 
     let mut decoder = kumo_hid::Decoder::new();
     let mut mouse_decoder = kumo_hid::MouseDecoder::new();
@@ -2008,7 +2037,7 @@ fn configure_and_read_keyboard(
             let mut first_transfer_logged = false;
             loop {
                 if !pending {
-                    report_buf.fill(0);
+                    report_buf.zero();
                     dsb();
                     let Ok(normal) =
                         Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, mps as u32))
@@ -2066,22 +2095,13 @@ fn configure_and_read_keyboard(
                     let _ = int_ring.reclaim_through(trb_iova);
                     pending = false;
                     dsb();
-                    let report: [u8; kumo_hid::REPORT_BYTES] = [
-                        report_buf[0],
-                        report_buf[1],
-                        report_buf[2],
-                        report_buf[3],
-                        report_buf[4],
-                        report_buf[5],
-                        report_buf[6],
-                        report_buf[7],
-                    ];
+                    let report: [u8; kumo_hid::REPORT_BYTES] = report_buf.read(0);
                     if hid.is_mouse() {
                         // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
                         // pointer pipeline already consumes. Idle reports repeat at the polling
                         // interval, so drop them rather than waking Sora for nothing.
                         if let Some((motion, _edges)) =
-                            mouse_decoder.decode(&report_buf[..mps.min(8) as usize], None)
+                            mouse_decoder.decode(&report[..mps.min(8) as usize], None)
                         {
                             let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
                             if mouse != 0 && !motion.is_idle() {
@@ -2131,7 +2151,7 @@ fn control_no_data(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
@@ -2166,7 +2186,7 @@ fn wait_ep0_status(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     slot_id: u8,
     status_iova: u64,
 ) -> Option<(u8, u32, u64)> {
@@ -2225,14 +2245,14 @@ fn read_descriptors_and_find_hid(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
     base_va: u64,
     base_phys: u64,
     speed: UsbSpeed,
-    data_buf: &mut [u8],
+    data_buf: DmaBuf,
 ) -> Option<(u8, kumo_hid::HidBootInterface)> {
     let data_phys = base_phys + OFF_DATA as u64;
     let ep0_ring_phys = base_phys + OFF_EP0_RING as u64;
@@ -2241,7 +2261,7 @@ fn read_descriptors_and_find_hid(
     let mps0 = speed.initial_ep0_max_packet_size();
 
     // Phase 1: 8-byte device descriptor at this speed's initial EP0 packet size.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let dev8 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
     match control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, dev8, data_phys, 8) {
@@ -2256,7 +2276,7 @@ fn read_descriptors_and_find_hid(
         }
     }
     dsb();
-    let encoded_mps0 = data_buf[7];
+    let encoded_mps0 = data_buf.byte(7);
     let real_mps0 = match speed.decode_ep0_max_packet_size(encoded_mps0) {
         Ok(size) => size,
         Err(_) => {
@@ -2306,7 +2326,7 @@ fn read_descriptors_and_find_hid(
     }
 
     // Phase 3: the full device descriptor.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let dev_full = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, DEVICE_DESCRIPTOR_LEN as u8, 0x00];
     match control_in(
@@ -2324,9 +2344,9 @@ fn read_descriptors_and_find_hid(
         Some((1, _)) => {
             dsb();
             log(b"drv-xhci: dev desc vid=");
-            log_hex(u16::from_le_bytes([data_buf[8], data_buf[9]]) as u64);
+            log_hex(u16::from_le_bytes([data_buf.byte(8), data_buf.byte(9)]) as u64);
             log(b" pid=");
-            log_hex(u16::from_le_bytes([data_buf[10], data_buf[11]]) as u64);
+            log_hex(u16::from_le_bytes([data_buf.byte(10), data_buf.byte(11)]) as u64);
             log(b"\n");
         }
         Some((cc, _)) => {
@@ -2340,13 +2360,13 @@ fn read_descriptors_and_find_hid(
     }
 
     // Configuration descriptor: header for wTotalLength, then the whole thing.
-    data_buf.fill(0);
+    data_buf.zero();
     dsb();
     let cfg_head = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
     control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, cfg_head, data_phys, 9)?;
     dsb();
-    let total = u16::from_le_bytes([data_buf[2], data_buf[3]]).min(DATA_BUF_LEN as u16);
-    data_buf.fill(0);
+    let total = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]).min(DATA_BUF_LEN as u16);
+    data_buf.zero();
     dsb();
     let cfg = [
         0x80,
@@ -2360,8 +2380,10 @@ fn read_descriptors_and_find_hid(
     ];
     control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, cfg, data_phys, total)?;
     dsb();
-    let config_value = data_buf[5];
-    match kumo_hid::find_hid_boot_keyboard(&data_buf[..total as usize]) {
+    let mut config = [0u8; DATA_BUF_LEN];
+    data_buf.read_into(0, &mut config[..total as usize]);
+    let config_value = config[5];
+    match kumo_hid::find_hid_boot_keyboard(&config[..total as usize]) {
         Some(hid) => {
             log(b"drv-xhci: dev hid if=");
             log_hex(hid.interface_number as u64);
@@ -2388,7 +2410,7 @@ fn configure_interrupt_endpoint(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     slot_id: u8,
     base_va: u64,
     enum_phys: u64,
@@ -2444,7 +2466,7 @@ fn configure_and_read_hub(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
@@ -2453,7 +2475,7 @@ fn configure_and_read_hub(
     speed_raw: u8,
     port_number: u8,
     config_value: u8,
-    data_buf: &mut [u8],
+    data_buf: DmaBuf,
     data_phys: u64,
     hub_int: Option<kumo_hid::InterruptInEndpoint>,
 ) {
@@ -2469,7 +2491,7 @@ fn configure_and_read_hub(
     // --- GET_DESCRIPTOR(Hub) --- class request; descriptor type 0x2A for SuperSpeed hubs, else
     // 0x29. bNbrPorts is byte 2.
     let hub_desc_type = if speed_raw >= 4 { 0x2a } else { 0x29 };
-    dma_zero(data_buf);
+    data_buf.zero();
     dsb();
     let hub_setup = [0xa0, 0x06, 0x00, hub_desc_type, 0x00, 0x00, 16, 0x00];
     match control_in(io, layout, image, evt, ep0_ring, &mut *ep0_seg, slot_id, hub_setup, data_phys, 16)
@@ -2479,7 +2501,7 @@ fn configure_and_read_hub(
         None => return log(b"drv-xhci: hub desc timeout\n"),
     }
     dsb();
-    let reply: [u8; 16] = dma_copy(data_buf);
+    let reply: [u8; 16] = data_buf.read(0);
     let Ok(hub) = HubDescriptor::parse(&reply) else {
         log(b"drv-xhci: hub desc invalid bytes=");
         for byte in &reply[..8] {
@@ -2571,10 +2593,10 @@ fn configure_and_read_hub(
             )
         };
         if let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_base) {
-            let report_buf = unsafe {
-                core::slice::from_raw_parts_mut((page_va as usize + OFF_REPORT) as *mut u8, 4)
-            };
-            report_buf.fill(0);
+            // SAFETY: inside this hub's mapped page, and only reached through `DmaBuf`.
+            let report_buf =
+                unsafe { DmaBuf::new((page_va as usize + OFF_REPORT) as *mut u8, report_phys, 4) };
+            report_buf.zero();
             dsb();
             if let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, 4)) {
                 if int_ring.enqueue(&mut *int_seg, normal).is_ok() {
@@ -2607,7 +2629,7 @@ fn configure_and_read_hub(
                             log(b"drv-xhci: hub status cc=");
                             log_hex(cc as u64);
                             log(b" ");
-                            for &byte in report_buf.iter() {
+                            for byte in report_buf.read::<4>(0) {
                                 log_hex(byte as u64);
                                 log(b" ");
                             }
@@ -2629,7 +2651,7 @@ fn configure_and_read_hub(
     let connected_port = loop {
         let mut port = 1u8;
         while port <= polled_ports {
-            dma_zero(data_buf);
+            data_buf.zero();
             dsb();
             let get_status = [0xa3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
             if let Some((1, _)) = control_in(
@@ -2645,7 +2667,7 @@ fn configure_and_read_hub(
                 4,
             ) {
                 dsb();
-                let reply: [u8; 2] = dma_copy(data_buf);
+                let reply: [u8; 2] = data_buf.read(0);
                 let status = u16::from_le_bytes(reply);
                 last_status[port as usize - 1] = Some(status);
                 debounce.observe(port, status & 1 != 0, clock_get());
@@ -2716,14 +2738,14 @@ fn enumerate_hub_downstream(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     hub_ep0_ring: &mut TransferRing,
     hub_ep0_seg: &mut [Trb],
     hub_slot_id: u8,
     hub_root_port: u8,
     hub_speed_raw: u8,
     hub_data_phys: u64,
-    hub_data_buf: &mut [u8],
+    hub_data_buf: DmaBuf,
     down_port: u8,
     pass: Deadline,
 ) {
@@ -2756,7 +2778,7 @@ fn enumerate_hub_downstream(
         // Keep each settle short: this driver preempts Sora, so a long spin here stalls the
         // whole system (and a sibling controller's live keyboard) while a port comes up.
         spin_delay(200_000);
-        dma_zero(hub_data_buf);
+        hub_data_buf.zero();
         dsb();
         let get_status = [0xa3, 0x00, 0x00, 0x00, down_port, 0x00, 0x04, 0x00];
         if control_in(
@@ -2776,7 +2798,7 @@ fn enumerate_hub_downstream(
             continue;
         }
         dsb();
-        let reply: [u8; 2] = dma_copy(hub_data_buf);
+        let reply: [u8; 2] = hub_data_buf.read(0);
         let status = u16::from_le_bytes(reply);
         if status & HUB_PORT_STATUS_ENABLE != 0 {
             down_speed = if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
@@ -2901,8 +2923,14 @@ fn enumerate_hub_downstream(
 
     // --- Descriptors over the downstream device's EP0, then the HID path ---
     let data_phys = dev_phys + OFF_DATA as u64;
+    // SAFETY: the downstream page is mapped for the driver's lifetime and only reached through
+    // `DmaBuf`.
     let data_buf = unsafe {
-        core::slice::from_raw_parts_mut((DEV2_VA as usize + OFF_DATA) as *mut u8, DATA_BUF_LEN)
+        DmaBuf::new(
+            (DEV2_VA as usize + OFF_DATA) as *mut u8,
+            data_phys,
+            DATA_BUF_LEN,
+        )
     };
     let _ = data_phys;
     let Some((config_value, hid)) = read_descriptors_and_find_hid(
@@ -3014,7 +3042,7 @@ fn control_in(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     ep0_ring: &mut TransferRing,
     ep0_seg: &mut [Trb],
     slot_id: u8,
@@ -3152,7 +3180,7 @@ fn submit_command(
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     cmd: &mut [Trb],
-    evt: &[Trb],
+    evt: &DmaTrbs,
     command: Trb,
 ) -> Option<(u8, u8, u32)> {
     let token = image.command_ring.enqueue(cmd, command).ok()?;
@@ -3204,7 +3232,7 @@ fn poll_transfer_event(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     slot_id: u8,
 ) -> Option<(u8, u32, u64)> {
     poll_transfer_event_limited(io, layout, image, evt, slot_id, EVENT_POLL_LIMIT)
@@ -3218,7 +3246,7 @@ fn poll_transfer_event_limited(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
-    evt: &[Trb],
+    evt: &DmaTrbs,
     slot_id: u8,
     limit: u32,
 ) -> Option<(u8, u32, u64)> {

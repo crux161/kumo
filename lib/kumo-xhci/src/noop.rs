@@ -1,9 +1,10 @@
 //j432
 //j433
+//j539
 
 use crate::{
     CommandRing, Error, Event, EventRing, EventRingSegmentTableEntry, NoOpRegisterConfig,
-    RingToken, Trb,
+    RingToken, Trb, TrbSource,
 };
 
 const DCBAA_ALIGNMENT: u64 = 64;
@@ -40,9 +41,9 @@ pub struct NoOpCommandCompletion {
 
 impl NoOpCommandImage {
     /// Consume one event-ring entry if it completes this image's No-Op command.
-    pub fn poll_completion(
+    pub fn poll_completion<S: TrbSource + ?Sized>(
         &mut self,
-        event_segment: &[Trb],
+        event_segment: &S,
     ) -> Result<Option<NoOpCommandCompletion>, Error> {
         let Some(event_trb) = self.event_ring.pop(event_segment)? else {
             return Ok(None);
