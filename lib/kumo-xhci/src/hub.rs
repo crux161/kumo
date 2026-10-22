@@ -1,4 +1,5 @@
 //j533
+//j541
 
 //! Downstream USB hub bring-up timing: the hub descriptor fields a driver must honour before it
 //! reads port status, and the connect-debounce rule for deciding a device is really attached.
@@ -56,16 +57,58 @@ impl HubDescriptor {
     }
 }
 
+/// A set of 1-based downstream port numbers, iterated in ascending order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HubPorts(u16);
+
+impl HubPorts {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// The set with `port` added. Ports outside `1..=MAX_HUB_PORTS` are not representable and
+    /// leave the set unchanged.
+    pub const fn with(self, port: u8) -> Self {
+        if port == 0 || port as usize > MAX_HUB_PORTS {
+            self
+        } else {
+            Self(self.0 | 1 << port)
+        }
+    }
+
+    pub const fn contains(self, port: u8) -> bool {
+        port != 0 && (port as usize) <= MAX_HUB_PORTS && self.0 & (1 << port) != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = u8> {
+        (1..=MAX_HUB_PORTS as u8).filter(move |port| self.contains(*port))
+    }
+}
+
 /// What the driver should do after one round of port-status polls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HubConnectVerdict {
-    /// This 1-based port has held a connection for [`HUB_DEBOUNCE_STABLE_NS`]: reset it.
-    Stable(u8),
+    /// The hub has settled, and these 1-based ports have each held a connection for
+    /// [`HUB_DEBOUNCE_STABLE_NS`]: reset and enumerate them, one at a time, in ascending order.
+    Stable(HubPorts),
     /// Poll again after [`HUB_DEBOUNCE_STEP_NS`].
     Waiting,
     /// No port holds a stable connection, and waiting longer will not change that.
     Empty,
 }
+
+// J541: the verdict used to name the first port that held still, so a keyboard on port 3 hid the
+// stick on port 4 for good. It now waits for the whole hub, then names every stable port: until the
+// connect window closes (a device may still attach), and while any connection is still bouncing
+// (until the timeout, after which that port is left out). — TIMBERDOODLE
 
 /// Connect debounce across one hub's downstream ports, fed by GET_STATUS polls that start once
 /// the ports' power is good.
@@ -103,24 +146,34 @@ impl HubConnectDebounce {
         };
     }
 
+    /// The ports that have held a connection for [`HUB_DEBOUNCE_STABLE_NS`] at `now_ns`.
+    pub fn stable_ports(&self, now_ns: u64) -> HubPorts {
+        self.connected_since[..self.port_count as usize]
+            .iter()
+            .enumerate()
+            .filter(|(_, since)| {
+                since.is_some_and(|since| now_ns.saturating_sub(since) >= HUB_DEBOUNCE_STABLE_NS)
+            })
+            .fold(HubPorts::empty(), |ports, (index, _)| {
+                ports.with(index as u8 + 1)
+            })
+    }
+
     pub fn verdict(&self, now_ns: u64) -> HubConnectVerdict {
-        let ports = &self.connected_since[..self.port_count as usize];
-        if let Some(index) = ports.iter().position(|since| {
-            since.is_some_and(|since| now_ns.saturating_sub(since) >= HUB_DEBOUNCE_STABLE_NS)
-        }) {
-            return HubConnectVerdict::Stable(index as u8 + 1);
-        }
+        let stable = self.stable_ports(now_ns);
+        let settling = self.connected_since[..self.port_count as usize]
+            .iter()
+            .enumerate()
+            .any(|(index, since)| since.is_some() && !stable.contains(index as u8 + 1));
         let elapsed = now_ns.saturating_sub(self.started_ns);
-        let connecting = ports.iter().any(Option::is_some);
-        let still_worth_waiting = if connecting {
-            elapsed < HUB_DEBOUNCE_TIMEOUT_NS
-        } else {
-            elapsed < HUB_CONNECT_WINDOW_NS
-        };
+        let still_worth_waiting =
+            elapsed < HUB_CONNECT_WINDOW_NS || (settling && elapsed < HUB_DEBOUNCE_TIMEOUT_NS);
         if still_worth_waiting {
             HubConnectVerdict::Waiting
-        } else {
+        } else if stable.is_empty() {
             HubConnectVerdict::Empty
+        } else {
+            HubConnectVerdict::Stable(stable)
         }
     }
 }
@@ -181,7 +234,12 @@ mod tests {
         hub.observe(3, true, 60 * MS);
         assert_eq!(hub.verdict(60 * MS), HubConnectVerdict::Waiting);
         hub.observe(3, true, 160 * MS);
-        assert_eq!(hub.verdict(160 * MS), HubConnectVerdict::Stable(3));
+        // Stable, but the connect window is still open for the other ports.
+        assert_eq!(hub.verdict(160 * MS), HubConnectVerdict::Waiting);
+        assert_eq!(
+            hub.verdict(200 * MS),
+            HubConnectVerdict::Stable(HubPorts::empty().with(3))
+        );
     }
 
     #[test]
@@ -191,7 +249,11 @@ mod tests {
         let mut hub = HubConnectDebounce::new(4, 0);
         hub.observe(3, true, 0);
         assert_eq!(hub.verdict(25 * MS), HubConnectVerdict::Waiting);
-        assert_eq!(hub.verdict(100 * MS), HubConnectVerdict::Stable(3));
+        assert_eq!(hub.stable_ports(100 * MS), HubPorts::empty().with(3));
+        assert_eq!(
+            hub.verdict(200 * MS),
+            HubConnectVerdict::Stable(HubPorts::empty().with(3))
+        );
     }
 
     #[test]
@@ -200,8 +262,8 @@ mod tests {
         hub.observe(2, true, 0);
         hub.observe(2, false, 50 * MS);
         hub.observe(2, true, 75 * MS);
-        assert_eq!(hub.verdict(150 * MS), HubConnectVerdict::Waiting);
-        assert_eq!(hub.verdict(175 * MS), HubConnectVerdict::Stable(2));
+        assert!(hub.stable_ports(150 * MS).is_empty());
+        assert_eq!(hub.stable_ports(175 * MS), HubPorts::empty().with(2));
     }
 
     #[test]
@@ -226,12 +288,81 @@ mod tests {
     }
 
     #[test]
-    fn the_lowest_stable_port_wins_and_out_of_range_ports_are_ignored() {
+    fn every_stable_port_is_named_and_out_of_range_ports_are_ignored() {
         let mut hub = HubConnectDebounce::new(4, 0);
         hub.observe(4, true, 0);
         hub.observe(2, true, 0);
         hub.observe(9, true, 0);
         hub.observe(0, true, 0);
-        assert_eq!(hub.verdict(100 * MS), HubConnectVerdict::Stable(2));
+        let HubConnectVerdict::Stable(ports) = hub.verdict(200 * MS) else {
+            panic!("expected a settled hub");
+        };
+        assert!(ports.iter().eq([2, 4]));
+    }
+
+    #[test]
+    fn the_keyboard_no_longer_hides_the_stick_beside_it() {
+        // J539/J540 on metal: the front USB2 hub reported port 3 `status=0x301` (keyboard) and
+        // port 4 `status=0x101` (CRUX's stick) on the same scan. Only port 3 was ever enumerated.
+        let mut hub = HubConnectDebounce::new(4, 0);
+        let mut now = 0;
+        while now <= 200 * MS {
+            hub.observe(1, false, now);
+            hub.observe(2, false, now);
+            hub.observe(3, true, now);
+            hub.observe(4, true, now);
+            if now < 200 * MS {
+                assert_eq!(hub.verdict(now), HubConnectVerdict::Waiting);
+            }
+            now += 25 * MS;
+        }
+        let HubConnectVerdict::Stable(ports) = hub.verdict(200 * MS) else {
+            panic!("expected a settled hub");
+        };
+        assert_eq!(ports.len(), 2);
+        assert!(ports.iter().eq([3, 4]));
+    }
+
+    #[test]
+    fn a_bouncing_port_delays_the_stable_ones_only_until_the_timeout() {
+        // Port 2 is connected at every poll but drops out between polls every 75 ms, so its
+        // debounce keeps restarting and never reaches T_ATTDB.
+        let mut hub = HubConnectDebounce::new(4, 0);
+        let mut now = 0;
+        while now < HUB_DEBOUNCE_TIMEOUT_NS {
+            hub.observe(1, true, now);
+            if (now / (25 * MS)).is_multiple_of(3) {
+                hub.observe(2, false, now);
+            }
+            hub.observe(2, true, now);
+            assert_eq!(hub.verdict(now), HubConnectVerdict::Waiting);
+            now += 25 * MS;
+        }
+        assert_eq!(
+            hub.verdict(now),
+            HubConnectVerdict::Stable(HubPorts::empty().with(1))
+        );
+    }
+
+    #[test]
+    fn a_device_attaching_late_in_the_window_is_waited_for() {
+        let mut hub = HubConnectDebounce::new(4, 0);
+        hub.observe(3, true, 0);
+        hub.observe(1, true, 190 * MS);
+        assert_eq!(hub.verdict(200 * MS), HubConnectVerdict::Waiting);
+        let HubConnectVerdict::Stable(ports) = hub.verdict(290 * MS) else {
+            panic!("expected a settled hub");
+        };
+        assert!(ports.iter().eq([1, 3]));
+    }
+
+    #[test]
+    fn port_sets_hold_exactly_the_representable_ports() {
+        let ports = HubPorts::empty().with(0).with(1).with(15).with(16).with(1);
+        assert_eq!(ports.len(), 2);
+        assert!(ports.contains(1) && ports.contains(15));
+        assert!(!ports.contains(0) && !ports.contains(16));
+        assert!(ports.iter().eq([1, 15]));
+        assert!(HubPorts::empty().is_empty());
     }
 }

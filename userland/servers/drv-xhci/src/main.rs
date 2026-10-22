@@ -6,8 +6,9 @@
 //j538
 //j539
 //j540
+//j541
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{Bpb, FatError, PartitionFitError};
@@ -25,7 +26,7 @@ use kumo_usb_storage::{
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
     ContextSize, ControllerStatus, DmaBuf, DmaQwords, DmaTrbs, EndpointContext, Event,
-    HubConnectDebounce, HubConnectVerdict, HubDescriptor, InputControlContext,
+    HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts, InputControlContext,
     NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
     QwordSink, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
     TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
@@ -108,9 +109,13 @@ const PORT_POLL_LIMIT: u32 = 4_000_000;
 const PORT_POLL_BUDGET_NS: u64 = 250_000_000;
 
 // U2: a hub-downstream device gets its own page, laid out exactly like the root device's so the
-// same enumeration/HID helpers serve both (they take `base_va` + phys).
+// same enumeration/HID helpers serve both (they take `base_va` + phys). J541: one page per device,
+// `DEV2_VA + n * PAGE_SIZE`, so every stable hub port gets its own.
 const DEV2_VA: u64 = 0x0000_0000_1400_0000;
+/// Downstream device pages the `DEV2_VA` window hands out (it spans 16 MiB of VA).
+const DOWNSTREAM_PAGES: u32 = 32;
 /// Hub class feature selectors (USB 2.0 §11.24.2) and port-status bits used by the reach-through.
+const HUB_FEATURE_PORT_ENABLE: u8 = 1;
 const HUB_FEATURE_PORT_RESET: u8 = 4;
 const HUB_FEATURE_C_PORT_RESET: u8 = 20;
 const HUB_PORT_STATUS_ENABLE: u16 = 1 << 1;
@@ -131,6 +136,11 @@ const SETTLE_SPIN_ROUNDS: u32 = 4096;
 /// The device Resource handle and GIC IRQ this controller was granted, stashed from the bootstrap
 /// so the keyboard path can bind the interrupt (single-threaded driver — plain atomics suffice).
 static RESOURCE_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// Downstream device pages handed out so far (J541).
+static DOWNSTREAM_PAGES_USED: AtomicU32 = AtomicU32::new(0);
+/// The storage probe runs once per driver: it maps one fixed read window and fills one static
+/// snapshot. A second mass-storage device is named and left alone (J541).
+static STORAGE_PROBED: AtomicBool = AtomicBool::new(false);
 static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 /// The keyboard-channel writer Sora handed us (U5); 0 = none (this controller delivers to the
 /// serial log instead). Decoded key bytes are written here → Sora → the shell.
@@ -1010,17 +1020,7 @@ fn enumerate_root_device(
 
     match kumo_usb_storage::find_bulk_only_scsi_interface(&config[..read_len as usize]) {
         Ok(Some(storage)) => {
-            log(b"drv-xhci: storage if=");
-            log_hex(storage.interface_number as u64);
-            log(b" out=");
-            log_hex(storage.bulk_out.address as u64);
-            log(b" in=");
-            log_hex(storage.bulk_in.address as u64);
-            log(b" burst=");
-            log_hex(storage.bulk_out.max_burst as u64);
-            log(b"/");
-            log_hex(storage.bulk_in.max_burst as u64);
-            log(b"\n");
+            log_storage_interface(storage);
             configure_and_probe_storage(
                 io,
                 layout,
@@ -1099,6 +1099,11 @@ fn configure_and_probe_storage(
     storage: MassStorageInterface,
     storage_buf: DmaBuf,
 ) {
+    // J541: one probe per driver. A second mass-storage device would remap the fixed read window
+    // and refill the one static snapshot mid-probe, so it is named and left alone instead.
+    if STORAGE_PROBED.swap(true, Ordering::Relaxed) {
+        return log(b"drv-xhci: storage probe already ran; device left alone\n");
+    }
     log_storage_phase(b"set-config", b"begin");
     let set_config = [0x00, 0x09, storage.configuration_value, 0, 0, 0, 0, 0];
     match control_no_data(
@@ -1797,6 +1802,20 @@ fn bulk_transfer(
     Some(length - remaining)
 }
 
+fn log_storage_interface(storage: MassStorageInterface) {
+    log(b"drv-xhci: storage if=");
+    log_hex(storage.interface_number as u64);
+    log(b" out=");
+    log_hex(storage.bulk_out.address as u64);
+    log(b" in=");
+    log_hex(storage.bulk_in.address as u64);
+    log(b" burst=");
+    log_hex(storage.bulk_out.max_burst as u64);
+    log(b"/");
+    log_hex(storage.bulk_in.max_burst as u64);
+    log(b"\n");
+}
+
 fn log_storage_phase(phase: &[u8], state: &[u8]) {
     log(b"drv-xhci: storage phase=");
     log(phase);
@@ -2224,12 +2243,26 @@ fn log_cc(prefix: &[u8], cc: u8) {
     log(b"\n");
 }
 
-/// Read a device's descriptors over its EP0 and locate a boot-HID interface. Handles the
-/// speed-aware `bMaxPacketSize0` dance (8-byte probe → optional Evaluate Context → full read), then
-/// walks the configuration descriptor. Returns `(bConfigurationValue, interface)`. Shared by the
-/// root-port and hub-downstream paths, which differ only in which DMA page they operate on.
+/// What a device's descriptors say it is, copied out of device memory for the class matchers.
+struct DeviceConfig {
+    device_class: u8,
+    config_value: u8,
+    len: usize,
+    bytes: [u8; DATA_BUF_LEN],
+}
+
+impl DeviceConfig {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Read a hub-downstream device's descriptors over its EP0. Handles the speed-aware
+/// `bMaxPacketSize0` dance (8-byte probe → optional Evaluate Context → full read), then copies the
+/// configuration descriptor out for the caller to match a class against (J541: it used to look
+/// only for a boot keyboard).
 #[allow(clippy::too_many_arguments)]
-fn read_descriptors_and_find_hid(
+fn read_device_config(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
@@ -2242,7 +2275,7 @@ fn read_descriptors_and_find_hid(
     base_phys: u64,
     speed: UsbSpeed,
     data_buf: DmaBuf,
-) -> Option<(u8, kumo_hid::HidBootInterface)> {
+) -> Option<DeviceConfig> {
     let data_phys = base_phys + OFF_DATA as u64;
     let ep0_ring_phys = base_phys + OFF_EP0_RING as u64;
     let input_ctx_phys = base_phys + OFF_INPUT_CTX as u64;
@@ -2348,6 +2381,9 @@ fn read_descriptors_and_find_hid(
         }
     }
 
+    // bDeviceClass, captured before data_buf is reused.
+    let device_class = data_buf.byte(4);
+
     // Configuration descriptor: header for wTotalLength, then the whole thing.
     data_buf.zero();
     dsb();
@@ -2371,23 +2407,12 @@ fn read_descriptors_and_find_hid(
     dsb();
     let mut config = [0u8; DATA_BUF_LEN];
     data_buf.read_into(0, &mut config[..total as usize]);
-    let config_value = config[5];
-    match kumo_hid::find_hid_boot_keyboard(&config[..total as usize]) {
-        Some(hid) => {
-            log(b"drv-xhci: dev hid if=");
-            log_hex(hid.interface_number as u64);
-            log(b" proto=");
-            log_hex(hid.protocol as u64);
-            log(b" ep=");
-            log_hex(hid.in_endpoint_address as u64);
-            log(b"\n");
-            Some((config_value, hid))
-        }
-        None => {
-            log(b"drv-xhci: dev no hid boot iface\n");
-            None
-        }
-    }
+    Some(DeviceConfig {
+        device_class,
+        config_value: config[5],
+        len: total as usize,
+        bytes: config,
+    })
 }
 
 /// Issue a Configure Endpoint command adding one interrupt-IN endpoint (and bumping the slot's
@@ -2634,7 +2659,7 @@ fn configure_and_read_hub(
     let mut debounce = HubConnectDebounce::new(polled_ports, attach_start);
     let mut last_status = [None::<u16>; kumo_xhci::MAX_HUB_PORTS];
     let mut rounds = 0u32;
-    let connected_port = loop {
+    let stable = loop {
         let mut port = 1u8;
         while port <= polled_ports {
             data_buf.zero();
@@ -2661,13 +2686,14 @@ fn configure_and_read_hub(
             port += 1;
         }
         match debounce.verdict(clock_get()) {
-            HubConnectVerdict::Stable(port) => break Some(port),
-            HubConnectVerdict::Empty => break None,
+            HubConnectVerdict::Stable(ports) => break ports,
+            HubConnectVerdict::Empty => break HubPorts::empty(),
             HubConnectVerdict::Waiting if rounds < HUB_ATTACH_MAX_ROUNDS => {
                 rounds += 1;
                 settle(kumo_xhci::HUB_DEBOUNCE_STEP_NS);
             }
-            HubConnectVerdict::Waiting => break None,
+            // The wall clock never settled the hub: take what has held still so far.
+            HubConnectVerdict::Waiting => break debounce.stable_ports(clock_get()),
         }
     };
     for (index, status) in last_status[..polled_ports as usize].iter().enumerate() {
@@ -2689,35 +2715,127 @@ fn configure_and_read_hub(
     log(b"\n");
     log(b"drv-xhci: hub scan done\n");
 
-    // U2: reach through the hub to the device on that port. The attach wait above slept rather
-    // than held the CPU, so the downstream pass gets a full budget of its own.
-    let pass = Deadline::after(HUB_PASS_BUDGET_NS);
-    if let (Some(down_port), true) = (connected_port, speed_raw >= 4) {
+    if speed_raw >= 4 {
         // A device behind a SuperSpeed hub needs a SuperSpeed slot context (Route String, no
         // Transaction Translator) and SS port-status decoding that `enumerate_hub_downstream` does
         // not have yet. Name what is there; enumerating it is the next slice. — TIMBERDOODLE
-        log(b"drv-xhci: ss hub dev port=");
-        log_hex(down_port as u64);
-        log(b" (downstream enumeration pending)\n");
+        for down_port in stable.iter() {
+            log(b"drv-xhci: ss hub dev port=");
+            log_hex(down_port as u64);
+            log(b" (downstream enumeration pending)\n");
+        }
         return;
     }
-    if let Some(down_port) = connected_port {
-        if pass.expired() {
-            log(b"drv-xhci: hub pass budget spent; downstream deferred\n");
-        } else {
-            enumerate_hub_downstream(
-                io, layout, image, cmd, evt, ep0_ring, ep0_seg, slot_id, port_number, speed_raw,
-                data_phys, data_buf, down_port, pass,
-            );
+
+    // U2/J541: reach through the hub to every stable port, in ascending order and one at a time:
+    // only one device may answer at address 0 while its port resets. Each gets its own slot, page
+    // and pass budget (the attach wait above slept rather than held the CPU). A boot keyboard's
+    // report loop never returns, so it runs only after every one-shot device (storage) has had its
+    // turn. — TIMBERDOODLE
+    let mut keyboard = None;
+    for down_port in stable.iter() {
+        let found = enumerate_hub_downstream(
+            io,
+            layout,
+            image,
+            cmd,
+            evt,
+            ep0_ring,
+            ep0_seg,
+            slot_id,
+            port_number,
+            speed_raw,
+            data_phys,
+            data_buf,
+            down_port,
+            Deadline::after(HUB_PASS_BUDGET_NS),
+        );
+        if let Some(handoff) = found {
+            if keyboard.is_none() {
+                keyboard = Some(handoff);
+            } else {
+                log(b"drv-xhci: hub dev second keyboard left alone\n");
+            }
         }
+    }
+    if let Some(handoff) = keyboard {
+        handoff.run(io, layout, image, cmd, evt);
     }
 }
 
-/// Slice U2: enumerate a device attached to `down_port` of an already-configured hub. Resets the
-/// downstream port through hub class requests, then addresses the device with a **route string**
-/// (and, for a Full/Low-speed device behind a High-speed hub, the Transaction Translator fields)
-/// so the controller can reach it through the hub — multi-tier addressing. On finding a boot
-/// keyboard it hands off to the same HID path the root-port device uses.
+/// A boot keyboard behind a hub, addressed and described. Its report loop never returns, so it
+/// waits here until every other downstream device has been enumerated (J541).
+#[derive(Clone, Copy)]
+struct KeyboardHandoff {
+    slot_id: u8,
+    page_va: u64,
+    page_phys: u64,
+    speed_raw: u8,
+    slot_words: [u32; 8],
+    config_value: u8,
+    hid: kumo_hid::HidBootInterface,
+    ep0_ring: TransferRing,
+}
+
+impl KeyboardHandoff {
+    fn run(
+        mut self,
+        io: &mut Mmio,
+        layout: RegisterLayout,
+        image: &mut NoOpCommandImage,
+        cmd: &mut DmaTrbs,
+        evt: &DmaTrbs,
+    ) {
+        // SAFETY: the device's page stays mapped for the driver's lifetime.
+        let ep0_seg = &mut unsafe {
+            DmaTrbs::new(
+                (self.page_va as usize + OFF_EP0_RING) as *mut Trb,
+                EP0_RING_TRBS,
+            )
+        };
+        configure_and_read_keyboard(
+            io,
+            layout,
+            image,
+            cmd,
+            evt,
+            &mut self.ep0_ring,
+            &mut *ep0_seg,
+            self.slot_id,
+            self.page_va,
+            self.page_phys,
+            self.speed_raw,
+            self.slot_words,
+            self.config_value,
+            self.hid,
+        );
+    }
+}
+
+/// The next unused downstream device page in the `DEV2_VA` window, mapped: `(va, phys)` (J541).
+fn map_downstream_page() -> Option<(u64, u64)> {
+    let index = DOWNSTREAM_PAGES_USED.fetch_add(1, Ordering::Relaxed);
+    if index >= DOWNSTREAM_PAGES {
+        return skipped(b"drv-xhci: hub dev pages exhausted\n");
+    }
+    let va = DEV2_VA + index as u64 * PAGE_SIZE;
+    map_device_page(va).map(|phys| (va, phys))
+}
+
+/// Log why a downstream device was skipped.
+fn skipped<T>(msg: &[u8]) -> Option<T> {
+    log(msg);
+    None
+}
+
+fn skipped_cc<T>(prefix: &[u8], cc: u8) -> Option<T> {
+    log_cc(prefix, cc);
+    None
+}
+
+/// Slice U2/J541: enumerate the device on `down_port` of an already-configured hub. Mass storage is
+/// probed here and now; a boot keyboard comes back as a [`KeyboardHandoff`] for the caller to run
+/// once every port has had its turn.
 #[allow(clippy::too_many_arguments)]
 fn enumerate_hub_downstream(
     io: &mut Mmio,
@@ -2734,7 +2852,161 @@ fn enumerate_hub_downstream(
     hub_data_buf: DmaBuf,
     down_port: u8,
     pass: Deadline,
-) {
+) -> Option<KeyboardHandoff> {
+    let Some(DownstreamDevice {
+        slot_id: dev_slot,
+        speed_raw: down_speed,
+        page_va: dev_va,
+        page_phys: dev_phys,
+        slot_words,
+        mut ep0_ring,
+    }) = reset_and_address_downstream(
+        io,
+        layout,
+        image,
+        cmd,
+        evt,
+        &mut *hub_ep0_ring,
+        &mut *hub_ep0_seg,
+        hub_slot_id,
+        hub_root_port,
+        hub_speed_raw,
+        hub_data_phys,
+        hub_data_buf,
+        down_port,
+        pass,
+    )
+    else {
+        // The device may have come out of reset and be answering at address 0. Left enabled, it
+        // would answer beside the next port's device while that one is addressed. — TIMBERDOODLE
+        disable_hub_port(
+            io,
+            layout,
+            image,
+            evt,
+            hub_ep0_ring,
+            hub_ep0_seg,
+            hub_slot_id,
+            down_port,
+        );
+        return None;
+    };
+    // SAFETY: the device's page stays mapped for the driver's lifetime.
+    let ep0_seg =
+        &mut unsafe { DmaTrbs::new((dev_va as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS) };
+    let speed = usb_speed(down_speed);
+
+    // --- Descriptors over the downstream device's EP0 ---
+    let data_phys = dev_phys + OFF_DATA as u64;
+    // SAFETY: the downstream page is mapped for the driver's lifetime and only reached through
+    // `DmaBuf`.
+    let data_buf = unsafe {
+        DmaBuf::new(
+            (dev_va as usize + OFF_DATA) as *mut u8,
+            data_phys,
+            DATA_BUF_LEN,
+        )
+    };
+    let config = read_device_config(
+        io,
+        layout,
+        image,
+        cmd,
+        evt,
+        &mut ep0_ring,
+        &mut *ep0_seg,
+        dev_slot,
+        dev_va,
+        dev_phys,
+        speed,
+        data_buf,
+    )?;
+
+    // --- What is it? Storage is probed now; a keyboard waits for the other ports ---
+    if config.device_class == kumo_hid::USB_CLASS_HUB {
+        return skipped(b"drv-xhci: hub dev is a hub; nested hubs left alone\n");
+    }
+    match kumo_usb_storage::find_bulk_only_scsi_interface(config.bytes()) {
+        Ok(Some(storage)) => {
+            log_storage_interface(storage);
+            configure_and_probe_storage(
+                io,
+                layout,
+                image,
+                cmd,
+                evt,
+                &mut ep0_ring,
+                &mut *ep0_seg,
+                dev_slot,
+                dev_va,
+                dev_phys,
+                slot_words,
+                storage,
+                data_buf,
+            );
+            return None;
+        }
+        // As on a root port: a configuration the BOT matcher rejects may still be a keyboard's.
+        Err(_) => log(b"drv-xhci: malformed storage interface\n"),
+        Ok(None) => {}
+    }
+    let Some(hid) = kumo_hid::find_hid_boot_keyboard(config.bytes()) else {
+        return skipped(b"drv-xhci: dev no hid boot iface\n");
+    };
+    log(b"drv-xhci: dev hid if=");
+    log_hex(hid.interface_number as u64);
+    log(b" proto=");
+    log_hex(hid.protocol as u64);
+    log(b" ep=");
+    log_hex(hid.in_endpoint_address as u64);
+    log(b"\n");
+    if !hid.is_keyboard() {
+        return skipped(b"drv-xhci: hub dev not a boot keyboard\n");
+    }
+    Some(KeyboardHandoff {
+        slot_id: dev_slot,
+        page_va: dev_va,
+        page_phys: dev_phys,
+        speed_raw: down_speed,
+        slot_words,
+        config_value: config.config_value,
+        hid,
+        ep0_ring,
+    })
+}
+
+/// A hub-downstream device that answered Address Device on its own slot and page.
+#[derive(Clone, Copy)]
+struct DownstreamDevice {
+    slot_id: u8,
+    speed_raw: u8,
+    page_va: u64,
+    page_phys: u64,
+    slot_words: [u32; 8],
+    ep0_ring: TransferRing,
+}
+
+/// Slice U2: reset `down_port` of an already-configured hub through hub class requests, then
+/// address its device with a **route string** (and, for a Full/Low-speed device behind a
+/// High-speed hub, the Transaction Translator fields) so the controller can reach it through the
+/// hub — multi-tier addressing. `None` means the device may still sit at address 0.
+#[allow(clippy::too_many_arguments)]
+fn reset_and_address_downstream(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
+    evt: &DmaTrbs,
+    hub_ep0_ring: &mut TransferRing,
+    hub_ep0_seg: &mut DmaTrbs,
+    hub_slot_id: u8,
+    hub_root_port: u8,
+    hub_speed_raw: u8,
+    hub_data_phys: u64,
+    hub_data_buf: DmaBuf,
+    down_port: u8,
+    pass: Deadline,
+) -> Option<DownstreamDevice> {
     // --- Reset the downstream port (SET_FEATURE PORT_RESET) ---
     let set_reset = [
         0x23,
@@ -2750,8 +3022,8 @@ fn enumerate_hub_downstream(
         io, layout, image, evt, hub_ep0_ring, &mut *hub_ep0_seg, hub_slot_id, set_reset,
     ) {
         Some((1, _)) => {}
-        Some((cc, _)) => return log_cc(b"drv-xhci: hub port reset cc=", cc),
-        None => return log(b"drv-xhci: hub port reset timeout\n"),
+        Some((cc, _)) => return skipped_cc(b"drv-xhci: hub port reset cc=", cc),
+        None => return skipped(b"drv-xhci: hub port reset timeout\n"),
     }
 
     // Wait for the port to leave reset and report enabled, then read its negotiated speed.
@@ -2759,7 +3031,7 @@ fn enumerate_hub_downstream(
     let mut enabled = false;
     for _ in 0..HUB_RESET_POLL_ROUNDS {
         if pass.expired() {
-            return log(b"drv-xhci: hub pass budget spent (reset)\n");
+            return skipped(b"drv-xhci: hub pass budget spent (reset)\n");
         }
         // Keep each settle short: this driver preempts Sora, so a long spin here stalls the
         // whole system (and a sibling controller's live keyboard) while a port comes up.
@@ -2799,7 +3071,7 @@ fn enumerate_hub_downstream(
         }
     }
     if !enabled {
-        return log(b"drv-xhci: hub port never enabled\n");
+        return skipped(b"drv-xhci: hub port never enabled\n");
     }
     log(b"drv-xhci: hub dev port=");
     log_hex(down_port as u64);
@@ -2823,33 +3095,19 @@ fn enumerate_hub_downstream(
     );
 
     // --- A private DMA page for this device's contexts, EP0 ring and buffers ---
-    let (dev_raw, dev_phys) = vmo_create_contiguous(ENUM_LEN);
-    if dev_raw == u64::MAX || dev_phys == 0 {
-        return log(b"drv-xhci: hub dev vmo fail\n");
-    }
-    if vmar_map(
-        Handle(0),
-        Handle(dev_raw as u32),
-        0,
-        DEV2_VA,
-        ENUM_LEN,
-        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
-    ) != 0
-    {
-        return log(b"drv-xhci: hub dev map fail\n");
-    }
+    let (dev_va, dev_phys) = map_downstream_page()?;
 
     // --- Enable a slot for the downstream device ---
     let Ok(enable) = Trb::enable_slot(0) else {
-        return log(b"drv-xhci: hub dev enable build fail\n");
+        return skipped(b"drv-xhci: hub dev enable build fail\n");
     };
     let dev_slot = match submit_command(io, layout, image, cmd, evt, enable) {
         Some((1, slot, _)) => slot,
-        Some((cc, _, _)) => return log_cc(b"drv-xhci: hub dev enable cc=", cc),
-        None => return log(b"drv-xhci: hub dev enable timeout\n"),
+        Some((cc, _, _)) => return skipped_cc(b"drv-xhci: hub dev enable cc=", cc),
+        None => return skipped(b"drv-xhci: hub dev enable timeout\n"),
     };
     if dev_slot == 0 || dev_slot as usize >= DCBAA_ENTRIES {
-        return log(b"drv-xhci: hub dev slot out of range\n");
+        return skipped(b"drv-xhci: hub dev slot out of range\n");
     }
     log(b"drv-xhci: hub dev slot=");
     log_hex(dev_slot as u64);
@@ -2860,9 +3118,9 @@ fn enumerate_hub_downstream(
     let input_ctx_phys = dev_phys + OFF_INPUT_CTX as u64;
     let output_ctx_phys = dev_phys + OFF_OUTPUT_CTX as u64;
     let ep0_seg =
-        &mut unsafe { DmaTrbs::new((DEV2_VA as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS) };
-    let Ok(mut ep0_ring) = TransferRing::new(&mut *ep0_seg, ep0_ring_phys) else {
-        return log(b"drv-xhci: hub dev ep0 ring fail\n");
+        &mut unsafe { DmaTrbs::new((dev_va as usize + OFF_EP0_RING) as *mut Trb, EP0_RING_TRBS) };
+    let Ok(ep0_ring) = TransferRing::new(&mut *ep0_seg, ep0_ring_phys) else {
+        return skipped(b"drv-xhci: hub dev ep0 ring fail\n");
     };
 
     // One tier down: the route string's first nibble is this hub's downstream port number.
@@ -2878,18 +3136,18 @@ fn enumerate_hub_downstream(
     let speed = usb_speed(down_speed);
     let mps0 = speed.initial_ep0_max_packet_size();
     let Ok(ep0_ctx) = EndpointContext::control(mps0, ep0_ring_phys) else {
-        return log(b"drv-xhci: hub dev ep0 ctx fail\n");
+        return skipped(b"drv-xhci: hub dev ep0 ctx fail\n");
     };
     let mut icc = InputControlContext::default();
     let _ = icc.add(0);
     let _ = icc.add(1);
     let stride = ContextSize::Bytes64;
     let (Some(slot_off), Some(ep0_off)) = (stride.input_offset(0), stride.input_offset(1)) else {
-        return log(b"drv-xhci: hub dev ctx offset fail\n");
+        return skipped(b"drv-xhci: hub dev ctx offset fail\n");
     };
-    write_ctx(DEV2_VA + OFF_INPUT_CTX as u64, icc.words());
-    write_ctx(DEV2_VA + OFF_INPUT_CTX as u64 + slot_off as u64, slot_words);
-    write_ctx(DEV2_VA + OFF_INPUT_CTX as u64 + ep0_off as u64, ep0_ctx.words());
+    write_ctx(dev_va + OFF_INPUT_CTX as u64, icc.words());
+    write_ctx(dev_va + OFF_INPUT_CTX as u64 + slot_off as u64, slot_words);
+    write_ctx(dev_va + OFF_INPUT_CTX as u64 + ep0_off as u64, ep0_ctx.words());
     // SAFETY: the DCBAA sits inside the mapped DMA page.
     let mut dcbaa =
         unsafe { DmaQwords::new((DMA_VA as usize + OFF_DCBAA) as *mut u64, DCBAA_ENTRIES) };
@@ -2898,61 +3156,64 @@ fn enumerate_hub_downstream(
 
     // --- Address Device (through the hub) ---
     let Ok(addr) = Trb::address_device(input_ctx_phys, dev_slot, false) else {
-        return log(b"drv-xhci: hub dev addr build fail\n");
+        return skipped(b"drv-xhci: hub dev addr build fail\n");
     };
     match submit_command(io, layout, image, cmd, evt, addr) {
         Some((1, _, _)) => log(b"drv-xhci: hub dev addr cc=0x1 ok\n"),
-        Some((cc, _, _)) => return log_cc(b"drv-xhci: hub dev addr cc=", cc),
-        None => return log(b"drv-xhci: hub dev addr timeout\n"),
+        Some((cc, _, _)) => return skipped_cc(b"drv-xhci: hub dev addr cc=", cc),
+        None => return skipped(b"drv-xhci: hub dev addr timeout\n"),
     }
 
-    // --- Descriptors over the downstream device's EP0, then the HID path ---
-    let data_phys = dev_phys + OFF_DATA as u64;
-    // SAFETY: the downstream page is mapped for the driver's lifetime and only reached through
-    // `DmaBuf`.
-    let data_buf = unsafe {
-        DmaBuf::new(
-            (DEV2_VA as usize + OFF_DATA) as *mut u8,
-            data_phys,
-            DATA_BUF_LEN,
-        )
-    };
-    let _ = data_phys;
-    let Some((config_value, hid)) = read_descriptors_and_find_hid(
-        io,
-        layout,
-        image,
-        cmd,
-        evt,
-        &mut ep0_ring,
-        &mut *ep0_seg,
-        dev_slot,
-        DEV2_VA,
-        dev_phys,
-        speed,
-        data_buf,
-    ) else {
-        return;
-    };
-    if !hid.is_keyboard() {
-        return log(b"drv-xhci: hub dev not a boot keyboard\n");
-    }
-    configure_and_read_keyboard(
-        io,
-        layout,
-        image,
-        cmd,
-        evt,
-        &mut ep0_ring,
-        &mut *ep0_seg,
-        dev_slot,
-        DEV2_VA,
-        dev_phys,
-        down_speed,
+    Some(DownstreamDevice {
+        slot_id: dev_slot,
+        speed_raw: down_speed,
+        page_va: dev_va,
+        page_phys: dev_phys,
         slot_words,
-        config_value,
-        hid,
+        ep0_ring,
+    })
+}
+
+/// CLEAR_FEATURE(PORT_ENABLE) on a hub's downstream port (USB 2.0 §11.24.2.2), for a device that
+/// was reset but never addressed (J541).
+#[allow(clippy::too_many_arguments)]
+fn disable_hub_port(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    hub_ep0_ring: &mut TransferRing,
+    hub_ep0_seg: &mut DmaTrbs,
+    hub_slot_id: u8,
+    port: u8,
+) {
+    let clear_enable = [
+        0x23,
+        0x01,
+        HUB_FEATURE_PORT_ENABLE,
+        0x00,
+        port,
+        0x00,
+        0x00,
+        0x00,
+    ];
+    let done = control_no_data(
+        io,
+        layout,
+        image,
+        evt,
+        hub_ep0_ring,
+        hub_ep0_seg,
+        hub_slot_id,
+        clear_enable,
     );
+    log(if matches!(done, Some((1, _))) {
+        b"drv-xhci: hub port disabled port="
+    } else {
+        b"drv-xhci: hub port disable failed port="
+    });
+    log_hex(port as u64);
+    log(b"\n");
 }
 
 /// Iterations between cooperative yields inside a long driver loop.

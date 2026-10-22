@@ -4,6 +4,7 @@
 //j533
 //j539
 //j540
+//j541
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -36,7 +37,7 @@ pub use fdt::{
     X13S_USB0_XHCI_REGISTER_MMIO_LEN, X13S_USB0_XHCI_STREAM_ID,
 };
 pub use hub::{
-    HubConnectDebounce, HubConnectVerdict, HubDescriptor, HUB_CONNECT_WINDOW_NS,
+    HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts, HUB_CONNECT_WINDOW_NS,
     HUB_DEBOUNCE_STABLE_NS, HUB_DEBOUNCE_STEP_NS, HUB_DEBOUNCE_TIMEOUT_NS, MAX_HUB_PORTS,
 };
 pub use noop::{
