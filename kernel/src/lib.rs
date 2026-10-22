@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j478
 //j479
 //j482
 //j483
 //j493
+//j536
 
 extern crate alloc;
 
@@ -962,14 +962,12 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             // The UART now has exactly one reader — the IRQ handler in `conin` — because the
             // boot floor stops running whenever a child spins at EL0, which is the very case the
             // escape hatch exists for. What arrives here is what that handler judged ordinary
-            // input. TAB drives ttyd's completion and ESC opens its escape-sequence state machine
-            // (arrow keys arrive as `ESC [ A`/`B`); both used to be dropped, which left history
-            // and completion written, tested, and unreachable over serial.
+            // input. Every C0 control key crosses, as it does from a USB keyboard: TAB drives
+            // ttyd's completion, ESC its escape sequences, Ctrl-C cancels a line, and kilo's
+            // Ctrl-S/Ctrl-Q save and quit. See `conin::forwarded_to_userland` for the two
+            // exceptions.
             if let Some(byte) = conin::next_byte() {
-                if matches!(
-                    byte,
-                    0x08 | 0x09 | 0x1b | 0x7f | b'\r' | b'\n' | 0x20..=0x7e
-                ) {
+                if conin::forwarded_to_userland(byte) {
                     usermode::kbd_forward(byte);
                 }
             }

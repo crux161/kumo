@@ -21,6 +21,8 @@
 //! is a best-effort path by definition: if the floor is wedged, only the bounded actions fire, and
 //! those are the ones that matter.
 
+//j536
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Bytes buffered between the interrupt that read them and the REPL loop that consumes them.
@@ -190,6 +192,24 @@ pub fn run_action_in_irq(action: crate::sysrq::Action) {
     }
 }
 
+/// Whether the boot floor forwards a queued serial byte to userland.
+///
+/// Every C0 control byte goes through, the same set a USB keyboard's Ctrl chords already deliver
+/// (`kumo_hid::ctrl_ascii`): kilo's Ctrl-S/Ctrl-Q/Ctrl-F and ttyd's Ctrl-C are ordinary input. The
+/// old allowlist forwarded only BS/TAB/ESC/CR/LF/DEL beside printable ASCII, so over serial kilo
+/// could neither save nor quit. Two bytes stay out. `sysrq::PREFIX` (Ctrl-\) belongs to the escape
+/// hatch, whose IRQ-side recogniser consumes it before it is queued, and this keeps that true even
+/// if the recogniser changes. NUL is what a UART break or line noise reads as, so it is not taken
+/// as a keystroke. Bytes above DEL have no encoding defined here and are dropped. — TIMBERDOODLE
+pub const fn forwarded_to_userland(byte: u8) -> bool {
+    match byte {
+        0x00 => false,
+        crate::sysrq::PREFIX => false,
+        0x01..=0x7f => true,
+        _ => false,
+    }
+}
+
 /// Consumer side for the boot floor's REPL loop.
 pub fn next_byte() -> Option<u8> {
     RING.pop()
@@ -241,6 +261,59 @@ mod tests {
             }
         }
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn kilo_and_ttyd_control_keys_reach_userland() {
+        // Ctrl-S save, Ctrl-Q quit, Ctrl-F find, Ctrl-C cancel, Ctrl-D, plus the keys the old
+        // allowlist already carried.
+        for byte in [
+            0x13, 0x11, 0x06, 0x03, 0x04, 0x08, 0x09, 0x1b, b'\r', b'\n', 0x7f,
+        ] {
+            assert!(
+                forwarded_to_userland(byte),
+                "{byte:#04x} must reach userland"
+            );
+        }
+        for byte in 0x20..=0x7e {
+            assert!(forwarded_to_userland(byte));
+        }
+    }
+
+    #[test]
+    fn the_escape_prefix_nul_and_eight_bit_bytes_stay_out() {
+        assert!(!forwarded_to_userland(crate::sysrq::PREFIX));
+        assert!(!forwarded_to_userland(0x00));
+        for byte in 0x80..=0xff {
+            assert!(
+                !forwarded_to_userland(byte),
+                "{byte:#04x} has no encoding here"
+            );
+        }
+    }
+
+    #[test]
+    fn every_control_key_a_usb_keyboard_can_send_also_crosses_serial() {
+        // Parity with `kumo_hid::ctrl_ascii`: Ctrl-A..Ctrl-Z, Ctrl-[, Ctrl-], Ctrl-^, Ctrl-_.
+        // Ctrl-\ and Ctrl-@/Ctrl-Space (NUL) are the two deliberate exceptions over serial.
+        for byte in (0x01..=0x1a).chain([0x1b, 0x1d, 0x1e, 0x1f]) {
+            assert!(forwarded_to_userland(byte), "{byte:#04x}");
+        }
+    }
+
+    #[test]
+    fn ctrl_backslash_still_arms_the_escape_hatch_and_is_never_queued() {
+        let mut sysrq = crate::sysrq::Sysrq::new();
+        let (consumed, action) = sysrq.feed(crate::sysrq::PREFIX);
+        assert!(consumed);
+        assert_eq!(action, Some(crate::sysrq::Action::Armed));
+        // Ctrl-Q while armed is a command byte for the hatch, not a key for kilo.
+        let (consumed, _) = sysrq.feed(0x11);
+        assert!(consumed);
+        // Disarmed, Ctrl-Q is ordinary input again and the floor forwards it.
+        let (consumed, action) = sysrq.feed(0x11);
+        assert!(!consumed && action.is_none());
+        assert!(forwarded_to_userland(0x11));
     }
 
     #[test]
