@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-//j525
 //j529
 //j530
 //j531
 //j533
+//j537
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use kumo_abi::{Handle, VmarFlags};
+use kumo_fatfs::{Bpb, FatError, PartitionFitError};
 use kumo_gpt::{validate_protective_mbr, GptError, GptHeader, Guid};
 use kumo_rt::{
     channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
@@ -89,6 +90,7 @@ const BOT_TAG_READ_CAPACITY: u32 = 0x4b55_0002;
 const BOT_TAG_READ_LBA0: u32 = 0x4b55_0003;
 const BOT_TAG_READ_GPT_HEADER: u32 = 0x4b55_0004;
 const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
+const BOT_TAG_READ_ESP_BOOT: u32 = 0x4b55_0006;
 // J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
@@ -1396,7 +1398,89 @@ fn configure_and_probe_storage(
     log(b" blocks=");
     log_hex(esp.block_count());
     log(b"\n");
+
+    // J537: the ESP's own first block is its FAT32 boot sector. Read and judge it in place; a
+    // partition-relative mount is the next gate, so nothing here is exposed or written.
+    let boot_plan = match adapter.plan_read(esp.first_lba, 1) {
+        Ok(plan) => plan,
+        Err(_) => return log(b"drv-xhci: storage ESP boot sector plan fail\n"),
+    };
+    let Some(boot_len) = bot_command(
+        io,
+        layout,
+        image,
+        evt,
+        &mut out_ring,
+        out_seg,
+        out_dci,
+        &mut in_ring,
+        in_seg,
+        in_dci,
+        slot_id,
+        cbw_buf,
+        cbw_phys,
+        &mut read_window[..boot_plan.byte_length],
+        read_phys,
+        csw_buf,
+        csw_phys,
+        BOT_TAG_READ_ESP_BOOT,
+        &boot_plan.command,
+        b"read10-esp-boot",
+    ) else {
+        return;
+    };
+    if boot_len != boot_plan.byte_length {
+        return log(b"drv-xhci: storage short ESP boot sector\n");
+    }
+    let bpb = match Bpb::parse(&read_window[..boot_len]) {
+        Ok(bpb) => bpb,
+        Err(error) => return log_fat_error(error),
+    };
+    if let Err(error) = bpb.fits_partition(esp.block_count(), logical_block_size) {
+        return log_fit_error(error);
+    }
+    log_storage_phase(b"esp-fat32", b"ok");
+    log(b"drv-xhci: storage esp fat32 serial=");
+    log_hex(bpb.volume_serial as u64);
+    log(b" sectors=");
+    log_hex(bpb.total_sectors as u64);
+    log(b" per-cluster=");
+    log_hex(bpb.sectors_per_cluster as u64);
+    log(b" reserved=");
+    log_hex(bpb.reserved_sectors as u64);
+    log(b" fats=");
+    log_hex(bpb.num_fats as u64);
+    log(b"x");
+    log_hex(bpb.sectors_per_fat as u64);
+    log(b" root-cluster=");
+    log_hex(bpb.root_cluster as u64);
+    log(b"\n");
     log_storage_phase(b"probe", b"complete");
+}
+
+fn log_fat_error(error: FatError) {
+    let name = match error {
+        FatError::TooShort => b"too-short" as &[u8],
+        FatError::BadSignature => b"bad-signature",
+        FatError::NotFat32 => b"not-fat32",
+        FatError::BadGeometry => b"bad-geometry",
+        FatError::ReadFailed => b"read-failed",
+    };
+    log(b"drv-xhci: storage esp fat32 error=");
+    log(name);
+    log(b"\n");
+}
+
+fn log_fit_error(error: PartitionFitError) {
+    let name = match error {
+        PartitionFitError::BlockSize => b"block-size" as &[u8],
+        PartitionFitError::SectorSize => b"sector-size",
+        PartitionFitError::VolumeTooLarge => b"volume-too-large",
+        PartitionFitError::RegionsPastEnd => b"regions-past-end",
+    };
+    log(b"drv-xhci: storage esp fat32 fit error=");
+    log(name);
+    log(b"\n");
 }
 
 /// Execute exactly one BOT transaction. The CBW, optional data-IN TD, and CSW are submitted and

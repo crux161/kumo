@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j514
+//j537
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -81,6 +82,22 @@ pub struct Bpb {
     pub sectors_per_fat: u32,
     /// First cluster of the root directory (offset 0x2C); normally 2.
     pub root_cluster: u32,
+    /// Volume serial number, FAT32 `BS_VolID` (offset 0x43): the FAT filesystem's own identity,
+    /// written by the formatter and stable across re-partitioning (PLAN/008 `U2`).
+    pub volume_serial: u32,
+}
+
+/// Why a parsed FAT32 boot sector cannot be the volume of the partition it was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionFitError {
+    /// The device's logical block is not the [`SECTOR_SIZE`]-byte sector this engine reads.
+    BlockSize,
+    /// The BPB's own `bytes_per_sector` disagrees with [`SECTOR_SIZE`].
+    SectorSize,
+    /// The volume claims more sectors than the partition holds.
+    VolumeTooLarge,
+    /// The FATs, or the root directory's first cluster, start at or beyond the volume's own end.
+    RegionsPastEnd,
 }
 
 impl Bpb {
@@ -109,6 +126,7 @@ impl Bpb {
             total_sectors: u32_le(sector, 0x20),
             sectors_per_fat: u32_le(sector, 0x24),
             root_cluster: u32_le(sector, 0x2C),
+            volume_serial: u32_le(sector, 0x43),
         };
 
         if bpb.bytes_per_sector == 0
@@ -122,6 +140,44 @@ impl Bpb {
         }
 
         Ok(bpb)
+    }
+
+    /// Check that this volume can be mounted from a partition of `partition_blocks` blocks of
+    /// `block_size` bytes: the precondition for reading it through a partition-relative view of a
+    /// whole disk. A boot sector that passes [`Bpb::parse`] can still claim a volume larger than
+    /// its partition, or place its FATs past its own end, and a mount must not follow either one
+    /// off the partition. The region arithmetic is done in `u64` with overflow checks, because
+    /// [`Bpb::data_start_sector`]'s `u32` sum is only safe once this check has passed.
+    /// — TIMBERDOODLE
+    pub fn fits_partition(
+        &self,
+        partition_blocks: u64,
+        block_size: usize,
+    ) -> Result<(), PartitionFitError> {
+        if block_size != SECTOR_SIZE {
+            return Err(PartitionFitError::BlockSize);
+        }
+        if self.bytes_per_sector as usize != SECTOR_SIZE {
+            return Err(PartitionFitError::SectorSize);
+        }
+        let total = u64::from(self.total_sectors);
+        if total > partition_blocks {
+            return Err(PartitionFitError::VolumeTooLarge);
+        }
+        let data_start = u64::from(self.num_fats)
+            .checked_mul(u64::from(self.sectors_per_fat))
+            .and_then(|fats| fats.checked_add(u64::from(self.reserved_sectors)));
+        let root_dir = data_start.and_then(|start| {
+            u64::from(self.root_cluster - 2)
+                .checked_mul(u64::from(self.sectors_per_cluster))
+                .and_then(|offset| start.checked_add(offset))
+        });
+        match root_dir {
+            Some(root_dir) if root_dir < total && data_start.is_some_and(|start| start < total) => {
+                Ok(())
+            }
+            _ => Err(PartitionFitError::RegionsPastEnd),
+        }
     }
 
     /// Sector index of the first FAT (the FAT region follows the reserved area).
@@ -942,6 +998,77 @@ mod tests {
         e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
         e[28..32].copy_from_slice(&size.to_le_bytes());
         e
+    }
+
+    /// An ESP-shaped partition holding the fixture volume with room to spare.
+    const ESP_BLOCKS: u64 = 0x10_0000;
+
+    #[test]
+    fn the_fixture_volume_fits_its_partition() {
+        let bpb = Bpb::parse(&fixture_boot_sector()).unwrap();
+        assert_eq!(bpb.fits_partition(ESP_BLOCKS, SECTOR_SIZE), Ok(()));
+        assert_eq!(bpb.fits_partition(u64::from(TOTAL), SECTOR_SIZE), Ok(()));
+    }
+
+    #[test]
+    fn a_volume_larger_than_its_partition_is_refused() {
+        let bpb = Bpb::parse(&fixture_boot_sector()).unwrap();
+        assert_eq!(
+            bpb.fits_partition(u64::from(TOTAL) - 1, SECTOR_SIZE),
+            Err(PartitionFitError::VolumeTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_device_or_volume_that_is_not_512_byte_sectored_is_refused() {
+        let bpb = Bpb::parse(&fixture_boot_sector()).unwrap();
+        assert_eq!(
+            bpb.fits_partition(ESP_BLOCKS, 4096),
+            Err(PartitionFitError::BlockSize)
+        );
+        let mut sector = fixture_boot_sector();
+        sector[0x0B..0x0D].copy_from_slice(&4096u16.to_le_bytes());
+        let bpb = Bpb::parse(&sector).unwrap();
+        assert_eq!(
+            bpb.fits_partition(ESP_BLOCKS, SECTOR_SIZE),
+            Err(PartitionFitError::SectorSize)
+        );
+    }
+
+    #[test]
+    fn regions_past_the_volume_end_are_refused_without_overflowing() {
+        // FATs that would end beyond the volume.
+        let mut sector = fixture_boot_sector();
+        sector[0x24..0x28].copy_from_slice(&(TOTAL).to_le_bytes());
+        let bpb = Bpb::parse(&sector).unwrap();
+        assert_eq!(
+            bpb.fits_partition(ESP_BLOCKS, SECTOR_SIZE),
+            Err(PartitionFitError::RegionsPastEnd)
+        );
+        // A hostile BPB whose u32 region sum would wrap.
+        let mut sector = fixture_boot_sector();
+        sector[0x10] = 255;
+        sector[0x24..0x28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bpb = Bpb::parse(&sector).unwrap();
+        assert_eq!(
+            bpb.fits_partition(u64::MAX, SECTOR_SIZE),
+            Err(PartitionFitError::RegionsPastEnd)
+        );
+        // A root cluster far beyond the data region.
+        let mut sector = fixture_boot_sector();
+        sector[0x2C..0x30].copy_from_slice(&0x0FFF_FFF0u32.to_le_bytes());
+        let bpb = Bpb::parse(&sector).unwrap();
+        assert_eq!(
+            bpb.fits_partition(ESP_BLOCKS, SECTOR_SIZE),
+            Err(PartitionFitError::RegionsPastEnd)
+        );
+    }
+
+    #[test]
+    fn the_volume_serial_is_read_from_bs_volid() {
+        let mut sector = fixture_boot_sector();
+        sector[0x43..0x47].copy_from_slice(&0x1234_abcdu32.to_le_bytes());
+        assert_eq!(Bpb::parse(&sector).unwrap().volume_serial, 0x1234_abcd);
     }
 
     #[test]
