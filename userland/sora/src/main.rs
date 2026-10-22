@@ -6,10 +6,11 @@
 //j512
 //j514
 //j527
+//j545
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, KILO_PATH, LS_PATH,
@@ -244,6 +245,39 @@ const XHCI_KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
 /// ...and the pointer channel. A USB boot mouse emits the same 3-byte `[buttons, dx, dy]` frame
 /// the i2c-hid path does, so it joins the existing `PointerState` pipeline unchanged.
 const XHCI_MOUSE_BOOTSTRAP_TAG: u8 = b'm';
+/// J545: ...and the storage control channel. A driver that finds a USB stick offers its volume
+/// on it, and Sora answers with one block channel per `fatfs` instance it starts for the volume.
+const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
+/// Sora's ends of the drivers' storage control channels, one per controller (usb0, usb1,
+/// host2); 0 = none.
+static XHCI_STORAGE_CONTROLS: [AtomicU32; 3] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// The removable volume Sora knows, mounted at `/media/<name>` (DESIGN/012 §2.1, J545).
+#[derive(Clone, Copy)]
+struct Media {
+    ready: drv_blk::MediaReady,
+    /// The offering driver's control channel: where a new client's block channel goes.
+    control: Handle,
+}
+
+struct MediaCell(core::cell::UnsafeCell<Option<Media>>);
+
+// SAFETY: Sora is single-threaded, and `media`/`set_media` copy in and out without keeping a
+// reference.
+unsafe impl Sync for MediaCell {}
+
+static MEDIA: MediaCell = MediaCell(core::cell::UnsafeCell::new(None));
+
+fn media() -> Option<Media> {
+    // SAFETY: see `MediaCell`.
+    unsafe { *MEDIA.0.get() }
+}
+
+fn set_media(media: Option<Media>) {
+    // SAFETY: see `MediaCell`.
+    unsafe { *MEDIA.0.get() = media }
+}
 
 /// Spawn a drv-xhci per xHCI controller and return the keyboard-channel reader (bound to the serve
 /// port → shell). The writer goes to the usb0 driver — where the keyboard enumerates on a root port
@@ -290,6 +324,22 @@ fn launch_xhci_first_light(
     };
     let writer_for = |have: bool| -> u64 { dup_writer(have, kbd_writer) };
     let mouse_for = |have: bool| -> u64 { dup_writer(have, mouse_writer) };
+    // J545: a storage control channel per controller. Sora keeps controller `index`'s end and
+    // the driver gets the other; a failed pair just means that controller offers no storage.
+    let storage_for = |index: usize| -> u64 {
+        let (sora_end, driver_end) = channel_create_pair();
+        if sora_end == u64::MAX || driver_end == u64::MAX {
+            for end in [sora_end, driver_end] {
+                if end != u64::MAX {
+                    let _ = handle_close(Handle(end as u32));
+                }
+            }
+            log(b"drv-xhci: storage control unavailable\n");
+            return u64::MAX;
+        }
+        XHCI_STORAGE_CONTROLS[index].store(sora_end as u32, Ordering::Relaxed);
+        driver_end
+    };
 
     match xhci_usb0_probe_from_dtb(dtb_vmo, dtb_phys) {
         Some(config) => spawn_xhci(
@@ -298,6 +348,7 @@ fn launch_xhci_first_light(
             config,
             writer_for(have_channel),
             mouse_for(have_mouse),
+            storage_for(0),
         ),
         None => log(b"drv-xhci: no supported usb0 xhci\n"),
     }
@@ -312,6 +363,7 @@ fn launch_xhci_first_light(
         ),
         writer_for(have_channel),
         mouse_for(have_mouse),
+        storage_for(1),
     );
     spawn_xhci(
         initrd,
@@ -324,6 +376,7 @@ fn launch_xhci_first_light(
         ),
         writer_for(have_channel),
         mouse_for(have_mouse),
+        storage_for(2),
     );
     // The originals stay with Sora only as duplication sources; close them.
     if have_channel {
@@ -345,6 +398,7 @@ fn spawn_xhci(
     config: kumo_xhci::XhciProbeConfig,
     keyboard_writer: u64,
     mouse_writer: u64,
+    storage_writer: u64,
 ) {
     log(b"drv-xhci: topology mmio=");
     log_hex(config.mmio_base);
@@ -404,6 +458,9 @@ fn spawn_xhci(
         if mouse_writer != u64::MAX {
             let _ = handle_close(Handle(mouse_writer as u32));
         }
+        if storage_writer != u64::MAX {
+            let _ = handle_close(Handle(storage_writer as u32));
+        }
         return;
     }
     // Hand the keyboard-channel writer to the driver as a tagged second bootstrap message. The
@@ -424,6 +481,15 @@ fn spawn_xhci(
             tag.as_ptr(),
             1,
             Handle(mouse_writer as u32),
+        );
+    }
+    if storage_writer != u64::MAX {
+        let tag = [XHCI_STORAGE_BOOTSTRAP_TAG];
+        let _ = channel_write_with_handle(
+            Handle(sender as u32),
+            tag.as_ptr(),
+            1,
+            Handle(storage_writer as u32),
         );
     }
     if run_elf(
@@ -2000,6 +2066,16 @@ extern "C" fn sora_main(
         }
         SERVE_PORT.store(u64::from(port.0), Ordering::Relaxed);
         log(b"sora: ports bound\n");
+        // J545: each controller's storage control channel. `PortBind` replays a pending offer,
+        // so a stick probed before this point still wakes the loop below.
+        let mut storage_koids: [Option<Handle>; 3] = [None; 3];
+        for (koid, control) in storage_koids.iter_mut().zip(&XHCI_STORAGE_CONTROLS) {
+            let control = Handle(control.load(Ordering::Relaxed));
+            let raw_koid = handle_koid(control);
+            if control.0 != 0 && raw_koid != u64::MAX && port_bind(port, control) == 0 {
+                *koid = Some(Handle(raw_koid as u32));
+            }
+        }
         let cons_koid = Handle(console_koid as u32);
         let blk_koid = Handle(block_koid as u32);
         let net_k = Handle(net_koid as u32);
@@ -2051,6 +2127,10 @@ extern "C" fn sora_main(
         // borrow, leaving the boot floor alive but unable to forward any ordinary console input.
         loop {
             let source = Handle(port_wait(port) as u32);
+            if let Some(index) = storage_koids.iter().position(|koid| *koid == Some(source)) {
+                media_offered(initrd, port, index, &mut storage_koids);
+                continue;
+            }
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
                 let Some((timer, _)) = ttyd_restart_timer.take() else {
                     continue;
@@ -2629,6 +2709,120 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
         return None;
     }
     Some(client)
+}
+
+/// J545: a storage control channel woke the serve loop: its driver offered a stick's volume, or
+/// the driver is gone and its volume with it.
+fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option<Handle>; 3]) {
+    let control = Handle(XHCI_STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+    let mut frame = [0u8; drv_blk::MEDIA_READY_LEN];
+    let n = channel_read(control, frame.as_mut_ptr(), frame.len());
+    if n == 0 || n == u64::MAX {
+        let _ = port_unbind(port, control);
+        koids[index] = None;
+        if media().is_some_and(|media| media.control == control) {
+            set_media(None);
+            log(b"media: driver gone; volume removed\n");
+        }
+        return;
+    }
+    let Some(ready) = drv_blk::MediaReady::decode(&frame[..n as usize]) else {
+        return log(b"media: bad offer\n");
+    };
+    let name = sora::MediaName::new(ready.label, ready.serial);
+    set_media(Some(Media { ready, control }));
+    log(b"media: /media/");
+    log(name.as_bytes());
+    log(b" usb fat32 blocks=");
+    log_hex(ready.block_count);
+    log(b" serial=");
+    log(sora::MediaName::new(None, ready.serial).as_bytes());
+    log(if ready.read_only {
+        b" read-only\n" as &[u8]
+    } else {
+        b"\n"
+    });
+    // J545's end-to-end check: mount the volume once through a block-backed `fatfs`, then let
+    // that instance go. Its mount crosses every new hop (Sora's connect, the driver's resident
+    // loop, the block protocol), and its exit returns the driver's client slot. — TIMBERDOODLE
+    match spawn_media_fatfs(initrd) {
+        Some(vfs) => {
+            let _ = handle_close(vfs);
+            log(b"media: mount check started\n");
+        }
+        None => log(b"media: mount check spawn fail\n"),
+    }
+}
+
+/// J545: start a `fatfs` instance over the registered stick and return its vfs client channel.
+/// The instance gets its own block channel, whose other end goes to the stick's driver first;
+/// when the instance exits, the driver sees that channel close and frees the client slot.
+fn spawn_media_fatfs(initrd: Handle) -> Option<Handle> {
+    let media = media()?;
+    let (block_client_raw, block_server_raw) = channel_create_pair();
+    if block_client_raw == u64::MAX || block_server_raw == u64::MAX {
+        for end in [block_client_raw, block_server_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        log(b"media: block channel unavailable\n");
+        return None;
+    }
+    let block_client = Handle(block_client_raw as u32);
+    let block_server = Handle(block_server_raw as u32);
+    let connect = [drv_blk::CONTROL_CONNECT];
+    if channel_write_with_handle(media.control, connect.as_ptr(), 1, block_server)
+        != Errno::Ok.status()
+    {
+        let _ = handle_close(block_client);
+        let _ = handle_close(block_server);
+        log(b"media: driver connect failed\n");
+        return None;
+    }
+
+    let (vfs_client_raw, fatfs_end_raw) = channel_create_pair();
+    if vfs_client_raw == u64::MAX || fatfs_end_raw == u64::MAX {
+        for end in [vfs_client_raw, fatfs_end_raw] {
+            if end != u64::MAX {
+                let _ = handle_close(Handle(end as u32));
+            }
+        }
+        let _ = handle_close(block_client);
+        log(b"media: vfs channel unavailable\n");
+        return None;
+    }
+    let vfs_client = Handle(vfs_client_raw as u32);
+    let bootstrap = drv_blk::encode_client_bootstrap(media.ready.block_count);
+    if channel_write_with_handle(
+        vfs_client,
+        bootstrap.as_ptr(),
+        bootstrap.len(),
+        block_client,
+    ) != Errno::Ok.status()
+    {
+        let _ = handle_close(block_client);
+        let _ = handle_close(vfs_client);
+        let _ = handle_close(Handle(fatfs_end_raw as u32));
+        log(b"media: fatfs bootstrap failed\n");
+        return None;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    if !run_elf(
+        initrd,
+        FATFS_PATH.as_bytes(),
+        0,
+        fatfs_end_raw,
+        flags,
+        b"fatfs",
+    ) {
+        // Closing the client drops the queued bootstrap, and with it the block channel: the
+        // driver sees it close and frees the slot it had bound.
+        let _ = handle_close(vfs_client);
+        let _ = handle_close(Handle(fatfs_end_raw as u32));
+        return None;
+    }
+    Some(vfs_client)
 }
 
 fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {

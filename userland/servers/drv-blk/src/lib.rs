@@ -3,6 +3,7 @@
 //j166
 //j413
 //j414
+//j545
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -30,6 +31,10 @@ pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_BAD_LBA: u8 = 0x01;
 /// Response status: a write frame's data length did not match `count` blocks.
 pub const STATUS_BAD_LEN: u8 = 0x02;
+/// Response status: this device serves reads only (J545: a USB stick before WRITE(10) lands).
+pub const STATUS_READ_ONLY: u8 = 0x03;
+/// Response status: the device failed the transfer (a USB read that did not complete).
+pub const STATUS_IO_ERROR: u8 = 0x04;
 
 /// A block device backed by a contiguous VMO.
 pub struct BlockDevice {
@@ -212,9 +217,141 @@ pub fn read_payload(resp: &[u8]) -> Result<&[u8], ResponseError> {
     }
 }
 
+// --- Control channel between a block driver and Sora (J545) ---
+//
+// A driver that owns removable media (drv-xhci's USB stick) does not know who will read it.
+// It tells Sora over a control channel when a volume is ready; Sora then hands it one fresh
+// channel per client, each of which this block protocol runs over. The driver narrows every
+// client to the volume: LBA 0 on that channel is the partition's first block.
+
+/// Control message, driver to Sora: a volume is ready to serve. See [`MediaReady`].
+pub const CONTROL_MEDIA_READY: u8 = b'V';
+/// Control message, Sora to driver: the one transferred handle is a new client's channel.
+pub const CONTROL_CONNECT: u8 = b'C';
+/// Wire length of [`MediaReady`]: `[tag][flags][blocks: u64][serial: u32][label: 11]`.
+pub const MEDIA_READY_LEN: usize = 25;
+const MEDIA_HAS_LABEL: u8 = 1 << 0;
+const MEDIA_READ_ONLY: u8 = 1 << 1;
+
+/// What a driver announces about a volume it can serve: enough for Sora to name its mount point
+/// (FHS `/media/<label>`, DESIGN/012 §2.1) and bound its clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaReady {
+    /// Blocks of [`BLOCK_SIZE`] bytes a client may address, from 0.
+    pub block_count: u64,
+    /// The filesystem's serial (FAT32 `BS_VolID`), the name of last resort.
+    pub serial: u32,
+    /// The volume label, space-padded, when the volume has one.
+    pub label: Option<[u8; 11]>,
+    /// Whether writes are refused with [`STATUS_READ_ONLY`].
+    pub read_only: bool,
+}
+
+impl MediaReady {
+    pub fn encode(&self) -> [u8; MEDIA_READY_LEN] {
+        let mut buf = [0u8; MEDIA_READY_LEN];
+        buf[0] = CONTROL_MEDIA_READY;
+        buf[1] = if self.label.is_some() {
+            MEDIA_HAS_LABEL
+        } else {
+            0
+        } | if self.read_only { MEDIA_READ_ONLY } else { 0 };
+        buf[2..10].copy_from_slice(&self.block_count.to_le_bytes());
+        buf[10..14].copy_from_slice(&self.serial.to_le_bytes());
+        buf[14..25].copy_from_slice(&self.label.unwrap_or([b' '; 11]));
+        buf
+    }
+
+    /// Decode an announcement; `None` for a short frame, another tag, or unknown flags.
+    pub fn decode(raw: &[u8]) -> Option<MediaReady> {
+        let raw = raw.get(..MEDIA_READY_LEN)?;
+        let flags = raw[1];
+        if raw[0] != CONTROL_MEDIA_READY || flags & !(MEDIA_HAS_LABEL | MEDIA_READ_ONLY) != 0 {
+            return None;
+        }
+        Some(MediaReady {
+            block_count: u64::from_le_bytes(raw[2..10].try_into().ok()?),
+            serial: u32::from_le_bytes(raw[10..14].try_into().ok()?),
+            label: (flags & MEDIA_HAS_LABEL != 0).then(|| raw[14..25].try_into().unwrap()),
+            read_only: flags & MEDIA_READ_ONLY != 0,
+        })
+    }
+}
+
+/// First byte of the bootstrap a block-backed filesystem server receives (J545):
+/// `[CLIENT_BOOTSTRAP_TAG][block_count: u64 LE]`, carrying the client channel as its handle.
+pub const CLIENT_BOOTSTRAP_TAG: u8 = b'B';
+/// Wire length of a client bootstrap.
+pub const CLIENT_BOOTSTRAP_LEN: usize = 9;
+
+/// Encode the bootstrap that hands a filesystem server a volume of `block_count` blocks.
+pub fn encode_client_bootstrap(block_count: u64) -> [u8; CLIENT_BOOTSTRAP_LEN] {
+    let mut buf = [0u8; CLIENT_BOOTSTRAP_LEN];
+    buf[0] = CLIENT_BOOTSTRAP_TAG;
+    buf[1..].copy_from_slice(&block_count.to_le_bytes());
+    buf
+}
+
+/// The volume's block count from a client bootstrap; `None` for any other message, such as the
+/// RAM image's `[base][len]` header, which is 16 bytes.
+pub fn decode_client_bootstrap(raw: &[u8]) -> Option<u64> {
+    if raw.len() != CLIENT_BOOTSTRAP_LEN || raw[0] != CLIENT_BOOTSTRAP_TAG {
+        return None;
+    }
+    Some(u64::from_le_bytes(raw[1..].try_into().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_bootstrap_round_trips_and_is_told_from_the_image_header() {
+        let wire = encode_client_bootstrap(0x732_3800);
+        assert_eq!(decode_client_bootstrap(&wire), Some(0x732_3800));
+        // The RAM-image bootstrap fatfs also accepts: `[base: u64][len: u64]`.
+        let mut image_header = [0u8; 16];
+        image_header[0] = CLIENT_BOOTSTRAP_TAG;
+        assert_eq!(decode_client_bootstrap(&image_header), None);
+        assert_eq!(decode_client_bootstrap(&wire[..8]), None);
+    }
+
+    #[test]
+    fn a_media_announcement_round_trips() {
+        let stick = MediaReady {
+            block_count: 0x732_3800,
+            serial: 0x4567_13f4,
+            label: Some(*b"STICKY     "),
+            read_only: true,
+        };
+        let wire = stick.encode();
+        assert_eq!(wire[0], CONTROL_MEDIA_READY);
+        assert_eq!(MediaReady::decode(&wire), Some(stick));
+        let unnamed = MediaReady {
+            label: None,
+            read_only: false,
+            ..stick
+        };
+        assert_eq!(MediaReady::decode(&unnamed.encode()), Some(unnamed));
+    }
+
+    #[test]
+    fn a_malformed_announcement_is_refused() {
+        let wire = MediaReady {
+            block_count: 1,
+            serial: 2,
+            label: None,
+            read_only: true,
+        }
+        .encode();
+        assert_eq!(MediaReady::decode(&wire[..MEDIA_READY_LEN - 1]), None);
+        let mut other_tag = wire;
+        other_tag[0] = CONTROL_CONNECT;
+        assert_eq!(MediaReady::decode(&other_tag), None);
+        let mut unknown_flag = wire;
+        unknown_flag[1] |= 0x80;
+        assert_eq!(MediaReady::decode(&unknown_flag), None);
+    }
 
     #[test]
     fn zero_len_device_has_zero_blocks() {

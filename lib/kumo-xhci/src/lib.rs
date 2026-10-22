@@ -5,6 +5,7 @@
 //j539
 //j540
 //j541
+//j545
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -21,6 +22,7 @@ mod noop;
 mod probe;
 mod registers;
 mod ring;
+mod stash;
 mod trb;
 
 pub use context::{
@@ -48,6 +50,7 @@ pub use registers::{portsc_offset, CapabilityRegisters, PortStatus, RootPortScan
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
 };
+pub use stash::{StashedTransfer, TransferEventStash, STASH_CAPACITY};
 pub use trb::{Event, NormalTransfer, SetupTransferType, Trb, TrbType};
 
 /// Validation or ring-state failure detected before hardware is touched.

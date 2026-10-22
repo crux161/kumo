@@ -2,6 +2,7 @@
 #j521
 #j525
 #j537
+#j545
 
 [package]
 name = "drv-xhci"
@@ -19,6 +20,7 @@ doctest = false
 
 [dependencies]
 kumo-abi.workspace = true
+drv-blk = { path = "../drv-blk" }
 kumo-fatfs = { path = "../../../lib/kumo-fatfs" }
 kumo-gpt = { path = "../../../lib/kumo-gpt" }
 kumo-xhci = { path = "../../../lib/kumo-xhci" }

@@ -9,9 +9,15 @@
 //j541
 //j542
 //j543
+//j545
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use drv_blk::{
+    MediaReady, Request as BlockRequest, CMD_FLUSH, CMD_READ, CMD_WRITE, CONTROL_CONNECT,
+    REQUEST_LEN as BLOCK_REQUEST_LEN, STATUS_BAD_LBA, STATUS_BAD_LEN, STATUS_IO_ERROR, STATUS_OK,
+    STATUS_READ_ONLY,
+};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{
     BlockReader, Bpb, FatError, FatVolume, PartitionFitError, PartitionReader, SECTOR_SIZE,
@@ -21,9 +27,10 @@ use kumo_gpt::{
     Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
-    channel_read_with_handle, channel_write, clock_get, debug_write, interrupt_complete,
-    interrupt_create, interrupt_wait, port_bind, port_create, port_wait, process_exit,
-    resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
+    channel_read, channel_read_with_handle, channel_write, clock_get, debug_write, handle_close,
+    handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create,
+    port_unbind, port_wait, process_exit, resource_mint_mmio, sleep_ns, vmar_map,
+    vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -36,7 +43,8 @@ use kumo_xhci::{
     HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts, InputControlContext,
     NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
     QwordSink, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
-    TransferRing, Trb, UsbSpeed, XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    StashedTransfer, TransferEventStash, TransferRing, Trb, UsbSpeed, XhciProbeConfig,
+    XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 kumo_rt::entry!(main);
@@ -102,13 +110,8 @@ const BOT_TAG_READ_GPT_HEADER: u32 = 0x4b55_0004;
 const BOT_TAG_READ_GPT_ENTRIES: u32 = 0x4b55_0005;
 /// The boot sector of the FAT32 volume found, a GPT ESP or a classic MBR record (J542).
 const BOT_TAG_READ_FAT_BOOT: u32 = 0x4b55_0006;
-/// Sectors of the mounted FAT32 volume (J543).
+/// Sectors of the mounted FAT32 volume (J543), and the blocks served to clients (J545).
 const BOT_TAG_READ_VOLUME: u32 = 0x4b55_0007;
-/// Root entries the J543 volume read lists; a stick's root rarely holds more.
-const ROOT_LISTING_MAX: usize = 32;
-/// Bytes of the sample file read back, and the lines of it shown.
-const SAMPLE_READ_LEN: usize = 512;
-const SAMPLE_SHOW_LINES: usize = 8;
 // J525: a bounded 16-KiB data window covers the UEFI minimum GPT entry array. A 32-KiB backing run
 // guarantees a contained 16-KiB subwindow that does not cross an xHCI 64-KiB data-buffer boundary;
 // phys is again the IOVA under SMMU bypass. — KESTREL
@@ -159,6 +162,15 @@ static STORAGE_PROBED: AtomicBool = AtomicBool::new(false);
 /// Log every BOT phase's begin and success. The probe keeps this on; the volume reads after it
 /// turn it off and log only failures (J543).
 static STORAGE_TRACE: AtomicBool = AtomicBool::new(true);
+/// The storage control channel Sora handed this driver (J545); 0 = none. The driver offers its
+/// volume on it and receives one channel per block client from it.
+static STORAGE_CONTROL: AtomicU32 = AtomicU32::new(0);
+const STORAGE_BOOTSTRAP_TAG: u8 = b'b';
+/// Block clients one stick serves at once: one per `fatfs` instance Sora starts for it.
+const MAX_BLOCK_CLIENTS: usize = 4;
+/// Keep other slots' transfer events for their own poll (J545). Only the resident loop serving
+/// a stick turns this on; during enumeration another slot's event is stale and is dropped.
+static STASH_ENABLED: AtomicBool = AtomicBool::new(false);
 static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 /// The keyboard-channel writer Sora handed us (U5); 0 = none (this controller delivers to the
 /// serial log instead). Decoded key bytes are written here → Sora → the shell.
@@ -204,24 +216,29 @@ extern "C" fn main(
     RESOURCE_HANDLE.store(resource_raw as u32, Ordering::Relaxed);
     DEVICE_IRQ.store(config.irq, Ordering::Relaxed);
 
-    // Optional second bootstrap message: the keyboard-channel writer for delivering decoded
-    // keystrokes to the shell (U5). Absent for controllers Sora didn't grant one — the read then
-    // returns empty once Sora closes the bootstrap sender.
-    let mut kbd_tag = [0u8; 1];
-    let (tag_len, kbd_raw) =
-        channel_read_with_handle(bootstrap, kbd_tag.as_mut_ptr(), kbd_tag.len());
-    if tag_len == 1 && kbd_tag[0] == KEYBOARD_BOOTSTRAP_TAG && kbd_raw != 0 && kbd_raw != u64::MAX {
-        KEYBOARD_CHANNEL.store(kbd_raw as u32, Ordering::Relaxed);
-    }
-    let mut mouse_tag = [0u8; 1];
-    let (mouse_len, mouse_raw) =
-        channel_read_with_handle(bootstrap, mouse_tag.as_mut_ptr(), mouse_tag.len());
-    if mouse_len == 1
-        && mouse_tag[0] == MOUSE_BOOTSTRAP_TAG
-        && mouse_raw != 0
-        && mouse_raw != u64::MAX
-    {
-        MOUSE_CHANNEL.store(mouse_raw as u32, Ordering::Relaxed);
+    // Optional tagged bootstrap messages: the keyboard-channel writer for decoded keystrokes
+    // (U5), the pointer writer, and the storage control channel (J545). Read until Sora closes
+    // the bootstrap sender. J545 made this a loop: reading a fixed sequence lost whichever
+    // message came first whenever an earlier one was absent. — TIMBERDOODLE
+    let mut tag = [0u8; 1];
+    loop {
+        let (len, raw) = channel_read_with_handle(bootstrap, tag.as_mut_ptr(), tag.len());
+        if len == 0 {
+            break;
+        }
+        if raw == 0 || raw == u64::MAX {
+            continue;
+        }
+        let slot = match tag[0] {
+            KEYBOARD_BOOTSTRAP_TAG => &KEYBOARD_CHANNEL,
+            MOUSE_BOOTSTRAP_TAG => &MOUSE_CHANNEL,
+            STORAGE_BOOTSTRAP_TAG => &STORAGE_CONTROL,
+            _ => {
+                let _ = handle_close(Handle(raw as u32));
+                continue;
+            }
+        };
+        slot.store(raw as u32, Ordering::Relaxed);
     }
 
     log(b"drv-xhci: usb0 mmio=");
@@ -408,6 +425,34 @@ fn storage_snapshot(window: DmaBuf, len: usize) -> &'static [u8] {
     let snapshot = unsafe { &mut *STORAGE_SNAPSHOT.0.get() };
     window.read_into(0, &mut snapshot[..len]);
     &snapshot[..len]
+}
+
+/// Transfer events kept for their own slot while another slot is polled (J545).
+struct EventStashCell(core::cell::UnsafeCell<TransferEventStash>);
+
+// SAFETY: drv-xhci is single-threaded, and `event_stash` is the only way in.
+unsafe impl Sync for EventStashCell {}
+
+static EVENT_STASH: EventStashCell =
+    EventStashCell(core::cell::UnsafeCell::new(TransferEventStash::new()));
+
+fn event_stash() -> &'static mut TransferEventStash {
+    // SAFETY: single-threaded, and no caller keeps the reference across another call.
+    unsafe { &mut *EVENT_STASH.0.get() }
+}
+
+/// The stick this driver serves, once its volume has been judged and mounted (J545).
+struct StorageServiceCell(core::cell::UnsafeCell<Option<StorageService>>);
+
+// SAFETY: drv-xhci is single-threaded, and `storage_service` is the only way in.
+unsafe impl Sync for StorageServiceCell {}
+
+static STORAGE_SERVICE: StorageServiceCell = StorageServiceCell(core::cell::UnsafeCell::new(None));
+
+fn storage_service() -> &'static mut Option<StorageService> {
+    // SAFETY: single-threaded; each caller takes the reference once and passes it down rather
+    // than calling this again while it is live.
+    unsafe { &mut *STORAGE_SERVICE.0.get() }
 }
 
 /// Slice B: allocate the no-op DMA image, take the controller through reset → run, ring the
@@ -1454,7 +1499,7 @@ fn configure_and_probe_storage(
         block_count,
         logical_block_size,
     ) {
-        read_volume_sample(&mut disk, volume, first_lba, block_count);
+        keep_volume(&mut disk, base_va, volume, first_lba, block_count);
     }
 }
 
@@ -1706,117 +1751,305 @@ fn probe_fat32_volume(
     true
 }
 
-/// J543: mount the judged volume through a partition-relative reader, list its root directory,
-/// and read back its first non-empty `.TXT` file (else its first non-empty file). Nothing is
-/// exposed to other processes or written yet.
-fn read_volume_sample(disk: &mut BotDisk, volume: &[u8], first_lba: u64, block_count: u64) {
+/// J545: mount the judged volume through the partition-relative reader, read its label, and
+/// keep the stick's pipes so the resident loop can serve the volume. The volume is offered to
+/// Sora only once that loop runs ([`offer_storage`]), so no client is ever handed a driver that
+/// will not answer.
+fn keep_volume(disk: &mut BotDisk, page_va: u64, volume: &[u8], first_lba: u64, block_count: u64) {
     // The probe traced every BOT phase. The volume reads are many more, so from here on only a
     // failure or an unexpected completion code is logged. — TIMBERDOODLE
     STORAGE_TRACE.store(false, Ordering::Relaxed);
     log_storage_phase(b"trace", b"quiet");
-    let reads_before = disk.blocks_read;
     let mut sectors = PartitionReader::new(&mut *disk, first_lba, block_count);
     let fat = match FatVolume::mount(&mut sectors) {
         Ok(fat) => fat,
         Err(error) => return log_fat_error(volume, error),
     };
-    log_storage_phase_pair(volume, b"mount", b"ok");
-
-    let mut first_file = None;
-    let mut first_text = None;
-    let mut listed = 0usize;
-    let walked = fat.for_each_in_dir(&mut sectors, fat.bpb().root_cluster, |entry| {
-        log(b"drv-xhci: storage ");
-        log(volume);
-        log(b" root ");
-        log_short_name(&entry.name);
-        log(if entry.is_dir() { b" dir" } else { b" file" });
-        log(b" size=");
-        log_hex(entry.size as u64);
-        log(b" cluster=");
-        log_hex(entry.first_cluster as u64);
-        log(b"\n");
-        if !entry.is_dir() && entry.size > 0 {
-            first_file = first_file.or(Some(*entry));
-            if entry.name[8..] == *b"TXT" {
-                first_text = first_text.or(Some(*entry));
-            }
-        }
-        listed += 1;
-        listed < ROOT_LISTING_MAX
-    });
-    if !walked {
-        return log_storage_phase_pair(volume, b"root", b"read-fail");
-    }
-    log_storage_phase_pair(volume, b"root", b"listed");
-
-    let Some(entry) = first_text.or(first_file) else {
-        return log_storage_phase_pair(volume, b"sample", b"none");
+    let label = fat.volume_label(&mut sectors);
+    let ready = MediaReady {
+        block_count,
+        serial: fat.bpb().volume_serial,
+        label,
+        // Reads only until WRITE(10) and SYNCHRONIZE CACHE land.
+        read_only: true,
     };
-    let mut bytes = [0u8; SAMPLE_READ_LEN];
-    let read = fat.read_file(&mut sectors, &entry, &mut bytes);
     log(b"drv-xhci: storage ");
     log(volume);
-    log(b" read ");
-    log_short_name(&entry.name);
-    log(b" bytes=");
-    log_hex(read as u64);
-    log(b" of size=");
-    log_hex(entry.size as u64);
+    log(b" mount ok label=");
+    match label {
+        Some(label) => log_ascii(label.trim_ascii_end()),
+        None => log(b"(none)"),
+    }
+    log(b" serial=");
+    log_hex(ready.serial as u64);
     log(b"\n");
-    log_text_lines(&bytes[..read]);
-    log(b"drv-xhci: storage ");
-    log(volume);
-    log(b" blocks-read=");
-    log_hex(disk.blocks_read - reads_before);
-    log(b"\n");
-    if read == (entry.size as usize).min(SAMPLE_READ_LEN) {
-        log_storage_phase(b"volume-read", b"complete");
-    } else {
-        log_storage_phase(b"volume-read", b"short");
+    *storage_service() = Some(StorageService::keep(disk, page_va, first_lba, ready));
+}
+
+/// The stick's Bulk-Only pipes and its volume, kept after the probe so the resident loop can
+/// serve the volume to block clients (J545). It is all `Copy` state: the bulk rings' segments
+/// are rebuilt as `DmaTrbs` views over the device page for each use, and the rings' positions
+/// are written back afterwards.
+#[derive(Clone, Copy)]
+struct StorageService {
+    slot_id: u8,
+    page_va: u64,
+    out_ring: TransferRing,
+    out_dci: u8,
+    in_ring: TransferRing,
+    in_dci: u8,
+    cbw_buf: DmaBuf,
+    cbw_phys: u64,
+    csw_buf: DmaBuf,
+    csw_phys: u64,
+    adapter: Read10BlockAdapter,
+    read_window: DmaBuf,
+    read_phys: u64,
+    /// Device block of the volume's first sector: a client's LBA 0.
+    first_lba: u64,
+    ready: MediaReady,
+    clients: [BlockClient; MAX_BLOCK_CLIENTS],
+}
+
+/// One block client's channel, its koid for port wakes, and the blocks served to it.
+#[derive(Clone, Copy, Default)]
+struct BlockClient {
+    handle: u32,
+    koid: u64,
+    served: u32,
+}
+
+impl StorageService {
+    fn keep(disk: &BotDisk, page_va: u64, first_lba: u64, ready: MediaReady) -> Self {
+        Self {
+            slot_id: disk.slot_id,
+            page_va,
+            out_ring: disk.out_ring,
+            out_dci: disk.out_dci,
+            in_ring: disk.in_ring,
+            in_dci: disk.in_dci,
+            cbw_buf: disk.cbw_buf,
+            cbw_phys: disk.cbw_phys,
+            csw_buf: disk.csw_buf,
+            csw_phys: disk.csw_phys,
+            adapter: disk.adapter,
+            read_window: disk.read_window,
+            read_phys: disk.read_phys,
+            first_lba,
+            ready,
+            clients: [BlockClient::default(); MAX_BLOCK_CLIENTS],
+        }
+    }
+
+    /// Run `f` over a `BotDisk` rebuilt from these pipes, then keep the rings' new positions.
+    fn with_disk<T>(
+        &mut self,
+        io: &mut Mmio,
+        layout: RegisterLayout,
+        image: &mut NoOpCommandImage,
+        evt: &DmaTrbs,
+        f: impl FnOnce(&mut BotDisk) -> T,
+    ) -> T {
+        // SAFETY: the stick's device page stays mapped for the driver's lifetime, and these are
+        // the same ring segments `configure_and_probe_storage` built over it.
+        let out_seg = &mut unsafe {
+            DmaTrbs::new(
+                (self.page_va as usize + OFF_INT_RING) as *mut Trb,
+                BULK_RING_TRBS,
+            )
+        };
+        let in_seg = &mut unsafe {
+            DmaTrbs::new(
+                (self.page_va as usize + OFF_REPORT) as *mut Trb,
+                BULK_RING_TRBS,
+            )
+        };
+        let mut disk = BotDisk {
+            io,
+            layout,
+            image,
+            evt,
+            slot_id: self.slot_id,
+            out_ring: self.out_ring,
+            out_seg,
+            out_dci: self.out_dci,
+            in_ring: self.in_ring,
+            in_seg,
+            in_dci: self.in_dci,
+            cbw_buf: self.cbw_buf,
+            cbw_phys: self.cbw_phys,
+            csw_buf: self.csw_buf,
+            csw_phys: self.csw_phys,
+            adapter: self.adapter,
+            read_window: self.read_window,
+            read_phys: self.read_phys,
+            blocks_read: 0,
+        };
+        let result = f(&mut disk);
+        self.out_ring = disk.out_ring;
+        self.in_ring = disk.in_ring;
+        result
     }
 }
 
-/// Print a raw 8.3 name the way a listing shows it: `NAME.EXT`, padding dropped.
-fn log_short_name(name: &[u8; 11]) {
-    let mut text = [b'.'; 12];
-    let mut len = 0;
-    let base = name[..8].trim_ascii_end();
-    let ext = name[8..].trim_ascii_end();
-    for (part, separator) in [(base, false), (ext, true)] {
-        if part.is_empty() {
-            continue;
-        }
-        if separator {
-            len += 1;
-        }
-        for byte in part {
-            if byte.is_ascii_graphic() {
-                text[len] = *byte;
-            }
-            len += 1;
-        }
+/// J545: offer the kept volume to Sora and watch the storage control channel on the resident
+/// loop's `port`. Called only once that loop is about to run. Returns the control channel's
+/// koid when the volume was offered.
+fn offer_storage(port: Handle) -> Option<u64> {
+    let service = storage_service().as_mut()?;
+    let raw = STORAGE_CONTROL.load(Ordering::Relaxed);
+    if raw == 0 {
+        log(b"drv-xhci: storage kept, but no control channel to offer it on\n");
+        return None;
     }
-    log(&text[..len]);
+    let control = Handle(raw);
+    let koid = handle_koid(control);
+    if koid == u64::MAX || port_bind(port, control) != 0 {
+        log(b"drv-xhci: storage control bind fail\n");
+        return None;
+    }
+    // From here on a block read can pop the keyboard's completion: keep it for the keyboard.
+    STASH_ENABLED.store(true, Ordering::Relaxed);
+    let ready = service.ready.encode();
+    if channel_write(control, ready.as_ptr(), ready.len()) != 0 {
+        log(b"drv-xhci: storage offer fail\n");
+        return None;
+    }
+    log(b"drv-xhci: storage offered blocks=");
+    log_hex(service.ready.block_count);
+    log(b" read-only\n");
+    Some(koid)
 }
 
-/// Show text read from a medium: up to [`SAMPLE_SHOW_LINES`] lines of at most 96 bytes, each
-/// prefixed, with anything outside printable ASCII shown as `.`.
-fn log_text_lines(bytes: &[u8]) {
-    let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    for line in text.split(|byte| *byte == b'\n').take(SAMPLE_SHOW_LINES) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let mut safe = [b'.'; 96];
-        let len = line.len().min(safe.len());
-        for (shown, byte) in safe[..len].iter_mut().zip(line) {
-            if byte.is_ascii_graphic() || *byte == b' ' {
-                *shown = *byte;
-            }
-        }
-        log(b"drv-xhci: storage | ");
-        log(&safe[..len]);
+/// J545: one resident-loop wake that is not the controller's interrupt: a new client from the
+/// control channel, or a block request from a client. Returns `false` when `source` is none of
+/// them, and the caller goes back to waiting for the controller as before.
+fn serve_storage_wake(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    port: Handle,
+    source: u64,
+    control_koid: Option<u64>,
+) -> bool {
+    let Some(service) = storage_service().as_mut() else {
+        return false;
+    };
+    if Some(source) == control_koid {
+        accept_block_client(service, port);
+        return true;
+    }
+    let Some(index) = service
+        .clients
+        .iter()
+        .position(|client| client.handle != 0 && client.koid == source)
+    else {
+        return false;
+    };
+    serve_block_client(service, index, io, layout, image, evt, port);
+    true
+}
+
+/// Take one control message: `CONTROL_CONNECT` and a client channel, which joins the port.
+fn accept_block_client(service: &mut StorageService, port: Handle) {
+    let control = Handle(STORAGE_CONTROL.load(Ordering::Relaxed));
+    let mut tag = [0u8; 1];
+    let (len, raw) = channel_read_with_handle(control, tag.as_mut_ptr(), tag.len());
+    if len == 0 {
+        // Sora closed its end: no client will come again, so stop watching it.
+        let _ = port_unbind(port, control);
+        return log(b"drv-xhci: storage control closed\n");
+    }
+    if raw == 0 || raw == u64::MAX {
+        return log(b"drv-xhci: storage control message without a channel\n");
+    }
+    let client = Handle(raw as u32);
+    if tag[0] != CONTROL_CONNECT {
+        let _ = handle_close(client);
+        return log(b"drv-xhci: storage control unknown message\n");
+    }
+    let Some(slot) = service.clients.iter().position(|client| client.handle == 0) else {
+        let _ = handle_close(client);
+        return log(b"drv-xhci: block clients full; client refused\n");
+    };
+    let koid = handle_koid(client);
+    if koid == u64::MAX || port_bind(port, client) != 0 {
+        let _ = handle_close(client);
+        return log(b"drv-xhci: block client bind fail\n");
+    }
+    service.clients[slot] = BlockClient {
+        handle: client.0,
+        koid,
+        served: 0,
+    };
+    log(b"drv-xhci: block client connected slot=");
+    log_hex(slot as u64);
+    log(b"\n");
+}
+
+/// Answer one request from client `index` in the `drv-blk` protocol. LBAs are the volume's: a
+/// client can name no block outside it. Reads go one block at a time, which is how
+/// `kumo-fatfs` asks; writes are refused until WRITE(10) lands.
+#[allow(clippy::too_many_arguments)]
+fn serve_block_client(
+    service: &mut StorageService,
+    index: usize,
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    port: Handle,
+) {
+    let client = Handle(service.clients[index].handle);
+    let mut frame = [0u8; BLOCK_REQUEST_LEN + SECTOR_SIZE];
+    let n = channel_read(client, frame.as_mut_ptr(), frame.len());
+    if n == 0 || n == u64::MAX {
+        // The client's `fatfs` exited: drop the channel and free the slot.
+        let _ = port_unbind(port, client);
+        let _ = handle_close(client);
+        log(b"drv-xhci: block client closed slot=");
+        log_hex(index as u64);
+        log(b" served=");
+        log_hex(service.clients[index].served as u64);
         log(b"\n");
+        service.clients[index] = BlockClient::default();
+        return;
     }
+    let mut reply = [0u8; 1 + SECTOR_SIZE];
+    let mut reply_len = 1;
+    reply[0] = match BlockRequest::decode(&frame[..n as usize]) {
+        Some(request) if request.cmd == CMD_READ => {
+            if request.count != 1 {
+                STATUS_BAD_LEN
+            } else if request.lba >= service.ready.block_count {
+                STATUS_BAD_LBA
+            } else {
+                let lba = service.first_lba + request.lba;
+                let read = service.with_disk(io, layout, image, evt, |disk| {
+                    match disk.read_blocks(lba, 1, BOT_TAG_READ_VOLUME, b"read10-volume") {
+                        Some(block) if block.len() >= SECTOR_SIZE => {
+                            reply[1..].copy_from_slice(&block[..SECTOR_SIZE]);
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                if read {
+                    reply_len = reply.len();
+                    service.clients[index].served += 1;
+                    STATUS_OK
+                } else {
+                    STATUS_IO_ERROR
+                }
+            }
+        }
+        Some(request) if request.cmd == CMD_WRITE => STATUS_READ_ONLY,
+        // Nothing is buffered here: every read went to the stick.
+        Some(request) if request.cmd == CMD_FLUSH => STATUS_OK,
+        _ => STATUS_BAD_LEN,
+    };
+    let _ = channel_write(client, reply.as_ptr(), reply_len);
 }
 
 fn log_mbr_error(error: MbrError) {
@@ -2276,6 +2509,10 @@ fn configure_and_read_keyboard(
             clear_interrupt_pending(io, layout);
             enable_interrupter(io, layout);
             interrupt_complete(interrupt);
+            // J545: the loop below is resident, so a stick this driver kept can now be served on
+            // the same port. Wakes are told apart by their source's koid.
+            let interrupt_koid = handle_koid(interrupt);
+            let storage_control_koid = irq_port.and_then(offer_storage);
             log(if hid.is_mouse() {
                 b"drv-xhci: mouse irq-driven port=" as &[u8]
             } else {
@@ -2326,7 +2563,24 @@ fn configure_and_read_keyboard(
                 // Block until the controller raises its interrupt (a report completed).
                 match irq_port {
                     Some(port) => {
-                        port_wait(port);
+                        // J545: the port also wakes for the stick's control channel and its block
+                        // clients. Serve those in place and keep waiting for the controller.
+                        loop {
+                            let source = port_wait(port);
+                            if source == interrupt_koid
+                                || !serve_storage_wake(
+                                    io,
+                                    layout,
+                                    &mut *image,
+                                    evt,
+                                    port,
+                                    source,
+                                    storage_control_koid,
+                                )
+                            {
+                                break;
+                            }
+                        }
                         interrupt_wait(interrupt);
                     }
                     None => {
@@ -3745,6 +3999,12 @@ fn poll_transfer_event_limited(
     slot_id: u8,
     limit: u32,
 ) -> Option<(u8, u32, u64)> {
+    let stashing = STASH_ENABLED.load(Ordering::Relaxed);
+    if stashing {
+        if let Some(event) = event_stash().take(slot_id) {
+            return Some((event.completion_code, event.remaining, event.trb_iova));
+        }
+    }
     for spin in 0..limit {
         dsb();
         // Long event polls must not monopolise a non-preemptible driver child.
@@ -3772,6 +4032,20 @@ fn poll_transfer_event_limited(
             {
                 if event_slot == slot_id {
                     return Some((completion_code, remaining, trb_iova));
+                }
+                // J545: another device's completion, popped while this slot waited. In the
+                // resident loop that is the keyboard's report during a block read: keep it for
+                // the keyboard's own poll rather than drop it and stall typing. — TIMBERDOODLE
+                if stashing {
+                    let stashed = StashedTransfer {
+                        slot_id: event_slot,
+                        completion_code,
+                        remaining,
+                        trb_iova,
+                    };
+                    if event_stash().push(stashed).is_some() {
+                        log(b"drv-xhci: event stash full; oldest dropped\n");
+                    }
                 }
             }
         }

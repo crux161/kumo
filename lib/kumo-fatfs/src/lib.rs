@@ -3,6 +3,7 @@
 //j514
 //j537
 //j543
+//j545
 
 //! `kumo-fatfs` — a FAT32 engine for the ESP / interop role.
 //!
@@ -86,6 +87,10 @@ pub struct Bpb {
     /// Volume serial number, FAT32 `BS_VolID` (offset 0x43): the FAT filesystem's own identity,
     /// written by the formatter and stable across re-partitioning (PLAN/008 `U2`).
     pub volume_serial: u32,
+    /// Volume label, FAT32 `BS_VolLab` (offset 0x47), space-padded. The formatter's copy: a
+    /// rename usually updates only the root directory's label entry, so
+    /// [`FatVolume::volume_label`] prefers that one.
+    pub volume_label: [u8; 11],
 }
 
 /// Why a parsed FAT32 boot sector cannot be the volume of the partition it was read from.
@@ -128,6 +133,7 @@ impl Bpb {
             sectors_per_fat: u32_le(sector, 0x24),
             root_cluster: u32_le(sector, 0x2C),
             volume_serial: u32_le(sector, 0x43),
+            volume_label: sector[0x47..0x52].try_into().unwrap(),
         };
 
         if bpb.bytes_per_sector == 0
@@ -256,8 +262,9 @@ pub enum DirSlot {
     Free,
     /// A long-filename (LFN) component; skip it (this slice ignores LFNs).
     LongName,
-    /// The volume-label entry; not a file, skip it for listings.
-    VolumeLabel,
+    /// The volume-label entry and its space-padded 11-byte name; not a file, skip it for
+    /// listings.
+    VolumeLabel([u8; 11]),
     /// A regular file or directory entry.
     File(DirEntry),
 }
@@ -278,7 +285,7 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
         return DirSlot::LongName;
     }
     if attr & attr::VOLUME_ID != 0 {
-        return DirSlot::VolumeLabel;
+        return DirSlot::VolumeLabel(raw[0..11].try_into().unwrap());
     }
     let mut name = [0u8; 11];
     name.copy_from_slice(&raw[0..11]);
@@ -290,6 +297,12 @@ pub fn parse_dir_entry(raw: &[u8]) -> DirSlot {
         size: u32_le(raw, 0x1C),
         location: None,
     })
+}
+
+/// Whether a space-padded 11-byte label names something: not blank, and not the `NO NAME`
+/// placeholder formatters write for an unnamed volume.
+fn label_is_named(label: &[u8; 11]) -> bool {
+    label != b"NO NAME    " && label.iter().any(|byte| *byte != b' ' && *byte != 0)
 }
 
 /// Encode one path component into the raw 8.3 name field a [`DirEntry`] stores
@@ -527,6 +540,41 @@ impl FatVolume {
         dir_cluster: u32,
         mut visit: impl FnMut(&DirEntry) -> bool,
     ) -> bool {
+        self.walk_dir_slots(reader, dir_cluster, |slot, location| match slot {
+            DirSlot::File(mut entry) => {
+                entry.location = Some(location);
+                visit(&entry)
+            }
+            _ => true,
+        })
+    }
+
+    /// The volume's label: the root directory's label entry, which a rename updates, else the
+    /// boot sector's `BS_VolLab`. `None` when neither holds a name: blank, or the `NO NAME`
+    /// formatters write for an unnamed volume (J545).
+    pub fn volume_label<R: SectorReader>(&self, reader: &mut R) -> Option<[u8; 11]> {
+        let mut root_label = None;
+        self.walk_dir_slots(reader, self.bpb.root_cluster, |slot, _| match slot {
+            DirSlot::VolumeLabel(name) => {
+                root_label = Some(name);
+                false
+            }
+            _ => true,
+        });
+        [root_label, Some(self.bpb.volume_label)]
+            .into_iter()
+            .flatten()
+            .find(label_is_named)
+    }
+
+    /// Walk every slot of the directory at `dir_cluster` until `visit` returns `false` or the
+    /// 0x00 end marker. Bounded as [`for_each_in_dir`] documents.
+    fn walk_dir_slots<R: SectorReader>(
+        &self,
+        reader: &mut R,
+        dir_cluster: u32,
+        mut visit: impl FnMut(DirSlot, DirLocation) -> bool,
+    ) -> bool {
         let spc = self.bpb.sectors_per_cluster as u32;
         let limit = self.bpb.cluster_limit();
         let mut cluster = dir_cluster;
@@ -543,18 +591,16 @@ impl FatVolume {
                 }
                 let mut off = 0;
                 while off + DIR_ENTRY_SIZE <= SECTOR_SIZE {
-                    match parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]) {
-                        DirSlot::End => return true,
-                        DirSlot::File(mut e) => {
-                            e.location = Some(DirLocation {
-                                sector: first + s,
-                                offset: off as u16,
-                            });
-                            if !visit(&e) {
-                                return true;
-                            }
-                        }
-                        _ => {}
+                    let slot = parse_dir_entry(&buf[off..off + DIR_ENTRY_SIZE]);
+                    if slot == DirSlot::End {
+                        return true;
+                    }
+                    let location = DirLocation {
+                        sector: first + s,
+                        offset: off as u16,
+                    };
+                    if !visit(slot, location) {
+                        return true;
                     }
                     off += DIR_ENTRY_SIZE;
                 }
@@ -1219,7 +1265,7 @@ mod tests {
         // The fixture's root dir: volume label, README.TXT, HELLO.TXT, then end.
         assert_eq!(
             parse_dir_entry(&dir_entry(b"KUMO       ", attr::VOLUME_ID, 0, 0)),
-            DirSlot::VolumeLabel
+            DirSlot::VolumeLabel(*b"KUMO       ")
         );
 
         let readme = dir_entry(b"README  TXT", attr::ARCHIVE, 0, 128);
@@ -1836,5 +1882,68 @@ mod tests {
         assert_eq!(fat.find_in_root(&mut LoopingRoot, b"MISSING TXT"), None);
         assert!(!fat.for_each_in_dir(&mut FixtureDisk, 4002, |_| true));
         assert!(!fat.for_each_in_dir(&mut FixtureDisk, 1, |_| true));
+    }
+
+    #[test]
+    fn the_root_label_entry_names_the_volume() {
+        let fat = FatVolume::mount(&mut FixtureDisk).unwrap();
+        // The fixture's root holds `KUMO` as its label entry; its BPB label is zeroed.
+        assert_eq!(fat.bpb().volume_label, [0; 11]);
+        assert_eq!(fat.volume_label(&mut FixtureDisk), Some(*b"KUMO       "));
+    }
+
+    /// The fixture with its root label entry renamed, or gone, and a label in the boot sector.
+    struct LabelDisk {
+        root_label: Option<[u8; 11]>,
+        boot_label: [u8; 11],
+    }
+
+    impl SectorReader for LabelDisk {
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+            FixtureDisk.read_sector(lba, buf);
+            match lba {
+                0 => buf[0x47..0x52].copy_from_slice(&self.boot_label),
+                96 => match self.root_label {
+                    Some(label) => buf[0..11].copy_from_slice(&label),
+                    // A deleted label slot: skipped like any freed entry.
+                    None => buf[0] = 0xE5,
+                },
+                _ => {}
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn a_renamed_volume_keeps_its_new_name_over_the_formatters() {
+        let mut disk = LabelDisk {
+            root_label: Some(*b"STICKY     "),
+            boot_label: *b"OLDNAME    ",
+        };
+        let fat = FatVolume::mount(&mut disk).unwrap();
+        assert_eq!(fat.bpb().volume_label, *b"OLDNAME    ");
+        assert_eq!(fat.volume_label(&mut disk), Some(*b"STICKY     "));
+    }
+
+    #[test]
+    fn without_a_root_entry_the_boot_sector_label_is_used_unless_unnamed() {
+        let mut disk = LabelDisk {
+            root_label: None,
+            boot_label: *b"FROMBPB    ",
+        };
+        let fat = FatVolume::mount(&mut disk).unwrap();
+        assert_eq!(fat.volume_label(&mut disk), Some(*b"FROMBPB    "));
+
+        let mut unnamed = LabelDisk {
+            root_label: Some(*b"NO NAME    "),
+            boot_label: *b"NO NAME    ",
+        };
+        let fat = FatVolume::mount(&mut unnamed).unwrap();
+        assert_eq!(fat.volume_label(&mut unnamed), None);
+        let mut blank = LabelDisk {
+            root_label: None,
+            boot_label: *b"           ",
+        };
+        assert_eq!(fat.volume_label(&mut blank), None);
     }
 }

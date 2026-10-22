@@ -3,6 +3,7 @@
 
 //j382
 //j389
+//j545
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -220,6 +221,55 @@ impl kumo_rt::Server for Sora {
 
     fn dispatch(&mut self, _channel: Handle, _message: &[u8]) -> Status {
         Errno::Ok.status()
+    }
+}
+
+/// Longest `/media/<name>` component: an 11-byte FAT label, or a 9-byte `XXXX-XXXX` serial.
+pub const MEDIA_NAME_MAX: usize = 11;
+
+/// The directory a removable volume mounts under in `/media` (DESIGN/012 §2.1, J545): its label
+/// with the padding trimmed, else its serial written `XXXX-XXXX` the way Linux shows a FAT
+/// volume's UUID. Bytes a shell would need quoted, and a leading `.` that would hide the mount,
+/// become `_`, so `/media/<name>` is always one plain path component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaName {
+    bytes: [u8; MEDIA_NAME_MAX],
+    len: usize,
+}
+
+impl MediaName {
+    pub fn new(label: Option<[u8; 11]>, serial: u32) -> MediaName {
+        let mut name = MediaName {
+            bytes: [0; MEDIA_NAME_MAX],
+            len: 0,
+        };
+        if let Some(label) = label {
+            let trimmed = label.trim_ascii_end();
+            let trimmed = &trimmed[..trimmed.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)];
+            for (index, byte) in trimmed.iter().enumerate() {
+                let plain = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.');
+                name.bytes[index] = if plain && !(index == 0 && *byte == b'.') {
+                    *byte
+                } else {
+                    b'_'
+                };
+            }
+            name.len = trimmed.len();
+        }
+        if name.len == 0 {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            for (index, shift) in [28, 24, 20, 16, 12, 8, 4, 0].into_iter().enumerate() {
+                let at = if index < 4 { index } else { index + 1 };
+                name.bytes[at] = HEX[(serial >> shift) as usize & 0xf];
+            }
+            name.bytes[4] = b'-';
+            name.len = 9;
+        }
+        name
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 
@@ -503,5 +553,49 @@ mod tests {
         let mut capped = RestartBackoff::new(u64::MAX, 7);
         assert_eq!(capped.next_delay_ns(), 7);
         assert_eq!(capped.next_delay_ns(), 7);
+    }
+
+    #[test]
+    fn a_labelled_stick_mounts_under_its_label() {
+        assert_eq!(
+            MediaName::new(Some(*b"STICKY     "), 0x4567_13f4).as_bytes(),
+            b"STICKY"
+        );
+        assert_eq!(
+            MediaName::new(Some(*b"KUMO_DATA.1"), 0).as_bytes(),
+            b"KUMO_DATA.1"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_stick_mounts_under_its_serial() {
+        // CRUX's J543 stick's data volume serial, as Linux would show it.
+        assert_eq!(MediaName::new(None, 0x4567_13f4).as_bytes(), b"4567-13F4");
+        assert_eq!(MediaName::new(None, 0).as_bytes(), b"0000-0000");
+        assert_eq!(
+            MediaName::new(Some([b' '; 11]), 0xdead_beef).as_bytes(),
+            b"DEAD-BEEF"
+        );
+        assert_eq!(MediaName::new(Some([0; 11]), 0x1).as_bytes(), b"0000-0001");
+    }
+
+    #[test]
+    fn a_label_never_needs_quoting_or_hides_itself() {
+        assert_eq!(
+            MediaName::new(Some(*b"MY DISK    "), 0).as_bytes(),
+            b"MY_DISK"
+        );
+        assert_eq!(
+            MediaName::new(Some(*b"A/B*C?     "), 0).as_bytes(),
+            b"A_B_C_"
+        );
+        assert_eq!(
+            MediaName::new(Some(*b".HIDDEN    "), 0).as_bytes(),
+            b"_HIDDEN"
+        );
+        assert_eq!(
+            MediaName::new(Some(*b"\xc9T\xc9        "), 0).as_bytes(),
+            b"_T_"
+        );
     }
 }
