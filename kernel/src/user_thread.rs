@@ -8,16 +8,16 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j408
 //j422
 //j425
 //j493
 //j494
+//j534
 
 use core::cell::UnsafeCell;
 
 use kumo_abi::{Errno, KoId, Status};
-use kumo_hal::active::{switch_context, ThreadContext, UserState};
+use kumo_hal::active::{switch_context, ThreadContext, TowerContext, TowerThreadRole, UserState};
 
 use crate::mm::PAGE_SIZE;
 use crate::object::ObjectManager;
@@ -334,7 +334,54 @@ pub fn init(
             done: false,
         });
     }
+    kumo_hal::active::set_tower_context_hook(tower_context);
     Ok(())
+}
+
+/// What the EL1 exception TOWER needs from the kernel: the running thread, and where the
+/// faulting `sp` and the image are. It runs from a fatal exception, so it reads the scheduler
+/// through the raw cell and never panics, allocates, locks, or switches (DESIGN/014 §4): an
+/// uninitialised scheduler reports `Unknown` instead of `sched_ptr`'s panic.
+extern "C" fn tower_context(sp: u64) -> TowerContext {
+    let map = crate::diag::current_map();
+    let stack_limit = match crate::diag::place(&map, sp) {
+        crate::diag::Placement::Inside {
+            region: crate::diag::Region::BootStack,
+            ..
+        } => map.boot_stack.1,
+        crate::diag::Placement::Inside {
+            region: crate::diag::Region::Heap,
+            ..
+        } => map.heap.1,
+        _ => 0,
+    };
+    let mut context = TowerContext {
+        stack_limit,
+        image_start: map.image.0,
+        image_end: map.image.1,
+        ..TowerContext::default()
+    };
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    let Some(s) = (unsafe { (*opt).as_ref() }) else {
+        return context;
+    };
+    context.switches = s.switches;
+    let Some(current) = s.dispatcher.current() else {
+        return context;
+    };
+    let (role, process) = if current == s.idle.koid() {
+        (TowerThreadRole::Floor, 0)
+    } else if current == s.user_thread.koid() {
+        (TowerThreadRole::Sora, s.user_thread.process().0)
+    } else if let Some(child) = s.children.iter().find(|c| c.thread.koid() == current) {
+        (TowerThreadRole::Child, child.process.0)
+    } else {
+        (TowerThreadRole::Unknown, 0)
+    };
+    context.thread_koid = current.0;
+    context.process_koid = process;
+    context.role = role;
+    context
 }
 
 /// The process koid for the EL0 thread currently represented by the dispatcher, if any.

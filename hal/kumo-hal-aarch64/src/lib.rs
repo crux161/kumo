@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j472
 //j474
 //j482
 //j483
 //j493
+//j534
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -69,6 +69,162 @@ fn spsr_mode_name(spsr: u64) -> &'static str {
 #[cfg(any(target_os = "none", test))]
 fn spsr_is_illegal(spsr: u64) -> bool {
     spsr & SPSR_IL_BIT != 0
+}
+
+/// Which kind of thread the scheduler had running when a fatal EL1 exception arrived.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TowerThreadRole {
+    /// The scheduler had not started, or the current thread is none of the kinds below.
+    #[default]
+    Unknown = 0,
+    /// The kernel's own boot/idle floor, an EL1 thread that runs with IRQs enabled.
+    Floor = 1,
+    /// Sora, the userspace supervisor.
+    Sora = 2,
+    /// A resident child process: a driver or a program Sora spawned.
+    Child = 3,
+}
+
+/// What the kernel knows at a fatal EL1 exception that the HAL does not: the running thread as
+/// the scheduler saw it, and where the faulting stack and the kernel image are. The kernel
+/// supplies it through [`set_tower_context_hook`] from a function that never allocates, locks,
+/// or switches (DESIGN/014 §4).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TowerContext {
+    /// Dispatcher koid of the current thread; 0 when the scheduler has not started.
+    pub thread_koid: u64,
+    /// Process koid of an EL0 thread; 0 for the kernel's floor.
+    pub process_koid: u64,
+    pub role: TowerThreadRole,
+    /// Context switches so far: a rough clock for how long the system had been running.
+    pub switches: u64,
+    /// End of the mapped kernel region holding SP (boot stack or heap); 0 when SP lies in
+    /// neither, which is itself the finding: a kernel SP that is not on a kernel stack.
+    pub stack_limit: u64,
+    /// The linked kernel image, `[start, end)`; return addresses point into it.
+    pub image_start: u64,
+    pub image_end: u64,
+}
+
+static TOWER_CONTEXT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the kernel's reporter for the EL1 exception TOWER. It is called with the faulting SP.
+pub fn set_tower_context_hook(hook: extern "C" fn(u64) -> TowerContext) {
+    TOWER_CONTEXT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// The interrupted context's link register, stack pointer and frame pointer at a fatal exception.
+#[cfg(any(target_os = "none", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TowerRegisters {
+    lr: u64,
+    sp: u64,
+    fp: u64,
+}
+
+/// Saved return addresses the EL1 exception report lists at most.
+#[cfg(any(target_os = "none", test))]
+const TOWER_RETURN_ADDRESSES: usize = 8;
+/// How far above SP the report looks for them.
+#[cfg(any(target_os = "none", test))]
+const TOWER_STACK_SCAN_BYTES: u64 = 4096;
+
+/// `BL imm26` or `BLR Xn`: the instructions whose following address becomes a saved return
+/// address.
+#[cfg(any(target_os = "none", test))]
+const fn is_branch_with_link(insn: u32) -> bool {
+    insn & 0xfc00_0000 == 0x9400_0000 || insn & 0xffff_fc1f == 0xd63f_0000
+}
+
+/// Find the callers' saved return addresses on the faulting stack. The kernel is built without
+/// frame pointers, so x29 is an ordinary register and there is no frame chain; instead scan
+/// `[sp, min(sp + TOWER_STACK_SCAN_BYTES, stack_limit))` for words that point into the kernel
+/// image right after a `BL`/`BLR`. Those symbolize directly against `kumo-kernel.elf`
+/// (`llvm-addr2line -f -C -e …`), which matters most when the fault was a `ret` through a zero
+/// x30 and LR is 0. `stack_limit` comes from the kernel's region map, so the scan never reads
+/// past the end of the stack or heap that holds SP, and `read_insn` only ever reads inside the
+/// image. — TIMBERDOODLE
+#[cfg(any(target_os = "none", test))]
+fn scan_return_addresses(
+    sp: u64,
+    stack_limit: u64,
+    image: (u64, u64),
+    read_word: impl Fn(u64) -> u64,
+    read_insn: impl Fn(u64) -> u32,
+    out: &mut [u64; TOWER_RETURN_ADDRESSES],
+) -> usize {
+    if sp % 16 != 0 || stack_limit <= sp || image.0 >= image.1 {
+        return 0;
+    }
+    let end = stack_limit.min(sp.saturating_add(TOWER_STACK_SCAN_BYTES));
+    let mut count = 0;
+    let mut addr = sp;
+    while count < out.len() && addr.saturating_add(8) <= end {
+        let word = read_word(addr);
+        let in_image = word % 4 == 0 && word >= image.0.saturating_add(4) && word < image.1;
+        if in_image && is_branch_with_link(read_insn(word - 4)) {
+            out[count] = word;
+            count += 1;
+        }
+        addr += 8;
+    }
+    count
+}
+
+#[cfg(any(target_os = "none", test))]
+fn tower_thread_role_name(role: TowerThreadRole) -> &'static str {
+    match role {
+        TowerThreadRole::Unknown => "unknown",
+        TowerThreadRole::Floor => "kernel floor",
+        TowerThreadRole::Sora => "sora",
+        TowerThreadRole::Child => "child",
+    }
+}
+
+/// The interrupted-context lines of the EL1 exception report: registers, the return addresses
+/// found on the faulting stack (the live callers, plus any stale ones earlier calls left behind),
+/// and the thread the scheduler had running.
+#[cfg(any(target_os = "none", test))]
+fn write_tower_context(
+    out: &mut impl core::fmt::Write,
+    regs: TowerRegisters,
+    callers: &[u64],
+    context: Option<TowerContext>,
+) -> core::fmt::Result {
+    write!(
+        out,
+        "LR={:#018x}  SP={:#018x}  x29={:#018x}\r\n",
+        regs.lr, regs.sp, regs.fp
+    )?;
+    match context {
+        Some(context) if context.stack_limit == 0 => {
+            out.write_str("ret addrs on stack: not scanned - SP is not on a kernel stack\r\n")?
+        }
+        Some(_) if callers.is_empty() => {
+            out.write_str("ret addrs on stack: none found above SP\r\n")?
+        }
+        Some(_) => {
+            out.write_str("ret addrs on stack:")?;
+            for return_address in callers {
+                write!(out, " {:#x}", return_address)?;
+            }
+            out.write_str("\r\n")?;
+        }
+        None => {}
+    }
+    match context {
+        Some(context) => write!(
+            out,
+            "thread koid={:#x} ({}) process={:#x} switches={}\r\n",
+            context.thread_koid,
+            tower_thread_role_name(context.role),
+            context.process_koid,
+            context.switches
+        ),
+        None => out.write_str("thread: unknown (no kernel context hook)\r\n"),
+    }
 }
 
 /// Assembly layout shared by the EL0 SVC and IRQ entry paths.
@@ -2437,7 +2593,10 @@ pub mod el0 {
         "  ldr  x4, [sp, #264]", // EL0 SP (saved sp_el0): a wild value flags stack corruption
         "  mov  x5, sp",         // trap frame base: x0..x30 at [sp+0..]; lets the hook dump GPRs
         "  bl   kumo_el0_fault",
-        // Unhandled (no hook): the Tower.
+        // Unhandled (no hook): the Tower, with EL0's own LR/SP/FP from the saved frame.
+        "  ldr  x4, [sp, #240]",
+        "  ldr  x5, [sp, #264]",
+        "  ldr  x6, [sp, #232]",
         "  mrs  x1, esr_el1",
         "  mrs  x2, elr_el1",
         "  mrs  x3, far_el1",
@@ -4916,7 +5075,12 @@ mod traps {
         ".purgem KVEC_EXC",
         ".purgem KVEC_IRQ",
         ".purgem KVEC_SVC",
+        // x30/x29/sp still hold the interrupted context's values here: the vector slot wrote
+        // only x0. For a CurEL_SPx fault, sp is the faulting code's own stack pointer.
         "kumo_exception_common:",
+        "  mov x4, x30",
+        "  mov x5, sp",
+        "  mov x6, x29",
         "  mrs x1, esr_el1",
         "  mrs x2, elr_el1",
         "  mrs x3, far_el1",
@@ -5046,7 +5210,15 @@ mod traps {
     }
 
     #[no_mangle]
-    extern "C" fn kumo_exception_entry(index: u64, esr: u64, elr: u64, far: u64) -> ! {
+    extern "C" fn kumo_exception_entry(
+        index: u64,
+        esr: u64,
+        elr: u64,
+        far: u64,
+        lr: u64,
+        sp_at_entry: u64,
+        fp: u64,
+    ) -> ! {
         // A fatal EL1 exception ends the userspace ownership epoch. Take the glass
         // back before rendering so the Tower remains visible even if drv-fb died.
         reclaim_framebuffer_console();
@@ -5060,6 +5232,41 @@ mod traps {
         unsafe {
             core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr, options(nostack, nomem));
         }
+        // CurEL_SPx (4..=7) faulted on the stack `sp_at_entry` names; slot 8 is the EL0 fault
+        // fallthrough, whose stub loaded EL0's SP from the trap frame. Every other source's
+        // interrupted stack is SP_EL0.
+        let sp = match index {
+            4..=8 => sp_at_entry,
+            _ => {
+                let sp_el0: u64;
+                unsafe {
+                    core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0, options(nostack, nomem));
+                }
+                sp_el0
+            }
+        };
+        let regs = super::TowerRegisters { lr, sp, fp };
+        let hook = super::TOWER_CONTEXT_HOOK.load(Ordering::Acquire);
+        let context = (hook != 0).then(|| {
+            // SAFETY: only ever set from `set_tower_context_hook` with a real fn of this type.
+            let hook: extern "C" fn(u64) -> super::TowerContext =
+                unsafe { core::mem::transmute(hook) };
+            hook(sp)
+        });
+        // Only an EL1 fault's stack is kernel memory worth reading, and only up to the end of
+        // the region the kernel says holds it.
+        let mut callers = [0u64; super::TOWER_RETURN_ADDRESSES];
+        let caller_count = match context {
+            Some(context) if index < 8 => super::scan_return_addresses(
+                sp,
+                context.stack_limit,
+                (context.image_start, context.image_end),
+                |addr| unsafe { core::ptr::read_volatile(addr as *const u64) },
+                |addr| unsafe { core::ptr::read_volatile(addr as *const u32) },
+                &mut callers,
+            ),
+            _ => 0,
+        };
 
         // The framebuffer console renders the freshest line at the BOTTOM, and a lossy
         // HDMI/USB capture tends to drop or tear that bottom band — a one-shot dump then
@@ -5075,8 +5282,7 @@ mod traps {
                 "\r\n********** TOWER: CPU EXCEPTION **********\r\n\
                  src={}/{}  ec={:#04x} ({})\r\n\
                  ESR={:#018x}  ELR={:#018x}\r\n\
-                 FAR={:#018x}  SPSR={:#018x}  ({} IL={})\r\n\
-                 halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+                 FAR={:#018x}  SPSR={:#018x}  ({} IL={})\r\n",
                 src,
                 kind,
                 ec,
@@ -5087,6 +5293,11 @@ mod traps {
                 spsr,
                 spsr_mode_name(spsr),
                 u8::from(spsr_is_illegal(spsr)),
+            );
+            let _ = super::write_tower_context(&mut out, regs, &callers[..caller_count], context);
+            let _ = write!(
+                out,
+                "halted - repaint #{} (read any upper copy; bottom band may tear)\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
                 pass
             );
             pass = pass.wrapping_add(1);
@@ -5280,6 +5491,167 @@ pub fn spin_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed-size `core::fmt::Write` sink for checking report text without `std`.
+    struct TextBuf {
+        bytes: [u8; 512],
+        len: usize,
+    }
+
+    impl TextBuf {
+        fn new() -> Self {
+            Self {
+                bytes: [0; 512],
+                len: 0,
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.bytes[..self.len]).unwrap()
+        }
+    }
+
+    impl core::fmt::Write for TextBuf {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len + text.len();
+            if end > self.bytes.len() {
+                return Err(core::fmt::Error);
+            }
+            self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    const KERNEL_SP: u64 = 0xffff_8000_480e_0500;
+    const IMAGE: (u64, u64) = (0xffff_8000_4800_0000, 0xffff_8000_488d_b760);
+    const BL: u32 = 0x9400_0123;
+    const BLR_X16: u32 = 0xd63f_0200;
+    const RET: u32 = 0xd65f_03c0;
+
+    /// A stack of `(address, word)` pairs and an image whose instruction at each address is given.
+    fn reader(pairs: &[(u64, u64)]) -> impl Fn(u64) -> u64 + '_ {
+        move |addr| {
+            pairs
+                .iter()
+                .find(|(at, _)| *at == addr)
+                .map(|(_, word)| *word)
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn branch_with_link_decodes_bl_and_blr_only() {
+        assert!(is_branch_with_link(BL));
+        assert!(is_branch_with_link(BLR_X16));
+        assert!(!is_branch_with_link(RET));
+        assert!(!is_branch_with_link(0x1400_0000)); // B
+    }
+
+    #[test]
+    fn scan_keeps_only_image_words_that_follow_a_branch_with_link() {
+        let call_site = IMAGE.0 + 0x13aa8; // return address after a BL
+        let after_ret = IMAGE.0 + 0x2000; // in the image, but the word before is a RET
+        let data_ptr = IMAGE.1 - 0x100; // in the image's .bss, not code
+        let stack = [
+            (KERNEL_SP, 0x6000_0345),
+            (KERNEL_SP + 8, after_ret),
+            (KERNEL_SP + 16, data_ptr),
+            (KERNEL_SP + 24, call_site),
+            (KERNEL_SP + 32, call_site + 2), // misaligned
+        ];
+        let insns = |addr: u64| match addr {
+            a if a == call_site - 4 => BL,
+            a if a == after_ret - 4 => RET,
+            _ => 0,
+        };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        let count = scan_return_addresses(
+            KERNEL_SP,
+            KERNEL_SP + 0x1000,
+            IMAGE,
+            reader(&stack),
+            insns,
+            &mut callers,
+        );
+        assert_eq!(&callers[..count], &[call_site]);
+    }
+
+    #[test]
+    fn scan_never_reads_past_the_stack_limit() {
+        let limit = KERNEL_SP + 0x20;
+        let read_word = |addr: u64| -> u64 {
+            assert!(addr + 8 <= limit, "read {addr:#x} past the stack limit");
+            0
+        };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        scan_return_addresses(KERNEL_SP, limit, IMAGE, read_word, |_| 0, &mut callers);
+    }
+
+    #[test]
+    fn scan_reads_nothing_for_an_sp_off_any_kernel_stack() {
+        let never = |addr: u64| -> u64 { panic!("read {addr:#x}") };
+        let mut callers = [0; TOWER_RETURN_ADDRESSES];
+        for (sp, limit) in [(KERNEL_SP, 0), (KERNEL_SP + 8, KERNEL_SP + 0x100)] {
+            let count = scan_return_addresses(sp, limit, IMAGE, never, |_| 0, &mut callers);
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[test]
+    fn exception_context_names_lr_sp_callers_and_the_running_thread() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 0,
+            sp: KERNEL_SP,
+            fp: 1,
+        };
+        let context = TowerContext {
+            thread_koid: 0x5,
+            process_koid: 0,
+            role: TowerThreadRole::Floor,
+            switches: 487_000,
+            stack_limit: KERNEL_SP + 0x1000,
+            image_start: IMAGE.0,
+            image_end: IMAGE.1,
+        };
+        write_tower_context(&mut text, regs, &[0xffff_8000_4801_3aa8], Some(context)).unwrap();
+        assert_eq!(
+            text.as_str(),
+            "LR=0x0000000000000000  SP=0xffff8000480e0500  x29=0x0000000000000001\r\n\
+             ret addrs on stack: 0xffff800048013aa8\r\n\
+             thread koid=0x5 (kernel floor) process=0x0 switches=487000\r\n"
+        );
+    }
+
+    #[test]
+    fn exception_context_names_an_sp_that_is_off_every_kernel_stack() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 1,
+            sp: 2,
+            fp: 0,
+        };
+        let context = TowerContext::default();
+        write_tower_context(&mut text, regs, &[], Some(context)).unwrap();
+        assert!(text
+            .as_str()
+            .contains("ret addrs on stack: not scanned - SP is not on a kernel stack\r\n"));
+    }
+
+    #[test]
+    fn exception_context_without_the_kernel_hook_says_so() {
+        let mut text = TextBuf::new();
+        let regs = TowerRegisters {
+            lr: 1,
+            sp: 2,
+            fp: 0,
+        };
+        write_tower_context(&mut text, regs, &[], None).unwrap();
+        assert!(text
+            .as_str()
+            .ends_with("thread: unknown (no kernel context hook)\r\n"));
+    }
 
     #[test]
     fn reports_arch_name() {

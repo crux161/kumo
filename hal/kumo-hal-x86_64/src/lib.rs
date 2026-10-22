@@ -5,6 +5,7 @@
 //j472
 //j474
 //j493
+//j534
 
 mod fpsimd;
 mod gdt;
@@ -823,6 +824,34 @@ pub(crate) fn run_preempt_hook() {
 
 /// Stub: P9-a interrupt-signal hook — arm64 spine first.
 pub fn set_interrupt_hook(_hook: extern "C" fn(u32)) {}
+
+/// Which kind of thread was running at a fatal exception; mirrors the arm64 HAL's type so the
+/// arch-generic kernel can install one hook for both backends.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TowerThreadRole {
+    #[default]
+    Unknown = 0,
+    Floor = 1,
+    Sora = 2,
+    Child = 3,
+}
+
+/// What the kernel knows at a fatal exception; mirrors the arm64 HAL's type.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TowerContext {
+    pub thread_koid: u64,
+    pub process_koid: u64,
+    pub role: TowerThreadRole,
+    pub switches: u64,
+    pub stack_limit: u64,
+    pub image_start: u64,
+    pub image_end: u64,
+}
+
+/// Stub: the x86_64 exception report does not use the kernel's context yet — arm64 spine first.
+pub fn set_tower_context_hook(_hook: extern "C" fn(u64) -> TowerContext) {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerIrqReport {

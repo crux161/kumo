@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j456
 //j472
 //j474
 //j482
 //j493
+//j534
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -31,12 +31,12 @@ pub mod active {
         mmu600_pcie_status_from_dtb, monotonic_nanos, read_phys, read_user_aspace_root,
         reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once, run_el0_image,
         run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
-        set_svc_hook, set_user_aspace_root, set_user_kernel_stack, smmu_apps_discover_from_dtb,
-        spin_once, switch_context, sync_icache_to_pou, syscall_count, system_off, system_reset,
-        timer_irq_count, unmask_spi_interrupt, user_device_page_desc, user_entry_context,
-        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, El0Report,
-        GicTimerGateReport, ThreadContext, UserImage, UserImageError, UserLoadSegment, UserMapping,
-        UserState, ARCH,
+        set_svc_hook, set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
+        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
+        system_off, system_reset, timer_irq_count, unmask_spi_interrupt, user_device_page_desc,
+        user_entry_context, user_nc_page_desc, user_page_desc, wait_for_timer_irqs,
+        AppsSmmuTopology, El0Report, GicTimerGateReport, ThreadContext, TowerContext,
+        TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 
@@ -61,15 +61,16 @@ pub mod active {
         prove_fpsimd_boundary, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
         render_qr_diag, render_qr_diag_once, run_el0_image, run_el0_smoke, run_ring3_smoke,
         set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
-        set_user_aspace_root, set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once,
-        switch_context, sync_icache_to_pou, syscall_count, system_off, system_reset,
-        timer_irq_count, unmask_boot_io_apic_timer, unmask_spi_interrupt, user_device_page_desc,
-        user_entry_context, user_nc_page_desc, user_page_desc, wait_for_io_apic_timer_irqs,
-        wait_for_local_timer_irqs, wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport,
-        AcpiRootReport, AppsSmmuTopology, DescriptorTableReport, El0Report, FpSimdReport,
-        GicTimerGateReport, IoApicRedirectionEntry, IoApicReport, IoApicTimerApplied,
-        IoApicTimerPlan, Ring3Error, Ring3Report, ThreadContext, UserImage, UserImageError,
-        UserLoadSegment, UserMapping, UserState, ARCH, RING3_PING_TOKEN,
+        set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
+        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
+        system_off, system_reset, timer_irq_count, unmask_boot_io_apic_timer, unmask_spi_interrupt,
+        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
+        wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs, wait_for_timer_irqs,
+        AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
+        DescriptorTableReport, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
+        IoApicReport, IoApicTimerApplied, IoApicTimerPlan, Ring3Error, Ring3Report, ThreadContext,
+        TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping,
+        UserState, ARCH, RING3_PING_TOKEN,
     };
 }
 
