@@ -4,9 +4,10 @@
 //j219
 //j344
 //j519
+//j552
 
-//! `drv-fb` rendering core — a pure, host-tested 8x16 text console over a 32-bpp
-//! linear framebuffer.
+//! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
+//! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
 //!
 //! Per `PLAN §9` (server logic is arch-neutral and host-testable before it ever runs
 //! on metal) the load-bearing content lives here, not in the bin: a [`Console`] that
@@ -18,10 +19,10 @@
 //! userspace. The framebuffer driver — not the kernel — now owns the glass (`DESIGN/007`,
 //! the Redox posture of `PLAN_IV`).
 
-/// Embedded 8x16 console font (PSF2). Kept in-tree so the driver stays self-contained,
-/// mirroring the Stage-A kernel console. (Font *staging* via initrd/VMO — `DESIGN/005` —
-/// is a deferred refinement; embedding is the smallest provable step.)
-const FONT: &[u8] = include_bytes!("../font8x16.psf");
+mod font;
+
+#[cfg(test)]
+use font::ascii_rows as glyph_rows;
 
 /// Glyph cell dimensions of the embedded PSF2 font.
 pub const GLYPH_W: usize = 8;
@@ -60,31 +61,11 @@ const ESCAPE: u8 = 0x1b;
 const CSI_PARAM_LIMIT: usize = 4;
 const CSI_BYTE_LIMIT: u8 = 32;
 
-/// Read a little-endian `u32` PSF2 header field at `offset`.
-fn font_field(offset: usize) -> usize {
-    u32::from_le_bytes([
-        FONT[offset],
-        FONT[offset + 1],
-        FONT[offset + 2],
-        FONT[offset + 3],
-    ]) as usize
-}
-
-/// The `charsize`-byte glyph for a printable ASCII byte, falling back to `?`.
-fn glyph_rows(ch: u8) -> &'static [u8] {
-    let header_size = font_field(8); // PSF2 headersize
-    let charsize = font_field(20); // bytes per glyph
-    let index = if (0x20..=0x7e).contains(&ch) {
-        ch as usize
-    } else {
-        b'?' as usize
-    };
-    let start = header_size + index * charsize;
-    if start + charsize <= FONT.len() {
-        &FONT[start..start + charsize]
-    } else {
-        &FONT[header_size..header_size + charsize]
-    }
+#[derive(Default)]
+struct Utf8Decoder {
+    value: u32,
+    minimum: u32,
+    remaining: u8,
 }
 
 /// Clean one cache line containing `addr` to the point of coherency. The display
@@ -108,30 +89,29 @@ unsafe fn blit_glyph(
     base: *mut u32,
     len_px: usize,
     stride: usize,
-    x_px: usize,
-    y_px: usize,
-    ch: u8,
-    fg: u32,
-    bg: u32,
+    position: (usize, usize),
+    glyph: &font::Glyph,
+    width: usize,
+    colors: (u32, u32),
 ) {
-    let rows = glyph_rows(ch);
-    for (ry, &bits) in rows.iter().enumerate() {
+    let (x_px, y_px) = position;
+    let (fg, bg) = colors;
+    for (ry, &bits) in glyph.rows.iter().enumerate() {
         let py = y_px + ry;
         let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
-        for rx in 0..GLYPH_W {
-            let on = (bits >> (7 - rx)) & 1 != 0;
+        for rx in 0..width {
+            let on = (bits >> (15 - rx)) & 1 != 0;
             let idx = row_start.wrapping_add(rx);
             if idx < len_px {
                 unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
             }
         }
-        // Flush this row's pixels to RAM so the display actually shows them. The 8-pixel
-        // span is one cache line; clean both ends in case it straddles a line boundary.
+        // Clean both endpoints, including a wide glyph's second cache line. — KESTREL
         #[cfg(target_os = "none")]
         if row_start < len_px {
             unsafe {
                 fb_clean_line(base.add(row_start) as usize);
-                let row_end = row_start + GLYPH_W - 1;
+                let row_end = row_start + width - 1;
                 if row_end < len_px {
                     fb_clean_line(base.add(row_end) as usize);
                 }
@@ -144,7 +124,7 @@ unsafe fn blit_glyph(
     }
 }
 
-/// An 8x16 text console over a 32-bpp linear framebuffer. Holds only cursor state; the
+/// An 8x16 text grid over a 32-bpp linear framebuffer. Holds cursor/parser state; the
 /// pixels live in the caller's framebuffer mapping. Recoverable by construction — the
 /// console grid is derivable, never critical private RAM (`DESIGN/002`).
 pub struct Console {
@@ -160,6 +140,7 @@ pub struct Console {
     background: u32,
     reverse: bool,
     parse_state: ParseState,
+    utf8: Utf8Decoder,
     csi_params: [u16; CSI_PARAM_LIMIT],
     csi_param_count: usize,
     csi_value: u16,
@@ -208,6 +189,7 @@ impl Console {
             background: BG,
             reverse: false,
             parse_state: ParseState::Ground,
+            utf8: Utf8Decoder::default(),
             csi_params: [0; CSI_PARAM_LIMIT],
             csi_param_count: 0,
             csi_value: 0,
@@ -254,12 +236,13 @@ impl Console {
         self.background = BG;
         self.reverse = false;
         self.reset_parser();
+        self.utf8 = Utf8Decoder::default();
         self.cursor_visible = false;
         self.cursor_drawn = false;
     }
 
-    /// Feed one byte through the persistent terminal parser. CSI sequences may span
-    /// separate calls, matching channel reads that split a repaint arbitrarily.
+    /// Feed one byte through the persistent terminal parser. UTF-8 and CSI sequences
+    /// may span separate calls, matching arbitrarily split console-channel reads.
     pub fn write_byte(&mut self, b: u8) {
         if !self.is_renderable() {
             return;
@@ -267,20 +250,15 @@ impl Console {
 
         self.remove_cursor();
         self.consume_byte(b);
-        if self.cursor_visible && self.parse_state == ParseState::Ground {
+        if self.cursor_visible && self.parse_state == ParseState::Ground && self.utf8.remaining == 0
+        {
             self.draw_cursor();
         }
     }
 
     fn consume_byte(&mut self, b: u8) {
         match self.parse_state {
-            ParseState::Ground => {
-                if b == ESCAPE {
-                    self.parse_state = ParseState::Escape;
-                } else {
-                    self.render_byte(b);
-                }
-            }
+            ParseState::Ground => self.consume_utf8(b),
             ParseState::Escape => match b {
                 b'[' => self.begin_csi(),
                 ESCAPE => {}
@@ -290,20 +268,62 @@ impl Console {
         }
     }
 
-    /// Render one non-ANSI byte: printable ASCII draws a glyph and advances the
-    /// cursor; newline, carriage return, and backspace move it. Other bytes use
-    /// the font's question-mark fallback.
-    fn render_byte(&mut self, b: u8) {
-        match b {
-            b'\n' => self.newline(),
-            b'\r' => self.col = 0,
+    fn consume_utf8(&mut self, b: u8) {
+        if self.utf8.remaining != 0 {
+            if b & 0xc0 == 0x80 {
+                self.utf8.value = (self.utf8.value << 6) | u32::from(b & 0x3f);
+                self.utf8.remaining -= 1;
+                if self.utf8.remaining == 0 {
+                    let scalar = self.utf8.value;
+                    let valid = scalar >= self.utf8.minimum && char::from_u32(scalar).is_some();
+                    self.render_scalar(if valid { scalar } else { 0xfffd });
+                }
+                return;
+            }
+            self.utf8 = Utf8Decoder::default();
+            self.render_scalar(0xfffd);
+            // Reprocess a non-continuation byte, including ESC and newlines:
+            // malformed text must not swallow the next terminal control. — KESTREL
+        }
+        let (remaining, value, minimum) = match b {
+            ESCAPE => {
+                self.parse_state = ParseState::Escape;
+                return;
+            }
+            0..=0x7f => {
+                self.render_scalar(u32::from(b));
+                return;
+            }
+            0xc2..=0xdf => (1, u32::from(b & 0x1f), 0x80),
+            0xe0..=0xef => (2, u32::from(b & 0x0f), 0x800),
+            0xf0..=0xf4 => (3, u32::from(b & 0x07), 0x10000),
+            _ => {
+                self.render_scalar(0xfffd);
+                return;
+            }
+        };
+        self.utf8 = Utf8Decoder {
+            value,
+            minimum,
+            remaining,
+        };
+    }
+
+    fn render_scalar(&mut self, scalar: u32) {
+        match scalar {
+            0x0a => self.newline(),
+            0x0d => self.col = 0,
             0x08 => {
                 if self.col > 0 {
                     self.col -= 1;
                 }
             }
             _ => {
-                if self.col >= self.cols {
+                let glyph = font::glyph(scalar);
+                // A one-column framebuffer clips a wide glyph to its visible
+                // half instead of writing through stride padding. — KESTREL
+                let columns = glyph.columns.min(self.cols);
+                if self.col + columns > self.cols {
                     self.newline();
                 }
                 unsafe {
@@ -311,14 +331,13 @@ impl Console {
                         self.base,
                         self.len_px,
                         self.stride,
-                        self.col * GLYPH_W,
-                        self.row * GLYPH_H,
-                        b,
-                        self.effective_foreground(),
-                        self.effective_background(),
+                        (self.col * GLYPH_W, self.row * GLYPH_H),
+                        &glyph,
+                        columns * GLYPH_W,
+                        (self.effective_foreground(), self.effective_background()),
                     );
                 }
-                self.col += 1;
+                self.col += columns;
             }
         }
     }
@@ -673,6 +692,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_wide_cell(buf: &[u32], stride: usize, rows: &[u16; 16], cx: usize, cy: usize) {
+        for (y, &bits) in rows.iter().enumerate() {
+            for x in 0..16 {
+                let want = if bits & (1 << (15 - x)) != 0 { FG } else { BG };
+                assert_eq!(buf[(cy * GLYPH_H + y) * stride + cx * GLYPH_W + x], want);
+            }
+        }
+    }
+
+    #[test]
+    fn japanese_bitmap_and_mixed_cell_advances_are_exact() {
+        const WIDTH: usize = 48;
+        let mut buf = [BG; WIDTH * GLYPH_H];
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), WIDTH, GLYPH_H, WIDTH) };
+        con.write("AあB".as_bytes());
+
+        // Golden U+3042 rows from the existing Unifont asset, independent of
+        // the new lookup and width-aware blitter. — KESTREL
+        const HIRAGANA_A: [u16; 16] = [
+            0x0000, 0x0400, 0x0200, 0x02c0, 0x1f00, 0x0480, 0x0480, 0x07e0, 0x0d10, 0x1508, 0x2208,
+            0x2608, 0x2a10, 0x1060, 0x0000, 0x0000,
+        ];
+        assert_cell_colors(&buf, WIDTH, b'A', 0, 0, FG, BG);
+        assert_wide_cell(&buf, WIDTH, &HIRAGANA_A, 1, 0);
+        assert_cell_colors(&buf, WIDTH, b'B', 3, 0, FG, BG);
+        assert_eq!(con.col, 4);
+    }
+
+    #[test]
+    fn japanese_and_ansi_repaint_survives_every_read_boundary() {
+        const WIDTH: usize = 64;
+        const HEIGHT: usize = 48;
+        let bytes =
+            "\x1b[?25l\x1b[H┏━━━━━━┓\r\n┃\x1b[31m日本語\x1b[0m┃\r\n┗━━━━━━┛\x1b[2;2H\x1b[?25h"
+                .as_bytes();
+        let mut expected = [BG; WIDTH * HEIGHT];
+        let mut reference = unsafe { Console::new(expected.as_mut_ptr(), WIDTH, HEIGHT, WIDTH) };
+        reference.write(bytes);
+        for split in 0..=bytes.len() {
+            let mut buf = [BG; WIDTH * HEIGHT];
+            let mut con = unsafe { Console::new(buf.as_mut_ptr(), WIDTH, HEIGHT, WIDTH) };
+            con.write(&bytes[..split]);
+            con.write(&bytes[split..]);
+            assert!(buf == expected, "split at byte {split}");
+        }
+        let mut buf = [BG; WIDTH * HEIGHT];
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), WIDTH, HEIGHT, WIDTH) };
+        for &byte in bytes {
+            con.write_byte(byte);
+        }
+        assert!(buf == expected);
+        assert_eq!((con.col, con.row), (1, 1));
+        assert!(con.cursor_drawn);
+        con.write(b"\x1b[?25l");
+        // Cursor hiding restores the wide glyph's first cell exactly. — KESTREL
+        reference.write(b"\x1b[?25l");
+        assert!(buf == expected);
+    }
+
+    #[test]
+    fn malformed_utf8_cannot_hide_the_next_ascii_or_ansi_control() {
+        const WIDTH: usize = 192;
+        let mut buf = [BG; WIDTH * GLYPH_H];
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), WIDTH, GLYPH_H, WIDTH) };
+        con.write(&[
+            0xe7, b'A', 0xed, 0xa0, 0x80, b'B', 0xf4, 0x90, 0x80, 0x80, b'C', 0xc0, 0xaf, b'D',
+            0xe0, 0x80, 0xaf, b'E', 0xf0, 0x80, 0x80, 0xaf, b'F', 0xc3, 0xa9, b'G',
+        ]);
+        let mut expected = [BG; WIDTH * GLYPH_H];
+        let mut reference = unsafe { Console::new(expected.as_mut_ptr(), WIDTH, GLYPH_H, WIDTH) };
+        reference.write("�A�B�C��D�E�F�G".as_bytes());
+        assert!(buf == expected);
+        assert_eq!(con.col, 23);
+
+        con.clear();
+        con.write(b"\xe7\x1b[31mR");
+        assert_cell_colors(&buf, WIDTH, b'R', 2, 0, 0x00aa_0000, BG);
+        assert_eq!(con.parse_state, ParseState::Ground);
+        assert_eq!(con.utf8.remaining, 0);
+
+        con.clear();
+        con.write(&[0xe7]);
+        con.clear();
+        con.write(b"A");
+        assert_eq!(con.col, 1);
+        assert_cell_colors(&buf, WIDTH, b'A', 0, 0, FG, BG);
+    }
+
+    #[test]
+    fn wide_glyph_wraps_before_the_margin_and_scrolls_whole_rows() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+        con.write("ABあ".as_bytes());
+        assert_cell(&buf, b'A', 0, 0);
+        assert_cell(&buf, b'B', 1, 0);
+        assert_cell(&buf, b' ', 2, 0);
+        assert_wide_cell(&buf, STRIDE, &font::glyph('あ' as u32).rows, 0, 1);
+        con.write("日".as_bytes());
+        assert_wide_cell(&buf, STRIDE, &font::glyph('あ' as u32).rows, 0, 0);
+        assert_wide_cell(&buf, STRIDE, &font::glyph('日' as u32).rows, 0, 1);
+        assert_eq!((con.col, con.row), (2, 1));
+    }
+
+    #[test]
+    fn one_column_wide_glyph_never_touches_stride_padding_or_guards() {
+        const STRIDE: usize = 16;
+        const CANARY: u32 = 0x1234_5678;
+        let mut buf = [CANARY; STRIDE * GLYPH_H + 16];
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), 8, GLYPH_H, STRIDE) };
+        for y in 0..GLYPH_H {
+            buf[y * STRIDE + 8..(y + 1) * STRIDE].fill(CANARY);
+        }
+        con.write("あ".as_bytes());
+        for y in 0..GLYPH_H {
+            assert!(buf[y * STRIDE + 8..(y + 1) * STRIDE]
+                .iter()
+                .all(|&p| p == CANARY));
+        }
+        assert!(buf[STRIDE * GLYPH_H..].iter().all(|&p| p == CANARY));
+        assert_eq!(con.col, 1);
+    }
+
+    #[test]
+    fn missing_four_byte_scalar_is_one_visible_wide_glyph() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+        con.write("🙂A".as_bytes());
+        assert_eq!(con.col, 3);
+        assert_wide_cell(&buf, STRIDE, &font::glyph(0xfffd).rows, 0, 0);
+        assert_cell(&buf, b'A', 2, 0);
     }
 
     #[test]
