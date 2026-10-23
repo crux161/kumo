@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j552
 //j553
 //j554
 //j557
 //j565
+//j567
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -256,6 +256,66 @@ impl Console {
         self.utf8 = Utf8Decoder::default();
         self.cursor_visible = false;
         self.cursor_drawn = false;
+    }
+
+    /// Present an opaque surface as output at the next console line. Placement is the
+    /// server's policy, never a client coordinate. The picture becomes part of the shadow
+    /// and scrolls with text; this is a single-view software backend, not a window manager.
+    /// Invalid geometry changes nothing and never invokes `read_pixel`. The callback receives
+    /// only indices covered by the validated backing extent; shared mappings should use
+    /// volatile reads rather than constructing Rust references to client-owned memory.
+    pub fn present_surface(
+        &mut self,
+        surface: kumo_graphics::Surface,
+        backing_bytes: usize,
+        mut read_pixel: impl FnMut(usize) -> u32,
+    ) -> Result<(), kumo_graphics::Status> {
+        let image_rows = (surface.height as usize).div_ceil(GLYPH_H);
+        if !self.is_renderable()
+            || !surface.fits(backing_bytes)
+            || surface.width as usize > self.cols * GLYPH_W
+            || image_rows >= self.rows
+        {
+            return Err(kumo_graphics::Status::BadSurface);
+        }
+        self.remove_cursor();
+        if self.col != 0 {
+            self.newline();
+        }
+        // Reserve a complete line after the image for the shell prompt. Each scroll moves
+        // the preceding text too; no text beneath a newly inserted picture is overwritten.
+        while self.row + image_rows >= self.rows {
+            let previous_row = self.row;
+            self.scroll();
+            self.row = previous_row.saturating_sub(1);
+        }
+        let start = self.row * GLYPH_H * self.stride;
+        for y in 0..image_rows * GLYPH_H {
+            for x in 0..self.cols * GLYPH_W {
+                let color = if y < surface.height as usize && x < surface.width as usize {
+                    let pixel = read_pixel(y * surface.stride as usize + x);
+                    self.pixel_order
+                        .pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8)
+                } else {
+                    BG
+                };
+                // SAFETY: validated dimensions and reserved rows are inside the console.
+                unsafe { self.put(start + y * self.stride + x, color) };
+            }
+        }
+        #[cfg(target_os = "none")]
+        unsafe {
+            for pixel in (start..start + image_rows * GLYPH_H * self.stride).step_by(16) {
+                fb_clean_line(self.base.add(pixel) as usize);
+            }
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+        self.row += image_rows;
+        self.col = 0;
+        if self.cursor_visible {
+            self.draw_cursor();
+        }
+        Ok(())
     }
 
     // Full-display erase includes scanlines outside the last complete text row
@@ -770,6 +830,182 @@ mod tests {
 
     fn fresh() -> [u32; W * H] {
         [BG; W * H]
+    }
+
+    #[test]
+    fn surfaces_convert_channels_skip_padding_and_update_the_shadow() {
+        use kumo_graphics::{Surface, XRGB8888};
+        const WIDTH: usize = 32;
+        const PITCH: usize = 40;
+        const HEIGHT: usize = 64;
+        let source = [
+            0xffff0000, 0x0000ff00, 0x000000ff, 0xdeadbeef, 0x00123456, 0x00654321, 0x00abcdef,
+            0xdeadbeef,
+        ];
+        let surface = Surface {
+            width: 3,
+            height: 2,
+            stride: 4,
+            format: XRGB8888,
+        };
+        for order in [PixelOrder::Rgb, PixelOrder::Bgr] {
+            let mut glass = [0; PITCH * HEIGHT + 1];
+            let mut shadow = glass;
+            let mut con = unsafe {
+                Console::new_shadowed(
+                    glass.as_mut_ptr(),
+                    shadow.as_mut_ptr(),
+                    WIDTH,
+                    HEIGHT,
+                    PITCH,
+                    order,
+                )
+            };
+            glass[PITCH * HEIGHT] = 0xcafe;
+            shadow[PITCH * HEIGHT] = 0xbeef;
+            for y in 0..HEIGHT {
+                glass[y * PITCH + WIDTH..(y + 1) * PITCH].fill(0xf00d);
+            }
+            assert_eq!(
+                con.present_surface(surface, source.len() * 4, |i| source[i]),
+                Ok(())
+            );
+            assert_eq!(glass[0], order.pixel(255, 0, 0));
+            assert_eq!(glass[1], order.pixel(0, 255, 0));
+            assert_eq!(glass[2], order.pixel(0, 0, 255));
+            assert_eq!(glass[PITCH], order.pixel(0x12, 0x34, 0x56));
+            assert_eq!(glass[3], BG);
+            for y in 0..GLYPH_H {
+                assert_eq!(
+                    &glass[y * PITCH..y * PITCH + WIDTH],
+                    &shadow[y * PITCH..y * PITCH + WIDTH]
+                );
+                assert!(glass[y * PITCH + WIDTH..(y + 1) * PITCH]
+                    .iter()
+                    .all(|p| *p == 0xf00d));
+            }
+            assert_eq!(glass[PITCH * HEIGHT], 0xcafe);
+            assert_eq!(shadow[PITCH * HEIGHT], 0xbeef);
+            assert_eq!((con.col, con.row), (0, 1));
+        }
+    }
+
+    #[test]
+    fn invalid_surfaces_never_read_or_change_console_state() {
+        use kumo_graphics::{Status, Surface, XRGB8888};
+        let valid = Surface {
+            width: 8,
+            height: 16,
+            stride: 8,
+            format: XRGB8888,
+        };
+        let mut glass = [0; 32 * 64];
+        let mut con = unsafe { Console::new(glass.as_mut_ptr(), 32, 64, 32) };
+        con.write(b"hello\x1b[?25h");
+        let before = glass;
+        let cursor = (con.col, con.row, con.cursor_drawn);
+        for (surface, capacity) in [
+            (valid, 511),
+            (
+                Surface {
+                    width: 33,
+                    stride: 33,
+                    ..valid
+                },
+                4096,
+            ),
+            (
+                Surface {
+                    height: 64,
+                    ..valid
+                },
+                4096,
+            ),
+            (Surface { stride: 1, ..valid }, 4096),
+            (Surface { format: 9, ..valid }, 4096),
+        ] {
+            assert_eq!(
+                con.present_surface(surface, capacity, |_| panic!("invalid surface read")),
+                Err(Status::BadSurface)
+            );
+            assert_eq!(glass, before);
+            assert_eq!((con.col, con.row, con.cursor_drawn), cursor);
+        }
+    }
+
+    #[test]
+    fn images_scroll_with_text_and_allow_buffer_reuse() {
+        use kumo_graphics::{Present, Reply, Status, Surface, XRGB8888};
+        const WIDTH: usize = 32;
+        const HEIGHT: usize = 64;
+        let mut glass = [0; WIDTH * HEIGHT];
+        let mut shadow = glass;
+        let mut con = unsafe {
+            Console::new_shadowed(
+                glass.as_mut_ptr(),
+                shadow.as_mut_ptr(),
+                WIDTH,
+                HEIGHT,
+                WIDTH,
+                PixelOrder::Bgr,
+            )
+        };
+        con.write(b"A\nB\nC\n");
+        let mut source = [0xff0000; 8 * 16];
+        let surface = Surface {
+            width: 8,
+            height: 16,
+            stride: 8,
+            format: XRGB8888,
+        };
+        for (sequence, color) in [(1, 0xff0000), (2, 0x0000ff)] {
+            source.fill(color);
+            let request = Present::decode(&Present { sequence, surface }.encode()).unwrap();
+            let result = con.present_surface(request.surface, source.len() * 4, |i| source[i]);
+            let reply = Reply {
+                sequence: request.sequence,
+                status: result.err().unwrap_or(Status::Copied),
+            };
+            assert_eq!(
+                Reply::decode(&reply.encode()),
+                Some(Reply {
+                    sequence,
+                    status: Status::Copied
+                })
+            );
+            source.fill(0); // release: changing the source must not change the copied image
+            assert_eq!(glass[2 * GLYPH_H * WIDTH], color);
+            assert_eq!(glass, shadow);
+        }
+        // Previous picture survives the next insertion as an ordinary row of console output.
+        assert_eq!(glass[GLYPH_H * WIDTH], 0xff0000);
+        con.write(b"D");
+        assert_cell_colors(&glass, WIDTH, b'D', 0, 3, FG, BG);
+        assert_eq!(glass, shadow);
+    }
+
+    #[test]
+    fn multirow_surface_reserves_space_at_the_bottom_and_rounds_up() {
+        let mut glass = [0; 32 * 64];
+        let mut con = unsafe { Console::new(glass.as_mut_ptr(), 32, 64, 32) };
+        con.write(b"A\nB\nC\n");
+        let surface = kumo_graphics::Surface {
+            width: 8,
+            height: 17,
+            stride: 8,
+            format: kumo_graphics::XRGB8888,
+        };
+        assert_eq!(
+            con.present_surface(surface, 8 * 17 * 4, |_| 0x123456),
+            Ok(())
+        );
+        assert_eq!((con.col, con.row), (0, 3));
+        assert_cell_colors(&glass, 32, b'C', 0, 0, FG, BG);
+        assert_eq!(glass[16 * 32], 0x123456);
+        assert_eq!(glass[32 * 32], 0x123456);
+        assert_eq!(glass[33 * 32], BG);
+        con.write(b"D");
+        assert_cell_colors(&glass, 32, b'D', 0, 3, FG, BG);
     }
 
     /// Assert that glyph-cell `(cx, cy)` holds exactly the bitmap for `ch`.

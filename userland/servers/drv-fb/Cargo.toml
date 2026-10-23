@@ -1,3 +1,5 @@
+#j567
+
 [package]
 name = "drv-fb"
 version = "0.1.0"
@@ -8,6 +10,9 @@ name = "drv_fb"
 path = "src/lib.rs"
 test = true
 doctest = false
+
+[dependencies]
+kumo-graphics = { path = "../../../lib/kumo-graphics" }
 
 [[bin]]
 name = "drv-fb"

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j559
 //j562
 //j563
 //j564
 //j565
+//j567
 
 extern crate alloc;
 
@@ -65,6 +65,116 @@ static ARGV_VMO: AtomicU64 = AtomicU64::new(0);
 /// persistent block device, not the DESIGN/010 RedoxFS root. — KESTREL
 static FAT_IMAGE_VMO: AtomicU64 = AtomicU64::new(0);
 static FAT_IMAGE_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// The first presentation client is a supervisor-owned demo view. No app receives hardware
+/// authority. A failed round trip disables reuse until the service is re-established.
+static GRAPHICS_CHANNEL: AtomicU32 = AtomicU32::new(0);
+static GRAPHICS_VMO: AtomicU32 = AtomicU32::new(0);
+static GRAPHICS_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+
+/// Queue the surface grant on a new graphics channel before handing its server end to
+/// drv-fb. READ permits a read-only VmarMap in the current ABI; TRANSFER delivers the grant.
+fn bootstrap_graphics(bootstrap: Handle) -> Option<(Handle, Handle)> {
+    let (client, server) = channel_create_pair();
+    let vmo = vmo_create(kumo_graphics::SURFACE_BYTES as u64);
+    let valid = |raw| raw != 0 && raw != u64::MAX;
+    let surface = if valid(vmo) {
+        handle_duplicate(Handle(vmo as u32), Rights::READ | Rights::TRANSFER)
+    } else {
+        0
+    };
+    let mut sent_surface = false;
+    if [client, server, vmo, surface].into_iter().all(valid) {
+        sent_surface = channel_write_with_handle(
+            Handle(client as u32),
+            b"S".as_ptr(),
+            1,
+            Handle(surface as u32),
+        ) == 0;
+        if sent_surface
+            && channel_write_with_handle(bootstrap, b"G".as_ptr(), 1, Handle(server as u32)) == 0
+        {
+            return Some((Handle(client as u32), Handle(vmo as u32)));
+        }
+    }
+    for raw in [client, server, vmo] {
+        if valid(raw) {
+            let _ = handle_close(Handle(raw as u32));
+        }
+    }
+    if valid(surface) && !sent_surface {
+        let _ = handle_close(Handle(surface as u32));
+    }
+    let _ = channel_write_with_handle(bootstrap, b"G".as_ptr(), 1, Handle(0));
+    None
+}
+
+fn graphics_demo(cmd: &kumoza::Command) {
+    use kumo_graphics::{demo_pixel, Present, Reply, Status, DEMO, REPLY_LEN};
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-demo\n");
+        return;
+    }
+    let channel = Handle(GRAPHICS_CHANNEL.swap(0, Ordering::Relaxed));
+    let vmo = Handle(GRAPHICS_VMO.load(Ordering::Relaxed));
+    if channel.0 == 0 || vmo.0 == 0 {
+        log(b"gfx-demo: framebuffer presentation unavailable\n");
+        fail_status(1);
+        return;
+    }
+    let result = (|| {
+        // Let drv-fb drain the command echo before enqueueing the separate present request.
+        if !child_parked(process_wait()) {
+            return None;
+        }
+        let mut row = [0u8; 256 * 4];
+        for y in 0..DEMO.height {
+            for x in 0..DEMO.width {
+                let offset = x as usize * 4;
+                row[offset..offset + 4].copy_from_slice(&demo_pixel(x, y).to_le_bytes());
+            }
+            // The current VmoWrite syscall copies at most 256 bytes, even if passed more.
+            for (chunk_index, chunk) in row.chunks(256).enumerate() {
+                let offset = u64::from(y * DEMO.stride * 4) + (chunk_index * 256) as u64;
+                if vmo_write(vmo, offset, chunk.as_ptr(), chunk.len()) != 0 {
+                    return None;
+                }
+            }
+        }
+        let sequence = GRAPHICS_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let frame = Present {
+            sequence,
+            surface: DEMO,
+        }
+        .encode();
+        if channel_write(channel, frame.as_ptr(), frame.len()) != 0 || !child_parked(process_wait())
+        {
+            return None;
+        }
+        let mut reply = [0u8; REPLY_LEN + 1];
+        let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+        let reply = Reply::decode(reply.get(..len)?)?;
+        (reply.sequence == sequence).then_some(reply.status)
+    })();
+    match result {
+        Some(status) => {
+            // Every valid reply releases this software surface, even if its geometry was
+            // rejected. Failure without a matching reply cannot establish release.
+            GRAPHICS_CHANNEL.store(channel.0, Ordering::Relaxed);
+            if status == Status::Copied {
+                log(b"gfx-demo: 256x128 surface copied; buffer released (software GOP)\n");
+            } else {
+                log(b"gfx-demo: presenter rejected surface\n");
+                fail_status(1);
+            }
+        }
+        None => {
+            let _ = handle_close(channel);
+            log(b"gfx-demo: presentation failed; surface disabled\n");
+            fail_status(1);
+        }
+    }
+}
 
 // Sora's entry. Mirrors `kumo_rt::entry!` (a bare `bl sora_main`) but first stashes x8 into
 // `BOOTINFO_VMO_HANDLE`. x9 is scratch; sora_main is reached with x0–x7 (its C-ABI args)
@@ -1409,6 +1519,7 @@ extern "C" fn sora_main(
                         channel_write_with_handle(srv, b"F".as_ptr(), 1, Handle(fb_res_h as u32));
                         channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
                         channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
+                        let graphics = bootstrap_graphics(srv);
                         if run_elf(
                             initrd,
                             kumo_abi::DRV_FB_PATH.as_bytes(),
@@ -1418,6 +1529,10 @@ extern "C" fn sora_main(
                             b"drv-fb",
                         ) {
                             log(b"drv-fb: run ok\n");
+                            if let Some((channel, vmo)) = graphics {
+                                GRAPHICS_CHANNEL.store(channel.0, Ordering::Relaxed);
+                                GRAPHICS_VMO.store(vmo.0, Ordering::Relaxed);
+                            }
                             if let Some(size) = sora::console_window(fb.width, fb.height) {
                                 CONSOLE_WINDOW.store(
                                     (u32::from(size.rows) << 16) | u32::from(size.columns),
@@ -1426,6 +1541,10 @@ extern "C" fn sora_main(
                             }
                         } else {
                             log(b"drv-fb: run fail\n");
+                            if let Some((channel, vmo)) = graphics {
+                                let _ = handle_close(channel);
+                                let _ = handle_close(vmo);
+                            }
                         }
                     } else {
                         log(b"drv-fb: channel fail\n");
@@ -2632,6 +2751,10 @@ fn eval_command(
     cwd: &mut WorkingDirectory,
 ) -> bool {
     LAST_STATUS.store(0, Ordering::Relaxed);
+    if cmd.name == "gfx-demo" {
+        graphics_demo(cmd);
+        return true;
+    }
     if cmd.name == "dmesg" {
         dmesg(cmd);
         return true;

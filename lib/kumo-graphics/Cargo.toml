@@ -1,0 +1,10 @@
+#j567
+
+[package]
+name = "kumo-graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false

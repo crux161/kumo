@@ -1,8 +1,8 @@
-#j426
 #j548
 #j551
 #j558
 #j563
+#j567
 
 [package]
 name = "sora"
@@ -16,6 +16,7 @@ drv-blk = { path = "../servers/drv-blk" }
 drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 kumo-abi.workspace = true
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }
+kumo-graphics = { path = "../../lib/kumo-graphics" }
 kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
 kumo-identity = { path = "../../lib/kumo-identity" }
 kumo-ipc.workspace = true
