@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j382
 //j389
 //j545
 //j547
 //j551
+//j557
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -424,6 +424,21 @@ pub fn select_i2c_hid_optional_attention_irq(discovery: &I2cHidRuntimeTopology) 
     select_i2c_hid_optional_probe_candidates(discovery).shared_attention_irq()
 }
 
+/// The text cell drv-fb draws: 8x16 pixels (`drv_fb::GLYPH_W`/`GLYPH_H`, pinned by a test).
+pub const CONSOLE_CELL_PX: (u32, u32) = (8, 16);
+
+/// Restore default colors, clear the entire display, and show the cursor at home.
+pub const CONSOLE_SESSION_RESET: &[u8] = b"\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[?25h";
+
+/// The grid drv-fb's console has on a `width` x `height` framebuffer, as the window size a
+/// full-screen program should paint (J557). `None` when not even one cell fits, or the grid
+/// cannot be expressed in a `winsize`.
+pub fn console_window(width: u32, height: u32) -> Option<ttyd::WindowSize> {
+    let columns = u16::try_from(width / CONSOLE_CELL_PX.0).ok()?;
+    let rows = u16::try_from(height / CONSOLE_CELL_PX.1).ok()?;
+    (rows > 0 && columns > 0).then_some(ttyd::WindowSize { rows, columns })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -468,52 +483,77 @@ mod tests {
 
     #[test]
     fn full_kilo_repaint_reaches_pixels_and_final_cursor_through_short_writes() {
-        const COLS: usize = 80;
-        const ROWS: usize = 24;
-        const WIDTH: usize = COLS * GLYPH_W;
-        const HEIGHT: usize = ROWS * GLYPH_H;
+        check_kilo_repaint(80, 24);
+        check_kilo_repaint(80, 30);
+        check_kilo_repaint(200, 56);
+    }
 
-        // Upstream editorRefreshScreen's 80x24 shape, with full content rows so
-        // the status and cursor lie beyond both old truncation points. — KESTREL
+    fn check_kilo_repaint(columns: usize, rows: usize) {
+        let width = columns * GLYPH_W;
+        let height = rows * GLYPH_H;
         let mut repaint = Vec::from(b"\x1b[?25l\x1b[H".as_slice());
-        for row in 0..ROWS - 2 {
-            repaint.extend_from_slice(&[b'A' + row as u8; COLS]);
+        for row in 0..rows - 2 {
+            repaint.resize(repaint.len() + columns, b'A' + row as u8);
             repaint.extend_from_slice(b"\x1b[39m\x1b[0K\r\n");
         }
         repaint.extend_from_slice(b"\x1b[0K\x1b[7m");
-        repaint.extend_from_slice(&[b'S'; COLS]);
+        repaint.resize(repaint.len() + columns, b'S');
         repaint.extend_from_slice(
             b"\x1b[0m\r\n\x1b[0KHELP: Ctrl-S = save | Ctrl-Q = quit\x1b[2;3H\x1b[?25h",
         );
         assert!(repaint.len() > ttyd::REPLY_BUF_BYTES);
-
-        let message = Message::new(1, &repaint, &[]).unwrap();
-        let mut receive = [0u8; kumo_ipc::MAX_INLINE_BYTES];
-        receive[..message.bytes.len()].copy_from_slice(message.bytes);
-        let bytes = &receive[..message.bytes.len()];
-        let actual = TestFramebuffer::new(WIDTH * HEIGHT);
-        let mut console = unsafe { Console::new(actual.pixels, WIDTH, HEIGHT, WIDTH) };
+        let actual = TestFramebuffer::new(width * height);
+        let mut console = unsafe { Console::new(actual.pixels, width, height, width) };
         let mut relayed = Vec::new();
-        assert!(relay_console_output(bytes, |chunk| {
-            assert!(chunk.len() <= 256);
-            // Exercise a short acknowledgement, including split CSI sequences.
-            let accepted = chunk.len().min(73);
-            console.write(&chunk[..accepted]);
-            relayed.extend_from_slice(&chunk[..accepted]);
-            accepted as u64
-        }));
+        // Match relibc's bounded stdout messages, then the console's short writes.
+        // At 200x56 the status and final cursor are in the third message. — KESTREL
+        for payload in repaint.chunks(kumo_ipc::MAX_INLINE_BYTES) {
+            let message = Message::new(1, payload, &[]).unwrap();
+            let mut receive = [0u8; kumo_ipc::MAX_INLINE_BYTES];
+            receive[..message.bytes.len()].copy_from_slice(message.bytes);
+            assert!(relay_console_output(
+                &receive[..message.bytes.len()],
+                |chunk| {
+                    assert!(chunk.len() <= 256);
+                    let accepted = chunk.len().min(73);
+                    console.write(&chunk[..accepted]);
+                    relayed.extend_from_slice(&chunk[..accepted]);
+                    accepted as u64
+                }
+            ));
+        }
         assert_eq!(relayed, repaint);
-
-        let expected = TestFramebuffer::new(WIDTH * HEIGHT);
-        let mut reference = unsafe { Console::new(expected.pixels, WIDTH, HEIGHT, WIDTH) };
+        let expected = TestFramebuffer::new(width * height);
+        let mut reference = unsafe { Console::new(expected.pixels, width, height, width) };
         reference.write(&repaint);
         assert!(actual.pixels().iter().eq(expected.pixels()));
-        // The final show-cursor command must invert the blank pixel at (2,1),
-        // proving that the tail moved and showed it rather than stopping at SGR. — KESTREL
-        assert_eq!(actual.pixels()[GLYPH_H * WIDTH + 2 * GLYPH_W], 0x00ff_ffff);
-        assert!(actual.pixels()[(ROWS - 1) * GLYPH_H * WIDTH..]
+        assert_eq!(actual.pixels()[GLYPH_H * width + 2 * GLYPH_W], 0x00ff_ffff);
+        assert!(actual.pixels()[(rows - 1) * GLYPH_H * width..]
             .iter()
             .any(|&p| p != BG));
+    }
+
+    #[test]
+    fn session_reset_clears_the_whole_screen_and_homes_a_default_colored_prompt() {
+        for (width, height) in [(1600, 900), (640, 480)] {
+            let actual = TestFramebuffer::new(width * height);
+            let mut console = unsafe { Console::new(actual.pixels, width, height, width) };
+            console.write(b"\x1b[31;44m\x1b[7mold editor text\x1b[2;3H\x1b[?25h");
+            // Include the four sub-cell scanlines at the bottom of a 900px display.
+            // Nothing from the previous screen may survive the session. — KESTREL
+            unsafe { core::slice::from_raw_parts_mut(actual.pixels, actual.len).fill(0x00ab_cdef) };
+            console.write(CONSOLE_SESSION_RESET);
+            console.write(b"\x1b[?25l");
+            assert!(actual.pixels().iter().all(|&p| p == BG));
+            console.write(b"\x1b[?25h[MUREX> ");
+            assert!(actual.pixels()[..width * GLYPH_H].iter().any(|&p| p != BG));
+            assert!(actual.pixels()[width * GLYPH_H..].iter().all(|&p| p == BG));
+
+            let expected = TestFramebuffer::new(width * height);
+            let mut reference = unsafe { Console::new(expected.pixels, width, height, width) };
+            reference.write(b"\x1b[?25h[MUREX> ");
+            assert!(actual.pixels().iter().eq(expected.pixels()));
+        }
     }
 
     #[test]
@@ -795,5 +835,16 @@ mod tests {
         assert_eq!(media_route(b"/mediafoo"), MediaRoute::Elsewhere);
         assert_eq!(media_route(b"media/KUMO"), MediaRoute::Elsewhere);
         assert_eq!(media_route(b""), MediaRoute::Elsewhere);
+    }
+
+    #[test]
+    fn console_window_is_drv_fbs_own_grid() {
+        // J557: the size Kilo is told must be the grid drv-fb actually draws.
+        assert_eq!(CONSOLE_CELL_PX, (GLYPH_W as u32, GLYPH_H as u32));
+        let window = |w, h| console_window(w, h).map(|s| (s.rows, s.columns));
+        assert_eq!(window(1600, 900), Some((56, 200)));
+        assert_eq!(window(640, 480), Some((30, 80)));
+        assert_eq!(window(7, 900), None);
+        assert_eq!(window(u32::MAX, 900), None);
     }
 }

@@ -1,12 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j152
-//j219
-//j344
 //j519
 //j552
 //j553
 //j554
+//j557
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -248,8 +246,23 @@ impl Console {
         if !self.is_renderable() {
             return;
         }
+        self.fill_display(BG);
+        self.col = 0;
+        self.row = 0;
+        self.foreground = FG;
+        self.background = BG;
+        self.reverse = false;
+        self.reset_parser();
+        self.utf8 = Utf8Decoder::default();
+        self.cursor_visible = false;
+        self.cursor_drawn = false;
+    }
+
+    // Full-display erase includes scanlines outside the last complete text row
+    // (900px is 56 rows plus four pixels), without changing terminal state. — KESTREL
+    fn fill_display(&mut self, color: u32) {
         for idx in 0..self.len_px {
-            unsafe { self.put(idx, BG) };
+            unsafe { self.put(idx, color) };
         }
         #[cfg(target_os = "none")]
         unsafe {
@@ -260,15 +273,6 @@ impl Console {
             }
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         }
-        self.col = 0;
-        self.row = 0;
-        self.foreground = FG;
-        self.background = BG;
-        self.reverse = false;
-        self.reset_parser();
-        self.utf8 = Utf8Decoder::default();
-        self.cursor_visible = false;
-        self.cursor_drawn = false;
     }
 
     /// Feed one byte through the persistent terminal parser. UTF-8 and CSI sequences
@@ -581,7 +585,7 @@ impl Console {
                     background,
                 );
             }
-            2 => self.fill_cells(0, self.rows, 0, self.cols, background),
+            2 => self.fill_display(background),
             _ => {}
         }
     }

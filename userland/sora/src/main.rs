@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j548
 //j549
 //j550
 //j551
 //j556
+//j557
 
 extern crate alloc;
 
@@ -1298,6 +1298,12 @@ extern "C" fn sora_main(
                             b"drv-fb",
                         ) {
                             log(b"drv-fb: run ok\n");
+                            if let Some(size) = sora::console_window(fb.width, fb.height) {
+                                CONSOLE_WINDOW.store(
+                                    (u32::from(size.rows) << 16) | u32::from(size.columns),
+                                    Ordering::Relaxed,
+                                );
+                            }
                         } else {
                             log(b"drv-fb: run fail\n");
                         }
@@ -2952,9 +2958,20 @@ fn fat_image_alias(initrd: Handle) -> Option<(u64, u64)> {
     }
 }
 
-/// Spawn one private `ttyd` control service for a child and return its client channel.
-/// Stream bytes remain on the child's separately granted stdin/stdout channels; keeping
-/// this RPC channel distinct prevents a mode reply from ever being consumed as input.
+/// The framebuffer console's grid once drv-fb is drawing it, `rows << 16 | columns`; 0 while
+/// there is none, and sessions keep ttyd's 80x24 (J557).
+static CONSOLE_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+fn console_window_size() -> Option<ttyd::WindowSize> {
+    let packed = CONSOLE_WINDOW.load(Ordering::Relaxed);
+    let size = ttyd::WindowSize {
+        rows: (packed >> 16) as u16,
+        columns: packed as u16,
+    };
+    (size.rows != 0 && size.columns != 0).then_some(size)
+}
+
+/// Spawn a private ttyd control channel, distinct from the child's stream channels.
 fn spawn_ttyd_control(initrd: Handle) -> Option<Handle> {
     let recipe = SvcRecipe {
         initrd,
@@ -2966,6 +2983,22 @@ fn spawn_ttyd_control(initrd: Handle) -> Option<Handle> {
         let _ = handle_close(instance.process);
         log(b"ttyd: control park fail\n");
         return None;
+    }
+    // The session draws on the framebuffer console, so its terminal is that size. Sora owns the
+    // display and sets it before the client end goes to the program, the way a terminal sets
+    // `TIOCSWINSZ` on its pty. Kilo reads it once, at start. — TIMBERDOODLE
+    if let Some(size) = console_window_size() {
+        let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+        let set = ttyd_request_reply(
+            instance.client,
+            TtyRequest::set_window_size(size),
+            &mut reply,
+        )
+        .and_then(|n| TtyReply::parse(&reply[..n]))
+        .is_some_and(|reply| reply.window_size == Some(size));
+        if !set {
+            log(b"ttyd: window size not set; 80x24\n");
+        }
     }
     // Closing Sora's process handle does not terminate the admitted resident. Its client
     // channel is the lifetime authority; once the launched child exits, peer-closed lets
@@ -3279,13 +3312,17 @@ fn reclaim_startup_handles(bootstrap: Handle, count: Option<usize>) {
 }
 
 fn pump_to_console(read_end: Handle) {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; kumo_ipc::MAX_INLINE_BYTES];
     loop {
         let n = channel_read(read_end, buf.as_mut_ptr(), buf.len());
         if n == 0 || n == u64::MAX {
             break;
         }
-        debug_write(buf.as_ptr(), n as usize);
+        if !sora::relay_console_output(&buf[..n as usize], |chunk| {
+            debug_write(chunk.as_ptr(), chunk.len())
+        }) {
+            break;
+        }
     }
 }
 
@@ -3414,9 +3451,12 @@ fn end_kilo_session(kill: bool) {
     if stdout != 0 {
         let _ = handle_close(Handle(stdout as u32));
     }
-    // Kilo leaves the terminal in raw mode's visual state; put the cursor somewhere sane
-    // and re-show it so the shell prompt that follows is readable.
-    debug_write(b"\x1b[?25h\r\n".as_ptr(), 8);
+    // Clear after every exit, including forced exits, before the caller redraws
+    // the shell prompt. No newline should move that prompt off row one. — KESTREL
+    debug_write(
+        sora::CONSOLE_SESSION_RESET.as_ptr(),
+        sora::CONSOLE_SESSION_RESET.len(),
+    );
 }
 
 /// Sora's serve port, published so a session started deep in the shell can bind its
@@ -3553,6 +3593,10 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
     KILO_PROCESS.store(child.process.map_or(0, |p| p.0 as u64), Ordering::Relaxed);
     KILO_STDIN_WRITE.store(child.stdin.0 as u64, Ordering::Relaxed);
     KILO_STDOUT_READ.store(child.stdout.0 as u64, Ordering::Relaxed);
+    debug_write(
+        sora::CONSOLE_SESSION_RESET.as_ptr(),
+        sora::CONSOLE_SESSION_RESET.len(),
+    );
     // The editor queries the window size and paints its first screen before reading a key,
     // so this relay both renders the opening frame and proves the child is serving.
     // Stdout was bound to the serve port before the child was admitted, so its first screen
@@ -4279,8 +4323,8 @@ fn dispatch_ttyd_key(
     // A line was submitted (Enter): the command (if any) has finished writing its output, so render
     // the next prompt. Command output ends in a newline, so the prompt lands on a fresh line; an
     // empty line just re-prompts after ttyd's CRLF echo. This is the loop that makes it a shell.
-    // A `lua` that opened a session skips this: the child already printed `lua> `.
-    if !lua_session_active() {
+    // An interactive program owns the screen until its session ends. — KESTREL
+    if !lua_session_active() && !kilo_session_active() {
         debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
     }
     true

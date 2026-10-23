@@ -1,8 +1,8 @@
-//j507
 //j512
 //j513
 //j514
 //j535
+//j557
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -1342,11 +1342,17 @@ impl Pal for Sys {
         }
         match fd_slot(fildes).map(|slot| *slot) {
             Some(FdSlot::Output(handle)) if handle != 0 => {
-                if channel_write_bytes(handle, buf) == 0 {
-                    Ok(buf.len())
-                } else {
-                    Err(Errno(EIO))
+                // A full-screen repaint can exceed ChannelWrite's 4096-byte
+                // bound. A successful message does not acknowledge the whole
+                // POSIX buffer; report only committed progress. — KESTREL
+                let mut written = 0;
+                for chunk in buf.chunks(4096) {
+                    if channel_write_bytes(handle, chunk) != 0 {
+                        return if written == 0 { Err(Errno(EIO)) } else { Ok(written) };
+                    }
+                    written += chunk.len();
                 }
+                Ok(written)
             }
             Some(FdSlot::File {
                 handle,

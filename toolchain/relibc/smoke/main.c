@@ -1,8 +1,8 @@
-/* j511 */
 /* j512 */
 /* j513 */
 /* j514 */
 /* j535 */
+/* j557 */
 /*
  * Every declaration below now comes from KUMO's own installed headers, generated from
  * relibc by the vendored cbindgen and installed into `target/kumo-sysroot`. Until J511
@@ -22,6 +22,34 @@
 #include <termios.h>
 #include <unistd.h>
 
+/* A populated screen fixture on Sora's RAM FAT volume, never on USB. It makes
+ * Kilo's actual repaint exceed one IPC message at 1600x900. — KESTREL */
+static int screen_fixture(void) {
+    struct winsize window;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) != 0 ||
+        window.ws_row < 3 || window.ws_row > 128 || window.ws_col < 20 || window.ws_col > 512) {
+        return 50;
+    }
+    FILE *stream = fopen("/J557.TXT", "w");
+    if (!stream) return 51;
+    char row[513];
+    size_t total = 0;
+    for (unsigned y = 0; y < window.ws_row - 2; ++y) {
+        memset(row, 'A' + y % 26, window.ws_col);
+        char label[24];
+        int len = snprintf(label, sizeof(label), "j557 row %02u ", y + 1);
+        memcpy(row, label, (size_t)len);
+        row[window.ws_col] = '\n';
+        size_t n = window.ws_col + 1;
+        if (fwrite(row, 1, n, stream) != n) return 52;
+        total += n;
+    }
+    if (fclose(stream) != 0) return 53;
+    printf("relibc: screen fixture /J557.TXT %ux%u %zu bytes\n",
+           window.ws_col, window.ws_row, total);
+    return 0;
+}
+
 /*
  * Thread-local storage, resolved through the local-exec model against `tpidr_el0`.
  * Without relibc's TLS activation this would not be addressable at all.
@@ -32,6 +60,7 @@ static __thread unsigned tls_counter;
 static unsigned image_counter;
 
 int main(int argc, char **argv, char **envp) {
+    if (argc > 1 && strcmp(argv[1], "screen") == 0) return screen_fixture();
     enum { ALLOCATION_BYTES = 384 * 1024, PAGE_BYTES = 4096 };
 
     /* argv reached C through KUMO's argv VMO, not through an inherited POSIX stack. */
