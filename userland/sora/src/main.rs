@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j549
 //j550
 //j551
 //j556
 //j557
+//j558
 
 extern crate alloc;
 
@@ -27,7 +27,7 @@ use kumo_rt::{
     STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
     STARTUP_TAG_TTY,
 };
-use kumoza::parse;
+use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
 use persona_posix::{FdTable, TtyRpc, TtyRpcTransport, TtyStream, STDIN_FILENO, STDOUT_FILENO};
 use svc_health::{Request as HealthRequest, Response as HealthResponse};
@@ -83,6 +83,12 @@ core::arch::global_asm!(
 
 fn log(msg: &[u8]) {
     kumo_rt::debug_write(msg.as_ptr(), msg.len());
+}
+
+fn write_shell_prompt(cwd: &WorkingDirectory) {
+    cwd.write_prompt(|bytes| {
+        let _ = sora::relay_console_output(bytes, |chunk| debug_write(chunk.as_ptr(), chunk.len()));
+    });
 }
 
 /// Log a `u64` as `0x…` hex on the live serial. `no_std` Sora has no formatter, so a
@@ -1874,6 +1880,8 @@ extern "C" fn sora_main(
         log(b"handle close: sora fail\n");
     }
 
+    let mut cwd = WorkingDirectory::default();
+
     // Autoexec (input-less): run the boot script shipped at `etc/autoexec` in the initrd —
     // one shell command per line, `#` comments and blanks skipped (`kumoza::autoexec_lines`).
     // Each line is parsed and dispatched through the SAME `eval_command` as interactive input,
@@ -1889,7 +1897,7 @@ extern "C" fn sora_main(
                 for line in kumoza::autoexec_lines(&manifest[..n]) {
                     if let Ok(ls) = core::str::from_utf8(line) {
                         if let Some(stmt) = parse(ls) {
-                            run_statement(&stmt, line, initrd, prog_initrd, root);
+                            run_statement(&stmt, line, initrd, prog_initrd, root, &mut cwd);
                         }
                     }
                 }
@@ -2128,7 +2136,7 @@ extern "C" fn sora_main(
         // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
         // without one there is no line editor to receive the command the prompt would solicit.
         if interactive_ttyd.is_some() {
-            debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+            write_shell_prompt(&cwd);
         }
         // `PortBind` replays an endpoint's current READABLE state, so keys queued before setup
         // arrive through the ordinary loop below. Do not probe the channel with blocking
@@ -2316,7 +2324,7 @@ extern "C" fn sora_main(
             {
                 let stdout = Handle(KILO_STDOUT_READ.load(Ordering::Relaxed) as u32);
                 if stdout.0 != 0 && !kilo_relay_paint(stdout) {
-                    debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+                    write_shell_prompt(&cwd);
                 }
                 continue;
             }
@@ -2337,7 +2345,7 @@ extern "C" fn sora_main(
                     // shell prompt returns.
                     for i in 0..n {
                         if !kilo_session_key(serve_buf[i]) {
-                            debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+                            write_shell_prompt(&cwd);
                             break;
                         }
                     }
@@ -2352,6 +2360,7 @@ extern "C" fn sora_main(
                             initrd,
                             prog_initrd,
                             root,
+                            &mut cwd,
                         );
                     }
                 }
@@ -2447,6 +2456,7 @@ fn run_statement(
     initrd: Handle,
     prog_initrd: u64,
     root: Handle,
+    cwd: &mut WorkingDirectory,
 ) {
     if stmt.pipeline.commands.len() > 1 {
         let msg = b"sora: pipelines not yet supported\n";
@@ -2454,7 +2464,7 @@ fn run_statement(
         return;
     }
     kumoza::evaluate(stmt, |cmd| {
-        eval_command(cmd, raw, initrd, prog_initrd, root)
+        eval_command(cmd, raw, initrd, prog_initrd, root, cwd)
     });
 }
 
@@ -2470,7 +2480,44 @@ fn eval_command(
     initrd: Handle,
     prog_initrd: u64,
     root: Handle,
+    cwd: &mut WorkingDirectory,
 ) -> bool {
+    if cmd.name == "pwd" {
+        if cmd.args.is_empty() {
+            log(cwd.path().as_bytes());
+            log(b"\n");
+        } else {
+            log(b"usage: pwd\n");
+        }
+        return true;
+    }
+    if cmd.name == "cd" {
+        if cmd.args.len() > 1 {
+            log(b"usage: cd [path]\n");
+        } else if let Err(error) = cwd
+            .change(cmd.args.first().map_or("/", |path| path.as_str()), |path| {
+                check_directory(initrd, path)
+            })
+        {
+            log_directory_error(b"cd", error);
+        }
+        return true;
+    }
+    let mut resolved;
+    let cmd = if matches!(cmd.name.as_str(), "cat" | "wc" | "kilo") && cmd.args.len() == 1 {
+        let path = match cwd.resolve(&cmd.args[0]) {
+            Ok(path) => path,
+            Err(error) => {
+                log_directory_error(cmd.name.as_bytes(), error);
+                return true;
+            }
+        };
+        resolved = cmd.clone();
+        resolved.args[0] = path;
+        &resolved
+    } else {
+        cmd
+    };
     if kumoza::write_builtin_output(cmd, |bytes| {
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
@@ -2577,20 +2624,16 @@ fn eval_command(
         // remains authority-free.
         if cmd.args.len() != 1 {
             debug_write(b"usage: cat <path>\n".as_ptr(), 18);
-        } else if run_on_media(initrd, b"cat", CAT_PATH, &[], cmd.args[0].as_bytes()) {
-            // J547: a `/media` path; served from the USB volume instead of the initrd.
+        } else if run_on_filesystem(initrd, b"cat", CAT_PATH, &[], cmd.args[0].as_bytes()) {
+            // The selected scratch or removable volume supplies the file.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"cat: no initrd handle\n".as_ptr(), 22);
         } else {
-            let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
-            let count = command_argv_slots(cmd, &mut slots);
-            run_with_startup(
-                initrd,
-                CAT_PATH.as_bytes(),
-                b"cat",
-                Some(&slots[..count]),
-                true,
-            );
+            let slots = [
+                b"cat".as_slice(),
+                cmd.args[0].trim_start_matches('/').as_bytes(),
+            ];
+            run_with_startup(initrd, CAT_PATH.as_bytes(), b"cat", Some(&slots), true);
         }
     } else if cmd.name == "wc" {
         // wc: like cat, granted stdout, its argv VMO, and the read-only initrd capability in
@@ -2601,15 +2644,11 @@ fn eval_command(
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"wc: no initrd handle\n".as_ptr(), 21);
         } else {
-            let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
-            let count = command_argv_slots(cmd, &mut slots);
-            run_with_startup(
-                initrd,
-                WC_PATH.as_bytes(),
-                b"wc",
-                Some(&slots[..count]),
-                true,
-            );
+            let slots = [
+                b"wc".as_slice(),
+                cmd.args[0].trim_start_matches('/').as_bytes(),
+            ];
+            run_with_startup(initrd, WC_PATH.as_bytes(), b"wc", Some(&slots), true);
         }
     } else if cmd.name == "ls" {
         // ls: one bootstrap channel is moved into x0. Its finite startup message carries
@@ -2617,25 +2656,39 @@ fn eval_command(
         // Parse once with the child's rules so routing grants the filesystem it will read.
         // — KESTREL
         let Some(options) = ls::Options::parse(cmd.args.iter().map(|arg| arg.as_bytes())) else {
-            log(b"usage: ls [-a] [path]\n");
+            log(b"usage: ls [-al] [--] [path]\n");
             return true;
         };
-        let all: [&[u8]; 1] = [b"-a"];
-        let flags: &[&[u8]] = if options.show_all { &all } else { &[] };
-        if run_on_media(initrd, b"ls", LS_PATH, flags, options.path) {
-            // J547: a `/media` path; listed from the USB volume instead of the initrd.
+        let path = match core::str::from_utf8(options.path)
+            .ok()
+            .and_then(|path| cwd.resolve(path).ok())
+        {
+            Some(path) => path,
+            None => {
+                log_directory_error(b"ls", DirectoryError::InvalidPath);
+                return true;
+            }
+        };
+        let flags: &[&[u8]] = match (options.show_all, options.long) {
+            (true, true) => &[b"-al"],
+            (true, false) => &[b"-a"],
+            (false, true) => &[b"-l"],
+            (false, false) => &[],
+        };
+        if run_on_filesystem(initrd, b"ls", LS_PATH, flags, path.as_bytes()) {
+            // The selected scratch or removable volume supplies the listing.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"ls: no initrd handle\n".as_ptr(), 20);
         } else {
-            let slots: [&[u8]; 2] = [b"ls", b"-a"];
-            let count = if options.show_all { 2 } else { 1 };
-            run_with_startup(
-                initrd,
-                LS_PATH.as_bytes(),
-                b"ls",
-                Some(&slots[..count]),
-                true,
-            );
+            let mut slots = alloc::vec![b"ls".as_slice()];
+            slots.extend_from_slice(flags);
+            slots.push(path.as_bytes());
+            run_with_startup(initrd, LS_PATH.as_bytes(), b"ls", Some(&slots), true);
+            if path == "/" {
+                for name in [b"media".as_slice(), b"tmp"] {
+                    ls::write_entry(options, name, ls::NodeKind::Directory, log);
+                }
+            }
         }
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
@@ -2788,24 +2841,29 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
     }
 }
 
-/// J547: run `program` (`ls` or `cat`, from `image`) on a `/media` path. The child is granted a
-/// private `fatfs` over the USB volume and the path from that volume's root, so it names files
-/// on the stick the way it names them anywhere: through the one filesystem it holds. Returns
-/// `false` for a path outside `/media`, which the caller serves from the initrd as before.
-/// — TIMBERDOODLE
-/// `flags` go to the child ahead of the path (J548). — KESTREL
-fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], path: &[u8]) -> bool {
+/// Grant the selected scratch or USB filesystem and a volume-relative path. Return false
+/// outside those mounts, where the caller instead grants the read-only initrd. — KESTREL
+fn run_on_filesystem(
+    initrd: Handle,
+    program: &[u8],
+    image: &str,
+    flags: &[&[u8]],
+    path: &[u8],
+) -> bool {
+    if let Some(path) = sora::scratch_path(path) {
+        run_on_volume(initrd, program, image, flags, path, FsGrant::Image);
+        return true;
+    }
     let (name, path) = match sora::media_route(path) {
         sora::MediaRoute::Elsewhere => return false,
         sora::MediaRoute::Root => {
             // `/media` is Sora's own namespace: the volumes it has mounted.
             match (program, media()) {
                 (b"ls", Some(media)) => {
-                    log(b"     <dir>  ");
-                    log(media.name.as_bytes());
-                    log(b"/\n");
+                    let options = ls::Options::parse(flags.iter().copied()).unwrap();
+                    ls::write_entry(options, media.name.as_bytes(), ls::NodeKind::Directory, log);
                 }
-                (b"ls", None) => log(b"ls: nothing is mounted under /media\n"),
+                (b"ls", None) => {}
                 _ => {
                     log(program);
                     log(b": /media: is a directory\n");
@@ -2822,9 +2880,31 @@ fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], pa
         log(b": no such volume\n");
         return true;
     }
-    let mut slots: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(flags.len() + 2);
+    run_on_volume(
+        initrd,
+        program,
+        image,
+        flags,
+        path,
+        FsGrant::Media(BlockAccess::ReadOnly),
+    );
+    true
+}
+
+fn run_on_volume(
+    initrd: Handle,
+    program: &[u8],
+    image: &str,
+    flags: &[&[u8]],
+    path: &[u8],
+    fs: FsGrant,
+) {
+    let mut slots: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(flags.len() + 3);
     slots.push(program);
     slots.extend_from_slice(flags);
+    if program == b"ls" {
+        slots.push(b"--");
+    }
     slots.push(path);
     run_with_startup_input(
         initrd,
@@ -2832,12 +2912,95 @@ fn run_on_media(initrd: Handle, program: &[u8], image: &str, flags: &[&[u8]], pa
         program,
         Some(&slots),
         false,
-        FsGrant::Media(BlockAccess::ReadOnly),
+        fs,
         false,
         false,
         StdinMode::None,
     );
-    true
+}
+
+fn log_directory_error(command: &[u8], error: DirectoryError) {
+    log(command);
+    log(match error {
+        DirectoryError::InvalidPath => b": invalid or too long path\n",
+        DirectoryError::NotFound => b": no such directory\n",
+        DirectoryError::NotDirectory => b": not a directory\n",
+        DirectoryError::Unavailable => b": filesystem unavailable\n",
+    });
+}
+
+/// Validate against the same granted namespace used by the file launchers. A failed probe
+/// leaves the shell's directory untouched, and closing its channel disposes the server.
+/// No directory state or pathname authority moves into the kernel. — KESTREL
+fn check_directory(initrd: Handle, path: &str) -> Result<(), DirectoryError> {
+    if let Some(path) = sora::scratch_path(path.as_bytes()) {
+        return check_volume_directory(spawn_fatfs(initrd), path);
+    }
+    match sora::media_route(path.as_bytes()) {
+        sora::MediaRoute::Root => return Ok(()),
+        sora::MediaRoute::Volume { name, path } => {
+            if !media().is_some_and(|volume| volume.name.as_bytes() == name) {
+                return Err(DirectoryError::NotFound);
+            }
+            return check_volume_directory(spawn_media_fatfs(initrd, BlockAccess::ReadOnly), path);
+        }
+        sora::MediaRoute::Elsewhere => {}
+    }
+    let mut table = [0u8; 2048];
+    if vmo_read(initrd, 0, table.as_mut_ptr(), kumo_abi::INITRD_HEADER_LEN) != 0 {
+        return Err(DirectoryError::Unavailable);
+    }
+    let len = kumo_abi::entry_table_bytes(&table[..kumo_abi::INITRD_HEADER_LEN])
+        .map_err(|_| DirectoryError::Unavailable)?;
+    if len > table.len() {
+        return Err(DirectoryError::Unavailable);
+    }
+    let mut offset = kumo_abi::INITRD_HEADER_LEN;
+    while offset < len {
+        let count = (len - offset).min(256);
+        if vmo_read(initrd, offset as u64, table[offset..].as_mut_ptr(), count) != 0 {
+            return Err(DirectoryError::Unavailable);
+        }
+        offset += count;
+    }
+    match ls::initrd_kind(path, kumo_abi::entries(&table[..len])) {
+        Some(ls::NodeKind::Directory) => Ok(()),
+        Some(ls::NodeKind::File(_)) => Err(DirectoryError::NotDirectory),
+        None => Err(DirectoryError::NotFound),
+    }
+}
+
+fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), DirectoryError> {
+    let fs = fs.ok_or(DirectoryError::Unavailable)?;
+    let mut request = [0u8; 7 + kumo_vfs::MAX_PATH];
+    let mut reply = [0u8; 1024];
+    let result = (|| {
+        let len = kumo_vfs::Request::ReadDir { path, start: 0 }
+            .encode_into(&mut request)
+            .ok_or(DirectoryError::InvalidPath)?;
+        if channel_write(fs, request.as_ptr(), len) != 0 {
+            return Err(DirectoryError::Unavailable);
+        }
+        let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
+        if n == 0 || n > reply.len() as u64 {
+            return Err(DirectoryError::Unavailable);
+        }
+        match kumo_vfs::parse_dir_reply(&reply[..n as usize]) {
+            Ok(_) => Ok(()),
+            Err(kumo_vfs::VfsError::Status(kumo_vfs::VFS_NOT_FOUND)) => {
+                Err(DirectoryError::NotFound)
+            }
+            Err(kumo_vfs::VfsError::Status(kumo_vfs::VFS_NOT_DIR)) => {
+                Err(DirectoryError::NotDirectory)
+            }
+            Err(_) => Err(DirectoryError::Unavailable),
+        }
+    })();
+    let _ = handle_close(fs);
+    // Pump the disposable probe's exit and its block peer's close notification before
+    // drawing the next prompt, just as ordinary synchronous launches do. — KESTREL
+    let _ = process_wait();
+    result
 }
 
 /// J545: start a `fatfs` instance over the registered stick and return its vfs client channel.
@@ -3553,25 +3716,37 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
     let count = command_argv_slots(cmd, &mut slots);
     let mut fs = FsGrant::Image;
     if let Some(path) = cmd.args.first() {
-        match sora::media_route(path.as_bytes()) {
-            sora::MediaRoute::Elsewhere => {}
-            sora::MediaRoute::Root | sora::MediaRoute::Volume { path: b"/", .. } => {
+        if let Some(path) = sora::scratch_path(path.as_bytes()) {
+            if path == b"/" {
                 log(b"kilo: is a directory\n");
                 return true;
             }
-            sora::MediaRoute::Volume { name, path } => {
-                let Some(volume) = media().filter(|volume| volume.name.as_bytes() == name) else {
-                    log(b"kilo: no such volume\n");
-                    return true;
-                };
-                if volume.ready.read_only {
-                    log(b"kilo: volume is read-only\n");
+            slots[1] = path;
+        } else {
+            match sora::media_route(path.as_bytes()) {
+                sora::MediaRoute::Elsewhere => {
+                    log(b"kilo: root filesystem is read-only; use /tmp or /media/<volume>\n");
                     return true;
                 }
-                // The editor sees only its granted volume and a path from that volume's root.
-                // — KESTREL
-                slots[1] = path;
-                fs = FsGrant::Media(BlockAccess::ReadWrite);
+                sora::MediaRoute::Root | sora::MediaRoute::Volume { path: b"/", .. } => {
+                    log(b"kilo: is a directory\n");
+                    return true;
+                }
+                sora::MediaRoute::Volume { name, path } => {
+                    let Some(volume) = media().filter(|volume| volume.name.as_bytes() == name)
+                    else {
+                        log(b"kilo: no such volume\n");
+                        return true;
+                    };
+                    if volume.ready.read_only {
+                        log(b"kilo: volume is read-only\n");
+                        return true;
+                    }
+                    // The editor sees only its granted volume and a path from that volume's root.
+                    // — KESTREL
+                    slots[1] = path;
+                    fs = FsGrant::Media(BlockAccess::ReadWrite);
+                }
             }
         }
     }
@@ -3638,12 +3813,6 @@ fn log_dec(mut v: u64) {
 
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
 const MAX_ARGV: usize = 16;
-
-/// Interactive shell prompt for the framebuffer `ttyd` session. Matches the kernel serial shell's
-/// `[MUREX>` identity so both consoles read as one shell. Emitted once when the serve loop is ready to
-/// accept input, and again after every submitted line, so the console always invites the next command
-/// rather than sitting on a bare echo. — CORVUS
-const SHELL_PROMPT: &[u8] = b"[MUREX> ";
 
 /// Pack `slots` (each element one argv entry, `slots[0]` = program name) into the shared scratch
 /// VMO and mint a one-shot read+transfer handle suitable for a bootstrap startup message; returns
@@ -4286,6 +4455,7 @@ fn dispatch_ttyd_key(
     initrd: Handle,
     prog_initrd: u64,
     root: Handle,
+    cwd: &mut WorkingDirectory,
 ) -> bool {
     let Some(n) = ttyd_request_reply(tty, TtyRequest::input(byte), reply) else {
         log(b"ttyd: interactive input fail\n");
@@ -4312,12 +4482,12 @@ fn dispatch_ttyd_key(
         if lua_session_submit(line) {
             return true;
         }
-        debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+        write_shell_prompt(cwd);
         return true;
     }
     if let Ok(ls) = core::str::from_utf8(line) {
         if let Some(stmt) = parse(ls) {
-            run_statement(&stmt, line, initrd, prog_initrd, root);
+            run_statement(&stmt, line, initrd, prog_initrd, root, cwd);
         }
     }
     // A line was submitted (Enter): the command (if any) has finished writing its output, so render
@@ -4325,7 +4495,7 @@ fn dispatch_ttyd_key(
     // empty line just re-prompts after ttyd's CRLF echo. This is the loop that makes it a shell.
     // An interactive program owns the screen until its session ends. — KESTREL
     if !lua_session_active() && !kilo_session_active() {
-        debug_write(SHELL_PROMPT.as_ptr(), SHELL_PROMPT.len());
+        write_shell_prompt(cwd);
     }
     true
 }

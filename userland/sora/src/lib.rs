@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j389
 //j545
 //j547
 //j551
 //j557
+//j558
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -305,8 +305,7 @@ pub enum MediaRoute<'a> {
     Volume { name: &'a [u8], path: &'a [u8] },
 }
 
-/// Split a shell path into its `/media` route. Only absolute paths reach `/media`; the shell
-/// has no working directory yet.
+/// Split a canonical absolute shell path into its `/media` route.
 pub fn media_route(path: &[u8]) -> MediaRoute<'_> {
     let Some(rest) = path.strip_prefix(b"/media") else {
         return MediaRoute::Elsewhere;
@@ -327,6 +326,16 @@ pub fn media_route(path: &[u8]) -> MediaRoute<'_> {
             name: &rest[..slash],
             path: &rest[slash..],
         },
+    }
+}
+
+/// The boot-local writable FAT scratch volume is visible at `/tmp`, separate from the
+/// read-only initrd root. Only a whole mount component selects its capability. — KESTREL
+pub fn scratch_path(path: &[u8]) -> Option<&[u8]> {
+    match path.strip_prefix(b"/tmp")? {
+        b"" => Some(b"/"),
+        rest if rest.starts_with(b"/") => Some(rest),
+        _ => None,
     }
 }
 
@@ -545,13 +554,14 @@ mod tests {
             console.write(CONSOLE_SESSION_RESET);
             console.write(b"\x1b[?25l");
             assert!(actual.pixels().iter().all(|&p| p == BG));
-            console.write(b"\x1b[?25h[MUREX> ");
+            console.write(b"\x1b[?25h");
+            kumoza::WorkingDirectory::default().write_prompt(|bytes| console.write(bytes));
             assert!(actual.pixels()[..width * GLYPH_H].iter().any(|&p| p != BG));
             assert!(actual.pixels()[width * GLYPH_H..].iter().all(|&p| p == BG));
 
             let expected = TestFramebuffer::new(width * height);
             let mut reference = unsafe { Console::new(expected.pixels, width, height, width) };
-            reference.write(b"\x1b[?25h[MUREX> ");
+            reference.write(b"\x1b[?25h[MUREX /]> ");
             assert!(actual.pixels().iter().eq(expected.pixels()));
         }
     }
@@ -835,6 +845,33 @@ mod tests {
         assert_eq!(media_route(b"/mediafoo"), MediaRoute::Elsewhere);
         assert_eq!(media_route(b"media/KUMO"), MediaRoute::Elsewhere);
         assert_eq!(media_route(b""), MediaRoute::Elsewhere);
+    }
+
+    #[test]
+    fn scratch_mount_and_relative_paths_stay_in_the_canonical_namespace() {
+        assert_eq!(scratch_path(b"/tmp"), Some(b"/".as_slice()));
+        assert_eq!(
+            scratch_path(b"/tmp/HELLO.TXT"),
+            Some(b"/HELLO.TXT".as_slice())
+        );
+        assert_eq!(scratch_path(b"/tmp-other"), None);
+        assert_eq!(scratch_path(b"tmp"), None);
+        let mut cwd = kumoza::WorkingDirectory::default();
+        cwd.change("/media/KUMO", |_| Ok(())).unwrap();
+        let path = cwd.resolve("LOREM_JP.TXT").unwrap();
+        assert_eq!(
+            media_route(path.as_bytes()),
+            MediaRoute::Volume {
+                name: b"KUMO",
+                path: b"/LOREM_JP.TXT",
+            }
+        );
+        let scratch = cwd.resolve("../../tmp/HELLO.TXT").unwrap();
+        assert_eq!(
+            scratch_path(scratch.as_bytes()),
+            Some(b"/HELLO.TXT".as_slice())
+        );
+        assert_eq!(media_route(scratch.as_bytes()), MediaRoute::Elsewhere);
     }
 
     #[test]

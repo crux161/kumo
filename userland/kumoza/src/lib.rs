@@ -1,12 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j493
-//j506
 //j507
 //j517
 //j535
 //j553
+//j558
 
 extern crate alloc;
 
@@ -18,6 +17,86 @@ use alloc::vec::Vec;
 pub struct Command {
     pub name: String,
     pub args: Vec<String>,
+}
+
+/// Session-local logical directory. Paths select already granted namespaces; they never
+/// confer filesystem authority. Keep this state above the restartable line editor. — KESTREL
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkingDirectory(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryError {
+    InvalidPath,
+    NotFound,
+    NotDirectory,
+    Unavailable,
+}
+
+impl Default for WorkingDirectory {
+    fn default() -> Self {
+        Self(String::from("/"))
+    }
+}
+
+impl WorkingDirectory {
+    pub fn path(&self) -> &str {
+        &self.0
+    }
+
+    /// Logical `.`/`..` resolution, clamped at root. Reject control bytes so a pathname
+    /// cannot become terminal instructions when the prompt displays it. — KESTREL
+    pub fn resolve(&self, path: &str) -> Result<String, DirectoryError> {
+        if path.is_empty() || path.chars().any(char::is_control) {
+            return Err(DirectoryError::InvalidPath);
+        }
+        let mut result = if path.starts_with('/') {
+            String::new()
+        } else {
+            self.0.clone()
+        };
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => result.truncate(result.rfind('/').unwrap_or(0)),
+                name => {
+                    if result != "/" {
+                        result.push('/');
+                    }
+                    result.push_str(name);
+                }
+            }
+        }
+        if result.is_empty() {
+            result.push('/');
+        }
+        if result.len() > 255 {
+            return Err(DirectoryError::InvalidPath);
+        }
+        Ok(result)
+    }
+
+    /// Commit only after the namespace owner confirms the destination is a directory.
+    pub fn change(
+        &mut self,
+        path: &str,
+        validate: impl FnOnce(&str) -> Result<(), DirectoryError>,
+    ) -> Result<(), DirectoryError> {
+        let destination = self.resolve(path)?;
+        validate(&destination)?;
+        self.0 = destination;
+        Ok(())
+    }
+
+    pub fn write_prompt(&self, mut write: impl FnMut(&[u8])) {
+        let mut prompt = [0u8; 265];
+        let path_end = 7 + self.0.len();
+        prompt[..7].copy_from_slice(b"[MUREX ");
+        prompt[7..path_end].copy_from_slice(self.0.as_bytes());
+        prompt[path_end..path_end + 3].copy_from_slice(b"]> ");
+        // One ordinary prompt is one console write, so driver diagnostics cannot split
+        // its identity from its directory between syscall entries. — KESTREL
+        write(&prompt[..path_end + 3]);
+    }
 }
 
 /// A pipeline: `cmd1 | cmd2 | cmd3`.
@@ -50,10 +129,10 @@ pub struct Statement {
 
 /// Help text for the current Kumoza builtin scaffold.
 pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
-    builtins: cat <path>, clear, echo [-n], false, help, ls, lua [expr], run <program>,\n\
-              true, wc <path>\n\
+    builtins: cat <path>, cd [path], clear, echo [-n], false, help, ls [-al] [path],\n\
+              lua [expr], pwd, run <program>, true, wc <path>\n\
     power: halt, reboot, shutdown\n\
-    editor: kilo <path>\n\
+    editor: kilo /tmp/<file> or /media/<volume>/<file> (relative paths use cwd)\n\
     diag: heap, ipcstat, relibc [args], threads\n\
     other commands run via kernel shell\n";
 
@@ -373,6 +452,57 @@ pub fn write_builtin_output(cmd: &Command, mut write: impl FnMut(&[u8])) -> bool
 mod tests {
     use super::*;
     extern crate std;
+
+    #[test]
+    fn directory_navigation_resolves_paths_and_preserves_cwd_on_failure() {
+        let mut cwd = WorkingDirectory::default();
+        assert_eq!(cwd.path(), "/");
+        cwd.change("/media/KUMO/Boot Files", |_| Ok(())).unwrap();
+        assert_eq!(
+            cwd.resolve("./日本語.txt").unwrap(),
+            "/media/KUMO/Boot Files/日本語.txt"
+        );
+        assert_eq!(cwd.resolve("../file.txt").unwrap(), "/media/KUMO/file.txt");
+        assert_eq!(cwd.resolve("////etc//./autoexec").unwrap(), "/etc/autoexec");
+        assert_eq!(cwd.resolve("../../../../..").unwrap(), "/");
+        for error in [
+            DirectoryError::NotFound,
+            DirectoryError::NotDirectory,
+            DirectoryError::Unavailable,
+        ] {
+            assert_eq!(cwd.change("missing", |_| Err(error)), Err(error));
+            assert_eq!(cwd.path(), "/media/KUMO/Boot Files");
+        }
+        let mut prompt = Vec::new();
+        let mut writes = 0;
+        cwd.write_prompt(|bytes| {
+            writes += 1;
+            prompt.extend_from_slice(bytes);
+        });
+        assert_eq!(writes, 1);
+        assert_eq!(prompt, b"[MUREX /media/KUMO/Boot Files]> ");
+        cwd.change("..", |_| Ok(())).unwrap();
+        assert_eq!(cwd.path(), "/media/KUMO");
+    }
+
+    #[test]
+    fn directory_paths_reject_empty_control_and_oversized_names() {
+        let cwd = WorkingDirectory::default();
+        for path in ["", "a\0b", "a\x1b[2J", "a\nb", "a\u{7f}b"] {
+            assert_eq!(cwd.resolve(path), Err(DirectoryError::InvalidPath));
+        }
+        assert_eq!(
+            cwd.resolve(&"x".repeat(255)),
+            Err(DirectoryError::InvalidPath)
+        );
+        assert_eq!(cwd.resolve(&"x".repeat(254)).unwrap().len(), 255);
+        let mut longest = cwd;
+        longest.change(&"x".repeat(254), |_| Ok(())).unwrap();
+        let mut prompt = Vec::new();
+        longest.write_prompt(|bytes| prompt.extend_from_slice(bytes));
+        assert_eq!(prompt.len(), 265);
+        assert!(prompt.ends_with(b"]> "));
+    }
 
     #[test]
     fn tokenize_empty_line() {

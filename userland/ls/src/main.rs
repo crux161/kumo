@@ -2,16 +2,16 @@
 #![no_main]
 //j547
 //j548
+//j558
 
 //! `ls` — the first KUMO program that *uses a capability*.
 //!
 //! Where `hello` only writes and exits, `ls` receives one bootstrap channel in `x0`.
 //! Its startup message carries a **read-only initrd VMO** and stdout channel as explicit
 //! transferred capabilities. The initrd grant is least privilege: `ls` can read the
-//! image but not write it. It reads the initrd header + entry table and writes each path
-//! to stdout, so a `bin/<name>` entry is visibly runnable via `run <name>`, with its
-//! payload size (an `ls -l`-style listing). The parsing is `kumo_abi::entries`, shared
-//! with the host tests.
+//! image but not write it. It reads the initrd header + entry table and lists immediate
+//! children of the requested directory. Names are short by default; `-l` includes sizes.
+//! The parsing is `kumo_abi::entries`, shared with the host tests.
 //!
 //! `VmoRead` is capped at 256 bytes/call (kernel `usermode.rs`), so the table is read
 //! in 256-byte chunks — the same reason the loaders chunk. `ls` reads the header first,
@@ -20,32 +20,17 @@
 //! the listing.
 //!
 //! J547: when Sora grants a filesystem instead (`ls /media/<name>[/dir]`), `ls` lists the
-//! directory its argument names on that filesystem, through `kumo-vfs`, in the same columns.
+//! directory its argument names on that filesystem through `kumo-vfs`. J558 also mounts
+//! the boot-local RAM FAT at `/tmp` using this same filesystem grant.
 //! J548: names come back long, and those starting with `.` are hidden unless `-a` is given,
 //! as `ls` does elsewhere.
 
 use kumo_abi::{entries, entry_table_bytes, unpack_argv, Handle, INITRD_HEADER_LEN};
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 use kumo_vfs::{parse_dir_reply, Request, VfsError, MAX_PATH, VFS_NOT_DIR, VFS_NOT_FOUND};
-use ls::Options;
+use ls::{NodeKind, Options};
 
 kumo_rt::entry!(main);
-
-/// Right-align `value`'s decimal digits into `field`, space-padded on the left. `field`
-/// must already be space-filled; an oversized value keeps its low digits (the field is
-/// wide enough for any real initrd entry size).
-fn fmt_dec_right(value: u64, field: &mut [u8]) {
-    let mut v = value;
-    let mut i = field.len();
-    loop {
-        i -= 1;
-        field[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 || i == 0 {
-            break;
-        }
-    }
-}
 
 /// Write ordinary program output through the capability supplied by the shell. Keep
 /// `debug_write` only as a diagnostic fallback for direct/legacy launches that provide
@@ -64,8 +49,8 @@ fn fail(message: &[u8]) -> ! {
 }
 
 /// J547: list `options.path` on the filesystem behind `fs`, a `kumo-vfs` channel, page by
-/// page until the server answers with no more entries. Files show their size and directories
-/// `<dir>` and a trailing `/`. Dot-files are skipped unless `options.show_all` (J548).
+/// page until the server answers with no more entries. Directories have a trailing `/`;
+/// `-l` adds sizes or `<dir>`. Dot-files are skipped unless `options.show_all` (J548).
 fn list_volume(fs: Handle, stdout: Handle, options: Options<'_>) -> ! {
     let mut request = [0u8; 7 + MAX_PATH];
     // Room for a whole `fatfs` directory page (1024 bytes since J548's long names).
@@ -96,19 +81,12 @@ fn list_volume(fs: Handle, stdout: Handle, options: Options<'_>) -> ! {
             process_exit(0);
         }
         for record in records {
-            if !options.includes(record.name) {
-                continue;
-            }
-            let mut column = [b' '; 10];
-            if record.is_dir {
-                column[5..].copy_from_slice(b"<dir>");
+            let kind = if record.is_dir {
+                NodeKind::Directory
             } else {
-                fmt_dec_right(record.size, &mut column);
-            }
-            emit(stdout, &column);
-            emit(stdout, b"  ");
-            emit(stdout, record.name);
-            emit(stdout, if record.is_dir { b"/\n" } else { b"\n" });
+                NodeKind::File(record.size)
+            };
+            ls::write_entry(options, record.name, kind, |bytes| emit(stdout, bytes));
         }
         start += count as u32;
     }
@@ -133,7 +111,7 @@ extern "C" fn main(
         }
     }
     let Some(options) = Options::parse(unpack_argv(&argv_buf).skip(1)) else {
-        fail(b"usage: ls [-a] [path]\n");
+        fail(b"usage: ls [-al] [--] [path]\n");
     };
     if let Some(fs) = startup.fs {
         list_volume(fs, startup.stdout.unwrap_or(Handle(0)), options);
@@ -181,17 +159,17 @@ extern "C" fn main(
         filled += chunk;
     }
 
-    // `<size right-aligned in 10>  <path>` per entry — an ls -l-style listing.
-    for (path, size) in entries(&table[..table_len]) {
-        if !options.includes(path.as_bytes()) {
-            continue;
-        }
-        let mut sizebuf = [b' '; 10];
-        fmt_dec_right(size, &mut sizebuf);
-        emit(stdout, &sizebuf);
-        emit(stdout, b"  ");
-        emit(stdout, path.as_bytes());
-        emit(stdout, b"\n");
+    let Ok(path) = core::str::from_utf8(options.path) else {
+        fail(b"ls: invalid path\n");
+    };
+    if !ls::list_initrd(
+        path,
+        || entries(&table[..table_len]),
+        |name, kind| {
+            ls::write_entry(options, name.as_bytes(), kind, |bytes| emit(stdout, bytes));
+        },
+    ) {
+        fail(b"ls: no such path\n");
     }
     process_exit(0)
 }

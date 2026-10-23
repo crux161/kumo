@@ -1,6 +1,7 @@
 #j426
 #j548
 #j551
+#j558
 
 [package]
 name = "sora"
@@ -16,6 +17,7 @@ kumo-abi.workspace = true
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }
 kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
 kumo-ipc.workspace = true
+kumo-vfs = { path = "../../lib/kumo-vfs" }
 kumo-rt = { path = "../kumo-rt" }
 kumo-xhci = { path = "../../lib/kumo-xhci" }
 kumoza = { path = "../kumoza" }
