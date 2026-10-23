@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j545
 //j547
 //j551
 //j557
 //j558
+//j559
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -431,6 +431,31 @@ pub fn select_i2c_hid_optional_probe_candidates(
 
 pub fn select_i2c_hid_optional_attention_irq(discovery: &I2cHidRuntimeTopology) -> Option<u32> {
     select_i2c_hid_optional_probe_candidates(discovery).shared_attention_irq()
+}
+
+/// The kernel log levels by name, most urgent first, as `dmesg -n` takes them (J559).
+const LOG_LEVEL_NAMES: [&[u8]; 8] = [
+    b"emerg", b"alert", b"crit", b"err", b"warn", b"notice", b"info", b"debug",
+];
+
+/// `dmesg -n`'s argument: a digit 0-7 or a level name (`warning` is accepted for `warn`).
+pub fn parse_log_level(text: &[u8]) -> Option<u8> {
+    match text {
+        [digit @ b'0'..=b'7'] => Some(digit - b'0'),
+        b"warning" => Some(4),
+        _ => LOG_LEVEL_NAMES
+            .iter()
+            .position(|name| *name == text)
+            .map(|level| level as u8),
+    }
+}
+
+/// The name `dmesg -n` reports for a console level the kernel returned.
+pub fn log_level_name(level: u64) -> Option<&'static [u8]> {
+    usize::try_from(level)
+        .ok()
+        .and_then(|level| LOG_LEVEL_NAMES.get(level))
+        .copied()
 }
 
 /// The text cell drv-fb draws: 8x16 pixels (`drv_fb::GLYPH_W`/`GLYPH_H`, pinned by a test).
@@ -883,5 +908,26 @@ mod tests {
         assert_eq!(window(640, 480), Some((30, 80)));
         assert_eq!(window(7, 900), None);
         assert_eq!(window(u32::MAX, 900), None);
+    }
+
+    #[test]
+    fn dmesg_levels_read_as_digits_or_names() {
+        assert_eq!(parse_log_level(b"0"), Some(0));
+        assert_eq!(parse_log_level(b"7"), Some(7));
+        assert_eq!(parse_log_level(b"notice"), Some(5));
+        assert_eq!(parse_log_level(b"warning"), Some(4));
+        assert_eq!(parse_log_level(b"debug"), Some(7));
+        for bad in [b"8".as_slice(), b"", b"loud", b"77"] {
+            assert_eq!(parse_log_level(bad), None);
+        }
+        assert_eq!(log_level_name(5), Some(b"notice".as_slice()));
+        assert_eq!(log_level_name(8), None);
+        assert_eq!(log_level_name(u64::MAX), None);
+        for level in 0..8u8 {
+            assert_eq!(
+                parse_log_level(log_level_name(level.into()).unwrap()),
+                Some(level)
+            );
+        }
     }
 }

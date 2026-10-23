@@ -2,6 +2,7 @@
 //j508
 //j512
 //j556
+//j559
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -646,6 +647,66 @@ pub fn process_run(
     _flags: u64,
 ) -> u64 {
     u64::MAX
+}
+
+/// Keep a diagnostic in the kernel log at `level` (`kumo_abi::sys::log_level`), J559. The console
+/// shows it only while its level allows; `dmesg` always can. `debug_write` stays the call for
+/// terminal output. Returns the bytes kept (at most 256 a call), or `u64::MAX`.
+pub fn log_write(level: u8, bytes: &[u8]) -> u64 {
+    let len = bytes.len().min(256);
+    syscall(
+        Syscall::LogWrite,
+        u64::from(level),
+        bytes.as_ptr() as u64,
+        len as u64,
+        0,
+    )
+}
+
+/// Read the kernel log from byte `offset` into `buf`, holding `resource` with `MANAGE` (J559).
+/// Returns the bytes copied (`u64::MAX` when refused) and the offset to read from next.
+#[cfg(target_arch = "aarch64")]
+pub fn log_read(resource: Handle, offset: u64, buf: &mut [u8]) -> (u64, u64) {
+    let copied: u64;
+    let next: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::LogRead as u64,
+            inlateout("x0") resource.0 as u64 => copied,
+            inlateout("x1") offset => next,
+            in("x2") buf.as_mut_ptr() as u64,
+            in("x3") buf.len() as u64,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (copied, next)
+}
+
+/// Without a second return register here, the next offset is assumed to follow on directly; a
+/// ring that wrapped past `offset` is read again from its oldest line instead of skipped to.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn log_read(resource: Handle, offset: u64, buf: &mut [u8]) -> (u64, u64) {
+    let copied = syscall(
+        Syscall::LogRead,
+        resource.0 as u64,
+        offset,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    let next = if copied == u64::MAX {
+        offset
+    } else {
+        offset + copied
+    };
+    (copied, next)
+}
+
+/// Set the console log level (0-7), or with `kumo_abi::sys::LOG_LEVEL_QUERY` only report it.
+/// Returns the previous level, or `u64::MAX` when refused. Needs `resource` with `MANAGE`.
+pub fn log_level(resource: Handle, level: u64) -> u64 {
+    syscall(Syscall::LogLevel, resource.0 as u64, level, 0, 0)
 }
 
 /// End a process this caller manages (J556). Needs `MANAGE` on `process`, which the handle

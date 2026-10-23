@@ -1,15 +1,15 @@
 #![no_std]
 #![no_main]
 
-//j550
 //j551
 //j556
 //j557
 //j558
+//j559
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
@@ -20,7 +20,7 @@ use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
-    channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
+    channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
     thread_create, thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write,
@@ -82,8 +82,101 @@ core::arch::global_asm!(
 );
 
 fn log(msg: &[u8]) {
-    kumo_rt::debug_write(msg.as_ptr(), msg.len());
+    debug_write(msg.as_ptr(), msg.len());
 }
+
+/// Set when the serve loop is about to draw its first prompt (J559). Until then everything Sora
+/// prints is a boot record: its own diagnostics and the output of autoexec's smoke programs go
+/// to the kernel log, where `dmesg` shows them, instead of across the console. From then on
+/// `debug_write` is the terminal again, and serve-loop diagnostics say so with [`diag`].
+/// — TIMBERDOODLE
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// Sora's console write: the kernel log while booting, the terminal once serving.
+fn debug_write(ptr: *const u8, len: usize) -> u64 {
+    if SERVING.load(Ordering::Relaxed) {
+        kumo_rt::debug_write(ptr, len)
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        kumo_rt::log_write(kumo_abi::sys::log_level::INFO, bytes)
+    }
+}
+
+/// A boot milestone: one short line the console's default level shows, written in one call so
+/// no other source can land inside it (J559).
+fn notice(parts: &[&[u8]]) {
+    let mut line = alloc::vec::Vec::new();
+    for part in parts {
+        line.extend_from_slice(part);
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line);
+}
+
+/// The longest the first prompt waits for boot to settle (J559). The opi5's USB keyboard and
+/// stick finish enumerating about 1.5 s after the serve loop starts; their milestone lines belong
+/// above the prompt, not after it.
+const BOOT_SETTLE_NS: u64 = 3_000_000_000;
+
+/// Arm the first-prompt timer on `port`; `None` when no timer could be bound.
+fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
+    let raw = timer_create(BOOT_SETTLE_NS);
+    if raw == u64::MAX {
+        return None;
+    }
+    let timer = Handle(raw as u32);
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return None;
+    }
+    Some((timer, Handle(koid as u32)))
+}
+
+/// Draw the first prompt now if it is still waiting: boot has settled.
+fn settle_first_prompt(
+    pending: &mut Option<(Handle, Handle)>,
+    port: Handle,
+    cwd: &WorkingDirectory,
+    reason: &[u8],
+) {
+    if let Some((timer, _)) = pending.take() {
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        diag(b"sora: boot settled by ");
+        diag(reason);
+        diag(b"\n");
+        write_shell_prompt(cwd);
+    }
+}
+
+/// A diagnostic from the serve loop: kernel log only, at INFO.
+fn diag(msg: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, msg);
+}
+
+fn diag_hex(v: u64) {
+    let mut buf = [0u8; 18];
+    buf[..2].copy_from_slice(b"0x");
+    let mut digits = [0u8; 16];
+    let mut n = 0;
+    let mut v = v;
+    loop {
+        let d = (v & 0xf) as u8;
+        digits[n] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        n += 1;
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        buf[2 + i] = digits[n - 1 - i];
+    }
+    diag(&buf[..2 + n]);
+}
+
+/// The root resource, kept for `dmesg`: reading the kernel log takes MANAGE (J559).
+static ROOT_RESOURCE: AtomicU64 = AtomicU64::new(0);
 
 fn write_shell_prompt(cwd: &WorkingDirectory) {
     cwd.write_prompt(|bytes| {
@@ -128,14 +221,14 @@ fn log_fb_geometry(fb: &Framebuffer) {
 }
 
 fn log_process_koid(name: &[u8], process: Handle) {
-    log(name);
-    log(b": proc koid=");
+    diag(name);
+    diag(b": proc koid=");
     let koid = handle_koid(process);
     if koid == u64::MAX {
-        log(b"fail\n");
+        diag(b"fail\n");
     } else {
-        log_hex(koid);
-        log(b"\n");
+        diag_hex(koid);
+        diag(b"\n");
     }
 }
 
@@ -808,6 +901,7 @@ extern "C" fn sora_main(
     let initrd = Handle(initrd_vmo as u32);
     let block = Handle(block_handle as u32);
     let res = Handle(resource_handle as u32);
+    ROOT_RESOURCE.store(res.0 as u64, Ordering::Relaxed);
     let net = Handle(net_handle as u32);
     let kbd = Handle(kbd_handle as u32);
     let mut hid_keyboard_input: Option<Handle> = None;
@@ -822,6 +916,7 @@ extern "C" fn sora_main(
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
+    notice(&[b"sora: supervisor online\n"]);
 
     // Read the kernel's boot message from the root channel.
     let mut buf = [0u8; 64];
@@ -2132,11 +2227,18 @@ extern "C" fn sora_main(
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
 
         log(b"sora: entering serve loop\n");
+        SERVING.store(true, Ordering::Relaxed);
         // First light of the interactive shell: render the prompt once so the settled framebuffer
         // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
         // without one there is no line editor to receive the command the prompt would solicit.
+        // It waits for boot to settle (J559): the stick mounting, a key, or `BOOT_SETTLE_NS`.
+        let mut first_prompt = None;
         if interactive_ttyd.is_some() {
-            write_shell_prompt(&cwd);
+            first_prompt = arm_first_prompt(port);
+            if first_prompt.is_none() {
+                diag(b"sora: no settle timer; prompt now\n");
+                write_shell_prompt(&cwd);
+            }
         }
         // `PortBind` replays an endpoint's current READABLE state, so keys queued before setup
         // arrive through the ordinary loop below. Do not probe the channel with blocking
@@ -2145,7 +2247,13 @@ extern "C" fn sora_main(
         loop {
             let source = Handle(port_wait(port) as u32);
             if let Some(index) = storage_koids.iter().position(|koid| *koid == Some(source)) {
-                media_offered(initrd, port, index, &mut storage_koids);
+                if media_offered(initrd, port, index, &mut storage_koids) {
+                    settle_first_prompt(&mut first_prompt, port, &cwd, b"media");
+                }
+                continue;
+            }
+            if first_prompt.map(|(_, koid)| koid) == Some(source) {
+                settle_first_prompt(&mut first_prompt, port, &cwd, b"timeout");
                 continue;
             }
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
@@ -2301,19 +2409,19 @@ extern "C" fn sora_main(
                             pointer_state.apply_boot_mouse(report);
                             if mouse_events_seen <= 8 {
                                 let position = pointer_state.position();
-                                log(b"sora: mouse pointer x=");
-                                log_hex(position.x as u64);
-                                log(b" y=");
-                                log_hex(position.y as u64);
-                                log(b" buttons=");
-                                log_hex(pointer_state.buttons() as u64);
-                                log(b"\n");
+                                diag(b"sora: mouse pointer x=");
+                                diag_hex(position.x as u64);
+                                diag(b" y=");
+                                diag_hex(position.y as u64);
+                                diag(b" buttons=");
+                                diag_hex(pointer_state.buttons() as u64);
+                                diag(b"\n");
                             }
                         }
                     } else if n > 0 {
                         malformed_mouse_events_seen = malformed_mouse_events_seen.saturating_add(1);
                         if malformed_mouse_events_seen <= 8 {
-                            log(b"sora: mouse event malformed\n");
+                            diag(b"sora: mouse event malformed\n");
                         }
                     }
                 }
@@ -2339,6 +2447,11 @@ extern "C" fn sora_main(
                     }
                 };
                 let n = channel_read(input, serve_buf.as_mut_ptr(), 256) as usize;
+                // Binding replays the channel's state, so the first packet can carry no key:
+                // only bytes settle the boot (J559).
+                if n > 0 {
+                    settle_first_prompt(&mut first_prompt, port, &cwd, b"a key");
+                }
                 if n > 0 && kilo_session_active() {
                     // A full-screen editor owns the keyboard while it runs: each byte goes
                     // straight through, unedited and unechoed. When the session ends the
@@ -2482,6 +2595,10 @@ fn eval_command(
     root: Handle,
     cwd: &mut WorkingDirectory,
 ) -> bool {
+    if cmd.name == "dmesg" {
+        dmesg(cmd);
+        return true;
+    }
     if cmd.name == "pwd" {
         if cmd.args.is_empty() {
             log(cwd.path().as_bytes());
@@ -2796,7 +2913,13 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
 
 /// J545: a storage control channel woke the serve loop: its driver offered a stick's volume, or
 /// the driver is gone and its volume with it.
-fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option<Handle>; 3]) {
+/// Returns whether a volume was mounted: a closed or empty control channel is a driver leaving.
+fn media_offered(
+    initrd: Handle,
+    port: Handle,
+    index: usize,
+    koids: &mut [Option<Handle>; 3],
+) -> bool {
     let control = Handle(XHCI_STORAGE_CONTROLS[index].load(Ordering::Relaxed));
     let mut frame = [0u8; drv_blk::MEDIA_READY_LEN];
     let n = channel_read(control, frame.as_mut_ptr(), frame.len());
@@ -2807,10 +2930,11 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
             set_media(None);
             log(b"media: driver gone; volume removed\n");
         }
-        return;
+        return false;
     }
     let Some(ready) = drv_blk::MediaReady::decode(&frame[..n as usize]) else {
-        return log(b"media: bad offer\n");
+        log(b"media: bad offer\n");
+        return false;
     };
     let name = sora::MediaName::new(ready.label, ready.serial);
     set_media(Some(Media {
@@ -2818,27 +2942,37 @@ fn media_offered(initrd: Handle, port: Handle, index: usize, koids: &mut [Option
         ready,
         control,
     }));
-    log(b"media: /media/");
-    log(name.as_bytes());
-    log(b" usb fat32 blocks=");
-    log_hex(ready.block_count);
-    log(b" serial=");
-    log(sora::MediaName::new(None, ready.serial).as_bytes());
-    log(if ready.read_only {
+    diag(b"media: /media/");
+    diag(name.as_bytes());
+    diag(b" usb fat32 blocks=");
+    diag_hex(ready.block_count);
+    diag(b" serial=");
+    diag(sora::MediaName::new(None, ready.serial).as_bytes());
+    diag(if ready.read_only {
         b" read-only\n" as &[u8]
     } else {
         b"\n"
     });
+    notice(&[
+        b"media: /media/",
+        name.as_bytes(),
+        if ready.read_only {
+            b" mounted (fat32, read-only)\n" as &[u8]
+        } else {
+            b" mounted (fat32)\n"
+        },
+    ]);
     // J545's end-to-end check: mount the volume once through a block-backed `fatfs`, then let
     // that instance go. Its mount crosses every new hop (Sora's connect, the driver's resident
     // loop, the block protocol), and its exit returns the driver's client slot. — TIMBERDOODLE
     match spawn_media_fatfs(initrd, BlockAccess::ReadOnly) {
         Some(vfs) => {
             let _ = handle_close(vfs);
-            log(b"media: mount check started\n");
+            diag(b"media: mount check started\n");
         }
         None => log(b"media: mount check spawn fail\n"),
     }
+    true
 }
 
 /// Grant the selected scratch or USB filesystem and a volume-relative path. Return false
@@ -2917,6 +3051,57 @@ fn run_on_volume(
         false,
         StdinMode::None,
     );
+}
+
+/// `dmesg` prints the kernel log; `dmesg -n LEVEL` sets which levels the console also shows,
+/// as Linux's does (J559). LEVEL is 0-7 or a name from `emerg` to `debug`; `dmesg -n` alone
+/// reports the current one.
+fn dmesg(cmd: &kumoza::Command) {
+    let resource = Handle(ROOT_RESOURCE.load(Ordering::Relaxed) as u32);
+    match cmd.args.as_slice() {
+        [] => {
+            let mut buf = [0u8; 1024];
+            let mut offset = 0;
+            loop {
+                let (n, next) = kumo_rt::log_read(resource, offset, &mut buf);
+                if n == u64::MAX {
+                    log(b"dmesg: kernel log unavailable\n");
+                    return;
+                }
+                if n == 0 {
+                    return;
+                }
+                if !sora::relay_console_output(&buf[..n as usize], |chunk| {
+                    debug_write(chunk.as_ptr(), chunk.len())
+                }) {
+                    return;
+                }
+                offset = next;
+            }
+        }
+        [flag] if flag == "-n" => {
+            let level = kumo_rt::log_level(resource, kumo_abi::sys::LOG_LEVEL_QUERY);
+            match sora::log_level_name(level) {
+                Some(name) => {
+                    log(b"console level ");
+                    log(name);
+                    log(b"\n");
+                }
+                None => log(b"dmesg: kernel log unavailable\n"),
+            }
+        }
+        [flag, level] if flag == "-n" => match sora::parse_log_level(level.as_bytes()) {
+            Some(level) => {
+                if kumo_rt::log_level(resource, u64::from(level)) == u64::MAX {
+                    log(b"dmesg: kernel log unavailable\n");
+                }
+            }
+            None => {
+                log(b"dmesg: level is 0-7 or emerg, alert, crit, err, warn, notice, info, debug\n")
+            }
+        },
+        _ => log(b"usage: dmesg [-n level]\n"),
+    }
 }
 
 fn log_directory_error(command: &[u8], error: DirectoryError) {
@@ -3160,7 +3345,7 @@ fn spawn_ttyd_control(initrd: Handle) -> Option<Handle> {
         .and_then(|n| TtyReply::parse(&reply[..n]))
         .is_some_and(|reply| reply.window_size == Some(size));
         if !set {
-            log(b"ttyd: window size not set; 80x24\n");
+            diag(b"ttyd: window size not set; 80x24\n");
         }
     }
     // Closing Sora's process handle does not terminate the admitted resident. Its client
@@ -3593,9 +3778,9 @@ fn end_kilo_session(kill: bool) {
             // the far end of whatever channel the editor was parked on, so the two match
             // exactly when the editor was waiting for keys.
             let keys = KILO_STDIN_WRITE.load(Ordering::Relaxed);
-            log(b"kilo: keys channel ");
-            log_hex(handle_koid(Handle(keys as u32)));
-            log(b"\n");
+            diag(b"kilo: keys channel ");
+            diag_hex(handle_koid(Handle(keys as u32)));
+            diag(b"\n");
             let _ = process_kill(Handle(process as u32));
         }
         let _ = handle_close(Handle(process as u32));
@@ -4236,7 +4421,7 @@ fn spawn_from_recipe(recipe: &SvcRecipe) -> Option<sora::SupervisedServer> {
         log(b"spawn: bootstrap transfer fail\n");
         return None;
     }
-    log(b"spawn: bootstrap transfer ok\n");
+    diag(b"spawn: bootstrap transfer ok\n");
     Some(sora::SupervisedServer {
         process: child_as,
         client: client_chan,
@@ -4445,6 +4630,7 @@ fn spawn_ttyd_session(
         return None;
     }
     log(b"ttyd: interactive ok\n");
+    notice(&[b"ttyd: online, console line discipline\n"]);
     Some(sora::SupervisedService { recipe, instance })
 }
 

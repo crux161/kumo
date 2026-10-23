@@ -1,20 +1,28 @@
 #![no_std]
 #![no_main]
 
-//j166
 //j168
 //j230
 //j413
 //j414
+//j559
 
 use drv_blk::{
     split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_WRITE, STATUS_BAD_LBA,
     STATUS_OK,
 };
 use kumo_abi::{Handle, VmarFlags};
-use kumo_rt::{
-    channel_read, channel_read_with_handle, channel_write, debug_write, vmar_map, vmo_create,
-};
+use kumo_rt::{channel_read, channel_read_with_handle, channel_write, vmar_map, vmo_create};
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
+/// allows. Failures are ERR, so a default boot still shows them.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
+
+fn log_err(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, message);
+}
 
 kumo_rt::entry!(main);
 
@@ -36,7 +44,7 @@ extern "C" fn main(
     _arg6: u64,
     _arg7: u64,
 ) -> ! {
-    debug_write(b"drv-blk starting\n".as_ptr(), 16);
+    log_info(b"drv-blk starting\n");
 
     let ch = Handle(bootstrap_channel as u32);
 
@@ -45,7 +53,7 @@ extern "C" fn main(
     let (n, vmo_raw) = channel_read_with_handle(ch, size_buf.as_mut_ptr(), size_buf.len());
     let vmo = Handle(vmo_raw as u32);
     if vmo_raw == 0 {
-        debug_write(b"drv-blk: missing vmo\n".as_ptr(), 20);
+        log_err(b"drv-blk: missing vmo\n");
         kumo_rt::process_exit(1);
     }
     let vmo_len = if n >= 8 {
@@ -69,7 +77,7 @@ extern "C" fn main(
     // full 16 MiB below the 0x2000_0000 child-VMAR boundary.
     let vmo_va = 0x0000_0000_1100_0000;
     if vmar_map(Handle(0), vmo, 0, vmo_va, map_len, (VmarFlags::READ).0) != 0 {
-        debug_write(b"drv-blk: map failed\n".as_ptr(), 20);
+        log_err(b"drv-blk: map failed\n");
         kumo_rt::process_exit(1);
     }
 
@@ -82,7 +90,7 @@ extern "C" fn main(
     // a write persists in RAM and reads see it, while the initrd stays pristine. — KESTREL
     let rw_vmo_raw = vmo_create(map_len);
     if rw_vmo_raw == 0 || rw_vmo_raw == u64::MAX {
-        debug_write(b"drv-blk: rw vmo create failed\n".as_ptr(), 30);
+        log_err(b"drv-blk: rw vmo create failed\n");
         kumo_rt::process_exit(1);
     }
     let rw_vmo = Handle(rw_vmo_raw as u32);
@@ -98,7 +106,7 @@ extern "C" fn main(
         (VmarFlags::READ | VmarFlags::WRITE).0,
     ) != 0
     {
-        debug_write(b"drv-blk: rw map failed\n".as_ptr(), 23);
+        log_err(b"drv-blk: rw map failed\n");
         kumo_rt::process_exit(1);
     }
     // Seed the private copy from the initrd. Both mappings are Normal-WB RAM, so a plain
@@ -112,7 +120,11 @@ extern "C" fn main(
     // `read_blocks`/`write_blocks` bound every access to `map_len`, so a request past the
     // mapped extent is a clean STATUS_BAD_LBA, never a fault.
     let store = unsafe { core::slice::from_raw_parts_mut(rw_va as *mut u8, map_len as usize) };
-    debug_write(b"drv-blk: initialized (writable)\n".as_ptr(), 32);
+    log_info(b"drv-blk: initialized (writable)\n");
+    let _ = kumo_rt::log_write(
+        kumo_abi::sys::log_level::NOTICE,
+        b"drv-blk: online, initrd block device\n",
+    );
 
     // Serve loop: read the request frame, perform block I/O, write the response. One buffer
     // holds either an inbound write frame (`[header][data]`) or an outbound read response;

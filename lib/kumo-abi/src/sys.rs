@@ -2,6 +2,7 @@
 //j427
 //j493
 //j556
+//j559
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,7 +65,32 @@ pub enum Syscall {
     /// `Rights::MANAGE` on the process handle, which `ProcessCreate` gives the creator. A
     /// process cannot kill itself (that is [`Syscall::ProcessExit`]).
     ProcessKill = 46,
+    /// Keep a diagnostic in the kernel log (`dmesg`) at a [`log_level`]: `(level, ptr, len)`.
+    /// The console also shows it while its level is at or above the console's. Same authority
+    /// as `DebugWrite`, which stays the call for terminal output (J559).
+    LogWrite = 47,
+    /// Read the kernel log: `(resource, offset, ptr, len)` returns bytes copied in `x0` and the
+    /// next offset in `x1`. Needs a Resource handle with `MANAGE` (the root resource).
+    LogRead = 48,
+    /// Set the console log level: `(resource, level)` returns the previous level;
+    /// [`LOG_LEVEL_QUERY`] only reports it. Needs a Resource handle with `MANAGE`.
+    LogLevel = 49,
 }
+
+/// Kernel log levels, syslog's numbering: lower is more urgent (J559).
+pub mod log_level {
+    pub const EMERG: u8 = 0;
+    pub const ALERT: u8 = 1;
+    pub const CRIT: u8 = 2;
+    pub const ERR: u8 = 3;
+    pub const WARNING: u8 = 4;
+    pub const NOTICE: u8 = 5;
+    pub const INFO: u8 = 6;
+    pub const DEBUG: u8 = 7;
+}
+
+/// `LogLevel`'s level argument that reports the console level without changing it.
+pub const LOG_LEVEL_QUERY: u64 = u64::MAX;
 
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
 pub const TLMM_GPIO_PIN_MASK: u32 = 0x0000_0fff;
@@ -221,6 +247,16 @@ mod tests {
     #[test]
     fn process_kill_follows_the_contiguous_dma_vmo() {
         assert_eq!(Syscall::ProcessKill as usize, 46);
+    }
+
+    #[test]
+    fn the_kernel_log_calls_follow_process_kill() {
+        assert_eq!(Syscall::LogWrite as usize, 47);
+        assert_eq!(Syscall::LogRead as usize, 48);
+        assert_eq!(Syscall::LogLevel as usize, 49);
+        assert_eq!(log_level::EMERG, 0);
+        assert_eq!(log_level::NOTICE, 5);
+        assert_eq!(log_level::DEBUG, 7);
     }
 }
 

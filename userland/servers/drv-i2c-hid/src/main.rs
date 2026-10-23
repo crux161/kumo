@@ -1,13 +1,8 @@
-//j389
-//j397
-//j398
-//j399
-//j400
-//j401
 //j403
 //j404
 //j405
 //j425
+//j559
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -29,10 +24,16 @@ use kumo_i2c_hid::{
     HidDescriptor, LedOutputReport, PowerState, RegisterIo,
 };
 use kumo_rt::{
-    channel_read_with_handle, channel_write, clock_get, debug_write, handle_close, handle_koid,
+    channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid,
     interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
     port_wait, resource_mint_mmio, timer_create, vmar_map,
 };
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
+/// allows.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
 
 kumo_rt::entry!(main);
 
@@ -118,7 +119,7 @@ impl RegisterIo for MmioRegisters {
 }
 
 fn log(message: &[u8]) {
-    debug_write(message.as_ptr(), message.len());
+    log_info(message);
 }
 
 fn log_hex(label: &[u8], value: u64) {
@@ -156,7 +157,7 @@ fn log_frame(label: &[u8], bytes: &[u8]) {
             b"0123456789abcdef"[(byte & 0xf) as usize],
             b' ',
         ];
-        debug_write(pair.as_ptr(), pair.len());
+        log_info(&pair);
     }
     log(b"\n");
 }
@@ -788,6 +789,7 @@ extern "C" fn main(
     };
 
     log(b"drv-i2c-hid: report descriptor ok\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, b"drv-i2c-hid: online\n");
     startup_trace.record(StartupMilestone::ReportDescriptorOk, clock_get());
     log_hex(b"drv-i2c-hid: rdesc-len=0x", report_descriptor_len as u64);
     let led_output_report = find_led_output_report(&report_descriptor[..report_descriptor_len]);

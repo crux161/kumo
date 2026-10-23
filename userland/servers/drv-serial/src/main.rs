@@ -1,12 +1,21 @@
 #![no_std]
 #![no_main]
+//j559
 
 extern crate alloc;
 
 use kumo_abi::{Handle, VmarFlags};
-use kumo_rt::{
-    channel_write, debug_write, interrupt_create, interrupt_wait, resource_mint_mmio, vmar_map,
-};
+use kumo_rt::{channel_write, interrupt_create, interrupt_wait, resource_mint_mmio, vmar_map};
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
+/// allows. Failures are ERR, so a default boot still shows them.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
+
+fn log_err(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, message);
+}
 
 kumo_rt::entry!(main);
 
@@ -33,7 +42,7 @@ extern "C" fn main(
     _arg7: u64,
     _arg8: u64,
 ) -> ! {
-    debug_write(b"drv-serial starting\n".as_ptr(), 20);
+    log_info(b"drv-serial starting\n");
 
     let res = Handle(resource_handle as u32);
     let console = Handle(console_channel as u32);
@@ -41,7 +50,7 @@ extern "C" fn main(
     // 1. Mint MMIO VMO
     let vmo_h = resource_mint_mmio(res, UART_BASE, UART_SIZE);
     if vmo_h == u64::MAX {
-        debug_write(b"drv-serial: vmo mint failed\n".as_ptr(), 28);
+        log_err(b"drv-serial: vmo mint failed\n");
         kumo_rt::process_exit(1);
     }
     let vmo = Handle(vmo_h as u32);
@@ -57,7 +66,7 @@ extern "C" fn main(
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE).0,
     );
     if map_status != 0 {
-        debug_write(b"drv-serial: map failed\n".as_ptr(), 23);
+        log_err(b"drv-serial: map failed\n");
         kumo_rt::process_exit(1);
     }
 
@@ -65,7 +74,7 @@ extern "C" fn main(
     //    authorized the MMIO mint above (its grant covers exactly this IRQ line).
     let irq_h = interrupt_create(res, UART_IRQ);
     if irq_h == u64::MAX {
-        debug_write(b"drv-serial: irq failed\n".as_ptr(), 23);
+        log_err(b"drv-serial: irq failed\n");
         kumo_rt::process_exit(1);
     }
     let irq = Handle(irq_h as u32);
@@ -76,7 +85,8 @@ extern "C" fn main(
         imsc.write_volatile(imsc.read_volatile() | (1 << 4)); // RXIM
     }
 
-    debug_write(b"drv-serial: initialized\n".as_ptr(), 24);
+    log_info(b"drv-serial: initialized\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, b"drv-serial: online\n");
 
     let mut buf = [0u8; 1];
 

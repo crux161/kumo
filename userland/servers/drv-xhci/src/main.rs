@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j543
 //j545
 //j548
 //j549
 //j550
+//j559
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -23,10 +23,9 @@ use kumo_gpt::{
     Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
-    channel_read, channel_read_with_handle, channel_write, clock_get, debug_write, handle_close,
-    handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create,
-    port_unbind, port_wait, process_exit, resource_mint_mmio, sleep_ns, vmar_map,
-    vmo_create_contiguous,
+    channel_read, channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid,
+    interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
+    port_wait, process_exit, resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -42,6 +41,59 @@ use kumo_xhci::{
     StashedTransfer, TransferEventStash, TransferRing, Trb, UsbSpeed, XhciProbeConfig,
     XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
+/// allows.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
+
+/// A boot milestone, shown at the console's default level (J559): one short line, written in one
+/// call so no other source can land inside it.
+fn notice(parts: &[&[u8]]) {
+    let mut line = [0u8; 128];
+    let mut n = 0;
+    for part in parts {
+        let take = part.len().min(line.len() - n);
+        line[n..n + take].copy_from_slice(&part[..take]);
+        n += take;
+    }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line[..n]);
+}
+
+/// `value` as `0x…` hex, written into the end of `out`.
+fn hex(mut value: u64, out: &mut [u8; 18]) -> &[u8] {
+    let mut start = out.len();
+    loop {
+        start -= 1;
+        let digit = (value & 0xf) as u8;
+        out[start] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    start -= 2;
+    out[start..start + 2].copy_from_slice(b"0x");
+    &out[start..]
+}
+
+/// `value` in decimal, written into the end of `out`.
+fn decimal(mut value: u64, out: &mut [u8; 20]) -> &[u8] {
+    let mut start = out.len();
+    loop {
+        start -= 1;
+        out[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &out[start..];
+        }
+    }
+}
 
 kumo_rt::entry!(main);
 
@@ -319,6 +371,14 @@ extern "C" fn main(
     log(b" xecp=");
     log_hex(caps.extended_capabilities_offset() as u64);
     log(b"\n");
+    let (mut base, mut ports) = ([0u8; 18], [0u8; 20]);
+    notice(&[
+        b"drv-xhci: online, controller ",
+        hex(config.mmio_base, &mut base),
+        b", ",
+        decimal(caps.max_ports() as u64, &mut ports),
+        b" ports\n",
+    ]);
 
     log(b"drv-xhci: layout raw dboff=");
     log_hex(dboff as u64);
@@ -812,7 +872,10 @@ fn enumerate_root_device(
         }
     };
     match submit_command(io, layout, &mut *image, &mut *cmd, evt, addr) {
-        Some((1, _, _)) => log(b"drv-xhci: addr dev cc=0x1 ok\n"),
+        Some((1, _, _)) => {
+            log(b"drv-xhci: addr dev cc=0x1 ok\n");
+            settle(SET_ADDRESS_RECOVERY_NS);
+        }
         Some((cc, _, _)) => {
             log(b"drv-xhci: addr dev cc=");
             log_hex(cc as u64);
@@ -1380,6 +1443,19 @@ fn configure_and_probe_storage(
     log(b" bytes=");
     log_hex(capacity.byte_length());
     log(b"\n");
+    let product = &inquiry_data.product_identification;
+    let product_len = product
+        .iter()
+        .rposition(|&b| b != b' ' && b != 0)
+        .map_or(0, |end| end + 1);
+    let mut digits = [0u8; 20];
+    notice(&[
+        b"usb: storage \"",
+        &product[..product_len],
+        b"\" ",
+        decimal(capacity.byte_length() / 1_000_000_000, &mut digits),
+        b" GB\n",
+    ]);
 
     let adapter = match Read10BlockAdapter::new(capacity, STORAGE_DATA_LEN as usize) {
         Ok(adapter) => adapter,
@@ -2637,6 +2713,11 @@ fn configure_and_read_keyboard(
             });
             log_hex(irq_port.is_some() as u64);
             log(b"; type at the shell\n");
+            notice(&[if hid.is_mouse() {
+                b"usb: mouse ready\n" as &[u8]
+            } else {
+                b"usb: keyboard ready\n"
+            }]);
             // Exactly ONE transfer may be outstanding at a time. The previous shape enqueued a
             // TRB on every iteration but only reclaimed one when a MATCHING transfer event was
             // found, so every wake without a match (spurious interrupt, port-change event) leaked
@@ -3872,7 +3953,10 @@ fn reset_and_address_downstream(
         return skipped(b"drv-xhci: hub dev addr build fail\n");
     };
     match submit_command(io, layout, image, cmd, evt, addr) {
-        Some((1, _, _)) => log(b"drv-xhci: hub dev addr cc=0x1 ok\n"),
+        Some((1, _, _)) => {
+            log(b"drv-xhci: hub dev addr cc=0x1 ok\n");
+            settle(SET_ADDRESS_RECOVERY_NS);
+        }
         Some((cc, _, _)) => return skipped_cc(b"drv-xhci: hub dev addr cc=", cc),
         None => return skipped(b"drv-xhci: hub dev addr timeout\n"),
     }
@@ -3966,6 +4050,14 @@ impl Deadline {
 fn cooperative_yield() {
     let _ = clock_get();
 }
+
+/// How long a device gets after `Address Device` before its first control request. USB 2.0
+/// §9.2.6.3 allows it 2 ms of SetAddress recovery; Linux waits 10 ms. Until J559 the log line
+/// written between the two was a synchronous UART write, and that was the only delay. Once logs
+/// went to the kernel ring, the opi5's USB2 hub got GET_DESCRIPTOR 17 µs after its address,
+/// answered with a transaction error (cc 4), and the keyboard and stick behind it never
+/// enumerated. — TIMBERDOODLE
+const SET_ADDRESS_RECOVERY_NS: u64 = 10_000_000;
 
 /// Wait `delay_ns` without holding the CPU: block on a one-shot timer, and fall back to a
 /// deadline-bounded, yielding spin only when the timer cannot be set up.
@@ -4368,7 +4460,7 @@ fn usb_speed(raw: u8) -> UsbSpeed {
 }
 
 fn log(msg: &[u8]) {
-    debug_write(msg.as_ptr(), msg.len());
+    log_info(msg);
 }
 
 fn log_port(index: u8, port: PortStatus) {
@@ -4430,7 +4522,7 @@ fn log_controller_status(status: ControllerStatus) {
 }
 
 fn log_hex(mut value: u64) {
-    debug_write(b"0x".as_ptr(), 2);
+    log_info(b"0x");
     let mut digits = [0u8; 16];
     let mut start = digits.len();
     loop {
@@ -4446,7 +4538,7 @@ fn log_hex(mut value: u64) {
             break;
         }
     }
-    debug_write(digits[start..].as_ptr(), digits.len() - start);
+    log_info(&digits[start..]);
 }
 
 fn read32(offset: usize) -> u32 {

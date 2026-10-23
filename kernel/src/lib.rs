@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j479
 //j482
 //j483
 //j493
 //j536
+//j559
 
 extern crate alloc;
 
@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod ipcdemo;
 pub mod ipcstat;
 pub mod kdemo;
+pub mod kmsg;
 pub mod mm;
 pub mod object;
 pub mod power;
@@ -41,10 +42,20 @@ use crate::syscall::{KernelCall, KernelCallResult};
 
 pub const STAGE_A_BANNER: &str = "KUMO MUREX Stage-A core only; halting";
 
+/// A kernel diagnostic at INFO: kept in the kernel log (`dmesg`), shown on the console only when
+/// its level allows (J559). Shell and escape-hatch output use `bootstrap::console::Writer`.
 #[macro_export]
 macro_rules! klog {
     ($($arg:tt)*) => {
-        $crate::bootstrap::console::write_fmt(core::format_args!($($arg)*))
+        $crate::kmsg::kernel_fmt($crate::kmsg::INFO, core::format_args!($($arg)*))
+    };
+}
+
+/// [`klog!`] at an explicit level from `kumo_abi::sys::log_level`.
+#[macro_export]
+macro_rules! klog_at {
+    ($level:expr, $($arg:tt)*) => {
+        $crate::kmsg::kernel_fmt($level, core::format_args!($($arg)*))
     };
 }
 
@@ -387,7 +398,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         }
         Ok(None) => klog!("DEVICE TREE       Check     absent                  --\n"),
         Err(error) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "DEVICE TREE       Check     rejected {:#x}: {:?}   FAIL\n",
                 boot.platform.dtb,
                 error
@@ -428,10 +440,22 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     }
     klog!("\n\n");
     klog!("Uni+CJK Hi-SYS BOOT!\n\n");
-    klog!("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n");
-    klog!("┃ NIMBUS    筋斗雲                   Ver.0.1.0a              ┃\n");
-    klog!("┃ Copyright(c) 2025,2026    KOKEN.DEV SOFTWARE CONSORTIUM    ┃\n");
-    klog!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n");
+    klog_at!(
+        kmsg::NOTICE,
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+    );
+    klog_at!(
+        kmsg::NOTICE,
+        "┃ NIMBUS    筋斗雲                   Ver.0.1.0a              ┃\n"
+    );
+    klog_at!(
+        kmsg::NOTICE,
+        "┃ Copyright(c) 2025,2026    KOKEN.DEV SOFTWARE CONSORTIUM    ┃\n"
+    );
+    klog_at!(
+        kmsg::NOTICE,
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+    );
     // mixed ASCII+Kanji line: ASCII via the 8x16 PSF cell, Kanji via the 16x16 double-width glyphs.
     klog!("「我 所 思 兮 在 泰 山。路 遠 湲 且 阻、\n");
     klog!("  側 身 東 望 涕 沾 翰。」\n\n");
@@ -446,13 +470,25 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     klog!("[中國漢字  ........在線      OK ]\n");
     klog!("[日本漢字  ........出力成功  OK ]\n");
     klog!("[한국어한글 .......로드      OK ]\n\n");
-    klog!("紫微     MUREX Core Ver 0.1.0a  ({})\n", report.arch);
-    klog!("虹雲     ABIv{}     Check     OK\n", report.abi_version);
+    klog_at!(
+        kmsg::NOTICE,
+        "紫微     MUREX Core Ver 0.1.0a  ({})\n",
+        report.arch
+    );
+    klog_at!(
+        kmsg::NOTICE,
+        "虹雲     ABIv{}     Check     OK\n",
+        report.abi_version
+    );
     // Resolve the baked board identity (DESIGN/017 §4 step 2). Until the loader stamps
     // `board_id` from `nijigumo.conf`, this reads empty on QEMU (`-kernel` path) and prints
     // "unknown"; a stamped image names the board and confirms it is a supported BSP entry.
     match kumo_bsp::Board::from_id(boot.board_id()) {
-        Some(board) => klog!("盤石     BOARD {}     Check     OK\n", board.id()),
+        Some(board) => klog_at!(
+            kmsg::NOTICE,
+            "盤石     BOARD {}     Check     OK\n",
+            board.id()
+        ),
         None if boot.board_id().is_empty() => {
             klog!("盤石     BOARD unknown (unstamped)     Check     --\n")
         }
@@ -473,7 +509,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         n += 1;
     }
     let sum: u32 = squares.iter().copied().sum();
-    klog!(
+    klog_at!(
+        kmsg::NOTICE,
         "HEAP ALLOCATOR     Check     OK     [{} KiB bump  vec sum={}]\n",
         mm.heap_bytes >> 10,
         sum
@@ -487,7 +524,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             // The TTBR1 physmap is live: move console MMIO access onto it, so printing
             // works under any TTBR0 (user trees no longer carry a console window).
             kumo_hal::active::console_use_physmap();
-            klog!(
+            klog_at!(
+                kmsg::NOTICE,
                 "ROOTING TABLES     Check     {} MiB mapped  {} tables   OK\n",
                 p.mapped_bytes >> 20,
                 p.tables
@@ -497,7 +535,10 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             // Every permanent device path below (including GICv2 IAR/EOIR) uses TTBR1's
             // physmap so a userspace TTBR0 cannot cut the kernel off from MMIO. Continuing
             // without those tables would turn the first access into a second-stage fault.
-            klog!("ROOTING TABLES     Check     no usable memory map   FAIL\n");
+            klog_at!(
+                kmsg::ERR,
+                "ROOTING TABLES     Check     no usable memory map   FAIL\n"
+            );
             kumo_hal::active::halt();
         }
     }
@@ -513,14 +554,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             let start = kumo_hal::active::timer_irq_count();
             let seen = kumo_hal::active::wait_for_timer_irqs(start, 3, 1_000_000_000);
             if seen >= 3 {
-                klog!(
+                klog_at!(
+                    kmsg::NOTICE,
                     "GIC / TIMER        Check     {} Hz  IRQ {}  hb {}t   OK\n",
                     timer.counter_hz,
                     timer.irq,
                     seen
                 );
             } else {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "GIC / TIMER        Check     IRQ {} heartbeat timeout ({}t)   FAIL\n",
                     timer.irq,
                     seen
@@ -534,7 +577,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             }
         }
         Err(err) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "GIC / TIMER        Check     unavailable: {:?}   FAIL\n",
                 err
             );
@@ -580,7 +624,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // cooperatively yield through the HAL context switch — the first real use of the
     // task substrate on the boot path. Preemptive, timer-driven scheduling is next.
     let m3 = kdemo::run();
-    klog!(
+    klog_at!(
+        kmsg::NOTICE,
         "CONTEXT SWITCH     Check     {} kthreads  {} switches   OK\n",
         m3.threads,
         m3.switches
@@ -592,13 +637,15 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // a thread, and a more-urgent thread preempts a running one.
     let sc = sched::smoke();
     if sc.ordered && sc.idle_floor && sc.preemptions == 2 {
-        klog!(
+        klog_at!(
+            kmsg::NOTICE,
             "SCHEDULER          Check     O(1) {}-level  {} picks   OK\n",
             sc.levels,
             sc.picks
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "SCHEDULER          Check     ordered={} floor={} pre={}   FAIL\n",
             sc.ordered,
             sc.idle_floor,
@@ -608,7 +655,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     }
 
     let preempt = kdemo::run_preemption();
-    klog!(
+    klog_at!(
+        kmsg::NOTICE,
         "PREEMPTION         Check     {} body switches  {} ticks   OK\n",
         preempt.switches,
         preempt.ticks
@@ -622,7 +670,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             ipc.handle_count
         ),
         Err(err) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "I/O VECTORS        Check     IPC smoke failed: {:?}   FAIL\n",
                 err
             );
@@ -635,14 +684,16 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // driven by the cooperative context switch.
     let blk = ipcdemo::run();
     if blk.delivered {
-        klog!(
+        klog_at!(
+            kmsg::NOTICE,
             "IPC BLOCK / WAKE   Check     park {}x  wake {}x  {} bytes   OK\n",
             blk.consumer_blocks,
             blk.wakes,
             blk.received
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "IPC BLOCK / WAKE   Check     park {}x wake {}x {} bytes   FAIL\n",
             blk.consumer_blocks,
             blk.wakes,
@@ -661,7 +712,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         match bootstrap::user::plan_sora_from_initrd(&mut objects, initrd) {
             Ok(plan) => {
                 let mapped_bytes: u64 = plan.image_mappings.iter().map(|mapping| mapping.len).sum();
-                klog!(
+                klog_at!(
+                    kmsg::NOTICE,
                     "SORA INITRD        Check     {} seg  {}b  entry {:#x}  sp {:#x}   OK\n",
                     plan.image_mappings.len(),
                     mapped_bytes,
@@ -695,7 +747,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         None => usermode::run(boot),
     };
     if u.entered && u.syscalls >= 3 && u.wrote > 0 && u.chan.0 != 0 {
-        klog!(
+        klog_at!(
+            kmsg::NOTICE,
             "USERLAND  EL0      Check     {} svc  wrote {}b  boot h{}  {}   OK\n",
             u.syscalls,
             u.wrote,
@@ -703,7 +756,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             if u.serving { "serving" } else { "exited" }
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "USERLAND  EL0      Check     entered={} svc={} wrote={} boot h{}   FAIL\n",
             u.entered,
             u.syscalls,
@@ -724,15 +778,17 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         klog!("SORA HANDSHAKE     Check     no message on root channel   --\n");
     }
 
-    // P6-e: with Sora serving, route the kernel console through it. The probe line is
-    // the first routed `klog!`; the syscall delta proves Sora actually round-tripped it
-    // (wake -> ChannelRead -> DebugWrite -> park). On a zero delta the route is torn
+    // P6-e: with Sora serving, route the kernel console through it. The probe is an empty
+    // message (J559: the INFO line beside it is no longer echoed, so it no longer travels the
+    // route); the syscall delta proves Sora actually round-tripped it (wake -> ChannelRead
+    // -> park). On a zero delta the route is torn
     // back down so output never silently vanishes. Everything below — the remaining
     // POST lines and the serial shell — rides the userspace console server.
     if u.serving {
         let svc_before = kumo_hal::active::syscall_count();
         usermode::enable_console_route();
         klog!("MUREX console     -> Sora console channel\n");
+        let _ = usermode::probe_console_route();
         let probe_svcs = kumo_hal::active::syscall_count().saturating_sub(svc_before);
         // Keep the route as a bounded probe. Later POST checks call back into Sora and
         // can otherwise re-enter the console server while another Sora wake is active.
@@ -744,7 +800,10 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             );
         } else {
             usermode::disable_console_route();
-            klog!("CONSOLE ROUTE      Check     probe 0 svc  direct fallback   FAIL\n");
+            klog_at!(
+                kmsg::ERR,
+                "CONSOLE ROUTE      Check     probe 0 svc  direct fallback   FAIL\n"
+            );
         }
         // P7-g: the kernel as a *client* of the userspace block server. Two reads of
         // the "disk" (the initrd) served by Sora over the block channel, verified by
@@ -761,7 +820,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 magic_n + path_n
             );
         } else {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "BLOCK SERVE        Check     magic {}b ok={}  path {}b ok={}   FAIL\n",
                 magic_n,
                 magic_ok,
@@ -784,7 +844,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 if sig_ok {
                     klog!("BLOCK FAT32        Check     sector 0 BPB  via sora   OK\n");
                 } else {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "BLOCK FAT32        Check     sector 0 BPB  {}b sig-ok={}   FAIL\n",
                         bpb_n,
                         sig_ok
@@ -807,7 +868,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                         ranged_n
                     );
                 } else {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "BLOCK FILE         Check     HELLO {}b ok={}  ranged {}b ok={}   FAIL\n",
                         content_n,
                         content_ok,
@@ -821,7 +883,10 @@ pub fn stage_a(boot: &BootInfo) -> ! {
             if usermode::net_check_transfer() {
                 klog!("HANDLE XFER        Check     net channel  via sora   OK\n");
             } else {
-                klog!("HANDLE XFER        Check     net channel no handle   FAIL\n");
+                klog_at!(
+                    kmsg::ERR,
+                    "HANDLE XFER        Check     net channel no handle   FAIL\n"
+                );
             }
 
             // Console routing turns each `klog!` into a channel write + `wake_user`, which
@@ -881,11 +946,23 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     0 => {
                         klog!("PORT BIND          Check     channel signal  via eng   OK\n");
                     }
-                    1 => klog!("PORT BIND          Check     port create fail   FAIL\n"),
-                    2 => klog!("PORT BIND          Check     bind fail   FAIL\n"),
-                    3 => klog!("PORT BIND          Check     channel write fail   FAIL\n"),
-                    4 => klog!("PORT BIND          Check     wrong signal   FAIL\n"),
-                    _ => klog!("PORT BIND          Check     port empty   FAIL\n"),
+                    1 => klog_at!(
+                        kmsg::ERR,
+                        "PORT BIND          Check     port create fail   FAIL\n"
+                    ),
+                    2 => klog_at!(kmsg::ERR, "PORT BIND          Check     bind fail   FAIL\n"),
+                    3 => klog_at!(
+                        kmsg::ERR,
+                        "PORT BIND          Check     channel write fail   FAIL\n"
+                    ),
+                    4 => klog_at!(
+                        kmsg::ERR,
+                        "PORT BIND          Check     wrong signal   FAIL\n"
+                    ),
+                    _ => klog_at!(
+                        kmsg::ERR,
+                        "PORT BIND          Check     port empty   FAIL\n"
+                    ),
                 }
 
                 // Net loopback: send "ping" on the net channel, Sora echoes it.
@@ -905,7 +982,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 if lb_ok && cn_ok && pipe_ok {
                     klog!("NET LOOPBACK       Check     ping +conn +pipe  via sora   OK\n");
                 } else {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "NET LOOPBACK       Check     lb={}/{} cn={}/{} pipe={}/{}   FAIL\n",
                         lb_n,
                         lb_ok,
@@ -1441,7 +1519,7 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         match unsafe { x86_multiboot2_info(mbi) } {
             Ok(info) => Some(info),
             Err(err) => {
-                klog!("multiboot2: info {:?}   FAIL\n", err);
+                klog_at!(kmsg::ERR, "multiboot2: info {:?}   FAIL\n", err);
                 kumo_hal::active::halt();
             }
         }
@@ -1469,7 +1547,7 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             initrd
         }
         Err(err) => {
-            klog!("MULTIBOOT INITRD   Check     {:?}   FAIL\n", err);
+            klog_at!(kmsg::ERR, "MULTIBOOT INITRD   Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     };
@@ -1477,7 +1555,11 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     let memory_regions = match unsafe { x86_multiboot_memory_map(mbi, magic, X86_PHYS_MAP_LIMIT) } {
         Ok(regions) => regions,
         Err(err) => {
-            klog!("MULTIBOOT BOOTINFO Check     memory map {:?}   FAIL\n", err);
+            klog_at!(
+                kmsg::ERR,
+                "MULTIBOOT BOOTINFO Check     memory map {:?}   FAIL\n",
+                err
+            );
             kumo_hal::active::halt();
         }
     };
@@ -1485,7 +1567,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         match unsafe { x86_multiboot_memory_map(mbi, magic, X86_BOOT_IDENTITY_LIMIT) } {
             Ok(regions) => regions,
             Err(err) => {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "MULTIBOOT BOOTINFO Check     bootstrap map {:?}   FAIL\n",
                     err
                 );
@@ -1495,14 +1578,19 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     let boot = match unsafe { x86_boot_info(&memory_regions, initrd) } {
         Ok(boot) => boot,
         Err(err) => {
-            klog!("MULTIBOOT BOOTINFO Check     handoff {:?}   FAIL\n", err);
+            klog_at!(
+                kmsg::ERR,
+                "MULTIBOOT BOOTINFO Check     handoff {:?}   FAIL\n",
+                err
+            );
             kumo_hal::active::halt();
         }
     };
     let bootstrap_boot = match unsafe { x86_boot_info(&bootstrap_regions, initrd) } {
         Ok(boot) => boot,
         Err(err) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "MULTIBOOT BOOTINFO Check     bootstrap handoff {:?}   FAIL\n",
                 err
             );
@@ -1512,11 +1600,15 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     let handoff = match inspect_boot(&boot) {
         Ok(report) if report.has_initrd => report,
         Ok(report) => {
-            klog!("MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", report);
+            klog_at!(
+                kmsg::ERR,
+                "MULTIBOOT BOOTINFO Check     {:?}   FAIL\n",
+                report
+            );
             kumo_hal::active::halt();
         }
         Err(err) => {
-            klog!("MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", err);
+            klog_at!(kmsg::ERR, "MULTIBOOT BOOTINFO Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     };
@@ -1545,7 +1637,11 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                 && !overlaps(boot.initrd)
         });
     if memory.usable_frames == 0 || !samples_safe {
-        klog!("M1 MEMORY PLAN     Check     {:?}   FAIL\n", memory);
+        klog_at!(
+            kmsg::ERR,
+            "M1 MEMORY PLAN     Check     {:?}   FAIL\n",
+            memory
+        );
         kumo_hal::active::halt();
     }
     klog!(
@@ -1584,7 +1680,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             report
         }
         report => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "KERNEL CR3 / PHYSMAP Check     old {:#x} new {:#x} report {:?} frames {:?}   FAIL\n",
                 old_root,
                 new_root,
@@ -1613,7 +1710,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         let observed = unsafe { pointer.read_volatile() };
         unsafe { pointer.write_volatile(original) };
         if observed != pattern {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "KERNEL CR3 / PHYSMAP Check     high RAM probe {:#x} read {:#x} wanted {:#x}   FAIL\n",
                 address,
                 observed,
@@ -1681,7 +1779,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             descriptors.rsp0
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "GDT / TSS          Check     limit {:#x}  CS {:#04x} SS {:#04x} TR {:#04x}   FAIL\n",
             descriptors.gdt_limit,
             descriptors.kernel_code_selector,
@@ -1696,7 +1795,10 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         match kumo_hal::active::inspect_acpi_rsdp(rsdp, rsdp.as_ptr() as u64) {
             Some(acpi) => Some(acpi),
             None => {
-                klog!("ACPI TABLES        Check     Multiboot2 RSDP invalid   FAIL\n");
+                klog_at!(
+                    kmsg::ERR,
+                    "ACPI TABLES        Check     Multiboot2 RSDP invalid   FAIL\n"
+                );
                 kumo_hal::active::halt();
             }
         }
@@ -1706,7 +1808,10 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
         None => match kumo_hal::active::discover_acpi_root() {
             Some(acpi) => (acpi, "legacy scan"),
             None => {
-                klog!("ACPI TABLES        Check     RSDP absent   FAIL\n");
+                klog_at!(
+                    kmsg::ERR,
+                    "ACPI TABLES        Check     RSDP absent   FAIL\n"
+                );
                 kumo_hal::active::halt();
             }
         },
@@ -1734,7 +1839,10 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             madt
         }
         None => {
-            klog!("ACPI MADT          Check     APIC absent or invalid   FAIL\n");
+            klog_at!(
+                kmsg::ERR,
+                "ACPI MADT          Check     APIC absent or invalid   FAIL\n"
+            );
             kumo_hal::active::halt();
         }
     };
@@ -1847,7 +1955,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                                     );
                                 }
                                 Some(applied) => {
-                                    klog!(
+                                    klog_at!(
+                                        kmsg::ERR,
                                         "IOAPIC WRITE       Check     readback {:#010x}:{:#010x} != plan {:#010x}:{:#010x}   FAIL\n",
                                         applied.high_readback,
                                         applied.low_readback,
@@ -1857,7 +1966,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                                     kumo_hal::active::halt();
                                 }
                                 None => {
-                                    klog!(
+                                    klog_at!(
+                                        kmsg::ERR,
                                         "IOAPIC WRITE       Check     apply unavailable   FAIL\n"
                                     );
                                     kumo_hal::active::halt();
@@ -1865,7 +1975,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                             }
                         }
                         None => {
-                            klog!(
+                            klog_at!(
+                                kmsg::ERR,
                                 "IOAPIC PLAN        Check     timer route not encodable   FAIL\n"
                             );
                             kumo_hal::active::halt();
@@ -1873,7 +1984,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                     }
                 }
                 Some(io_apic) => {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "IOAPIC HW          Check     MADT id {} / HW id {}  GSI {}-{} route {}   FAIL\n",
                         io_apic.madt_id,
                         io_apic.hardware_id,
@@ -1884,13 +1996,19 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                     kumo_hal::active::halt();
                 }
                 None => {
-                    klog!("IOAPIC HW          Check     bootstrap window unavailable   FAIL\n");
+                    klog_at!(
+                        kmsg::ERR,
+                        "IOAPIC HW          Check     bootstrap window unavailable   FAIL\n"
+                    );
                     kumo_hal::active::halt();
                 }
             }
         }
         None => {
-            klog!("ACPI IRQ ROUTE     Check     ISA IRQ 0 unresolved   FAIL\n");
+            klog_at!(
+                kmsg::ERR,
+                "ACPI IRQ ROUTE     Check     ISA IRQ 0 unresolved   FAIL\n"
+            );
             kumo_hal::active::halt();
         }
     }
@@ -1910,7 +2028,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             seen
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "IDT / TOWER        Check     breakpoint not fielded (seen {})   FAIL\n",
             seen
         );
@@ -1928,7 +2047,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             fpsimd.xmm_after_isr
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "FPSIMD / SSE       Check     CR0 {:#x} CR4 {:#x}  xmm {:#x}->{:#x}   FAIL\n",
             fpsimd.cr0,
             fpsimd.cr4,
@@ -1982,7 +2102,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             );
         }
         Ok(report) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "RING3 / INT80      Check     entered={} calls={} ping={:#x} exit={} frames={:?}   FAIL\n",
                 report.entered,
                 report.calls,
@@ -1993,7 +2114,7 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             kumo_hal::active::halt();
         }
         Err(err) => {
-            klog!("RING3 / INT80      Check     {:?}   FAIL\n", err);
+            klog_at!(kmsg::ERR, "RING3 / INT80      Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     }
@@ -2018,11 +2139,15 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             }
         }
         Ok(report) => {
-            klog!("FPSIMD / SWITCH   Check     {:?}   FAIL\n", report);
+            klog_at!(
+                kmsg::ERR,
+                "FPSIMD / SWITCH   Check     {:?}   FAIL\n",
+                report
+            );
             kumo_hal::active::halt();
         }
         Err(err) => {
-            klog!("FPSIMD / SWITCH   Check     {:?}   FAIL\n", err);
+            klog_at!(kmsg::ERR, "FPSIMD / SWITCH   Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     }
@@ -2040,7 +2165,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                     seen
                 );
             } else {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "PIC / PIT          Check     IRQ {} heartbeat timeout ({}t)   FAIL\n",
                     timer.irq,
                     seen
@@ -2050,7 +2176,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             timer
         }
         Err(err) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "PIC / PIT          Check     unavailable: {:?}   FAIL\n",
                 err
             );
@@ -2071,7 +2198,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                     seen
                 );
             } else {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "x2APIC / TIMER    Check     vec {} heartbeat timeout ({}t)   FAIL\n",
                     timer.vector,
                     seen
@@ -2080,7 +2208,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             }
         }
         Err(err) => {
-            klog!(
+            klog_at!(
+                kmsg::ERR,
                 "x2APIC / TIMER    Check     unavailable: {:?}   FAIL\n",
                 err
             );
@@ -2097,7 +2226,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             seen
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "IOAPIC DISPATCH    Check     vec 0x31 software probe seen {}   FAIL\n",
             seen
         );
@@ -2122,7 +2252,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                         seen
                     );
                 } else {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "IOAPIC TIMER       Check     vec {:#04x} delivery timeout ({}t)   FAIL\n",
                         applied.plan.entry.vector,
                         seen
@@ -2131,14 +2262,18 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                 }
             }
             Some(applied) => {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "IOAPIC TIMER       Check     entry not live  low {:#010x}   FAIL\n",
                     applied.low_readback
                 );
                 kumo_hal::active::halt();
             }
             None => {
-                klog!("IOAPIC TIMER       Check     unmask unavailable   FAIL\n");
+                klog_at!(
+                    kmsg::ERR,
+                    "IOAPIC TIMER       Check     unmask unavailable   FAIL\n"
+                );
                 kumo_hal::active::halt();
             }
         }
@@ -2163,7 +2298,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                         io_seen
                     );
                 } else {
-                    klog!(
+                    klog_at!(
+                        kmsg::ERR,
                         "TIMER SOURCE       Check     local {}t  ioapic +{} (want 3 / 0)   FAIL\n",
                         local_seen,
                         io_seen
@@ -2172,14 +2308,18 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
                 }
             }
             Some(remask) => {
-                klog!(
+                klog_at!(
+                    kmsg::ERR,
                     "TIMER SOURCE       Check     re-mask readback {:#010x} not masked   FAIL\n",
                     remask.low_readback
                 );
                 kumo_hal::active::halt();
             }
             None => {
-                klog!("TIMER SOURCE       Check     re-mask unavailable   FAIL\n");
+                klog_at!(
+                    kmsg::ERR,
+                    "TIMER SOURCE       Check     re-mask unavailable   FAIL\n"
+                );
                 kumo_hal::active::halt();
             }
         }
@@ -2191,14 +2331,16 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
     // callee-saved-register restoration through the real HAL switch primitive.
     let context = kdemo::run();
     if context.threads == 2 && context.switches == 16 && context.work == 6 {
-        klog!(
+        klog_at!(
+            kmsg::NOTICE,
             "CONTEXT SWITCH     Check     {} kthreads  {} switches  work {}  callee-saved + stack resume   OK\n",
             context.threads,
             context.switches,
             context.work
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "CONTEXT SWITCH     Check     {} kthreads  {} switches  work {}   FAIL\n",
             context.threads,
             context.switches,
@@ -2223,7 +2365,8 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             preempt.ticks
         );
     } else {
-        klog!(
+        klog_at!(
+            kmsg::ERR,
             "PREEMPT SCHED      Check     {} kthreads  {} body switches  {} ticks  work {:?}   FAIL\n",
             preempt.threads,
             preempt.switches,
@@ -2269,11 +2412,15 @@ pub fn x86_first_light(mbi: u64, magic: u64, kernel_stack_top: u64) -> ! {
             );
         }
         Ok(report) => {
-            klog!("USER ELF / ENGINE  Check     {:?}   FAIL\n", report);
+            klog_at!(
+                kmsg::ERR,
+                "USER ELF / ENGINE  Check     {:?}   FAIL\n",
+                report
+            );
             kumo_hal::active::halt();
         }
         Err(err) => {
-            klog!("USER ELF / ENGINE  Check     {:?}   FAIL\n", err);
+            klog_at!(kmsg::ERR, "USER ELF / ENGINE  Check     {:?}   FAIL\n", err);
             kumo_hal::active::halt();
         }
     }

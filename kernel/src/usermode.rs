@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j494
 //j528
 //j532
 //j547
 //j556
+//j559
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -513,6 +513,29 @@ fn console_write_in_state(sora: &mut SoraState, bytes: &[u8]) {
     if write_hal {
         kumo_hal::active::early_console_write(bytes);
     }
+}
+
+/// Largest piece the boot replay sends drv-fb at once (J559): the size of every other console
+/// write. drv-fb used to read its channel 256 bytes at a time, and a channel read drops what
+/// does not fit, so a 4 KiB replay showed only the banner's first 256 bytes on the glass.
+const FRAMEBUFFER_CONSOLE_PIECE: usize = 256;
+
+/// `LogWrite` (J559): keep `(level, ptr, len)` from `source` in the kernel log, and echo it the
+/// way `DebugWrite` writes when the console level allows. The caller checks the buffer against
+/// its own address space (`readable`). Returns the byte count, or `u64::MAX` for a bad level or
+/// buffer.
+fn log_write_in_state(sora: &mut SoraState, source: KoId, readable: bool, r: &[u64]) -> u64 {
+    let level = r[0];
+    let user_ptr = r[1];
+    let len = (r[2] as usize).min(256);
+    if level > u64::from(crate::kmsg::DEBUG) || !readable {
+        return u64::MAX;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
+    if crate::kmsg::record(source.0, level as u8, bytes) {
+        console_write_in_state(sora, bytes);
+    }
+    len as u64
 }
 
 /// Pure dual-sink policy for [`console_write_without_switch`] (host-tested).
@@ -1483,6 +1506,39 @@ fn dispatch_object_syscall(
                 r[1] = 0;
             }
         }
+    } else if num == Syscall::LogRead as u64 || num == Syscall::LogLevel as u64 {
+        // The kernel log is system state: reading it or changing what the console shows takes
+        // a Resource with MANAGE. Only the root resource carries it (children are minted
+        // without), so in practice this is Sora's `dmesg` (J559).
+        let resource = Handle(r[0] as u32);
+        if target
+            .handles()
+            .require(resource, ObjectKind::Resource, Rights::MANAGE)
+            .is_err()
+        {
+            r[0] = u64::MAX;
+        } else if num == Syscall::LogLevel as u64 {
+            r[0] = if r[1] == kumo_abi::sys::LOG_LEVEL_QUERY {
+                u64::from(crate::kmsg::console_level())
+            } else {
+                u8::try_from(r[1])
+                    .ok()
+                    .and_then(crate::kmsg::set_console_level)
+                    .map_or(u64::MAX, u64::from)
+            };
+        } else {
+            let offset = r[1];
+            let user_buf = r[2];
+            let len = (r[3] as usize).min(MAX_CHANNEL_BYTES);
+            if !user_range_ok(target, user_buf, len as u64) {
+                r[0] = u64::MAX;
+                return true;
+            }
+            let dest = unsafe { core::slice::from_raw_parts_mut(user_buf as *mut u8, len) };
+            let (n, next) = crate::kmsg::read(offset, dest);
+            r[0] = n as u64;
+            r[1] = next;
+        }
     } else if num == Syscall::VmoRead as u64 {
         // A process reading a VMO it was handed (J186 capability-passing). Validate the
         // destination against the ISSUER's address space and resolve the handle in the
@@ -1964,8 +2020,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     linux_output_len += n;
                 });
                 if handled_linux {
+                    // The Stage-A M10 bridge serves only Sora's boot smokes, so what they print
+                    // is a boot record: kept for `dmesg`, shown at INFO (J559).
                     for chunk in linux_output[..linux_output_len].chunks(MAX_CHANNEL_BYTES) {
-                        console_write_in_state(sora, chunk);
+                        if crate::kmsg::record(cp_koid.0, crate::kmsg::INFO, chunk) {
+                            console_write_in_state(sora, chunk);
+                        }
                     }
                     return;
                 }
@@ -1986,6 +2046,9 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     // before the claim it remains an ordinary Stage-A HAL write.
                     console_write_in_state(sora, bytes);
                     r[0] = len as u64;
+                } else if num == Syscall::LogWrite as u64 {
+                    let readable = user_range_ok(child, r[1], r[2].min(256));
+                    r[0] = log_write_in_state(sora, cp_koid, readable, r);
                 } else if num == Syscall::ChannelRead as u64 {
                     // Child channel reads are served by the top-level
                     // `read_child_channel_without_borrow` arm before this block; this stub is
@@ -2030,6 +2093,11 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     );
                     if validated && kumo_hal::active::handoff_framebuffer_console(phys_base, len) {
                         sora.framebuffer_owner = Some(cp_koid);
+                        // drv-fb clears the glass; give it the boot lines the console
+                        // showed until now, ahead of anything later (J559).
+                        crate::kmsg::take_early(FRAMEBUFFER_CONSOLE_PIECE, |chunk| {
+                            let _ = queue_framebuffer_console(sora, chunk);
+                        });
                         r[0] = Errno::Ok.status() as u32 as u64;
                     } else {
                         r[0] = Errno::AccessDenied.status() as u32 as u64;
@@ -2055,6 +2123,15 @@ extern "C" fn svc_hook(regs: *mut u64) {
             console_write_in_state(sora, bytes);
             sora.wrote += len;
             r[0] = len as u64;
+        } else if num == Syscall::LogWrite as u64 {
+            let readable = user_range_ok(&sora.process, r[1], r[2].min(256));
+            let koid = sora.process.koid();
+            r[0] = log_write_in_state(sora, koid, readable, r);
+            // Sora's boot output is log records since J559; the USERLAND check counts it as
+            // output, as it counts `DebugWrite`.
+            if r[0] != u64::MAX {
+                sora.wrote += r[0] as usize;
+            }
         } else if dispatch_object_syscall(&mut sora.engine, &mut sora.process, num, r) {
             // Handled by the shared target-agnostic dispatcher (HandleClose, VmoRead/Write,
             // VmoCreate, Handle{Koid,Duplicate}, Port{Create,Bind,Unbind}, TimerCreate,
@@ -2514,17 +2591,15 @@ fn attempt_sora(
     let boot_ctx = kumo_hal::active::ThreadContext::default();
     unsafe { crate::user_thread::pin_boot_context(&boot_ctx) };
 
-    // P6-c: write several console messages from the kernel to Sora's console channel.
-    // Sora's read loop will echo each one via DebugWrite.
+    // P6-c: write several console messages from the kernel to Sora's console channel. Since
+    // J559 they are empty: the queue-then-drain proof is unchanged, but drv-fb reads this same
+    // channel, and the text drew a test pattern across the glass. The lines live in the log.
+    for line in 1..=4 {
+        crate::klog!("P6: console line {}\n", line);
+    }
     with_sora_mut(|sora| {
-        let messages: &[&[u8]] = &[
-            b"P6: console line 1\n",
-            b"P6: console line 2\n",
-            b"P6: console line 3\n",
-            b"P6: console line 4\n",
-        ];
-        for msg_bytes in messages {
-            if let Ok(message) = Message::new(1, msg_bytes, &[]) {
+        for _ in 0..4 {
+            if let Ok(message) = Message::new(1, &[], &[]) {
                 if let Ok(msg) = KernelMessage::from_borrowed(message) {
                     if let Some(channel) =
                         sora.engine.ipc_mut().channel_pair_mut(sora.console_channel)
@@ -2547,9 +2622,12 @@ fn attempt_sora(
     unsafe { crate::user_thread::spawn_user(user_state, user_ttbr0) };
 
     // P6-d: prove the park/wake cycle live — with Sora parked, push two more console
-    // lines; each write wakes Sora, it echoes and parks again before we continue.
-    console_to_sora(b"P6: live console A\n");
-    console_to_sora(b"P6: live console B\n");
+    // messages; each write wakes Sora, it reads and parks again before we continue. Empty
+    // since J559, for the reason P6-c gives; their lines go to the log.
+    crate::klog!("P6: live console A\n");
+    console_to_sora(&[]);
+    crate::klog!("P6: live console B\n");
+    console_to_sora(&[]);
 
     // Read Sora's reply from the root channel (kernel side).
     let mut handshake = [0u8; 32];
@@ -2708,6 +2786,18 @@ fn deliver_to_sora(bytes: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+/// Probe the console route with an empty message (J559): Sora wakes, reads it, writes nothing
+/// and parks, so the probe proves the round trip at any console level. It used to be the
+/// first routed `klog!` line, which an INFO line now never is. Same gates as
+/// [`try_console_route`].
+pub fn probe_console_route() -> bool {
+    CONSOLE_ROUTE.load(core::sync::atomic::Ordering::Acquire)
+        && crate::user_thread::is_started()
+        && !crate::user_thread::is_done()
+        && crate::user_thread::is_parked()
+        && deliver_to_sora(&[])
 }
 
 /// Send one console message to the live Sora server (the P6-c live-wake demo path).
@@ -3086,6 +3176,126 @@ mod tests {
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         let process = Process::new(engine.objects_mut(), &job, vmar);
         (engine, process)
+    }
+
+    #[test]
+    fn the_kernel_log_is_read_and_tuned_only_with_a_managing_resource() {
+        // J559: `dmesg` holds the root resource; a narrowed child resource (no MANAGE) or a
+        // non-resource handle may neither read the log nor change what the console shows.
+        let mut buffer = alloc::vec![0u8; 3 * crate::mm::PAGE_SIZE as usize];
+        let page = crate::mm::PAGE_SIZE;
+        let base = (buffer.as_mut_ptr() as u64 + page - 1) & !(page - 1);
+        let mut engine = SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(base, page).unwrap();
+        let mut process = Process::new(engine.objects_mut(), &job, vmar);
+        let root = engine
+            .root_resource_create(&mut process, 0x9000_0000, 0x10_0000, 0, 0)
+            .unwrap();
+        let mut r = [0u64; 31];
+        r[0] = root.0 as u64;
+        r[1] = 0x9000_0000;
+        r[2] = 0x1000;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::ResourceCreateChild as u64,
+            &mut r
+        ));
+        let child = r[0];
+        assert_ne!(child, u64::MAX);
+
+        let _level = crate::kmsg::LEVEL_TEST_LOCK.lock().unwrap();
+        crate::kmsg::record(4242, crate::kmsg::INFO, b"j559 test line\n");
+
+        let call = |engine: &mut SyscallEngine, process: &mut Process, num, args: [u64; 4]| {
+            let mut r = [0u64; 31];
+            r[..4].copy_from_slice(&args);
+            assert!(dispatch_object_syscall(engine, process, num, &mut r));
+            (r[0], r[1])
+        };
+        let read = Syscall::LogRead as u64;
+        let level = Syscall::LogLevel as u64;
+        let query = kumo_abi::sys::LOG_LEVEL_QUERY;
+        for denied in [child, 0x7777] {
+            assert_eq!(
+                call(&mut engine, &mut process, read, [denied, 0, base, 64]).0,
+                u64::MAX
+            );
+            assert_eq!(
+                call(&mut engine, &mut process, level, [denied, query, 0, 0]).0,
+                u64::MAX
+            );
+        }
+
+        // Other host tests log from their own threads; a read that meets the ring mid-update
+        // returns nothing, so read again until the line shows.
+        let mut text = alloc::vec::Vec::new();
+        for _ in 0..1000 {
+            text.clear();
+            let mut offset = 0;
+            loop {
+                let (n, next) = call(
+                    &mut engine,
+                    &mut process,
+                    read,
+                    [root.0 as u64, offset, base, page],
+                );
+                assert_ne!(n, u64::MAX);
+                if n == 0 {
+                    break;
+                }
+                text.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(base as *const u8, n as usize)
+                });
+                offset = next;
+            }
+            if text.windows(14).any(|w| w == b"j559 test line") {
+                break;
+            }
+        }
+        assert!(text.windows(14).any(|w| w == b"j559 test line"));
+        // A buffer outside the caller's address space is refused.
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                read,
+                [root.0 as u64, 0, 0x10, 64]
+            )
+            .0,
+            u64::MAX
+        );
+
+        let before = crate::kmsg::console_level();
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                level,
+                [root.0 as u64, query, 0, 0]
+            )
+            .0,
+            before as u64
+        );
+        assert_eq!(
+            call(&mut engine, &mut process, level, [root.0 as u64, 7, 0, 0]).0,
+            before as u64
+        );
+        assert_eq!(
+            call(&mut engine, &mut process, level, [root.0 as u64, 8, 0, 0]).0,
+            u64::MAX
+        );
+        assert_eq!(
+            call(
+                &mut engine,
+                &mut process,
+                level,
+                [root.0 as u64, before as u64, 0, 0]
+            )
+            .0,
+            7
+        );
     }
 
     #[test]

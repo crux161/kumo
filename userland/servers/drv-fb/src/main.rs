@@ -2,27 +2,75 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j231
-//j246
 //j249
 //j480
 //j519
 //j554
+//j559
 
-use drv_fb::{Console, PixelOrder, BG};
+use drv_fb::{Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_rt::{
-    channel_read, channel_read_with_handle, debug_write, framebuffer_claim, handle_koid, port_bind,
-    port_create, port_wait, resource_mint_mmio, vmar_map, vmo_create,
+    channel_read, channel_read_with_handle, framebuffer_claim, handle_koid, port_bind, port_create,
+    port_wait, resource_mint_mmio, vmar_map, vmo_create,
 };
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
+/// allows. Failures are ERR, so a default boot still shows them.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
+
+fn log_err(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, message);
+}
 
 kumo_rt::entry!(main);
 
-/// Print `label` then `v` in decimal and a newline to the debug console. The bootstrap path only
-/// offers raw `debug_write(ptr, len)` (no `core::fmt`, no alloc), so format the integer by hand.
+/// One log line built without `core::fmt` (J559).
+struct Line {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl Line {
+    fn new() -> Self {
+        Self {
+            buf: [0; 96],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let take = bytes.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+        self.len += take;
+    }
+
+    fn push_decimal(&mut self, mut value: usize) {
+        let mut digits = [0u8; 20];
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push(&digits[start..]);
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Log `label` then `v` in decimal and a newline. The bootstrap path offers no `core::fmt` and no
+/// alloc, so format the integer by hand.
 /// Used by the J231 X13s framebuffer-geometry diagnostic.
 fn dbg_kv(label: &[u8], v: u64) {
-    debug_write(label.as_ptr(), label.len());
+    log_info(label);
     let mut digits = [0u8; 20];
     let mut n = 0;
     let mut x = v;
@@ -39,7 +87,7 @@ fn dbg_kv(label: &[u8], v: u64) {
         line[i] = digits[n - 1 - i];
     }
     line[n] = b'\n';
-    debug_write(line.as_ptr(), n + 1);
+    log_info(&line[..n + 1]);
 }
 
 #[no_mangle]
@@ -53,7 +101,7 @@ extern "C" fn main(
     _arg6: u64,
     _arg7: u64,
 ) -> ! {
-    debug_write(b"drv-fb starting\n".as_ptr(), 16);
+    log_info(b"drv-fb starting\n");
 
     let bootstrap = Handle(bootstrap_channel as u32);
     let mut buf = [0u8; 32];
@@ -67,7 +115,7 @@ extern "C" fn main(
     let bootinfo_vmo = Handle(bootinfo_raw as u32);
 
     if res_raw == 0 || console_raw == 0 || bootinfo_raw == 0 {
-        debug_write(b"drv-fb: missing handles\n".as_ptr(), 24);
+        log_err(b"drv-fb: missing handles\n");
         kumo_rt::process_exit(1);
     }
 
@@ -82,13 +130,13 @@ extern "C" fn main(
         (VmarFlags::READ).0,
     ) != 0
     {
-        debug_write(b"drv-fb: bootinfo map failed\n".as_ptr(), 28);
+        log_err(b"drv-fb: bootinfo map failed\n");
         kumo_rt::process_exit(1);
     }
 
     let bootinfo = unsafe { &*(bootinfo_va as *const BootInfo) };
     if !bootinfo.has_framebuffer() {
-        debug_write(b"drv-fb: no fb in bootinfo\n".as_ptr(), 26);
+        log_err(b"drv-fb: no fb in bootinfo\n");
         kumo_rt::process_exit(1);
     }
 
@@ -106,7 +154,7 @@ extern "C" fn main(
     let fb_map_len = match bootinfo.framebuffer.mapping_len() {
         Some(len) => len,
         None => {
-            debug_write(b"drv-fb: fb map length overflow\n".as_ptr(), 31);
+            log_err(b"drv-fb: fb map length overflow\n");
             kumo_rt::process_exit(1);
         }
     };
@@ -125,7 +173,7 @@ extern "C" fn main(
     // visible-pixel bounds. This includes only the unavoidable tail of the final page.
     let fb_vmo_h = resource_mint_mmio(res, fb_phys, fb_map_len);
     if fb_vmo_h == u64::MAX {
-        debug_write(b"drv-fb: fb vmo mint failed\n".as_ptr(), 27);
+        log_err(b"drv-fb: fb vmo mint failed\n");
         kumo_rt::process_exit(1);
     }
 
@@ -143,7 +191,7 @@ extern "C" fn main(
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     ) != 0
     {
-        debug_write(b"drv-fb: fb map failed\n".as_ptr(), 22);
+        log_err(b"drv-fb: fb map failed\n");
         kumo_rt::process_exit(1);
     }
 
@@ -159,7 +207,7 @@ extern "C" fn main(
     // Pinpoint breadcrumb for the X13s fault hunt: if the panel shows this line but not
     // "fb probe ok", the FIRST framebuffer write faulted — compare the kernel's FAR dump
     // against fb_va (0x1100_0000) to confirm it is this mapping.
-    debug_write(b"drv-fb: probing fb write\n".as_ptr(), 25);
+    log_info(b"drv-fb: probing fb write\n");
     let fb_words = fb_va as *mut u32;
     let last_px = stride.saturating_mul(height).saturating_sub(1);
     unsafe {
@@ -167,7 +215,7 @@ extern "C" fn main(
         fb_words.add(last_px).write_volatile(BG);
     }
     let probe_ok = b"drv-fb: fb probe ok\n";
-    debug_write(probe_ok.as_ptr(), probe_ok.len());
+    log_info(probe_ok);
 
     // Bind the console port before taking ownership. Diagnostics emitted immediately
     // after the claim are queued to this channel; binding first guarantees each queued
@@ -178,7 +226,7 @@ extern "C" fn main(
         || console_koid == u64::MAX
         || port_bind(Handle(port_h as u32), console) != 0
     {
-        debug_write(b"drv-fb: port setup failed\n".as_ptr(), 26);
+        log_err(b"drv-fb: port setup failed\n");
         kumo_rt::process_exit(1);
     }
     let port = Handle(port_h as u32);
@@ -189,7 +237,7 @@ extern "C" fn main(
     // kernel/user diagnostic is routed to this driver and the HAL cursor is dormant.
     // Claim only after the mapping works, so a failed driver leaves the early console live.
     if framebuffer_claim(res, fb_phys, fb_len) != 0 {
-        debug_write(b"drv-fb: framebuffer claim failed\n".as_ptr(), 33);
+        log_err(b"drv-fb: framebuffer claim failed\n");
         kumo_rt::process_exit(1);
     }
 
@@ -213,15 +261,14 @@ extern "C" fn main(
     let shadow = if shadowed {
         shadow_va as *mut u32
     } else {
-        debug_write(
-            b"drv-fb: no shadow; scrolling reads the glass\n".as_ptr(),
-            45,
+        let _ = kumo_rt::log_write(
+            kumo_abi::sys::log_level::WARNING,
+            b"drv-fb: no shadow; scrolling reads the glass\n",
         );
         fb_va as *mut u32
     };
 
-    // Build the text console over the framebuffer (clears the screen) and show first
-    // light.
+    // Build the text console over the framebuffer (clears the screen).
     let mut con = unsafe {
         Console::new_shadowed(
             fb_va as *mut u32,
@@ -232,14 +279,27 @@ extern "C" fn main(
             pixel_order,
         )
     };
-    con.write(b"KUMO drv-fb console ready\n");
-
-    debug_write(b"drv-fb: initialized\n".as_ptr(), 20);
-    debug_write(b"drv-fb: console ready\n".as_ptr(), 22);
+    // The glass starts blank: first light is a log line (`dmesg`), not text on the screen. The
+    // console's size is the boot milestone the default level shows (J559).
+    let mut line = Line::new();
+    line.push(b"drv-fb: online, console ");
+    line.push_decimal(width);
+    line.push(b"x");
+    line.push_decimal(height);
+    line.push(b", ");
+    line.push_decimal(width / GLYPH_W);
+    line.push(b"x");
+    line.push_decimal(height / GLYPH_H);
+    line.push(b" cells\n");
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+    log_info(b"drv-fb: initialized\n");
+    log_info(b"drv-fb: console ready\n");
 
     // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
-    // Output-only — no keyboard device sits behind the framebuffer yet.
-    let mut rx = [0u8; 256];
+    // Output-only — no keyboard device sits behind the framebuffer yet. A read takes a whole
+    // message and drops what does not fit, so the buffer is a whole message (J559: a 256-byte
+    // buffer cut the boot replay after the banner's second line).
+    let mut rx = [0u8; 4096];
     loop {
         let source = Handle(port_wait(port) as u32);
         if source == console_source {

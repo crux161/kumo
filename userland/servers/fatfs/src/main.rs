@@ -4,6 +4,7 @@
 //j514
 //j545
 //j549
+//j559
 //! The resident `fatfs` server: the handler in this crate's library, wired to a
 //! `Channel` transport and a sector reader, as its module docs anticipated.
 //!
@@ -22,7 +23,13 @@ use fatfs::block::{BlockSectors, BlockTransport};
 use fatfs::{FatServer, Transport};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_fatfs::{FatVolume, SectorReader, SectorWriter, SECTOR_SIZE};
-use kumo_rt::{channel_read, channel_read_with_handle, channel_write, debug_write, vmar_map};
+use kumo_rt::{channel_read, channel_read_with_handle, channel_write, vmar_map};
+
+/// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
+/// allows.
+fn log_info(message: &[u8]) {
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::INFO, message);
+}
 
 kumo_rt::entry!(main);
 
@@ -36,7 +43,7 @@ const MAX_VMO_MAP: u64 = 16 * 1024 * 1024;
 const VMO_VA: u64 = 0x0000_0000_1100_0000;
 
 fn fail(message: &[u8]) -> ! {
-    debug_write(message.as_ptr(), message.len());
+    log_info(message);
     kumo_rt::process_exit(1)
 }
 
@@ -113,7 +120,7 @@ fn serve_blocks(channel: Handle, blocks: Handle, block_count: u64) -> ! {
     let Ok(volume) = FatVolume::mount(&mut disk) else {
         fail(b"fatfs: block mount failed\n");
     };
-    debug_write(b"fatfs: serving blocks\n".as_ptr(), 22);
+    log_info(b"fatfs: serving blocks\n");
     let mut transport = ChannelTransport { channel };
     FatServer::new().serve(&volume, &mut disk, &mut transport);
     kumo_rt::process_exit(0)
@@ -151,7 +158,7 @@ extern "C" fn main(
     _arg6: u64,
     _arg7: u64,
 ) -> ! {
-    debug_write(b"fatfs starting\n".as_ptr(), 15);
+    log_info(b"fatfs starting\n");
     let channel = Handle(bootstrap_channel as u32);
 
     let mut header = [0u8; 16];
@@ -189,7 +196,7 @@ extern "C" fn main(
     let Ok(volume) = FatVolume::mount(&mut disk) else {
         fail(b"fatfs: mount failed\n");
     };
-    debug_write(b"fatfs: serving\n".as_ptr(), 15);
+    log_info(b"fatfs: serving\n");
 
     let mut transport = ChannelTransport { channel };
     FatServer::new().serve(&volume, &mut disk, &mut transport);
