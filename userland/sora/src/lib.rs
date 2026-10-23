@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j551
 //j557
 //j558
 //j559
 //j562
+//j563
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -335,6 +335,26 @@ pub fn media_route(path: &[u8]) -> MediaRoute<'_> {
 /// (PLAN/012). `path` is canonical and absolute, as the shell's working directory resolves it.
 pub fn shell_may_read(path: &[u8]) -> bool {
     path != b"/etc/shadow"
+}
+
+/// `id`'s line for an account, as coreutils prints it: `uid=1000(crux) gid=1000(crux)
+/// groups=1000(crux)`. Only the primary group until `/etc/group` membership is served.
+pub fn write_id(
+    subject: &kumo_identity::protocol::Subject<'_>,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    let group = |out: &mut dyn core::fmt::Write| {
+        if subject.group.is_empty() {
+            write!(out, "{}", subject.gid)
+        } else {
+            write!(out, "{}({})", subject.gid, subject.group)
+        }
+    };
+    write!(out, "uid={}({}) gid=", subject.uid, subject.name)?;
+    group(out)?;
+    write!(out, " groups=")?;
+    group(out)?;
+    writeln!(out)
 }
 
 /// The boot-local writable FAT scratch volume is visible at `/tmp`, separate from the
@@ -937,6 +957,28 @@ mod tests {
                 Some(level)
             );
         }
+    }
+
+    #[test]
+    fn id_prints_like_coreutils() {
+        use kumo_identity::protocol::Subject;
+        let mut subject = Subject {
+            name: "crux",
+            uid: 1000,
+            gid: 1000,
+            group: "crux",
+            home: "/home/crux",
+            shell: "/bin/kumoza",
+            root: false,
+            may_log_in: true,
+        };
+        let mut out = alloc::string::String::new();
+        write_id(&subject, &mut out).unwrap();
+        assert_eq!(out, "uid=1000(crux) gid=1000(crux) groups=1000(crux)\n");
+        subject.group = "";
+        out.clear();
+        write_id(&subject, &mut out).unwrap();
+        assert_eq!(out, "uid=1000(crux) gid=1000 groups=1000\n");
     }
 
     #[test]

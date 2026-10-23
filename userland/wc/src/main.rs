@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+//j563
 
 //! `wc` — line/word/byte counts of one initrd file, via explicit capabilities.
 //!
@@ -10,7 +11,9 @@
 //! filesystem authority. (Reading standard input — the `… | wc` form — waits for the shell
 //! stdio model, DESIGN/013.)
 
-use kumo_abi::{entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN};
+use kumo_abi::{
+    entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN, INITRD_TABLE_MAX,
+};
 use kumo_rt::{channel_write, debug_write, process_exit, startup, vmo_read};
 use wc::Counter;
 
@@ -94,7 +97,7 @@ extern "C" fn main(
     };
 
     // Read the initrd entry table (mirrors `cat`).
-    let mut table = [0u8; 2048];
+    let mut table = [0u8; INITRD_TABLE_MAX];
     if vmo_read(initrd, 0, table.as_mut_ptr(), INITRD_HEADER_LEN) != 0 {
         fail(b"wc: initrd read fail\n");
     }

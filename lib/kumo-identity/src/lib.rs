@@ -1,6 +1,7 @@
 #![no_std]
 //j561
 //j562
+//j563
 
 //! The interim identity layer's policy (PLAN/012): `/etc/passwd`, `/etc/group` and
 //! `/etc/shadow` parsing, shared by the image builder that writes the files and by the
@@ -9,6 +10,13 @@
 //! Everything here borrows from the file text and allocates nothing. Identity is userspace
 //! policy over capabilities (`DESIGN/012` §0): an account names a subject, and "root" grants
 //! nothing by itself.
+
+pub mod protocol;
+pub mod verify;
+
+/// argon2's 1 KiB working block, so a caller can size and map the memory a check needs.
+pub use argon2::Block;
+pub use verify::{blocks_needed, verify_password, Identity, VerifyError};
 
 /// One `/etc/passwd` line: `name:x:uid:gid:gecos:home:shell`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

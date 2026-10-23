@@ -1,8 +1,8 @@
-#j493
 #j495
 #j520
 #j524
 #j561
+#j563
 [workspace]
 members = [
     "boot/niji-loader",
@@ -44,6 +44,7 @@ members = [
     "userland/servers/drv-xhci",
     "userland/servers/drv-serial",
     "userland/servers/fatfs",
+    "userland/servers/identityd",
     "userland/servers/svc-health",
     "userland/servers/ttyd",
     "userland/sora",

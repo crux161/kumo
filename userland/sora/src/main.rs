@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j556
 //j557
 //j558
 //j559
 //j562
+//j563
 
 extern crate alloc;
 
@@ -13,11 +13,16 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, KILO_PATH, LS_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GROUP_PATH, IDENTITYD_PATH, KILO_PATH,
+    LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH,
+    SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
+use kumo_identity::protocol::{
+    bundle_header, Reply as IdentityReply, Request as IdentityRequest, BUNDLE_HEADER_LEN,
+    REPLY_MAX as IDENTITY_REPLY_MAX, REQUEST_MAX as IDENTITY_REQUEST_MAX,
+};
 use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
@@ -2199,6 +2204,10 @@ extern "C" fn sora_main(
         let mut mouse_events_seen: u32 = 0;
         let mut malformed_mouse_events_seen: u32 = 0;
 
+        if let Some(client) = spawn_identityd(initrd) {
+            IDENTITYD.store(client.0, Ordering::Relaxed);
+        }
+
         let ttyd_recipe = sora::ServerRecipe {
             name: "ttyd",
             image_path: TTYD_PATH,
@@ -2597,6 +2606,10 @@ fn eval_command(
 ) -> bool {
     if cmd.name == "dmesg" {
         dmesg(cmd);
+        return true;
+    }
+    if cmd.name == "id" {
+        id(cmd);
         return true;
     }
     if cmd.name == "pwd" {
@@ -3060,6 +3073,150 @@ fn run_on_volume(
     );
 }
 
+/// The identity service's client end (PLAN/012), or 0 when it did not start.
+static IDENTITYD: AtomicU32 = AtomicU32::new(0);
+
+/// Start `identityd`. Its whole world is one read-only VMO holding `/etc/passwd`, `/etc/group`
+/// and `/etc/shadow`, copied out of the initrd (`kumo_identity::protocol::bundle_files`); it
+/// gets no initrd, no filesystem and no device. It parks in `PortWait` before this returns.
+fn spawn_identityd(initrd: Handle) -> Option<Handle> {
+    let files =
+        [PASSWD_PATH, GROUP_PATH, SHADOW_PATH].map(|path| initrd_find(initrd, path.as_bytes()));
+    let [Some(passwd), Some(group), Some(shadow)] = files else {
+        log(b"identityd: identity files missing\n");
+        return None;
+    };
+    let Some(header) = bundle_header(passwd.1 as usize, group.1 as usize, shadow.1 as usize) else {
+        log(b"identityd: identity files too large\n");
+        return None;
+    };
+    let len = BUNDLE_HEADER_LEN as u64 + passwd.1 + group.1 + shadow.1;
+    let raw = vmo_create(len);
+    if raw == 0 || raw == u64::MAX {
+        log(b"identityd: bundle vmo unavailable\n");
+        return None;
+    }
+    let bundle = Handle(raw as u32);
+    let mut at = BUNDLE_HEADER_LEN as u64;
+    let mut copied = vmo_write(bundle, 0, header.as_ptr(), header.len()) == 0;
+    for (base, file_len) in [passwd, group, shadow] {
+        copied = copied && copy_from_initrd(initrd, base, file_len, bundle, at);
+        at += file_len;
+    }
+    let grant = handle_duplicate(bundle, Rights::READ | Rights::TRANSFER);
+    let _ = handle_close(bundle);
+    if !copied || grant == 0 || grant == u64::MAX {
+        if grant != 0 && grant != u64::MAX {
+            let _ = handle_close(Handle(grant as u32));
+        }
+        log(b"identityd: bundle copy failed\n");
+        return None;
+    }
+
+    let (client_raw, server_raw) = channel_create_pair();
+    if client_raw == u64::MAX || server_raw == u64::MAX {
+        let _ = handle_close(Handle(grant as u32));
+        log(b"identityd: channel unavailable\n");
+        return None;
+    }
+    let client = Handle(client_raw as u32);
+    let close_all = || {
+        let _ = handle_close(client);
+        let _ = handle_close(Handle(server_raw as u32));
+    };
+    if channel_write_with_handle(client, len.to_le_bytes().as_ptr(), 8, Handle(grant as u32))
+        != Errno::Ok.status()
+    {
+        let _ = handle_close(Handle(grant as u32));
+        close_all();
+        log(b"identityd: bootstrap queue failed\n");
+        return None;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    if !run_elf(
+        initrd,
+        IDENTITYD_PATH.as_bytes(),
+        0,
+        server_raw,
+        flags,
+        b"identityd",
+    ) {
+        close_all();
+        return None;
+    }
+    if !child_parked(process_wait()) {
+        let _ = handle_close(client);
+        log(b"identityd: did not start\n");
+        return None;
+    }
+    Some(client)
+}
+
+/// Copy `len` bytes at `base` in the initrd to `offset` in `dst`. VMO copies are capped at 256
+/// bytes a call (J166), as `fat_image_alias` does it.
+fn copy_from_initrd(initrd: Handle, base: u64, len: u64, dst: Handle, offset: u64) -> bool {
+    let mut chunk = [0u8; 256];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(chunk.len() as u64) as usize;
+        if vmo_read(initrd, base + done, chunk.as_mut_ptr(), n) != 0
+            || vmo_write(dst, offset + done, chunk.as_ptr(), n) != 0
+        {
+            return false;
+        }
+        done += n as u64;
+    }
+    true
+}
+
+/// One request to `identityd` and its reply, pumped the way `ttyd_request_reply` is.
+fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Option<usize> {
+    let client = Handle(IDENTITYD.load(Ordering::Relaxed));
+    if client.0 == 0 {
+        return None;
+    }
+    let mut frame = [0u8; IDENTITY_REQUEST_MAX];
+    let len = request.encode_into(&mut frame)?;
+    let written = channel_write(client, frame.as_ptr(), len) == 0;
+    frame.fill(0);
+    if !written || !child_parked(process_wait()) {
+        return None;
+    }
+    let n = channel_read(client, reply.as_mut_ptr(), reply.len());
+    (n != 0 && n != u64::MAX).then_some(n as usize)
+}
+
+/// `id USER`: who an account is, as `identityd` knows it. Until login (PLAN/012 item 4) the
+/// shell has no user of its own to report.
+fn id(cmd: &kumoza::Command) {
+    let [name] = cmd.args.as_slice() else {
+        log(b"usage: id <user>\n");
+        return;
+    };
+    let no_such_user = || {
+        log(b"id: '");
+        log(name.as_bytes());
+        log(b"': no such user\n");
+    };
+    if !kumo_identity::valid_name(name) {
+        no_such_user();
+        return;
+    }
+    let mut reply = [0u8; IDENTITY_REPLY_MAX];
+    let answer = identity_request_reply(IdentityRequest::Lookup { name }, &mut reply)
+        .and_then(|n| IdentityReply::decode(&reply[..n]));
+    match answer {
+        Some(IdentityReply::Ok(subject)) => {
+            let mut line = alloc::string::String::new();
+            if sora::write_id(&subject, &mut line).is_ok() {
+                log(line.as_bytes());
+            }
+        }
+        Some(IdentityReply::NotFound) => no_such_user(),
+        _ => log(b"id: identity service unavailable\n"),
+    }
+}
+
 /// `dmesg` prints the kernel log; `dmesg -n LEVEL` sets which levels the console also shows,
 /// as Linux's does (J559). LEVEL is 0-7 or a name from `emerg` to `debug`; `dmesg -n` alone
 /// reports the current one.
@@ -3138,7 +3295,7 @@ fn check_directory(initrd: Handle, path: &str) -> Result<(), DirectoryError> {
         }
         sora::MediaRoute::Elsewhere => {}
     }
-    let mut table = [0u8; 2048];
+    let mut table = [0u8; kumo_abi::INITRD_TABLE_MAX];
     if vmo_read(initrd, 0, table.as_mut_ptr(), kumo_abi::INITRD_HEADER_LEN) != 0 {
         return Err(DirectoryError::Unavailable);
     }

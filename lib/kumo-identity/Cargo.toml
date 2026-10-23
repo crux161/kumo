@@ -1,5 +1,6 @@
 #j561
 #j562
+#j563
 [package]
 name = "kumo-identity"
 authors.workspace = true
@@ -11,6 +12,10 @@ version.workspace = true
 # argon2id for `/etc/shadow` (PLAN/012). Vendored in `vendor/cargo`; no defaults, so no `std`
 # and no `alloc` until the identity service decides it needs them.
 argon2 = { version = "0.5.3", default-features = false, features = ["password-hash"] }
+
+[dev-dependencies]
+# The tests mint real PHC strings, which needs `alloc`.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 
 [lib]
 path = "src/lib.rs"

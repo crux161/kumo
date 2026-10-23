@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j547
+//j563
 
 //! `cat` — stream one initrd file through explicit capabilities.
 //!
@@ -13,7 +14,9 @@
 //! J547: when Sora grants a filesystem instead (`cat /media/<name>/<path>`), `cat` opens the
 //! path on that filesystem through `kumo-vfs` and streams it the same way.
 
-use kumo_abi::{entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN};
+use kumo_abi::{
+    entry_table_bytes, find_entry, unpack_argv, Handle, INITRD_HEADER_LEN, INITRD_TABLE_MAX,
+};
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 use kumo_vfs::{
     parse_open_reply, read_payload, Request, VfsError, MAX_PATH, VFS_IS_DIR, VFS_NOT_FOUND,
@@ -115,7 +118,7 @@ extern "C" fn main(
         Err(_) => fail(b"cat: bad path\n"),
     };
 
-    let mut table = [0u8; 2048];
+    let mut table = [0u8; INITRD_TABLE_MAX];
     if vmo_read(initrd, 0, table.as_mut_ptr(), INITRD_HEADER_LEN) != 0 {
         fail(b"cat: initrd read fail\n");
     }

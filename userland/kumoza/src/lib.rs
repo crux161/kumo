@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j517
 //j535
 //j553
 //j558
 //j559
+//j563
 
 extern crate alloc;
 
@@ -129,8 +129,8 @@ pub struct Statement {
 
 /// Help text for the current Kumoza builtin scaffold.
 pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
-    builtins: cat <path>, cd [path], clear, echo [-n], false, help, ls [-al] [path],\n\
-              lua [expr], pwd, run <program>, true, wc <path>\n\
+    builtins: cat <path>, cd [path], clear, echo [-n], false, help, id <user>,\n\
+              ls [-al] [path], lua [expr], pwd, run <program>, true, wc <path>\n\
     power: halt, reboot, shutdown\n\
     editor: kilo /tmp/<file> or /media/<volume>/<file> (relative paths use cwd)\n\
     diag: dmesg [-n level], heap, ipcstat, relibc [args], threads\n\

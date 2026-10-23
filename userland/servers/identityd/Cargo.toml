@@ -1,0 +1,32 @@
+#j563
+
+[package]
+name = "identityd"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-identity = { path = "../../../lib/kumo-identity" }
+
+[dev-dependencies]
+# The tests mint real PHC strings, which needs `alloc`.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi = { path = "../../../lib/kumo-abi" }
+kumo-rt = { path = "../../kumo-rt" }
+
+[lib]
+test = true
+doctest = false
+
+# The resident binary, built for the image target only, so `cargo test -p identityd` runs the
+# serve loop on the host without the runtime (the svc-health split).
+[[bin]]
+name = "identityd"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

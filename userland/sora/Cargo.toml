@@ -2,6 +2,7 @@
 #j548
 #j551
 #j558
+#j563
 
 [package]
 name = "sora"
@@ -16,6 +17,7 @@ drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 kumo-abi.workspace = true
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }
 kumo-i2c-hid = { path = "../../lib/kumo-i2c-hid" }
+kumo-identity = { path = "../../lib/kumo-identity" }
 kumo-ipc.workspace = true
 kumo-vfs = { path = "../../lib/kumo-vfs" }
 kumo-rt = { path = "../kumo-rt" }

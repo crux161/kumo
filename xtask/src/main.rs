@@ -1,8 +1,8 @@
-//j493
 //j506
 //j507
 //j517
 //j562
+//j563
 
 use std::env;
 use std::fmt;
@@ -20,11 +20,11 @@ use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
     DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, HELLO_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN,
-    INITRD_MAGIC, INITRD_PATH_MAX, INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
-    TTYD_PATH, WC_PATH,
+    INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION, KILO_PATH, LS_PATH,
+    LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
+    THREADS_PATH, TTYD_PATH, WC_PATH,
 };
-use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, PASSWD_PATH, SHADOW_PATH};
+use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
 mod identity;
 
@@ -843,6 +843,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fatfs = build_fatfs_image(&workspace_root()?)?;
+            let identityd = build_identityd_image(&workspace_root()?)?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
@@ -866,6 +867,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
+                (IDENTITYD_PATH, identityd.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
@@ -1406,6 +1408,31 @@ fn build_fatfs_image(root: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn build_identityd_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "identityd",
+            "--bin",
+            "identityd",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("identityd");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as identityd ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
 fn build_persona_linux_hello_elf() -> Vec<u8> {
     const ELF_HEADER_LEN: usize = 64;
     const ELF_PHDR_LEN: usize = 56;
@@ -1485,6 +1512,13 @@ fn build_persona_linux_hello_elf() -> Vec<u8> {
 }
 
 fn build_initrd(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    if files.len() > INITRD_MAX_ENTRIES {
+        return Err(format!(
+            "initrd has {} entries; programs that read its table hold at most {INITRD_MAX_ENTRIES} \
+             (kumo_abi::INITRD_MAX_ENTRIES)",
+            files.len()
+        ));
+    }
     let table_bytes = files
         .len()
         .checked_mul(INITRD_ENTRY_LEN)
@@ -2878,4 +2912,23 @@ fn print_help() {
     println!("--console-uart: image-only explicit PL011 route; use firmware's reported MMIO base");
     println!("x86-uefi-smoke: exact OVMF -> GRUB -> Multiboot2 ISO path; KUMO_OVMF_CODE/KUMO_OVMF_VARS override firmware discovery");
     println!("preflight: mechanical guardrail tripwires (GUIDANCE/006 §5); KUMO_PREFLIGHT_FULL=1 adds both-backend build + smoke");
+}
+
+#[cfg(test)]
+mod initrd_tests {
+    use super::{build_initrd, INITRD_MAX_ENTRIES};
+
+    /// J563: a 26th entry silently overflowed the 2048-byte table copies in `ls`/`cat`/`wc`
+    /// and Sora's `cd`. The builder now refuses what they cannot hold.
+    #[test]
+    fn an_initrd_past_the_table_limit_is_refused() {
+        let names: Vec<String> = (0..=INITRD_MAX_ENTRIES)
+            .map(|i| format!("bin/f{i}"))
+            .collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        assert!(build_initrd(&files[..INITRD_MAX_ENTRIES]).is_ok());
+        assert!(build_initrd(&files)
+            .unwrap_err()
+            .contains("INITRD_MAX_ENTRIES"));
+    }
 }

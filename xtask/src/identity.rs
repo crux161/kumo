@@ -1,4 +1,5 @@
 //j562
+//j563
 
 //! INDRA's identity files for the initrd, and `cargo xtask passwd` (PLAN/012).
 //!
@@ -271,6 +272,18 @@ mod tests {
             hash,
             hash_password("correct horse").unwrap(),
             "salts differ"
+        );
+        // identityd's no-alloc verifier accepts what this tool writes, at the shipped cost.
+        let blocks = kumo_identity::blocks_needed(&hash).unwrap();
+        assert_eq!(blocks, 19456);
+        let mut memory = vec![kumo_identity::Block::default(); blocks];
+        assert_eq!(
+            kumo_identity::verify_password(&hash, b"correct horse", &mut memory),
+            Ok(true)
+        );
+        assert_eq!(
+            kumo_identity::verify_password(&hash, b"correct horsf", &mut memory),
+            Ok(false)
         );
     }
 }

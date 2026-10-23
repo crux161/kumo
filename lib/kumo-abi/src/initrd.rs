@@ -1,14 +1,20 @@
-//j493
 //j506
 //j508
 //j517
 //j562
+//j563
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
 pub const INITRD_ENTRY_LEN: usize = 80;
 pub const INITRD_PATH_MAX: usize = 64;
 pub const INITRD_VERSION: u32 = 1;
+/// The most entries an initrd may carry. `ls`, `cat`, `wc` and Sora's `cd` copy the whole entry
+/// table into a fixed [`INITRD_TABLE_MAX`]-byte buffer on a 16 KiB stack, and the image builder
+/// refuses an initrd that would not fit. J563's `bin/identityd`, the 26th entry, overflowed the
+/// 2048 bytes each of them used to hard-code.
+pub const INITRD_MAX_ENTRIES: usize = 48;
+pub const INITRD_TABLE_MAX: usize = INITRD_HEADER_LEN + INITRD_MAX_ENTRIES * INITRD_ENTRY_LEN;
 pub const SORA_INIT_PATH: &str = "bin/sora";
 pub const SVC_HEALTH_PATH: &str = "bin/svc-health";
 pub const TTYD_PATH: &str = "bin/ttyd";
@@ -22,6 +28,10 @@ pub const DRV_BLK_PATH: &str = "bin/drv-blk";
 /// on the same channel — the storage domain's first live server.
 pub const FATFS_PATH: &str = "bin/fatfs";
 pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
+/// The identity service (PLAN/012): handed `/etc/passwd`, `/etc/group` and `/etc/shadow` as one
+/// read-only bundle, it answers `verify` and `lookup` and is the only process that checks a
+/// password.
+pub const IDENTITYD_PATH: &str = "bin/identityd";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
@@ -364,6 +374,12 @@ mod tests {
             find_entry(&table[..INITRD_HEADER_LEN + INITRD_ENTRY_LEN], HELLO_PATH),
             Err(InitrdError::TruncatedTable)
         );
+    }
+
+    #[test]
+    fn the_table_limit_fits_a_child_stack_with_room() {
+        assert_eq!(INITRD_TABLE_MAX, 3856);
+        assert!(INITRD_TABLE_MAX <= 4096);
     }
 
     #[test]

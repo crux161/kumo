@@ -3,6 +3,7 @@
 //j547
 //j548
 //j558
+//j563
 
 //! `ls` — the first KUMO program that *uses a capability*.
 //!
@@ -25,7 +26,9 @@
 //! J548: names come back long, and those starting with `.` are hidden unless `-a` is given,
 //! as `ls` does elsewhere.
 
-use kumo_abi::{entries, entry_table_bytes, unpack_argv, Handle, INITRD_HEADER_LEN};
+use kumo_abi::{
+    entries, entry_table_bytes, unpack_argv, Handle, INITRD_HEADER_LEN, INITRD_TABLE_MAX,
+};
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 use kumo_vfs::{parse_dir_reply, Request, VfsError, MAX_PATH, VFS_NOT_DIR, VFS_NOT_FOUND};
 use ls::{NodeKind, Options};
@@ -126,7 +129,7 @@ extern "C" fn main(
     };
     let stdout = startup.stdout.unwrap_or(Handle(0));
 
-    let mut table = [0u8; 2048];
+    let mut table = [0u8; INITRD_TABLE_MAX];
 
     if vmo_read(initrd, 0, table.as_mut_ptr(), INITRD_HEADER_LEN) != 0 {
         const ERR: &[u8] = b"ls: read fail\n";
