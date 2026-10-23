@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j563
 //j564
 //j565
 //j567
 //j568
+//j569
 
 extern crate alloc;
 
@@ -13,9 +13,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH,
-    KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH,
-    SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GFX_CLIENT_PATH, GROUP_PATH,
+    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH,
+    RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -144,7 +144,12 @@ fn graphics_demo(cmd: &kumoza::Command) {
     for view in 0..VIEW_COUNT {
         let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
         let vmo = Handle(GRAPHICS_VMO[view].load(Ordering::Relaxed));
-        if channel.0 == 0 || vmo.0 == 0 {
+        if channel.0 == 0 {
+            // A separate client owns this view now (F1b); Sora paints only what it holds.
+            continue;
+        }
+        if vmo.0 == 0 {
+            let _ = handle_close(channel);
             failed = true;
             continue;
         }
@@ -190,6 +195,9 @@ fn graphics_demo(cmd: &kumoza::Command) {
                 GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
                 if status == Status::Copied {
                     copied[view] = true;
+                    log(b"gfx-demo: view ");
+                    log(&[b'0' + view as u8]);
+                    log(b" copied; buffer released (software GOP)\n");
                 } else {
                     failed = true;
                 }
@@ -203,8 +211,64 @@ fn graphics_demo(cmd: &kumoza::Command) {
     if failed {
         log(b"gfx-demo: one or more views failed; those views disabled\n");
         fail_status(1);
-    } else if copied.iter().all(|value| *value) {
-        log(b"gfx-demo: views 0 and 1 copied; buffers released (software GOP)\n");
+    } else if !copied.iter().any(|value| *value) {
+        log(b"gfx-demo: no graphics view held\n");
+        fail_status(1);
+    }
+}
+
+/// Hand one supervisor-held presentation grant to a separate process (F1b). The child receives
+/// the client end of the channel in x0 and the surface VMO in x1; both handles move into the
+/// child's table. A grant that is not admitted stays with Sora and is closed.
+fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
+    use kumo_graphics::VIEW_COUNT;
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-client\n");
+        return;
+    }
+    let mut selected = None;
+    for view in 0..VIEW_COUNT {
+        let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
+        if channel.0 == 0 {
+            continue;
+        }
+        let vmo = Handle(GRAPHICS_VMO[view].swap(0, Ordering::Relaxed));
+        selected = Some((view, channel, vmo));
+        break;
+    }
+    let Some((view, channel, vmo)) = selected else {
+        log(b"gfx-client: no graphics view available\n");
+        fail_status(1);
+        return;
+    };
+    if vmo.0 == 0 {
+        let _ = handle_close(channel);
+        log(b"gfx-client: no surface available\n");
+        fail_status(1);
+        return;
+    }
+    log(b"gfx-client: view ");
+    log(&[b'0' + view as u8]);
+    log(b" handed to a client process\n");
+    let flags = (ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let ran = run_elf_threads(
+        initrd,
+        GFX_CLIENT_PATH.as_bytes(),
+        channel.0 as u64,
+        vmo.0 as u64,
+        flags,
+        b"gfx-client",
+        0,
+        None,
+    );
+    if !ran {
+        // An admitted child owns the handles even if it exited non-zero; only an admission
+        // failure leaves them with Sora.
+        if handle_koid(channel) != u64::MAX {
+            let _ = handle_close(channel);
+            let _ = handle_close(vmo);
+        }
+        fail_status(1);
     }
 }
 
@@ -2790,6 +2854,10 @@ fn eval_command(
     LAST_STATUS.store(0, Ordering::Relaxed);
     if cmd.name == "gfx-demo" {
         graphics_demo(cmd);
+        return true;
+    }
+    if cmd.name == "gfx-client" {
+        graphics_client(cmd, initrd);
         return true;
     }
     if cmd.name == "dmesg" {

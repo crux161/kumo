@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j567
 #j568
+#j569
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed: only the copy's autoexec
@@ -31,7 +32,7 @@ def replace_autoexec(path):
         offset, size = struct.unpack_from("<QQ", original, entry + 64)
         data = original[offset:offset + size]
         if name == b"etc/autoexec":
-            data = b"dmesg -n 6\ngfx-demo\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            data = b"dmesg -n 6\ngfx-client\ngfx-demo\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
             found = True
         struct.pack_into("<QQ", out, entry + 64, len(out), len(data))
         out.extend(data)
@@ -90,8 +91,9 @@ def check_pixels(path):
                 if border:
                     assert at(x, y) == CHROME_COLOR, f"chrome at {(x, y)} is {at(x, y)}"
 
-    # View 0 shows the full diagnostic image; view 1 presents an over-sized surface whose
-    # visible corner is solid. Both are copied by the server into server-owned rectangles.
+    # View 0 is painted by the separate gfx-client process; view 1 by the supervisor demo,
+    # which presents an over-sized surface whose visible corner is solid. Both are copied by
+    # the server into server-owned rectangles.
     vx, vy = rects[0]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
@@ -149,9 +151,12 @@ def main():
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"boot timed out; inspect {serial}")
-            marker = b"gfx-demo: views 0 and 1 copied; buffers released (software GOP)"
-            assert transcript.count(marker) == 2, f"missing release replies; inspect {serial}"
+            client = b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
+            assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
+            demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
+            assert transcript.count(demo) == 2, f"missing view 1 replies; inspect {serial}"
             assert b"gfx-demo: one or more views failed" not in transcript
+            assert b"gfx-client: presenter rejected surface" not in transcript
             time.sleep(0.2)  # let the final queued console line reach drv-fb
             def read_qmp():
                 if not select.select([process.stdout], [], [], 5)[0]:
@@ -175,7 +180,7 @@ def main():
             command("qmp_capabilities")
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm")
-            print("Graphics UEFI smoke green: two views, clipping, chrome, buffer reuse, console text, login")
+            print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()
             try:

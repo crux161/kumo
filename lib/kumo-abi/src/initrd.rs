@@ -1,8 +1,8 @@
-//j506
 //j508
 //j517
 //j562
 //j563
+//j569
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -36,6 +36,10 @@ pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";
+
+/// A separate-process presentation client (F1b): Sora transfers one presentation channel and
+/// one surface VMO in `x0`/`x1`; the client writes the diagnostic image, presents, and exits.
+pub const GFX_CLIENT_PATH: &str = "bin/gfx-client";
 /// `ls` as a real program: receives a read-only initrd VMO handle in `x0` and prints
 /// the entry list. The first program proven to *use* a passed capability (vs. the
 /// capability-less `hello`); launched by the shell's `ls` builtin, which narrows the

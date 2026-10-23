@@ -1,0 +1,20 @@
+#j569
+
+[package]
+name = "gfx-client"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+kumo-abi.workspace = true
+kumo-graphics = { path = "../../lib/kumo-graphics" }
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "gfx-client"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

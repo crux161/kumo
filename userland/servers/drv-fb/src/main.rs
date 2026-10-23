@@ -2,18 +2,18 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j519
 //j554
 //j559
 //j567
 //j568
+//j569
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
     channel_read, channel_read_with_handle, framebuffer_claim, handle_koid, port_bind, port_create,
-    port_wait, resource_mint_mmio, vmar_map, vmo_create,
+    port_unbind, port_wait, resource_mint_mmio, vmar_map, vmo_create,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
@@ -69,6 +69,7 @@ impl Line {
 
 /// One bound presentation channel: its port source koID, the server end of the channel,
 /// the mapped read-only surface, and the server-owned view it presents into.
+#[derive(Clone, Copy)]
 struct GraphicsLane {
     source: Handle,
     channel: Handle,
@@ -389,9 +390,22 @@ extern "C" fn main(
             if n > 0 && n <= rx.len() {
                 con.write(&rx[..n]);
             }
-        } else if let Some(lane) = lanes.iter().flatten().find(|lane| lane.source == source) {
+        } else if let Some(index) = lanes
+            .iter()
+            .position(|lane| lane.as_ref().is_some_and(|lane| lane.source == source))
+        {
+            let lane = lanes[index].expect("lane selected");
             let (n, extra_handle) =
                 channel_read_with_handle(lane.channel, rx.as_mut_ptr(), rx.len());
+            if n == 0 && extra_handle == 0 {
+                // The client exited and closed its end. The view keeps its last pixels; the
+                // lane retires so a dead channel cannot keep waking the port.
+                let _ = kumo_rt::port_unbind(port, lane.channel);
+                let _ = kumo_rt::handle_close(lane.channel);
+                lanes[index] = None;
+                log_info(b"drv-fb: presentation client closed\n");
+                continue;
+            }
             if extra_handle != 0 {
                 let _ = kumo_rt::handle_close(Handle(extra_handle as u32));
             }

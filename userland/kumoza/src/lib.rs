@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j559
 //j563
 //j564
 //j565
 //j567
+//j569
 
 extern crate alloc;
 
@@ -260,7 +260,7 @@ pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
               whoami\n\
     power: halt, reboot, shutdown\n\
     editor: kilo /tmp/<file> or /media/<volume>/<file> (relative paths use cwd)\n\
-    diag: dmesg [-n level], gfx-demo, heap, ipcstat, relibc [args], threads\n\
+    diag: dmesg [-n level], gfx-client, gfx-demo, heap, ipcstat, relibc [args], threads\n\
     other commands run via kernel shell\n";
 
 /// Tokenize a line into a single `Command`. Splits on ASCII whitespace, except inside

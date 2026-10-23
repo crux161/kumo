@@ -1,8 +1,8 @@
-//j506
 //j507
 //j517
 //j562
 //j563
+//j569
 
 use std::env;
 use std::fmt;
@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
-    DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, HELLO_PATH, INITRD_ENTRY_LEN, INITRD_HEADER_LEN,
-    INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION, KILO_PATH, LS_PATH,
-    LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH,
-    THREADS_PATH, TTYD_PATH, WC_PATH,
+    DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
+    INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
+    KILO_PATH, LS_PATH, LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH,
+    SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -847,6 +847,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
+            let gfx_client = build_gfx_client_image(&workspace_root()?)?;
             let ls = build_ls_image(&workspace_root()?)?;
             let args = build_args_image(&workspace_root()?)?;
             let cat = build_cat_image(&workspace_root()?)?;
@@ -871,6 +872,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
+                (GFX_CLIENT_PATH, gfx_client.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),
                 (CAT_PATH, cat.as_slice()),
@@ -1029,6 +1031,35 @@ fn build_hello_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as hello ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_gfx_client_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "gfx-client",
+            "--bin",
+            "gfx-client",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("gfx-client");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
+        format!(
+            "validate {} as gfx-client ELF: {err}",
+            source_path.display()
+        )
+    })?;
     Ok(bytes)
 }
 
