@@ -1,3 +1,4 @@
+#j562
 [package]
 name = "xtask"
 authors.workspace = true
@@ -6,8 +7,13 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+# argon2id hashing for `cargo xtask passwd` (PLAN/012, J562); vendored in J561.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 imager = { path = "../imager" }
 kumo-abi.workspace = true
+kumo-identity = { path = "../lib/kumo-identity" }
+# Echo off at /dev/tty while a password is typed.
+libc = "0.2"
 
 [dev-dependencies]
 # Host-test the generated bin/fat32.img with the same reader that runs on target.

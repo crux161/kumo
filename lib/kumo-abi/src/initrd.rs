@@ -1,8 +1,8 @@
-//j426
 //j493
 //j506
 //j508
 //j517
+//j562
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -56,6 +56,12 @@ pub const RELIBC_SMOKE_PATH: &str = "bin/relibc-smoke";
 /// byte-identical to upstream, built against KUMO's own C sysroot.
 pub const KILO_PATH: &str = "bin/kilo";
 pub const AUTOEXEC_PATH: &str = "etc/autoexec";
+/// The interim identity files (PLAN/012, J562), at their FHS paths. `etc/shadow` is the only
+/// one a shell program may not read.
+pub const HOSTNAME_PATH: &str = "etc/hostname";
+pub const PASSWD_PATH: &str = "etc/passwd";
+pub const GROUP_PATH: &str = "etc/group";
+pub const SHADOW_PATH: &str = "etc/shadow";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitrdError {

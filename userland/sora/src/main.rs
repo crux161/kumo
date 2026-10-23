@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j551
 //j556
 //j557
 //j558
 //j559
+//j562
 
 extern crate alloc;
 
@@ -2629,6 +2629,13 @@ fn eval_command(
                 return true;
             }
         };
+        if matches!(cmd.name.as_str(), "cat" | "wc") && !sora::shell_may_read(path.as_bytes()) {
+            log(cmd.name.as_bytes());
+            log(b": ");
+            log(path.as_bytes());
+            log(b": permission denied\n");
+            return true;
+        }
         resolved = cmd.clone();
         resolved.args[0] = path;
         &resolved

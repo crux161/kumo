@@ -1,10 +1,8 @@
-//j457
-//j460
-//j467
 //j493
 //j506
 //j507
 //j517
+//j562
 
 use std::env;
 use std::fmt;
@@ -26,6 +24,9 @@ use kumo_abi::initrd::{
     PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
     TTYD_PATH, WC_PATH,
 };
+use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, PASSWD_PATH, SHADOW_PATH};
+
+mod identity;
 
 const FAT32_IMG_PATH: &str = "bin/fat32.img";
 
@@ -102,6 +103,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    // `passwd` takes a user, not the image flags, so it is dispatched before them.
+    if env::args().nth(1).as_deref() == Some("passwd") {
+        let users: Vec<String> = env::args().skip(2).collect();
+        return identity::passwd(&users);
+    }
     let args = parse_args()?;
     let root = workspace_root()?;
     let hardware = args
@@ -849,6 +855,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let relibc_smoke = build_relibc_smoke_image(&workspace_root()?)?;
             let kilo = build_kilo_image(&workspace_root()?)?;
             let autoexec = build_autoexec();
+            let shadow = identity::shadow_file()?;
             build_initrd(&[
                 (SORA_INIT_PATH, sora.as_slice()),
                 (SVC_HEALTH_PATH, svc_health.as_slice()),
@@ -871,6 +878,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (RELIBC_SMOKE_PATH, relibc_smoke.as_slice()),
                 (KILO_PATH, kilo.as_slice()),
                 (AUTOEXEC_PATH, autoexec.as_slice()),
+                (HOSTNAME_PATH, identity::HOSTNAME.as_bytes()),
+                (PASSWD_PATH, identity::PASSWD.as_bytes()),
+                (GROUP_PATH, identity::GROUP.as_bytes()),
+                (SHADOW_PATH, shadow.as_bytes()),
             ])?
         }
         ImageArch::X86_64 => {
@@ -2862,6 +2873,7 @@ fn print_help() {
     println!(
         "usage: cargo xtask <build|test|boot-files|qemu-smoke|x86-smoke|x86-uefi-smoke|x86-initrd|image|product|run|preflight> [--arch aarch64|x86_64] [--hardware x13s|qemu-virt-aarch64|rpi5|opi5plus|generic-uefi-x86_64] [--console-uart pl011@0x<base>]"
     );
+    println!("       cargo xtask passwd <root|crux>: set a KUMO password at this terminal; only its argon2id hash is kept, in $KUMO_SHADOW or ~/.config/kumo/shadow");
     println!("default arch: aarch64; default hardware: thinkpad-x13s-gen1");
     println!("--console-uart: image-only explicit PL011 route; use firmware's reported MMIO base");
     println!("x86-uefi-smoke: exact OVMF -> GRUB -> Multiboot2 ISO path; KUMO_OVMF_CODE/KUMO_OVMF_VARS override firmware discovery");

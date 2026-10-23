@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j547
 //j551
 //j557
 //j558
 //j559
+//j562
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -327,6 +327,14 @@ pub fn media_route(path: &[u8]) -> MediaRoute<'_> {
             path: &rest[slash..],
         },
     }
+}
+
+/// Whether a shell program may be handed `path` to read (J562). `/etc/shadow` holds password
+/// hashes, and `cat`/`wc` receive the whole read-only initrd to read it from, so Sora refuses
+/// that one path itself until the identity service is the only holder of the shadow file
+/// (PLAN/012). `path` is canonical and absolute, as the shell's working directory resolves it.
+pub fn shell_may_read(path: &[u8]) -> bool {
+    path != b"/etc/shadow"
 }
 
 /// The boot-local writable FAT scratch volume is visible at `/tmp`, separate from the
@@ -928,6 +936,19 @@ mod tests {
                 parse_log_level(log_level_name(level.into()).unwrap()),
                 Some(level)
             );
+        }
+    }
+
+    #[test]
+    fn the_shell_may_not_read_the_shadow_file() {
+        assert!(!shell_may_read(b"/etc/shadow"));
+        for path in [
+            b"/etc/passwd".as_slice(),
+            b"/etc/group",
+            b"/etc/hostname",
+            b"/etc/shadowy",
+        ] {
+            assert!(shell_may_read(path));
         }
     }
 }
