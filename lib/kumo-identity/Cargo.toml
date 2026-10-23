@@ -1,0 +1,17 @@
+#j561
+[package]
+name = "kumo-identity"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+# argon2id for `/etc/shadow` (PLAN/012). Vendored in `vendor/cargo`; no defaults, so no `std`
+# and no `alloc` until the identity service decides it needs them.
+argon2 = { version = "0.5.3", default-features = false, features = ["password-hash"] }
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
