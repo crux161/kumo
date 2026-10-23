@@ -1,5 +1,6 @@
 #![no_std]
 //j383
+//j555
 
 //! Allocation-free USB HID boot-keyboard report decoding.
 //!
@@ -311,7 +312,11 @@ pub fn key_sym(usage: u8, modifiers: Modifiers) -> KeySym {
                 PLAIN[index]
             })
         }
-        0x28 => KeySym::Ascii(b'\n'),
+        // Return sends CR, as a terminal's Return key does. ttyd's cooked line takes CR or LF as
+        // the end of a line, the way ICRNL does on Unix. A raw-mode program sees the byte itself:
+        // Kilo's Enter is CR, and an LF went into the row as an ordinary byte, which then broke
+        // the line on the glass and left Kilo's cursor rows out of step. — TIMBERDOODLE
+        0x28 => KeySym::Ascii(b'\r'),
         0x29 => KeySym::Ascii(0x1b),
         0x2a => KeySym::Ascii(0x7f),
         0x2b => KeySym::Ascii(b'\t'),
@@ -348,7 +353,7 @@ pub fn key_sym(usage: u8, modifiers: Modifiers) -> KeySym {
         0x55 => KeySym::Ascii(b'*'),
         0x56 => KeySym::Ascii(b'-'),
         0x57 => KeySym::Ascii(b'+'),
-        0x58 => KeySym::Ascii(b'\n'),
+        0x58 => KeySym::Ascii(b'\r'),
         0x59..=0x61 => KeySym::Ascii(b'1' + usage - 0x59),
         0x62 => KeySym::Ascii(b'0'),
         0x63 => KeySym::Ascii(b'.'),
@@ -826,7 +831,7 @@ mod tests {
         let ctrl = Modifiers::from_bits(Modifiers::LEFT_CTRL);
 
         assert_eq!(key_sym(0x04, plain), KeySym::Ascii(b'a'));
-        assert_eq!(key_sym(0x28, plain), KeySym::Ascii(b'\n'));
+        assert_eq!(key_sym(0x28, plain), KeySym::Ascii(b'\r'));
         assert_eq!(key_sym(0x2a, plain), KeySym::Ascii(0x7f));
         assert_eq!(key_sym(0x4c, plain), KeySym::Delete);
         assert_eq!(key_sym(0x33, shift), KeySym::Ascii(b':'));
@@ -834,6 +839,20 @@ mod tests {
         assert_eq!(key_sym(0x06, ctrl), KeySym::Ascii(0x03)); // Ctrl-C
         assert_eq!(key_sym(0x0b, ctrl), KeySym::Ascii(0x08)); // Ctrl-H
         assert_eq!(key_sym(0x10, ctrl), KeySym::Ascii(0x0d)); // Ctrl-M
+    }
+
+    #[test]
+    fn return_and_keypad_enter_send_carriage_return_like_a_terminal() {
+        // A raw-mode editor reads the key's own byte: Kilo's Enter is CR (13) and LF is text.
+        for modifiers in [
+            Modifiers::default(),
+            Modifiers::from_bits(Modifiers::LEFT_SHIFT),
+        ] {
+            for usage in [0x28, 0x58] {
+                let bytes = key_sym(usage, modifiers).terminal_bytes();
+                assert_eq!(bytes.as_slice(), b"\r");
+            }
+        }
     }
 
     #[test]
