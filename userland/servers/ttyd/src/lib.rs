@@ -3,6 +3,7 @@
 //j512
 //j513
 //j557
+//j564
 
 //! `ttyd` - the P8 TTY line-discipline core.
 //!
@@ -37,6 +38,8 @@ pub const OP_GET_WINDOW_SIZE: u8 = 0x06;
 /// Five-byte request: set the terminal's dimensions (`[OP_SET_WINDOW_SIZE, rows_le(2),
 /// columns_le(2)]`). It is `TIOCSWINSZ`, sent by whoever owns the display the session draws on.
 pub const OP_SET_WINDOW_SIZE: u8 = 0x07;
+/// One-byte request: forget every remembered line, as a new login session starts (J564).
+pub const OP_FORGET_HISTORY: u8 = 0x08;
 /// One-byte request: terminate the serve loop without a reply.
 pub const OP_SHUTDOWN: u8 = 0xff;
 
@@ -72,7 +75,18 @@ pub const HISTORY_CAPACITY: usize = 8;
 
 /// Known builtin command names for tab completion, sorted alphabetically.
 pub const BUILTINS: &[&[u8]] = &[
-    b"cat", b"echo", b"false", b"help", b"ls", b"run", b"true", b"wc",
+    b"cat",
+    b"echo",
+    b"false",
+    b"help",
+    b"hostname",
+    b"id",
+    b"logout",
+    b"ls",
+    b"run",
+    b"true",
+    b"wc",
+    b"whoami",
 ];
 
 const ENTER_ECHO: &[u8] = b"\r\n";
@@ -202,6 +216,9 @@ pub enum Request {
     GetWindowSize,
     /// Set the terminal dimensions; both must be non-zero.
     SetWindowSize(WindowSize),
+    /// Forget the history and the current edit line: one session's lines must not be recalled
+    /// in the next.
+    ForgetHistory,
     /// Gracefully stop the server.
     Shutdown,
 }
@@ -239,6 +256,10 @@ impl Request {
         Request::SetWindowSize(size)
     }
 
+    pub const fn forget_history() -> Request {
+        Request::ForgetHistory
+    }
+
     pub const fn shutdown() -> Request {
         Request::Shutdown
     }
@@ -249,6 +270,7 @@ impl Request {
             | Request::Read
             | Request::GetMode
             | Request::GetWindowSize
+            | Request::ForgetHistory
             | Request::Shutdown => {
                 let frame = out.get_mut(..1)?;
                 frame[0] = match *self {
@@ -256,6 +278,7 @@ impl Request {
                     Request::Read => OP_READ,
                     Request::GetMode => OP_GET_MODE,
                     Request::GetWindowSize => OP_GET_WINDOW_SIZE,
+                    Request::ForgetHistory => OP_FORGET_HISTORY,
                     Request::Shutdown => OP_SHUTDOWN,
                     Request::Input(_)
                     | Request::Write(_)
@@ -275,6 +298,7 @@ impl Request {
                     | Request::GetWindowSize
                     | Request::SetMode { .. }
                     | Request::SetWindowSize(_)
+                    | Request::ForgetHistory
                     | Request::Shutdown => {
                         unreachable!()
                     }
@@ -315,6 +339,7 @@ impl Request {
                 rows: u16::from_le_bytes([*r0, *r1]),
                 columns: u16::from_le_bytes([*c0, *c1]),
             })),
+            [OP_FORGET_HISTORY] => Some(Request::ForgetHistory),
             [OP_SHUTDOWN] => Some(Request::Shutdown),
             _ => None,
         }
@@ -456,6 +481,110 @@ impl InputResult {
     }
 }
 
+/// Canonical input with echo off: a password (PLAN/012). Bytes are kept, erased and submitted as
+/// a cooked line's are, but nothing is echoed except the newline on Enter (POSIX `ECHONL`, as
+/// `getpass` and `login` use it). Nothing is recorded in history or recalled from it, and Tab,
+/// arrows and other escape sequences do nothing. Enter and Ctrl-C wipe the buffer; Ctrl-C rings
+/// the bell so the typist knows the line is gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecretLine<const N: usize = DEFAULT_LINE_BYTES> {
+    buf: [u8; N],
+    len: usize,
+    escape: EscapeState,
+}
+
+impl<const N: usize> SecretLine<N> {
+    pub const fn new() -> SecretLine<N> {
+        SecretLine {
+            buf: [0; N],
+            len: 0,
+            escape: EscapeState::Ground,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn feed_byte(&mut self, byte: u8, submitted: &mut [u8]) -> InputResult {
+        if self.escape != EscapeState::Ground {
+            // Swallow the rest of an escape sequence: `ESC [` parameters, then a final byte.
+            self.escape = match (self.escape, byte) {
+                (EscapeState::Esc, b'[') => EscapeState::Csi,
+                (EscapeState::Csi, 0x20..=0x3f) => EscapeState::Csi,
+                _ => EscapeState::Ground,
+            };
+            return InputResult::none();
+        }
+        match byte {
+            b'\r' | b'\n' => {
+                let len = self.len;
+                let Some(out) = submitted.get_mut(..len) else {
+                    self.wipe();
+                    return InputResult {
+                        echo: Echo::bytes(ENTER_ECHO),
+                        event: LineEvent::Overflow,
+                    };
+                };
+                out.copy_from_slice(&self.buf[..len]);
+                self.wipe();
+                InputResult {
+                    echo: Echo::bytes(ENTER_ECHO),
+                    event: LineEvent::Submitted { len },
+                }
+            }
+            0x03 => {
+                self.wipe();
+                InputResult {
+                    echo: Echo::bytes(BELL),
+                    event: LineEvent::None,
+                }
+            }
+            ESC => {
+                self.escape = EscapeState::Esc;
+                InputResult::none()
+            }
+            0x08 | 0x7f => {
+                if self.len > 0 {
+                    self.len -= 1;
+                    self.buf[self.len] = 0;
+                }
+                InputResult::none()
+            }
+            0x20..=0x7e if self.len < N => {
+                self.buf[self.len] = byte;
+                self.len += 1;
+                InputResult::none()
+            }
+            0x20..=0x7e => InputResult {
+                echo: Echo::bytes(BELL),
+                event: LineEvent::None,
+            },
+            _ => InputResult::none(),
+        }
+    }
+
+    /// Forget the line, overwriting it.
+    pub fn wipe(&mut self) {
+        for byte in self.buf.iter_mut() {
+            // SAFETY: `byte` is a valid, exclusive reference.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        self.len = 0;
+        self.escape = EscapeState::Ground;
+    }
+}
+
+impl<const N: usize> Default for SecretLine<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EscapeState {
     Ground,
@@ -510,6 +639,24 @@ impl<const N: usize> LineDiscipline<N> {
         self.cursor = 0;
         self.escape = EscapeState::Ground;
         self.history_index = 0;
+    }
+
+    /// Forget every remembered line and the one being edited, overwriting them.
+    pub fn forget_history(&mut self) {
+        for byte in self
+            .history
+            .iter_mut()
+            .flatten()
+            .chain(self.buf.iter_mut())
+            .chain(self.saved_edit.iter_mut())
+        {
+            // SAFETY: `byte` is a valid, exclusive reference.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        self.history_len = [0; HISTORY_CAPACITY];
+        self.history_count = 0;
+        self.saved_len = 0;
+        self.clear();
     }
 
     /// Feed one raw input byte.
@@ -906,6 +1053,8 @@ pub trait Transport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TtyServer<const N: usize = DEFAULT_LINE_BYTES> {
     line: LineDiscipline<N>,
+    /// The line typed while canonical with echo off. It is never copied into `submitted`.
+    secret: SecretLine<N>,
     mode: TerminalMode,
     window_size: WindowSize,
     submitted: [u8; N],
@@ -917,6 +1066,7 @@ impl<const N: usize> TtyServer<N> {
     pub const fn new() -> TtyServer<N> {
         TtyServer {
             line: LineDiscipline::new(),
+            secret: SecretLine::new(),
             mode: TerminalMode::cooked(),
             window_size: WindowSize::text_console(),
             submitted: [0; N],
@@ -947,6 +1097,11 @@ impl<const N: usize> TtyServer<N> {
                 self.line.clear();
                 write_reply(reply, TTY_OK, Echo::none(), None)
             }
+            Request::ForgetHistory => {
+                self.line.forget_history();
+                self.secret.wipe();
+                write_reply(reply, TTY_OK, Echo::none(), None)
+            }
             Request::Shutdown => 0,
             Request::Write(byte) => write_reply(reply, TTY_OK, Echo::byte(byte), None),
             Request::GetMode => write_mode_reply(reply, self.mode),
@@ -960,6 +1115,7 @@ impl<const N: usize> TtyServer<N> {
             }
             Request::SetMode { mode, action } => {
                 self.mode = mode;
+                self.secret.wipe();
                 if action == SetModeAction::Flush {
                     self.line.clear();
                     self.submitted_len = 0;
@@ -991,6 +1147,24 @@ impl<const N: usize> TtyServer<N> {
                         Echo::none()
                     };
                     return write_reply(reply, TTY_OK, echo, Some(&self.submitted[..1]));
+                }
+                if !self.mode.echo {
+                    // The line goes out in this reply only: `Read` never sees it and nothing
+                    // keeps it.
+                    let mut secret = [0u8; N];
+                    let result = self.secret.feed_byte(byte, &mut secret);
+                    let n = match result.event {
+                        LineEvent::Submitted { len } => {
+                            write_reply(reply, TTY_OK, result.echo, Some(&secret[..len]))
+                        }
+                        LineEvent::Overflow => write_reply(reply, TTY_OVERFLOW, result.echo, None),
+                        LineEvent::None => write_reply(reply, TTY_OK, result.echo, None),
+                    };
+                    for byte in secret.iter_mut() {
+                        // SAFETY: `byte` is a valid, exclusive reference.
+                        unsafe { core::ptr::write_volatile(byte, 0) };
+                    }
+                    return n;
                 }
                 let mut submitted = [0u8; N];
                 let result = self.line.feed_byte(byte, &mut submitted);
@@ -1028,6 +1202,11 @@ impl<const N: usize> TtyServer<N> {
         let reply_len = self.dispatch(&request_buf[..n], reply_buf);
         if reply_len != 0 {
             transport.send(&reply_buf[..reply_len]);
+            // A reply can carry a password line; do not leave it in the buffer.
+            for byte in reply_buf[..reply_len].iter_mut() {
+                // SAFETY: `byte` is a valid, exclusive reference.
+                unsafe { core::ptr::write_volatile(byte, 0) };
+            }
         }
         true
     }
@@ -1052,6 +1231,13 @@ impl<const N: usize> Default for TtyServer<N> {
 
 fn write_reply(reply: &mut [u8], status: u8, echo: Echo, line: Option<&[u8]>) -> usize {
     let echo = echo.as_bytes();
+    // An empty submitted line is still a line: Enter alone re-prompts the shell, and an empty
+    // password is an attempt (J564). Only `None` is "no line yet".
+    let event = if line.is_some() {
+        EVENT_LINE
+    } else {
+        EVENT_NONE
+    };
     let line = line.unwrap_or(&[]);
     let Some(total) = REPLY_HEADER_BYTES
         .checked_add(echo.len())
@@ -1066,11 +1252,7 @@ fn write_reply(reply: &mut [u8], status: u8, echo: Echo, line: Option<&[u8]>) ->
         return 0;
     }
     out[0] = status;
-    out[1] = if line.is_empty() {
-        EVENT_NONE
-    } else {
-        EVENT_LINE
-    };
+    out[1] = event;
     out[2..4].copy_from_slice(&(echo.len() as u16).to_le_bytes());
     out[4..6].copy_from_slice(&(line.len() as u16).to_le_bytes());
     out[REPLY_HEADER_BYTES..REPLY_HEADER_BYTES + echo.len()].copy_from_slice(echo);
@@ -1394,6 +1576,123 @@ mod tests {
         assert_eq!(Reply::parse(&reply[..n]).unwrap().line, Some(&[0x03][..]));
     }
 
+    fn feed_secret<const N: usize>(
+        line: &mut SecretLine<N>,
+        bytes: &[u8],
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut echo = Vec::new();
+        let mut out = [0u8; 64];
+        let mut submitted = None;
+        for &byte in bytes {
+            let result = line.feed_byte(byte, &mut out);
+            echo.extend_from_slice(result.echo.as_bytes());
+            if let LineEvent::Submitted { len } = result.event {
+                submitted = Some(out[..len].to_vec());
+            }
+        }
+        (echo, submitted)
+    }
+
+    #[test]
+    fn a_secret_line_edits_silently_and_echoes_only_the_newline() {
+        let mut line = SecretLine::<16>::new();
+        // Arrows and Tab do nothing; Backspace erases; Enter submits and echoes CRLF only.
+        let (echo, submitted) = feed_secret(&mut line, b"hunx\x7fter\x1b[A\x1b[3~\t2\r");
+        assert_eq!(echo, b"\r\n");
+        assert_eq!(submitted.as_deref(), Some(&b"hunter2"[..]));
+        assert!(line.is_empty());
+        // Ctrl-C forgets the line and rings the bell; the next line starts clean.
+        let (echo, submitted) = feed_secret(&mut line, b"oops\x03ok\r");
+        assert_eq!(echo, b"\x07\r\n");
+        assert_eq!(submitted.as_deref(), Some(&b"ok"[..]));
+        // A full buffer rings instead of growing.
+        let mut small = SecretLine::<2>::new();
+        let (echo, submitted) = feed_secret(&mut small, b"abc\r");
+        assert_eq!(echo, b"\x07\r\n");
+        assert_eq!(submitted.as_deref(), Some(&b"ab"[..]));
+    }
+
+    #[test]
+    fn echo_off_lines_reach_the_reply_but_not_history_or_read() {
+        let mut server = TtyServer::<32>::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let quiet = TerminalMode {
+            canonical: true,
+            echo: false,
+        };
+        server.dispatch(
+            &encode_request(Request::set_mode(quiet, SetModeAction::Flush)),
+            &mut reply,
+        );
+        let mut line = None;
+        for &byte in b"s3cret\r" {
+            let n = server.dispatch(&encode_request(Request::input(byte)), &mut reply);
+            let parsed = Reply::parse(&reply[..n]).unwrap();
+            if byte != b'\r' {
+                assert_eq!(parsed.echo, b"", "byte {byte:#x} echoed");
+            }
+            line = parsed.line.map(<[u8]>::to_vec).or(line);
+        }
+        assert_eq!(line.as_deref(), Some(&b"s3cret"[..]));
+        let n = server.dispatch(&encode_request(Request::read()), &mut reply);
+        assert_eq!(Reply::parse(&reply[..n]).unwrap().line, None);
+
+        // Back to cooked: Up recalls nothing, because the password never entered history.
+        let cooked = Request::set_mode(TerminalMode::cooked(), SetModeAction::Flush);
+        server.dispatch(&encode_request(cooked), &mut reply);
+        for &byte in b"\x1b[A" {
+            server.dispatch(&encode_request(Request::input(byte)), &mut reply);
+        }
+        assert_eq!(server.pending(), b"");
+        // And a half-typed secret does not survive a mode change.
+        server.dispatch(
+            &encode_request(Request::set_mode(quiet, SetModeAction::Flush)),
+            &mut reply,
+        );
+        server.dispatch(&encode_request(Request::input(b'x')), &mut reply);
+        server.dispatch(
+            &encode_request(Request::set_mode(quiet, SetModeAction::Now)),
+            &mut reply,
+        );
+        let n = server.dispatch(&encode_request(Request::input(b'\r')), &mut reply);
+        assert_eq!(Reply::parse(&reply[..n]).unwrap().line, Some(&b""[..]));
+    }
+
+    #[test]
+    fn forgetting_history_leaves_nothing_to_recall() {
+        let mut server = TtyServer::<16>::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        for &byte in b"ls\rcrux\r" {
+            server.dispatch(&encode_request(Request::input(byte)), &mut reply);
+        }
+        for &byte in b"\x1b[A" {
+            server.dispatch(&encode_request(Request::input(byte)), &mut reply);
+        }
+        assert_eq!(server.pending(), b"crux");
+        let n = server.dispatch(&encode_request(Request::forget_history()), &mut reply);
+        assert_eq!(Reply::parse(&reply[..n]).unwrap().status, TTY_OK);
+        assert_eq!(server.pending(), b"");
+        for &byte in b"\x1b[A\x1b[A" {
+            server.dispatch(&encode_request(Request::input(byte)), &mut reply);
+        }
+        assert_eq!(server.pending(), b"");
+        assert_eq!(
+            Request::decode(&[OP_FORGET_HISTORY]),
+            Some(Request::ForgetHistory)
+        );
+    }
+
+    #[test]
+    fn enter_alone_is_an_empty_line_not_no_line() {
+        let mut server = TtyServer::<8>::new();
+        let mut reply = [0u8; REPLY_BUF_BYTES];
+        let n = server.dispatch(&encode_request(Request::input(b'\r')), &mut reply);
+        let parsed = Reply::parse(&reply[..n]).unwrap();
+        assert_eq!((parsed.echo, parsed.line), (&b"\r\n"[..], Some(&b""[..])));
+        let n = server.dispatch(&encode_request(Request::input(b'x')), &mut reply);
+        assert_eq!(Reply::parse(&reply[..n]).unwrap().line, None);
+    }
+
     #[test]
     fn flush_mode_change_discards_pending_cooked_input() {
         let mut server = TtyServer::<8>::new();
@@ -1666,11 +1965,11 @@ mod tests {
     fn tab_completes_single_char_unique() {
         let mut tty = LineDiscipline::<DEFAULT_LINE_BYTES>::new();
         let mut submitted = [0u8; DEFAULT_LINE_BYTES];
-        // "w" matches only "wc"
-        tty.feed_byte(b'w', &mut submitted);
+        // "r" matches only "run" ("w" is no longer unique: `wc` and `whoami`)
+        tty.feed_byte(b'r', &mut submitted);
         let result = tty.feed_byte(0x09, &mut submitted);
-        assert_eq!(tty.pending(), b"wc ");
-        assert_eq!(result.echo.as_bytes(), b"c ");
+        assert_eq!(tty.pending(), b"run ");
+        assert_eq!(result.echo.as_bytes(), b"un ");
     }
 
     #[test]

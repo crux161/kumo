@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j557
 //j558
 //j559
 //j562
 //j563
+//j564
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -355,6 +355,205 @@ pub fn write_id(
     write!(out, " groups=")?;
     group(out)?;
     writeln!(out)
+}
+
+/// A short string held by value, for session state that outlives the reply it arrived in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Text<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Text<N> {
+    pub const fn empty() -> Self {
+        Text {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    /// `None` when `text` does not fit.
+    pub fn new(text: &str) -> Option<Self> {
+        let mut out = Self::empty();
+        out.bytes
+            .get_mut(..text.len())?
+            .copy_from_slice(text.as_bytes());
+        out.len = text.len();
+        Some(out)
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only ever filled from a `&str`, whole.
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+/// Who the console session is (PLAN/012 item 4), copied out of `identityd`'s reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionUser {
+    pub name: Text<32>,
+    pub group: Text<32>,
+    pub home: Text<128>,
+    pub shell: Text<64>,
+    pub uid: u32,
+    pub gid: u32,
+    pub root: bool,
+}
+
+impl SessionUser {
+    pub fn new(subject: &kumo_identity::protocol::Subject<'_>) -> Option<Self> {
+        Some(SessionUser {
+            name: Text::new(subject.name)?,
+            group: Text::new(subject.group)?,
+            home: Text::new(subject.home)?,
+            shell: Text::new(subject.shell)?,
+            uid: subject.uid,
+            gid: subject.gid,
+            root: subject.root,
+        })
+    }
+
+    pub fn subject(&self) -> kumo_identity::protocol::Subject<'_> {
+        kumo_identity::protocol::Subject {
+            name: self.name.as_str(),
+            uid: self.uid,
+            gid: self.gid,
+            group: self.group.as_str(),
+            home: self.home.as_str(),
+            shell: self.shell.as_str(),
+            root: self.root,
+            may_log_in: true,
+        }
+    }
+}
+
+/// Failed logins allowed before the console pauses (PLAN/012).
+pub const LOGIN_TRIES: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoginStage {
+    /// `INDRA login: `, echo on.
+    #[default]
+    Name,
+    /// `Password: `, echo off.
+    Password,
+    /// The tries are spent; input is ignored until the pause ends.
+    Paused,
+}
+
+/// What the console should do with the line just submitted at the login prompt.
+#[derive(Debug, Eq, PartialEq)]
+pub enum LoginStep<'a> {
+    /// Ask for the name again: the line was empty.
+    AskName,
+    /// Turn echo off and ask for the password.
+    AskPassword,
+    /// Check `password` for `name`. `name` is empty when what was typed cannot be an account,
+    /// which the check refuses like any other failure: the prompt never says which part was
+    /// wrong.
+    Check { name: &'a str, password: &'a [u8] },
+    /// Paused; drop the line.
+    Ignore,
+}
+
+/// The console login (PLAN/012 item 4), as `login(1)` runs it: a name, then a password whatever
+/// the name was, then `Login incorrect` or a session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Login {
+    name: [u8; 32],
+    name_len: usize,
+    stage: LoginStage,
+    failures: u8,
+}
+
+impl Login {
+    pub const fn new() -> Login {
+        Login {
+            name: [0; 32],
+            name_len: 0,
+            stage: LoginStage::Name,
+            failures: 0,
+        }
+    }
+
+    pub const fn stage(&self) -> LoginStage {
+        self.stage
+    }
+
+    pub fn line<'a>(&'a mut self, line: &'a [u8]) -> LoginStep<'a> {
+        match self.stage {
+            LoginStage::Paused => LoginStep::Ignore,
+            LoginStage::Name => {
+                let typed = line.trim_ascii();
+                if typed.is_empty() {
+                    return LoginStep::AskName;
+                }
+                let name = core::str::from_utf8(typed)
+                    .ok()
+                    .filter(|name| kumo_identity::valid_name(name));
+                self.name_len = match name {
+                    Some(name) => {
+                        self.name[..name.len()].copy_from_slice(name.as_bytes());
+                        name.len()
+                    }
+                    None => 0,
+                };
+                self.stage = LoginStage::Password;
+                LoginStep::AskPassword
+            }
+            LoginStage::Password => {
+                self.stage = LoginStage::Name;
+                let name = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("");
+                LoginStep::Check {
+                    name,
+                    password: line,
+                }
+            }
+        }
+    }
+
+    /// A check failed. Returns whether that spent the last try, pausing the console.
+    pub fn failed(&mut self) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= LOGIN_TRIES {
+            self.failures = 0;
+            self.stage = LoginStage::Paused;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The pause is over: ask for a name, with the tries renewed.
+    pub fn resume(&mut self) {
+        self.stage = LoginStage::Name;
+    }
+
+    /// Start the prompt over at the name without forgiving failures, as after the terminal
+    /// restarted mid-password.
+    pub fn restart(&mut self) {
+        if self.stage == LoginStage::Password {
+            self.stage = LoginStage::Name;
+        }
+    }
+}
+
+/// The hostname from `/etc/hostname`: its first line, if that is a plain hostname, else `kumo`.
+pub fn hostname(file: &[u8]) -> Text<64> {
+    let first = file
+        .split(|&b| b == b'\n')
+        .next()
+        .unwrap_or(&[])
+        .trim_ascii();
+    let plain = !first.is_empty()
+        && first
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'));
+    core::str::from_utf8(first)
+        .ok()
+        .filter(|_| plain)
+        .and_then(Text::new)
+        .unwrap_or_else(|| Text::new("kumo").unwrap_or(Text::empty()))
 }
 
 /// The boot-local writable FAT scratch volume is visible at `/tmp`, separate from the
@@ -979,6 +1178,76 @@ mod tests {
         out.clear();
         write_id(&subject, &mut out).unwrap();
         assert_eq!(out, "uid=1000(crux) gid=1000 groups=1000\n");
+    }
+
+    #[test]
+    fn login_asks_name_then_password_and_pauses_after_three_failures() {
+        let mut login = Login::default();
+        assert_eq!(login.line(b"  "), LoginStep::AskName);
+        assert_eq!(login.line(b" crux "), LoginStep::AskPassword);
+        assert_eq!(login.stage(), LoginStage::Password);
+        assert_eq!(
+            login.line(b"pw"),
+            LoginStep::Check {
+                name: "crux",
+                password: b"pw"
+            }
+        );
+        assert_eq!(login.stage(), LoginStage::Name);
+        assert!(!login.failed());
+        // Something that cannot be an account still gets a password prompt, then a check with
+        // no name, which fails like any other.
+        assert_eq!(login.line(b"Robert'); DROP"), LoginStep::AskPassword);
+        assert_eq!(
+            login.line(b""),
+            LoginStep::Check {
+                name: "",
+                password: b""
+            }
+        );
+        assert!(!login.failed());
+        assert!(login.failed());
+        assert_eq!(login.stage(), LoginStage::Paused);
+        assert_eq!(login.line(b"crux"), LoginStep::Ignore);
+        login.resume();
+        assert_eq!(login.line(b"crux"), LoginStep::AskPassword);
+        // A terminal restart mid-password goes back to the name and forgives nothing.
+        login.restart();
+        assert_eq!(login.stage(), LoginStage::Name);
+        assert!(!login.failed() && !login.failed() && login.failed());
+    }
+
+    #[test]
+    fn a_session_user_keeps_what_id_needs() {
+        let subject = kumo_identity::protocol::Subject {
+            name: "root",
+            uid: 0,
+            gid: 0,
+            group: "root",
+            home: "/root",
+            shell: "/bin/kumoza",
+            root: true,
+            may_log_in: true,
+        };
+        let user = SessionUser::new(&subject).unwrap();
+        assert_eq!(user.subject(), subject);
+        let long = "/".repeat(129);
+        assert_eq!(
+            SessionUser::new(&kumo_identity::protocol::Subject {
+                home: &long,
+                ..subject
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_hostname_is_the_first_plain_line() {
+        assert_eq!(hostname(b"INDRA\n").as_str(), "INDRA");
+        assert_eq!(hostname(b"  indra.local \nextra").as_str(), "indra.local");
+        for bad in [&b""[..], b"\n", b"bad host\n", b"a/b", b"\xff"] {
+            assert_eq!(hostname(bad).as_str(), "kumo");
+        }
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j557
 //j558
 //j559
 //j562
 //j563
+//j564
 
 extern crate alloc;
 
@@ -13,8 +13,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GROUP_PATH, IDENTITYD_PATH, KILO_PATH,
-    LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH,
+    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH,
+    KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH,
     SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
@@ -184,6 +184,10 @@ fn diag_hex(v: u64) {
 static ROOT_RESOURCE: AtomicU64 = AtomicU64::new(0);
 
 fn write_shell_prompt(cwd: &WorkingDirectory) {
+    if session().is_none() {
+        write_login_prompt();
+        return;
+    }
     cwd.write_prompt(|bytes| {
         let _ = sora::relay_console_output(bytes, |chunk| debug_write(chunk.as_ptr(), chunk.len()));
     });
@@ -2207,6 +2211,7 @@ extern "C" fn sora_main(
         if let Some(client) = spawn_identityd(initrd) {
             IDENTITYD.store(client.0, Ordering::Relaxed);
         }
+        read_hostname(initrd);
 
         let ttyd_recipe = sora::ServerRecipe {
             name: "ttyd",
@@ -2265,6 +2270,10 @@ extern "C" fn sora_main(
                 settle_first_prompt(&mut first_prompt, port, &cwd, b"timeout");
                 continue;
             }
+            if login_pause_koid() == Some(source) {
+                end_login_pause();
+                continue;
+            }
             if ttyd_restart_timer.map(|(_, koid)| koid) == Some(source) {
                 let Some((timer, _)) = ttyd_restart_timer.take() else {
                     continue;
@@ -2296,6 +2305,14 @@ extern "C" fn sora_main(
                                 interactive_ttyd = Some(replacement);
                                 interactive_ttyd_koid = Some(koid);
                                 log(b"ttyd: restart ok\n");
+                                // A fresh ttyd echoes: never carry on into a password prompt.
+                                if session().is_none() {
+                                    let mut login = LOGIN.get();
+                                    login.restart();
+                                    LOGIN.set(login);
+                                    log(b"\n");
+                                    write_login_prompt();
+                                }
                             } else {
                                 let _ = close_supervised_service(replacement);
                                 log(b"ttyd: restart identity fail\n");
@@ -2610,6 +2627,32 @@ fn eval_command(
     }
     if cmd.name == "id" {
         id(cmd);
+        return true;
+    }
+    if cmd.name == "whoami" {
+        match (cmd.args.is_empty(), session()) {
+            (true, Some(user)) => {
+                log(user.name.as_str().as_bytes());
+                log(b"\n");
+            }
+            (true, None) => log(b"whoami: not logged in\n"),
+            (false, _) => log(b"usage: whoami\n"),
+        }
+        return true;
+    }
+    if cmd.name == "hostname" {
+        if cmd.args.is_empty() {
+            log(HOSTNAME.get().as_str().as_bytes());
+            log(b"\n");
+        } else {
+            log(b"usage: hostname\n");
+        }
+        return true;
+    }
+    if cmd.name == "logout" || cmd.name == "exit" {
+        if session().is_some() {
+            end_session(cwd);
+        }
         return true;
     }
     if cmd.name == "pwd" {
@@ -3076,6 +3119,214 @@ fn run_on_volume(
 /// The identity service's client end (PLAN/012), or 0 when it did not start.
 static IDENTITYD: AtomicU32 = AtomicU32::new(0);
 
+/// Sora's single-threaded session state: copied in and out, never borrowed across a call.
+struct Shared<T: Copy>(core::cell::UnsafeCell<T>);
+
+// SAFETY: Sora is single-threaded, and `get`/`set` copy without keeping a reference.
+unsafe impl<T: Copy> Sync for Shared<T> {}
+
+impl<T: Copy> Shared<T> {
+    fn get(&self) -> T {
+        // SAFETY: see `Shared`.
+        unsafe { *self.0.get() }
+    }
+
+    fn set(&self, value: T) {
+        // SAFETY: see `Shared`.
+        unsafe { *self.0.get() = value }
+    }
+}
+
+/// Who is logged in on the console (PLAN/012 item 4); `None` shows the login prompt.
+static SESSION: Shared<Option<sora::SessionUser>> = Shared(core::cell::UnsafeCell::new(None));
+static LOGIN: Shared<sora::Login> = Shared(core::cell::UnsafeCell::new(sora::Login::new()));
+/// `/etc/hostname`, read once at boot.
+static HOSTNAME: Shared<sora::Text<64>> = Shared(core::cell::UnsafeCell::new(sora::Text::empty()));
+/// The pause after the last failed try: its timer and koid, 0 when not paused.
+static LOGIN_PAUSE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// How long the console ignores input after [`sora::LOGIN_TRIES`] failures.
+const LOGIN_PAUSE_NS: u64 = 5_000_000_000;
+
+fn session() -> Option<sora::SessionUser> {
+    SESSION.get()
+}
+
+fn read_hostname(initrd: Handle) {
+    let mut file = [0u8; 64];
+    let n = initrd_find(initrd, HOSTNAME_PATH.as_bytes())
+        .map(|(base, len)| (base, (len as usize).min(file.len())))
+        .filter(|&(base, n)| vmo_read(initrd, base, file.as_mut_ptr(), n) == 0)
+        .map_or(0, |(_, n)| n);
+    HOSTNAME.set(sora::hostname(&file[..n]));
+}
+
+fn write_login_prompt() {
+    match LOGIN.get().stage() {
+        sora::LoginStage::Name => {
+            log(HOSTNAME.get().as_str().as_bytes());
+            log(b" login: ");
+        }
+        sora::LoginStage::Password => log(b"Password: "),
+        sora::LoginStage::Paused => {}
+    }
+}
+
+/// Canonical input with echo on or off on the console's ttyd, dropping anything typed ahead
+/// (`TCSAFLUSH`, as `login` and `getpass` use it).
+fn set_console_echo(tty: Handle, echo: bool) -> bool {
+    let mode = ttyd::TerminalMode {
+        canonical: true,
+        echo,
+    };
+    let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+    ttyd_request_reply(
+        tty,
+        TtyRequest::set_mode(mode, ttyd::SetModeAction::Flush),
+        &mut reply,
+    )
+    .and_then(|n| TtyReply::parse(&reply[..n]))
+    .is_some_and(|reply| reply.status == ttyd::TTY_OK)
+}
+
+/// Drop the console's line history: each session starts with none, so nobody recalls the last
+/// user's commands, or a password typed at `login:` by mistake.
+fn forget_console_history(tty: Handle) {
+    let mut reply = [0u8; ttyd::REPLY_BUF_BYTES];
+    let forgot = ttyd_request_reply(tty, TtyRequest::forget_history(), &mut reply)
+        .and_then(|n| TtyReply::parse(&reply[..n]))
+        .is_some_and(|reply| reply.status == ttyd::TTY_OK);
+    if !forgot {
+        diag(b"login: console history not cleared\n");
+    }
+}
+
+/// `identityd`'s answer to a login. Anything but a match is `None`, the same for every reason.
+fn check_login(name: &str, password: &[u8]) -> Option<sora::SessionUser> {
+    if !kumo_identity::valid_name(name) {
+        return None;
+    }
+    let mut reply = [0u8; IDENTITY_REPLY_MAX];
+    let n = identity_request_reply(IdentityRequest::Verify { name, password }, &mut reply)?;
+    match IdentityReply::decode(&reply[..n]) {
+        Some(IdentityReply::Ok(subject)) => sora::SessionUser::new(&subject),
+        _ => None,
+    }
+}
+
+/// A line submitted while nobody is logged in.
+fn login_line(tty: Handle, line: &[u8], initrd: Handle, cwd: &mut WorkingDirectory) {
+    let mut login = LOGIN.get();
+    match login.line(line) {
+        sora::LoginStep::Ignore => {}
+        sora::LoginStep::AskName => {
+            LOGIN.set(login);
+            write_login_prompt();
+        }
+        sora::LoginStep::AskPassword => {
+            LOGIN.set(login);
+            if !set_console_echo(tty, false) {
+                // Never ask for a password the terminal would show.
+                log(b"login: cannot turn echo off\n");
+                let mut login = LOGIN.get();
+                login.restart();
+                LOGIN.set(login);
+            }
+            write_login_prompt();
+        }
+        sora::LoginStep::Check { name, password } => {
+            let user = check_login(name, password);
+            let _ = set_console_echo(tty, true);
+            match user {
+                Some(user) => {
+                    LOGIN.set(sora::Login::default());
+                    forget_console_history(tty);
+                    start_session(user, initrd, cwd);
+                    write_shell_prompt(cwd);
+                }
+                None => {
+                    diag(b"login: failed on the console\n");
+                    log(b"\nLogin incorrect\n");
+                    let paused = login.failed();
+                    LOGIN.set(login);
+                    if paused {
+                        log(b"Maximum number of tries exceeded (3)\n");
+                        if !arm_login_pause() {
+                            end_login_pause();
+                        }
+                    } else {
+                        write_login_prompt();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn start_session(user: sora::SessionUser, initrd: Handle, cwd: &mut WorkingDirectory) {
+    SESSION.set(Some(user));
+    *cwd = WorkingDirectory::default();
+    if cwd
+        .change(user.home.as_str(), |path| check_directory(initrd, path))
+        .is_err()
+    {
+        // As `login(1)` does when the home directory is missing, which it is until RedoxFS.
+        log(b"No directory, logging in with HOME=/\n");
+    }
+    diag(b"login: ");
+    diag(user.name.as_str().as_bytes());
+    diag(b" on the console\n");
+}
+
+/// `logout`/`exit`: back to the login prompt.
+fn end_session(cwd: &mut WorkingDirectory) {
+    if let Some(user) = session() {
+        diag(b"login: ");
+        diag(user.name.as_str().as_bytes());
+        diag(b" logged out\n");
+    }
+    SESSION.set(None);
+    LOGIN.set(sora::Login::default());
+    *cwd = WorkingDirectory::default();
+    log(b"\n");
+}
+
+fn arm_login_pause() -> bool {
+    let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+    let raw = timer_create(LOGIN_PAUSE_NS);
+    if port.0 == 0 || raw == u64::MAX {
+        return false;
+    }
+    let timer = Handle(raw as u32);
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return false;
+    }
+    LOGIN_PAUSE[0].store(raw, Ordering::Relaxed);
+    LOGIN_PAUSE[1].store(koid, Ordering::Relaxed);
+    true
+}
+
+fn login_pause_koid() -> Option<Handle> {
+    let koid = LOGIN_PAUSE[1].load(Ordering::Relaxed);
+    (koid != 0).then_some(Handle(koid as u32))
+}
+
+fn end_login_pause() {
+    let timer = LOGIN_PAUSE[0].swap(0, Ordering::Relaxed);
+    LOGIN_PAUSE[1].store(0, Ordering::Relaxed);
+    if timer != 0 {
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let _ = port_unbind(port, Handle(timer as u32));
+        let _ = handle_close(Handle(timer as u32));
+    }
+    let mut login = LOGIN.get();
+    login.resume();
+    LOGIN.set(login);
+    log(b"\n");
+    write_login_prompt();
+}
+
 /// Start `identityd`. Its whole world is one read-only VMO holding `/etc/passwd`, `/etc/group`
 /// and `/etc/shadow`, copied out of the initrd (`kumo_identity::protocol::bundle_files`); it
 /// gets no initrd, no filesystem and no device. It parks in `PortWait` before this returns.
@@ -3186,11 +3437,18 @@ fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Opt
     (n != 0 && n != u64::MAX).then_some(n as usize)
 }
 
-/// `id USER`: who an account is, as `identityd` knows it. Until login (PLAN/012 item 4) the
-/// shell has no user of its own to report.
+/// `id [USER]`: who an account is, as `identityd` knows it; with no name, the session's user.
 fn id(cmd: &kumoza::Command) {
     let [name] = cmd.args.as_slice() else {
-        log(b"usage: id <user>\n");
+        match (cmd.args.is_empty(), session()) {
+            (true, Some(user)) => {
+                let mut line = alloc::string::String::new();
+                if sora::write_id(&user.subject(), &mut line).is_ok() {
+                    log(line.as_bytes());
+                }
+            }
+            _ => log(b"usage: id [user]\n"),
+        }
         return;
     };
     let no_such_user = || {
@@ -4807,6 +5065,9 @@ fn dispatch_ttyd_key(
     root: Handle,
     cwd: &mut WorkingDirectory,
 ) -> bool {
+    if session().is_none() && LOGIN.get().stage() == sora::LoginStage::Paused {
+        return true;
+    }
     let Some(n) = ttyd_request_reply(tty, TtyRequest::input(byte), reply) else {
         log(b"ttyd: interactive input fail\n");
         return false;
@@ -4825,6 +5086,12 @@ fn dispatch_ttyd_key(
     let Some(line) = parsed.line else {
         return true;
     };
+    if session().is_none() {
+        login_line(tty, line, initrd, cwd);
+        // The line may have been a password.
+        reply.fill(0);
+        return true;
+    }
     // While a Lua session is live it owns every submitted line — including ones that look like
     // shell commands, which in Lua they are not. Its reply carries its own prompt, so the shell
     // prompt returns only once the child is gone.
@@ -4839,6 +5106,10 @@ fn dispatch_ttyd_key(
         if let Some(stmt) = parse(ls) {
             run_statement(&stmt, line, initrd, prog_initrd, root, cwd);
         }
+    }
+    if session().is_none() {
+        // That line was `logout` or `exit`.
+        forget_console_history(tty);
     }
     // A line was submitted (Enter): the command (if any) has finished writing its output, so render
     // the next prompt. Command output ends in a newline, so the prompt lands on a fresh line; an
