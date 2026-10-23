@@ -7,12 +7,13 @@
 //j249
 //j480
 //j519
+//j554
 
 use drv_fb::{Console, PixelOrder, BG};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_rt::{
     channel_read, channel_read_with_handle, debug_write, framebuffer_claim, handle_koid, port_bind,
-    port_create, port_wait, resource_mint_mmio, vmar_map,
+    port_create, port_wait, resource_mint_mmio, vmar_map, vmo_create,
 };
 
 kumo_rt::entry!(main);
@@ -192,10 +193,44 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
+    // J554: a copy of the screen in ordinary cached memory. The framebuffer is mapped
+    // non-cacheable, and reading it back to scroll cost about 165 ms a line at 1600x900; with
+    // the shadow, the glass is only ever written. It sits above the framebuffer's mapping,
+    // rounded to 16 MiB, inside the 512 MiB child VMAR. Without one, the console reads the
+    // glass as before. — TIMBERDOODLE
+    let shadow_va = fb_va + fb_map_len.next_multiple_of(0x100_0000);
+    let shadow_vmo = vmo_create(fb_map_len);
+    let shadowed = shadow_vmo != 0
+        && shadow_vmo != u64::MAX
+        && vmar_map(
+            Handle(0),
+            Handle(shadow_vmo as u32),
+            0,
+            shadow_va,
+            fb_map_len,
+            (VmarFlags::READ | VmarFlags::WRITE).0,
+        ) == 0;
+    let shadow = if shadowed {
+        shadow_va as *mut u32
+    } else {
+        debug_write(
+            b"drv-fb: no shadow; scrolling reads the glass\n".as_ptr(),
+            45,
+        );
+        fb_va as *mut u32
+    };
+
     // Build the text console over the framebuffer (clears the screen) and show first
     // light.
     let mut con = unsafe {
-        Console::new_with_pixel_order(fb_va as *mut u32, width, height, stride, pixel_order)
+        Console::new_shadowed(
+            fb_va as *mut u32,
+            shadow,
+            width,
+            height,
+            stride,
+            pixel_order,
+        )
     };
     con.write(b"KUMO drv-fb console ready\n");
 

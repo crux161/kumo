@@ -6,6 +6,7 @@
 //j519
 //j552
 //j553
+//j554
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -87,7 +88,7 @@ unsafe fn fb_clean_line(addr: usize) {
 /// # Safety
 /// `base` must point at `len_px` writable `u32` pixels.
 unsafe fn blit_glyph(
-    base: *mut u32,
+    (base, shadow): (*mut u32, *mut u32),
     len_px: usize,
     stride: usize,
     position: (usize, usize),
@@ -104,7 +105,11 @@ unsafe fn blit_glyph(
             let on = (bits >> (15 - rx)) & 1 != 0;
             let idx = row_start.wrapping_add(rx);
             if idx < len_px {
-                unsafe { base.add(idx).write_volatile(if on { fg } else { bg }) };
+                let color = if on { fg } else { bg };
+                unsafe {
+                    shadow.add(idx).write(color);
+                    base.add(idx).write_volatile(color);
+                }
             }
         }
         // Clean both endpoints, including a wide glyph's second cache line. — KESTREL
@@ -130,6 +135,11 @@ unsafe fn blit_glyph(
 /// console grid is derivable, never critical private RAM (`DESIGN/002`).
 pub struct Console {
     base: *mut u32,
+    /// A copy of every pixel in ordinary cached memory, which every draw writes beside `base`
+    /// and every read uses instead (J554). The glass is mapped non-cacheable, and a read there
+    /// is a full memory round trip per pixel: scrolling a 1600x900 screen by reading it back
+    /// took about 165 ms a line on the opi5. Equal to `base` when no shadow was given.
+    shadow: *mut u32,
     len_px: usize,
     stride: usize,
     cols: usize,
@@ -176,9 +186,28 @@ impl Console {
         stride: usize,
         pixel_order: PixelOrder,
     ) -> Console {
+        unsafe { Self::new_shadowed(base, base, width_px, height_px, stride, pixel_order) }
+    }
+
+    /// Build a console that draws to `base` and keeps a copy of every pixel at `shadow`, so
+    /// scrolling and the cursor never read the framebuffer back (J554).
+    ///
+    /// # Safety
+    /// `base` and `shadow` must each point at a writable buffer of at least
+    /// `stride * height_px` `u32` pixels, outlive the `Console`, and either be the same buffer
+    /// or not overlap.
+    pub unsafe fn new_shadowed(
+        base: *mut u32,
+        shadow: *mut u32,
+        width_px: usize,
+        height_px: usize,
+        stride: usize,
+        pixel_order: PixelOrder,
+    ) -> Console {
         let stride = if stride == 0 { width_px } else { stride };
         let mut con = Console {
             base,
+            shadow,
             len_px: stride.saturating_mul(height_px),
             stride,
             cols: width_px / GLYPH_W,
@@ -220,7 +249,7 @@ impl Console {
             return;
         }
         for idx in 0..self.len_px {
-            unsafe { self.base.add(idx).write_volatile(BG) };
+            unsafe { self.put(idx, BG) };
         }
         #[cfg(target_os = "none")]
         unsafe {
@@ -329,7 +358,7 @@ impl Console {
                 }
                 unsafe {
                     blit_glyph(
-                        self.base,
+                        (self.base, self.shadow),
                         self.len_px,
                         self.stride,
                         (self.col * GLYPH_W, self.row * GLYPH_H),
@@ -579,7 +608,7 @@ impl Console {
                 let start = y * self.stride + col_start * GLYPH_W;
                 let end = (y * self.stride + col_end * GLYPH_W).min(self.len_px);
                 for index in start.min(self.len_px)..end {
-                    unsafe { self.base.add(index).write_volatile(color) };
+                    unsafe { self.put(index, color) };
                 }
                 #[cfg(target_os = "none")]
                 if start < end {
@@ -616,8 +645,8 @@ impl Console {
             let start = y * self.stride + self.col * GLYPH_W;
             let end = (start + GLYPH_W).min(self.len_px);
             for index in start..end {
-                let pixel = unsafe { self.base.add(index).read_volatile() };
-                unsafe { self.base.add(index).write_volatile(pixel ^ 0x00ff_ffff) };
+                let pixel = unsafe { self.shadow.add(index).read() };
+                unsafe { self.put(index, pixel ^ 0x00ff_ffff) };
             }
             #[cfg(target_os = "none")]
             if start < end {
@@ -647,26 +676,58 @@ impl Console {
     /// Scroll the text grid up by one glyph row: move every full glyph band up
     /// `GLYPH_H` pixel rows and clear the freed bottom band. Leaves the cursor on the
     /// (now blank) last row.
-    fn scroll(&mut self) {
-        let shift = GLYPH_H * self.stride;
-        let visible = self.rows * GLYPH_H * self.stride;
-        for idx in 0..visible {
-            let src = idx + shift;
-            let v = if src < self.len_px {
-                unsafe { self.base.add(src).read_volatile() }
-            } else {
-                BG
-            };
-            if idx < self.len_px {
-                unsafe { self.base.add(idx).write_volatile(v) };
+    /// Copy the first `len` pixels of the shadow to the glass, two pixels per store where both
+    /// buffers allow it. A no-op when there is no separate shadow.
+    ///
+    /// # Safety
+    /// `len` must be at most `len_px`.
+    unsafe fn flush_shadow(&self, len: usize) {
+        if self.shadow == self.base {
+            return;
+        }
+        let paired =
+            (self.base as usize).is_multiple_of(8) && (self.shadow as usize).is_multiple_of(8);
+        let mut idx = 0;
+        if paired {
+            let (glass, copy) = (self.base as *mut u64, self.shadow as *const u64);
+            while idx + 1 < len {
+                unsafe { glass.add(idx / 2).write_volatile(copy.add(idx / 2).read()) };
+                idx += 2;
             }
         }
-        // Clear the freed bottom band.
-        let bottom = (self.rows - 1) * GLYPH_H * self.stride;
-        for idx in bottom..visible {
-            if idx < self.len_px {
-                unsafe { self.base.add(idx).write_volatile(BG) };
+        while idx < len {
+            unsafe {
+                self.base
+                    .add(idx)
+                    .write_volatile(self.shadow.add(idx).read())
+            };
+            idx += 1;
+        }
+    }
+
+    /// Write one pixel to the shadow and the glass.
+    ///
+    /// # Safety
+    /// `index` must be below `len_px`.
+    unsafe fn put(&self, index: usize, color: u32) {
+        unsafe {
+            self.shadow.add(index).write(color);
+            self.base.add(index).write_volatile(color);
+        }
+    }
+
+    fn scroll(&mut self) {
+        let shift = GLYPH_H * self.stride;
+        let visible = (self.rows * GLYPH_H * self.stride).min(self.len_px);
+        let kept = visible.saturating_sub(shift);
+        // Move the picture up one text row in the cached shadow, blank the freed bottom row
+        // there, then copy the result out. The glass is only ever written. — TIMBERDOODLE
+        unsafe {
+            core::ptr::copy(self.shadow.add(shift), self.shadow, kept);
+            for idx in kept..visible {
+                self.shadow.add(idx).write(BG);
             }
+            self.flush_shadow(visible);
         }
         #[cfg(target_os = "none")]
         unsafe {
@@ -1055,6 +1116,76 @@ mod tests {
         con.write(b"\x1b[44m\x1b[2J");
         let blue = con.ansi_color(4);
         assert!(buf.iter().all(|&pixel| pixel == blue));
+    }
+
+    /// The same bytes through an unshadowed console (the reference) and a shadowed one.
+    fn shadowed_against_reference(
+        bytes: &[u8],
+    ) -> ([u32; ED_W * ED_H], [u32; ED_W * ED_H], [u32; ED_W * ED_H]) {
+        let mut reference = [BG; ED_W * ED_H];
+        let mut glass = [0x00ee_eeee; ED_W * ED_H];
+        let mut shadow = [0x0012_3456; ED_W * ED_H];
+        unsafe { Console::new(reference.as_mut_ptr(), ED_W, ED_H, ED_W) }.write(bytes);
+        unsafe {
+            Console::new_shadowed(
+                glass.as_mut_ptr(),
+                shadow.as_mut_ptr(),
+                ED_W,
+                ED_H,
+                ED_W,
+                PixelOrder::Bgr,
+            )
+        }
+        .write(bytes);
+        (reference, glass, shadow)
+    }
+
+    #[test]
+    fn a_shadowed_console_paints_exactly_what_an_unshadowed_one_does() {
+        // Text, colours, Japanese, a wrap, enough newlines to scroll twice, an erase and a
+        // visible cursor: every drawing path (J554).
+        let bytes = "AB\x1b[44mC\x1b[0mD\r\nあE\r\nFGHIJKL\r\nM\r\nN\r\nO\x1b[1;2H\x1b[0J\x1b[?25h"
+            .as_bytes();
+        let (reference, glass, shadow) = shadowed_against_reference(bytes);
+        assert!(glass == reference);
+        assert!(shadow == reference);
+    }
+
+    #[test]
+    fn scrolling_and_the_cursor_never_read_the_glass() {
+        let mut glass = [BG; ED_W * ED_H];
+        let mut shadow = [BG; ED_W * ED_H];
+        let mut con = unsafe {
+            Console::new_shadowed(
+                glass.as_mut_ptr(),
+                shadow.as_mut_ptr(),
+                ED_W,
+                ED_H,
+                ED_W,
+                PixelOrder::Bgr,
+            )
+        };
+        con.write(b"A\r\nB\r\nC\r\nD");
+        // Scribble over the glass behind the console's back. Anything read from the glass
+        // would carry the scribble along.
+        glass.fill(0x00ab_cdef);
+        con.write(b"\r\nE");
+        let mut reference = [BG; ED_W * ED_H];
+        unsafe { Console::new(reference.as_mut_ptr(), ED_W, ED_H, ED_W) }
+            .write(b"A\r\nB\r\nC\r\nD\r\nE");
+        assert!(glass == reference, "scroll copied out of the glass");
+
+        glass.fill(0x00ab_cdef);
+        con.write(b"\x1b[?25h\x1b[?25l");
+        // Only the cursor's cell (column 1 after `E`) was drawn, inverted and restored, and
+        // both from the shadow: it is the blank cell the shadow holds, not the scribble.
+        assert_eq!((con.col, con.row), (1, 3));
+        for y in 0..GLYPH_H {
+            let start = (3 * GLYPH_H + y) * ED_W + GLYPH_W;
+            assert!(glass[start..start + GLYPH_W]
+                .iter()
+                .all(|&pixel| pixel == BG));
+        }
     }
 
     #[test]
