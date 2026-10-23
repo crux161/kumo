@@ -2,13 +2,13 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j480
 //j519
 //j554
 //j559
 //j567
+//j568
 
-use drv_fb::{Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
+use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
@@ -67,6 +67,15 @@ impl Line {
     }
 }
 
+/// One bound presentation channel: its port source koID, the server end of the channel,
+/// the mapped read-only surface, and the server-owned view it presents into.
+struct GraphicsLane {
+    source: Handle,
+    channel: Handle,
+    surface: u64,
+    view: usize,
+}
+
 /// Log `label` then `v` in decimal and a newline. The bootstrap path offers no `core::fmt` and no
 /// alloc, so format the integer by hand.
 /// Used by the J231 X13s framebuffer-geometry diagnostic.
@@ -115,14 +124,19 @@ extern "C" fn main(
     let (_n3, bootinfo_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let bootinfo_vmo = Handle(bootinfo_raw as u32);
 
-    // Optional graphics lane: one private channel and one read-only ordinary VMO. Sora
-    // always sends the G record; Handle(0) disables it without preventing console startup.
-    let (_, graphics_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
-    let graphics = Handle(graphics_raw as u32);
-    let mut surface_handle = Handle(0);
-    if graphics_raw != 0 {
-        let (_, surface_raw) = channel_read_with_handle(graphics, buf.as_mut_ptr(), buf.len());
-        surface_handle = Handle(surface_raw as u32);
+    // Optional graphics lanes: one private channel and one read-only ordinary VMO per
+    // server-owned view. Sora always sends one G record per view; Handle(0) disables that
+    // view without preventing console startup.
+    let mut graphics = [Handle(0); kumo_graphics::VIEW_COUNT];
+    let mut surface_handles = [Handle(0); kumo_graphics::VIEW_COUNT];
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        let (_, graphics_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+        graphics[view] = Handle(graphics_raw as u32);
+        if graphics_raw != 0 {
+            let (_, surface_raw) =
+                channel_read_with_handle(graphics[view], buf.as_mut_ptr(), buf.len());
+            surface_handles[view] = Handle(surface_raw as u32);
+        }
     }
 
     if res_raw == 0 || console_raw == 0 || bootinfo_raw == 0 {
@@ -242,18 +256,6 @@ extern "C" fn main(
     }
     let port = Handle(port_h as u32);
     let console_source = Handle(console_koid as u32);
-    let graphics_source = if graphics_raw != 0 {
-        let koid = handle_koid(graphics);
-        if koid != u64::MAX && port_bind(port, graphics) == 0 {
-            Some(Handle(koid as u32))
-        } else {
-            let _ = kumo_rt::handle_close(graphics);
-            None
-        }
-    } else {
-        None
-    };
-
     // This successful, capability-checked claim is the single ownership boundary:
     // before it the HAL console alone may paint the GOP framebuffer; after it every
     // kernel/user diagnostic is routed to this driver and the HAL cursor is dormant.
@@ -290,47 +292,90 @@ extern "C" fn main(
         fb_va as *mut u32
     };
 
-    // Build the text console over the framebuffer (clears the screen).
+    // The server owns the layout: two views in a band above the text console. When the
+    // framebuffer cannot hold both, graphics is disabled and the console keeps the screen.
+    let layout = kumo_graphics::band(width as u32, height as u32);
+    let region = kumo_graphics::console_region(width as u32, height as u32);
+    let console_px = region.y as usize * stride;
+    // Build the text console below the band (clears only that region).
     let mut con = unsafe {
         Console::new_shadowed(
-            fb_va as *mut u32,
-            shadow,
-            width,
-            height,
+            (fb_va as *mut u32).add(console_px),
+            shadow.add(console_px),
+            region.width as usize,
+            region.height as usize,
             stride,
             pixel_order,
         )
     };
+    // Paint the band: background, server-drawn chrome, and empty view wells. Client pixels
+    // reach the glass only through present_view, and only inside a view rectangle.
+    if let Some(band) = &layout {
+        paint_band(band, width, stride, pixel_order, |index, color| unsafe {
+            (fb_va as *mut u32).add(index).write_volatile(color)
+        });
+        unsafe {
+            clean_pixels(fb_va as *mut u32, 0, band.height as usize * stride);
+        }
+    }
     // The glass starts blank: first light is a log line (`dmesg`), not text on the screen. The
     // console's size is the boot milestone the default level shows (J559).
     let mut line = Line::new();
     line.push(b"drv-fb: online, console ");
-    line.push_decimal(width);
+    line.push_decimal(region.width as usize);
     line.push(b"x");
-    line.push_decimal(height);
+    line.push_decimal(region.height as usize);
     line.push(b", ");
-    line.push_decimal(width / GLYPH_W);
+    line.push_decimal(region.width as usize / GLYPH_W);
     line.push(b"x");
-    line.push_decimal(height / GLYPH_H);
-    line.push(b" cells\n");
+    line.push_decimal(region.height as usize / GLYPH_H);
+    line.push(b" cells");
+    if layout.is_some() {
+        line.push(b", ");
+        line.push_decimal(kumo_graphics::VIEW_COUNT);
+        line.push(b" views");
+    }
+    line.push(b"\n");
     let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
     log_info(b"drv-fb: initialized\n");
     log_info(b"drv-fb: console ready\n");
 
-    // Map after the fixed framebuffer and shadow mappings so the kernel's placement cannot
-    // be overwritten by them. Mapping failure only disables graphics; the console survives.
-    let surface_base = if surface_handle.0 != 0 {
-        let (status, addr) =
-            kumo_rt::vmar_map_anywhere(surface_handle, SURFACE_BYTES as u64, VmarFlags::READ.0);
-        let _ = kumo_rt::handle_close(surface_handle);
-        if status == 0 {
-            addr
-        } else {
-            0
+    // Map each view's read-only surface after the fixed framebuffer and shadow mappings, so
+    // the kernel's placement cannot be overwritten by them. Mapping failure disables only
+    // that view; the console survives.
+    let mut surface_bases = [0u64; kumo_graphics::VIEW_COUNT];
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        let handle = surface_handles[view];
+        if handle.0 != 0 {
+            let (status, addr) =
+                kumo_rt::vmar_map_anywhere(handle, SURFACE_BYTES as u64, VmarFlags::READ.0);
+            let _ = kumo_rt::handle_close(handle);
+            if status == 0 {
+                surface_bases[view] = addr;
+            }
         }
-    } else {
-        0
-    };
+    }
+
+    // Bind each presentation channel to its port after the surface mapping, so a lane never
+    // exists without the base it will read.
+    let mut lanes: [Option<GraphicsLane>; kumo_graphics::VIEW_COUNT] =
+        core::array::from_fn(|_| None);
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        if graphics[view].0 == 0 {
+            continue;
+        }
+        let koid = handle_koid(graphics[view]);
+        if koid != u64::MAX && port_bind(port, graphics[view]) == 0 {
+            lanes[view] = Some(GraphicsLane {
+                source: Handle(koid as u32),
+                channel: graphics[view],
+                surface: surface_bases[view],
+                view,
+            });
+        } else {
+            let _ = kumo_rt::handle_close(graphics[view]);
+        }
+    }
 
     // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
     // Output-only — no keyboard device sits behind the framebuffer yet. A read takes a whole
@@ -344,19 +389,38 @@ extern "C" fn main(
             if n > 0 && n <= rx.len() {
                 con.write(&rx[..n]);
             }
-        } else if graphics_source == Some(source) {
-            let (n, extra_handle) = channel_read_with_handle(graphics, rx.as_mut_ptr(), rx.len());
+        } else if let Some(lane) = lanes.iter().flatten().find(|lane| lane.source == source) {
+            let (n, extra_handle) =
+                channel_read_with_handle(lane.channel, rx.as_mut_ptr(), rx.len());
             if extra_handle != 0 {
                 let _ = kumo_rt::handle_close(Handle(extra_handle as u32));
             }
             let request = rx.get(..n).and_then(Present::decode);
-            let reply = match request {
-                Some(request) if extra_handle == 0 && surface_base != 0 => {
-                    let result = con.present_surface(request.surface, SURFACE_BYTES, |index| {
-                        // SAFETY: the permanent mapping covers SURFACE_BYTES; present_surface
-                        // checks every read's extent. No reference aliases the producer's VMO.
-                        unsafe { (surface_base as *const u32).add(index).read_volatile() }
-                    });
+            let reply = match (request, &layout) {
+                (Some(request), Some(band)) if extra_handle == 0 && lane.surface != 0 => {
+                    let view = &band.views[lane.view];
+                    let result = present_view(
+                        view,
+                        stride,
+                        request.surface,
+                        SURFACE_BYTES,
+                        pixel_order,
+                        |index| unsafe {
+                            // SAFETY: the permanent mapping covers SURFACE_BYTES; present_view
+                            // checks the extent and never reads beyond the view.
+                            (lane.surface as *const u32).add(index).read_volatile()
+                        },
+                        |index, color| unsafe {
+                            (fb_va as *mut u32).add(index).write_volatile(color)
+                        },
+                    );
+                    unsafe {
+                        clean_pixels(
+                            fb_va as *mut u32,
+                            view.y as usize * stride,
+                            view.height as usize * stride,
+                        );
+                    }
                     Reply {
                         sequence: request.sequence,
                         status: result.err().unwrap_or(Status::Copied),
@@ -368,7 +432,7 @@ extern "C" fn main(
                 },
             }
             .encode();
-            let _ = kumo_rt::channel_write(graphics, reply.as_ptr(), reply.len());
+            let _ = kumo_rt::channel_write(lane.channel, reply.as_ptr(), reply.len());
         }
     }
 }

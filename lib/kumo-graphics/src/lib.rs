@@ -1,16 +1,104 @@
 #![no_std]
 //j567
+//j568
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
 //! addresses or screen coordinates. Only one request may be outstanding. Stop writing before
 //! Present, and reuse the buffer only after its matching reply. A reply means copied, not vblank.
 
-pub const SURFACE_BYTES: usize = 128 * 1024;
+pub const SURFACE_BYTES: usize = 256 * 1024;
 pub const REQUEST_LEN: usize = 24;
 pub const REPLY_LEN: usize = 12;
 /// Linear little-endian pixels: B, G, R, ignored. No alpha, tiling, or compression.
 pub const XRGB8888: u32 = 1;
+
+/// Server-owned presentation layout. The presenter places these rectangles; clients never
+/// name coordinates or screen addresses. The text console owns the region below the band,
+/// and the presenter and Sora compute the console grid from this one function, so the
+/// shell's winsize always matches the pixels the console actually owns.
+pub const VIEW_COUNT: usize = 2;
+pub const VIEW_WIDTH: u32 = 256;
+pub const VIEW_HEIGHT: u32 = 128;
+/// Server-drawn border around each view; client pixels never reach it.
+pub const VIEW_CHROME: u32 = 2;
+pub const VIEW_GAP: u32 = 16;
+pub const BAND_MARGIN: u32 = 8;
+/// A whole number of 8x16 text rows, so the console starts on a cell row.
+pub const BAND_HEIGHT: u32 = 160;
+pub const CONSOLE_CELL_W: u32 = 8;
+pub const CONSOLE_CELL_H: u32 = 16;
+pub const MIN_CONSOLE_ROWS: u32 = 8;
+pub const VIEW_BG: u32 = 0x0000_0000;
+pub const BAND_BG: u32 = 0x0016_1b22;
+pub const VIEW_CHROME_COLOR: u32 = 0x005a_8fc8;
+pub const VIEW_SOLID: u32 = 0x0000_a0ff;
+pub const CLIP_POISON: u32 = 0x00ff_00ff;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct View {
+    /// Left edge of the client-visible rectangle, in framebuffer pixels.
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Band {
+    pub height: u32,
+    pub views: [View; VIEW_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsoleRegion {
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Place the two views in a centered band, or decline when the framebuffer cannot also hold
+/// a usable text console. Declining leaves the whole display to the console.
+pub fn band(width: u32, height: u32) -> Option<Band> {
+    let content =
+        (VIEW_WIDTH + 2 * VIEW_CHROME) * VIEW_COUNT as u32 + VIEW_GAP * (VIEW_COUNT as u32 - 1);
+    if width < content + 2 * BAND_MARGIN || height < BAND_HEIGHT + MIN_CONSOLE_ROWS * CONSOLE_CELL_H
+    {
+        return None;
+    }
+    let left = (width - content) / 2;
+    let top = (BAND_HEIGHT - (VIEW_HEIGHT + 2 * VIEW_CHROME)) / 2;
+    let mut views = [View {
+        x: 0,
+        y: 0,
+        width: VIEW_WIDTH,
+        height: VIEW_HEIGHT,
+    }; VIEW_COUNT];
+    for (index, view) in views.iter_mut().enumerate() {
+        view.x = left + index as u32 * (VIEW_WIDTH + 2 * VIEW_CHROME + VIEW_GAP) + VIEW_CHROME;
+        view.y = top + VIEW_CHROME;
+    }
+    Some(Band {
+        height: BAND_HEIGHT,
+        views,
+    })
+}
+
+/// The text console's region: below the band when views exist, the whole display otherwise.
+pub fn console_region(width: u32, height: u32) -> ConsoleRegion {
+    match band(width, height) {
+        Some(band) => ConsoleRegion {
+            y: band.height,
+            width,
+            height: height - band.height,
+        },
+        None => ConsoleRegion {
+            y: 0,
+            width,
+            height,
+        },
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Surface {
@@ -148,6 +236,23 @@ pub fn demo_pixel(x: u32, y: u32) -> u32 {
     }
 }
 
+/// A deliberately over-large demo surface. Its visible 256x128 corner is a solid colour;
+/// every pixel outside the view is poison that must never reach the glass.
+pub const CLIP_DEMO: Surface = Surface {
+    width: 320,
+    height: 160,
+    stride: 320,
+    format: XRGB8888,
+};
+
+pub fn clip_demo_pixel(x: u32, y: u32) -> u32 {
+    if x < VIEW_WIDTH && y < VIEW_HEIGHT {
+        VIEW_SOLID
+    } else {
+        CLIP_POISON
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +260,8 @@ mod tests {
     #[test]
     fn rejects_untrusted_geometry_and_short_backing() {
         assert!(DEMO.fits(SURFACE_BYTES));
-        assert!(!DEMO.fits(SURFACE_BYTES - 1));
+        assert!(CLIP_DEMO.fits(SURFACE_BYTES));
+        assert!(!CLIP_DEMO.fits(CLIP_DEMO.byte_len().unwrap() - 1));
         for surface in [
             Surface { width: 0, ..DEMO },
             Surface { height: 0, ..DEMO },
@@ -213,5 +319,54 @@ mod tests {
         .encode();
         reply[8] = 99;
         assert_eq!(Reply::decode(&reply), None);
+    }
+
+    #[test]
+    fn band_places_two_views_above_the_console() {
+        for (width, height) in [(800, 600), (640, 480), (1600, 900), (552, 288)] {
+            let layout = band(width, height).expect("views fit");
+            assert_eq!(layout.height, BAND_HEIGHT);
+            assert_eq!(layout.views.len(), VIEW_COUNT);
+            let console = console_region(width, height);
+            assert_eq!(console.y, BAND_HEIGHT);
+            assert_eq!(console.height, height - BAND_HEIGHT);
+            assert!(console.height >= MIN_CONSOLE_ROWS * CONSOLE_CELL_H);
+            for (index, view) in layout.views.iter().enumerate() {
+                assert_eq!((view.width, view.height), (VIEW_WIDTH, VIEW_HEIGHT));
+                assert!(view.x >= VIEW_CHROME && view.y >= VIEW_CHROME);
+                assert!(view.x + view.width + VIEW_CHROME <= width);
+                assert!(view.y + view.height + VIEW_CHROME <= BAND_HEIGHT);
+                if index > 0 {
+                    let previous = layout.views[index - 1];
+                    assert_eq!(
+                        view.x,
+                        previous.x + previous.width + 2 * VIEW_CHROME + VIEW_GAP
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_declines_when_the_console_would_not_fit() {
+        assert_eq!(band(551, 600), None);
+        assert_eq!(band(800, 287), None);
+        assert_eq!(
+            console_region(800, 287),
+            ConsoleRegion {
+                y: 0,
+                width: 800,
+                height: 287
+            }
+        );
+        assert_eq!(console_region(551, 600).y, 0);
+    }
+
+    #[test]
+    fn clip_demo_poisons_only_the_pixels_the_view_cannot_show() {
+        assert!(CLIP_DEMO.fits(SURFACE_BYTES));
+        assert_eq!(clip_demo_pixel(VIEW_WIDTH - 1, VIEW_HEIGHT - 1), VIEW_SOLID);
+        assert_eq!(clip_demo_pixel(VIEW_WIDTH, VIEW_HEIGHT / 2), CLIP_POISON);
+        assert_eq!(clip_demo_pixel(VIEW_WIDTH / 2, VIEW_HEIGHT), CLIP_POISON);
     }
 }

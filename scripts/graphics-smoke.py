@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j567
-"""Boot a disposable copy of the full UEFI image and verify F0 pixels via QMP.
+#j568
+"""Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed: only the copy's autoexec
 is replaced. QEMU, its EDK2 firmware, and Python's standard library are the dependencies.
@@ -38,6 +39,36 @@ def replace_autoexec(path):
     path.write_bytes(out)
 
 
+VIEW_W, VIEW_H = 256, 128
+CHROME, GAP, BAND_H, MARGIN = 2, 16, 160, 8
+BAND_BG = (0x16, 0x1B, 0x22)
+VIEW_BG = (0, 0, 0)
+CHROME_COLOR = (0x5A, 0x8F, 0xC8)
+VIEW_SOLID = (0x00, 0xA0, 0xFF)
+POISON = (0xFF, 0x00, 0xFF)
+FG = (0, 0xFF, 0)
+
+
+def view_rects(width, height):
+    # Server-owned layout; must match kumo-graphics::band.
+    content = 2 * (VIEW_W + 2 * CHROME) + GAP
+    assert width >= content + 2 * MARGIN, f"screen {width}x{height} cannot hold the view band"
+    assert height >= BAND_H + 8 * 16, f"screen {width}x{height} cannot hold a console"
+    left = (width - content) // 2
+    top = (BAND_H - (VIEW_H + 2 * CHROME)) // 2
+    return [
+        (left + index * (VIEW_W + 2 * CHROME + GAP) + CHROME, top + CHROME)
+        for index in range(2)
+    ]
+
+
+def demo_pixel(x, y):
+    if y < 32:
+        return [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)][min(x // 64, 3)]
+    blue = 0x40 if ((x // 16) + (y // 16)) % 2 == 0 else 0xC0
+    return (x & 255, (y * 2) & 255, blue)
+
+
 def check_pixels(path):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
@@ -45,19 +76,42 @@ def check_pixels(path):
     width, height = map(int, header.groups())
     pixels = data[header.end():]
     assert len(pixels) == width * height * 3
-    bars = b"".join(bytes(rgb) * 64 for rgb in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)])
-    images = []
-    for y in range(height - 127):
-        # Server owns placement: F0 inserts at column zero of the console.
-        if pixels[y * width * 3:y * width * 3 + len(bars)] != bars:
-            continue
-        expected = [bars] * 32
-        for row in range(32, 128):
-            expected.append(b"".join(bytes((x, (row * 2) & 255, 64 if (x // 16 + row // 16) % 2 == 0 else 192)) for x in range(256)))
-        if all(pixels[(y + row) * width * 3:(y + row) * width * 3 + 768] == expected[row] for row in range(128)):
-            images.append(y)
-    assert len(images) >= 2, f"expected two complete surface copies; found {images} on {width}x{height}"
-    print(f"Graphics pixels green: two complete 256x128 images at y={images}; screen {width}x{height}")
+    rects = view_rects(width, height)
+
+    def at(x, y):
+        offset = (y * width + x) * 3
+        return tuple(pixels[offset:offset + 3])
+
+    assert at(0, 0) == BAND_BG, f"band background {at(0, 0)} != {BAND_BG}"
+    for vx, vy in rects:
+        for y in range(vy - CHROME, vy + VIEW_H + CHROME):
+            for x in range(vx - CHROME, vx + VIEW_W + CHROME):
+                border = x < vx or x >= vx + VIEW_W or y < vy or y >= vy + VIEW_H
+                if border:
+                    assert at(x, y) == CHROME_COLOR, f"chrome at {(x, y)} is {at(x, y)}"
+
+    # View 0 shows the full diagnostic image; view 1 presents an over-sized surface whose
+    # visible corner is solid. Both are copied by the server into server-owned rectangles.
+    vx, vy = rects[0]
+    for y in range(VIEW_H):
+        for x in range(VIEW_W):
+            assert at(vx + x, vy + y) == demo_pixel(x, y), f"view 0 pixel {(x, y)}"
+    vx, vy = rects[1]
+    for y in range(VIEW_H):
+        for x in range(VIEW_W):
+            assert at(vx + x, vy + y) == VIEW_SOLID, f"view 1 pixel {(x, y)}"
+
+    # The clipped surface's out-of-view poison must never reach the glass.
+    poison = sum(1 for y in range(height) for x in range(width) if at(x, y) == POISON)
+    assert poison == 0, f"clipped surface leaked {poison} poison pixels"
+
+    # The text console below the band still renders glyphs (echo, boot log, login prompt).
+    text = sum(1 for y in range(BAND_H, height) for x in range(width) if at(x, y) == FG)
+    assert text > 100, f"console region has only {text} foreground pixels"
+    print(
+        f"Graphics pixels green: two views at {rects} on {width}x{height}, "
+        f"chrome intact, clip poison absent, console text {text}px"
+    )
 
 
 def main():
@@ -95,9 +149,9 @@ def main():
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"boot timed out; inspect {serial}")
-            marker = b"gfx-demo: 256x128 surface copied; buffer released (software GOP)"
+            marker = b"gfx-demo: views 0 and 1 copied; buffers released (software GOP)"
             assert transcript.count(marker) == 2, f"missing release replies; inspect {serial}"
-            assert b"gfx-demo: presentation failed" not in transcript
+            assert b"gfx-demo: one or more views failed" not in transcript
             time.sleep(0.2)  # let the final queued console line reach drv-fb
             def read_qmp():
                 if not select.select([process.stdout], [], [], 5)[0]:
@@ -121,7 +175,7 @@ def main():
             command("qmp_capabilities")
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm")
-            print("Graphics UEFI smoke green: two acknowledged presents, buffer reuse, subsequent console output, login")
+            print("Graphics UEFI smoke green: two views, clipping, chrome, buffer reuse, console text, login")
         finally:
             process.terminate()
             try:

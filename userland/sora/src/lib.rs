@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j558
 //j559
 //j562
 //j563
 //j564
+//j568
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -695,8 +695,12 @@ pub const CONSOLE_SESSION_RESET: &[u8] = b"\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[?25
 /// full-screen program should paint (J557). `None` when not even one cell fits, or the grid
 /// cannot be expressed in a `winsize`.
 pub fn console_window(width: u32, height: u32) -> Option<ttyd::WindowSize> {
-    let columns = u16::try_from(width / CONSOLE_CELL_PX.0).ok()?;
-    let rows = u16::try_from(height / CONSOLE_CELL_PX.1).ok()?;
+    // The presenter reserves a view band above the text console (F1a). Both sides derive the
+    // console grid from the same shared layout, so a full-screen program never paints past
+    // the rows drv-fb actually owns.
+    let region = kumo_graphics::console_region(width, height);
+    let columns = u16::try_from(region.width / CONSOLE_CELL_PX.0).ok()?;
+    let rows = u16::try_from(region.height / CONSOLE_CELL_PX.1).ok()?;
     (rows > 0 && columns > 0).then_some(ttyd::WindowSize { rows, columns })
 }
 
@@ -1131,10 +1135,13 @@ mod tests {
         // J557: the size Kilo is told must be the grid drv-fb actually draws.
         assert_eq!(CONSOLE_CELL_PX, (GLYPH_W as u32, GLYPH_H as u32));
         let window = |w, h| console_window(w, h).map(|s| (s.rows, s.columns));
-        assert_eq!(window(1600, 900), Some((56, 200)));
-        assert_eq!(window(640, 480), Some((30, 80)));
+        assert_eq!(window(1600, 900), Some((46, 200)));
+        assert_eq!(window(800, 600), Some((27, 100)));
+        assert_eq!(window(640, 480), Some((20, 80)));
         assert_eq!(window(7, 900), None);
         assert_eq!(window(u32::MAX, 900), None);
+        // Too short for the view band: the console keeps the whole display.
+        assert_eq!(window(800, 287), Some((17, 100)));
     }
 
     #[test]
