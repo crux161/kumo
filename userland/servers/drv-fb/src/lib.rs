@@ -5,6 +5,7 @@
 //j344
 //j519
 //j552
+//j553
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -428,6 +429,7 @@ impl Console {
                 self.row = row.min(self.rows - 1);
                 self.col = col.min(self.cols - 1);
             }
+            b'J' => self.erase_display(self.csi_param(0)),
             b'K' => self.erase_line(self.csi_param(0)),
             b'm' => self.apply_sgr(),
             _ => {}
@@ -520,6 +522,37 @@ impl Console {
                 background,
             ),
             2 => self.fill_cells(self.row, self.row + 1, 0, self.cols, background),
+            _ => {}
+        }
+    }
+
+    /// Erase in display (CSI `J`), what `clear` sends (J553): `0` from the cursor to the end of
+    /// the screen, `1` from the start of the screen through the cursor, `2` all of it. `3` asks
+    /// a terminal to drop its saved lines; this console keeps none, so the screen is left alone,
+    /// as xterm leaves it. Like `K`, the cursor stays where it is and erased cells take the
+    /// current background.
+    ///
+    /// Without this the kernel shell's `clear` (`ESC[2J ESC[H`) only homed the cursor, and the
+    /// old text stayed on the glass under the prompt. — TIMBERDOODLE
+    fn erase_display(&mut self, mode: u16) {
+        let background = self.effective_background();
+        let col = self.col.min(self.cols);
+        match mode {
+            0 => {
+                self.fill_cells(self.row, self.row + 1, col, self.cols, background);
+                self.fill_cells(self.row + 1, self.rows, 0, self.cols, background);
+            }
+            1 => {
+                self.fill_cells(0, self.row, 0, self.cols, background);
+                self.fill_cells(
+                    self.row,
+                    self.row + 1,
+                    0,
+                    col.saturating_add(1).min(self.cols),
+                    background,
+                );
+            }
+            2 => self.fill_cells(0, self.rows, 0, self.cols, background),
             _ => {}
         }
     }
@@ -912,6 +945,116 @@ mod tests {
         assert_cell(&buf, b'Y', 1, 0);
         assert_cell(&buf, b' ', 2, 0);
         assert_cell(&buf, b'D', 0, 1);
+    }
+
+    // A 5x4-cell screen for erase-in-display: room above, beside and below a cursor.
+    const ED_W: usize = 5 * GLYPH_W;
+    const ED_H: usize = 4 * GLYPH_H;
+
+    /// A screen whose every cell holds a letter, `A` to `T` in reading order.
+    fn full_screen(buf: &mut [u32; ED_W * ED_H]) -> Console {
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), ED_W, ED_H, ED_W) };
+        con.write(b"ABCDE\r\nFGHIJ\r\nKLMNO\r\nPQRST");
+        con
+    }
+
+    /// The cells of `buf` that still hold their `full_screen` letter, row by row (`.` = blank).
+    fn cells(buf: &[u32; ED_W * ED_H]) -> [[u8; 5]; 4] {
+        let mut out = [[b'.'; 5]; 4];
+        for (row, line) in out.iter_mut().enumerate() {
+            for (col, cell) in line.iter_mut().enumerate() {
+                let letter = b'A' + (row * 5 + col) as u8;
+                let rows = glyph_rows(letter);
+                let holds = (0..GLYPH_H).all(|ry| {
+                    (0..GLYPH_W).all(|rx| {
+                        let on = (rows[ry] >> (7 - rx)) & 1 != 0;
+                        buf[(row * GLYPH_H + ry) * ED_W + col * GLYPH_W + rx]
+                            == if on { FG } else { BG }
+                    })
+                });
+                let blank = (0..GLYPH_H).all(|ry| {
+                    (0..GLYPH_W)
+                        .all(|rx| buf[(row * GLYPH_H + ry) * ED_W + col * GLYPH_W + rx] == BG)
+                });
+                *cell = match (holds, blank) {
+                    (true, _) => letter,
+                    (false, true) => b'.',
+                    _ => b'?',
+                };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_kernel_shells_clear_blanks_every_cell_and_the_prompt_returns_home() {
+        // `kernel/src/shell.rs` answers `clear` with ESC[2J then ESC[H; the prompt follows.
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[2J\x1b[H");
+        assert_eq!(cells(&buf), [*b"....."; 4]);
+        assert_eq!((con.col, con.row), (0, 0));
+        con.write(b"P");
+        assert_cell_colors(&buf, ED_W, b'P', 0, 0, FG, BG);
+        assert_eq!((con.col, con.row), (1, 0));
+    }
+
+    #[test]
+    fn busybox_and_ncurses_clear_sequences_blank_the_screen_at_any_read_split() {
+        // busybox `clear` sends ESC[H ESC[J; ncurses `clear` adds ESC[2J and ESC[3J.
+        for sequence in [&b"\x1b[H\x1b[J"[..], b"\x1b[H\x1b[2J\x1b[3J"] {
+            for split in 0..=sequence.len() {
+                let mut buf = [BG; ED_W * ED_H];
+                let mut con = full_screen(&mut buf);
+                con.write(&sequence[..split]);
+                con.write(&sequence[split..]);
+                assert_eq!(cells(&buf), [*b"....."; 4], "split at {split}");
+                assert_eq!((con.col, con.row), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn erase_below_and_above_keep_the_other_side_and_the_cursor() {
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[2;3H\x1b[0J");
+        assert_eq!(cells(&buf), [*b"ABCDE", *b"FG...", *b".....", *b"....."]);
+        assert_eq!((con.col, con.row), (2, 1));
+
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[2;3H\x1b[1J");
+        assert_eq!(cells(&buf), [*b".....", *b"...IJ", *b"KLMNO", *b"PQRST"]);
+        assert_eq!((con.col, con.row), (2, 1));
+    }
+
+    #[test]
+    fn erase_display_leaves_the_cursor_where_it_was() {
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[3;2H\x1b[2J");
+        assert_eq!(cells(&buf), [*b"....."; 4]);
+        assert_eq!((con.col, con.row), (1, 2));
+        con.write(b"X");
+        assert_cell_colors(&buf, ED_W, b'X', 1, 2, FG, BG);
+    }
+
+    #[test]
+    fn erasing_saved_lines_leaves_the_visible_screen() {
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[3J");
+        assert_eq!(cells(&buf), [*b"ABCDE", *b"FGHIJ", *b"KLMNO", *b"PQRST"]);
+    }
+
+    #[test]
+    fn erased_cells_take_the_current_background_like_erase_line() {
+        let mut buf = [BG; ED_W * ED_H];
+        let mut con = full_screen(&mut buf);
+        con.write(b"\x1b[44m\x1b[2J");
+        let blue = con.ansi_color(4);
+        assert!(buf.iter().all(|&pixel| pixel == blue));
     }
 
     #[test]

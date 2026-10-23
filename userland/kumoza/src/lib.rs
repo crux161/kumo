@@ -6,6 +6,7 @@
 //j507
 //j517
 //j535
+//j553
 
 extern crate alloc;
 
@@ -49,8 +50,8 @@ pub struct Statement {
 
 /// Help text for the current Kumoza builtin scaffold.
 pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
-    builtins: cat <path>, echo [-n], false, help, ls, lua [expr], run <program>, true,\n\
-              wc <path>\n\
+    builtins: cat <path>, clear, echo [-n], false, help, ls, lua [expr], run <program>,\n\
+              true, wc <path>\n\
     power: halt, reboot, shutdown\n\
     editor: kilo <path>\n\
     diag: heap, ipcstat, relibc [args], threads\n\
@@ -322,6 +323,13 @@ pub fn evaluate(statement: &Statement, mut handler: impl FnMut(&Command) -> bool
     true
 }
 
+/// What `clear` writes (J553): cursor home, erase the whole screen, drop saved lines. It is
+/// the sequence ncurses' `clear` sends on Linux, so a real terminal on the serial line and
+/// `drv-fb` on the framebuffer both end up blank, with the cursor top-left where the next
+/// prompt is drawn. A shell builtin, as in busybox, so the prompt that follows is the shell's
+/// own and comes after the erase, not raced against it. — TIMBERDOODLE
+pub const CLEAR_SCREEN: &[u8] = b"\x1b[H\x1b[2J\x1b[3J";
+
 /// Render output-only builtins. Returns `true` when `cmd` was handled.
 ///
 /// Sora still owns authority-bearing effects such as `ls`, `run`, and forwarding
@@ -348,6 +356,9 @@ pub fn write_builtin_output(cmd: &Command, mut write: impl FnMut(&[u8])) -> bool
         true
     } else if cmd.name == "help" {
         write(HELP_TEXT);
+        true
+    } else if cmd.name == "clear" {
+        write(CLEAR_SCREEN);
         true
     } else if cmd.name == "true" || cmd.name == "false" {
         // Recognised no-output builtins. Their exit status is not observable yet (no `&&`,
@@ -712,5 +723,18 @@ mod tests {
             );
             assert!(out.is_empty(), "{name} should produce no output");
         }
+    }
+
+    #[test]
+    fn clear_homes_the_cursor_and_erases_the_whole_screen() {
+        let cmd = tokenize("clear").unwrap();
+        let mut out = Vec::new();
+
+        assert!(write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
+
+        // Home first, then erase everything: whatever the screen size, nothing is left and the
+        // prompt the shell prints next lands top-left.
+        assert_eq!(out, b"\x1b[H\x1b[2J\x1b[3J");
+        assert!(HELP_TEXT.windows(5).any(|window| window == b"clear"));
     }
 }
