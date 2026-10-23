@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j519
 //j552
 //j553
 //j554
 //j557
+//j565
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -485,7 +485,8 @@ impl Console {
             self.reset_sgr();
             return;
         }
-        for index in 0..self.csi_param_count {
+        let mut index = 0;
+        while index < self.csi_param_count {
             match self.csi_params[index] {
                 0 => self.reset_sgr(),
                 7 => self.reverse = true,
@@ -494,8 +495,19 @@ impl Console {
                 39 => self.foreground = FG,
                 40..=47 => self.background = self.ansi_color(self.csi_params[index] - 40),
                 49 => self.background = BG,
+                // Extended colours (`38;5;N`, `38;2;R;G;B`, and 48/58 alike) are not drawn on
+                // this console, but their sub-parameters must not be read as attributes:
+                // `38;5;7` is not reverse video, and `38;5;0` is not a reset (J565).
+                38 | 48 | 58 if index + 1 < self.csi_param_count => {
+                    index += match self.csi_params[index + 1] {
+                        5 => 2,
+                        2 => 4,
+                        _ => 0,
+                    };
+                }
                 _ => {}
             }
+            index += 1;
         }
     }
 
@@ -1225,6 +1237,20 @@ mod tests {
         assert_cell_colors(&buf, STRIDE, b'R', 0, 0, 0x00aa_0000, BG);
         assert_cell_colors(&buf, STRIDE, b'B', 1, 0, 0x0000_00aa, BG);
         assert_cell_colors(&buf, STRIDE, b'S', 0, 1, BG, FG);
+    }
+
+    #[test]
+    fn extended_colour_sub_parameters_are_skipped_not_misread() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+
+        // `7` and `0` here are colour indices, not reverse video and reset; `31` after a
+        // complete `38;5;N` still applies.
+        con.write(b"\x1b[31m\x1b[38;5;7mA\x1b[38;5;0;34mB\x1b[48;2;1;2;3mC");
+
+        assert_cell_colors(&buf, STRIDE, b'A', 0, 0, 0x00aa_0000, BG);
+        assert_cell_colors(&buf, STRIDE, b'B', 1, 0, 0x0000_00aa, BG);
+        assert_cell_colors(&buf, STRIDE, b'C', 2, 0, 0x0000_00aa, BG);
     }
 
     #[test]

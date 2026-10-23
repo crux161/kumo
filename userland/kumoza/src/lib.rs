@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j553
 //j558
 //j559
 //j563
 //j564
+//j565
 
 extern crate alloc;
 
@@ -97,6 +97,132 @@ impl WorkingDirectory {
         // its identity from its directory between syscall entries. — KESTREL
         write(&prompt[..path_end + 3]);
     }
+}
+
+/// What the session prompt shows (PLAN/012 item 5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Prompt<'a> {
+    pub user: &'a str,
+    pub host: &'a str,
+    pub root: bool,
+    /// The working directory, absolute.
+    pub cwd: &'a str,
+    /// `HOME`. `/` means no home, and nothing is shown as `~`.
+    pub home: &'a str,
+    /// The last command's status; non-zero adds the `✖` block.
+    pub status: u8,
+}
+
+/// CRUX's prompt colours, xterm 256-colour indices, from their zsh theme.
+mod prompt_colour {
+    pub const BORDER: u8 = 240;
+    pub const USER: u8 = 135;
+    pub const SEPARATOR: u8 = 242;
+    pub const HOST: u8 = 51;
+    pub const DIRECTORY: u8 = 39;
+    pub const ERROR: u8 = 196;
+}
+
+impl Prompt<'_> {
+    /// The two-line prompt in CRUX's style, as one console write:
+    ///
+    /// ```text
+    /// ┌──[crux⬡INDRA]──[~/d/s/u/kernel] ✖ [127]
+    /// └──// λ
+    /// ```
+    ///
+    /// Root adds a `]──[#` segment after the host and ends in `⟁`. Every colour is an SGR
+    /// `38;5;N`, and the prompt resets all attributes before the cursor.
+    pub fn render(&self) -> Vec<u8> {
+        use prompt_colour::*;
+        let mut out = String::new();
+        let colour = |out: &mut String, index: u8| {
+            out.push_str("\x1b[38;5;");
+            push_decimal(out, index.into());
+            out.push('m');
+        };
+        colour(&mut out, BORDER);
+        out.push_str("┌──[");
+        colour(&mut out, USER);
+        out.push_str(self.user);
+        colour(&mut out, SEPARATOR);
+        out.push('⬡');
+        colour(&mut out, HOST);
+        out.push_str(self.host);
+        if self.root {
+            colour(&mut out, BORDER);
+            out.push_str("]──[");
+            colour(&mut out, ERROR);
+            out.push('#');
+        }
+        colour(&mut out, BORDER);
+        out.push_str("]──[");
+        colour(&mut out, DIRECTORY);
+        out.push_str(&compact_path(self.cwd, self.home));
+        colour(&mut out, BORDER);
+        out.push(']');
+        if self.status != 0 {
+            out.push(' ');
+            colour(&mut out, ERROR);
+            out.push_str("✖ ");
+            colour(&mut out, BORDER);
+            out.push('[');
+            colour(&mut out, ERROR);
+            push_decimal(&mut out, self.status.into());
+            colour(&mut out, BORDER);
+            out.push(']');
+        }
+        out.push_str("\x1b[0m\n");
+        colour(&mut out, BORDER);
+        out.push_str("└──// ");
+        if self.root {
+            colour(&mut out, ERROR);
+            out.push('⟁');
+        } else {
+            colour(&mut out, HOST);
+            out.push('λ');
+        }
+        out.push_str("\x1b[0m ");
+        out.into_bytes()
+    }
+}
+
+fn push_decimal(out: &mut String, value: u32) {
+    if value >= 10 {
+        push_decimal(out, value / 10);
+    }
+    out.push(char::from(b'0' + (value % 10) as u8));
+}
+
+/// The prompt's path: `HOME` shown as `~`, and every component but the last cut to its first
+/// character, so `~/dev/src/sys/init` reads `~/d/s/s/init` (CRUX's `compact_path`). `/` and `~`
+/// show whole. Unlike zsh's `${PWD/#$HOME/~}`, `HOME` matches only a whole leading component, and
+/// a `HOME` of `/` is never shown as `~`.
+pub fn compact_path(cwd: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let (mut out, rest) = match cwd.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            (String::from("~"), rest)
+        }
+        _ => (String::new(), cwd),
+    };
+    let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return if out.is_empty() {
+            String::from("/")
+        } else {
+            out
+        };
+    }
+    for (index, part) in parts.iter().enumerate() {
+        out.push('/');
+        if index + 1 == parts.len() {
+            out.push_str(part);
+        } else if let Some(first) = part.chars().next() {
+            out.push(first);
+        }
+    }
+    out
 }
 
 /// A pipeline: `cmd1 | cmd2 | cmd3`.
@@ -800,6 +926,84 @@ mod tests {
         assert!(write_builtin_output(&cmd, |bytes| out.extend_from_slice(bytes)));
 
         assert_eq!(out, b"\n");
+    }
+
+    fn plain(bytes: &[u8]) -> String {
+        let text = core::str::from_utf8(bytes).unwrap();
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_prompt_matches_cruxs_examples() {
+        let user = Prompt {
+            user: "kali",
+            host: "vermillion",
+            root: false,
+            cwd: "/home/kali/dev/src/user/kernel",
+            home: "/home/kali",
+            status: 127,
+        };
+        assert_eq!(
+            plain(&user.render()),
+            "┌──[kali⬡vermillion]──[~/d/s/u/kernel] ✖ [127]\n└──// λ "
+        );
+        let root = Prompt {
+            user: "root",
+            home: "/root",
+            cwd: "/root/dev/src/user/kernel",
+            root: true,
+            status: 0,
+            ..user
+        };
+        assert_eq!(
+            plain(&root.render()),
+            "┌──[root⬡vermillion]──[#]──[~/d/s/u/kernel]\n└──// ⟁ "
+        );
+        // The colours are CRUX's 256-colour indices, and attributes reset before the cursor.
+        let bytes = user.render();
+        let text = core::str::from_utf8(&bytes).unwrap();
+        for sgr in [
+            "38;5;240m┌",
+            "38;5;135mkali",
+            "38;5;242m⬡",
+            "38;5;51mvermillion",
+        ] {
+            assert!(text.contains(sgr), "{sgr}");
+        }
+        assert!(text.contains("38;5;39m~/d/s/u/kernel") && text.contains("38;5;196m✖"));
+        assert!(text.ends_with("38;5;51mλ\x1b[0m "));
+        assert_eq!(text.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn paths_compact_like_cruxs_zsh_function() {
+        let cases = [
+            ("/", "/home/crux", "/"),
+            ("/home/crux", "/home/crux", "~"),
+            ("/home/crux/dev/src/sys/init", "/home/crux", "~/d/s/s/init"),
+            ("/home/cruxy/notes", "/home/crux", "/h/c/notes"),
+            ("/media/KUMO/Boot Files", "/home/crux", "/m/K/Boot Files"),
+            ("/media/日本語/メモ", "/", "/m/日/メモ"),
+            ("/tmp", "/", "/tmp"),
+            ("/", "/", "/"),
+            ("/root", "/root/", "~"),
+        ];
+        for (cwd, home, want) in cases {
+            assert_eq!(compact_path(cwd, home), want, "{cwd} with HOME={home}");
+        }
     }
 
     #[test]

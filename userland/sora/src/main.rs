@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j558
 //j559
 //j562
 //j563
 //j564
+//j565
 
 extern crate alloc;
 
@@ -184,13 +184,23 @@ fn diag_hex(v: u64) {
 static ROOT_RESOURCE: AtomicU64 = AtomicU64::new(0);
 
 fn write_shell_prompt(cwd: &WorkingDirectory) {
-    if session().is_none() {
+    let Some(user) = session() else {
         write_login_prompt();
         return;
+    };
+    let host = HOSTNAME.get();
+    let prompt = kumoza::Prompt {
+        user: user.name.as_str(),
+        host: host.as_str(),
+        root: user.root,
+        cwd: cwd.path(),
+        home: user.home.as_str(),
+        status: LAST_STATUS.load(Ordering::Relaxed).min(255) as u8,
     }
-    cwd.write_prompt(|bytes| {
-        let _ = sora::relay_console_output(bytes, |chunk| debug_write(chunk.as_ptr(), chunk.len()));
-    });
+    .render();
+    // Rendered whole and written back to back, so a driver line cannot split it except at a
+    // 256-byte DebugWrite boundary.
+    let _ = sora::relay_console_output(&prompt, |chunk| debug_write(chunk.as_ptr(), chunk.len()));
 }
 
 /// Log a `u64` as `0x…` hex on the live serial. `no_std` Sora has no formatter, so a
@@ -2621,6 +2631,7 @@ fn eval_command(
     root: Handle,
     cwd: &mut WorkingDirectory,
 ) -> bool {
+    LAST_STATUS.store(0, Ordering::Relaxed);
     if cmd.name == "dmesg" {
         dmesg(cmd);
         return true;
@@ -2635,8 +2646,11 @@ fn eval_command(
                 log(user.name.as_str().as_bytes());
                 log(b"\n");
             }
-            (true, None) => log(b"whoami: not logged in\n"),
-            (false, _) => log(b"usage: whoami\n"),
+            (true, None) => {
+                log(b"whoami: not logged in\n");
+                fail_status(1);
+            }
+            (false, _) => usage(b"usage: whoami\n"),
         }
         return true;
     }
@@ -2645,7 +2659,7 @@ fn eval_command(
             log(HOSTNAME.get().as_str().as_bytes());
             log(b"\n");
         } else {
-            log(b"usage: hostname\n");
+            usage(b"usage: hostname\n");
         }
         return true;
     }
@@ -2660,13 +2674,13 @@ fn eval_command(
             log(cwd.path().as_bytes());
             log(b"\n");
         } else {
-            log(b"usage: pwd\n");
+            usage(b"usage: pwd\n");
         }
         return true;
     }
     if cmd.name == "cd" {
         if cmd.args.len() > 1 {
-            log(b"usage: cd [path]\n");
+            usage(b"usage: cd [path]\n");
         } else if let Err(error) = cwd
             .change(cmd.args.first().map_or("/", |path| path.as_str()), |path| {
                 check_directory(initrd, path)
@@ -2690,6 +2704,7 @@ fn eval_command(
             log(b": ");
             log(path.as_bytes());
             log(b": permission denied\n");
+            fail_status(1);
             return true;
         }
         resolved = cmd.clone();
@@ -2701,6 +2716,9 @@ fn eval_command(
     if kumoza::write_builtin_output(cmd, |bytes| {
         debug_write(bytes.as_ptr(), bytes.len());
     }) {
+        if cmd.name == "false" {
+            fail_status(1);
+        }
         return true;
     } else if cmd.name == "heap" {
         // S1's on-target proof: allocate past the 256 KiB bootstrap floor and show the heap
@@ -2803,7 +2821,7 @@ fn eval_command(
         // Only this explicit shell launcher grants the filesystem image; plain `run cat ...`
         // remains authority-free.
         if cmd.args.len() != 1 {
-            debug_write(b"usage: cat <path>\n".as_ptr(), 18);
+            usage(b"usage: cat <path>\n");
         } else if run_on_filesystem(initrd, b"cat", CAT_PATH, &[], cmd.args[0].as_bytes()) {
             // The selected scratch or removable volume supplies the file.
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
@@ -2820,7 +2838,7 @@ fn eval_command(
         // one finite bootstrap startup message; it counts the named file. Only this explicit
         // launcher grants the initrd — plain `run wc ...` stays authority-free.
         if cmd.args.len() != 1 {
-            debug_write(b"usage: wc <path>\n".as_ptr(), 17);
+            usage(b"usage: wc <path>\n");
         } else if prog_initrd == 0 || prog_initrd == u64::MAX {
             debug_write(b"wc: no initrd handle\n".as_ptr(), 21);
         } else {
@@ -2836,7 +2854,7 @@ fn eval_command(
         // Parse once with the child's rules so routing grants the filesystem it will read.
         // — KESTREL
         let Some(options) = ls::Options::parse(cmd.args.iter().map(|arg| arg.as_bytes())) else {
-            log(b"usage: ls [-al] [--] [path]\n");
+            usage(b"usage: ls [-al] [--] [path]\n");
             return true;
         };
         let path = match core::str::from_utf8(options.path)
@@ -2877,11 +2895,15 @@ fn eval_command(
         // program's argv with argv[0] = its name. The interactive twin of the boot autoexec —
         // both drive the same `run_program`.
         if cmd.args.is_empty() {
-            debug_write(b"usage: run <program> [args...]\n".as_ptr(), 31);
+            usage(b"usage: run <program> [args...]\n");
         } else {
             run_program(initrd, &cmd.args);
         }
     } else if !cmd.name.is_empty() {
+        if !kumo_abi::KERNEL_SHELL_COMMANDS.contains(&cmd.name.as_str()) {
+            // The kernel shell prints `unknown command`; the status says so too.
+            fail_status(127);
+        }
         channel_write(root, raw.as_ptr(), raw.len());
     }
     true
@@ -3119,6 +3141,22 @@ fn run_on_volume(
 /// The identity service's client end (PLAN/012), or 0 when it did not start.
 static IDENTITYD: AtomicU32 = AtomicU32::new(0);
 
+/// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a
+/// failure (a child's non-zero exit included, until the kernel reports exit codes), 2 a usage
+/// error, 127 a command or program that does not exist.
+static LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+
+/// Record a failure. The first one in a command wins, so the most specific report stands.
+fn fail_status(code: u8) {
+    let _ = LAST_STATUS.compare_exchange(0, u32::from(code), Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// A usage message: status 2, as POSIX utilities and shell builtins report it.
+fn usage(message: &[u8]) {
+    log(message);
+    fail_status(2);
+}
+
 /// Sora's single-threaded session state: copied in and out, never borrowed across a call.
 struct Shared<T: Copy>(core::cell::UnsafeCell<T>);
 
@@ -3262,8 +3300,7 @@ fn login_line(tty: Handle, line: &[u8], initrd: Handle, cwd: &mut WorkingDirecto
     }
 }
 
-fn start_session(user: sora::SessionUser, initrd: Handle, cwd: &mut WorkingDirectory) {
-    SESSION.set(Some(user));
+fn start_session(mut user: sora::SessionUser, initrd: Handle, cwd: &mut WorkingDirectory) {
     *cwd = WorkingDirectory::default();
     if cwd
         .change(user.home.as_str(), |path| check_directory(initrd, path))
@@ -3271,7 +3308,10 @@ fn start_session(user: sora::SessionUser, initrd: Handle, cwd: &mut WorkingDirec
     {
         // As `login(1)` does when the home directory is missing, which it is until RedoxFS.
         log(b"No directory, logging in with HOME=/\n");
+        user.home = sora::Text::new("/").unwrap_or(user.home);
     }
+    SESSION.set(Some(user));
+    LAST_STATUS.store(0, Ordering::Relaxed);
     diag(b"login: ");
     diag(user.name.as_str().as_bytes());
     diag(b" on the console\n");
@@ -3447,7 +3487,7 @@ fn id(cmd: &kumoza::Command) {
                     log(line.as_bytes());
                 }
             }
-            _ => log(b"usage: id [user]\n"),
+            _ => usage(b"usage: id [user]\n"),
         }
         return;
     };
@@ -3455,6 +3495,7 @@ fn id(cmd: &kumoza::Command) {
         log(b"id: '");
         log(name.as_bytes());
         log(b"': no such user\n");
+        fail_status(1);
     };
     if !kumo_identity::valid_name(name) {
         no_such_user();
@@ -3471,7 +3512,10 @@ fn id(cmd: &kumoza::Command) {
             }
         }
         Some(IdentityReply::NotFound) => no_such_user(),
-        _ => log(b"id: identity service unavailable\n"),
+        _ => {
+            log(b"id: identity service unavailable\n");
+            fail_status(1);
+        }
     }
 }
 
@@ -3487,7 +3531,10 @@ fn dmesg(cmd: &kumoza::Command) {
             loop {
                 let (n, next) = kumo_rt::log_read(resource, offset, &mut buf);
                 if n == u64::MAX {
-                    log(b"dmesg: kernel log unavailable\n");
+                    {
+                        log(b"dmesg: kernel log unavailable\n");
+                        fail_status(1);
+                    }
                     return;
                 }
                 if n == 0 {
@@ -3509,24 +3556,31 @@ fn dmesg(cmd: &kumoza::Command) {
                     log(name);
                     log(b"\n");
                 }
-                None => log(b"dmesg: kernel log unavailable\n"),
+                None => {
+                    log(b"dmesg: kernel log unavailable\n");
+                    fail_status(1);
+                }
             }
         }
         [flag, level] if flag == "-n" => match sora::parse_log_level(level.as_bytes()) {
             Some(level) => {
                 if kumo_rt::log_level(resource, u64::from(level)) == u64::MAX {
-                    log(b"dmesg: kernel log unavailable\n");
+                    {
+                        log(b"dmesg: kernel log unavailable\n");
+                        fail_status(1);
+                    }
                 }
             }
-            None => {
-                log(b"dmesg: level is 0-7 or emerg, alert, crit, err, warn, notice, info, debug\n")
-            }
+            None => usage(
+                b"dmesg: level is 0-7 or emerg, alert, crit, err, warn, notice, info, debug\n",
+            ),
         },
-        _ => log(b"usage: dmesg [-n level]\n"),
+        _ => usage(b"usage: dmesg [-n level]\n"),
     }
 }
 
 fn log_directory_error(command: &[u8], error: DirectoryError) {
+    fail_status(1);
     log(command);
     log(match error {
         DirectoryError::InvalidPath => b": invalid or too long path\n",
@@ -4026,9 +4080,13 @@ fn run_with_startup_input(
     } else {
         None
     };
-    let _ = run_elf_threads(initrd, path, bootstrap_child_raw, 0, flags, name, 0, keep);
+    let ran = run_elf_threads(initrd, path, bootstrap_child_raw, 0, flags, name, 0, keep);
 
     if handle_koid(bootstrap_child) == u64::MAX {
+        if !ran && stdin_writer.is_none() {
+            // A finite child ran to completion and exited non-zero.
+            fail_status(1);
+        }
         // The child is admitted. An interactive session hands both ends back and returns *without
         // draining: the child is parked on its first stdin read, and pumping to EOF here would
         // wait for a child that is waiting for us.
@@ -4043,6 +4101,7 @@ fn run_with_startup_input(
     } else {
         // Admission failed before the bootstrap transfer committed. Recover and close
         // every capability queued in its message so no authority is stranded.
+        fail_status(1);
         reclaim_startup_handles(bootstrap_child, None);
         let _ = handle_close(bootstrap_child);
         if let Some(writer) = stdin_writer {
@@ -4316,7 +4375,7 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         return true;
     }
     if cmd.args.len() > 1 {
-        log(b"usage: kilo [path]\n");
+        usage(b"usage: kilo [path]\n");
         return true;
     }
     let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
@@ -4495,7 +4554,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
     let count = string_argv_slots(argv, &mut slots);
     if name == b"lua-repl" {
         if argv.len() == 1 {
-            debug_write(b"usage: run lua-repl <expression>\n".as_ptr(), 33);
+            usage(b"usage: run lua-repl <expression>\n");
             return false;
         }
         let mut input = [0u8; 256];
@@ -4584,6 +4643,7 @@ fn run_elf_threads(
         None => {
             log(name);
             log(b": missing\n");
+            fail_status(127);
             return false;
         }
     };

@@ -1,3 +1,5 @@
+//j565
+
 //! A tiny Stage-A serial command shell — KUMO's first interactive surface.
 //!
 //! The command *dispatch* here is pure (host-tested): it takes a whole line plus a
@@ -185,6 +187,31 @@ mod tests {
             "shutdown", "halt",
         ] {
             assert!(out.contains(cmd), "help missing '{cmd}'");
+        }
+    }
+
+    /// Sora calls any name outside `KERNEL_SHELL_COMMANDS` "not found" (J565), so every name in
+    /// it must be one this shell answers, and every command `help` advertises must be in it.
+    #[test]
+    fn the_shared_command_list_matches_this_shell() {
+        for &name in kumo_abi::KERNEL_SHELL_COMMANDS {
+            let known = crate::power::PowerAction::from_command(name).is_some()
+                || !run(name).contains("unknown command");
+            assert!(known, "'{name}' is listed but unknown");
+        }
+        let help = run("help");
+        for word in help
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+        {
+            let command = crate::power::PowerAction::from_command(word).is_some()
+                || !run(word).contains("unknown command");
+            if command {
+                assert!(
+                    kumo_abi::KERNEL_SHELL_COMMANDS.contains(&word),
+                    "'{word}' is a command but not in KERNEL_SHELL_COMMANDS"
+                );
+            }
         }
     }
 

@@ -1,8 +1,8 @@
-//j397
 //j427
 //j493
 //j556
 //j559
+//j565
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +88,14 @@ pub mod log_level {
     pub const INFO: u8 = 6;
     pub const DEBUG: u8 = 7;
 }
+
+/// The commands the kernel's console shell answers (`kernel/src/shell.rs`, with `power`'s verbs)
+/// when Sora forwards a line it does not handle itself. Sora reports any other name as not found,
+/// status 127 (J565); the kernel's tests keep this list honest.
+pub const KERNEL_SHELL_COMMANDS: &[&str] = &[
+    "help", "ver", "banner", "mem", "ps", "ticks", "uptime", "echo", "clear", "ipcstat",
+    "shutdown", "poweroff", "halt", "reboot", "reset",
+];
 
 /// `LogLevel`'s level argument that reports the console level without changing it.
 pub const LOG_LEVEL_QUERY: u64 = u64::MAX;
