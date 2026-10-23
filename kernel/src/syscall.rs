@@ -1,9 +1,8 @@
-//j392
-//j406
 //j409
 //j410
 //j527
 //j547
+//j556
 use alloc::vec::Vec;
 use core::mem;
 
@@ -1174,12 +1173,31 @@ impl SyscallEngine {
     ) -> Result<Handle, ObjectError> {
         let job = Job::child(&mut self.objects, parent_job);
         let child = Process::new(&mut self.objects, &job, vmar);
+        // MANAGE is the creator's authority over the child's lifetime: `ProcessKill` (J556)
+        // requires it, and a duplicate made without it cannot end the process.
         let handle = caller.handles_mut().insert(
             child.object(),
-            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT,
+            Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT | Rights::MANAGE,
         )?;
         self.processes.push(child);
         Ok(handle)
+    }
+
+    /// The process `ProcessKill` would end: `handle` must name a live process in `caller`'s
+    /// table with `MANAGE`. A process may not kill itself; it exits instead. Pure, so the
+    /// policy is host-tested apart from the scheduler half of the kill.
+    pub fn process_kill_target(&self, caller: &Process, handle: Handle) -> Result<KoId, Errno> {
+        let entry = caller
+            .handles()
+            .require(handle, ObjectKind::Process, Rights::MANAGE)
+            .map_err(errno_from_object)?;
+        if entry.koid == caller.koid() {
+            return Err(Errno::InvalidArgs);
+        }
+        if self.process_by_koid(entry.koid).is_none() {
+            return Err(Errno::BadHandle);
+        }
+        Ok(entry.koid)
     }
 
     /// Dispatch a syscall by process koid (avoids borrow conflict when the caller
@@ -2553,6 +2571,40 @@ mod tests {
         let job = crate::task::Job::root(engine.objects_mut());
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         Process::new(engine.objects_mut(), &job, vmar)
+    }
+
+    #[test]
+    fn process_kill_needs_manage_on_a_live_process_and_never_the_caller() {
+        let mut engine = SyscallEngine::new();
+        let mut parent = test_process(&mut engine);
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x1000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let child = engine.process_create(&mut parent, &job, vmar).unwrap();
+        let child_koid = parent.handles().get(child).unwrap().koid;
+        // The creator manages its child (J556).
+        assert_eq!(engine.process_kill_target(&parent, child), Ok(child_koid));
+        // A duplicate made without MANAGE can watch the child but not end it.
+        let watcher = parent
+            .handles_mut()
+            .duplicate(child, Rights::READ | Rights::WAIT)
+            .unwrap();
+        assert_eq!(
+            engine.process_kill_target(&parent, watcher),
+            Err(Errno::AccessDenied)
+        );
+        // Only a process handle names a process.
+        let (channel, _) = create_channel(&mut engine, &mut parent);
+        assert_eq!(
+            engine.process_kill_target(&parent, channel),
+            Err(Errno::WrongType)
+        );
+        // A process ends itself by exiting, not by killing.
+        let own = parent.object();
+        let me = parent.handles_mut().insert(own, Rights::MANAGE).unwrap();
+        assert_eq!(
+            engine.process_kill_target(&parent, me),
+            Err(Errno::InvalidArgs)
+        );
     }
 
     fn create_channel(engine: &mut SyscallEngine, process: &mut Process) -> (Handle, Handle) {

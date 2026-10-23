@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j422
 //j425
 //j493
 //j494
 //j534
+//j556
 
 use core::cell::UnsafeCell;
 
@@ -70,6 +70,19 @@ enum WaitTarget {
         process: KoId,
         addr: u64,
     },
+}
+
+impl WaitTarget {
+    /// A kind name and the object koid (a futex's user address) for a kill report.
+    fn describe(self) -> (&'static str, u64) {
+        match self {
+            WaitTarget::Channel(koid) => ("channel", koid.0),
+            WaitTarget::Port(koid) => ("port", koid.0),
+            WaitTarget::Interrupt(koid) => ("interrupt", koid.0),
+            WaitTarget::DeviceCtx(koid) => ("device-ctx", koid.0),
+            WaitTarget::Futex { addr, .. } => ("futex", addr),
+        }
+    }
 }
 
 /// One parked thread and the typed object it blocked on.
@@ -141,6 +154,14 @@ impl WaitQueue {
 
     fn remove_thread(&mut self, thread: KoId) {
         self.entries.retain(|e| e.thread != thread);
+    }
+
+    /// What `thread` is parked on, if it is parked at all.
+    fn target_of(&self, thread: KoId) -> Option<WaitTarget> {
+        self.entries
+            .iter()
+            .find(|e| e.thread == thread)
+            .map(|e| e.target)
     }
 }
 
@@ -821,6 +842,76 @@ pub fn wake_children_waiting_on_futex(process: KoId, addr: u64, count: u32) -> u
     }
 }
 
+/// Exit code recorded for a thread `ProcessKill` ended: 128 + 9, what a Unix shell reports for a
+/// process killed by `SIGKILL`.
+pub const KILLED_EXIT_CODE: u64 = 137;
+
+const _: () = assert!(CHILD_PRIORITY.0 == CHILD_ASYNC_PRIORITY.0);
+
+/// What a killed process's threads were doing when [`kill_process_threads`] took them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KillReport {
+    /// Threads taken off the scheduler.
+    pub killed: u32,
+    /// Of those, how many were waiting for the CPU rather than parked.
+    pub ready: u32,
+    /// The first parked thread's wait: what kind of object, and its koid (a futex's address).
+    pub parked_on: Option<(&'static str, u64)>,
+    /// That wait's channel endpoint, when it was a channel, so the caller can ask whether
+    /// messages were already waiting there.
+    pub parked_channel: Option<KoId>,
+}
+
+/// The scheduler half of `ProcessKill` (J556): take every live resident thread of `process` out
+/// of its wait or off the run queue, terminate it, and leave it `done` for the next reap, as if it
+/// had exited. The caller holds no `SoraState` borrow, and closes the process's handles next;
+/// that is what wakes its peers. The running thread is never touched: it is the killer, and the
+/// killer may not name its own process.
+///
+/// A parked thread is left suspended in its syscall on its own kernel stack, and that frame is
+/// never resumed. That is safe for the same reason preempting one is: it holds no `SoraState`
+/// borrow while parked. — TIMBERDOODLE
+pub fn kill_process_threads(process: KoId) -> KillReport {
+    let mut report = KillReport::default();
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if !unsafe { (&*opt).is_some() } {
+        return report;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        let current = s.dispatcher.current();
+        for child in s.children.iter_mut() {
+            let thread = child.thread.koid();
+            if child.process != process || child.done || Some(thread) == current {
+                continue;
+            }
+            match s.wait_queue.target_of(thread) {
+                Some(target) => {
+                    s.wait_queue.remove_thread(thread);
+                    if report.parked_on.is_none() {
+                        report.parked_on = Some(target.describe());
+                        if let WaitTarget::Channel(koid) = target {
+                            report.parked_channel = Some(koid);
+                        }
+                    }
+                }
+                // Blocking and async children share one priority (asserted below).
+                None => {
+                    if s.dispatcher.remove_ready_rt(thread, CHILD_PRIORITY) {
+                        report.ready += 1;
+                    }
+                }
+            }
+            child.exit_code = KILLED_EXIT_CODE;
+            child.done = true;
+            child.thread.terminate();
+            report.killed += 1;
+        }
+    }
+    report
+}
+
 fn wait_target_needs_safe_reschedule(target: WaitTarget) -> bool {
     matches!(
         target,
@@ -1257,6 +1348,23 @@ fn dispatch_context(
 #[cfg(test)]
 mod tests {
     use super::{wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget};
+
+    #[test]
+    fn target_of_reports_where_a_thread_is_parked() {
+        // What a kill report prints: the object the thread was parked on (J556).
+        let mut q = WaitQueue::new();
+        q.park(KoId(7), WaitTarget::Channel(KoId(42)));
+        assert_eq!(q.target_of(KoId(7)), Some(WaitTarget::Channel(KoId(42))));
+        assert_eq!(q.target_of(KoId(8)), None);
+        assert_eq!(WaitTarget::Channel(KoId(42)).describe(), ("channel", 42));
+        let futex = WaitTarget::Futex {
+            process: KoId(1),
+            addr: 0x1000,
+        };
+        assert_eq!(futex.describe(), ("futex", 0x1000));
+        q.remove_thread(KoId(7));
+        assert_eq!(q.target_of(KoId(7)), None);
+    }
 
     #[test]
     fn park_then_waiter_for_finds_thread_by_object() {

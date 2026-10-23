@@ -1,6 +1,7 @@
 //j397
 //j427
 //j493
+//j556
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +59,11 @@ pub enum Syscall {
     /// backing is per-page and non-contiguous. Returns the handle in the primary result
     /// and the physical base in the secondary register (like `ChannelRead`'s handle).
     VmoCreateContiguous = 45,
+    /// End a process its caller manages: take its threads off the CPU and out of every wait,
+    /// then close its handles as an exit would, so peers see `PEER_CLOSED`. Requires
+    /// `Rights::MANAGE` on the process handle, which `ProcessCreate` gives the creator. A
+    /// process cannot kill itself (that is [`Syscall::ProcessExit`]).
+    ProcessKill = 46,
 }
 
 pub const IRQ_KIND_TLMM_GPIO: u32 = 0x8000_0000;
@@ -210,6 +216,11 @@ mod tests {
         // laid out; pinning them here keeps the now-live syscalls where userland expects them.
         assert_eq!(Syscall::FutexWait as usize, 28);
         assert_eq!(Syscall::FutexWake as usize, 29);
+    }
+
+    #[test]
+    fn process_kill_follows_the_contiguous_dma_vmo() {
+        assert_eq!(Syscall::ProcessKill as usize, 46);
     }
 }
 

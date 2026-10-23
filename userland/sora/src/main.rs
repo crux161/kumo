@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j547
 //j548
 //j549
 //j550
 //j551
+//j556
 
 extern crate alloc;
 
@@ -22,9 +22,10 @@ use kumo_rt::{
     address_space_create, channel_create, channel_create_pair, channel_read,
     channel_read_with_handle, channel_write, channel_write_with_handle, debug_write, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
-    port_wait, process_create, process_run, process_wait, resource_create_child, thread_create,
-    thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV,
-    STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
+    port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
+    thread_create, thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write,
+    STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
+    STARTUP_TAG_TTY,
 };
 use kumoza::parse;
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -2547,6 +2548,7 @@ fn eval_command(
             ProcessRunFlags::ASYNC.bits(),
             b"threads",
             1,
+            None,
         ) {
             debug_write(b"threads: launch failed\n".as_ptr(), 23);
         }
@@ -3014,7 +3016,7 @@ fn run_with_startup_input(
     grant_tty: bool,
     bind_stdout: bool,
     stdin: StdinMode<'_>,
-) -> Option<(Handle, Handle)> {
+) -> Option<InteractiveChild> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
         log(name);
@@ -3215,14 +3217,24 @@ fn run_with_startup_input(
     }
 
     let flags = ProcessRunFlags::TRANSFER_ARG.bits();
-    let _ = run_elf(initrd, path, bootstrap_child_raw, 0, flags, name);
+    let mut process = None;
+    let keep = if stdin_writer.is_some() {
+        Some(&mut process)
+    } else {
+        None
+    };
+    let _ = run_elf_threads(initrd, path, bootstrap_child_raw, 0, flags, name, 0, keep);
 
     if handle_koid(bootstrap_child) == u64::MAX {
         // The child is admitted. An interactive session hands both ends back and returns *without
         // draining: the child is parked on its first stdin read, and pumping to EOF here would
         // wait for a child that is waiting for us.
         if let Some(writer) = stdin_writer {
-            return Some((writer, stdout_read));
+            return Some(InteractiveChild {
+                stdin: writer,
+                stdout: stdout_read,
+                process,
+            });
         }
         pump_to_console(stdout_read);
     } else {
@@ -3234,8 +3246,19 @@ fn run_with_startup_input(
             let _ = handle_close(writer);
         }
     }
+    if let Some(process) = process {
+        let _ = handle_close(process);
+    }
     let _ = handle_close(stdout_read);
     None
+}
+
+/// A running interactive child's ends: the writer for its stdin, the reader for its stdout, and
+/// the process handle that can end it when it stops answering (J556).
+struct InteractiveChild {
+    stdin: Handle,
+    stdout: Handle,
+    process: Option<Handle>,
 }
 
 /// Recover handles from a startup message that could not be delivered. `Some(n)` drains
@@ -3313,7 +3336,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         return true;
     }
     let slots: [&[u8]; 2] = [b"lua-repl", b"-i"];
-    let Some((stdin_write, stdout_read)) = run_with_startup_input(
+    let Some(child) = run_with_startup_input(
         initrd,
         b"bin/lua-repl",
         b"lua-repl",
@@ -3327,7 +3350,13 @@ fn start_lua_session(initrd: Handle) -> bool {
         debug_write(b"lua: session unavailable\n".as_ptr(), 25);
         return false;
     };
-    LUA_STDIN_WRITE.store(stdin_write.0 as u64, Ordering::Relaxed);
+    // A Lua session ends when the REPL itself exits and its stdout closes; Sora keeps no handle
+    // to end it, as before.
+    if let Some(process) = child.process {
+        let _ = handle_close(process);
+    }
+    let stdout_read = child.stdout;
+    LUA_STDIN_WRITE.store(child.stdin.0 as u64, Ordering::Relaxed);
     LUA_STDOUT_READ.store(stdout_read.0 as u64, Ordering::Relaxed);
     // The child writes its banner and prompt before its first read, so this relay both renders the
     // greeting and proves the session is actually serving.
@@ -3338,12 +3367,39 @@ fn start_lua_session(initrd: Handle) -> bool {
 /// reason the Lua session's are: the session outlives the shell frame that created it.
 static KILO_STDIN_WRITE: AtomicU64 = AtomicU64::new(0);
 static KILO_STDOUT_READ: AtomicU64 = AtomicU64::new(0);
+/// The live editor's process handle (with `MANAGE`), kept so Sora can end an editor it gives
+/// up on (J556). 0 when there is none.
+static KILO_PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// The key that ends a live editor from the keyboard: Ctrl-\, the serial console's escape
+/// prefix. The kernel keeps that byte on serial, so this reaches Sora only from a USB or I2C
+/// keyboard, which until now had no way out of an editor that stopped answering.
+const KILO_ESCAPE_KEY: u8 = 0x1c;
 
 fn kilo_session_active() -> bool {
     KILO_STDIN_WRITE.load(Ordering::Relaxed) != 0
 }
 
-fn end_kilo_session() {
+/// End the editor session. `kill` also ends the editor: Sora is giving up on a child that may
+/// still be alive. Closing its stdin alone is not enough. relibc reads end-of-file as 0, and
+/// Kilo's `while ((nread = read(fd,&c,1)) == 0);` then spins at child priority, above Sora's,
+/// for good. That is how J555's watchdog left the board needing a reset. An editor that
+/// already exited only needs its handle closed. — TIMBERDOODLE
+fn end_kilo_session(kill: bool) {
+    let process = KILO_PROCESS.swap(0, Ordering::Relaxed);
+    if process != 0 {
+        if kill {
+            // Name Sora's end of the editor's key channel. The kernel's kill report names
+            // the far end of whatever channel the editor was parked on, so the two match
+            // exactly when the editor was waiting for keys.
+            let keys = KILO_STDIN_WRITE.load(Ordering::Relaxed);
+            log(b"kilo: keys channel ");
+            log_hex(handle_koid(Handle(keys as u32)));
+            log(b"\n");
+            let _ = process_kill(Handle(process as u32));
+        }
+        let _ = handle_close(Handle(process as u32));
+    }
     let stdin = KILO_STDIN_WRITE.swap(0, Ordering::Relaxed);
     let stdout = KILO_STDOUT_READ.swap(0, Ordering::Relaxed);
     KILO_STDOUT_KOID.store(0, Ordering::Relaxed);
@@ -3390,7 +3446,8 @@ fn kilo_relay_paint(stdout: Handle) -> bool {
     let mut buf = [0u8; kumo_ipc::MAX_INLINE_BYTES];
     let n = channel_read(stdout, buf.as_mut_ptr(), buf.len());
     if n == 0 || n == u64::MAX {
-        end_kilo_session();
+        // 0 is the editor's stdout closing: it exited.
+        end_kilo_session(n == u64::MAX);
         return false;
     }
     if sora::relay_console_output(&buf[..n as usize], |chunk| {
@@ -3401,7 +3458,7 @@ fn kilo_relay_paint(stdout: Handle) -> bool {
         KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
         true
     } else {
-        end_kilo_session();
+        end_kilo_session(true);
         false
     }
 }
@@ -3418,13 +3475,21 @@ fn kilo_session_key(byte: u8) -> bool {
         return false;
     }
     let _ = stdout;
+    if byte == KILO_ESCAPE_KEY {
+        const MESSAGE: &[u8] = b"\r\nkilo: ended by Ctrl-\\\r\n";
+        debug_write(MESSAGE.as_ptr(), MESSAGE.len());
+        end_kilo_session(true);
+        return false;
+    }
     if channel_write(stdin, &byte, 1) != Errno::Ok.status() {
-        end_kilo_session();
+        // Its stdin's read end is gone: the editor exited.
+        end_kilo_session(false);
         return false;
     }
     if KILO_SILENT_KEYS.fetch_add(1, Ordering::Relaxed) + 1 >= KILO_SILENT_KEY_LIMIT {
-        debug_write(b"\nkilo: not responding; keyboard released\n".as_ptr(), 40);
-        end_kilo_session();
+        const MESSAGE: &[u8] = b"\r\nkilo: not responding; ended\r\n";
+        debug_write(MESSAGE.as_ptr(), MESSAGE.len());
+        end_kilo_session(true);
         return false;
     }
     true
@@ -3470,7 +3535,7 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
             }
         }
     }
-    let Some((stdin_write, stdout_read)) = run_with_startup_input(
+    let Some(child) = run_with_startup_input(
         initrd,
         KILO_PATH.as_bytes(),
         b"kilo",
@@ -3485,8 +3550,9 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         return false;
     };
     KILO_SILENT_KEYS.store(0, Ordering::Relaxed);
-    KILO_STDIN_WRITE.store(stdin_write.0 as u64, Ordering::Relaxed);
-    KILO_STDOUT_READ.store(stdout_read.0 as u64, Ordering::Relaxed);
+    KILO_PROCESS.store(child.process.map_or(0, |p| p.0 as u64), Ordering::Relaxed);
+    KILO_STDIN_WRITE.store(child.stdin.0 as u64, Ordering::Relaxed);
+    KILO_STDOUT_READ.store(child.stdout.0 as u64, Ordering::Relaxed);
     // The editor queries the window size and paints its first screen before reading a key,
     // so this relay both renders the opening frame and proves the child is serving.
     // Stdout was bound to the serve port before the child was admitted, so its first screen
@@ -3655,6 +3721,7 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
 /// from its thread, so two residents naming the same process koid *are* two threads, and
 /// `ProcessRun`'s ASYNC arm resolves that identity from the handle. No kernel change was needed.
 /// Every existing caller passes 0 and is unaffected.
+#[allow(clippy::too_many_arguments)]
 fn run_elf_threads(
     initrd: Handle,
     path: &[u8],
@@ -3663,6 +3730,7 @@ fn run_elf_threads(
     flags: u64,
     name: &[u8],
     extra_threads: u32,
+    kept: Option<&mut Option<Handle>>,
 ) -> bool {
     const PAGE_SIZE: u64 = 4096;
     const MAX_SEGMENTS: usize = 8;
@@ -3897,7 +3965,14 @@ fn run_elf_threads(
 
     // `VmarMap`/`AddressSpaceCreate` copied everything an admitted child needs
     // into its process record. Sora does not supervise this path by handle, so
-    // both success and every post-allocation failure surrender all acquired handles.
+    // both success and every post-allocation failure surrender all acquired handles,
+    // except the process handle of an admitted child whose caller asked to keep it: an
+    // interactive session needs it to end a child that stops answering (J556).
+    if loaded {
+        if let Some(kept) = kept {
+            *kept = loader_handles[1].take();
+        }
+    }
     let cleanup_ok = sora::close_handles(&loader_handles, handle_close);
     if !cleanup_ok {
         log(name);
@@ -3907,7 +3982,7 @@ fn run_elf_threads(
 }
 
 fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {
-    run_elf_threads(initrd, path, arg, arg2, flags, name, 0)
+    run_elf_threads(initrd, path, arg, arg2, flags, name, 0, None)
 }
 
 /// Stage-C milestone (Journal 134): two `svc-health` servers run as **independent**

@@ -9,12 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j477
-//j493
 //j494
 //j528
 //j532
 //j547
+//j556
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1076,9 +1075,14 @@ fn wait_child_device_ctx_fault_without_borrow(process_koid: KoId, ctx: Handle) -
 /// Tears down the current process before it exits: closes all handles (firing PEER_CLOSED
 /// on any channels) and signals TERMINATED on its process object so the supervisor wakes up.
 fn teardown_current_process_and_signal() {
-    let Some(koid) = crate::user_thread::current_process_koid() else {
-        return;
-    };
+    if let Some(koid) = crate::user_thread::current_process_koid() {
+        teardown_process_and_signal(koid);
+    }
+}
+
+/// Close every handle `koid` holds and signal `TERMINATED`: the handle half of an exit, shared
+/// by `ProcessExit` (the current process) and `ProcessKill` (another one, J556).
+fn teardown_process_and_signal(koid: KoId) {
     // Surviving channel ends whose peer this exit closes. Their readers are woken after the
     // Sora borrow below ends (GUIDANCE/006 §2.1).
     let mut closed_peers = Vec::new();
@@ -1142,6 +1146,73 @@ fn teardown_current_process_and_signal() {
     if reclaim_framebuffer {
         kumo_hal::active::reclaim_framebuffer_console();
     }
+}
+
+/// `ProcessKill` (J556). Resolve and check the target under the borrow, then stop its threads
+/// and close its handles outside it, in the order an exit uses: the threads first, so no wake the
+/// teardown causes can re-admit one. The report says what the process was doing, which is the
+/// question a supervisor that gave up on it cannot otherwise answer. — TIMBERDOODLE
+fn kill_process_without_borrow(handle: Handle) -> kumo_abi::Status {
+    let Some(caller) = crate::user_thread::current_process_koid() else {
+        return Errno::Internal.status();
+    };
+    let target = with_sora(|sora| {
+        let caller_process = if caller == sora.process.koid() {
+            &sora.process
+        } else {
+            sora.engine
+                .process_by_koid(caller)
+                .ok_or(Errno::BadHandle)?
+        };
+        sora.engine.process_kill_target(caller_process, handle)
+    });
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => return error.status(),
+    };
+    let report = crate::user_thread::kill_process_threads(target);
+    // Asked before the teardown closes that endpoint. A thread parked on a channel that already
+    // held a message missed its wake, which is a kernel fault. Parked on an empty one, it was
+    // waiting on a peer that never answered.
+    // The peer names the channel to whoever holds its other end.
+    let channel = report.parked_channel.and_then(|koid| {
+        with_sora_mut(|sora| {
+            let ipc = sora.engine.ipc_mut();
+            let signals = ipc.channel_signals_by_koid(koid).ok()?;
+            let peer = ipc.peer_koid_for(koid).ok()?;
+            Some((peer, signals.contains(kumo_abi::Signals::READABLE)))
+        })
+    });
+    teardown_process_and_signal(target);
+    match (report.parked_on, channel) {
+        (Some((kind, object)), Some((peer, unread))) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), parked on {} {:#x} (peer {:#x}, {})\n",
+            target.0,
+            report.killed,
+            kind,
+            object,
+            peer.0,
+            if unread {
+                "messages waiting: a missed wake"
+            } else {
+                "empty"
+            }
+        ),
+        (Some((kind, object)), None) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), parked on {} {:#x}\n",
+            target.0,
+            report.killed,
+            kind,
+            object
+        ),
+        (None, _) => crate::klog!(
+            "kill: process {:#x}: {} thread(s), {} ready to run\n",
+            target.0,
+            report.killed,
+            report.ready
+        ),
+    }
+    Errno::Ok.status()
 }
 
 /// Exit code stamped on a thread the kernel terminated for faulting (vs. a clean
@@ -1736,6 +1807,12 @@ extern "C" fn svc_hook(regs: *mut u64) {
             crate::user_thread::exit_current_user(r[0]);
         }
         kumo_hal::active::el0_exit(r[0]);
+    }
+
+    if num == Syscall::ProcessKill as u64 {
+        r[0] = kill_process_without_borrow(Handle(r[0] as u32)) as u32 as u64;
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
     }
 
     if num == Syscall::ProcessRun as u64 {

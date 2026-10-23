@@ -1,6 +1,7 @@
 //j493
 //j508
 //j512
+//j556
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -644,6 +645,18 @@ pub fn process_run(
     _arg2: u64,
     _flags: u64,
 ) -> u64 {
+    u64::MAX
+}
+
+/// End a process this caller manages (J556). Needs `MANAGE` on `process`, which the handle
+/// `process_create` returned carries. Returns 0 on success.
+#[cfg(target_arch = "aarch64")]
+pub fn process_kill(process: Handle) -> u64 {
+    syscall(Syscall::ProcessKill, process.0 as u64, 0, 0, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn process_kill(_process: Handle) -> u64 {
     u64::MAX
 }
 
