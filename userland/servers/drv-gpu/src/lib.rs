@@ -4,13 +4,14 @@
 //j574
 //j575
 //j576
+//j577
 
-//! G1b–G2b: power, identity, reset and the first MMU state for the RK3588 Mali-G610.
-//! Recovery class: soft-state; all state is rediscovered on launch and DevicePowerUp is
-//! idempotent. The driver probes identity, soft-resets the GPU, powers the L2, builds address
-//! space 0 in contiguous DMA memory, and runs the MCU against those tables so a deliberate
-//! fault and its containment are observed. Firmware, command serving and supervised recovery
-//! follow with the later GPU execution slices.
+//! G1b–G3a: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
+//! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
+//! builds address space 0 in contiguous DMA memory, and runs the MCU against those tables so a
+//! deliberate fault and its containment are observed. G3a adds a parse-only CSF image parser;
+//! loading its sections and booting the MCU wait on CRUX's firmware decision (PLAN/013 #1).
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -654,6 +655,428 @@ pub fn install_mapping(writer: &mut impl TableWriter, mapping: Mapping, table_ph
         table_index(mapping.va, PAGE_TABLE_LEVELS - 1),
         page_descriptor(mapping.pa, mapping.cached, mapping.readonly, mapping.noexec),
     );
+}
+
+// ---- G3a: the CSF firmware image (RESEARCH/009 §8) ----
+
+/// RESEARCH/009 §8.2: the image header is 20 bytes; every integer is little-endian.
+pub const FIRMWARE_HEADER_LEN: usize = 20;
+pub const FIRMWARE_MAGIC: u32 = 0xC3F1_3A6E;
+/// RESEARCH/009 §7.8/§8.4: the MCU's shared region, whose first section the firmware marks
+/// SHARED and panthor requires to exist.
+pub const CSF_SHARED_REGION_START: u64 = 0x0400_0000;
+/// The MCU's VM uses a 4 KiB granule (RESEARCH/009 §7.2), so every section VA is page-aligned.
+pub const FIRMWARE_PAGE_SIZE: u64 = 4096;
+const FIRMWARE_ENTRY_UPDATE: u32 = 1 << 30;
+const FIRMWARE_ENTRY_OPTIONAL: u32 = 1 << 31;
+
+/// `CSF_FW_BINARY_IFACE_ENTRY_*` (RESEARCH/009 §8.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SectionFlags(pub u32);
+
+impl SectionFlags {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+    const CACHE_MODE_MASK: u32 = 0b11 << 3;
+    pub const PROT: Self = Self(1 << 5);
+    pub const SHARED: Self = Self(1 << 30);
+    pub const ZERO: Self = Self(1 << 31);
+    const SUPPORTED: u32 = Self::READ.0
+        | Self::WRITE.0
+        | Self::EXECUTE.0
+        | Self::CACHE_MODE_MASK
+        | Self::PROT.0
+        | Self::SHARED.0
+        | Self::ZERO.0;
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// RESEARCH/009 §8.4: the cache mode in bits [4:3]; 0 none, 1 cached, 2 uncached-coherent,
+    /// 3 cached-coherent.
+    pub const fn cache_mode(self) -> u8 {
+        ((self.0 >> 3) & 0b11) as u8
+    }
+
+    /// RESEARCH/009 §8.4: panthor maps a section uncached unless the cache mode is CACHED; the
+    /// two coherent modes are also mapped uncached.
+    pub const fn cached(self) -> bool {
+        self.cache_mode() == 1
+    }
+
+    pub const fn writable(self) -> bool {
+        self.0 & Self::WRITE.0 != 0
+    }
+
+    pub const fn executable(self) -> bool {
+        self.0 & Self::EXECUTE.0 != 0
+    }
+}
+
+impl core::ops::BitOr for SectionFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// One validated IFACE entry (RESEARCH/009 §8.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareSection<'a> {
+    /// The entry's trailing bytes. The format does not promise text: the arch10.8 image in
+    /// `resources/` carries binary values here, so this stays opaque. — TIMBERDOODLE
+    pub name: &'a [u8],
+    /// The MCU virtual address the section starts at.
+    pub va: u64,
+    /// `va.end - va.start`.
+    pub len: u64,
+    /// The image bytes that initialize the section (`data.start..data.end`).
+    pub data: &'a [u8],
+    pub flags: SectionFlags,
+    /// The entry's UPDATE bit. panthor does not act on it at load time.
+    pub update: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareError {
+    /// The image is shorter than the 20-byte header.
+    HeaderShort {
+        len: usize,
+    },
+    Magic {
+        magic: u32,
+    },
+    /// `major` must be 0 (RESEARCH/009 §8.2).
+    Major {
+        major: u8,
+    },
+    /// A header padding word was not zero.
+    HeaderPadding,
+    /// The declared size is below the header or beyond the file.
+    Size {
+        size: u32,
+        len: usize,
+    },
+    /// An entry's size is not a positive multiple of 4.
+    EntrySize {
+        offset: usize,
+        size: u8,
+    },
+    /// An entry lies outside the declared image size.
+    EntryOverrun {
+        offset: usize,
+        size: u8,
+    },
+    /// An unknown entry type without the OPTIONAL bit (RESEARCH/009 §8.3).
+    UnknownEntry {
+        offset: usize,
+        kind: u8,
+    },
+    /// An IFACE entry is too small for the five-word section header.
+    SectionShort {
+        offset: usize,
+    },
+    /// `data.end < data.start` or `va.end < va.start`.
+    SectionRange {
+        offset: usize,
+    },
+    /// `data.end` lies beyond the file.
+    SectionData {
+        offset: usize,
+    },
+    /// A section VA is not page-aligned.
+    SectionAlignment {
+        va_start: u32,
+        va_end: u32,
+    },
+    /// A section carries flag bits outside `SUPPORTED`.
+    SectionFlags {
+        offset: usize,
+        flags: u32,
+    },
+    /// The data is larger than the section it initializes (RESEARCH/009 §8.4).
+    SectionTooLarge {
+        offset: usize,
+    },
+    /// The section at the shared region start lacks SHARED.
+    SharedSectionNotShared {
+        va: u64,
+    },
+    /// No non-PROT section marks the shared region.
+    SharedSectionMissing,
+    /// A build-info entry is too small for its two-word header.
+    BuildInfoShort {
+        offset: usize,
+    },
+}
+
+struct Header {
+    magic: u32,
+    minor: u8,
+    major: u8,
+    padding1: u16,
+    version_hash: u32,
+    padding2: u32,
+    size: u32,
+}
+
+fn header(bytes: &[u8]) -> Option<Header> {
+    let raw = bytes.get(..FIRMWARE_HEADER_LEN)?;
+    Some(Header {
+        magic: u32::from_le_bytes(raw[0..4].try_into().ok()?),
+        minor: raw[4],
+        major: raw[5],
+        padding1: u16::from_le_bytes(raw[6..8].try_into().ok()?),
+        version_hash: u32::from_le_bytes(raw[8..12].try_into().ok()?),
+        padding2: u32::from_le_bytes(raw[12..16].try_into().ok()?),
+        size: u32::from_le_bytes(raw[16..20].try_into().ok()?),
+    })
+}
+
+enum Entry<'a> {
+    Section(FirmwareSection<'a>),
+    Build(Option<&'a [u8]>),
+    Ignored,
+}
+
+/// Parse one entry and return it with the offset of the next one. The rules and their order
+/// follow panthor as source-as-spec (RESEARCH/009 §8.3/§8.4). — TIMBERDOODLE
+fn entry_at<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    end: usize,
+) -> Result<(Entry<'a>, usize), FirmwareError> {
+    if offset % 4 != 0 {
+        return Err(FirmwareError::EntrySize { offset, size: 0 });
+    }
+    let Some(raw) = bytes.get(offset..offset.saturating_add(4)) else {
+        return Err(FirmwareError::EntryOverrun { offset, size: 0 });
+    };
+    let ehdr = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let kind = (ehdr & 0xff) as u8;
+    let size = ((ehdr >> 8) & 0xff) as usize;
+    if size % 4 != 0 || size < 4 {
+        return Err(FirmwareError::EntrySize {
+            offset,
+            size: size as u8,
+        });
+    }
+    let next = offset + size;
+    if next > end {
+        return Err(FirmwareError::EntryOverrun {
+            offset,
+            size: size as u8,
+        });
+    }
+    let body = offset + 4;
+    let entry = match kind {
+        0 => Entry::Section(section(bytes, body, next, ehdr)?),
+        6 => Entry::Build(build_sha(bytes, body, next)?),
+        1..=4 => Entry::Ignored,
+        _ if ehdr & FIRMWARE_ENTRY_OPTIONAL != 0 => Entry::Ignored,
+        _ => return Err(FirmwareError::UnknownEntry { offset, kind }),
+    };
+    Ok((entry, next))
+}
+
+fn section<'a>(
+    bytes: &'a [u8],
+    body: usize,
+    end: usize,
+    ehdr: u32,
+) -> Result<FirmwareSection<'a>, FirmwareError> {
+    if end.saturating_sub(body) < 20 {
+        return Err(FirmwareError::SectionShort { offset: body });
+    }
+    let raw = &bytes[body..end];
+    let flags = SectionFlags(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+    let va_start = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let va_end = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let data_start = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
+    let data_end = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+    if data_end < data_start || va_end < va_start {
+        return Err(FirmwareError::SectionRange { offset: body });
+    }
+    if data_end as usize > bytes.len() {
+        return Err(FirmwareError::SectionData { offset: body });
+    }
+    if u64::from(va_start) % FIRMWARE_PAGE_SIZE != 0 || u64::from(va_end) % FIRMWARE_PAGE_SIZE != 0
+    {
+        return Err(FirmwareError::SectionAlignment { va_start, va_end });
+    }
+    if flags.0 & !SectionFlags::SUPPORTED != 0 {
+        return Err(FirmwareError::SectionFlags {
+            offset: body,
+            flags: flags.0,
+        });
+    }
+    // panthor skips a protected-mode section before its shared-region check.
+    if !flags.contains(SectionFlags::PROT)
+        && u64::from(va_start) == CSF_SHARED_REGION_START
+        && !flags.contains(SectionFlags::SHARED)
+    {
+        return Err(FirmwareError::SharedSectionNotShared {
+            va: u64::from(va_start),
+        });
+    }
+    // RESEARCH/009 §8.4's loading rule. panthor copies without this check, so a malformed image
+    // that reaches it would overflow its section buffer; the parser refuses it here instead.
+    if data_end - data_start > va_end - va_start {
+        return Err(FirmwareError::SectionTooLarge { offset: body });
+    }
+    Ok(FirmwareSection {
+        name: &bytes[body + 20..end],
+        va: u64::from(va_start),
+        len: u64::from(va_end - va_start),
+        data: &bytes[data_start as usize..data_end as usize],
+        flags,
+        update: ehdr & FIRMWARE_ENTRY_UPDATE != 0,
+    })
+}
+
+/// RESEARCH/009 §8.5: the metadata points at `"git_sha: <sha>\0"`. panthor treats corrupt
+/// metadata as non-fatal, so this reports `None` rather than an error for anything unusable.
+fn build_sha<'a>(
+    bytes: &'a [u8],
+    body: usize,
+    end: usize,
+) -> Result<Option<&'a [u8]>, FirmwareError> {
+    if end.saturating_sub(body) < 8 {
+        return Err(FirmwareError::BuildInfoShort { offset: body });
+    }
+    let raw = &bytes[body..end];
+    let meta_start = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    let meta_size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    let Some(meta_end) = meta_start.checked_add(meta_size) else {
+        return Ok(None);
+    };
+    if meta_end > bytes.len() {
+        return Ok(None);
+    }
+    let text = &bytes[meta_start..meta_end];
+    const PREFIX: &[u8] = b"git_sha: ";
+    if text.len() <= PREFIX.len() || !text.starts_with(PREFIX) || text[text.len() - 1] != 0 {
+        return Ok(None);
+    }
+    Ok(Some(&text[PREFIX.len()..text.len() - 1]))
+}
+
+/// A validated CSF firmware image (RESEARCH/009 §8.2-§8.5). `parse` walks the whole entry table
+/// once and refuses every malformed case the references name, so `sections` can re-walk without
+/// error handling. The bytes are borrowed; the caller keeps the image alive. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug)]
+pub struct Firmware<'a> {
+    bytes: &'a [u8],
+    minor: u8,
+    version_hash: u32,
+    end: usize,
+    build_sha: Option<&'a [u8]>,
+}
+
+impl<'a> Firmware<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, FirmwareError> {
+        let Some(header) = header(bytes) else {
+            return Err(FirmwareError::HeaderShort { len: bytes.len() });
+        };
+        if header.magic != FIRMWARE_MAGIC {
+            return Err(FirmwareError::Magic {
+                magic: header.magic,
+            });
+        }
+        if header.major != 0 {
+            return Err(FirmwareError::Major {
+                major: header.major,
+            });
+        }
+        if header.padding1 != 0 || header.padding2 != 0 {
+            return Err(FirmwareError::HeaderPadding);
+        }
+        let end = header.size as usize;
+        if end < FIRMWARE_HEADER_LEN || end > bytes.len() {
+            return Err(FirmwareError::Size {
+                size: header.size,
+                len: bytes.len(),
+            });
+        }
+        let mut offset = FIRMWARE_HEADER_LEN;
+        let mut shared = false;
+        let mut build_sha = None;
+        while offset < end {
+            let (entry, next) = entry_at(bytes, offset, end)?;
+            match entry {
+                Entry::Section(section) => {
+                    if section.va == CSF_SHARED_REGION_START
+                        && !section.flags.contains(SectionFlags::PROT)
+                        && section.flags.contains(SectionFlags::SHARED)
+                    {
+                        shared = true;
+                    }
+                }
+                Entry::Build(sha) => build_sha = sha,
+                Entry::Ignored => {}
+            }
+            offset = next;
+        }
+        // panthor refuses an image whose shared interface section is missing.
+        if !shared {
+            return Err(FirmwareError::SharedSectionMissing);
+        }
+        Ok(Self {
+            bytes,
+            minor: header.minor,
+            version_hash: header.version_hash,
+            end,
+            build_sha,
+        })
+    }
+
+    pub const fn minor(&self) -> u8 {
+        self.minor
+    }
+
+    pub const fn version_hash(&self) -> u32 {
+        self.version_hash
+    }
+
+    pub const fn build_sha(&self) -> Option<&'a [u8]> {
+        self.build_sha
+    }
+
+    /// Every IFACE section, PROT included. The loader skips PROT sections (RESEARCH/009 §8.4);
+    /// `parse` only counts a non-PROT section as the shared interface.
+    pub fn sections(&self) -> Sections<'a> {
+        Sections {
+            bytes: self.bytes,
+            offset: FIRMWARE_HEADER_LEN,
+            end: self.end,
+        }
+    }
+}
+
+/// Walks the image a second time. `Firmware::parse` already proved every entry valid, so a
+/// parse failure here cannot occur; it ends the iteration rather than panicking.
+pub struct Sections<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for Sections<'a> {
+    type Item = FirmwareSection<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.offset < self.end {
+            let (entry, next) = entry_at(self.bytes, self.offset, self.end).ok()?;
+            self.offset = next;
+            if let Entry::Section(section) = entry {
+                return Some(section);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1341,5 +1764,400 @@ mod tests {
         assert_eq!(PAGE_SIZE, 4096);
         assert_eq!(PAGE_TABLE_ENTRIES, 512);
         assert_eq!(PAGE_TABLE_LEVELS, 4);
+    }
+}
+
+#[cfg(test)]
+mod fw_tests {
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    const SHARED_VA: (u32, u32) = (0x0400_0000, 0x0400_1000);
+
+    fn le(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn header(size: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        le(&mut out, FIRMWARE_MAGIC);
+        out.push(3); // minor
+        out.push(0); // major
+        out.extend_from_slice(&[0, 0]); // padding1
+        le(&mut out, 0x0101_0000); // version_hash
+        le(&mut out, 0); // padding2
+        le(&mut out, size);
+        out
+    }
+
+    fn entry(kind: u32, bits: u32, body: &[u8]) -> Vec<u8> {
+        assert_eq!(body.len() % 4, 0, "entries are 4-byte packed");
+        let size = 4 + body.len();
+        assert!(size < 256);
+        let mut out = Vec::new();
+        le(&mut out, kind | ((size as u32) << 8) | bits);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn section_entry(flags: u32, va: (u32, u32), data: (u32, u32), name: &[u8]) -> Vec<u8> {
+        assert_eq!(name.len() % 4, 0);
+        let mut body = Vec::new();
+        le(&mut body, flags);
+        le(&mut body, va.0);
+        le(&mut body, va.1);
+        le(&mut body, data.0);
+        le(&mut body, data.1);
+        body.extend_from_slice(name);
+        entry(0, 0, &body)
+    }
+
+    fn image(entries: &[Vec<u8>]) -> Vec<u8> {
+        let size = FIRMWARE_HEADER_LEN + entries.iter().map(|entry| entry.len()).sum::<usize>();
+        let mut out = header(size as u32);
+        for entry in entries {
+            out.extend_from_slice(entry);
+        }
+        out
+    }
+
+    fn shared() -> Vec<u8> {
+        section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            SHARED_VA,
+            (0, 4),
+            b"iface\x00\x00\x00",
+        )
+    }
+
+    fn set_size(image: &mut [u8], size: u32) {
+        image[16..20].copy_from_slice(&size.to_le_bytes());
+    }
+
+    #[test]
+    fn firmware_parse_reads_the_section_plan() {
+        let bytes = image(&[shared()]);
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert_eq!(firmware.minor(), 3);
+        assert_eq!(firmware.version_hash(), 0x0101_0000);
+        assert_eq!(firmware.build_sha(), None);
+        let sections: Vec<_> = firmware.sections().collect();
+        assert_eq!(sections.len(), 1);
+        let section = sections[0];
+        assert_eq!(section.va, CSF_SHARED_REGION_START);
+        assert_eq!(section.len, 0x1000);
+        assert_eq!(section.data, &bytes[0..4]);
+        assert!(section
+            .flags
+            .contains(SectionFlags::READ | SectionFlags::SHARED));
+        assert!(!section.update);
+        assert_eq!(section.name, b"iface\x00\x00\x00");
+    }
+
+    #[test]
+    fn firmware_parse_accepts_ignored_optional_and_build_info_entries() {
+        let shared = shared();
+        let config = entry(1, FIRMWARE_ENTRY_OPTIONAL, &[0; 8]);
+        let unknown = entry(9, FIRMWARE_ENTRY_OPTIONAL, &[0; 4]);
+        let sha = b"git_sha: abc123\x00";
+        let table = FIRMWARE_HEADER_LEN + shared.len() + config.len() + unknown.len() + 12;
+        let mut body = Vec::new();
+        le(&mut body, table as u32);
+        le(&mut body, sha.len() as u32);
+        let build = entry(6, FIRMWARE_ENTRY_OPTIONAL, &body);
+        let mut bytes = header(table as u32);
+        bytes.extend_from_slice(&shared);
+        bytes.extend_from_slice(&config);
+        bytes.extend_from_slice(&unknown);
+        bytes.extend_from_slice(&build);
+        bytes.extend_from_slice(sha);
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert_eq!(firmware.build_sha(), Some(&b"abc123"[..]));
+        assert_eq!(firmware.sections().count(), 1);
+    }
+
+    #[test]
+    fn firmware_parse_refuses_a_bad_header() {
+        let base = image(&[shared()]);
+
+        let mut bad = base.clone();
+        bad[0] ^= 0xff;
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::Magic { .. })
+        ));
+
+        let mut bad = base.clone();
+        bad[5] = 1;
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::Major { major: 1 })
+        ));
+
+        let mut bad = base.clone();
+        bad[6] = 1;
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::HeaderPadding)
+        ));
+
+        let mut bad = base.clone();
+        bad[12] = 1;
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::HeaderPadding)
+        ));
+
+        let mut bad = base.clone();
+        let len = bad.len() as u32;
+        set_size(&mut bad, len + 1);
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::Size { .. })
+        ));
+
+        let mut bad = base.clone();
+        set_size(&mut bad, 16);
+        assert!(matches!(
+            Firmware::parse(&bad),
+            Err(FirmwareError::Size { .. })
+        ));
+
+        let short = [0u8; 12];
+        assert!(matches!(
+            Firmware::parse(&short),
+            Err(FirmwareError::HeaderShort { len: 12 })
+        ));
+    }
+
+    #[test]
+    fn firmware_parse_refuses_a_bad_entry() {
+        let zero_size = {
+            let mut out = Vec::new();
+            le(&mut out, 0); // kind 0, size 0
+            out
+        };
+        let bytes = image(&[zero_size, shared()]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::EntrySize { size: 0, .. })
+        ));
+
+        let odd_size = {
+            let mut out = Vec::new();
+            le(&mut out, 5 << 8); // kind 0, size 5
+            out.extend_from_slice(&[0; 4]);
+            out
+        };
+        let bytes = image(&[odd_size, shared()]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::EntrySize { size: 5, .. })
+        ));
+
+        // Declared size stops short of the entry it contains.
+        let mut bytes = image(&[shared()]);
+        set_size(&mut bytes, (FIRMWARE_HEADER_LEN + 32 - 4) as u32);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::EntryOverrun { .. })
+        ));
+
+        let unknown_required = entry(9, 0, &[0; 4]);
+        let bytes = image(&[unknown_required, shared()]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::UnknownEntry { kind: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn firmware_parse_refuses_a_bad_section() {
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            SHARED_VA,
+            (8, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionRange { .. })
+        ));
+
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            (0x0400_1000, 0x0400_0000),
+            (0, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionRange { .. })
+        ));
+
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            SHARED_VA,
+            (0, 4000),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionData { .. })
+        ));
+
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            (0x0400_0001, 0x0400_1000),
+            (0, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionAlignment { .. })
+        ));
+
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            (0x0400_0000, 0x0400_0fff),
+            (0, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionAlignment { .. })
+        ));
+
+        let bytes = image(&[section_entry(0x4000_0041, SHARED_VA, (0, 4), b"")]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionFlags { .. })
+        ));
+    }
+
+    #[test]
+    fn firmware_parse_requires_a_shared_interface() {
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0,
+            (0, 0x1000),
+            (0, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SharedSectionMissing)
+        ));
+
+        let bytes = image(&[section_entry(SectionFlags::READ.0, SHARED_VA, (0, 4), b"")]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SharedSectionNotShared {
+                va: CSF_SHARED_REGION_START
+            })
+        ));
+
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::PROT.0,
+            SHARED_VA,
+            (0, 4),
+            b"",
+        )]);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SharedSectionMissing)
+        ));
+
+        let prot = section_entry(
+            SectionFlags::READ.0 | SectionFlags::PROT.0,
+            (0x0300_0000, 0x0300_1000),
+            (0, 4),
+            b"",
+        );
+        let bytes = image(&[prot, shared()]);
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert_eq!(firmware.sections().count(), 2);
+    }
+
+    #[test]
+    fn firmware_parse_refuses_data_larger_than_the_section() {
+        let mut bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            SHARED_VA,
+            (0, 0x1004),
+            b"",
+        )]);
+        bytes.resize(0x1004, 0);
+        assert!(matches!(
+            Firmware::parse(&bytes),
+            Err(FirmwareError::SectionTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn section_flags_decode_panthor_map_flags() {
+        let flags = SectionFlags(0xd); // READ | EXECUTE | cache mode 1
+        assert!(flags.contains(SectionFlags::READ));
+        assert!(!flags.writable());
+        assert!(flags.executable());
+        assert!(flags.cached());
+        assert_eq!(flags.cache_mode(), 1);
+
+        let flags = SectionFlags(0x1b); // READ | WRITE | cache mode 3
+        assert!(flags.writable());
+        assert!(!flags.executable());
+        assert!(!flags.cached());
+        assert_eq!(flags.cache_mode(), 3);
+    }
+
+    #[test]
+    fn section_names_stay_opaque_bytes() {
+        let name = b"\xff\x00\x00\x40";
+        let bytes = image(&[section_entry(
+            SectionFlags::READ.0 | SectionFlags::SHARED.0,
+            SHARED_VA,
+            (0, 4),
+            name,
+        )]);
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert_eq!(firmware.sections().next().unwrap().name, name);
+    }
+
+    #[test]
+    fn corrupt_build_info_is_ignored_like_panthor() {
+        let shared = shared();
+        let mut body = Vec::new();
+        le(&mut body, u32::MAX);
+        le(&mut body, 64);
+        let build = entry(6, 0, &body);
+        let size = FIRMWARE_HEADER_LEN + shared.len() + build.len();
+        let mut bytes = header(size as u32);
+        bytes.extend_from_slice(&shared);
+        bytes.extend_from_slice(&build);
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert_eq!(firmware.build_sha(), None);
+        assert_eq!(firmware.sections().count(), 1);
+    }
+
+    #[test]
+    #[ignore = "set KUMO_MALI_CSFFW to a mali_csffw.bin to parse a real image"]
+    fn a_real_image_parses_when_pointed_at() {
+        let Ok(path) = std::env::var("KUMO_MALI_CSFFW") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let firmware = Firmware::parse(&bytes).unwrap();
+        assert!(firmware.build_sha().is_some());
+        let sections: Vec<_> = firmware.sections().collect();
+        assert!(!sections.is_empty());
+        assert!(sections.iter().any(|section| section.va == 0));
+        let shared: Vec<_> = sections
+            .iter()
+            .filter(|section| section.va == CSF_SHARED_REGION_START)
+            .collect();
+        assert_eq!(shared.len(), 1);
+        assert!(shared[0]
+            .flags
+            .contains(SectionFlags::SHARED | SectionFlags::ZERO));
     }
 }
