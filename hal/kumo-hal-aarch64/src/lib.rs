@@ -1,18 +1,22 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j474
-//j482
 //j483
 //j493
 //j534
 //j546
+//j570
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod mali;
 pub mod smmuv2;
 pub mod smmuv3;
+pub use mali::{
+    discover_rk3588_mali_g610, MaliG610ClockSource, MaliG610ClockStatus, MaliG610PowerStatus,
+    MaliG610StatusReport, MaliG610Topology, RK3588_MALI_BASE, RK3588_MALI_LENGTH,
+};
 pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
 pub use smmuv3::{
     decode_smmuv3_fault_event, discover_rk3588_mmu600_pcie, iommu_create_device_context,
@@ -3315,6 +3319,34 @@ pub fn mmu600_pcie_status_from_dtb(dtb: u64) -> Option<Mmu600PcieStatusReport> {
 
 #[cfg(not(target_os = "none"))]
 pub fn mmu600_pcie_status_from_dtb(_dtb: u64) -> Option<Mmu600PcieStatusReport> {
+    None
+}
+
+/// Discover the enabled RK3588 Mali-G610 and sample only its always-on integration state: six PMU
+/// words for `VD_GPU` (power gate, bus idle, memory repair) and eight CRU words (clock selects,
+/// gates, resets). PLAN/013 G1's first step: measure before touching anything.
+///
+/// The GPU aperture at `0xFB00_0000` is never dereferenced, here or by the caller: with `VD_GPU`
+/// down a read there may hang the bus, and even a clean report does not prove APB admission. There
+/// are no writes, so firmware's state survives for the Linux oracle comparison. `None` off RK3588.
+/// — TIMBERDOODLE
+#[cfg(target_os = "none")]
+pub fn mali_g610_status_from_dtb(dtb: u64) -> Option<MaliG610StatusReport> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let topology = mali::discover_rk3588_mali_g610(bytes)?;
+    let power =
+        mali::RK3588_MALI_POWER_REGISTERS.map(|phys| unsafe { mmio_read32(mmio_phys(phys)) });
+    let clock =
+        mali::RK3588_MALI_CLOCK_REGISTERS.map(|phys| unsafe { mmio_read32(mmio_phys(phys)) });
+    Some(MaliG610StatusReport {
+        topology,
+        power: MaliG610PowerStatus::from_words(power),
+        clock: MaliG610ClockStatus::from_words(clock),
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mali_g610_status_from_dtb(_dtb: u64) -> Option<MaliG610StatusReport> {
     None
 }
 

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j482
 //j483
 //j493
 //j536
 //j559
+//j570
 
 extern crate alloc;
 
@@ -617,6 +617,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         match kumo_hal::active::mmu600_pcie_status_from_dtb(boot.platform.dtb) {
             Some(report) => klog!("{}", report),
             None => klog!("MMU600 PCIE       Check     no enabled RK3588 MMU600  --\n"),
+        }
+    }
+
+    // PLAN/013 G1, observation half: select only the enabled RK3588 Mali-G610 and record VD_GPU's
+    // PMU power/bus-idle/repair status plus the CRU's GPU clock and reset controls. The GPU aperture
+    // stays untouched (a read with VD_GPU down may hang the bus); the MMIO line names the first unmet
+    // precondition. No writes: power-up waits for CRUX's clock-path decision. — TIMBERDOODLE
+    #[cfg(feature = "arch_aarch64")]
+    {
+        match kumo_hal::active::mali_g610_status_from_dtb(boot.platform.dtb) {
+            Some(report) => klog!("{}", report),
+            None => klog!("MALI G610         Check     no enabled RK3588 Mali  --\n"),
         }
     }
 
