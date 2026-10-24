@@ -1,19 +1,22 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j574
 //j575
 //j576
 //j579
 //j580
+//j581
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    enable_as0, init_global_interface, latched_fault, map_range, mcu_boot, mmu_info, power_l2,
-    probe, quiet_mmu, soft_reset, ClockIo, Completion, CompletionIo, Firmware, GlbIo,
-    GlobalInterface, MmioIo, ProbeError, ProbeIo, ResetPath, SectionFlags, TableArena, TableMemory,
-    APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START, GLB_DOORBELL, GLB_PING_TIMEOUT_NS,
-    PAGE_SIZE,
+    csf_doorbell, enable_as, enable_as0, first_stream, init_global_interface, latched_fault,
+    map_range, mcu_boot, mmu_info, power_l2, probe, program_group, program_queue, publish_insert,
+    quiet_mmu, read_cs_control, read_cs_status, read_csg_control, ring_offset, soft_reset,
+    start_group, ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo,
+    GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface,
+    ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN,
+    CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, GLB_DOORBELL,
+    GLB_PING_TIMEOUT_NS, PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -33,6 +36,21 @@ const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.
 const GLB_TIMER_HZ: u32 = 24_000_000;
+/// The group's structures in the MCU's address space (AS0), at VAs the firmware image leaves
+/// free: the queue's two interface pages and the suspend buffer.
+const MCU_IO_PAGES_VA: u64 = 0x0900_0000;
+const MCU_SUSPEND_VA: u64 = 0x0900_2000;
+/// The group's own address space (AS1) holds the ring and the first stream's target word.
+const AS1_WORK_VA: u64 = 0x1000_0000;
+const RING_SIZE: u64 = 0x1000;
+const WORK_LEN: u64 = 0x2000;
+const GROUP_SLOT: u32 = 0;
+const GROUP_AS: u32 = 1;
+const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
+const WORK_TIMEOUT_NS: u64 = 1_000_000_000;
+const FIRST_WORK_VALUE: u32 = 0x00C0_FFEE;
+const TILER_PRESENT_LO: u32 = 0x110;
+const TILER_PRESENT_HI: u32 = 0x114;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -334,11 +352,90 @@ fn read_initrd_table(initrd: Handle, table: &mut [u8; INITRD_TABLE_MAX]) -> Opti
     Some(table_bytes)
 }
 
-/// The firmware's shared input/output blocks plus the global doorbell, for G4a's initialization.
+/// One MCU address window this process has mapped: `mcu..mcu+len` corresponds to `cpu..`.
+#[derive(Clone, Copy, Default)]
+struct McuWindow {
+    mcu: u64,
+    cpu: u64,
+    len: u64,
+}
+
+/// The firmware's shared input/output blocks, the global doorbell, and every MCU window G4a/G4b
+/// touch. The windows translate firmware VAs into this process's Normal-NC mappings.
 struct SharedGlb<'a> {
     device: &'a mut Device,
     input: u64,
     output: u64,
+    windows: [McuWindow; 3],
+}
+
+impl<'a> SharedGlb<'a> {
+    fn new(device: &'a mut Device, input: u64, output: u64, windows: [McuWindow; 3]) -> Self {
+        Self {
+            device,
+            input,
+            output,
+            windows,
+        }
+    }
+
+    fn cpu_for(&self, mcu: u64) -> Option<u64> {
+        self.windows
+            .iter()
+            .find(|window| window.len != 0 && mcu >= window.mcu && mcu < window.mcu + window.len)
+            .map(|window| window.cpu + (mcu - window.mcu))
+    }
+}
+
+/// The shared section alone, for reading the CSG/CS control blocks before the other windows
+/// exist.
+struct SharedMemory {
+    mcu: u64,
+    cpu: u64,
+    len: u64,
+}
+
+impl FirmwareMemory for SharedMemory {
+    fn read32(&mut self, mcu: u64) -> u32 {
+        let Some(offset) = mcu
+            .checked_sub(self.mcu)
+            .filter(|offset| *offset < self.len)
+        else {
+            return 0;
+        };
+        // SAFETY: the offset stays inside the shared section this process maps.
+        unsafe { ((self.cpu + offset) as *const u32).read_volatile() }
+    }
+
+    fn write32(&mut self, mcu: u64, value: u32) {
+        let Some(offset) = mcu
+            .checked_sub(self.mcu)
+            .filter(|offset| *offset < self.len)
+        else {
+            return;
+        };
+        // SAFETY: as `read32`.
+        unsafe { ((self.cpu + offset) as *mut u32).write_volatile(value) };
+    }
+}
+
+impl FirmwareMemory for SharedGlb<'_> {
+    fn read32(&mut self, mcu: u64) -> u32 {
+        match self.cpu_for(mcu) {
+            // SAFETY: windows only cover memory this process mapped.
+            Some(cpu) => unsafe { (cpu as *const u32).read_volatile() },
+            None => 0,
+        }
+    }
+
+    fn write32(&mut self, mcu: u64, value: u32) {
+        match self.cpu_for(mcu) {
+            // SAFETY: as `read32`. The driver only writes firmware-provided VAs it has checked
+            // against a window, so the None arm is unreachable.
+            Some(cpu) => unsafe { (cpu as *mut u32).write_volatile(value) },
+            None => {}
+        }
+    }
 }
 
 impl GlbIo for SharedGlb<'_> {
@@ -698,11 +795,8 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             let input = shared.mapping.va + (glb.input_va - shared.va);
             let output = shared.mapping.va + (glb.output_va - shared.va);
             let ping = {
-                let mut glb_io = SharedGlb {
-                    device: &mut *device,
-                    input,
-                    output,
-                };
+                let mut glb_io =
+                    SharedGlb::new(&mut *device, input, output, [McuWindow::default(); 3]);
                 init_global_interface(
                     &mut glb_io,
                     shader_present,
@@ -727,6 +821,309 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     return 1;
                 }
             }
+            // G4b: the first command-stream group. Its control blocks live in the shared
+            // section; the queue's interface pages and the suspend buffer go into the MCU's
+            // address space at VAs the image leaves free; the ring and the target word get the
+            // group's own space (AS1).
+            let mut shared_memory = SharedMemory {
+                mcu: shared.va,
+                cpu: shared.mapping.va,
+                len: shared.len,
+            };
+            let csg_mcu = shared.va + u64::from(CSG_CONTROL_BASE);
+            let csg = read_csg_control(&mut shared_memory, csg_mcu);
+            let cs = read_cs_control(
+                &mut shared_memory,
+                csg_mcu + u64::from(CSG_STREAM_CONTROL_OFFSET),
+            );
+            let inside = |va: u64| va >= shared.va && va < shared.va + shared.len;
+            if !inside(csg.input_va)
+                || !inside(csg.output_va)
+                || !inside(cs.input_va)
+                || !inside(cs.output_va)
+            {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: CSG/CS blocks outside the shared section\n"),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
+            if !(8..=32).contains(&csg.stream_num) {
+                log(
+                    log_level::ERR,
+                    format_args!(
+                        "drv-gpu: unexpected CSG stream count {} (stride 0x{:x})\n",
+                        csg.stream_num, csg.stream_stride
+                    ),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: CSG 0 streams={} stride=0x{:x} suspend={}b\n",
+                    csg.stream_num, csg.stream_stride, csg.suspend_size
+                ),
+            );
+
+            let noexec_uncached = PageAttrs {
+                cached: false,
+                readonly: false,
+                executable: false,
+            };
+            let Some(io_pages) = map_contiguous(2 * PAGE_SIZE) else {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: queue interface pages allocation failed\n"),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            };
+            zero_mapping(&io_pages, 2 * PAGE_SIZE);
+            if let Err(error) = map_range(
+                &mut table_memory,
+                &mut arena,
+                transtab,
+                MCU_IO_PAGES_VA,
+                io_pages.phys,
+                2 * PAGE_SIZE,
+                noexec_uncached,
+            ) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: queue interface pages map failed: {:?}\n", error),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
+
+            let suspend_len = (u64::from(csg.suspend_size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let mut suspend_va = 0u64;
+            let mut suspend_window = McuWindow::default();
+            if suspend_len > 0 {
+                let Some(mapping) = map_contiguous(suspend_len) else {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: suspend buffer allocation failed\n"),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                };
+                zero_mapping(&mapping, suspend_len);
+                if let Err(error) = map_range(
+                    &mut table_memory,
+                    &mut arena,
+                    transtab,
+                    MCU_SUSPEND_VA,
+                    mapping.phys,
+                    suspend_len,
+                    noexec_uncached,
+                ) {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: suspend buffer map failed: {:?}\n", error),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+                suspend_va = MCU_SUSPEND_VA;
+                suspend_window = McuWindow {
+                    mcu: MCU_SUSPEND_VA,
+                    cpu: mapping.va,
+                    len: suspend_len,
+                };
+            }
+
+            let Some(work) = map_contiguous(WORK_LEN) else {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: group work buffer allocation failed\n"),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            };
+            zero_mapping(&work, WORK_LEN);
+            let Some(as1_l0) = arena.alloc_table(&mut table_memory) else {
+                log(log_level::ERR, format_args!("drv-gpu: no table for AS1\n"));
+                let _ = soft_reset(device);
+                return 1;
+            };
+            if let Err(error) = map_range(
+                &mut table_memory,
+                &mut arena,
+                as1_l0,
+                AS1_WORK_VA,
+                work.phys,
+                WORK_LEN,
+                noexec_uncached,
+            ) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: AS1 work map failed: {:?}\n", error),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
+            dsb();
+            if let Err(error) = enable_as(device, GROUP_AS, as1_l0, mmu.va_bits) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: AS1 enable failed: {:?}\n", error),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: AS1 online for the group, transtab=0x{:x}\n",
+                    as1_l0
+                ),
+            );
+
+            let tiler_present = u64::from(read_aperture(TILER_PRESENT_LO))
+                | (u64::from(read_aperture(TILER_PRESENT_HI)) << 32);
+            let windows = [
+                McuWindow {
+                    mcu: shared.va,
+                    cpu: shared.mapping.va,
+                    len: shared.len,
+                },
+                McuWindow {
+                    mcu: MCU_IO_PAGES_VA,
+                    cpu: io_pages.va,
+                    len: 2 * PAGE_SIZE,
+                },
+                suspend_window,
+            ];
+            let queue = QueueConfig {
+                ring_va: AS1_WORK_VA,
+                ring_size: RING_SIZE,
+                ring_input_va: MCU_IO_PAGES_VA,
+                ring_output_va: MCU_IO_PAGES_VA + PAGE_SIZE,
+                doorbell: GROUP_SLOT + 1,
+                priority: 0,
+            };
+            let group = GroupConfig {
+                compute_mask: shader_present,
+                fragment_mask: shader_present,
+                tiler_mask: tiler_present,
+                max_compute: shader_present.count_ones(),
+                max_fragment: shader_present.count_ones(),
+                max_tiler: tiler_present.count_ones(),
+                priority: 0,
+                address_space: GROUP_AS,
+                suspend_va,
+                protm_suspend_va: 0,
+                queue_mask: 1,
+            };
+            let start = {
+                let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                program_queue(&mut glb_io, cs.input_va, queue);
+                program_group(&mut glb_io, csg.input_va, csg.output_va, group);
+                start_group(
+                    &mut glb_io,
+                    csg.input_va,
+                    csg.output_va,
+                    GROUP_SLOT,
+                    GROUP_START_TIMEOUT_NS,
+                )
+            };
+            match start {
+                Ok(ack) => log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: group started on CSG {} (ack=0x{:08x})\n",
+                        GROUP_SLOT, ack
+                    ),
+                ),
+                Err(error) => {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: group start failed: {:?}\n", error),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+            }
+
+            let stream = first_stream(AS1_WORK_VA + PAGE_SIZE);
+            let position = ring_offset(0, RING_SIZE);
+            for (index, word) in stream.iter().enumerate() {
+                // SAFETY: five words inside the ring's first page, which this process maps
+                // Normal-NC in AS1's backing buffer.
+                unsafe {
+                    ((work.va + (position + index * 8) as u64) as *mut u64).write_volatile(*word)
+                };
+            }
+            dsb();
+            {
+                let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                publish_insert(
+                    &mut glb_io,
+                    QueueIface {
+                        input_va: cs.input_va,
+                        output_va: cs.output_va,
+                    },
+                    (stream.len() * 8) as u64,
+                );
+            }
+            dsb();
+            device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: first stream submitted ({} bytes, target VA 0x{:016x})\n",
+                    stream.len() * 8,
+                    AS1_WORK_VA + PAGE_SIZE
+                ),
+            );
+
+            let target = work.va + PAGE_SIZE;
+            let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
+            loop {
+                // SAFETY: the target word is the work buffer's second page, Normal-NC.
+                let value = unsafe { (target as *const u32).read_volatile() };
+                if value == FIRST_WORK_VALUE {
+                    log(
+                        log_level::NOTICE,
+                        format_args!(
+                            "drv-gpu: first GPU work: the command stream wrote 0x{:08x}\n",
+                            value
+                        ),
+                    );
+                    break;
+                }
+                if device.now_ns() >= deadline {
+                    log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: the first stream did not land within the timeout (target=0x{:08x})\n",
+                            value
+                        ),
+                    );
+                    {
+                        let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                        let status = read_cs_status(&mut glb_io, cs.output_va);
+                        log(
+                            log_level::ERR,
+                            format_args!(
+                                "drv-gpu: stream status cmd_ptr=0x{:x} blocked={} fault=0x{:08x} fatal=0x{:08x}\n",
+                                status.cmd_ptr,
+                                status.blocked_reason,
+                                status.fault,
+                                status.fatal
+                            ),
+                        );
+                    }
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+                device.delay_us(100);
+            }
+
             log(
                 log_level::INFO,
                 format_args!("drv-gpu: GPU resident; firmware keeps the device until reboot\n"),

@@ -1,18 +1,18 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j576
 //j577
 //j578
 //j579
 //j580
+//j581
 
-//! G1b–G3a: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
 //! its sections into address space 0, boots the MCU, and validates the global interface the
 //! firmware publishes when it comes up. G4a initializes that interface and proves a ping
-//! round-trip.
+//! round-trip. G4b starts a command-stream group and has the GPU write a value.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -379,6 +379,8 @@ pub fn mmu_info(io: &mut impl MmioIo) -> MmuInfo {
 pub enum AsError {
     /// `AS_ACTIVE` would not clear around a command.
     Busy { status: u32 },
+    /// The hardware has no such address space (eight exist; RESEARCH/009 §7.1).
+    Space { space: u32 },
 }
 
 /// RESEARCH/009 §7.4: AArch64 4 KiB stage-1 walks, write-back and read-allocate, with the
@@ -390,10 +392,25 @@ pub fn as_transcfg(va_bits: u32) -> u64 {
         | AS_TRANSCFG_PTW_RA
 }
 
-fn wait_as_idle(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
+/// The MMU's per-space register window: space n starts at `0x2400 + n*0x40` (RESEARCH/009
+/// §4.8), and this GPU reports eight spaces (`AS_PRESENT = 0xFF`). — TIMBERDOODLE
+pub fn as_window(space: u32) -> Option<u32> {
+    if space >= 8 {
+        return None;
+    }
+    Some(MMU_AS0 + space * 0x40)
+}
+
+/// The window-relative offset of an AS0-absolute register constant, so the offsets are written
+/// once above and every space's helper adds them to its own window.
+const fn as_offset(register: u32) -> u32 {
+    register - MMU_AS0
+}
+
+fn wait_as_idle(io: &mut (impl MmioIo + ClockIo), window: u32) -> Result<(), AsError> {
     match poll32(
         io,
-        AS_STATUS,
+        window + as_offset(AS_STATUS),
         MMU_COMMAND_TIMEOUT_NS,
         MMU_POLL_INTERVAL_US,
         |value| value & AS_STATUS_AS_ACTIVE == 0,
@@ -403,46 +420,73 @@ fn wait_as_idle(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
     }
 }
 
-fn as_command(io: &mut (impl MmioIo + ClockIo), command: u32) -> Result<(), AsError> {
-    wait_as_idle(io)?;
-    io.write32(AS_COMMAND, command);
-    wait_as_idle(io)
+fn as_command(io: &mut (impl MmioIo + ClockIo), window: u32, command: u32) -> Result<(), AsError> {
+    wait_as_idle(io, window)?;
+    io.write32(window + as_offset(AS_COMMAND), command);
+    wait_as_idle(io, window)
 }
 
 /// panthor's opening move on a space: lock the whole range and flush its memory
 /// (RESEARCH/009 §7.5; `panthor_mmu_as_enable`/`_disable`).
-fn lock_and_flush_mem(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
-    write64(io, AS_LOCKADDR, AS_LOCKADDR + 4, AS_LOCKADDR_WHOLE);
-    as_command(io, AS_COMMAND_LOCK)?;
-    as_command(io, AS_COMMAND_FLUSH_MEM)
+fn lock_and_flush_mem(io: &mut (impl MmioIo + ClockIo), window: u32) -> Result<(), AsError> {
+    let lockaddr = window + as_offset(AS_LOCKADDR);
+    write64(io, lockaddr, lockaddr + 4, AS_LOCKADDR_WHOLE);
+    as_command(io, window, AS_COMMAND_LOCK)?;
+    as_command(io, window, AS_COMMAND_FLUSH_MEM)
 }
 
 /// RESEARCH/009 §7.5: publish `transtab`, the memory-attribute table and the translation
 /// config, then `UPDATE` so the MMU loads them.
+pub fn enable_as(
+    io: &mut (impl MmioIo + ClockIo),
+    space: u32,
+    transtab: u64,
+    va_bits: u32,
+) -> Result<(), AsError> {
+    let Some(window) = as_window(space) else {
+        return Err(AsError::Space { space });
+    };
+    lock_and_flush_mem(io, window)?;
+    let transtab_lo = window + as_offset(AS_TRANSTAB);
+    write64(io, transtab_lo, transtab_lo + 4, transtab);
+    let memattr_lo = window + as_offset(AS_MEMATTR);
+    write64(io, memattr_lo, memattr_lo + 4, AS_MEMATTR_NON_COHERENT);
+    let transcfg_lo = window + as_offset(AS_TRANSCFG);
+    write64(io, transcfg_lo, transcfg_lo + 4, as_transcfg(va_bits));
+    as_command(io, window, AS_COMMAND_UPDATE)
+}
+
+/// Address space 0 is the MCU's; G3b uses this wrapper.
 pub fn enable_as0(
     io: &mut (impl MmioIo + ClockIo),
     transtab: u64,
     va_bits: u32,
 ) -> Result<(), AsError> {
-    lock_and_flush_mem(io)?;
-    write64(io, AS_TRANSTAB, AS_TRANSTAB + 4, transtab);
-    write64(io, AS_MEMATTR, AS_MEMATTR + 4, AS_MEMATTR_NON_COHERENT);
-    write64(io, AS_TRANSCFG, AS_TRANSCFG + 4, as_transcfg(va_bits));
-    as_command(io, AS_COMMAND_UPDATE)
+    enable_as(io, 0, transtab, va_bits)
 }
 
 /// RESEARCH/009 §7.5: flush, then leave the space unmapped.
-pub fn disable_as0(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
-    lock_and_flush_mem(io)?;
-    write64(io, AS_TRANSTAB, AS_TRANSTAB + 4, 0);
-    write64(io, AS_MEMATTR, AS_MEMATTR + 4, 0);
+pub fn disable_as(io: &mut (impl MmioIo + ClockIo), space: u32) -> Result<(), AsError> {
+    let Some(window) = as_window(space) else {
+        return Err(AsError::Space { space });
+    };
+    lock_and_flush_mem(io, window)?;
+    let transtab_lo = window + as_offset(AS_TRANSTAB);
+    write64(io, transtab_lo, transtab_lo + 4, 0);
+    let memattr_lo = window + as_offset(AS_MEMATTR);
+    write64(io, memattr_lo, memattr_lo + 4, 0);
+    let transcfg_lo = window + as_offset(AS_TRANSCFG);
     write64(
         io,
-        AS_TRANSCFG,
-        AS_TRANSCFG + 4,
+        transcfg_lo,
+        transcfg_lo + 4,
         AS_TRANSCFG_ADRMODE_UNMAPPED,
     );
-    as_command(io, AS_COMMAND_UPDATE)
+    as_command(io, window, AS_COMMAND_UPDATE)
+}
+
+pub fn disable_as0(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
+    disable_as(io, 0)
 }
 
 /// Clear a latched address-space-0 fault and keep the MMU line masked.
@@ -1481,6 +1525,282 @@ pub fn init_global_interface(
     }
 }
 
+// ---- G4b: the first command-stream group (RESEARCH/009 §9.5-§9.7, §10, §11) ----
+
+/// GLB `doorbell_req` (input) and `doorbell_ack` (output): one bit per CSG slot (§9.3).
+pub const GLB_DOORBELL_REQ: u32 = 0x08;
+/// A CSG's control block sits at `shared + 0x1000 + g*group_stride`; its first stream's control
+/// block is `0x40` bytes further in (§9.1).
+pub const CSG_CONTROL_BASE: u32 = 0x1000;
+pub const CSG_STREAM_CONTROL_OFFSET: u32 = 0x40;
+
+/// Doorbell *n* lives at `0x8_0000 + n*0x1_0000`; doorbell 0 is the global interface and a queue
+/// in CSG slot g uses g + 1 (§4.10).
+pub const fn csf_doorbell(index: u32) -> u32 {
+    0x0008_0000 + index * 0x0001_0000
+}
+
+/// Firmware-VA access to the MCU's memory. The driver translates addresses through the windows it
+/// mapped; host tests use a fake store. — TIMBERDOODLE
+pub trait FirmwareMemory {
+    fn read32(&mut self, mcu: u64) -> u32;
+    fn write32(&mut self, mcu: u64, value: u32);
+}
+
+fn read_mcu64(mem: &mut impl FirmwareMemory, mcu: u64) -> u64 {
+    u64::from(mem.read32(mcu)) | (u64::from(mem.read32(mcu + 4)) << 32)
+}
+
+fn write_mcu64(mem: &mut impl FirmwareMemory, mcu: u64, value: u64) {
+    mem.write32(mcu, value as u32);
+    mem.write32(mcu + 4, (value >> 32) as u32);
+}
+
+/// CS/CSG request and config fields (§9.5/§9.6).
+pub const CS_STATE_MASK: u32 = 0b111;
+pub const CS_STATE_START: u32 = 1;
+pub const CS_EXTRACT_EVENT: u32 = 1 << 4;
+pub const CS_IDLE_SYNC_WAIT: u32 = 1 << 8;
+pub const CS_IDLE_EMPTY: u32 = 1 << 10;
+pub const CSG_STATE_MASK: u32 = 0b111;
+pub const CSG_STATE_START: u32 = 1;
+
+/// A CSG slot's read-only control block (§9.5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsgControl {
+    pub features: u32,
+    pub input_va: u64,
+    pub output_va: u64,
+    pub suspend_size: u32,
+    pub protm_suspend_size: u32,
+    pub stream_num: u32,
+    pub stream_stride: u32,
+}
+
+/// A stream slot's read-only control block (§9.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsControl {
+    pub features: u32,
+    pub input_va: u64,
+    pub output_va: u64,
+}
+
+pub fn read_csg_control(mem: &mut impl FirmwareMemory, addr: u64) -> CsgControl {
+    CsgControl {
+        features: mem.read32(addr),
+        input_va: u64::from(mem.read32(addr + 0x04)),
+        output_va: u64::from(mem.read32(addr + 0x08)),
+        suspend_size: mem.read32(addr + 0x0C),
+        protm_suspend_size: mem.read32(addr + 0x10),
+        stream_num: mem.read32(addr + 0x14),
+        stream_stride: mem.read32(addr + 0x18),
+    }
+}
+
+pub fn read_cs_control(mem: &mut impl FirmwareMemory, addr: u64) -> CsControl {
+    CsControl {
+        features: mem.read32(addr),
+        input_va: u64::from(mem.read32(addr + 0x04)),
+        output_va: u64::from(mem.read32(addr + 0x08)),
+    }
+}
+
+/// What a queue slot needs to run (§9.6 including §11.2's initial values).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueConfig {
+    /// GPU virtual address of the ring in the group's address space.
+    pub ring_va: u64,
+    pub ring_size: u64,
+    /// MCU addresses of the queue's input and output pages (§9.7).
+    pub ring_input_va: u64,
+    pub ring_output_va: u64,
+    pub doorbell: u32,
+    pub priority: u32,
+}
+
+pub fn program_queue(mem: &mut impl FirmwareMemory, input_va: u64, queue: QueueConfig) {
+    mem.write32(
+        input_va,
+        CS_STATE_START | CS_EXTRACT_EVENT | CS_IDLE_SYNC_WAIT | CS_IDLE_EMPTY,
+    );
+    mem.write32(
+        input_va + 0x04,
+        (queue.priority & 0xF) | ((queue.doorbell << 8) & 0xFF00),
+    );
+    mem.write32(input_va + 0x0C, u32::MAX);
+    write_mcu64(mem, input_va + 0x10, queue.ring_va);
+    mem.write32(input_va + 0x18, queue.ring_size as u32);
+    write_mcu64(mem, input_va + 0x30, queue.ring_input_va);
+    write_mcu64(mem, input_va + 0x38, queue.ring_output_va);
+}
+
+/// What a CSG slot needs to run (§9.5 including §11.2's initial values).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupConfig {
+    pub compute_mask: u64,
+    pub fragment_mask: u64,
+    pub tiler_mask: u64,
+    pub max_compute: u32,
+    pub max_fragment: u32,
+    pub max_tiler: u32,
+    pub priority: u32,
+    /// The address space the group's GPU VAs live in (§11.2's `config`).
+    pub address_space: u32,
+    pub suspend_va: u64,
+    pub protm_suspend_va: u64,
+    /// One bit per programmed queue, toggled into `doorbell_req` (§9.2).
+    pub queue_mask: u32,
+}
+
+pub fn program_group(
+    mem: &mut impl FirmwareMemory,
+    input_va: u64,
+    output_va: u64,
+    group: GroupConfig,
+) {
+    mem.write32(input_va + 0x04, u32::MAX);
+    write_mcu64(mem, input_va + 0x20, group.compute_mask);
+    write_mcu64(mem, input_va + 0x28, group.fragment_mask);
+    mem.write32(input_va + 0x30, group.tiler_mask as u32);
+    mem.write32(
+        input_va + 0x34,
+        (group.max_compute & 0xFF)
+            | ((group.max_fragment & 0xFF) << 8)
+            | ((group.max_tiler & 0xF) << 16)
+            | ((group.priority & 0xF) << 28),
+    );
+    write_mcu64(mem, input_va + 0x40, group.suspend_va);
+    write_mcu64(mem, input_va + 0x48, group.protm_suspend_va);
+    mem.write32(input_va + 0x50, group.address_space);
+    let req = mem.read32(input_va + 0x08);
+    let ack = mem.read32(output_va + 0x08);
+    mem.write32(
+        input_va + 0x08,
+        (req & !group.queue_mask) | (!ack & group.queue_mask),
+    );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupError {
+    /// The CSG acknowledge never showed the start state.
+    AckTimeout { req: u32, ack: u32 },
+}
+
+/// RESEARCH/009 §11.2 step 3: set the group's STATE to start, toggle its GLB doorbell-request
+/// bit, ring doorbell 0, and require the CSG acknowledge to show the start state. — TIMBERDOODLE
+pub fn start_group(
+    io: &mut (impl FirmwareMemory + GlbIo + ClockIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+    slot: u32,
+    timeout_ns: u64,
+) -> Result<u32, GroupError> {
+    let req = (io.read32(csg_input_va) & !CSG_STATE_MASK) | CSG_STATE_START;
+    io.write32(csg_input_va, req);
+    let bit = 1u32 << slot;
+    let doorbell_req = io.read_input(GLB_DOORBELL_REQ);
+    let doorbell_ack = io.read_output(GLB_DOORBELL_REQ);
+    io.write_input(
+        GLB_DOORBELL_REQ,
+        (doorbell_req & !bit) | (!doorbell_ack & bit),
+    );
+    io.ring_doorbell();
+    let deadline = io.now_ns().saturating_add(timeout_ns);
+    loop {
+        let ack = io.read32(csg_output_va);
+        if ack & CSG_STATE_MASK == CSG_STATE_START {
+            return Ok(ack);
+        }
+        if io.now_ns() >= deadline {
+            return Err(GroupError::AckTimeout { req, ack });
+        }
+        io.delay_us(10);
+    }
+}
+
+/// The queue's two interface pages (§9.7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueIface {
+    pub input_va: u64,
+    pub output_va: u64,
+}
+
+pub fn queue_insert(mem: &mut impl FirmwareMemory, iface: QueueIface) -> u64 {
+    read_mcu64(mem, iface.input_va)
+}
+
+/// RESEARCH/009 §11.3: mirror the firmware's `extract` into the input page, then advance
+/// `insert`. The caller writes the ring and issues its barrier before calling this.
+pub fn publish_insert(mem: &mut impl FirmwareMemory, iface: QueueIface, insert: u64) {
+    let extract = read_mcu64(mem, iface.output_va);
+    write_mcu64(mem, iface.input_va + 0x08, extract);
+    write_mcu64(mem, iface.input_va, insert);
+}
+
+/// The byte position inside the ring for a monotonically growing insert (§9.7).
+pub fn ring_offset(insert: u64, size: u64) -> usize {
+    (insert & (size - 1)) as usize
+}
+
+/// The command-stream words for RESEARCH/009 §10.7's first stream: write `target` with
+/// 0x00C0FFEE, flush the caches, and wait for both completions. — TIMBERDOODLE
+pub fn first_stream(target: u64) -> [u64; 5] {
+    [
+        move48(0, target),
+        move32(2, 0x00C0_FFEE),
+        sync_set32(0, 0, 2),
+        flush_cache2(0),
+        wait_slot(1),
+    ]
+}
+
+/// MOVE48: a 48-bit immediate into a register pair (§10.3).
+pub fn move48(destination_pair: u8, address: u64) -> u64 {
+    (1u64 << 56) | (u64::from(destination_pair) << 48) | (address & 0x0000_FFFF_FFFF_FFFF)
+}
+
+/// MOVE32: a 32-bit immediate into one register (§10.3).
+pub fn move32(destination: u8, value: u32) -> u64 {
+    (2u64 << 56) | (u64::from(destination) << 48) | u64::from(value)
+}
+
+/// SYNC_SET32: store a register to an address pair with system scope; signal on completion
+/// (§10.3; error propagation off).
+pub fn sync_set32(signal_slot: u8, address_pair: u8, data_reg: u8) -> u64 {
+    (38u64 << 56)
+        | (u64::from(signal_slot) << 48)
+        | (u64::from(address_pair) << 40)
+        | (u64::from(data_reg) << 32)
+}
+
+/// FLUSH_CACHE2: L2 clean+invalidate, LSC clean+invalidate, other invalidate (§4.4's 0x233).
+pub fn flush_cache2(signal_slot: u8) -> u64 {
+    (36u64 << 56) | (u64::from(signal_slot) << 48) | 0x233
+}
+
+/// WAIT: block until every scoreboard in the mask has signalled (§10.3).
+pub fn wait_slot(mask: u16) -> u64 {
+    (3u64 << 56) | (u64::from(mask) << 16)
+}
+
+/// The stream's diagnostic words, read when it faults or stalls (§9.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsStatus {
+    pub cmd_ptr: u64,
+    pub blocked_reason: u32,
+    pub fault: u32,
+    pub fatal: u32,
+}
+
+pub fn read_cs_status(mem: &mut impl FirmwareMemory, output_va: u64) -> CsStatus {
+    CsStatus {
+        cmd_ptr: read_mcu64(mem, output_va + 0x40),
+        blocked_reason: mem.read32(output_va + 0x60),
+        fault: mem.read32(output_va + 0x80),
+        fatal: mem.read32(output_va + 0x84),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -1890,6 +2210,36 @@ mod tests {
                 (AS_COMMAND, AS_COMMAND_UPDATE),
             ]
         );
+    }
+
+    #[test]
+    fn address_spaces_beyond_zero_use_their_own_windows() {
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(enable_as(&mut io, 1, 0x2000, 48), Ok(()));
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x2450, 63),
+                (0x2454, 0),
+                (0x2458, AS_COMMAND_LOCK),
+                (0x2458, AS_COMMAND_FLUSH_MEM),
+                (0x2440, 0x2000),
+                (0x2444, 0),
+                (0x2448, 0x8c4c_8f4c),
+                (0x244c, 0x4c4c_4c4c),
+                (0x2470, 0x4200_01c6),
+                (0x2474, 0),
+                (0x2458, AS_COMMAND_UPDATE),
+            ]
+        );
+        assert_eq!(io.read_log, std::vec![0x2468; 6]);
+        assert_eq!(as_window(8), None);
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(
+            enable_as(&mut io, 8, 0x2000, 48),
+            Err(AsError::Space { space: 8 })
+        );
+        assert!(io.writes.is_empty());
     }
 
     #[test]
@@ -3105,5 +3455,270 @@ mod g4a_tests {
         assert_eq!(GLB_INIT_ACK_IRQ_MASK, 0x0400_050e);
         assert_eq!(GLB_PROGRESS_TIMEOUT, 2_560_000);
         assert_eq!(GLB_PING_TIMEOUT_NS, 100_000_000);
+    }
+}
+
+#[cfg(test)]
+mod g4b_tests {
+    extern crate std;
+    use super::*;
+    use std::collections::HashMap;
+    use std::vec::Vec;
+
+    struct FakeFirmware {
+        words: HashMap<u64, u32>,
+        glb_input: HashMap<u32, u32>,
+        glb_output: HashMap<u32, u32>,
+        writes: Vec<(u64, u32)>,
+        doorbells: u32,
+        now: u64,
+        delays: u64,
+    }
+
+    impl FakeFirmware {
+        fn new() -> Self {
+            Self {
+                words: HashMap::new(),
+                glb_input: HashMap::new(),
+                glb_output: HashMap::new(),
+                writes: Vec::new(),
+                doorbells: 0,
+                now: 0,
+                delays: 0,
+            }
+        }
+
+        fn set(&mut self, mcu: u64, value: u32) {
+            self.words.insert(mcu, value);
+        }
+
+        fn get(&self, mcu: u64) -> u32 {
+            *self.words.get(&mcu).unwrap_or(&0)
+        }
+
+        fn set_glb_output(&mut self, offset: u32, value: u32) {
+            self.glb_output.insert(offset, value);
+        }
+    }
+
+    impl FirmwareMemory for FakeFirmware {
+        fn read32(&mut self, mcu: u64) -> u32 {
+            self.get(mcu)
+        }
+
+        fn write32(&mut self, mcu: u64, value: u32) {
+            self.writes.push((mcu, value));
+            self.words.insert(mcu, value);
+        }
+    }
+
+    impl GlbIo for FakeFirmware {
+        fn read_input(&mut self, offset: u32) -> u32 {
+            *self.glb_input.get(&offset).unwrap_or(&0)
+        }
+
+        fn write_input(&mut self, offset: u32, value: u32) {
+            self.glb_input.insert(offset, value);
+        }
+
+        fn read_output(&mut self, offset: u32) -> u32 {
+            *self.glb_output.get(&offset).unwrap_or(&0)
+        }
+
+        fn ring_doorbell(&mut self) {
+            self.doorbells += 1;
+        }
+    }
+
+    impl ClockIo for FakeFirmware {
+        fn now_ns(&mut self) -> u64 {
+            self.now
+        }
+
+        fn delay_us(&mut self, us: u64) {
+            self.delays += 1;
+            self.now += us * 1_000;
+        }
+    }
+
+    #[test]
+    fn csg_and_cs_controls_decode_research_009() {
+        let mut io = FakeFirmware::new();
+        io.set(0x5000, 0x10);
+        io.set(0x5004, 0x6000);
+        io.set(0x5008, 0x7000);
+        io.set(0x500c, 0x100);
+        io.set(0x5010, 0x200);
+        io.set(0x5014, 8);
+        io.set(0x5018, 0x20);
+        assert_eq!(
+            read_csg_control(&mut io, 0x5000),
+            CsgControl {
+                features: 0x10,
+                input_va: 0x6000,
+                output_va: 0x7000,
+                suspend_size: 0x100,
+                protm_suspend_size: 0x200,
+                stream_num: 8,
+                stream_stride: 0x20,
+            }
+        );
+        io.set(0x5040, 0x33);
+        io.set(0x5044, 0x6100);
+        io.set(0x5048, 0x7100);
+        assert_eq!(
+            read_cs_control(&mut io, 0x5040),
+            CsControl {
+                features: 0x33,
+                input_va: 0x6100,
+                output_va: 0x7100,
+            }
+        );
+    }
+
+    #[test]
+    fn program_queue_writes_the_research_009_fields() {
+        let mut io = FakeFirmware::new();
+        program_queue(
+            &mut io,
+            0x6000,
+            QueueConfig {
+                ring_va: 0x1000_0000,
+                ring_size: 0x1000,
+                ring_input_va: 0x0900_0000,
+                ring_output_va: 0x0900_1000,
+                doorbell: 1,
+                priority: 0,
+            },
+        );
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x6000, 0x511),
+                (0x6004, 0x100),
+                (0x600c, 0xffff_ffff),
+                (0x6010, 0x1000_0000),
+                (0x6014, 0),
+                (0x6018, 0x1000),
+                (0x6030, 0x0900_0000),
+                (0x6034, 0),
+                (0x6038, 0x0900_1000),
+                (0x603c, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn program_group_writes_masks_endpoint_and_toggles_the_doorbell() {
+        let mut io = FakeFirmware::new();
+        program_group(
+            &mut io,
+            0x6500,
+            0x6700,
+            GroupConfig {
+                compute_mask: 0x5_0005,
+                fragment_mask: 0x5_0005,
+                tiler_mask: 0x1,
+                max_compute: 4,
+                max_fragment: 4,
+                max_tiler: 1,
+                priority: 0,
+                address_space: 1,
+                suspend_va: 0x0900_2000,
+                protm_suspend_va: 0,
+                queue_mask: 1,
+            },
+        );
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x6504, 0xffff_ffff),
+                (0x6520, 0x5_0005),
+                (0x6524, 0),
+                (0x6528, 0x5_0005),
+                (0x652c, 0),
+                (0x6530, 0x1),
+                (0x6534, 0x0001_0404),
+                (0x6540, 0x0900_2000),
+                (0x6544, 0),
+                (0x6548, 0),
+                (0x654c, 0),
+                (0x6550, 1),
+                (0x6508, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_group_toggles_the_glb_bit_rings_and_waits_for_the_start_ack() {
+        let mut io = FakeFirmware::new();
+        io.set(0x6700, CSG_STATE_START);
+        assert_eq!(start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000), Ok(1));
+        assert_eq!(io.get(0x6500), 1);
+        assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&1));
+        assert_eq!(io.doorbells, 1);
+        assert_eq!(io.delays, 0);
+    }
+
+    #[test]
+    fn start_group_times_out_without_the_ack() {
+        let mut io = FakeFirmware::new();
+        assert_eq!(
+            start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000),
+            Err(GroupError::AckTimeout { req: 1, ack: 0 })
+        );
+        assert_eq!(io.delays, 10_000);
+    }
+
+    #[test]
+    fn stream_encodings_match_research_009() {
+        assert_eq!(
+            first_stream(0x1000_1000),
+            [
+                0x0100_0000_1000_1000,
+                0x0202_0000_00c0_ffee,
+                0x2600_0002_0000_0000,
+                0x2400_0000_0000_0233,
+                0x0300_0000_0001_0000,
+            ]
+        );
+        assert_eq!(csf_doorbell(0), 0x0008_0000);
+        assert_eq!(csf_doorbell(1), 0x0009_0000);
+    }
+
+    #[test]
+    fn publishing_insert_mirrors_the_firmwares_extract() {
+        let mut io = FakeFirmware::new();
+        io.set(0x7100, 77);
+        publish_insert(
+            &mut io,
+            QueueIface {
+                input_va: 0x6000,
+                output_va: 0x7100,
+            },
+            40,
+        );
+        assert_eq!(
+            io.writes,
+            std::vec![(0x6008, 77), (0x600c, 0), (0x6000, 40), (0x6004, 0)]
+        );
+        assert_eq!(ring_offset(0x1040, 0x1000), 0x40);
+    }
+
+    #[test]
+    fn cs_status_reads_the_diagnostic_fields() {
+        let mut io = FakeFirmware::new();
+        io.set(0x7140, 0x1234);
+        io.set(0x7160, 5);
+        io.set(0x7180, 0x41);
+        assert_eq!(
+            read_cs_status(&mut io, 0x7100),
+            CsStatus {
+                cmd_ptr: 0x1234,
+                blocked_reason: 5,
+                fault: 0x41,
+                fatal: 0,
+            }
+        );
     }
 }
