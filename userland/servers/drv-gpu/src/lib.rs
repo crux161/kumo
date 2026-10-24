@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j580
 //j581
 //j582
 //j583
 //j584
+//j585
 
 //! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1430,6 +1430,21 @@ pub fn latched_fault(io: &mut impl MmioIo) -> Option<Fault> {
     Some(decode_fault(raw, address))
 }
 
+/// The MMU block's raw status: bit n is a fault in address space n, bit 16+n a command
+/// completion (§4.5).
+pub fn mmu_rawstat(io: &mut impl MmioIo) -> u32 {
+    io.read32(MMU_INT_RAWSTAT)
+}
+
+/// One address space's latched fault registers, whether or not its rawstat bit is set.
+pub fn read_fault_as(io: &mut impl MmioIo, space: u32) -> Option<Fault> {
+    let window = as_window(space)?;
+    let raw = io.read32(window + as_offset(AS_FAULTSTATUS));
+    let address_lo = window + as_offset(AS_FAULTADDRESS);
+    let address = read64(io, address_lo, address_lo + 4);
+    Some(decode_fault(raw, address))
+}
+
 // ---- G4a: the global interface (RESEARCH/009 §9.2-§9.4) ----
 
 /// GLB input-block offsets (§9.3), relative to the control block's `input_va`.
@@ -1767,6 +1782,33 @@ pub fn publish_insert(mem: &mut impl FirmwareMemory, iface: QueueIface, insert: 
     let extract = read_mcu64(mem, iface.output_va);
     write_mcu64(mem, iface.input_va + 0x08, extract);
     write_mcu64(mem, iface.input_va, insert);
+}
+
+/// RESEARCH/009 §9.2's stream-doorbell path: toggle the stream's `doorbell_req` bit in the
+/// group, toggle the group's GLB bit, and ring doorbell 0. Panthor's fast path rings only the
+/// queue's own doorbell (§11.3); KUMO rings both so the firmware cannot miss new work. — TIMBERDOODLE
+pub fn wake_stream(
+    io: &mut (impl FirmwareMemory + GlbIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+    slot: u32,
+    stream: u32,
+) {
+    let stream_bit = 1u32 << stream;
+    let req = io.read32(csg_input_va + 0x08);
+    let ack = io.read32(csg_output_va + 0x08);
+    io.write32(
+        csg_input_va + 0x08,
+        (req & !stream_bit) | (!ack & stream_bit),
+    );
+    let slot_bit = 1u32 << slot;
+    let glb_req = io.read_input(GLB_DOORBELL_REQ);
+    let glb_ack = io.read_output(GLB_DOORBELL_REQ);
+    io.write_input(
+        GLB_DOORBELL_REQ,
+        (glb_req & !slot_bit) | (!glb_ack & slot_bit),
+    );
+    io.ring_doorbell();
 }
 
 /// The byte position inside the ring for a monotonically growing insert (§9.7).
@@ -2302,6 +2344,18 @@ mod tests {
         assert!(!shared_region_contains(CSF_SHARED_REGION_END));
         assert!(!shared_region_contains(0x0900_0000));
         assert!(!shared_region_contains(0x03ff_ffff));
+    }
+
+    #[test]
+    fn per_space_faults_read_their_own_window() {
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(mmu_rawstat(&mut io), 0);
+        assert!(matches!(read_fault_as(&mut io, 8), None));
+        io.set_reads(0x245c, &[0x7cd0_03cb]);
+        io.set_reads(0x2460, &[0x0100_1000]);
+        let fault = read_fault_as(&mut io, 1).unwrap();
+        assert_eq!(fault.exception, 0xcb);
+        assert_eq!(fault.address, 0x0100_1000);
     }
 
     #[test]
@@ -3616,6 +3670,21 @@ mod g4b_tests {
             self.delays += 1;
             self.now += us * 1_000;
         }
+    }
+
+    #[test]
+    fn wake_stream_toggles_both_doorbell_levels_and_rings_the_glb() {
+        let mut io = FakeFirmware::new();
+        wake_stream(&mut io, 0x6000, 0x7000, 0, 0);
+        assert_eq!(io.get(0x6008), 1);
+        assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&1));
+        assert_eq!(io.doorbells, 1);
+        io.set(0x7008, 1);
+        io.glb_output.insert(GLB_DOORBELL_REQ, 1);
+        wake_stream(&mut io, 0x6000, 0x7000, 0, 0);
+        assert_eq!(io.get(0x6008), 0);
+        assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&0));
+        assert_eq!(io.doorbells, 2);
     }
 
     #[test]

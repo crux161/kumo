@@ -1,22 +1,23 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j579
 //j580
 //j581
 //j583
 //j584
+//j585
 
 use core::fmt::{self, Write};
 use drv_gpu::{
     csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
-    latched_fault, map_range, mcu_boot, mmu_info, power_l2, probe, program_group, program_queue,
-    publish_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control, ring_offset,
-    shared_region_contains, soft_reset, start_group, ClockIo, Completion, CompletionIo, Firmware,
-    FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo,
-    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
-    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
-    GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
+    latched_fault, map_range, mcu_boot, mmu_info, mmu_rawstat, power_l2, probe, program_group,
+    program_queue, publish_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
+    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, wake_stream,
+    ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo, GlobalInterface,
+    GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath,
+    SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START,
+    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, GLB_DOORBELL, GLB_DOORBELL_REQ,
+    GLB_PING_TIMEOUT_NS, PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -1132,6 +1133,14 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 }
             }
 
+            {
+                let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                let cs_ack = glb_io.read32(cs.output_va);
+                log(
+                    log_level::NOTICE,
+                    format_args!("drv-gpu: CS 0 ack=0x{:08x}\n", cs_ack),
+                );
+            }
             let stream = first_stream(AS1_WORK_VA + PAGE_SIZE);
             let position = ring_offset(0, RING_SIZE);
             for (index, word) in stream.iter().enumerate() {
@@ -1154,6 +1163,10 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 );
             }
             dsb();
+            {
+                let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+            }
             device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
             log(
                 log_level::INFO,
@@ -1191,13 +1204,53 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                         let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
                         let status = read_cs_status(&mut glb_io, cs.output_va);
                         log(
-                            log_level::ERR,
+                            log_level::NOTICE,
                             format_args!(
-                                "drv-gpu: stream status cmd_ptr=0x{:x} blocked={} fault=0x{:08x} fatal=0x{:08x}\n",
-                                status.cmd_ptr,
-                                status.blocked_reason,
-                                status.fault,
-                                status.fatal
+                                "drv-gpu: CS status cmd_ptr=0x{:x} blocked={} fault=0x{:08x} fatal=0x{:08x}\n",
+                                status.cmd_ptr, status.blocked_reason, status.fault, status.fatal
+                            ),
+                        );
+                        let cs_req = glb_io.read32(cs.input_va);
+                        let cs_ack = glb_io.read32(cs.output_va);
+                        let csg_doorbell_req = glb_io.read32(csg.input_va + 0x08);
+                        let csg_doorbell_ack = glb_io.read32(csg.output_va + 0x08);
+                        let cs_irq_ack = glb_io.read32(csg.input_va + 0x0C);
+                        let cs_irq_req = glb_io.read32(csg.output_va + 0x0C);
+                        log(
+                            log_level::NOTICE,
+                            format_args!(
+                                "drv-gpu: CS req=0x{:08x} ack=0x{:08x}; CSG doorbell=0x{:x}/0x{:x} irq=0x{:x}/0x{:x}\n",
+                                cs_req, cs_ack, csg_doorbell_req, csg_doorbell_ack, cs_irq_ack, cs_irq_req
+                            ),
+                        );
+                        let insert = u64::from(glb_io.read32(MCU_IO_PAGES_VA))
+                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + 4)) << 32);
+                        let extract = u64::from(glb_io.read32(MCU_IO_PAGES_VA + 0x08))
+                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + 0x0C)) << 32);
+                        let consumed = u64::from(glb_io.read32(MCU_IO_PAGES_VA + PAGE_SIZE))
+                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + PAGE_SIZE + 4)) << 32);
+                        log(
+                            log_level::NOTICE,
+                            format_args!(
+                                "drv-gpu: queue insert=0x{:x} extract=0x{:x} consumed=0x{:x}\n",
+                                insert, extract, consumed
+                            ),
+                        );
+                    }
+                    log(
+                        log_level::NOTICE,
+                        format_args!("drv-gpu: MMU rawstat=0x{:08x}\n", mmu_rawstat(device)),
+                    );
+                    if let Some(fault) = read_fault_as(device, GROUP_AS) {
+                        log(
+                            log_level::NOTICE,
+                            format_args!(
+                                "drv-gpu: AS{} fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
+                                GROUP_AS,
+                                fault.address,
+                                drv_gpu::exception_name(fault.exception),
+                                fault.access,
+                                fault.raw
                             ),
                         );
                     }
