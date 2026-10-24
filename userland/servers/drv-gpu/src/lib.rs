@@ -1564,6 +1564,8 @@ pub const CS_IDLE_SYNC_WAIT: u32 = 1 << 8;
 pub const CS_IDLE_EMPTY: u32 = 1 << 10;
 pub const CSG_STATE_MASK: u32 = 0b111;
 pub const CSG_STATE_START: u32 = 1;
+/// Re-apply the endpoint configuration; a toggle, and part of every group start (§9.5).
+pub const CSG_ENDPOINT_CONFIG: u32 = 1 << 4;
 
 /// A CSG slot's read-only control block (§9.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1695,7 +1697,12 @@ pub fn start_group(
     slot: u32,
     timeout_ns: u64,
 ) -> Result<u32, GroupError> {
-    let req = (io.read32(csg_input_va) & !CSG_STATE_MASK) | CSG_STATE_START;
+    // panthor's start queues both the state change and an ENDPOINT_CONFIG toggle, then waits for
+    // every queued bit to be acknowledged. Without the endpoint toggle the firmware never
+    // acknowledges the start (metal, J582). — TIMBERDOODLE
+    let ack = io.read32(csg_output_va);
+    let mut req = (io.read32(csg_input_va) & !CSG_STATE_MASK) | CSG_STATE_START;
+    req = (req & !CSG_ENDPOINT_CONFIG) | ((ack ^ CSG_ENDPOINT_CONFIG) & CSG_ENDPOINT_CONFIG);
     io.write32(csg_input_va, req);
     let bit = 1u32 << slot;
     let doorbell_req = io.read_input(GLB_DOORBELL_REQ);
@@ -1705,10 +1712,11 @@ pub fn start_group(
         (doorbell_req & !bit) | (!doorbell_ack & bit),
     );
     io.ring_doorbell();
+    let mask = CSG_STATE_MASK | CSG_ENDPOINT_CONFIG;
     let deadline = io.now_ns().saturating_add(timeout_ns);
     loop {
         let ack = io.read32(csg_output_va);
-        if ack & CSG_STATE_MASK == CSG_STATE_START {
+        if ack & mask == req & mask {
             return Ok(ack);
         }
         if io.now_ns() >= deadline {
@@ -3462,11 +3470,12 @@ mod g4a_tests {
 mod g4b_tests {
     extern crate std;
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::vec::Vec;
 
     struct FakeFirmware {
         words: HashMap<u64, u32>,
+        script: HashMap<u64, VecDeque<u32>>,
         glb_input: HashMap<u32, u32>,
         glb_output: HashMap<u32, u32>,
         writes: Vec<(u64, u32)>,
@@ -3479,6 +3488,7 @@ mod g4b_tests {
         fn new() -> Self {
             Self {
                 words: HashMap::new(),
+                script: HashMap::new(),
                 glb_input: HashMap::new(),
                 glb_output: HashMap::new(),
                 writes: Vec::new(),
@@ -3492,6 +3502,11 @@ mod g4b_tests {
             self.words.insert(mcu, value);
         }
 
+        /// Successive reads of `mcu` return `values` in order; the last value repeats.
+        fn script_reads(&mut self, mcu: u64, values: &[u32]) {
+            self.script.insert(mcu, values.iter().copied().collect());
+        }
+
         fn get(&self, mcu: u64) -> u32 {
             *self.words.get(&mcu).unwrap_or(&0)
         }
@@ -3503,6 +3518,14 @@ mod g4b_tests {
 
     impl FirmwareMemory for FakeFirmware {
         fn read32(&mut self, mcu: u64) -> u32 {
+            if let Some(values) = self.script.get_mut(&mcu) {
+                if values.len() > 1 {
+                    return values.pop_front().unwrap();
+                }
+                if let Some(&value) = values.front() {
+                    return value;
+                }
+            }
             self.get(mcu)
         }
 
@@ -3652,12 +3675,31 @@ mod g4b_tests {
     #[test]
     fn start_group_toggles_the_glb_bit_rings_and_waits_for_the_start_ack() {
         let mut io = FakeFirmware::new();
-        io.set(0x6700, CSG_STATE_START);
-        assert_eq!(start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000), Ok(1));
-        assert_eq!(io.get(0x6500), 1);
+        io.script_reads(0x6700, &[0, CSG_STATE_START | CSG_ENDPOINT_CONFIG]);
+        assert_eq!(
+            start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000),
+            Ok(0x11)
+        );
+        assert_eq!(io.get(0x6500), 0x11);
         assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&1));
         assert_eq!(io.doorbells, 1);
         assert_eq!(io.delays, 0);
+    }
+
+    #[test]
+    fn start_group_toggles_the_endpoint_bit_from_the_ack() {
+        // The endpoint bit is already configured (ack bit 4 set), so the toggle clears it in the
+        // request while the state stays at start; the fake never acks the state.
+        let mut io = FakeFirmware::new();
+        io.set(0x6700, CSG_ENDPOINT_CONFIG);
+        assert_eq!(
+            start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000),
+            Err(GroupError::AckTimeout {
+                req: 0x01,
+                ack: CSG_ENDPOINT_CONFIG
+            })
+        );
+        assert_eq!(io.get(0x6500), 0x01);
     }
 
     #[test]
@@ -3665,7 +3707,7 @@ mod g4b_tests {
         let mut io = FakeFirmware::new();
         assert_eq!(
             start_group(&mut io, 0x6500, 0x6700, 0, 100_000_000),
-            Err(GroupError::AckTimeout { req: 1, ack: 0 })
+            Err(GroupError::AckTimeout { req: 0x11, ack: 0 })
         );
         assert_eq!(io.delays, 10_000);
     }
