@@ -1,8 +1,8 @@
-//j517
 //j562
 //j563
 //j569
 //j572
+//j578
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -21,6 +21,10 @@ pub const TTYD_PATH: &str = "bin/ttyd";
 pub const DRV_SERIAL_PATH: &str = "bin/drv-serial";
 pub const DRV_FB_PATH: &str = "bin/drv-fb";
 pub const DRV_GPU_PATH: &str = "bin/drv-gpu";
+/// The vendored Arm Mali-G610 CSF firmware (PLAN/013 decision 1, CRUX 2026-10-24): KUMO's first
+/// proprietary binary, shipped under `firmware/LICENCE.mali_csffw` in the tree. `drv-gpu` parses
+/// it with the G3a parser; G3b loads it into address space 0 and boots the MCU.
+pub const MALI_FIRMWARE_PATH: &str = "lib/firmware/mali_csffw.bin";
 pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
 pub const DRV_XHCI_PATH: &str = "bin/drv-xhci";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";

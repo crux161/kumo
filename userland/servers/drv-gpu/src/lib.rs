@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j572
 //j574
 //j575
 //j576
 //j577
+//j578
 
 //! G1b–G3a: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -2140,16 +2140,20 @@ mod fw_tests {
     }
 
     #[test]
-    #[ignore = "set KUMO_MALI_CSFFW to a mali_csffw.bin to parse a real image"]
-    fn a_real_image_parses_when_pointed_at() {
-        let Ok(path) = std::env::var("KUMO_MALI_CSFFW") else {
-            return;
-        };
-        let bytes = std::fs::read(path).unwrap();
+    fn the_vendored_firmware_image_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../firmware/mali_csffw.bin"
+        );
+        let bytes = std::fs::read(path).expect("vendored mali_csffw.bin");
         let firmware = Firmware::parse(&bytes).unwrap();
-        assert!(firmware.build_sha().is_some());
+        assert_eq!(firmware.minor(), 3);
+        assert_eq!(firmware.version_hash(), 0x0105_0000);
+        assert_eq!(
+            firmware.build_sha(),
+            Some(&b"95a25d71030715381f33105394285e1dcc860a65 "[..])
+        );
         let sections: Vec<_> = firmware.sections().collect();
-        assert!(!sections.is_empty());
         assert!(sections.iter().any(|section| section.va == 0));
         let shared: Vec<_> = sections
             .iter()

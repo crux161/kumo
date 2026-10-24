@@ -1,8 +1,8 @@
-//j517
 //j562
 //j563
 //j569
 //j572
+//j578
 
 use std::env;
 use std::fmt;
@@ -21,8 +21,8 @@ use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH, DRV_I2C_HID_PATH,
     DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
     INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
-    KILO_PATH, LS_PATH, LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH,
-    SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, PERSONA_LINUX_HELLO_PATH,
+    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -840,6 +840,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_serial = build_drv_serial_image(&workspace_root()?)?;
             let drv_fb = build_drv_fb_image(&workspace_root()?)?;
             let drv_gpu = build_drv_gpu_image(&workspace_root()?)?;
+            let mali_firmware = build_mali_firmware(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
@@ -866,6 +867,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_SERIAL_PATH, drv_serial.as_slice()),
                 (DRV_FB_PATH, drv_fb.as_slice()),
                 (DRV_GPU_PATH, drv_gpu.as_slice()),
+                (MALI_FIRMWARE_PATH, mali_firmware.as_slice()),
                 (DRV_I2C_HID_PATH, drv_i2c_hid.as_slice()),
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
@@ -1335,6 +1337,13 @@ fn build_drv_fb_image(root: &Path) -> Result<Vec<u8>, String> {
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as drv-fb ELF: {err}", source_path.display()))?;
     Ok(bytes)
+}
+
+/// The vendored Arm Mali CSF firmware (PLAN/013 decision 1): read from the tree so the initrd
+/// carries exactly the bytes the licence in `firmware/` covers. — TIMBERDOODLE
+fn build_mali_firmware(root: &Path) -> Result<Vec<u8>, String> {
+    let path = root.join("firmware/mali_csffw.bin");
+    fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))
 }
 
 fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
