@@ -1,18 +1,19 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j583
 //j584
 //j585
 //j586
 //j587
+//j588
 
-//! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G4c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
 //! its sections into address space 0, boots the MCU, and validates the global interface the
 //! firmware publishes when it comes up. G4a initializes that interface and proves a ping
-//! round-trip. G4b starts a command-stream group and has the GPU write a value.
+//! round-trip. G4b starts a command-stream group and has the GPU write a value. G4c wraps each
+//! job the way panthor does (§10.6) and counts completions in the queue's sync object (§11.4).
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -1304,6 +1305,25 @@ const JOB_INT_MASK: u32 = 0x1008;
 const JOB_INT_STAT: u32 = 0x100c;
 const JOB_IRQ_GLOBAL_IF: u32 = 1 << 31;
 pub const JOB_IRQ: u32 = IRQ_BASE;
+
+/// RESEARCH/009 §4.5: JOB_INT_RAWSTAT bit g is an event on CSG slot g, bit 31 the global
+/// interface. The mask stays 0 after the boot, so reading it asserts nothing.
+pub fn job_irq_rawstat(io: &mut impl MmioIo) -> u32 {
+    io.read32(JOB_INT_RAWSTAT)
+}
+
+pub fn clear_job_irqs(io: &mut impl MmioIo, bits: u32) {
+    io.write32(JOB_INT_CLEAR, bits);
+}
+
+/// RESEARCH/009 §4.9: the completed-flush counter a job's FLUSH_CACHE2 compares against. Read only
+/// while the GPU is powered; a powered-down GPU here can hang the bus.
+const LATEST_FLUSH_ID: u32 = 0x1_0000;
+
+pub fn latest_flush_id(io: &mut impl MmioIo) -> u32 {
+    io.read32(LATEST_FLUSH_ID)
+}
+
 /// RESEARCH/009 §8.6: panthor gives the firmware boot one second.
 pub const BOOT_TIMEOUT_NS: u64 = 1_000_000_000;
 
@@ -1605,6 +1625,13 @@ pub const CSG_STATE_MASK: u32 = 0b111;
 pub const CSG_STATE_START: u32 = 1;
 /// Re-apply the endpoint configuration; a toggle, and part of every group start (§9.5).
 pub const CSG_ENDPOINT_CONFIG: u32 = 1 << 4;
+/// CSG events: the firmware toggles the ACK bit, the host acknowledges by copying it into REQ
+/// (§9.5). SYNC_UPDATE follows a sync-object change such as the §10.6 wrapper's add.
+pub const CSG_SYNC_UPDATE: u32 = 1 << 28;
+pub const CSG_IDLE: u32 = 1 << 29;
+pub const CSG_PROGRESS_TIMER_EVENT: u32 = 1 << 31;
+/// The events §11.5 step 3 acknowledges by copy.
+pub const CSG_EVENTS: u32 = CSG_SYNC_UPDATE | CSG_IDLE | CSG_PROGRESS_TIMER_EVENT;
 
 /// A CSG slot's read-only control block (§9.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1839,6 +1866,30 @@ pub fn ack_cs_irqs(mem: &mut impl FirmwareMemory, csg_input_va: u64, req: u32) {
     mem.write32(csg_input_va + 0x0C, req);
 }
 
+/// RESEARCH/009 §11.5 step 1: the group's raised, unacknowledged events, `(req ^ ack)` under
+/// [`CSG_EVENTS`].
+pub fn csg_pending_events(
+    mem: &mut impl FirmwareMemory,
+    csg_input_va: u64,
+    csg_output_va: u64,
+) -> u32 {
+    (mem.read32(csg_input_va) ^ mem.read32(csg_output_va)) & CSG_EVENTS
+}
+
+/// RESEARCH/009 §11.5 step 3: acknowledge `events` by copying their ACK bits into REQ. The STATE
+/// level and the ENDPOINT_CONFIG toggle outside the mask are left as the host last wrote them.
+pub fn ack_csg_events(
+    mem: &mut impl FirmwareMemory,
+    csg_input_va: u64,
+    csg_output_va: u64,
+    events: u32,
+) {
+    let mask = events & CSG_EVENTS;
+    let req = mem.read32(csg_input_va);
+    let ack = mem.read32(csg_output_va);
+    mem.write32(csg_input_va, (req & !mask) | (ack & mask));
+}
+
 /// The byte position inside the ring for a monotonically growing insert (§9.7).
 pub fn ring_offset(insert: u64, size: u64) -> usize {
     (insert & (size - 1)) as usize
@@ -1847,11 +1898,18 @@ pub fn ring_offset(insert: u64, size: u64) -> usize {
 /// The command-stream words for RESEARCH/009 §10.7's first stream: write `target` with
 /// 0x00C0FFEE, flush the caches, and wait for both completions. — TIMBERDOODLE
 pub fn first_stream(target: u64) -> [u64; 5] {
+    store_stream(target, 0x00C0_FFEE)
+}
+
+/// §10.7's stream for any value: store it at `target`, flush, wait. It touches only r0-r2, well
+/// below the wrapper's scratch quad. The flush names r0 as its flush-ID register, exactly the
+/// encoding metal proved at J586.
+pub fn store_stream(target: u64, value: u32) -> [u64; 5] {
     [
         move48(0, target),
-        move32(2, 0x00C0_FFEE),
+        move32(2, value),
         sync_set32(0, 0, 2),
-        flush_cache2(0),
+        flush_cache2(0, 0),
         wait_slot(1),
     ]
 }
@@ -1875,9 +1933,10 @@ pub fn sync_set32(signal_slot: u8, address_pair: u8, data_reg: u8) -> u64 {
         | (u64::from(data_reg) << 32)
 }
 
-/// FLUSH_CACHE2: L2 clean+invalidate, LSC clean+invalidate, other invalidate (§4.4's 0x233).
-pub fn flush_cache2(signal_slot: u8) -> u64 {
-    (36u64 << 56) | (u64::from(signal_slot) << 48) | 0x233
+/// FLUSH_CACHE2: L2 clean+invalidate, LSC clean+invalidate, other invalidate (§4.4's 0x233),
+/// skipped by the hardware if a flush has completed since the ID in `flush_id_reg` (§4.9).
+pub fn flush_cache2(signal_slot: u8, flush_id_reg: u8) -> u64 {
+    (36u64 << 56) | (u64::from(signal_slot) << 48) | (u64::from(flush_id_reg) << 40) | 0x233
 }
 
 /// WAIT: block until every scoreboard in the mask has signalled (§10.3).
@@ -1885,10 +1944,182 @@ pub fn wait_slot(mask: u16) -> u64 {
     (3u64 << 56) | (u64::from(mask) << 16)
 }
 
+/// CALL: run `length_reg` bytes of stream at the address pair, then return (§10.3).
+pub fn call_stream(address_pair: u8, length_reg: u8) -> u64 {
+    (32u64 << 56) | (u64::from(address_pair) << 40) | (u64::from(length_reg) << 32)
+}
+
+/// SYNC_ADD64: add a register pair to the 64-bit sync object at an address pair, system scope,
+/// propagating the stream's error state into it; signal on completion (§10.3).
+pub fn sync_add64(signal_slot: u8, address_pair: u8, data_pair: u8) -> u64 {
+    (51u64 << 56)
+        | (u64::from(signal_slot) << 48)
+        | (u64::from(address_pair) << 40)
+        | (u64::from(data_pair) << 32)
+        | 1
+}
+
+/// ERROR_BARRIER: a fault before this point is recoverable at the job boundary (§10.3).
+pub fn error_barrier() -> u64 {
+    47u64 << 56
+}
+
+/// CS_FEATURES (§9.6): what a wrapper is built against. Metal reports `0x0007085f`: 96
+/// registers, 8 scoreboard slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsFeatures {
+    pub work_regs: u32,
+    pub scoreboards: u32,
+}
+
+impl CsFeatures {
+    pub const fn decode(raw: u32) -> Self {
+        Self {
+            work_regs: (raw & 0xFF) + 1,
+            scoreboards: (raw >> 8) & 0xFF,
+        }
+    }
+}
+
+/// The top four registers are the kernel's scratch (§10.2, panthor's
+/// `CSF_UNPRESERVED_REG_COUNT`).
+pub const CS_UNPRESERVED_REGS: u32 = 4;
+/// The command-stream prefetcher reads whole 64-byte lines (§10.6).
+pub const CS_LINE_BYTES: u64 = 64;
+/// One wrapper: eleven instructions, NOP-padded to two whole lines (§10.6).
+pub const JOB_WRAPPER_WORDS: usize = 16;
+pub const JOB_WRAPPER_BYTES: u64 = JOB_WRAPPER_WORDS as u64 * 8;
+/// A per-queue sync object: `seqno` (64), `status` (32; non-zero means the job failed), padding
+/// (§11.4).
+pub const SYNC_OBJECT_BYTES: u64 = 16;
+pub const SYNC_STATUS_OFFSET: u64 = 8;
+
+/// One job for the wrapper to run (§10.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobCall {
+    /// LATEST_FLUSH_ID, sampled after the stream's inputs were written (§4.9).
+    pub latest_flush: u32,
+    /// GPU VA and length in bytes of the stream the wrapper CALLs.
+    pub stream_va: u64,
+    pub stream_len: u32,
+    /// GPU VA of the queue's sync object.
+    pub sync_va: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WrapperError {
+    /// Too few registers for the scratch quad, or a quad that does not start on a pair.
+    Registers(u32),
+    /// No scoreboard to wait on, or more than WAIT's 16-bit mask can name.
+    Scoreboards(u32),
+    /// panthor's submit rule: a 64-byte-aligned stream of whole, non-zero instructions.
+    Stream { va: u64, len: u32 },
+    /// SYNC_ADD64 needs an 8-byte-aligned object.
+    SyncObject(u64),
+    /// panthor rejects a flush ID with bits 24-30 set.
+    FlushId(u32),
+}
+
+/// RESEARCH/009 §10.6, panthor's `prepare_job_instrs` with profiling off: flush the caches the
+/// job reads, CALL its stream, wait for every scoreboard, add 1 to the queue's sync object, and
+/// end on an error barrier. The scratch quad rX..rX+3 is the top of the register file, so the
+/// user stream's registers survive. — TIMBERDOODLE
+pub fn job_wrapper(
+    features: CsFeatures,
+    call: JobCall,
+) -> Result<[u64; JOB_WRAPPER_WORDS], WrapperError> {
+    let regs = features.work_regs;
+    if !(8..=256).contains(&regs) || regs % 2 != 0 {
+        return Err(WrapperError::Registers(regs));
+    }
+    if !(1..=16).contains(&features.scoreboards) {
+        return Err(WrapperError::Scoreboards(features.scoreboards));
+    }
+    let max_va = 0x0000_FFFF_FFFF_FFFF;
+    if call.stream_va % CS_LINE_BYTES != 0
+        || call.stream_len == 0
+        || call.stream_len % 8 != 0
+        || call.stream_va > max_va
+    {
+        return Err(WrapperError::Stream {
+            va: call.stream_va,
+            len: call.stream_len,
+        });
+    }
+    if call.sync_va % 8 != 0 || call.sync_va > max_va {
+        return Err(WrapperError::SyncObject(call.sync_va));
+    }
+    if call.latest_flush & 0x7F00_0000 != 0 {
+        return Err(WrapperError::FlushId(call.latest_flush));
+    }
+    let addr = (regs - CS_UNPRESERVED_REGS) as u8;
+    let val = addr + 2;
+    let wait_all = ((1u32 << features.scoreboards) - 1) as u16;
+    let instructions = [
+        move32(val, call.latest_flush),
+        flush_cache2(0, val),
+        move48(addr, call.stream_va),
+        move32(val, call.stream_len),
+        wait_slot(1),
+        call_stream(addr, val),
+        move48(addr, call.sync_va),
+        move48(val, 1),
+        wait_slot(wait_all),
+        sync_add64(0, addr, val),
+        error_barrier(),
+    ];
+    let mut words = [0u64; JOB_WRAPPER_WORDS];
+    words[..instructions.len()].copy_from_slice(&instructions);
+    Ok(words)
+}
+
+/// Where one wrapper lands, as ring positions that only grow (§9.7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobSlot {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// The next wrapper starts on a whole line at or after `insert`, so the prefetcher never fetches
+/// a line the host is still writing; a queue left mid-line (J586's 40-byte first stream) skips
+/// ahead over NOPs. None when the job would overwrite words the firmware has not consumed.
+pub fn job_slot(insert: u64, extract: u64, ring_size: u64) -> Option<JobSlot> {
+    let start = insert.checked_add(CS_LINE_BYTES - 1)? & !(CS_LINE_BYTES - 1);
+    let end = start + JOB_WRAPPER_BYTES;
+    if extract > insert || end - extract > ring_size {
+        return None;
+    }
+    Some(JobSlot { start, end })
+}
+
+/// Every ring word a job writes, as (byte offset in the ring, word): NOPs from `insert` to the
+/// slot's start, then the wrapper, each wrapping round the ring's end the way panthor's
+/// `copy_instrs_to_ringbuf` does.
+pub fn write_job_words(
+    insert: u64,
+    slot: JobSlot,
+    wrapper: &[u64; JOB_WRAPPER_WORDS],
+    ring_size: u64,
+    mut write: impl FnMut(usize, u64),
+) {
+    let mut position = insert & !7;
+    while position < slot.start {
+        write(ring_offset(position, ring_size), 0);
+        position += 8;
+    }
+    for (index, word) in wrapper.iter().enumerate() {
+        write(ring_offset(slot.start + index as u64 * 8, ring_size), *word);
+    }
+}
+
 /// The stream's diagnostic words, read when it faults or stalls (§9.6).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CsStatus {
     pub cmd_ptr: u64,
+    /// `status_wait`: bit 31 waiting on a sync object, [15:0] scoreboard mask.
+    pub wait: u32,
+    pub wait_sync_ptr: u64,
+    pub wait_sync_value: u64,
     pub blocked_reason: u32,
     pub fault: u32,
     pub fatal: u32,
@@ -1897,6 +2128,10 @@ pub struct CsStatus {
 pub fn read_cs_status(mem: &mut impl FirmwareMemory, output_va: u64) -> CsStatus {
     CsStatus {
         cmd_ptr: read_mcu64(mem, output_va + 0x40),
+        wait: mem.read32(output_va + 0x48),
+        wait_sync_ptr: read_mcu64(mem, output_va + 0x50),
+        wait_sync_value: u64::from(mem.read32(output_va + 0x58))
+            | (u64::from(mem.read32(output_va + 0x64)) << 32),
         blocked_reason: mem.read32(output_va + 0x60),
         fault: mem.read32(output_va + 0x80),
         fatal: mem.read32(output_va + 0x84),
@@ -3924,16 +4159,270 @@ mod g4b_tests {
     fn cs_status_reads_the_diagnostic_fields() {
         let mut io = FakeFirmware::new();
         io.set(0x7140, 0x1234);
+        io.set(0x7148, 0xC000_00FF);
+        io.set(0x7150, 0x1000_3000);
+        io.set(0x7158, 2);
+        io.set(0x7164, 1);
         io.set(0x7160, 5);
         io.set(0x7180, 0x41);
         assert_eq!(
             read_cs_status(&mut io, 0x7100),
             CsStatus {
                 cmd_ptr: 0x1234,
+                wait: 0xC000_00FF,
+                wait_sync_ptr: 0x1000_3000,
+                wait_sync_value: 0x1_0000_0002,
                 blocked_reason: 5,
                 fault: 0x41,
                 fatal: 0,
             }
         );
+    }
+
+    #[test]
+    fn csg_events_are_pending_until_their_ack_bits_are_copied() {
+        let mut io = FakeFirmware::new();
+        // The host started the group (STATE=1, endpoint toggle set); the firmware acknowledged it
+        // and then toggled SYNC_UPDATE and IDLE.
+        io.set(0x6500, CSG_STATE_START | CSG_ENDPOINT_CONFIG);
+        io.set(
+            0x6700,
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE | CSG_IDLE,
+        );
+        assert_eq!(
+            csg_pending_events(&mut io, 0x6500, 0x6700),
+            CSG_SYNC_UPDATE | CSG_IDLE
+        );
+        ack_csg_events(&mut io, 0x6500, 0x6700, CSG_SYNC_UPDATE);
+        assert_eq!(
+            io.get(0x6500),
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE
+        );
+        assert_eq!(csg_pending_events(&mut io, 0x6500, 0x6700), CSG_IDLE);
+        // A mask outside the events never touches STATE or the endpoint toggle.
+        ack_csg_events(
+            &mut io,
+            0x6500,
+            0x6700,
+            CSG_STATE_MASK | CSG_ENDPOINT_CONFIG,
+        );
+        assert_eq!(
+            io.get(0x6500),
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE
+        );
+        // The firmware toggles SYNC_UPDATE again: the copy now clears the REQ bit.
+        io.set(0x6700, CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE);
+        assert_eq!(
+            csg_pending_events(&mut io, 0x6500, 0x6700),
+            CSG_SYNC_UPDATE | CSG_IDLE
+        );
+        ack_csg_events(&mut io, 0x6500, 0x6700, CSG_EVENTS);
+        assert_eq!(
+            io.get(0x6500),
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE
+        );
+        assert_eq!(csg_pending_events(&mut io, 0x6500, 0x6700), 0);
+    }
+}
+
+#[cfg(test)]
+mod g4c_tests {
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    const METAL: CsFeatures = CsFeatures::decode(0x0007_085f);
+
+    fn call() -> JobCall {
+        JobCall {
+            latest_flush: 0x0000_0123,
+            stream_va: 0x1000_2000,
+            stream_len: 40,
+            sync_va: 0x1000_3000,
+        }
+    }
+
+    #[test]
+    fn metal_cs_features_decode_to_96_registers_and_8_scoreboards() {
+        assert_eq!(
+            METAL,
+            CsFeatures {
+                work_regs: 96,
+                scoreboards: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn the_wrapper_matches_research_009_section_10_6_word_for_word() {
+        // RESEARCH/009 §10.6's table, with rX = r92 (0x5C) and rX+2 = r94 (0x5E).
+        assert_eq!(
+            job_wrapper(METAL, call()),
+            Ok([
+                0x025E_0000_0000_0123,
+                0x2400_5E00_0000_0233,
+                0x015C_0000_1000_2000,
+                0x025E_0000_0000_0028,
+                0x0300_0000_0001_0000,
+                0x2000_5C5E_0000_0000,
+                0x015C_0000_1000_3000,
+                0x015E_0000_0000_0001,
+                0x0300_0000_00FF_0000,
+                0x3300_5C5E_0000_0001,
+                0x2F00_0000_0000_0000,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+        );
+        assert_eq!(JOB_WRAPPER_BYTES, 128);
+    }
+
+    #[test]
+    fn the_wrapper_follows_the_register_file_and_scoreboard_count() {
+        let small = CsFeatures {
+            work_regs: 32,
+            scoreboards: 4,
+        };
+        let words = job_wrapper(small, call()).unwrap();
+        assert_eq!(words[1], 0x2400_1E00_0000_0233);
+        assert_eq!(words[5], 0x2000_1C1E_0000_0000);
+        assert_eq!(words[8], 0x0300_0000_000F_0000);
+        assert_eq!(words[9], 0x3300_1C1E_0000_0001);
+        let full = CsFeatures {
+            work_regs: 96,
+            scoreboards: 16,
+        };
+        assert_eq!(job_wrapper(full, call()).unwrap()[8], 0x0300_0000_FFFF_0000);
+    }
+
+    #[test]
+    fn the_wrapper_refuses_what_panthor_refuses() {
+        let odd = CsFeatures {
+            work_regs: 95,
+            scoreboards: 8,
+        };
+        assert_eq!(job_wrapper(odd, call()), Err(WrapperError::Registers(95)));
+        let tiny = CsFeatures {
+            work_regs: 6,
+            scoreboards: 8,
+        };
+        assert_eq!(job_wrapper(tiny, call()), Err(WrapperError::Registers(6)));
+        let none = CsFeatures {
+            work_regs: 96,
+            scoreboards: 0,
+        };
+        assert_eq!(job_wrapper(none, call()), Err(WrapperError::Scoreboards(0)));
+        let mut bad = call();
+        bad.stream_va = 0x1000_2020;
+        assert_eq!(
+            job_wrapper(METAL, bad),
+            Err(WrapperError::Stream {
+                va: 0x1000_2020,
+                len: 40
+            })
+        );
+        let mut bad = call();
+        bad.stream_len = 0;
+        assert!(matches!(
+            job_wrapper(METAL, bad),
+            Err(WrapperError::Stream { .. })
+        ));
+        let mut bad = call();
+        bad.stream_len = 44;
+        assert!(matches!(
+            job_wrapper(METAL, bad),
+            Err(WrapperError::Stream { .. })
+        ));
+        let mut bad = call();
+        bad.sync_va = 0x1000_3004;
+        assert_eq!(
+            job_wrapper(METAL, bad),
+            Err(WrapperError::SyncObject(0x1000_3004))
+        );
+        let mut bad = call();
+        bad.latest_flush = 0x0100_0000;
+        assert_eq!(
+            job_wrapper(METAL, bad),
+            Err(WrapperError::FlushId(0x0100_0000))
+        );
+        // Bit 31 is outside panthor's rejected range.
+        let mut ok = call();
+        ok.latest_flush = 0x8000_0001;
+        assert!(job_wrapper(METAL, ok).is_ok());
+    }
+
+    #[test]
+    fn job_slots_start_on_a_line_and_respect_unconsumed_words() {
+        // After J586's 40-byte first stream the first wrapper skips to the next line.
+        assert_eq!(
+            job_slot(0x28, 0x28, 0x1000),
+            Some(JobSlot {
+                start: 0x40,
+                end: 0xC0
+            })
+        );
+        assert_eq!(
+            job_slot(0xC0, 0x28, 0x1000),
+            Some(JobSlot {
+                start: 0xC0,
+                end: 0x140
+            })
+        );
+        // Exactly a full ring of unconsumed words fits; one line more does not.
+        assert_eq!(
+            job_slot(0x1000, 0x80, 0x1000),
+            Some(JobSlot {
+                start: 0x1000,
+                end: 0x1080
+            })
+        );
+        assert_eq!(job_slot(0x1000, 0x40, 0x1000), None);
+        // An extract past the insert is a corrupt queue, not free space.
+        assert_eq!(job_slot(0x40, 0x80, 0x1000), None);
+    }
+
+    #[test]
+    fn job_words_pad_to_the_line_and_wrap_round_the_ring() {
+        let wrapper = job_wrapper(METAL, call()).unwrap();
+        let mut writes = Vec::new();
+        let slot = job_slot(0x28, 0x28, 0x1000).unwrap();
+        write_job_words(0x28, slot, &wrapper, 0x1000, |offset, word| {
+            writes.push((offset, word))
+        });
+        assert_eq!(writes.len(), 3 + JOB_WRAPPER_WORDS);
+        assert_eq!(&writes[..3], &[(0x28, 0), (0x30, 0), (0x38, 0)]);
+        assert_eq!(writes[3], (0x40, wrapper[0]));
+        assert_eq!(writes[18], (0xB8, 0));
+
+        // A wrapper that starts one line before the ring's end puts its second line at 0.
+        let mut writes = Vec::new();
+        let slot = job_slot(0x1FC0, 0x1F00, 0x1000).unwrap();
+        write_job_words(0x1FC0, slot, &wrapper, 0x1000, |offset, word| {
+            writes.push((offset, word))
+        });
+        assert_eq!(writes.len(), JOB_WRAPPER_WORDS);
+        assert_eq!(writes[0], (0xFC0, wrapper[0]));
+        assert_eq!(writes[7], (0xFF8, wrapper[7]));
+        assert_eq!(writes[8], (0x000, wrapper[8]));
+        assert_eq!(writes[15], (0x038, 0));
+    }
+
+    #[test]
+    fn the_store_stream_keeps_the_proven_first_stream_encoding() {
+        let stream = store_stream(0x1000_1040, 0xC0DE_0001);
+        assert_eq!(
+            stream,
+            [
+                0x0100_0000_1000_1040,
+                0x0202_0000_C0DE_0001,
+                0x2600_0002_0000_0000,
+                0x2400_0000_0000_0233,
+                0x0300_0000_0001_0000,
+            ]
+        );
+        assert_eq!(first_stream(0x1000_1000)[1], 0x0202_0000_00c0_ffee);
     }
 }

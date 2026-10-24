@@ -1,23 +1,26 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j583
 //j584
 //j585
 //j586
 //j587
+//j588
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    ack_cs_irqs, cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
-    init_global_interface, latched_fault, map_range, mcu_boot, mmu_info, mmu_rawstat, power_l2,
-    probe, program_group, program_queue, publish_insert, queue_extract, quiet_mmu, read_cs_control,
-    read_cs_status, read_csg_control, read_fault_as, ring_offset, shared_region_contains,
-    soft_reset, start_group, wake_stream, ClockIo, Completion, CompletionIo, Firmware,
-    FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo,
-    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
-    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
-    GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
+    ack_cs_irqs, ack_csg_events, clear_job_irqs, cs_irq_req, csf_doorbell, csg_pending_events,
+    enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface, job_irq_rawstat,
+    job_slot, job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info,
+    mmu_rawstat, power_l2, probe, program_group, program_queue, publish_insert, queue_extract,
+    queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control, read_fault_as,
+    ring_offset, shared_region_contains, soft_reset, start_group, store_stream, wake_stream,
+    write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl,
+    Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, MmioIo, PageAttrs,
+    ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory,
+    APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_EVENTS,
+    CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS,
+    PAGE_SIZE, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -46,10 +49,20 @@ const MCU_IO_PAGES_VA: u64 = 0x0410_0000;
 const MCU_SUSPEND_VA: u64 = 0x0410_2000;
 const _: () = assert!(shared_region_contains(MCU_IO_PAGES_VA));
 const _: () = assert!(shared_region_contains(MCU_SUSPEND_VA));
-/// The group's own address space (AS1) holds the ring and the first stream's target word.
+/// The group's own address space (AS1), one page each: the ring; the target words (the first
+/// stream's at +0, wrapped job n's at +64n); the streams the §10.6 wrapper CALLs, one 64-byte
+/// line per job; and the queue's sync object. All of it is GPU-uncached and no-execute, as
+/// panthor maps its rings and sync objects.
 const AS1_WORK_VA: u64 = 0x1000_0000;
 const RING_SIZE: u64 = 0x1000;
-const WORK_LEN: u64 = 0x2000;
+const AS1_TARGET_VA: u64 = AS1_WORK_VA + PAGE_SIZE;
+const AS1_STREAMS_VA: u64 = AS1_WORK_VA + 2 * PAGE_SIZE;
+const AS1_SYNC_VA: u64 = AS1_WORK_VA + 3 * PAGE_SIZE;
+const WORK_LEN: u64 = 4 * PAGE_SIZE;
+/// Two wrapped jobs: the second proves the ring advances past a wrapper and the sync object
+/// counts rather than being set.
+const WRAPPED_JOBS: u64 = 2;
+const WRAPPED_VALUE_BASE: u32 = 0xC0DE_0000;
 const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
@@ -476,6 +489,84 @@ impl ClockIo for SharedGlb<'_> {
 
     fn delay_us(&mut self, us: u64) {
         self.device.delay_us(us);
+    }
+}
+
+/// Everything a stalled stream leaves behind, at NOTICE so the boot console shows it: the CS
+/// status (current instruction, what it waits on, fault and fatal words), both request/ack
+/// pairs, the queue's counters, and any AS1 fault. J585-J587 used these to tell a dead doorbell
+/// from a misplaced queue page; the wrapper's waits and sync add show up in `wait`/`sync`.
+fn report_stream_stall(
+    device: &mut Device,
+    input: u64,
+    output: u64,
+    windows: [McuWindow; 3],
+    csg: CsgControl,
+    cs: CsControl,
+) {
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+        let status = read_cs_status(&mut glb_io, cs.output_va);
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: CS status cmd_ptr=0x{:x} blocked={} wait=0x{:08x} sync=0x{:x}@0x{:x} fault=0x{:08x} fatal=0x{:08x}\n",
+                status.cmd_ptr,
+                status.blocked_reason,
+                status.wait,
+                status.wait_sync_value,
+                status.wait_sync_ptr,
+                status.fault,
+                status.fatal
+            ),
+        );
+        let cs_req = glb_io.read32(cs.input_va);
+        let cs_ack = glb_io.read32(cs.output_va);
+        let csg_doorbell_req = glb_io.read32(csg.input_va + 0x08);
+        let csg_doorbell_ack = glb_io.read32(csg.output_va + 0x08);
+        let cs_irq_ack = glb_io.read32(csg.input_va + 0x0C);
+        let cs_irq_req = glb_io.read32(csg.output_va + 0x0C);
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: CS req=0x{:08x} ack=0x{:08x}; CSG doorbell=0x{:x}/0x{:x} irq=0x{:x}/0x{:x}\n",
+                cs_req, cs_ack, csg_doorbell_req, csg_doorbell_ack, cs_irq_ack, cs_irq_req
+            ),
+        );
+        let iface = QueueIface::at(MCU_IO_PAGES_VA);
+        let insert = queue_insert(&mut glb_io, iface);
+        let extract = u64::from(glb_io.read32(iface.input_va + 0x08))
+            | (u64::from(glb_io.read32(iface.input_va + 0x0C)) << 32);
+        let consumed = queue_extract(&mut glb_io, iface);
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: queue insert=0x{:x} extract=0x{:x} consumed=0x{:x}\n",
+                insert, extract, consumed
+            ),
+        );
+    }
+    let rawstat = mmu_rawstat(device);
+    log(
+        log_level::NOTICE,
+        format_args!("drv-gpu: MMU rawstat=0x{:08x}\n", rawstat),
+    );
+    // Zeroed fault registers decode to "OK Atomic"; print them only when AS1's rawstat bit says a
+    // fault is actually latched.
+    if rawstat & (1u32 << GROUP_AS) != 0 {
+        if let Some(fault) = read_fault_as(device, GROUP_AS) {
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: AS{} fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
+                    GROUP_AS,
+                    fault.address,
+                    drv_gpu::exception_name(fault.exception),
+                    fault.access,
+                    fault.raw
+                ),
+            );
+        }
     }
 }
 
@@ -1147,7 +1238,7 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     format_args!("drv-gpu: CS 0 ack=0x{:08x}\n", cs_ack),
                 );
             }
-            let stream = first_stream(AS1_WORK_VA + PAGE_SIZE);
+            let stream = first_stream(AS1_TARGET_VA);
             let position = ring_offset(0, RING_SIZE);
             for (index, word) in stream.iter().enumerate() {
                 // SAFETY: five words inside the ring's first page, which this process maps
@@ -1179,11 +1270,11 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 format_args!(
                     "drv-gpu: first stream submitted ({} bytes, target VA 0x{:016x})\n",
                     stream.len() * 8,
-                    AS1_WORK_VA + PAGE_SIZE
+                    AS1_TARGET_VA
                 ),
             );
 
-            let target = work.va + PAGE_SIZE;
+            let target = work.va + (AS1_TARGET_VA - AS1_WORK_VA);
             let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
             loop {
                 // SAFETY: the target word is the work buffer's second page, Normal-NC.
@@ -1206,65 +1297,7 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                             value
                         ),
                     );
-                    {
-                        let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                        let status = read_cs_status(&mut glb_io, cs.output_va);
-                        log(
-                            log_level::NOTICE,
-                            format_args!(
-                                "drv-gpu: CS status cmd_ptr=0x{:x} blocked={} fault=0x{:08x} fatal=0x{:08x}\n",
-                                status.cmd_ptr, status.blocked_reason, status.fault, status.fatal
-                            ),
-                        );
-                        let cs_req = glb_io.read32(cs.input_va);
-                        let cs_ack = glb_io.read32(cs.output_va);
-                        let csg_doorbell_req = glb_io.read32(csg.input_va + 0x08);
-                        let csg_doorbell_ack = glb_io.read32(csg.output_va + 0x08);
-                        let cs_irq_ack = glb_io.read32(csg.input_va + 0x0C);
-                        let cs_irq_req = glb_io.read32(csg.output_va + 0x0C);
-                        log(
-                            log_level::NOTICE,
-                            format_args!(
-                                "drv-gpu: CS req=0x{:08x} ack=0x{:08x}; CSG doorbell=0x{:x}/0x{:x} irq=0x{:x}/0x{:x}\n",
-                                cs_req, cs_ack, csg_doorbell_req, csg_doorbell_ack, cs_irq_ack, cs_irq_req
-                            ),
-                        );
-                        let insert = u64::from(glb_io.read32(MCU_IO_PAGES_VA))
-                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + 4)) << 32);
-                        let extract = u64::from(glb_io.read32(MCU_IO_PAGES_VA + 0x08))
-                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + 0x0C)) << 32);
-                        let consumed = u64::from(glb_io.read32(MCU_IO_PAGES_VA + PAGE_SIZE))
-                            | (u64::from(glb_io.read32(MCU_IO_PAGES_VA + PAGE_SIZE + 4)) << 32);
-                        log(
-                            log_level::NOTICE,
-                            format_args!(
-                                "drv-gpu: queue insert=0x{:x} extract=0x{:x} consumed=0x{:x}\n",
-                                insert, extract, consumed
-                            ),
-                        );
-                    }
-                    let rawstat = mmu_rawstat(device);
-                    log(
-                        log_level::NOTICE,
-                        format_args!("drv-gpu: MMU rawstat=0x{:08x}\n", rawstat),
-                    );
-                    // Zeroed fault registers decode to "OK Atomic"; print them only when AS1's
-                    // rawstat bit says a fault is actually latched.
-                    if rawstat & (1u32 << GROUP_AS) != 0 {
-                        if let Some(fault) = read_fault_as(device, GROUP_AS) {
-                            log(
-                                log_level::NOTICE,
-                                format_args!(
-                                    "drv-gpu: AS{} fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
-                                    GROUP_AS,
-                                    fault.address,
-                                    drv_gpu::exception_name(fault.exception),
-                                    fault.access,
-                                    fault.raw
-                                ),
-                            );
-                        }
-                    }
+                    report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
                     return 1;
                 }
@@ -1278,15 +1311,14 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 let expected_insert = (stream.len() * 8) as u64;
                 let iface = QueueIface::at(MCU_IO_PAGES_VA);
                 let drain_deadline = device.now_ns() + DRAIN_TIMEOUT_NS;
-                let mut extract = 0;
                 let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                loop {
-                    extract = queue_extract(&mut glb_io, iface);
+                let extract = loop {
+                    let extract = queue_extract(&mut glb_io, iface);
                     if extract >= expected_insert || glb_io.now_ns() >= drain_deadline {
-                        break;
+                        break extract;
                     }
                     glb_io.delay_us(100);
-                }
+                };
                 let status = read_cs_status(&mut glb_io, cs.output_va);
                 let req = cs_irq_req(&mut glb_io, csg.output_va);
                 let ack = glb_io.read32(csg.input_va + 0x0C);
@@ -1304,6 +1336,178 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     format_args!("drv-gpu: stream irqs acknowledged (ack=0x{:x})\n", acked),
                 );
             }
+
+            // G4c: two jobs through RESEARCH/009 §10.6's wrapper, the way panthor submits every
+            // job. Each wrapper flushes, CALLs its own store stream, waits for every scoreboard
+            // and adds 1 to the queue's sync object; a job is done when the seqno reaches its
+            // number (§11.4). The group's SYNC_UPDATE event and JOB_INT_RAWSTAT are read and
+            // acknowledged in §11.5's order as evidence for the JOB-interrupt slice; nothing
+            // here waits on the interrupt yet. — TIMBERDOODLE
+            let features = CsFeatures::decode(cs.features);
+            let iface = QueueIface::at(MCU_IO_PAGES_VA);
+            let sync = work.va + (AS1_SYNC_VA - AS1_WORK_VA);
+            let mut seqno = 0;
+            for job in 1..=WRAPPED_JOBS {
+                let stream_va = AS1_STREAMS_VA + (job - 1) * CS_LINE_BYTES;
+                let target_va = AS1_TARGET_VA + job * CS_LINE_BYTES;
+                let value = WRAPPED_VALUE_BASE | job as u32;
+                let stream = store_stream(target_va, value);
+                let stream_cpu = work.va + (stream_va - AS1_WORK_VA);
+                for (index, word) in stream.iter().enumerate() {
+                    // SAFETY: five words on one line of the streams page in AS1's Normal-NC
+                    // backing buffer.
+                    unsafe { ((stream_cpu + index as u64 * 8) as *mut u64).write_volatile(*word) };
+                }
+                dsb();
+                let call = JobCall {
+                    latest_flush: latest_flush_id(device),
+                    stream_va,
+                    stream_len: (stream.len() * 8) as u32,
+                    sync_va: AS1_SYNC_VA,
+                };
+                let wrapper = match job_wrapper(features, call) {
+                    Ok(words) => words,
+                    Err(error) => {
+                        log(
+                            log_level::ERR,
+                            format_args!(
+                                "drv-gpu: job {} wrapper refused: {:?} (CS features=0x{:08x})\n",
+                                job, error, cs.features
+                            ),
+                        );
+                        let _ = soft_reset(device);
+                        return 1;
+                    }
+                };
+                let (insert, extract) = {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    (
+                        queue_insert(&mut glb_io, iface),
+                        queue_extract(&mut glb_io, iface),
+                    )
+                };
+                let Some(slot) = job_slot(insert, extract, RING_SIZE) else {
+                    log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: job {} has no room in the ring (insert=0x{:x} extract=0x{:x})\n",
+                            job, insert, extract
+                        ),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                };
+                write_job_words(insert, slot, &wrapper, RING_SIZE, |offset, word| {
+                    // SAFETY: `offset` is below RING_SIZE, inside the ring page of AS1's
+                    // Normal-NC backing buffer.
+                    unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
+                });
+                dsb();
+                {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    publish_insert(&mut glb_io, iface, slot.end);
+                }
+                dsb();
+                {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+                }
+                device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+                log(
+                    log_level::INFO,
+                    format_args!(
+                        "drv-gpu: job {} submitted: wrapper 0x{:x}..0x{:x} calls 0x{:x} ({} bytes), flush id 0x{:x}\n",
+                        job, slot.start, slot.end, stream_va, call.stream_len, call.latest_flush
+                    ),
+                );
+
+                let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
+                seqno = loop {
+                    // SAFETY: the sync object is 8-byte aligned in AS1's Normal-NC sync page; one
+                    // 64-bit load sees the GPU's 64-bit add whole.
+                    let seen = unsafe { (sync as *const u64).read_volatile() };
+                    if seen >= job || device.now_ns() >= deadline {
+                        break seen;
+                    }
+                    device.delay_us(100);
+                };
+                // SAFETY: the status word of the same sync object.
+                let status = unsafe { ((sync + SYNC_STATUS_OFFSET) as *const u32).read_volatile() };
+                // SAFETY: job n's target word on its own line of the target page.
+                let landed = unsafe {
+                    ((work.va + (target_va - AS1_WORK_VA)) as *const u32).read_volatile()
+                };
+                if seqno < job {
+                    log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: job {} did not signal within the timeout (seqno={} status=0x{:x} target=0x{:08x})\n",
+                            job, seqno, status, landed
+                        ),
+                    );
+                    report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+
+                // Give the firmware the drain window to consume the wrapper's tail and raise
+                // SYNC_UPDATE, so a missing event reads as "not raised", not "not yet".
+                let drain_deadline = device.now_ns().saturating_add(DRAIN_TIMEOUT_NS);
+                let (consumed, events) = loop {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    let consumed = queue_extract(&mut glb_io, iface);
+                    let events = csg_pending_events(&mut glb_io, csg.input_va, csg.output_va);
+                    if (consumed >= slot.end && events & CSG_EVENTS != 0)
+                        || glb_io.now_ns() >= drain_deadline
+                    {
+                        break (consumed, events);
+                    }
+                    glb_io.delay_us(100);
+                };
+                let job_irqs = job_irq_rawstat(device);
+                clear_job_irqs(device, job_irqs);
+                let (irq_req, irq_ack) = {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    let irq_req = cs_irq_req(&mut glb_io, csg.output_va);
+                    let irq_ack = glb_io.read32(csg.input_va + 0x0C);
+                    ack_cs_irqs(&mut glb_io, csg.input_va, irq_req);
+                    ack_csg_events(&mut glb_io, csg.input_va, csg.output_va, events);
+                    (irq_req, irq_ack)
+                };
+                log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: job {} signalled seqno={} status=0x{:x} target=0x{:08x} extract=0x{:x}\n",
+                        job, seqno, status, landed, consumed
+                    ),
+                );
+                log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: job {} events csg=0x{:08x} cs_irq=0x{:x}/0x{:x} job_irq=0x{:08x} (acknowledged)\n",
+                        job, events, irq_req, irq_ack, job_irqs
+                    ),
+                );
+                if seqno != job || status != 0 || landed != value {
+                    log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: job {} finished wrong (expected seqno={} status=0x0 target=0x{:08x})\n",
+                            job, job, value
+                        ),
+                    );
+                    report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+            }
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}\n",
+                    WRAPPED_JOBS, seqno
+                ),
+            );
 
             log(
                 log_level::INFO,
