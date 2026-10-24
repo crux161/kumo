@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j580
 //j581
 //j583
 //j584
 //j585
+//j586
 
 use core::fmt::{self, Write};
 use drv_gpu::{
@@ -1025,11 +1025,15 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 },
                 suspend_window,
             ];
+            // One source for the queue interface pages: program_queue's ringbuf fields and
+            // publish_insert take the same value, so the host and the firmware cannot disagree
+            // about which page carries insert/extract. — TIMBERDOODLE
+            let queue_iface = QueueIface::at(MCU_IO_PAGES_VA);
             let queue = QueueConfig {
                 ring_va: AS1_WORK_VA,
                 ring_size: RING_SIZE,
-                ring_input_va: MCU_IO_PAGES_VA,
-                ring_output_va: MCU_IO_PAGES_VA + PAGE_SIZE,
+                ring_input_va: queue_iface.input_va,
+                ring_output_va: queue_iface.output_va,
                 doorbell: GROUP_SLOT + 1,
                 priority: 0,
             };
@@ -1153,13 +1157,13 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             dsb();
             {
                 let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                publish_insert(
-                    &mut glb_io,
-                    QueueIface {
-                        input_va: cs.input_va,
-                        output_va: cs.output_va,
-                    },
-                    (stream.len() * 8) as u64,
+                let queue_input_va = queue_iface.input_va;
+                publish_insert(&mut glb_io, queue_iface, (stream.len() * 8) as u64);
+                let insert = u64::from(glb_io.read32(queue_input_va))
+                    | (u64::from(glb_io.read32(queue_input_va + 4)) << 32);
+                log(
+                    log_level::NOTICE,
+                    format_args!("drv-gpu: queue published insert=0x{:x}\n", insert),
                 );
             }
             dsb();
@@ -1237,22 +1241,27 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                             ),
                         );
                     }
+                    let rawstat = mmu_rawstat(device);
                     log(
                         log_level::NOTICE,
-                        format_args!("drv-gpu: MMU rawstat=0x{:08x}\n", mmu_rawstat(device)),
+                        format_args!("drv-gpu: MMU rawstat=0x{:08x}\n", rawstat),
                     );
-                    if let Some(fault) = read_fault_as(device, GROUP_AS) {
-                        log(
-                            log_level::NOTICE,
-                            format_args!(
-                                "drv-gpu: AS{} fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
-                                GROUP_AS,
-                                fault.address,
-                                drv_gpu::exception_name(fault.exception),
-                                fault.access,
-                                fault.raw
-                            ),
-                        );
+                    // Zeroed fault registers decode to "OK Atomic"; print them only when AS1's
+                    // rawstat bit says a fault is actually latched.
+                    if rawstat & (1u32 << GROUP_AS) != 0 {
+                        if let Some(fault) = read_fault_as(device, GROUP_AS) {
+                            log(
+                                log_level::NOTICE,
+                                format_args!(
+                                    "drv-gpu: AS{} fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
+                                    GROUP_AS,
+                                    fault.address,
+                                    drv_gpu::exception_name(fault.exception),
+                                    fault.access,
+                                    fault.raw
+                                ),
+                            );
+                        }
                     }
                     let _ = soft_reset(device);
                     return 1;

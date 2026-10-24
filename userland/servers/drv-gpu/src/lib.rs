@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j581
 //j582
 //j583
 //j584
 //j585
+//j586
 
 //! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1770,6 +1770,17 @@ pub fn start_group(
 pub struct QueueIface {
     pub input_va: u64,
     pub output_va: u64,
+}
+
+impl QueueIface {
+    /// Both interface pages from one base, one page apart (§9.7). The firmware's ringbuf fields
+    /// and the host's `insert` publication take this same value, so they cannot diverge. — TIMBERDOODLE
+    pub const fn at(base: u64) -> Self {
+        Self {
+            input_va: base,
+            output_va: base + PAGE_SIZE,
+        }
+    }
 }
 
 pub fn queue_insert(mem: &mut impl FirmwareMemory, iface: QueueIface) -> u64 {
@@ -3685,6 +3696,13 @@ mod g4b_tests {
         assert_eq!(io.get(0x6008), 0);
         assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&0));
         assert_eq!(io.doorbells, 2);
+    }
+
+    #[test]
+    fn queue_iface_pages_are_one_apart() {
+        let iface = QueueIface::at(0x0410_0000);
+        assert_eq!(iface.input_va, 0x0410_0000);
+        assert_eq!(iface.output_va, 0x0410_1000);
     }
 
     #[test]
