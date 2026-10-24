@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j565
 //j567
 //j568
 //j569
 //j572
+//j579
 
 extern crate alloc;
 
@@ -737,15 +737,29 @@ fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
         );
         return;
     }
+    // G3b: the driver reads the vendored firmware from the initrd itself. Grant it read-only and
+    // transfer it beside the Resource in x1; `find_entry` needs only the header and entry table,
+    // and the payload is copied in 256-byte VmoRead chunks.
+    let firmware = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
+    if firmware == u64::MAX {
+        let _ = handle_close(Handle(resource as u32));
+        let _ = kumo_rt::log_write(
+            kumo_abi::sys::log_level::ERR,
+            b"drv-gpu: initrd grant failed\n",
+        );
+        return;
+    }
     if !run_elf(
         initrd,
         DRV_GPU_PATH.as_bytes(),
         resource,
-        0,
-        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits(),
+        firmware,
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits(),
         b"drv-gpu",
     ) {
         let _ = handle_close(Handle(resource as u32));
+        let _ = handle_close(Handle(firmware as u32));
         let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, b"drv-gpu: launch failed\n");
     }
 }

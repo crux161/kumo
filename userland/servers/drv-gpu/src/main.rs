@@ -5,23 +5,32 @@
 //j574
 //j575
 //j576
+//j579
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    enable_as0, exception_name, install_mapping, mcu_fault, mmu_info, power_l2, probe, quiet_mmu,
-    soft_reset, ClockIo, Completion, CompletionIo, Mapping, MmioIo, ProbeError, ProbeIo, ResetPath,
-    TableWriter, APERTURE_BASE, APERTURE_LEN, PAGE_SIZE, PAGE_TABLE_ENTRIES,
+    enable_as0, latched_fault, map_range, mcu_boot, mmu_info, power_l2, probe, quiet_mmu,
+    soft_reset, ClockIo, Completion, CompletionIo, Firmware, GlobalInterface, MmioIo, ProbeError,
+    ProbeIo, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN,
+    CSF_SHARED_REGION_START, PAGE_SIZE,
+};
+use kumo_abi::initrd::{
+    find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
 };
 use kumo_abi::{sys::log_level, DevicePowerStatus, Errno, Handle, Status, VmarFlags};
 
 kumo_rt::entry!(main);
 
 const MMIO_VA: u64 = 0x1100_0000;
-/// Four 4 KiB translation tables (L0-L3) plus one scratch page the deliberate mapping points
-/// at. RESEARCH/009 §7.2: 48 VA bits with a 4 KiB granule is four levels, so every table has
-/// 512 eight-byte entries.
-const TABLE_PAGES: u64 = 4;
-const DMA_PAGES: u64 = TABLE_PAGES + 1;
+/// The vendored image is 282624 bytes. The staging buffer lives in BSS, so the ELF loader maps it
+/// zero-filled and the initrd does not carry it.
+const FIRMWARE_MAX: usize = 320 * 1024;
+/// Seven loadable sections need L0, L1, L2 and one L3 per 2 MiB region the image touches: nine
+/// tables for the vendored image, with room to spare.
+const TABLE_ARENA_LEN: u64 = 16 * PAGE_SIZE;
+const MAX_SECTIONS: usize = 8;
+
+static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
 /// From G2a on the aperture is mapped writable Device memory: reset, L2 and MMU writes land here.
 struct Device {
@@ -31,74 +40,71 @@ struct Device {
     timer: Option<Handle>,
 }
 
-/// One contiguous DMA allocation holding address space 0's tables and the scratch page a
-/// deliberate mapping points at. The CPU sees it Normal-NC through an uncached userspace map;
-/// the GPU walks it through the physical addresses returned by the allocation.
-struct Dma {
+/// One contiguous DMA allocation mapped Normal-NC into this process. The GPU sees `phys`; the CPU
+/// writes through `va` with volatile stores only (the J539/J540 noalias lesson).
+#[derive(Clone, Copy)]
+struct Mapping {
+    /// Kept open for the life of the process: the handle is what keeps the VMO (and the
+    /// firmware's memory) alive; nothing reads it after the mapping is made.
+    #[allow(dead_code)]
     handle: Handle,
     va: u64,
     phys: u64,
 }
 
-impl Dma {
-    fn new() -> Option<Self> {
-        let len = DMA_PAGES * PAGE_SIZE;
-        let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
-        let handle = valid_handle(raw)?;
-        let (status, va) = kumo_rt::vmar_map_anywhere(
-            handle,
-            len,
-            (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
-        );
-        if status != 0 || va == 0 || va & (PAGE_SIZE - 1) != 0 {
-            let _ = kumo_rt::handle_close(handle);
-            return None;
-        }
-        Some(Self { handle, va, phys })
+fn map_contiguous(len: u64) -> Option<Mapping> {
+    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
+    let handle = valid_handle(raw)?;
+    let (status, va) = kumo_rt::vmar_map_anywhere(
+        handle,
+        len,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+    );
+    if status != 0 || va == 0 || va & (PAGE_SIZE - 1) != 0 {
+        let _ = kumo_rt::handle_close(handle);
+        return None;
     }
+    Some(Mapping { handle, va, phys })
+}
 
-    /// Zero every table and the scratch page with volatile stores: these bytes are
-    /// device-visible DMA memory, never compiler-visible slices (the J539/J540 noalias lesson).
-    fn zero(&self) {
-        for page in 0..DMA_PAGES {
-            for index in 0..PAGE_TABLE_ENTRIES {
-                // SAFETY: aligned u64 inside the mapped DMA VMO.
-                unsafe { self.entry(page, index).write_volatile(0) };
-            }
-        }
-    }
-
-    fn write_entry(&self, level: u32, index: usize, value: u64) {
-        // SAFETY: as `zero`; `level` is 0-3, one of the four table pages.
-        unsafe { self.entry(u64::from(level), index).write_volatile(value) };
-    }
-
-    fn entry(&self, page: u64, index: usize) -> *mut u64 {
-        (self.va as usize + page as usize * PAGE_SIZE as usize + index * 8) as *mut u64
-    }
-
-    fn table_phys(&self) -> [u64; 4] {
-        [
-            self.phys,
-            self.phys + PAGE_SIZE,
-            self.phys + 2 * PAGE_SIZE,
-            self.phys + 3 * PAGE_SIZE,
-        ]
-    }
-
-    fn scratch_phys(&self) -> u64 {
-        self.phys + TABLE_PAGES * PAGE_SIZE
+fn zero_mapping(mapping: &Mapping, len: u64) {
+    for offset in 0..len {
+        // SAFETY: byte inside the mapped DMA VMO.
+        unsafe { ((mapping.va + offset) as *mut u8).write_volatile(0) };
     }
 }
 
-struct Tables<'a> {
-    dma: &'a Dma,
+fn copy_mapping(mapping: &Mapping, bytes: &[u8]) {
+    for (offset, byte) in bytes.iter().enumerate() {
+        // SAFETY: byte inside the mapped DMA VMO.
+        unsafe { ((mapping.va + offset as u64) as *mut u8).write_volatile(*byte) };
+    }
 }
 
-impl TableWriter for Tables<'_> {
-    fn write_entry(&mut self, level: u32, index: usize, value: u64) {
-        self.dma.write_entry(level, index, value);
+/// Page-table access for the library's mapper: every physical address it asks about lies in the
+/// arena's contiguous VMO, so a subtraction maps it into this process's uncached window.
+struct TableDma {
+    arena: Mapping,
+}
+
+impl TableMemory for TableDma {
+    fn read64(&mut self, phys: u64) -> u64 {
+        // SAFETY: as `write64`.
+        unsafe { ((self.arena.va + (phys - self.arena.phys)) as *const u64).read_volatile() }
     }
+
+    fn write64(&mut self, phys: u64, value: u64) {
+        // SAFETY: the library only passes arena physical addresses, 8-byte aligned inside the VMO.
+        unsafe { ((self.arena.va + (phys - self.arena.phys)) as *mut u64).write_volatile(value) };
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Loaded {
+    va: u64,
+    len: u64,
+    mapping: Mapping,
+    flags: SectionFlags,
 }
 
 /// Handle-returning syscalls report failure as a negative status; 0 is never a valid handle.
@@ -289,9 +295,45 @@ fn log(level: u8, args: fmt::Arguments<'_>) {
     let _ = kumo_rt::log_write(level, &line.bytes[..line.len]);
 }
 
-/// G2b: after the reset, power the L2 and run the MMU experiment. Each step logs at its own
-/// level; the NOTICE lines are the ones a boot report can rely on.
-fn run_mali(device: &mut Device) -> u8 {
+/// Copy `dest.len()` bytes from the initrd VMO, `VmoRead`'s 256-byte cap at a time.
+fn read_initrd(initrd: Handle, offset: u64, dest: &mut [u8]) -> bool {
+    let mut copied = 0usize;
+    while copied < dest.len() {
+        let chunk = (dest.len() - copied).min(256);
+        // SAFETY: `copied < dest.len()` and `chunk` stays inside the slice.
+        let ptr = unsafe { dest.as_mut_ptr().add(copied) };
+        if kumo_rt::vmo_read(initrd, offset + copied as u64, ptr, chunk) != 0 {
+            return false;
+        }
+        copied += chunk;
+    }
+    true
+}
+
+/// Read the initrd header and entry table into `table`, returning the table's byte length.
+fn read_initrd_table(initrd: Handle, table: &mut [u8; INITRD_TABLE_MAX]) -> Option<usize> {
+    if !read_initrd(initrd, 0, &mut table[..INITRD_HEADER_LEN]) {
+        return None;
+    }
+    let count = u32::from_le_bytes([table[12], table[13], table[14], table[15]]) as usize;
+    let table_bytes = INITRD_HEADER_LEN.checked_add(count.checked_mul(INITRD_ENTRY_LEN)?)?;
+    if table_bytes > INITRD_TABLE_MAX {
+        return None;
+    }
+    if !read_initrd(
+        initrd,
+        INITRD_HEADER_LEN as u64,
+        &mut table[INITRD_HEADER_LEN..table_bytes],
+    ) {
+        return None;
+    }
+    Some(table_bytes)
+}
+
+/// G3b: after the reset, read the vendored firmware out of the initrd, map its sections into
+/// address space 0 with their own flags, boot the MCU, and validate the global interface the
+/// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
+fn run_mali(device: &mut Device, initrd: Handle) -> u8 {
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
             log_level::NOTICE,
@@ -356,24 +398,174 @@ fn run_mali(device: &mut Device) -> u8 {
         }
     }
 
-    let Some(dma) = Dma::new() else {
+    // The launcher granted this process a read-only initrd: find the vendored image, copy it in
+    // 256-byte VmoRead chunks, and validate it before any GPU state depends on it.
+    let mut table = [0u8; INITRD_TABLE_MAX];
+    let Some(table_bytes) = read_initrd_table(initrd, &mut table) else {
         log(
             log_level::ERR,
-            format_args!("drv-gpu: contiguous DMA allocation failed\n"),
+            format_args!("drv-gpu: initrd table unreadable\n"),
         );
         return 1;
     };
+    let entry = match find_entry(&table[..table_bytes], MALI_FIRMWARE_PATH) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: firmware image missing from the initrd\n"),
+            );
+            return 1;
+        }
+        Err(_) => {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: initrd entry table invalid\n"),
+            );
+            return 1;
+        }
+    };
+    if entry.len as usize > FIRMWARE_MAX {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: firmware image larger than the staging buffer\n"),
+        );
+        return 1;
+    }
+    // SAFETY: one driver process, and the staging buffer is only used during this boot.
+    let buffer = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(FIRMWARE_IMAGE) as *mut u8,
+            FIRMWARE_MAX,
+        )
+    };
+    if !read_initrd(initrd, entry.offset, &mut buffer[..entry.len as usize]) {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: firmware image unreadable\n"),
+        );
+        return 1;
+    }
+    let firmware = match Firmware::parse(&buffer[..entry.len as usize]) {
+        Ok(firmware) => firmware,
+        Err(error) => {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: firmware parse failed: {:?}\n", error),
+            );
+            return 1;
+        }
+    };
+    let build = firmware
+        .build_sha()
+        .and_then(|sha| core::str::from_utf8(sha).ok())
+        .unwrap_or("unknown");
     log(
         log_level::INFO,
         format_args!(
-            "drv-gpu: AS0 tables phys=0x{:x} mapped=0x{:x}\n",
-            dma.phys, dma.va
+            "drv-gpu: firmware image {}b, version hash 0x{:08x}, build {}\n",
+            entry.len,
+            firmware.version_hash(),
+            build
         ),
     );
-    dma.zero();
+
+    // Page tables come from one contiguous arena; every loadable section gets its own contiguous
+    // allocation, zero-filled and then initialized from the image.
+    let Some(arena_mapping) = map_contiguous(TABLE_ARENA_LEN) else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: table arena allocation failed\n"),
+        );
+        return 1;
+    };
+    zero_mapping(&arena_mapping, TABLE_ARENA_LEN);
+    let mut table_memory = TableDma {
+        arena: arena_mapping,
+    };
+    let Some(mut arena) = TableArena::new(arena_mapping.phys, TABLE_ARENA_LEN) else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: table arena rejected\n"),
+        );
+        return 1;
+    };
+    let Some(transtab) = arena.alloc_table(&mut table_memory) else {
+        log(log_level::ERR, format_args!("drv-gpu: no L0 table\n"));
+        return 1;
+    };
+
+    let mut loaded: [Option<Loaded>; MAX_SECTIONS] = [None; MAX_SECTIONS];
+    let mut count = 0usize;
+    for section in firmware.loadable() {
+        if count == MAX_SECTIONS {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: more firmware sections than the loader holds\n"),
+            );
+            let _ = soft_reset(device);
+            return 1;
+        }
+        let Some(mapping) = map_contiguous(section.len) else {
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: section at VA=0x{:016x} allocation failed\n",
+                    section.va
+                ),
+            );
+            let _ = soft_reset(device);
+            return 1;
+        };
+        zero_mapping(&mapping, section.len);
+        copy_mapping(&mapping, section.data);
+        let attrs = section.flags.page_attrs();
+        if let Err(error) = map_range(
+            &mut table_memory,
+            &mut arena,
+            transtab,
+            section.va,
+            mapping.phys,
+            section.len,
+            attrs,
+        ) {
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: section at VA=0x{:016x} map failed: {:?}\n",
+                    section.va, error
+                ),
+            );
+            let _ = soft_reset(device);
+            return 1;
+        }
+        loaded[count] = Some(Loaded {
+            va: section.va,
+            len: section.len,
+            mapping,
+            flags: section.flags,
+        });
+        count += 1;
+    }
+    if count == 0 {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: no loadable firmware sections\n"),
+        );
+        let _ = soft_reset(device);
+        return 1;
+    }
     dsb();
+    log(
+        log_level::INFO,
+        format_args!(
+            "drv-gpu: {} sections loaded, transtab=0x{:x} arena=0x{:x}\n",
+            count, transtab, arena_mapping.phys
+        ),
+    );
+
     quiet_mmu(device);
-    if let Err(error) = enable_as0(device, dma.phys, mmu.va_bits) {
+    if let Err(error) = enable_as0(device, transtab, mmu.va_bits) {
         log(
             log_level::ERR,
             format_args!("drv-gpu: AS0 enable failed: {:?}\n", error),
@@ -383,146 +575,117 @@ fn run_mali(device: &mut Device) -> u8 {
     log(
         log_level::NOTICE,
         format_args!(
-            "drv-gpu: AS0 online, transtab=0x{:x} va={} pa={}\n",
-            dma.phys, mmu.va_bits, mmu.pa_bits
+            "drv-gpu: AS0 online, transtab=0x{:x} sections={}\n",
+            transtab, count
         ),
     );
 
-    // Stage 1: the MCU's first fetch goes through empty tables, so address space 0 must fault.
-    let first = match mcu_fault(device) {
-        Ok(observed) => observed.fault,
+    match mcu_boot(device) {
+        Ok(observed) => log(
+            log_level::INFO,
+            format_args!(
+                "drv-gpu: MCU boot completed ({:?}), rawstat=0x{:08x}\n",
+                observed.completion, observed.rawstat
+            ),
+        ),
         Err(error) => {
             log(
                 log_level::ERR,
-                format_args!(
-                    "drv-gpu: the deliberate fault was not observed: {:?}\n",
-                    error
-                ),
+                format_args!("drv-gpu: firmware boot failed: {:?}\n", error),
             );
+            if let Some(fault) = latched_fault(device) {
+                log(
+                    log_level::ERR,
+                    format_args!(
+                        "drv-gpu: AS0 fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
+                        fault.address,
+                        drv_gpu::exception_name(fault.exception),
+                        fault.access,
+                        fault.raw
+                    ),
+                );
+            }
             let _ = soft_reset(device);
             return 1;
         }
+    }
+
+    let shared = loaded[..count]
+        .iter()
+        .flatten()
+        .find(|section| section.va == CSF_SHARED_REGION_START);
+    let Some(shared) = shared else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: no shared firmware section was loaded\n"),
+        );
+        let _ = soft_reset(device);
+        return 1;
     };
-    log(
-        log_level::NOTICE,
-        format_args!(
-            "drv-gpu: deliberate fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
-            first.address,
-            exception_name(first.exception),
-            first.access,
-            first.raw
-        ),
-    );
-
-    // Containment: the firmware-less MCU does not stop on `MCU_CONTROL = DISABLE`. Metal (J575)
-    // kept MCU_STATUS = ENABLED for the full 100 ms: the stop path expects the halt handshake
-    // only firmware can acknowledge (RESEARCH/009 §8.7). Contain with the G2a soft reset
-    // instead; metal proved it takes the GPU down even while the MCU is faulting, and a reset
-    // leaves the L2 off, every address space unconfigured and the MCU stopped (§6.3).
-    if let Err(error) = soft_reset(device) {
-        log(
-            log_level::ERR,
-            format_args!("drv-gpu: containment reset failed: {:?}\n", error),
-        );
-        return 1;
+    let mut control = [0u32; 8];
+    for (index, word) in control.iter_mut().enumerate() {
+        // SAFETY: the control block sits at the start of the shared section, which this process
+        // maps Normal-NC; volatile reads see the MCU's stores.
+        *word = unsafe { ((shared.mapping.va + index as u64 * 4) as *const u32).read_volatile() };
     }
-    log(
-        log_level::NOTICE,
-        format_args!("drv-gpu: fault contained by soft reset (the MCU does not stop on DISABLE)\n"),
-    );
-
-    // Recovery: a reset powers the L2 down and unconfigures every space, so redo both. If the
-    // faulting VA is inside the 48-bit window, point its page at the zero-filled scratch page
-    // first: metal (J575) showed the MCU's first access through AS0 is a read at VA 0 — its
-    // vector table — so a zero page there should carry it into execution and move the next
-    // fault to the page after it.
-    let mappable = first.address < (1u64 << 48);
-    if mappable {
-        let page = first.address & !(PAGE_SIZE - 1);
-        install_mapping(
-            &mut Tables { dma: &dma },
-            Mapping {
-                va: page,
-                pa: dma.scratch_phys(),
-                cached: false,
-                readonly: false,
-                noexec: false,
-            },
-            dma.table_phys(),
-        );
-        dsb();
-        log(
-            log_level::INFO,
-            format_args!(
-                "drv-gpu: mapped 4 KiB at VA=0x{:016x} for the retry\n",
-                page
-            ),
-        );
-    }
-    quiet_mmu(device);
-    if let Err(error) = enable_as0(device, dma.phys, mmu.va_bits) {
-        log(
-            log_level::ERR,
-            format_args!("drv-gpu: AS0 re-enable failed: {:?}\n", error),
-        );
-        return 1;
-    }
-    log(
-        log_level::NOTICE,
-        format_args!("drv-gpu: AS0 re-enabled after the fault\n"),
-    );
-
-    let second = if mappable {
-        match mcu_fault(device) {
-            Ok(observed) => Some(observed.fault),
-            Err(error) => {
-                log(
-                    log_level::ERR,
-                    format_args!("drv-gpu: the retry fault was not observed: {:?}\n", error),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Leave the GPU in the reset state: the final reset stops the running MCU and unconfigures
-    // AS0, which is the only clean shutdown available without firmware.
-    let clean = soft_reset(device);
-    let _ = kumo_rt::handle_close(dma.handle);
-    if let Err(error) = clean {
-        log(
-            log_level::ERR,
-            format_args!("drv-gpu: final reset failed: {:?}\n", error),
-        );
-        return 1;
-    }
-
-    if let Some(second) = second {
-        if second.address != first.address {
+    match GlobalInterface::read(control, shared.va, shared.len) {
+        Ok(glb) => {
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: the mapped page translated; the next fault moved to VA=0x{:016x}\n",
-                    second.address
+                    "drv-gpu: firmware v{}.{}.{} running, features=0x{:08x}\n",
+                    glb.major(),
+                    glb.minor(),
+                    glb.patch(),
+                    glb.features
                 ),
             );
-        } else {
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: global interface groups={} stride=0x{:x} in=0x{:x} out=0x{:x} flags=0x{:08x}\n",
+                    glb.group_num,
+                    glb.group_stride,
+                    glb.input_va,
+                    glb.output_va,
+                    shared.flags.0
+                ),
+            );
+            log(
+                log_level::INFO,
+                format_args!("drv-gpu: GPU resident; firmware keeps the device until reboot\n"),
+            );
+            park()
+        }
+        Err(error) => {
             log(
                 log_level::ERR,
-                format_args!(
-                    "drv-gpu: the second fault was at the same VA (0x{:016x}); the mapping did not take\n",
-                    second.address
-                ),
+                format_args!("drv-gpu: global interface invalid: {:?}\n", error),
             );
+            let _ = soft_reset(device);
+            1
         }
     }
-    0
+}
+
+/// The firmware runs on memory this process owns: exiting would free the sections under the MCU.
+/// Park instead, waking only to sleep again if the empty port ever returns without a signal.
+fn park() -> ! {
+    if let Some(port) = valid_handle(kumo_rt::port_create()) {
+        loop {
+            let source = kumo_rt::port_wait(port);
+            if source == 0 {
+                let _ = kumo_rt::sleep_ns(1_000_000_000);
+            }
+        }
+    }
+    loop {
+        let _ = kumo_rt::sleep_ns(1_000_000_000);
+    }
 }
 
 #[no_mangle]
-extern "C" fn main(resource: u64) -> ! {
+extern "C" fn main(resource: u64, initrd: u64) -> ! {
     let mut device = Device {
         resource: Handle(resource as u32),
         interrupt: None,
@@ -553,7 +716,7 @@ extern "C" fn main(resource: u64) -> ! {
                     identity.shader_present
                 ),
             );
-            run_mali(&mut device)
+            run_mali(&mut device, Handle(initrd as u32))
         }
         Err(ProbeError::PowerUp(status)) if status == Errno::NotSupported.status() => {
             log(

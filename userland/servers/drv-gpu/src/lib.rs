@@ -1,17 +1,17 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j574
 //j575
 //j576
 //j577
 //j578
+//j579
 
 //! G1b–G3a: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
-//! builds address space 0 in contiguous DMA memory, and runs the MCU against those tables so a
-//! deliberate fault and its containment are observed. G3a adds a parse-only CSF image parser;
-//! loading its sections and booting the MCU wait on CRUX's firmware decision (PLAN/013 #1).
+//! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
+//! its sections into address space 0, boots the MCU, and validates the global interface the
+//! firmware publishes when it comes up.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -1077,6 +1077,288 @@ impl<'a> Iterator for Sections<'a> {
         }
         None
     }
+}
+
+// ---- G3b: loading the firmware into address space 0 (RESEARCH/009 §7.2/§7.5/§8.6/§9.3) ----
+
+/// Physical access to page-table memory. The driver implements this over an uncached DMA mapping
+/// of the table arena; host tests implement it over their own store.
+pub trait TableMemory {
+    fn read64(&mut self, phys: u64) -> u64;
+    fn write64(&mut self, phys: u64, value: u64);
+}
+
+/// A bump allocator over one contiguous physical range of 4 KiB tables. Tables are zeroed when
+/// handed out, so a fresh walk always starts from invalid entries. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableArena {
+    next: u64,
+    end: u64,
+}
+
+impl TableArena {
+    pub fn new(base_phys: u64, len: u64) -> Option<Self> {
+        if base_phys % PAGE_SIZE != 0 || len < PAGE_SIZE || len % PAGE_SIZE != 0 {
+            return None;
+        }
+        Some(Self {
+            next: base_phys,
+            end: base_phys.checked_add(len)?,
+        })
+    }
+
+    /// Hand out and zero one table. The first call is the caller's L0 (the `TRANSTAB` value).
+    pub fn alloc_table(&mut self, memory: &mut impl TableMemory) -> Option<u64> {
+        if self.next >= self.end {
+            return None;
+        }
+        let table = self.next;
+        self.next += PAGE_SIZE;
+        zero_table(memory, table);
+        Some(table)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableError {
+    /// The arena has no free table.
+    OutOfTables,
+    /// The range is empty, unaligned, or leaves the 48-bit window.
+    Range { va: u64, len: u64 },
+    /// An entry that must be a table is a block descriptor.
+    Collision { level: u32 },
+}
+
+/// The attributes a leaf page is mapped with (RESEARCH/009 §7.2; panthor's map flags).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageAttrs {
+    pub cached: bool,
+    pub readonly: bool,
+    pub executable: bool,
+}
+
+impl SectionFlags {
+    /// RESEARCH/009 §8.4: read-only unless WR, no-execute unless EX, uncached unless the cache
+    /// mode is CACHED. PROT handling stays with the caller, which skips those sections.
+    pub const fn page_attrs(self) -> PageAttrs {
+        PageAttrs {
+            cached: self.cached(),
+            readonly: !self.writable(),
+            executable: self.executable(),
+        }
+    }
+}
+
+fn zero_table(memory: &mut impl TableMemory, phys: u64) {
+    for index in 0..PAGE_TABLE_ENTRIES {
+        memory.write64(phys + index as u64 * 8, 0);
+    }
+}
+
+/// Walk (and allocate) the chain from `transtab` to the table holding `va`'s entries at `target`
+/// level (3 for 4 KiB pages). Existing table descriptors are reused, so ranges sharing a parent
+/// share its tables. — TIMBERDOODLE
+fn resolve_table(
+    memory: &mut impl TableMemory,
+    arena: &mut TableArena,
+    transtab: u64,
+    va: u64,
+    target: u32,
+) -> Result<u64, TableError> {
+    let mut table = transtab;
+    for level in 0..target {
+        let entry = table + table_index(va, level) as u64 * 8;
+        let value = memory.read64(entry);
+        table = if value == 0 {
+            let next = arena.alloc_table(memory).ok_or(TableError::OutOfTables)?;
+            memory.write64(entry, table_descriptor(next));
+            next
+        } else if value & 0b11 == 0b11 {
+            value & PHYSICAL_ADDRESS_MASK
+        } else {
+            return Err(TableError::Collision { level });
+        };
+    }
+    Ok(table)
+}
+
+/// Map `len` bytes at `pa` to `va` through `transtab`, one 4 KiB page at a time, allocating
+/// intermediate tables from `arena`. Only pages are produced; panthor's 2 MiB blocks are not
+/// needed by a firmware image whose sections are page-granular. — TIMBERDOODLE
+pub fn map_range(
+    memory: &mut impl TableMemory,
+    arena: &mut TableArena,
+    transtab: u64,
+    va: u64,
+    pa: u64,
+    len: u64,
+    attrs: PageAttrs,
+) -> Result<(), TableError> {
+    let Some(end) = va.checked_add(len) else {
+        return Err(TableError::Range { va, len });
+    };
+    if len == 0
+        || va % PAGE_SIZE != 0
+        || pa % PAGE_SIZE != 0
+        || len % PAGE_SIZE != 0
+        || end > (1u64 << 48)
+        || pa.checked_add(len).is_none()
+    {
+        return Err(TableError::Range { va, len });
+    }
+    let mut offset = 0u64;
+    while offset < len {
+        let page_va = va + offset;
+        let table = resolve_table(memory, arena, transtab, page_va, 3)?;
+        memory.write64(
+            table + table_index(page_va, 3) as u64 * 8,
+            page_descriptor(pa + offset, attrs.cached, attrs.readonly, !attrs.executable),
+        );
+        offset += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+impl<'a> Firmware<'a> {
+    /// The sections G3b loads: panthor skips PROT entries, and a zero-length VA range allocates
+    /// nothing (RESEARCH/009 §8.4).
+    pub fn loadable(&self) -> impl Iterator<Item = FirmwareSection<'a>> {
+        self.sections()
+            .filter(|section| !section.flags.contains(SectionFlags::PROT) && section.len != 0)
+    }
+}
+
+// RESEARCH/009 §4.5: the JOB block (INTID 124).
+const JOB_INT_RAWSTAT: u32 = 0x1000;
+const JOB_INT_CLEAR: u32 = 0x1004;
+const JOB_INT_MASK: u32 = 0x1008;
+const JOB_INT_STAT: u32 = 0x100c;
+const JOB_IRQ_GLOBAL_IF: u32 = 1 << 31;
+pub const JOB_IRQ: u32 = IRQ_BASE;
+/// RESEARCH/009 §8.6: panthor gives the firmware boot one second.
+pub const BOOT_TIMEOUT_NS: u64 = 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootObserved {
+    pub completion: Completion,
+    pub rawstat: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootError {
+    /// The boot wait could not be armed; the MCU was not started.
+    Arm(Status),
+    /// No global-interface interrupt, and `JOB_INT_STAT` does not show it either.
+    Timeout { rawstat: u32, mcu_status: u32 },
+    /// The wait fired, but neither the raw nor the masked status shows the global bit.
+    UnexpectedCompletion { rawstat: u32, stat: u32 },
+}
+
+/// RESEARCH/009 §8.6 steps 1-4: clear and unmask the JOB block, arm the boot wait **before**
+/// starting the MCU, and require the global-interface bit, with panthor's `JOB_INT_STAT`
+/// recheck after the timeout. The line is quieted afterwards; G4 takes over the per-group
+/// interrupts. — TIMBERDOODLE
+pub fn mcu_boot(io: &mut (impl MmioIo + CompletionIo)) -> Result<BootObserved, BootError> {
+    io.arm_completion(JOB_IRQ, BOOT_TIMEOUT_NS)
+        .map_err(BootError::Arm)?;
+    io.write32(JOB_INT_CLEAR, u32::MAX);
+    io.write32(JOB_INT_MASK, u32::MAX);
+    io.write32(MCU_CONTROL, MCU_CONTROL_AUTO);
+    let completion = io.wait_completion();
+    let rawstat = io.read32(JOB_INT_RAWSTAT);
+    let stat = io.read32(JOB_INT_STAT);
+    io.write32(JOB_INT_CLEAR, JOB_IRQ_GLOBAL_IF);
+    io.write32(JOB_INT_MASK, 0);
+    io.complete();
+    if rawstat & JOB_IRQ_GLOBAL_IF != 0 || stat & JOB_IRQ_GLOBAL_IF != 0 {
+        return Ok(BootObserved {
+            completion,
+            rawstat,
+        });
+    }
+    match completion {
+        Completion::Fired => Err(BootError::UnexpectedCompletion { rawstat, stat }),
+        Completion::TimedOut => Err(BootError::Timeout {
+            rawstat,
+            mcu_status: io.read32(MCU_STATUS),
+        }),
+    }
+}
+
+/// RESEARCH/009 §9.3: the global control block at the start of the shared section, in the
+/// firmware's MCU address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlobalInterface {
+    pub version: u32,
+    pub features: u32,
+    pub input_va: u64,
+    pub output_va: u64,
+    pub group_num: u32,
+    pub group_stride: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlbError {
+    /// Version 0 means the firmware never wrote the interface.
+    NotBooted,
+    InputOutside,
+    OutputOutside,
+    GroupCount {
+        group_num: u32,
+    },
+}
+
+impl GlobalInterface {
+    /// Validate the control words against the shared section (RESEARCH/009 §8.6 step 5/§9.3).
+    pub fn read(control: [u32; 8], shared_va: u64, shared_len: u64) -> Result<Self, GlbError> {
+        let version = control[0];
+        if version == 0 {
+            return Err(GlbError::NotBooted);
+        }
+        let inside = |va: u64| va >= shared_va && va < shared_va.saturating_add(shared_len);
+        let input_va = u64::from(control[2]);
+        let output_va = u64::from(control[3]);
+        if !inside(input_va) {
+            return Err(GlbError::InputOutside);
+        }
+        if !inside(output_va) {
+            return Err(GlbError::OutputOutside);
+        }
+        let group_num = control[4];
+        if !(3..=31).contains(&group_num) {
+            return Err(GlbError::GroupCount { group_num });
+        }
+        Ok(Self {
+            version,
+            features: control[1],
+            input_va,
+            output_va,
+            group_num,
+            group_stride: control[5],
+        })
+    }
+
+    pub const fn major(self) -> u8 {
+        (self.version >> 24) as u8
+    }
+
+    pub const fn minor(self) -> u8 {
+        (self.version >> 16) as u8
+    }
+
+    pub const fn patch(self) -> u16 {
+        self.version as u16
+    }
+}
+
+/// The address-space-0 fault currently latched in `MMU_INT_RAWSTAT`, if any (§4.5/§5.1).
+pub fn latched_fault(io: &mut impl MmioIo) -> Option<Fault> {
+    if io.read32(MMU_INT_RAWSTAT) & MMU_AS0_FAULT_BIT == 0 {
+        return None;
+    }
+    let raw = io.read32(AS_FAULTSTATUS);
+    let address = read64(io, AS_FAULTADDRESS, AS_FAULTADDRESS + 4);
+    Some(decode_fault(raw, address))
 }
 
 #[cfg(test)]
@@ -2163,5 +2445,400 @@ mod fw_tests {
         assert!(shared[0]
             .flags
             .contains(SectionFlags::SHARED | SectionFlags::ZERO));
+    }
+}
+
+#[cfg(test)]
+mod g3b_tests {
+    extern crate std;
+    use super::*;
+    use std::collections::HashMap;
+    use std::vec::Vec;
+
+    struct FakeMemory {
+        words: HashMap<u64, u64>,
+    }
+
+    impl FakeMemory {
+        fn new() -> Self {
+            Self {
+                words: HashMap::new(),
+            }
+        }
+
+        fn get(&self, phys: u64) -> u64 {
+            *self.words.get(&phys).unwrap_or(&0)
+        }
+    }
+
+    impl TableMemory for FakeMemory {
+        fn read64(&mut self, phys: u64) -> u64 {
+            self.get(phys)
+        }
+
+        fn write64(&mut self, phys: u64, value: u64) {
+            self.words.insert(phys, value);
+        }
+    }
+
+    const ARENA: u64 = 0x10_0000;
+    const ARENA_LEN: u64 = 0x1_0000;
+
+    fn arena() -> (FakeMemory, TableArena, u64) {
+        let mut memory = FakeMemory::new();
+        let mut arena = TableArena::new(ARENA, ARENA_LEN).unwrap();
+        let l0 = arena.alloc_table(&mut memory).unwrap();
+        (memory, arena, l0)
+    }
+
+    fn attrs() -> PageAttrs {
+        PageAttrs {
+            cached: true,
+            readonly: false,
+            executable: true,
+        }
+    }
+
+    #[test]
+    fn map_range_links_levels_and_reuses_parent_tables() {
+        let (mut memory, mut arena, l0) = arena();
+        assert_eq!(l0, ARENA);
+        assert_eq!(
+            map_range(
+                &mut memory,
+                &mut arena,
+                l0,
+                0x0400_0000,
+                0x0020_0000,
+                0x2000,
+                attrs()
+            ),
+            Ok(())
+        );
+        assert_eq!(memory.get(l0), 0x10_1003);
+        assert_eq!(memory.get(0x10_1000), 0x10_2003);
+        assert_eq!(memory.get(0x10_2000 + 0x20 * 8), 0x10_3003);
+        assert_eq!(memory.get(0x10_3000), 0x0020_0f47);
+        assert_eq!(memory.get(0x10_3008), 0x0020_1f47);
+
+        // A second page in the same 2 MiB region reuses the L3 table.
+        assert_eq!(
+            map_range(
+                &mut memory,
+                &mut arena,
+                l0,
+                0x0400_2000,
+                0x0030_0000,
+                0x1000,
+                attrs()
+            ),
+            Ok(())
+        );
+        assert_eq!(memory.get(0x10_3000 + 2 * 8), 0x0030_0f47);
+        assert_eq!(memory.get(0x10_2000 + 0x20 * 8), 0x10_3003);
+
+        // A page in the next 2 MiB region allocates one more L3 table.
+        assert_eq!(
+            map_range(
+                &mut memory,
+                &mut arena,
+                l0,
+                0x0420_0000,
+                0x0040_0000,
+                0x1000,
+                attrs()
+            ),
+            Ok(())
+        );
+        assert_eq!(memory.get(0x10_2000 + 0x21 * 8), 0x10_4003);
+        assert_eq!(memory.get(0x10_4000), 0x0040_0f47);
+    }
+
+    #[test]
+    fn map_range_applies_read_only_and_no_execute_attributes() {
+        let (mut memory, mut arena, l0) = arena();
+        let attrs = PageAttrs {
+            cached: false,
+            readonly: true,
+            executable: false,
+        };
+        assert_eq!(
+            map_range(
+                &mut memory,
+                &mut arena,
+                l0,
+                0x0100_0000,
+                0x0050_0000,
+                0x1000,
+                attrs
+            ),
+            Ok(())
+        );
+        assert_eq!(memory.get(0x10_2000 + 0x8 * 8), 0x10_3003);
+        assert_eq!(memory.get(0x10_3000), 0x0060_0000_0050_0ec3);
+    }
+
+    #[test]
+    fn map_range_refuses_bad_ranges() {
+        let (mut memory, mut arena, l0) = arena();
+        for (va, pa, len) in [
+            (0x1000, 0x2000, 0),
+            (0x1001, 0x2000, 0x1000),
+            (0x1000, 0x2001, 0x1000),
+            (0x1000, 0x2000, 0x800),
+            (1u64 << 48, 0x2000, 0x1000),
+        ] {
+            assert!(matches!(
+                map_range(&mut memory, &mut arena, l0, va, pa, len, attrs()),
+                Err(TableError::Range { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn map_range_reports_exhaustion_and_collisions() {
+        let mut memory = FakeMemory::new();
+        let mut small = TableArena::new(ARENA, PAGE_SIZE).unwrap();
+        let l0 = small.alloc_table(&mut memory).unwrap();
+        assert_eq!(
+            map_range(&mut memory, &mut small, l0, 0x1000, 0x2000, 0x1000, attrs()),
+            Err(TableError::OutOfTables)
+        );
+
+        let (mut memory, mut arena, l0) = arena();
+        memory.write64(l0, 0x3001); // a block descriptor where a table must be
+        assert_eq!(
+            map_range(&mut memory, &mut arena, l0, 0x1000, 0x2000, 0x1000, attrs()),
+            Err(TableError::Collision { level: 0 })
+        );
+    }
+
+    const ARM: u32 = 1;
+    const WAIT: u32 = 2;
+    const COMPLETE: u32 = 3;
+    const WRITE: u32 = 0x1000;
+    const READ: u32 = 0x2000;
+
+    struct FakeBoot {
+        reads: HashMap<u32, u32>,
+        calls: Vec<u32>,
+        writes: Vec<(u32, u32)>,
+        irqs: Vec<u32>,
+        completion: Completion,
+        arm: Result<(), Status>,
+    }
+
+    impl FakeBoot {
+        fn new(completion: Completion) -> Self {
+            Self {
+                reads: HashMap::new(),
+                calls: Vec::new(),
+                writes: Vec::new(),
+                irqs: Vec::new(),
+                completion,
+                arm: Ok(()),
+            }
+        }
+
+        fn set(&mut self, offset: u32, value: u32) {
+            self.reads.insert(offset, value);
+        }
+    }
+
+    impl MmioIo for FakeBoot {
+        fn read32(&mut self, offset: u32) -> u32 {
+            self.calls.push(READ + offset);
+            *self.reads.get(&offset).unwrap_or(&0)
+        }
+
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.calls.push(WRITE + offset);
+            self.writes.push((offset, value));
+        }
+    }
+
+    impl CompletionIo for FakeBoot {
+        fn arm_completion(&mut self, irq: u32, _timeout_ns: u64) -> Result<(), Status> {
+            self.calls.push(ARM);
+            self.irqs.push(irq);
+            self.arm
+        }
+
+        fn wait_completion(&mut self) -> Completion {
+            self.calls.push(WAIT);
+            self.completion
+        }
+
+        fn complete(&mut self) {
+            self.calls.push(COMPLETE);
+        }
+    }
+
+    #[test]
+    fn mcu_boot_arms_before_the_start_and_quiets_the_job_line() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        io.set(JOB_INT_RAWSTAT, JOB_IRQ_GLOBAL_IF);
+        assert_eq!(
+            mcu_boot(&mut io),
+            Ok(BootObserved {
+                completion: Completion::Fired,
+                rawstat: JOB_IRQ_GLOBAL_IF
+            })
+        );
+        assert_eq!(
+            io.calls,
+            std::vec![
+                ARM,
+                WRITE + JOB_INT_CLEAR,
+                WRITE + JOB_INT_MASK,
+                WRITE + MCU_CONTROL,
+                WAIT,
+                READ + JOB_INT_RAWSTAT,
+                READ + JOB_INT_STAT,
+                WRITE + JOB_INT_CLEAR,
+                WRITE + JOB_INT_MASK,
+                COMPLETE,
+            ]
+        );
+        assert_eq!(io.irqs, std::vec![JOB_IRQ]);
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (JOB_INT_CLEAR, u32::MAX),
+                (JOB_INT_MASK, u32::MAX),
+                (MCU_CONTROL, MCU_CONTROL_AUTO),
+                (JOB_INT_CLEAR, JOB_IRQ_GLOBAL_IF),
+                (JOB_INT_MASK, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcu_boot_accepts_the_status_register_after_a_missed_interrupt() {
+        let mut io = FakeBoot::new(Completion::TimedOut);
+        io.set(JOB_INT_STAT, JOB_IRQ_GLOBAL_IF);
+        let observed = mcu_boot(&mut io).unwrap();
+        assert_eq!(observed.completion, Completion::TimedOut);
+    }
+
+    #[test]
+    fn mcu_boot_reports_timeout_with_the_mcu_status() {
+        let mut io = FakeBoot::new(Completion::TimedOut);
+        io.set(MCU_STATUS, 1);
+        assert_eq!(
+            mcu_boot(&mut io),
+            Err(BootError::Timeout {
+                rawstat: 0,
+                mcu_status: 1
+            })
+        );
+        assert_eq!(io.calls.last(), Some(&(READ + MCU_STATUS)));
+    }
+
+    #[test]
+    fn mcu_boot_an_irq_without_the_global_bit_is_unexpected() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        assert_eq!(
+            mcu_boot(&mut io),
+            Err(BootError::UnexpectedCompletion {
+                rawstat: 0,
+                stat: 0
+            })
+        );
+    }
+
+    #[test]
+    fn mcu_boot_an_unarmable_wait_touches_no_register() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        io.arm = Err(Errno::NotSupported.status());
+        assert_eq!(
+            mcu_boot(&mut io),
+            Err(BootError::Arm(Errno::NotSupported.status()))
+        );
+        assert_eq!(io.calls, [ARM]);
+        assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn global_interface_validation_matches_research_009() {
+        let control = [0x0101_0000, 0x2, 0x0400_1000, 0x0400_2000, 31, 0x40, 0, 0];
+        let glb = GlobalInterface::read(control, 0x0400_0000, 0x10000).unwrap();
+        assert_eq!(glb.version, 0x0101_0000);
+        assert_eq!(glb.major(), 1);
+        assert_eq!(glb.minor(), 1);
+        assert_eq!(glb.patch(), 0);
+        assert_eq!(glb.input_va, 0x0400_1000);
+        assert_eq!(glb.output_va, 0x0400_2000);
+        assert_eq!(glb.group_num, 31);
+        assert_eq!(glb.group_stride, 0x40);
+
+        assert_eq!(
+            GlobalInterface::read([0; 8], 0x0400_0000, 0x10000),
+            Err(GlbError::NotBooted)
+        );
+        let mut bad = control;
+        bad[2] = 0x0401_0000;
+        assert_eq!(
+            GlobalInterface::read(bad, 0x0400_0000, 0x10000),
+            Err(GlbError::InputOutside)
+        );
+        let mut bad = control;
+        bad[3] = 0x03ff_f000;
+        assert_eq!(
+            GlobalInterface::read(bad, 0x0400_0000, 0x10000),
+            Err(GlbError::OutputOutside)
+        );
+        let mut bad = control;
+        bad[4] = 2;
+        assert_eq!(
+            GlobalInterface::read(bad, 0x0400_0000, 0x10000),
+            Err(GlbError::GroupCount { group_num: 2 })
+        );
+    }
+
+    #[test]
+    fn latched_fault_reads_the_status_only_when_bit_zero_is_set() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        assert_eq!(latched_fault(&mut io), None);
+        assert_eq!(io.calls, std::vec![READ + MMU_INT_RAWSTAT]);
+
+        let mut io = FakeBoot::new(Completion::Fired);
+        io.set(MMU_INT_RAWSTAT, MMU_AS0_FAULT_BIT);
+        io.set(AS_FAULTSTATUS, 0x5c1);
+        io.set(AS_FAULTADDRESS, 0x0040_0000);
+        let fault = latched_fault(&mut io).unwrap();
+        assert_eq!(fault.exception, 0xc1);
+        assert_eq!(fault.address, 0x0040_0000);
+        assert_eq!(
+            io.calls,
+            std::vec![
+                READ + MMU_INT_RAWSTAT,
+                READ + AS_FAULTSTATUS,
+                READ + AS_FAULTADDRESS,
+                READ + AS_FAULTADDRESS + 4,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_vendored_image_loads_seven_sections_and_skips_prot() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../firmware/mali_csffw.bin"
+        );
+        let bytes = std::fs::read(path).expect("vendored mali_csffw.bin");
+        let firmware = Firmware::parse(&bytes).unwrap();
+        let loadable: Vec<_> = firmware.loadable().collect();
+        assert_eq!(loadable.len(), 7);
+        assert!(loadable.iter().any(|section| section.va == 0));
+        assert!(loadable
+            .iter()
+            .any(|section| section.va == CSF_SHARED_REGION_START));
+        assert!(loadable
+            .iter()
+            .all(|section| !section.flags.contains(SectionFlags::PROT)));
+        assert!(firmware
+            .sections()
+            .any(|section| section.flags.contains(SectionFlags::PROT)));
     }
 }
