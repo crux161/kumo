@@ -3,6 +3,7 @@
 //j572
 //j574
 //j575
+//j576
 
 //! G1b–G2b: power, identity, reset and the first MMU state for the RK3588 Mali-G610.
 //! Recovery class: soft-state; all state is rediscovered on launch and DevicePowerUp is
@@ -454,6 +455,10 @@ pub enum McuError {
 }
 
 /// RESEARCH/009 §8.7: disable the MCU and require it to report disabled.
+///
+/// Metal (J576): with no firmware loaded this never leaves ENABLED — the stop path expects the
+/// GLB halt handshake only firmware can acknowledge, so a faulted firmware-less MCU is contained
+/// by a soft reset instead. This stays as G3's post-halt stop primitive. — TIMBERDOODLE
 pub fn stop_mcu(io: &mut (impl MmioIo + ClockIo)) -> Result<u32, McuError> {
     io.write32(MCU_CONTROL, MCU_CONTROL_DISABLE);
     match poll32(

@@ -4,13 +4,13 @@
 //j572
 //j574
 //j575
+//j576
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    disable_as0, enable_as0, exception_name, install_mapping, mcu_fault, mmu_info, power_l2, probe,
-    quiet_mmu, soft_reset, stop_mcu, ClockIo, Completion, CompletionIo, Mapping, McuError, MmioIo,
-    ProbeError, ProbeIo, ResetPath, TableWriter, APERTURE_BASE, APERTURE_LEN, PAGE_SIZE,
-    PAGE_TABLE_ENTRIES,
+    enable_as0, exception_name, install_mapping, mcu_fault, mmu_info, power_l2, probe, quiet_mmu,
+    soft_reset, ClockIo, Completion, CompletionIo, Mapping, MmioIo, ProbeError, ProbeIo, ResetPath,
+    TableWriter, APERTURE_BASE, APERTURE_LEN, PAGE_SIZE, PAGE_TABLE_ENTRIES,
 };
 use kumo_abi::{sys::log_level, DevicePowerStatus, Errno, Handle, Status, VmarFlags};
 
@@ -399,8 +399,7 @@ fn run_mali(device: &mut Device) -> u8 {
                     error
                 ),
             );
-            let _ = stop_mcu(device);
-            let _ = disable_as0(device);
+            let _ = soft_reset(device);
             return 1;
         }
     };
@@ -415,52 +414,28 @@ fn run_mali(device: &mut Device) -> u8 {
         ),
     );
 
-    // Containment: stop the MCU before touching the space; a stuck MCU is recovered by the
-    // G2a soft reset rather than left running against a faulted AS.
-    match stop_mcu(device) {
-        Ok(status) => log(
-            log_level::INFO,
-            format_args!("drv-gpu: MCU stopped, status={}\n", status),
-        ),
-        Err(McuError::StopTimeout { status }) => match soft_reset(device) {
-            Ok(_) => {
-                log(
-                    log_level::NOTICE,
-                    format_args!(
-                        "drv-gpu: MCU stuck in status {}; soft reset recovered the GPU\n",
-                        status
-                    ),
-                );
-                let _ = kumo_rt::handle_close(dma.handle);
-                return 0;
-            }
-            Err(error) => {
-                log(
-                    log_level::ERR,
-                    format_args!(
-                        "drv-gpu: MCU stuck in status {} and reset failed: {:?}\n",
-                        status, error
-                    ),
-                );
-                return 1;
-            }
-        },
-    }
-    if let Err(error) = disable_as0(device) {
+    // Containment: the firmware-less MCU does not stop on `MCU_CONTROL = DISABLE`. Metal (J575)
+    // kept MCU_STATUS = ENABLED for the full 100 ms: the stop path expects the halt handshake
+    // only firmware can acknowledge (RESEARCH/009 §8.7). Contain with the G2a soft reset
+    // instead; metal proved it takes the GPU down even while the MCU is faulting, and a reset
+    // leaves the L2 off, every address space unconfigured and the MCU stopped (§6.3).
+    if let Err(error) = soft_reset(device) {
         log(
             log_level::ERR,
-            format_args!("drv-gpu: AS0 disable failed: {:?}\n", error),
+            format_args!("drv-gpu: containment reset failed: {:?}\n", error),
         );
         return 1;
     }
     log(
-        log_level::INFO,
-        format_args!("drv-gpu: AS0 disabled after the fault\n"),
+        log_level::NOTICE,
+        format_args!("drv-gpu: fault contained by soft reset (the MCU does not stop on DISABLE)\n"),
     );
 
-    // Recovery: panthor re-activates a faulted VM by clearing the fault and updating again. If
-    // the faulting VA is inside the 48-bit window, point its page at the scratch page first, so
-    // a second fault at a different address proves the installed table translated.
+    // Recovery: a reset powers the L2 down and unconfigures every space, so redo both. If the
+    // faulting VA is inside the 48-bit window, point its page at the zero-filled scratch page
+    // first: metal (J575) showed the MCU's first access through AS0 is a read at VA 0 — its
+    // vector table — so a zero page there should carry it into execution and move the next
+    // fault to the page after it.
     let mappable = first.address < (1u64 << 48);
     if mappable {
         let page = first.address & !(PAGE_SIZE - 1);
@@ -484,6 +459,7 @@ fn run_mali(device: &mut Device) -> u8 {
             ),
         );
     }
+    quiet_mmu(device);
     if let Err(error) = enable_as0(device, dma.phys, mmu.va_bits) {
         log(
             log_level::ERR,
@@ -493,7 +469,7 @@ fn run_mali(device: &mut Device) -> u8 {
     }
     log(
         log_level::NOTICE,
-        format_args!("drv-gpu: fault contained and AS0 re-enabled\n"),
+        format_args!("drv-gpu: AS0 re-enabled after the fault\n"),
     );
 
     let second = if mappable {
@@ -511,31 +487,16 @@ fn run_mali(device: &mut Device) -> u8 {
         None
     };
 
-    let stopped = stop_mcu(device);
-    let disabled = disable_as0(device);
+    // Leave the GPU in the reset state: the final reset stops the running MCU and unconfigures
+    // AS0, which is the only clean shutdown available without firmware.
+    let clean = soft_reset(device);
     let _ = kumo_rt::handle_close(dma.handle);
-    match (stopped, disabled) {
-        (Ok(_), Ok(())) => {}
-        (Err(error), _) => {
-            log(
-                log_level::ERR,
-                format_args!(
-                    "drv-gpu: the MCU did not stop after the retry: {:?}\n",
-                    error
-                ),
-            );
-            return 1;
-        }
-        (_, Err(error)) => {
-            log(
-                log_level::ERR,
-                format_args!(
-                    "drv-gpu: AS0 did not disable after the retry: {:?}\n",
-                    error
-                ),
-            );
-            return 1;
-        }
+    if let Err(error) = clean {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: final reset failed: {:?}\n", error),
+        );
+        return 1;
     }
 
     if let Some(second) = second {
