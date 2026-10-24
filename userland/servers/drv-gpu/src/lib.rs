@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j579
 //j580
 //j581
 //j582
 //j583
+//j584
 
 //! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -726,6 +726,14 @@ pub const FIRMWARE_MAGIC: u32 = 0xC3F1_3A6E;
 /// RESEARCH/009 §7.8/§8.4: the MCU's shared region, whose first section the firmware marks
 /// SHARED and panthor requires to exist.
 pub const CSF_SHARED_REGION_START: u64 = 0x0400_0000;
+/// RESEARCH/009 §7.8: the shared region ends here; the firmware confines host-supplied MCU
+/// addresses to it. Metal (J584) showed an address outside the region truncated into the low
+/// firmware image, so every KUMO allocation the firmware addresses must live inside.
+pub const CSF_SHARED_REGION_END: u64 = 0x0800_0000;
+
+pub const fn shared_region_contains(va: u64) -> bool {
+    va >= CSF_SHARED_REGION_START && va < CSF_SHARED_REGION_END
+}
 /// The MCU's VM uses a 4 KiB granule (RESEARCH/009 §7.2), so every section VA is page-aligned.
 pub const FIRMWARE_PAGE_SIZE: u64 = 4096;
 const FIRMWARE_ENTRY_UPDATE: u32 = 1 << 30;
@@ -2285,6 +2293,15 @@ mod tests {
             flush_page_tables(&mut io, 8),
             Err(AsError::Space { space: 8 })
         );
+    }
+
+    #[test]
+    fn shared_region_bounds_match_research_009() {
+        assert!(shared_region_contains(CSF_SHARED_REGION_START));
+        assert!(shared_region_contains(CSF_SHARED_REGION_START + 0x10_0000));
+        assert!(!shared_region_contains(CSF_SHARED_REGION_END));
+        assert!(!shared_region_contains(0x0900_0000));
+        assert!(!shared_region_contains(0x03ff_ffff));
     }
 
     #[test]

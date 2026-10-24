@@ -1,22 +1,22 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j576
 //j579
 //j580
 //j581
 //j583
+//j584
 
 use core::fmt::{self, Write};
 use drv_gpu::{
     csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
     latched_fault, map_range, mcu_boot, mmu_info, power_l2, probe, program_group, program_queue,
     publish_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control, ring_offset,
-    soft_reset, start_group, ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo,
-    GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface,
-    ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN,
-    CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, GLB_DOORBELL,
-    GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
+    shared_region_contains, soft_reset, start_group, ClockIo, Completion, CompletionIo, Firmware,
+    FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
+    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -36,10 +36,15 @@ const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.
 const GLB_TIMER_HZ: u32 = 24_000_000;
-/// The group's structures in the MCU's address space (AS0), at VAs the firmware image leaves
-/// free: the queue's two interface pages and the suspend buffer.
-const MCU_IO_PAGES_VA: u64 = 0x0900_0000;
-const MCU_SUSPEND_VA: u64 = 0x0900_2000;
+/// The group's structures in the MCU's address space (AS0): the queue's two interface pages and
+/// the suspend buffer. The firmware confines host-supplied MCU addresses to its shared region
+/// (RESEARCH/009 §7.8), so these live inside 0x0400_0000-0x07FF_FFFF, clear of the section the
+/// image loads at the region's start. Metal (J584): an address outside the region truncated to
+/// 0x0100_1000 and faulted writing the read-only firmware image. — TIMBERDOODLE
+const MCU_IO_PAGES_VA: u64 = 0x0410_0000;
+const MCU_SUSPEND_VA: u64 = 0x0410_2000;
+const _: () = assert!(shared_region_contains(MCU_IO_PAGES_VA));
+const _: () = assert!(shared_region_contains(MCU_SUSPEND_VA));
 /// The group's own address space (AS1) holds the ring and the first stream's target word.
 const AS1_WORK_VA: u64 = 0x1000_0000;
 const RING_SIZE: u64 = 0x1000;
@@ -1041,9 +1046,9 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 queue_mask: 1,
             };
             log(
-                log_level::INFO,
+                log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: group masks compute=0x{:x} tiler=0x{:x} endpoint=0x{:08x} as={} ring=0x{:x} suspend=0x{:x}\n",
+                    "drv-gpu: group masks compute=0x{:x} tiler=0x{:x} endpoint=0x{:08x} as={} ring=0x{:x} pages=0x{:x} suspend=0x{:x}\n",
                     shader_present,
                     tiler_present,
                     (group.max_compute & 0xFF)
@@ -1051,6 +1056,7 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                         | ((group.max_tiler & 0xF) << 16),
                     GROUP_AS,
                     AS1_WORK_VA,
+                    MCU_IO_PAGES_VA,
                     suspend_va
                 ),
             );
