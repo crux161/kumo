@@ -2,10 +2,14 @@
 #j567
 #j568
 #j569
+#j573
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
-No login credentials or changes to the built image are needed: only the copy's autoexec
-is replaced. QEMU, its EDK2 firmware, and Python's standard library are the dependencies.
+No login credentials or changes to the built image are needed. By default only the copy's
+autoexec is replaced. QEMU, its EDK2 firmware, and Python's standard library are the dependencies.
+
+With --with-dtb, stage QEMU's own DTB to exercise device discovery from a child syscall.
+That mode requires an image built with KUMO_CONSOLE_LOGLEVEL=6 (or 7) to assert drv-gpu's trace.
 """
 
 import argparse
@@ -123,10 +127,21 @@ def main():
     parser.add_argument("--firmware-code", type=Path, default=Path("/opt/homebrew/share/qemu/edk2-aarch64-code.fd"))
     parser.add_argument("--firmware-vars", type=Path, default=Path("/opt/homebrew/share/qemu/edk2-arm-vars.fd"))
     parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--with-dtb", action="store_true", help="exercise drv-gpu with a staged QEMU DTB; requires image log level >=6")
     args = parser.parse_args()
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
+    if args.with_dtb:
+        # Nijigumo currently searches these fixed candidate paths. Use one only in the
+        # disposable ESP: the bytes describe QEMU, and the manifest's board stays QEMU. — KESTREL
+        dtb = work / "esp/EFI/KUMO/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb"
+        dtb.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "qemu-system-aarch64", "-machine", f"virt,gic-version=3,dumpdtb={dtb}",
+            "-cpu", "cortex-a72", "-m", "512", "-display", "none", "-device", "ramfb",
+            "-net", "none",
+        ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img")
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
@@ -146,6 +161,8 @@ def main():
                 if process.poll() is not None:
                     raise RuntimeError((work / "qemu.log").read_text())
                 transcript = serial.read_bytes() if serial.exists() else b""
+                if args.with_dtb and b"TOWER: CPU EXCEPTION" in transcript:
+                    raise RuntimeError(f"kernel fault during DTB syscall smoke; inspect {serial}")
                 if b"INDRA login:" in transcript and b"graphics-smoke-after-present" in transcript:
                     break
                 time.sleep(0.1)
@@ -157,6 +174,12 @@ def main():
             assert transcript.count(demo) == 2, f"missing view 1 replies; inspect {serial}"
             assert b"gfx-demo: one or more views failed" not in transcript
             assert b"gfx-client: presenter rejected surface" not in transcript
+            if args.with_dtb:
+                assert b" declared / " in transcript, f"staged DTB was not loaded; inspect {serial}"
+                marker = b"drv-gpu: DevicePowerUp NotSupported; aperture untouched"
+                assert transcript.count(marker) == 1, f"missing drv-gpu trace (image log level >=6 required); inspect {serial}"
+                assert b"drv-gpu: probe failed" not in transcript
+                print("DTB syscall smoke green: drv-gpu rejected absent GPU with a nonzero DTB; login reached")
             time.sleep(0.2)  # let the final queued console line reach drv-fb
             def read_qmp():
                 if not select.select([process.stdout], [], [], 5)[0]:

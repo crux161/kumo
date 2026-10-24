@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j493
 //j534
 //j546
 //j570
 //j571
+//j573
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3459,6 +3459,8 @@ const fn plausible_dtb_pointer(dtb: u64) -> bool {
         }
 }
 
+/// The physical range must have passed the kernel's DTB handoff validation. On target, callers
+/// run after the permanent kernel physmap is installed.
 unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
     const FDT_MAGIC: u32 = 0xd00d_feed;
     const MAX_DTB_BYTES: usize = 16 * 1024 * 1024;
@@ -3466,7 +3468,14 @@ unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
     if !plausible_dtb_pointer(dtb) {
         return None;
     }
-    let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
+    // A device syscall runs with the child's TTBR0, which does not map the physical DTB.
+    // Use TTBR1 for both the header and body; keep range checks in physical coordinates.
+    // Boot-time discoverers share this reader and already run after MMU setup. — KESTREL
+    #[cfg(target_os = "none")]
+    let address = mmu::PHYSMAP_BASE.checked_add(dtb)?;
+    #[cfg(not(target_os = "none"))]
+    let address = dtb;
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 8) };
     if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
         return None;
     }
@@ -3480,7 +3489,7 @@ unsafe fn dtb_bytes(dtb: u64) -> Option<&'static [u8]> {
     {
         return None;
     }
-    Some(unsafe { core::slice::from_raw_parts(dtb as *const u8, total) })
+    Some(unsafe { core::slice::from_raw_parts(address as *const u8, total) })
 }
 
 // ---- SC8280XP PDC (Power Domain Controller) wake-interrupt routing ----------------------------
