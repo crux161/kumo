@@ -1,22 +1,22 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j575
 //j576
 //j579
 //j580
 //j581
+//j583
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    csf_doorbell, enable_as, enable_as0, first_stream, init_global_interface, latched_fault,
-    map_range, mcu_boot, mmu_info, power_l2, probe, program_group, program_queue, publish_insert,
-    quiet_mmu, read_cs_control, read_cs_status, read_csg_control, ring_offset, soft_reset,
-    start_group, ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo,
+    csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
+    latched_fault, map_range, mcu_boot, mmu_info, power_l2, probe, program_group, program_queue,
+    publish_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control, ring_offset,
+    soft_reset, start_group, ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo,
     GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface,
     ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN,
     CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, GLB_DOORBELL,
-    GLB_PING_TIMEOUT_NS, PAGE_SIZE,
+    GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -863,8 +863,19 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             log(
                 log_level::INFO,
                 format_args!(
-                    "drv-gpu: CSG 0 streams={} stride=0x{:x} suspend={}b\n",
-                    csg.stream_num, csg.stream_stride, csg.suspend_size
+                    "drv-gpu: CSG 0 streams={} stride=0x{:x} suspend={}b in=0x{:x} out=0x{:x}\n",
+                    csg.stream_num,
+                    csg.stream_stride,
+                    csg.suspend_size,
+                    csg.input_va,
+                    csg.output_va
+                ),
+            );
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: CS 0 in=0x{:x} out=0x{:x} features=0x{:08x}\n",
+                    cs.input_va, cs.output_va, cs.features
                 ),
             );
 
@@ -934,6 +945,16 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     cpu: mapping.va,
                     len: suspend_len,
                 };
+            }
+            // AS0 gained mappings while it is live; panthor flushes page-table caches after
+            // every such change, and so must KUMO. — TIMBERDOODLE
+            if let Err(error) = flush_page_tables(device, 0) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: AS0 page-table flush failed: {:?}\n", error),
+                );
+                let _ = soft_reset(device);
+                return 1;
             }
 
             let Some(work) = map_contiguous(WORK_LEN) else {
@@ -1019,6 +1040,20 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 protm_suspend_va: 0,
                 queue_mask: 1,
             };
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: group masks compute=0x{:x} tiler=0x{:x} endpoint=0x{:08x} as={} ring=0x{:x} suspend=0x{:x}\n",
+                    shader_present,
+                    tiler_present,
+                    (group.max_compute & 0xFF)
+                        | ((group.max_fragment & 0xFF) << 8)
+                        | ((group.max_tiler & 0xF) << 16),
+                    GROUP_AS,
+                    AS1_WORK_VA,
+                    suspend_va
+                ),
+            );
             let start = {
                 let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
                 program_queue(&mut glb_io, cs.input_va, queue);
@@ -1044,6 +1079,48 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                         log_level::ERR,
                         format_args!("drv-gpu: group start failed: {:?}\n", error),
                     );
+                    // Name what the firmware did with the request: a stale doorbell, a CSG state
+                    // word that never moved, a stream fault, or an AS0 MMU fault on the queue
+                    // pages all point at different causes. — TIMBERDOODLE
+                    {
+                        let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                        let doorbell_ack = glb_io.read_output(GLB_DOORBELL_REQ);
+                        log(
+                            log_level::INFO,
+                            format_args!("drv-gpu: GLB doorbell_ack=0x{:08x}\n", doorbell_ack),
+                        );
+                        let ack = glb_io.read32(csg.output_va);
+                        let doorbell = glb_io.read32(csg.output_va + 0x08);
+                        let cs_irq_req = glb_io.read32(csg.output_va + 0x0C);
+                        let state = glb_io.read32(csg.output_va + 0x18);
+                        log(
+                            log_level::INFO,
+                            format_args!(
+                                "drv-gpu: CSG out ack=0x{:08x} doorbell=0x{:08x} cs_irq_req=0x{:08x} state=0x{:08x}\n",
+                                ack, doorbell, cs_irq_req, state
+                            ),
+                        );
+                        let status = read_cs_status(&mut glb_io, cs.output_va);
+                        log(
+                            log_level::INFO,
+                            format_args!(
+                                "drv-gpu: CS status cmd_ptr=0x{:x} blocked={} fault=0x{:08x} fatal=0x{:08x}\n",
+                                status.cmd_ptr, status.blocked_reason, status.fault, status.fatal
+                            ),
+                        );
+                    }
+                    if let Some(fault) = latched_fault(device) {
+                        log(
+                            log_level::ERR,
+                            format_args!(
+                                "drv-gpu: AS0 fault at VA=0x{:016x}: {} {:?} (raw=0x{:08x})\n",
+                                fault.address,
+                                drv_gpu::exception_name(fault.exception),
+                                fault.access,
+                                fault.raw
+                            ),
+                        );
+                    }
                     let _ = soft_reset(device);
                     return 1;
                 }

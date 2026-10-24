@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j577
-//j578
 //j579
 //j580
 //j581
+//j582
+//j583
 
 //! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -84,6 +84,8 @@ pub const MMU_AS0_FAULT_BIT: u32 = 1;
 const AS_STATUS_AS_ACTIVE: u32 = 1;
 const AS_COMMAND_UPDATE: u32 = 1;
 const AS_COMMAND_LOCK: u32 = 2;
+const AS_COMMAND_UNLOCK: u32 = 3;
+const AS_COMMAND_FLUSH_PT: u32 = 4;
 const AS_COMMAND_FLUSH_MEM: u32 = 5;
 /// panthor locks the whole 64-bit range before a space's UPDATE: region width 63, base 0
 /// (RESEARCH/009 §7.6's packing with start 0 and size 2^64).
@@ -487,6 +489,20 @@ pub fn disable_as(io: &mut (impl MmioIo + ClockIo), space: u32) -> Result<(), As
 
 pub fn disable_as0(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
     disable_as(io, 0)
+}
+
+/// Flush a live space's page-table caches: lock the whole range, `FLUSH_PT`, unlock
+/// (RESEARCH/009 §7.6; panthor runs this after every live mapping change). KUMO maps the queue
+/// pages and the suspend buffer into AS0 after it is enabled, so those edits need it. — TIMBERDOODLE
+pub fn flush_page_tables(io: &mut (impl MmioIo + ClockIo), space: u32) -> Result<(), AsError> {
+    let Some(window) = as_window(space) else {
+        return Err(AsError::Space { space });
+    };
+    let lockaddr = window + as_offset(AS_LOCKADDR);
+    write64(io, lockaddr, lockaddr + 4, AS_LOCKADDR_WHOLE);
+    as_command(io, window, AS_COMMAND_LOCK)?;
+    as_command(io, window, AS_COMMAND_FLUSH_PT)?;
+    as_command(io, window, AS_COMMAND_UNLOCK)
 }
 
 /// Clear a latched address-space-0 fault and keep the MMU line masked.
@@ -2248,6 +2264,27 @@ mod tests {
             Err(AsError::Space { space: 8 })
         );
         assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn flush_page_tables_locks_flushes_and_unlocks_the_space() {
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(flush_page_tables(&mut io, 1), Ok(()));
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x2450, 63),
+                (0x2454, 0),
+                (0x2458, AS_COMMAND_LOCK),
+                (0x2458, AS_COMMAND_FLUSH_PT),
+                (0x2458, AS_COMMAND_UNLOCK),
+            ]
+        );
+        assert_eq!(io.read_log, std::vec![0x2468; 6]);
+        assert_eq!(
+            flush_page_tables(&mut io, 8),
+            Err(AsError::Space { space: 8 })
+        );
     }
 
     #[test]
