@@ -1,10 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j572
+//j574
 
-//! G1b: power and identity for the RK3588 Mali-G610. Recovery class: soft-state; all state is
-//! rediscovered on launch and DevicePowerUp is idempotent. This first slice probes once and exits;
-//! command serving, reset and supervised recovery follow with the GPU execution slices.
+//! G1b/G2a: power, identity and reset for the RK3588 Mali-G610. Recovery class: soft-state; all
+//! state is rediscovered on launch and DevicePowerUp is idempotent. This slice probes identity,
+//! then soft-resets the GPU and requires its completion interrupt; L2, address spaces, command
+//! serving and supervised recovery follow with the later GPU execution slices.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -13,11 +15,24 @@ pub const APERTURE_BASE: u64 = 0xfb00_0000;
 pub const APERTURE_LEN: u64 = 0x20_0000;
 pub const IRQ_BASE: u32 = 124;
 pub const IRQ_COUNT: u32 = 3;
+/// The GPU block's interrupt (INTID 126 = SPI 94; RESEARCH/009 §4.1/§4.5). The job and MMU
+/// blocks are `IRQ_BASE` and `IRQ_BASE + 1`.
+pub const GPU_IRQ: u32 = IRQ_BASE + 2;
 
 // RESEARCH/009 §1.2 and §4.2: read-only GPU_CONTROL identity registers.
 const GPU_ID: u32 = 0x000;
 const SHADER_PRESENT_LO: u32 = 0x100;
 const SHADER_PRESENT_HI: u32 = 0x104;
+
+// RESEARCH/009 §4.2, §4.4 and §4.5: the GPU_CONTROL interrupt and command words.
+const GPU_INT_RAWSTAT: u32 = 0x020;
+const GPU_INT_CLEAR: u32 = 0x024;
+const GPU_INT_MASK: u32 = 0x028;
+const GPU_CMD: u32 = 0x030;
+const GPU_IRQ_RESET_COMPLETED: u32 = 1 << 8;
+const GPU_CMD_SOFT_RESET: u32 = 0x0000_0101;
+/// panthor's reset timeout (RESEARCH/009 §4.4).
+pub const RESET_TIMEOUT_NS: u64 = 100_000_000;
 
 pub trait ProbeIo {
     fn power_up(&mut self) -> Status;
@@ -89,6 +104,70 @@ pub fn probe(io: &mut impl ProbeIo) -> Result<Identity, ProbeError> {
         gpu_id,
         shader_present,
         power,
+    })
+}
+
+/// The outcome of the bound completion-interrupt wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Completion {
+    Fired,
+    TimedOut,
+}
+
+/// How the reset completion was observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetPath {
+    Interrupt,
+    /// The wait expired, but panthor's RAWSTAT recheck showed completion anyway.
+    PolledAfterTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetError {
+    /// The completion wait could not be armed; no GPU register was touched.
+    Arm(Status),
+    /// No completion interrupt, and RAWSTAT does not show the reset bit.
+    Timeout { rawstat: u32 },
+    /// The wait fired, but RAWSTAT does not show the reset bit.
+    UnexpectedCompletion { rawstat: u32 },
+}
+
+/// The device-side half of reset, kept behind a trait so the sequence is host-testable.
+pub trait ResetIo {
+    fn read32(&mut self, offset: u32) -> u32;
+    fn write32(&mut self, offset: u32, value: u32);
+    /// Create the completion interrupt and bind its wait **before** the command is issued.
+    /// The wait must expire after `timeout_ns`.
+    fn arm_completion(&mut self, timeout_ns: u64) -> Result<(), Status>;
+    fn wait_completion(&mut self) -> Completion;
+    /// Release the wait objects and acknowledge the interrupt.
+    fn complete(&mut self);
+}
+
+/// G2a: ask the GPU for a soft reset and require its completion interrupt. Clears any stale
+/// completion, unmasks only `RESET_COMPLETED`, and always restores a quiet mask before
+/// acknowledging, so a failed or late reset cannot storm a line nobody serves. — TIMBERDOODLE
+pub fn soft_reset(io: &mut impl ResetIo) -> Result<ResetPath, ResetError> {
+    io.arm_completion(RESET_TIMEOUT_NS)
+        .map_err(ResetError::Arm)?;
+    io.write32(GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
+    io.write32(GPU_INT_MASK, GPU_IRQ_RESET_COMPLETED);
+    io.write32(GPU_CMD, GPU_CMD_SOFT_RESET);
+    let completion = io.wait_completion();
+    // panthor rechecks RAWSTAT after its timeout before declaring failure (RESEARCH/009 §4.4).
+    let rawstat = io.read32(GPU_INT_RAWSTAT);
+    io.write32(GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
+    io.write32(GPU_INT_MASK, 0);
+    io.complete();
+    if rawstat & GPU_IRQ_RESET_COMPLETED == 0 {
+        return Err(match completion {
+            Completion::Fired => ResetError::UnexpectedCompletion { rawstat },
+            Completion::TimedOut => ResetError::Timeout { rawstat },
+        });
+    }
+    Ok(match completion {
+        Completion::Fired => ResetPath::Interrupt,
+        Completion::TimedOut => ResetPath::PolledAfterTimeout,
     })
 }
 
@@ -217,5 +296,136 @@ mod tests {
             ..Fake::default()
         };
         assert!(matches!(probe(&mut io), Err(ProbeError::Identity { .. })));
+    }
+
+    const ARM: u32 = 1;
+    const WAIT: u32 = 2;
+    const COMPLETE: u32 = 3;
+    const WRITE: u32 = 0x1000;
+    const READ: u32 = 0x2000;
+
+    struct FakeReset {
+        rawstat: u32,
+        completion: Completion,
+        arm: Result<(), Status>,
+        calls: Vec<u32>,
+        writes: Vec<(u32, u32)>,
+    }
+
+    impl FakeReset {
+        fn new(rawstat: u32, completion: Completion) -> Self {
+            Self {
+                rawstat,
+                completion,
+                arm: Ok(()),
+                calls: Vec::new(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl ResetIo for FakeReset {
+        fn read32(&mut self, offset: u32) -> u32 {
+            self.calls.push(READ + offset);
+            self.rawstat
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.calls.push(WRITE + offset);
+            self.writes.push((offset, value));
+        }
+        fn arm_completion(&mut self, _timeout_ns: u64) -> Result<(), Status> {
+            self.calls.push(ARM);
+            self.arm
+        }
+        fn wait_completion(&mut self) -> Completion {
+            self.calls.push(WAIT);
+            self.completion
+        }
+        fn complete(&mut self) {
+            self.calls.push(COMPLETE);
+        }
+    }
+
+    fn success_sequence() -> Vec<u32> {
+        std::vec![
+            ARM,
+            WRITE + GPU_INT_CLEAR,
+            WRITE + GPU_INT_MASK,
+            WRITE + GPU_CMD,
+            WAIT,
+            READ + GPU_INT_RAWSTAT,
+            WRITE + GPU_INT_CLEAR,
+            WRITE + GPU_INT_MASK,
+            COMPLETE,
+        ]
+    }
+
+    fn quiet_mask_writes() -> Vec<(u32, u32)> {
+        std::vec![
+            (GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED),
+            (GPU_INT_MASK, GPU_IRQ_RESET_COMPLETED),
+            (GPU_CMD, GPU_CMD_SOFT_RESET),
+            (GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED),
+            (GPU_INT_MASK, 0),
+        ]
+    }
+
+    #[test]
+    fn soft_reset_arms_before_any_register_and_restores_a_quiet_mask() {
+        let mut io = FakeReset::new(GPU_IRQ_RESET_COMPLETED, Completion::Fired);
+        assert_eq!(soft_reset(&mut io), Ok(ResetPath::Interrupt));
+        assert_eq!(io.calls, success_sequence());
+        assert_eq!(io.writes, quiet_mask_writes());
+    }
+
+    #[test]
+    fn timeout_rechecks_rawstat_like_panthor() {
+        let mut io = FakeReset::new(GPU_IRQ_RESET_COMPLETED, Completion::TimedOut);
+        assert_eq!(soft_reset(&mut io), Ok(ResetPath::PolledAfterTimeout));
+        assert_eq!(io.calls, success_sequence());
+        assert_eq!(io.writes, quiet_mask_writes());
+    }
+
+    #[test]
+    fn a_timeout_without_completion_errors_but_still_quiets_the_line() {
+        let mut io = FakeReset::new(0, Completion::TimedOut);
+        assert_eq!(soft_reset(&mut io), Err(ResetError::Timeout { rawstat: 0 }));
+        assert_eq!(io.calls, success_sequence());
+        assert_eq!(io.writes, quiet_mask_writes());
+    }
+
+    #[test]
+    fn an_irq_without_the_reset_bit_is_unexpected() {
+        let mut io = FakeReset::new(0, Completion::Fired);
+        assert_eq!(
+            soft_reset(&mut io),
+            Err(ResetError::UnexpectedCompletion { rawstat: 0 })
+        );
+        assert_eq!(io.calls, success_sequence());
+        assert_eq!(io.writes, quiet_mask_writes());
+    }
+
+    #[test]
+    fn an_unarmable_wait_touches_no_register() {
+        let mut io = FakeReset::new(0, Completion::Fired);
+        io.arm = Err(Errno::NotSupported.status());
+        assert_eq!(
+            soft_reset(&mut io),
+            Err(ResetError::Arm(Errno::NotSupported.status()))
+        );
+        assert_eq!(io.calls, [ARM]);
+        assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn register_offsets_and_timeout_match_research_009() {
+        assert_eq!(GPU_INT_RAWSTAT, 0x020);
+        assert_eq!(GPU_INT_CLEAR, 0x024);
+        assert_eq!(GPU_INT_MASK, 0x028);
+        assert_eq!(GPU_CMD, 0x030);
+        assert_eq!(GPU_IRQ_RESET_COMPLETED, 1 << 8);
+        assert_eq!(GPU_CMD_SOFT_RESET, 0x0000_0101);
+        assert_eq!(GPU_IRQ, 126);
+        assert_eq!(RESET_TIMEOUT_NS, 100_000_000);
     }
 }
