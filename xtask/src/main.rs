@@ -1,8 +1,8 @@
-//j507
 //j517
 //j562
 //j563
 //j569
+//j572
 
 use std::env;
 use std::fmt;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_I2C_HID_PATH,
+    ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH, DRV_I2C_HID_PATH,
     DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
     INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
     KILO_PATH, LS_PATH, LUA_REPL_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH,
@@ -839,6 +839,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let ttyd = build_ttyd_image(&workspace_root()?)?;
             let drv_serial = build_drv_serial_image(&workspace_root()?)?;
             let drv_fb = build_drv_fb_image(&workspace_root()?)?;
+            let drv_gpu = build_drv_gpu_image(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
@@ -864,6 +865,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (TTYD_PATH, ttyd.as_slice()),
                 (DRV_SERIAL_PATH, drv_serial.as_slice()),
                 (DRV_FB_PATH, drv_fb.as_slice()),
+                (DRV_GPU_PATH, drv_gpu.as_slice()),
                 (DRV_I2C_HID_PATH, drv_i2c_hid.as_slice()),
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
@@ -1332,6 +1334,31 @@ fn build_drv_fb_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as drv-fb ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "drv-gpu",
+            "--bin",
+            "drv-gpu",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+
+    let source_path = root
+        .join("target/aarch64-unknown-none/release")
+        .join("drv-gpu");
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as drv-gpu ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 

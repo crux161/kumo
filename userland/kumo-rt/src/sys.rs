@@ -1,8 +1,8 @@
-//j493
 //j508
 //j512
 //j556
 //j559
+//j572
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -844,6 +844,62 @@ pub fn resource_mint_mmio(resource: Handle, phys_base: u64, len: u64) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn resource_mint_mmio(_resource: Handle, _phys_base: u64, _len: u64) -> u64 {
     u64::MAX
+}
+
+/// Raise the device's power domain at its safe boot clock. Requires a Resource with WRITE
+/// covering the aperture; the kernel selects the power unit from the live DTB.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub fn device_power_up(resource: Handle, aperture_base: u64) -> Status {
+    syscall(
+        Syscall::DevicePowerUp,
+        resource.0 as u64,
+        aperture_base,
+        0,
+        0,
+    ) as Status
+}
+
+#[cfg(not(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+pub fn device_power_up(_resource: Handle, _aperture_base: u64) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
+/// Read the device's power/clock evidence. Requires Resource READ; inspect `record` only on
+/// success. The typed buffer supplies the ABI's size and alignment.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub fn device_power_status(
+    resource: Handle,
+    aperture_base: u64,
+    record: &mut kumo_abi::DevicePowerStatus,
+) -> Status {
+    syscall(
+        Syscall::DevicePowerStatus,
+        resource.0 as u64,
+        aperture_base,
+        record as *mut kumo_abi::DevicePowerStatus as u64,
+        core::mem::size_of::<kumo_abi::DevicePowerStatus>() as u64,
+    ) as Status
+}
+
+#[cfg(not(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+pub fn device_power_status(
+    _resource: Handle,
+    _aperture_base: u64,
+    _record: &mut kumo_abi::DevicePowerStatus,
+) -> Status {
+    kumo_abi::Errno::NotSupported.status()
 }
 
 /// Claim the boot framebuffer for a userspace console driver. The kernel accepts

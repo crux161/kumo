@@ -1,8 +1,8 @@
-#j548
 #j551
 #j558
 #j563
 #j567
+#j572
 
 [package]
 name = "sora"
@@ -12,6 +12,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+drv-gpu = { path = "../servers/drv-gpu" }
 drv-blk = { path = "../servers/drv-blk" }
 drv-i2c-hid = { path = "../servers/drv-i2c-hid" }
 kumo-abi.workspace = true

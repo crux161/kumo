@@ -1,8 +1,8 @@
-#j524
 #j561
 #j563
 #j567
 #j569
+#j572
 [workspace]
 members = [
     "boot/niji-loader",
@@ -42,6 +42,7 @@ members = [
     "userland/persona-posix",
     "userland/servers/drv-blk",
     "userland/servers/drv-fb",
+    "userland/servers/drv-gpu",
     "userland/servers/drv-i2c-hid",
     "userland/servers/drv-xhci",
     "userland/servers/drv-serial",

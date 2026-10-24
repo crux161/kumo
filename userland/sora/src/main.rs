@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j564
 //j565
 //j567
 //j568
 //j569
+//j572
 
 extern crate alloc;
 
@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GFX_CLIENT_PATH, GROUP_PATH,
+    CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GFX_CLIENT_PATH, GROUP_PATH,
     HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH,
     RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
@@ -717,6 +717,37 @@ fn launch_xhci_first_light(
         have_channel.then(|| Handle(kbd_reader as u32)),
         have_mouse.then(|| Handle(mouse_reader as u32)),
     )
+}
+
+/// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
+/// absent hardware before touching registers, including on QEMU. No initrd, PMU or CRU grant
+/// reaches the child. The one-shot identity probe exits after reporting. — KESTREL
+fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
+    let resource = resource_create_child(
+        root_resource,
+        drv_gpu::APERTURE_BASE,
+        drv_gpu::APERTURE_LEN,
+        drv_gpu::IRQ_BASE,
+        drv_gpu::IRQ_COUNT,
+    );
+    if resource == u64::MAX {
+        let _ = kumo_rt::log_write(
+            kumo_abi::sys::log_level::ERR,
+            b"drv-gpu: resource creation failed\n",
+        );
+        return;
+    }
+    if !run_elf(
+        initrd,
+        DRV_GPU_PATH.as_bytes(),
+        resource,
+        0,
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits(),
+        b"drv-gpu",
+    ) {
+        let _ = handle_close(Handle(resource as u32));
+        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, b"drv-gpu: launch failed\n");
+    }
 }
 
 fn spawn_xhci(
@@ -1572,6 +1603,8 @@ extern "C" fn sora_main(
             log(b"fatfs-blk: image not found\n");
         }
     }
+
+    launch_gpu_identity(initrd, res);
 
     // J159: spawn drv-fb when a framebuffer is present.
     // Map the BootInfo VMO (populated by the kernel), read framebuffer geometry,
