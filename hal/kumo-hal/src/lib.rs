@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j474
 //j482
 //j493
 //j534
 //j570
+//j571
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -21,8 +21,9 @@ pub mod active {
         arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
-        console_set_dw8250_base, console_set_pl011_base, console_use_physmap, early_console_write,
-        el0_exit, enable_kernel_mmu, fb_fill, fb_geometry, fb_paint_band,
+        console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
+        device_aperture_blocked, device_power_status, device_power_unit, device_power_up,
+        early_console_write, el0_exit, enable_kernel_mmu, fb_fill, fb_geometry, fb_paint_band,
         framebuffer_console_owned_by_kernel, freeze_console, gic_set_no_dtb_fallback,
         gic_timer_gate_report, halt, halt_cpu, handoff_framebuffer_console, init_timer_interrupts,
         install_exception_vectors, interrupted_at_el0, iommu_create_device_context,
@@ -35,9 +36,10 @@ pub mod active {
         set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once, switch_context,
         sync_icache_to_pou, syscall_count, system_off, system_reset, timer_irq_count,
         unmask_spi_interrupt, user_device_page_desc, user_entry_context, user_nc_page_desc,
-        user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, El0Report, GicTimerGateReport,
-        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
-        UserMapping, UserState, ARCH,
+        user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError,
+        DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report,
+        GicTimerGateReport, PowerStep, ThreadContext, TowerContext, TowerThreadRole, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
 }
 
@@ -47,10 +49,11 @@ pub mod active {
         apply_boot_io_apic_timer, arch_name, build_user_tables, clean_dcache_to_poc,
         clear_preempt_hook, complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
-        console_set_dw8250_base, console_set_pl011_base, console_use_physmap, discover_acpi_madt,
-        discover_acpi_root, early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen,
-        fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
-        gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
+        console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
+        device_aperture_blocked, device_power_status, device_power_unit, device_power_up,
+        discover_acpi_madt, discover_acpi_root, early_console_write, el0_exit, enable_kernel_mmu,
+        exceptions_seen, fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel,
+        freeze_console, gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
         inspect_acpi_rsdp, inspect_boot_io_apic, install_descriptor_tables,
         install_exception_vectors, interrupted_at_el0, io_apic_timer_irq_count,
@@ -68,10 +71,11 @@ pub mod active {
         user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
         wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs, wait_for_timer_irqs,
         AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
-        DescriptorTableReport, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
-        IoApicReport, IoApicTimerApplied, IoApicTimerPlan, Ring3Error, Ring3Report, ThreadContext,
-        TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping,
-        UserState, ARCH, RING3_PING_TOKEN,
+        DescriptorTableReport, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
+        DevicePowerUpOutcome, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
+        IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PowerStep, Ring3Error, Ring3Report,
+        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
+        UserMapping, UserState, ARCH, RING3_PING_TOKEN,
     };
 }
 

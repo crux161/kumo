@@ -1,8 +1,8 @@
-//j427
 //j493
 //j556
 //j559
 //j565
+//j571
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +75,16 @@ pub enum Syscall {
     /// Set the console log level: `(resource, level)` returns the previous level;
     /// [`LOG_LEVEL_QUERY`] only reports it. Needs a Resource handle with `MANAGE`.
     LogLevel = 49,
+    /// Raise the power domain of the device whose register aperture starts at `aperture_base`:
+    /// `(resource, aperture_base)` returns a status. The kernel runs the device's whole power-up
+    /// sequence (clock first, then power, memory repair, bus out of idle) from its own table;
+    /// the caller passes no registers, bits or rates. Needs a Resource with `WRITE` whose window
+    /// contains the aperture. Idempotent (DESIGN/020).
+    DevicePowerUp = 50,
+    /// Report a device's power, bus and clock state: `(resource, aperture_base, ptr, len)`
+    /// copies a [`DevicePowerStatus`]. Needs a Resource with `READ` whose window contains the
+    /// aperture (DESIGN/020).
+    DevicePowerStatus = 51,
 }
 
 /// Kernel log levels, syslog's numbering: lower is more urgent (J559).
@@ -120,6 +130,42 @@ pub enum IoMmuKind {
 pub struct DeviceCtxInfo {
     pub fault_record: u64,
     pub fault_addr: u64,
+}
+
+/// What [`Syscall::DevicePowerStatus`] copies out (DESIGN/020 §6). The flags let a driver act
+/// without knowing its SoC's register layout; the raw words keep the evidence, in the order the
+/// kernel's boot report reads them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DevicePowerStatus {
+    /// [`DevicePowerStatus::VERSION`].
+    pub version: u32,
+    /// `DevicePowerStatus::*` flag bits.
+    pub flags: u32,
+    /// The power-controller words the kernel read.
+    pub pmu: [u32; 6],
+    /// The clock-and-reset-controller words the kernel read.
+    pub cru: [u32; 8],
+}
+
+impl DevicePowerStatus {
+    pub const VERSION: u32 = 1;
+    /// The domain is powered.
+    pub const POWERED: u32 = 1 << 0;
+    /// The domain's memory repair has completed since it was powered.
+    pub const REPAIR_DONE: u32 = 1 << 1;
+    /// The device's bus interface is idle (passing no traffic).
+    pub const BUS_IDLE: u32 = 1 << 2;
+    /// Software is asking the bus interface to go idle.
+    pub const BUS_IDLE_REQUESTED: u32 = 1 << 3;
+    /// The device clock is at the kernel's safe boot rate.
+    pub const CLOCK_AT_BOOT_RATE: u32 = 1 << 4;
+    /// Every precondition for touching the aperture holds, so `ResourceMintMmio` will mint it.
+    pub const APERTURE_MINTABLE: u32 = 1 << 5;
+
+    pub const fn contains(self, flag: u32) -> bool {
+        self.flags & flag == flag
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,6 +304,40 @@ mod tests {
     }
 
     #[test]
+    fn device_power_calls_follow_the_kernel_log_calls() {
+        assert_eq!(Syscall::DevicePowerUp as usize, 50);
+        assert_eq!(Syscall::DevicePowerStatus as usize, 51);
+        assert_eq!(Errno::TimedOut.status(), -10);
+        assert_eq!(Errno::BadState.status(), -11);
+    }
+
+    #[test]
+    fn device_power_status_is_a_fixed_64_byte_record() {
+        assert_eq!(core::mem::size_of::<DevicePowerStatus>(), 64);
+        assert_eq!(core::mem::align_of::<DevicePowerStatus>(), 4);
+        let flags = [
+            DevicePowerStatus::POWERED,
+            DevicePowerStatus::REPAIR_DONE,
+            DevicePowerStatus::BUS_IDLE,
+            DevicePowerStatus::BUS_IDLE_REQUESTED,
+            DevicePowerStatus::CLOCK_AT_BOOT_RATE,
+            DevicePowerStatus::APERTURE_MINTABLE,
+        ];
+        let mut seen = 0;
+        for flag in flags {
+            assert_eq!(flag.count_ones(), 1);
+            assert_eq!(seen & flag, 0, "flag bits overlap");
+            seen |= flag;
+        }
+        let status = DevicePowerStatus {
+            flags: DevicePowerStatus::POWERED | DevicePowerStatus::REPAIR_DONE,
+            ..DevicePowerStatus::default()
+        };
+        assert!(status.contains(DevicePowerStatus::POWERED));
+        assert!(!status.contains(DevicePowerStatus::APERTURE_MINTABLE));
+    }
+
+    #[test]
     fn the_kernel_log_calls_follow_process_kill() {
         assert_eq!(Syscall::LogWrite as usize, 47);
         assert_eq!(Syscall::LogRead as usize, 48);
@@ -283,6 +363,11 @@ pub enum Errno {
     NoMemory = -7,
     NotSupported = -8,
     Internal = -9,
+    /// The hardware did not reach the requested state in time (DESIGN/020).
+    TimedOut = -10,
+    /// The object is not in a state that allows the operation, e.g. minting the registers of a
+    /// powered-down device (DESIGN/020).
+    BadState = -11,
 }
 
 impl Errno {

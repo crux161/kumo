@@ -1,21 +1,25 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j483
 //j493
 //j534
 //j546
 //j570
+//j571
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
 pub mod mali;
+pub mod power_unit;
 pub mod smmuv2;
 pub mod smmuv3;
 pub use mali::{
     discover_rk3588_mali_g610, MaliG610ClockSource, MaliG610ClockStatus, MaliG610PowerStatus,
     MaliG610StatusReport, MaliG610Topology, RK3588_MALI_BASE, RK3588_MALI_LENGTH,
+};
+pub use power_unit::{
+    DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, PowerStep,
 };
 pub use smmuv2::{AppsSmmuTopology, SmmuBypassReport};
 pub use smmuv3::{
@@ -3348,6 +3352,95 @@ pub fn mali_g610_status_from_dtb(dtb: u64) -> Option<MaliG610StatusReport> {
 #[cfg(not(target_os = "none"))]
 pub fn mali_g610_status_from_dtb(_dtb: u64) -> Option<MaliG610StatusReport> {
     None
+}
+
+/// Physical PMU/CRU access for the power sequence: the kernel physmap and the generic timer.
+#[cfg(target_os = "none")]
+struct PhysPowerIo;
+
+#[cfg(target_os = "none")]
+impl power_unit::PowerIo for PhysPowerIo {
+    fn read(&mut self, phys: u64) -> u32 {
+        unsafe { mmio_read32(mmio_phys(phys)) }
+    }
+
+    fn write(&mut self, phys: u64, value: u32) {
+        unsafe { mmio_write32(mmio_phys(phys), value) };
+        // Each control write lands before the next read polls its effect.
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        monotonic_nanos()
+    }
+}
+
+/// The live power unit at `aperture_base` (DESIGN/020): `None` unless the board DTB holds its
+/// device, enabled, there. Reads no register.
+#[cfg(target_os = "none")]
+pub fn device_power_unit(dtb: u64, aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    power_unit::live_unit(bytes, aperture_base).map(|unit| unit.info())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_unit(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    None
+}
+
+/// Run the power-up sequence of the live unit at `aperture_base` (DESIGN/020 §4). The caller has
+/// already proven the right; this only refuses a unit the DTB does not hold.
+#[cfg(target_os = "none")]
+pub fn device_power_up(
+    dtb: u64,
+    aperture_base: u64,
+) -> Result<DevicePowerUpOutcome, DevicePowerError> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(DevicePowerError::NoUnit)?;
+    let unit = power_unit::live_unit(bytes, aperture_base).ok_or(DevicePowerError::NoUnit)?;
+    power_unit::power_up(unit, &mut PhysPowerIo)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_up(
+    _dtb: u64,
+    _aperture_base: u64,
+) -> Result<DevicePowerUpOutcome, DevicePowerError> {
+    Err(DevicePowerError::NoUnit)
+}
+
+/// Read and decode the status words of the live unit at `aperture_base`.
+#[cfg(target_os = "none")]
+pub fn device_power_status(dtb: u64, aperture_base: u64) -> Option<DevicePowerReadout> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let unit = power_unit::live_unit(bytes, aperture_base)?;
+    Some(power_unit::readout(unit, &mut PhysPowerIo))
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_power_status(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerReadout> {
+    None
+}
+
+/// The mint guard (DESIGN/020 §5): true when `[phys_base, phys_base + len)` overlaps a live power
+/// unit's aperture while that unit is not ready. Only an overlapping range costs a DTB walk and
+/// PMU/CRU reads; every other mint returns at the first comparison.
+#[cfg(target_os = "none")]
+pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
+    if !power_unit::POWER_UNITS
+        .iter()
+        .any(|unit| unit.overlaps(phys_base, len))
+    {
+        return false;
+    }
+    match unsafe { dtb_bytes(dtb) } {
+        Some(bytes) => power_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo),
+        None => false,
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
+    false
 }
 
 const DTB_PHYS_LIMIT: u64 = 1u64 << 48;

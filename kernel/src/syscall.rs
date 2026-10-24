@@ -1,16 +1,19 @@
-//j409
 //j410
 //j527
 //j547
 //j556
+//j571
 use alloc::vec::Vec;
 use core::mem;
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
 use kumo_abi::{
-    decode_tlmm_gpio_irq, interrupt_authority_key, sys::DeviceCtxInfo, BootInfo, Errno, Handle,
-    KoId, ObjectKind, Rights, Status, Syscall,
+    decode_tlmm_gpio_irq, interrupt_authority_key, sys::DeviceCtxInfo, BootInfo, DevicePowerStatus,
+    Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall,
+};
+use kumo_hal::active::{
+    DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome,
 };
 use kumo_hal::PageFlags;
 use kumo_ipc::Message;
@@ -169,6 +172,18 @@ pub enum KernelCall<'a> {
         user_ptr: u64,
         user_len: u64,
     },
+    /// DESIGN/020: raise the power domain of the device at `aperture_base`.
+    DevicePowerUp {
+        resource: Handle,
+        aperture_base: u64,
+    },
+    /// DESIGN/020: copy the device's [`DevicePowerStatus`] to `user_ptr`.
+    DevicePowerStatus {
+        resource: Handle,
+        aperture_base: u64,
+        user_ptr: u64,
+        user_len: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -319,6 +334,33 @@ fn resource_contains_irq(parent: ResourceBinding, irq: u32) -> bool {
     let parent_start = parent.irq_base as u64;
     let parent_end = parent_start + parent.irq_count as u64;
     irq >= parent_start && irq < parent_end
+}
+
+/// The ABI record for a HAL power readout (DESIGN/020 §6).
+fn device_power_status_record(readout: &DevicePowerReadout) -> DevicePowerStatus {
+    let flags = [
+        (readout.powered, DevicePowerStatus::POWERED),
+        (readout.repair_done, DevicePowerStatus::REPAIR_DONE),
+        (readout.bus_idle, DevicePowerStatus::BUS_IDLE),
+        (
+            readout.bus_idle_requested,
+            DevicePowerStatus::BUS_IDLE_REQUESTED,
+        ),
+        (
+            readout.clock_at_boot_rate,
+            DevicePowerStatus::CLOCK_AT_BOOT_RATE,
+        ),
+        (readout.aperture_ready, DevicePowerStatus::APERTURE_MINTABLE),
+    ]
+    .into_iter()
+    .filter(|(set, _)| *set)
+    .fold(0, |flags, (_, flag)| flags | flag);
+    DevicePowerStatus {
+        version: DevicePowerStatus::VERSION,
+        flags,
+        pmu: readout.pmu,
+        cru: readout.cru,
+    }
 }
 
 fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
@@ -2074,6 +2116,12 @@ impl SyscallEngine {
                 if !resource_contains(res, phys_base, len) {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
+                // DESIGN/020 §5: a powered-down device's registers cannot be minted, so no driver
+                // can map, and then read, an aperture whose read may hang the bus. Ranges outside
+                // every power unit return at the HAL's first comparison.
+                if kumo_hal::active::device_aperture_blocked(self.dtb(), phys_base, len) {
+                    return KernelCallResult::Status(Errno::BadState.status());
+                }
                 // Create a Physical VMO from the MMIO range.
                 match crate::mm::Vmo::from_mmio_range(phys_base, len) {
                     Ok(vmo) => match self.root_vmo_create(
@@ -2508,7 +2556,131 @@ impl SyscallEngine {
                 }
                 KernelCallResult::Status(Errno::Ok.status())
             }
+            KernelCall::DevicePowerUp {
+                resource,
+                aperture_base,
+            } => match self.device_power_authority(process, resource, Rights::WRITE, aperture_base)
+            {
+                Ok(unit) => KernelCallResult::Status(self.device_power_up(unit).status()),
+                Err(errno) => KernelCallResult::Status(errno.status()),
+            },
+            KernelCall::DevicePowerStatus {
+                resource,
+                aperture_base,
+                user_ptr,
+                user_len,
+            } => {
+                if let Err(errno) =
+                    process
+                        .handles()
+                        .require(resource, ObjectKind::Resource, Rights::READ)
+                {
+                    return KernelCallResult::Status(errno_from_object(errno).status());
+                }
+                let record_len = mem::size_of::<DevicePowerStatus>() as u64;
+                if user_ptr == 0
+                    || user_len < record_len
+                    || user_ptr.checked_add(record_len).is_none()
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                let unit = match self.device_power_authority(
+                    process,
+                    resource,
+                    Rights::READ,
+                    aperture_base,
+                ) {
+                    Ok(unit) => unit,
+                    Err(errno) => return KernelCallResult::Status(errno.status()),
+                };
+                let Some(readout) =
+                    kumo_hal::active::device_power_status(self.dtb(), unit.aperture_base)
+                else {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                };
+                unsafe {
+                    core::ptr::write_unaligned(
+                        user_ptr as *mut DevicePowerStatus,
+                        device_power_status_record(&readout),
+                    );
+                }
+                KernelCallResult::Status(Errno::Ok.status())
+            }
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
+        }
+    }
+
+    /// The address of the board DTB the kernel accepted at boot, or 0.
+    fn dtb(&self) -> u64 {
+        self.boot_info.as_ref().map_or(0, |boot| boot.platform.dtb)
+    }
+
+    /// DESIGN/020 §1: the caller must hold a Resource with `needed` whose window contains the
+    /// aperture of a live power unit. The device is named by its aperture base; there is no other
+    /// identifier, and nothing outside the unit's own bits can be reached through it.
+    fn device_power_authority(
+        &self,
+        process: &Process,
+        resource: Handle,
+        needed: Rights,
+        aperture_base: u64,
+    ) -> Result<DevicePowerUnitInfo, Errno> {
+        let entry = process
+            .handles()
+            .require(resource, ObjectKind::Resource, needed)
+            .map_err(errno_from_object)?;
+        let res = self.resource_by_koid(entry.koid).ok_or(Errno::BadHandle)?;
+        let unit = kumo_hal::active::device_power_unit(self.dtb(), aperture_base)
+            .ok_or(Errno::NotSupported)?;
+        if !resource_contains(res, unit.aperture_base, unit.aperture_len) {
+            return Err(Errno::AccessDenied);
+        }
+        Ok(unit)
+    }
+
+    /// Run the HAL power-up for `unit` and say what happened in the kernel log: one line on
+    /// success, an `ERR` line naming the step on failure (DESIGN/014).
+    fn device_power_up(&self, unit: DevicePowerUnitInfo) -> Errno {
+        match kumo_hal::active::device_power_up(self.dtb(), unit.aperture_base) {
+            Ok(DevicePowerUpOutcome::AlreadyUp) => {
+                crate::klog!(
+                    "{} POWER-UP Check     {:#x} already up   OK\n",
+                    unit.name,
+                    unit.aperture_base
+                );
+                Errno::Ok
+            }
+            Ok(DevicePowerUpOutcome::Raised { repair_ns, idle_ns }) => {
+                crate::klog!(
+                    "{} POWER-UP Check     {:#x} clock set, repair {} us, bus {} us   OK\n",
+                    unit.name,
+                    unit.aperture_base,
+                    repair_ns / 1_000,
+                    idle_ns / 1_000
+                );
+                Errno::Ok
+            }
+            Err(DevicePowerError::NoUnit) => Errno::NotSupported,
+            Err(DevicePowerError::PllMismatch { hz }) => {
+                crate::klog_at!(
+                    crate::kmsg::ERR,
+                    "{} POWER-UP Check     refused: parent PLL at {} Hz, not the expected rate; \
+                     nothing written   FAIL\n",
+                    unit.name,
+                    hz
+                );
+                Errno::NotSupported
+            }
+            Err(DevicePowerError::Timeout { step }) => {
+                crate::klog_at!(
+                    crate::kmsg::ERR,
+                    "{} POWER-UP Check     {} timed out; power-down request restored \
+                     (is the rail on?)   FAIL\n",
+                    unit.name,
+                    step.name()
+                );
+                Errno::TimedOut
+            }
         }
     }
 
@@ -2605,6 +2777,182 @@ mod tests {
             engine.process_kill_target(&parent, me),
             Err(Errno::InvalidArgs)
         );
+    }
+
+    const GPU_APERTURE: u64 = 0xfb00_0000;
+
+    fn device_power_up(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        resource: Handle,
+    ) -> Status {
+        match engine.dispatch(
+            process,
+            KernelCall::DevicePowerUp {
+                resource,
+                aperture_base: GPU_APERTURE,
+            },
+        ) {
+            KernelCallResult::Status(status) => status,
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    fn device_power_status(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        resource: Handle,
+        record: Option<&mut DevicePowerStatus>,
+        user_len: u64,
+    ) -> Status {
+        let user_ptr = record.map_or(0, |record| record as *mut DevicePowerStatus as u64);
+        match engine.dispatch(
+            process,
+            KernelCall::DevicePowerStatus {
+                resource,
+                aperture_base: GPU_APERTURE,
+                user_ptr,
+                user_len,
+            },
+        ) {
+            KernelCallResult::Status(status) => status,
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_power_calls_check_rights_first_and_find_no_unit_off_rk3588() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, GPU_APERTURE, 0x20_0000, 0, u32::MAX)
+            .unwrap();
+        let (channel, _) = create_channel(&mut engine, &mut process);
+        assert_eq!(
+            device_power_up(&mut engine, &mut process, channel),
+            Errno::WrongType.status()
+        );
+        // Raising power needs WRITE; reading status needs READ.
+        let reader = process.handles_mut().duplicate(root, Rights::READ).unwrap();
+        let writer = process
+            .handles_mut()
+            .duplicate(root, Rights::WRITE)
+            .unwrap();
+        assert_eq!(
+            device_power_up(&mut engine, &mut process, reader),
+            Errno::AccessDenied.status()
+        );
+        let mut record = DevicePowerStatus::default();
+        assert_eq!(
+            device_power_status(&mut engine, &mut process, writer, Some(&mut record), 64),
+            Errno::AccessDenied.status()
+        );
+        // The record pointer is checked before any unit is looked up.
+        assert_eq!(
+            device_power_status(&mut engine, &mut process, reader, None, 64),
+            Errno::InvalidArgs.status()
+        );
+        assert_eq!(
+            device_power_status(&mut engine, &mut process, reader, Some(&mut record), 16),
+            Errno::InvalidArgs.status()
+        );
+        // With the right rights the host HAL holds no power unit: inert, nothing written.
+        assert_eq!(
+            device_power_up(&mut engine, &mut process, writer),
+            Errno::NotSupported.status()
+        );
+        assert_eq!(
+            device_power_status(&mut engine, &mut process, reader, Some(&mut record), 64),
+            Errno::NotSupported.status()
+        );
+        assert_eq!(record, DevicePowerStatus::default());
+    }
+
+    #[test]
+    fn the_status_record_maps_every_readout_flag() {
+        let none = DevicePowerReadout {
+            powered: false,
+            repair_done: false,
+            bus_idle: false,
+            bus_idle_requested: false,
+            clock_at_boot_rate: false,
+            aperture_ready: false,
+            pmu: [1, 2, 3, 4, 5, 6],
+            cru: [7, 8, 9, 10, 11, 12, 13, 14],
+        };
+        let record = device_power_status_record(&none);
+        assert_eq!(record.version, DevicePowerStatus::VERSION);
+        assert_eq!(record.flags, 0);
+        assert_eq!(record.pmu, none.pmu);
+        assert_eq!(record.cru, none.cru);
+        let cases = [
+            (
+                DevicePowerReadout {
+                    powered: true,
+                    ..none
+                },
+                DevicePowerStatus::POWERED,
+            ),
+            (
+                DevicePowerReadout {
+                    repair_done: true,
+                    ..none
+                },
+                DevicePowerStatus::REPAIR_DONE,
+            ),
+            (
+                DevicePowerReadout {
+                    bus_idle: true,
+                    ..none
+                },
+                DevicePowerStatus::BUS_IDLE,
+            ),
+            (
+                DevicePowerReadout {
+                    bus_idle_requested: true,
+                    ..none
+                },
+                DevicePowerStatus::BUS_IDLE_REQUESTED,
+            ),
+            (
+                DevicePowerReadout {
+                    clock_at_boot_rate: true,
+                    ..none
+                },
+                DevicePowerStatus::CLOCK_AT_BOOT_RATE,
+            ),
+            (
+                DevicePowerReadout {
+                    aperture_ready: true,
+                    ..none
+                },
+                DevicePowerStatus::APERTURE_MINTABLE,
+            ),
+        ];
+        for (readout, flag) in cases {
+            assert_eq!(device_power_status_record(&readout).flags, flag);
+        }
+    }
+
+    #[test]
+    fn minting_the_gpu_aperture_is_unchanged_off_rk3588() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, GPU_APERTURE, 0x20_0000, 0, u32::MAX)
+            .unwrap();
+        // No power unit is live on the host, so the guard never blocks (DESIGN/020 §5).
+        assert!(matches!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::ResourceMintMmio {
+                    resource: root,
+                    phys_base: GPU_APERTURE,
+                    len: 0x1000,
+                },
+            ),
+            KernelCallResult::Handle(_)
+        ));
     }
 
     fn create_channel(engine: &mut SyscallEngine, process: &mut Process) -> (Handle, Handle) {

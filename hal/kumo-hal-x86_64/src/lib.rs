@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j457
 //j472
 //j474
 //j493
 //j534
+//j571
 
 mod fpsimd;
 mod gdt;
@@ -1135,6 +1135,77 @@ pub struct AppsSmmuTopology {
 
 pub fn smmu_apps_discover_from_dtb(_dtb: u64) -> Option<AppsSmmuTopology> {
     None
+}
+
+/// Device power units (DESIGN/020), mirrored from the aarch64 backend so arch-generic kernel code
+/// names one set of types. The x86 backend has no power-unit table: every unit is absent, so the
+/// device power syscalls answer `NotSupported` and the mint guard never blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DevicePowerUnitInfo {
+    pub name: &'static str,
+    pub aperture_base: u64,
+    pub aperture_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerStep {
+    Repair,
+    IdleAck,
+    Idle,
+}
+
+impl PowerStep {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Repair => "repair",
+            Self::IdleAck => "idle-ack",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevicePowerUpOutcome {
+    AlreadyUp,
+    Raised { repair_ns: u64, idle_ns: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevicePowerError {
+    NoUnit,
+    PllMismatch { hz: u64 },
+    Timeout { step: PowerStep },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DevicePowerReadout {
+    pub powered: bool,
+    pub repair_done: bool,
+    pub bus_idle: bool,
+    pub bus_idle_requested: bool,
+    pub clock_at_boot_rate: bool,
+    pub aperture_ready: bool,
+    pub pmu: [u32; 6],
+    pub cru: [u32; 8],
+}
+
+pub fn device_power_unit(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    None
+}
+
+pub fn device_power_up(
+    _dtb: u64,
+    _aperture_base: u64,
+) -> Result<DevicePowerUpOutcome, DevicePowerError> {
+    Err(DevicePowerError::NoUnit)
+}
+
+pub fn device_power_status(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerReadout> {
+    None
+}
+
+pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
+    false
 }
 
 pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {

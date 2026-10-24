@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j528
 //j532
 //j547
 //j556
 //j559
+//j571
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1814,6 +1814,41 @@ fn dispatch_object_syscall(
     } else if num == Syscall::DeviceCtxWaitFault as u64 {
         let ctx = Handle(r[0] as u32);
         match engine.dispatch(target, KernelCall::DeviceCtxWaitFault { ctx }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DevicePowerUp as u64 {
+        let resource = Handle(r[0] as u32);
+        let aperture_base = r[1];
+        match engine.dispatch(
+            target,
+            KernelCall::DevicePowerUp {
+                resource,
+                aperture_base,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DevicePowerStatus as u64 {
+        let resource = Handle(r[0] as u32);
+        let aperture_base = r[1];
+        let user_ptr = r[2];
+        let user_len = r[3];
+        let record_len = core::mem::size_of::<kumo_abi::DevicePowerStatus>() as u64;
+        if user_len < record_len || !user_range_ok(target, user_ptr, record_len) {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        }
+        match engine.dispatch(
+            target,
+            KernelCall::DevicePowerStatus {
+                resource,
+                aperture_base,
+                user_ptr,
+                user_len,
+            },
+        ) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }

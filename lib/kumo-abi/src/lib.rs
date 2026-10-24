@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j517
 //j562
 //j563
 //j565
 //j569
+//j571
 
 pub mod argv;
 pub mod boot;
@@ -29,8 +29,9 @@ pub use initrd::{
 };
 pub use object::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
 pub use sys::{
-    decode_tlmm_gpio_irq, interrupt_authority_key, tlmm_gpio_irq, tlmm_gpio_irq_window_base, Errno,
-    ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags, KERNEL_SHELL_COMMANDS,
+    decode_tlmm_gpio_irq, interrupt_authority_key, tlmm_gpio_irq, tlmm_gpio_irq_window_base,
+    DevicePowerStatus, Errno, ProcessRunFlags, Status, Syscall, TlmmGpioIrq, VmarFlags,
+    KERNEL_SHELL_COMMANDS,
 };
 
 // v2: BootInfo carries `board_id` (the baked board identity — DESIGN/017 §4 step 2).

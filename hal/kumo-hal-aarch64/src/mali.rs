@@ -1,4 +1,5 @@
 //j570
+//j571
 
 //! RK3588 Mali-G610 integration-status discovery: the observation half of PLAN/013 G1.
 //!
@@ -82,8 +83,10 @@ pub const RK3588_MALI_CLOCK_REGISTERS: [u64; 8] = [
 
 const CLK_GPU_SRC_SEL_PVTPLL: u32 = 1 << 14;
 const CLK_GPU_PVTPLL_SEL_OSC: u32 = 1 << 2;
-/// `GATE_CON66`: `clk_gpu_src` (3), `clk_gpu` (4), `clk_gpu_coregroup` (6), `clk_gpu_stacks` (7).
-const GPU_CORE_CLOCK_GATES: u32 = (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7);
+/// `GATE_CON66`: `clk_gpu_src_t` (1), `clk_gpu_src` (3), `clk_gpu` (4), `clk_gpu_coregroup` (6),
+/// `clk_gpu_stacks` (7). `clk_gpu_src_t` is on the path decision 4 fixed (the PLL path, PVTPLL
+/// off), and on the reset path too (SPLL through `clk_gpu_src_t`), so its gate counts (J571).
+const GPU_CORE_CLOCK_GATES: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7);
 /// `GATE_CON66`: `aclk_s/m0/m1/m2/m3_gpu_biu` (8-12), `pclk_gpu_root` (13), `pclk_gpu_biu` (14).
 const GPU_BIU_CLOCK_GATES: u32 = 0x7f << 8;
 /// `SOFTRST_CON66`: `resetn_gpu` (4), `sysresetn_gpu` (5).
@@ -650,7 +653,7 @@ mod tests {
             "pvtpll(osc)"
         );
 
-        for gate in [3, 4, 6, 7] {
+        for gate in [1, 3, 4, 6, 7] {
             let gated = MaliG610ClockStatus {
                 gate_con66: 1 << gate,
                 ..RESET_CLOCK
