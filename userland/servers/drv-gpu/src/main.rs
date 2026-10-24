@@ -1,18 +1,19 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j572
 //j574
 //j575
 //j576
 //j579
+//j580
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    enable_as0, latched_fault, map_range, mcu_boot, mmu_info, power_l2, probe, quiet_mmu,
-    soft_reset, ClockIo, Completion, CompletionIo, Firmware, GlobalInterface, MmioIo, ProbeError,
-    ProbeIo, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN,
-    CSF_SHARED_REGION_START, PAGE_SIZE,
+    enable_as0, init_global_interface, latched_fault, map_range, mcu_boot, mmu_info, power_l2,
+    probe, quiet_mmu, soft_reset, ClockIo, Completion, CompletionIo, Firmware, GlbIo,
+    GlobalInterface, MmioIo, ProbeError, ProbeIo, ResetPath, SectionFlags, TableArena, TableMemory,
+    APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START, GLB_DOORBELL, GLB_PING_TIMEOUT_NS,
+    PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -29,6 +30,9 @@ const FIRMWARE_MAX: usize = 320 * 1024;
 /// tables for the vendored image, with room to spare.
 const TABLE_ARENA_LEN: u64 = 16 * PAGE_SIZE;
 const MAX_SECTIONS: usize = 8;
+/// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
+/// the firmware's timers are expressed in 1024-tick units of it.
+const GLB_TIMER_HZ: u32 = 24_000_000;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -330,10 +334,50 @@ fn read_initrd_table(initrd: Handle, table: &mut [u8; INITRD_TABLE_MAX]) -> Opti
     Some(table_bytes)
 }
 
+/// The firmware's shared input/output blocks plus the global doorbell, for G4a's initialization.
+struct SharedGlb<'a> {
+    device: &'a mut Device,
+    input: u64,
+    output: u64,
+}
+
+impl GlbIo for SharedGlb<'_> {
+    fn read_input(&mut self, offset: u32) -> u32 {
+        // SAFETY: the input block lies inside the shared section this process maps.
+        unsafe { ((self.input + u64::from(offset)) as *const u32).read_volatile() }
+    }
+
+    fn write_input(&mut self, offset: u32, value: u32) {
+        // SAFETY: as `read_input`.
+        unsafe { ((self.input + u64::from(offset)) as *mut u32).write_volatile(value) };
+    }
+
+    fn read_output(&mut self, offset: u32) -> u32 {
+        // SAFETY: the output block lies inside the same section.
+        unsafe { ((self.output + u64::from(offset)) as *const u32).read_volatile() }
+    }
+
+    fn ring_doorbell(&mut self) {
+        // Order the Normal-NC input stores before the Device doorbell write.
+        dsb();
+        self.device.write32(GLB_DOORBELL, 1);
+    }
+}
+
+impl ClockIo for SharedGlb<'_> {
+    fn now_ns(&mut self) -> u64 {
+        self.device.now_ns()
+    }
+
+    fn delay_us(&mut self, us: u64) {
+        self.device.delay_us(us);
+    }
+}
+
 /// G3b: after the reset, read the vendored firmware out of the initrd, map its sections into
 /// address space 0 with their own flags, boot the MCU, and validate the global interface the
 /// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
-fn run_mali(device: &mut Device, initrd: Handle) -> u8 {
+fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
             log_level::NOTICE,
@@ -651,6 +695,38 @@ fn run_mali(device: &mut Device, initrd: Handle) -> u8 {
                     shared.flags.0
                 ),
             );
+            let input = shared.mapping.va + (glb.input_va - shared.va);
+            let output = shared.mapping.va + (glb.output_va - shared.va);
+            let ping = {
+                let mut glb_io = SharedGlb {
+                    device: &mut *device,
+                    input,
+                    output,
+                };
+                init_global_interface(
+                    &mut glb_io,
+                    shader_present,
+                    GLB_TIMER_HZ,
+                    GLB_PING_TIMEOUT_NS,
+                )
+            };
+            match ping {
+                Ok(report) => log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: global interface initialized, ping acknowledged (req=0x{:08x} ack=0x{:08x})\n",
+                        report.req, report.ack
+                    ),
+                ),
+                Err(error) => {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: global interface init failed: {:?}\n", error),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+            }
             log(
                 log_level::INFO,
                 format_args!("drv-gpu: GPU resident; firmware keeps the device until reboot\n"),
@@ -716,7 +792,7 @@ extern "C" fn main(resource: u64, initrd: u64) -> ! {
                     identity.shader_present
                 ),
             );
-            run_mali(&mut device, Handle(initrd as u32))
+            run_mali(&mut device, Handle(initrd as u32), identity.shader_present)
         }
         Err(ProbeError::PowerUp(status)) if status == Errno::NotSupported.status() => {
             log(

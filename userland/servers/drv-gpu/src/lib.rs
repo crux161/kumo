@@ -1,17 +1,18 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j575
 //j576
 //j577
 //j578
 //j579
+//j580
 
 //! G1b–G3a: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
 //! its sections into address space 0, boots the MCU, and validates the global interface the
-//! firmware publishes when it comes up.
+//! firmware publishes when it comes up. G4a initializes that interface and proves a ping
+//! round-trip.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -1359,6 +1360,125 @@ pub fn latched_fault(io: &mut impl MmioIo) -> Option<Fault> {
     let raw = io.read32(AS_FAULTSTATUS);
     let address = read64(io, AS_FAULTADDRESS, AS_FAULTADDRESS + 4);
     Some(decode_fault(raw, address))
+}
+
+// ---- G4a: the global interface (RESEARCH/009 §9.2-§9.4) ----
+
+/// GLB input-block offsets (§9.3), relative to the control block's `input_va`.
+pub const GLB_REQ: u32 = 0x00;
+pub const GLB_ACK_IRQ_MASK: u32 = 0x04;
+pub const GLB_PROGRESS_TIMER: u32 = 0x10;
+pub const GLB_POWEROFF_TIMER: u32 = 0x14;
+pub const GLB_CORE_EN_MASK: u32 = 0x18;
+pub const GLB_IDLE_TIMER: u32 = 0x80;
+/// GLB output-block offset of the acknowledge word (§9.3).
+pub const GLB_ACK: u32 = 0x00;
+/// Doorbell 0 rings the global interface; doorbells start at `0x8_0000` and sit 64 KiB apart
+/// (RESEARCH/009 §4.10).
+pub const GLB_DOORBELL: u32 = 0x0008_0000;
+
+/// GLB request/ack bits (§9.3).
+pub const GLB_REQ_CFG_PROGRESS_TIMER: u32 = 1 << 1;
+pub const GLB_REQ_CFG_ALLOC_EN: u32 = 1 << 2;
+pub const GLB_REQ_CFG_POWEROFF_TIMER: u32 = 1 << 3;
+pub const GLB_REQ_COUNTER_EN: u32 = 1 << 7;
+pub const GLB_REQ_PING: u32 = 1 << 8;
+pub const GLB_REQ_IDLE_EN: u32 = 1 << 10;
+
+/// panthor's initial acknowledge mask: the three config toggles, PING, IDLE_EN and the IDLE
+/// event (§9.4).
+pub const GLB_INIT_ACK_IRQ_MASK: u32 = GLB_REQ_CFG_PROGRESS_TIMER
+    | GLB_REQ_CFG_ALLOC_EN
+    | GLB_REQ_CFG_POWEROFF_TIMER
+    | GLB_REQ_PING
+    | GLB_REQ_IDLE_EN
+    | (1 << 26);
+/// panthor's progress timeout in the firmware's 1024-tick units (§9.4).
+pub const GLB_PROGRESS_TIMEOUT: u32 = 2_560_000;
+/// panthor gives a ping 100 ms to be acknowledged (§8.7).
+pub const GLB_PING_TIMEOUT_NS: u64 = 100_000_000;
+
+/// The driver's window on the firmware's shared section and the global doorbell. The input and
+/// output blocks are Normal-NC memory the firmware also accesses; `ring_doorbell` must order the
+/// input stores before its Device write.
+pub trait GlbIo {
+    fn read_input(&mut self, offset: u32) -> u32;
+    fn write_input(&mut self, offset: u32, value: u32);
+    fn read_output(&mut self, offset: u32) -> u32;
+    fn ring_doorbell(&mut self);
+}
+
+/// RESEARCH/009 §9.3: a timer value is `ceil(us * rate / (10^6 * 1024))` in the low 30 bits. Bit
+/// 31 would select the GPU cycle counter instead of the system timer; KUMO uses the latter.
+pub fn glb_timer_ticks(us: u32, rate_hz: u32) -> u32 {
+    if rate_hz == 0 {
+        return 0;
+    }
+    let numerator = u64::from(us) * u64::from(rate_hz);
+    let denominator = 1_000_000u64 * 1024;
+    let ticks = (numerator + denominator - 1) / denominator;
+    ticks.min(0x7fff_ffff) as u32
+}
+
+/// A toggle request is pending while its REQ bit differs from the ACK bit: set it to the opposite
+/// of the firmware's current acknowledge (§9.2).
+fn with_toggle(req: u32, ack: u32, bit: u32) -> u32 {
+    let value = if ack & bit == 0 { bit } else { 0 };
+    (req & !bit) | value
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlbReport {
+    pub req: u32,
+    pub ack: u32,
+    pub core_en_mask: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlbInitError {
+    /// The acknowledge never mirrored the PING request within the timeout.
+    PingTimeout { req: u32, ack: u32 },
+}
+
+/// RESEARCH/009 §9.4 plus §9.2's liveness check: program the core mask, timers and acknowledge
+/// mask, set the IDLE_EN/COUNTER_EN levels, toggle the three config requests and PING from the
+/// firmware's current acknowledge, ring doorbell 0, and require PING to be mirrored within
+/// `timeout_ns`. The final acknowledge is returned for the boot report. — TIMBERDOODLE
+pub fn init_global_interface(
+    io: &mut (impl GlbIo + ClockIo),
+    shader_present: u64,
+    timer_hz: u32,
+    timeout_ns: u64,
+) -> Result<GlbReport, GlbInitError> {
+    io.write_input(GLB_CORE_EN_MASK, shader_present as u32);
+    io.write_input(GLB_CORE_EN_MASK + 4, (shader_present >> 32) as u32);
+    io.write_input(GLB_PROGRESS_TIMER, GLB_PROGRESS_TIMEOUT);
+    io.write_input(GLB_POWEROFF_TIMER, glb_timer_ticks(10_000, timer_hz));
+    io.write_input(GLB_IDLE_TIMER, glb_timer_ticks(800, timer_hz));
+    io.write_input(GLB_ACK_IRQ_MASK, GLB_INIT_ACK_IRQ_MASK);
+    let ack = io.read_output(GLB_ACK);
+    let mut req = io.read_input(GLB_REQ) | GLB_REQ_IDLE_EN | GLB_REQ_COUNTER_EN;
+    req = with_toggle(req, ack, GLB_REQ_CFG_ALLOC_EN);
+    req = with_toggle(req, ack, GLB_REQ_CFG_PROGRESS_TIMER);
+    req = with_toggle(req, ack, GLB_REQ_CFG_POWEROFF_TIMER);
+    req = with_toggle(req, ack, GLB_REQ_PING);
+    io.write_input(GLB_REQ, req);
+    io.ring_doorbell();
+    let deadline = io.now_ns().saturating_add(timeout_ns);
+    loop {
+        let ack = io.read_output(GLB_ACK);
+        if (ack ^ req) & GLB_REQ_PING == 0 {
+            return Ok(GlbReport {
+                req,
+                ack,
+                core_en_mask: shader_present,
+            });
+        }
+        if io.now_ns() >= deadline {
+            return Err(GlbInitError::PingTimeout { req, ack });
+        }
+        io.delay_us(10);
+    }
 }
 
 #[cfg(test)]
@@ -2840,5 +2960,150 @@ mod g3b_tests {
         assert!(firmware
             .sections()
             .any(|section| section.flags.contains(SectionFlags::PROT)));
+    }
+}
+
+#[cfg(test)]
+mod g4a_tests {
+    extern crate std;
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::vec::Vec;
+
+    struct FakeGlb {
+        input: HashMap<u32, u32>,
+        acks: VecDeque<u32>,
+        writes: Vec<(u32, u32)>,
+        doorbells: u32,
+        now: u64,
+        delays: u64,
+    }
+
+    impl FakeGlb {
+        fn new(acks: &[u32]) -> Self {
+            Self {
+                input: HashMap::new(),
+                acks: acks.iter().copied().collect(),
+                writes: Vec::new(),
+                doorbells: 0,
+                now: 0,
+                delays: 0,
+            }
+        }
+
+        /// The last scripted acknowledge repeats.
+        fn next_ack(&mut self) -> u32 {
+            if self.acks.len() > 1 {
+                self.acks.pop_front().unwrap()
+            } else {
+                *self.acks.front().unwrap_or(&0)
+            }
+        }
+    }
+
+    impl GlbIo for FakeGlb {
+        fn read_input(&mut self, offset: u32) -> u32 {
+            *self.input.get(&offset).unwrap_or(&0)
+        }
+
+        fn write_input(&mut self, offset: u32, value: u32) {
+            self.writes.push((offset, value));
+            self.input.insert(offset, value);
+        }
+
+        fn read_output(&mut self, offset: u32) -> u32 {
+            assert_eq!(offset, GLB_ACK);
+            self.next_ack()
+        }
+
+        fn ring_doorbell(&mut self) {
+            self.doorbells += 1;
+        }
+    }
+
+    impl ClockIo for FakeGlb {
+        fn now_ns(&mut self) -> u64 {
+            self.now
+        }
+
+        fn delay_us(&mut self, us: u64) {
+            self.delays += 1;
+            self.now += us * 1_000;
+        }
+    }
+
+    #[test]
+    fn global_init_programs_the_controls_and_waits_for_the_ping_ack() {
+        let mut io = FakeGlb::new(&[0, 0x58e]);
+        assert_eq!(
+            init_global_interface(&mut io, 0x5_0005, 24_000_000, GLB_PING_TIMEOUT_NS),
+            Ok(GlbReport {
+                req: 0x58e,
+                ack: 0x58e,
+                core_en_mask: 0x5_0005
+            })
+        );
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (GLB_CORE_EN_MASK, 0x5_0005),
+                (GLB_CORE_EN_MASK + 4, 0),
+                (GLB_PROGRESS_TIMER, GLB_PROGRESS_TIMEOUT),
+                (GLB_POWEROFF_TIMER, 235),
+                (GLB_IDLE_TIMER, 19),
+                (GLB_ACK_IRQ_MASK, GLB_INIT_ACK_IRQ_MASK),
+                (GLB_REQ, 0x58e),
+            ]
+        );
+        assert_eq!(io.doorbells, 1);
+        assert_eq!(io.delays, 0);
+    }
+
+    #[test]
+    fn global_init_toggles_against_the_firmwares_existing_ack() {
+        let mut io = FakeGlb::new(&[GLB_REQ_CFG_ALLOC_EN, 0x58a]);
+        assert_eq!(
+            init_global_interface(&mut io, 1, 24_000_000, GLB_PING_TIMEOUT_NS),
+            Ok(GlbReport {
+                req: 0x58a,
+                ack: 0x58a,
+                core_en_mask: 1
+            })
+        );
+        assert_eq!(io.writes.last(), Some(&(GLB_REQ, 0x58a)));
+    }
+
+    #[test]
+    fn global_init_times_out_without_the_ping_ack() {
+        let mut io = FakeGlb::new(&[0]);
+        assert_eq!(
+            init_global_interface(&mut io, 1, 24_000_000, GLB_PING_TIMEOUT_NS),
+            Err(GlbInitError::PingTimeout { req: 0x58e, ack: 0 })
+        );
+        assert_eq!(io.delays, 10_000);
+    }
+
+    #[test]
+    fn glb_timer_ticks_match_the_worked_values() {
+        assert_eq!(glb_timer_ticks(10_000, 24_000_000), 235);
+        assert_eq!(glb_timer_ticks(800, 24_000_000), 19);
+        assert_eq!(glb_timer_ticks(1_000, 1_000_000), 1);
+        assert_eq!(glb_timer_ticks(0, 24_000_000), 0);
+        assert_eq!(glb_timer_ticks(1_000, 0), 0);
+    }
+
+    #[test]
+    fn g4a_constants_match_research_009() {
+        assert_eq!(GLB_REQ, 0x00);
+        assert_eq!(GLB_ACK_IRQ_MASK, 0x04);
+        assert_eq!(GLB_PROGRESS_TIMER, 0x10);
+        assert_eq!(GLB_POWEROFF_TIMER, 0x14);
+        assert_eq!(GLB_CORE_EN_MASK, 0x18);
+        assert_eq!(GLB_IDLE_TIMER, 0x80);
+        assert_eq!(GLB_ACK, 0x00);
+        assert_eq!(GLB_DOORBELL, 0x0008_0000);
+        assert_eq!(GLB_INIT_ACK_IRQ_MASK, 0x0400_050e);
+        assert_eq!(GLB_PROGRESS_TIMEOUT, 2_560_000);
+        assert_eq!(GLB_PING_TIMEOUT_NS, 100_000_000);
     }
 }
