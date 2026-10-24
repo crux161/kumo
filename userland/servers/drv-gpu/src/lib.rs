@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j582
 //j583
 //j584
 //j585
 //j586
+//j587
 
 //! G1b–G4b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1820,6 +1820,23 @@ pub fn wake_stream(
         (glb_req & !slot_bit) | (!glb_ack & slot_bit),
     );
     io.ring_doorbell();
+}
+
+/// RESEARCH/009 §9.7: the firmware's consumption pointer from the queue's output page.
+pub fn queue_extract(mem: &mut impl FirmwareMemory, iface: QueueIface) -> u64 {
+    read_mcu64(mem, iface.output_va)
+}
+
+/// RESEARCH/009 §11.5: the group's per-stream event level, held until acknowledged.
+pub fn cs_irq_req(mem: &mut impl FirmwareMemory, csg_output_va: u64) -> u32 {
+    mem.read32(csg_output_va + 0x0C)
+}
+
+/// RESEARCH/009 §11.5: acknowledge every raised stream event the caller has seen. panthor copies
+/// `cs_irq_req` into `cs_irq_ack` before reading the streams, so an event that arrives meanwhile
+/// is not lost; this is that copy. — TIMBERDOODLE
+pub fn ack_cs_irqs(mem: &mut impl FirmwareMemory, csg_input_va: u64, req: u32) {
+    mem.write32(csg_input_va + 0x0C, req);
 }
 
 /// The byte position inside the ring for a monotonically growing insert (§9.7).
@@ -3703,6 +3720,21 @@ mod g4b_tests {
         let iface = QueueIface::at(0x0410_0000);
         assert_eq!(iface.input_va, 0x0410_0000);
         assert_eq!(iface.output_va, 0x0410_1000);
+    }
+
+    #[test]
+    fn queue_extract_and_the_stream_irq_ack_follow_research_009() {
+        let mut io = FakeFirmware::new();
+        io.set(0x7000, 0x28);
+        let iface = QueueIface {
+            input_va: 0x6000,
+            output_va: 0x7000,
+        };
+        assert_eq!(queue_extract(&mut io, iface), 0x28);
+        io.set(0x670c, 0x3);
+        assert_eq!(cs_irq_req(&mut io, 0x6700), 0x3);
+        ack_cs_irqs(&mut io, 0x6500, 0x3);
+        assert_eq!(io.get(0x650c), 0x3);
     }
 
     #[test]

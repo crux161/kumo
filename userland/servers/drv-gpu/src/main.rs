@@ -1,23 +1,23 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j581
 //j583
 //j584
 //j585
 //j586
+//j587
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
-    latched_fault, map_range, mcu_boot, mmu_info, mmu_rawstat, power_l2, probe, program_group,
-    program_queue, publish_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
-    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, wake_stream,
-    ClockIo, Completion, CompletionIo, Firmware, FirmwareMemory, GlbIo, GlobalInterface,
-    GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath,
-    SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START,
-    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, GLB_DOORBELL, GLB_DOORBELL_REQ,
-    GLB_PING_TIMEOUT_NS, PAGE_SIZE,
+    ack_cs_irqs, cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
+    init_global_interface, latched_fault, map_range, mcu_boot, mmu_info, mmu_rawstat, power_l2,
+    probe, program_group, program_queue, publish_insert, queue_extract, quiet_mmu, read_cs_control,
+    read_cs_status, read_csg_control, read_fault_as, ring_offset, shared_region_contains,
+    soft_reset, start_group, wake_stream, ClockIo, Completion, CompletionIo, Firmware,
+    FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
+    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, PAGE_SIZE,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -54,6 +54,8 @@ const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
 const WORK_TIMEOUT_NS: u64 = 1_000_000_000;
+/// After the stream lands, how long the firmware's extract may take to catch up (polled).
+const DRAIN_TIMEOUT_NS: u64 = 100_000_000;
 const FIRST_WORK_VALUE: u32 = 0x00C0_FFEE;
 const TILER_PRESENT_LO: u32 = 0x110;
 const TILER_PRESENT_HI: u32 = 0x114;
@@ -1267,6 +1269,40 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     return 1;
                 }
                 device.delay_us(100);
+            }
+
+            {
+                // RESEARCH/009 §9.7 and §11.5: once the stream lands the firmware's extract should
+                // reach the published insert, and any pending per-stream event is acknowledged by
+                // copying cs_irq_req into cs_irq_ack. — TIMBERDOODLE
+                let expected_insert = (stream.len() * 8) as u64;
+                let iface = QueueIface::at(MCU_IO_PAGES_VA);
+                let drain_deadline = device.now_ns() + DRAIN_TIMEOUT_NS;
+                let mut extract = 0;
+                let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                loop {
+                    extract = queue_extract(&mut glb_io, iface);
+                    if extract >= expected_insert || glb_io.now_ns() >= drain_deadline {
+                        break;
+                    }
+                    glb_io.delay_us(100);
+                }
+                let status = read_cs_status(&mut glb_io, cs.output_va);
+                let req = cs_irq_req(&mut glb_io, csg.output_va);
+                let ack = glb_io.read32(csg.input_va + 0x0C);
+                log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: queue drained extract=0x{:x} cmd_ptr=0x{:x} blocked={} irq=0x{:x}/0x{:x} pending=0x{:x}\n",
+                        extract, status.cmd_ptr, status.blocked_reason, req, ack, req ^ ack
+                    ),
+                );
+                ack_cs_irqs(&mut glb_io, csg.input_va, req);
+                let acked = glb_io.read32(csg.input_va + 0x0C);
+                log(
+                    log_level::NOTICE,
+                    format_args!("drv-gpu: stream irqs acknowledged (ack=0x{:x})\n", acked),
+                );
             }
 
             log(
