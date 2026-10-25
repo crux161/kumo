@@ -1,28 +1,29 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j587
 //j588
 //j589
 //j590
 //j591
+//j593
 
 use core::fmt::{self, Write};
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
     cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
-    init_global_interface, job_irq_csg, job_slot, job_wrapper, latched_fault, latest_flush_id,
-    map_range, mcu_boot, mmu_info, mmu_rawstat, paint_reference_checksum, paint_stream, power_l2,
-    probe, program_group, program_queue, publish_insert, queue_extract, queue_insert, quiet_mmu,
-    read_cs_control, read_cs_status, read_csg_control, read_fault_as, ring_offset,
-    shared_region_contains, soft_reset, start_group, store_stream, surface_chunks, wake_stream,
-    write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl,
-    Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo,
-    PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena,
-    TableMemory, APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL,
-    BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
-    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, GPU_VIEW,
-    JOB_IRQ_GLOBAL_IF, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
+    init_global_interface, job_irq_csg, job_slot, job_wrapper, kumo_paint_data, kumo_paint_stream,
+    latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info, mmu_rawstat,
+    paint_reference_checksum, power_l2, probe, program_group, program_queue, publish_insert,
+    queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
+    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
+    surface_chunks, wake_stream, write_job_words, ClockIo, Completion, CompletionIo, CsControl,
+    CsFeatures, CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall,
+    JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath,
+    SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE,
+    BOOTSTRAP_VIEW_CHANNEL, BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE,
+    CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS,
+    GPU_VIEW, JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
+    KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
     PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
@@ -67,7 +68,7 @@ const WORK_LEN: u64 = 4 * PAGE_SIZE;
 /// counts rather than being set.
 const WRAPPED_JOBS: u64 = 2;
 const WRAPPED_VALUE_BASE: u32 = 0xC0DE_0000;
-/// G5a: job 3 paints the test pattern. Its stream sits 1 KiB into the streams page, clear of
+/// G5c-2: job 3 dispatches kumo_paint. Its stream sits 1 KiB into the streams page, clear of
 /// the store jobs' lines; the target is its own 128 KiB in AS1, inside the same 2 MiB table as
 /// the work buffer.
 const PAINT_JOB: u64 = WRAPPED_JOBS + 1;
@@ -1135,6 +1136,64 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 let _ = soft_reset(device);
                 return 1;
             }
+            // Separate GPU permissions: the binary is cached read-only executable; descriptor
+            // and push data are uncached read-only no-execute. CPU uploads use Normal-NC, and
+            // AS1 is still disabled while these mappings are installed. — TIMBERDOODLE
+            let data = match kumo_paint_data(AS1_PAINT_VA) {
+                Ok(data) => data,
+                Err(error) => {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: kernel data refused: {:?}\n", error),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+            };
+            for (gpu_va, bytes, executable) in [
+                (KUMO_PAINT_BINARY_VA, KUMO_PAINT_V10.binary, true),
+                (KUMO_PAINT_DATA_VA, data.as_slice(), false),
+            ] {
+                let Some(mapping) = map_contiguous(PAGE_SIZE) else {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: kernel allocation failed at 0x{:x}\n", gpu_va),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                };
+                zero_mapping(&mapping, PAGE_SIZE);
+                copy_mapping(&mapping, bytes);
+                if let Err(error) = map_range(
+                    &mut table_memory,
+                    &mut arena,
+                    as1_l0,
+                    gpu_va,
+                    mapping.phys,
+                    PAGE_SIZE,
+                    PageAttrs {
+                        cached: executable,
+                        readonly: true,
+                        executable,
+                    },
+                ) {
+                    log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: kernel map failed at 0x{:x}: {:?}\n",
+                            gpu_va, error
+                        ),
+                    );
+                    let _ = soft_reset(device);
+                    return 1;
+                }
+            }
+            log(log_level::NOTICE, format_args!(
+                "drv-gpu: kumo_paint executable at 0x{:x} ({} bytes), descriptors at 0x{:x}, workgroups={}x{}x{} local={}x{}x{}\n",
+                KUMO_PAINT_BINARY_VA, KUMO_PAINT_V10.binary.len(), KUMO_PAINT_DATA_VA,
+                KUMO_PAINT_WORKGROUPS[0], KUMO_PAINT_WORKGROUPS[1], KUMO_PAINT_WORKGROUPS[2],
+                KUMO_PAINT_V10.local_size[0], KUMO_PAINT_V10.local_size[1], KUMO_PAINT_V10.local_size[2]
+            ));
             dsb();
             if let Err(error) = enable_as(device, GROUP_AS, as1_l0, mmu.va_bits) {
                 log(
@@ -1397,15 +1456,25 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             let mut seqno = 0;
             let mut flush_ids = [0u32; PAINT_JOB as usize];
             for job in 1..=PAINT_JOB {
-                // Jobs 1 and 2 store one value each; job 3 (G5a) paints the test pattern.
+                // Jobs 1 and 2 store one value each; job 3 runs the compute kernel.
                 let painting = job == PAINT_JOB;
                 let target_va = AS1_TARGET_VA + job * CS_LINE_BYTES;
                 let value = WRAPPED_VALUE_BASE | job as u32;
                 let mut words = [0u64; PAINT_STREAM_MAX];
                 let (stream_va, len) = if painting {
-                    let stream = paint_stream(AS1_PAINT_VA, features);
-                    words[..stream.words().len()].copy_from_slice(stream.words());
-                    (PAINT_STREAM_VA, stream.words().len())
+                    let stream = match kumo_paint_stream(features) {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            log(
+                                log_level::ERR,
+                                format_args!("drv-gpu: compute stream refused: {:?}\n", error),
+                            );
+                            let _ = soft_reset(device);
+                            return 1;
+                        }
+                    };
+                    words[..stream.len()].copy_from_slice(&stream);
+                    (PAINT_STREAM_VA, stream.len())
                 } else {
                     let stream = store_stream(target_va, value);
                     words[..stream.len()].copy_from_slice(&stream);
@@ -1630,7 +1699,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     return 1;
                 }
                 if painting {
-                    // G5a: the GPU wrote the surface through a GPU-uncached mapping and cleaned
+                    // G5c-2: the shader wrote the surface through a GPU-uncached mapping and cleaned
                     // L2/LSC before signalling, and the CPU maps it Normal-NC, so a volatile read
                     // after the interrupt sees the result with no cache maintenance (§13).
                     let check = check_paint(|x, y| {
@@ -1644,7 +1713,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     log(
                         log_level::NOTICE,
                         format_args!(
-                            "drv-gpu: job {} painted {}x{} with the command stream: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",
+                            "drv-gpu: job {} painted {}x{} with kumo_paint compute: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",
                             job, PAINT_WIDTH, PAINT_HEIGHT, check.mismatches, check.checksum, reference
                         ),
                     );

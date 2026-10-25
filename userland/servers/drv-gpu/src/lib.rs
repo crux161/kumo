@@ -1,12 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j588
 //j589
 //j590
 //j591
 //j592
+//j593
 
-//! G1b–G5b: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
@@ -18,7 +18,7 @@
 //! test pattern with the command stream alone and checks it against a CPU reference.
 //! G5b presents it in one of drv-fb's views (DESIGN/019).
 //! G5c-1 carries the offline-compiled kernel (shaders/mali) and packs its descriptors exactly as
-//! Mesa does.
+//! Mesa does. G5c-2 maps it executable and dispatches it as the pixel producer.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -2559,6 +2559,20 @@ pub const KUMO_PAINT_V10: ComputeKernel = ComputeKernel {
 pub const KERNEL_SYSVALS_BYTES: u32 = 24;
 /// panvk uploads shader code 128-byte aligned (`panvk_pool_upload_aligned(..., 128)`).
 pub const SHADER_BINARY_ALIGN: u64 = 128;
+/// The manifest's reference address: the GPU reads exactly the SPD pinned against Mesa.
+pub const KUMO_PAINT_BINARY_VA: u64 = 0x1004_0000;
+/// A separate read-only, no-execute page: SPD, TSD, then the 40-byte FAU push data.
+pub const KUMO_PAINT_DATA_VA: u64 = KUMO_PAINT_BINARY_VA + PAGE_SIZE;
+pub const KUMO_PAINT_TSD_VA: u64 = KUMO_PAINT_DATA_VA + 32;
+pub const KUMO_PAINT_PUSH_VA: u64 = KUMO_PAINT_DATA_VA + 64;
+pub const KUMO_PAINT_WORKGROUPS: [u32; 3] = [
+    PAINT_WIDTH / KUMO_PAINT_V10.local_size[0],
+    PAINT_HEIGHT / KUMO_PAINT_V10.local_size[1],
+    1,
+];
+const _: () = assert!(KUMO_PAINT_V10.binary.len() as u64 <= PAGE_SIZE);
+const _: () = assert!(PAINT_WIDTH % KUMO_PAINT_V10.local_size[0] == 0);
+const _: () = assert!(PAINT_HEIGHT % KUMO_PAINT_V10.local_size[1] == 0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelError {
@@ -2572,6 +2586,8 @@ pub enum KernelError {
     BinaryAddress(u64),
     /// The push data is not 8-byte aligned, empty, or more than 255 FAU slots.
     PushData { va: u64, bytes: u32 },
+    /// The fixed compute registers plus wrapper scratch, and separate endpoint/flush slots.
+    DispatchFeatures(CsFeatures),
 }
 
 /// RESEARCH/009 §12.2's Shader Program descriptor for a compute kernel, packed the way panvk's
@@ -2650,6 +2666,61 @@ pub fn kumo_paint_push(workgroups: [u32; 3], out: u64, stride: u32) -> [u8; 40] 
     push[args..args + 8].copy_from_slice(&out.to_le_bytes());
     push[args + 8..args + 12].copy_from_slice(&stride.to_le_bytes());
     push
+}
+
+/// One page's initialized bytes: Mesa-pinned SPD and TSD followed by the precompiled ABI's
+/// sysvals/arguments. The rest of the allocation is zeroed by the caller.
+pub fn kumo_paint_data(out: u64) -> Result<[u8; 104], KernelError> {
+    let mut data = [0u8; 104];
+    for (index, word) in shader_program_descriptor(&KUMO_PAINT_V10, KUMO_PAINT_BINARY_VA)?
+        .iter()
+        .chain(local_storage_descriptor(&KUMO_PAINT_V10)?.iter())
+        .enumerate()
+    {
+        data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    data[64..].copy_from_slice(&kumo_paint_push(KUMO_PAINT_WORKGROUPS, out, PAINT_WIDTH));
+    Ok(data)
+}
+
+/// G5c-2, Mesa v10.xml and panvk's dispatch_precomp: select resource set 0, task increment 1
+/// on X. Use endpoint scoreboard 1 and other scoreboard 0, then wait before the unconditional
+/// L2/LSC clean; the wrapper must never publish completion ahead of the shader's writes.
+/// MOVE48 would discard the FAU count in bits 63:56, so its pair uses two MOVE32s.
+/// — TIMBERDOODLE
+pub fn kumo_paint_stream(features: CsFeatures) -> Result<[u64; 24], KernelError> {
+    if !(44..=256).contains(&features.work_regs) || !(2..=16).contains(&features.scoreboards) {
+        return Err(KernelError::DispatchFeatures(features));
+    }
+    let fau = fau_pointer(KUMO_PAINT_PUSH_VA, 40)?;
+    let [x, y, z] = KUMO_PAINT_WORKGROUPS;
+    let wait_all = ((1u32 << features.scoreboards) - 1) as u16;
+    Ok([
+        (34u64 << 56) | 1, // REQ_RESOURCE compute
+        (23u64 << 56) | 1, // SET_SB_ENTRY endpoint=1, other=0
+        move48(0, 0),
+        move32(8, fau as u32),
+        move32(9, (fau >> 32) as u32),
+        move48(16, KUMO_PAINT_DATA_VA),
+        move48(24, KUMO_PAINT_TSD_VA),
+        move32(32, 0),
+        move32(33, workgroup_size_word(&KUMO_PAINT_V10)?),
+        move32(34, 0),
+        move32(35, 0),
+        move32(36, 0),
+        move32(37, x),
+        move32(38, y),
+        move32(39, z),
+        (4u64 << 56) | 1, // RUN_COMPUTE task increment=1, X, resource set 0
+        wait_slot(wait_all),
+        move32(40, 0),
+        flush_caches(0, 40, FLUSH_CLEAN),
+        wait_slot(1),
+        34u64 << 56, // release resources after completion and cache clean
+        0,
+        0,
+        0,
+    ])
 }
 
 /// Every chunk of the painted surface as (byte offset, first pixel's x, y), row-major. The same
@@ -5559,6 +5630,93 @@ mod g5c_tests {
         );
         assert!(fau_pointer(0x1000_3104, 36).is_err());
         assert!(fau_pointer(0x1000_3100, 0).is_err());
+    }
+
+    #[test]
+    fn compute_upload_matches_mesa_and_covers_every_pixel_once() {
+        let m = manifest();
+        assert_eq!(KUMO_PAINT_BINARY_VA, number(&m, "reference_binary_va"));
+        let data = kumo_paint_data(0x1010_0000).unwrap();
+        for (bytes, key) in [(&data[..32], "spd_v10"), (&data[32..64], "tsd_v10")] {
+            let expected: Vec<u8> = hex_words(&m, key)
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(KUMO_PAINT_TSD_VA, KUMO_PAINT_DATA_VA + 32);
+        assert_eq!(KUMO_PAINT_PUSH_VA, KUMO_PAINT_DATA_VA + 64);
+        assert_eq!(
+            &data[64..],
+            &kumo_paint_push(KUMO_PAINT_WORKGROUPS, 0x1010_0000, PAINT_WIDTH)
+        );
+        let [gx, gy, gz] = KUMO_PAINT_WORKGROUPS;
+        let [lx, ly, lz] = KUMO_PAINT_V10.local_size;
+        assert_eq!([gx * lx, gy * ly, gz * lz], [PAINT_WIDTH, PAINT_HEIGHT, 1]);
+    }
+
+    #[test]
+    fn compute_stream_keeps_the_fau_count_and_waits_before_cleaning_and_signalling() {
+        let features = CsFeatures::decode(0x0007_085f);
+        let stream = kumo_paint_stream(features).unwrap();
+        assert_eq!(stream.len() * 8 % CS_LINE_BYTES as usize, 0);
+        let mut regs = [u32::MAX; 96];
+        for word in &stream[..15] {
+            let dst = ((word >> 48) & 0xFF) as usize;
+            match word >> 56 {
+                1 => {
+                    regs[dst] = *word as u32;
+                    regs[dst + 1] = ((word >> 32) & 0xFFFF) as u32;
+                }
+                2 => regs[dst] = *word as u32,
+                23 | 34 => (),
+                opcode => panic!("unexpected setup opcode {opcode}"),
+            }
+        }
+        let pair = |r: usize| u64::from(regs[r]) | (u64::from(regs[r + 1]) << 32);
+        assert_eq!(pair(0), 0);
+        assert_eq!(pair(8), 0x0500_0000_1004_1040);
+        assert_eq!(pair(16), KUMO_PAINT_DATA_VA);
+        assert_eq!(pair(24), KUMO_PAINT_TSD_VA);
+        assert_eq!(&regs[32..40], &[0, 0x3c0f, 0, 0, 0, 16, 8, 1]);
+        // Independent v10.xml decode: resources requested, endpoint=1, then RUN_COMPUTE
+        // (increment 1, X, selects 0); both scoreboards finish before L2/LSC clean.
+        assert_eq!(stream[0], 0x2200_0000_0000_0001);
+        assert_eq!(stream[1], 0x1700_0000_0000_0001);
+        assert_eq!(stream[15], 0x0400_0000_0000_0001);
+        assert_eq!(stream[16], 0x0300_0000_00ff_0000);
+        assert_eq!(stream[17], 0x0228_0000_0000_0000);
+        assert_eq!(stream[18], 0x2400_2800_0000_0011);
+        assert_eq!(stream[19], 0x0300_0000_0001_0000);
+        assert_eq!(stream[20], 0x2200_0000_0000_0000);
+        assert_eq!(&stream[21..], &[0; 3]);
+        assert!(
+            !stream.iter().any(|w| matches!(w >> 56, 21 | 38)),
+            "the stream never paints pixels itself"
+        );
+    }
+
+    #[test]
+    fn compute_dispatch_refuses_missing_registers_and_scoreboards() {
+        for features in [
+            CsFeatures {
+                work_regs: 40,
+                scoreboards: 8,
+            },
+            CsFeatures {
+                work_regs: 96,
+                scoreboards: 1,
+            },
+            CsFeatures {
+                work_regs: 96,
+                scoreboards: 17,
+            },
+        ] {
+            assert_eq!(
+                kumo_paint_stream(features),
+                Err(KernelError::DispatchFeatures(features))
+            );
+        }
     }
 
     #[test]
