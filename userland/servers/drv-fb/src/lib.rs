@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j599
 //j600
 //j601
 //j606
 //j607
+//j608
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -25,6 +25,7 @@ pub mod probe_va;
 pub mod rk3588;
 pub mod rk3588_clock;
 pub mod rk3588_hdmi;
+pub mod rk3588_latch;
 pub mod rk3588_mode;
 pub mod rk3588_shared;
 

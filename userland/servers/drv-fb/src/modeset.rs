@@ -1,4 +1,5 @@
 //j607
+//j608
 
 //! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
 //! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
@@ -8,11 +9,16 @@
 //! The dwell and the verification wait are one-shot timers on drv-fb's own port, so the
 //! console keeps draining while the glass is blank. J607's first metal run slept instead, and
 //! Sora stalled behind drv-fb's unread console channel. — TIMBERDOODLE
+//!
+//! J608 adds R1b between the dwell and removing black: run a distinguishable program with
+//! HDMI0 clocked under black, observe its active registers and completed load, restore and
+//! observe the target under black, then remove black. Every wait uses the port. — KESTREL
 
 use core::fmt::{self, Write};
 use drv_fb::probe_va::{TX_R1, VOP_R1};
 use drv_fb::rk3588::{self, Power};
 use drv_fb::rk3588_hdmi::{self, Tx, D0A_TIMING};
+use drv_fb::rk3588_latch as latch;
 use drv_fb::rk3588_mode::{
     blank, rebuild, verify, Blanked, Block, Framebuffer, Hardware, Outcome, Program, CHECKS,
     CHECK_BIT, DMT_1600X900_60_RB, PLAN, RECORDED, REG_CFG_DONE, TX_WINDOW_LEN, VOP_WINDOW_LEN,
@@ -127,6 +133,13 @@ fn map(resource: Handle, base: u64, len: u64, va: u64, writable: bool, label: &s
 enum Phase {
     /// Blank and scrubbed; the timer ends the dwell.
     Dwell,
+    /// VP2 runs the black-pixel proof, then the black-pixel target; one retry per stage.
+    Proof {
+        retried: bool,
+    },
+    Restore {
+        retried: bool,
+    },
     /// Rebuilt and out of standby; the timer starts the verification.
     Verify,
 }
@@ -141,6 +154,7 @@ pub struct Pending {
     /// The timer's koid, which is what `port_wait` reports.
     pub source: u64,
     started: u64,
+    proof_verified: bool,
 }
 
 fn arm(port: Handle, ms: u64) -> Option<(Handle, u64)> {
@@ -285,7 +299,7 @@ fn begin(boot: &BootInfo, vop: Handle, tx: Handle, port: Handle) -> Option<Pendi
             "display: R1 dwell timer unavailable; rebuilding immediately\n"
         ));
         rebuild(&mut device, &program);
-        finish(&mut device, &program, blanked, started);
+        finish(&mut device, &program, blanked, started, false);
         return None;
     };
     Some(Pending {
@@ -296,41 +310,92 @@ fn begin(boot: &BootInfo, vop: Handle, tx: Handle, port: Handle) -> Option<Pendi
         timer,
         source,
         started,
+        proof_verified: false,
     })
 }
 
 /// Handle the timer `port_wait` reported as `pending.source`. Returns the next step, if any.
-pub fn advance(pending: Pending) -> Option<Pending> {
+pub fn advance(mut pending: Pending) -> Option<Pending> {
     disarm(pending.port, pending.timer);
     let mut device = Device;
     match pending.phase {
         Phase::Dwell => {
-            rebuild(&mut device, &pending.program);
-            match arm(pending.port, PLAN.verify_after_ms) {
-                Some((timer, source)) => Some(Pending {
-                    phase: Phase::Verify,
-                    timer,
-                    source,
-                    ..pending
-                }),
-                None => {
-                    finish(
-                        &mut device,
-                        &pending.program,
-                        pending.blanked,
-                        pending.started,
-                    );
-                    None
-                }
+            latch::stage(&mut device, &latch::proof(&pending.program));
+            log(format_args!(
+                "display: R1b staged black-pixel proof: H total {} V total {}, ESMART2 region0 disabled; VP2 running\n",
+                latch::PROOF_MODE.h_total(), latch::PROOF_MODE.v_total()
+            ));
+            next(pending, Phase::Proof { retried: false }, latch::SETTLE_MS)
+        }
+        Phase::Proof { retried } => {
+            let image = latch::proof(&pending.program);
+            let observed = latch::observe(&mut device, &image);
+            if !observed.matches() && !retried {
+                latch::stage(&mut device, &image);
+                return next(pending, Phase::Proof { retried: true }, latch::SETTLE_MS);
             }
+            pending.proof_verified = observed.matches();
+            log_at(if observed.matches() { kumo_abi::sys::log_level::NOTICE } else { kumo_abi::sys::log_level::ERR }, format_args!(
+                "display: R1b black-pixel proof {}: mismatch mask {:#x}, load_pending={}{}; restoring target\n",
+                if observed.matches() { "latched" } else { "FAILED" },
+                observed.mismatched, u8::from(observed.load_pending),
+                if retried { " (after one retry)" } else { "" }
+            ));
+            latch::stage(&mut device, &latch::blacked(&pending.program));
+            next(pending, Phase::Restore { retried: false }, latch::SETTLE_MS)
+        }
+        Phase::Restore { retried } => {
+            let image = latch::blacked(&pending.program);
+            let observed = latch::observe(&mut device, &image);
+            if !observed.matches() && !retried {
+                latch::stage(&mut device, &image);
+                return next(pending, Phase::Restore { retried: true }, latch::SETTLE_MS);
+            }
+            let observed = latch::unblack(&mut device, &pending.program);
+            if !observed.matches() {
+                error(format_args!(
+                    "display: R1b restoration FAILED after one retry: mismatch mask {:#x}, load_pending={}; HDMI0 off, VP2 in standby\n",
+                    observed.mismatched, u8::from(observed.load_pending)
+                ));
+                return None;
+            }
+            log(format_args!(
+                "display: R1b target latched under black{}; removing black\n",
+                if retried { " (after one retry)" } else { "" }
+            ));
+            next(pending, Phase::Verify, PLAN.verify_after_ms)
         }
         Phase::Verify => {
-            finish(
+            let restored = finish(
                 &mut device,
                 &pending.program,
                 pending.blanked,
                 pending.started,
+                true,
             );
+            if restored && pending.proof_verified {
+                log(format_args!(
+                    "display: R1b complete: distinct timing and disabled region latched, target restored and TX timing matched\n"
+                ));
+            }
+            None
+        }
+    }
+}
+
+fn next(pending: Pending, phase: Phase, ms: u64) -> Option<Pending> {
+    match arm(pending.port, ms) {
+        Some((timer, source)) => Some(Pending {
+            phase,
+            timer,
+            source,
+            ..pending
+        }),
+        None => {
+            latch::stop(&mut Device, &pending.program);
+            error(format_args!(
+                "display: R1b timer unavailable; HDMI0 off, VP2 in standby\n"
+            ));
             None
         }
     }
@@ -356,14 +421,34 @@ fn report_mismatches(device: &mut Device, program: &Program, mask: u32) {
     }
 }
 
-fn finish(device: &mut Device, program: &Program, blanked: Blanked, started: u64) {
-    let Outcome::Rebuilt {
-        retried,
-        mismatched,
-        ..
-    } = verify(device, program, blanked)
-    else {
-        return;
+fn finish(
+    device: &mut Device,
+    program: &Program,
+    blanked: Blanked,
+    started: u64,
+    require_latch: bool,
+) -> bool {
+    let (retried, mismatched) = if require_latch {
+        let observed = latch::observe(device, program);
+        if !observed.matches() {
+            latch::stop(device, program);
+            error(format_args!(
+                "display: R1b final program FAILED: mismatch mask {:#x}, load_pending={}; HDMI0 off, VP2 in standby\n",
+                observed.mismatched, u8::from(observed.load_pending)
+            ));
+            return false;
+        }
+        (false, 0)
+    } else {
+        let Outcome::Rebuilt {
+            retried,
+            mismatched,
+            ..
+        } = verify(device, program, blanked)
+        else {
+            return false;
+        };
+        (retried, mismatched)
     };
     let elapsed_ms = kumo_rt::clock_get().saturating_sub(started) / 1_000_000;
     if mismatched == 0 {
@@ -407,4 +492,12 @@ fn finish(device: &mut Device, program: &Program, blanked: Blanked, started: u64
             monitor[0], monitor[1], monitor[2], monitor[3], monitor[4], monitor[5]
         )),
     }
+    let restored = mismatched == 0 && measured == Some(D0A_TIMING);
+    if require_latch && !restored {
+        latch::stop(device, program);
+        error(format_args!(
+            "display: R1b final timing FAILED; HDMI0 off, VP2 in standby\n"
+        ));
+    }
+    restored
 }

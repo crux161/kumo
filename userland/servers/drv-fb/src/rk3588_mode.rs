@@ -1,4 +1,5 @@
 //j607
+//j608
 
 //! R1 (DESIGN/020 Amendment D0): KUMO rebuilds the HDMI0 mode's VOP2 and TX program from its
 //! own mode table, after scrubbing it to TRM reset values with VP2 in standby.
@@ -57,8 +58,11 @@ pub const TX_LINK_CONFIG0: u32 = 0x0968;
 pub const STANDBY: u32 = 1 << 31;
 /// `DSP_INFACE_POL` bit 28: the interface registers take effect immediately.
 pub const REGDONE_IMD_EN: u32 = 1 << 28;
-/// `REG_CFG_DONE` for port 2: write-mask bit 18 and `reg_load_global2_en` bit 2.
-pub const CFG_DONE_VP2: u32 = (1 << 18) | (1 << 2);
+/// `REG_CFG_DONE` for port 2: mask bit 18, VP2 request bit 2, and global enable bit 15.
+/// The global enable is included in each commit by both reference implementations; omitting
+/// it left our requests pending on metal. This is register data, not copied driver code.
+/// — KESTREL
+pub const CFG_DONE_VP2: u32 = (1 << 18) | (1 << 15) | (1 << 2);
 
 /// POST2 words R1 records but never writes. `+0x30` is `PRE_SCAN_HTIMING0`; `+0x34..+0x40`
 /// have no field description in the TRM.
