@@ -1,8 +1,8 @@
-//j556
 //j571
 //j605
 //j609
 //j614
+//j616
 use alloc::vec::Vec;
 use core::mem;
 
@@ -440,7 +440,7 @@ struct VmoEntry {
 
 const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
 
-fn phys_ptr_mut(phys: u64) -> *mut u8 {
+pub(crate) fn phys_ptr_mut(phys: u64) -> *mut u8 {
     (PHYSMAP_BASE + phys) as *mut u8
 }
 
@@ -463,19 +463,24 @@ fn alloc_anonymous_frame(boot: &BootInfo) -> Result<u64, Errno> {
 /// Allocate a physically-contiguous, zeroed run of `count` frames for device DMA, returning
 /// its physical base. Runs with the kernel identity map active in TTBR0 (like
 /// [`alloc_anonymous_frame`]) so the run can be zeroed and cleaned to PoC by physical address.
-fn alloc_contiguous(boot: &BootInfo, count: u64) -> Result<u64, Errno> {
+fn alloc_contiguous(
+    boot: &BootInfo,
+    count: u64,
+    excluded: &[kumo_abi::Range],
+) -> Result<u64, Errno> {
     #[cfg(target_os = "none")]
     {
         let saved_ttbr0 = kumo_hal::active::read_user_aspace_root();
         unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
-        let base = unsafe { crate::mm::alloc_contiguous_frames(boot, count) };
+        let base = unsafe { crate::mm::alloc_contiguous_frames_excluding(boot, count, excluded) };
         unsafe { kumo_hal::active::set_user_aspace_root(saved_ttbr0) };
         base.ok_or(Errno::NoMemory)
     }
 
     #[cfg(not(target_os = "none"))]
     {
-        unsafe { crate::mm::alloc_contiguous_frames(boot, count) }.ok_or(Errno::NoMemory)
+        unsafe { crate::mm::alloc_contiguous_frames_excluding(boot, count, excluded) }
+            .ok_or(Errno::NoMemory)
     }
 }
 
@@ -511,6 +516,8 @@ pub struct SyscallEngine {
     device_ctxs: Vec<DeviceCtxBinding>,
     device_vmar_mappings: Vec<DeviceVmarMapping>,
     device_ctx_faults: Vec<DeviceCtxFault>,
+    #[cfg(feature = "arch_aarch64")]
+    table_pages: crate::device_memory::TablePool<crate::device_memory::KernelPages>,
 }
 
 impl SyscallEngine {
@@ -530,6 +537,8 @@ impl SyscallEngine {
             device_ctxs: Vec::new(),
             device_vmar_mappings: Vec::new(),
             device_ctx_faults: Vec::new(),
+            #[cfg(feature = "arch_aarch64")]
+            table_pages: Default::default(),
         }
     }
 
@@ -850,6 +859,8 @@ impl SyscallEngine {
 
     pub fn set_boot_info(&mut self, boot: kumo_abi::BootInfo) {
         self.boot_info = Some(boot);
+        #[cfg(feature = "arch_aarch64")]
+        self.table_pages.set_boot_info(boot);
     }
 
     pub fn objects_mut(&mut self) -> &mut ObjectManager {
@@ -886,14 +897,169 @@ impl SyscallEngine {
         vmo: Vmo,
         rights: Rights,
     ) -> Result<Handle, ObjectError> {
+        #[cfg(feature = "arch_aarch64")]
+        let span = self.table_pages.prepare_vmo(vmo)?;
         let object = self.objects.create(ObjectKind::Vmo);
         let handle = process.handles_mut().insert(object, rights)?;
+        #[cfg(feature = "arch_aarch64")]
+        self.table_pages.commit_vmo(span);
         self.vmos.push(VmoEntry {
             koid: object.koid(),
             vmo,
             frames: Vec::new(),
         });
         Ok(handle)
+    }
+
+    /// Prove the offline table provider on actual kernel RAM before Sora runs. The data
+    /// page is the existing boot-info VMO; no MMU root, user table handle or device command
+    /// is published. This is backing/alias/reuse evidence, not DMA confinement. — KESTREL
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    pub(crate) fn verify_private_device_tables(
+        &mut self,
+        process: &mut Process,
+        resource: Handle,
+        data_vmo: Handle,
+    ) -> Result<(), Errno> {
+        use kumo_hal::active::{DeviceTableAccess as Access, OfflineDeviceTable as Table};
+        let entry = process
+            .handles()
+            .require(data_vmo, ObjectKind::Vmo, Rights::READ)
+            .map_err(errno_from_object)?;
+        let data = self.vmo_by_koid(entry.koid).ok_or(Errno::BadHandle)?;
+        let crate::mm::VmoBacking::PhysicalRam { phys_base } = data.backing() else {
+            return Err(Errno::BadState);
+        };
+        let pool = self.table_pages.clone();
+        let mut table = Table::new(pool.lease()).map_err(|_| Errno::NoMemory)?;
+        table
+            .map_read_only(0x003f_f000, &[phys_base, phys_base])
+            .map_err(|_| Errno::Internal)?;
+        let expected = unsafe { core::ptr::read_volatile(phys_ptr_mut(phys_base).cast::<u32>()) };
+        for iova in [0x003f_f000, 0x0040_0000] {
+            let phys = table
+                .walk(iova, Access::Read)
+                .map_err(|_| Errno::Internal)?;
+            if phys != Some(phys_base)
+                || table.walk(iova, Access::Write).is_ok()
+                || unsafe { core::ptr::read_volatile(phys_ptr_mut(phys.unwrap()).cast::<u32>()) }
+                    != expected
+            {
+                return Err(Errno::Internal);
+            }
+        }
+        let frames = pool.frames();
+        if frames.len() != 3 {
+            return Err(Errno::Internal);
+        }
+        let handles = process.handles().live_count();
+        let vmos = self.vmos.len();
+        for &phys in &frames {
+            for constructor in [
+                Vmo::from_physical_range,
+                Vmo::from_mmio_range,
+                Vmo::from_dma_range,
+            ] {
+                let vmo = constructor(phys, crate::mm::PAGE_SIZE).map_err(|_| Errno::Internal)?;
+                if self.root_vmo_create(process, vmo, Rights::READ | Rights::WRITE)
+                    != Err(ObjectError::AccessDenied)
+                {
+                    return Err(Errno::Internal);
+                }
+            }
+            if self.dispatch(
+                process,
+                KernelCall::ResourceMintMmio {
+                    resource,
+                    phys_base: phys,
+                    len: crate::mm::PAGE_SIZE,
+                },
+            ) != KernelCallResult::Status(Errno::AccessDenied.status())
+            {
+                return Err(Errno::Internal);
+            }
+        }
+        // Reject an adjacent coarse alias as well as exact table-page aliases.
+        let block = frames[0] & !((1 << 21) - 1);
+        let neighbor = (0..512)
+            .map(|i| block + i * crate::mm::PAGE_SIZE)
+            .find(|phys| !frames.contains(phys))
+            .ok_or(Errno::Internal)?;
+        if self.dispatch(
+            process,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base: neighbor,
+                len: crate::mm::PAGE_SIZE,
+            },
+        ) != KernelCallResult::Status(Errno::AccessDenied.status())
+        {
+            return Err(Errno::Internal);
+        }
+        // This boot-only proof runs on the identity tree. Exercise the same allocation
+        // primitive as VmoCreateContiguous while tables are live in private RAM. — KESTREL
+        let boot = self.boot_info.ok_or(Errno::Internal)?;
+        let excluded = pool.dma_exclusions();
+        let dma = unsafe { crate::mm::alloc_contiguous_frames_excluding(&boot, 1, &excluded) }
+            .ok_or(Errno::NoMemory)?;
+        let dma_vmo =
+            Vmo::from_dma_range(dma, crate::mm::PAGE_SIZE).map_err(|_| Errno::Internal)?;
+        if pool.prepare_vmo(dma_vmo).is_err()
+            || table
+                .walk(0x0040_0000, Access::Read)
+                .map_err(|_| Errno::Internal)?
+                != Some(phys_base)
+        {
+            return Err(Errno::Internal);
+        }
+        table
+            .unmap(0x003f_f000, 2 * crate::mm::PAGE_SIZE)
+            .map_err(|_| Errno::Internal)?;
+        if table
+            .walk(0x003f_f000, Access::Read)
+            .map_err(|_| Errno::Internal)?
+            .is_some()
+        {
+            return Err(Errno::Internal);
+        }
+        drop(table);
+        if !pool.all_free() {
+            return Err(Errno::Internal);
+        }
+        // Free pool pages remain private, and a new owner must reuse the same frames.
+        // This also proves that release did not return them to ordinary allocation. — KESTREL
+        for &phys in &frames {
+            if self.dispatch(
+                process,
+                KernelCall::ResourceMintMmio {
+                    resource,
+                    phys_base: phys,
+                    len: crate::mm::PAGE_SIZE,
+                },
+            ) != KernelCallResult::Status(Errno::AccessDenied.status())
+            {
+                return Err(Errno::Internal);
+            }
+        }
+        let mut again = Table::new(pool.lease()).map_err(|_| Errno::NoMemory)?;
+        again
+            .map_read_only(0x003f_f000, &[phys_base, phys_base])
+            .map_err(|_| Errno::Internal)?;
+        if again
+            .walk(0x0040_0000, Access::Read)
+            .map_err(|_| Errno::Internal)?
+            != Some(phys_base)
+            || pool.frames() != frames
+            || process.handles().live_count() != handles
+            || self.vmos.len() != vmos
+        {
+            return Err(Errno::Internal);
+        }
+        drop(again);
+        if !pool.all_free() {
+            return Err(Errno::Internal);
+        }
+        Ok(())
     }
 
     /// Look up a VMO by koid. Returns `None` if not found.
@@ -2276,7 +2442,11 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
                 let count = len / crate::mm::PAGE_SIZE;
-                let phys = match alloc_contiguous(&boot, count) {
+                #[cfg(feature = "arch_aarch64")]
+                let excluded = self.table_pages.dma_exclusions();
+                #[cfg(not(feature = "arch_aarch64"))]
+                let excluded = Vec::new();
+                let phys = match alloc_contiguous(&boot, count, &excluded) {
                     Ok(phys) => phys,
                     Err(e) => return KernelCallResult::Status(e.status()),
                 };

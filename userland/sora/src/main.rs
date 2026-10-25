@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j606
 //j607
 //j609
 //j611
 //j614
+//j616
 
 extern crate alloc;
 
@@ -1563,6 +1563,33 @@ const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
 /// `true` to run the demos when iterating on supervision.
 const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
 
+/// Keep full live vectors across the VMO factory syscall while its private-table guard
+/// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn verify_vmo_factory_vectors() {
+    let mut raw = 4096u64;
+    let (a, b, c, d): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "movi v0.16b, #0x5a", "movi v31.16b, #0xa5", "svc #0",
+            "umov x9, v0.d[0]", "umov x10, v0.d[1]",
+            "umov x11, v31.d[0]", "umov x12, v31.d[1]",
+            inlateout("x0") raw, in("x1") 0u64, in("x2") 0u64, in("x3") 0u64,
+            in("x8") kumo_abi::Syscall::VmoCreate as u64,
+            lateout("x9") a, lateout("x10") b, lateout("x11") c, lateout("x12") d,
+            clobber_abi("C"), options(nostack),
+        );
+    }
+    let handle = syscall_handle(raw).expect("VMO vector smoke creation");
+    let _ = handle_close(handle);
+    assert!(
+        a == 0x5a5a5a5a5a5a5a5a && b == a && c == 0xa5a5a5a5a5a5a5a5 && d == c,
+        "VMO SVC vector preservation"
+    );
+    notice(&[b"sora: VmoCreate SIMD preserved\n"]);
+}
+
 /// Bootstrap args (arrive in x0-x7, aarch64 calling convention):
 ///   x0: root-channel handle
 ///   x1: framebuffer virtual address (0 if no FB)
@@ -1604,6 +1631,8 @@ extern "C" fn sora_main(
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
     notice(&[b"sora: supervisor online\n"]);
+    #[cfg(target_arch = "aarch64")]
+    verify_vmo_factory_vectors();
 
     // Read the kernel's boot message from the root channel.
     let mut buf = [0u8; 64];

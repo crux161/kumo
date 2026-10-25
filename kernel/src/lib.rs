@@ -1,17 +1,19 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j483
 //j493
 //j536
 //j559
 //j570
+//j616
 
 extern crate alloc;
 
 pub mod bootstrap;
 pub mod cap;
 pub mod conin;
+#[cfg(feature = "arch_aarch64")]
+mod device_memory;
 pub mod diag;
 pub mod ipc;
 pub mod ipcdemo;

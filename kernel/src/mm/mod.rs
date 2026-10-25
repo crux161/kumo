@@ -4,6 +4,7 @@ use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range};
 use kumo_hal::PageFlags;
 
 //j469
+//j616
 
 pub mod heap;
 
@@ -29,8 +30,17 @@ static FRAME_WATERMARK: AtomicU64 = AtomicU64::new(0);
 /// `boot.mem_regions` must be the validated handoff slice, readable for the call, and the
 /// returned frame must be mapped by the currently-active page tables.
 pub unsafe fn alloc_zeroed_frame(boot: &BootInfo) -> Option<u64> {
+    unsafe { alloc_zeroed_frame_excluding(boot, &[]) }
+}
+
+/// Allocate private RAM while excluding already-issued physical aliases. The exclusions are
+/// applied before zeroing, so rejecting an aliased candidate cannot damage its VMO. — KESTREL
+///
+/// # Safety
+/// Same boot handoff and active identity-map requirements as [`alloc_zeroed_frame`].
+pub unsafe fn alloc_zeroed_frame_excluding(boot: &BootInfo, excluded: &[Range]) -> Option<u64> {
     let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
-    let mut frames = plan.frame_allocator();
+    let mut frames = plan.frame_allocator().excluding(excluded);
     let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
     #[cfg(feature = "arch_aarch64")]
     let framebuffer = boot_framebuffer_range(boot);
@@ -75,12 +85,25 @@ pub unsafe fn alloc_zeroed_frame(boot: &BootInfo) -> Option<u64> {
 /// Same contract as [`alloc_zeroed_frame`]: the kernel identity map must be active in TTBR0
 /// so the run can be zeroed and cache-maintained by physical address.
 pub unsafe fn alloc_contiguous_frames(boot: &BootInfo, count: u64) -> Option<u64> {
+    unsafe { alloc_contiguous_frames_excluding(boot, count, &[]) }
+}
+
+/// Contiguous DMA allocation with extra private-table/alias exclusions, applied before
+/// zeroing and cache maintenance. Same safety contract as [`alloc_contiguous_frames`].
+///
+/// # Safety
+/// The validated boot ranges and selected physical run must be mapped in the active tree.
+pub unsafe fn alloc_contiguous_frames_excluding(
+    boot: &BootInfo,
+    count: u64,
+    excluded: &[Range],
+) -> Option<u64> {
     if count == 0 {
         return None;
     }
     let bytes = count.checked_mul(PAGE_SIZE)?;
     let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
-    let mut frames = plan.frame_allocator();
+    let mut frames = plan.frame_allocator().excluding(excluded);
     let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
     #[cfg(feature = "arch_aarch64")]
     let framebuffer = boot_framebuffer_range(boot);
@@ -537,6 +560,7 @@ impl<'a> KernelMemoryPlan<'a> {
 pub struct BootFrameAllocator<'a> {
     regions: &'a [MemRegion],
     exclusions: &'a [Range],
+    additional_exclusions: &'a [Range],
     region_index: usize,
     cursor: u64,
     limit: u64,
@@ -547,12 +571,19 @@ impl<'a> BootFrameAllocator<'a> {
         let mut allocator = Self {
             regions,
             exclusions,
+            additional_exclusions: &[],
             region_index: 0,
             cursor: 0,
             limit: 0,
         };
         allocator.advance_to_usable_region();
         allocator
+    }
+
+    /// Set an additional exclusion slice without replacing the boot's reserved spans.
+    pub fn excluding(mut self, ranges: &'a [Range]) -> Self {
+        self.additional_exclusions = ranges;
+        self
     }
 
     pub fn next_frame(&mut self) -> Option<PhysFrame> {
@@ -642,6 +673,7 @@ impl<'a> BootFrameAllocator<'a> {
     fn is_excluded(&self, frame: PhysFrame) -> bool {
         self.exclusions
             .iter()
+            .chain(self.additional_exclusions)
             .any(|range| overlaps(frame.start, PAGE_SIZE, range.start, range.len))
     }
 }
@@ -692,6 +724,30 @@ fn overlaps(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
 mod tests {
     use super::*;
     use kumo_abi::{RawSlice, ABI_VERSION};
+
+    #[test]
+    fn additional_frame_exclusions_preserve_boot_reservations_and_split_runs() {
+        let regions = [MemRegion {
+            range: Range::new(0x1000, 0x8000),
+            kind: MemRegionKind::Usable,
+            _reserved: 0,
+        }];
+        let boot_reserved = [Range::new(0x2000, PAGE_SIZE)];
+        let aliases = [Range::new(0x3fff, 2), Range::new(0x6000, PAGE_SIZE)];
+        let allocator = BootFrameAllocator::new(&regions, &boot_reserved).excluding(&aliases);
+        let mut singles = allocator.clone();
+        let mut got = Vec::new();
+        while let Some(frame) = singles.next_frame() {
+            got.push(frame.start);
+        }
+        assert_eq!(got, [0x1000, 0x5000, 0x7000, 0x8000]);
+        assert_eq!(allocator.clone().count_remaining(), 4);
+        assert_eq!(
+            allocator.clone().next_run(2),
+            Some(PhysFrame { start: 0x7000 })
+        );
+        assert_eq!(allocator.clone().next_run(3), None);
+    }
 
     #[test]
     fn frame_ranges_are_page_aligned() {

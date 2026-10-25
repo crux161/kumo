@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j534
 //j570
 //j571
 //j609
 //j614
+//j616
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -17,6 +17,10 @@ compile_error!("select a HAL backend");
 
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
+    pub use kumo_hal_aarch64::rockchip_v2::{
+        Access as DeviceTableAccess, Error as DeviceTableError, OfflineTable as OfflineDeviceTable,
+        TableMemory as DeviceTableMemory,
+    };
     pub use kumo_hal_aarch64::{
         arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
