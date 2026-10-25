@@ -1,4 +1,5 @@
 //j595
+//j596
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -36,6 +37,13 @@ struct Hardware<'a> {
 }
 
 impl Backend for Hardware<'_> {
+    fn info(&mut self) -> Result<protocol::DeviceInfo, GpuStatus> {
+        // GPU_ID at aperture +0, already checked by probe before this server starts.
+        Ok(protocol::DeviceInfo {
+            gpu_id: read_aperture(0),
+            cs_features: self.cs.features,
+        })
+    }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
         log(
             log_level::NOTICE,

@@ -1,11 +1,12 @@
 //j595
+//j596
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, Request, RequestIds, Response, Status, Submission,
-    Timeline, MAX_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceInfo, Request, RequestIds, Response, Status,
+    Submission, Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -20,6 +21,7 @@ pub enum SubmitError {
 }
 
 pub trait Backend {
+    fn info(&mut self) -> Result<DeviceInfo, Status>;
     fn create_vm(&mut self) -> Result<(), Status>;
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), Status>;
     fn bind(&mut self, binding: Binding) -> Result<(), Status>;
@@ -68,6 +70,7 @@ impl Session {
         backend: &mut impl Backend,
     ) -> Result<Response, Status> {
         match command {
+            Command::GetInfo => backend.info().map(Response::Info),
             Command::VmCreate => {
                 if self.vm {
                     return Err(Status::BadState);
@@ -202,6 +205,13 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn info(&mut self) -> Result<DeviceInfo, Status> {
+            self.record(Command::GetInfo)?;
+            Ok(DeviceInfo {
+                gpu_id: 0xa8670005,
+                cs_features: 0x7085f,
+            })
+        }
         fn create_vm(&mut self) -> Result<(), Status> {
             self.record(Command::VmCreate)
         }
@@ -251,6 +261,23 @@ mod tests {
         send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
         (s, b)
     }
+    #[test]
+    fn info_query_is_available_before_vm_creation_and_does_not_consume_objects() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        assert_eq!(
+            send(&mut s, &mut b, Command::GetInfo),
+            Ok(Response::Info(DeviceInfo {
+                gpu_id: 0xa8670005,
+                cs_features: 0x7085f
+            }))
+        );
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        assert_eq!(b.calls.as_slice(), &[Command::GetInfo, Command::VmCreate]);
+    }
+
     #[test]
     fn two_submissions_remain_pending_until_backend_completion() {
         let (mut s, mut b) = ready();

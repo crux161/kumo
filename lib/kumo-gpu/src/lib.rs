@@ -1,6 +1,7 @@
 #![no_std]
 //j594
 //j595
+//j596
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -28,6 +29,14 @@ pub const VA_END: u64 = 0x2100_0000;
 pub const MAX_BUFFER_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_STREAM_BYTES: u32 = 64 * 1024;
 pub const RING_BYTES: u32 = 4096;
+
+/// Read-only hardware identity and command-stream capabilities. No address, handle or
+/// firmware interface pointer crosses this query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub gpu_id: u32,
+    pub cs_features: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]

@@ -1,16 +1,22 @@
 #![no_std]
 #![no_main]
 //j595
+//j596
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
 
 use core::fmt::{self, Write};
-use gpu_client::{proof_stream, VALUES};
+use gpu_client::{
+    bindings, compute_data, compute_stream, proof_stream, BINARY_OFFSET, BUFFER_BYTES, DATA_OFFSET,
+    PAINT_OFFSET, PIXEL_POISON, SCRATCH_OFFSET, VALUES,
+};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_gpu::{
-    BindFlags, Binding, Command, Reply, Request, Response, Submission, SyncState, PAGE_BYTES,
-    REPLY_LEN, VA_START,
+use kumo_gpu::{Command, Reply, Request, Response, Submission, SyncState, REPLY_LEN, VA_START};
+
+use kumo_mali::{
+    check_paint, paint_reference_checksum, CsFeatures, KUMO_PAINT_V10, PAINT_BYTES, PAINT_HEIGHT,
+    PAINT_WIDTH,
 };
 
 kumo_rt::entry!(main);
@@ -100,18 +106,94 @@ impl Client {
     }
 }
 
+/// All writes target the retained Normal-NC mapping returned for BUFFER_BYTES in run.
+fn upload(cpu: u64, offset: u64, bytes: &[u8]) -> Result<(), ()> {
+    if offset
+        .checked_add(bytes.len() as u64)
+        .is_none_or(|end| end > BUFFER_BYTES)
+    {
+        return Err(());
+    }
+    for (i, byte) in bytes.iter().enumerate() {
+        // SAFETY: caller's mapped buffer, with the byte extent checked above.
+        unsafe {
+            ((cpu + offset + i as u64) as *mut u8).write_volatile(*byte);
+        }
+    }
+    Ok(())
+}
+
+fn submit_wait(
+    client: &mut Client,
+    cpu: u64,
+    group: u32,
+    point: u64,
+    stream: &[u64],
+) -> Result<(), ()> {
+    if stream.len() * 8 > kumo_gpu::PAGE_BYTES as usize {
+        return Err(());
+    }
+    for (i, word) in stream.iter().enumerate() {
+        // SAFETY: the validated command page, reused only after the last completed point.
+        unsafe {
+            ((cpu + i as u64 * 8) as *mut u64).write_volatile(*word);
+        }
+    }
+    barrier();
+    if client.simple(Command::Submit(Submission {
+        group,
+        stream_va: VA_START,
+        stream_bytes: (stream.len() * 8) as u32,
+        signal_point: point,
+    }))? != (Response::Submitted { point })
+    {
+        return Err(());
+    }
+    for _ in 0..1000 {
+        match client.simple(Command::SyncRead { group, point })? {
+            Response::Sync {
+                point: p,
+                state: SyncState::Complete { gpu_status: 0 },
+            } if p == point => {
+                barrier();
+                return Ok(());
+            }
+            Response::Sync {
+                point: p,
+                state: SyncState::Pending,
+            } if p == point => {
+                let _ = kumo_rt::sleep_ns(1_000_000);
+            }
+            _ => return Err(()),
+        }
+    }
+    Err(())
+}
+
 fn run(channel: Handle) -> Result<(), ()> {
     let mut client = Client { channel, id: 0 };
+    let Response::Info(info) = client.simple(Command::GetInfo)? else {
+        return Err(());
+    };
+    if info.gpu_id & 0xffff_0000 != 0xa867_0000 {
+        return Err(());
+    }
+    let features = CsFeatures::decode(info.cs_features);
+    let compute = compute_stream(features).map_err(|_| ())?;
+    log(format_args!(
+        "gpu-client: GPU_ID=0x{:08x}, queue registers={} scoreboards={}\n",
+        info.gpu_id, features.work_regs, features.scoreboards
+    ));
     let Response::VmCreated { vm } = client.simple(Command::VmCreate)? else {
         return Err(());
     };
     let (response, grant) = client.call(Command::BufferCreate {
-        bytes: 2 * PAGE_BYTES,
+        bytes: BUFFER_BYTES,
     })?;
     let Response::BufferCreated { buffer, bytes } = response else {
         return Err(());
     };
-    if bytes != 2 * PAGE_BYTES {
+    if bytes != BUFFER_BYTES {
         return Err(());
     }
     let vmo = grant.ok_or(())?;
@@ -123,22 +205,17 @@ fn run(channel: Handle) -> Result<(), ()> {
     if status != 0 || cpu == 0 {
         return Err(());
     }
-    for (offset, flags) in [
-        (
-            0,
-            BindFlags::READ_ONLY | BindFlags::NO_EXECUTE | BindFlags::UNCACHED,
-        ),
-        (PAGE_BYTES, BindFlags::NO_EXECUTE | BindFlags::UNCACHED),
-    ] {
-        let b = Binding {
-            vm,
-            buffer,
-            va: VA_START + offset,
-            offset,
-            bytes: PAGE_BYTES,
-            flags: BindFlags(flags),
-        };
-        if client.simple(Command::VmBind(b))? != Response::VmBound {
+    upload(cpu, BINARY_OFFSET, KUMO_PAINT_V10.binary)?;
+    upload(cpu, DATA_OFFSET, &compute_data().map_err(|_| ())?)?;
+    for offset in (0..PAINT_BYTES).step_by(4) {
+        // SAFETY: each word lies inside the image extent of this retained mapping.
+        unsafe {
+            ((cpu + PAINT_OFFSET + offset) as *mut u32).write_volatile(PIXEL_POISON);
+        }
+    }
+    barrier();
+    for binding in bindings(vm, buffer) {
+        if client.simple(Command::VmBind(binding))? != Response::VmBound {
             return Err(());
         }
     }
@@ -147,52 +224,19 @@ fn run(channel: Handle) -> Result<(), ()> {
     };
     for (index, value) in VALUES.into_iter().enumerate() {
         let point = index as u64 + 1;
-        let stream = proof_stream(VA_START + PAGE_BYTES, value);
-        for (i, word) in stream.iter().enumerate() {
-            // SAFETY: aligned words inside the shared 8 KiB Normal-NC mapping. This client
-            // writes only before submission or after the previous point completed.
-            unsafe {
-                ((cpu + i as u64 * 8) as *mut u64).write_volatile(*word);
-            }
-        }
+        // SAFETY: the scratch word is in its own mapped page, outside the image and code.
         unsafe {
-            ((cpu + PAGE_BYTES) as *mut u32).write_volatile(0xfeed_face);
+            ((cpu + SCRATCH_OFFSET) as *mut u32).write_volatile(0xfeed_face);
         }
-        barrier();
-        if client.simple(Command::Submit(Submission {
+        submit_wait(
+            &mut client,
+            cpu,
             group,
-            stream_va: VA_START,
-            stream_bytes: (stream.len() * 8) as u32,
-            signal_point: point,
-        }))? != (Response::Submitted { point })
-        {
-            return Err(());
-        }
-        let mut complete = false;
-        for _ in 0..1000 {
-            match client.simple(Command::SyncRead { group, point })? {
-                Response::Sync {
-                    point: p,
-                    state: SyncState::Complete { gpu_status: 0 },
-                } if p == point => {
-                    complete = true;
-                    break;
-                }
-                Response::Sync {
-                    point: p,
-                    state: SyncState::Pending,
-                } if p == point => {
-                    let _ = kumo_rt::sleep_ns(1_000_000);
-                }
-                _ => return Err(()),
-            }
-        }
-        if !complete {
-            return Err(());
-        }
-        barrier();
-        // SAFETY: the target word of the retained mapping, read only after observed completion.
-        let got = unsafe { ((cpu + PAGE_BYTES) as *const u32).read_volatile() };
+            point,
+            &proof_stream(VA_START + SCRATCH_OFFSET, value),
+        )?;
+        // SAFETY: read only after the matching completion reply and barrier.
+        let got = unsafe { ((cpu + SCRATCH_OFFSET) as *const u32).read_volatile() };
         if got != value {
             log(format_args!(
                 "gpu-client: point {} wrong value 0x{:08x}, expected 0x{:08x}\n",
@@ -207,6 +251,38 @@ fn run(channel: Handle) -> Result<(), ()> {
     }
     log(format_args!(
         "gpu-client: two submissions complete; shared values verified\n"
+    ));
+    log(format_args!(
+        "gpu-client: dispatching kumo_paint: binary=0x{:x} data=0x{:x} output=0x{:x}\n",
+        VA_START + BINARY_OFFSET,
+        VA_START + DATA_OFFSET,
+        VA_START + PAINT_OFFSET
+    ));
+    submit_wait(&mut client, cpu, group, 3, &compute)?;
+    let check = check_paint(|x, y| {
+        // SAFETY: check_paint visits exactly the 256x128 words of this mapped image.
+        unsafe {
+            ((cpu + PAINT_OFFSET + u64::from(y * PAINT_WIDTH + x) * 4) as *const u32)
+                .read_volatile()
+        }
+    });
+    log(format_args!(
+        "gpu-client: compute painted {}x{}: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",
+        PAINT_WIDTH,
+        PAINT_HEIGHT,
+        check.mismatches,
+        check.checksum,
+        paint_reference_checksum()
+    ));
+    if let Some((x, y, got, want)) = check.first {
+        log(format_args!(
+            "gpu-client: first wrong pixel ({}, {}): got 0x{:08x}, want 0x{:08x}\n",
+            x, y, got, want
+        ));
+        return Err(());
+    }
+    log(format_args!(
+        "gpu-client: client compute frame verified; 32768 pixels match\n"
     ));
     let _ = kumo_rt::handle_close(vmo);
     Ok(())

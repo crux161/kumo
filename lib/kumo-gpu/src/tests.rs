@@ -1,4 +1,5 @@
 //j594
+//j596
 
 extern crate std;
 
@@ -27,6 +28,7 @@ fn submission() -> Submission {
 #[test]
 fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
     for command in [
+        Command::GetInfo,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -66,6 +68,38 @@ fn bind_wire_has_no_native_padding_pointers_or_handles() {
         .flat_map(u64::to_le_bytes)
         .collect();
     assert_eq!(&wire[16..], expected);
+}
+
+#[test]
+fn info_query_has_exact_frames_and_rejects_reserved_or_truncated_capabilities() {
+    let request = Request {
+        id: 9,
+        command: Command::GetInfo,
+    }
+    .encode();
+    assert_eq!(&request[8..16], &[7, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&request[16..], &[0u8; 48]);
+    let mut bad = request;
+    bad[63] = 1;
+    assert_eq!(Request::decode(&bad), None);
+    let reply = Reply {
+        id: 9,
+        result: Ok(Response::Info(DeviceInfo {
+            gpu_id: 0xa8670005,
+            cs_features: 0x7085f,
+        })),
+    };
+    let bytes = reply.encode();
+    assert_eq!(&bytes[12..16], &[7, 0, 0, 0]);
+    assert_eq!(&bytes[16..24], &[5, 0, 0x67, 0xa8, 0, 0, 0, 0]);
+    assert_eq!(&bytes[24..32], &[0x5f, 8, 7, 0, 0, 0, 0, 0]);
+    assert_eq!(Reply::decode(&bytes), Some(reply));
+    assert_eq!(reply.result.unwrap().handle_count(), 0);
+    for at in [20, 28, 32, 47] {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "byte {at}");
+    }
 }
 
 #[test]
@@ -151,6 +185,10 @@ fn malformed_semantic_requests_never_decode() {
 #[test]
 fn replies_distinguish_acceptance_pending_success_and_gpu_error() {
     let responses = [
+        Response::Info(DeviceInfo {
+            gpu_id: 0xa8670005,
+            cs_features: 0x7085f,
+        }),
         Response::VmCreated { vm: 1 },
         Response::BufferCreated {
             buffer: 2,

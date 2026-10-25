@@ -1,4 +1,6 @@
 # Vendored Mali compute kernels
+<!-- j592 -->
+<!-- j596 -->
 
 KUMO's own GPU kernels for the Mali-G610 (Valhall CSF, Mesa arch 10), compiled offline by Mesa
 and vendored by CRUX's decision (PLAN/013 decision 2, option A, 2026-10-24): the kernel source,
@@ -28,10 +30,18 @@ Mesa's `mesa_clc` and `panfrost_compile`, compiles `kumo_paint.cl` with Mesa's o
 and runs `tools/manifest.c`. A clean rebuild must reproduce `kumo_paint.v10.bin` bit for bit;
 the script exits non-zero if any vendored file differs.
 
-## How drv-gpu uses it
+## How KUMO uses it
 
-`drv-gpu` embeds the binary with `include_bytes!` (`KUMO_PAINT_V10`) and carries the manifest's
-fields as constants. Its host tests parse this manifest and check every field, and they check
-its shader program, local storage and workgroup-size descriptors against Mesa's `pan_pack`
+`lib/kumo-mali` embeds the binary with `include_bytes!` (`KUMO_PAINT_V10`) and carries the
+manifest's fields and descriptor packers. Both `drv-gpu` and the separate `gpu-client` use this
+shared library; the driver re-exports its original API. The driver's host tests parse this
+manifest and check every field, and check the shader program, local storage and workgroup-size
+descriptors against Mesa's `pan_pack`
 output byte for byte (the `spd_v10`, `tsd_v10` and `wg_size_v10` lines, packed for the binary at
 `reference_binary_va`). RESEARCH/009 §12.9 describes the push-data layout and the dispatch.
+
+The `_at` upload/dispatch helpers also pack a caller's GPU addresses. Host tests verify that
+relocation changes only the intended descriptor pointers and output argument, and that the
+full FAU count survives instruction encoding. G6c's separate client queries the queue's
+capabilities, uploads code, descriptors and commands through its shared VMO, dispatches the
+kernel, and checks every pixel against the shared CPU reference before closing its session.

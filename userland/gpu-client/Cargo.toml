@@ -1,4 +1,5 @@
 #j595
+#j596
 [package]
 name = "gpu-client"
 authors.workspace = true
@@ -9,9 +10,12 @@ version.workspace = true
 [lib]
 doctest = false
 
+[dependencies]
+kumo-mali = { path = "../../lib/kumo-mali" }
+kumo-gpu = { path = "../../lib/kumo-gpu" }
+
 [target.'cfg(target_os = "none")'.dependencies]
 kumo-abi.workspace = true
-kumo-gpu = { path = "../../lib/kumo-gpu" }
 kumo-rt = { path = "../kumo-rt" }
 
 [[bin]]
