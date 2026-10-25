@@ -1,12 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j584
 //j585
 //j586
 //j587
 //j588
+//j589
 
-//! G1b–G4c: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G4d: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
@@ -14,6 +14,7 @@
 //! firmware publishes when it comes up. G4a initializes that interface and proves a ping
 //! round-trip. G4b starts a command-stream group and has the GPU write a value. G4c wraps each
 //! job the way panthor does (§10.6) and counts completions in the queue's sync object (§11.4).
+//! G4d waits for each job on the JOB interrupt and handles it in §11.5's order.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -1303,8 +1304,13 @@ const JOB_INT_RAWSTAT: u32 = 0x1000;
 const JOB_INT_CLEAR: u32 = 0x1004;
 const JOB_INT_MASK: u32 = 0x1008;
 const JOB_INT_STAT: u32 = 0x100c;
-const JOB_IRQ_GLOBAL_IF: u32 = 1 << 31;
+pub const JOB_IRQ_GLOBAL_IF: u32 = 1 << 31;
 pub const JOB_IRQ: u32 = IRQ_BASE;
+
+/// JOB_INT bit for an event on CSG slot `slot` (§4.5).
+pub const fn job_irq_csg(slot: u32) -> u32 {
+    1 << slot
+}
 
 /// RESEARCH/009 §4.5: JOB_INT_RAWSTAT bit g is an event on CSG slot g, bit 31 the global
 /// interface. The mask stays 0 after the boot, so reading it asserts nothing.
@@ -1322,6 +1328,67 @@ const LATEST_FLUSH_ID: u32 = 0x1_0000;
 
 pub fn latest_flush_id(io: &mut impl MmioIo) -> u32 {
     io.read32(LATEST_FLUSH_ID)
+}
+
+/// What the JOB block showed when one wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobIrq {
+    pub completion: Completion,
+    pub rawstat: u32,
+    pub stat: u32,
+}
+
+/// RESEARCH/009 §11.5 step 1 around one wait: arm the interrupt wait, unmask `bits`, run
+/// `submit` (the doorbell, or nothing when waiting again), wait, then clear what the JOB block
+/// raised and re-mask it before acknowledging the interrupt. The line is level-triggered, so the
+/// device must be quiet before the SPI is unmasked again, the discipline `mcu_boot` already
+/// follows. `submit` runs only after the wait is armed, so a fast completion cannot fire into
+/// nothing. — TIMBERDOODLE
+pub fn await_job_irq<I: MmioIo + CompletionIo>(
+    io: &mut I,
+    bits: u32,
+    timeout_ns: u64,
+    submit: impl FnOnce(&mut I),
+) -> Result<JobIrq, Status> {
+    io.arm_completion(JOB_IRQ, timeout_ns)?;
+    io.write32(JOB_INT_MASK, bits);
+    submit(io);
+    let completion = io.wait_completion();
+    let rawstat = io.read32(JOB_INT_RAWSTAT);
+    let stat = io.read32(JOB_INT_STAT);
+    io.write32(JOB_INT_CLEAR, rawstat);
+    io.write32(JOB_INT_MASK, 0);
+    io.complete();
+    Ok(JobIrq {
+        completion,
+        rawstat,
+        stat,
+    })
+}
+
+/// How a job's interrupt-driven wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobWait {
+    /// The JOB interrupt fired and the seqno had reached the job: the intended path.
+    Interrupt,
+    /// The interrupt fired, but the seqno only showed up after a later wait timed out: the event
+    /// overtook the sync object's write.
+    LateSeqno,
+    /// The seqno reached the job, but no wait ever fired with the group's bit.
+    NoInterrupt,
+    /// The deadline passed with the seqno short of the job.
+    Stalled,
+}
+
+/// The decision table for one job: `reached` is whether the seqno got to the job, `last` how
+/// the final wait ended, `fired` how many waits fired with the group's bit set.
+pub const fn classify_job_wait(reached: bool, last: Completion, fired: u32) -> JobWait {
+    match (reached, last, fired) {
+        (false, _, _) => JobWait::Stalled,
+        (true, Completion::Fired, 1..) => JobWait::Interrupt,
+        (true, _, 0) => JobWait::NoInterrupt,
+        (true, _, _) => JobWait::LateSeqno,
+    }
 }
 
 /// RESEARCH/009 §8.6: panthor gives the firmware boot one second.
@@ -1496,6 +1563,26 @@ pub const GLB_INIT_ACK_IRQ_MASK: u32 = GLB_REQ_CFG_PROGRESS_TIMER
     | GLB_REQ_PING
     | GLB_REQ_IDLE_EN
     | (1 << 26);
+/// GLB events (§9.3, event mask [26:20]): the firmware toggles ACK, the host copies it into REQ.
+/// IDLE follows `idle_timer` (800 µs) with no work, and is in the init acknowledge mask, so it
+/// raises JOB IRQ bit 31.
+pub const GLB_IDLE: u32 = 1 << 26;
+pub const GLB_EVENTS: u32 = 0x7F << 20;
+
+/// RESEARCH/009 §11.5 step 2: the global interface's raised, unacknowledged events.
+pub fn glb_pending_events(io: &mut impl GlbIo) -> u32 {
+    (io.read_input(GLB_REQ) ^ io.read_output(GLB_ACK)) & GLB_EVENTS
+}
+
+/// Acknowledge global `events` by copying their ACK bits into REQ; request toggles in flight
+/// (PING, the config bits) are left alone. Like panthor's IDLE handling, no doorbell follows.
+pub fn ack_glb_events(io: &mut impl GlbIo, events: u32) {
+    let mask = events & GLB_EVENTS;
+    let req = io.read_input(GLB_REQ);
+    let ack = io.read_output(GLB_ACK);
+    io.write_input(GLB_REQ, (req & !mask) | (ack & mask));
+}
+
 /// panthor's progress timeout in the firmware's 1024-tick units (§9.4).
 pub const GLB_PROGRESS_TIMEOUT: u32 = 2_560_000;
 /// panthor gives a ping 100 ms to be acknowledged (§8.7).
@@ -1864,6 +1951,46 @@ pub fn cs_irq_req(mem: &mut impl FirmwareMemory, csg_output_va: u64) -> u32 {
 /// is not lost; this is that copy. — TIMBERDOODLE
 pub fn ack_cs_irqs(mem: &mut impl FirmwareMemory, csg_input_va: u64, req: u32) {
     mem.write32(csg_input_va + 0x0C, req);
+}
+
+/// What one pass of §11.5's acknowledgements found pending.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventsAcked {
+    pub glb: u32,
+    pub cs_irq_req: u32,
+    pub cs_irq_ack: u32,
+    pub csg: u32,
+}
+
+impl EventsAcked {
+    pub const fn any(self) -> bool {
+        self.glb != 0 || self.cs_irq_req != self.cs_irq_ack || self.csg != 0
+    }
+}
+
+/// RESEARCH/009 §11.5 steps 2-3 for one group: acknowledge the global events, copy the stream
+/// level, then acknowledge the group's events, and say what was pending. Afterwards the
+/// interface holds no unacknowledged event. That is what lets the firmware raise the next JOB
+/// interrupt: on metal (J589's first run) a group whose IDLE from an earlier stream was still
+/// pending raised no JOB interrupt for a new SYNC_UPDATE. — TIMBERDOODLE
+pub fn ack_group_events(
+    io: &mut (impl FirmwareMemory + GlbIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+) -> EventsAcked {
+    let glb = glb_pending_events(io);
+    ack_glb_events(io, glb);
+    let cs_irq_req = cs_irq_req(io, csg_output_va);
+    let cs_irq_ack = io.read32(csg_input_va + 0x0C);
+    ack_cs_irqs(io, csg_input_va, cs_irq_req);
+    let csg = csg_pending_events(io, csg_input_va, csg_output_va);
+    ack_csg_events(io, csg_input_va, csg_output_va, csg);
+    EventsAcked {
+        glb,
+        cs_irq_req,
+        cs_irq_ack,
+        csg,
+    }
 }
 
 /// RESEARCH/009 §11.5 step 1: the group's raised, unacknowledged events, `(req ^ ack)` under
@@ -3690,6 +3817,73 @@ mod g3b_tests {
             .sections()
             .any(|section| section.flags.contains(SectionFlags::PROT)));
     }
+
+    const SUBMIT: u32 = 4;
+
+    #[test]
+    fn a_job_wait_arms_before_the_doorbell_and_quiets_the_line_before_completing() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        io.set(JOB_INT_RAWSTAT, job_irq_csg(0) | JOB_IRQ_GLOBAL_IF);
+        io.set(JOB_INT_STAT, job_irq_csg(0));
+        let irq = await_job_irq(&mut io, job_irq_csg(0), 1_000_000, |io| {
+            io.calls.push(SUBMIT)
+        });
+        assert_eq!(
+            irq,
+            Ok(JobIrq {
+                completion: Completion::Fired,
+                rawstat: 0x8000_0001,
+                stat: 0x1,
+            })
+        );
+        assert_eq!(io.irqs, [JOB_IRQ]);
+        assert_eq!(
+            io.calls,
+            std::vec![
+                ARM,
+                WRITE + JOB_INT_MASK,
+                SUBMIT,
+                WAIT,
+                READ + JOB_INT_RAWSTAT,
+                READ + JOB_INT_STAT,
+                WRITE + JOB_INT_CLEAR,
+                WRITE + JOB_INT_MASK,
+                COMPLETE,
+            ]
+        );
+        // Only the group's bit is unmasked; everything raised is cleared, then the mask closes.
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (JOB_INT_MASK, 0x1),
+                (JOB_INT_CLEAR, 0x8000_0001),
+                (JOB_INT_MASK, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_wait_that_cannot_arm_never_submits() {
+        let mut io = FakeBoot::new(Completion::Fired);
+        io.arm = Err(-5);
+        let irq = await_job_irq(&mut io, job_irq_csg(0), 1_000_000, |io| {
+            io.calls.push(SUBMIT)
+        });
+        assert_eq!(irq, Err(-5));
+        assert_eq!(io.calls, [ARM]);
+        assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn a_timed_out_job_wait_still_reports_and_clears_the_raw_status() {
+        let mut io = FakeBoot::new(Completion::TimedOut);
+        io.set(JOB_INT_RAWSTAT, job_irq_csg(0));
+        let irq = await_job_irq(&mut io, job_irq_csg(0), 1_000_000, |_| {}).unwrap();
+        assert_eq!(irq.completion, Completion::TimedOut);
+        assert_eq!(irq.rawstat, 0x1);
+        assert_eq!(io.calls.last(), Some(&COMPLETE));
+        assert!(io.writes.contains(&(JOB_INT_CLEAR, 0x1)));
+    }
 }
 
 #[cfg(test)]
@@ -4223,6 +4417,57 @@ mod g4b_tests {
         );
         assert_eq!(csg_pending_events(&mut io, 0x6500, 0x6700), 0);
     }
+
+    #[test]
+    fn glb_idle_is_acknowledged_by_copy_without_touching_a_ping_in_flight() {
+        let mut io = FakeFirmware::new();
+        // A ping is requested but not yet acknowledged, and the firmware raised IDLE.
+        io.write_input(GLB_REQ, GLB_REQ_IDLE_EN | GLB_REQ_PING);
+        io.set_glb_output(GLB_ACK, GLB_REQ_IDLE_EN | GLB_IDLE);
+        assert_eq!(glb_pending_events(&mut io), GLB_IDLE);
+        ack_glb_events(&mut io, GLB_IDLE | GLB_REQ_PING);
+        assert_eq!(
+            io.read_input(GLB_REQ),
+            GLB_REQ_IDLE_EN | GLB_REQ_PING | GLB_IDLE
+        );
+        assert_eq!(glb_pending_events(&mut io), 0);
+        assert_eq!(io.doorbells, 0);
+    }
+
+    #[test]
+    fn one_ack_pass_leaves_no_event_pending_anywhere() {
+        // J589's first metal run: the direct stream's group IDLE and a global IDLE were still
+        // pending when the first wrapped job armed its wait.
+        let mut io = FakeFirmware::new();
+        io.set(0x6500, CSG_STATE_START | CSG_ENDPOINT_CONFIG);
+        io.set(0x6700, CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE);
+        io.set(0x670c, 0x1);
+        io.write_input(GLB_REQ, GLB_REQ_IDLE_EN);
+        io.set_glb_output(GLB_ACK, GLB_REQ_IDLE_EN | GLB_IDLE);
+        let acked = ack_group_events(&mut io, 0x6500, 0x6700);
+        assert_eq!(
+            acked,
+            EventsAcked {
+                glb: GLB_IDLE,
+                cs_irq_req: 0x1,
+                cs_irq_ack: 0,
+                csg: CSG_IDLE,
+            }
+        );
+        assert!(acked.any());
+        let again = ack_group_events(&mut io, 0x6500, 0x6700);
+        assert_eq!(
+            again,
+            EventsAcked {
+                glb: 0,
+                cs_irq_req: 0x1,
+                cs_irq_ack: 0x1,
+                csg: 0,
+            }
+        );
+        assert!(!again.any());
+        assert_eq!(io.get(0x6500), CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE);
+    }
 }
 
 #[cfg(test)]
@@ -4408,6 +4653,20 @@ mod g4c_tests {
         assert_eq!(writes[7], (0xFF8, wrapper[7]));
         assert_eq!(writes[8], (0x000, wrapper[8]));
         assert_eq!(writes[15], (0x038, 0));
+    }
+
+    #[test]
+    fn a_job_wait_is_classified_by_seqno_last_wait_and_fired_count() {
+        use Completion::{Fired, TimedOut};
+        assert_eq!(classify_job_wait(true, Fired, 1), JobWait::Interrupt);
+        // A wake for a late IDLE, then the job's own SYNC_UPDATE.
+        assert_eq!(classify_job_wait(true, Fired, 2), JobWait::Interrupt);
+        assert_eq!(classify_job_wait(true, TimedOut, 1), JobWait::LateSeqno);
+        assert_eq!(classify_job_wait(true, TimedOut, 0), JobWait::NoInterrupt);
+        // The wait fired without the group's bit: not the job's interrupt.
+        assert_eq!(classify_job_wait(true, Fired, 0), JobWait::NoInterrupt);
+        assert_eq!(classify_job_wait(false, Fired, 3), JobWait::Stalled);
+        assert_eq!(classify_job_wait(false, TimedOut, 0), JobWait::Stalled);
     }
 
     #[test]

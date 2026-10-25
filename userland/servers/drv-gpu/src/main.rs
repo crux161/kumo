@@ -1,25 +1,26 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j584
 //j585
 //j586
 //j587
 //j588
+//j589
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    ack_cs_irqs, ack_csg_events, clear_job_irqs, cs_irq_req, csf_doorbell, csg_pending_events,
-    enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface, job_irq_rawstat,
-    job_slot, job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info,
-    mmu_rawstat, power_l2, probe, program_group, program_queue, publish_insert, queue_extract,
-    queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control, read_fault_as,
-    ring_offset, shared_region_contains, soft_reset, start_group, store_stream, wake_stream,
-    write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl,
-    Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, MmioIo, PageAttrs,
-    ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory,
-    APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_EVENTS,
-    CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS,
+    ack_cs_irqs, ack_csg_events, ack_glb_events, await_job_irq, classify_job_wait, clear_job_irqs,
+    cs_irq_req, csf_doorbell, csg_pending_events, enable_as, enable_as0, first_stream,
+    flush_page_tables, glb_pending_events, init_global_interface, job_irq_csg, job_slot,
+    job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info, mmu_rawstat,
+    power_l2, probe, program_group, program_queue, publish_insert, queue_extract, queue_insert,
+    quiet_mmu, read_cs_control, read_cs_status, read_csg_control, read_fault_as, ring_offset,
+    shared_region_contains, soft_reset, start_group, store_stream, wake_stream, write_job_words,
+    ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory,
+    GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
+    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF,
     PAGE_SIZE, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
@@ -904,13 +905,19 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 )
             };
             match ping {
-                Ok(report) => log(
-                    log_level::NOTICE,
-                    format_args!(
-                        "drv-gpu: global interface initialized, ping acknowledged (req=0x{:08x} ack=0x{:08x})\n",
-                        report.req, report.ack
-                    ),
-                ),
+                Ok(report) => {
+                    log(
+                        log_level::NOTICE,
+                        format_args!(
+                            "drv-gpu: global interface initialized, ping acknowledged (req=0x{:08x} ack=0x{:08x})\n",
+                            report.req, report.ack
+                        ),
+                    );
+                    // The config and ping acknowledgements are in GLB_INIT_ACK_IRQ_MASK, so they
+                    // latch JOB IRQ bit 31 while the line is masked; the handshake above polled
+                    // them, so the bit is stale. J588's job 1 still read it (0x80000001).
+                    clear_job_irqs(device, JOB_IRQ_GLOBAL_IF);
+                }
                 Err(error) => {
                     log(
                         log_level::ERR,
@@ -1340,9 +1347,8 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             // G4c: two jobs through RESEARCH/009 §10.6's wrapper, the way panthor submits every
             // job. Each wrapper flushes, CALLs its own store stream, waits for every scoreboard
             // and adds 1 to the queue's sync object; a job is done when the seqno reaches its
-            // number (§11.4). The group's SYNC_UPDATE event and JOB_INT_RAWSTAT are read and
-            // acknowledged in §11.5's order as evidence for the JOB-interrupt slice; nothing
-            // here waits on the interrupt yet. — TIMBERDOODLE
+            // number (§11.4). Metal (J588): SYNC_UPDATE and IDLE are raised per job and JOB IRQ
+            // bit 0 follows, so G4d waits on that interrupt. — TIMBERDOODLE
             let features = CsFeatures::decode(cs.features);
             let iface = QueueIface::at(MCU_IO_PAGES_VA);
             let sync = work.va + (AS1_SYNC_VA - AS1_WORK_VA);
@@ -1397,39 +1403,95 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     let _ = soft_reset(device);
                     return 1;
                 };
-                write_job_words(insert, slot, &wrapper, RING_SIZE, |offset, word| {
-                    // SAFETY: `offset` is below RING_SIZE, inside the ring page of AS1's
-                    // Normal-NC backing buffer.
-                    unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
-                });
-                dsb();
-                {
-                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                    publish_insert(&mut glb_io, iface, slot.end);
-                }
-                dsb();
-                {
-                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                    wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
-                }
-                device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
-                log(
-                    log_level::INFO,
-                    format_args!(
-                        "drv-gpu: job {} submitted: wrapper 0x{:x}..0x{:x} calls 0x{:x} ({} bytes), flush id 0x{:x}\n",
-                        job, slot.start, slot.end, stream_va, call.stream_len, call.latest_flush
-                    ),
-                );
-
+                // G4d: wait for the job on the JOB interrupt (INTID 124) instead of polling. The
+                // first wait is armed before the doorbell rings (inside `await_job_irq`), so a
+                // fast job cannot complete into nothing; a wake that leaves the seqno short, such
+                // as a late IDLE from the previous job, re-arms for the time left. JOB_INT bits
+                // from before this job (the direct stream's, a global IDLE in the gap) are
+                // cleared first; the interface events behind them stay visible in req ^ ack and
+                // are acknowledged on the first wake. Each wake runs §11.5's order: JOB_INT is
+                // already cleared, then the global events, the stream level, the group events.
+                // — TIMBERDOODLE
+                let csg_bit = job_irq_csg(GROUP_SLOT);
+                clear_job_irqs(device, csg_bit | JOB_IRQ_GLOBAL_IF);
                 let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
-                seqno = loop {
+                let mut waits = 0u32;
+                let mut fired = 0u32;
+                let (mut rawstat, mut stat, mut events, mut glb_events) = (0u32, 0u32, 0u32, 0u32);
+                let (last, irq_req, irq_ack) = loop {
+                    let remaining = deadline.saturating_sub(device.now_ns()).max(1_000);
+                    let submit = waits == 0;
+                    let irq = match await_job_irq(device, csg_bit, remaining, |device| {
+                        if !submit {
+                            return;
+                        }
+                        write_job_words(insert, slot, &wrapper, RING_SIZE, |offset, word| {
+                            // SAFETY: `offset` is below RING_SIZE, inside the ring page of AS1's
+                            // Normal-NC backing buffer.
+                            unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
+                        });
+                        dsb();
+                        {
+                            let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                            publish_insert(&mut glb_io, iface, slot.end);
+                        }
+                        dsb();
+                        {
+                            let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                            wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+                        }
+                        device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+                    }) {
+                        Ok(irq) => irq,
+                        Err(status) => {
+                            log(
+                                log_level::ERR,
+                                format_args!(
+                                    "drv-gpu: job {} could not arm the JOB interrupt wait: {}\n",
+                                    job, status
+                                ),
+                            );
+                            let _ = soft_reset(device);
+                            return 1;
+                        }
+                    };
+                    if submit {
+                        log(
+                            log_level::INFO,
+                            format_args!(
+                                "drv-gpu: job {} submitted: wrapper 0x{:x}..0x{:x} calls 0x{:x} ({} bytes), flush id 0x{:x}\n",
+                                job, slot.start, slot.end, stream_va, call.stream_len, call.latest_flush
+                            ),
+                        );
+                    }
+                    waits += 1;
+                    if irq.completion == Completion::Fired && irq.rawstat & csg_bit != 0 {
+                        fired += 1;
+                    }
+                    rawstat |= irq.rawstat;
+                    stat |= irq.stat;
+                    let (irq_req, irq_ack) = {
+                        let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                        let glb = glb_pending_events(&mut glb_io);
+                        ack_glb_events(&mut glb_io, glb);
+                        glb_events |= glb;
+                        let irq_req = cs_irq_req(&mut glb_io, csg.output_va);
+                        let irq_ack = glb_io.read32(csg.input_va + 0x0C);
+                        ack_cs_irqs(&mut glb_io, csg.input_va, irq_req);
+                        let raised = csg_pending_events(&mut glb_io, csg.input_va, csg.output_va);
+                        ack_csg_events(&mut glb_io, csg.input_va, csg.output_va, raised);
+                        events |= raised;
+                        (irq_req, irq_ack)
+                    };
                     // SAFETY: the sync object is 8-byte aligned in AS1's Normal-NC sync page; one
                     // 64-bit load sees the GPU's 64-bit add whole.
-                    let seen = unsafe { (sync as *const u64).read_volatile() };
-                    if seen >= job || device.now_ns() >= deadline {
-                        break seen;
+                    seqno = unsafe { (sync as *const u64).read_volatile() };
+                    if seqno >= job
+                        || irq.completion == Completion::TimedOut
+                        || device.now_ns() >= deadline
+                    {
+                        break (irq.completion, irq_req, irq_ack);
                     }
-                    device.delay_us(100);
                 };
                 // SAFETY: the status word of the same sync object.
                 let status = unsafe { ((sync + SYNC_STATUS_OFFSET) as *const u32).read_volatile() };
@@ -1437,57 +1499,57 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 let landed = unsafe {
                     ((work.va + (target_va - AS1_WORK_VA)) as *const u32).read_volatile()
                 };
-                if seqno < job {
-                    log(
+                let (consumed, cs_req, cs_ack) = {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    (
+                        queue_extract(&mut glb_io, iface),
+                        glb_io.read32(cs.input_va),
+                        glb_io.read32(cs.output_va),
+                    )
+                };
+                let outcome = classify_job_wait(seqno >= job, last, fired);
+                match outcome {
+                    JobWait::Interrupt => log(
+                        log_level::NOTICE,
+                        format_args!(
+                            "drv-gpu: job {} signalled on the JOB interrupt: seqno={} status=0x{:x} target=0x{:08x} extract=0x{:x} (waits={})\n",
+                            job, seqno, status, landed, consumed, waits
+                        ),
+                    ),
+                    JobWait::Stalled => log(
                         log_level::ERR,
                         format_args!(
-                            "drv-gpu: job {} did not signal within the timeout (seqno={} status=0x{:x} target=0x{:08x})\n",
-                            job, seqno, status, landed
+                            "drv-gpu: job {} did not signal within the timeout (seqno={} status=0x{:x} target=0x{:08x} waits={} fired={})\n",
+                            job, seqno, status, landed, waits, fired
                         ),
-                    );
+                    ),
+                    JobWait::NoInterrupt => log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: job {} reached seqno={} but the JOB interrupt never fired (waits={} target=0x{:08x})\n",
+                            job, seqno, waits, landed
+                        ),
+                    ),
+                    JobWait::LateSeqno => log(
+                        log_level::ERR,
+                        format_args!(
+                            "drv-gpu: job {}'s JOB interrupt fired before its seqno landed (seqno={} after {} waits, {} fired)\n",
+                            job, seqno, waits, fired
+                        ),
+                    ),
+                }
+                log(
+                    log_level::NOTICE,
+                    format_args!(
+                        "drv-gpu: job {} events csg=0x{:08x} glb=0x{:08x} cs_irq=0x{:x}/0x{:x} cs=0x{:08x}/0x{:08x} job_irq=0x{:08x}/0x{:08x} (acknowledged)\n",
+                        job, events, glb_events, irq_req, irq_ack, cs_req, cs_ack, rawstat, stat
+                    ),
+                );
+                if outcome != JobWait::Interrupt {
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
                     return 1;
                 }
-
-                // Give the firmware the drain window to consume the wrapper's tail and raise
-                // SYNC_UPDATE, so a missing event reads as "not raised", not "not yet".
-                let drain_deadline = device.now_ns().saturating_add(DRAIN_TIMEOUT_NS);
-                let (consumed, events) = loop {
-                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                    let consumed = queue_extract(&mut glb_io, iface);
-                    let events = csg_pending_events(&mut glb_io, csg.input_va, csg.output_va);
-                    if (consumed >= slot.end && events & CSG_EVENTS != 0)
-                        || glb_io.now_ns() >= drain_deadline
-                    {
-                        break (consumed, events);
-                    }
-                    glb_io.delay_us(100);
-                };
-                let job_irqs = job_irq_rawstat(device);
-                clear_job_irqs(device, job_irqs);
-                let (irq_req, irq_ack) = {
-                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                    let irq_req = cs_irq_req(&mut glb_io, csg.output_va);
-                    let irq_ack = glb_io.read32(csg.input_va + 0x0C);
-                    ack_cs_irqs(&mut glb_io, csg.input_va, irq_req);
-                    ack_csg_events(&mut glb_io, csg.input_va, csg.output_va, events);
-                    (irq_req, irq_ack)
-                };
-                log(
-                    log_level::NOTICE,
-                    format_args!(
-                        "drv-gpu: job {} signalled seqno={} status=0x{:x} target=0x{:08x} extract=0x{:x}\n",
-                        job, seqno, status, landed, consumed
-                    ),
-                );
-                log(
-                    log_level::NOTICE,
-                    format_args!(
-                        "drv-gpu: job {} events csg=0x{:08x} cs_irq=0x{:x}/0x{:x} job_irq=0x{:08x} (acknowledged)\n",
-                        job, events, irq_req, irq_ack, job_irqs
-                    ),
-                );
                 if seqno != job || status != 0 || landed != value {
                     log(
                         log_level::ERR,
