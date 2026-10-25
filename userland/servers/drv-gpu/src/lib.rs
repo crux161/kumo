@@ -1,12 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j585
 //j586
 //j587
 //j588
 //j589
+//j590
 
-//! G1b–G4d: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G5a: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
@@ -14,7 +14,8 @@
 //! firmware publishes when it comes up. G4a initializes that interface and proves a ping
 //! round-trip. G4b starts a command-stream group and has the GPU write a value. G4c wraps each
 //! job the way panthor does (§10.6) and counts completions in the queue's sync object (§11.4).
-//! G4d waits for each job on the JOB interrupt and handles it in §11.5's order.
+//! G4d waits for each job on the JOB interrupt and handles it in §11.5's order. G5a paints a
+//! test pattern with the command stream alone and checks it against a CPU reference.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -2024,19 +2025,21 @@ pub fn ring_offset(insert: u64, size: u64) -> usize {
 
 /// The command-stream words for RESEARCH/009 §10.7's first stream: write `target` with
 /// 0x00C0FFEE, flush the caches, and wait for both completions. — TIMBERDOODLE
-pub fn first_stream(target: u64) -> [u64; 5] {
+pub fn first_stream(target: u64) -> [u64; 6] {
     store_stream(target, 0x00C0_FFEE)
 }
 
-/// §10.7's stream for any value: store it at `target`, flush, wait. It touches only r0-r2, well
-/// below the wrapper's scratch quad. The flush names r0 as its flush-ID register, exactly the
-/// encoding metal proved at J586.
-pub fn store_stream(target: u64, value: u32) -> [u64; 5] {
+/// §10.7's stream for any value: store it at `target`, flush, wait. It touches only r0-r3, well
+/// below the wrapper's scratch quad. J586-J589 named r0 (the target's low word) as the flush-ID
+/// register; that is no flush ID, and J588's counter rose by one per job for two flushes. panvk
+/// gives every in-stream flush the ID 0 (`cs_move32_to(b, flush_id, 0)`), and so does this.
+pub fn store_stream(target: u64, value: u32) -> [u64; 6] {
     [
         move48(0, target),
         move32(2, value),
         sync_set32(0, 0, 2),
-        flush_cache2(0, 0),
+        move32(3, 0),
+        flush_cache2(0, 3),
         wait_slot(1),
     ]
 }
@@ -2063,7 +2066,60 @@ pub fn sync_set32(signal_slot: u8, address_pair: u8, data_reg: u8) -> u64 {
 /// FLUSH_CACHE2: L2 clean+invalidate, LSC clean+invalidate, other invalidate (§4.4's 0x233),
 /// skipped by the hardware if a flush has completed since the ID in `flush_id_reg` (§4.9).
 pub fn flush_cache2(signal_slot: u8, flush_id_reg: u8) -> u64 {
-    (36u64 << 56) | (u64::from(signal_slot) << 48) | (u64::from(flush_id_reg) << 40) | 0x233
+    flush_caches(signal_slot, flush_id_reg, 0x233)
+}
+
+/// FLUSH_CACHE2's mode word for L2 clean and LSC clean, other untouched: panvk's end-of-stream
+/// flush (`finish_cs`), enough to make the stream's writes visible (§10.4, §13).
+pub const FLUSH_CLEAN: u16 = 0x011;
+
+/// FLUSH_CACHE2 with explicit modes: L2 [3:0], LSC [7:4], other [11:8] (§10.3-§10.4).
+pub fn flush_caches(signal_slot: u8, flush_id_reg: u8, modes: u16) -> u64 {
+    (36u64 << 56)
+        | (u64::from(signal_slot) << 48)
+        | (u64::from(flush_id_reg) << 40)
+        | u64::from(modes & 0x0FFF)
+}
+
+/// STORE_MULTIPLE: store the registers `base_reg + i` for each bit i of `mask` at the address
+/// pair plus a signed byte offset (Mesa `v10.xml`). The sources may be read after issue: Mesa's
+/// load/store tracker forbids overwriting a store's registers before a WAIT on the load/store
+/// scoreboard.
+pub fn store_multiple(base_reg: u8, address_pair: u8, mask: u16, offset: i16) -> u64 {
+    (21u64 << 56)
+        | (u64::from(base_reg) << 48)
+        | (u64::from(address_pair) << 40)
+        | (u64::from(mask) << 16)
+        | u64::from(offset as u16)
+}
+
+/// ADD_IMMEDIATE32: `destination = source + immediate` (signed), one register (§10.3).
+pub fn add_imm32(destination: u8, source: u8, immediate: i32) -> u64 {
+    (16u64 << 56)
+        | (u64::from(destination) << 48)
+        | (u64::from(source) << 40)
+        | u64::from(immediate as u32)
+}
+
+/// ADD_IMMEDIATE64: the same on register pairs, the immediate sign-extended (§10.3).
+pub fn add_imm64(destination_pair: u8, source_pair: u8, immediate: i32) -> u64 {
+    (17u64 << 56)
+        | (u64::from(destination_pair) << 48)
+        | (u64::from(source_pair) << 40)
+        | u64::from(immediate as u32)
+}
+
+/// BRANCH conditions (§10.4): the value register is tested against zero.
+pub const CS_COND_NEQUAL: u8 = 3;
+pub const CS_COND_ALWAYS: u8 = 6;
+
+/// BRANCH: when the 32-bit `value_reg` meets `condition`, continue `offset` instructions after
+/// the branch's successor. Mesa computes `offset = target - branch_position - 1`.
+pub fn branch(condition: u8, value_reg: u8, offset: i16) -> u64 {
+    (22u64 << 56)
+        | (u64::from(value_reg) << 40)
+        | (u64::from(condition & 0xF) << 28)
+        | u64::from(offset as u16)
 }
 
 /// WAIT: block until every scoreboard in the mask has signalled (§10.3).
@@ -2263,6 +2319,175 @@ pub fn read_cs_status(mem: &mut impl FirmwareMemory, output_va: u64) -> CsStatus
         fault: mem.read32(output_va + 0x80),
         fatal: mem.read32(output_va + 0x84),
     }
+}
+
+// ---- G5a: a test pattern painted by the command stream (PLAN/013 G5) ----
+
+/// The pattern fills one DESIGN/019 view: linear XRGB8888 (`0x00RRGGBB`), stride = width.
+pub const PAINT_WIDTH: u32 = 256;
+pub const PAINT_HEIGHT: u32 = 128;
+pub const PAINT_BYTES: u64 = PAINT_WIDTH as u64 * PAINT_HEIGHT as u64 * 4;
+/// gfx-demo's channel-order bars: red, green, blue, white.
+pub const PAINT_BARS: [u32; 4] = [0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0x00FF_FFFF];
+const PAINT_BAR_WIDTH: u32 = PAINT_WIDTH / PAINT_BARS.len() as u32;
+/// Sixteen 32-bit registers per STORE_MULTIPLE: 64 bytes, sixteen pixels.
+const PAINT_CHUNK_PIXELS: u32 = 16;
+const PAINT_CHUNKS_PER_ROW: u32 = PAINT_WIDTH / PAINT_CHUNK_PIXELS;
+/// Registers: r0:r1 the address, r2-r65 the four bar colours (sixteen each, then r2-r17 the
+/// ramp), r80/r81 the row and chunk counters, r82 the flush ID. All below the wrapper's r92-r95.
+const PAINT_ADDR: u8 = 0;
+const PAINT_COLOURS: u8 = 2;
+const PAINT_ROWS: u8 = 80;
+const PAINT_CHUNKS: u8 = 81;
+const PAINT_FLUSH_ID: u8 = 82;
+/// The stream is 176 instructions; the builder holds a little more.
+pub const PAINT_STREAM_MAX: usize = 192;
+
+/// The CPU reference. The top half is four 64-pixel bars; the bottom half is a ramp, blue
+/// following x and green following twice the row.
+pub const fn paint_pixel(x: u32, y: u32) -> u32 {
+    if y < PAINT_HEIGHT / 2 {
+        PAINT_BARS[(x / PAINT_BAR_WIDTH) as usize]
+    } else {
+        (((y - PAINT_HEIGHT / 2) * 2) << 8) | x
+    }
+}
+
+/// A command stream with its length; built once, copied into GPU memory.
+pub struct PaintStream {
+    words: [u64; PAINT_STREAM_MAX],
+    len: usize,
+}
+
+impl PaintStream {
+    pub fn words(&self) -> &[u64] {
+        &self.words[..self.len]
+    }
+
+    fn push(&mut self, word: u64) {
+        self.words[self.len] = word;
+        self.len += 1;
+    }
+
+    /// A conditional branch back to `target` (an instruction index), in Mesa's convention.
+    fn branch_back(&mut self, condition: u8, value_reg: u8, target: usize) {
+        let offset = target as i32 - self.len as i32 - 1;
+        self.push(branch(condition, value_reg, offset as i16));
+    }
+
+    /// One 64-byte store, its WAIT, and the address step. The WAIT comes before the address
+    /// (a store source) changes, per Mesa's load/store tracker rule.
+    fn store_chunk(&mut self, base_reg: u8, wait_all: u16) {
+        self.push(store_multiple(base_reg, PAINT_ADDR, 0xFFFF, 0));
+        self.push(wait_slot(wait_all));
+        self.push(add_imm64(PAINT_ADDR, PAINT_ADDR, 64));
+    }
+}
+
+/// G5a's stream: paint [`paint_pixel`] into the 256x128 surface at `target` using only the
+/// command-stream processor (STORE_MULTIPLE, ADD_IMMEDIATE and BRANCH loops, no shader), then
+/// clean L2 and LSC with flush ID 0 as panvk does and wait for it. Every store is followed by a
+/// WAIT on all scoreboards, so the stream needs no assumption about which slot the load/store
+/// unit signals. — TIMBERDOODLE
+pub fn paint_stream(target: u64, features: CsFeatures) -> PaintStream {
+    let wait_all = match features.scoreboards {
+        1..=15 => ((1u32 << features.scoreboards) - 1) as u16,
+        _ => 0xFFFF,
+    };
+    let mut s = PaintStream {
+        words: [0; PAINT_STREAM_MAX],
+        len: 0,
+    };
+    s.push(move48(PAINT_ADDR, target));
+    for (bar, colour) in PAINT_BARS.iter().enumerate() {
+        for i in 0..PAINT_CHUNK_PIXELS as u8 {
+            s.push(move32(
+                PAINT_COLOURS + bar as u8 * PAINT_CHUNK_PIXELS as u8 + i,
+                *colour,
+            ));
+        }
+    }
+    // Top half: each row is four bars of four chunks, each bar stored from its own registers.
+    s.push(move32(PAINT_ROWS, PAINT_HEIGHT / 2));
+    let bars = s.len;
+    for bar in 0..PAINT_BARS.len() as u8 {
+        for _ in 0..PAINT_BAR_WIDTH / PAINT_CHUNK_PIXELS {
+            s.store_chunk(PAINT_COLOURS + bar * PAINT_CHUNK_PIXELS as u8, wait_all);
+        }
+    }
+    s.push(add_imm32(PAINT_ROWS, PAINT_ROWS, -1));
+    s.branch_back(CS_COND_NEQUAL, PAINT_ROWS, bars);
+    // Bottom half: r(2+i) holds the pixel at x = 16c + i. Each chunk adds 16 to every register;
+    // sixteen chunks add 0x100, which carries the blue byte back to i and green up by one, so
+    // the row step adds another 0x100 for green = 2 * row.
+    for i in 0..PAINT_CHUNK_PIXELS as u8 {
+        s.push(move32(PAINT_COLOURS + i, u32::from(i)));
+    }
+    s.push(move32(PAINT_ROWS, PAINT_HEIGHT / 2));
+    let rows = s.len;
+    s.push(move32(PAINT_CHUNKS, PAINT_CHUNKS_PER_ROW));
+    let chunks = s.len;
+    s.store_chunk(PAINT_COLOURS, wait_all);
+    for i in 0..PAINT_CHUNK_PIXELS as u8 {
+        s.push(add_imm32(
+            PAINT_COLOURS + i,
+            PAINT_COLOURS + i,
+            PAINT_CHUNK_PIXELS as i32,
+        ));
+    }
+    s.push(add_imm32(PAINT_CHUNKS, PAINT_CHUNKS, -1));
+    s.branch_back(CS_COND_NEQUAL, PAINT_CHUNKS, chunks);
+    for i in 0..PAINT_CHUNK_PIXELS as u8 {
+        s.push(add_imm32(PAINT_COLOURS + i, PAINT_COLOURS + i, 0x100));
+    }
+    s.push(add_imm32(PAINT_ROWS, PAINT_ROWS, -1));
+    s.branch_back(CS_COND_NEQUAL, PAINT_ROWS, rows);
+    s.push(move32(PAINT_FLUSH_ID, 0));
+    s.push(flush_caches(0, PAINT_FLUSH_ID, FLUSH_CLEAN));
+    s.push(wait_slot(1));
+    s
+}
+
+/// The comparison of a painted surface against [`paint_pixel`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaintCheck {
+    pub mismatches: u32,
+    /// The first wrong pixel as (x, y, got, want).
+    pub first: Option<(u32, u32, u32, u32)>,
+    /// FNV-1a over the surface's pixels, row-major, little-endian.
+    pub checksum: u32,
+}
+
+fn fnv1a(hash: u32, pixel: u32) -> u32 {
+    pixel.to_le_bytes().iter().fold(hash, |h, byte| {
+        (h ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Compare every pixel `read(x, y)` returns against the reference. The caller reads the
+/// surface with volatile loads; this never sees GPU memory itself.
+pub fn check_paint(mut read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
+    let mut check = PaintCheck {
+        checksum: 0x811C_9DC5,
+        ..PaintCheck::default()
+    };
+    for y in 0..PAINT_HEIGHT {
+        for x in 0..PAINT_WIDTH {
+            let got = read(x, y);
+            let want = paint_pixel(x, y);
+            if got != want {
+                check.mismatches += 1;
+                check.first.get_or_insert((x, y, got, want));
+            }
+            check.checksum = fnv1a(check.checksum, got);
+        }
+    }
+    check
+}
+
+/// The reference image's checksum, for the boot log beside the measured one.
+pub fn paint_reference_checksum() -> u32 {
+    check_paint(paint_pixel).checksum
 }
 
 #[cfg(test)]
@@ -4322,7 +4547,8 @@ mod g4b_tests {
                 0x0100_0000_1000_1000,
                 0x0202_0000_00c0_ffee,
                 0x2600_0002_0000_0000,
-                0x2400_0000_0000_0233,
+                0x0203_0000_0000_0000,
+                0x2400_0300_0000_0233,
                 0x0300_0000_0001_0000,
             ]
         );
@@ -4673,7 +4899,9 @@ mod g4c_tests {
     }
 
     #[test]
-    fn the_store_stream_keeps_the_proven_first_stream_encoding() {
+    fn the_store_stream_flushes_with_panvks_flush_id_zero() {
+        // J586-J589's words, except the flush now names r3 = 0 instead of r0 (the target's low
+        // word), as panvk's in-stream flushes do.
         let stream = store_stream(0x1000_1040, 0xC0DE_0001);
         assert_eq!(
             stream,
@@ -4681,10 +4909,273 @@ mod g4c_tests {
                 0x0100_0000_1000_1040,
                 0x0202_0000_C0DE_0001,
                 0x2600_0002_0000_0000,
-                0x2400_0000_0000_0233,
+                0x0203_0000_0000_0000,
+                0x2400_0300_0000_0233,
                 0x0300_0000_0001_0000,
             ]
         );
         assert_eq!(first_stream(0x1000_1000)[1], 0x0202_0000_00c0_ffee);
+    }
+}
+
+#[cfg(test)]
+mod g5a_tests {
+    extern crate std;
+    use super::*;
+    use std::collections::HashMap;
+    use std::vec::Vec;
+
+    const METAL: CsFeatures = CsFeatures::decode(0x0007_085f);
+    const TARGET: u64 = 0x1010_0000;
+    const STREAM: u64 = 0x1000_2400;
+    const SYNC: u64 = 0x1000_3000;
+    const POISON: u32 = 0x00FF_00FF;
+
+    /// A model of the command-stream processor for the opcodes KUMO emits, with the semantics
+    /// RESEARCH/009 §10 and Mesa's `v10.xml`/`cs_builder.h` give them: BRANCH lands `offset`
+    /// instructions after its successor when the 32-bit value register meets the condition
+    /// against zero; STORE_MULTIPLE stores register `base + i` at `address + offset + 4i` for each
+    /// mask bit i (KUMO only uses full masks, where packed and positional layouts agree). WAIT,
+    /// FLUSH_CACHE2 and ERROR_BARRIER only order work, which this sequential model already does.
+    /// It checks a stream's logic, not the hardware.
+    struct Csp {
+        regs: [u32; 96],
+        mem: HashMap<u64, u32>,
+        stored: Vec<u64>,
+        executed: u64,
+    }
+
+    impl Csp {
+        fn new() -> Self {
+            Self {
+                regs: [0; 96],
+                mem: HashMap::new(),
+                stored: Vec::new(),
+                executed: 0,
+            }
+        }
+
+        fn load(&mut self, va: u64, words: &[u64]) {
+            for (index, word) in words.iter().enumerate() {
+                let at = va + index as u64 * 8;
+                self.mem.insert(at, *word as u32);
+                self.mem.insert(at + 4, (*word >> 32) as u32);
+            }
+        }
+
+        fn read32(&self, va: u64) -> u32 {
+            *self.mem.get(&va).unwrap_or(&0)
+        }
+
+        fn read64(&self, va: u64) -> u64 {
+            u64::from(self.read32(va)) | (u64::from(self.read32(va + 4)) << 32)
+        }
+
+        fn write64(&mut self, va: u64, value: u64) {
+            self.mem.insert(va, value as u32);
+            self.mem.insert(va + 4, (value >> 32) as u32);
+        }
+
+        fn pair(&self, reg: u8) -> u64 {
+            u64::from(self.regs[reg as usize]) | (u64::from(self.regs[reg as usize + 1]) << 32)
+        }
+
+        fn set_pair(&mut self, reg: u8, value: u64) {
+            self.regs[reg as usize] = value as u32;
+            self.regs[reg as usize + 1] = (value >> 32) as u32;
+        }
+
+        fn run(&mut self, start: u64, len: u64) {
+            let count = (len / 8) as i64;
+            let mut pc: i64 = 0;
+            while pc < count {
+                self.executed += 1;
+                assert!(self.executed < 2_000_000, "runaway stream");
+                let at = start + pc as u64 * 8;
+                let w = self.read64(at);
+                let op = (w >> 56) as u8;
+                let r48 = ((w >> 48) & 0xFF) as u8;
+                let r40 = ((w >> 40) & 0xFF) as u8;
+                let r32 = ((w >> 32) & 0xFF) as u8;
+                match op {
+                    0 | 3 | 36 | 47 => {}
+                    1 => self.set_pair(r48, w & 0x0000_FFFF_FFFF_FFFF),
+                    2 => self.regs[r48 as usize] = w as u32,
+                    16 => self.regs[r48 as usize] = self.regs[r40 as usize].wrapping_add(w as u32),
+                    17 => {
+                        let value = self.pair(r40).wrapping_add(w as u32 as i32 as i64 as u64);
+                        self.set_pair(r48, value);
+                    }
+                    21 => {
+                        let address = self.pair(r40).wrapping_add(w as u16 as i16 as i64 as u64);
+                        let mask = (w >> 16) as u16;
+                        for i in 0..16u64 {
+                            if mask & (1 << i) != 0 {
+                                let value = self.regs[r48 as usize + i as usize];
+                                self.mem.insert(address + 4 * i, value);
+                                self.stored.push(address + 4 * i);
+                            }
+                        }
+                    }
+                    22 => {
+                        let value = self.regs[r40 as usize];
+                        let taken = match (w >> 28) & 0xF {
+                            2 => value == 0,
+                            3 => value != 0,
+                            6 => true,
+                            other => panic!("condition {other} not modelled"),
+                        };
+                        if taken {
+                            pc += 1 + i64::from(w as u16 as i16);
+                            continue;
+                        }
+                    }
+                    32 => {
+                        let (address, length) =
+                            (self.pair(r40), u64::from(self.regs[r32 as usize]));
+                        self.run(address, length);
+                    }
+                    38 => {
+                        let address = self.pair(r40);
+                        self.mem.insert(address, self.regs[r32 as usize]);
+                        self.stored.push(address);
+                    }
+                    51 => {
+                        let address = self.pair(r40);
+                        let sum = self.read64(address).wrapping_add(self.pair(r32));
+                        self.write64(address, sum);
+                    }
+                    other => panic!("opcode {other} not modelled at 0x{at:x}"),
+                }
+                pc += 1;
+            }
+        }
+
+        fn poison_target(&mut self) {
+            for offset in (0..PAINT_BYTES).step_by(4) {
+                self.mem.insert(TARGET + offset, POISON);
+            }
+        }
+
+        fn pixel(&self, x: u32, y: u32) -> u32 {
+            self.read32(TARGET + u64::from(y * PAINT_WIDTH + x) * 4)
+        }
+    }
+
+    #[test]
+    fn the_new_encoders_follow_mesas_v10_fields() {
+        assert_eq!(store_multiple(2, 0, 0xFFFF, 0), 0x1502_0000_FFFF_0000);
+        assert_eq!(store_multiple(50, 0, 0xFFFF, -64), 0x1532_0000_FFFF_FFC0);
+        assert_eq!(add_imm64(0, 0, 64), 0x1100_0000_0000_0040);
+        assert_eq!(add_imm32(81, 81, -1), 0x1051_5100_FFFF_FFFF);
+        assert_eq!(branch(CS_COND_NEQUAL, 81, -21), 0x1600_5100_3000_FFEB);
+        assert_eq!(flush_caches(0, 82, FLUSH_CLEAN), 0x2400_5200_0000_0011);
+        assert_eq!(flush_cache2(0, 3), flush_caches(0, 3, 0x233));
+    }
+
+    #[test]
+    fn the_paint_stream_fits_a_call_and_stays_below_the_wrapper_registers() {
+        let stream = paint_stream(TARGET, METAL);
+        let words = stream.words();
+        assert_eq!(words.len(), 176);
+        assert!(words.len() <= PAINT_STREAM_MAX);
+        assert_eq!(*words.last().unwrap(), wait_slot(1));
+        let mut csp = Csp::new();
+        csp.load(STREAM, words);
+        csp.regs[92..96].copy_from_slice(&[0x9292_9292, 0x9393_9393, 0x9494_9494, 0x9595_9595]);
+        csp.run(STREAM, words.len() as u64 * 8);
+        assert_eq!(
+            csp.regs[92..96],
+            [0x9292_9292, 0x9393_9393, 0x9494_9494, 0x9595_9595]
+        );
+    }
+
+    #[test]
+    fn the_paint_stream_paints_exactly_the_reference_and_nothing_else() {
+        let stream = paint_stream(TARGET, METAL);
+        let mut csp = Csp::new();
+        csp.poison_target();
+        csp.load(STREAM, stream.words());
+        csp.run(STREAM, stream.words().len() as u64 * 8);
+        assert_eq!(csp.stored.len() as u64, PAINT_BYTES / 4);
+        assert!(csp
+            .stored
+            .iter()
+            .all(|va| (TARGET..TARGET + PAINT_BYTES).contains(va)));
+        let check = check_paint(|x, y| csp.pixel(x, y));
+        assert_eq!(check.mismatches, 0, "first wrong pixel {:?}", check.first);
+        assert_eq!(check.checksum, paint_reference_checksum());
+        // 2048 stores, each with its WAIT and address step, plus the loop bookkeeping.
+        assert!(
+            csp.executed > 6_000 && csp.executed < 30_000,
+            "{}",
+            csp.executed
+        );
+    }
+
+    #[test]
+    fn the_wrapped_paint_job_signals_seqno_one_after_the_image_is_complete() {
+        let stream = paint_stream(TARGET, METAL);
+        let len = stream.words().len() as u32 * 8;
+        let wrapper = job_wrapper(
+            METAL,
+            JobCall {
+                latest_flush: 0x00FF_FFE0,
+                stream_va: STREAM,
+                stream_len: len,
+                sync_va: SYNC,
+            },
+        )
+        .unwrap();
+        let mut csp = Csp::new();
+        csp.poison_target();
+        csp.load(STREAM, stream.words());
+        csp.load(0x1000_0040, &wrapper);
+        csp.run(0x1000_0040, JOB_WRAPPER_BYTES);
+        assert_eq!(csp.read64(SYNC), 1);
+        assert_eq!(check_paint(|x, y| csp.pixel(x, y)).mismatches, 0);
+    }
+
+    #[test]
+    fn the_store_stream_still_lands_its_value_in_the_model() {
+        let mut csp = Csp::new();
+        let stream = store_stream(0x1000_1040, 0xC0DE_0001);
+        csp.load(STREAM, &stream);
+        csp.run(STREAM, stream.len() as u64 * 8);
+        assert_eq!(csp.read32(0x1000_1040), 0xC0DE_0001);
+        assert_eq!(csp.regs[3], 0);
+    }
+
+    #[test]
+    fn the_reference_pattern_has_bars_on_top_and_a_ramp_below() {
+        assert_eq!(paint_pixel(0, 0), 0x00FF_0000);
+        assert_eq!(paint_pixel(63, 63), 0x00FF_0000);
+        assert_eq!(paint_pixel(64, 0), 0x0000_FF00);
+        assert_eq!(paint_pixel(128, 10), 0x0000_00FF);
+        assert_eq!(paint_pixel(255, 63), 0x00FF_FFFF);
+        assert_eq!(paint_pixel(0, 64), 0x0000_0000);
+        assert_eq!(paint_pixel(255, 64), 0x0000_00FF);
+        assert_eq!(paint_pixel(17, 65), 0x0000_0211);
+        assert_eq!(paint_pixel(255, 127), 0x0000_7EFF);
+    }
+
+    #[test]
+    fn the_check_names_the_first_wrong_pixel_and_counts_poison() {
+        let good = check_paint(paint_pixel);
+        assert_eq!(good.mismatches, 0);
+        assert_eq!(good.first, None);
+        let one = check_paint(|x, y| {
+            if (x, y) == (5, 70) {
+                0
+            } else {
+                paint_pixel(x, y)
+            }
+        });
+        assert_eq!(one.mismatches, 1);
+        assert_eq!(one.first, Some((5, 70, 0, paint_pixel(5, 70))));
+        assert_ne!(one.checksum, good.checksum);
+        let poison = check_paint(|_, _| POISON);
+        assert_eq!(poison.mismatches, PAINT_WIDTH * PAINT_HEIGHT);
+        assert_eq!(poison.first, Some((0, 0, POISON, 0x00FF_0000)));
     }
 }

@@ -1,26 +1,27 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j585
 //j586
 //j587
 //j588
 //j589
+//j590
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    ack_cs_irqs, ack_group_events, await_job_irq, classify_job_wait, clear_job_irqs, cs_irq_req,
-    csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
-    job_irq_csg, job_slot, job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot,
-    mmu_info, mmu_rawstat, power_l2, probe, program_group, program_queue, publish_insert,
-    queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
-    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
-    wake_stream, write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures,
-    CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait,
-    MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags,
-    TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START,
-    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ,
-    GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF, PAGE_SIZE, SYNC_STATUS_OFFSET,
+    ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
+    cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
+    init_global_interface, job_irq_csg, job_slot, job_wrapper, latched_fault, latest_flush_id,
+    map_range, mcu_boot, mmu_info, mmu_rawstat, paint_reference_checksum, paint_stream, power_l2,
+    probe, program_group, program_queue, publish_insert, queue_extract, queue_insert, quiet_mmu,
+    read_cs_control, read_cs_status, read_csg_control, read_fault_as, ring_offset,
+    shared_region_contains, soft_reset, start_group, store_stream, wake_stream, write_job_words,
+    ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory,
+    GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
+    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF,
+    PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_WIDTH, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -63,6 +64,15 @@ const WORK_LEN: u64 = 4 * PAGE_SIZE;
 /// counts rather than being set.
 const WRAPPED_JOBS: u64 = 2;
 const WRAPPED_VALUE_BASE: u32 = 0xC0DE_0000;
+/// G5a: job 3 paints the test pattern. Its stream sits 1 KiB into the streams page, clear of
+/// the store jobs' lines; the target is its own 128 KiB in AS1, inside the same 2 MiB table as
+/// the work buffer.
+const PAINT_JOB: u64 = WRAPPED_JOBS + 1;
+const PAINT_STREAM_VA: u64 = AS1_STREAMS_VA + 0x400;
+const AS1_PAINT_VA: u64 = AS1_WORK_VA + 0x10_0000;
+/// DESIGN/019's clip poison, never a value of the reference pattern.
+const PAINT_POISON: u32 = 0x00FF_00FF;
+const _: () = assert!(PAINT_STREAM_VA + (PAINT_STREAM_MAX as u64) * 8 <= AS1_SYNC_VA);
 const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
@@ -1092,6 +1102,36 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 let _ = soft_reset(device);
                 return 1;
             }
+            // G5a's offscreen target: one 256x128 XRGB8888 view, poisoned so a pixel the GPU
+            // never wrote shows up as a mismatch.
+            let Some(paint) = map_contiguous(PAINT_BYTES) else {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: paint target allocation failed\n"),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            };
+            for offset in (0..PAINT_BYTES).step_by(4) {
+                // SAFETY: a word inside the paint target's Normal-NC DMA mapping.
+                unsafe { ((paint.va + offset) as *mut u32).write_volatile(PAINT_POISON) };
+            }
+            if let Err(error) = map_range(
+                &mut table_memory,
+                &mut arena,
+                as1_l0,
+                AS1_PAINT_VA,
+                paint.phys,
+                PAINT_BYTES,
+                noexec_uncached,
+            ) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: AS1 paint target map failed: {:?}\n", error),
+                );
+                let _ = soft_reset(device);
+                return 1;
+            }
             dsb();
             if let Err(error) = enable_as(device, GROUP_AS, as1_l0, mmu.va_bits) {
                 log(
@@ -1352,24 +1392,37 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             let iface = QueueIface::at(MCU_IO_PAGES_VA);
             let sync = work.va + (AS1_SYNC_VA - AS1_WORK_VA);
             let mut seqno = 0;
-            for job in 1..=WRAPPED_JOBS {
-                let stream_va = AS1_STREAMS_VA + (job - 1) * CS_LINE_BYTES;
+            let mut flush_ids = [0u32; PAINT_JOB as usize];
+            for job in 1..=PAINT_JOB {
+                // Jobs 1 and 2 store one value each; job 3 (G5a) paints the test pattern.
+                let painting = job == PAINT_JOB;
                 let target_va = AS1_TARGET_VA + job * CS_LINE_BYTES;
                 let value = WRAPPED_VALUE_BASE | job as u32;
-                let stream = store_stream(target_va, value);
+                let mut words = [0u64; PAINT_STREAM_MAX];
+                let (stream_va, len) = if painting {
+                    let stream = paint_stream(AS1_PAINT_VA, features);
+                    words[..stream.words().len()].copy_from_slice(stream.words());
+                    (PAINT_STREAM_VA, stream.words().len())
+                } else {
+                    let stream = store_stream(target_va, value);
+                    words[..stream.len()].copy_from_slice(&stream);
+                    (AS1_STREAMS_VA + (job - 1) * CS_LINE_BYTES, stream.len())
+                };
                 let stream_cpu = work.va + (stream_va - AS1_WORK_VA);
-                for (index, word) in stream.iter().enumerate() {
-                    // SAFETY: five words on one line of the streams page in AS1's Normal-NC
-                    // backing buffer.
+                for (index, word) in words[..len].iter().enumerate() {
+                    // SAFETY: the stream lies in the streams page of AS1's Normal-NC backing
+                    // buffer: a store job on its own line, the paint stream from 1 KiB (the
+                    // const assert keeps it below the sync page).
                     unsafe { ((stream_cpu + index as u64 * 8) as *mut u64).write_volatile(*word) };
                 }
                 dsb();
                 let call = JobCall {
                     latest_flush: latest_flush_id(device),
                     stream_va,
-                    stream_len: (stream.len() * 8) as u32,
+                    stream_len: (len * 8) as u32,
                     sync_va: AS1_SYNC_VA,
                 };
+                flush_ids[job as usize - 1] = call.latest_flush;
                 let wrapper = match job_wrapper(features, call) {
                     Ok(words) => words,
                     Err(error) => {
@@ -1429,7 +1482,8 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     );
                 }
                 clear_job_irqs(device, csg_bit | JOB_IRQ_GLOBAL_IF);
-                let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
+                let started = device.now_ns();
+                let deadline = started.saturating_add(WORK_TIMEOUT_NS);
                 let mut waits = 0u32;
                 let mut fired = 0u32;
                 let (mut rawstat, mut stat, mut events, mut glb_events) = (0u32, 0u32, 0u32, 0u32);
@@ -1502,6 +1556,7 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                         break (irq.completion, irq_req, irq_ack);
                     }
                 };
+                let elapsed_us = (device.now_ns() - started) / 1_000;
                 // SAFETY: the status word of the same sync object.
                 let status = unsafe { ((sync + SYNC_STATUS_OFFSET) as *const u32).read_volatile() };
                 // SAFETY: job n's target word on its own line of the target page.
@@ -1521,8 +1576,8 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     JobWait::Interrupt => log(
                         log_level::NOTICE,
                         format_args!(
-                            "drv-gpu: job {} signalled on the JOB interrupt: seqno={} status=0x{:x} target=0x{:08x} extract=0x{:x} (waits={})\n",
-                            job, seqno, status, landed, consumed, waits
+                            "drv-gpu: job {} signalled on the JOB interrupt: seqno={} status=0x{:x} target=0x{:08x} extract=0x{:x} (waits={}, {} us)\n",
+                            job, seqno, status, landed, consumed, waits, elapsed_us
                         ),
                     ),
                     JobWait::Stalled => log(
@@ -1559,7 +1614,7 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     let _ = soft_reset(device);
                     return 1;
                 }
-                if seqno != job || status != 0 || landed != value {
+                if seqno != job || status != 0 || (!painting && landed != value) {
                     log(
                         log_level::ERR,
                         format_args!(
@@ -1571,12 +1626,48 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     let _ = soft_reset(device);
                     return 1;
                 }
+                if painting {
+                    // G5a: the GPU wrote the surface through a GPU-uncached mapping and cleaned
+                    // L2/LSC before signalling, and the CPU maps it Normal-NC, so a volatile read
+                    // after the interrupt sees the result with no cache maintenance (§13).
+                    let check = check_paint(|x, y| {
+                        // SAFETY: (x, y) lies inside the 256x128 target; one aligned word.
+                        unsafe {
+                            ((paint.va + u64::from(y * PAINT_WIDTH + x) * 4) as *const u32)
+                                .read_volatile()
+                        }
+                    });
+                    let reference = paint_reference_checksum();
+                    log(
+                        log_level::NOTICE,
+                        format_args!(
+                            "drv-gpu: job {} painted {}x{} with the command stream: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",
+                            job, PAINT_WIDTH, PAINT_HEIGHT, check.mismatches, check.checksum, reference
+                        ),
+                    );
+                    if let Some((x, y, got, want)) = check.first {
+                        log(
+                            log_level::ERR,
+                            format_args!(
+                                "drv-gpu: first wrong pixel ({}, {}): got 0x{:08x}, want 0x{:08x}{}\n",
+                                x,
+                                y,
+                                got,
+                                want,
+                                if got == PAINT_POISON { " (never written)" } else { "" }
+                            ),
+                        );
+                        report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                        let _ = soft_reset(device);
+                        return 1;
+                    }
+                }
             }
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}\n",
-                    WRAPPED_JOBS, seqno
+                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}; flush ids 0x{:x} 0x{:x} 0x{:x}\n",
+                    PAINT_JOB, seqno, flush_ids[0], flush_ids[1], flush_ids[2]
                 ),
             );
 
