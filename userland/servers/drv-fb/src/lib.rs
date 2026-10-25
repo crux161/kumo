@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j601
 //j606
 //j607
 //j608
 //j609
+//j610
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -29,6 +29,7 @@ pub mod rk3588_latch;
 pub mod rk3588_mode;
 pub mod rk3588_phy_image;
 pub mod rk3588_relock;
+pub mod rk3588_scanout;
 pub mod rk3588_shared;
 
 #[cfg(test)]
@@ -52,7 +53,7 @@ pub enum PixelOrder {
 }
 
 impl PixelOrder {
-    const fn pixel(self, red: u8, green: u8, blue: u8) -> u32 {
+    pub const fn pixel(self, red: u8, green: u8, blue: u8) -> u32 {
         match self {
             Self::Rgb => red as u32 | (green as u32) << 8 | (blue as u32) << 16,
             Self::Bgr => blue as u32 | (green as u32) << 8 | (red as u32) << 16,

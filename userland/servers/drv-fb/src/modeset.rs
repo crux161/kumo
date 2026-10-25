@@ -1,6 +1,7 @@
 //j607
 //j608
 //j609
+//j610
 
 //! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
 //! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
@@ -14,6 +15,10 @@
 //! J608 adds R1b between the dwell and removing black: run a distinguishable program with
 //! HDMI0 clocked under black, observe its active registers and completed load, restore and
 //! observe the target under black, then remove black. Every wait uses the port. — KESTREL
+//!
+//! J610 adds D1a after R2: paint a KUMO-owned contiguous buffer, flip ESMART2 region0 to it at
+//! a frame start, hold it on the glass, then flip back to the GOP console buffer. Each flip's
+//! load is timed until VP2 consumes it; no interrupt is used yet. — TIMBERDOODLE
 
 use crate::phy_relock;
 use core::fmt::{self, Write};
@@ -26,7 +31,9 @@ use drv_fb::rk3588_mode::{
     CHECK_BIT, DMT_1600X900_60_RB, PLAN, RECORDED, REG_CFG_DONE, TX_WINDOW_LEN, VOP_WINDOW_LEN,
     WORDS,
 };
-use kumo_abi::{BootInfo, Handle, VmarFlags};
+use drv_fb::rk3588_scanout as scanout;
+use drv_fb::PixelOrder;
+use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_rt::{
     handle_close, handle_koid, port_bind, port_unbind, resource_mint_mmio, syscall_handle,
     timer_create, vmar_map,
@@ -148,6 +155,8 @@ enum Phase {
     R2Relock,
     R2Restore,
     R2Verify,
+    /// D1a: the owned buffer is on the glass; the timer returns the console.
+    D1Hold,
 }
 
 /// R1 in flight between port wakes.
@@ -163,6 +172,10 @@ pub struct Pending {
     proof_verified: bool,
     power: Power,
     grants: phy_relock::Grants,
+    /// The console's colour convention, which G5b confirmed on the glass.
+    pixel_order: PixelOrder,
+    /// D1a's buffer handle, kept open while the VOP may scan it.
+    owned: Handle,
 }
 
 fn arm(port: Handle, ms: u64) -> Option<(Handle, u64)> {
@@ -318,6 +331,10 @@ fn begin(
         finish(&mut device, &program, blanked, started, false);
         return None;
     };
+    let pixel_order = match boot.framebuffer.format {
+        FramebufferFormat::Rgb => PixelOrder::Rgb,
+        FramebufferFormat::Bgr | FramebufferFormat::Unknown => PixelOrder::Bgr,
+    };
     Some(Pending {
         program,
         blanked,
@@ -329,6 +346,8 @@ fn begin(
         proof_verified: false,
         power,
         grants,
+        pixel_order,
+        owned: Handle(0),
     })
 }
 
@@ -445,6 +464,22 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             ) && phy_relock::verify(pending.power)
             {
                 log(format_args!("display: R2 complete: native HDMI0 1600x900@60 reconstructed; D0 hardware gates complete\n"));
+                if d1a_show(&mut device, &mut pending) {
+                    // Without a hold timer, hand the glass straight back to the console rather
+                    // than let `next` stop the display.
+                    return match arm(pending.port, scanout::HOLD_MS) {
+                        Some((timer, source)) => Some(Pending {
+                            phase: Phase::D1Hold,
+                            timer,
+                            source,
+                            ..pending
+                        }),
+                        None => {
+                            d1a_return(&mut device, &pending);
+                            None
+                        }
+                    };
+                }
             } else {
                 latch::stop(&mut device, &pending.program);
                 error(format_args!(
@@ -453,7 +488,113 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             }
             None
         }
+        Phase::D1Hold => {
+            d1a_return(&mut device, &pending);
+            None
+        }
     }
+}
+
+/// D1a: allocate, paint and flip to a KUMO-owned buffer. Returns whether it is on the glass;
+/// on any failure the GOP console buffer is (re)latched before returning.
+fn d1a_show(device: &mut Device, pending: &mut Pending) -> bool {
+    let (gop, stride) = scanout::target_scanout(&pending.program);
+    let width = DMT_1600X900_60_RB.h_active;
+    let height = DMT_1600X900_60_RB.v_active;
+    let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
+    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
+    let Some(vmo) = syscall_handle(raw) else {
+        error(format_args!(
+            "display: D1a contiguous buffer of {} bytes unavailable; console stays on the GOP buffer\n",
+            len
+        ));
+        return false;
+    };
+    let buffer = scanout::Buffer {
+        phys,
+        len,
+        stride,
+        height,
+    };
+    let Some(address) = buffer.scanout() else {
+        error(format_args!(
+            "display: D1a buffer at {:#x} is not VOP-addressable; console stays on the GOP buffer\n",
+            phys
+        ));
+        let _ = handle_close(vmo);
+        return false;
+    };
+    let flags = VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED;
+    let (status, va) = kumo_rt::vmar_map_anywhere(vmo, len, flags.0);
+    if status != 0 || va == 0 {
+        error(format_args!(
+            "display: D1a buffer mapping failed; console stays on the GOP buffer\n"
+        ));
+        let _ = handle_close(vmo);
+        return false;
+    }
+    let painted = kumo_rt::clock_get();
+    for y in 0..height {
+        for x in 0..width {
+            let (r, g, b) = scanout::pattern(x, y, width, height);
+            let index = u64::from(y) * u64::from(stride) + u64::from(x);
+            // SAFETY: index < stride * height <= len / 4 inside the uncached mapping.
+            unsafe {
+                ((va + index * 4) as *mut u32).write_volatile(pending.pixel_order.pixel(r, g, b))
+            };
+        }
+    }
+    device.barrier();
+    let paint_ms = kumo_rt::clock_get().saturating_sub(painted) / 1_000_000;
+    pending.owned = vmo;
+    log(format_args!(
+        "display: D1a owned scanout buffer {:#x}, {} bytes uncached, KUMO test pattern painted in {} ms\n",
+        address, len, paint_ms
+    ));
+    scanout::flip(device, address);
+    match scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS) {
+        Some(ns) if scanout::on_glass(device, address) => {
+            log(format_args!(
+                "display: D1a flipped to the owned buffer: VP2 consumed the load {} us after the commit (next frame start); GOP buffer {:#x} retired from scanout; holding {} ms\n",
+                ns / 1_000,
+                gop,
+                scanout::HOLD_MS
+            ));
+            true
+        }
+        result => {
+            error(format_args!(
+                "display: D1a flip FAILED (latched={}, active={:#010x}); returning to the GOP buffer\n",
+                u8::from(result.is_some()),
+                device.read(Block::Vop, drv_fb::rk3588_mode::ESMART2_R0_MST_YRGB)
+            ));
+            scanout::flip(device, gop);
+            let _ = scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
+            false
+        }
+    }
+}
+
+/// D1a: flip back to the GOP console buffer and confirm it is latched.
+fn d1a_return(device: &mut Device, pending: &Pending) {
+    let (gop, _) = scanout::target_scanout(&pending.program);
+    for attempt in 0..2 {
+        scanout::flip(device, gop);
+        let latched = scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
+        if let Some(ns) = latched.filter(|_| scanout::on_glass(device, gop)) {
+            log(format_args!(
+                "display: D1a returned to the GOP console buffer {:#x}: load consumed {} us after the commit{}; owned buffer retired; D1a complete\n",
+                gop,
+                ns / 1_000,
+                if attempt > 0 { " (after one retry)" } else { "" }
+            ));
+            return;
+        }
+    }
+    error(format_args!(
+        "display: D1a FAILED to return to the GOP buffer; the owned buffer stays on the glass (handle {} kept)\n",
+        pending.owned.0
+    ));
 }
 
 fn next(pending: Pending, phase: Phase, ms: u64) -> Option<Pending> {
