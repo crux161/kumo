@@ -2,16 +2,17 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j599
 //j600
 //j601
 //j605
 //j606
+//j607
 
 mod clock_probe;
 mod display_probe;
 mod display_topology;
 mod hdmi_probe;
+mod modeset;
 mod shared_probe;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
@@ -158,6 +159,11 @@ extern "C" fn main(
     let (_, vo1_grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let (_, sys_grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
+    // R1: the two writable device windows, always sent as U (VOP2 registers) and X (HDMI0 TX
+    // page); Handle(0) off the Orange Pi or with the display down. — TIMBERDOODLE
+    let (_, vop_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, tx_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+
     // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle,
     // D0c's clock grant and D0d's H/P/R records. The record is fixed-size on every board;
     // an absent copy arrives as Handle(0). — TIMBERDOODLE
@@ -225,7 +231,7 @@ extern "C" fn main(
         Handle(phy_raw as u32),
         Handle(grf_raw as u32),
     );
-    shared_probe::report(
+    let r0_matched = shared_probe::report(
         bootinfo,
         power,
         cru_mapped,
@@ -459,8 +465,26 @@ extern "C" fn main(
     // message and drops what does not fit, so the buffer is a whole message (J559: a 256-byte
     // buffer cut the boot replay after the banner's second line).
     let mut rx = [0u8; 4096];
+    // R1: blank and scrub now, once the console drains through the port; the rebuild and its
+    // verification run from one-shot timers on the same port, so the console never stalls
+    // behind the deliberate blank. — TIMBERDOODLE
+    let mut r1 = modeset::start(
+        bootinfo,
+        power,
+        r0_matched,
+        Handle(vop_rw_raw as u32),
+        Handle(tx_rw_raw as u32),
+        port,
+    );
     loop {
         let source = Handle(port_wait(port) as u32);
+        if r1
+            .as_ref()
+            .is_some_and(|pending| Handle(pending.source as u32) == source)
+        {
+            r1 = r1.take().and_then(modeset::advance);
+            continue;
+        }
         if source == console_source {
             let n = channel_read(console, rx.as_mut_ptr(), rx.len()) as usize;
             if n > 0 && n <= rx.len() {

@@ -1,4 +1,5 @@
 //j606
+//j607
 
 //! R0 live adapter: read-only mappings of VOP_GRF, VO1_GRF and SYS_GRF, plus two words each
 //! through D0c's CRU window and D0d's TX window when those probes mapped them. No device
@@ -105,7 +106,8 @@ fn flag(value: Option<bool>) -> &'static str {
 }
 
 /// Observe the shared state after D0a-D0d. `cru` and `tx` say whether D0c's and D0d's
-/// windows are mapped; the three GRF handles are closed on every path.
+/// windows are mapped; the three GRF handles are closed on every path. Returns whether all
+/// five reference-enable expectations matched, which R1 requires (J607).
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     boot: &BootInfo,
@@ -115,13 +117,14 @@ pub fn report(
     vop_grf: Handle,
     vo1_grf: Handle,
     sys_grf: Handle,
-) {
+) -> bool {
+    let mut matched = false;
     if rk3588::eligible(
         boot.board_id(),
         boot.has_framebuffer() && boot.framebuffer.is_plausible(),
     ) {
         match power {
-            Some(power) => probe(power, cru, tx, vop_grf, vo1_grf, sys_grf),
+            Some(power) => matched = probe(power, cru, tx, vop_grf, vo1_grf, sys_grf),
             None => log(format_args!(
                 "display: no PMU observation; R0 probe skipped\n"
             )),
@@ -132,9 +135,17 @@ pub fn report(
             let _ = handle_close(handle);
         }
     }
+    matched
 }
 
-fn probe(power: Power, cru: bool, tx: bool, vop_grf: Handle, vo1_grf: Handle, sys_grf: Handle) {
+fn probe(
+    power: Power,
+    cru: bool,
+    tx: bool,
+    vop_grf: Handle,
+    vo1_grf: Handle,
+    sys_grf: Handle,
+) -> bool {
     log(format_args!(
         "display: R0 read-only shared display state (VOP_GRF, VO1_GRF, SYS_GRF, PMU1CRU, TX)\n"
     ));
@@ -260,4 +271,5 @@ fn probe(power: Power, cru: bool, tx: bool, vop_grf: Handle, vo1_grf: Handle, sy
         matched,
         expectations.len()
     ));
+    matched == expectations.len()
 }

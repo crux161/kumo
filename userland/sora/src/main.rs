@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j599
 //j600
 //j601
 //j605
 //j606
+//j607
 
 extern crate alloc;
 
@@ -915,6 +915,30 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     for (tag, (allowed, base, len)) in [b"V", b"W", b"Y"].iter().zip(shared) {
         let grant = if allowed {
             read_only_grant(resource_create_child(root, base, len, 0, 0))
+        } else {
+            Handle(0)
+        };
+        if channel_write_with_handle(bootstrap, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+            let _ = handle_close(grant);
+        }
+    }
+
+    // R1 (DESIGN/020 D0-2): the display holder's own device windows, writable, always sent as
+    // U/X. The VOP2 window stops before the MMU page (`+0x7000`), which stays read-only until
+    // D1 decides who owns the display IOMMU; the TX page is the one D0d reads. These are not
+    // narrowed: drv-fb rebuilds the mode through them. CRU, PMU and GRF grants stay read-only.
+    // — TIMBERDOODLE
+    let windows = [
+        (
+            power.is_some_and(Power::vop_accessible),
+            VOP_BASE,
+            drv_fb::rk3588_mode::VOP_WINDOW_LEN,
+        ),
+        (accessible, HDMI_BASE, drv_fb::rk3588_mode::TX_WINDOW_LEN),
+    ];
+    for (tag, (allowed, base, len)) in [b"U", b"X"].iter().zip(windows) {
+        let grant = if allowed {
+            syscall_handle(resource_create_child(root, base, len, 0, 0)).unwrap_or(Handle(0))
         } else {
             Handle(0)
         };
