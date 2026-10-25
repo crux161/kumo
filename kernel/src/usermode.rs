@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j532
 //j547
 //j556
 //j559
 //j571
+//j595
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -875,6 +875,33 @@ fn futex_wait(process_koid: KoId, addr: u64, expected: u32) -> u64 {
             // Control returns here only once a `FutexWake` released this thread.
             Errno::Ok.status() as u32 as u64
         }
+    }
+}
+
+/// Both Sora and resident children use the same ChannelWrite argument decoder. The child's
+/// old arm discarded the optional transfer slot, so a valid reply silently lost its VMO.
+/// User bytes have already passed the calling process's range check. — TIMBERDOODLE
+fn write_channel_message(
+    engine: &mut SyscallEngine,
+    process: &mut Process,
+    r: &[u64],
+    bytes: &[u8],
+) -> u64 {
+    let handles = [Handle(r[3] as u32)];
+    let transfer = if r[3] == 0 { &[][..] } else { &handles[..] };
+    let message = match Message::new(1, bytes, transfer) {
+        Ok(message) => message,
+        Err(_) => return u64::MAX,
+    };
+    match engine.dispatch(
+        process,
+        KernelCall::ChannelWrite {
+            channel: Handle(r[0] as u32),
+            message,
+        },
+    ) {
+        KernelCallResult::Status(status) => status as u32 as u64,
+        _ => u64::MAX,
     }
 }
 
@@ -2090,7 +2117,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                     // the inert remainder of that earlier routing.
                     r[0] = 0;
                 } else if num == Syscall::ChannelWrite as u64 {
-                    let channel = Handle(r[0] as u32);
                     let user_ptr = r[1];
                     let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
                     if !user_range_ok(child, user_ptr, len as u64) {
@@ -2098,19 +2124,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                         return;
                     }
                     let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-                    match Message::new(1, bytes, &[]) {
-                        Ok(message) => {
-                            // P10-e: use child's own process.
-                            match sora
-                                .engine
-                                .dispatch(child, KernelCall::ChannelWrite { channel, message })
-                            {
-                                KernelCallResult::Status(s) => r[0] = s as u32 as u64,
-                                _ => r[0] = u64::MAX,
-                            }
-                        }
-                        Err(_) => r[0] = u64::MAX,
-                    }
+                    r[0] = write_channel_message(&mut sora.engine, child, r, bytes);
                 } else if num == Syscall::FramebufferClaim as u64 {
                     let resource = Handle(r[0] as u32);
                     let phys_base = r[1];
@@ -2233,7 +2247,6 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 _ => r[0] = u64::MAX,
             }
         } else if num == Syscall::ChannelWrite as u64 {
-            let channel = Handle(r[0] as u32);
             let user_ptr = r[1];
             let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
             if !user_range_ok(&sora.process, user_ptr, len as u64) {
@@ -2241,23 +2254,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 return;
             }
             let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
-            // P9-e: r[3] is an optional handle to transfer alongside the message.
-            let transfer_handle = if r[3] != 0 {
-                &[Handle(r[3] as u32)]
-            } else {
-                &[][..]
-            };
-            let status = match Message::new(1, bytes, transfer_handle) {
-                Ok(message) => match sora.engine.dispatch(
-                    &mut sora.process,
-                    KernelCall::ChannelWrite { channel, message },
-                ) {
-                    KernelCallResult::Status(s) => s,
-                    _ => -1,
-                },
-                Err(_) => -1,
-            };
-            r[0] = status as u32 as u64;
+            r[0] = write_channel_message(&mut sora.engine, &mut sora.process, r, bytes);
         } else {
             r[0] = u64::MAX;
         }
@@ -3211,6 +3208,72 @@ mod tests {
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         let process = Process::new(engine.objects_mut(), &job, vmar);
         (engine, process)
+    }
+
+    #[test]
+    fn channel_write_register_decoder_transfers_vmo_and_preserves_rights() {
+        use crate::syscall::{KernelCall, KernelCallResult};
+        let (mut engine, mut process) = engine_and_process();
+        let (left, right) = engine.channel_create(&mut process).unwrap();
+        let rights = kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER;
+        let vmo = crate::mm::Vmo::from_physical_range(0x100000, crate::mm::PAGE_SIZE).unwrap();
+        let grant = engine.root_vmo_create(&mut process, vmo, rights).unwrap();
+        let koid = process.handles().get(grant).unwrap().koid;
+        let r = [u64::from(left.0), 0, 6, u64::from(grant.0)];
+        assert_eq!(
+            super::write_channel_message(&mut engine, &mut process, &r, b"buffer"),
+            0
+        );
+        assert!(
+            process.handles().get(grant).is_err(),
+            "successful transfer consumes the sender's capability"
+        );
+        let KernelCallResult::Message(message) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("message expected")
+        };
+        assert_eq!(message.bytes(), b"buffer");
+        assert_eq!(message.handles().len(), 1);
+        let entry = process.handles().get(message.handles()[0]).unwrap();
+        assert_eq!(entry.koid, koid);
+        assert_eq!(entry.rights, rights);
+        assert_eq!(
+            super::write_channel_message(
+                &mut engine,
+                &mut process,
+                &[u64::from(left.0), 0, 4, 0],
+                b"data"
+            ),
+            0
+        );
+        let KernelCallResult::Message(message) =
+            engine.dispatch(&mut process, KernelCall::ChannelRead { channel: right })
+        else {
+            panic!("message expected")
+        };
+        assert!(message.handles().is_empty());
+    }
+
+    #[test]
+    fn channel_write_register_decoder_rejects_missing_transfer_right_without_consuming() {
+        use crate::syscall::{KernelCall, KernelCallResult};
+        let (mut engine, mut process) = engine_and_process();
+        let (left, right) = engine.channel_create(&mut process).unwrap();
+        let vmo = crate::mm::Vmo::from_physical_range(0x100000, crate::mm::PAGE_SIZE).unwrap();
+        let grant = engine
+            .root_vmo_create(&mut process, vmo, kumo_abi::Rights::READ)
+            .unwrap();
+        let r = [u64::from(left.0), 0, 6, u64::from(grant.0)];
+        assert_eq!(
+            super::write_channel_message(&mut engine, &mut process, &r, b"buffer"),
+            Errno::AccessDenied.status() as u32 as u64
+        );
+        assert!(process.handles().get(grant).is_ok());
+        assert!(
+            matches!(engine.dispatch(&mut process,KernelCall::ChannelRead { channel:right }),
+            KernelCallResult::Status(s) if s==Errno::ShouldWait.status())
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![no_std]
 //j594
+//j595
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -14,8 +15,9 @@
 //! Clients stop writing bound buffers before Submit and reuse them after completion. This
 //! cooperative first lane does not claim isolation from hostile command streams.
 //!
-//! G6a is inert: the live server, broker grant and separate client follow in G6b.
+//! G6b serves this contract from drv-gpu for one brokered client per boot.
 
+pub mod session;
 pub mod wire;
 pub use wire::{Command, Reply, Request, Response, REPLY_LEN, REQUEST_LEN};
 

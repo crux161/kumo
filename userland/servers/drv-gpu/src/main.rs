@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j588
 //j589
 //j590
 //j591
 //j593
+//j595
+
+mod client;
 
 use core::fmt::{self, Write};
 use drv_gpu::{
@@ -588,6 +590,17 @@ fn report_stream_stall(
 /// address space 0 with their own flags, boot the MCU, and validate the global interface the
 /// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
 fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_present: u64) -> u8 {
+    let mut tag = [0u8; 1];
+    let (len, raw) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
+    let Some(client_channel) =
+        valid_handle(raw).filter(|_| len == 1 && tag[0] == drv_gpu::BOOTSTRAP_CLIENT)
+    else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: no client session grant\n"),
+        );
+        return 1;
+    };
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
             log_level::NOTICE,
@@ -1745,11 +1758,19 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             // G5b: only a pixel-exact paint reaches here, so the view never shows a bad image.
             present_paint(bootstrap, paint.va);
 
-            log(
-                log_level::INFO,
-                format_args!("drv-gpu: GPU resident; firmware keeps the device until reboot\n"),
-            );
-            park()
+            client::serve(
+                client_channel,
+                device,
+                &mut table_memory,
+                &mut arena,
+                as1_l0,
+                work,
+                input,
+                output,
+                windows,
+                csg,
+                cs,
+            )
         }
         Err(error) => {
             log(

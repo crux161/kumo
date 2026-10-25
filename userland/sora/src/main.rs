@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j568
 //j569
 //j572
 //j579
 //j591
+//j595
 
 extern crate alloc;
 
@@ -81,6 +81,30 @@ static GRAPHICS_SEQUENCE: [AtomicU32; kumo_graphics::VIEW_COUNT] =
 /// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
 /// `drv_gpu::GPU_VIEW` has been handed over; otherwise it is closed so drv-gpu stops waiting.
 static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
+/// One cooperative G6b lease per boot. It is transferred once and never re-granted after
+/// client/driver failure; a new boot resets the device before any fresh grant. — TIMBERDOODLE
+static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
+
+fn launch_gpu_client(initrd: Handle) {
+    let channel = GPU_CLIENT_CHANNEL.swap(0, Ordering::Relaxed);
+    if channel == 0 {
+        return;
+    }
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    if run_elf(
+        initrd,
+        kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
+        u64::from(channel),
+        0,
+        flags,
+        b"gpu-client",
+    ) {
+        log(b"gpu-client: session handed to a separate process\n");
+    } else {
+        let _ = handle_close(Handle(channel));
+        log(b"gpu-client: launch failed; session retired\n");
+    }
+}
 
 /// Hand one view's grant (its presentation channel and writable surface) to drv-gpu, which
 /// paints and presents it. Returns false, leaving the grant with Sora, when no GPU driver is
@@ -814,6 +838,28 @@ fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
         );
         return;
     }
+    let mut client_channel = 0;
+    if has_gpu {
+        let (client, server) = channel_create_pair();
+        let tag = [drv_gpu::BOOTSTRAP_CLIENT];
+        if ![client, server].into_iter().all(valid)
+            || channel_write_with_handle(
+                Handle(sender as u32),
+                tag.as_ptr(),
+                1,
+                Handle(server as u32),
+            ) != 0
+        {
+            for raw in [client, server, resource, sender, bootstrap] {
+                if valid(raw) {
+                    let _ = handle_close(Handle(raw as u32));
+                }
+            }
+            log(b"drv-gpu: client bootstrap failed\n");
+            return;
+        }
+        client_channel = client;
+    }
     if !run_elf(
         initrd,
         DRV_GPU_PATH.as_bytes(),
@@ -824,14 +870,17 @@ fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
         b"drv-gpu",
     ) {
         // The firmware grant sits queued in the channel and goes with it.
-        for raw in [resource, sender, bootstrap] {
-            let _ = handle_close(Handle(raw as u32));
+        for raw in [resource, sender, bootstrap, client_channel] {
+            if valid(raw) {
+                let _ = handle_close(Handle(raw as u32));
+            }
         }
         let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, b"drv-gpu: launch failed\n");
         return;
     }
     if has_gpu {
         GPU_VIEW_BOOTSTRAP.store(sender as u32, Ordering::Relaxed);
+        GPU_CLIENT_CHANNEL.store(client_channel as u32, Ordering::Relaxed);
     } else {
         let _ = handle_close(Handle(sender as u32));
     }
@@ -2479,6 +2528,7 @@ extern "C" fn sora_main(
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
     release_gpu_bootstrap();
+    launch_gpu_client(initrd);
     log(b"sora: serve setup\n");
     let port_h = port_create();
     let console_koid = handle_koid(console);

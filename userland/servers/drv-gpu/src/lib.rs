@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j590
 //j591
 //j592
 //j593
 //j594
+//j595
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -22,7 +22,7 @@
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
-/// G6a's shared channel contract; live serving and client grants follow in G6b.
+/// Shared GPU channel contract and bounded session state.
 pub use kumo_gpu as protocol;
 
 /// DESIGN/020's device grant. The kernel's live DTB gate decides whether this unit exists.
@@ -2262,6 +2262,24 @@ pub fn job_wrapper(
     Ok(words)
 }
 
+/// G6b owns output visibility even when the client stream omits cache maintenance. The last
+/// wrapper scratch register is zero (the high half of MOVE48 val=1): use it as the always-zero
+/// flush ID, wait for the clean, then signal the queue seqno. — TIMBERDOODLE
+pub fn client_job_wrapper(
+    features: CsFeatures,
+    call: JobCall,
+) -> Result<[u64; JOB_WRAPPER_WORDS], WrapperError> {
+    let mut words = job_wrapper(features, call)?;
+    let sync = words[9];
+    let barrier = words[10];
+    let zero_reg = (features.work_regs - 1) as u8;
+    words[9] = flush_caches(0, zero_reg, FLUSH_CLEAN);
+    words[10] = wait_slot(1);
+    words[11] = sync;
+    words[12] = barrier;
+    Ok(words)
+}
+
 /// Where one wrapper lands, as ring positions that only grow (§9.7).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobSlot {
@@ -2502,6 +2520,7 @@ pub fn paint_reference_checksum() -> u32 {
 /// drv-fb's views exist, on a board with the GPU power unit, it sends view [`GPU_VIEW`]'s
 /// presentation channel and surface VMO, then closes its end; elsewhere it only closes.
 pub const BOOTSTRAP_FIRMWARE: u8 = b'f';
+pub const BOOTSTRAP_CLIENT: u8 = b'g';
 pub const BOOTSTRAP_VIEW_CHANNEL: u8 = b'v';
 pub const BOOTSTRAP_VIEW_SURFACE: u8 = b's';
 /// The band's second well (DESIGN/019 F1a); Sora keeps the first for gfx-demo and gfx-client.
@@ -5407,6 +5426,41 @@ mod g5a_tests {
     }
 
     #[test]
+    fn g6b_actual_client_stream_and_visibility_wrapper_complete_twice() {
+        let mut csp = Csp::new();
+        let stream_va = protocol::VA_START;
+        let target = stream_va + protocol::PAGE_BYTES;
+        let sync_va = 0x1000_3000;
+        for (index, value) in gpu_client::VALUES.into_iter().enumerate() {
+            let stream = gpu_client::proof_stream(target, value);
+            let wrapper = client_job_wrapper(
+                METAL,
+                JobCall {
+                    latest_flush: 0xffffe5,
+                    stream_va,
+                    stream_len: (stream.len() * 8) as u32,
+                    sync_va,
+                },
+            )
+            .unwrap();
+            // Driver-owned clean follows WAIT-all and precedes the completion signal.
+            assert_eq!(wrapper[8], wait_slot(0xff));
+            assert_eq!(wrapper[9], flush_caches(0, 95, FLUSH_CLEAN));
+            assert_eq!(wrapper[10], wait_slot(1));
+            assert_eq!(wrapper[11] >> 56, 51);
+            csp.load(stream_va, &stream);
+            csp.load(0x1000_0000, &wrapper);
+            csp.run(0x1000_0000, (wrapper.len() * 8) as u64);
+            assert_eq!(csp.read32(target), value);
+            assert_eq!(csp.read64(sync_va), index as u64 + 1);
+            assert_eq!(
+                csp.regs[95], 0,
+                "the post-job flush cannot be skipped by an old ID"
+            );
+        }
+    }
+
+    #[test]
     fn the_check_names_the_first_wrong_pixel_and_counts_poison() {
         let good = check_paint(paint_pixel);
         assert_eq!(good.mismatches, 0);
@@ -5552,6 +5606,7 @@ mod g5b_tests {
         assert_eq!(Present::decode(&frame.encode()), Some(frame));
         let tags = [
             BOOTSTRAP_FIRMWARE,
+            BOOTSTRAP_CLIENT,
             BOOTSTRAP_VIEW_CHANNEL,
             BOOTSTRAP_VIEW_SURFACE,
         ];

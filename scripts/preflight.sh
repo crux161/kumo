@@ -1,9 +1,9 @@
 #!/bin/sh
-#j419
 #j563
 #j567
 #j572
 #j594
+#j595
 # preflight.sh — mechanical guardrail tripwires (GUIDANCE/006 §5).
 #
 # The machine, not a teammate, catches drift. Run before you say "done":
@@ -68,7 +68,7 @@ fi
 #    `kumo-rt` is no_std but its panic_impl is cfg'd out under `test`, so its lib tests
 #    (e.g. the growable-heap soak) DO link on the host and are policed here.
 #    Add new host-testable crates (e.g. a new server) to this list.
-HOST_TEST_CRATES="kumo-abi kumo-bsp kumo-ipc kumo-rt drv-blk drv-fb drv-gpu imager kernel persona-linux kumoza svc-health kumo-virtio kumo-identity identityd kumo-graphics kumo-gpu"
+HOST_TEST_CRATES="kumo-abi kumo-bsp kumo-ipc kumo-rt drv-blk drv-fb drv-gpu imager kernel persona-linux kumoza svc-health kumo-virtio kumo-identity identityd kumo-graphics kumo-gpu gpu-client"
 for p in $HOST_TEST_CRATES; do
     if cargo test -p "$p" --quiet >/dev/null 2>&1; then
         pass "cargo test -p $p"

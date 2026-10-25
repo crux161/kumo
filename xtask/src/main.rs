@@ -1,8 +1,8 @@
-//j562
 //j563
 //j569
 //j572
 //j578
+//j595
 
 use std::env;
 use std::fmt;
@@ -850,6 +850,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
             let gfx_client = build_gfx_client_image(&workspace_root()?)?;
+            let gpu_client = build_gpu_client_image(&workspace_root()?)?;
             let ls = build_ls_image(&workspace_root()?)?;
             let args = build_args_image(&workspace_root()?)?;
             let cat = build_cat_image(&workspace_root()?)?;
@@ -877,6 +878,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
+                (kumo_abi::initrd::GPU_CLIENT_PATH, gpu_client.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),
                 (CAT_PATH, cat.as_slice()),
@@ -1064,6 +1066,27 @@ fn build_gfx_client_image(root: &Path) -> Result<Vec<u8>, String> {
             source_path.display()
         )
     })?;
+    Ok(bytes)
+}
+
+fn build_gpu_client_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "gpu-client",
+            "--bin",
+            "gpu-client",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let path = root.join("target/aarch64-unknown-none/release/gpu-client");
+    let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as gpu-client ELF: {err}", path.display()))?;
     Ok(bytes)
 }
 
