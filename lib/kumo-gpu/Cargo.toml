@@ -1,0 +1,10 @@
+#j594
+[package]
+name = "kumo-gpu"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+doctest = false

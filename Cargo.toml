@@ -1,8 +1,8 @@
-#j561
 #j563
 #j567
 #j569
 #j572
+#j594
 [workspace]
 members = [
     "boot/niji-loader",
@@ -16,6 +16,7 @@ members = [
     "lib/kumo-bsp",
     "lib/kumo-fatfs",
     "lib/kumo-gpt",
+    "lib/kumo-gpu",
     "lib/kumo-graphics",
     "lib/kumo-hid",
     "lib/kumo-identity",

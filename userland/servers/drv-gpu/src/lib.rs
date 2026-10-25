@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j589
 //j590
 //j591
 //j592
 //j593
+//j594
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -21,6 +21,9 @@
 //! Mesa does. G5c-2 maps it executable and dispatches it as the pixel producer.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
+
+/// G6a's shared channel contract; live serving and client grants follow in G6b.
+pub use kumo_gpu as protocol;
 
 /// DESIGN/020's device grant. The kernel's live DTB gate decides whether this unit exists.
 pub const APERTURE_BASE: u64 = 0xfb00_0000;
@@ -5421,6 +5424,91 @@ mod g5a_tests {
         let poison = check_paint(|_, _| POISON);
         assert_eq!(poison.mismatches, PAINT_WIDTH * PAINT_HEIGHT);
         assert_eq!(poison.first, Some((0, 0, POISON, 0x00FF_0000)));
+    }
+
+    #[test]
+    fn g6a_client_submission_round_trips_through_the_real_wrapper_and_host_csp() {
+        use protocol::{
+            BindFlags, Binding, Command, Reply, Request, RequestIds, Response, Submission,
+            SyncState, Timeline, PAGE_BYTES, VA_START,
+        };
+        let binding = Binding {
+            vm: 1,
+            buffer: 2,
+            va: VA_START,
+            offset: 0,
+            bytes: PAGE_BYTES,
+            flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+        };
+        binding.validate(PAGE_BYTES).unwrap();
+        let target = VA_START + PAGE_BYTES;
+        let value = 0x00c0_ffee;
+        let stream = store_stream(target, value);
+        let request = Request {
+            id: 5,
+            command: Command::Submit(Submission {
+                group: 3,
+                stream_va: VA_START,
+                stream_bytes: (stream.len() * 8) as u32,
+                signal_point: 1,
+            }),
+        };
+        let decoded = Request::decode(&request.encode()).unwrap();
+        let mut ids = RequestIds::default();
+        ids.accept(decoded.id).unwrap();
+        let Command::Submit(job) = decoded.command else {
+            panic!("submit expected")
+        };
+        job.validate_for(binding.vm, binding).unwrap();
+        let mut timeline = Timeline::default();
+        timeline.reserve(job.signal_point).unwrap();
+        let accepted = Reply {
+            id: request.id,
+            result: Ok(Response::Submitted { point: 1 }),
+        };
+        assert_eq!(Reply::decode(&accepted.encode()), Some(accepted));
+        assert_eq!(timeline.query(1), Ok(SyncState::Pending));
+
+        let sync_va = 0x1000_3000;
+        let wrapper = job_wrapper(
+            METAL,
+            JobCall {
+                latest_flush: 0xffffe5,
+                stream_va: job.stream_va,
+                stream_len: job.stream_bytes,
+                sync_va,
+            },
+        )
+        .unwrap();
+        let mut csp = Csp::new();
+        csp.load(job.stream_va, &stream);
+        csp.load(0x1000_0000, &wrapper);
+        csp.run(0x1000_0000, (wrapper.len() * 8) as u64);
+        assert_eq!(csp.read32(target), value);
+        assert_eq!(csp.read64(sync_va), 1);
+        // Only this simulated completion observation advances the protocol timeline.
+        // This is a host model, not a channel round-trip or GPU execution proof.
+        timeline
+            .complete(
+                csp.read64(sync_va),
+                csp.read32(sync_va + SYNC_STATUS_OFFSET),
+            )
+            .unwrap();
+        let complete = Reply {
+            id: 6,
+            result: Ok(Response::Sync {
+                point: 1,
+                state: timeline.query(1).unwrap(),
+            }),
+        };
+        assert_eq!(Reply::decode(&complete.encode()), Some(complete));
+        assert_eq!(
+            complete.result,
+            Ok(Response::Sync {
+                point: 1,
+                state: SyncState::Complete { gpu_status: 0 }
+            })
+        );
     }
 }
 
