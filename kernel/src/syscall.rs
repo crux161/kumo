@@ -1,9 +1,10 @@
-//j571
 //j605
 //j609
 //j614
 //j616
-use alloc::vec::Vec;
+//j617
+use alloc::{rc::Rc, vec::Vec};
+use core::cell::RefCell;
 use core::mem;
 
 #[cfg(target_os = "none")]
@@ -430,12 +431,95 @@ fn complete_interrupt_source(irq: u32) -> Result<(), Errno> {
 }
 
 /// Stored VMO with optional pre-allocated frames for anonymous backing.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct VmoEntry {
     koid: KoId,
     vmo: Vmo,
     #[allow(dead_code)]
-    frames: Vec<Option<u64>>,
+    frames: RefCell<Vec<Option<u64>>>,
+}
+
+/// Own the VMO identity and its materialized page list, independent of user handles.
+/// This pin is for unpublished, read-only device tables. It does not authorize MMIO
+/// enrollment or release after live DMA; those remain separate gates. — KESTREL
+#[cfg(feature = "arch_aarch64")]
+pub(crate) struct VmoPin {
+    entry: Rc<VmoEntry>,
+    offset: u64,
+    len: u64,
+    pages: Vec<u64>,
+}
+
+#[cfg(feature = "arch_aarch64")]
+impl VmoPin {
+    fn new(
+        entry: Rc<VmoEntry>,
+        offset: u64,
+        len: u64,
+        mut allocate: impl FnMut() -> Result<u64, Errno>,
+    ) -> Result<Self, Errno> {
+        use crate::mm::{VmoBacking, PAGE_SIZE};
+        if len == 0
+            || offset % PAGE_SIZE != 0
+            || len % PAGE_SIZE != 0
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| end > entry.vmo.len())
+        {
+            return Err(Errno::InvalidArgs);
+        }
+        let base = match entry.vmo.backing() {
+            VmoBacking::PhysicalRam { phys_base } | VmoBacking::Dma { phys_base } => {
+                if phys_base
+                    .checked_add(offset)
+                    .and_then(|p| p.checked_add(len))
+                    .is_none_or(|end| end > 1 << 32)
+                {
+                    return Err(Errno::NotSupported);
+                }
+                Some(phys_base)
+            }
+            VmoBacking::Anonymous => None,
+            // A resource-minted MMIO page is not proof of RAM. Exact GOP admission
+            // needs the recorded framebuffer and reserved-RAM classification. — KESTREL
+            VmoBacking::Mmio { .. } => return Err(Errno::NotSupported),
+        };
+        let count = usize::try_from(len / PAGE_SIZE).map_err(|_| Errno::InvalidArgs)?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| Errno::NoMemory)?;
+        for n in 0..count {
+            let pos = offset + n as u64 * PAGE_SIZE;
+            let phys = match base {
+                Some(base) => base + pos,
+                None => ensure_vmo_frame(&entry, (pos / PAGE_SIZE) as usize, &mut allocate)?,
+            };
+            if phys % PAGE_SIZE != 0 || phys >= 1 << 32 {
+                return Err(Errno::NotSupported);
+            }
+            pages.push(phys);
+        }
+        Ok(Self {
+            entry,
+            offset,
+            len,
+            pages,
+        })
+    }
+
+    pub fn koid(&self) -> KoId {
+        self.entry.koid
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+    pub fn pages(&self) -> &[u64] {
+        &self.pages
+    }
 }
 
 const PHYSMAP_BASE: u64 = 0xffff_9000_0000_0000;
@@ -485,18 +569,31 @@ fn alloc_contiguous(
 }
 
 fn ensure_anonymous_frame(
-    entry: &mut VmoEntry,
+    entry: &VmoEntry,
     page_index: usize,
     boot: &BootInfo,
 ) -> Result<u64, Errno> {
-    if entry.frames.len() <= page_index {
-        entry.frames.resize(page_index + 1, None);
+    ensure_vmo_frame(entry, page_index, || alloc_anonymous_frame(boot))
+}
+
+fn ensure_vmo_frame(
+    entry: &VmoEntry,
+    page_index: usize,
+    mut allocate: impl FnMut() -> Result<u64, Errno>,
+) -> Result<u64, Errno> {
+    let mut frames = entry.frames.borrow_mut();
+    if frames.len() <= page_index {
+        let additional = page_index + 1 - frames.len();
+        frames
+            .try_reserve(additional)
+            .map_err(|_| Errno::NoMemory)?;
+        frames.resize(page_index + 1, None);
     }
-    if let Some(frame) = entry.frames[page_index] {
+    if let Some(frame) = frames[page_index] {
         return Ok(frame);
     }
-    let frame = alloc_anonymous_frame(boot)?;
-    entry.frames[page_index] = Some(frame);
+    let frame = allocate()?;
+    frames[page_index] = Some(frame);
     Ok(frame)
 }
 
@@ -504,7 +601,9 @@ fn ensure_anonymous_frame(
 pub struct SyscallEngine {
     objects: ObjectManager,
     ipc: IpcRegistry,
-    vmos: Vec<VmoEntry>,
+    // Registry clones and device pins own the same immutable VMO identity and the same
+    // demand-page cache. Copying the cache could allocate divergent backing. — KESTREL
+    vmos: Vec<Rc<VmoEntry>>,
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
@@ -899,16 +998,46 @@ impl SyscallEngine {
     ) -> Result<Handle, ObjectError> {
         #[cfg(feature = "arch_aarch64")]
         let span = self.table_pages.prepare_vmo(vmo)?;
+        self.vmos
+            .try_reserve(1)
+            .map_err(|_| ObjectError::TableFull)?;
         let object = self.objects.create(ObjectKind::Vmo);
         let handle = process.handles_mut().insert(object, rights)?;
         #[cfg(feature = "arch_aarch64")]
         self.table_pages.commit_vmo(span);
-        self.vmos.push(VmoEntry {
+        self.vmos.push(Rc::new(VmoEntry {
             koid: object.koid(),
             vmo,
-            frames: Vec::new(),
-        });
+            frames: RefCell::new(Vec::new()),
+        }));
         Ok(handle)
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    pub(crate) fn pin_device_vmo_read_only(
+        &self,
+        process: &Process,
+        handle: Handle,
+        offset: u64,
+        len: u64,
+        rights: Rights,
+    ) -> Result<VmoPin, Errno> {
+        if rights != Rights::READ {
+            return Err(Errno::AccessDenied);
+        }
+        let handle = process
+            .handles()
+            .require(handle, ObjectKind::Vmo, Rights::READ)
+            .map_err(errno_from_object)?;
+        let entry = self
+            .vmos
+            .iter()
+            .find(|v| v.koid == handle.koid)
+            .ok_or(Errno::BadHandle)?
+            .clone();
+        VmoPin::new(entry, offset, len, || {
+            alloc_anonymous_frame(self.boot_info.as_ref().ok_or(Errno::BadState)?)
+        })
     }
 
     /// Prove the offline table provider on actual kernel RAM before Sora runs. The data
@@ -1041,14 +1170,58 @@ impl SyscallEngine {
                 return Err(Errno::Internal);
             }
         }
-        let mut again = Table::new(pool.lease()).map_err(|_| Errno::NoMemory)?;
-        again
-            .map_read_only(0x003f_f000, &[phys_base, phys_base])
-            .map_err(|_| Errno::Internal)?;
-        if again
-            .walk(0x0040_0000, Access::Read)
-            .map_err(|_| Errno::Internal)?
-            != Some(phys_base)
+        let source = process
+            .handles_mut()
+            .duplicate(data_vmo, Rights::READ)
+            .map_err(errno_from_object)?;
+        let data_koid = process
+            .handles()
+            .get(data_vmo)
+            .map_err(errno_from_object)?
+            .koid;
+        let owner = self
+            .vmos
+            .iter()
+            .find(|v| v.koid == data_koid)
+            .ok_or(Errno::Internal)?
+            .clone();
+        let refs = Rc::strong_count(&owner);
+        let mut again = crate::device_memory::OfflineMappings::new(&pool)?;
+        for iova in [0x003f_f000, 0x0040_0000] {
+            let pin = self.pin_device_vmo_read_only(
+                process,
+                source,
+                0,
+                crate::mm::PAGE_SIZE,
+                Rights::READ,
+            )?;
+            again.map(iova, pin)?;
+        }
+        if self.dispatch(process, KernelCall::HandleClose { handle: source })
+            != KernelCallResult::Status(Errno::Ok.status())
+            || self
+                .pin_device_vmo_read_only(process, source, 0, crate::mm::PAGE_SIZE, Rights::READ)
+                .is_ok()
+            || Rc::strong_count(&owner) != refs + 2
+        {
+            return Err(Errno::Internal);
+        }
+        let record = again.mapping(0x0040_0000).ok_or(Errno::Internal)?;
+        if record.koid() != data_koid
+            || record.offset() != 0
+            || record.len() != crate::mm::PAGE_SIZE
+            || record.pages() != [phys_base]
+            || again.walk(0x0040_0000, Access::Read)? != Some(phys_base)
+            || again.walk(0x0040_0000, Access::Write) != Err(Errno::AccessDenied)
+            || again.unmap(0x003f_f000, 2 * crate::mm::PAGE_SIZE) != Err(Errno::InvalidArgs)
+            || Rc::strong_count(&owner) != refs + 2
+        {
+            return Err(Errno::Internal);
+        }
+        again.unmap(0x003f_f000, crate::mm::PAGE_SIZE)?;
+        if again.walk(0x003f_f000, Access::Read)?.is_some()
+            || again.walk(0x0040_0000, Access::Read)? != Some(phys_base)
+            || Rc::strong_count(&owner) != refs + 1
             || pool.frames() != frames
             || process.handles().live_count() != handles
             || self.vmos.len() != vmos
@@ -1056,9 +1229,11 @@ impl SyscallEngine {
             return Err(Errno::Internal);
         }
         drop(again);
-        if !pool.all_free() {
+        if !pool.all_free() || Rc::strong_count(&owner) != refs {
             return Err(Errno::Internal);
         }
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+            "DEVICE PINS       Check     VMO identity, closed handle, exact unmap, offline release OK\n");
         Ok(())
     }
 
@@ -1074,11 +1249,10 @@ impl SyscallEngine {
     }
 
     fn vmo_entry_by_koid(&self, koid: KoId) -> Option<&VmoEntry> {
-        self.vmos.iter().find(|entry| entry.koid == koid)
-    }
-
-    fn vmo_entry_by_koid_mut(&mut self, koid: KoId) -> Option<&mut VmoEntry> {
-        self.vmos.iter_mut().find(|entry| entry.koid == koid)
+        self.vmos
+            .iter()
+            .find(|entry| entry.koid == koid)
+            .map(Rc::as_ref)
     }
 
     fn device_dma_phys_page(&mut self, vmo_koid: KoId, vmo_offset: u64) -> Result<u64, Errno> {
@@ -1096,7 +1270,7 @@ impl SyscallEngine {
                     return Err(Errno::Internal);
                 };
                 let page_index = (vmo_offset / crate::mm::PAGE_SIZE) as usize;
-                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
                     return Err(Errno::BadHandle);
                 };
                 ensure_anonymous_frame(vmo_entry, page_index, &boot)
@@ -1283,7 +1457,7 @@ impl SyscallEngine {
             let va = mapping.virt + off;
             let pa = if needs_frame_alloc {
                 let vmo_page = ((mapping.vmo_offset + off) / crate::mm::PAGE_SIZE) as usize;
-                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
                     return Err(Errno::BadHandle);
                 };
                 match ensure_anonymous_frame(vmo_entry, vmo_page, boot_ref) {
@@ -1567,7 +1741,7 @@ impl SyscallEngine {
                                             let chunk = (len - copied)
                                                 .min(crate::mm::PAGE_SIZE as usize - page_off);
                                             if let Some(Some(frame)) =
-                                                vmo_entry.frames.get(page_index)
+                                                vmo_entry.frames.borrow().get(page_index)
                                             {
                                                 kumo_hal::active::read_phys(
                                                     frame + page_off as u64,
@@ -1629,8 +1803,7 @@ impl SyscallEngine {
                                     let Some(boot) = self.boot_info else {
                                         return KernelCallResult::Status(Errno::Internal.status());
                                     };
-                                    let Some(vmo_entry) =
-                                        self.vmo_entry_by_koid_mut(handle_entry.koid)
+                                    let Some(vmo_entry) = self.vmo_entry_by_koid(handle_entry.koid)
                                     else {
                                         return KernelCallResult::Status(Errno::BadHandle.status());
                                     };
@@ -2020,7 +2193,7 @@ impl SyscallEngine {
                                 let off = page * crate::mm::PAGE_SIZE;
                                 let vmo_page =
                                     ((mapping.vmo_offset + off) / crate::mm::PAGE_SIZE) as usize;
-                                let Some(vmo_entry) = self.vmo_entry_by_koid_mut(vmo_koid) else {
+                                let Some(vmo_entry) = self.vmo_entry_by_koid(vmo_koid) else {
                                     return KernelCallResult::Status(Errno::BadHandle.status());
                                 };
                                 let phys_base =
@@ -3056,6 +3229,382 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    #[cfg(feature = "arch_aarch64")]
+    mod device_pins {
+        use super::*;
+        use crate::device_memory::{OfflineMappings, PageMemory, TablePool};
+        use crate::mm::PAGE_SIZE;
+        use alloc::rc::Weak;
+        use kumo_hal::active::DeviceTableAccess as Access;
+        use std::collections::BTreeMap;
+
+        #[derive(Default)]
+        struct Model {
+            words: BTreeMap<u64, Vec<u32>>,
+            limit: Option<usize>,
+            guard: Option<Weak<VmoEntry>>,
+        }
+        #[derive(Clone, Default)]
+        struct Memory(Rc<RefCell<Model>>);
+        impl PageMemory for Memory {
+            fn allocate(&mut self, excluded: &[kumo_abi::Range]) -> Option<u64> {
+                let mut m = self.0.borrow_mut();
+                if m.limit.is_some_and(|limit| m.words.len() >= limit) {
+                    return None;
+                }
+                let mut phys = (m.words.len() as u64 + 1) * PAGE_SIZE;
+                while excluded
+                    .iter()
+                    .any(|r| ranges_overlap(r.start, r.len, phys, PAGE_SIZE))
+                {
+                    phys += PAGE_SIZE;
+                }
+                m.words.insert(phys, vec![0; 1024]);
+                Some(phys)
+            }
+            fn read(&self, page: u64, index: usize) -> u32 {
+                self.0.borrow().words[&page][index]
+            }
+            fn write(&mut self, page: u64, index: usize, word: u32) {
+                let mut m = self.0.borrow_mut();
+                if let Some(owner) = &m.guard {
+                    assert!(
+                        owner.upgrade().is_some(),
+                        "descriptor removed after backing released"
+                    );
+                }
+                m.words.get_mut(&page).unwrap()[index] = word;
+            }
+        }
+
+        fn fixture() -> (SyscallEngine, Process, Handle) {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let handle = create_physical_vmo(&mut engine, &mut process, 0x1000_0000, 3 * PAGE_SIZE);
+            (engine, process, handle)
+        }
+
+        #[test]
+        fn pin_requires_current_read_authority_and_an_exact_supported_ram_range() {
+            let (mut engine, mut process, handle) = fixture();
+            let no_read = process
+                .handles_mut()
+                .duplicate(handle, Rights::WRITE)
+                .unwrap();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            for rights in [
+                Rights::empty(),
+                Rights::WRITE,
+                Rights::READ | Rights::WRITE,
+                Rights::MAP,
+            ] {
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, rights),
+                    Err(Errno::AccessDenied)
+                ));
+            }
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, no_read, 0, PAGE_SIZE, Rights::READ),
+                Err(Errno::AccessDenied)
+            ));
+            for (offset, len) in [
+                (0, 0),
+                (1, PAGE_SIZE),
+                (0, 1),
+                (3 * PAGE_SIZE, PAGE_SIZE),
+                (u64::MAX - 4095, PAGE_SIZE),
+            ] {
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(&process, handle, offset, len, Rights::READ),
+                    Err(Errno::InvalidArgs)
+                ));
+            }
+            for vmo in [
+                Vmo::from_mmio_range(0x2000_0000, PAGE_SIZE).unwrap(),
+                Vmo::from_physical_range(1 << 32, PAGE_SIZE).unwrap(),
+                Vmo::from_dma_range((1 << 32) - PAGE_SIZE, 2 * PAGE_SIZE).unwrap(),
+            ] {
+                let h = engine
+                    .root_vmo_create(&mut process, vmo, Rights::READ)
+                    .unwrap();
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(&process, h, 0, vmo.len(), Rights::READ),
+                    Err(Errno::NotSupported)
+                ));
+            }
+            let overflow = Rc::new(VmoEntry {
+                koid: KoId(98),
+                vmo: Vmo::from_physical_range(u64::MAX - 4095, 2 * PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            });
+            assert!(matches!(
+                VmoPin::new(overflow, 0, 2 * PAGE_SIZE, || unreachable!()),
+                Err(Errno::NotSupported)
+            ));
+            assert_eq!(weak.strong_count(), 1);
+            let object = engine.objects.create(ObjectKind::Job);
+            let job = process.handles_mut().insert(object, Rights::READ).unwrap();
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, job, 0, PAGE_SIZE, Rights::READ),
+                Err(Errno::WrongType)
+            ));
+            process.handles_mut().close(handle).unwrap();
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ),
+                Err(Errno::BadHandle)
+            ));
+        }
+
+        #[test]
+        fn two_exact_mappings_retain_identity_after_all_source_handles_and_registry_drop() {
+            let (engine, mut process, handle) = fixture();
+            let koid = process.handles().get(handle).unwrap().koid;
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let duplicate = process
+                .handles_mut()
+                .duplicate(handle, Rights::READ)
+                .unwrap();
+            let memory = Memory::default();
+            let pool = TablePool::new(memory);
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            for (iova, offset) in [(0x003f_f000, PAGE_SIZE), (0x0040_0000, 2 * PAGE_SIZE)] {
+                maps.map(
+                    iova,
+                    engine
+                        .pin_device_vmo_read_only(
+                            &process,
+                            duplicate,
+                            offset,
+                            PAGE_SIZE,
+                            Rights::READ,
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                let record = maps.mapping(iova).unwrap();
+                assert_eq!(
+                    (record.koid(), record.offset(), record.len()),
+                    (koid, offset, PAGE_SIZE)
+                );
+                assert_eq!(record.pages(), [0x1000_0000 + offset]);
+            }
+            process.handles_mut().close(handle).unwrap();
+            process.handles_mut().close(duplicate).unwrap();
+            drop(process);
+            drop(engine);
+            assert_eq!(weak.strong_count(), 2);
+            assert_eq!(maps.walk(0x0040_0123, Access::Read), Ok(Some(0x1000_2123)));
+            assert_eq!(
+                maps.walk(0x0040_0123, Access::Write),
+                Err(Errno::AccessDenied)
+            );
+            assert_eq!(
+                maps.unmap(0x003f_f000, 2 * PAGE_SIZE),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(weak.strong_count(), 2);
+            maps.unmap(0x003f_f000, PAGE_SIZE).unwrap();
+            assert_eq!(maps.walk(0x003f_f000, Access::Read), Ok(None));
+            assert_eq!(weak.strong_count(), 1);
+            maps.unmap(0x0040_0000, PAGE_SIZE).unwrap();
+            assert!(weak.upgrade().is_none());
+            assert_eq!(maps.walk(0x0040_0000, Access::Read), Ok(None));
+        }
+
+        #[test]
+        fn failed_map_rolls_back_prefix_and_pin_without_harming_existing_record() {
+            let (engine, process, handle) = fixture();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x1000,
+                engine
+                    .pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            let before = memory.0.borrow().words.clone();
+            memory.0.borrow_mut().limit = Some(2);
+            assert_eq!(
+                maps.map(
+                    0x003f_f000,
+                    engine
+                        .pin_device_vmo_read_only(
+                            &process,
+                            handle,
+                            PAGE_SIZE,
+                            2 * PAGE_SIZE,
+                            Rights::READ
+                        )
+                        .unwrap()
+                ),
+                Err(Errno::NoMemory)
+            );
+            assert_eq!(weak.strong_count(), 2);
+            assert!(maps.mapping(0x003f_f000).is_none());
+            assert_eq!(maps.walk(0x003f_f000, Access::Read), Ok(None));
+            assert_eq!(memory.0.borrow().words, before);
+            assert_eq!(
+                maps.map(
+                    0x1000,
+                    engine
+                        .pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ)
+                        .unwrap()
+                ),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(weak.strong_count(), 2);
+            memory.0.borrow_mut().limit = None;
+            maps.map(
+                0x003f_f000,
+                engine
+                    .pin_device_vmo_read_only(
+                        &process,
+                        handle,
+                        PAGE_SIZE,
+                        2 * PAGE_SIZE,
+                        Rights::READ,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(weak.strong_count(), 3);
+            maps.unmap(0x003f_f000, 2 * PAGE_SIZE).unwrap();
+            assert_eq!(maps.walk(0x1000, Access::Read), Ok(Some(0x1000_0000)));
+        }
+
+        #[test]
+        fn offline_drop_removes_table_descriptors_while_backing_is_still_owned() {
+            let (engine, process, handle) = fixture();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x003f_f000,
+                engine
+                    .pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            drop(engine);
+            drop(process);
+            memory.0.borrow_mut().guard = Some(weak.clone());
+            drop(maps);
+            assert!(weak.upgrade().is_none());
+            assert!(memory
+                .0
+                .borrow()
+                .words
+                .values()
+                .all(|page| page.iter().all(|&word| word == 0)));
+        }
+
+        #[test]
+        fn corrupt_unmap_keeps_the_complete_record_and_both_backing_references() {
+            let (engine, process, handle) = fixture();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x003f_f000,
+                engine
+                    .pin_device_vmo_read_only(
+                        &process,
+                        handle,
+                        PAGE_SIZE,
+                        2 * PAGE_SIZE,
+                        Rights::READ,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            // Directory and leaves occupy model pages 1, 2, 3. Damage the suffix;
+            // the valid prefix must survive the failed all-range preflight. — KESTREL
+            memory
+                .0
+                .borrow_mut()
+                .words
+                .get_mut(&(3 * PAGE_SIZE))
+                .unwrap()[0] = 8;
+            let before = memory.0.borrow().words.clone();
+            assert_eq!(maps.unmap(0x003f_f000, 2 * PAGE_SIZE), Err(Errno::BadState));
+            assert_eq!(memory.0.borrow().words, before);
+            assert_eq!(maps.walk(0x003f_f000, Access::Read), Ok(Some(0x1000_1000)));
+            assert_eq!(
+                maps.mapping(0x003f_f000).unwrap().pages(),
+                [0x1000_1000, 0x1000_2000]
+            );
+            assert_eq!(weak.strong_count(), 2);
+        }
+
+        #[test]
+        fn anonymous_pins_share_materialized_pages_and_failed_pin_keeps_only_vmo_cache() {
+            let entry = Rc::new(VmoEntry {
+                koid: KoId(99),
+                vmo: Vmo::new(3 * PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            });
+            let weak = Rc::downgrade(&entry);
+            let mut calls = 0;
+            let failed = VmoPin::new(entry.clone(), PAGE_SIZE, 2 * PAGE_SIZE, || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(0x2000_0000)
+                } else {
+                    Err(Errno::NoMemory)
+                }
+            });
+            assert!(matches!(failed, Err(Errno::NoMemory)));
+            assert_eq!(weak.strong_count(), 1);
+            assert_eq!(*entry.frames.borrow(), [None, Some(0x2000_0000), None]);
+            let first =
+                VmoPin::new(entry.clone(), PAGE_SIZE, 2 * PAGE_SIZE, || Ok(0x3000_0000)).unwrap();
+            let second = VmoPin::new(entry.clone(), PAGE_SIZE, 2 * PAGE_SIZE, || {
+                panic!("shared page allocated twice")
+            })
+            .unwrap();
+            assert_eq!(first.pages(), [0x2000_0000, 0x3000_0000]);
+            assert_eq!(first.pages(), second.pages());
+            drop(entry);
+            drop(first);
+            assert_eq!(weak.strong_count(), 1);
+            drop(second);
+            assert!(weak.upgrade().is_none());
+        }
+
+        #[test]
+        fn dma_pin_accepts_the_top_32_bit_page_and_engine_clone_shares_vmo_pages() {
+            let (mut engine, mut process, _) = fixture();
+            let dma = engine
+                .root_vmo_create(
+                    &mut process,
+                    Vmo::from_dma_range((1 << 32) - PAGE_SIZE, PAGE_SIZE).unwrap(),
+                    Rights::READ,
+                )
+                .unwrap();
+            let pin = engine
+                .pin_device_vmo_read_only(&process, dma, 0, PAGE_SIZE, Rights::READ)
+                .unwrap();
+            assert_eq!(pin.pages(), [(1 << 32) - PAGE_SIZE]);
+            let clone = engine.clone();
+            assert!(Rc::ptr_eq(&engine.vmos[0], &clone.vmos[0]));
+            let anon = Rc::new(VmoEntry {
+                koid: KoId(100),
+                vmo: Vmo::new(PAGE_SIZE).unwrap(),
+                frames: RefCell::new(vec![Some(1 << 32)]),
+            });
+            assert!(matches!(
+                VmoPin::new(anon.clone(), 0, PAGE_SIZE, || unreachable!()),
+                Err(Errno::NotSupported)
+            ));
+            assert_eq!(Rc::strong_count(&anon), 1);
+        }
+    }
 
     #[cfg(feature = "arch_aarch64")]
     #[test]

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j567
 #j568
 #j569
 #j573
 #j616
+#j617
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -171,6 +171,8 @@ def main():
                 raise RuntimeError(f"boot timed out; inspect {serial}")
             client = b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
             assert b"private RAM, read-only walk, VMO denial, DMA gap, reuse OK" in transcript, f"missing kernel device-table RAM proof; inspect {serial}"
+            assert b"VMO identity, closed handle, exact unmap, offline release OK" in transcript, f"missing kernel VMO pin proof; inspect {serial}"
+            print("Device VMO pin smoke green: identity, closed handle, exact unmap, offline release")
             assert b"sora: VmoCreate SIMD preserved" in transcript, f"missing EL0 vector proof; inspect {serial}"
             print("Device table RAM smoke green: private pages, read-only walk, VMO alias denial, DMA gap, reuse, EL0 SIMD")
             assert transcript.count(client) == 1, f"missing client present; inspect {serial}"

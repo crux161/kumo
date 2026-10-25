@@ -1,9 +1,10 @@
 //j616
+//j617
 
-//! Private RAM backing for offline device tables (DESIGN/022 D1d-b2a).
+//! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
 //! through table leases. Frames never return to the global bump allocator. No device root
-//! is published; cross-server pin/quarantine lifetime remains a later gate. — KESTREL
+//! is published; live context/quarantine lifetime remains a later gate. — KESTREL
 
 use crate::{
     mm::{Vmo, VmoBacking, PAGE_SIZE},
@@ -13,6 +14,79 @@ use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 use kumo_abi::{BootInfo, Range};
 use kumo_hal::active::DeviceTableMemory;
+
+struct PinnedMapping {
+    iova: u64,
+    pin: crate::syscall::VmoPin,
+}
+
+/// Only unpublished tables: exact mapping records retain the VMO and resolved pages.
+/// Table Drop precedes pin Drop, so no descriptor outlives its backing reference.
+/// A future live owner must retain both on uncertain drain/invalidation. — KESTREL
+pub(crate) struct OfflineMappings<A: PageMemory> {
+    table: kumo_hal::active::OfflineDeviceTable<TableLease<A>>,
+    mappings: Vec<PinnedMapping>,
+}
+
+impl<A: PageMemory> OfflineMappings<A> {
+    pub fn new(pool: &TablePool<A>) -> Result<Self, kumo_abi::Errno> {
+        Ok(Self {
+            table: kumo_hal::active::OfflineDeviceTable::new(pool.lease()).map_err(table_error)?,
+            mappings: Vec::new(),
+        })
+    }
+
+    pub fn map(&mut self, iova: u64, pin: crate::syscall::VmoPin) -> Result<(), kumo_abi::Errno> {
+        self.mappings
+            .try_reserve(1)
+            .map_err(|_| kumo_abi::Errno::NoMemory)?;
+        // The pin stays alive throughout a failed walker's prefix rollback. Publishing
+        // its record is infallible after this point. No device can see this table. — KESTREL
+        self.table
+            .map_read_only(iova, pin.pages())
+            .map_err(table_error)?;
+        self.mappings.push(PinnedMapping { iova, pin });
+        Ok(())
+    }
+
+    pub fn unmap(&mut self, iova: u64, len: u64) -> Result<(), kumo_abi::Errno> {
+        let index = self
+            .mappings
+            .iter()
+            .position(|m| m.iova == iova && m.pin.len() == len)
+            .ok_or(kumo_abi::Errno::InvalidArgs)?;
+        self.table.unmap(iova, len).map_err(table_error)?;
+        self.mappings.remove(index);
+        Ok(())
+    }
+
+    pub fn mapping(&self, iova: u64) -> Option<&crate::syscall::VmoPin> {
+        self.mappings
+            .iter()
+            .find(|m| m.iova == iova)
+            .map(|m| &m.pin)
+    }
+
+    pub fn walk(
+        &self,
+        iova: u64,
+        access: kumo_hal::active::DeviceTableAccess,
+    ) -> Result<Option<u64>, kumo_abi::Errno> {
+        self.table.walk(iova, access).map_err(table_error)
+    }
+}
+
+fn table_error(error: kumo_hal::active::DeviceTableError) -> kumo_abi::Errno {
+    use kumo_abi::Errno;
+    use kumo_hal::active::DeviceTableError as E;
+    match error {
+        E::NoMemory => Errno::NoMemory,
+        E::PermissionDenied => Errno::AccessDenied,
+        E::UnsupportedAddress => Errno::NotSupported,
+        E::CorruptTable | E::InvalidDescriptor | E::TableAlias => Errno::BadState,
+        E::InvalidRange | E::AlreadyMapped | E::NotMapped => Errno::InvalidArgs,
+    }
+}
 
 /// Allocation must exclude every supplied span before zeroing, and return a fresh mapped
 /// RAM page. Word access is infallible only for pages owned by the calling lease. — KESTREL
