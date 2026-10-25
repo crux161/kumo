@@ -8,6 +8,7 @@
 //j597
 //j598
 
+mod clock_probe;
 mod display_probe;
 mod display_topology;
 
@@ -133,8 +134,19 @@ extern "C" fn main(
         .get(..power_len as usize)
         .and_then(drv_fb::rk3588::Power::decode);
     let (_, display_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
-    // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle. The
-    // record is fixed-size on every board; an absent copy arrives as Handle(0). — TIMBERDOODLE
+    // D0c: the grant data record precedes the one CRU Resource handle. Decode it
+    // immediately so the 32-byte buffer is free for the graphics reads below; an
+    // absent record (one zero byte) or any malformed record becomes None and the
+    // probe performs zero CRU reads. — TIMBERDOODLE
+    let clock_grant_len = channel_read(bootstrap, buf.as_mut_ptr(), buf.len());
+    let clock_grant = buf
+        .get(..clock_grant_len as usize)
+        .and_then(drv_fb::rk3588_clock::Grant::decode);
+    let (_, clock_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+
+    // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle and
+    // D0c's clock grant. The record is fixed-size on every board; an absent copy arrives as
+    // Handle(0). — TIMBERDOODLE
     let (topology_len, topology_raw) =
         channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let topology_transfer =
@@ -195,6 +207,7 @@ extern "C" fn main(
         Handle(0)
     };
     display_probe::report(bootinfo, power, Handle(display_raw as u32));
+    clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
     display_topology::report(
         bootinfo,
         power,

@@ -791,6 +791,9 @@ fn launch_xhci_first_light(
 /// Pi board with a plausible existing GOP image is probed. — TIMBERDOODLE
 fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebuffer_valid: bool) {
     use drv_fb::rk3588::{eligible, Power, PMU_BASE, PMU_LEN, VOP_BASE, VOP_LEN};
+    use drv_fb::rk3588_clock::{
+        Grant, CLOCK_PROBE_IRQ_BASE, CLOCK_PROBE_IRQ_COUNT, CRU_BASE, CRU_LEN, GRANT_LEN,
+    };
     let mut power = None;
     if eligible(board, framebuffer_valid) {
         // Sora already owns root hardware authority. Its sole PMU mapping is read-only;
@@ -823,6 +826,38 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     };
     if channel_write_with_handle(bootstrap, b"D".as_ptr(), 1, grant) != 0 && grant.0 != 0 {
         let _ = handle_close(grant);
+    }
+
+    // D0c: one read-only CRU child Resource, no IRQ authority. Data record first
+    // (12 bytes, or one zero byte when absent), then the 'K' handle message, so
+    // the bootstrap order stays F,C,B,power,D,K. The span covers CRU, PHPTOPCRU's
+    // PPLL and PMU1CRU's PHY reference selector, within the board DTB's 0x5c000
+    // CRU window. A READ-only mapping of a wider span grants no write reach:
+    // DESIGN/020's concern is write authority. — TIMBERDOODLE
+    let cru_raw = if power.is_some_and(Power::vop_accessible) {
+        resource_create_child(
+            root,
+            CRU_BASE,
+            CRU_LEN,
+            CLOCK_PROBE_IRQ_BASE,
+            CLOCK_PROBE_IRQ_COUNT,
+        )
+    } else {
+        u64::MAX
+    };
+    let cru = if cru_raw == u64::MAX {
+        Handle(0)
+    } else {
+        Handle(cru_raw as u32)
+    };
+    let mut record = [0u8; GRANT_LEN];
+    if cru.0 != 0 {
+        record = Grant::expected().encode();
+    }
+    let len = if cru.0 != 0 { record.len() } else { 1 };
+    let _ = channel_write(bootstrap, record.as_ptr(), len);
+    if channel_write_with_handle(bootstrap, b"K".as_ptr(), 1, cru) != 0 && cru.0 != 0 {
+        let _ = handle_close(cru);
     }
 }
 

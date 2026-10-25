@@ -22,6 +22,7 @@
 pub mod dtb_topology;
 mod font;
 pub mod rk3588;
+pub mod rk3588_clock;
 
 #[cfg(test)]
 use font::ascii_rows as glyph_rows;
