@@ -1,0 +1,38 @@
+# kumo_paint.v10.manifest: written by scripts/build-mali-shaders.sh; do not edit.
+# What Mesa's compiler reported for kumo_paint.cl on arch 10, and Mesa's reference
+# descriptors for it (pan_pack, PAN_ARCH 10), which drv-gpu's packers must match.
+mesa = 26.2.5-1
+image = debian@sha256:92d7265e51d67d3a2094c1aad9faa88c74cf9d52e6c354200e429cd60237cc55
+snapshot = 20261024T000000Z
+tool libclc-22 = 1:22.1.8-3
+tool llvm-22 = 1:22.1.8-3
+tool llvm-spirv-22 = 22.1.0-1
+tool meson = 1.12.1-2
+tool spirv-tools = 2026.4~rc2-1
+source_sha256 = dfe3cd0cdc621ac374c9fb0f83d7b20de1fee2ef471712c6a86f13b7a5f62ac4
+binary_sha256 = fb5817fa360f653b0f83408956ad26fb7f77c983be909ccfa4a6300de8379b34
+kernel = kumo_paint
+arch = 10
+binary_bytes = 256
+local_size = 16 16 1
+stage_compute = 1
+work_reg_count = 32
+preload = 0x3000000000000000
+tls_size = 0
+wls_size = 0
+fau_reserved_words = 9
+allow_merging_workgroups = 0
+ftz_fp16 = 0
+ftz_fp32 = 0
+ubo_count = 0
+texture_count = 0
+sampler_count = 0
+sysvals_bytes = 24
+args_offset = 24
+arg_out = 0 8
+arg_stride = 8 4
+args_bytes = 12
+reference_binary_va = 0x10040000
+spd_v10 = 1800008000300000000004100000000000000000000000000000000000000000
+tsd_v10 = 000000001f000000000000000000000000000000000000000000000000000000
+wg_size_v10 = 0f3c0000

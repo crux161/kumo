@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j587
 //j588
 //j589
 //j590
 //j591
+//j592
 
 //! G1b–G5b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -17,6 +17,8 @@
 //! G4d waits for each job on the JOB interrupt and handles it in §11.5's order. G5a paints a
 //! test pattern with the command stream alone and checks it against a CPU reference.
 //! G5b presents it in one of drv-fb's views (DESIGN/019).
+//! G5c-1 carries the offline-compiled kernel (shaders/mali) and packs its descriptors exactly as
+//! Mesa does.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -2514,6 +2516,141 @@ pub const PAINT_SURFACE: kumo_graphics::Surface = kumo_graphics::Surface {
 /// pixels of one row.
 pub const SURFACE_CHUNK_BYTES: usize = 256;
 const SURFACE_CHUNK_PIXELS: u32 = SURFACE_CHUNK_BYTES as u32 / 4;
+
+// ---- G5c: the offline-compiled compute kernel (shaders/mali, PLAN/013 decision 2 option A) ----
+
+/// What Mesa's compiler reported for one vendored kernel. A host test checks every field
+/// against the kernel's `.manifest`, which `scripts/build-mali-shaders.sh` writes.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeKernel {
+    pub binary: &'static [u8],
+    pub local_size: [u32; 3],
+    pub work_reg_count: u32,
+    /// Registers the hardware preloads (bit n = rn); r60/r61 carry the global x/y.
+    pub preload: u64,
+    pub tls_size: u32,
+    pub wls_size: u32,
+    pub allow_merging_workgroups: bool,
+    pub ftz_fp16: bool,
+    pub ftz_fp32: bool,
+    /// The kernel's arguments start after Mesa's precompiled-kernel sysvals (§12.9).
+    pub args_offset: u32,
+    pub args_bytes: u32,
+}
+
+/// `shaders/mali/kumo_paint.cl` compiled for arch 10: the G5a pattern as a compute kernel, one
+/// invocation per pixel. Arguments: `out` (u64) at +0 and `stride` (u32) at +8.
+pub const KUMO_PAINT_V10: ComputeKernel = ComputeKernel {
+    binary: include_bytes!("../../../../shaders/mali/kumo_paint.v10.bin"),
+    local_size: [16, 16, 1],
+    work_reg_count: 32,
+    preload: 0x3000_0000_0000_0000,
+    tls_size: 0,
+    wls_size: 0,
+    allow_merging_workgroups: false,
+    ftz_fp16: false,
+    ftz_fp32: false,
+    args_offset: 24,
+    args_bytes: 12,
+};
+
+/// Mesa's precompiled-kernel sysvals, the first 24 bytes of the push data: the workgroup counts
+/// x, y, z, padding, then a printf buffer address (`bifrost_precompiled_kernel_sysvals`).
+pub const KERNEL_SYSVALS_BYTES: u32 = 24;
+/// panvk uploads shader code 128-byte aligned (`panvk_pool_upload_aligned(..., 128)`).
+pub const SHADER_BINARY_ALIGN: u64 = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelError {
+    /// Only the "preserve subnormals" flush-to-zero mode has been pinned against Mesa.
+    FlushToZero,
+    /// Only kernels without thread-local or workgroup memory are supported so far.
+    LocalStorage { tls_size: u32, wls_size: u32 },
+    /// A workgroup dimension outside 1-1024.
+    WorkgroupSize([u32; 3]),
+    /// The binary's GPU address is not 128-byte aligned or wider than 48 bits.
+    BinaryAddress(u64),
+    /// The push data is not 8-byte aligned, empty, or more than 255 FAU slots.
+    PushData { va: u64, bytes: u32 },
+}
+
+/// RESEARCH/009 §12.2's Shader Program descriptor for a compute kernel, packed the way panvk's
+/// `panvk_shader_upload` fills it: type 8, stage compute (1), 32 or 64 registers per thread
+/// (`pan_register_allocation`: 32 when `work_reg_count <= 32`), the r48-r63 preload window, and
+/// the binary's address. Pinned byte for byte to Mesa's `pan_pack` output in the manifest.
+/// — TIMBERDOODLE
+pub fn shader_program_descriptor(
+    kernel: &ComputeKernel,
+    binary_va: u64,
+) -> Result<[u32; 8], KernelError> {
+    if kernel.ftz_fp16 || kernel.ftz_fp32 {
+        return Err(KernelError::FlushToZero);
+    }
+    if binary_va % SHADER_BINARY_ALIGN != 0 || binary_va > 0x0000_FFFF_FFFF_FFFF {
+        return Err(KernelError::BinaryAddress(binary_va));
+    }
+    let register_allocation = if kernel.work_reg_count <= 32 { 2 } else { 0 };
+    let mut words = [0u32; 8];
+    words[0] = 8 | (1 << 4) | (register_allocation << 30);
+    words[1] = ((kernel.preload >> 48) & 0xFFFF) as u32;
+    words[2] = binary_va as u32;
+    words[3] = (binary_va >> 32) as u32;
+    Ok(words)
+}
+
+/// RESEARCH/009 §12.3's Local Storage descriptor for a kernel with no TLS and no WLS, as Mesa's
+/// `pan_emit_tls` packs it: everything zero except the "no workgroup memory" WLS instance count
+/// (log2 field `0x1F`).
+pub fn local_storage_descriptor(kernel: &ComputeKernel) -> Result<[u32; 8], KernelError> {
+    if kernel.tls_size != 0 || kernel.wls_size != 0 {
+        return Err(KernelError::LocalStorage {
+            tls_size: kernel.tls_size,
+            wls_size: kernel.wls_size,
+        });
+    }
+    let mut words = [0u32; 8];
+    words[1] = 0x1F;
+    Ok(words)
+}
+
+/// RESEARCH/009 §12.6's workgroup-size word for r33: each dimension minus one in 10 bits, and
+/// bit 31 when the compiler allows merging workgroups.
+pub fn workgroup_size_word(kernel: &ComputeKernel) -> Result<u32, KernelError> {
+    let [x, y, z] = kernel.local_size;
+    if [x, y, z].iter().any(|d| !(1..=1024).contains(d)) {
+        return Err(KernelError::WorkgroupSize(kernel.local_size));
+    }
+    Ok((x - 1)
+        | ((y - 1) << 10)
+        | ((z - 1) << 20)
+        | (u32::from(kernel.allow_merging_workgroups) << 31))
+}
+
+/// The FAU register pair's value: the push data's GPU address with its size in 8-byte slots in
+/// bits [63:56] (panvk's `push_uniforms.gpu | (fau_count << 56)`).
+pub fn fau_pointer(push_va: u64, push_bytes: u32) -> Result<u64, KernelError> {
+    let slots = u64::from(push_bytes).div_ceil(8);
+    if push_va % 8 != 0 || push_va > 0x00FF_FFFF_FFFF_FFFF || slots == 0 || slots > 255 {
+        return Err(KernelError::PushData {
+            va: push_va,
+            bytes: push_bytes,
+        });
+    }
+    Ok(push_va | (slots << 56))
+}
+
+/// The push data for one `kumo_paint` dispatch: the sysvals (workgroup counts, no printf
+/// buffer), then `out` and `stride`, padded to whole 8-byte FAU slots.
+pub fn kumo_paint_push(workgroups: [u32; 3], out: u64, stride: u32) -> [u8; 40] {
+    let mut push = [0u8; 40];
+    for (index, count) in workgroups.iter().enumerate() {
+        push[index * 4..index * 4 + 4].copy_from_slice(&count.to_le_bytes());
+    }
+    let args = KUMO_PAINT_V10.args_offset as usize;
+    push[args..args + 8].copy_from_slice(&out.to_le_bytes());
+    push[args + 8..args + 12].copy_from_slice(&stride.to_le_bytes());
+    push
+}
 
 /// Every chunk of the painted surface as (byte offset, first pixel's x, y), row-major. The same
 /// offset addresses the GPU target and the surface VMO, since neither has padding.
@@ -5263,5 +5400,178 @@ mod g5b_tests {
             .iter()
             .enumerate()
             .all(|(i, a)| tags[i + 1..].iter().all(|b| a != b)));
+    }
+}
+
+#[cfg(test)]
+mod g5c_tests {
+    extern crate std;
+    use super::*;
+    use std::collections::HashMap;
+    use std::string::{String, ToString};
+    use std::vec::Vec;
+
+    const MANIFEST: &str = include_str!("../../../../shaders/mali/kumo_paint.v10.manifest");
+
+    fn manifest() -> HashMap<String, String> {
+        MANIFEST
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| {
+                let (key, value) = line.split_once(" = ").expect("key = value");
+                (key.trim().to_string(), value.trim().to_string())
+            })
+            .collect()
+    }
+
+    fn number(m: &HashMap<String, String>, key: &str) -> u64 {
+        let value = &m[key];
+        match value.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+            None => value.parse().unwrap(),
+        }
+    }
+
+    fn hex_words(m: &HashMap<String, String>, key: &str) -> Vec<u32> {
+        let hex = &m[key];
+        (0..hex.len())
+            .step_by(8)
+            .map(|i| {
+                let bytes = u32::from_str_radix(&hex[i..i + 8], 16).unwrap();
+                bytes.swap_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_kernel_constants_match_the_vendored_manifest() {
+        let m = manifest();
+        let k = KUMO_PAINT_V10;
+        assert_eq!(m["kernel"], "kumo_paint");
+        assert_eq!(number(&m, "arch"), 10);
+        assert_eq!(number(&m, "binary_bytes"), k.binary.len() as u64);
+        assert_eq!(m["local_size"], "16 16 1");
+        assert_eq!(k.local_size, [16, 16, 1]);
+        assert_eq!(number(&m, "stage_compute"), 1);
+        assert_eq!(number(&m, "work_reg_count"), u64::from(k.work_reg_count));
+        assert_eq!(number(&m, "preload"), k.preload);
+        assert_eq!(number(&m, "tls_size"), u64::from(k.tls_size));
+        assert_eq!(number(&m, "wls_size"), u64::from(k.wls_size));
+        assert_eq!(
+            number(&m, "allow_merging_workgroups"),
+            u64::from(k.allow_merging_workgroups)
+        );
+        assert_eq!(number(&m, "ftz_fp16"), u64::from(k.ftz_fp16));
+        assert_eq!(number(&m, "ftz_fp32"), u64::from(k.ftz_fp32));
+        for key in ["ubo_count", "texture_count", "sampler_count"] {
+            assert_eq!(number(&m, key), 0, "{key}");
+        }
+        assert_eq!(number(&m, "sysvals_bytes"), u64::from(KERNEL_SYSVALS_BYTES));
+        assert_eq!(number(&m, "args_offset"), u64::from(k.args_offset));
+        assert_eq!(number(&m, "args_bytes"), u64::from(k.args_bytes));
+        assert_eq!(m["arg_out"], "0 8");
+        assert_eq!(m["arg_stride"], "8 4");
+        // Mesa reserves the sysvals and the arguments at the start of the FAU, in 32-bit words.
+        assert_eq!(
+            number(&m, "fau_reserved_words"),
+            u64::from(k.args_offset + k.args_bytes) / 4
+        );
+    }
+
+    #[test]
+    fn the_descriptors_match_mesas_pan_pack_byte_for_byte() {
+        let m = manifest();
+        let va = number(&m, "reference_binary_va");
+        assert_eq!(
+            shader_program_descriptor(&KUMO_PAINT_V10, va)
+                .unwrap()
+                .to_vec(),
+            hex_words(&m, "spd_v10")
+        );
+        assert_eq!(
+            local_storage_descriptor(&KUMO_PAINT_V10).unwrap().to_vec(),
+            hex_words(&m, "tsd_v10")
+        );
+        assert_eq!(
+            [workgroup_size_word(&KUMO_PAINT_V10).unwrap()].to_vec(),
+            hex_words(&m, "wg_size_v10")
+        );
+    }
+
+    #[test]
+    fn the_descriptors_decode_as_research_009_section_12_says() {
+        let spd = shader_program_descriptor(&KUMO_PAINT_V10, 0x1004_0000).unwrap();
+        assert_eq!(spd[0] & 0xF, 8, "type: shader");
+        assert_eq!((spd[0] >> 4) & 0xF, 1, "stage: compute");
+        assert_eq!(spd[0] >> 30, 2, "32 registers per thread");
+        assert_eq!(spd[1], 0x3000, "r60/r61 preloaded");
+        assert_eq!((spd[2], spd[3]), (0x1004_0000, 0));
+        assert_eq!(workgroup_size_word(&KUMO_PAINT_V10), Ok(0x3C0F));
+    }
+
+    #[test]
+    fn the_packers_refuse_what_has_not_been_pinned() {
+        let mut k = KUMO_PAINT_V10;
+        assert_eq!(
+            shader_program_descriptor(&k, 0x1004_0040),
+            Err(KernelError::BinaryAddress(0x1004_0040))
+        );
+        k.ftz_fp32 = true;
+        assert_eq!(
+            shader_program_descriptor(&k, 0x1004_0000),
+            Err(KernelError::FlushToZero)
+        );
+        let mut k = KUMO_PAINT_V10;
+        k.tls_size = 16;
+        assert!(matches!(
+            local_storage_descriptor(&k),
+            Err(KernelError::LocalStorage { .. })
+        ));
+        k.local_size = [2048, 1, 1];
+        assert!(matches!(
+            workgroup_size_word(&k),
+            Err(KernelError::WorkgroupSize(_))
+        ));
+        let wide = KUMO_PAINT_V10;
+        assert_eq!(
+            shader_program_descriptor(&wide, 0x1004_0000).unwrap()[0] >> 30,
+            2
+        );
+        let mut wide = KUMO_PAINT_V10;
+        wide.work_reg_count = 64;
+        assert_eq!(
+            shader_program_descriptor(&wide, 0x1004_0000).unwrap()[0] >> 30,
+            0
+        );
+    }
+
+    #[test]
+    fn the_push_data_follows_mesas_precompiled_kernel_layout() {
+        let push = kumo_paint_push([16, 8, 1], 0x1010_0000, 256);
+        assert_eq!(&push[0..12], &[16, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&push[12..24], &[0u8; 12], "padding and no printf buffer");
+        assert_eq!(&push[24..32], &0x1010_0000u64.to_le_bytes());
+        assert_eq!(&push[32..36], &256u32.to_le_bytes());
+        assert_eq!(fau_pointer(0x1000_3100, 36), Ok(0x0500_0000_1000_3100));
+        assert_eq!(
+            fau_pointer(0x1000_3100, push.len() as u32),
+            Ok(0x0500_0000_1000_3100)
+        );
+        assert!(fau_pointer(0x1000_3104, 36).is_err());
+        assert!(fau_pointer(0x1000_3100, 0).is_err());
+    }
+
+    #[test]
+    fn the_vendored_binary_is_the_one_the_manifest_describes() {
+        let m = manifest();
+        let on_disk = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../shaders/mali/kumo_paint.v10.bin"
+        ))
+        .unwrap();
+        assert_eq!(on_disk, KUMO_PAINT_V10.binary);
+        assert_eq!(on_disk.len() as u64, number(&m, "binary_bytes"));
+        assert_eq!(on_disk.len() % 8, 0);
+        assert_eq!(m["mesa"], "26.2.5-1");
     }
 }

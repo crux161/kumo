@@ -1,0 +1,25 @@
+   LSHIFT_OR.i32 r0, r61, 0xB0A0908.b11, 0x0
+   IADD_IMM.i32 r0, r0^, #0xFFFF8000
+   LSHIFT_OR.i32 r0, r0^, 0x0.b00, r60
+   ICMP_OR.u32.lt.m1 r1, r60, 0xC0B0A090.b3, 0x0
+   IADD_IMM.i32 r2, 0x0, #0xFFFFFF
+   IADD_IMM.i32 r3, 0x0, #0xFF
+   CSEL.u32.eq r1, r1^, 0x0, r2^, r3^
+   ICMP_OR.u32.lt.m1 r2, r60, 0x80002000.b3, 0x0
+   IADD_IMM.i32 r3, 0x0, #0xFF00
+   CSEL.u32.eq r1, r2^, 0x0, r1^, r3^
+   ICMP_OR.u32.lt.m1 r2, r60, 0x40490FDB.b3, 0x0
+   IADD_IMM.i32 r3, 0x0, #0xFF0000
+   CSEL.u32.eq r1, r2^, 0x0, r1^, r3^
+   ICMP_OR.u32.lt.m1 r2, r61, 0x40490FDB.b3, 0x0
+   CSEL.u32.eq r0, r2^, 0x0, r0^, r1^
+   IMUL.i32 r1, r61^, u4.w0
+   IADD.s32 r1, r1^, r60^
+   LSHIFT_OR.i32 r2, r1, 0x3020100.b22, 0x0
+   RSHIFT_OR.i32 r1, r1^, 0x1F1E1D1C.b22, 0x0
+   MOV.i32 r4, u3.w0
+   MOV.i32 r5, u3.w1
+   MOV.i32 r3, r1^
+   SHADDX.s64 [r2:r3], [r4^:r5^], [r2^:r3^], shift:0x0
+   STORE.i32.slot0.end @r0, [r2^:r3^], offset:0
+
