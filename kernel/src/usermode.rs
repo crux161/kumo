@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j556
 //j559
 //j571
 //j595
 //j601
+//j609
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};

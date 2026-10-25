@@ -1,5 +1,6 @@
 //j607
 //j608
+//j609
 
 //! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
 //! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
