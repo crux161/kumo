@@ -2,15 +2,16 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j567
-//j568
 //j569
 //j597
 //j598
+//j599
+//j600
 
 mod clock_probe;
 mod display_probe;
 mod display_topology;
+mod hdmi_probe;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
@@ -144,9 +145,15 @@ extern "C" fn main(
         .and_then(drv_fb::rk3588_clock::Grant::decode);
     let (_, clock_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
-    // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle and
-    // D0c's clock grant. The record is fixed-size on every board; an absent copy arrives as
-    // Handle(0). — TIMBERDOODLE
+    // D0d: the three read-only display apertures, always sent, in H/P/R order.
+    // — TIMBERDOODLE
+    let (_, hdmi_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, phy_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+
+    // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle,
+    // D0c's clock grant and D0d's H/P/R records. The record is fixed-size on every board;
+    // an absent copy arrives as Handle(0). — TIMBERDOODLE
     let (topology_len, topology_raw) =
         channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let topology_transfer =
@@ -208,6 +215,13 @@ extern "C" fn main(
     };
     display_probe::report(bootinfo, power, Handle(display_raw as u32));
     clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
+    hdmi_probe::report(
+        bootinfo,
+        power,
+        Handle(hdmi_raw as u32),
+        Handle(phy_raw as u32),
+        Handle(grf_raw as u32),
+    );
     display_topology::report(
         bootinfo,
         power,

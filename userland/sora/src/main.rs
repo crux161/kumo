@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j579
-//j591
 //j595
 //j597
 //j598
+//j599
+//j600
 
 extern crate alloc;
 
@@ -794,7 +794,14 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     use drv_fb::rk3588_clock::{
         Grant, CLOCK_PROBE_IRQ_BASE, CLOCK_PROBE_IRQ_COUNT, CRU_BASE, CRU_LEN, GRANT_LEN,
     };
+    use drv_fb::rk3588_hdmi::{
+        hdmi_accessible, HDMI_BASE, HDMI_LEN, PHY_BASE, PHY_GRF_BASE, PHY_GRF_LEN, PHY_LEN,
+    };
     let mut power = None;
+    // D0d: PMU_BIU_IDLE_SFTCON1 bit 0 is VO1's idle request enable, which D0a's fixed
+    // 16-byte record does not carry. Sora observes it read-only for the HDMI gate.
+    // — TIMBERDOODLE
+    let mut vo1_request = 0u32;
     if eligible(board, framebuffer_valid) {
         // Sora already owns root hardware authority. Its sole PMU mapping is read-only;
         // D0a leaves shared power/clock mutations with DESIGN/020's kernel mechanism.
@@ -804,6 +811,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
         if raw != 0 && raw != u64::MAX {
             let vmo = Handle(raw as u32);
             if vmar_map(Handle(0), vmo, 0, PMU_VA, PMU_LEN, VmarFlags::READ.0) == 0 {
+                vo1_request = unsafe { core::ptr::read_volatile((PMU_VA + 0x110) as *const u32) };
                 power = Some(Power::read(|offset| unsafe {
                     core::ptr::read_volatile((PMU_VA + u64::from(offset)) as *const u32)
                 }));
@@ -858,6 +866,31 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     let _ = channel_write(bootstrap, record.as_ptr(), len);
     if channel_write_with_handle(bootstrap, b"K".as_ptr(), 1, cru) != 0 && cru.0 != 0 {
         let _ = handle_close(cru);
+    }
+
+    // D0d: HDMI0 TX, combo PHY and HDPTXPHY0_GRF as three read-only child Resources.
+    // Every board receives the same three tagged records; an ineligible, powered-down or
+    // idle-requested display path transfers Handle(0) instead of a capability. The PHY GRF
+    // span is the DTB's 0x100 bytes. — TIMBERDOODLE
+    let accessible = power.is_some_and(|power| hdmi_accessible(power) && vo1_request & 1 == 0);
+    let mut grants = [Handle(0); 3];
+    if accessible {
+        let apertures = [
+            (HDMI_BASE, HDMI_LEN),
+            (PHY_BASE, PHY_LEN),
+            (PHY_GRF_BASE, PHY_GRF_LEN),
+        ];
+        for (slot, (base, len)) in grants.iter_mut().zip(apertures) {
+            let raw = resource_create_child(root, base, len, 0, 0);
+            if raw != u64::MAX {
+                *slot = Handle(raw as u32);
+            }
+        }
+    }
+    for (tag, grant) in [b"H", b"P", b"R"].iter().zip(grants) {
+        if channel_write_with_handle(bootstrap, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+            let _ = handle_close(grant);
+        }
     }
 }
 

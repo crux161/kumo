@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j565
-//j567
 //j568
 //j597
 //j598
+//j599
+//j600
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -23,6 +23,7 @@ pub mod dtb_topology;
 mod font;
 pub mod rk3588;
 pub mod rk3588_clock;
+pub mod rk3588_hdmi;
 
 #[cfg(test)]
 use font::ascii_rows as glyph_rows;
