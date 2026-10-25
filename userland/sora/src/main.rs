@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j569
 //j572
 //j579
 //j591
 //j595
+//j597
 
 extern crate alloc;
 
@@ -784,6 +784,46 @@ fn launch_xhci_first_light(
         have_channel.then(|| Handle(kbd_reader as u32)),
         have_mouse.then(|| Handle(mouse_reader as u32)),
     )
+}
+
+/// D0a: observe shared PMU status in the supervisor, then pass data and one VOP Resource.
+/// No PMU/CRU capability or IRQ authority reaches the display driver. Only the exact Orange
+/// Pi board with a plausible existing GOP image is probed. — TIMBERDOODLE
+fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebuffer_valid: bool) {
+    use drv_fb::rk3588::{eligible, Power, PMU_BASE, PMU_LEN, VOP_BASE, VOP_LEN};
+    let mut power = None;
+    if eligible(board, framebuffer_valid) {
+        // Sora already owns root hardware authority. Its sole PMU mapping is read-only;
+        // D0a leaves shared power/clock mutations with DESIGN/020's kernel mechanism.
+        // — TIMBERDOODLE
+        const PMU_VA: u64 = 0x3500_0000;
+        let raw = kumo_rt::resource_mint_mmio(root, PMU_BASE, PMU_LEN);
+        if raw != 0 && raw != u64::MAX {
+            let vmo = Handle(raw as u32);
+            if vmar_map(Handle(0), vmo, 0, PMU_VA, PMU_LEN, VmarFlags::READ.0) == 0 {
+                power = Some(Power::read(|offset| unsafe {
+                    core::ptr::read_volatile((PMU_VA + u64::from(offset)) as *const u32)
+                }));
+            }
+            let _ = handle_close(vmo);
+        }
+    }
+    let record = power.map(Power::encode).unwrap_or([0; 16]);
+    let len = if power.is_some() { record.len() } else { 1 };
+    let _ = channel_write(bootstrap, record.as_ptr(), len);
+    let raw = if power.is_some_and(Power::vop_accessible) {
+        resource_create_child(root, VOP_BASE, VOP_LEN, 0, 0)
+    } else {
+        0
+    };
+    let grant = if raw == u64::MAX {
+        Handle(0)
+    } else {
+        Handle(raw as u32)
+    };
+    if channel_write_with_handle(bootstrap, b"D".as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+        let _ = handle_close(grant);
+    }
 }
 
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
@@ -1784,6 +1824,7 @@ extern "C" fn sora_main(
                         channel_write_with_handle(srv, b"F".as_ptr(), 1, Handle(fb_res_h as u32));
                         channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
                         channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
+                        bootstrap_display_probe(srv, res, bootinfo.board_id(), fb.is_plausible());
                         let graphics_enabled = kumo_graphics::band(fb.width, fb.height).is_some();
                         let graphics = bootstrap_graphics(srv, graphics_enabled);
                         if run_elf(

@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j554
 //j557
 //j565
 //j567
 //j568
+//j597
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -20,6 +20,7 @@
 //! the Redox posture of `PLAN_IV`).
 
 mod font;
+pub mod rk3588;
 
 #[cfg(test)]
 use font::ascii_rows as glyph_rows;

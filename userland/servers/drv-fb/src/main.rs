@@ -2,18 +2,20 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j554
 //j559
 //j567
 //j568
 //j569
+//j597
+
+mod display_probe;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
     channel_read, channel_read_with_handle, framebuffer_claim, handle_koid, port_bind, port_create,
-    port_unbind, port_wait, resource_mint_mmio, vmar_map, vmo_create,
+    port_wait, resource_mint_mmio, vmar_map, vmo_create,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
@@ -125,6 +127,12 @@ extern "C" fn main(
     let (_n3, bootinfo_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let bootinfo_vmo = Handle(bootinfo_raw as u32);
 
+    let power_len = channel_read(bootstrap, buf.as_mut_ptr(), buf.len());
+    let power = buf
+        .get(..power_len as usize)
+        .and_then(drv_fb::rk3588::Power::decode);
+    let (_, display_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+
     // Optional graphics lanes: one private channel and one read-only ordinary VMO per
     // server-owned view. Sora always sends one G record per view; Handle(0) disables that
     // view without preventing console startup.
@@ -165,6 +173,8 @@ extern "C" fn main(
         log_err(b"drv-fb: no fb in bootinfo\n");
         kumo_rt::process_exit(1);
     }
+
+    display_probe::report(bootinfo, power, Handle(display_raw as u32));
 
     let fb_phys = bootinfo.framebuffer.phys;
     let fb_len = bootinfo.framebuffer.len;
