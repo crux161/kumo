@@ -1,8 +1,8 @@
-#j569
 #j572
 #j594
 #j595
 #j596
+#j598
 [workspace]
 members = [
     "boot/niji-loader",
@@ -15,6 +15,7 @@ members = [
     "lib/kumo-abi",
     "lib/kumo-bsp",
     "lib/kumo-fatfs",
+    "lib/kumo-fdt",
     "lib/kumo-gpt",
     "lib/kumo-gpu",
     "lib/kumo-graphics",
@@ -75,6 +76,7 @@ version = "0.1.0"
 [workspace.dependencies]
 kumo-abi = { path = "lib/kumo-abi" }
 kumo-bsp = { path = "lib/kumo-bsp" }
+kumo-fdt = { path = "lib/kumo-fdt" }
 kumo-hal = { path = "hal/kumo-hal", default-features = false }
 kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
 kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }

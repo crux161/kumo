@@ -1,4 +1,5 @@
 #j567
+#j598
 
 [package]
 name = "drv-fb"
@@ -13,6 +14,7 @@ doctest = false
 
 [dependencies]
 kumo-graphics = { path = "../../../lib/kumo-graphics" }
+kumo-fdt = { path = "../../../lib/kumo-fdt" }
 
 [[bin]]
 name = "drv-fb"

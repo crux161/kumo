@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j557
 //j565
 //j567
 //j568
 //j597
+//j598
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -19,6 +19,7 @@
 //! userspace. The framebuffer driver — not the kernel — now owns the glass (`DESIGN/007`,
 //! the Redox posture of `PLAN_IV`).
 
+pub mod dtb_topology;
 mod font;
 pub mod rk3588;
 

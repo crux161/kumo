@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j572
 //j579
 //j591
 //j595
 //j597
+//j598
 
 extern crate alloc;
 
@@ -824,6 +824,116 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     if channel_write_with_handle(bootstrap, b"D".as_ptr(), 1, grant) != 0 && grant.0 != 0 {
         let _ = handle_close(grant);
     }
+}
+
+/// D0b: forward the *live* boot DTB's display topology to drv-fb. The kernel's x9 capability
+/// carries READ|DUPLICATE but not TRANSFER, so the capability itself cannot cross a channel;
+/// Sora maps it read-only, validates magic and extent, copies the blob into a fresh VMO, and
+/// transfers a read-only alias. Every board receives the same 13-byte record, with Handle(0)
+/// when ineligible, so the bootstrap stream stays aligned. Sora keeps its own live handle for
+/// the i2c-hid and xHCI users. — TIMBERDOODLE
+fn bootstrap_display_topology(
+    bootstrap: Handle,
+    dtb_vmo: Handle,
+    dtb_phys: u64,
+    board: &str,
+    framebuffer_valid: bool,
+) {
+    let mut transfer = drv_fb::dtb_topology::Transfer::NONE;
+    let mut grant = Handle(0);
+    if drv_fb::rk3588::eligible(board, framebuffer_valid) {
+        if let Some((copied, handle)) = copy_live_dtb(dtb_vmo, dtb_phys) {
+            transfer = copied;
+            grant = handle;
+        }
+    }
+    let record = transfer.encode();
+    if channel_write_with_handle(bootstrap, record.as_ptr(), record.len(), grant) != 0
+        && grant.0 != 0
+    {
+        let _ = handle_close(grant);
+    }
+}
+
+/// Copy the validated live DTB into a private VMO and return its transfer record plus a
+/// read+transfer alias. `None` leaves the original capability untouched and sends no data.
+/// — TIMBERDOODLE
+fn copy_live_dtb(
+    dtb_vmo: Handle,
+    dtb_phys: u64,
+) -> Option<(drv_fb::dtb_topology::Transfer, Handle)> {
+    use drv_fb::dtb_topology::{checksum, Transfer, MAX_DTB_BYTES};
+    const PAGE_SIZE: u64 = 4096;
+    const HEADER_VA: u64 = 0x3600_0000;
+    const DTB_VA: u64 = 0x3700_0000;
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+
+    if dtb_vmo.0 == 0 || dtb_phys == 0 {
+        return None;
+    }
+    let offset = (dtb_phys & (PAGE_SIZE - 1)) as usize;
+    if offset > PAGE_SIZE as usize - 8
+        || vmar_map(
+            Handle(0),
+            dtb_vmo,
+            0,
+            HEADER_VA,
+            PAGE_SIZE,
+            VmarFlags::READ.0,
+        ) != 0
+    {
+        return None;
+    }
+    let header =
+        unsafe { core::slice::from_raw_parts((HEADER_VA as usize + offset) as *const u8, 8) };
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != FDT_MAGIC {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(40..=MAX_DTB_BYTES).contains(&total) {
+        return None;
+    }
+    let mapped_len = (offset as u64)
+        .checked_add(total as u64)?
+        .checked_add(PAGE_SIZE - 1)?
+        & !(PAGE_SIZE - 1);
+    if vmar_map(Handle(0), dtb_vmo, 0, DTB_VA, mapped_len, VmarFlags::READ.0) != 0 {
+        return None;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
+    let copy = vmo_create(total as u64);
+    if copy == 0 || copy == u64::MAX {
+        return None;
+    }
+    let copy_handle = Handle(copy as u32);
+    let mut written = 0usize;
+    while written < total {
+        let chunk = (total - written).min(PAGE_SIZE as usize);
+        if vmo_write(
+            copy_handle,
+            written as u64,
+            bytes[written..].as_ptr(),
+            chunk,
+        ) != 0
+        {
+            let _ = handle_close(copy_handle);
+            return None;
+        }
+        written += chunk;
+    }
+    let alias = handle_duplicate(copy_handle, Rights::READ | Rights::TRANSFER);
+    let _ = handle_close(copy_handle);
+    if alias == 0 || alias == u64::MAX {
+        return None;
+    }
+    Some((
+        Transfer {
+            total: total as u32,
+            checksum: checksum(bytes),
+        },
+        Handle(alias as u32),
+    ))
 }
 
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
@@ -1825,6 +1935,13 @@ extern "C" fn sora_main(
                         channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
                         channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
                         bootstrap_display_probe(srv, res, bootinfo.board_id(), fb.is_plausible());
+                        bootstrap_display_topology(
+                            srv,
+                            Handle(dtb_vmo as u32),
+                            bootinfo.platform.dtb,
+                            bootinfo.board_id(),
+                            fb.is_plausible(),
+                        );
                         let graphics_enabled = kumo_graphics::band(fb.width, fb.height).is_some();
                         let graphics = bootstrap_graphics(srv, graphics_enabled);
                         if run_elf(

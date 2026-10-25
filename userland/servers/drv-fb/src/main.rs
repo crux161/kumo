@@ -2,20 +2,21 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j559
 //j567
 //j568
 //j569
 //j597
+//j598
 
 mod display_probe;
+mod display_topology;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
-use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
+use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
-    channel_read, channel_read_with_handle, framebuffer_claim, handle_koid, port_bind, port_create,
-    port_wait, resource_mint_mmio, vmar_map, vmo_create,
+    channel_read, channel_read_with_handle, framebuffer_claim, handle_duplicate, handle_koid,
+    port_bind, port_create, port_wait, resource_mint_mmio, vmar_map, vmo_create,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
@@ -132,6 +133,12 @@ extern "C" fn main(
         .get(..power_len as usize)
         .and_then(drv_fb::rk3588::Power::decode);
     let (_, display_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle. The
+    // record is fixed-size on every board; an absent copy arrives as Handle(0). — TIMBERDOODLE
+    let (topology_len, topology_raw) =
+        channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let topology_transfer =
+        drv_fb::dtb_topology::Transfer::decode(buf.get(..topology_len as usize).unwrap_or(&[]));
 
     // Optional graphics lanes: one private channel and one read-only ordinary VMO per
     // server-owned view. Sora always sends one G record per view; Handle(0) disables that
@@ -174,7 +181,27 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
+    // D0b: duplicate the VOP Resource before D0a's report consumes it. The duplicate carries
+    // only the READ|WRITE the original already held; no new authority and no second mint path.
+    // — TIMBERDOODLE
+    let topology_vop = if display_raw != 0 {
+        let duplicated = handle_duplicate(Handle(display_raw as u32), Rights::READ | Rights::WRITE);
+        if duplicated == 0 || duplicated == u64::MAX {
+            Handle(0)
+        } else {
+            Handle(duplicated as u32)
+        }
+    } else {
+        Handle(0)
+    };
     display_probe::report(bootinfo, power, Handle(display_raw as u32));
+    display_topology::report(
+        bootinfo,
+        power,
+        topology_vop,
+        topology_transfer,
+        Handle(topology_raw as u32),
+    );
 
     let fb_phys = bootinfo.framebuffer.phys;
     let fb_len = bootinfo.framebuffer.len;
