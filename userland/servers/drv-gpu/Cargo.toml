@@ -1,4 +1,5 @@
 #j572
+#j591
 [package]
 name = "drv-gpu"
 authors.workspace = true
@@ -19,6 +20,7 @@ doctest = false
 
 [dependencies]
 kumo-abi.workspace = true
+kumo-graphics = { path = "../../../lib/kumo-graphics" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 kumo-rt = { path = "../../kumo-rt" }

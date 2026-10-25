@@ -1,12 +1,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j586
 //j587
 //j588
 //j589
 //j590
+//j591
 
-//! G1b–G5a: power, identity, reset, the first MMU state and the CSF firmware image for the
+//! G1b–G5b: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
 //! DevicePowerUp is idempotent. The driver probes identity, soft-resets the GPU, powers the L2,
 //! builds address space 0 in contiguous DMA memory. G3a parses the vendored CSF image; G3b maps
@@ -16,6 +16,7 @@
 //! job the way panthor does (§10.6) and counts completions in the queue's sync object (§11.4).
 //! G4d waits for each job on the JOB interrupt and handles it in §11.5's order. G5a paints a
 //! test pattern with the command stream alone and checks it against a CPU reference.
+//! G5b presents it in one of drv-fb's views (DESIGN/019).
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
@@ -2488,6 +2489,41 @@ pub fn check_paint(mut read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
 /// The reference image's checksum, for the boot log beside the measured one.
 pub fn paint_reference_checksum() -> u32 {
     check_paint(paint_pixel).checksum
+}
+
+// ---- G5b: presenting the painted view through drv-fb (DESIGN/019) ----
+
+/// drv-gpu's bootstrap channel, its x1. Sora queues the firmware's initrd handle first. Once
+/// drv-fb's views exist, on a board with the GPU power unit, it sends view [`GPU_VIEW`]'s
+/// presentation channel and surface VMO, then closes its end; elsewhere it only closes.
+pub const BOOTSTRAP_FIRMWARE: u8 = b'f';
+pub const BOOTSTRAP_VIEW_CHANNEL: u8 = b'v';
+pub const BOOTSTRAP_VIEW_SURFACE: u8 = b's';
+/// The band's second well (DESIGN/019 F1a); Sora keeps the first for gfx-demo and gfx-client.
+pub const GPU_VIEW: usize = 1;
+
+/// The painted target as DESIGN/019 describes a surface: linear XRGB8888, no padding.
+pub const PAINT_SURFACE: kumo_graphics::Surface = kumo_graphics::Surface {
+    width: PAINT_WIDTH,
+    height: PAINT_HEIGHT,
+    stride: PAINT_WIDTH,
+    format: kumo_graphics::XRGB8888,
+};
+
+/// The surface VMO is written in the VmoWrite syscall's 256-byte chunks (DESIGN/019 F0): 64
+/// pixels of one row.
+pub const SURFACE_CHUNK_BYTES: usize = 256;
+const SURFACE_CHUNK_PIXELS: u32 = SURFACE_CHUNK_BYTES as u32 / 4;
+
+/// Every chunk of the painted surface as (byte offset, first pixel's x, y), row-major. The same
+/// offset addresses the GPU target and the surface VMO, since neither has padding.
+pub fn surface_chunks() -> impl Iterator<Item = (u64, u32, u32)> {
+    (0..PAINT_HEIGHT).flat_map(|y| {
+        (0..PAINT_WIDTH / SURFACE_CHUNK_PIXELS).map(move |chunk| {
+            let x = chunk * SURFACE_CHUNK_PIXELS;
+            (u64::from(y * PAINT_WIDTH + x) * 4, x, y)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -5177,5 +5213,55 @@ mod g5a_tests {
         let poison = check_paint(|_, _| POISON);
         assert_eq!(poison.mismatches, PAINT_WIDTH * PAINT_HEIGHT);
         assert_eq!(poison.first, Some((0, 0, POISON, 0x00FF_0000)));
+    }
+}
+
+#[cfg(test)]
+mod g5b_tests {
+    use super::*;
+    use kumo_graphics::{Present, VIEW_COUNT, VIEW_HEIGHT, VIEW_WIDTH};
+
+    #[test]
+    fn the_painted_surface_is_exactly_one_view_and_fits_the_grant() {
+        assert_eq!(
+            (PAINT_SURFACE.width, PAINT_SURFACE.height),
+            (VIEW_WIDTH, VIEW_HEIGHT)
+        );
+        assert_eq!(PAINT_SURFACE.byte_len(), Some(PAINT_BYTES as usize));
+        assert!(PAINT_SURFACE.fits(kumo_graphics::SURFACE_BYTES));
+        assert!(GPU_VIEW < VIEW_COUNT);
+    }
+
+    #[test]
+    fn the_chunks_tile_the_surface_in_order_without_gaps() {
+        let mut expected = 0u64;
+        let mut count = 0;
+        for (offset, x, y) in surface_chunks() {
+            assert_eq!(offset, expected);
+            assert_eq!(offset, u64::from(y * PAINT_WIDTH + x) * 4);
+            assert_eq!(x % 64, 0);
+            expected += SURFACE_CHUNK_BYTES as u64;
+            count += 1;
+        }
+        assert_eq!(count, 512);
+        assert_eq!(expected, PAINT_BYTES);
+    }
+
+    #[test]
+    fn the_present_request_round_trips_through_the_contract() {
+        let frame = Present {
+            sequence: 1,
+            surface: PAINT_SURFACE,
+        };
+        assert_eq!(Present::decode(&frame.encode()), Some(frame));
+        let tags = [
+            BOOTSTRAP_FIRMWARE,
+            BOOTSTRAP_VIEW_CHANNEL,
+            BOOTSTRAP_VIEW_SURFACE,
+        ];
+        assert!(tags
+            .iter()
+            .enumerate()
+            .all(|(i, a)| tags[i + 1..].iter().all(|b| a != b)));
     }
 }

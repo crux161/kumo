@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j586
 //j587
 //j588
 //j589
 //j590
+//j591
 
 use core::fmt::{self, Write};
 use drv_gpu::{
@@ -15,18 +15,21 @@ use drv_gpu::{
     map_range, mcu_boot, mmu_info, mmu_rawstat, paint_reference_checksum, paint_stream, power_l2,
     probe, program_group, program_queue, publish_insert, queue_extract, queue_insert, quiet_mmu,
     read_cs_control, read_cs_status, read_csg_control, read_fault_as, ring_offset,
-    shared_region_contains, soft_reset, start_group, store_stream, wake_stream, write_job_words,
-    ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory,
-    GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
-    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
-    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
-    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF,
-    PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_WIDTH, SYNC_STATUS_OFFSET,
+    shared_region_contains, soft_reset, start_group, store_stream, surface_chunks, wake_stream,
+    write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl,
+    Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo,
+    PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena,
+    TableMemory, APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL,
+    BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, GPU_VIEW,
+    JOB_IRQ_GLOBAL_IF, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
+    PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
 };
 use kumo_abi::{sys::log_level, DevicePowerStatus, Errno, Handle, Status, VmarFlags};
+use kumo_graphics::{Present, Reply, Status as PresentStatus, REPLY_LEN};
 
 kumo_rt::entry!(main);
 
@@ -583,7 +586,7 @@ fn report_stream_stall(
 /// G3b: after the reset, read the vendored firmware out of the initrd, map its sections into
 /// address space 0 with their own flags, boot the MCU, and validate the global interface the
 /// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
-fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
+fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_present: u64) -> u8 {
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
             log_level::NOTICE,
@@ -1670,6 +1673,8 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     PAINT_JOB, seqno, flush_ids[0], flush_ids[1], flush_ids[2]
                 ),
             );
+            // G5b: only a pixel-exact paint reaches here, so the view never shows a bad image.
+            present_paint(bootstrap, paint.va);
 
             log(
                 log_level::INFO,
@@ -1685,6 +1690,90 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
             let _ = soft_reset(device);
             1
         }
+    }
+}
+
+/// G5b: take view [`GPU_VIEW`] from the bootstrap channel, copy the painted target into its
+/// surface and present it through drv-fb, the DESIGN/019 F0 contract `gfx-client` proved (J569).
+/// The target is Normal-NC and the paint already completed and cleaned the caches, so volatile
+/// reads see the GPU's pixels (§13). The view's handles stay open: the view remains the GPU's
+/// for the life of the boot. — TIMBERDOODLE
+fn present_paint(bootstrap: Handle, paint_va: u64) {
+    let mut tag = [0u8; 1];
+    let (len, channel) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
+    let Some(channel) =
+        valid_handle(channel).filter(|_| len == 1 && tag[0] == BOOTSTRAP_VIEW_CHANNEL)
+    else {
+        log(
+            log_level::NOTICE,
+            format_args!("drv-gpu: no view granted; the painted target stays offscreen\n"),
+        );
+        return;
+    };
+    let (len, surface) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
+    let Some(surface) =
+        valid_handle(surface).filter(|_| len == 1 && tag[0] == BOOTSTRAP_VIEW_SURFACE)
+    else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: view {} arrived without its surface\n", GPU_VIEW),
+        );
+        return;
+    };
+    let _ = kumo_rt::handle_close(bootstrap);
+    for (offset, _, _) in surface_chunks() {
+        let mut bytes = [0u8; SURFACE_CHUNK_BYTES];
+        for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+            // SAFETY: a word of the 256x128 target; `surface_chunks` stays inside it.
+            let value =
+                unsafe { ((paint_va + offset + index as u64 * 4) as *const u32).read_volatile() };
+            pixel.copy_from_slice(&value.to_le_bytes());
+        }
+        if kumo_rt::vmo_write(surface, offset, bytes.as_ptr(), bytes.len()) != 0 {
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: view {} surface write failed at 0x{:x}\n",
+                    GPU_VIEW, offset
+                ),
+            );
+            return;
+        }
+    }
+    let sequence = 1;
+    let frame = Present {
+        sequence,
+        surface: PAINT_SURFACE,
+    }
+    .encode();
+    if kumo_rt::channel_write(channel, frame.as_ptr(), frame.len()) != 0 {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: view {} present request failed\n", GPU_VIEW),
+        );
+        return;
+    }
+    let mut reply = [0u8; REPLY_LEN + 1];
+    let len = kumo_rt::channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+    match reply.get(..len).and_then(Reply::decode) {
+        Some(reply) if reply.sequence == sequence && reply.status == PresentStatus::Copied => log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: view {} on screen: drv-fb copied the GPU-painted {}x{} surface (software GOP)\n",
+                GPU_VIEW, PAINT_WIDTH, PAINT_HEIGHT
+            ),
+        ),
+        Some(reply) => log(
+            log_level::ERR,
+            format_args!(
+                "drv-gpu: drv-fb answered sequence {} with {:?}\n",
+                reply.sequence, reply.status
+            ),
+        ),
+        None => log(
+            log_level::ERR,
+            format_args!("drv-gpu: no reply from drv-fb for view {}\n", GPU_VIEW),
+        ),
     }
 }
 
@@ -1705,7 +1794,20 @@ fn park() -> ! {
 }
 
 #[no_mangle]
-extern "C" fn main(resource: u64, initrd: u64) -> ! {
+extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
+    // G5b: x1 is a bootstrap channel. Its first message carries the initrd handle the firmware
+    // is read from (x1 itself until J590); the view arrives later on the same channel.
+    let bootstrap = Handle(bootstrap as u32);
+    let mut tag = [0u8; 1];
+    let (len, initrd) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
+    let Some(initrd) = valid_handle(initrd).filter(|_| len == 1 && tag[0] == BOOTSTRAP_FIRMWARE)
+    else {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: no firmware handle on the bootstrap channel\n"),
+        );
+        kumo_rt::process_exit(1)
+    };
     let mut device = Device {
         resource: Handle(resource as u32),
         interrupt: None,
@@ -1736,7 +1838,7 @@ extern "C" fn main(resource: u64, initrd: u64) -> ! {
                     identity.shader_present
                 ),
             );
-            run_mali(&mut device, Handle(initrd as u32), identity.shader_present)
+            run_mali(&mut device, initrd, bootstrap, identity.shader_present)
         }
         Err(ProbeError::PowerUp(status)) if status == Errno::NotSupported.status() => {
             log(

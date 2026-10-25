@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j567
 //j568
 //j569
 //j572
 //j579
+//j591
 
 extern crate alloc;
 
@@ -76,6 +76,49 @@ static GRAPHICS_VMO: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 static GRAPHICS_SEQUENCE: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(1), AtomicU32::new(1)];
+
+/// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
+/// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
+/// `drv_gpu::GPU_VIEW` has been handed over; otherwise it is closed so drv-gpu stops waiting.
+static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
+
+/// Hand one view's grant (its presentation channel and writable surface) to drv-gpu, which
+/// paints and presents it. Returns false, leaving the grant with Sora, when no GPU driver is
+/// waiting or the first send fails; a refused send leaves the handle in Sora's table.
+/// — TIMBERDOODLE
+fn hand_view_to_gpu(view: usize, channel: Handle, vmo: Handle) -> bool {
+    let sender = Handle(GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed));
+    if sender.0 == 0 {
+        return false;
+    }
+    let tag = [drv_gpu::BOOTSTRAP_VIEW_CHANNEL];
+    if channel_write_with_handle(sender, tag.as_ptr(), 1, channel) != 0 {
+        let _ = handle_close(sender);
+        log(b"drv-gpu: view handoff refused; Sora keeps the view\n");
+        return false;
+    }
+    let tag = [drv_gpu::BOOTSTRAP_VIEW_SURFACE];
+    if channel_write_with_handle(sender, tag.as_ptr(), 1, vmo) != 0 {
+        // The channel already moved; without its surface the view cannot be painted.
+        let _ = handle_close(vmo);
+        log(b"drv-gpu: view surface handoff failed\n");
+    } else {
+        log(b"drv-gpu: view ");
+        log(&[b'0' + view as u8]);
+        log(b" handed to the GPU driver\n");
+    }
+    let _ = handle_close(sender);
+    true
+}
+
+/// Close drv-gpu's bootstrap sender when no view went to it (no framebuffer, no band), so its
+/// read ends with PeerClosed instead of waiting for the rest of the boot.
+fn release_gpu_bootstrap() {
+    let sender = GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed);
+    if sender != 0 {
+        let _ = handle_close(Handle(sender));
+    }
+}
 
 /// Queue each view's surface grant on its own graphics channel before handing the server
 /// ends to drv-fb. READ permits a read-only VmarMap in the current ABI; TRANSFER delivers
@@ -737,15 +780,37 @@ fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
         );
         return;
     }
-    // G3b: the driver reads the vendored firmware from the initrd itself. Grant it read-only and
-    // transfer it beside the Resource in x1; `find_entry` needs only the header and entry table,
-    // and the payload is copied in 256-byte VmoRead chunks.
+    // G5b: a view goes to the GPU driver only where the GPU's power unit exists. QEMU has none,
+    // and its drv-gpu exits as soon as DevicePowerUp answers NotSupported, so a view handed to it
+    // could die with it.
+    let mut power = kumo_abi::DevicePowerStatus::default();
+    let has_gpu =
+        kumo_rt::device_power_status(Handle(resource as u32), drv_gpu::APERTURE_BASE, &mut power)
+            == 0;
+    // G3b: the driver reads the vendored firmware from the initrd itself, read-only;
+    // `find_entry` needs only the header and entry table, and the payload is copied in 256-byte
+    // VmoRead chunks. G5b: x1 is now a bootstrap channel, the initrd grant its first message, so
+    // the view can follow on the same channel once drv-fb has made it.
     let firmware = handle_duplicate(initrd, Rights::READ | Rights::TRANSFER);
-    if firmware == u64::MAX {
-        let _ = handle_close(Handle(resource as u32));
+    let (sender, bootstrap) = channel_create_pair();
+    let valid = |raw| raw != 0 && raw != u64::MAX;
+    let tag = [drv_gpu::BOOTSTRAP_FIRMWARE];
+    if ![firmware, sender, bootstrap].into_iter().all(valid)
+        || channel_write_with_handle(
+            Handle(sender as u32),
+            tag.as_ptr(),
+            1,
+            Handle(firmware as u32),
+        ) != 0
+    {
+        for raw in [resource, firmware, sender, bootstrap] {
+            if valid(raw) {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
         let _ = kumo_rt::log_write(
             kumo_abi::sys::log_level::ERR,
-            b"drv-gpu: initrd grant failed\n",
+            b"drv-gpu: bootstrap setup failed\n",
         );
         return;
     }
@@ -753,14 +818,22 @@ fn launch_gpu_identity(initrd: Handle, root_resource: Handle) {
         initrd,
         DRV_GPU_PATH.as_bytes(),
         resource,
-        firmware,
+        bootstrap,
         (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
             .bits(),
         b"drv-gpu",
     ) {
-        let _ = handle_close(Handle(resource as u32));
-        let _ = handle_close(Handle(firmware as u32));
+        // The firmware grant sits queued in the channel and goes with it.
+        for raw in [resource, sender, bootstrap] {
+            let _ = handle_close(Handle(raw as u32));
+        }
         let _ = kumo_rt::log_write(kumo_abi::sys::log_level::ERR, b"drv-gpu: launch failed\n");
+        return;
+    }
+    if has_gpu {
+        GPU_VIEW_BOOTSTRAP.store(sender as u32, Ordering::Relaxed);
+    } else {
+        let _ = handle_close(Handle(sender as u32));
     }
 }
 
@@ -1675,6 +1748,11 @@ extern "C" fn sora_main(
                             log(b"drv-fb: run ok\n");
                             for (view, grant) in graphics.iter().enumerate() {
                                 if let Some((channel, vmo)) = grant {
+                                    if view == drv_gpu::GPU_VIEW
+                                        && hand_view_to_gpu(view, *channel, *vmo)
+                                    {
+                                        continue;
+                                    }
                                     GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
                                     GRAPHICS_VMO[view].store(vmo.0, Ordering::Relaxed);
                                 }
@@ -2400,6 +2478,7 @@ extern "C" fn sora_main(
     // either console or block has data. Source koid matching dispatches to
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
+    release_gpu_bootstrap();
     log(b"sora: serve setup\n");
     let port_h = port_create();
     let console_koid = handle_koid(console);
