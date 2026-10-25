@@ -1,5 +1,6 @@
 //j597
 //j601
+//j611
 
 //! D0a live adapter: read-only mappings and serial evidence; no device programming.
 
@@ -61,13 +62,16 @@ fn map(resource: Handle, base: u64, len: u64, va: u64) -> bool {
     ok
 }
 
-pub fn report(boot: &BootInfo, power: Option<Power>, vop: Handle) {
+/// Returns whether D0a's read-only VOP window (including the MMU page) is mapped at
+/// `VOP_D0A`; D1b reads the display IOMMU's interrupt registers through it (J611).
+pub fn report(boot: &BootInfo, power: Option<Power>, vop: Handle) -> bool {
+    let mut mapped = false;
     if rk3588::eligible(
         boot.board_id(),
         boot.has_framebuffer() && boot.framebuffer.is_plausible(),
     ) {
         if let Some(power) = power {
-            probe(boot, power, vop);
+            mapped = probe(boot, power, vop);
         } else {
             log(format_args!(
                 "display: no PMU observation; D0a probe skipped\n"
@@ -77,9 +81,10 @@ pub fn report(boot: &BootInfo, power: Option<Power>, vop: Handle) {
     if vop.0 != 0 {
         let _ = handle_close(vop);
     }
+    mapped
 }
 
-fn probe(boot: &BootInfo, power: Power, vop: Handle) {
+fn probe(boot: &BootInfo, power: Power, vop: Handle) -> bool {
     log(format_args!(
         "display: D0a read-only firmware scanout probe\n"
     ));
@@ -91,14 +96,14 @@ fn probe(boot: &BootInfo, power: Power, vop: Handle) {
         log(format_args!(
             "display: VOP down or bus idle; zero VOP reads\n"
         ));
-        return;
+        return false;
     }
     if !map(vop, rk3588::VOP_BASE, rk3588::VOP_LEN, VOP_D0A) {
         log(format_args!("display: VOP mapping failed; probe skipped\n"));
-        return;
+        return false;
     }
     let Some(snapshot) = Snapshot::read(power, &mut Registers) else {
-        return;
+        return true;
     };
     let s = snapshot.system;
     log(format_args!(
@@ -162,4 +167,5 @@ fn probe(boot: &BootInfo, power: Power, vop: Handle) {
             "display: D0a no unique progressive HDMI/GOP geometry match; raw snapshot retained\n"
         )),
     }
+    true
 }

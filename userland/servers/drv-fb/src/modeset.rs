@@ -2,6 +2,7 @@
 //j608
 //j609
 //j610
+//j611
 
 //! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
 //! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
@@ -19,9 +20,16 @@
 //! J610 adds D1a after R2: paint a KUMO-owned contiguous buffer, flip ESMART2 region0 to it at
 //! a frame start, hold it on the glass, then flip back to the GOP console buffer. Each flip's
 //! load is timed until VP2 consumes it; no interrupt is used yet. — TIMBERDOODLE
+//!
+//! J611 adds D1b after D1a: arm the VOP's interrupt (INTID 188) with VP2's frame start as its
+//! only source, count 120 frame starts on drv-fb's port and report their rate. — TIMBERDOODLE
+//! The retained VOP grant closes on every terminal path; the final delivery is completed only
+//! after the device source is disabled. — KESTREL
 
 use crate::phy_relock;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
+use drv_fb::probe_va::VOP_D0A;
 use drv_fb::probe_va::{TX_R1, VOP_R1};
 use drv_fb::rk3588::{self, Power};
 use drv_fb::rk3588_hdmi::{self, Tx, D0A_TIMING};
@@ -32,11 +40,12 @@ use drv_fb::rk3588_mode::{
     WORDS,
 };
 use drv_fb::rk3588_scanout as scanout;
+use drv_fb::rk3588_vblank as vblank;
 use drv_fb::PixelOrder;
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
 use kumo_rt::{
-    handle_close, handle_koid, port_bind, port_unbind, resource_mint_mmio, syscall_handle,
-    timer_create, vmar_map,
+    handle_close, handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind,
+    port_unbind, resource_mint_mmio, syscall_handle, timer_create, vmar_map,
 };
 
 struct Log {
@@ -157,6 +166,43 @@ enum Phase {
     R2Verify,
     /// D1a: the owned buffer is on the glass; the timer returns the console.
     D1Hold,
+    /// D1b: let the console drain the scanout diagnostics before arming the source.
+    D1bReady,
+    /// D1b: counting VP2 frame starts; the timer is the watchdog.
+    D1bCount,
+}
+
+/// What D1b needs from the earlier probes.
+#[derive(Clone, Copy)]
+pub struct Vblank {
+    /// The live DTB's VOP interrupt as D0b decoded it, or 0.
+    pub live_irq: u32,
+    /// Whether D0a's read-only VOP window (with the MMU page) is mapped at `VOP_D0A`.
+    pub mmu_view: bool,
+}
+
+/// Own the grant across timer transitions, including failures before D1b. — KESTREL
+struct VopResource(Handle);
+
+// A buffer inside Pending multiplies across phase moves and exhausts drv-fb's 16 KiB stack.
+// This boot diagnostic claims one static sample buffer exactly once; the atomic prevents
+// aliasing even if a future caller attempts a second sequence. No heap or DMA is needed.
+// — KESTREL
+static SAMPLES_TAKEN: AtomicBool = AtomicBool::new(false);
+static mut INTERVALS: [u64; vblank::FRAMES as usize - 1] = [0; vblank::FRAMES as usize - 1];
+
+fn take_samples() -> Option<&'static mut [u64; vblank::FRAMES as usize - 1]> {
+    if SAMPLES_TAKEN.swap(true, Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: the claim can succeed only once and the reference is moved with Pending.
+    Some(unsafe { &mut *core::ptr::addr_of_mut!(INTERVALS) })
+}
+
+impl Drop for VopResource {
+    fn drop(&mut self) {
+        close(self.0);
+    }
 }
 
 /// R1 in flight between port wakes.
@@ -176,6 +222,31 @@ pub struct Pending {
     pixel_order: PixelOrder,
     /// D1a's buffer handle, kept open while the VOP may scan it.
     owned: Handle,
+    /// The VOP window Resource, kept until D1b creates its interrupt from it.
+    vop: VopResource,
+    vblank: Vblank,
+    /// D1b's interrupt object and its koid, once armed.
+    irq: Handle,
+    irq_source: u64,
+    meter: vblank::Meter,
+    intervals: Option<&'static mut [u64; vblank::FRAMES as usize - 1]>,
+}
+
+impl Pending {
+    /// Whether a port wake belongs to R1-D1b: its timer, or D1b's interrupt.
+    pub fn owns(&self, source: Handle) -> bool {
+        Handle(self.source as u32) == source
+            || (self.irq.0 != 0 && Handle(self.irq_source as u32) == source)
+    }
+}
+
+/// Route a wake that [`Pending::owns`]: D1b's interrupt, or the phase timer.
+pub fn wake(pending: Pending, source: Handle) -> Option<Pending> {
+    if pending.irq.0 != 0 && Handle(pending.irq_source as u32) == source {
+        on_vblank(pending)
+    } else {
+        advance(pending)
+    }
 }
 
 fn arm(port: Handle, ms: u64) -> Option<(Handle, u64)> {
@@ -195,8 +266,8 @@ fn disarm(port: Handle, timer: Handle) {
 }
 
 /// Blank HDMI0 and scrub the VP2/ESMART2 program, when R0's five expectations all matched,
-/// and arm the dwell timer on `port`. Both handles are closed on every path. Returns the
-/// work left for [`advance`].
+/// and arm the dwell timer on `port`. Consumes both grants, retaining the VOP grant while
+/// work remains for [`wake`].
 pub fn start(
     boot: &BootInfo,
     power: Option<Power>,
@@ -204,6 +275,7 @@ pub fn start(
     vop: Handle,
     tx: Handle,
     grants: phy_relock::Grants,
+    vblank: Vblank,
     port: Handle,
 ) -> Option<Pending> {
     let eligible = rk3588::eligible(
@@ -215,7 +287,7 @@ pub fn start(
         match power {
             Some(power) if power.vop_accessible() && rk3588_hdmi::hdmi_accessible(power) => {
                 if r0_matched {
-                    pending = begin(boot, vop, tx, grants, power, port);
+                    pending = begin(boot, vop, tx, grants, vblank, power, port);
                 } else {
                     log(format_args!(
                         "display: R1 skipped: R0's shared state did not match 5/5\n"
@@ -227,10 +299,12 @@ pub fn start(
             )),
         }
     }
-    for handle in [vop, tx] {
-        if handle.0 != 0 {
-            let _ = handle_close(handle);
-        }
+    // The VOP Resource stays open in `Pending` for D1b's interrupt; otherwise close it.
+    if pending.is_none() && vop.0 != 0 {
+        let _ = handle_close(vop);
+    }
+    if tx.0 != 0 {
+        let _ = handle_close(tx);
     }
     pending
 }
@@ -240,6 +314,7 @@ fn begin(
     vop: Handle,
     tx: Handle,
     grants: phy_relock::Grants,
+    vblank: Vblank,
     power: Power,
     port: Handle,
 ) -> Option<Pending> {
@@ -348,6 +423,12 @@ fn begin(
         grants,
         pixel_order,
         owned: Handle(0),
+        vop: VopResource(vop),
+        vblank,
+        irq: Handle(0),
+        irq_source: 0,
+        meter: vblank::Meter::default(),
+        intervals: None,
     })
 }
 
@@ -489,9 +570,202 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             None
         }
         Phase::D1Hold => {
-            d1a_return(&mut device, &pending);
+            if d1a_return(&mut device, &pending) {
+                // Console scrolling can exceed a frame; our own diagnostics must drain before
+                // measuring deliveries on the same event loop. The wait uses the port. — KESTREL
+                log(format_args!(
+                    "display: D1b waiting {} ms for console diagnostics to drain before counting {} VP2 frame starts on INTID {}\n",
+                    vblank::SETTLE_MS, vblank::FRAMES, rk3588::VOP_INTID
+                ));
+                match arm(pending.port, vblank::SETTLE_MS) {
+                    Some((timer, source)) => Some(Pending {
+                        phase: Phase::D1bReady,
+                        timer,
+                        source,
+                        ..pending
+                    }),
+                    None => {
+                        error(format_args!(
+                            "display: D1b settle timer unavailable; nothing armed\n"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Phase::D1bReady => d1b_start(pending, &mut device),
+        Phase::D1bCount => {
+            // The watchdog fired before the frames arrived; the timer is already disarmed.
+            d1b_finish(pending, &mut device, true);
             None
         }
+    }
+}
+
+fn close(handle: Handle) {
+    if handle.0 != 0 {
+        let _ = handle_close(handle);
+    }
+}
+
+/// D1b: arm the VOP interrupt with VP2's frame start as its only source and count frames.
+fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
+    let intid = rk3588::VOP_INTID;
+    if pending.vblank.live_irq != intid {
+        log(format_args!(
+            "display: D1b skipped: live DTB VOP interrupt {} is not the granted INTID {}\n",
+            pending.vblank.live_irq, intid
+        ));
+        return None;
+    }
+    if !pending.vblank.mmu_view {
+        log(format_args!(
+            "display: D1b skipped: no read-only view of the display IOMMU's interrupt registers\n"
+        ));
+        return None;
+    }
+    // SAFETY: D0a mapped VOP_LEN (0x8000) bytes read-only at VOP_D0A; every offset read is
+    // inside the MMU page below that length.
+    let mmu = |offset: u32| unsafe {
+        assert!(u64::from(offset) + 4 <= rk3588::VOP_LEN);
+        core::ptr::read_volatile((VOP_D0A + u64::from(offset)) as *const u32)
+    };
+    if let Err(conflict) = vblank::preflight(device, mmu) {
+        log(format_args!(
+            "display: D1b refused, nothing armed: another source could drive the shared VOP line ({:?})\n",
+            conflict
+        ));
+        return None;
+    }
+    let Some(intervals) = take_samples() else {
+        error(format_args!(
+            "display: D1b sample buffer already claimed; nothing armed\n"
+        ));
+        return None;
+    };
+    let raw = interrupt_create(pending.vop.0, intid);
+    let Some(irq) = syscall_handle(raw) else {
+        error(format_args!(
+            "display: D1b interrupt {} unavailable (errno {})\n",
+            intid, raw as u32 as i32
+        ));
+        return None;
+    };
+    let koid = handle_koid(irq);
+    if koid == u64::MAX || port_bind(pending.port, irq) != 0 {
+        error(format_args!(
+            "display: D1b could not bind interrupt {}\n",
+            intid
+        ));
+        close(irq);
+        return None;
+    }
+    let Some((timer, source)) = arm(pending.port, vblank::WATCHDOG_MS) else {
+        let _ = port_unbind(pending.port, irq);
+        close(irq);
+        error(format_args!(
+            "display: D1b watchdog timer unavailable; disarmed\n"
+        ));
+        return None;
+    };
+    // A stale GIC delivery can race InterruptCreate's binding. Complete it while every
+    // device source is still off, then enable only after both port bindings exist. — KESTREL
+    let _ = interrupt_complete(irq);
+    vblank::enable(device);
+    // No console log between enable and finish: rendering it could coalesce frame starts
+    // while this same event loop is scrolling the console. — KESTREL
+    pending.irq = irq;
+    pending.irq_source = koid;
+    pending.meter = vblank::Meter::default();
+    pending.intervals = Some(intervals);
+    Some(Pending {
+        phase: Phase::D1bCount,
+        timer,
+        source,
+        ..pending
+    })
+}
+
+/// One D1b delivery: take it, clear the device's status, record it, then let the kernel unmask
+/// the line (DESIGN/016's order).
+fn on_vblank(mut pending: Pending) -> Option<Pending> {
+    let mut device = Device;
+    let _ = interrupt_wait(pending.irq);
+    let status = vblank::acknowledge(&mut device);
+    let now = kumo_rt::clock_get();
+    let previous = pending.meter.last_ns;
+    let count = pending.meter.count;
+    pending.meter.record(status, now);
+    if status & vblank::FS != 0 && count != 0 {
+        if let Some(sample) = pending
+            .intervals
+            .as_mut()
+            .and_then(|samples| samples.get_mut(count as usize - 1))
+        {
+            *sample = now.saturating_sub(previous);
+        }
+    }
+    if pending.meter.done() {
+        disarm(pending.port, pending.timer);
+        d1b_finish(pending, &mut device, false);
+        return None;
+    }
+    let _ = interrupt_complete(pending.irq);
+    Some(pending)
+}
+
+fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) {
+    vblank::disable(device);
+    let _ = vblank::acknowledge(device);
+    let _ = interrupt_complete(pending.irq);
+    let _ = port_unbind(pending.port, pending.irq);
+    close(pending.irq);
+    let meter = pending.meter;
+    let mode_mhz = vblank::mode_millihertz(&DMT_1600X900_60_RB);
+    let delivered = meter.millihertz().unwrap_or(0);
+    let cadence = pending.intervals.as_mut().and_then(|samples| {
+        vblank::cadence(&mut samples[..meter.count.saturating_sub(1) as usize])
+    });
+    match cadence {
+        Some(rate) if !timed_out && meter.done() && rate.credible() && vblank::matches(rate.millihertz, mode_mhz) => log(format_args!(
+            "display: D1b vblank: {} IRQs, median {}.{:03} Hz (mode {}.{:03}; {}/{} stable), delivery {}.{:03} Hz, interval min/max {}/{} us, spurious {}; interrupt disarmed; D1b complete\n",
+            meter.count,
+            rate.millihertz / 1_000,
+            rate.millihertz % 1_000,
+            mode_mhz / 1_000,
+            mode_mhz % 1_000,
+            rate.stable,
+            rate.total,
+            delivered / 1_000,
+            delivered % 1_000,
+            meter.min_interval_ns / 1_000,
+            meter.max_interval_ns / 1_000,
+            meter.spurious
+        )),
+        Some(rate) => error(format_args!(
+            "display: D1b DISAGREEMENT: {} IRQs{}, median {}.{:03} Hz against mode {}.{:03}, {}/{} stable, delivery {}.{:03} Hz (interval min/max {}/{} us, spurious {}); disarmed\n",
+            meter.count,
+            if timed_out { " before the watchdog" } else { "" },
+            rate.millihertz / 1_000,
+            rate.millihertz % 1_000,
+            mode_mhz / 1_000,
+            mode_mhz % 1_000,
+            rate.stable,
+            rate.total,
+            delivered / 1_000,
+            delivered % 1_000,
+            meter.min_interval_ns / 1_000,
+            meter.max_interval_ns / 1_000,
+            meter.spurious
+        )),
+        None => error(format_args!(
+            "display: D1b FAILED: {} frame-start interrupt(s) within {} ms (spurious {}); interrupt disarmed\n",
+            meter.count,
+            vblank::WATCHDOG_MS,
+            meter.spurious
+        )),
     }
 }
 
@@ -576,7 +850,7 @@ fn d1a_show(device: &mut Device, pending: &mut Pending) -> bool {
 }
 
 /// D1a: flip back to the GOP console buffer and confirm it is latched.
-fn d1a_return(device: &mut Device, pending: &Pending) {
+fn d1a_return(device: &mut Device, pending: &Pending) -> bool {
     let (gop, _) = scanout::target_scanout(&pending.program);
     for attempt in 0..2 {
         scanout::flip(device, gop);
@@ -588,13 +862,14 @@ fn d1a_return(device: &mut Device, pending: &Pending) {
                 ns / 1_000,
                 if attempt > 0 { " (after one retry)" } else { "" }
             ));
-            return;
+            return true;
         }
     }
     error(format_args!(
         "display: D1a FAILED to return to the GOP buffer; the owned buffer stays on the glass (handle {} kept)\n",
         pending.owned.0
     ));
+    false
 }
 
 fn next(pending: Pending, phase: Phase, ms: u64) -> Option<Pending> {

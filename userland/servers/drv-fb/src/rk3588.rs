@@ -1,4 +1,5 @@
 //j597
+//j611
 
 //! D0a: read-only discovery of firmware-owned RK3588 VOP2 scanout. Recovery class:
 //! soft-state; a fresh probe reconstructs this diagnostic snapshot. No mode is programmed.
@@ -8,6 +9,9 @@
 
 pub const VOP_BASE: u64 = 0xfdd9_0000;
 pub const VOP_LEN: u64 = 0x8000;
+/// VOP2's interrupt: GIC SPI 156, INTID 188, shared with the display IOMMU (DTB `interrupts`;
+/// D0b checks the live blob). D1b receives it with the VOP window (J611).
+pub const VOP_INTID: u32 = 188;
 pub const PMU_BASE: u64 = 0xfd8d_8000;
 pub const PMU_LEN: u64 = 0x1000;
 

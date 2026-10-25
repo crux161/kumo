@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j601
 //j605
 //j606
 //j607
 //j609
+//j611
 
 extern crate alloc;
 
@@ -928,17 +928,29 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     // D1 decides who owns the display IOMMU; the TX page is the one D0d reads. These are not
     // narrowed: drv-fb rebuilds the mode through them. CRU, PMU and GRF grants stay read-only.
     // — TIMBERDOODLE
+    // D1b (J611): the VOP window also carries the VOP's interrupt, INTID 188 (SPI 156), which
+    // it shares with the display IOMMU; drv-fb refuses to arm it unless every other source on
+    // that line is off. The TX page carries no interrupt. — TIMBERDOODLE
     let windows = [
         (
             power.is_some_and(Power::vop_accessible),
             VOP_BASE,
             drv_fb::rk3588_mode::VOP_WINDOW_LEN,
+            drv_fb::rk3588::VOP_INTID,
+            1,
         ),
-        (accessible, HDMI_BASE, drv_fb::rk3588_mode::TX_WINDOW_LEN),
+        (
+            accessible,
+            HDMI_BASE,
+            drv_fb::rk3588_mode::TX_WINDOW_LEN,
+            0,
+            0,
+        ),
     ];
-    for (tag, (allowed, base, len)) in [b"U", b"X"].iter().zip(windows) {
+    for (tag, (allowed, base, len, irq_base, irq_count)) in [b"U", b"X"].iter().zip(windows) {
         let grant = if allowed {
-            syscall_handle(resource_create_child(root, base, len, 0, 0)).unwrap_or(Handle(0))
+            syscall_handle(resource_create_child(root, base, len, irq_base, irq_count))
+                .unwrap_or(Handle(0))
         } else {
             Handle(0)
         };

@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j601
 //j605
 //j606
 //j607
 //j609
+//j611
 
 mod clock_probe;
 mod display_probe;
@@ -225,7 +225,7 @@ extern "C" fn main(
     } else {
         Handle(0)
     };
-    display_probe::report(bootinfo, power, Handle(display_raw as u32));
+    let vop_view_mapped = display_probe::report(bootinfo, power, Handle(display_raw as u32));
     let cru_mapped = clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
     let tx_mapped = hdmi_probe::report(
         bootinfo,
@@ -243,7 +243,7 @@ extern "C" fn main(
         Handle(vo1_grf_raw as u32),
         Handle(sys_grf_raw as u32),
     );
-    display_topology::report(
+    let live_vop_irq = display_topology::report(
         bootinfo,
         power,
         topology_vop,
@@ -481,15 +481,16 @@ extern "C" fn main(
             phy: Handle(phy_rw_raw as u32),
             grf: Handle(grf_rw_raw as u32),
         },
+        modeset::Vblank {
+            live_irq: live_vop_irq,
+            mmu_view: vop_view_mapped,
+        },
         port,
     );
     loop {
         let source = Handle(port_wait(port) as u32);
-        if r1
-            .as_ref()
-            .is_some_and(|pending| Handle(pending.source as u32) == source)
-        {
-            r1 = r1.take().and_then(modeset::advance);
+        if r1.as_ref().is_some_and(|pending| pending.owns(source)) {
+            r1 = r1.take().and_then(|pending| modeset::wake(pending, source));
             continue;
         }
         if source == console_source {

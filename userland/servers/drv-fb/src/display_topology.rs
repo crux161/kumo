@@ -1,5 +1,6 @@
 //j598
 //j601
+//j611
 
 //! D0b live adapter: map the supervisor's private live-DTB copy read-only, decode the RK3588
 //! display topology, and compare the tree's VP→HDMI routing with D0a's measured scanout.
@@ -105,18 +106,21 @@ fn map_vop(resource: Handle) -> bool {
 /// Entry point for the D0b record. `vop` is a private duplicate of D0a's VOP Resource so this
 /// comparison can re-read the scanout after `display_probe::report` closes the original. Both
 /// handles are consumed here. — TIMBERDOODLE
+/// Returns the live DTB's VOP interrupt (GIC INTID) when the blob was received intact and
+/// decoded, or 0; D1b arms its interrupt only when this equals the granted INTID (J611).
 pub fn report(
     boot: &BootInfo,
     power: Option<Power>,
     vop: Handle,
     transfer: Option<Transfer>,
     dtb: Handle,
-) {
+) -> u32 {
+    let mut vop_irq = 0;
     if rk3588::eligible(
         boot.board_id(),
         boot.has_framebuffer() && boot.framebuffer.is_plausible(),
     ) {
-        probe(boot, power, vop, transfer, dtb);
+        vop_irq = probe(boot, power, vop, transfer, dtb);
     }
     if vop.0 != 0 {
         let _ = handle_close(vop);
@@ -124,6 +128,7 @@ pub fn report(
     if dtb.0 != 0 {
         let _ = handle_close(dtb);
     }
+    vop_irq
 }
 
 fn probe(
@@ -132,24 +137,24 @@ fn probe(
     vop: Handle,
     transfer: Option<Transfer>,
     dtb: Handle,
-) {
+) -> u32 {
     let Some(transfer) = transfer else {
         log(format_args!(
             "display: D0b no live-DTB record; topology skipped\n"
         ));
-        return;
+        return 0;
     };
     if transfer.total == 0 {
         log(format_args!(
             "display: D0b live-DTB record empty; topology skipped\n"
         ));
-        return;
+        return 0;
     }
     if !map_dtb(dtb, u64::from(transfer.total)) {
         log(format_args!(
             "display: D0b live-DTB mapping failed; topology skipped\n"
         ));
-        return;
+        return 0;
     }
     // SAFETY: `map_dtb` mapped exactly this extent read-only at DTB_D0B; the slice borrows the
     // process VA for the rest of this function, which owns both the mapping and the decoder.
@@ -161,13 +166,13 @@ fn probe(
             "display: D0b live-DTB checksum got={:#018x} sent={:#018x}; topology skipped\n",
             checksum, transfer.checksum
         ));
-        return;
+        return 0;
     }
     let Some(topology) = dtb_topology::decode(bytes) else {
         log(format_args!(
             "display: D0b live DTB rejected: magic, extent or structure invalid\n"
         ));
-        return;
+        return 0;
     };
     log(format_args!(
         "display: D0b live-DTB topology: {} bytes checksum={:#018x}\n",
@@ -191,6 +196,7 @@ fn probe(
     ));
     log_checks(&topology);
     report_routing(boot, power, vop, &topology);
+    topology.vop_irq
 }
 
 fn log_vop(topology: &dtb_topology::Topology) {
