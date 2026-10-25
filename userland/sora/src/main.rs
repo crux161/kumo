@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j595
 //j597
 //j598
 //j599
 //j600
+//j601
 
 extern crate alloc;
 
@@ -28,9 +28,9 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
-    thread_create, thread_start, timer_create, vmar_map, vmo_create, vmo_read, vmo_write,
-    STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT,
-    STARTUP_TAG_TTY,
+    syscall_handle, thread_create, thread_start, timer_create, vmar_map, vmo_create, vmo_read,
+    vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN,
+    STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -808,8 +808,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
         // — TIMBERDOODLE
         const PMU_VA: u64 = 0x3500_0000;
         let raw = kumo_rt::resource_mint_mmio(root, PMU_BASE, PMU_LEN);
-        if raw != 0 && raw != u64::MAX {
-            let vmo = Handle(raw as u32);
+        if let Some(vmo) = syscall_handle(raw) {
             if vmar_map(Handle(0), vmo, 0, PMU_VA, PMU_LEN, VmarFlags::READ.0) == 0 {
                 vo1_request = unsafe { core::ptr::read_volatile((PMU_VA + 0x110) as *const u32) };
                 power = Some(Power::read(|offset| unsafe {
@@ -827,11 +826,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     } else {
         0
     };
-    let grant = if raw == u64::MAX {
-        Handle(0)
-    } else {
-        Handle(raw as u32)
-    };
+    let grant = syscall_handle(raw).unwrap_or(Handle(0));
     if channel_write_with_handle(bootstrap, b"D".as_ptr(), 1, grant) != 0 && grant.0 != 0 {
         let _ = handle_close(grant);
     }
@@ -851,13 +846,9 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
             CLOCK_PROBE_IRQ_COUNT,
         )
     } else {
-        u64::MAX
+        0
     };
-    let cru = if cru_raw == u64::MAX {
-        Handle(0)
-    } else {
-        Handle(cru_raw as u32)
-    };
+    let cru = syscall_handle(cru_raw).unwrap_or(Handle(0));
     let mut record = [0u8; GRANT_LEN];
     if cru.0 != 0 {
         record = Grant::expected().encode();
@@ -881,9 +872,8 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
             (PHY_GRF_BASE, PHY_GRF_LEN),
         ];
         for (slot, (base, len)) in grants.iter_mut().zip(apertures) {
-            let raw = resource_create_child(root, base, len, 0, 0);
-            if raw != u64::MAX {
-                *slot = Handle(raw as u32);
+            if let Some(handle) = syscall_handle(resource_create_child(root, base, len, 0, 0)) {
+                *slot = handle;
             }
         }
     }
@@ -970,14 +960,12 @@ fn copy_live_dtb(
     }
     let bytes =
         unsafe { core::slice::from_raw_parts((DTB_VA as usize + offset) as *const u8, total) };
-    let copy = vmo_create(total as u64);
-    if copy == 0 || copy == u64::MAX {
-        return None;
-    }
-    let copy_handle = Handle(copy as u32);
+    // The kernel moves at most `VMO_TRANSFER_MAX` bytes per VmoWrite and refuses more
+    // (J601), so chunk at the ABI cap rather than the page size.
+    let copy_handle = syscall_handle(vmo_create(total as u64))?;
     let mut written = 0usize;
     while written < total {
-        let chunk = (total - written).min(PAGE_SIZE as usize);
+        let chunk = (total - written).min(kumo_abi::sys::VMO_TRANSFER_MAX);
         if vmo_write(
             copy_handle,
             written as u64,
@@ -992,15 +980,13 @@ fn copy_live_dtb(
     }
     let alias = handle_duplicate(copy_handle, Rights::READ | Rights::TRANSFER);
     let _ = handle_close(copy_handle);
-    if alias == 0 || alias == u64::MAX {
-        return None;
-    }
+    let alias = syscall_handle(alias)?;
     Some((
         Transfer {
             total: total as u32,
             checksum: checksum(bytes),
         },
-        Handle(alias as u32),
+        alias,
     ))
 }
 

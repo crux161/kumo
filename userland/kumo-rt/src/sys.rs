@@ -1,8 +1,8 @@
-//j508
 //j512
 //j556
 //j559
 //j572
+//j601
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -183,6 +183,20 @@ pub fn handle_close(handle: Handle) -> Status {
 )))]
 pub fn handle_close(_handle: Handle) -> Status {
     kumo_abi::Errno::NotSupported.status()
+}
+
+/// Turn a handle-returning syscall's raw `u64` result into a handle. Failure comes back as
+/// a negative `Errno` widened to `u64` (`AccessDenied` is `0xffff_fffc`), never as
+/// `u64::MAX`, so every value above `i32::MAX` is a status, not a handle; handle tables are
+/// small and never number that high. `0` is `INVALID_HANDLE`. J601: the D0 probes compared
+/// only against `0`/`u64::MAX`, so a refused mint reached `VmarMap` as a bogus handle and the
+/// log said only "mapping failed". — TIMBERDOODLE
+pub const fn syscall_handle(raw: u64) -> Option<Handle> {
+    if raw != 0 && raw <= i32::MAX as u64 {
+        Some(Handle(raw as u32))
+    } else {
+        None
+    }
 }
 
 /// Duplicate a handle with a subset of its original rights.
@@ -996,6 +1010,20 @@ pub fn port_unbind(_port: Handle, _object: Handle) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syscall_handles_reject_widened_errno_statuses() {
+        assert_eq!(syscall_handle(1), Some(Handle(1)));
+        assert_eq!(syscall_handle(0), None);
+        assert_eq!(
+            syscall_handle(i32::MAX as u64),
+            Some(Handle(i32::MAX as u32))
+        );
+        assert_eq!(syscall_handle(0x8000_0000), None);
+        assert_eq!(syscall_handle(0xffff_fffe), None); // BadHandle = -2
+        assert_eq!(syscall_handle(0xffff_ffff), None); // InvalidArgs = -1
+        assert_eq!(syscall_handle(u64::MAX), None);
+    }
 
     #[test]
     fn startup_tags_install_explicit_handles_and_reject_unknown_tags() {

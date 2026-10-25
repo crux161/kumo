@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j547
 //j556
 //j559
 //j571
 //j595
+//j601
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1569,11 +1569,11 @@ fn dispatch_object_syscall(
     } else if num == Syscall::VmoRead as u64 {
         // A process reading a VMO it was handed (J186 capability-passing). Validate the
         // destination against the ISSUER's address space and resolve the handle in the
-        // ISSUER's table. Kernel `VmoRead` caps each read at 256 bytes.
+        // ISSUER's table. Kernel `VmoRead` caps each read at `VMO_TRANSFER_MAX` bytes.
         let vmo = Handle(r[0] as u32);
         let offset = r[1];
         let user_buf = r[2];
-        let len = (r[3] as usize).min(256);
+        let len = (r[3] as usize).min(kumo_abi::sys::VMO_TRANSFER_MAX);
         if !user_range_ok(target, user_buf, len as u64) {
             r[0] = u64::MAX;
             return true;
@@ -1594,7 +1594,13 @@ fn dispatch_object_syscall(
         let vmo = Handle(r[0] as u32);
         let offset = r[1];
         let user_buf = r[2];
-        let len = (r[3] as usize).min(256);
+        let len = match vmo_write_len(r[3]) {
+            Ok(len) => len,
+            Err(error) => {
+                r[0] = error.status() as u32 as u64;
+                return true;
+            }
+        };
         if !user_range_ok(target, user_buf, len as u64) {
             r[0] = u64::MAX;
             return true;
@@ -2335,6 +2341,17 @@ fn build_recipe(initrd: &[u8]) -> Result<SoraRecipe, UsermodeError> {
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const MAX_DTB_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The byte count a `VmoWrite` call transfers. `VmoRead` keeps the historical 256-byte cap;
+/// an over-cap write is refused with `InvalidArgs` instead of silently truncated (J601: a
+/// 4096-byte chunk landed as its first 256 bytes, every call reported success, and the D0b
+/// live-DTB checksum failed on metal).
+fn vmo_write_len(requested: u64) -> Result<usize, Errno> {
+    if requested > kumo_abi::sys::VMO_TRANSFER_MAX as u64 {
+        return Err(Errno::InvalidArgs);
+    }
+    Ok(requested as usize)
+}
 
 fn dtb_backing_range(address: u64, total_size: u64) -> Option<(u64, u64)> {
     if address == 0 || !(40..=MAX_DTB_BYTES).contains(&total_size) {
@@ -3151,6 +3168,19 @@ mod tests {
         );
         assert_eq!(aarch64_leaf_phys(0x0000_0000_9123_4c03, va, 2), None);
         assert_eq!(aarch64_leaf_phys(0, va, 3), None);
+    }
+
+    #[test]
+    fn vmo_write_refuses_over_cap_transfers() {
+        use super::vmo_write_len;
+        use kumo_abi::sys::VMO_TRANSFER_MAX;
+        assert_eq!(vmo_write_len(0), Ok(0));
+        assert_eq!(vmo_write_len(VMO_TRANSFER_MAX as u64), Ok(VMO_TRANSFER_MAX));
+        assert_eq!(
+            vmo_write_len(VMO_TRANSFER_MAX as u64 + 1),
+            Err(Errno::InvalidArgs)
+        );
+        assert_eq!(vmo_write_len(u64::MAX), Err(Errno::InvalidArgs));
     }
 
     #[test]

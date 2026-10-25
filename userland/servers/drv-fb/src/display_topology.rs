@@ -1,4 +1,5 @@
 //j598
+//j601
 
 //! D0b live adapter: map the supervisor's private live-DTB copy read-only, decode the RK3588
 //! display topology, and compare the tree's VP→HDMI routing with D0a's measured scanout.
@@ -9,15 +10,11 @@
 
 use core::fmt::{self, Write};
 use drv_fb::dtb_topology::{self, Routing, Transfer};
+use drv_fb::probe_va::{DTB_D0B, VOP_D0B};
 use drv_fb::rk3588::{self, Power, ReadRegisters, Snapshot};
 use kumo_abi::{BootInfo, Handle, VmarFlags};
-use kumo_rt::{handle_close, resource_mint_mmio, vmar_map};
+use kumo_rt::{handle_close, resource_mint_mmio, syscall_handle, vmar_map};
 
-/// drv-fb's private VA windows. D0a owns 0x1501_0000 for its VOP observation, bootinfo sits at
-/// 0x1000_0000 and the framebuffer/shadow from 0x1100_0000, so both windows are free and do not
-/// overlap an existing mapping. The DTB copy is at most 16 MiB by admission. — TIMBERDOODLE
-const DTB_VA: u64 = 0x1600_0000;
-const VOP_VA: u64 = 0x1502_0000;
 const PAGE_SIZE: u64 = 4096;
 
 struct Log {
@@ -63,7 +60,7 @@ struct Registers;
 impl ReadRegisters for Registers {
     fn vop(&mut self, offset: u32) -> u32 {
         assert!(u64::from(offset) + 4 <= rk3588::VOP_LEN && offset % 4 == 0);
-        unsafe { core::ptr::read_volatile((VOP_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((VOP_D0B + u64::from(offset)) as *const u32) }
     }
 }
 
@@ -77,7 +74,7 @@ fn map_dtb(vmo: Handle, len: u64) -> bool {
     else {
         return false;
     };
-    vmar_map(Handle(0), vmo, 0, DTB_VA, mapped, VmarFlags::READ.0) == 0
+    vmar_map(Handle(0), vmo, 0, DTB_D0B, mapped, VmarFlags::READ.0) == 0
 }
 
 /// Mint and map the duplicate VOP Resource read-only, exactly as D0a does for its own probe.
@@ -86,15 +83,18 @@ fn map_vop(resource: Handle) -> bool {
         return false;
     }
     let raw = resource_mint_mmio(resource, rk3588::VOP_BASE, rk3588::VOP_LEN);
-    if raw == 0 || raw == u64::MAX {
+    let Some(vmo) = syscall_handle(raw) else {
+        log(format_args!(
+            "display: D0b VOP mint failed (errno {})\n",
+            raw as u32 as i32
+        ));
         return false;
-    }
-    let vmo = Handle(raw as u32);
+    };
     let mapped = vmar_map(
         Handle(0),
         vmo,
         0,
-        VOP_VA,
+        VOP_D0B,
         rk3588::VOP_LEN,
         VmarFlags::READ.0,
     ) == 0;
@@ -151,10 +151,10 @@ fn probe(
         ));
         return;
     }
-    // SAFETY: `map_dtb` mapped exactly this extent read-only at DTB_VA; the slice borrows the
+    // SAFETY: `map_dtb` mapped exactly this extent read-only at DTB_D0B; the slice borrows the
     // process VA for the rest of this function, which owns both the mapping and the decoder.
     let bytes =
-        unsafe { core::slice::from_raw_parts(DTB_VA as *const u8, transfer.total as usize) };
+        unsafe { core::slice::from_raw_parts(DTB_D0B as *const u8, transfer.total as usize) };
     let checksum = dtb_topology::checksum(bytes);
     if checksum != transfer.checksum {
         log(format_args!(

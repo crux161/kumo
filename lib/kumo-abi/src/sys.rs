@@ -1,8 +1,8 @@
-//j493
 //j556
 //j559
 //j565
 //j571
+//j601
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +347,11 @@ mod tests {
         assert_eq!(log_level::DEBUG, 7);
     }
 }
+
+/// The most bytes a single `VmoRead` or `VmoWrite` call moves. Callers chunk at this cap;
+/// the kernel refuses an over-cap `VmoWrite` with `InvalidArgs` instead of silently
+/// truncating it (J601).
+pub const VMO_TRANSFER_MAX: usize = 256;
 
 pub type Status = i32;
 

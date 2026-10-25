@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j569
 //j597
 //j598
 //j599
 //j600
+//j601
 
 mod clock_probe;
 mod display_probe;
@@ -18,7 +18,7 @@ use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
     channel_read, channel_read_with_handle, framebuffer_claim, handle_duplicate, handle_koid,
-    port_bind, port_create, port_wait, resource_mint_mmio, vmar_map, vmo_create,
+    port_bind, port_create, port_wait, resource_mint_mmio, syscall_handle, vmar_map, vmo_create,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
@@ -205,11 +205,7 @@ extern "C" fn main(
     // — TIMBERDOODLE
     let topology_vop = if display_raw != 0 {
         let duplicated = handle_duplicate(Handle(display_raw as u32), Rights::READ | Rights::WRITE);
-        if duplicated == 0 || duplicated == u64::MAX {
-            Handle(0)
-        } else {
-            Handle(duplicated as u32)
-        }
+        syscall_handle(duplicated).unwrap_or(Handle(0))
     } else {
         Handle(0)
     };

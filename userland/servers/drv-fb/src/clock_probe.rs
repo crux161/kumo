@@ -1,4 +1,5 @@
 //j599
+//j601
 
 //! D0c live adapter: one read-only CRU mapping, one fixed sample, one NOTICE
 //! inventory. There is no write path: [`Registers`] implements only
@@ -6,15 +7,13 @@
 //! carries no IRQs.
 
 use core::fmt::{self, Write};
+use drv_fb::probe_va::CRU_D0C;
 use drv_fb::rk3588_clock::{
     clock_name, decode, implied_ratio, parent_name, unknown_name, ClockId, ClockRecord, Grant,
     ImpliedRatio, Rate, ReadCru, Sample, CRU_LEN, FLAG_FRACTIONAL, KIND_PLL,
 };
 use kumo_abi::{Handle, VmarFlags};
-use kumo_rt::{handle_close, resource_mint_mmio, vmar_map};
-
-/// D0a maps the VOP at 0x1501_0000; the CRU span starts one 64 KiB slot later.
-const CRU_VA: u64 = 0x1502_0000;
+use kumo_rt::{handle_close, resource_mint_mmio, syscall_handle, vmar_map};
 
 struct Log {
     bytes: [u8; 384],
@@ -46,7 +45,7 @@ struct Registers;
 impl ReadCru for Registers {
     fn cru(&mut self, offset: u32) -> u32 {
         assert!(offset % 4 == 0 && u64::from(offset) + 4 <= CRU_LEN);
-        unsafe { core::ptr::read_volatile((CRU_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((CRU_D0C + u64::from(offset)) as *const u32) }
     }
 }
 
@@ -55,10 +54,13 @@ fn map(resource: Handle, base: u64, len: u64, va: u64) -> bool {
         return false;
     }
     let raw = resource_mint_mmio(resource, base, len);
-    if raw == 0 || raw == u64::MAX {
+    let Some(vmo) = syscall_handle(raw) else {
+        log(format_args!(
+            "display: CRU mint failed (errno {})\n",
+            raw as u32 as i32
+        ));
         return false;
-    }
-    let vmo = Handle(raw as u32);
+    };
     // Device memory is the default for an MMIO VMO; READ gives an EL0 read-only
     // mapping. The process never retains a writable mapping of the CRU.
     // — TIMBERDOODLE
@@ -155,7 +157,7 @@ pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) {
         resource,
         u64::from(grant.base),
         u64::from(grant.len),
-        CRU_VA,
+        CRU_D0C,
     ) {
         log(format_args!(
             "display: D0c CRU mapping failed; probe skipped\n"

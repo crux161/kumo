@@ -1,18 +1,16 @@
 //j600
+//j601
 
 //! D0d live adapter: read-only mappings of the HDMI0 TX, combo PHY and PHY GRF.
 //! No device write, no DDC/EDID transaction and no clock/PMU mutation exists here.
 //! — TIMBERDOODLE
 
 use core::fmt::{self, Write};
+use drv_fb::probe_va::{GRF_D0D, HDMI_D0D, PHY_D0D};
 use drv_fb::rk3588::{self, Power};
 use drv_fb::rk3588_hdmi::{self, Link, Output, Protocol, ReadRegisters, Snapshot};
 use kumo_abi::{BootInfo, Handle, VmarFlags};
-use kumo_rt::{handle_close, resource_mint_mmio, vmar_map};
-
-const HDMI_VA: u64 = 0x1502_0000;
-const PHY_VA: u64 = 0x1503_0000;
-const PHY_GRF_VA: u64 = 0x1504_0000;
+use kumo_rt::{handle_close, resource_mint_mmio, syscall_handle, vmar_map};
 
 struct Log {
     bytes: [u8; 384],
@@ -47,7 +45,7 @@ impl ReadRegisters for Registers {
             u64::from(offset) + 4 <= rk3588_hdmi::HDMI_LEN && offset % 4 == 0,
             "HDMI0 TX read outside the granted aperture"
         );
-        unsafe { core::ptr::read_volatile((HDMI_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((HDMI_D0D + u64::from(offset)) as *const u32) }
     }
 
     fn phy(&mut self, offset: u32) -> u32 {
@@ -55,7 +53,7 @@ impl ReadRegisters for Registers {
             u64::from(offset) + 4 <= rk3588_hdmi::PHY_LEN && offset % 4 == 0,
             "PHY0 read outside the granted aperture"
         );
-        unsafe { core::ptr::read_volatile((PHY_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((PHY_D0D + u64::from(offset)) as *const u32) }
     }
 
     fn grf(&mut self, offset: u32) -> u32 {
@@ -63,19 +61,22 @@ impl ReadRegisters for Registers {
             u64::from(offset) + 4 <= rk3588_hdmi::PHY_GRF_LEN && offset % 4 == 0,
             "PHY GRF read outside the granted aperture"
         );
-        unsafe { core::ptr::read_volatile((PHY_GRF_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((GRF_D0D + u64::from(offset)) as *const u32) }
     }
 }
 
-fn map(resource: Handle, base: u64, len: u64, map_len: u64, va: u64) -> bool {
+fn map(resource: Handle, base: u64, len: u64, map_len: u64, va: u64, label: &str) -> bool {
     if resource.0 == 0 {
         return false;
     }
     let raw = resource_mint_mmio(resource, base, len);
-    if raw == 0 || raw == u64::MAX {
+    let Some(vmo) = syscall_handle(raw) else {
+        log(format_args!(
+            "display: {} mint failed (errno {})\n",
+            label, raw as u32 as i32
+        ));
         return false;
-    }
-    let vmo = Handle(raw as u32);
+    };
     // Device memory is the default for an MMIO VMO; READ gives an EL0 read-only mapping.
     // The process never retains a writable mapping of these registers. — TIMBERDOODLE
     let ok = vmar_map(Handle(0), vmo, 0, va, map_len, VmarFlags::READ.0) == 0;
@@ -136,7 +137,8 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         rk3588_hdmi::HDMI_BASE,
         rk3588_hdmi::HDMI_LEN,
         rk3588_hdmi::HDMI_LEN,
-        HDMI_VA,
+        HDMI_D0D,
+        "HDMI0 TX",
     ) {
         log(format_args!("display: HDMI0 TX mapping failed\n"));
         return;
@@ -146,7 +148,8 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         rk3588_hdmi::PHY_BASE,
         rk3588_hdmi::PHY_LEN,
         rk3588_hdmi::PHY_LEN,
-        PHY_VA,
+        PHY_D0D,
+        "PHY0",
     ) {
         log(format_args!("display: PHY0 mapping failed\n"));
         return;
@@ -156,7 +159,8 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         rk3588_hdmi::PHY_GRF_BASE,
         rk3588_hdmi::PHY_GRF_LEN,
         rk3588_hdmi::PHY_GRF_MAP_LEN,
-        PHY_GRF_VA,
+        GRF_D0D,
+        "PHY GRF",
     ) {
         log(format_args!("display: PHY GRF mapping failed\n"));
         return;

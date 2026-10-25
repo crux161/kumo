@@ -1,13 +1,13 @@
 //j597
+//j601
 
 //! D0a live adapter: read-only mappings and serial evidence; no device programming.
 
 use core::fmt::{self, Write};
+use drv_fb::probe_va::VOP_D0A;
 use drv_fb::rk3588::{self, Power, ReadRegisters, Snapshot};
 use kumo_abi::{BootInfo, Handle, VmarFlags};
-use kumo_rt::{handle_close, resource_mint_mmio, vmar_map};
-
-const VOP_VA: u64 = 0x1501_0000;
+use kumo_rt::{handle_close, resource_mint_mmio, syscall_handle, vmar_map};
 
 struct Log {
     bytes: [u8; 320],
@@ -38,7 +38,7 @@ struct Registers;
 impl ReadRegisters for Registers {
     fn vop(&mut self, offset: u32) -> u32 {
         assert!(u64::from(offset) + 4 <= rk3588::VOP_LEN && offset % 4 == 0);
-        unsafe { core::ptr::read_volatile((VOP_VA + u64::from(offset)) as *const u32) }
+        unsafe { core::ptr::read_volatile((VOP_D0A + u64::from(offset)) as *const u32) }
     }
 }
 
@@ -47,10 +47,13 @@ fn map(resource: Handle, base: u64, len: u64, va: u64) -> bool {
         return false;
     }
     let raw = resource_mint_mmio(resource, base, len);
-    if raw == 0 || raw == u64::MAX {
+    let Some(vmo) = syscall_handle(raw) else {
+        log(format_args!(
+            "display: VOP mint failed (errno {})\n",
+            raw as u32 as i32
+        ));
         return false;
-    }
-    let vmo = Handle(raw as u32);
+    };
     // Device memory is the default for an MMIO VMO; READ gives an EL0 read-only mapping.
     // The process never retains a writable mapping of these registers. — TIMBERDOODLE
     let ok = vmar_map(Handle(0), vmo, 0, va, len, VmarFlags::READ.0) == 0;
@@ -90,7 +93,7 @@ fn probe(boot: &BootInfo, power: Power, vop: Handle) {
         ));
         return;
     }
-    if !map(vop, rk3588::VOP_BASE, rk3588::VOP_LEN, VOP_VA) {
+    if !map(vop, rk3588::VOP_BASE, rk3588::VOP_LEN, VOP_D0A) {
         log(format_args!("display: VOP mapping failed; probe skipped\n"));
         return;
     }
