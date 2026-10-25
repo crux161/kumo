@@ -1,8 +1,8 @@
-//j607
 //j608
 //j609
 //j610
 //j611
+//j612
 
 //! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
 //! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
@@ -25,9 +25,14 @@
 //! only source, count 120 frame starts on drv-fb's port and report their rate. — TIMBERDOODLE
 //! The retained VOP grant closes on every terminal path; the final delivery is completed only
 //! after the device source is disabled. — KESTREL
+//!
+//! J612 follows D1b with two owned buffers, 24 alternating consumed loads and explicit
+//! retirement before repainting. IRQs only prompt observations; the console is restored on
+//! completion or timeout, and uncertain buffers remain allocated. — KESTREL
 
 use crate::phy_relock;
 use core::fmt::{self, Write};
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use drv_fb::probe_va::VOP_D0A;
 use drv_fb::probe_va::{TX_R1, VOP_R1};
@@ -170,6 +175,8 @@ enum Phase {
     D1bReady,
     /// D1b: counting VP2 frame starts; the timer is the watchdog.
     D1bCount,
+    D1cReady,
+    D1cRun,
 }
 
 /// What D1b needs from the earlier probes.
@@ -183,6 +190,28 @@ pub struct Vblank {
 
 /// Own the grant across timer transitions, including failures before D1b. — KESTREL
 struct VopResource(Handle);
+
+#[derive(Clone, Copy)]
+struct OwnedBuffer {
+    vmo: Handle,
+    address: u32,
+    va: u64,
+}
+
+struct Alternation {
+    pair: scanout::Pair,
+    buffers: [OwnedBuffer; 2],
+    painted: [u32; 2],
+    started: u64,
+    front_since: u64,
+    submitted: u64,
+    irqs: u32,
+}
+
+// As with J611's samples, phase moves must not copy this state through the 16 KiB stack.
+// The one-time claim owns the sole reference for this boot diagnostic. — KESTREL
+static ALTERNATION_TAKEN: AtomicBool = AtomicBool::new(false);
+static mut ALTERNATION: MaybeUninit<Alternation> = MaybeUninit::uninit();
 
 // A buffer inside Pending multiplies across phase moves and exhausts drv-fb's 16 KiB stack.
 // This boot diagnostic claims one static sample buffer exactly once; the atomic prevents
@@ -221,7 +250,7 @@ pub struct Pending {
     /// The console's colour convention, which G5b confirmed on the glass.
     pixel_order: PixelOrder,
     /// D1a's buffer handle, kept open while the VOP may scan it.
-    owned: Handle,
+    owned: OwnedBuffer,
     /// The VOP window Resource, kept until D1b creates its interrupt from it.
     vop: VopResource,
     vblank: Vblank,
@@ -230,6 +259,7 @@ pub struct Pending {
     irq_source: u64,
     meter: vblank::Meter,
     intervals: Option<&'static mut [u64; vblank::FRAMES as usize - 1]>,
+    alternation: Option<&'static mut Alternation>,
 }
 
 impl Pending {
@@ -422,13 +452,18 @@ fn begin(
         power,
         grants,
         pixel_order,
-        owned: Handle(0),
+        owned: OwnedBuffer {
+            vmo: Handle(0),
+            address: 0,
+            va: 0,
+        },
         vop: VopResource(vop),
         vblank,
         irq: Handle(0),
         irq_source: 0,
         meter: vblank::Meter::default(),
         intervals: None,
+        alternation: None,
     })
 }
 
@@ -598,7 +633,11 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
         Phase::D1bReady => d1b_start(pending, &mut device),
         Phase::D1bCount => {
             // The watchdog fired before the frames arrived; the timer is already disarmed.
-            d1b_finish(pending, &mut device, true);
+            d1b_finish(pending, &mut device, true)
+        }
+        Phase::D1cReady => d1c_start(pending, &mut device),
+        Phase::D1cRun => {
+            d1c_finish(pending, &mut device, false, "watchdog");
             None
         }
     }
@@ -611,57 +650,55 @@ fn close(handle: Handle) {
 }
 
 /// D1b: arm the VOP interrupt with VP2's frame start as its only source and count frames.
-fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
+fn open_vop_irq(pending: &Pending, device: &mut Device, label: &str) -> Option<(Handle, u64)> {
     let intid = rk3588::VOP_INTID;
-    if pending.vblank.live_irq != intid {
+    if pending.vblank.live_irq != intid || !pending.vblank.mmu_view {
         log(format_args!(
-            "display: D1b skipped: live DTB VOP interrupt {} is not the granted INTID {}\n",
-            pending.vblank.live_irq, intid
+            "display: {} skipped: live DTB IRQ or read-only MMU view unavailable\n",
+            label
         ));
         return None;
     }
-    if !pending.vblank.mmu_view {
-        log(format_args!(
-            "display: D1b skipped: no read-only view of the display IOMMU's interrupt registers\n"
-        ));
-        return None;
-    }
-    // SAFETY: D0a mapped VOP_LEN (0x8000) bytes read-only at VOP_D0A; every offset read is
-    // inside the MMU page below that length.
+    // SAFETY: D0a mapped VOP_LEN read-only at VOP_D0A; all four MMU offsets lie within it.
     let mmu = |offset: u32| unsafe {
         assert!(u64::from(offset) + 4 <= rk3588::VOP_LEN);
         core::ptr::read_volatile((VOP_D0A + u64::from(offset)) as *const u32)
     };
     if let Err(conflict) = vblank::preflight(device, mmu) {
         log(format_args!(
-            "display: D1b refused, nothing armed: another source could drive the shared VOP line ({:?})\n",
-            conflict
+            "display: {} refused, nothing armed: shared VOP line conflict {:?}\n",
+            label, conflict
         ));
         return None;
     }
-    let Some(intervals) = take_samples() else {
-        error(format_args!(
-            "display: D1b sample buffer already claimed; nothing armed\n"
-        ));
-        return None;
-    };
     let raw = interrupt_create(pending.vop.0, intid);
     let Some(irq) = syscall_handle(raw) else {
         error(format_args!(
-            "display: D1b interrupt {} unavailable (errno {})\n",
-            intid, raw as u32 as i32
+            "display: {} interrupt {} unavailable (errno {})\n",
+            label, intid, raw as u32 as i32
         ));
         return None;
     };
     let koid = handle_koid(irq);
     if koid == u64::MAX || port_bind(pending.port, irq) != 0 {
         error(format_args!(
-            "display: D1b could not bind interrupt {}\n",
-            intid
+            "display: {} could not bind interrupt {}\n",
+            label, intid
         ));
         close(irq);
         return None;
     }
+    Some((irq, koid))
+}
+
+fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
+    let Some(intervals) = take_samples() else {
+        error(format_args!(
+            "display: D1b sample buffer already claimed; nothing armed\n"
+        ));
+        return None;
+    };
+    let (irq, koid) = open_vop_irq(&pending, device, "D1b")?;
     let Some((timer, source)) = arm(pending.port, vblank::WATCHDOG_MS) else {
         let _ = port_unbind(pending.port, irq);
         close(irq);
@@ -670,12 +707,10 @@ fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
         ));
         return None;
     };
-    // A stale GIC delivery can race InterruptCreate's binding. Complete it while every
-    // device source is still off, then enable only after both port bindings exist. — KESTREL
+    // Recover a stale masked GIC delivery while device sources are still off. Both port
+    // bindings exist before enabling; no console log runs inside the measurement. — KESTREL
     let _ = interrupt_complete(irq);
     vblank::enable(device);
-    // No console log between enable and finish: rendering it could coalesce frame starts
-    // while this same event loop is scrolling the console. — KESTREL
     pending.irq = irq;
     pending.irq_source = koid;
     pending.meter = vblank::Meter::default();
@@ -691,6 +726,9 @@ fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
 /// One D1b delivery: take it, clear the device's status, record it, then let the kernel unmask
 /// the line (DESIGN/016's order).
 fn on_vblank(mut pending: Pending) -> Option<Pending> {
+    if matches!(pending.phase, Phase::D1cRun) {
+        return d1c_vblank(pending);
+    }
     let mut device = Device;
     let _ = interrupt_wait(pending.irq);
     let status = vblank::acknowledge(&mut device);
@@ -709,25 +747,30 @@ fn on_vblank(mut pending: Pending) -> Option<Pending> {
     }
     if pending.meter.done() {
         disarm(pending.port, pending.timer);
-        d1b_finish(pending, &mut device, false);
-        return None;
+        return d1b_finish(pending, &mut device, false);
     }
     let _ = interrupt_complete(pending.irq);
     Some(pending)
 }
 
-fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) {
+fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Option<Pending> {
     vblank::disable(device);
     let _ = vblank::acknowledge(device);
     let _ = interrupt_complete(pending.irq);
     let _ = port_unbind(pending.port, pending.irq);
     close(pending.irq);
+    pending.irq = Handle(0);
+    pending.irq_source = 0;
     let meter = pending.meter;
     let mode_mhz = vblank::mode_millihertz(&DMT_1600X900_60_RB);
     let delivered = meter.millihertz().unwrap_or(0);
     let cadence = pending.intervals.as_mut().and_then(|samples| {
         vblank::cadence(&mut samples[..meter.count.saturating_sub(1) as usize])
     });
+    let passed = !timed_out
+        && meter.done()
+        && cadence
+            .is_some_and(|rate| rate.credible() && vblank::matches(rate.millihertz, mode_mhz));
     match cadence {
         Some(rate) if !timed_out && meter.done() && rate.credible() && vblank::matches(rate.millihertz, mode_mhz) => log(format_args!(
             "display: D1b vblank: {} IRQs, median {}.{:03} Hz (mode {}.{:03}; {}/{} stable), delivery {}.{:03} Hz, interval min/max {}/{} us, spurious {}; interrupt disarmed; D1b complete\n",
@@ -766,6 +809,273 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) {
             vblank::WATCHDOG_MS,
             meter.spurious
         )),
+    }
+    if passed {
+        d1c_prepare(pending, device)
+    } else {
+        None
+    }
+}
+
+fn d1c_allocate(stride: u32, height: u32) -> Option<OwnedBuffer> {
+    let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
+    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
+    let vmo = syscall_handle(raw)?;
+    let buffer = scanout::Buffer {
+        phys,
+        len,
+        stride,
+        height,
+    };
+    let Some(address) = buffer.scanout() else {
+        close(vmo);
+        return None;
+    };
+    let flags = VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED;
+    let (status, va) = kumo_rt::vmar_map_anywhere(vmo, len, flags.0);
+    if status != 0 || va == 0 {
+        close(vmo);
+        return None;
+    }
+    Some(OwnedBuffer { vmo, address, va })
+}
+
+fn d1c_prepare(mut pending: Pending, device: &mut Device) -> Option<Pending> {
+    let (gop, stride) = scanout::target_scanout(&pending.program);
+    if pending.owned.vmo.0 == 0 || !scanout::on_glass(device, gop) {
+        error(format_args!(
+            "display: D1c refused: D1a buffer or confirmed console unavailable\n"
+        ));
+        return None;
+    }
+    if ALTERNATION_TAKEN.swap(true, Ordering::Relaxed) {
+        error(format_args!(
+            "display: D1c already attempted; nothing armed\n"
+        ));
+        return None;
+    }
+    let height = DMT_1600X900_60_RB.v_active;
+    let Some(second) = d1c_allocate(stride, height) else {
+        error(format_args!(
+            "display: D1c second buffer unavailable; console retained\n"
+        ));
+        return None;
+    };
+    let buffers = [pending.owned, second];
+    let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
+    let Some(pair) = scanout::Pair::new(
+        buffers.map(|b| scanout::Buffer {
+            phys: u64::from(b.address),
+            len,
+            stride,
+            height,
+        }),
+        gop,
+    ) else {
+        error(format_args!(
+            "display: D1c invalid/overlapping pair; console retained\n"
+        ));
+        return None;
+    };
+    // SAFETY: the atomic claim above succeeds only once. This state is initialized in place,
+    // and its sole mutable reference moves with Pending; buffer handles remain open. — KESTREL
+    pending.alternation = Some(unsafe {
+        let ptr = core::ptr::addr_of_mut!(ALTERNATION).cast::<Alternation>();
+        ptr.write(Alternation {
+            pair,
+            buffers,
+            painted: [0; 2],
+            started: 0,
+            front_since: 0,
+            submitted: 0,
+            irqs: 0,
+        });
+        &mut *ptr
+    });
+    log(format_args!(
+        "display: D1c prepared owned A={:#x} B={:#x}, {} bytes each uncached; {} alternating loads, {} ms holds, repaint only after consumed replacement; console then returns\n",
+        buffers[0].address, buffers[1].address, len,
+        scanout::ALTERNATIONS, scanout::FRAME_HOLD_NS / 1_000_000
+    ));
+    let Some((timer, source)) = arm(pending.port, vblank::SETTLE_MS) else {
+        error(format_args!(
+            "display: D1c settle timer unavailable; console retained\n"
+        ));
+        return None;
+    };
+    Some(Pending {
+        phase: Phase::D1cReady,
+        timer,
+        source,
+        ..pending
+    })
+}
+
+fn d1c_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
+    pending.alternation.as_mut()?.started = kumo_rt::clock_get();
+    let (irq, koid) = open_vop_irq(&pending, device, "D1c")?;
+    let Some((timer, source)) = arm(pending.port, scanout::ALTERNATION_WATCHDOG_MS) else {
+        let _ = port_unbind(pending.port, irq);
+        close(irq);
+        error(format_args!(
+            "display: D1c watchdog unavailable; nothing armed\n"
+        ));
+        return None;
+    };
+    let _ = interrupt_complete(irq);
+    vblank::enable(device);
+    pending.irq = irq;
+    pending.irq_source = koid;
+    Some(Pending {
+        phase: Phase::D1cRun,
+        timer,
+        source,
+        ..pending
+    })
+}
+
+fn d1c_paint(
+    device: &mut Device,
+    buffer: OwnedBuffer,
+    slot: usize,
+    generation: u32,
+    order: PixelOrder,
+    stride: u32,
+) {
+    let mode = DMT_1600X900_60_RB;
+    for y in 0..mode.v_active {
+        for x in 0..mode.h_active {
+            let (r, g, b) =
+                scanout::alternating_pattern(slot, generation, x, y, mode.h_active, mode.v_active);
+            let index = u64::from(y) * u64::from(stride) + u64::from(x);
+            // SAFETY: each uncached mapping covers stride * height * 4; the pair has certified
+            // this slot retired, with no outstanding load. No new load runs during painting.
+            unsafe {
+                ((buffer.va + index * 4) as *mut u32).write_volatile(order.pixel(r, g, b));
+            }
+        }
+    }
+    device.barrier();
+}
+
+fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
+    let mut device = Device;
+    let _ = interrupt_wait(pending.irq);
+    let status = vblank::acknowledge(&mut device);
+    if status & vblank::FS == 0 {
+        let _ = interrupt_complete(pending.irq);
+        return Some(pending);
+    }
+    let now = kumo_rt::clock_get();
+    let (_, stride) = scanout::target_scanout(&pending.program);
+    let state = pending.alternation.as_mut().expect("D1c state");
+    state.irqs += 1;
+    let mut finished = false;
+    let mut stalled = false;
+    if let Some((_, front)) = state.pair.observe(&mut device) {
+        state.front_since = now;
+        state.submitted = 0;
+        finished = front == scanout::CONSOLE;
+    }
+    if !finished {
+        if state.pair.pending().is_some() {
+            // An IRQ count is not retirement. Allow delayed userspace delivery, but fail a
+            // load still unconfirmed after 500 ms; the 15 s watchdog also covers lost IRQs.
+            // — KESTREL
+            stalled = now.saturating_sub(state.submitted) > 500_000_000;
+        } else if state.pair.front() == scanout::CONSOLE
+            || now.saturating_sub(state.front_since) >= scanout::FRAME_HOLD_NS
+        {
+            if state.pair.confirmed() >= scanout::ALTERNATIONS {
+                state.pair.restore_console(&mut device);
+                state.submitted = kumo_rt::clock_get();
+            } else {
+                let slot = if state.pair.front() == scanout::CONSOLE {
+                    0
+                } else {
+                    1 - state.pair.front()
+                };
+                if state.pair.can_paint(slot) {
+                    d1c_paint(
+                        &mut device,
+                        state.buffers[slot],
+                        slot,
+                        state.pair.confirmed() + 1,
+                        pending.pixel_order,
+                        stride,
+                    );
+                    if state.pair.stage(&mut device, slot) {
+                        state.painted[slot] += 1;
+                        state.submitted = kumo_rt::clock_get();
+                    } else {
+                        stalled = true;
+                    }
+                } else {
+                    stalled = true;
+                }
+            }
+        }
+    }
+    if finished || stalled {
+        disarm(pending.port, pending.timer);
+        d1c_finish(
+            pending,
+            &mut device,
+            finished,
+            "load unconfirmed or invalid painting target",
+        );
+        return None;
+    }
+    let _ = interrupt_complete(pending.irq);
+    Some(pending)
+}
+
+/// The caller has disarmed the timer. Keep both VMO handles/mappings until reboot, including
+/// on recovery failure: an unverified front must never be freed or reused. — KESTREL
+fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: &str) {
+    vblank::disable(device);
+    let state = pending.alternation.as_mut().expect("D1c state");
+    let (gop, _) = scanout::target_scanout(&pending.program);
+    let mut restored = state.pair.front() == scanout::CONSOLE
+        && state.pair.pending().is_none()
+        && scanout::on_glass(device, gop);
+    if !restored {
+        for _ in 0..2 {
+            state.pair.restore_console(device);
+            let latched =
+                scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
+            if latched.is_some() && state.pair.observe(device).is_some() {
+                restored = true;
+                break;
+            }
+        }
+    }
+    let _ = vblank::acknowledge(device);
+    let _ = interrupt_complete(pending.irq);
+    let _ = port_unbind(pending.port, pending.irq);
+    close(pending.irq);
+    let expected = scanout::ALTERNATIONS / 2;
+    let verified = success
+        && restored
+        && state.pair.confirmed() == scanout::ALTERNATIONS
+        && state.painted == [expected; 2]
+        && state.pair.retirements() == [expected; 2];
+    let elapsed = kumo_rt::clock_get().saturating_sub(state.started) / 1_000_000;
+    if verified {
+        log(format_args!(
+            "display: D1c {} owned loads consumed in {} ms on {} IRQs; paints A/B={}/{}, retired A/B={}/{}, post-retirement reuses A/B={}/{}\n",
+            state.pair.confirmed(), elapsed, state.irqs, state.painted[0], state.painted[1],
+            state.pair.retirements()[0], state.pair.retirements()[1],
+            state.painted[0] - 1, state.painted[1] - 1
+        ));
+        log(format_args!("display: D1c console {:#x} latched; both owned buffers retired; interrupt disarmed; D1c complete\n", gop));
+    } else {
+        if !restored {
+            latch::stop(device, &pending.program);
+        }
+        error(format_args!("display: D1c FAILED ({}): {} owned loads, console restored={}; buffers retained, interrupt disarmed{}\n",
+            reason, state.pair.confirmed(), u8::from(restored),
+            if restored { "" } else { "; VP2 in standby" }));
     }
 }
 
@@ -820,7 +1130,7 @@ fn d1a_show(device: &mut Device, pending: &mut Pending) -> bool {
     }
     device.barrier();
     let paint_ms = kumo_rt::clock_get().saturating_sub(painted) / 1_000_000;
-    pending.owned = vmo;
+    pending.owned = OwnedBuffer { vmo, address, va };
     log(format_args!(
         "display: D1a owned scanout buffer {:#x}, {} bytes uncached, KUMO test pattern painted in {} ms\n",
         address, len, paint_ms
@@ -867,7 +1177,7 @@ fn d1a_return(device: &mut Device, pending: &Pending) -> bool {
     }
     error(format_args!(
         "display: D1a FAILED to return to the GOP buffer; the owned buffer stays on the glass (handle {} kept)\n",
-        pending.owned.0
+        pending.owned.vmo.0
     ));
     false
 }

@@ -1,6 +1,7 @@
 //j610
+//j612
 
-//! D1a: scan out a KUMO-owned buffer, then hand the glass back to the GOP console buffer.
+//! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
 //! Recovery class: soft-state. The buffer is a physically contiguous DMA VMO
 //! (`VmoCreateContiguous`), mapped uncached, so the VOP reads exactly what the CPU wrote once
@@ -11,6 +12,10 @@
 //! yet: [`wait_latched`] times the request's consumption. From that frame on the previous
 //! buffer is no longer read, i.e. it is retired from scanout. Register sources: RK3588 TRM
 //! Part 2 ch. 7 (`REG_CFG_DONE`, ESMART region0). — TIMBERDOODLE
+//!
+//! J612's [`Pair`] blocks repainting until the replacement address is active and its load
+//! consumed. Delayed/coalesced IRQs do not advance the state. The console can replace an
+//! uncertain request, but both owned buffers stay protected until it is proven. — KESTREL
 
 use crate::rk3588_mode::{
     Block, Hardware, Program, ESMART2_R0_MST_YRGB, ESMART2_R0_VIR, REG_CFG_DONE,
@@ -90,6 +95,137 @@ pub fn wait_latched(
 pub fn on_glass(hw: &mut impl Hardware, phys: u32) -> bool {
     hw.read(Block::Vop, REG_CFG_DONE) & VP2_LOAD_PENDING == 0
         && hw.read(Block::Vop, ESMART2_R0_MST_YRGB) == phys
+}
+
+/// The third address in [`Pair`] is the existing console, never an owned painting target.
+pub const CONSOLE: usize = 2;
+pub const ALTERNATIONS: u32 = 24;
+pub const FRAME_HOLD_NS: u64 = 250_000_000;
+pub const ALTERNATION_WATCHDOG_MS: u64 = 15_000;
+
+/// D1c's fixed pair, with at most one outstanding load. An IRQ is only a reason to call
+/// `observe`: retirement requires the requested address AND a consumed VP2 load. While
+/// a load is pending, neither its target nor the last confirmed front can be repainted.
+/// Recovery class: soft-state; restore the console before abandoning the sequence. — KESTREL
+#[derive(Debug)]
+pub struct Pair {
+    addresses: [u32; 3],
+    front: usize,
+    pending: Option<usize>,
+    confirmed: u32,
+    retirements: [u32; 2],
+}
+
+impl Pair {
+    /// The caller must first confirm that `console` is on the glass.
+    pub fn new(buffers: [Buffer; 2], console: u32) -> Option<Self> {
+        let first = buffers[0].scanout()?;
+        let second = buffers[1].scanout()?;
+        if buffers[0].stride == 0
+            || buffers[0].height == 0
+            || buffers[0].stride != buffers[1].stride
+            || buffers[0].height != buffers[1].height
+        {
+            return None;
+        }
+        let console_buffer = Buffer {
+            phys: u64::from(console),
+            len: u64::from(buffers[0].stride) * u64::from(buffers[0].height) * 4,
+            ..buffers[0]
+        };
+        console_buffer.scanout()?;
+        let overlap = |a: Buffer, b: Buffer| a.phys < b.phys + b.len && b.phys < a.phys + a.len;
+        if overlap(buffers[0], buffers[1]) || buffers.iter().any(|&b| overlap(b, console_buffer)) {
+            return None;
+        }
+        Some(Self {
+            addresses: [first, second, console],
+            front: CONSOLE,
+            pending: None,
+            confirmed: 0,
+            retirements: [0; 2],
+        })
+    }
+
+    pub fn front(&self) -> usize {
+        self.front
+    }
+
+    pub fn pending(&self) -> Option<usize> {
+        self.pending
+    }
+
+    pub fn confirmed(&self) -> u32 {
+        self.confirmed
+    }
+
+    pub fn retirements(&self) -> [u32; 2] {
+        self.retirements
+    }
+
+    pub fn can_paint(&self, slot: usize) -> bool {
+        slot < 2 && slot != self.front && self.pending.is_none()
+    }
+
+    /// The caller paints only after `can_paint`, then barriers before staging.
+    pub fn stage(&mut self, hw: &mut impl Hardware, slot: usize) -> bool {
+        if self.pending.is_some() || !self.can_paint(slot) {
+            return false;
+        }
+        flip(hw, self.addresses[slot]);
+        self.pending = Some(slot);
+        true
+    }
+
+    /// Observe a consumed load, returning (retired slot, new front). Repeated or coalesced
+    /// notifications cannot retire a second buffer without another consumed load. — KESTREL
+    pub fn observe(&mut self, hw: &mut impl Hardware) -> Option<(usize, usize)> {
+        let target = self.pending?;
+        if !on_glass(hw, self.addresses[target]) {
+            return None;
+        }
+        let retired = self.front;
+        self.front = target;
+        self.pending = None;
+        if target != CONSOLE {
+            self.confirmed += 1;
+        }
+        if retired != CONSOLE {
+            self.retirements[retired] += 1;
+        }
+        Some((retired, target))
+    }
+
+    /// Also allowed during a stuck/uncertain load. Neither owned buffer is paintable until
+    /// the console is confirmed, since the displaced request may already have latched.
+    pub fn restore_console(&mut self, hw: &mut impl Hardware) {
+        flip(hw, self.addresses[CONSOLE]);
+        self.pending = Some(CONSOLE);
+    }
+}
+
+/// Distinct A/B palettes plus an eight-bit generation marker, rewritten only after retirement.
+pub fn alternating_pattern(
+    slot: usize,
+    generation: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> (u8, u8, u8) {
+    if (16..144).contains(&x) && (16..48).contains(&y) {
+        return if generation & (1 << ((x - 16) / 16)) != 0 {
+            (255, 255, 255)
+        } else {
+            (0, 0, 0)
+        };
+    }
+    let (r, g, b) = pattern(x, y, width, height);
+    if slot == 0 {
+        (r, g, b)
+    } else {
+        (255 - r, 255 - g, 255 - b)
+    }
 }
 
 /// KUMO's test pattern: eight vertical bars (white, yellow, cyan, green, magenta, red, blue,
@@ -204,6 +340,140 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn pair_buffers() -> [Buffer; 2] {
+        [0x4000_0000, 0x4100_0000].map(|phys| Buffer {
+            phys,
+            len: 0x60_0000,
+            stride: 1600,
+            height: 900,
+        })
+    }
+
+    #[test]
+    fn a_pair_refuses_aliasing_console_overlap_or_incompatible_geometry() {
+        let good = pair_buffers();
+        assert!(Pair::new(good, 0xed0c_0000).is_some());
+        assert!(Pair::new([good[0]; 2], 0xed0c_0000).is_none());
+        let mut overlap = good;
+        overlap[1].phys = overlap[0].phys + 4096;
+        assert!(Pair::new(overlap, 0xed0c_0000).is_none());
+        assert!(Pair::new(good, good[0].phys as u32 + 4096).is_none());
+        assert!(Pair::new(good, good[0].phys as u32 - 4096).is_none());
+        let mut wrong = good;
+        wrong[1].stride += 1;
+        assert!(Pair::new(wrong, 0xed0c_0000).is_none());
+        wrong = good;
+        wrong[1].height -= 1;
+        assert!(Pair::new(wrong, 0xed0c_0000).is_none());
+        assert!(Pair::new(good, 0).is_none());
+    }
+
+    #[test]
+    fn repeated_irqs_and_even_equal_address_readback_cannot_retire_a_pending_load() {
+        let mut pair = Pair::new(pair_buffers(), 0xed0c_0000).unwrap();
+        let mut hw = Vop::new(0xed0c_0000);
+        assert!(pair.stage(&mut hw, 0));
+        hw.active = pair_buffers()[0].phys as u32;
+        for _ in 0..20 {
+            assert_eq!(pair.observe(&mut hw), None);
+            assert!(!pair.can_paint(0) && !pair.can_paint(1));
+            assert!(!pair.stage(&mut hw, 1));
+        }
+        assert_eq!(pair.confirmed(), 0);
+        hw.pending = false;
+        assert_eq!(pair.observe(&mut hw), Some((CONSOLE, 0)));
+        assert!(!pair.can_paint(0) && pair.can_paint(1));
+        assert_eq!(pair.observe(&mut hw), None);
+        assert_eq!(pair.confirmed(), 1);
+    }
+
+    #[test]
+    fn a_consumed_request_with_the_wrong_address_does_not_release_either_buffer() {
+        let mut pair = Pair::new(pair_buffers(), 0xed0c_0000).unwrap();
+        let mut hw = Vop::new(0xed0c_0000);
+        assert!(pair.stage(&mut hw, 0));
+        hw.pending = false;
+        hw.active = pair_buffers()[1].phys as u32;
+        assert_eq!(pair.observe(&mut hw), None);
+        assert_eq!(pair.pending(), Some(0));
+        assert!(!pair.can_paint(0) && !pair.can_paint(1));
+        assert_eq!(pair.retirements(), [0, 0]);
+    }
+
+    #[test]
+    fn two_buffers_are_repainted_only_after_replacement_even_with_coalesced_irqs() {
+        let buffers = pair_buffers();
+        let mut pair = Pair::new(buffers, 0xed0c_0000).unwrap();
+        let mut hw = Vop::new(0xed0c_0000);
+        let mut painted = [0; 2];
+        for generation in 0..ALTERNATIONS {
+            let slot = generation as usize % 2;
+            assert!(pair.can_paint(slot));
+            assert_ne!(
+                hw.active, buffers[slot].phys as u32,
+                "painting live scanout"
+            );
+            painted[slot] += 1;
+            assert!(pair.stage(&mut hw, slot));
+            assert!(!pair.stage(&mut hw, 1 - slot));
+            assert_eq!(pair.observe(&mut hw), None);
+            // Several frame starts before one delivery still acknowledge exactly one load.
+            for _ in 0..(80 + generation) {
+                hw.tick();
+            }
+            let old = if generation == 0 { CONSOLE } else { 1 - slot };
+            assert_eq!(pair.observe(&mut hw), Some((old, slot)));
+            assert_eq!(pair.confirmed(), generation + 1);
+            assert_eq!(pair.observe(&mut hw), None);
+        }
+        pair.restore_console(&mut hw);
+        assert!(!pair.can_paint(0) && !pair.can_paint(1));
+        while hw.pending {
+            hw.tick();
+        }
+        assert_eq!(pair.observe(&mut hw), Some((1, CONSOLE)));
+        assert_eq!(painted, [12, 12]);
+        assert_eq!(pair.retirements(), [12, 12]);
+        assert!(pair.can_paint(0) && pair.can_paint(1));
+    }
+
+    #[test]
+    fn aborting_an_unobserved_flip_protects_both_buffers_until_console_is_proven() {
+        for consume_first in [false, true] {
+            let mut pair = Pair::new(pair_buffers(), 0xed0c_0000).unwrap();
+            let mut hw = Vop::new(0xed0c_0000);
+            assert!(pair.stage(&mut hw, 0));
+            if consume_first {
+                while hw.pending {
+                    hw.tick();
+                }
+            }
+            pair.restore_console(&mut hw);
+            assert_eq!(pair.observe(&mut hw), None);
+            assert!(!pair.can_paint(0) && !pair.can_paint(1));
+            while hw.pending {
+                hw.tick();
+            }
+            assert!(pair.observe(&mut hw).is_some());
+            assert_eq!(pair.front(), CONSOLE);
+            assert!(pair.can_paint(0) && pair.can_paint(1));
+        }
+    }
+
+    #[test]
+    fn alternating_frames_change_both_palette_and_generation_marker() {
+        assert_ne!(
+            alternating_pattern(0, 0, 300, 100, 1600, 900),
+            alternating_pattern(1, 0, 300, 100, 1600, 900)
+        );
+        assert_ne!(
+            alternating_pattern(0, 0, 20, 20, 1600, 900),
+            alternating_pattern(0, 1, 20, 20, 1600, 900)
+        );
+        assert_eq!(alternating_pattern(0, 0, 0, 0, 1600, 900), (255, 255, 255));
+        assert_eq!(alternating_pattern(1, 0, 0, 0, 1600, 900), (0, 0, 0));
     }
 
     #[test]
