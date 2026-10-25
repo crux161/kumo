@@ -13,6 +13,7 @@ mod display_probe;
 mod display_topology;
 mod hdmi_probe;
 mod modeset;
+mod phy_relock;
 mod shared_probe;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
@@ -163,6 +164,8 @@ extern "C" fn main(
     // page); Handle(0) off the Orange Pi or with the display down. — TIMBERDOODLE
     let (_, vop_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let (_, tx_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, phy_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, grf_rw_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
     // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle,
     // D0c's clock grant and D0d's H/P/R records. The record is fixed-size on every board;
@@ -474,6 +477,10 @@ extern "C" fn main(
         r0_matched,
         Handle(vop_rw_raw as u32),
         Handle(tx_rw_raw as u32),
+        phy_relock::Grants {
+            phy: Handle(phy_rw_raw as u32),
+            grf: Handle(grf_rw_raw as u32),
+        },
         port,
     );
     loop {

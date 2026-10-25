@@ -184,6 +184,12 @@ pub enum KernelCall<'a> {
         user_ptr: u64,
         user_len: u64,
     },
+    DeviceResetSet {
+        resource: Handle,
+        aperture_base: u64,
+        line: u64,
+        asserted: u64,
+    },
     Unsupported(Syscall),
 }
 
@@ -2618,6 +2624,16 @@ impl SyscallEngine {
                 }
                 KernelCallResult::Status(Errno::Ok.status())
             }
+            KernelCall::DeviceResetSet {
+                resource,
+                aperture_base,
+                line,
+                asserted,
+            } => {
+                let status =
+                    self.device_reset_set(process, resource, aperture_base, line, asserted);
+                KernelCallResult::Status(status.status())
+            }
             KernelCall::Unsupported(_) => KernelCallResult::Status(Errno::NotSupported.status()),
         }
     }
@@ -2625,6 +2641,46 @@ impl SyscallEngine {
     /// The address of the board DTB the kernel accepted at boot, or 0.
     fn dtb(&self) -> u64 {
         self.boot_info.as_ref().map_or(0, |boot| boot.platform.dtb)
+    }
+
+    fn device_reset_set(
+        &self,
+        process: &Process,
+        resource: Handle,
+        base: u64,
+        line: u64,
+        asserted: u64,
+    ) -> Errno {
+        let entry = match process
+            .handles()
+            .require(resource, ObjectKind::Resource, Rights::WRITE)
+        {
+            Ok(entry) => entry,
+            Err(error) => return errno_from_object(error),
+        };
+        if asserted > 1 || line > u64::from(u32::MAX) {
+            return Errno::InvalidArgs;
+        }
+        let Some(res) = self.resource_by_koid(entry.koid) else {
+            return Errno::BadHandle;
+        };
+        if !resource_contains(res, base, 1) {
+            return Errno::AccessDenied;
+        }
+        let Some((len, count)) = kumo_hal::active::device_reset_unit(self.dtb(), base) else {
+            return Errno::NotSupported;
+        };
+        if !resource_contains(res, base, len) {
+            return Errno::AccessDenied;
+        }
+        if line >= u64::from(count) {
+            return Errno::InvalidArgs;
+        }
+        if kumo_hal::active::device_reset_set(self.dtb(), base, line as u32, asserted != 0) {
+            Errno::Ok
+        } else {
+            Errno::BadState
+        }
     }
 
     /// DESIGN/020 §1: the caller must hold a Resource with `needed` whose window contains the
@@ -2750,6 +2806,38 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    #[test]
+    fn device_reset_checks_type_rights_range_and_raw_argument_widths_before_hardware() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0xfed6_0000, 0x2000, 0, 0)
+            .unwrap();
+        let reader = process.handles_mut().duplicate(root, Rights::READ).unwrap();
+        let (channel, _) = create_channel(&mut engine, &mut process);
+        let call = |resource, base, line, asserted| KernelCall::DeviceResetSet {
+            resource,
+            aperture_base: base,
+            line,
+            asserted,
+        };
+        for (request, expected) in [
+            (call(Handle(u32::MAX), 0xfed6_0000, 0, 0), Errno::BadHandle),
+            (call(channel, 0xfed6_0000, 0, 0), Errno::WrongType),
+            (call(reader, 0xfed6_0000, 0, 0), Errno::AccessDenied),
+            (call(root, 0xfd7c_0000, 0, 0), Errno::AccessDenied),
+            (call(root, u64::MAX, 0, 0), Errno::AccessDenied),
+            (call(root, 0xfed6_0000, 1 << 32, 0), Errno::InvalidArgs),
+            (call(root, 0xfed6_0000, 0, 2), Errno::InvalidArgs),
+            (call(root, 0xfed6_0000, 0, u64::MAX), Errno::InvalidArgs),
+            (call(root, 0xfed6_0000, 0, 1), Errno::NotSupported),
+        ] {
+            assert!(
+                matches!(engine.dispatch(&mut process, request), KernelCallResult::Status(s) if s == expected.status())
+            );
+        }
+    }
 
     fn test_process(engine: &mut SyscallEngine) -> Process {
         let job = crate::task::Job::root(engine.objects_mut());

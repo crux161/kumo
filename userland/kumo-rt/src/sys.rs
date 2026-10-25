@@ -884,6 +884,34 @@ pub fn device_power_up(_resource: Handle, _aperture_base: u64) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
 
+/// Change one DTB-approved reset line; the kernel writes only that line's masked bit.
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub fn device_reset_set(resource: Handle, aperture_base: u64, line: u32, asserted: bool) -> Status {
+    syscall(
+        Syscall::DeviceResetSet,
+        resource.0 as u64,
+        aperture_base,
+        u64::from(line),
+        u64::from(asserted),
+    ) as Status
+}
+
+#[cfg(not(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+pub fn device_reset_set(
+    _resource: Handle,
+    _aperture_base: u64,
+    _line: u32,
+    _asserted: bool,
+) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
 /// Read the device's power/clock evidence. Requires Resource READ; inspect `record` only on
 /// success. The typed buffer supplies the ABI's size and alignment.
 #[cfg(all(

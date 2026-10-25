@@ -14,6 +14,7 @@
 //! HDMI0 clocked under black, observe its active registers and completed load, restore and
 //! observe the target under black, then remove black. Every wait uses the port. — KESTREL
 
+use crate::phy_relock;
 use core::fmt::{self, Write};
 use drv_fb::probe_va::{TX_R1, VOP_R1};
 use drv_fb::rk3588::{self, Power};
@@ -142,6 +143,10 @@ enum Phase {
     },
     /// Rebuilt and out of standby; the timer starts the verification.
     Verify,
+    R2Blank,
+    R2Relock,
+    R2Restore,
+    R2Verify,
 }
 
 /// R1 in flight between port wakes.
@@ -155,6 +160,8 @@ pub struct Pending {
     pub source: u64,
     started: u64,
     proof_verified: bool,
+    power: Power,
+    grants: phy_relock::Grants,
 }
 
 fn arm(port: Handle, ms: u64) -> Option<(Handle, u64)> {
@@ -182,6 +189,7 @@ pub fn start(
     r0_matched: bool,
     vop: Handle,
     tx: Handle,
+    grants: phy_relock::Grants,
     port: Handle,
 ) -> Option<Pending> {
     let eligible = rk3588::eligible(
@@ -193,7 +201,7 @@ pub fn start(
         match power {
             Some(power) if power.vop_accessible() && rk3588_hdmi::hdmi_accessible(power) => {
                 if r0_matched {
-                    pending = begin(boot, vop, tx, port);
+                    pending = begin(boot, vop, tx, grants, power, port);
                 } else {
                     log(format_args!(
                         "display: R1 skipped: R0's shared state did not match 5/5\n"
@@ -213,7 +221,14 @@ pub fn start(
     pending
 }
 
-fn begin(boot: &BootInfo, vop: Handle, tx: Handle, port: Handle) -> Option<Pending> {
+fn begin(
+    boot: &BootInfo,
+    vop: Handle,
+    tx: Handle,
+    grants: phy_relock::Grants,
+    power: Power,
+    port: Handle,
+) -> Option<Pending> {
     let fb = Framebuffer {
         phys: boot.framebuffer.phys,
         width: boot.framebuffer.width,
@@ -311,6 +326,8 @@ fn begin(boot: &BootInfo, vop: Handle, tx: Handle, port: Handle) -> Option<Pendi
         source,
         started,
         proof_verified: false,
+        power,
+        grants,
     })
 }
 
@@ -376,6 +393,61 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             if restored && pending.proof_verified {
                 log(format_args!(
                     "display: R1b complete: distinct timing and disabled region latched, target restored and TX timing matched\n"
+                ));
+                if phy_relock::prepare(&pending.grants) {
+                    latch::stage(&mut device, &latch::blacked(&pending.program));
+                    return next(pending, Phase::R2Blank, latch::SETTLE_MS);
+                }
+            }
+            None
+        }
+        Phase::R2Blank => {
+            if !latch::observe(&mut device, &latch::blacked(&pending.program)).matches() {
+                latch::stop(&mut device, &pending.program);
+                error(format_args!(
+                    "display: R2 black program did not latch; no PHY reset, VP2 in standby\n"
+                ));
+                return None;
+            }
+            let ctrl = pending.program.words[drv_fb::rk3588_mode::DSP_CTRL_INDEX];
+            device.write(
+                ctrl.block,
+                ctrl.offset,
+                ctrl.value | latch::BLACK | drv_fb::rk3588_mode::STANDBY,
+            );
+            device.barrier();
+            next(pending, Phase::R2Relock, PLAN.standby_settle_ms)
+        }
+        Phase::R2Relock => {
+            phy_relock::run(&pending.grants)?;
+            latch::stage(&mut device, &latch::blacked(&pending.program));
+            next(pending, Phase::R2Restore, latch::SETTLE_MS)
+        }
+        Phase::R2Restore => {
+            let observed = latch::unblack(&mut device, &pending.program);
+            if !observed.matches() {
+                error(format_args!(
+                    "display: R2 target failed to latch after PHY re-lock: {:?}; VP2 in standby\n",
+                    observed
+                ));
+                return None;
+            }
+            next(pending, Phase::R2Verify, PLAN.verify_after_ms)
+        }
+        Phase::R2Verify => {
+            if finish(
+                &mut device,
+                &pending.program,
+                pending.blanked,
+                pending.started,
+                true,
+            ) && phy_relock::verify(pending.power)
+            {
+                log(format_args!("display: R2 complete: native HDMI0 1600x900@60 reconstructed; D0 hardware gates complete\n"));
+            } else {
+                latch::stop(&mut device, &pending.program);
+                error(format_args!(
+                    "display: R2 final verification failed; VP2 in standby\n"
                 ));
             }
             None

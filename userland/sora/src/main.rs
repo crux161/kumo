@@ -946,6 +946,19 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
             let _ = handle_close(grant);
         }
     }
+    // R2: writable PHY0/PHY0-GRF windows only. The PHY capability authorizes four indexed
+    // reset lines; CRU and PMU mappings remain read-only. Send both tags on every board.
+    // — KESTREL
+    for (tag, base, len) in [(b"E", PHY_BASE, PHY_LEN), (b"Q", PHY_GRF_BASE, PHY_GRF_LEN)] {
+        let grant = if accessible {
+            syscall_handle(resource_create_child(root, base, len, 0, 0)).unwrap_or(Handle(0))
+        } else {
+            Handle(0)
+        };
+        if channel_write_with_handle(bootstrap, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+            let _ = handle_close(grant);
+        }
+    }
 }
 
 /// D0b: forward the *live* boot DTB's display topology to drv-fb. The kernel's x9 capability

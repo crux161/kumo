@@ -10,6 +10,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod display_unit;
 pub mod mali;
 pub mod power_unit;
 pub mod smmuv2;
@@ -3429,17 +3430,43 @@ pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
     if !power_unit::POWER_UNITS
         .iter()
         .any(|unit| unit.overlaps(phys_base, len))
+        && !display_unit::overlaps_display(phys_base, len)
     {
         return false;
     }
     match unsafe { dtb_bytes(dtb) } {
-        Some(bytes) => power_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo),
+        Some(bytes) => {
+            power_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
+                || display_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
+        }
         None => false,
     }
 }
 
 #[cfg(not(target_os = "none"))]
 pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
+    false
+}
+
+#[cfg(target_os = "none")]
+pub fn device_reset_unit(dtb: u64, base: u64) -> Option<(u64, u32)> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    display_unit::live_unit(bytes, base).map(|u| (u.len, u.resets.len() as u32))
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_reset_unit(_dtb: u64, _base: u64) -> Option<(u64, u32)> {
+    None
+}
+
+#[cfg(target_os = "none")]
+pub fn device_reset_set(dtb: u64, base: u64, line: u32, asserted: bool) -> bool {
+    let Some(bytes) = (unsafe { dtb_bytes(dtb) }) else {
+        return false;
+    };
+    display_unit::reset_set(bytes, base, line, asserted, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_reset_set(_dtb: u64, _base: u64, _line: u32, _asserted: bool) -> bool {
     false
 }
 

@@ -85,6 +85,10 @@ pub enum Syscall {
     /// copies a [`DevicePowerStatus`]. Needs a Resource with `READ` whose window contains the
     /// aperture (DESIGN/020).
     DevicePowerStatus = 51,
+    /// Set one approved reset line: `(resource, aperture_base, line_index, asserted)`.
+    /// Needs Resource WRITE covering the live DTB-gated device aperture. `asserted` is 0/1;
+    /// no register, bit mask or sequence is supplied by the caller (DESIGN/020 D0).
+    DeviceResetSet = 52,
 }
 
 /// Kernel log levels, syslog's numbering: lower is more urgent (J559).
@@ -307,6 +311,7 @@ mod tests {
     fn device_power_calls_follow_the_kernel_log_calls() {
         assert_eq!(Syscall::DevicePowerUp as usize, 50);
         assert_eq!(Syscall::DevicePowerStatus as usize, 51);
+        assert_eq!(Syscall::DeviceResetSet as usize, 52);
         assert_eq!(Errno::TimedOut.status(), -10);
         assert_eq!(Errno::BadState.status(), -11);
     }

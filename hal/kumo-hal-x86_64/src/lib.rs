@@ -1193,6 +1193,13 @@ pub fn device_power_unit(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerUn
     None
 }
 
+pub fn device_reset_unit(_dtb: u64, _base: u64) -> Option<(u64, u32)> {
+    None
+}
+pub fn device_reset_set(_dtb: u64, _base: u64, _line: u32, _asserted: bool) -> bool {
+    false
+}
+
 pub fn device_power_up(
     _dtb: u64,
     _aperture_base: u64,

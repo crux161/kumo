@@ -1850,6 +1850,17 @@ fn dispatch_object_syscall(
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::DeviceResetSet as u64 {
+        let call = KernelCall::DeviceResetSet {
+            resource: Handle(r[0] as u32),
+            aperture_base: r[1],
+            line: r[2],
+            asserted: r[3],
+        };
+        match engine.dispatch(target, call) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::DevicePowerUp as u64 {
         let resource = Handle(r[0] as u32);
         let aperture_base = r[1];

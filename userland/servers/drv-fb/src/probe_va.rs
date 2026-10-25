@@ -43,6 +43,9 @@ pub const VOP_R1: u64 = 0x150d_0000;
 
 /// R1's writable HDMI0 TX page.
 pub const TX_R1: u64 = 0x150e_0000;
+/// R2's writable, device-owned PHY0 and PHY0 GRF mappings.
+pub const PHY_R2: u64 = 0x150f_0000;
+pub const GRF_R2: u64 = 0x1510_0000;
 
 /// D0b's live-DTB copy, worst case `MAX_DTB_BYTES` (16 MiB).
 pub const DTB_D0B: u64 = 0x1600_0000;
@@ -53,7 +56,7 @@ mod tests {
     use crate::{dtb_topology, rk3588, rk3588_clock, rk3588_hdmi, rk3588_mode, rk3588_shared};
 
     /// `(base, mapped length)` for every fixed probe window.
-    const WINDOWS: [(u64, u64); 12] = [
+    const WINDOWS: [(u64, u64); 14] = [
         (VOP_D0A, rk3588::VOP_LEN),
         (CRU_D0C, rk3588_clock::CRU_LEN),
         (HDMI_D0D, rk3588_hdmi::HDMI_LEN),
@@ -65,6 +68,8 @@ mod tests {
         (SYS_GRF_R0, rk3588_shared::SYS_GRF_LEN),
         (VOP_R1, rk3588_mode::VOP_WINDOW_LEN),
         (TX_R1, rk3588_mode::TX_WINDOW_LEN),
+        (PHY_R2, rk3588_hdmi::PHY_LEN),
+        (GRF_R2, rk3588_hdmi::PHY_GRF_MAP_LEN),
         (DTB_D0B, dtb_topology::MAX_DTB_BYTES as u64),
     ];
 

@@ -27,6 +27,8 @@ pub mod rk3588_clock;
 pub mod rk3588_hdmi;
 pub mod rk3588_latch;
 pub mod rk3588_mode;
+pub mod rk3588_phy_image;
+pub mod rk3588_relock;
 pub mod rk3588_shared;
 
 #[cfg(test)]
