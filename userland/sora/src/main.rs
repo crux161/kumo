@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j598
 //j599
 //j600
 //j601
 //j605
+//j606
 
 extern crate alloc;
 
@@ -812,6 +812,9 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     use drv_fb::rk3588_hdmi::{
         hdmi_accessible, HDMI_BASE, HDMI_LEN, PHY_BASE, PHY_GRF_BASE, PHY_GRF_LEN, PHY_LEN,
     };
+    use drv_fb::rk3588_shared::{
+        SYS_GRF_BASE, SYS_GRF_LEN, VO1_GRF_BASE, VO1_GRF_LEN, VOP_GRF_BASE, VOP_GRF_LEN,
+    };
     let mut power = None;
     // D0d: PMU_BIU_IDLE_SFTCON1 bit 0 is VO1's idle request enable, which D0a's fixed
     // 16-byte record does not carry. Sora observes it read-only for the HDMI gate.
@@ -891,6 +894,30 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
         }
     }
     for (tag, grant) in [b"H", b"P", b"R"].iter().zip(grants) {
+        if channel_write_with_handle(bootstrap, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+            let _ = handle_close(grant);
+        }
+    }
+
+    // R0 (DESIGN/020 Amendment D0): one read-only page each of VOP_GRF, VO1_GRF and SYS_GRF,
+    // always sent as V/W/Y. VOP_GRF follows PD_VOP; VO1_GRF follows the HDMI gate above
+    // (drv-fb also proves VO1's bus clocks open before it reads); SYS_GRF is always on. Every
+    // grant is narrowed to READ. — TIMBERDOODLE
+    let shared = [
+        (
+            power.is_some_and(Power::vop_accessible),
+            VOP_GRF_BASE,
+            VOP_GRF_LEN,
+        ),
+        (accessible, VO1_GRF_BASE, VO1_GRF_LEN),
+        (power.is_some(), SYS_GRF_BASE, SYS_GRF_LEN),
+    ];
+    for (tag, (allowed, base, len)) in [b"V", b"W", b"Y"].iter().zip(shared) {
+        let grant = if allowed {
+            read_only_grant(resource_create_child(root, base, len, 0, 0))
+        } else {
+            Handle(0)
+        };
         if channel_write_with_handle(bootstrap, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
             let _ = handle_close(grant);
         }

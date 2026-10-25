@@ -2,16 +2,17 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j598
 //j599
 //j600
 //j601
 //j605
+//j606
 
 mod clock_probe;
 mod display_probe;
 mod display_topology;
 mod hdmi_probe;
+mod shared_probe;
 
 use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
@@ -151,6 +152,12 @@ extern "C" fn main(
     let (_, phy_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let (_, grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
+    // R0: three read-only GRF pages, always sent, in VOP_GRF/VO1_GRF/SYS_GRF order (tags
+    // V/W/Y). An ineligible or powered-down path sends Handle(0). — TIMBERDOODLE
+    let (_, vop_grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, vo1_grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, sys_grf_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+
     // D0b: the supervisor's private copy of the live firmware DTB follows D0a's handle,
     // D0c's clock grant and D0d's H/P/R records. The record is fixed-size on every board;
     // an absent copy arrives as Handle(0). — TIMBERDOODLE
@@ -210,13 +217,22 @@ extern "C" fn main(
         Handle(0)
     };
     display_probe::report(bootinfo, power, Handle(display_raw as u32));
-    clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
-    hdmi_probe::report(
+    let cru_mapped = clock_probe::report_clock_probe(clock_grant, Handle(clock_raw as u32));
+    let tx_mapped = hdmi_probe::report(
         bootinfo,
         power,
         Handle(hdmi_raw as u32),
         Handle(phy_raw as u32),
         Handle(grf_raw as u32),
+    );
+    shared_probe::report(
+        bootinfo,
+        power,
+        cru_mapped,
+        tx_mapped,
+        Handle(vop_grf_raw as u32),
+        Handle(vo1_grf_raw as u32),
+        Handle(sys_grf_raw as u32),
     );
     display_topology::report(
         bootinfo,

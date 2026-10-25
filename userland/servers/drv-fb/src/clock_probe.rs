@@ -1,6 +1,7 @@
 //j599
 //j601
 //j605
+//j606
 
 //! D0c live adapter: one read-only CRU mapping, one fixed sample, one NOTICE
 //! inventory. There is no write path: [`Registers`] implements only
@@ -162,8 +163,9 @@ fn log_record(record: &ClockRecord) {
 
 /// Report the D0c inventory. `grant` is decoded before any graphics reads so a
 /// malformed record can never select a mapping; `resource` is closed on every
-/// path.
-pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) {
+/// path. Returns whether the read-only CRU window at `CRU_D0C` is mapped, so R0
+/// can read its two words through the same window (J606).
+pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) -> bool {
     let Some(grant) = grant else {
         log(format_args!(
             "display: D0c clock grant absent or malformed; zero CRU reads\n"
@@ -171,13 +173,13 @@ pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) {
         if resource.0 != 0 {
             let _ = handle_close(resource);
         }
-        return;
+        return false;
     };
     if resource.0 == 0 {
         log(format_args!(
             "display: D0c clock grant data without a Resource; zero CRU reads\n"
         ));
-        return;
+        return false;
     }
     log(format_args!(
         "display: D0c CRU clock inventory base={:#x} len={:#x} (Device/READ; IRQs 0)\n",
@@ -193,7 +195,7 @@ pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) {
             "display: D0c CRU mapping failed; probe skipped\n"
         ));
         let _ = handle_close(resource);
-        return;
+        return false;
     }
 
     let inventory = decode(&Sample::read(&mut Registers));
@@ -231,4 +233,5 @@ pub fn report_clock_probe(grant: Option<Grant>, resource: Handle) {
     }
 
     let _ = handle_close(resource);
+    true
 }

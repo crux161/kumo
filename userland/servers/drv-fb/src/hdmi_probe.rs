@@ -1,6 +1,7 @@
 //j600
 //j601
 //j602
+//j606
 
 //! D0d live adapter: read-only mappings of the HDMI0 TX, combo PHY and PHY GRF.
 //! No device write, no DDC/EDID transaction and no clock/PMU mutation exists here.
@@ -87,13 +88,22 @@ fn map(resource: Handle, base: u64, len: u64, map_len: u64, va: u64, label: &str
 
 /// Observe the firmware-programmed HDMI0 identity after D0a's scanout report. The three
 /// handles are closed whether or not the probe runs, mirroring D0a's record hygiene.
-pub fn report(boot: &BootInfo, power: Option<Power>, hdmi: Handle, phy: Handle, grf: Handle) {
+/// Returns whether the read-only TX window at `HDMI_D0D` is mapped, so R0 can read two
+/// configuration words through it (J606).
+pub fn report(
+    boot: &BootInfo,
+    power: Option<Power>,
+    hdmi: Handle,
+    phy: Handle,
+    grf: Handle,
+) -> bool {
+    let mut tx_mapped = false;
     if rk3588::eligible(
         boot.board_id(),
         boot.has_framebuffer() && boot.framebuffer.is_plausible(),
     ) {
         match power {
-            Some(power) => probe(power, hdmi, phy, grf),
+            Some(power) => tx_mapped = probe(power, hdmi, phy, grf),
             None => log(format_args!(
                 "display: no PMU observation; D0d probe skipped\n"
             )),
@@ -104,9 +114,10 @@ pub fn report(boot: &BootInfo, power: Option<Power>, hdmi: Handle, phy: Handle, 
             let _ = handle_close(handle);
         }
     }
+    tx_mapped
 }
 
-fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
+fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) -> bool {
     log(format_args!(
         "display: D0d read-only HDMI0 TX/PHY identity probe\n"
     ));
@@ -125,13 +136,13 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         log(format_args!(
             "display: HDMI0/VO1 down or bus idle; zero HDMI/PHY reads\n"
         ));
-        return;
+        return false;
     }
     if !rk3588_hdmi::records_present([hdmi.0, phy.0, grf.0]) {
         log(format_args!(
             "display: HDMI0/PHY0/PHY-GRF records absent; D0d probe skipped\n"
         ));
-        return;
+        return false;
     }
     if !map(
         hdmi,
@@ -142,7 +153,7 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         "HDMI0 TX",
     ) {
         log(format_args!("display: HDMI0 TX mapping failed\n"));
-        return;
+        return false;
     }
     if !map(
         phy,
@@ -153,7 +164,7 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         "PHY0",
     ) {
         log(format_args!("display: PHY0 mapping failed\n"));
-        return;
+        return true;
     }
     if !map(
         grf,
@@ -164,11 +175,11 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         "PHY GRF",
     ) {
         log(format_args!("display: PHY GRF mapping failed\n"));
-        return;
+        return true;
     }
     let Some(snapshot) = Snapshot::read(power, &mut Registers) else {
         log(format_args!("display: D0d PMU guard refused; zero reads\n"));
-        return;
+        return true;
     };
 
     let tx = snapshot.tx;
@@ -345,6 +356,7 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         "display: D0d output {}\n",
         output_name(snapshot.output())
     ));
+    true
 }
 
 fn link_name(link: Link) -> &'static str {

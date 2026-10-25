@@ -1,4 +1,5 @@
 //j601
+//j606
 
 //! Fixed user virtual-address windows for drv-fb's D0 display probes.
 //!
@@ -27,22 +28,34 @@ pub const GRF_D0D: u64 = 0x1508_0000;
 /// D0b's private VOP view (J598), used to re-read the routing after D0a closes its handle.
 pub const VOP_D0B: u64 = 0x1509_0000;
 
+/// R0's VOP_GRF page (J606).
+pub const VOP_GRF_R0: u64 = 0x150a_0000;
+
+/// R0's VO1_GRF page.
+pub const VO1_GRF_R0: u64 = 0x150b_0000;
+
+/// R0's SYS_GRF page.
+pub const SYS_GRF_R0: u64 = 0x150c_0000;
+
 /// D0b's live-DTB copy, worst case `MAX_DTB_BYTES` (16 MiB).
 pub const DTB_D0B: u64 = 0x1600_0000;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{dtb_topology, rk3588, rk3588_clock, rk3588_hdmi};
+    use crate::{dtb_topology, rk3588, rk3588_clock, rk3588_hdmi, rk3588_shared};
 
     /// `(base, mapped length)` for every fixed probe window.
-    const WINDOWS: [(u64, u64); 7] = [
+    const WINDOWS: [(u64, u64); 10] = [
         (VOP_D0A, rk3588::VOP_LEN),
         (CRU_D0C, rk3588_clock::CRU_LEN),
         (HDMI_D0D, rk3588_hdmi::HDMI_LEN),
         (PHY_D0D, rk3588_hdmi::PHY_LEN),
         (GRF_D0D, rk3588_hdmi::PHY_GRF_MAP_LEN),
         (VOP_D0B, rk3588::VOP_LEN),
+        (VOP_GRF_R0, rk3588_shared::VOP_GRF_LEN),
+        (VO1_GRF_R0, rk3588_shared::VO1_GRF_LEN),
+        (SYS_GRF_R0, rk3588_shared::SYS_GRF_LEN),
         (DTB_D0B, dtb_topology::MAX_DTB_BYTES as u64),
     ];
 
