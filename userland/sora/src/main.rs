@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j597
 //j598
 //j599
 //j600
 //j601
+//j605
 
 extern crate alloc;
 
@@ -786,6 +786,21 @@ fn launch_xhci_first_light(
     )
 }
 
+/// DESIGN/020 D0-1: a display probe grant carries READ (to mint a read-only VMO), DUPLICATE
+/// (D0b mints the VOP a second time) and TRANSFER, never WRITE. The writable child is closed,
+/// so drv-fb cannot map these registers writable even by mistake. — TIMBERDOODLE
+fn read_only_grant(raw: u64) -> Handle {
+    let Some(writable) = syscall_handle(raw) else {
+        return Handle(0);
+    };
+    let narrowed = handle_duplicate(
+        writable,
+        Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+    );
+    let _ = handle_close(writable);
+    syscall_handle(narrowed).unwrap_or(Handle(0))
+}
+
 /// D0a: observe shared PMU status in the supervisor, then pass data and one VOP Resource.
 /// No PMU/CRU capability or IRQ authority reaches the display driver. Only the exact Orange
 /// Pi board with a plausible existing GOP image is probed. — TIMBERDOODLE
@@ -826,7 +841,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     } else {
         0
     };
-    let grant = syscall_handle(raw).unwrap_or(Handle(0));
+    let grant = read_only_grant(raw);
     if channel_write_with_handle(bootstrap, b"D".as_ptr(), 1, grant) != 0 && grant.0 != 0 {
         let _ = handle_close(grant);
     }
@@ -835,8 +850,8 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     // (12 bytes, or one zero byte when absent), then the 'K' handle message, so
     // the bootstrap order stays F,C,B,power,D,K. The span covers CRU, PHPTOPCRU's
     // PPLL and PMU1CRU's PHY reference selector, within the board DTB's 0x5c000
-    // CRU window. A READ-only mapping of a wider span grants no write reach:
-    // DESIGN/020's concern is write authority. — TIMBERDOODLE
+    // CRU window. The grant is narrowed to READ (J605), so the wider span gives no write
+    // reach: DESIGN/020's concern is write authority. — TIMBERDOODLE
     let cru_raw = if power.is_some_and(Power::vop_accessible) {
         resource_create_child(
             root,
@@ -848,7 +863,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     } else {
         0
     };
-    let cru = syscall_handle(cru_raw).unwrap_or(Handle(0));
+    let cru = read_only_grant(cru_raw);
     let mut record = [0u8; GRANT_LEN];
     if cru.0 != 0 {
         record = Grant::expected().encode();
@@ -872,9 +887,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
             (PHY_GRF_BASE, PHY_GRF_LEN),
         ];
         for (slot, (base, len)) in grants.iter_mut().zip(apertures) {
-            if let Some(handle) = syscall_handle(resource_create_child(root, base, len, 0, 0)) {
-                *slot = handle;
-            }
+            *slot = read_only_grant(resource_create_child(root, base, len, 0, 0));
         }
     }
     for (tag, grant) in [b"H", b"P", b"R"].iter().zip(grants) {

@@ -1,10 +1,12 @@
 //j599
 //j601
+//j605
 
 //! D0c live adapter: one read-only CRU mapping, one fixed sample, one NOTICE
 //! inventory. There is no write path: [`Registers`] implements only
 //! [`ReadCru::cru`], the mapping is `VmarFlags::READ`, and the child Resource
-//! carries no IRQs.
+//! carries no IRQs. Since J605 the Resource itself is READ-only (DESIGN/020 D0-1),
+//! and the probe asks the kernel for a writable mapping once to prove it.
 
 use core::fmt::{self, Write};
 use drv_fb::probe_va::CRU_D0C;
@@ -31,12 +33,16 @@ impl Write for Log {
 }
 
 fn log(args: fmt::Arguments<'_>) {
+    log_at(kumo_abi::sys::log_level::NOTICE, args);
+}
+
+fn log_at(level: u8, args: fmt::Arguments<'_>) {
     let mut line = Log {
         bytes: [0; 384],
         len: 0,
     };
     if line.write_fmt(args).is_ok() {
-        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.bytes[..line.len]);
+        let _ = kumo_rt::log_write(level, &line.bytes[..line.len]);
     }
 }
 
@@ -61,6 +67,30 @@ fn map(resource: Handle, base: u64, len: u64, va: u64) -> bool {
         ));
         return false;
     };
+    // DESIGN/020 D0-1 (J605): Sora narrowed this grant to READ, so the kernel must
+    // refuse a writable mapping of the CRU. Ask once and report the answer. A success
+    // means read-only is not enforced: it is logged as an error and the mapping is only
+    // ever read, never written. — TIMBERDOODLE
+    let writable = vmar_map(
+        Handle(0),
+        vmo,
+        0,
+        va,
+        len,
+        (VmarFlags::READ | VmarFlags::WRITE).0,
+    );
+    if writable == 0 {
+        log_at(
+            kumo_abi::sys::log_level::ERR,
+            format_args!("display: D0-1 FAILED: the CRU grant mapped writable\n"),
+        );
+        let _ = handle_close(vmo);
+        return true;
+    }
+    log(format_args!(
+        "display: D0-1 CRU grant is read-only: writable map refused (errno {})\n",
+        writable as u32 as i32
+    ));
     // Device memory is the default for an MMIO VMO; READ gives an EL0 read-only
     // mapping. The process never retains a writable mapping of the CRU.
     // — TIMBERDOODLE

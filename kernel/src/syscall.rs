@@ -1,8 +1,8 @@
-//j410
 //j527
 //j547
 //j556
 //j571
+//j605
 use alloc::vec::Vec;
 use core::mem;
 
@@ -1508,10 +1508,18 @@ impl SyscallEngine {
                 len,
                 flags,
             } => {
+                // DESIGN/020 D0-1: a writable mapping needs a writable handle, as
+                // DeviceVmarMap already requires for DMA. Before J605 READ alone let any VMO
+                // handle, even one narrowed to READ, be mapped writable. — TIMBERDOODLE
+                let needed = if flags.contains(PageFlags::WRITE) {
+                    Rights::READ | Rights::WRITE
+                } else {
+                    Rights::READ
+                };
                 let (vmo_koid, vmo) =
                     match process
                         .handles()
-                        .require(vmo_handle, ObjectKind::Vmo, Rights::READ)
+                        .require(vmo_handle, ObjectKind::Vmo, needed)
                     {
                         Ok(entry) => (entry.koid, self.vmo_by_koid(entry.koid)),
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
@@ -2099,10 +2107,13 @@ impl SyscallEngine {
                 phys_base,
                 len,
             } => {
+                // DESIGN/020 D0-1: READ mints; the VMO is writable only if the Resource is. A
+                // holder narrowed to READ can map its registers but never write them.
+                // — TIMBERDOODLE
                 let res_entry =
                     match process
                         .handles()
-                        .require(resource, ObjectKind::Resource, Rights::WRITE)
+                        .require(resource, ObjectKind::Resource, Rights::READ)
                     {
                         Ok(e) => e,
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
@@ -2123,11 +2134,12 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
                 // Create a Physical VMO from the MMIO range.
+                let write = res_entry.rights & Rights::WRITE;
                 match crate::mm::Vmo::from_mmio_range(phys_base, len) {
                     Ok(vmo) => match self.root_vmo_create(
                         process,
                         vmo,
-                        Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+                        Rights::READ | Rights::DUPLICATE | write,
                     ) {
                         Ok(handle) => KernelCallResult::Handle(handle),
                         Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
@@ -2932,6 +2944,141 @@ mod tests {
         for (readout, flag) in cases {
             assert_eq!(device_power_status_record(&readout).flags, flag);
         }
+    }
+
+    fn map_page(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        target: Handle,
+        vmo: Handle,
+        virt: u64,
+        flags: PageFlags,
+    ) -> KernelCallResult {
+        engine.dispatch(
+            process,
+            KernelCall::VmarMap {
+                process_handle: target,
+                vmo_handle: vmo,
+                vmo_offset: 0,
+                virt,
+                len: crate::mm::PAGE_SIZE,
+                flags,
+            },
+        )
+    }
+
+    fn mapped(result: KernelCallResult) -> bool {
+        matches!(result, KernelCallResult::StatusAndValue { status, .. } if status == Errno::Ok.status())
+    }
+
+    #[test]
+    fn a_writable_mapping_needs_write_on_the_vmo() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9100_0000, crate::mm::PAGE_SIZE);
+        let read_only = process.handles_mut().duplicate(vmo, Rights::READ).unwrap();
+        let rw = PageFlags(PageFlags::READ.0 | PageFlags::WRITE.0);
+        let base = 0xffff_0000_0000_0000;
+
+        assert_eq!(
+            map_page(
+                &mut engine,
+                &mut process,
+                kumo_abi::INVALID_HANDLE,
+                read_only,
+                base,
+                rw
+            ),
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+        assert!(process.mappings().is_empty());
+        assert!(mapped(map_page(
+            &mut engine,
+            &mut process,
+            kumo_abi::INVALID_HANDLE,
+            read_only,
+            base,
+            PageFlags::READ,
+        )));
+        assert!(mapped(map_page(
+            &mut engine,
+            &mut process,
+            kumo_abi::INVALID_HANDLE,
+            vmo,
+            base + crate::mm::PAGE_SIZE,
+            rw,
+        )));
+
+        // The same rule covers mapping into a child's VMAR.
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x1000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let child = engine.process_create(&mut process, &job, vmar).unwrap();
+        assert_eq!(
+            map_page(&mut engine, &mut process, child, read_only, 0x1000_0000, rw),
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+    }
+
+    #[test]
+    fn a_read_only_resource_mints_a_read_only_vmo() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0x9000_0000, 0x1000, 0, u32::MAX)
+            .unwrap();
+        let mint = |engine: &mut SyscallEngine, process: &mut Process, resource| {
+            engine.dispatch(
+                process,
+                KernelCall::ResourceMintMmio {
+                    resource,
+                    phys_base: 0x9000_0000,
+                    len: 0x1000,
+                },
+            )
+        };
+
+        let KernelCallResult::Handle(writable) = mint(&mut engine, &mut process, root) else {
+            panic!("a WRITE Resource must mint");
+        };
+        assert!(process
+            .handles()
+            .get(writable)
+            .unwrap()
+            .rights
+            .contains(Rights::READ | Rights::WRITE));
+
+        let narrowed = process
+            .handles_mut()
+            .duplicate(root, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER)
+            .unwrap();
+        let KernelCallResult::Handle(read_only) = mint(&mut engine, &mut process, narrowed) else {
+            panic!("a READ Resource must mint");
+        };
+        assert_eq!(
+            process.handles().get(read_only).unwrap().rights,
+            Rights::READ | Rights::DUPLICATE
+        );
+        let rw = PageFlags(PageFlags::READ.0 | PageFlags::WRITE.0);
+        assert_eq!(
+            map_page(
+                &mut engine,
+                &mut process,
+                kumo_abi::INVALID_HANDLE,
+                read_only,
+                0xffff_0000_0000_0000,
+                rw,
+            ),
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
+
+        let blind = process
+            .handles_mut()
+            .duplicate(root, Rights::TRANSFER)
+            .unwrap();
+        assert_eq!(
+            mint(&mut engine, &mut process, blind),
+            KernelCallResult::Status(Errno::AccessDenied.status())
+        );
     }
 
     #[test]

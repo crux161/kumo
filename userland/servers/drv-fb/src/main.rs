@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j597
 //j598
 //j599
 //j600
 //j601
+//j605
 
 mod clock_probe;
 mod display_probe;
@@ -200,11 +200,11 @@ extern "C" fn main(
         kumo_rt::process_exit(1);
     }
 
-    // D0b: duplicate the VOP Resource before D0a's report consumes it. The duplicate carries
-    // only the READ|WRITE the original already held; no new authority and no second mint path.
-    // — TIMBERDOODLE
+    // D0b: duplicate the VOP Resource before D0a's report consumes it. Since J605 the grant is
+    // READ|DUPLICATE|TRANSFER (DESIGN/020 D0-1) and READ is all a mint needs, so the duplicate
+    // asks for READ alone: no new authority and no second mint path. — TIMBERDOODLE
     let topology_vop = if display_raw != 0 {
-        let duplicated = handle_duplicate(Handle(display_raw as u32), Rights::READ | Rights::WRITE);
+        let duplicated = handle_duplicate(Handle(display_raw as u32), Rights::READ);
         syscall_handle(duplicated).unwrap_or(Handle(0))
     } else {
         Handle(0)
