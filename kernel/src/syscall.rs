@@ -1,8 +1,8 @@
-//j547
 //j556
 //j571
 //j605
 //j609
+//j614
 use alloc::vec::Vec;
 use core::mem;
 
@@ -183,6 +183,12 @@ pub enum KernelCall<'a> {
         aperture_base: u64,
         user_ptr: u64,
         user_len: u64,
+    },
+    DeviceRegisterWrite {
+        resource: Handle,
+        aperture_base: u64,
+        index: u64,
+        value: u64,
     },
     DeviceResetSet {
         resource: Handle,
@@ -1435,6 +1441,8 @@ impl SyscallEngine {
                             || offset.saturating_add(len as u64) > vmo_entry.vmo.len()
                         {
                             Errno::InvalidArgs.status()
+                        } else if !physical_vmo_write_allowed(&vmo_entry.vmo, offset, len as u64) {
+                            Errno::AccessDenied.status()
                         } else {
                             let backing = vmo_entry.vmo.backing();
                             let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
@@ -1533,6 +1541,11 @@ impl SyscallEngine {
                 let Some(vmo) = vmo else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
+                if flags.contains(PageFlags::WRITE)
+                    && !physical_vmo_write_allowed(&vmo, vmo_offset, len)
+                {
+                    return KernelCallResult::Status(Errno::AccessDenied.status());
+                }
                 if process_handle == kumo_abi::INVALID_HANDLE {
                     // Self-map: map into the calling process's own VMAR.
                     //
@@ -2140,7 +2153,11 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
                 // Create a Physical VMO from the MMIO range.
-                let write = res_entry.rights & Rights::WRITE;
+                let write = if kumo_hal::active::device_mmio_read_only(phys_base, len) {
+                    Rights::empty()
+                } else {
+                    res_entry.rights & Rights::WRITE
+                };
                 match crate::mm::Vmo::from_mmio_range(phys_base, len) {
                     Ok(vmo) => match self.root_vmo_create(
                         process,
@@ -2624,6 +2641,15 @@ impl SyscallEngine {
                 }
                 KernelCallResult::Status(Errno::Ok.status())
             }
+            KernelCall::DeviceRegisterWrite {
+                resource,
+                aperture_base,
+                index,
+                value,
+            } => KernelCallResult::Status(
+                self.device_register_write(process, resource, aperture_base, index, value)
+                    .status(),
+            ),
             KernelCall::DeviceResetSet {
                 resource,
                 aperture_base,
@@ -2641,6 +2667,47 @@ impl SyscallEngine {
     /// The address of the board DTB the kernel accepted at boot, or 0.
     fn dtb(&self) -> u64 {
         self.boot_info.as_ref().map_or(0, |boot| boot.platform.dtb)
+    }
+
+    fn device_register_write(
+        &self,
+        process: &Process,
+        resource: Handle,
+        base: u64,
+        index: u64,
+        value: u64,
+    ) -> Errno {
+        let entry = match process
+            .handles()
+            .require(resource, ObjectKind::Resource, Rights::WRITE)
+        {
+            Ok(entry) => entry,
+            Err(error) => return errno_from_object(error),
+        };
+        if index > u64::from(u32::MAX) || value > u64::from(u32::MAX) {
+            return Errno::InvalidArgs;
+        }
+        let Some(res) = self.resource_by_koid(entry.koid) else {
+            return Errno::BadHandle;
+        };
+        if !resource_contains(res, base, 1) {
+            return Errno::AccessDenied;
+        }
+        let Some(len) = kumo_hal::active::device_register_window(base) else {
+            return Errno::NotSupported;
+        };
+        if !resource_contains(res, base, len) {
+            return Errno::AccessDenied;
+        }
+        if !kumo_hal::active::device_register_valid(base, index as u32, value as u32) {
+            return Errno::InvalidArgs;
+        }
+        match kumo_hal::active::device_register_write(self.dtb(), base, index as u32, value as u32)
+        {
+            Some(true) => Errno::Ok,
+            Some(false) => Errno::BadState,
+            None => Errno::NotSupported,
+        }
     }
 
     fn device_reset_set(
@@ -2793,6 +2860,19 @@ pub const fn errno_from_ipc(error: IpcError) -> Errno {
     }
 }
 
+/// Apply the backend reservation to stale/privileged physical aliases too, not only MMIO
+/// mints. No physical dereference or page-table update precedes this check. — KESTREL
+fn physical_vmo_write_allowed(vmo: &Vmo, offset: u64, len: u64) -> bool {
+    match vmo.backing() {
+        crate::mm::VmoBacking::PhysicalRam { phys_base }
+        | crate::mm::VmoBacking::Mmio { phys_base }
+        | crate::mm::VmoBacking::Dma { phys_base } => phys_base
+            .checked_add(offset)
+            .is_some_and(|base| !kumo_hal::active::device_mmio_read_only(base, len)),
+        crate::mm::VmoBacking::Anonymous => true,
+    }
+}
+
 pub const fn errno_from_object(error: ObjectError) -> Errno {
     match error {
         ObjectError::BadHandle => Errno::BadHandle,
@@ -2806,6 +2886,185 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn register_write_checks_authority_whole_window_widths_and_selectors() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0xfdd9_0000, 0x7000, 0, 0)
+            .unwrap();
+        let narrow = engine
+            .root_resource_create(&mut process, 0xfdd9_0000, 0x1000, 0, 0)
+            .unwrap();
+        let reader = process.handles_mut().duplicate(root, Rights::READ).unwrap();
+        let (channel, _) = create_channel(&mut engine, &mut process);
+        let call = |resource, base, index, value| KernelCall::DeviceRegisterWrite {
+            resource,
+            aperture_base: base,
+            index,
+            value,
+        };
+        for (request, expected) in [
+            (call(Handle(u32::MAX), 0xfdd9_0000, 0, 2), Errno::BadHandle),
+            (call(channel, 0xfdd9_0000, 0, 2), Errno::WrongType),
+            (call(reader, 0xfdd9_0000, 0, 2), Errno::AccessDenied),
+            (call(root, 0xfde8_0000, 0, 2), Errno::AccessDenied),
+            (call(root, u64::MAX, 0, 2), Errno::AccessDenied),
+            (call(narrow, 0xfdd9_0000, 0, 2), Errno::AccessDenied),
+            (call(root, 0xfdd9_0004, 0, 2), Errno::NotSupported),
+            (call(root, 0xfdd9_0000, 1 << 32, 2), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 0, 1 << 32), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 0x24, 0), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 0, 1 << 31), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 14, 0x48005), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 15, 0x20002), Errno::InvalidArgs),
+            (call(root, 0xfdd9_0000, 0, 2), Errno::NotSupported),
+        ] {
+            assert_eq!(
+                engine.dispatch(&mut process, request),
+                KernelCallResult::Status(expected.status())
+            );
+        }
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn full_and_partial_protected_mints_are_read_only_even_from_write_authority() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let root = engine
+            .root_resource_create(&mut process, 0xfdd8_f000, 0xa000, 0, 0)
+            .unwrap();
+        for (base, len) in [
+            (0xfdd9_0000, 0x8000),
+            (0xfdd8_f000, 0x2000),
+            (0xfdd9_7000, 0x1000),
+        ] {
+            let KernelCallResult::Handle(vmo) = engine.dispatch(
+                &mut process,
+                KernelCall::ResourceMintMmio {
+                    resource: root,
+                    phys_base: base,
+                    len,
+                },
+            ) else {
+                panic!("read mint refused");
+            };
+            assert_eq!(
+                process.handles().get(vmo).unwrap().rights,
+                Rights::READ | Rights::DUPLICATE
+            );
+            let rw = PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE;
+            assert_eq!(
+                map_page(
+                    &mut engine,
+                    &mut process,
+                    kumo_abi::INVALID_HANDLE,
+                    vmo,
+                    0,
+                    rw
+                ),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            let value = 0u32;
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::VmoWrite {
+                        vmo,
+                        offset: 0,
+                        src: &value as *const u32 as *const u8,
+                        len: 4
+                    }
+                ),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            assert!(mapped(map_page(
+                &mut engine,
+                &mut process,
+                kumo_abi::INVALID_HANDLE,
+                vmo,
+                0,
+                PageFlags::READ | PageFlags::DEVICE
+            )));
+        }
+        for base in [0xfdd8_f000, 0xfdd9_8000] {
+            let KernelCallResult::Handle(vmo) = engine.dispatch(
+                &mut process,
+                KernelCall::ResourceMintMmio {
+                    resource: root,
+                    phys_base: base,
+                    len: 0x1000,
+                },
+            ) else {
+                panic!("neighbor refused");
+            };
+            assert!(process
+                .handles()
+                .get(vmo)
+                .unwrap()
+                .rights
+                .contains(Rights::WRITE));
+        }
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn stale_physical_dma_and_mmio_write_aliases_cannot_bypass_reservation() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let parent = crate::task::Job::root(engine.objects_mut());
+        let child = engine
+            .process_create(
+                &mut process,
+                &parent,
+                Vmar::new(0x1000, 0x2000_0000).unwrap(),
+            )
+            .unwrap();
+        for constructor in [
+            Vmo::from_physical_range,
+            Vmo::from_mmio_range,
+            Vmo::from_dma_range,
+        ] {
+            // The protected page is reached through a nonzero VMO offset. — KESTREL
+            let vmo = constructor(0xfdd8_f000, 0xa000).unwrap();
+            let handle = engine
+                .root_vmo_create(&mut process, vmo, Rights::READ | Rights::WRITE)
+                .unwrap();
+            for offset in [0x1000, 0x2000, 0x8000] {
+                for target in [kumo_abi::INVALID_HANDLE, child] {
+                    let call = KernelCall::VmarMap {
+                        process_handle: target,
+                        vmo_handle: handle,
+                        vmo_offset: offset,
+                        virt: 0x1000,
+                        len: 0x1000,
+                        flags: PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE,
+                    };
+                    assert_eq!(
+                        engine.dispatch(&mut process, call),
+                        KernelCallResult::Status(Errno::AccessDenied.status())
+                    );
+                }
+                let value = 0u32;
+                let call = KernelCall::VmoWrite {
+                    vmo: handle,
+                    offset,
+                    src: &value as *const u32 as *const u8,
+                    len: 4,
+                };
+                assert_eq!(
+                    engine.dispatch(&mut process, call),
+                    KernelCallResult::Status(Errno::AccessDenied.status())
+                );
+            }
+            assert!(physical_vmo_write_allowed(&vmo, 0, 0x1000));
+            assert!(physical_vmo_write_allowed(&vmo, 0x9000, 0x1000));
+            assert!(!physical_vmo_write_allowed(&vmo, 0xfff, 2));
+        }
+    }
 
     #[test]
     fn device_reset_checks_type_rights_range_and_raw_argument_widths_before_hardware() {

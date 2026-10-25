@@ -1,8 +1,8 @@
-//j559
 //j565
 //j571
 //j601
 //j609
+//j614
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +89,33 @@ pub enum Syscall {
     /// Needs Resource WRITE covering the live DTB-gated device aperture. `asserted` is 0/1;
     /// no register, bit mask or sequence is supplied by the caller (DESIGN/020 D0).
     DeviceResetSet = 52,
+    /// One indexed, masked register write: `(resource, aperture_base, register_index, value)`.
+    /// Requires Resource WRITE over the live DT-gated aperture. No caller offset or mask.
+    DeviceRegisterWrite = 53,
+}
+
+/// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
+/// These are selectors, never byte offsets. Other device apertures do not implement this table.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayRegister {
+    Vp2Clock = 0,
+    InterfaceControl = 1,
+    HorizontalTotal = 2,
+    HorizontalActive = 3,
+    VerticalTotal = 4,
+    VerticalActive = 5,
+    RegionControl = 6,
+    RegionAddress = 7,
+    RegionStride = 8,
+    RegionActive = 9,
+    RegionDisplay = 10,
+    RegionOffset = 11,
+    InterfaceEnable = 12,
+    Vp2Control = 13,
+    Commit = 14,
+    FrameInterruptEnable = 15,
+    FrameInterruptClear = 16,
 }
 
 /// Kernel log levels, syslog's numbering: lower is more urgent (J559).
@@ -312,6 +339,7 @@ mod tests {
         assert_eq!(Syscall::DevicePowerUp as usize, 50);
         assert_eq!(Syscall::DevicePowerStatus as usize, 51);
         assert_eq!(Syscall::DeviceResetSet as usize, 52);
+        assert_eq!(Syscall::DeviceRegisterWrite as usize, 53);
         assert_eq!(Errno::TimedOut.status(), -10);
         assert_eq!(Errno::BadState.status(), -11);
     }

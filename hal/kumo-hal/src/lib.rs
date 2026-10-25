@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j493
 //j534
 //j570
 //j571
 //j609
+//j614
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -22,7 +22,8 @@ pub mod active {
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
         console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
-        device_aperture_blocked, device_power_status, device_power_unit, device_power_up,
+        device_aperture_blocked, device_mmio_read_only, device_power_status, device_power_unit,
+        device_power_up, device_register_valid, device_register_window, device_register_write,
         device_reset_set, device_reset_unit, early_console_write, el0_exit, enable_kernel_mmu,
         fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
@@ -51,7 +52,8 @@ pub mod active {
         clear_preempt_hook, complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
         console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
-        device_aperture_blocked, device_power_status, device_power_unit, device_power_up,
+        device_aperture_blocked, device_mmio_read_only, device_power_status, device_power_unit,
+        device_power_up, device_register_valid, device_register_window, device_register_write,
         device_reset_set, device_reset_unit, discover_acpi_madt, discover_acpi_root,
         early_console_write, el0_exit, enable_kernel_mmu, exceptions_seen, fb_fill, fb_geometry,
         fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,

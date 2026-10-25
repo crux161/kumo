@@ -1,5 +1,6 @@
 //j607
 //j608
+//j614
 
 //! R1 (DESIGN/020 Amendment D0): KUMO rebuilds the HDMI0 mode's VOP2 and TX program from its
 //! own mode table, after scrubbing it to TRM reset values with VP2 in standby.
@@ -23,10 +24,10 @@
 //! R1 records those words but does not write them). Register sources: RK3588 TRM Part 2 ch. 7
 //! (VOP2) and ch. 24 (HDMI TX). — TIMBERDOODLE
 
-/// The writable VOP2 window: system, overlay, the four post blocks, cluster/esmart windows and
+/// The diagnostic VOP2 window: system, overlay, the four post blocks, cluster/esmart windows and
 /// the LUTs, but not the MMU page at `+0x7000`.
 pub const VOP_WINDOW_LEN: u64 = 0x7000;
-/// The writable HDMI0 TX page.
+/// The read-only HDMI0 TX page.
 pub const TX_WINDOW_LEN: u64 = 0x1000;
 
 pub const REG_CFG_DONE: u32 = 0x0000;
@@ -52,6 +53,31 @@ pub const ESMART2_R0_DSP_OFFSET: u32 = ESMART2 + 0x28;
 /// HDMI TX words.
 pub const TX_HDCP2LOGIC_CONFIG0: u32 = 0x08e0;
 pub const TX_LINK_CONFIG0: u32 = 0x0968;
+
+/// Translate driver register names to stable checked-call selectors, never arbitrary offsets.
+pub fn register_index(offset: u32) -> Option<u32> {
+    use kumo_abi::sys::DisplayRegister as R;
+    Some(match offset {
+        VP2_CLK_CTRL => R::Vp2Clock,
+        DSP_INFACE_CTRL => R::InterfaceControl,
+        VP2_HTOTAL_HS_END => R::HorizontalTotal,
+        VP2_HACT_ST_END => R::HorizontalActive,
+        VP2_VTOTAL_VS_END => R::VerticalTotal,
+        VP2_VACT_ST_END => R::VerticalActive,
+        ESMART2_R0_MST_CTL => R::RegionControl,
+        ESMART2_R0_MST_YRGB => R::RegionAddress,
+        ESMART2_R0_VIR => R::RegionStride,
+        ESMART2_R0_ACT_INFO => R::RegionActive,
+        ESMART2_R0_DSP_INFO => R::RegionDisplay,
+        ESMART2_R0_DSP_OFFSET => R::RegionOffset,
+        DSP_INFACE_EN => R::InterfaceEnable,
+        VP2_DSP_CTRL => R::Vp2Control,
+        REG_CFG_DONE => R::Commit,
+        super::rk3588_vblank::PORT2_INTR_EN => R::FrameInterruptEnable,
+        super::rk3588_vblank::PORT2_INTR_CLR => R::FrameInterruptClear,
+        _ => return None,
+    } as u32)
+}
 
 /// `POST_DSP_CTRL` bit 31, `vop_standby_en_imd`: immediate; the port stops fetching at the end
 /// of the current frame and its output is blank.
@@ -365,6 +391,31 @@ pub fn run(hw: &mut impl Hardware, program: &Program, plan: Plan) -> Outcome {
     rebuild(hw, program);
     hw.sleep_ms(plan.verify_after_ms);
     verify(hw, program, blanked)
+}
+
+#[cfg(test)]
+mod checked_register_tests {
+    use super::*;
+    #[test]
+    fn all_program_words_have_unique_selectors_and_privileged_offsets_do_not() {
+        let program = Program::build(
+            DMT_1600X900_60_RB,
+            Framebuffer {
+                phys: 0xed0c0000,
+                width: 1600,
+                height: 900,
+                stride: 1600,
+            },
+        )
+        .unwrap();
+        for (index, word) in program.words.iter().enumerate() {
+            assert_eq!(register_index(word.offset), Some(index as u32));
+        }
+        assert_eq!(register_index(REG_CFG_DONE), Some(14));
+        for offset in [0x24, 0x1c08, 0x1100, 0x7000, 0x30, 0x1c14 + 1] {
+            assert_eq!(register_index(offset), None);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 //j611
+//j614
 
 //! D1b: VP2's frame-start interrupt, delivered to drv-fb, and a measurement of its rate.
 //!
@@ -82,12 +83,12 @@ pub fn enable(hw: &mut impl Hardware) {
     hw.barrier();
 }
 
-/// Read VP2's interrupt status and clear what is set, before the line is unmasked. Returns the
-/// status that was read.
+/// Read VP2 status and clear only our frame-start source before completing the IRQ.
+/// Return every observed source, without clearing sources we do not own. — KESTREL
 pub fn acknowledge(hw: &mut impl Hardware) -> u32 {
     let status = hw.read(Block::Vop, PORT2_INTR_STATUS) & 0x3ff;
-    if status != 0 {
-        hw.write(Block::Vop, PORT2_INTR_CLR, masked(status, status));
+    if status & FS != 0 {
+        hw.write(Block::Vop, PORT2_INTR_CLR, masked(FS, FS));
         hw.barrier();
     }
     status
@@ -313,6 +314,18 @@ mod tests {
         for (offset, _) in &vop.writes {
             assert!([PORT2_INTR_EN, PORT2_INTR_CLR].contains(offset));
         }
+    }
+
+    #[test]
+    fn acknowledge_leaves_unowned_pending_sources_untouched() {
+        let mut vop = Vop::default();
+        vop.regs.insert(PORT2_INTR_STATUS, FS | (1 << 5));
+        assert_eq!(acknowledge(&mut vop), FS | (1 << 5));
+        assert_eq!(vop.writes, [(PORT2_INTR_CLR, 0x10001)]);
+        assert_eq!(vop.regs[&PORT2_INTR_STATUS], 1 << 5);
+        vop.writes.clear();
+        assert_eq!(acknowledge(&mut vop), 1 << 5);
+        assert!(vop.writes.is_empty());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j605
 //j606
 //j607
 //j609
 //j611
+//j614
 
 extern crate alloc;
 
@@ -923,11 +923,9 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
         }
     }
 
-    // R1 (DESIGN/020 D0-2): the display holder's own device windows, writable, always sent as
-    // U/X. The VOP2 window stops before the MMU page (`+0x7000`), which stays read-only until
-    // D1 decides who owns the display IOMMU; the TX page is the one D0d reads. These are not
-    // narrowed: drv-fb rebuilds the mode through them. CRU, PMU and GRF grants stay read-only.
-    // — TIMBERDOODLE
+    // DESIGN/022 D1d-a: VOP WRITE authorizes checked register calls and its IRQ; every raw
+    // VOP/MMU mapping is read-only in the kernel. TX has no writers, so narrow its grant.
+    // CRU/PMU/GRF diagnostic authority stays read-only. — KESTREL
     // D1b (J611): the VOP window also carries the VOP's interrupt, INTID 188 (SPI 156), which
     // it shares with the display IOMMU; drv-fb refuses to arm it unless every other source on
     // that line is off. The TX page carries no interrupt. — TIMBERDOODLE
@@ -949,8 +947,12 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     ];
     for (tag, (allowed, base, len, irq_base, irq_count)) in [b"U", b"X"].iter().zip(windows) {
         let grant = if allowed {
-            syscall_handle(resource_create_child(root, base, len, irq_base, irq_count))
-                .unwrap_or(Handle(0))
+            let raw = resource_create_child(root, base, len, irq_base, irq_count);
+            if base == HDMI_BASE {
+                read_only_grant(raw)
+            } else {
+                syscall_handle(raw).unwrap_or(Handle(0))
+            }
         } else {
             Handle(0)
         };

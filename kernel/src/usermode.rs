@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j559
 //j571
 //j595
 //j601
 //j609
+//j614
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1847,6 +1847,17 @@ fn dispatch_object_syscall(
     } else if num == Syscall::DeviceCtxWaitFault as u64 {
         let ctx = Handle(r[0] as u32);
         match engine.dispatch(target, KernelCall::DeviceCtxWaitFault { ctx }) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::DeviceRegisterWrite as u64 {
+        let call = KernelCall::DeviceRegisterWrite {
+            resource: Handle(r[0] as u32),
+            aperture_base: r[1],
+            index: r[2],
+            value: r[3],
+        };
+        match engine.dispatch(target, call) {
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }

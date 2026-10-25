@@ -1,11 +1,11 @@
-//j608
 //j609
 //j610
 //j611
 //j612
+//j614
 
-//! R1 live adapter: writable mappings of the VOP2 registers (`0xfdd90000` + `0x7000`, not the
-//! MMU page) and the HDMI0 TX page, granted by Sora as device windows (DESIGN/020 D0-2). It
+//! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
+//! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
 //! blanks HDMI0 for about two seconds and rebuilds the mode from KUMO's table. No clock, reset,
 //! PHY, GRF or PMU write exists here, and the TX page is only read (see `rk3588_mode`).
 //!
@@ -86,7 +86,7 @@ fn error(args: fmt::Arguments<'_>) {
     log_at(kumo_abi::sys::log_level::ERR, args);
 }
 
-struct Device;
+struct Device(Handle);
 
 impl Device {
     fn address(block: Block, offset: u32) -> u64 {
@@ -109,7 +109,9 @@ impl Hardware for Device {
 
     fn write(&mut self, block: Block, offset: u32, value: u32) {
         assert!(block == Block::Vop, "R1 never writes the HDMI TX");
-        unsafe { core::ptr::write_volatile(Self::address(block, offset) as *mut u32, value) }
+        let index = drv_fb::rk3588_mode::register_index(offset).expect("unapproved VOP register");
+        let status = kumo_rt::device_register_write(self.0, rk3588::VOP_BASE, index, value);
+        assert_eq!(status, 0, "checked VOP write refused");
     }
 
     fn barrier(&mut self) {
@@ -124,9 +126,38 @@ impl Hardware for Device {
     }
 }
 
-/// Mint and map one device window. The VOP2 grant keeps `WRITE` because it is the display
-/// holder's own device (DESIGN/020 D0-2); the TX page is mapped read-only.
-fn map(resource: Handle, base: u64, len: u64, va: u64, writable: bool, label: &str) -> bool {
+/// Exercise the new SVC with live vectors. The selected index is the forbidden +0x24
+/// bypass/reset offset, not a table slot; this must return before any register access. — KESTREL
+#[cfg(target_arch = "aarch64")]
+fn register_boundary_probe(resource: Handle) -> bool {
+    let mut status = u64::from(resource.0);
+    let (a, b, c, d): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "movi v0.16b, #0x5a", "movi v31.16b, #0xa5", "svc #0",
+            "umov x9, v0.d[0]", "umov x10, v0.d[1]",
+            "umov x11, v31.d[0]", "umov x12, v31.d[1]",
+            inlateout("x0") status,
+            in("x1") rk3588::VOP_BASE, in("x2") 0x24u64, in("x3") 0u64,
+            in("x8") kumo_abi::Syscall::DeviceRegisterWrite as u64,
+            lateout("x9") a, lateout("x10") b, lateout("x11") c, lateout("x12") d,
+            clobber_abi("C"), options(nostack),
+        );
+    }
+    status as u32 as i32 == kumo_abi::Errno::InvalidArgs.status()
+        && a == 0x5a5a5a5a5a5a5a5a
+        && b == a
+        && c == 0xa5a5a5a5a5a5a5a5
+        && d == c
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn register_boundary_probe(_resource: Handle) -> bool {
+    false
+}
+
+/// Mint diagnostic views. VOP Resource WRITE authorizes checked calls/IRQ, never a writable
+/// VMO. Probe the denial before the real read-only mapping, without writing a register. — KESTREL
+fn map(resource: Handle, base: u64, len: u64, va: u64, label: &str) -> bool {
     if resource.0 == 0 {
         log(format_args!("display: R1 {} grant absent\n", label));
         return false;
@@ -139,11 +170,26 @@ fn map(resource: Handle, base: u64, len: u64, va: u64, writable: bool, label: &s
         ));
         return false;
     };
-    let flags = if writable {
-        VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE
-    } else {
-        VmarFlags::READ | VmarFlags::DEVICE
-    };
+    if base == rk3588::VOP_BASE {
+        let rw = VmarFlags::READ | VmarFlags::WRITE | VmarFlags::DEVICE;
+        let map_denied = vmar_map(Handle(0), vmo, 0, va, len, rw.0) as u32 as i32
+            == kumo_abi::Errno::AccessDenied.status();
+        let value = 0u32;
+        let write_denied = kumo_rt::vmo_write(vmo, 0, &value as *const u32 as *const u8, 4) as u32
+            as i32
+            == kumo_abi::Errno::AccessDenied.status();
+        let index_denied = register_boundary_probe(resource);
+        if !(map_denied && write_denied && index_denied) {
+            let _ = handle_close(vmo);
+            error(format_args!(
+                "display: D1d-a protection FAILED map={} write={} index/SIMD={}\n",
+                map_denied, write_denied, index_denied
+            ));
+            return false;
+        }
+        log(format_args!("display: D1d-a raw writable map/VMO write and offset injection denied; SVC SIMD preserved\n"));
+    }
+    let flags = VmarFlags::READ | VmarFlags::DEVICE;
     let ok = vmar_map(Handle(0), vmo, 0, va, len, flags.0) == 0;
     let _ = handle_close(vmo);
     if !ok {
@@ -362,19 +408,12 @@ fn begin(
         ));
         return None;
     };
-    if !map(vop, rk3588::VOP_BASE, VOP_WINDOW_LEN, VOP_R1, true, "VOP2")
-        || !map(
-            tx,
-            rk3588_hdmi::HDMI_BASE,
-            TX_WINDOW_LEN,
-            TX_R1,
-            false,
-            "HDMI0 TX",
-        )
+    if !map(vop, rk3588::VOP_BASE, VOP_WINDOW_LEN, VOP_R1, "VOP2")
+        || !map(tx, rk3588_hdmi::HDMI_BASE, TX_WINDOW_LEN, TX_R1, "HDMI0 TX")
     {
         return None;
     }
-    let mut device = Device;
+    let mut device = Device(vop);
     log(format_args!(
         "display: R1 KUMO mode table: DMT 1600x900@60 RB, H {}/{}/{}/{} V {}/{}/{}/{}, {} Hz; {} VOP words written, {} TX words checked; scanout {:#x} stride {}\n",
         mode.h_active,
@@ -470,7 +509,7 @@ fn begin(
 /// Handle the timer `port_wait` reported as `pending.source`. Returns the next step, if any.
 pub fn advance(mut pending: Pending) -> Option<Pending> {
     disarm(pending.port, pending.timer);
-    let mut device = Device;
+    let mut device = Device(pending.vop.0);
     match pending.phase {
         Phase::Dwell => {
             latch::stage(&mut device, &latch::proof(&pending.program));
@@ -538,10 +577,17 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             None
         }
         Phase::R2Blank => {
-            if !latch::observe(&mut device, &latch::blacked(&pending.program)).matches() {
+            let observed = latch::observe(&mut device, &latch::blacked(&pending.program));
+            if !observed.matches() {
+                report_mismatches(
+                    &mut device,
+                    &latch::blacked(&pending.program),
+                    observed.mismatched,
+                );
                 latch::stop(&mut device, &pending.program);
                 error(format_args!(
-                    "display: R2 black program did not latch; no PHY reset, VP2 in standby\n"
+                    "display: R2 black program did not latch: {:?}; no PHY reset, VP2 in standby\n",
+                    observed
                 ));
                 return None;
             }
@@ -729,7 +775,7 @@ fn on_vblank(mut pending: Pending) -> Option<Pending> {
     if matches!(pending.phase, Phase::D1cRun) {
         return d1c_vblank(pending);
     }
-    let mut device = Device;
+    let mut device = Device(pending.vop.0);
     let _ = interrupt_wait(pending.irq);
     let status = vblank::acknowledge(&mut device);
     let now = kumo_rt::clock_get();
@@ -959,7 +1005,7 @@ fn d1c_paint(
 }
 
 fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
-    let mut device = Device;
+    let mut device = Device(pending.vop.0);
     let _ = interrupt_wait(pending.irq);
     let status = vblank::acknowledge(&mut device);
     if status & vblank::FS == 0 {
@@ -1191,7 +1237,7 @@ fn next(pending: Pending, phase: Phase, ms: u64) -> Option<Pending> {
             ..pending
         }),
         None => {
-            latch::stop(&mut Device, &pending.program);
+            latch::stop(&mut Device(pending.vop.0), &pending.program);
             error(format_args!(
                 "display: R1b timer unavailable; HDMI0 off, VP2 in standby\n"
             ));

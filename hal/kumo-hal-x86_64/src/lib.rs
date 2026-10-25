@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j474
 //j493
 //j534
 //j571
 //j609
+//j614
 
 mod fpsimd;
 mod gdt;
@@ -1190,6 +1190,19 @@ pub struct DevicePowerReadout {
 }
 
 pub fn device_power_unit(_dtb: u64, _aperture_base: u64) -> Option<DevicePowerUnitInfo> {
+    None
+}
+
+pub fn device_mmio_read_only(_base: u64, _len: u64) -> bool {
+    false
+}
+pub fn device_register_window(_base: u64) -> Option<u64> {
+    None
+}
+pub fn device_register_valid(_base: u64, _index: u32, _value: u32) -> bool {
+    false
+}
+pub fn device_register_write(_dtb: u64, _base: u64, _index: u32, _value: u32) -> Option<bool> {
     None
 }
 

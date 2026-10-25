@@ -1,4 +1,5 @@
 //j608
+//j614
 
 //! R1b: prove the VOP's active mirrored program changed before restoring visible pixels.
 //!
@@ -87,13 +88,21 @@ pub fn proof(target: &Program) -> Program {
 /// Stage an image under black and request its load with VP2 and HDMI running. The live
 /// adapter waits on its port timer before observing it, keeping console IPC draining.
 pub fn stage(hw: &mut impl Hardware, image: &Program) {
+    let standby = hw.read(Block::Vop, VP2_DSP_CTRL) & STANDBY != 0;
     for word in &image.words[..DSP_CTRL_INDEX] {
         put(hw, word.offset, word.value);
     }
-    put(hw, REG_CFG_DONE, CFG_DONE_VP2);
-    // Match R1's proven resume order: commit the complete image before leaving standby.
-    // — KESTREL
-    put(hw, VP2_DSP_CTRL, image.words[DSP_CTRL_INDEX].value);
+    let ctrl = image.words[DSP_CTRL_INDEX].value;
+    // A checked call may span a frame: stage black before requesting a running port's load.
+    // In standby, keep R1's commit-before-resume order so the first frame loads the image.
+    // Both orders remain driver policy; the kernel writes one word. — KESTREL
+    if standby {
+        put(hw, REG_CFG_DONE, CFG_DONE_VP2);
+        put(hw, VP2_DSP_CTRL, ctrl);
+    } else {
+        put(hw, VP2_DSP_CTRL, ctrl);
+        put(hw, REG_CFG_DONE, CFG_DONE_VP2);
+    }
 }
 
 pub fn observe(hw: &mut impl Hardware, image: &Program) -> Observation {
@@ -261,6 +270,40 @@ mod tests {
         }
         fn sleep_ms(&mut self, _: u64) {
             self.frame();
+        }
+    }
+
+    #[test]
+    fn a_frame_between_each_checked_write_cannot_consume_an_incomplete_program() {
+        struct Framing(Vop);
+        impl Hardware for Framing {
+            fn read(&mut self, block: Block, offset: u32) -> u32 {
+                self.0.read(block, offset)
+            }
+            fn write(&mut self, block: Block, offset: u32, value: u32) {
+                self.0.write(block, offset, value);
+            }
+            fn barrier(&mut self) {
+                self.0.barrier();
+                self.0.frame();
+            }
+            fn sleep_ms(&mut self, ms: u64) {
+                self.0.sleep_ms(ms);
+            }
+        }
+        let target = target();
+        for standby in [false, true] {
+            let mut device = Framing(Vop::new(&target));
+            if standby {
+                device.write(
+                    Block::Vop,
+                    VP2_DSP_CTRL,
+                    target.words[DSP_CTRL_INDEX].value | STANDBY,
+                );
+            }
+            let image = blacked(&target);
+            stage(&mut device, &image);
+            assert!(observe(&mut device, &image).matches(), "standby={standby}");
         }
     }
 

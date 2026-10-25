@@ -1,15 +1,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j546
 //j570
 //j571
 //j573
 //j609
+//j614
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod display_register;
 pub mod display_unit;
 pub mod mali;
 pub mod power_unit;
@@ -3446,6 +3447,40 @@ pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
 #[cfg(not(target_os = "none"))]
 pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
     false
+}
+
+/// Raw write reservation is independent of DT discovery and power state (DESIGN/022).
+pub fn device_mmio_read_only(base: u64, len: u64) -> bool {
+    display_register::read_only(base, len)
+}
+pub fn device_register_window(base: u64) -> Option<u64> {
+    display_register::window(base)
+}
+pub fn device_register_valid(base: u64, index: u32, value: u32) -> bool {
+    display_register::valid(base, index, value)
+}
+#[cfg(target_os = "none")]
+impl display_register::RegisterIo for PhysPowerIo {
+    fn barrier(&mut self) {
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
+}
+#[cfg(target_os = "none")]
+static DISPLAY_REGISTERS: display_register::BootRegisters = display_register::BootRegisters::new();
+#[cfg(target_os = "none")]
+pub fn device_register_write(dtb: u64, base: u64, index: u32, value: u32) -> Option<bool> {
+    DISPLAY_REGISTERS.write(
+        dtb,
+        base,
+        index,
+        value,
+        || unsafe { dtb_bytes(dtb) },
+        &mut PhysPowerIo,
+    )
+}
+#[cfg(not(target_os = "none"))]
+pub fn device_register_write(_dtb: u64, _base: u64, _index: u32, _value: u32) -> Option<bool> {
+    None
 }
 
 #[cfg(target_os = "none")]

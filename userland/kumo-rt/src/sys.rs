@@ -1,8 +1,8 @@
-//j556
 //j559
 //j572
 //j601
 //j609
+//j614
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -881,6 +881,38 @@ pub fn device_power_up(resource: Handle, aperture_base: u64) -> Status {
     any(target_arch = "aarch64", target_arch = "x86_64")
 )))]
 pub fn device_power_up(_resource: Handle, _aperture_base: u64) -> Status {
+    kumo_abi::Errno::NotSupported.status()
+}
+
+/// Write one field-checked display register through Resource WRITE authority (DESIGN/022).
+#[cfg(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub fn device_register_write(
+    resource: Handle,
+    aperture_base: u64,
+    index: u32,
+    value: u32,
+) -> Status {
+    syscall(
+        Syscall::DeviceRegisterWrite,
+        resource.0 as u64,
+        aperture_base,
+        u64::from(index),
+        u64::from(value),
+    ) as Status
+}
+#[cfg(not(all(
+    target_os = "none",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+pub fn device_register_write(
+    _resource: Handle,
+    _aperture_base: u64,
+    _index: u32,
+    _value: u32,
+) -> Status {
     kumo_abi::Errno::NotSupported.status()
 }
 
