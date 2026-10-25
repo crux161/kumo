@@ -1,4 +1,5 @@
 //j600
+//j602
 
 //! D0d: read-only identification of the RK3588 HDMI0 transmitter and its combo PHY.
 //!
@@ -7,6 +8,11 @@
 //! sampled under the PMU evidence carried by D0a's bootstrap record. Register sources:
 //! RK3588 TRM Part 2 ch. 24 (HDMI TX controller) and ch. 27 (HDMI TX/eDP combo PHY),
 //! Part 1 ch. 6 (HDPTXPHY_GRF) and ch. 7 (PMU). — TIMBERDOODLE
+//!
+//! D0f (J602) corrected the PLL reconstruction against the metal capture: the serializer
+//! is DDR (two bits per PLL-output cycle), the SDM fraction only applies when 0x0178[6]
+//! enables it and is scaled by SDC/16 rather than by the reference, and SDIV is a 4-bit
+//! N-1 code. RESEARCH/013 records the anchors. — TIMBERDOODLE
 
 use crate::rk3588::Power;
 
@@ -24,6 +30,9 @@ pub const PHY_GRF_MAP_LEN: u64 = 0x1000;
 
 /// The PHY's reference is the 24 MHz board crystal when the selector says XO.
 pub const REF_HZ: u64 = 24_000_000;
+/// The reset phase-interpolator setting (0x01A4[5:3] = 0, 16 phases) divides the SDC
+/// clock by 16 before the SDM fraction is applied.
+pub const SDM_PI_PHASES: u64 = 16;
 /// VESA DMT 1600x900@60 reduced blanking: the mode D0a measured on VP2.
 pub const D0A_PIXEL_HZ: u64 = 108_000_000;
 
@@ -212,6 +221,7 @@ impl Tx {
 pub struct Phy {
     pub mdiv_rbr: u32,
     pub sdiv: u32,
+    pub sdm_ctrl: u32,
     pub sdm_den_rbr: u32,
     pub sdm_sign: u32,
     pub sdm_num_rbr: u32,
@@ -272,6 +282,7 @@ impl Snapshot {
             phy: Phy {
                 mdiv_rbr: io.phy(0x0144),
                 sdiv: io.phy(0x0168),
+                sdm_ctrl: io.phy(0x0178),
                 sdm_den_rbr: io.phy(0x0180),
                 sdm_sign: io.phy(0x0190),
                 sdm_num_rbr: io.phy(0x0194),
@@ -364,7 +375,8 @@ impl Snapshot {
         self.grf.status & 1 != 0
     }
 
-    /// The PHY's own status register (0x026C): 3 PHY ready, 2 PHY clock ready.
+    /// 0x026C bits 3 (`phy_ready`) and 2 (`phy_clk_ready`) are RW indications that
+    /// software sets, not hardware status; GRF STATUS0 is the read-only evidence.
     pub fn phy_status_ready(&self) -> bool {
         self.phy.status & (1 << 3) != 0
     }
@@ -439,54 +451,95 @@ impl Snapshot {
         (self.reference_selector() == 0).then_some(REF_HZ)
     }
 
-    /// The serializer bit clock from the RBR register set:
+    /// 0x0178[6] `ana_ropll_sdm_en`: with the modulator off the SDM fraction words are
+    /// inert, whatever they hold.
+    pub fn sdm_enabled(&self) -> bool {
+        self.phy.sdm_ctrl & (1 << 6) != 0
+    }
+
+    /// 0x0178[3]: fractional (1) or integer (0) SDC division for the RBR set.
+    pub fn sdc_fractional(&self) -> bool {
+        self.phy.sdm_ctrl & (1 << 3) != 0
+    }
+
+    /// 0x01A4[5:3]: the reset 8-phase, 1-step (16-phase) interpolator setting.
+    pub fn sdm_pi_default(&self) -> bool {
+        (self.phy.sdc_n_rbr >> 3) & 0b111 == 0
+    }
+
+    /// The ROPLL VCO from the RBR register set:
     ///
-    /// `serial = reference * (mdiv -/+ numerator/denominator) / sdiv`
+    /// `vco = ref * mdiv` with the SDM off; with it on,
+    /// `vco = ref * mdiv -/+ (num/den) * sdc / 16`, `sdc = ref * mdiv / (n - sdc_num/sdc_den)`.
     ///
-    /// The formula is anchored by the TRM's own DP settings (ch. 27 table 27-9):
-    /// RBR 135 / 4 = 810 MHz exactly, HBR (113 - 13/39) / 2 = 1352 MHz and
-    /// HBR2 (113 - 13/39) / 1 = 2704 MHz. It is reported only when the words show
-    /// ROPLL-alone TMDS mode and the RBR PLL register set; every other case is Unknown.
-    pub fn serial_hz(&self) -> Option<u64> {
-        if self.output() != Output::Hdmi0Tmds {
-            return None;
-        }
-        if !self.ropll_alone() || !self.ropll_reference_selected() {
-            return None;
-        }
-        if self.dp_link_bw() != 0 {
-            return None;
-        }
+    /// The SDM form reproduces the TRM's DP settings (ch. 27 table 27-9, reset SDC /5)
+    /// exactly: RBR 3240 MHz, HBR and HBR2 2712 - 12 = 2700 MHz. Scaling the fraction by
+    /// the reference instead gave 2704 MHz. An SDM configuration with integer SDC division
+    /// or a non-default interpolator is Unknown: no anchor covers it.
+    pub fn vco_hz(&self) -> Option<u64> {
         let reference = self.reference_hz()?;
         let mdiv = u64::from(self.phy.mdiv_rbr & 0xff);
+        if mdiv == 0 {
+            return None;
+        }
+        let integer = reference.checked_mul(mdiv)?;
+        if !self.sdm_enabled() {
+            return Some(integer);
+        }
+        if !self.sdc_fractional() || !self.sdm_pi_default() {
+            return None;
+        }
         let denominator = u64::from(self.phy.sdm_den_rbr & 0xff);
         let numerator = u64::from(self.phy.sdm_num_rbr & 0xff);
         let negative = self.phy.sdm_sign & (1 << 3) != 0;
-        let divider = u64::from(sdiv_divider(self.phy.sdiv >> 4)?);
-        if mdiv == 0 || denominator == 0 {
+        let n = u64::from(self.sdc_divider()?);
+        let sdc_numerator = u64::from(self.phy.sdc_num_rbr & 0x3f);
+        let sdc_denominator = u64::from(self.phy.sdc_den_rbr & 0x3f);
+        if denominator == 0 || sdc_denominator == 0 {
             return None;
         }
-        let integer = mdiv.checked_mul(denominator)?;
+        // vco = integer * (1 -/+ num * sdc_den / (den * (n * sdc_den - sdc_num) * 16)).
+        let sdc_scaled = n.checked_mul(sdc_denominator)?.checked_sub(sdc_numerator)?;
+        if sdc_scaled == 0 {
+            return None;
+        }
+        let whole = denominator
+            .checked_mul(sdc_scaled)?
+            .checked_mul(SDM_PI_PHASES)?;
+        let part = numerator.checked_mul(sdc_denominator)?;
         let scaled = if negative {
-            integer.checked_sub(numerator)?
+            whole.checked_sub(part)?
         } else {
-            integer.checked_add(numerator)?
+            whole.checked_add(part)?
         };
-        if scaled == 0 {
-            return None;
-        }
-        let hz = reference.checked_mul(scaled)? / denominator.checked_mul(divider)?;
+        let hz = integer.checked_mul(scaled)? / whole;
         (hz != 0).then_some(hz)
     }
 
-    /// The TMDS pixel clock for the 8-bit ratio the TRM's HDMI setting programs:
-    /// `pixel = serial / 10`. Other color depths are reported as unknown in D0d.
+    /// The PLL output, `vco / sdiv`, reported only when the words show ROPLL-alone TMDS
+    /// mode and the RBR register set; every other case is Unknown.
+    pub fn pll_out_hz(&self) -> Option<u64> {
+        if self.output() != Output::Hdmi0Tmds || self.dp_link_bw() != 0 {
+            return None;
+        }
+        let divider = u64::from(sdiv_divider(self.phy.sdiv >> 4)?);
+        let hz = self.vco_hz()? / divider;
+        (hz != 0).then_some(hz)
+    }
+
+    /// The serializer is DDR: TRM table 27-9's RBR PLL output of 810 MHz is the 1.62 Gbps
+    /// lane rate, so the line carries two bits per PLL-output cycle.
+    pub fn bit_rate_hz(&self) -> Option<u64> {
+        self.pll_out_hz()?.checked_mul(2)
+    }
+
+    /// The TMDS pixel clock for the 8-bit ratio the TRM's HDMI setting programs: ten bits
+    /// per character, so `pixel = bit rate / 10`. Other color depths are Unknown in D0d.
     pub fn pixel_hz(&self) -> Option<u64> {
         if !self.pcg_enabled() || self.pcg_depth() != 0 {
             return None;
         }
-        let serial = self.serial_hz()?;
-        Some(serial / 10)
+        Some(self.bit_rate_hz()? / 10)
     }
 
     /// Refresh rate in millhertz from the derived pixel clock and the TX's own totals.
@@ -512,17 +565,13 @@ impl Snapshot {
     }
 }
 
-/// sdiv encoding: 0../1, 1../2, 2../3, 3../4, 4../5, 5../6, 6 invalid, 7../8.
+/// sdiv is the 4-bit 0x0168[7:4] field, "N-1, except /7": code 6 is invalid and every
+/// other code divides by code + 1, so 11 is /12 and 15 is /16. Masking it to the three
+/// bits the TRM's enumeration prints would turn /12 into /4.
 pub fn sdiv_divider(code: u32) -> Option<u32> {
-    match code & 0b111 {
-        0 => Some(1),
-        1 => Some(2),
-        2 => Some(3),
-        3 => Some(4),
-        4 => Some(5),
-        5 => Some(6),
+    match code & 0xf {
         6 => None,
-        _ => Some(8),
+        code => Some(code + 1),
     }
 }
 
@@ -575,15 +624,16 @@ mod tests {
         }
     }
 
-    /// The live 1600x900@60 configuration the TRM's HDMI table describes: HDMI TMDS,
-    /// ROPLL alone, 24 MHz XO, RBR set, mdiv 225 and sdiv /5 (1080 MHz serial).
+    /// The Orange Pi's live HDMI0 words from the J601 image's metal boot (2026-10-24):
+    /// TMDS in DVI mode, ROPLL alone, 24 MHz XO, mdiv 135, sdiv /6, PCG postdiv 5. The
+    /// SDM words hold 5/9 and SDC 20/24, but 0x0178[6] leaves the modulator off.
     fn fixture() -> Snapshot {
         Snapshot {
             tx: Tx {
                 core_id: 0x4851_5458,
                 version: 0x3031_3030,
-                video_status: 0,
-                frame_composer: 0,
+                video_status: 0x0006_0000,
+                frame_composer: 0x4200_0000,
                 monitor: [
                     (80 << 16) | 24,
                     (200 << 16) | 96,
@@ -593,34 +643,63 @@ mod tests {
                     (1000 << 16) | 900,
                 ],
                 scrambler: 0,
-                link_config: 0,
+                link_config: 0x10,
             },
             phy: Phy {
-                mdiv_rbr: 225,
-                sdiv: 4 << 4,
-                sdm_den_rbr: 78,
+                mdiv_rbr: 135,
+                sdiv: 5 << 4,
+                sdm_ctrl: 0,
+                sdm_den_rbr: 9,
                 sdm_sign: 0,
-                sdm_num_rbr: 0,
-                sdc_n_rbr: 2,
-                sdc_num_rbr: 3,
-                sdc_den_rbr: 8,
-                pcg: 0x11,
+                sdm_num_rbr: 5,
+                sdc_n_rbr: 0,
+                sdc_num_rbr: 20,
+                sdc_den_rbr: 24,
+                pcg: 0x51,
                 frl_mode: 0,
                 lane_mux: 0,
                 dig_clk_sel: 1 << 1,
                 ropll: 1 << 2,
-                status: (1 << 3) | (1 << 2),
+                status: 0,
                 ref_sel: 0,
                 protocol: (1 << 2) | (1 << 1),
                 lane_en: 0xf,
                 tmds_clk_lane: 1 << 3,
             },
             grf: Grf {
-                con0: 1 << 7,
-                status: (1 << 3) | (1 << 2) | (1 << 1),
+                con0: 0xe0,
+                status: 0x0e,
             },
         }
     }
+
+    /// Program a fixture's RBR PLL words with one register set.
+    #[allow(clippy::too_many_arguments)]
+    fn with_pll(
+        mdiv: u32,
+        sdiv_code: u32,
+        sdm_ctrl: u32,
+        den: u32,
+        negative: bool,
+        num: u32,
+        sdc_n: u32,
+        sdc: (u32, u32),
+    ) -> Snapshot {
+        let mut s = fixture();
+        s.phy.mdiv_rbr = mdiv;
+        s.phy.sdiv = sdiv_code << 4;
+        s.phy.sdm_ctrl = sdm_ctrl;
+        s.phy.sdm_den_rbr = den;
+        s.phy.sdm_sign = if negative { 1 << 3 } else { 0 };
+        s.phy.sdm_num_rbr = num;
+        s.phy.sdc_n_rbr = sdc_n;
+        s.phy.sdc_num_rbr = sdc.0;
+        s.phy.sdc_den_rbr = sdc.1;
+        s
+    }
+
+    /// 0x0178's reset value: SDM enabled, fractional SDC division for every rate set.
+    const SDM_RESET: u32 = 0x4f;
 
     #[test]
     fn power_or_a_busy_vo1_prevents_every_hdmi_read() {
@@ -675,6 +754,7 @@ mod tests {
             (0, 0x0968),
             (1, 0x0144),
             (1, 0x0168),
+            (1, 0x0178),
             (1, 0x0180),
             (1, 0x0190),
             (1, 0x0194),
@@ -703,61 +783,92 @@ mod tests {
                     _ => u64::from(offset) < PHY_GRF_LEN,
                 }
         }));
-        assert_eq!(io.reads.len(), 32);
+        assert_eq!(io.reads.len(), 33);
     }
 
     #[test]
-    fn dmt_1600x900_tmds_decodes_to_the_expected_identity_and_clock() {
+    fn the_metal_capture_decodes_to_dmt_1600x900_at_exactly_108_mhz() {
         let s = fixture();
         assert_eq!(s.protocol(), Protocol::Hdmi);
         assert_eq!(s.link(), Link::Tmds);
         assert_eq!(s.output(), Output::Hdmi0Tmds);
         assert_eq!(s.reference_hz(), Some(REF_HZ));
-        assert_eq!(s.serial_hz(), Some(1_080_000_000));
-        assert_eq!(s.pixel_hz(), Some(108_000_000));
+        assert!(!s.sdm_enabled());
+        assert_eq!(s.vco_hz(), Some(3_240_000_000));
+        assert_eq!(s.pll_out_hz(), Some(540_000_000));
+        assert_eq!(s.bit_rate_hz(), Some(1_080_000_000));
+        assert_eq!(s.pixel_hz(), Some(D0A_PIXEL_HZ));
         assert_eq!(s.tx.timing(), Some(D0A_TIMING));
         assert_eq!(s.timing_matches_d0a(), Some(true));
         assert_eq!(s.pixel_matches_d0a(), Some(true));
         assert_eq!(s.refresh_millihz(), Some(60_000));
         assert!(!s.tx.scrambled());
-        assert!(!s.tx.dvi());
+        assert!(s.tx.dvi());
+        assert!(s.tx.hsync_positive() && s.tx.vsync_positive());
         assert!(!s.tx.measure_override());
         assert!(s.pll_locked() && s.phy_ready() && s.phy_clk_ready());
         assert!(!s.sb_ready());
+        assert!(!s.phy_status_ready() && !s.phy_status_clk_ready());
         assert!(s.lanes_enabled() && s.tmds_clock_lane());
         assert!(s.ropll_alone() && s.ropll_reference_selected());
         assert!(!s.frl_mode_enabled());
         assert_eq!(s.lane_mux_dp(), 0);
         assert_eq!(s.pcg_depth(), 0);
-        assert_eq!(s.pcg_postdiv(), 1);
-        assert_eq!(s.sdc_divider(), Some(5));
+        assert_eq!(s.pcg_postdiv(), 5);
+        assert_eq!(s.sdc_divider(), Some(3));
     }
 
     #[test]
-    fn the_ropll_formula_reproduces_the_trm_dp_rate_anchors() {
-        let mut rbr = fixture();
-        rbr.phy.mdiv_rbr = 0x87;
-        rbr.phy.sdiv = 3 << 4;
-        rbr.phy.sdm_den_rbr = 0x21;
-        rbr.phy.sdm_sign = 0;
-        rbr.phy.sdm_num_rbr = 0;
-        assert_eq!(rbr.serial_hz(), Some(810_000_000));
+    fn the_sdm_enable_bit_decides_whether_the_fraction_words_count() {
+        // J600 applied 5/9 regardless and dropped the DDR factor: 54.2 MHz, 30.1 Hz.
+        // Were the modulator on, the same words would run 1.6% fast instead.
+        let mut s = fixture();
+        s.phy.sdm_ctrl = SDM_RESET;
+        assert_eq!(s.vco_hz(), Some(3_291_923_076));
+        assert_eq!(s.pixel_hz(), Some(109_730_769));
+        assert_eq!(s.pixel_matches_d0a(), Some(false));
+    }
 
-        let mut hbr = fixture();
-        hbr.phy.mdiv_rbr = 0x71;
-        hbr.phy.sdiv = 1 << 4;
-        hbr.phy.sdm_den_rbr = 0x27;
-        hbr.phy.sdm_num_rbr = 0x0d;
-        hbr.phy.sdm_sign = 1 << 3;
-        assert_eq!(hbr.serial_hz(), Some(1_352_000_000));
+    #[test]
+    fn the_ropll_model_reproduces_the_trm_dp_rate_anchors_exactly() {
+        // Table 27-9's RBR/HBR/HBR2 values in the RBR set, SDC at its reset /5.
+        let rbr = with_pll(0x87, 3, SDM_RESET, 0x21, false, 0, 2, (3, 8));
+        assert_eq!(rbr.vco_hz(), Some(3_240_000_000));
+        assert_eq!(rbr.bit_rate_hz(), Some(1_620_000_000));
 
-        let mut hbr2 = fixture();
-        hbr2.phy.mdiv_rbr = 0x71;
-        hbr2.phy.sdiv = 0;
-        hbr2.phy.sdm_den_rbr = 0x27;
-        hbr2.phy.sdm_num_rbr = 0x0d;
-        hbr2.phy.sdm_sign = 1 << 3;
-        assert_eq!(hbr2.serial_hz(), Some(2_704_000_000));
+        let hbr = with_pll(0x71, 1, SDM_RESET, 0x27, true, 0x0d, 2, (7, 24));
+        assert_eq!(hbr.vco_hz(), Some(2_700_000_000));
+        assert_eq!(hbr.bit_rate_hz(), Some(2_700_000_000));
+
+        let hbr2 = with_pll(0x71, 0, SDM_RESET, 0x27, true, 0x0d, 2, (7, 24));
+        assert_eq!(hbr2.bit_rate_hz(), Some(5_400_000_000));
+    }
+
+    #[test]
+    fn the_ropll_model_reproduces_reference_tmds_settings() {
+        // Rows of Linux 6.16-rc2 phy-rockchip-samsung-hdptx.c's TMDS table (cross-check
+        // only): 74.25 MHz (negative fraction), 65 MHz (positive fraction, /12) and
+        // 27 MHz (SDM off, /16).
+        let p74 = with_pll(124, 7, SDM_RESET, 62, true, 16, 5, (0, 1));
+        assert_eq!(p74.vco_hz(), Some(2_970_000_000));
+        assert_eq!(p74.pixel_hz(), Some(74_250_000));
+
+        let p65 = with_pll(162, 11, SDM_RESET, 54, false, 16, 4, (1, 1));
+        assert_eq!(p65.vco_hz(), Some(3_900_000_000));
+        assert_eq!(p65.pixel_hz(), Some(65_000_000));
+
+        let p27 = with_pll(0x5a, 0xf, 0, 9, false, 5, 0, (20, 24));
+        assert_eq!(p27.pixel_hz(), Some(27_000_000));
+    }
+
+    #[test]
+    fn sdiv_is_a_four_bit_n_minus_one_code() {
+        assert_eq!(sdiv_divider(0), Some(1));
+        assert_eq!(sdiv_divider(5), Some(6));
+        assert_eq!(sdiv_divider(6), None);
+        assert_eq!(sdiv_divider(7), Some(8));
+        assert_eq!(sdiv_divider(11), Some(12));
+        assert_eq!(sdiv_divider(15), Some(16));
     }
 
     #[test]
@@ -766,44 +877,64 @@ mod tests {
         s.tx.link_config |= 1;
         assert_eq!(s.link(), Link::Unknown);
         assert_eq!(s.output(), Output::Unknown);
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
         assert_eq!(s.pixel_hz(), None);
 
         let mut s = fixture();
         s.phy.protocol = 0;
         assert_eq!(s.output(), Output::NotHdmi);
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.phy.ropll = 0;
         assert_eq!(s.output(), Output::Unknown);
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.phy.dig_clk_sel = 0;
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.grf.con0 = (1 << 7) | (2 << 10);
         assert_eq!(s.reference_hz(), None);
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.phy.lane_mux = 2;
         assert_eq!(s.dp_link_bw(), 2);
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.grf.con0 = 0;
-        assert_eq!(s.serial_hz(), None);
-
-        let mut s = fixture();
-        s.phy.sdm_den_rbr = 0;
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
 
         let mut s = fixture();
         s.phy.sdiv = 6 << 4;
-        assert_eq!(s.serial_hz(), None);
+        assert_eq!(s.pll_out_hz(), None);
+
+        // With the modulator on, a zero denominator, integer SDC division, a
+        // non-default interpolator or a degenerate SDC divisor has no anchor.
+        let mut s = fixture();
+        s.phy.sdm_ctrl = SDM_RESET;
+        s.phy.sdm_den_rbr = 0;
+        assert_eq!(s.vco_hz(), None);
+
+        let mut s = fixture();
+        s.phy.sdm_ctrl = SDM_RESET & !(1 << 3);
+        assert!(s.sdm_enabled() && !s.sdc_fractional());
+        assert_eq!(s.vco_hz(), None);
+
+        let mut s = fixture();
+        s.phy.sdm_ctrl = SDM_RESET;
+        s.phy.sdc_n_rbr = 1 << 3;
+        assert!(!s.sdm_pi_default());
+        assert_eq!(s.vco_hz(), None);
+
+        let mut s = fixture();
+        s.phy.sdm_ctrl = SDM_RESET;
+        s.phy.sdc_num_rbr = 3;
+        s.phy.sdc_den_rbr = 1;
+        assert_eq!(s.vco_hz(), None);
 
         let mut s = fixture();
         s.phy.pcg = 0x10;
@@ -868,6 +999,8 @@ mod tests {
     #[test]
     fn transmitter_status_bits_decode_individually() {
         let mut s = fixture();
+        s.tx.link_config = 0;
+        s.tx.video_status = 0;
         assert!(!s.tx.dvi());
         assert!(!s.tx.scrambled());
         assert!(!s.tx.hsync_positive());

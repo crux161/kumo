@@ -1,5 +1,6 @@
 //j600
 //j601
+//j602
 
 //! D0d live adapter: read-only mappings of the HDMI0 TX, combo PHY and PHY GRF.
 //! No device write, no DDC/EDID transaction and no clock/PMU mutation exists here.
@@ -256,7 +257,7 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         snapshot.reference_selector()
     ));
     log(format_args!(
-        "display: PHY0 own status={:#010x} ready={} clk_ready={} pcs_ref={} frl_mode={} ropll_alone={} ropll_ref={}\n",
+        "display: PHY0 0x026c={:#010x} (RW flags, not status) ready={} clk_ready={} pcs_ref={} frl_mode={} ropll_alone={} ropll_ref={}\n",
         snapshot.phy.status,
         snapshot.phy_status_ready(),
         snapshot.phy_status_clk_ready(),
@@ -266,8 +267,11 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         snapshot.ropll_reference_selected()
     ));
     log(format_args!(
-        "display: PHY0 PLL mdiv={} sign={} num={} den={} sdiv_code={} pcg={:#010x} postdiv={} depth={} en={} sdc_n={}\n",
+        "display: PHY0 PLL mdiv={} sdiv={:#04x} sdm_ctrl={:#04x} sdm_en={} sign={} num={} den={} sdc_n={:#04x} sdc={}/{} sdc_frac={} pcg={:#010x} postdiv={} depth={} pcg_en={}\n",
         snapshot.phy.mdiv_rbr & 0xff,
+        snapshot.phy.sdiv & 0xff,
+        snapshot.phy.sdm_ctrl & 0xff,
+        snapshot.sdm_enabled(),
         if snapshot.phy.sdm_sign & (1 << 3) != 0 {
             "-"
         } else {
@@ -275,28 +279,35 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
         },
         snapshot.phy.sdm_num_rbr & 0xff,
         snapshot.phy.sdm_den_rbr & 0xff,
-        snapshot.phy.sdiv >> 4,
+        snapshot.phy.sdc_n_rbr & 0xff,
+        snapshot.phy.sdc_num_rbr & 0x3f,
+        snapshot.phy.sdc_den_rbr & 0x3f,
+        snapshot.sdc_fractional(),
         snapshot.phy.pcg,
         snapshot.pcg_postdiv(),
         snapshot.pcg_depth(),
-        snapshot.pcg_enabled(),
-        snapshot.phy.sdc_n_rbr & 0b111
+        snapshot.pcg_enabled()
     ));
 
-    match (snapshot.serial_hz(), snapshot.pixel_hz()) {
-        (Some(serial), Some(pixel)) => {
-            let mdiv = snapshot.phy.mdiv_rbr & 0xff;
-            let numerator = snapshot.phy.sdm_num_rbr & 0xff;
-            let denominator = snapshot.phy.sdm_den_rbr & 0xff;
-            let sign = if snapshot.phy.sdm_sign & (1 << 3) != 0 {
-                " - "
-            } else {
-                " + "
-            };
+    match (
+        snapshot.vco_hz(),
+        snapshot.pll_out_hz(),
+        snapshot.bit_rate_hz(),
+        snapshot.pixel_hz(),
+    ) {
+        (Some(vco), Some(out), Some(bit_rate), Some(pixel)) => {
             let divider = rk3588_hdmi::sdiv_divider(snapshot.phy.sdiv >> 4).unwrap_or(0);
             log(format_args!(
-                "display: PHY0 serial={} Hz = 24000000 * ({}{}{}/{}) / {}; 8-bit TMDS pixel = serial/10\n",
-                serial, mdiv, sign, numerator, denominator, divider
+                "display: PHY0 vco={} Hz ({}), out={} Hz (vco/{}), bit rate={} bps (DDR, 2 bits/cycle); 8-bit TMDS pixel = bit rate/10\n",
+                vco,
+                if snapshot.sdm_enabled() {
+                    "24 MHz * mdiv -/+ num/den * SDC/16"
+                } else {
+                    "24 MHz * mdiv, SDM off"
+                },
+                out,
+                divider,
+                bit_rate
             ));
             log(format_args!(
                 "display: D0d pixel clock {} Hz (derived), refresh={}.{:03} Hz from VMON totals\n",
@@ -315,11 +326,14 @@ fn probe(power: Power, hdmi: Handle, phy: Handle, grf: Handle) {
                 None => {}
             }
         }
-        (Some(serial), None) => log(format_args!(
-            "display: D0d pixel clock UNKNOWN: serial={} Hz but pcg en/depth is not 8-bit (pcg={:#010x})\n",
-            serial, snapshot.phy.pcg
+        (_, Some(out), Some(bit_rate), None) => log(format_args!(
+            "display: D0d pixel clock UNKNOWN: out={} Hz, bit rate={} bps, but pcg en/depth is not 8-bit (pcg={:#010x})\n",
+            out, bit_rate, snapshot.phy.pcg
         )),
-        (None, _) => log(format_args!(
+        (None, _, _, _) if snapshot.output() == Output::Hdmi0Tmds => log(format_args!(
+            "display: D0d pixel clock UNKNOWN: PLL reference, SDM/SDC or interpolator words have no anchored decoding\n"
+        )),
+        _ => log(format_args!(
             "display: D0d pixel clock UNKNOWN: PHY/TX words are not a TMDS ROPLL-alone configuration\n"
         )),
     }
