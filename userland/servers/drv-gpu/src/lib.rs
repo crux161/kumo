@@ -4466,7 +4466,10 @@ mod g4b_tests {
             }
         );
         assert!(!again.any());
-        assert_eq!(io.get(0x6500), CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE);
+        assert_eq!(
+            io.get(0x6500),
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE
+        );
     }
 }
 

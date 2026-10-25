@@ -9,19 +9,18 @@
 
 use core::fmt::{self, Write};
 use drv_gpu::{
-    ack_cs_irqs, ack_csg_events, ack_glb_events, await_job_irq, classify_job_wait, clear_job_irqs,
-    cs_irq_req, csf_doorbell, csg_pending_events, enable_as, enable_as0, first_stream,
-    flush_page_tables, glb_pending_events, init_global_interface, job_irq_csg, job_slot,
-    job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info, mmu_rawstat,
-    power_l2, probe, program_group, program_queue, publish_insert, queue_extract, queue_insert,
-    quiet_mmu, read_cs_control, read_cs_status, read_csg_control, read_fault_as, ring_offset,
-    shared_region_contains, soft_reset, start_group, store_stream, wake_stream, write_job_words,
-    ClockIo, Completion, CompletionIo, CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory,
-    GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
-    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, APERTURE_BASE,
-    APERTURE_LEN, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
-    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF,
-    PAGE_SIZE, SYNC_STATUS_OFFSET,
+    ack_cs_irqs, ack_group_events, await_job_irq, classify_job_wait, clear_job_irqs, cs_irq_req,
+    csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, init_global_interface,
+    job_irq_csg, job_slot, job_wrapper, latched_fault, latest_flush_id, map_range, mcu_boot,
+    mmu_info, mmu_rawstat, power_l2, probe, program_group, program_queue, publish_insert,
+    queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
+    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
+    wake_stream, write_job_words, ClockIo, Completion, CompletionIo, CsControl, CsFeatures,
+    CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall, JobWait,
+    MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath, SectionFlags,
+    TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, CSF_SHARED_REGION_START,
+    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ,
+    GLB_PING_TIMEOUT_NS, JOB_IRQ_GLOBAL_IF, PAGE_SIZE, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -1406,13 +1405,29 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                 // G4d: wait for the job on the JOB interrupt (INTID 124) instead of polling. The
                 // first wait is armed before the doorbell rings (inside `await_job_irq`), so a
                 // fast job cannot complete into nothing; a wake that leaves the seqno short, such
-                // as a late IDLE from the previous job, re-arms for the time left. JOB_INT bits
-                // from before this job (the direct stream's, a global IDLE in the gap) are
-                // cleared first; the interface events behind them stay visible in req ^ ack and
-                // are acknowledged on the first wake. Each wake runs §11.5's order: JOB_INT is
-                // already cleared, then the global events, the stream level, the group events.
-                // — TIMBERDOODLE
+                // as a late IDLE from the previous job, re-arms for the time left. Each wake runs
+                // §11.5's order: JOB_INT is already cleared, then the global events, the stream
+                // level, the group events.
+                //
+                // Before arming, every event still pending is acknowledged and only then are the
+                // JOB_INT bits behind them cleared. J589's first metal run armed with the direct
+                // stream's group IDLE (and a global IDLE) unacknowledged, and the firmware raised
+                // no JOB interrupt for the job's SYNC_UPDATE: it signals a group whose events are
+                // all acknowledged, which panthor's handler always leaves behind. — TIMBERDOODLE
                 let csg_bit = job_irq_csg(GROUP_SLOT);
+                let stale = {
+                    let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+                    ack_group_events(&mut glb_io, csg.input_va, csg.output_va)
+                };
+                if stale.any() {
+                    log(
+                        log_level::NOTICE,
+                        format_args!(
+                            "drv-gpu: job {} acknowledged stale events before arming: csg=0x{:08x} glb=0x{:08x} cs_irq=0x{:x}/0x{:x}\n",
+                            job, stale.csg, stale.glb, stale.cs_irq_req, stale.cs_irq_ack
+                        ),
+                    );
+                }
                 clear_job_irqs(device, csg_bit | JOB_IRQ_GLOBAL_IF);
                 let deadline = device.now_ns().saturating_add(WORK_TIMEOUT_NS);
                 let mut waits = 0u32;
@@ -1470,19 +1485,13 @@ fn run_mali(device: &mut Device, initrd: Handle, shader_present: u64) -> u8 {
                     }
                     rawstat |= irq.rawstat;
                     stat |= irq.stat;
-                    let (irq_req, irq_ack) = {
+                    let acked = {
                         let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
-                        let glb = glb_pending_events(&mut glb_io);
-                        ack_glb_events(&mut glb_io, glb);
-                        glb_events |= glb;
-                        let irq_req = cs_irq_req(&mut glb_io, csg.output_va);
-                        let irq_ack = glb_io.read32(csg.input_va + 0x0C);
-                        ack_cs_irqs(&mut glb_io, csg.input_va, irq_req);
-                        let raised = csg_pending_events(&mut glb_io, csg.input_va, csg.output_va);
-                        ack_csg_events(&mut glb_io, csg.input_va, csg.output_va, raised);
-                        events |= raised;
-                        (irq_req, irq_ack)
+                        ack_group_events(&mut glb_io, csg.input_va, csg.output_va)
                     };
+                    glb_events |= acked.glb;
+                    events |= acked.csg;
+                    let (irq_req, irq_ack) = (acked.cs_irq_req, acked.cs_irq_ack);
                     // SAFETY: the sync object is 8-byte aligned in AS1's Normal-NC sync page; one
                     // 64-bit load sees the GPU's 64-bit add whole.
                     seqno = unsafe { (sync as *const u64).read_volatile() };
