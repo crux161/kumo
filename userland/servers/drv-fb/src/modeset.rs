@@ -47,10 +47,11 @@ use drv_fb::rk3588_mode::{
 use drv_fb::rk3588_scanout as scanout;
 use drv_fb::rk3588_vblank as vblank;
 use drv_fb::PixelOrder;
-use kumo_abi::{BootInfo, FramebufferFormat, Handle, VmarFlags};
+use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
 use kumo_rt::{
-    handle_close, handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind,
-    port_unbind, resource_mint_mmio, syscall_handle, timer_create, vmar_map,
+    handle_close, handle_duplicate, handle_koid, interrupt_complete, interrupt_create,
+    interrupt_wait, port_bind, port_unbind, resource_mint_mmio, syscall_handle, timer_create,
+    vmar_map,
 };
 
 struct Log {
@@ -726,6 +727,36 @@ fn open_vop_irq(pending: &Pending, device: &mut Device, label: &str) -> Option<(
         return None;
     };
     let koid = handle_koid(irq);
+    // Exercise ownership before enabling a device source: a second binding must
+    // refuse, while a duplicate survives closing its original handle. — KESTREL
+    let second = interrupt_create(pending.vop.0, intid);
+    if second as u32 as i32 != kumo_abi::Errno::BadState as i32 {
+        if let Some(extra) = syscall_handle(second) {
+            close(extra);
+        }
+        close(irq);
+        error(format_args!(
+            "display: {} independent IRQ owner was not denied\n",
+            label
+        ));
+        return None;
+    }
+    let Some(duplicate) = syscall_handle(handle_duplicate(
+        irq,
+        Rights::READ | Rights::WAIT | Rights::DUPLICATE,
+    )) else {
+        close(irq);
+        return None;
+    };
+    if handle_close(irq) != 0 || handle_koid(duplicate) != koid {
+        close(duplicate);
+        return None;
+    }
+    let irq = duplicate;
+    log(format_args!(
+        "display: D1d-c1 {} IRQ {}: second owner denied, original closed, duplicate retained\n",
+        label, intid
+    ));
     if koid == u64::MAX || port_bind(pending.port, irq) != 0 {
         error(format_args!(
             "display: {} could not bind interrupt {}\n",

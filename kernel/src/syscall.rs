@@ -3280,9 +3280,11 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
                 let key = interrupt_authority_key(irq);
-                if self.interrupts.iter().any(|binding| {
-                    binding.irq == key && binding.state.get() != IrqState::Released
-                }) {
+                if self
+                    .interrupts
+                    .iter()
+                    .any(|binding| binding.irq == key && binding.state.get() != IrqState::Released)
+                {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
                 // Reserve both allocations before configuring a physical source. No
@@ -3294,10 +3296,10 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::NoMemory.status());
                 }
                 let object = self.objects.create(ObjectKind::Interrupt);
-                let (handle, references) = match process.handles_mut().insert_interrupt(
-                    object,
-                    Rights::READ | Rights::WAIT | Rights::DUPLICATE,
-                ) {
+                let (handle, references) = match process
+                    .handles_mut()
+                    .insert_interrupt(object, Rights::READ | Rights::WAIT | Rights::DUPLICATE)
+                {
                     Ok(owner) => owner,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
@@ -6847,7 +6849,6 @@ mod tests {
             KernelCallResult::Handle(handle) => handle,
             other => panic!("expected TLMM GPIO interrupt handle, got {other:?}"),
         };
-        let irq_koid = process.handles().get(irq_handle).unwrap().koid;
         engine.signal_interrupt(kumo_abi::tlmm_gpio_irq_window_base(104));
         assert_eq!(
             engine.dispatch(
@@ -6858,7 +6859,10 @@ mod tests {
             ),
             KernelCallResult::Handle(Handle(1))
         );
-        assert!(engine.release_interrupt(irq_koid));
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::HandleClose { handle: irq_handle }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
 
         let outside = engine.dispatch(
             &mut process,
@@ -7004,6 +7008,314 @@ mod tests {
         assert!(matches!(inside, KernelCallResult::Handle(_)));
     }
 
+    mod interrupt_lifetime {
+        use super::*;
+
+        fn setup() -> (SyscallEngine, Process, Handle, Handle) {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let resource = engine
+                .root_resource_create(&mut process, 0x0900_0000, 0x1000, 33, 1)
+                .unwrap();
+            let KernelCallResult::Handle(irq) = engine.dispatch(
+                &mut process,
+                KernelCall::InterruptCreate { resource, irq: 33 },
+            ) else {
+                panic!("create");
+            };
+            (engine, process, resource, irq)
+        }
+
+        #[test]
+        fn ordinary_close_preserves_a_duplicate_then_reclaims_before_rebind() {
+            let (mut engine, mut process, resource, irq) = setup();
+            let koid = process.handles().get(irq).unwrap().koid;
+            let duplicate = process.handles_mut().duplicate(irq, Rights::WAIT).unwrap();
+            let port = create_port(&mut engine, &mut process);
+            engine.dispatch(&mut process, KernelCall::PortBind { port, object: irq });
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::HandleClose { handle: irq }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            assert_eq!(engine.interrupts.len(), 1);
+            assert_eq!(engine.devices.port_bindings.len(), 1);
+            engine.signal_interrupt(33);
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptWait {
+                        interrupt: duplicate
+                    }
+                ),
+                KernelCallResult::Handle(Handle(1))
+            );
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::HandleClose { handle: duplicate }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            assert!(engine.interrupts.is_empty() && engine.devices.port_bindings.is_empty());
+            engine.signal_interrupt(33);
+            let KernelCallResult::Handle(next) = engine.dispatch(
+                &mut process,
+                KernelCall::InterruptCreate { resource, irq: 33 },
+            ) else {
+                panic!("rebind");
+            };
+            assert_ne!(process.handles().get(next).unwrap().koid, koid);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: next }),
+                KernelCallResult::Status(Errno::ShouldWait.status())
+            );
+        }
+
+        #[test]
+        fn copied_grants_and_drained_entries_keep_the_source_and_watch_alive() {
+            let (mut engine, mut source, _, irq) = setup();
+            let mut target = test_process(&mut engine);
+            let grant = source
+                .handles()
+                .stage_grant_to(target.handles_mut(), irq, false)
+                .unwrap();
+            source.handles_mut().commit_grant(grant).unwrap();
+            let port = create_port(&mut engine, &mut target);
+            engine.dispatch(
+                &mut target,
+                KernelCall::PortBind {
+                    port,
+                    object: grant.target(),
+                },
+            );
+            drop(source.handles_mut().drain());
+            assert_eq!(
+                engine.retire_interrupts_with(|_| panic!("surviving grant ignored")),
+                0
+            );
+            engine.signal_interrupt(33);
+            assert_eq!(
+                engine.dispatch(
+                    &mut target,
+                    KernelCall::InterruptWait {
+                        interrupt: grant.target()
+                    }
+                ),
+                KernelCallResult::Handle(Handle(1))
+            );
+            assert_eq!(engine.devices.port_bindings.len(), 1);
+            let drained = target.handles_mut().drain();
+            assert_eq!(
+                engine.retire_interrupts_with(|_| panic!("drained owners ignored")),
+                0
+            );
+            drop(drained);
+            let mut masks = Vec::new();
+            assert_eq!(
+                engine.retire_interrupts_with(|irq| {
+                    masks.push(irq);
+                    true
+                }),
+                1
+            );
+            assert_eq!(masks, [33]);
+            assert!(engine.devices.port_bindings.is_empty());
+            assert_eq!(engine.retire_interrupts_with(|_| panic!("masked twice")), 0);
+        }
+
+        #[test]
+        fn second_owner_cannot_reconfigure_an_outstanding_source_or_gpio_alias() {
+            let (mut engine, mut process, resource, irq) = setup();
+            engine.signal_interrupt(33);
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate { resource, irq: 33 }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            assert_eq!(engine.interrupts.len(), 1);
+            assert!(engine.interrupts[0].outstanding);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+                KernelCallResult::Handle(Handle(1))
+            );
+            let root = engine
+                .root_resource_create(&mut process, 0x0894_0000, 0x4000, 0, u32::MAX)
+                .unwrap();
+            assert!(matches!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate {
+                        resource: root,
+                        irq: kumo_abi::tlmm_gpio_irq(104, 8)
+                    }
+                ),
+                KernelCallResult::Handle(_)
+            ));
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate {
+                        resource: root,
+                        irq: kumo_abi::tlmm_gpio_irq(104, 2)
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+        }
+
+        #[test]
+        fn failed_mask_reserves_the_source_without_retry_or_delivery() {
+            let (mut engine, mut process, resource, irq) = setup();
+            process.handles_mut().close(irq).unwrap();
+            let mut masks = Vec::new();
+            assert_eq!(
+                engine.retire_interrupts_with(|irq| {
+                    masks.push(irq);
+                    false
+                }),
+                0
+            );
+            assert_eq!(masks, [33]);
+            assert_eq!(engine.interrupts[0].state.get(), IrqState::MaskFailed);
+            engine.signal_interrupt(33);
+            assert_eq!(engine.interrupts[0].count, 0);
+            assert_eq!(
+                engine.retire_interrupts_with(|_| panic!("failed mask retried")),
+                0
+            );
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate { resource, irq: 33 }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+        }
+
+        #[test]
+        fn cloned_engines_share_retirement_and_do_not_mask_a_rebound_source() {
+            let (mut engine, mut process, resource, irq) = setup();
+            let mut snapshot = engine.clone();
+            process.handles_mut().close(irq).unwrap();
+            assert_eq!(
+                engine.retire_interrupts_with(|n| {
+                    assert_eq!(n, 33);
+                    true
+                }),
+                1
+            );
+            assert!(matches!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate { resource, irq: 33 }
+                ),
+                KernelCallResult::Handle(_)
+            ));
+            assert_eq!(
+                snapshot.retire_interrupts_with(|_| panic!("stale clone masked new owner")),
+                1
+            );
+            assert_eq!(engine.interrupts.len(), 1);
+        }
+
+        #[test]
+        fn queued_owner_survives_source_drain_and_failed_receiver_installation() {
+            let mut engine = SyscallEngine::new();
+            let mut source = test_process(&mut engine);
+            let mut target = test_process(&mut engine);
+            let (left, right) = create_channel(&mut engine, &mut source);
+            let grant = source
+                .handles()
+                .stage_grant_to(target.handles_mut(), right, true)
+                .unwrap();
+            source.handles_mut().commit_grant(grant).unwrap();
+            // Synthetic kernel grant: public InterruptCreate deliberately retains its
+            // existing non-TRANSFER rights. Exercise the generic queued owner. — KESTREL
+            let object = engine.objects.create(ObjectKind::Interrupt);
+            let (irq, references) = source
+                .handles_mut()
+                .insert_interrupt(object, Rights::WAIT | Rights::TRANSFER)
+                .unwrap();
+            engine.interrupts.push(IrqBinding {
+                references,
+                state: Rc::new(Cell::new(IrqState::Bound)),
+                irq: 33,
+                koid: object.koid(),
+                count: 0,
+                requires_complete: false,
+                outstanding: false,
+            });
+            assert_eq!(
+                engine.dispatch(
+                    &mut source,
+                    KernelCall::ChannelWrite {
+                        channel: left,
+                        message: Message::new(1, b"irq", &[irq]).unwrap(),
+                    }
+                ),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            drop(source.handles_mut().drain());
+            assert_eq!(
+                engine.retire_interrupts_with(|_| panic!("queued owner ignored")),
+                0
+            );
+            target.handles_mut().fail_insert_after(Some(0));
+            assert_eq!(
+                engine.dispatch(
+                    &mut target,
+                    KernelCall::ChannelRead {
+                        channel: grant.target()
+                    }
+                ),
+                KernelCallResult::Status(Errno::NoMemory.status())
+            );
+            assert!(engine.interrupts[0].references.is_referenced());
+            target.handles_mut().fail_insert_after(None);
+            let KernelCallResult::Message(message) = engine.dispatch(
+                &mut target,
+                KernelCall::ChannelRead {
+                    channel: grant.target(),
+                },
+            ) else {
+                panic!("receive");
+            };
+            let received = message.handles()[0];
+            drop(message);
+            assert_eq!(target.handles().get(received).unwrap().koid, object.koid());
+            assert_eq!(
+                engine.dispatch(&mut target, KernelCall::HandleClose { handle: received }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            assert!(engine.interrupts.is_empty());
+        }
+
+        #[test]
+        fn failed_handle_admission_leaves_no_source_reservation() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let resource = engine
+                .root_resource_create(&mut process, 0x0900_0000, 0x1000, 33, 1)
+                .unwrap();
+            process.handles_mut().fail_insert_after(Some(0));
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate { resource, irq: 33 }
+                ),
+                KernelCallResult::Status(Errno::NoMemory.status())
+            );
+            assert!(engine.interrupts.is_empty());
+            process.handles_mut().fail_insert_after(None);
+            assert!(matches!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::InterruptCreate { resource, irq: 33 }
+                ),
+                KernelCallResult::Handle(_)
+            ));
+        }
+    }
+
     #[test]
     fn teardown_reclaims_interrupt_and_resource_bindings() {
         let mut engine = SyscallEngine::new();
@@ -7022,17 +7334,25 @@ mod tests {
         assert_eq!(engine.resources.len(), 1);
 
         // The object koids the dying process's handles carry (as teardown drains them).
-        let irq_koid = process.handles().get(irq).unwrap().koid;
         let resource_koid = process.handles().get(resource).unwrap().koid;
 
-        // Teardown reclaims both bindings so a restarted driver re-binds cleanly.
-        assert!(engine.release_interrupt(irq_koid));
+        // Drained entries retain ownership until teardown actually drops them.
+        let drained = process.handles_mut().drain();
+        assert_eq!(
+            engine.retire_interrupts_with(|_| panic!("drained owners ignored")),
+            0
+        );
+        drop(drained);
+        assert_eq!(engine.retire_interrupts(), 1);
         assert!(engine.release_resource(resource_koid));
         assert_eq!(engine.interrupts.len(), 0);
         assert_eq!(engine.resources.len(), 0);
 
         // Idempotent: a second reclamation finds nothing left to remove.
-        assert!(!engine.release_interrupt(irq_koid));
+        assert_eq!(
+            engine.retire_interrupts_with(|_| panic!("retirement repeated")),
+            0
+        );
         assert!(!engine.release_resource(resource_koid));
     }
 
@@ -7043,15 +7363,14 @@ mod tests {
         let resource = engine
             .root_resource_create(&mut process, 0x0900_0000, 0x1000, 252, 3)
             .unwrap();
-        // Two drivers on one line plus a second line: the power path wants distinct lines,
-        // since masking the same SPI twice is pointless and the caller's slice is finite.
-        for irq in [252, 252, 253] {
+        // Independent owners reserve distinct sources; duplicates share one binding.
+        for irq in [252, 253] {
             match engine.dispatch(&mut process, KernelCall::InterruptCreate { resource, irq }) {
                 KernelCallResult::Handle(_) => {}
                 other => panic!("expected interrupt handle for {irq}, got {other:?}"),
             }
         }
-        assert_eq!(engine.interrupts.len(), 3);
+        assert_eq!(engine.interrupts.len(), 2);
 
         let mut irqs = [0u32; 8];
         assert_eq!(engine.bound_interrupt_irqs(&mut irqs), 2);

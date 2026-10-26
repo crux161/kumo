@@ -148,8 +148,8 @@ impl HandleTable {
     }
 
     pub fn insert(&mut self, object: KernelObject, rights: Rights) -> Result<Handle, ObjectError> {
-        // Every DeviceCtx/Interrupt must start with one canonical reference lineage. Subsequent
-        // grants clone/move its owner rather than minting from copied metadata. — KESTREL
+        // DeviceCtx/Interrupt start with one canonical reference lineage. Grants
+        // clone/move its owner rather than minting from copied metadata. — KESTREL
         if matches!(object.kind, ObjectKind::DeviceCtx | ObjectKind::Interrupt) {
             return Err(ObjectError::AccessDenied);
         }
@@ -447,6 +447,58 @@ mod tests {
         assert!(source.get(handle).is_ok());
         assert_eq!(target.live_count(), 0);
         source.close(handle).unwrap();
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn interrupt_metadata_cannot_mint_or_retain_an_owner() {
+        let mut table = HandleTable::new();
+        let object = KernelObject::new(KoId(81), ObjectKind::Interrupt);
+        assert_eq!(
+            table.insert(object, Rights::WAIT),
+            Err(ObjectError::AccessDenied)
+        );
+        let (handle, refs) = table
+            .insert_interrupt(object, Rights::WAIT | Rights::DUPLICATE)
+            .unwrap();
+        let metadata = table.get(handle).unwrap();
+        let observer = refs.clone();
+        table.close(handle).unwrap();
+        assert!(!refs.is_referenced() && !observer.is_referenced());
+        assert_eq!(
+            table.insert(
+                KernelObject::new(metadata.koid, metadata.kind),
+                metadata.rights
+            ),
+            Err(ObjectError::AccessDenied)
+        );
+        assert!(matches!(
+            table.insert_interrupt(KernelObject::new(KoId(82), ObjectKind::Vmo), Rights::READ),
+            Err(ObjectError::WrongType)
+        ));
+    }
+
+    #[test]
+    fn interrupt_staged_and_removed_owners_survive_rollback_and_drain() {
+        let mut source = HandleTable::new();
+        let mut target = HandleTable::new();
+        let (handle, refs) = source
+            .insert_interrupt(
+                KernelObject::new(KoId(83), ObjectKind::Interrupt),
+                Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap();
+        let staged = source.stage_grant_to(&mut target, handle, true).unwrap();
+        target.rollback_grant(staged).unwrap();
+        assert!(source.get(handle).is_ok() && refs.is_referenced());
+        let staged = source.stage_grant_to(&mut target, handle, true).unwrap();
+        source.commit_grant(staged).unwrap();
+        assert_eq!(source.get(handle), Err(ObjectError::BadHandle));
+        let removed = target.remove(staged.target()).unwrap();
+        drop(source.drain());
+        drop(target);
+        assert!(refs.is_referenced());
+        drop(removed);
         assert!(!refs.is_referenced());
     }
 

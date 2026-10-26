@@ -1749,6 +1749,7 @@ fn dispatch_object_syscall(
         let irq = r[1] as u32;
         match engine.dispatch(target, KernelCall::InterruptCreate { resource, irq }) {
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
     } else if num == Syscall::InterruptComplete as u64 {
@@ -3658,6 +3659,59 @@ mod tests {
                 "{special:?}: a declined syscall must not touch r",
             );
         }
+    }
+
+    #[test]
+    fn interrupt_create_adapter_preserves_refusal_status_and_final_close_rebind() {
+        let (mut engine, mut process) = engine_and_process();
+        let resource = engine
+            .root_resource_create(&mut process, 0x0900_0000, 0x1000, 188, 1)
+            .unwrap();
+        let mut r = [0u64; 31];
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        let original = r[0];
+        assert!(original > 0 && original <= i32::MAX as u64);
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], Errno::BadState.status() as u32 as u64);
+        r[0] = 0;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], Errno::BadHandle.status() as u32 as u64);
+        r[0] = original;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::HandleClose as u64,
+            &mut r
+        ));
+        assert_eq!(r[0], 0);
+        r[0] = resource.0 as u64;
+        r[1] = 188;
+        assert!(dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            Syscall::InterruptCreate as u64,
+            &mut r
+        ));
+        assert!(r[0] > 0 && r[0] <= i32::MAX as u64 && r[0] != original);
     }
 
     #[test]
