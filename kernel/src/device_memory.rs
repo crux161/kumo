@@ -1,18 +1,19 @@
 //j616
 //j617
 //j622
+//j628
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
-//! through table leases. Frames never return to the global bump allocator. No device root
-//! is published; live context/quarantine lifetime remains a later gate. — KESTREL
+//! through table leases. Published owners retain private tables and actual VMO pins on
+//! uncertainty; bootstrap reset does not enable paging or admit a live context. — KESTREL
 
 use crate::{
     mm::{Vmo, VmoBacking, PAGE_SIZE},
     object::ObjectError,
 };
 use alloc::{rc::Rc, vec, vec::Vec};
-use core::cell::RefCell;
+use core::{cell::RefCell, mem::ManuallyDrop};
 use kumo_abi::{BootInfo, FramebufferFormat, MemRegion, MemRegionKind, Range};
 use kumo_hal::active::DeviceTableMemory;
 
@@ -83,13 +84,51 @@ struct PinnedMapping {
 
 /// Only unpublished tables: exact mapping records retain the VMO and resolved pages.
 /// Table Drop precedes pin Drop, so no descriptor outlives its backing reference.
-/// A future live owner must retain both on uncertain drain/invalidation. — KESTREL
+/// PublishedMappings retains both on uncertain drain/invalidation. — KESTREL
 pub(crate) struct OfflineMappings<A: PageMemory> {
     table: kumo_hal::active::OfflineDeviceTable<TableLease<A>>,
     mappings: Vec<PinnedMapping>,
 }
 
+/// Tables and all actual VMO pins survive even an unexpected owner drop. No live
+/// mutation/unmap is exposed. A matching two-bank reset must precede reclamation.
+/// Keeping the allocator alive also preserves every private-RAM reservation. — KESTREL
+pub(crate) struct PublishedMappings<A: PageMemory> {
+    table: kumo_hal::active::PublishedDeviceTable<TableLease<A>>,
+    mappings: ManuallyDrop<Vec<PinnedMapping>>,
+}
+
+impl<A: PageMemory> PublishedMappings<A> {
+    pub fn root(&self) -> u64 {
+        self.table.root()
+    }
+
+    pub fn reclaim(
+        self,
+        proof: kumo_hal::active::DetachedDeviceRoot,
+    ) -> Result<OfflineMappings<A>, Self> {
+        match self.table.reclaim(proof) {
+            Ok(table) => Ok(OfflineMappings {
+                table,
+                mappings: ManuallyDrop::into_inner(self.mappings),
+            }),
+            Err(table) => Err(Self {
+                table,
+                mappings: self.mappings,
+            }),
+        }
+    }
+}
+
 impl<A: PageMemory> OfflineMappings<A> {
+    pub fn publish(self, clean: impl FnMut(u64)) -> PublishedMappings<A> {
+        // Retain pins before a cleaner or any later hardware operation can fail.
+        // No root escapes until both owners have their fail-closed lifetime. — KESTREL
+        let mappings = ManuallyDrop::new(self.mappings);
+        let table = self.table.publish(clean);
+        PublishedMappings { table, mappings }
+    }
+
     pub fn new(pool: &TablePool<A>) -> Result<Self, kumo_abi::Errno> {
         Ok(Self {
             table: kumo_hal::active::OfflineDeviceTable::new(pool.lease()).map_err(table_error)?,

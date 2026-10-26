@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j623
 //j624
 //j625
 //j626
 //j627
+//j628
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -15,6 +15,7 @@ pub mod display_iommu;
 pub mod display_irq;
 pub mod display_mmu;
 pub mod display_register;
+pub mod display_reset;
 pub mod display_unit;
 pub mod mali;
 pub mod power_unit;
@@ -3526,6 +3527,23 @@ pub fn display_dma_probe(
     display_dma::Error,
 > {
     Err(display_dma::Error::NoUnit)
+}
+
+#[cfg(target_os = "none")]
+pub fn display_directory_reset_probe(
+    dtb: u64,
+    root: u64,
+) -> Result<display_reset::Report, display_reset::Error> {
+    let bytes =
+        unsafe { dtb_bytes(dtb) }.ok_or(display_reset::Error::Dma(display_dma::Error::NoUnit))?;
+    display_reset::probe(bytes, root, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_directory_reset_probe(
+    _dtb: u64,
+    _root: u64,
+) -> Result<display_reset::Report, display_reset::Error> {
+    Err(display_reset::Error::Dma(display_dma::Error::NoUnit))
 }
 
 #[cfg(target_os = "none")]

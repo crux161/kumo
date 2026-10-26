@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j623
 //j624
 //j625
 //j626
 //j627
+//j628
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -22,7 +22,8 @@ pub mod active {
         check_request as check_display_mmu_stall_request, Error as DisplayMmuError,
     };
     pub use kumo_hal_aarch64::rockchip_v2::{
-        Access as DeviceTableAccess, Error as DeviceTableError, OfflineTable as OfflineDeviceTable,
+        Access as DeviceTableAccess, DetachedRoot as DetachedDeviceRoot, Error as DeviceTableError,
+        OfflineTable as OfflineDeviceTable, PublishedTable as PublishedDeviceTable,
         TableMemory as DeviceTableMemory,
     };
     pub use kumo_hal_aarch64::{
@@ -52,8 +53,8 @@ pub mod active {
         UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
-        display_dma_probe, display_interrupt_guard_register, display_iommu_from_dtb,
-        display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
+        display_directory_reset_probe, display_dma_probe, display_interrupt_guard_register,
+        display_iommu_from_dtb, display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
     };
 }
 

@@ -1,4 +1,5 @@
 //j627
+//j628
 
 //! DESIGN/022: quiesce the supported VP2 scanout, then drain both VOP BIUs.
 //! VOP TRM Part2 pp. 863, 870–877, 933: standby completes at fresh display-hold.
@@ -233,9 +234,9 @@ impl Stopped {
         self.phase = Phase::RegistersReady;
         Ok(())
     }
-    /// Explicit restart only after the owning runtime's root/pin contract permits.
-    /// Failure never invokes this automatically or clears a saved standby word. — KESTREL
-    pub fn resume(&mut self, io: &mut impl RegisterIo) -> Result<State, Error> {
+    /// Recheck the held producer after reopening configuration. Callers must retain
+    /// exclusive control/clock ownership throughout their register operation. — KESTREL
+    pub fn check_held(&mut self, io: &mut impl RegisterIo) -> Result<State, Error> {
         self.registers_ready(io)?;
         let current = Unit(()).read(io)?;
         if current.ports[2] != self.before.ports[2] | STANDBY
@@ -248,6 +249,12 @@ impl Stopped {
         {
             return Err(Error::Changed);
         }
+        Ok(current)
+    }
+    /// Explicit restart only after the owning runtime's root/pin contract permits.
+    /// Failure never invokes this automatically or clears a saved standby word. — KESTREL
+    pub fn resume(&mut self, io: &mut impl RegisterIo) -> Result<State, Error> {
+        let current = self.check_held(io)?;
         ready(io)?;
         io.write(VP2, self.before.ports[2]);
         io.barrier();

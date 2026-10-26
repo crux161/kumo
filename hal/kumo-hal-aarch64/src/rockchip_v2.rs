@@ -1,6 +1,7 @@
 //j615
+//j628
 
-//! DESIGN/022 D1d-b1: Rockchip-v2 descriptors and a strictly offline, read-only page table.
+//! DESIGN/022 D1d-b1: Rockchip-v2 descriptors and an owning read-only page table.
 //! 1024 directory words × 1024 leaf words × 4 KiB cover a 32-bit IOVA. The descriptor
 //! codec represents 40-bit physical addresses; this first walker admits only below 4 GiB.
 //!
@@ -8,12 +9,13 @@
 //! e3bc123a2260145e34b57454da3db0edd117eb8e. READ is bit 1, WRITE bit 2 in both versions;
 //! the old kernel-next oracle reverses them. No GPL implementation code is imported.
 //!
-//! No MMIO, cache/TLB operation, live context or ABI admission exists here. A future live
-//! owner must take the table's ownership before publishing its root; it cannot use this
-//! offline destructor on tables still reachable by a device. — KESTREL
+//! No MMIO, live context or ABI admission exists here. Publication freezes the walker
+//! and retains every table page before cleaning/exposing its root. Only a matching
+//! two-bank reset witness can restore the offline destructor. — KESTREL
 
 extern crate alloc;
 use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ENTRIES: usize = 1024;
@@ -160,7 +162,53 @@ pub struct OfflineTable<M: TableMemory> {
     leaves: Vec<OwnedLeaf>,
 }
 
+/// A single-use checked reset result. Only the hardware mechanism can construct
+/// this evidence; it names the owned directory observed before both banks reset.
+/// It is deliberately neither Copy nor Clone. — KESTREL
+#[derive(Debug)]
+pub struct DetachedRoot {
+    root: u64,
+}
+impl DetachedRoot {
+    pub(crate) fn after_reset(root: u64) -> Self {
+        Self { root }
+    }
+}
+
+/// Own the directory before exposing it. Dropping an uncertain publication retains
+/// every table page and its allocator; only a matching checked reset reclaims it.
+/// VMO pins belong to the kernel's outer owner and must follow the same rule. — KESTREL
+pub struct PublishedTable<M: TableMemory> {
+    table: ManuallyDrop<OfflineTable<M>>,
+}
+impl<M: TableMemory> PublishedTable<M> {
+    pub fn root(&self) -> u64 {
+        self.table.root
+    }
+
+    pub fn reclaim(self, proof: DetachedRoot) -> Result<OfflineTable<M>, Self> {
+        if self.root() != proof.root {
+            return Err(self);
+        }
+        Ok(ManuallyDrop::into_inner(self.table))
+    }
+}
+
 impl<M: TableMemory> OfflineTable<M> {
+    /// Freeze mutation and transfer ownership before cache cleaning/root exposure.
+    /// The cleaner receives only privately owned pages, never a descriptor address.
+    /// A failed/panicking cleaner cannot invoke the offline destructor. — KESTREL
+    pub fn publish(self, mut clean: impl FnMut(u64)) -> PublishedTable<M> {
+        let owned = PublishedTable {
+            table: ManuallyDrop::new(self),
+        };
+        for leaf in &owned.table.leaves {
+            clean(leaf.phys);
+        }
+        clean(owned.table.root);
+        owned
+    }
+
     pub fn new(mut memory: M) -> Result<Self, Error> {
         let root = memory.allocate().ok_or(Error::NoMemory)?;
         if let Err(error) = low_page(root) {
@@ -757,5 +805,58 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::Write(..))));
+    }
+    #[test]
+    fn publication_cleans_owned_leaves_before_root_and_uncertain_drop_retains_pages() {
+        let memory = Memory::new();
+        let mut table = OfflineTable::new(memory.clone()).unwrap();
+        table
+            .map_read_only(0x3ff000, &[0x10000000, 0x20000000])
+            .unwrap();
+        let root = table.root;
+        let before = memory.image();
+        let mut cleaned = Vec::new();
+        let published = table.publish(|p| cleaned.push(p));
+        assert_eq!(published.root(), root);
+        assert_eq!(cleaned.last(), Some(&root));
+        assert_eq!(cleaned.len(), 3);
+        for page in before.keys() {
+            assert!(cleaned.contains(page));
+        }
+        drop(published);
+        assert_eq!(memory.image(), before);
+    }
+    #[test]
+    fn only_a_matching_single_use_reset_can_reclaim_frozen_tables() {
+        let memory = Memory::new();
+        let mut table = OfflineTable::new(memory.clone()).unwrap();
+        table.map_read_only(0x1000, &[0x10000000]).unwrap();
+        let root = table.root;
+        let published = table.publish(|_| {});
+        let published = match published.reclaim(DetachedRoot::after_reset(root + 4096)) {
+            Ok(_) => panic!("wrong root reclaimed"),
+            Err(p) => p,
+        };
+        assert_eq!(memory.image().len(), 2);
+        let mut offline = match published.reclaim(DetachedRoot::after_reset(root)) {
+            Ok(p) => p,
+            Err(_) => panic!("matching reset refused"),
+        };
+        assert_eq!(offline.walk(0x1123, Access::Read), Ok(Some(0x10000123)));
+        offline.unmap(0x1000, 4096).unwrap();
+        drop(offline);
+        assert!(memory.image().is_empty());
+    }
+    #[test]
+    fn panicking_cleaner_never_runs_offline_destruction() {
+        let memory = Memory::new();
+        let mut table = OfflineTable::new(memory.clone()).unwrap();
+        table.map_read_only(0x1000, &[0x10000000]).unwrap();
+        let before = memory.image();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.publish(|_| panic!("clean failed"));
+        }))
+        .is_err());
+        assert_eq!(memory.image(), before);
     }
 }

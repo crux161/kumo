@@ -1,8 +1,8 @@
-//j619
 //j620
 //j622
 //j625
 //j626
+//j628
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -1587,6 +1587,78 @@ impl SyscallEngine {
         crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
             "GOP DEVICE PIN    Check     {:#x}, visible {:#x}, mapped {:#x}, padding {:#x}; read-only, closed handle, offline unmap OK; no paging\n",
             span.start, fb.len, span.len, span.len - fb.len);
+        Ok(())
+    }
+
+    /// Hold the known producer and roundtrip an owned, cleaned GOP directory through
+    /// both MMUs with paging off. Failure retains every table page and pin. — KESTREL
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    pub(crate) fn verify_display_directory_reset(
+        &mut self,
+        process: &mut Process,
+        resource: Handle,
+    ) -> Result<(), Errno> {
+        let span = self.framebuffer_ram.ok_or(Errno::NotSupported)?.span();
+        let handle = match self.dispatch(
+            process,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base: span.start,
+                len: span.len,
+            },
+        ) {
+            KernelCallResult::Handle(h) => h,
+            _ => return Err(Errno::Internal),
+        };
+        let koid = process
+            .handles()
+            .get(handle)
+            .map_err(errno_from_object)?
+            .koid;
+        let owner = Rc::downgrade(
+            self.vmos
+                .iter()
+                .find(|v| v.koid == koid)
+                .ok_or(Errno::Internal)?,
+        );
+        let pin = self.pin_device_vmo_read_only(process, handle, 0, span.len, Rights::READ)?;
+        let mut mappings = crate::device_memory::OfflineMappings::new(&self.table_pages)?;
+        mappings.map(span.start, pin)?;
+        if self.dispatch(process, KernelCall::HandleClose { handle })
+            != KernelCallResult::Status(Errno::Ok.status())
+        {
+            return Err(Errno::Internal);
+        }
+        self.vmos.retain(|v| v.koid != koid);
+        let published = mappings.publish(|page| {
+            kumo_hal::active::clean_dcache_to_poc(
+                phys_ptr_mut(page) as usize,
+                crate::mm::PAGE_SIZE as usize,
+            );
+        });
+        let root = published.root();
+        let boot = self.boot_info.ok_or(Errno::Internal)?;
+        let report = match kumo_hal::active::display_directory_reset_probe(boot.platform.dtb, root)
+        {
+            Ok(report) => report,
+            Err(error) => {
+                crate::klog_at!(kumo_abi::sys::log_level::ERR,
+                    "DISPLAY ROOT RESET Refuse   {:?}; owned root {:#x}, tables and GOP pins retained\n", error, root);
+                return Err(Errno::BadState);
+            }
+        };
+        let mut offline = published
+            .reclaim(report.detached)
+            .map_err(|_| Errno::BadState)?;
+        offline.unmap(span.start, span.len)?;
+        drop(offline);
+        if owner.upgrade().is_some() || !self.table_pages.all_free() {
+            return Err(Errno::Internal);
+        }
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+            "DISPLAY ROOT RESET Check    owned {:#x}, both roots {:#x}/{:#x}->0/0, status {:#x}/{:#x}, hold {:#x}, BIU idle {:#x}; VP2 {:#x} resumed; closed-handle GOP pins/tables reclaimed; no paging\n",
+            root, report.published[0], report.published[1], report.reset[0].status, report.reset[1].status,
+            report.stop.hold, report.stop.bus.idle, report.resumed.ports[2]);
         Ok(())
     }
 
@@ -5085,6 +5157,64 @@ mod tests {
                 engine.pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ),
                 Err(Errno::BadHandle)
             ));
+        }
+
+        #[test]
+        fn published_drop_retains_actual_pins_tables_and_allocator_after_engine_loss() {
+            let (engine, mut process, handle) = fixture();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x1000,
+                engine
+                    .pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            process.handles_mut().close(handle).unwrap();
+            drop(process);
+            drop(engine);
+            let before = memory.0.borrow().words.clone();
+            let mut cleaned = Vec::new();
+            let published = maps.publish(|p| cleaned.push(p));
+            assert_eq!(cleaned.last(), Some(&published.root()));
+            assert_eq!(cleaned.len(), 2);
+            assert_eq!(weak.strong_count(), 1);
+            drop(published);
+            assert_eq!(weak.strong_count(), 1);
+            assert_eq!(memory.0.borrow().words, before);
+            assert!(!pool.all_free());
+            assert!(pool
+                .prepare_vmo(Vmo::from_physical_range(cleaned[0], PAGE_SIZE).unwrap())
+                .is_err());
+            drop(pool);
+            assert_eq!(weak.strong_count(), 1);
+            assert_eq!(memory.0.borrow().words, before);
+        }
+
+        #[test]
+        fn publication_clean_failure_retains_pins_as_well_as_private_tables() {
+            let (engine, process, handle) = fixture();
+            let weak = Rc::downgrade(&engine.vmos[0]);
+            let pool = TablePool::new(Memory::default());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x1000,
+                engine
+                    .pin_device_vmo_read_only(&process, handle, 0, PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            drop(process);
+            drop(engine);
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || maps.publish(|_| panic!("clean failed"))
+            ))
+            .is_err());
+            assert_eq!(weak.strong_count(), 1);
+            assert!(!pool.all_free());
         }
 
         #[test]

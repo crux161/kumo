@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j623
 //j624
 //j625
 //j626
 //j627
+//j628
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -2616,6 +2616,9 @@ fn attempt_sora(
                 return Err(UsermodeError::DisplayDmaStop);
             }
         }
+        engine
+            .verify_display_directory_reset(&mut process, root_resource_handle)
+            .map_err(UsermodeError::DeviceTableMemory)?;
     }
     #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
     if matches!(boot.board_id(), "qemu-virt-aarch64" | "orange-pi-5-plus") {
