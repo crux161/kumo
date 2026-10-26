@@ -1,12 +1,13 @@
 //j399
 //j409
+//j618
 
 use alloc::vec::Vec;
 
 use kumo_abi::{Handle, KoId, ObjectKind, Rights, Signals};
 use kumo_ipc::{Message, MessageHeader, MAX_INLINE_BYTES, MAX_MESSAGE_HANDLES};
 
-use crate::object::{HandleEntry, KernelObject, ObjectError, ObjectManager};
+use crate::object::{KernelObject, ObjectError, ObjectManager, OwnedHandleEntry};
 use crate::task::Process;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +37,7 @@ pub struct KernelMessage {
     pub header: MessageHeader,
     bytes: Vec<u8>,
     handles: Vec<Handle>,
-    transfers: Vec<HandleEntry>,
+    transfers: Vec<OwnedHandleEntry>,
 }
 
 impl KernelMessage {
@@ -78,15 +79,27 @@ impl KernelMessage {
         &self.handles
     }
 
-    fn attach_transfers(&mut self, transfers: Vec<HandleEntry>) {
+    fn attach_transfers(&mut self, transfers: Vec<OwnedHandleEntry>) {
         self.transfers = transfers;
     }
 
     fn install_transfers(&mut self, process: &mut Process) -> Result<(), IpcError> {
         let mut installed = Vec::new();
+        installed
+            .try_reserve(self.transfers.len())
+            .map_err(|_| IpcError::TableFull)?;
         for entry in &self.transfers {
-            let handle = process.handles_mut().insert_entry(*entry)?;
-            installed.push(handle);
+            match process.handles_mut().insert_entry(entry.clone()) {
+                Ok(handle) => installed.push(handle),
+                Err(error) => {
+                    // Roll back every target grant, retaining the queued owners for a
+                    // retry. No copied metadata substitutes for ownership. — KESTREL
+                    for handle in installed {
+                        process.handles_mut().close(handle)?;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
         self.handles = installed;
         self.header.handles_len = self.handles.len() as u32;
@@ -238,21 +251,25 @@ impl IpcRegistry {
                 .require(channel, ObjectKind::Channel, Rights::WRITE)?;
         let end = self.channel_end_for(channel_entry.koid)?;
         let mut transfers = Vec::new();
-        for handle in message.handles {
+        for (index, handle) in message.handles.iter().enumerate() {
+            if message.handles[..index].contains(handle) {
+                return Err(IpcError::BadHandle);
+            }
             let entry = process.handles().get(*handle)?;
             if !entry.rights.contains(Rights::TRANSFER) {
                 return Err(IpcError::AccessDenied);
             }
-            transfers.push(entry);
+            transfers.push(process.handles().clone_entry(*handle)?);
         }
 
+        let source_handles = message.handles;
         let mut message = KernelMessage::from_borrowed(message)?;
-        message.attach_transfers(transfers.clone());
+        message.attach_transfers(transfers);
         let channel = self.channel_mut_by_koid(channel_entry.koid)?;
         channel.write(end, message)?;
 
-        for entry in transfers {
-            process.handles_mut().remove(entry.handle)?;
+        for &handle in source_handles {
+            process.handles_mut().close(handle)?;
         }
         Ok(())
     }
@@ -268,9 +285,12 @@ impl IpcRegistry {
                 .require(channel, ObjectKind::Channel, Rights::READ)?;
         let end = self.channel_end_for(channel_entry.koid)?;
         let channel = self.channel_mut_by_koid(channel_entry.koid)?;
-        let mut message = channel.read(end)?;
-        message.install_transfers(process)?;
-        Ok(message)
+        // Keep the front message in its inbox until all receiver grants are installed.
+        // A full receiver table cannot destroy the last queued capability. — KESTREL
+        if let Some(message) = channel.endpoint_mut(end).inbox.first_mut() {
+            message.install_transfers(process)?;
+        }
+        channel.read(end)
     }
 
     pub fn channel_call<F>(
@@ -568,6 +588,170 @@ pub fn smoke() -> Result<IpcReport, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(
+        objects: &mut ObjectManager,
+        process: &mut Process,
+    ) -> (Handle, crate::object::HandleReferences) {
+        process
+            .handles_mut()
+            .insert_device_context(
+                objects.create(ObjectKind::DeviceCtx),
+                Rights::MAP | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn queued_context_survives_source_process_drain_and_receiver_installation() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut receiver = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let grant = sender
+            .handles()
+            .stage_grant_to(receiver.handles_mut(), right, true)
+            .unwrap();
+        sender.handles_mut().commit_grant(grant).unwrap();
+        let (handle, refs) = context(&mut objects, &mut sender);
+        let koid = sender.handles().get(handle).unwrap().koid;
+        ipc.channel_write(
+            &mut sender,
+            left,
+            Message::new(1, b"context", &[handle]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sender.handles().get(handle), Err(ObjectError::BadHandle));
+        drop(sender.handles_mut().drain());
+        drop(sender);
+        assert!(refs.is_referenced());
+        let received = ipc.channel_read(&mut receiver, grant.target()).unwrap();
+        let handle = received.handles()[0];
+        assert_eq!(
+            receiver
+                .handles()
+                .require(handle, ObjectKind::DeviceCtx, Rights::MAP)
+                .unwrap()
+                .koid,
+            koid
+        );
+        drop(received);
+        assert!(refs.is_referenced());
+        receiver.handles_mut().close(handle).unwrap();
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn failed_receiver_prefix_install_keeps_the_queue_and_rolls_back_target_owners() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut receiver = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let grant = sender
+            .handles()
+            .stage_grant_to(receiver.handles_mut(), right, true)
+            .unwrap();
+        sender.handles_mut().commit_grant(grant).unwrap();
+        let (a, refs_a) = context(&mut objects, &mut sender);
+        let (b, refs_b) = context(&mut objects, &mut sender);
+        ipc.channel_write(&mut sender, left, Message::new(1, b"two", &[a, b]).unwrap())
+            .unwrap();
+        drop(sender);
+        let before = receiver.handles().live_count();
+        receiver.handles_mut().fail_insert_after(Some(1));
+        assert_eq!(
+            ipc.channel_read(&mut receiver, grant.target()),
+            Err(IpcError::TableFull)
+        );
+        assert_eq!(receiver.handles().live_count(), before);
+        assert!(refs_a.is_referenced() && refs_b.is_referenced());
+        receiver.handles_mut().fail_insert_after(None);
+        let received = ipc.channel_read(&mut receiver, grant.target()).unwrap();
+        assert_eq!(received.bytes(), b"two");
+        assert_eq!(received.handles().len(), 2);
+        drop(receiver.handles_mut().drain());
+        assert!(!refs_a.is_referenced() && !refs_b.is_referenced());
+    }
+
+    #[test]
+    fn failed_send_and_repeated_source_handle_leave_no_ghost_context_owner() {
+        let mut objects = ObjectManager::new();
+        let mut process = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut process).unwrap();
+        let (handle, refs) = context(&mut objects, &mut process);
+        assert_eq!(
+            ipc.channel_write(
+                &mut process,
+                left,
+                Message::new(1, b"bad", &[handle, handle]).unwrap()
+            ),
+            Err(IpcError::BadHandle)
+        );
+        assert!(process.handles().get(handle).is_ok());
+        assert_eq!(
+            ipc.channel_read(&mut process, right),
+            Err(IpcError::ShouldWait)
+        );
+        let right_koid = process.handles().get(right).unwrap().koid;
+        ipc.close_by_koid(right_koid).unwrap();
+        assert_eq!(
+            ipc.channel_write(
+                &mut process,
+                left,
+                Message::new(1, b"closed", &[handle]).unwrap()
+            ),
+            Err(IpcError::PeerClosed)
+        );
+        process.handles_mut().close(handle).unwrap();
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn kernel_message_clones_hold_a_context_until_the_last_queued_owner_drops() {
+        let mut objects = ObjectManager::new();
+        let mut process = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, _) = ipc.channel_create(&mut objects, &mut process).unwrap();
+        let (handle, refs) = context(&mut objects, &mut process);
+        ipc.channel_write(
+            &mut process,
+            left,
+            Message::new(1, b"cap", &[handle]).unwrap(),
+        )
+        .unwrap();
+        let message = ipc
+            .channel_pair_mut(0)
+            .unwrap()
+            .read(ChannelEnd::Right)
+            .unwrap();
+        let copy = message.clone();
+        drop(message);
+        assert!(refs.is_referenced());
+        drop(copy);
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn dropping_the_queue_discards_its_context_ownership() {
+        let mut objects = ObjectManager::new();
+        let mut process = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, _) = ipc.channel_create(&mut objects, &mut process).unwrap();
+        let (handle, refs) = context(&mut objects, &mut process);
+        ipc.channel_write(
+            &mut process,
+            left,
+            Message::new(1, b"cap", &[handle]).unwrap(),
+        )
+        .unwrap();
+        drop(process);
+        assert!(refs.is_referenced());
+        drop(ipc);
+        assert!(!refs.is_referenced());
+    }
     use kumo_abi::{Rights, INVALID_HANDLE};
 
     fn test_process(objects: &mut ObjectManager) -> Process {

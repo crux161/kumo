@@ -1,8 +1,8 @@
-//j605
 //j609
 //j614
 //j616
 //j617
+//j618
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
 use core::mem;
@@ -21,7 +21,7 @@ use kumo_ipc::Message;
 
 use crate::ipc::{IpcError, IpcRegistry, KernelMessage, PortPacket};
 use crate::mm::{Mapping, Vmar, Vmo};
-use crate::object::{HandleTable, ObjectError, ObjectManager, StagedHandleGrant};
+use crate::object::{HandleReferences, HandleTable, ObjectError, ObjectManager, StagedHandleGrant};
 use crate::task::{Job, Process, Thread};
 
 #[derive(Clone, Copy, Debug)]
@@ -289,12 +289,13 @@ struct IoMmuBinding {
     phys_base: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DeviceCtxBinding {
     koid: KoId,
     iommu_koid: KoId,
     stream_id: u32,
     pgd_phys: u64,
+    references: HandleReferences,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -769,6 +770,16 @@ impl SyscallEngine {
         self.resources.len() != before
     }
 
+    /// A binding is an observer, not a user capability. Unknown contexts must never
+    /// be mistaken for a confirmed last close. Checked teardown is a later gate. — KESTREL
+    pub(crate) fn device_ctx_has_capabilities(&self, koid: KoId) -> Result<bool, Errno> {
+        self.device_ctxs
+            .iter()
+            .find(|ctx| ctx.koid == koid)
+            .map(|ctx| ctx.references.is_referenced())
+            .ok_or(Errno::BadHandle)
+    }
+
     /// Drop every port binding touching `koid`, whether it is the watching port or the
     /// watched object. Called at teardown for each handle a dying process releases: once
     /// either endpoint is gone the binding can never fire again, so leaving it would leak
@@ -1234,6 +1245,71 @@ impl SyscallEngine {
         }
         crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
             "DEVICE PINS       Check     VMO identity, closed handle, exact unmap, offline release OK\n");
+        self.verify_device_context_references()?;
+        Ok(())
+    }
+
+    /// Exercise capability transport only, without constructing a backend binding,
+    /// allocating a device root or granting a driver any new authority. — KESTREL
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    fn verify_device_context_references(&mut self) -> Result<(), Errno> {
+        let job = Job::root(&mut self.objects);
+        let vmar = Vmar::new(0, 1 << 32).map_err(|_| Errno::Internal)?;
+        let mut source = Process::new(&mut self.objects, &job, vmar);
+        let mut target = Process::new(&mut self.objects, &job, vmar);
+        let object = self.objects.create(ObjectKind::DeviceCtx);
+        let (handle, references) = source
+            .handles_mut()
+            .insert_device_context(object, Rights::MAP | Rights::DUPLICATE | Rights::TRANSFER)
+            .map_err(errno_from_object)?;
+        let duplicate = source
+            .handles_mut()
+            .duplicate(handle, Rights::MAP | Rights::TRANSFER)
+            .map_err(errno_from_object)?;
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc
+            .channel_create(&mut self.objects, &mut source)
+            .map_err(errno_from_ipc)?;
+        let grant = source
+            .handles()
+            .stage_grant_to(target.handles_mut(), right, true)
+            .map_err(errno_from_object)?;
+        source
+            .handles_mut()
+            .commit_grant(grant)
+            .map_err(errno_from_object)?;
+        ipc.channel_write(
+            &mut source,
+            left,
+            Message::new(0, b"reference proof", &[duplicate]).map_err(|_| Errno::Internal)?,
+        )
+        .map_err(errno_from_ipc)?;
+        drop(source.handles_mut().drain());
+        drop(source);
+        if !references.is_referenced() {
+            return Err(Errno::Internal);
+        }
+        let message = ipc
+            .channel_read(&mut target, grant.target())
+            .map_err(errno_from_ipc)?;
+        let received = *message.handles().first().ok_or(Errno::Internal)?;
+        let entry = target
+            .handles()
+            .require(received, ObjectKind::DeviceCtx, Rights::MAP)
+            .map_err(errno_from_object)?;
+        if entry.koid != object.koid() || !references.is_referenced() {
+            return Err(Errno::Internal);
+        }
+        let drained = target.handles_mut().drain();
+        if !references.is_referenced() {
+            return Err(Errno::Internal);
+        }
+        drop(drained);
+        if references.is_referenced() {
+            return Err(Errno::Internal);
+        }
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+            "DEVICE REFS       Check     duplicate, queued transfer, process drain, final drop OK\n");
         Ok(())
     }
 
@@ -1280,7 +1356,7 @@ impl SyscallEngine {
 
     fn device_vmar_backend_map(
         &mut self,
-        ctx: DeviceCtxBinding,
+        ctx: &DeviceCtxBinding,
         iommu: IoMmuBinding,
         vmo_koid: KoId,
         vmo_offset: u64,
@@ -1318,7 +1394,7 @@ impl SyscallEngine {
 
     fn device_vmar_backend_unmap_prefix(
         &self,
-        ctx: DeviceCtxBinding,
+        ctx: &DeviceCtxBinding,
         iommu: IoMmuBinding,
         iova: u64,
         pages: u64,
@@ -1339,7 +1415,7 @@ impl SyscallEngine {
 
     fn device_vmar_backend_unmap_range(
         &self,
-        ctx: DeviceCtxBinding,
+        ctx: &DeviceCtxBinding,
         iommu: IoMmuBinding,
         iova: u64,
         len: u64,
@@ -2709,6 +2785,15 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 }
 
+                // Preflight metadata before touching the backend. No handle-table
+                // mutation intervenes before installing its sole initial grant. — KESTREL
+                if let Err(error) = process.handles_mut().reserve_insert() {
+                    return KernelCallResult::Status(errno_from_object(error).status());
+                }
+                if self.device_ctxs.try_reserve(1).is_err() {
+                    return KernelCallResult::Status(Errno::NoMemory.status());
+                }
+
                 let pgd_phys =
                     unsafe { crate::mm::alloc_zeroed_frame(self.boot_info.as_ref().unwrap()) };
                 let Some(pgd_phys) = pgd_phys else {
@@ -2726,20 +2811,20 @@ impl SyscallEngine {
 
                 let object = self.objects.create(ObjectKind::DeviceCtx);
 
-                self.device_ctxs.push(DeviceCtxBinding {
-                    koid: object.koid(),
-                    iommu_koid: _iommu_entry.koid,
-                    stream_id,
-                    pgd_phys,
-                });
-
-                let handle = match process.handles_mut().insert(
+                let (handle, references) = match process.handles_mut().insert_device_context(
                     object,
                     Rights::MAP | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
                 ) {
                     Ok(h) => h,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
+                self.device_ctxs.push(DeviceCtxBinding {
+                    koid: object.koid(),
+                    iommu_koid: _iommu_entry.koid,
+                    stream_id,
+                    pgd_phys,
+                    references,
+                });
                 KernelCallResult::Handle(handle)
             }
             KernelCall::DeviceVmarMap {
@@ -2762,7 +2847,7 @@ impl SyscallEngine {
                     .device_ctxs
                     .iter()
                     .find(|b| b.koid == ctx_entry.koid)
-                    .copied()
+                    .cloned()
                 else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
@@ -2811,7 +2896,7 @@ impl SyscallEngine {
                 }
 
                 if let Err(errno) = self.device_vmar_backend_map(
-                    ctx_binding,
+                    &ctx_binding,
                     iommu_binding,
                     vmo_koid,
                     vmo_offset,
@@ -2842,7 +2927,7 @@ impl SyscallEngine {
                     .device_ctxs
                     .iter()
                     .find(|b| b.koid == ctx_entry.koid)
-                    .copied()
+                    .cloned()
                 else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
@@ -2870,7 +2955,7 @@ impl SyscallEngine {
                 };
 
                 if let Err(errno) =
-                    self.device_vmar_backend_unmap_range(ctx_binding, iommu_binding, iova, len)
+                    self.device_vmar_backend_unmap_range(&ctx_binding, iommu_binding, iova, len)
                 {
                     return KernelCallResult::Status(errno.status());
                 }
@@ -3229,6 +3314,44 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    #[test]
+    fn context_binding_observes_duplicate_close_and_process_drain_without_owning_a_capability() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let handle = create_test_device_ctx(&mut engine, &mut process);
+        let koid = process.handles().get(handle).unwrap().koid;
+        let duplicate = match engine.dispatch(
+            &mut process,
+            KernelCall::HandleDuplicate {
+                handle,
+                rights: Rights::MAP,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            result => panic!("{result:?}"),
+        };
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::HandleClose { handle }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(engine.device_ctx_has_capabilities(koid), Ok(true));
+        let entries = process.handles_mut().drain();
+        assert_eq!(
+            process.handles().get(duplicate),
+            Err(ObjectError::BadHandle)
+        );
+        assert_eq!(engine.device_ctx_has_capabilities(koid), Ok(true));
+        drop(entries);
+        assert_eq!(engine.device_ctx_has_capabilities(koid), Ok(false));
+        assert_eq!(
+            engine.device_ctx_has_capabilities(KoId(u64::MAX)),
+            Err(Errno::BadHandle)
+        );
+        // A last-reference observation alone cannot free the binding or reuse its stream.
+        // Checked containment and quarantine are still required. — KESTREL
+        assert_eq!(engine.device_ctxs.len(), 1);
+    }
 
     #[cfg(feature = "arch_aarch64")]
     mod device_pins {
@@ -4239,9 +4362,9 @@ mod tests {
         let (_iommu, iommu_koid) = create_test_iommu_with_kind(engine, process, iommu_kind);
         let object = engine.objects.create(ObjectKind::DeviceCtx);
         let koid = object.koid();
-        let handle = process
+        let (handle, references) = process
             .handles_mut()
-            .insert(
+            .insert_device_context(
                 object,
                 Rights::MAP | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
             )
@@ -4251,6 +4374,7 @@ mod tests {
             iommu_koid,
             stream_id,
             pgd_phys: 0x8000_0000,
+            references,
         });
         handle
     }
@@ -4501,11 +4625,16 @@ mod tests {
             kumo_abi::sys::IoMmuKind::SmmuV3 as u32,
         );
         let object = engine.objects.create(ObjectKind::DeviceCtx);
+        let (_, references) = process
+            .handles_mut()
+            .insert_device_context(object, Rights::MAP)
+            .unwrap();
         engine.device_ctxs.push(DeviceCtxBinding {
             koid: object.koid(),
             iommu_koid,
             stream_id: 0x820,
             pgd_phys: 0x8000_0000,
+            references,
         });
 
         let duplicate = engine.dispatch(
@@ -4922,11 +5051,16 @@ mod tests {
         );
         let iommu_koid = engine.device_ctxs[0].iommu_koid;
         let object = engine.objects.create(ObjectKind::DeviceCtx);
+        let (_, references) = process
+            .handles_mut()
+            .insert_device_context(object, Rights::MAP)
+            .unwrap();
         engine.device_ctxs.push(DeviceCtxBinding {
             koid: object.koid(),
             iommu_koid,
             stream_id: 0x42,
             pgd_phys: 0x9000_0000,
+            references,
         });
 
         assert_eq!(

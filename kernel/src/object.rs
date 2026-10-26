@@ -1,4 +1,10 @@
-use alloc::vec::Vec;
+//j618
+
+use alloc::{
+    rc::{Rc, Weak},
+    vec::Vec,
+};
+use core::ops::Deref;
 
 use kumo_abi::{Handle, KoId, ObjectKind, Rights, Signals, INVALID_HANDLE};
 
@@ -78,6 +84,33 @@ pub struct HandleEntry {
     pub rights: Rights,
 }
 
+/// Observe capability owners without keeping one alive. Metadata lookups and a kernel
+/// binding are not capabilities; tables, staged grants and messages are. — KESTREL
+#[derive(Clone, Debug)]
+pub(crate) struct HandleReferences(Weak<()>);
+
+impl HandleReferences {
+    pub fn is_referenced(&self) -> bool {
+        self.0.strong_count() != 0
+    }
+}
+
+/// A removed/transferred entry owns its reference until installed or discarded. The
+/// Copy HandleEntry above is only a metadata view and cannot recreate this owner.
+/// Keep ownership private so IPC cannot accidentally rebuild it from a koid. — KESTREL
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedHandleEntry {
+    entry: HandleEntry,
+    reference: Option<Rc<()>>,
+}
+
+impl Deref for OwnedHandleEntry {
+    type Target = HandleEntry;
+    fn deref(&self) -> &HandleEntry {
+        &self.entry
+    }
+}
+
 /// A handle grant staged in a target table but not yet committed in its source.
 ///
 /// Staging makes `ProcessRun` transactional: admission failure can discard the
@@ -97,8 +130,10 @@ impl StagedHandleGrant {
 
 #[derive(Clone, Debug)]
 pub struct HandleTable {
-    entries: Vec<Option<HandleEntry>>,
+    entries: Vec<Option<OwnedHandleEntry>>,
     next_handle: u32,
+    #[cfg(test)]
+    insertion_limit: Option<usize>,
 }
 
 impl HandleTable {
@@ -106,18 +141,39 @@ impl HandleTable {
         Self {
             entries: Vec::new(),
             next_handle: 1,
+            #[cfg(test)]
+            insertion_limit: None,
         }
     }
 
     pub fn insert(&mut self, object: KernelObject, rights: Rights) -> Result<Handle, ObjectError> {
-        self.insert_parts(object.koid, object.kind, rights)
+        // Every DeviceCtx must start with one canonical reference lineage. Subsequent
+        // grants clone/move its owner rather than minting from copied metadata. — KESTREL
+        if object.kind == ObjectKind::DeviceCtx {
+            return Err(ObjectError::AccessDenied);
+        }
+        self.insert_parts(object.koid, object.kind, rights, None)
+    }
+
+    pub(crate) fn insert_device_context(
+        &mut self,
+        object: KernelObject,
+        rights: Rights,
+    ) -> Result<(Handle, HandleReferences), ObjectError> {
+        if object.kind != ObjectKind::DeviceCtx {
+            return Err(ObjectError::WrongType);
+        }
+        let reference = Rc::new(());
+        let observer = HandleReferences(Rc::downgrade(&reference));
+        let handle = self.insert_parts(object.koid, object.kind, rights, Some(reference))?;
+        Ok((handle, observer))
     }
 
     pub fn get(&self, handle: Handle) -> Result<HandleEntry, ObjectError> {
         let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
         self.entries
             .get(index)
-            .and_then(|slot| *slot)
+            .and_then(|slot| slot.as_ref().map(|owner| owner.entry))
             .ok_or(ObjectError::BadHandle)
     }
 
@@ -142,14 +198,16 @@ impl HandleTable {
         if !entry.rights.contains(Rights::DUPLICATE) || !entry.rights.contains(rights) {
             return Err(ObjectError::AccessDenied);
         }
-        self.insert_parts(entry.koid, entry.kind, rights)
+        let mut owner = self.clone_entry(handle)?;
+        owner.entry.rights = rights;
+        self.insert_entry(owner)
     }
 
     pub fn close(&mut self, handle: Handle) -> Result<(), ObjectError> {
         self.remove(handle).map(|_| ())
     }
 
-    pub fn remove(&mut self, handle: Handle) -> Result<HandleEntry, ObjectError> {
+    pub fn remove(&mut self, handle: Handle) -> Result<OwnedHandleEntry, ObjectError> {
         let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
         let slot = self.entries.get_mut(index).ok_or(ObjectError::BadHandle)?;
         slot.take().ok_or(ObjectError::BadHandle)
@@ -159,7 +217,7 @@ impl HandleTable {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
-    pub fn drain(&mut self) -> Vec<HandleEntry> {
+    pub fn drain(&mut self) -> Vec<OwnedHandleEntry> {
         let mut removed = Vec::new();
         for slot in &mut self.entries {
             if let Some(entry) = slot.take() {
@@ -169,8 +227,22 @@ impl HandleTable {
         removed
     }
 
-    pub fn insert_entry(&mut self, entry: HandleEntry) -> Result<Handle, ObjectError> {
-        self.insert_parts(entry.koid, entry.kind, entry.rights)
+    pub fn insert_entry(&mut self, entry: OwnedHandleEntry) -> Result<Handle, ObjectError> {
+        self.insert_parts(entry.koid, entry.kind, entry.rights, entry.reference)
+    }
+
+    pub(crate) fn clone_entry(&self, handle: Handle) -> Result<OwnedHandleEntry, ObjectError> {
+        let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
+        self.entries
+            .get(index)
+            .and_then(Option::as_ref)
+            .cloned()
+            .ok_or(ObjectError::BadHandle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_insert_after(&mut self, successful: Option<usize>) {
+        self.insertion_limit = successful.map(|count| self.entries.len() + count);
     }
 
     /// Stage a copied or moved grant in `target` without changing this table.
@@ -189,7 +261,7 @@ impl HandleTable {
         if !entry.rights.contains(required) {
             return Err(ObjectError::AccessDenied);
         }
-        let target = target.insert_entry(entry)?;
+        let target = target.insert_entry(self.clone_entry(source)?)?;
         Ok(StagedHandleGrant {
             source,
             target,
@@ -215,20 +287,41 @@ impl HandleTable {
         koid: KoId,
         kind: ObjectKind,
         rights: Rights,
+        reference: Option<Rc<()>>,
     ) -> Result<Handle, ObjectError> {
+        self.reserve_insert()?;
+        let handle = Handle(self.next_handle);
+        self.next_handle = self.next_handle.checked_add(1).unwrap_or(0);
+        self.entries.push(Some(OwnedHandleEntry {
+            entry: HandleEntry {
+                handle,
+                koid,
+                kind,
+                rights,
+            },
+            reference,
+        }));
+        Ok(handle)
+    }
+
+    /// Reserve before a caller creates external state. With no intervening table
+    /// mutation, installing the corresponding handle cannot then fail. — KESTREL
+    pub(crate) fn reserve_insert(&mut self) -> Result<(), ObjectError> {
         if self.next_handle == 0 {
             return Err(ObjectError::TableFull);
         }
+        #[cfg(test)]
+        if self
+            .insertion_limit
+            .is_some_and(|limit| self.entries.len() >= limit)
+        {
+            return Err(ObjectError::TableFull);
+        }
 
-        let handle = Handle(self.next_handle);
-        self.next_handle = self.next_handle.checked_add(1).unwrap_or(0);
-        self.entries.push(Some(HandleEntry {
-            handle,
-            koid,
-            kind,
-            rights,
-        }));
-        Ok(handle)
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| ObjectError::TableFull)?;
+        Ok(())
     }
 }
 
@@ -249,6 +342,93 @@ fn handle_index(handle: Handle) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(table: &mut HandleTable) -> (Handle, HandleReferences) {
+        table
+            .insert_device_context(
+                KernelObject::new(KoId(73), ObjectKind::DeviceCtx),
+                Rights::MAP | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn context_metadata_and_binding_observers_cannot_keep_a_capability_alive() {
+        let mut table = HandleTable::new();
+        let (handle, refs) = context(&mut table);
+        let metadata = table.get(handle).unwrap();
+        let observer = refs.clone();
+        table.close(handle).unwrap();
+        assert_eq!(metadata.koid, KoId(73));
+        assert!(!refs.is_referenced());
+        assert!(!observer.is_referenced());
+        assert_eq!(
+            table.insert(
+                KernelObject::new(metadata.koid, metadata.kind),
+                metadata.rights
+            ),
+            Err(ObjectError::AccessDenied)
+        );
+        assert!(matches!(
+            table.insert_device_context(KernelObject::new(KoId(74), ObjectKind::Vmo), Rights::READ),
+            Err(ObjectError::WrongType)
+        ));
+    }
+
+    #[test]
+    fn removed_and_drained_contexts_own_references_until_their_final_drop() {
+        let mut table = HandleTable::new();
+        let (handle, refs) = context(&mut table);
+        let duplicate = table.duplicate(handle, Rights::WAIT).unwrap();
+        assert_eq!(
+            table.duplicate(duplicate, Rights::MAP),
+            Err(ObjectError::AccessDenied)
+        );
+        let removed = table.remove(handle).unwrap();
+        let drained = table.drain();
+        drop(table);
+        assert!(refs.is_referenced());
+        drop(removed);
+        assert!(refs.is_referenced());
+        drop(drained);
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn context_stage_commit_rollback_and_table_clone_preserve_ownership() {
+        let mut source = HandleTable::new();
+        let (handle, refs) = context(&mut source);
+        let mut target = HandleTable::new();
+        let rolled_back = source.stage_grant_to(&mut target, handle, true).unwrap();
+        target.rollback_grant(rolled_back).unwrap();
+        assert!(source.get(handle).is_ok());
+        let copy = source.stage_grant_to(&mut target, handle, false).unwrap();
+        source.commit_grant(copy).unwrap();
+        let moved = source.stage_grant_to(&mut target, handle, true).unwrap();
+        source.commit_grant(moved).unwrap();
+        assert_eq!(source.get(handle), Err(ObjectError::BadHandle));
+        let snapshot = target.clone();
+        drop(target);
+        assert!(refs.is_referenced());
+        drop(snapshot);
+        assert!(!refs.is_referenced());
+    }
+
+    #[test]
+    fn failed_context_grant_does_not_consume_the_source_or_keep_a_ghost_owner() {
+        let mut source = HandleTable::new();
+        let (handle, refs) = context(&mut source);
+        let mut target = HandleTable::new();
+        target.fail_insert_after(Some(0));
+        assert_eq!(
+            source.stage_grant_to(&mut target, handle, true),
+            Err(ObjectError::TableFull)
+        );
+        assert!(source.get(handle).is_ok());
+        assert_eq!(target.live_count(), 0);
+        source.close(handle).unwrap();
+        assert!(!refs.is_referenced());
+    }
 
     #[test]
     fn object_ids_are_monotonic_and_nonzero() {
