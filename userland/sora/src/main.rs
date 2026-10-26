@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j607
 //j609
 //j611
 //j614
 //j616
+//j629
 
 extern crate alloc;
 
@@ -804,6 +804,79 @@ fn read_only_grant(raw: u64) -> Handle {
 /// D0a: observe shared PMU status in the supervisor, then pass data and one VOP Resource.
 /// No PMU/CRU capability or IRQ authority reaches the display driver. Only the exact Orange
 /// Pi board with a plausible existing GOP image is probed. — TIMBERDOODLE
+/// Exercise real offline DeviceCtx syscalls before the trusted display diagnostic.
+/// This prepares no live domain and grants no extra authority to drv-fb. — KESTREL
+fn verify_offline_display_context(root: Handle, boot: &BootInfo) -> bool {
+    use kumo_abi::sys::IoMmuKind;
+    use kumo_rt::{device_ctx_create, device_vmar_map, device_vmar_unmap, iommu_from_resource};
+    if boot.board_id() != "orange-pi-5-plus" {
+        return true;
+    }
+    let result = (|| {
+        let base = 0xfdd9_7e00;
+        let len = 0x200;
+        if syscall_handle(iommu_from_resource(root, IoMmuKind::SmmuV3, base, len)).is_some() {
+            return None;
+        }
+        let iommu = syscall_handle(iommu_from_resource(root, IoMmuKind::RockchipV2, base, len))?;
+        if syscall_handle(iommu_from_resource(root, IoMmuKind::RockchipV2, base, len)).is_some()
+            || syscall_handle(device_ctx_create(iommu, 1)).is_some()
+        {
+            return None;
+        }
+        let ctx = syscall_handle(device_ctx_create(iommu, 0))?;
+        if syscall_handle(device_ctx_create(iommu, 0)).is_some() {
+            return None;
+        }
+        let span = boot.framebuffer.mapping_len()?;
+        let source = syscall_handle(kumo_rt::resource_mint_mmio(
+            root,
+            boot.framebuffer.phys,
+            span,
+        ))?;
+        let iova = 0x6000_0000;
+        if device_vmar_map(ctx, source, 0, span, iova, Rights::READ | Rights::WRITE) == 0
+            || device_vmar_map(ctx, source, 0, span - 4096, iova, Rights::READ) == 0
+            || device_vmar_map(ctx, source, 0, span, iova, Rights::READ) != 0
+        {
+            return None;
+        }
+        let duplicate = syscall_handle(handle_duplicate(ctx, Rights::MAP | Rights::WAIT))?;
+        if handle_close(source) != 0
+            || handle_close(ctx) != 0
+            || device_vmar_unmap(duplicate, iova, span - 4096) == 0
+            || device_vmar_unmap(duplicate, iova, span) != 0
+        {
+            return None;
+        }
+        // Last close must discard even a still-mapped offline owner, permitting a
+        // new sole context on the same IOMMU capability. — KESTREL
+        let source = syscall_handle(kumo_rt::resource_mint_mmio(
+            root,
+            boot.framebuffer.phys,
+            span,
+        ))?;
+        if device_vmar_map(duplicate, source, 0, span, iova, Rights::READ) != 0
+            || handle_close(source) != 0
+            || handle_close(duplicate) != 0
+        {
+            return None;
+        }
+        let again = syscall_handle(device_ctx_create(iommu, 0))?;
+        if handle_close(again) != 0 || handle_close(iommu) != 0 {
+            return None;
+        }
+        Some(())
+    })();
+    if result.is_some() {
+        notice(&[b"display: D1d-b offline DeviceCtx: READ/GOP maps, authority/range denials, closed source, duplicate survival, final-close/recreate OK; no paging\n"]);
+        true
+    } else {
+        notice(&[b"display: D1d-b offline DeviceCtx refused; no paging proof\n"]);
+        false
+    }
+}
+
 fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebuffer_valid: bool) {
     use drv_fb::rk3588::{eligible, Power, PMU_BASE, PMU_LEN, VOP_BASE, VOP_LEN};
     use drv_fb::rk3588_clock::{
@@ -2079,6 +2152,7 @@ extern "C" fn sora_main(
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
             if bootinfo.has_framebuffer() {
                 let fb = bootinfo.framebuffer;
+                let _ = verify_offline_display_context(res, bootinfo);
                 // Unconditional pre-gate dump of the geometry read from the BootInfo snapshot, so a
                 // blank boot reveals whether the snapshot is stale/garbage (a coherency bug upstream)
                 // or sane-but-rejected (the is_plausible gate too strict). Fires every boot — unlike

@@ -1,8 +1,8 @@
-//j620
 //j622
 //j625
 //j626
 //j628
+//j629
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -334,6 +334,23 @@ struct DeviceCtxBinding {
     pgd_phys: u64,
     references: HandleReferences,
     state: Rc<Cell<DeviceCtxState>>,
+}
+
+#[cfg(feature = "arch_aarch64")]
+#[derive(Clone)]
+struct DisplayContext {
+    koid: KoId,
+    mappings: Rc<
+        RefCell<Option<crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>>>,
+    >,
+}
+#[cfg(feature = "arch_aarch64")]
+impl core::fmt::Debug for DisplayContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DisplayContext")
+            .field("koid", &self.koid)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -672,6 +689,10 @@ fn ensure_vmo_frame(
 struct DeviceState {
     iommus: Vec<IoMmuBinding>,
     device_ctxs: Vec<DeviceCtxBinding>,
+    #[cfg(feature = "arch_aarch64")]
+    display_contexts: Vec<DisplayContext>,
+    #[cfg(feature = "arch_aarch64")]
+    display_reservation: Option<Rc<()>>,
     device_vmar_mappings: Vec<DeviceVmarMapping>,
     device_ctx_faults: Vec<DeviceCtxFault>,
     port_bindings: Vec<(KoId, KoId)>,
@@ -697,6 +718,27 @@ impl DeviceState {
             }
             if ctx.pgd_phys != 0 && ranges_overlap(base, len, ctx.pgd_phys, crate::mm::PAGE_SIZE) {
                 return false;
+            }
+            #[cfg(feature = "arch_aarch64")]
+            if let Some(domain) = self.display_contexts.iter().find(|d| d.koid == ctx.koid) {
+                let Ok(maps) = domain.mappings.try_borrow() else {
+                    return false;
+                };
+                if let Some(maps) = maps.as_ref() {
+                    for pin in maps.pins() {
+                        if authorized.is_some_and(|entry| core::ptr::eq(entry, pin.entry.as_ref()))
+                        {
+                            continue;
+                        }
+                        if pin
+                            .pages()
+                            .iter()
+                            .any(|p| ranges_overlap(base, len, *p, crate::mm::PAGE_SIZE))
+                        {
+                            return false;
+                        }
+                    }
+                }
             }
             for map in self
                 .device_vmar_mappings
@@ -769,6 +811,8 @@ struct DeviceRetention {
     frozen: Cell<bool>,
     #[cfg(feature = "arch_aarch64")]
     table_pages: crate::device_memory::TablePool<crate::device_memory::KernelPages>,
+    #[cfg(feature = "arch_aarch64")]
+    display_reservation: RefCell<alloc::rc::Weak<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -780,6 +824,8 @@ impl KernelDeviceOwner {
             frozen: Cell::new(false),
             #[cfg(feature = "arch_aarch64")]
             table_pages: Default::default(),
+            #[cfg(feature = "arch_aarch64")]
+            display_reservation: RefCell::new(alloc::rc::Weak::new()),
         }))
     }
 
@@ -870,6 +916,8 @@ pub struct SyscallEngine {
     boot_info: Option<kumo_abi::BootInfo>,
     #[cfg(feature = "arch_aarch64")]
     framebuffer_ram: Option<crate::device_memory::FramebufferRam>,
+    #[cfg(feature = "arch_aarch64")]
+    display_unit: Option<kumo_hal::active::DisplayIoMmu>,
     interrupts: Vec<IrqBinding>,
     timers: Vec<TimerBinding>,
     resources: Vec<ResourceBinding>,
@@ -918,6 +966,8 @@ impl SyscallEngine {
             boot_info: None,
             #[cfg(feature = "arch_aarch64")]
             framebuffer_ram: None,
+            #[cfg(feature = "arch_aarch64")]
+            display_unit: None,
             interrupts: Vec::new(),
             timers: Vec::new(),
             resources: Vec::new(),
@@ -1094,6 +1144,35 @@ impl SyscallEngine {
         self.devices.unit_reserved(base, len) || !self.device_owner.unit_allowed(base, len)
     }
 
+    #[cfg(feature = "arch_aarch64")]
+    fn display_context(&self, koid: KoId) -> Option<DisplayContext> {
+        self.devices
+            .display_contexts
+            .iter()
+            .find(|d| d.koid == koid)
+            .cloned()
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    fn display_iommu_supported(&self, base: u64, len: u64) -> bool {
+        if !self
+            .display_unit
+            .is_some_and(|u| u.matches_range(base, len))
+        {
+            return false;
+        }
+        #[cfg(target_os = "none")]
+        {
+            kumo_hal::active::display_iommu_unit_ready(self.dtb(), base, len)
+        }
+        // Host tests supply the descriptor explicitly; production host builds never
+        // discover a physical unit. No host MMIO or physical pointer access. — KESTREL
+        #[cfg(not(target_os = "none"))]
+        {
+            cfg!(test)
+        }
+    }
+
     fn physical_access_allowed(
         &self,
         entry: &VmoEntry,
@@ -1177,7 +1256,21 @@ impl SyscallEngine {
                 // Fail closed before calling the backend. No logging, wake or context
                 // switch may re-enter Sora from this checked hardware operation. — KESTREL
                 ctx.state.set(DeviceCtxState::Quarantined);
-                if !unit_quarantined && unit.is_some_and(|unit| block_and_detach(&unit, &ctx)) {
+                let released = !unit_quarantined
+                    && unit.is_some_and(|unit| {
+                        #[cfg(feature = "arch_aarch64")]
+                        if unit.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                            // This admitted owner is strictly unpublished. Take the shared
+                            // payload once; cloned engines cannot destroy it twice. — KESTREL
+                            return self.display_context(ctx.koid).is_some_and(|d| {
+                                d.mappings
+                                    .try_borrow_mut()
+                                    .is_ok_and(|mut m| m.take().is_some())
+                            });
+                        }
+                        block_and_detach(&unit, &ctx)
+                    });
+                if released {
                     ctx.state.set(DeviceCtxState::Released);
                 } else {
                     report.quarantined += 1;
@@ -1195,6 +1288,8 @@ impl SyscallEngine {
                     .retain(|fault| fault.ctx_koid != ctx.koid);
                 self.release_port_bindings(ctx.koid);
                 self.devices.device_ctxs.remove(index);
+                #[cfg(feature = "arch_aarch64")]
+                self.devices.display_contexts.retain(|d| d.koid != ctx.koid);
                 report.released += 1;
             } else {
                 index += 1;
@@ -1407,6 +1502,7 @@ impl SyscallEngine {
         // trust a userspace BootInfo copy on an SVC path. — KESTREL
         #[cfg(feature = "arch_aarch64")]
         {
+            self.display_unit = kumo_hal::active::display_iommu_from_dtb(boot.platform.dtb);
             self.framebuffer_ram = if boot.flags & BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM != 0 {
                 crate::device_memory::FramebufferRam::from_boot(&boot, unsafe {
                     boot.mem_regions.as_slice()
@@ -3659,8 +3755,45 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
 
-                if !kumo_hal::active::iommu_init(_kind as u32, phys_base, len) {
+                let mut supported = false;
+                #[cfg(feature = "arch_aarch64")]
+                if _kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                    if self.devices.iommus.iter().any(|u| {
+                        u.iommu_kind == _kind && ranges_overlap(phys_base, len, u.phys_base, u.len)
+                    }) {
+                        return KernelCallResult::Status(Errno::BadState.status());
+                    }
+                    supported = self.display_iommu_supported(phys_base, len);
+                }
+                if _kind != kumo_abi::sys::IoMmuKind::RockchipV2 as u32
+                    && !kumo_hal::active::device_mmio_read_only(phys_base, len)
+                {
+                    supported = kumo_hal::active::iommu_init(_kind, phys_base, len);
+                }
+                if !supported {
                     return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+
+                if let Err(e) = process.handles_mut().reserve_insert() {
+                    return KernelCallResult::Status(errno_from_object(e).status());
+                }
+                if self.devices.iommus.try_reserve(1).is_err() {
+                    return KernelCallResult::Status(Errno::NoMemory.status());
+                }
+                #[cfg(feature = "arch_aarch64")]
+                if _kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                    let Ok(mut owner) = self.device_owner.0.display_reservation.try_borrow_mut()
+                    else {
+                        return KernelCallResult::Status(Errno::BadState.status());
+                    };
+                    if owner.upgrade().is_some() {
+                        return KernelCallResult::Status(Errno::BadState.status());
+                    }
+                    // Physical ownership is shared by engine clones and retained payloads,
+                    // not recreated from a fresh object koid after restart. — KESTREL
+                    let reservation = Rc::new(());
+                    *owner = Rc::downgrade(&reservation);
+                    self.devices.display_reservation = Some(reservation);
                 }
 
                 let object = self.objects.create(ObjectKind::IoMmu);
@@ -3706,6 +3839,11 @@ impl SyscallEngine {
                 let Ok(stream_id) = u32::try_from(_stream_or_rid) else {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 };
+                if iommu_binding.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32
+                    && stream_id != 0
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
                 if self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len) {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
@@ -3727,18 +3865,44 @@ impl SyscallEngine {
                     return KernelCallResult::Status(Errno::NoMemory.status());
                 }
 
-                let pgd_phys =
-                    unsafe { crate::mm::alloc_zeroed_frame(self.boot_info.as_ref().unwrap()) };
-                let Some(pgd_phys) = pgd_phys else {
-                    return KernelCallResult::Status(Errno::NoMemory.status());
-                };
+                #[cfg(feature = "arch_aarch64")]
+                let mut display = None;
+                let pgd_phys;
+                if iommu_binding.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                    #[cfg(feature = "arch_aarch64")]
+                    {
+                        if self.devices.display_contexts.try_reserve(1).is_err() {
+                            return KernelCallResult::Status(Errno::NoMemory.status());
+                        }
+                        display =
+                            match crate::device_memory::OfflineMappings::new(&self.table_pages) {
+                                Ok(m) => Some(m),
+                                Err(e) => return KernelCallResult::Status(e.status()),
+                            };
+                        pgd_phys = 0;
+                    }
+                    #[cfg(not(feature = "arch_aarch64"))]
+                    {
+                        return KernelCallResult::Status(Errno::NotSupported.status());
+                    }
+                } else {
+                    let Some(boot) = self.boot_info.as_ref() else {
+                        return KernelCallResult::Status(Errno::BadState.status());
+                    };
+                    let Some(root) = (unsafe { crate::mm::alloc_zeroed_frame(boot) }) else {
+                        return KernelCallResult::Status(Errno::NoMemory.status());
+                    };
+                    pgd_phys = root;
+                }
 
-                if !kumo_hal::active::iommu_create_device_context(
-                    iommu_binding.iommu_kind,
-                    iommu_binding.phys_base,
-                    stream_id,
-                    pgd_phys,
-                ) {
+                if iommu_binding.iommu_kind != kumo_abi::sys::IoMmuKind::RockchipV2 as u32
+                    && !kumo_hal::active::iommu_create_device_context(
+                        iommu_binding.iommu_kind,
+                        iommu_binding.phys_base,
+                        stream_id,
+                        pgd_phys,
+                    )
+                {
                     return KernelCallResult::Status(Errno::NotSupported.status());
                 }
 
@@ -3759,6 +3923,13 @@ impl SyscallEngine {
                     references,
                     state: Rc::new(Cell::new(DeviceCtxState::Bound)),
                 });
+                #[cfg(feature = "arch_aarch64")]
+                if let Some(mappings) = display {
+                    self.devices.display_contexts.push(DisplayContext {
+                        koid: object.koid(),
+                        mappings: Rc::new(RefCell::new(Some(mappings))),
+                    });
+                }
                 KernelCallResult::Handle(handle)
             }
             KernelCall::DeviceVmarMap {
@@ -3809,6 +3980,28 @@ impl SyscallEngine {
                     || iova_hint.checked_add(len).is_none()
                 {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                #[cfg(feature = "arch_aarch64")]
+                if iommu_binding.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                    let result = (|| {
+                        if rights != Rights::READ {
+                            return Err(Errno::AccessDenied);
+                        }
+                        let pin =
+                            self.pin_device_vmo_read_only(process, vmo, vmo_offset, len, rights)?;
+                        let domain = self
+                            .display_context(ctx_entry.koid)
+                            .ok_or(Errno::BadState)?;
+                        let mut maps = domain
+                            .mappings
+                            .try_borrow_mut()
+                            .map_err(|_| Errno::BadState)?;
+                        maps.as_mut().ok_or(Errno::BadState)?.map(iova_hint, pin)
+                    })();
+                    return KernelCallResult::Status(
+                        result.err().map_or(Errno::Ok.status(), Errno::status),
+                    );
                 }
 
                 let vmo_entry = match process.handles().require(
@@ -3901,6 +4094,23 @@ impl SyscallEngine {
                     || iova.checked_add(len).is_none()
                 {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+
+                #[cfg(feature = "arch_aarch64")]
+                if iommu_binding.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
+                    let result = (|| {
+                        let domain = self
+                            .display_context(ctx_entry.koid)
+                            .ok_or(Errno::BadState)?;
+                        let mut maps = domain
+                            .mappings
+                            .try_borrow_mut()
+                            .map_err(|_| Errno::BadState)?;
+                        maps.as_mut().ok_or(Errno::BadState)?.unmap(iova, len)
+                    })();
+                    return KernelCallResult::Status(
+                        result.err().map_or(Errno::Ok.status(), Errno::status),
+                    );
                 }
 
                 let Some(index) = self
@@ -8128,5 +8338,370 @@ mod tests {
             result,
             KernelCallResult::Status(Errno::NotSupported.status())
         );
+    }
+    #[cfg(feature = "arch_aarch64")]
+    mod rockchip_contexts {
+        use super::*;
+        use kumo_abi::sys::IoMmuKind;
+        const BASE: u64 = 0xfdd9_7e00;
+        const LEN: u64 = 0x200;
+        fn handle(result: KernelCallResult) -> Handle {
+            match result {
+                KernelCallResult::Handle(h) => h,
+                other => panic!("expected handle: {other:?}"),
+            }
+        }
+        fn fixture() -> (SyscallEngine, Process, Handle) {
+            let mut engine = SyscallEngine::new();
+            engine.boot_info = Some(BootInfo::empty(kumo_abi::ABI_VERSION));
+            // The parser/physical readiness seam is separately tested. Host dispatch
+            // gets the exact validated descriptor and emulated private table RAM. — KESTREL
+            engine.display_unit = Some(kumo_hal::active::DisplayIoMmu {
+                banks: [(BASE, 0x100), (BASE + 0x100, 0x100)],
+                interrupt: 188,
+            });
+            let mut process = test_process(&mut engine);
+            let resource = engine
+                .root_resource_create(&mut process, 0, u64::MAX, 0, u32::MAX)
+                .unwrap();
+            (engine, process, resource)
+        }
+        fn unit(engine: &mut SyscallEngine, process: &mut Process, resource: Handle) -> Handle {
+            handle(engine.dispatch(
+                process,
+                KernelCall::IoMmuFromResource {
+                    resource,
+                    kind: IoMmuKind::RockchipV2 as u32,
+                    phys_base: BASE,
+                    len: LEN,
+                },
+            ))
+        }
+        fn context(engine: &mut SyscallEngine, process: &mut Process, iommu: Handle) -> Handle {
+            handle(engine.dispatch(
+                process,
+                KernelCall::DeviceCtxCreate {
+                    iommu,
+                    stream_or_rid: 0,
+                },
+            ))
+        }
+        fn map(
+            engine: &mut SyscallEngine,
+            process: &mut Process,
+            ctx: Handle,
+            vmo: Handle,
+            iova: u64,
+            len: u64,
+            rights: Rights,
+        ) -> KernelCallResult {
+            engine.dispatch(
+                process,
+                KernelCall::DeviceVmarMap {
+                    ctx,
+                    vmo,
+                    vmo_offset: 0,
+                    len,
+                    iova_hint: iova,
+                    rights,
+                },
+            )
+        }
+        #[test]
+        fn exact_unit_authority_wrong_kinds_unknown_topology_and_duplicate_admission() {
+            let (mut e, mut p, res) = fixture();
+            for kind in [IoMmuKind::Virtio, IoMmuKind::SmmuV3, IoMmuKind::SmmuV2] {
+                assert_eq!(
+                    e.dispatch(
+                        &mut p,
+                        KernelCall::IoMmuFromResource {
+                            resource: res,
+                            kind: kind as u32,
+                            phys_base: BASE,
+                            len: LEN
+                        }
+                    ),
+                    KernelCallResult::Status(Errno::NotSupported.status())
+                );
+            }
+            for (base, len) in [
+                (BASE + 0x100, 0x100),
+                (BASE, LEN - 1),
+                (BASE - 4096, LEN + 4096),
+            ] {
+                assert_eq!(
+                    e.dispatch(
+                        &mut p,
+                        KernelCall::IoMmuFromResource {
+                            resource: res,
+                            kind: 4,
+                            phys_base: base,
+                            len
+                        }
+                    ),
+                    KernelCallResult::Status(Errno::NotSupported.status())
+                );
+            }
+            let saved = e.display_unit.take();
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::IoMmuFromResource {
+                        resource: res,
+                        kind: 4,
+                        phys_base: BASE,
+                        len: LEN
+                    }
+                ),
+                KernelCallResult::Status(Errno::NotSupported.status())
+            );
+            e.display_unit = saved;
+            let ro = p.handles_mut().duplicate(res, Rights::READ).unwrap();
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::IoMmuFromResource {
+                        resource: ro,
+                        kind: 4,
+                        phys_base: BASE,
+                        len: LEN
+                    }
+                ),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            let _ = unit(&mut e, &mut p, res);
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::IoMmuFromResource {
+                        resource: res,
+                        kind: 4,
+                        phys_base: BASE,
+                        len: LEN
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+        }
+        #[test]
+        fn a_live_engine_reserves_the_unit_against_a_second_engine() {
+            let (mut first, mut process, res) = fixture();
+            let owner = first.device_owner.clone();
+            let descriptor = first.display_unit;
+            let _ = unit(&mut first, &mut process, res);
+            let mut second = SyscallEngine::with_device_owner(owner);
+            second.display_unit = descriptor;
+            let mut other = test_process(&mut second);
+            let grant = second
+                .root_resource_create(&mut other, 0, u64::MAX, 0, u32::MAX)
+                .unwrap();
+            assert_eq!(
+                second.dispatch(
+                    &mut other,
+                    KernelCall::IoMmuFromResource {
+                        resource: grant,
+                        kind: 4,
+                        phys_base: BASE,
+                        len: LEN
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            drop(process);
+            drop(first);
+            let _ = unit(&mut second, &mut other, grant);
+        }
+
+        #[test]
+        fn selector_single_context_rights_and_final_close_recreate() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            for selector in [1, u32::MAX as u64, 1 << 32] {
+                assert_eq!(
+                    e.dispatch(
+                        &mut p,
+                        KernelCall::DeviceCtxCreate {
+                            iommu: io,
+                            stream_or_rid: selector
+                        }
+                    ),
+                    KernelCallResult::Status(Errno::InvalidArgs.status())
+                );
+            }
+            let ro = p.handles_mut().duplicate(io, Rights::READ).unwrap();
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceCtxCreate {
+                        iommu: ro,
+                        stream_or_rid: 0
+                    }
+                ),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            let ctx = context(&mut e, &mut p, io);
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceCtxCreate {
+                        iommu: io,
+                        stream_or_rid: 0
+                    }
+                ),
+                KernelCallResult::Status(Errno::InvalidArgs.status())
+            );
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::HandleClose { handle: ctx }),
+                KernelCallResult::Status(0)
+            );
+            assert!(e.table_pages.all_free());
+            let _ = context(&mut e, &mut p, io);
+        }
+        #[test]
+        fn real_read_only_walk_and_transactional_map_unmap_ranges() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x1000_0000, 8192);
+            for (iova, len, rights) in [
+                (0x40000000, 8192, Rights::WRITE),
+                (0x40000000, 8192, Rights::READ | Rights::WRITE),
+                (1 << 32, 4096, Rights::READ),
+            ] {
+                assert_ne!(
+                    map(&mut e, &mut p, ctx, vmo, iova, len, rights),
+                    KernelCallResult::Status(0)
+                );
+            }
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x3ff000, 8192, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let koid = p.handles().get(ctx).unwrap().koid;
+            let d = e.display_context(koid).unwrap();
+            {
+                let m = d.mappings.borrow();
+                let m = m.as_ref().unwrap();
+                assert_eq!(
+                    m.walk(0x400123, kumo_hal::active::DeviceTableAccess::Read),
+                    Ok(Some(0x10001123))
+                );
+                assert_eq!(
+                    m.walk(0x400123, kumo_hal::active::DeviceTableAccess::Write),
+                    Err(Errno::AccessDenied)
+                );
+            }
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x400000, 8192, Rights::READ),
+                KernelCallResult::Status(Errno::InvalidArgs.status())
+            );
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceVmarUnmap {
+                        ctx,
+                        iova: 0x3ff000,
+                        len: 4096
+                    }
+                ),
+                KernelCallResult::Status(Errno::InvalidArgs.status())
+            );
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceVmarUnmap {
+                        ctx,
+                        iova: 0x3ff000,
+                        len: 8192
+                    }
+                ),
+                KernelCallResult::Status(0)
+            );
+        }
+        #[test]
+        fn closed_source_duplicate_context_and_cloned_engine_share_one_owner() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x1000_0000, 4096);
+            let koid = p.handles().get(vmo).unwrap().koid;
+            let weak = Rc::downgrade(e.vmos.iter().find(|v| v.koid == koid).unwrap());
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x40000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let dup = p
+                .handles_mut()
+                .duplicate(ctx, Rights::MAP | Rights::WAIT)
+                .unwrap();
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: vmo });
+            e.vmos.retain(|v| v.koid != koid);
+            let mut copy = e.clone();
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: ctx });
+            assert_eq!(weak.strong_count(), 1);
+            assert!(!e.table_pages.all_free());
+            assert_eq!(
+                copy.dispatch(
+                    &mut p,
+                    KernelCall::DeviceVmarUnmap {
+                        ctx: dup,
+                        iova: 0x40000000,
+                        len: 4096
+                    }
+                ),
+                KernelCallResult::Status(0)
+            );
+            assert!(weak.upgrade().is_none());
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: dup });
+            copy.retire_device_contexts();
+            assert!(e.table_pages.all_free());
+            assert!(
+                e.devices.display_contexts.is_empty() && copy.devices.display_contexts.is_empty()
+            );
+        }
+        #[test]
+        fn drained_capabilities_delay_retirement_then_release_still_mapped_pins() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x1000_0000, 4096);
+            let koid = p.handles().get(vmo).unwrap().koid;
+            let weak = Rc::downgrade(e.vmos.iter().find(|v| v.koid == koid).unwrap());
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x40000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let drained = p.handles_mut().drain();
+            e.vmos.retain(|v| v.koid != koid);
+            assert_eq!(e.retire_device_contexts(), DeviceCtxRetirement::default());
+            assert_eq!(weak.strong_count(), 1);
+            drop(drained);
+            assert_eq!(e.retire_device_contexts().released, 1);
+            assert!(weak.upgrade().is_none());
+            assert!(e.table_pages.all_free());
+        }
+        #[test]
+        fn engine_loss_retains_actual_pins_tables_and_physical_unit_across_restart() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x1000_0000, 4096);
+            let koid = p.handles().get(vmo).unwrap().koid;
+            let weak = Rc::downgrade(e.vmos.iter().find(|v| v.koid == koid).unwrap());
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x40000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let owner = e.device_owner.clone();
+            e.vmos.retain(|v| v.koid != koid);
+            drop(p);
+            drop(e);
+            assert_eq!(weak.strong_count(), 1);
+            assert!(!owner.unit_allowed(BASE, LEN));
+            assert!(!owner.ram_allowed(0x10000000, 4096, None));
+            assert!(!owner.0.table_pages.all_free());
+            let fresh = SyscallEngine::with_device_owner(owner);
+            assert!(fresh.iommu_unit_quarantined(BASE, LEN));
+        }
     }
 }

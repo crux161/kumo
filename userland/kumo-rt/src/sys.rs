@@ -1,8 +1,8 @@
-//j559
 //j572
 //j601
 //j609
 //j614
+//j629
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -165,6 +165,82 @@ pub fn channel_create_pair() -> (u64, u64) {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn channel_create_pair() -> (u64, u64) {
     (u64::MAX, u64::MAX)
+}
+
+/// Mint the translation-unit capability from a Resource; this does not activate paging.
+pub fn iommu_from_resource(
+    resource: Handle,
+    kind: kumo_abi::sys::IoMmuKind,
+    base: u64,
+    len: u64,
+) -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        syscall(
+            Syscall::IoMmuFromResource,
+            resource.0 as u64,
+            kind as u64,
+            base,
+            len,
+        )
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (resource, kind, base, len);
+        kumo_abi::Errno::NotSupported.status() as u32 as u64
+    }
+}
+
+pub fn device_ctx_create(iommu: Handle, selector: u64) -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        syscall(Syscall::DeviceCtxCreate, iommu.0 as u64, selector, 0, 0)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (iommu, selector);
+        kumo_abi::Errno::NotSupported.status() as u32 as u64
+    }
+}
+
+/// Map exact VMO pages at the supplied IOVA. READ/WRITE are device access rights.
+pub fn device_vmar_map(
+    ctx: Handle,
+    vmo: Handle,
+    offset: u64,
+    len: u64,
+    iova: u64,
+    rights: Rights,
+) -> Status {
+    #[cfg(target_os = "none")]
+    {
+        syscall6(
+            Syscall::DeviceVmarMap,
+            ctx.0 as u64,
+            vmo.0 as u64,
+            offset,
+            len,
+            iova,
+            rights.0 as u64,
+        ) as Status
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (ctx, vmo, offset, len, iova, rights);
+        kumo_abi::Errno::NotSupported.status()
+    }
+}
+
+pub fn device_vmar_unmap(ctx: Handle, iova: u64, len: u64) -> Status {
+    #[cfg(target_os = "none")]
+    {
+        syscall(Syscall::DeviceVmarUnmap, ctx.0 as u64, iova, len, 0) as Status
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (ctx, iova, len);
+        kumo_abi::Errno::NotSupported.status()
+    }
 }
 
 /// Close one process-local handle. A successful close invalidates the handle

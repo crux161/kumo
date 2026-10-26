@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j624
 //j625
 //j626
 //j627
 //j628
+//j629
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -54,7 +54,8 @@ pub mod active {
     };
     pub use kumo_hal_aarch64::{
         display_directory_reset_probe, display_dma_probe, display_interrupt_guard_register,
-        display_iommu_from_dtb, display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
+        display_iommu_from_dtb, display_iommu_unit_ready, display_mmu_read_routes,
+        display_mmu_read_state, DisplayIoMmu,
     };
 }
 

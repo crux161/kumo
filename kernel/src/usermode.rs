@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j624
 //j625
 //j626
 //j627
 //j628
+//j629
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1816,7 +1816,10 @@ fn dispatch_object_syscall(
         }
     } else if num == Syscall::IoMmuFromResource as u64 {
         let resource = Handle(r[0] as u32);
-        let kind = r[1] as u32;
+        let Ok(kind) = u32::try_from(r[1]) else {
+            r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            return true;
+        };
         let phys_base = r[2];
         let len = r[3];
         match engine.dispatch(
@@ -3824,5 +3827,24 @@ mod tests {
         assert!(!set.defer(0x200));
         assert!(set.defer(32), "a key already waiting is still accepted");
         assert_eq!(drained(&set).len(), DEFERRED_INTERRUPT_SLOTS);
+    }
+    #[test]
+    fn iommu_kind_high_bits_are_rejected_before_handle_or_hardware_lookup() {
+        let mut engine = crate::syscall::SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let mut process = crate::task::Process::new(
+            engine.objects_mut(),
+            &job,
+            crate::mm::Vmar::new(0, 1 << 32).unwrap(),
+        );
+        let mut args = [0u64; 8];
+        args[1] = (1 << 32) | 4;
+        assert!(super::dispatch_object_syscall(
+            &mut engine,
+            &mut process,
+            kumo_abi::Syscall::IoMmuFromResource as u64,
+            &mut args
+        ));
+        assert_eq!(args[0], kumo_abi::Errno::InvalidArgs.status() as u32 as u64);
     }
 }

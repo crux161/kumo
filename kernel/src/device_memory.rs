@@ -2,6 +2,7 @@
 //j617
 //j622
 //j628
+//j629
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
@@ -167,6 +168,10 @@ impl<A: PageMemory> OfflineMappings<A> {
             .map(|m| &m.pin)
     }
 
+    pub fn pins(&self) -> impl Iterator<Item = &crate::syscall::VmoPin> {
+        self.mappings.iter().map(|m| &m.pin)
+    }
+
     pub fn walk(
         &self,
         iova: u64,
@@ -199,6 +204,8 @@ pub(crate) trait PageMemory {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct KernelPages {
     pub boot: Option<BootInfo>,
+    #[cfg(test)]
+    test_pages: Rc<RefCell<alloc::collections::BTreeMap<u64, Vec<u32>>>>,
 }
 
 impl PageMemory for KernelPages {
@@ -223,7 +230,24 @@ impl PageMemory for KernelPages {
             }
             frame
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(all(not(target_os = "none"), test))]
+        {
+            let mut pages = self.test_pages.borrow_mut();
+            let mut page = PAGE_SIZE;
+            while pages.contains_key(&page)
+                || excluded
+                    .iter()
+                    .any(|span| overlap(*span, Range::new(page, PAGE_SIZE)))
+            {
+                page = page.checked_add(PAGE_SIZE)?;
+                if page >= 1 << 32 {
+                    return None;
+                }
+            }
+            pages.insert(page, vec![0; 1024]);
+            Some(page)
+        }
+        #[cfg(all(not(target_os = "none"), not(test)))]
         {
             let _ = excluded;
             None
@@ -239,7 +263,11 @@ impl PageMemory for KernelPages {
                 )
             }
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(all(not(target_os = "none"), test))]
+        {
+            self.test_pages.borrow()[&page][index]
+        }
+        #[cfg(all(not(target_os = "none"), not(test)))]
         {
             let _ = page;
             panic!("host cannot dereference physical RAM")
@@ -256,7 +284,14 @@ impl PageMemory for KernelPages {
                 )
             };
         }
-        #[cfg(not(target_os = "none"))]
+        #[cfg(all(not(target_os = "none"), test))]
+        {
+            self.test_pages
+                .borrow_mut()
+                .get_mut(&page)
+                .expect("owned test table")[index] = word;
+        }
+        #[cfg(all(not(target_os = "none"), not(test)))]
         {
             let _ = (page, word);
             panic!("host cannot dereference physical RAM")

@@ -1,4 +1,5 @@
 //j621
+//j629
 
 //! DESIGN/022 D1d-b2f: identify the single VOP domain from the live DTB.
 //! Binding facts: RESEARCH/015 and the pinned Orange Pi DTB. Discovery reads only
@@ -10,6 +11,14 @@ use kumo_fdt::{be32, status_enabled, string_list_contains, Fdt, Node};
 pub struct DisplayIoMmu {
     pub banks: [(u64, u64); 2],
     pub interrupt: u32,
+}
+
+impl DisplayIoMmu {
+    pub fn matches_range(self, base: u64, len: u64) -> bool {
+        base == self.banks[0].0
+            && self.banks[0].0.checked_add(self.banks[0].1) == Some(self.banks[1].0)
+            && self.banks[0].1.checked_add(self.banks[1].1) == Some(len)
+    }
 }
 
 fn words(bytes: &[u8], expected: &[u32]) -> bool {
@@ -484,5 +493,18 @@ mod tests {
         assert!(discover(&bad).is_none());
         let v1 = set(DTB, MMU, b"compatible", Some(b"rockchip,rk3588-iommu\0"));
         assert!(discover(&v1).is_none());
+    }
+    #[test]
+    fn unit_capability_range_is_exactly_both_contiguous_banks() {
+        let unit = discover(DTB).unwrap();
+        assert!(unit.matches_range(0xfdd97e00, 0x200));
+        for (base, len) in [
+            (0xfdd97e00, 0x100),
+            (0xfdd97f00, 0x100),
+            (0xfdd97e00, 0x201),
+            (0xfdd97000, 0x1000),
+        ] {
+            assert!(!unit.matches_range(base, len));
+        }
     }
 }

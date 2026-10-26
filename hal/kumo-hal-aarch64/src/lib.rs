@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j624
 //j625
 //j626
 //j627
 //j628
+//j629
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3499,6 +3499,18 @@ pub fn display_iommu_from_dtb(dtb: u64) -> Option<DisplayIoMmu> {
 #[cfg(not(target_os = "none"))]
 pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
     None
+}
+
+#[cfg(target_os = "none")]
+pub fn display_iommu_unit_ready(dtb: u64, base: u64, len: u64) -> bool {
+    display_iommu_from_dtb(dtb).is_some_and(|unit| {
+        unit.matches_range(base, len)
+            && DISPLAY_INTERRUPT_GUARD.permits(unit.interrupt, &mut PhysPowerIo)
+    })
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_iommu_unit_ready(_dtb: u64, _base: u64, _len: u64) -> bool {
+    false
 }
 
 #[cfg(target_os = "none")]

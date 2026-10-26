@@ -1,8 +1,8 @@
-//j565
 //j571
 //j601
 //j609
 //j614
+//j629
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +154,8 @@ pub enum IoMmuKind {
     /// ARM MMU-500 (SMMUv2) — the SC8280XP `apps_smmu` the X13s USB/display/etc. ride. A wholly
     /// different programming model from SmmuV3 (Stream Match Registers → context banks).
     SmmuV2 = 3,
+    /// RK3588's single VOP attachment: two Rockchip-v2 banks, selector zero.
+    RockchipV2 = 4,
 }
 
 #[repr(C)]
