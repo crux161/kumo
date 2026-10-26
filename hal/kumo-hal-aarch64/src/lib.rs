@@ -1,16 +1,17 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j573
 //j609
 //j614
 //j615
 //j621
+//j623
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
 pub mod display_iommu;
+pub mod display_mmu;
 pub mod display_register;
 pub mod display_unit;
 pub mod mali;
@@ -3495,6 +3496,29 @@ pub fn display_iommu_from_dtb(dtb: u64) -> Option<DisplayIoMmu> {
 #[cfg(not(target_os = "none"))]
 pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
     None
+}
+
+#[cfg(target_os = "none")]
+pub fn display_mmu_read_state(dtb: u64) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::read_state(bytes, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_mmu_read_state(
+    _dtb: u64,
+) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    Err(display_mmu::Error::NoUnit)
+}
+
+/// Kernel-internal translator operation. Not exported by the active HAL facade or
+/// connected to an ABI kind/teardown hook until ownership/containment is wired. — KESTREL
+#[cfg(target_os = "none")]
+pub fn display_mmu_stall(
+    dtb: u64,
+    root: u64,
+) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::stall(bytes, root, &mut PhysPowerIo)
 }
 
 #[cfg(target_os = "none")]

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j609
 //j614
 //j616
 //j619
 //j621
+//j623
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -17,6 +17,9 @@ compile_error!("select a HAL backend");
 
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
+    pub use kumo_hal_aarch64::display_mmu::{
+        check_request as check_display_mmu_stall_request, Error as DisplayMmuError,
+    };
     pub use kumo_hal_aarch64::rockchip_v2::{
         Access as DeviceTableAccess, Error as DeviceTableError, OfflineTable as OfflineDeviceTable,
         TableMemory as DeviceTableMemory,
@@ -47,7 +50,7 @@ pub mod active {
         TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping,
         UserState, ARCH,
     };
-    pub use kumo_hal_aarch64::{display_iommu_from_dtb, DisplayIoMmu};
+    pub use kumo_hal_aarch64::{display_iommu_from_dtb, display_mmu_read_state, DisplayIoMmu};
 }
 
 #[cfg(feature = "arch_x86_64")]

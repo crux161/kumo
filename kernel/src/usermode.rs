@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j616
 //j619
 //j620
 //j621
 //j622
+//j623
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -2533,6 +2533,29 @@ fn attempt_sora(
         match engine.verify_framebuffer_device_pin(&mut process, root_resource_handle) {
             Ok(()) | Err(Errno::NotSupported) => {}
             Err(error) => return Err(UsermodeError::DeviceTableMemory(error)),
+        }
+        // The candidate root is only a pure-check input, never passed to a live
+        // command. This probe has no writable operation or containment claim. — KESTREL
+        match kumo_hal::active::display_mmu_read_state(boot.platform.dtb) {
+            Ok(states) => {
+                if kumo_hal::active::check_display_mmu_stall_request(&states, 0x1000)
+                    == Err(kumo_hal::active::DisplayMmuError::NotTranslated)
+                {
+                    crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                        "DISPLAY STALL     Check     bypass refuses translator stall, status {:#x}/{:#x}; read-only, no commands, no containment\n",
+                        states[0].status, states[1].status);
+                } else {
+                    crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                        "DISPLAY STALL     Refuse    unexpected translated state; read-only, no commands\n");
+                }
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY STALL     Refuse    {:?}; read-only, no commands\n",
+                    error
+                );
+            }
         }
     }
     #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
