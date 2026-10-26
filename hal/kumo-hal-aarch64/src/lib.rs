@@ -1,15 +1,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j571
 //j573
 //j609
 //j614
 //j615
+//j621
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod display_iommu;
 pub mod display_register;
 pub mod display_unit;
 pub mod mali;
@@ -17,6 +18,7 @@ pub mod power_unit;
 pub mod rockchip_v2;
 pub mod smmuv2;
 pub mod smmuv3;
+pub use display_iommu::DisplayIoMmu;
 pub use mali::{
     discover_rk3588_mali_g610, MaliG610ClockSource, MaliG610ClockStatus, MaliG610PowerStatus,
     MaliG610StatusReport, MaliG610Topology, RK3588_MALI_BASE, RK3588_MALI_LENGTH,
@@ -3481,6 +3483,17 @@ pub fn device_register_write(dtb: u64, base: u64, index: u32, value: u32) -> Opt
 }
 #[cfg(not(target_os = "none"))]
 pub fn device_register_write(_dtb: u64, _base: u64, _index: u32, _value: u32) -> Option<bool> {
+    None
+}
+
+/// Read-only topology discovery from the kernel-validated boot DTB. This does not
+/// register an interrupt owner or authorize a DeviceCtx. — KESTREL
+#[cfg(target_os = "none")]
+pub fn display_iommu_from_dtb(dtb: u64) -> Option<DisplayIoMmu> {
+    display_iommu::discover(unsafe { dtb_bytes(dtb)? })
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
     None
 }
 

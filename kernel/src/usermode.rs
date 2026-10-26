@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j609
 //j614
 //j616
 //j619
 //j620
+//j621
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -448,6 +448,8 @@ pub enum UsermodeError {
     BootInfoFrameAllocation,
     #[cfg(feature = "arch_aarch64")]
     DeviceTableMemory(Errno),
+    #[cfg(feature = "arch_aarch64")]
+    DisplayIoMmuTopology,
     UserThreadInit(crate::user_thread::UserSchedError),
     BadSegmentRange,
     ChannelSetup,
@@ -2513,6 +2515,20 @@ fn attempt_sora(
     let root_resource_handle = engine
         .root_resource_create(&mut process, 0, u64::MAX, 0, u32::MAX)
         .map_err(|_| UsermodeError::ChannelSetup)?;
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    if boot.board_id() == "orange-pi-5-plus" {
+        let unit = kumo_hal::active::display_iommu_from_dtb(boot.platform.dtb)
+            .ok_or(UsermodeError::DisplayIoMmuTopology)?;
+        crate::klog_at!(
+            kumo_abi::sys::log_level::NOTICE,
+            "DISPLAY IOMMU     Check     live DT banks {:#x}+{:#x}/{:#x}+{:#x}, VOP attachment, IRQ {}; topology only\n",
+            unit.banks[0].0,
+            unit.banks[0].1,
+            unit.banks[1].0,
+            unit.banks[1].1,
+            unit.interrupt
+        );
+    }
     #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
     if matches!(boot.board_id(), "qemu-virt-aarch64" | "orange-pi-5-plus") {
         engine

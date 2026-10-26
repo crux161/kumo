@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j571
 //j609
 //j614
 //j616
 //j619
+//j621
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -47,6 +47,7 @@ pub mod active {
         TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping,
         UserState, ARCH,
     };
+    pub use kumo_hal_aarch64::{display_iommu_from_dtb, DisplayIoMmu};
 }
 
 #[cfg(feature = "arch_x86_64")]
