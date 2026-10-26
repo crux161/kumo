@@ -1,8 +1,8 @@
-//j622
 //j625
 //j626
 //j628
 //j629
+//j630
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -337,9 +337,17 @@ struct DeviceCtxBinding {
 }
 
 #[cfg(feature = "arch_aarch64")]
+#[derive(Default)]
+struct DisplayFaults {
+    latched: Cell<bool>,
+    slots: [Cell<Option<DeviceCtxInfo>>; 2],
+}
+
+#[cfg(feature = "arch_aarch64")]
 #[derive(Clone)]
 struct DisplayContext {
     koid: KoId,
+    faults: Rc<DisplayFaults>,
     mappings: Rc<
         RefCell<Option<crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>>>,
     >,
@@ -1356,6 +1364,36 @@ impl SyscallEngine {
                 self.signal_ports(koid, kumo_abi::Signals::TIMER);
             }
             i += 1;
+        }
+    }
+
+    /// Raw capture already happened outside Sora. Fixed per-context slots share the
+    /// first unit refusal across engine clones and never allocate a fault record.
+    /// Reading/closing an IRQ or consuming records cannot clear quarantine. — KESTREL
+    #[cfg(feature = "arch_aarch64")]
+    pub(crate) fn signal_display_fault(&mut self, fault: kumo_hal::active::DisplayFault) {
+        let mut index = 0;
+        while index < self.devices.display_contexts.len() {
+            let domain = self.devices.display_contexts[index].clone();
+            index += 1;
+            let Some(ctx) = self
+                .devices
+                .device_ctxs
+                .iter()
+                .find(|c| c.koid == domain.koid)
+            else {
+                continue;
+            };
+            if ctx.state.get() == DeviceCtxState::Released || domain.faults.latched.replace(true) {
+                continue;
+            }
+            ctx.state.set(DeviceCtxState::Quarantined);
+            for (slot, record) in domain.faults.slots.iter().zip(fault.records()) {
+                slot.set(record);
+            }
+            #[cfg(target_os = "none")]
+            crate::user_thread::wake_child_waiting_on_device_ctx_fault(domain.koid);
+            self.signal_ports(domain.koid, kumo_abi::Signals::DEVICE_FAULT);
         }
     }
 
@@ -3927,6 +3965,7 @@ impl SyscallEngine {
                 if let Some(mappings) = display {
                     self.devices.display_contexts.push(DisplayContext {
                         koid: object.koid(),
+                        faults: Rc::new(DisplayFaults::default()),
                         mappings: Rc::new(RefCell::new(Some(mappings))),
                     });
                 }
@@ -4152,6 +4191,16 @@ impl SyscallEngine {
                 {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 }
+                #[cfg(feature = "arch_aarch64")]
+                if let Some(domain) = self.display_context(ctx_entry.koid) {
+                    return KernelCallResult::Status(
+                        if domain.faults.slots.iter().any(|s| s.get().is_some()) {
+                            Errno::Ok.status()
+                        } else {
+                            Errno::ShouldWait.status()
+                        },
+                    );
+                }
                 if self
                     .devices
                     .device_ctx_faults
@@ -4188,6 +4237,16 @@ impl SyscallEngine {
                 if user_ptr == 0 || user_len < info_len || user_ptr.checked_add(info_len).is_none()
                 {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                #[cfg(feature = "arch_aarch64")]
+                if let Some(domain) = self.display_context(ctx_entry.koid) {
+                    let Some(info) = domain.faults.slots.iter().find_map(Cell::take) else {
+                        return KernelCallResult::Status(Errno::ShouldWait.status());
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(user_ptr as *mut DeviceCtxInfo, info);
+                    }
+                    return KernelCallResult::Status(Errno::Ok.status());
                 }
                 let Some(index) = self
                     .devices
@@ -8702,6 +8761,110 @@ mod tests {
             assert!(!owner.0.table_pages.all_free());
             let fresh = SyscallEngine::with_device_owner(owner);
             assert!(fresh.iommu_unit_quarantined(BASE, LEN));
+        }
+        #[test]
+        fn fixed_fault_records_survive_clones_and_consumption_does_not_release_quarantine() {
+            use kumo_abi::sys::device_ctx_fault as f;
+            use kumo_hal::active::{
+                DisplayFault, DisplayInterruptBank as B, DisplayInterruptError as E,
+            };
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x10000000, 4096);
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x40000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let mut copy = e.clone();
+            let capacity = e.devices.device_ctx_faults.capacity();
+            assert!(e.interrupts.is_empty());
+            let fault = DisplayFault {
+                error: E::MmuSource,
+                line_masked: true,
+                banks: Some([
+                    B {
+                        status: 0x1a,
+                        fault_address: 0x60001000,
+                        raw: 1,
+                        mask: 0,
+                        pending: 0,
+                    },
+                    B {
+                        status: 0x18,
+                        fault_address: 0x70002000,
+                        raw: 2,
+                        mask: 3,
+                        pending: 2,
+                    },
+                ]),
+            };
+            e.signal_display_fault(fault);
+            assert_eq!(e.devices.device_ctx_faults.capacity(), capacity);
+            assert_eq!(
+                copy.dispatch(&mut p, KernelCall::DeviceCtxWaitFault { ctx }),
+                KernelCallResult::Status(0)
+            );
+            let mut info = DeviceCtxInfo {
+                fault_record: 0,
+                fault_addr: 0,
+            };
+            let pointer = &mut info as *mut _ as u64;
+            let no_wait = p.handles_mut().duplicate(ctx, Rights::MAP).unwrap();
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceCtxInfo {
+                        ctx: no_wait,
+                        user_ptr: pointer,
+                        user_len: 16
+                    }
+                ),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            for (bank, address) in [(0, 0x60001000), (1, 0x70002000)] {
+                assert_eq!(
+                    e.dispatch(
+                        &mut p,
+                        KernelCall::DeviceCtxInfo {
+                            ctx,
+                            user_ptr: pointer,
+                            user_len: 16
+                        }
+                    ),
+                    KernelCallResult::Status(0)
+                );
+                assert_eq!(info.fault_addr, address);
+                assert_eq!((info.fault_record >> f::BANK_SHIFT) & 3, bank);
+            }
+            copy.signal_display_fault(DisplayFault {
+                error: E::NotReady,
+                banks: None,
+                line_masked: false,
+            });
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxWaitFault { ctx }),
+                KernelCallResult::Status(Errno::ShouldWait.status())
+            );
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceVmarUnmap {
+                        ctx,
+                        iova: 0x40000000,
+                        len: 4096
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: ctx });
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: no_wait });
+            assert!(!e.table_pages.all_free());
+            assert_eq!(
+                e.devices.device_ctxs[0].state.get(),
+                DeviceCtxState::Quarantined
+            );
+            assert!(e.iommu_unit_quarantined(BASE, LEN));
         }
     }
 }

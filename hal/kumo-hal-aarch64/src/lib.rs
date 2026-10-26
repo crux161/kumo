@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j625
 //j626
 //j627
 //j628
 //j629
+//j630
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3476,6 +3476,9 @@ impl display_register::RegisterIo for PhysPowerIo {
 static DISPLAY_REGISTERS: display_register::BootRegisters = display_register::BootRegisters::new();
 #[cfg(target_os = "none")]
 pub fn device_register_write(dtb: u64, base: u64, index: u32, value: u32) -> Option<bool> {
+    if !DISPLAY_INTERRUPT_GUARD.control_allowed() {
+        return Some(false);
+    }
     DISPLAY_REGISTERS.write(
         dtb,
         base,
@@ -3525,7 +3528,19 @@ pub fn display_dma_probe(
     display_dma::Error,
 > {
     let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_dma::Error::NoUnit)?;
-    display_dma::probe(bytes, &mut PhysPowerIo)
+    if !DISPLAY_INTERRUPT_GUARD.begin_update(mask_spi_interrupt) {
+        return Err(display_dma::Error::NotReady);
+    }
+    let mut io = PhysPowerIo;
+    let result = display_dma::probe(bytes, &mut io);
+    if result.is_err() {
+        DISPLAY_INTERRUPT_GUARD.fail_update();
+        return result;
+    }
+    if !DISPLAY_INTERRUPT_GUARD.end_update(&mut io) {
+        return Err(display_dma::Error::NotReady);
+    }
+    result
 }
 #[cfg(not(target_os = "none"))]
 pub fn display_dma_probe(
@@ -3548,7 +3563,19 @@ pub fn display_directory_reset_probe(
 ) -> Result<display_reset::Report, display_reset::Error> {
     let bytes =
         unsafe { dtb_bytes(dtb) }.ok_or(display_reset::Error::Dma(display_dma::Error::NoUnit))?;
-    display_reset::probe(bytes, root, &mut PhysPowerIo)
+    if !DISPLAY_INTERRUPT_GUARD.begin_update(mask_spi_interrupt) {
+        return Err(display_reset::Error::NotReady);
+    }
+    let mut io = PhysPowerIo;
+    let result = display_reset::probe(bytes, root, &mut io);
+    if result.is_err() {
+        DISPLAY_INTERRUPT_GUARD.fail_update();
+        return result;
+    }
+    if !DISPLAY_INTERRUPT_GUARD.end_update(&mut io) {
+        return Err(display_reset::Error::NotReady);
+    }
+    result
 }
 #[cfg(not(target_os = "none"))]
 pub fn display_directory_reset_probe(
@@ -3556,6 +3583,15 @@ pub fn display_directory_reset_probe(
     _root: u64,
 ) -> Result<display_reset::Report, display_reset::Error> {
     Err(display_reset::Error::Dma(display_dma::Error::NoUnit))
+}
+
+#[cfg(target_os = "none")]
+pub fn display_fault_poll(irq: u32) -> Option<display_irq::Fault> {
+    DISPLAY_INTERRUPT_GUARD.poll(irq, &mut PhysPowerIo, mask_spi_interrupt)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_fault_poll(_irq: u32) -> Option<display_irq::Fault> {
+    None
 }
 
 #[cfg(target_os = "none")]

@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j625
 //j626
 //j627
 //j628
 //j629
+//j630
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -334,7 +334,15 @@ extern "C" fn signal_irq(irq: u32) {
     // holder never releases the borrow, and only the UART poll above stays alive. That was the
     // Orange Pi wedge whenever a USB keyboard was armed (sysrq `?`/`r` answer, `t` and quiesce
     // do not). DESIGN/016: a level line stays masked until `InterruptComplete`. — TIMBERDOODLE
+    // The kernel unit snapshot precedes any Sora borrow and also runs on timer
+    // ticks while the driver has the shared physical line masked. — KESTREL
+    #[cfg(feature = "arch_aarch64")]
+    let display_fault = kumo_hal::active::display_fault_poll(irq);
     let delivered = try_with_sora_mut(|sora| {
+        #[cfg(feature = "arch_aarch64")]
+        if let Some(fault) = display_fault {
+            sora.engine.signal_display_fault(fault);
+        }
         let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
         sora.engine.signal_interrupt(irq);
         sora.engine.signal_timers(now_ns);

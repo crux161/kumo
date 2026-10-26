@@ -1,8 +1,8 @@
-//j571
 //j601
 //j609
 //j614
 //j629
+//j630
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +163,20 @@ pub enum IoMmuKind {
 pub struct DeviceCtxInfo {
     pub fault_record: u64,
     pub fault_addr: u64,
+}
+
+/// Rockchip unit-refusal snapshots in DeviceCtxInfo.fault_record (kind4 only).
+/// Low32 bits retain status; IRQ low2 bits, bank, reason and validity are separate.
+pub mod device_ctx_fault {
+    pub const IRQ_SHIFT: u32 = 32;
+    pub const BANK_SHIFT: u32 = 34;
+    pub const REASON_SHIFT: u32 = 40;
+    pub const UNKNOWN_RAW: u64 = 1 << 48;
+    pub const NONZERO_MASK: u64 = 1 << 49;
+    pub const NONZERO_PENDING: u64 = 1 << 50;
+    pub const SNAPSHOT_VALID: u64 = 1 << 61;
+    pub const LINE_MASKED: u64 = 1 << 62;
+    pub const KERNEL_DISPLAY: u64 = 1 << 63;
 }
 
 /// What [`Syscall::DevicePowerStatus`] copies out (DESIGN/020 §6). The flags let a driver act

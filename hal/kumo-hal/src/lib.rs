@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j625
 //j626
 //j627
 //j628
 //j629
+//j630
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -17,7 +17,9 @@ compile_error!("select a HAL backend");
 
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
-    pub use kumo_hal_aarch64::display_irq::Error as DisplayInterruptError;
+    pub use kumo_hal_aarch64::display_irq::{
+        Bank as DisplayInterruptBank, Error as DisplayInterruptError, Fault as DisplayFault,
+    };
     pub use kumo_hal_aarch64::display_mmu::{
         check_request as check_display_mmu_stall_request, Error as DisplayMmuError,
     };
@@ -53,9 +55,9 @@ pub mod active {
         UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
-        display_directory_reset_probe, display_dma_probe, display_interrupt_guard_register,
-        display_iommu_from_dtb, display_iommu_unit_ready, display_mmu_read_routes,
-        display_mmu_read_state, DisplayIoMmu,
+        display_directory_reset_probe, display_dma_probe, display_fault_poll,
+        display_interrupt_guard_register, display_iommu_from_dtb, display_iommu_unit_ready,
+        display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
     };
 }
 
