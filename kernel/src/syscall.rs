@@ -1,8 +1,8 @@
-//j618
 //j619
 //j620
 //j622
 //j625
+//j626
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -282,6 +282,20 @@ struct IrqBinding {
     outstanding: bool,
 }
 
+impl IrqBinding {
+    fn complete(&mut self, complete: impl FnOnce(u32) -> Result<(), Errno>) -> Result<(), Errno> {
+        // Plain SPIs must recheck the kernel source gate even without an outstanding
+        // notification: an early delivery may have masked the line before binding.
+        // GPIO completion without a delivery remains a no-op. — KESTREL
+        if !self.outstanding && self.requires_complete {
+            return Ok(());
+        }
+        complete(self.irq)?;
+        self.outstanding = false;
+        Ok(())
+    }
+}
+
 /// A one-shot monotonic timer. `fired` retains the level after its deadline so a
 /// port bound just after expiry still observes the signal instead of losing a race.
 #[derive(Clone, Copy, Debug)]
@@ -460,7 +474,9 @@ fn complete_interrupt_source(irq: u32) -> Result<(), Errno> {
     } else if irq >= 32 {
         // Re-enable the device SPI masked when it fired; the driver has now serviced the device
         // and cleared the condition holding the line asserted.
-        kumo_hal::active::unmask_spi_interrupt(irq);
+        if !kumo_hal::active::unmask_spi_interrupt(irq) {
+            return Err(Errno::BadState);
+        }
     }
     Ok(())
 }
@@ -3357,23 +3373,12 @@ impl SyscallEngine {
                     };
                 for binding in &mut self.interrupts {
                     if binding.koid == entry.koid && binding.state.get() == IrqState::Bound {
-                        // Releasing a masked device line must NOT depend on `outstanding`.
-                        // `signal_irq` masks every device SPI it sees — including a fire that
-                        // raced ahead of this binding, which leaves `outstanding` false with the
-                        // line still masked. Gating the unmask on it strands the interrupt
-                        // forever (metal: driver armed, not one interrupt for the whole boot).
-                        // Unmasking an already-enabled line is a no-op, so this is safe to repeat.
-                        if binding.irq >= 32 && decode_tlmm_gpio_irq(binding.irq).is_none() {
-                            kumo_hal::active::unmask_spi_interrupt(binding.irq);
-                        }
-                        if !binding.outstanding {
-                            return KernelCallResult::Status(Errno::Ok.status());
-                        }
-                        if let Err(error) = complete_interrupt_source(binding.irq) {
-                            return KernelCallResult::Status(error.status());
-                        }
-                        binding.outstanding = false;
-                        return KernelCallResult::Status(Errno::Ok.status());
+                        return KernelCallResult::Status(
+                            match binding.complete(complete_interrupt_source) {
+                                Ok(()) => Errno::Ok.status(),
+                                Err(error) => error.status(),
+                            },
+                        );
                     }
                 }
                 KernelCallResult::Status(Errno::BadHandle.status())
@@ -7287,6 +7292,58 @@ mod tests {
                 KernelCallResult::Status(Errno::Ok.status())
             );
             assert!(engine.interrupts.is_empty());
+        }
+
+        #[test]
+        fn plain_spi_completion_checks_even_without_a_notification_and_retains_failure() {
+            let (mut engine, _process, _, _) = setup();
+            let binding = &mut engine.interrupts[0];
+            binding.outstanding = true;
+            let mut completions = Vec::new();
+            assert_eq!(
+                binding.complete(|irq| {
+                    completions.push(irq);
+                    Err(Errno::BadState)
+                }),
+                Err(Errno::BadState)
+            );
+            assert!(binding.outstanding);
+            assert_eq!(
+                binding.complete(|irq| {
+                    completions.push(irq);
+                    Ok(())
+                }),
+                Ok(())
+            );
+            assert!(!binding.outstanding);
+            assert_eq!(
+                binding.complete(|irq| {
+                    completions.push(irq);
+                    Err(Errno::BadState)
+                }),
+                Err(Errno::BadState)
+            );
+            assert_eq!(completions, [33, 33, 33]);
+        }
+
+        #[test]
+        fn gpio_completion_keeps_its_no_outstanding_delivery_contract() {
+            let (mut engine, _process, _, _) = setup();
+            let binding = &mut engine.interrupts[0];
+            binding.requires_complete = true;
+            binding.outstanding = false;
+            assert_eq!(
+                binding.complete(|_| panic!("GPIO rearmed without delivery")),
+                Ok(())
+            );
+            binding.outstanding = true;
+            assert_eq!(
+                binding.complete(|_| Err(Errno::NotSupported)),
+                Err(Errno::NotSupported)
+            );
+            assert!(binding.outstanding);
+            assert_eq!(binding.complete(|_| Ok(())), Ok(()));
+            assert!(!binding.outstanding);
         }
 
         #[test]

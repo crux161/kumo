@@ -1,16 +1,17 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j615
 //j621
 //j623
 //j624
 //j625
+//j626
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
 pub mod display_iommu;
+pub mod display_irq;
 pub mod display_mmu;
 pub mod display_register;
 pub mod display_unit;
@@ -3499,6 +3500,34 @@ pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
 }
 
 #[cfg(target_os = "none")]
+static DISPLAY_INTERRUPT_GUARD: display_irq::Guard = display_irq::Guard::new();
+
+#[cfg(target_os = "none")]
+pub fn display_interrupt_guard_register(
+    dtb: u64,
+) -> Result<[display_irq::Bank; 2], display_irq::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_irq::Error::NoUnit)?;
+    DISPLAY_INTERRUPT_GUARD.register(bytes, &mut PhysPowerIo, mask_spi_interrupt)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_interrupt_guard_register(
+    _dtb: u64,
+) -> Result<[display_irq::Bank; 2], display_irq::Error> {
+    Err(display_irq::Error::NoUnit)
+}
+
+// The GIC entry points below are the single boundary for enabling plain SPIs,
+// including creation, repeated completion and power-path re-enables. — KESTREL
+#[cfg(target_os = "none")]
+fn display_interrupt_permitted(irq: u32) -> bool {
+    if DISPLAY_INTERRUPT_GUARD.permits(irq, &mut PhysPowerIo) {
+        return true;
+    }
+    let _ = mask_spi_interrupt(irq);
+    false
+}
+
+#[cfg(target_os = "none")]
 pub fn display_mmu_read_state(dtb: u64) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
     let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
     display_mmu::read_state(bytes, &mut PhysPowerIo)
@@ -5002,7 +5031,9 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
         } else {
             return false;
         }
-        gic_configure_spi(gicd, TLMM_PARENT_IRQ);
+        if !gic_configure_spi(gicd, TLMM_PARENT_IRQ) {
+            return false;
+        }
         TLMM_WAKE_PDC_INTID[slot].store(0, ORD);
         // Wake-capable GPIOs (the keyboard attention line) are PDC-routed: the TLMM summary SPI does
         // not reliably reach the CPU for them. Program the PDC to present this pin as a dedicated GIC
@@ -5011,7 +5042,9 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
         // it (J315). — CORVUS
         if let Some(route) = pdc_route_for_gpio(pin, flags) {
             pdc_enable_pin(route);
-            gic_configure_spi(gicd, route.gic_intid);
+            if !gic_configure_spi(gicd, route.gic_intid) {
+                return false;
+            }
             TLMM_WAKE_PDC_INTID[slot].store(route.gic_intid, ORD);
         }
     }
@@ -5025,15 +5058,14 @@ pub fn configure_tlmm_gpio_interrupt(pin: u32, flags: u32, irq_key: u32) -> bool
 /// holding the matching Resource can wait on it via `interrupt_create`. Unlike the TLMM GPIO path,
 /// this is a direct device SPI (e.g. the RK3588 xHCI controller). Delivery is already generic:
 /// `on_irq` signals the kernel hook with any non-timer/non-GPIO intid. Returns false if the GIC
-/// distributor base is not yet known.
+/// distributor base is unknown or the boot display source guard refuses. — KESTREL
 #[cfg(target_os = "none")]
 pub fn configure_spi_interrupt(irq: u32) -> bool {
     let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
     if gicd == 0 {
         return false;
     }
-    unsafe { gic_configure_spi(gicd, irq) };
-    true
+    unsafe { gic_configure_spi(gicd, irq) }
 }
 
 #[cfg(not(target_os = "none"))]
@@ -5065,11 +5097,12 @@ pub fn mask_spi_interrupt(_irq: u32) -> bool {
 }
 
 /// Re-enable a device SPI masked by [`mask_spi_interrupt`], once its driver has serviced the
-/// device and cleared the condition that asserted the line.
+/// device and cleared the condition that asserted the line. The boot display source
+/// guard must also permit this enable; refusal leaves the source masked. — KESTREL
 #[cfg(target_os = "none")]
 pub fn unmask_spi_interrupt(irq: u32) -> bool {
     let gicd = GIC_DISTRIBUTOR_BASE.load(ORD);
-    if gicd == 0 {
+    if gicd == 0 || !display_interrupt_permitted(irq) {
         return false;
     }
     let base = mmio_phys(gicd);
@@ -5232,7 +5265,10 @@ unsafe fn pdc_set_pin_enabled(route: PdcRoute, enabled: bool) {
 }
 
 #[cfg(target_os = "none")]
-unsafe fn gic_configure_spi(gicd: u64, irq: u32) {
+unsafe fn gic_configure_spi(gicd: u64, irq: u32) -> bool {
+    if !display_interrupt_permitted(irq) {
+        return false;
+    }
     let gicd = mmio_phys(gicd);
     let bit = 1u32 << (irq % 32);
     let bank = (irq / 32) as u64 * 4;
@@ -5241,6 +5277,7 @@ unsafe fn gic_configure_spi(gicd: u64, irq: u32) {
     unsafe { mmio_write32(gicd + GICD_IGROUPR0 + bank, group) };
     unsafe { mmio_write8(gicd + GICD_IPRIORITYR + irq as u64, 0x80) };
     unsafe { mmio_write32(gicd + GICD_ISENABLER0 + bank, bit) };
+    true
 }
 
 #[cfg(target_os = "none")]

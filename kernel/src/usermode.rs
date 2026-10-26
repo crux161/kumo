@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j621
 //j622
 //j623
 //j624
 //j625
+//j626
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -2531,6 +2531,23 @@ fn attempt_sora(
             unit.banks[1].1,
             unit.interrupt
         );
+        match kumo_hal::active::display_interrupt_guard_register(boot.platform.dtb) {
+            Ok(banks) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY IRQ GUARD Check     IRQ {} reserved across engines; zero MMU sources/masks, paging off; status {:#x}/{:#x}; every GIC enable checked\n",
+                    unit.interrupt, banks[0].status, banks[1].status);
+            }
+            Err(kumo_hal::active::DisplayInterruptError::NoUnit) => {
+                return Err(UsermodeError::DisplayIoMmuTopology);
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY IRQ GUARD Refuse    {:?}; line cannot be enabled, no MMU commands\n",
+                    error
+                );
+            }
+        }
         // Missing evidence refuses GOP pins, not the already-trusted bypass
         // bootstrap. Unsupported enrollment never prints a passing proof. — KESTREL
         match engine.verify_framebuffer_device_pin(&mut process, root_resource_handle) {
