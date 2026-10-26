@@ -1,14 +1,18 @@
 //j610
 //j612
+//j632
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
-//! Recovery class: soft-state. The buffer is a physically contiguous DMA VMO
-//! (`VmoCreateContiguous`), mapped uncached, so the VOP reads exactly what the CPU wrote once
-//! a barrier completes; the display IOMMU stays in bypass, as firmware left it (DESIGN/019 D1
-//! decides its owner later). A flip rewrites one word, ESMART2 region0's `MST_YRGB`, and
-//! requests VP2's load with the global-enable commit word J608 proved. The VOP consumes the
-//! request at the next frame start, so the flip is frame-synchronous and needs no interrupt
+//! Recovery class: soft-state. The buffer's address is a device address, backed by an
+//! explicitly prepared READ mapping in the kernel-owned DeviceCtx. CPU painting uses an
+//! uncached mapping of the actual VMO, so DMA sees completed writes after a barrier.
+//! The historical trusted bypass diagnostic used physical addresses in this field.
+//! A flip rewrites ESMART2 region0's `MST_YRGB` and requests the consumed VP2 load.
+//! — KESTREL
+//!
+//! The VOP consumes the request at the next frame start, so the flip is frame-synchronous
+//! and needs no interrupt
 //! yet: [`wait_latched`] times the request's consumption. From that frame on the previous
 //! buffer is no longer read, i.e. it is retired from scanout. Register sources: RK3588 TRM
 //! Part 2 ch. 7 (`REG_CFG_DONE`, ESMART region0). — TIMBERDOODLE
@@ -36,7 +40,7 @@ pub const SCANOUT_LIMIT: u64 = 1 << 32;
 /// One scanout buffer: ARGB8888, `stride` pixels per line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Buffer {
-    pub phys: u64,
+    pub address: u64,
     pub len: u64,
     pub stride: u32,
     pub height: u32,
@@ -46,9 +50,9 @@ impl Buffer {
     /// The 32-bit scanout address, when the whole buffer is VOP-addressable and holds a frame.
     pub fn scanout(&self) -> Option<u32> {
         let frame = u64::from(self.stride) * u64::from(self.height) * 4;
-        let end = self.phys.checked_add(self.len)?;
-        (self.phys != 0 && self.phys % 4096 == 0 && end <= SCANOUT_LIMIT && self.len >= frame)
-            .then_some(self.phys as u32)
+        let end = self.address.checked_add(self.len)?;
+        (self.address != 0 && self.address % 4096 == 0 && end <= SCANOUT_LIMIT && self.len >= frame)
+            .then_some(self.address as u32)
     }
 }
 
@@ -64,9 +68,9 @@ pub fn target_scanout(target: &Program) -> (u32, u32) {
     (word(ESMART2_R0_MST_YRGB), word(ESMART2_R0_VIR) & 0xffff)
 }
 
-/// Point ESMART2 region0 at `phys` and request VP2's load. Each write has its own barrier.
-pub fn flip(hw: &mut impl Hardware, phys: u32) {
-    hw.write(Block::Vop, ESMART2_R0_MST_YRGB, phys);
+/// Point ESMART2 region0 at `address` and request VP2's load. Each write has its own barrier.
+pub fn flip(hw: &mut impl Hardware, address: u32) {
+    hw.write(Block::Vop, ESMART2_R0_MST_YRGB, address);
     hw.barrier();
     hw.write(Block::Vop, REG_CFG_DONE, COMMIT_VP2);
     hw.barrier();
@@ -91,10 +95,10 @@ pub fn wait_latched(
     }
 }
 
-/// Whether `phys` is the latched scanout address and no load is pending.
-pub fn on_glass(hw: &mut impl Hardware, phys: u32) -> bool {
+/// Whether `address` is the latched scanout address and no load is pending.
+pub fn on_glass(hw: &mut impl Hardware, address: u32) -> bool {
     hw.read(Block::Vop, REG_CFG_DONE) & VP2_LOAD_PENDING == 0
-        && hw.read(Block::Vop, ESMART2_R0_MST_YRGB) == phys
+        && hw.read(Block::Vop, ESMART2_R0_MST_YRGB) == address
 }
 
 /// The third address in [`Pair`] is the existing console, never an owned painting target.
@@ -129,12 +133,13 @@ impl Pair {
             return None;
         }
         let console_buffer = Buffer {
-            phys: u64::from(console),
+            address: u64::from(console),
             len: u64::from(buffers[0].stride) * u64::from(buffers[0].height) * 4,
             ..buffers[0]
         };
         console_buffer.scanout()?;
-        let overlap = |a: Buffer, b: Buffer| a.phys < b.phys + b.len && b.phys < a.phys + a.len;
+        let overlap =
+            |a: Buffer, b: Buffer| a.address < b.address + b.len && b.address < a.address + a.len;
         if overlap(buffers[0], buffers[1]) || buffers.iter().any(|&b| overlap(b, console_buffer)) {
             return None;
         }
@@ -343,8 +348,8 @@ mod tests {
     }
 
     fn pair_buffers() -> [Buffer; 2] {
-        [0x4000_0000, 0x4100_0000].map(|phys| Buffer {
-            phys,
+        [0x4000_0000, 0x4100_0000].map(|address| Buffer {
+            address,
             len: 0x60_0000,
             stride: 1600,
             height: 900,
@@ -357,10 +362,10 @@ mod tests {
         assert!(Pair::new(good, 0xed0c_0000).is_some());
         assert!(Pair::new([good[0]; 2], 0xed0c_0000).is_none());
         let mut overlap = good;
-        overlap[1].phys = overlap[0].phys + 4096;
+        overlap[1].address = overlap[0].address + 4096;
         assert!(Pair::new(overlap, 0xed0c_0000).is_none());
-        assert!(Pair::new(good, good[0].phys as u32 + 4096).is_none());
-        assert!(Pair::new(good, good[0].phys as u32 - 4096).is_none());
+        assert!(Pair::new(good, good[0].address as u32 + 4096).is_none());
+        assert!(Pair::new(good, good[0].address as u32 - 4096).is_none());
         let mut wrong = good;
         wrong[1].stride += 1;
         assert!(Pair::new(wrong, 0xed0c_0000).is_none());
@@ -375,7 +380,7 @@ mod tests {
         let mut pair = Pair::new(pair_buffers(), 0xed0c_0000).unwrap();
         let mut hw = Vop::new(0xed0c_0000);
         assert!(pair.stage(&mut hw, 0));
-        hw.active = pair_buffers()[0].phys as u32;
+        hw.active = pair_buffers()[0].address as u32;
         for _ in 0..20 {
             assert_eq!(pair.observe(&mut hw), None);
             assert!(!pair.can_paint(0) && !pair.can_paint(1));
@@ -395,7 +400,7 @@ mod tests {
         let mut hw = Vop::new(0xed0c_0000);
         assert!(pair.stage(&mut hw, 0));
         hw.pending = false;
-        hw.active = pair_buffers()[1].phys as u32;
+        hw.active = pair_buffers()[1].address as u32;
         assert_eq!(pair.observe(&mut hw), None);
         assert_eq!(pair.pending(), Some(0));
         assert!(!pair.can_paint(0) && !pair.can_paint(1));
@@ -412,7 +417,7 @@ mod tests {
             let slot = generation as usize % 2;
             assert!(pair.can_paint(slot));
             assert_ne!(
-                hw.active, buffers[slot].phys as u32,
+                hw.active, buffers[slot].address as u32,
                 "painting live scanout"
             );
             painted[slot] += 1;
@@ -582,24 +587,24 @@ mod tests {
     #[test]
     fn only_a_vop_addressable_frame_sized_buffer_is_accepted() {
         let good = Buffer {
-            phys: 0x4000_0000,
+            address: 0x4000_0000,
             len: 0x60_0000,
             stride: 1600,
             height: 900,
         };
         assert_eq!(good.scanout(), Some(0x4000_0000));
         for bad in [
-            Buffer { phys: 0, ..good },
+            Buffer { address: 0, ..good },
             Buffer {
-                phys: 0x4000_0800,
+                address: 0x4000_0800,
                 ..good
             },
             Buffer {
-                phys: 0xffc0_0000,
+                address: 0xffc0_0000,
                 ..good
             },
             Buffer {
-                phys: 0x1_0000_0000,
+                address: 0x1_0000_0000,
                 ..good
             },
             Buffer {

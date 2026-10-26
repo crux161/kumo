@@ -1,5 +1,6 @@
 //j618
 //j625
+//j632
 
 use alloc::{
     rc::{Rc, Weak},
@@ -231,6 +232,13 @@ impl HandleTable {
         let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
         let slot = self.entries.get_mut(index).ok_or(ObjectError::BadHandle)?;
         slot.take().ok_or(ObjectError::BadHandle)
+    }
+
+    pub(crate) fn holds(&self, koid: KoId, kind: ObjectKind, rights: Rights) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|e| e.koid == koid && e.kind == kind && e.rights.contains(rights))
     }
 
     pub fn live_count(&self) -> usize {

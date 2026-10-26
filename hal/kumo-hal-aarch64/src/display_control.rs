@@ -1,7 +1,8 @@
 //j631
+//j632
 
 //! DESIGN/022: bounded live controller, called only with a published table owner.
-//! No public activation syscall is wired in this slice. All uncertain outcomes retain
+//! The kernel DeviceCtx path supplies the retaining root owner. Uncertain outcomes retain
 //! ownership and prohibit automatic resume/bypass; a successful detach stays held.
 //! TRM MMU0/1 pp1047–1049 and pinned Linux reset/bit31 workaround. — KESTREL
 

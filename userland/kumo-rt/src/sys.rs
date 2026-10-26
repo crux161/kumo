@@ -1,8 +1,8 @@
-//j572
 //j601
 //j609
 //j614
 //j629
+//j632
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -188,6 +188,35 @@ pub fn iommu_from_resource(
     {
         let _ = (resource, kind, base, len);
         kumo_abi::Errno::NotSupported.status() as u32 as u64
+    }
+}
+
+pub fn device_ctx_activate(ctx: Handle) -> Status {
+    #[cfg(target_os = "none")]
+    {
+        syscall(Syscall::DeviceCtxActivate, ctx.0 as u64, 0, 0, 0) as Status
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = ctx;
+        kumo_abi::Errno::NotSupported.status()
+    }
+}
+pub fn device_ctx_info(ctx: Handle, info: &mut kumo_abi::sys::DeviceCtxInfo) -> Status {
+    #[cfg(target_os = "none")]
+    {
+        syscall(
+            Syscall::DeviceCtxInfo,
+            ctx.0 as u64,
+            info as *mut _ as u64,
+            core::mem::size_of_val(info) as u64,
+            0,
+        ) as Status
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (ctx, info);
+        kumo_abi::Errno::NotSupported.status()
     }
 }
 

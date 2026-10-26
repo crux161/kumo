@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j609
 //j611
 //j614
 //j616
 //j629
+//j632
 
 extern crate alloc;
 
@@ -806,11 +806,11 @@ fn read_only_grant(raw: u64) -> Handle {
 /// Pi board with a plausible existing GOP image is probed. — TIMBERDOODLE
 /// Exercise real offline DeviceCtx syscalls before the trusted display diagnostic.
 /// This prepares no live domain and grants no extra authority to drv-fb. — KESTREL
-fn verify_offline_display_context(root: Handle, boot: &BootInfo) -> bool {
+fn verify_offline_display_context(root: Handle, boot: &BootInfo) -> Option<Handle> {
     use kumo_abi::sys::IoMmuKind;
     use kumo_rt::{device_ctx_create, device_vmar_map, device_vmar_unmap, iommu_from_resource};
     if boot.board_id() != "orange-pi-5-plus" {
-        return true;
+        return None;
     }
     let result = (|| {
         let base = 0xfdd9_7e00;
@@ -863,21 +863,135 @@ fn verify_offline_display_context(root: Handle, boot: &BootInfo) -> bool {
             return None;
         }
         let again = syscall_handle(device_ctx_create(iommu, 0))?;
-        if handle_close(again) != 0 || handle_close(iommu) != 0 {
+        if handle_close(again) != 0 {
+            return None;
+        }
+        Some(iommu)
+    })();
+    if let Some(iommu) = result {
+        notice(&[b"display: D1d-b offline DeviceCtx: READ/GOP maps, authority/range denials, closed source, duplicate survival, final-close/recreate OK; no paging\n"]);
+        Some(iommu)
+    } else {
+        notice(&[b"display: D1d-b offline DeviceCtx refused; no paging proof\n"]);
+        None
+    }
+}
+
+/// Prove the successful activation SVC keeps live EL0 vectors across table/hardware
+/// work, not just across a validation refusal. — KESTREL
+#[cfg(target_arch = "aarch64")]
+fn activate_display_with_vectors(ctx: Handle) -> bool {
+    let mut status = u64::from(ctx.0);
+    let (a, b, c, d): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "movi v0.16b, #0x5a", "movi v31.16b, #0xa5", "svc #0",
+            "umov x9, v0.d[0]", "umov x10, v0.d[1]", "umov x11, v31.d[0]", "umov x12, v31.d[1]",
+            inlateout("x0")status,in("x8")kumo_abi::Syscall::DeviceCtxActivate as u64,
+            lateout("x9")a,lateout("x10")b,lateout("x11")c,lateout("x12")d,
+            clobber_abi("C"),options(nostack),
+        );
+    }
+    status as u32 as i32 == 0
+        && a == 0x5a5a5a5a5a5a5a5a
+        && b == a
+        && c == 0xa5a5a5a5a5a5a5a5
+        && d == c
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn activate_display_with_vectors(_ctx: Handle) -> bool {
+    false
+}
+
+/// Prepare the exact three DMA ranges before granting any checked VOP WRITE.
+/// Sora retains the IOMMU; the sole context and actual mapped VMOs transfer to drv-fb.
+/// The two owned device addresses deliberately differ from their physical backing. — KESTREL
+fn prepare_display_context(
+    root: Handle,
+    boot: &BootInfo,
+    iommu: Option<Handle>,
+) -> Option<[Handle; 4]> {
+    let iommu = iommu?;
+    let ctx = syscall_handle(kumo_rt::device_ctx_create(iommu, 0))?;
+    let span = boot.framebuffer.mapping_len()?;
+    let mut grants = [ctx, Handle(0), Handle(0), Handle(0)];
+    let result = (|| {
+        grants[1] = syscall_handle(kumo_rt::resource_mint_mmio(
+            root,
+            boot.framebuffer.phys,
+            span,
+        ))?;
+        let (a, pa) = kumo_rt::vmo_create_contiguous(span);
+        grants[2] = syscall_handle(a)?;
+        let (b, pb) = kumo_rt::vmo_create_contiguous(span);
+        grants[3] = syscall_handle(b)?;
+        if pa == 0x60000000 || pb == 0x61000000 {
+            return None;
+        }
+        for (vmo, iova) in [
+            (grants[1], boot.framebuffer.phys),
+            (grants[2], 0x60000000),
+            (grants[3], 0x61000000),
+        ] {
+            if kumo_rt::device_vmar_map(ctx, vmo, 0, span, iova, Rights::READ) != 0 {
+                return None;
+            }
+        }
+        if kumo_rt::device_ctx_activate(ctx) != 0 {
+            return None;
+        }
+        // Exercise the sole holder's checked teardown with live GOP DMA before any
+        // driver grant. The physical controller must keep VP2 held across recreation. — KESTREL
+        if handle_close(ctx) != 0 {
+            return None;
+        }
+        let ctx = syscall_handle(kumo_rt::device_ctx_create(iommu, 0))?;
+        grants[0] = ctx;
+        for (vmo, iova) in [
+            (grants[1], boot.framebuffer.phys),
+            (grants[2], 0x60000000),
+            (grants[3], 0x61000000),
+        ] {
+            if kumo_rt::device_vmar_map(ctx, vmo, 0, span, iova, Rights::READ) != 0 {
+                return None;
+            }
+        }
+        if !activate_display_with_vectors(ctx) {
+            return None;
+        }
+        let mut info = kumo_abi::sys::DeviceCtxInfo {
+            fault_record: 0,
+            fault_addr: 0,
+        };
+        if kumo_rt::device_ctx_info(ctx, &mut info) != 0
+            || info.fault_record
+                != kumo_abi::sys::device_ctx_state::RECORD | kumo_abi::sys::device_ctx_state::LIVE
+            || info.fault_addr == 0
+        {
             return None;
         }
         Some(())
     })();
-    if result.is_some() {
-        notice(&[b"display: D1d-b offline DeviceCtx: READ/GOP maps, authority/range denials, closed source, duplicate survival, final-close/recreate OK; no paging\n"]);
-        true
-    } else {
-        notice(&[b"display: D1d-b offline DeviceCtx refused; no paging proof\n"]);
-        false
+    if result.is_none() {
+        for h in grants {
+            if h.0 != 0 {
+                let _ = handle_close(h);
+            }
+        }
+        notice(&[b"display: D1d activation refused; checked VOP WRITE withheld; uncertain backing retained\n"]);
+        return None;
     }
+    notice(&[b"display: D1d live final-close/recreate and activated READ-only GOP/A/B, A IOVA 0x60000000 and B 0x61000000 differ from backing; SVC SIMD preserved; VOP WRITE grant follows kernel ownership\n"]);
+    Some(grants)
 }
 
-fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebuffer_valid: bool) {
+fn bootstrap_display_probe(
+    bootstrap: Handle,
+    root: Handle,
+    board: &str,
+    framebuffer_valid: bool,
+    display_live: bool,
+) {
     use drv_fb::rk3588::{eligible, Power, PMU_BASE, PMU_LEN, VOP_BASE, VOP_LEN};
     use drv_fb::rk3588_clock::{
         Grant, CLOCK_PROBE_IRQ_BASE, CLOCK_PROBE_IRQ_COUNT, CRU_BASE, CRU_LEN, GRANT_LEN,
@@ -1004,7 +1118,7 @@ fn bootstrap_display_probe(bootstrap: Handle, root: Handle, board: &str, framebu
     // that line is off. The TX page carries no interrupt. — TIMBERDOODLE
     let windows = [
         (
-            power.is_some_and(Power::vop_accessible),
+            power.is_some_and(Power::vop_accessible) && display_live,
             VOP_BASE,
             drv_fb::rk3588_mode::VOP_WINDOW_LEN,
             drv_fb::rk3588::VOP_INTID,
@@ -2152,7 +2266,8 @@ extern "C" fn sora_main(
             let bootinfo = unsafe { &*(bi_va as *const BootInfo) };
             if bootinfo.has_framebuffer() {
                 let fb = bootinfo.framebuffer;
-                let _ = verify_offline_display_context(res, bootinfo);
+                let display_iommu = verify_offline_display_context(res, bootinfo);
+                let prepared = prepare_display_context(res, bootinfo, display_iommu);
                 // Unconditional pre-gate dump of the geometry read from the BootInfo snapshot, so a
                 // blank boot reveals whether the snapshot is stale/garbage (a coherency bug upstream)
                 // or sane-but-rejected (the is_plausible gate too strict). Fires every boot — unlike
@@ -2182,7 +2297,40 @@ extern "C" fn sora_main(
                         channel_write_with_handle(srv, b"F".as_ptr(), 1, Handle(fb_res_h as u32));
                         channel_write_with_handle(srv, b"C".as_ptr(), 1, console);
                         channel_write_with_handle(srv, b"B".as_ptr(), 1, bi_vmo);
-                        bootstrap_display_probe(srv, res, bootinfo.board_id(), fb.is_plausible());
+                        let mut transferred = prepared.is_some();
+                        for (tag, handle) in [b"D", b"O", b"A", b"Z"]
+                            .into_iter()
+                            .zip(prepared.unwrap_or([Handle(0); 4]))
+                        {
+                            if channel_write_with_handle(srv, tag.as_ptr(), 1, handle) != 0 {
+                                if handle.0 != 0 {
+                                    let _ = handle_close(handle);
+                                }
+                                transferred = false;
+                                let _ = channel_write_with_handle(srv, tag.as_ptr(), 1, Handle(0));
+                                notice(&[b"display: D1d bootstrap transfer refused; absent record sent, WRITE withheld\n"]);
+                            }
+                        }
+                        // A queued context keeps DMA backing alive but conveys no MAP
+                        // authority to its old process, even with the root Resource. — KESTREL
+                        let display_live = transferred
+                            && kumo_rt::device_register_write(
+                                res,
+                                drv_fb::rk3588::VOP_BASE,
+                                kumo_abi::sys::DisplayRegister::Commit as u32,
+                                drv_fb::rk3588_scanout::COMMIT_VP2,
+                            ) as u32 as i32
+                                == kumo_abi::Errno::BadState.status();
+                        if display_live {
+                            notice(&[b"display: D1d queued context retains DMA; old holder checked write denied; driver WRITE grant follows\n"]);
+                        }
+                        bootstrap_display_probe(
+                            srv,
+                            res,
+                            bootinfo.board_id(),
+                            fb.is_plausible(),
+                            display_live,
+                        );
                         bootstrap_display_topology(
                             srv,
                             Handle(dtb_vmo as u32),

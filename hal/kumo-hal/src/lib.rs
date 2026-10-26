@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j626
 //j627
 //j628
 //j629
 //j630
+//j632
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -17,6 +17,9 @@ compile_error!("select a HAL backend");
 
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
+    pub use kumo_hal_aarch64::display_control::{
+        Controller as DisplayController, Phase as DisplayPhase,
+    };
     pub use kumo_hal_aarch64::display_irq::{
         Bank as DisplayInterruptBank, Error as DisplayInterruptError, Fault as DisplayFault,
     };
@@ -25,8 +28,8 @@ pub mod active {
     };
     pub use kumo_hal_aarch64::rockchip_v2::{
         Access as DeviceTableAccess, DetachedRoot as DetachedDeviceRoot, Error as DeviceTableError,
-        OfflineTable as OfflineDeviceTable, PublishedTable as PublishedDeviceTable,
-        TableMemory as DeviceTableMemory,
+        OfflineTable as OfflineDeviceTable, PublishedRoot as PublishedDeviceRoot,
+        PublishedTable as PublishedDeviceTable, TableMemory as DeviceTableMemory,
     };
     pub use kumo_hal_aarch64::{
         arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
@@ -55,9 +58,10 @@ pub mod active {
         UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
+        display_controller_activate, display_controller_detach, display_controller_new,
         display_directory_reset_probe, display_dma_probe, display_fault_poll,
         display_interrupt_guard_register, display_iommu_from_dtb, display_iommu_unit_ready,
-        display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
+        display_live_binding, display_mmu_read_routes, display_mmu_read_state, DisplayIoMmu,
     };
 }
 

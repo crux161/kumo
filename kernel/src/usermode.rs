@@ -1,3 +1,4 @@
+//j632
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -1843,6 +1844,14 @@ fn dispatch_object_syscall(
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::DeviceCtxActivate as u64 {
+        let call = KernelCall::DeviceCtxActivate {
+            ctx: Handle(r[0] as u32),
+        };
+        r[0] = match engine.dispatch(target, call) {
+            KernelCallResult::Status(status) => status as u32 as u64,
+            _ => u64::MAX,
+        };
     } else if num == Syscall::DeviceCtxCreate as u64 {
         let iommu = Handle(r[0] as u32);
         let stream_or_rid = r[1];

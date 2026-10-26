@@ -1,8 +1,8 @@
-//j610
 //j611
 //j612
 //j614
 //j625
+//j632
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -233,6 +233,8 @@ pub struct Vblank {
     pub live_irq: u32,
     /// Whether D0a's read-only VOP window (with the MMU page) is mapped at `VOP_D0A`.
     pub mmu_view: bool,
+    pub context: Handle,
+    pub buffers: [Handle; 2],
 }
 
 /// Own the grant across timer transitions, including failures before D1b. — KESTREL
@@ -711,7 +713,27 @@ fn open_vop_irq(pending: &Pending, device: &mut Device, label: &str) -> Option<(
         assert!(u64::from(offset) + 4 <= rk3588::VOP_LEN);
         core::ptr::read_volatile((VOP_D0A + u64::from(offset)) as *const u32)
     };
-    if let Err(conflict) = vblank::preflight(device, mmu) {
+    let preflight = if pending.vblank.context.0 != 0 {
+        let mut info = kumo_abi::sys::DeviceCtxInfo {
+            fault_record: 0,
+            fault_addr: 0,
+        };
+        if kumo_rt::device_ctx_info(pending.vblank.context, &mut info) != 0
+            || info.fault_record
+                != kumo_abi::sys::device_ctx_state::RECORD | kumo_abi::sys::device_ctx_state::LIVE
+            || info.fault_addr == 0
+        {
+            error(format_args!(
+                "display: {} refused: DeviceCtx is not LIVE\n",
+                label
+            ));
+            return None;
+        }
+        vblank::preflight_owned(device, mmu)
+    } else {
+        vblank::preflight(device, mmu)
+    };
+    if let Err(conflict) = preflight {
         log(format_args!(
             "display: {} refused, nothing armed: shared VOP line conflict {:?}\n",
             label, conflict
@@ -894,12 +916,16 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
     }
 }
 
-fn d1c_allocate(stride: u32, height: u32) -> Option<OwnedBuffer> {
+fn d1c_allocate(stride: u32, height: u32, prepared: Handle, iova: u32) -> Option<OwnedBuffer> {
     let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
-    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
-    let vmo = syscall_handle(raw)?;
+    let (vmo, phys) = if prepared.0 != 0 {
+        (prepared, u64::from(iova))
+    } else {
+        let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
+        (syscall_handle(raw)?, phys)
+    };
     let buffer = scanout::Buffer {
-        phys,
+        address: phys,
         len,
         stride,
         height,
@@ -932,7 +958,7 @@ fn d1c_prepare(mut pending: Pending, device: &mut Device) -> Option<Pending> {
         return None;
     }
     let height = DMT_1600X900_60_RB.v_active;
-    let Some(second) = d1c_allocate(stride, height) else {
+    let Some(second) = d1c_allocate(stride, height, pending.vblank.buffers[1], 0x61000000) else {
         error(format_args!(
             "display: D1c second buffer unavailable; console retained\n"
         ));
@@ -942,7 +968,7 @@ fn d1c_prepare(mut pending: Pending, device: &mut Device) -> Option<Pending> {
     let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
     let Some(pair) = scanout::Pair::new(
         buffers.map(|b| scanout::Buffer {
-            phys: u64::from(b.address),
+            address: u64::from(b.address),
             len,
             stride,
             height,
@@ -1163,37 +1189,13 @@ fn d1a_show(device: &mut Device, pending: &mut Pending) -> bool {
     let width = DMT_1600X900_60_RB.h_active;
     let height = DMT_1600X900_60_RB.v_active;
     let len = (u64::from(stride) * u64::from(height) * 4).next_multiple_of(4096);
-    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
-    let Some(vmo) = syscall_handle(raw) else {
+    let Some(buffer) = d1c_allocate(stride, height, pending.vblank.buffers[0], 0x60000000) else {
         error(format_args!(
-            "display: D1a contiguous buffer of {} bytes unavailable; console stays on the GOP buffer\n",
-            len
+            "display: D1a prepared buffer unavailable; console retained\n"
         ));
         return false;
     };
-    let buffer = scanout::Buffer {
-        phys,
-        len,
-        stride,
-        height,
-    };
-    let Some(address) = buffer.scanout() else {
-        error(format_args!(
-            "display: D1a buffer at {:#x} is not VOP-addressable; console stays on the GOP buffer\n",
-            phys
-        ));
-        let _ = handle_close(vmo);
-        return false;
-    };
-    let flags = VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED;
-    let (status, va) = kumo_rt::vmar_map_anywhere(vmo, len, flags.0);
-    if status != 0 || va == 0 {
-        error(format_args!(
-            "display: D1a buffer mapping failed; console stays on the GOP buffer\n"
-        ));
-        let _ = handle_close(vmo);
-        return false;
-    }
+    let OwnedBuffer { vmo, address, va } = buffer;
     let painted = kumo_rt::clock_get();
     for y in 0..height {
         for x in 0..width {

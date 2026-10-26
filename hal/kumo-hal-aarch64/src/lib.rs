@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j627
 //j628
 //j629
 //j630
 //j631
+//j632
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3596,6 +3596,60 @@ pub fn display_fault_poll(irq: u32) -> Option<display_irq::Fault> {
 #[cfg(not(target_os = "none"))]
 pub fn display_fault_poll(_irq: u32) -> Option<display_irq::Fault> {
     None
+}
+
+/// Discover once; the kernel owner retains this controller across context/engine life.
+pub fn display_controller_new(dtb: u64) -> Option<display_control::Controller> {
+    #[cfg(target_os = "none")]
+    {
+        display_control::Controller::discover(unsafe { dtb_bytes(dtb)? }).ok()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = dtb;
+        None
+    }
+}
+pub fn display_controller_activate(
+    controller: &mut display_control::Controller,
+    root: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<display_control::Activation, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        controller.activate(root, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (controller, root, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_controller_detach(
+    controller: &mut display_control::Controller,
+    root: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<rockchip_v2::DetachedRoot, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        controller.detach(root, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (controller, root, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_live_binding() -> Option<(u64, u64)> {
+    #[cfg(target_os = "none")]
+    {
+        let binding = DISPLAY_INTERRUPT_GUARD.binding();
+        (binding.0 != 0 && DISPLAY_INTERRUPT_GUARD.control_allowed()).then_some(binding)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
 }
 
 #[cfg(target_os = "none")]

@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j605
 //j606
 //j607
 //j609
 //j611
+//j632
 
 mod clock_probe;
 mod display_probe;
@@ -132,6 +132,12 @@ extern "C" fn main(
     let console = Handle(console_raw as u32);
     let (_n3, bootinfo_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let bootinfo_vmo = Handle(bootinfo_raw as u32);
+
+    // Kernel-owned display context and its exact GOP/A/B VMOs; fixed records on every board.
+    let (_, ctx_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, gop_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, a_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, b_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
     let power_len = channel_read(bootstrap, buf.as_mut_ptr(), buf.len());
     let power = buf
@@ -282,7 +288,11 @@ extern "C" fn main(
     // Mint and map the actual framebuffer.
     // Map the page-granular backing span, but retain `fb_len` for framebuffer ownership and
     // visible-pixel bounds. This includes only the unavoidable tail of the final page.
-    let fb_vmo_h = resource_mint_mmio(res, fb_phys, fb_map_len);
+    let fb_vmo_h = if gop_raw != 0 {
+        gop_raw
+    } else {
+        resource_mint_mmio(res, fb_phys, fb_map_len)
+    };
     if fb_vmo_h == u64::MAX {
         log_err(b"drv-fb: fb vmo mint failed\n");
         kumo_rt::process_exit(1);
@@ -484,6 +494,8 @@ extern "C" fn main(
         modeset::Vblank {
             live_irq: live_vop_irq,
             mmu_view: vop_view_mapped,
+            context: Handle(ctx_raw as u32),
+            buffers: [Handle(a_raw as u32), Handle(b_raw as u32)],
         },
         port,
     );

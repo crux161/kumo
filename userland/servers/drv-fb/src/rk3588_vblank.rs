@@ -1,5 +1,6 @@
 //j611
 //j614
+//j632
 
 //! D1b: VP2's frame-start interrupt, delivered to drv-fb, and a measurement of its rate.
 //!
@@ -70,6 +71,43 @@ pub fn preflight(hw: &mut impl Hardware, mut mmu: impl FnMut(u32) -> u32) -> Res
         let value = mmu(offset);
         if value != 0 {
             return Err(Conflict::Mmu(offset, value));
+        }
+    }
+    Ok(())
+}
+
+/// For a caller that just queried an actual LIVE kernel DeviceCtx: kernel-owned
+/// MMU sources may share the line, but both banks must name one paging-on root.
+/// A fault source is never treated as frame-start completion. — KESTREL
+pub fn preflight_owned(
+    hw: &mut impl Hardware,
+    mut mmu: impl FnMut(u32) -> u32,
+) -> Result<(), Conflict> {
+    for offset in OTHER_ENABLES {
+        let value = hw.read(Block::Vop, offset) & 0xffff;
+        if value != 0 {
+            return Err(Conflict::VopEnable(offset, value));
+        }
+    }
+    let enabled = hw.read(Block::Vop, PORT2_INTR_EN) & 0xffff;
+    if enabled != 0 {
+        return Err(Conflict::AlreadyEnabled(enabled));
+    }
+    let root = mmu(0x7e00);
+    if root == 0 || root & 4095 != 0 || mmu(0x7f00) != root {
+        return Err(Conflict::Mmu(0x7e00, root));
+    }
+    for base in [0x7e00, 0x7f00] {
+        for (offset, expected, mask) in [
+            (4, 1, 7),
+            (0x14, 0, u32::MAX),
+            (0x1c, 3, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            let value = mmu(base + offset);
+            if value & mask != expected {
+                return Err(Conflict::Mmu(base + offset, value));
+            }
         }
     }
     Ok(())
@@ -279,6 +317,42 @@ mod tests {
         let mut vop = Vop::default();
         vop.regs.insert(0x00b0, 0xffff_0000);
         assert_eq!(preflight(&mut vop, |_| 0), Ok(()));
+        assert!(vop.writes.is_empty());
+    }
+
+    #[test]
+    fn owned_preflight_requires_both_roots_paging_masks_and_zero_fault_sources() {
+        let mut regs = std::collections::BTreeMap::new();
+        for b in [0x7e00, 0x7f00] {
+            regs.insert(b, 0x1000);
+            regs.insert(b + 4, 0x19);
+            regs.insert(b + 0x1c, 3);
+        }
+        let mut vop = Vop::default();
+        assert_eq!(
+            preflight_owned(&mut vop, |p| *regs.get(&p).unwrap_or(&0)),
+            Ok(())
+        );
+        assert!(preflight(&mut vop, |p| *regs.get(&p).unwrap_or(&0)).is_err());
+        for b in [0x7e00, 0x7f00] {
+            for (offset, value) in [
+                (0, 0),
+                (0, 0x2000),
+                (4, 0x18),
+                (4, 0x1b),
+                (4, 0x1d),
+                (0x14, 1),
+                (0x14, 2),
+                (0x14, 4),
+                (0x1c, 0),
+                (0x1c, 7),
+                (0x20, 1),
+            ] {
+                let mut fault = regs.clone();
+                fault.insert(b + offset, value);
+                assert!(preflight_owned(&mut vop, |p| *fault.get(&p).unwrap_or(&0)).is_err());
+            }
+        }
         assert!(vop.writes.is_empty());
     }
 

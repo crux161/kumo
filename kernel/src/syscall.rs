@@ -1,8 +1,8 @@
-//j626
 //j628
 //j629
 //j630
 //j631
+//j632
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -147,6 +147,9 @@ pub enum KernelCall<'a> {
         kind: u32,
         phys_base: u64,
         len: u64,
+    },
+    DeviceCtxActivate {
+        ctx: Handle,
     },
     DeviceCtxCreate {
         iommu: Handle,
@@ -348,6 +351,10 @@ struct DisplayFaults {
 struct DisplayContext {
     koid: KoId,
     faults: Rc<DisplayFaults>,
+    epoch: Rc<Cell<u64>>,
+    published: Rc<
+        RefCell<Option<crate::device_memory::PublishedMappings<crate::device_memory::KernelPages>>>,
+    >,
     mappings: Rc<
         RefCell<Option<crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>>>,
     >,
@@ -732,8 +739,13 @@ impl DeviceState {
                 let Ok(maps) = domain.mappings.try_borrow() else {
                     return false;
                 };
-                if let Some(maps) = maps.as_ref() {
-                    for pin in maps.pins() {
+                let Ok(published) = domain.published.try_borrow() else {
+                    return false;
+                };
+                let offline_pins = maps.as_ref().into_iter().flat_map(|m| m.pins());
+                let live_pins = published.as_ref().into_iter().flat_map(|m| m.pins());
+                {
+                    for pin in offline_pins.chain(live_pins) {
                         if authorized.is_some_and(|entry| core::ptr::eq(entry, pin.entry.as_ref()))
                         {
                             continue;
@@ -821,6 +833,8 @@ struct DeviceRetention {
     table_pages: crate::device_memory::TablePool<crate::device_memory::KernelPages>,
     #[cfg(feature = "arch_aarch64")]
     display_reservation: RefCell<alloc::rc::Weak<()>>,
+    #[cfg(feature = "arch_aarch64")]
+    display_controller: RefCell<Option<kumo_hal::active::DisplayController>>,
 }
 
 #[derive(Clone, Debug)]
@@ -834,6 +848,8 @@ impl KernelDeviceOwner {
             table_pages: Default::default(),
             #[cfg(feature = "arch_aarch64")]
             display_reservation: RefCell::new(alloc::rc::Weak::new()),
+            #[cfg(feature = "arch_aarch64")]
+            display_controller: RefCell::new(None),
         }))
     }
 
@@ -1268,9 +1284,40 @@ impl SyscallEngine {
                     && unit.is_some_and(|unit| {
                         #[cfg(feature = "arch_aarch64")]
                         if unit.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32 {
-                            // This admitted owner is strictly unpublished. Take the shared
-                            // payload once; cloned engines cannot destroy it twice. — KESTREL
                             return self.display_context(ctx.koid).is_some_and(|d| {
+                                let Ok(mut published) = d.published.try_borrow_mut() else {
+                                    return false;
+                                };
+                                if let Some(live) = published.as_ref() {
+                                    let Ok(mut controller) =
+                                        self.device_owner.0.display_controller.try_borrow_mut()
+                                    else {
+                                        return false;
+                                    };
+                                    let Some(controller) = controller.as_mut() else {
+                                        return false;
+                                    };
+                                    let Ok(proof) = kumo_hal::active::display_controller_detach(
+                                        controller,
+                                        live.root_ref(),
+                                        d.epoch.get(),
+                                    ) else {
+                                        return false;
+                                    };
+                                    let owned = published.take().expect("checked publication");
+                                    match owned.reclaim(proof) {
+                                        Ok(offline) => {
+                                            drop(offline);
+                                            #[cfg(target_os="none")]
+                                            crate::klog_at!(kumo_abi::sys::log_level::NOTICE,"DISPLAY DETACH Check       final holder gone, generation {} both roots reset, pins/tables released; producer remains held, no bypass resume\n",d.epoch.get());
+                                        },
+                                        Err(owned) => {
+                                            *published = Some(owned);
+                                            return false;
+                                        }
+                                    }
+                                    return true;
+                                }
                                 d.mappings
                                     .try_borrow_mut()
                                     .is_ok_and(|mut m| m.take().is_some())
@@ -1384,6 +1431,9 @@ impl SyscallEngine {
             else {
                 continue;
             };
+            if fault.epoch != 0 && domain.epoch.get() != fault.epoch {
+                continue;
+            }
             if ctx.state.get() == DeviceCtxState::Released || domain.faults.latched.replace(true) {
                 continue;
             }
@@ -3626,11 +3676,22 @@ impl SyscallEngine {
                 } else {
                     res_entry.rights & Rights::WRITE
                 };
+                let mut transfer = Rights::empty();
+                #[cfg(feature = "arch_aarch64")]
+                if res_entry.rights.contains(Rights::TRANSFER)
+                    && self
+                        .framebuffer_ram
+                        .is_some_and(|p| p.span() == kumo_abi::Range::new(phys_base, len))
+                {
+                    // The exact loader-attested GOP span is reserved RAM data, so its
+                    // actual mapped identity may cross IPC. Other MMIO stays nontransferable. — KESTREL
+                    transfer = Rights::TRANSFER;
+                }
                 match crate::mm::Vmo::from_mmio_range(phys_base, len) {
                     Ok(vmo) => match self.root_vmo_create(
                         process,
                         vmo,
-                        Rights::READ | Rights::DUPLICATE | write,
+                        Rights::READ | Rights::DUPLICATE | write | transfer,
                     ) {
                         Ok(handle) => KernelCallResult::Handle(handle),
                         Err(e) => KernelCallResult::Status(errno_from_object(e).status()),
@@ -3851,6 +3912,10 @@ impl SyscallEngine {
                 };
                 KernelCallResult::Handle(handle)
             }
+            KernelCall::DeviceCtxActivate { ctx } => {
+                let result = self.activate_display_context(process, ctx);
+                KernelCallResult::Status(result.err().map_or(Errno::Ok.status(), Errno::status))
+            }
             KernelCall::DeviceCtxCreate {
                 iommu,
                 stream_or_rid: _stream_or_rid,
@@ -3966,6 +4031,8 @@ impl SyscallEngine {
                     self.devices.display_contexts.push(DisplayContext {
                         koid: object.koid(),
                         faults: Rc::new(DisplayFaults::default()),
+                        epoch: Rc::new(Cell::new(0)),
+                        published: Rc::new(RefCell::new(None)),
                         mappings: Rc::new(RefCell::new(Some(mappings))),
                     });
                 }
@@ -4240,7 +4307,20 @@ impl SyscallEngine {
                 }
                 #[cfg(feature = "arch_aarch64")]
                 if let Some(domain) = self.display_context(ctx_entry.koid) {
-                    let Some(info) = domain.faults.slots.iter().find_map(Cell::take) else {
+                    let info = if let Some(info) = domain.faults.slots.iter().find_map(Cell::take) {
+                        info
+                    } else if domain.epoch.get() != 0 {
+                        use kumo_abi::sys::device_ctx_state as s;
+                        DeviceCtxInfo {
+                            fault_record: s::RECORD
+                                | if self.display_context_live(&domain) {
+                                    s::LIVE
+                                } else {
+                                    s::QUARANTINED
+                                },
+                            fault_addr: domain.epoch.get(),
+                        }
+                    } else {
                         return KernelCallResult::Status(Errno::ShouldWait.status());
                     };
                     unsafe {
@@ -4340,6 +4420,101 @@ impl SyscallEngine {
         self.boot_info.as_ref().map_or(0, |boot| boot.platform.dtb)
     }
 
+    #[cfg(feature = "arch_aarch64")]
+    fn display_context_live(&self, d: &DisplayContext) -> bool {
+        if !self
+            .devices
+            .device_ctxs
+            .iter()
+            .any(|c| c.koid == d.koid && c.state.get() == DeviceCtxState::Bound)
+        {
+            return false;
+        }
+        let Ok(published) = d.published.try_borrow() else {
+            return false;
+        };
+        published.as_ref().is_some_and(|p| {
+            kumo_hal::active::display_live_binding() == Some((p.root(), d.epoch.get()))
+        })
+    }
+    fn activate_display_context(&mut self, process: &Process, ctx: Handle) -> Result<(), Errno> {
+        let entry = process
+            .handles()
+            .require(ctx, ObjectKind::DeviceCtx, Rights::MAP)
+            .map_err(errno_from_object)?;
+        let binding = self
+            .devices
+            .device_ctxs
+            .iter()
+            .find(|c| c.koid == entry.koid)
+            .cloned()
+            .ok_or(Errno::BadHandle)?;
+        if binding.state.get() != DeviceCtxState::Bound {
+            return Err(Errno::BadState);
+        }
+        #[cfg(feature = "arch_aarch64")]
+        {
+            let domain = self
+                .display_context(entry.koid)
+                .ok_or(Errno::NotSupported)?;
+            let mut maps = domain
+                .mappings
+                .try_borrow_mut()
+                .map_err(|_| Errno::BadState)?;
+            let mut published = domain
+                .published
+                .try_borrow_mut()
+                .map_err(|_| Errno::BadState)?;
+            if published.is_some() {
+                return Err(Errno::BadState);
+            }
+            if maps.as_ref().is_none_or(|m| m.pins().next().is_none()) {
+                return Err(Errno::InvalidArgs);
+            }
+            let mut controller = self
+                .device_owner
+                .0
+                .display_controller
+                .try_borrow_mut()
+                .map_err(|_| Errno::BadState)?;
+            if controller.is_none() {
+                *controller = kumo_hal::active::display_controller_new(self.dtb());
+            }
+            let c = controller.as_mut().ok_or(Errno::NotSupported)?;
+            let epoch = c.next_epoch().map_err(|_| Errno::BadState)?;
+            *published = Some(maps.take().ok_or(Errno::BadState)?.publish(|page| {
+                kumo_hal::active::clean_dcache_to_poc(
+                    phys_ptr_mut(page) as usize,
+                    crate::mm::PAGE_SIZE as usize,
+                );
+            }));
+            domain.epoch.set(epoch);
+            let p = published.as_ref().ok_or(Errno::BadState)?;
+            match kumo_hal::active::display_controller_activate(c, p.root_ref(), epoch) {
+                Ok(report) => {
+                    if report.previous.is_some() {
+                        binding.state.set(DeviceCtxState::Quarantined);
+                        return Err(Errno::BadState);
+                    }
+                    #[cfg(target_os = "none")]
+                    crate::klog_at!(kumo_abi::sys::log_level::NOTICE,"DISPLAY ACTIVATE Check     generation {} owned root {:#x}, both roots {:#x}/{:#x}, paging/masks {:#x}/{:#x} {:#x}/{:#x}; bypass sealed, VP2 resumed\n",epoch,p.root(),report.banks[0].root,report.banks[1].root,report.banks[0].status,report.banks[1].status,report.banks[0].mask,report.banks[1].mask);
+                    Ok(())
+                }
+                Err(error) => {
+                    binding.state.set(DeviceCtxState::Quarantined);
+                    #[cfg(target_os = "none")]
+                    crate::klog_at!(kumo_abi::sys::log_level::ERR,"DISPLAY ACTIVATE Refuse    {:?}; generation {}, root {:#x} tables and pins retained\n",error,epoch,p.root());
+                    let _ = error;
+                    Err(Errno::BadState)
+                }
+            }
+        }
+        #[cfg(not(feature = "arch_aarch64"))]
+        {
+            Err(Errno::NotSupported)
+        }
+    }
+
     fn device_register_write(
         &self,
         process: &Process,
@@ -4372,6 +4547,17 @@ impl SyscallEngine {
         }
         if !kumo_hal::active::device_register_valid(base, index as u32, value as u32) {
             return Errno::InvalidArgs;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        if self.device_owner.0.display_controller.borrow().is_some()
+            && !self.devices.display_contexts.iter().any(|d| {
+                self.display_context_live(d)
+                    && process
+                        .handles()
+                        .holds(d.koid, ObjectKind::DeviceCtx, Rights::MAP)
+            })
+        {
+            return Errno::BadState;
         }
         match kumo_hal::active::device_register_write(self.dtb(), base, index as u32, value as u32)
         {
@@ -5191,6 +5377,66 @@ mod tests {
                 )
                 .unwrap();
             (engine, process, handle, boot)
+        }
+
+        #[test]
+        fn only_exact_attested_gop_mints_transferable_data_with_source_authority() {
+            let (mut e, mut p, _, boot) = gop_fixture();
+            let root = e
+                .root_resource_create(&mut p, 0x90000000, 3 * PAGE_SIZE, 0, 0)
+                .unwrap();
+            let ro = p
+                .handles_mut()
+                .duplicate(root, Rights::READ | Rights::DUPLICATE | Rights::TRANSFER)
+                .unwrap();
+            let confined = p
+                .handles_mut()
+                .duplicate(root, Rights::READ | Rights::DUPLICATE)
+                .unwrap();
+            for (res, base, len, yes, writable) in [
+                (root, boot.framebuffer.phys, 2 * PAGE_SIZE, true, true),
+                (ro, boot.framebuffer.phys, 2 * PAGE_SIZE, true, false),
+                (confined, boot.framebuffer.phys, 2 * PAGE_SIZE, false, false),
+                (root, boot.framebuffer.phys, PAGE_SIZE, false, true),
+                (
+                    root,
+                    boot.framebuffer.phys + PAGE_SIZE,
+                    2 * PAGE_SIZE,
+                    false,
+                    true,
+                ),
+            ] {
+                let KernelCallResult::Handle(h) = e.dispatch(
+                    &mut p,
+                    KernelCall::ResourceMintMmio {
+                        resource: res,
+                        phys_base: base,
+                        len,
+                    },
+                ) else {
+                    panic!("mint");
+                };
+                let entry = p.handles().get(h).unwrap();
+                assert_eq!(entry.rights.contains(Rights::TRANSFER), yes);
+                assert_eq!(entry.rights.contains(Rights::WRITE), writable);
+            }
+            e.framebuffer_ram = None;
+            let KernelCallResult::Handle(h) = e.dispatch(
+                &mut p,
+                KernelCall::ResourceMintMmio {
+                    resource: root,
+                    phys_base: boot.framebuffer.phys,
+                    len: 2 * PAGE_SIZE,
+                },
+            ) else {
+                panic!("mint");
+            };
+            assert!(!p
+                .handles()
+                .get(h)
+                .unwrap()
+                .rights
+                .contains(Rights::TRANSFER));
         }
 
         #[test]
@@ -8465,6 +8711,127 @@ mod tests {
                     rights,
                 },
             )
+        }
+        #[test]
+        fn activation_checks_map_rights_prepared_state_and_preserves_offline_on_unsupported_host() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let wait = p.handles_mut().duplicate(ctx, Rights::WAIT).unwrap();
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx: wait }),
+                KernelCallResult::Status(Errno::AccessDenied.status())
+            );
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx }),
+                KernelCallResult::Status(Errno::InvalidArgs.status())
+            );
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx: res }),
+                KernelCallResult::Status(Errno::WrongType.status())
+            );
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x10000000, 4096);
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x60000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx }),
+                KernelCallResult::Status(Errno::NotSupported.status())
+            );
+            let d = e
+                .display_context(p.handles().get(ctx).unwrap().koid)
+                .unwrap();
+            assert_eq!(d.epoch.get(), 0);
+            assert!(d.published.borrow().is_none());
+            assert_eq!(
+                d.mappings
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .walk(0x60000000, kumo_hal::active::DeviceTableAccess::Read),
+                Ok(Some(0x10000000))
+            );
+        }
+        #[test]
+        fn failed_published_activation_retains_actual_pins_across_close_clone_and_engine_loss() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let vmo = create_physical_vmo(&mut e, &mut p, 0x10000000, 4096);
+            let vmo_koid = p.handles().get(vmo).unwrap().koid;
+            let weak = Rc::downgrade(e.vmos.iter().find(|v| v.koid == vmo_koid).unwrap());
+            assert_eq!(
+                map(&mut e, &mut p, ctx, vmo, 0x60000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            *e.device_owner.0.display_controller.borrow_mut() = Some(
+                kumo_hal::active::DisplayController::discover(include_bytes!(
+                    "../../rk3588-orangepi-5-plus.dtb"
+                ))
+                .unwrap(),
+            );
+            // A discovered model controller can never perform physical activation on the
+            // host. Exercise the post-publication failure owner, not scaffold success. — KESTREL
+            assert_eq!(
+                e.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx }),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            let d = e
+                .display_context(p.handles().get(ctx).unwrap().koid)
+                .unwrap();
+            assert!(d.mappings.borrow().is_none());
+            assert_eq!(d.epoch.get(), 1);
+            let root = d.published.borrow().as_ref().unwrap().root();
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: vmo });
+            e.vmos.retain(|v| v.koid != vmo_koid);
+            assert_eq!(weak.strong_count(), 1);
+            assert!(!e.devices.ram_allowed(0x10000000, 4096, None));
+            assert!(!e.table_pages.all_free());
+            let mut copy = e.clone();
+            assert_eq!(
+                copy.dispatch(
+                    &mut p,
+                    KernelCall::DeviceVmarUnmap {
+                        ctx,
+                        iova: 0x60000000,
+                        len: 4096
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            assert_eq!(
+                copy.dispatch(&mut p, KernelCall::DeviceCtxActivate { ctx }),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            let mut info = DeviceCtxInfo {
+                fault_record: 0,
+                fault_addr: 0,
+            };
+            assert_eq!(
+                copy.dispatch(
+                    &mut p,
+                    KernelCall::DeviceCtxInfo {
+                        ctx,
+                        user_ptr: (&mut info as *mut DeviceCtxInfo) as u64,
+                        user_len: 16
+                    }
+                ),
+                KernelCallResult::Status(0)
+            );
+            assert_eq!(
+                info.fault_record,
+                kumo_abi::sys::device_ctx_state::RECORD
+                    | kumo_abi::sys::device_ctx_state::QUARANTINED
+            );
+            assert_eq!(info.fault_addr, 1);
+            copy.dispatch(&mut p, KernelCall::HandleClose { handle: ctx });
+            assert_eq!(d.published.borrow().as_ref().unwrap().root(), root);
+            let owner = e.device_owner.clone();
+            drop(copy);
+            drop(e);
+            assert_eq!(weak.strong_count(), 1);
+            assert!(!owner.ram_allowed(0x10000000, 4096, None));
         }
         #[test]
         fn exact_unit_authority_wrong_kinds_unknown_topology_and_duplicate_admission() {

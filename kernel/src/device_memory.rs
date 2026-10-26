@@ -1,13 +1,13 @@
-//j616
 //j617
 //j622
 //j628
 //j629
+//j632
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
 //! through table leases. Published owners retain private tables and actual VMO pins on
-//! uncertainty; bootstrap reset does not enable paging or admit a live context. — KESTREL
+//! uncertainty. Runtime activation retains the same published table/pin owner. — KESTREL
 
 use crate::{
     mm::{Vmo, VmoBacking, PAGE_SIZE},
@@ -100,6 +100,12 @@ pub(crate) struct PublishedMappings<A: PageMemory> {
 }
 
 impl<A: PageMemory> PublishedMappings<A> {
+    pub fn root_ref(&self) -> kumo_hal::active::PublishedDeviceRoot<'_> {
+        self.table.root_ref()
+    }
+    pub fn pins(&self) -> impl Iterator<Item = &crate::syscall::VmoPin> {
+        self.mappings.iter().map(|m| &m.pin)
+    }
     pub fn root(&self) -> u64 {
         self.table.root()
     }

@@ -1,8 +1,8 @@
-//j601
 //j609
 //j614
 //j629
 //j630
+//j632
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +92,8 @@ pub enum Syscall {
     /// One indexed, masked register write: `(resource, aperture_base, register_index, value)`.
     /// Requires Resource WRITE over the live DT-gated aperture. No caller offset or mask.
     DeviceRegisterWrite = 53,
+    /// Activate a prepared kernel-owned DeviceCtx; MAP right required.
+    DeviceCtxActivate = 54,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -163,6 +165,14 @@ pub enum IoMmuKind {
 pub struct DeviceCtxInfo {
     pub fault_record: u64,
     pub fault_addr: u64,
+}
+
+/// Kind4 ownership status when no fault is queued after activation. `fault_addr` is
+/// the generation; fault snapshots retain their distinct bit63 class and IOVA.
+pub mod device_ctx_state {
+    pub const RECORD: u64 = 1 << 60;
+    pub const LIVE: u64 = 1;
+    pub const QUARANTINED: u64 = 2;
 }
 
 /// Rockchip unit-refusal snapshots in DeviceCtxInfo.fault_record (kind4 only).
@@ -356,6 +366,7 @@ mod tests {
         assert_eq!(Syscall::DevicePowerStatus as usize, 51);
         assert_eq!(Syscall::DeviceResetSet as usize, 52);
         assert_eq!(Syscall::DeviceRegisterWrite as usize, 53);
+        assert_eq!(Syscall::DeviceCtxActivate as usize, 54);
         assert_eq!(Errno::TimedOut.status(), -10);
         assert_eq!(Errno::BadState.status(), -11);
     }
