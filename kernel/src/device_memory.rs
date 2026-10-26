@@ -1,5 +1,6 @@
 //j616
 //j617
+//j622
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
@@ -12,8 +13,68 @@ use crate::{
 };
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
-use kumo_abi::{BootInfo, Range};
+use kumo_abi::{BootInfo, FramebufferFormat, MemRegion, MemRegionKind, Range};
 use kumo_hal::active::DeviceTableMemory;
+
+/// The exact GOP pages, backed by independently attested reserved system RAM.
+/// The private span cannot be constructed from a Resource or FramebufferClaim.
+/// It is copied from the kernel handoff before user runtime starts. — KESTREL
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FramebufferRam {
+    span: Range,
+}
+
+impl FramebufferRam {
+    pub fn from_boot(boot: &BootInfo, regions: &[MemRegion]) -> Option<Self> {
+        let fb = boot.framebuffer;
+        if !boot.has_framebuffer()
+            || boot.flags & BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM == 0
+            || !fb.is_plausible()
+            || fb.format == FramebufferFormat::Unknown
+        {
+            return None;
+        }
+        let span = Range::new(fb.phys, fb.mapping_len()?);
+        let end = span.start.checked_add(span.len)?;
+        if end > 1 << 32 {
+            return None;
+        }
+        for protected in [boot.kernel_phys, boot.initrd] {
+            if protected.len != 0 && overlap(span, protected) {
+                return None;
+            }
+        }
+        let mut found = false;
+        for region in regions {
+            let region_end = region.range.start.checked_add(region.range.len)?;
+            if region.range.len == 0 || region.range.start >= end || region_end <= span.start {
+                continue;
+            }
+            if found
+                || region.kind != MemRegionKind::Reserved
+                || region.range.start % PAGE_SIZE != 0
+                || region.range.len % PAGE_SIZE != 0
+                || region.range.start > span.start
+                || region_end < end
+            {
+                return None;
+            }
+            found = true;
+        }
+        found.then_some(Self { span })
+    }
+
+    pub fn span(self) -> Range {
+        self.span
+    }
+
+    pub fn allows(self, vmo: Vmo, offset: u64, len: u64) -> bool {
+        matches!(vmo.backing(), VmoBacking::Mmio { phys_base } if phys_base == self.span.start)
+            && vmo.len() == self.span.len
+            && offset == 0
+            && len == self.span.len
+    }
+}
 
 struct PinnedMapping {
     iova: u64,
@@ -291,7 +352,7 @@ impl<A> TablePool<A> {
             .map(|frame| frame.phys)
             .collect()
     }
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test))]
     pub fn all_free(&self) -> bool {
         self.0.borrow().frames.iter().all(|frame| !frame.leased)
     }
@@ -620,5 +681,106 @@ impl<A: PageMemory> DeviceTableMemory for TableLease<A> {
         assert!(slot.leased);
         slot.leased = false;
         self.owned.swap_remove(i);
+    }
+}
+
+#[cfg(test)]
+mod framebuffer_tests {
+    use super::*;
+    use kumo_abi::{Framebuffer, ABI_VERSION};
+    fn fixture() -> (BootInfo, [MemRegion; 1]) {
+        let mut boot = BootInfo::empty(ABI_VERSION);
+        boot.flags = BootInfo::FLAG_FRAMEBUFFER_PRESENT | BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM;
+        boot.framebuffer = Framebuffer {
+            phys: 0xed0c_0000,
+            len: 0x57e400,
+            width: 1600,
+            height: 900,
+            stride: 1600,
+            format: FramebufferFormat::Bgr,
+        };
+        let regions = [MemRegion {
+            range: Range::new(boot.framebuffer.phys, 0x580000),
+            kind: MemRegionKind::Reserved,
+            _reserved: 0,
+        }];
+        (boot, regions)
+    }
+    #[test]
+    fn only_the_complete_recorded_mmio_vmo_can_use_the_gop_proof() {
+        let (boot, regions) = fixture();
+        let proof = FramebufferRam::from_boot(&boot, &regions).unwrap();
+        let span = proof.span();
+        assert_eq!(span, Range::new(0xed0c_0000, 0x57f000));
+        let vmo = Vmo::from_mmio_range(span.start, boot.framebuffer.len).unwrap();
+        assert!(proof.allows(vmo, 0, span.len));
+        assert!(!proof.allows(vmo, 0, span.len - PAGE_SIZE));
+        assert!(!proof.allows(vmo, PAGE_SIZE, span.len - PAGE_SIZE));
+        for vmo in [
+            Vmo::from_mmio_range(span.start - PAGE_SIZE, span.len + PAGE_SIZE).unwrap(),
+            Vmo::from_mmio_range(span.start, span.len + PAGE_SIZE).unwrap(),
+            Vmo::from_mmio_range(span.start + PAGE_SIZE, span.len).unwrap(),
+            Vmo::from_physical_range(span.start, span.len).unwrap(),
+            Vmo::from_dma_range(span.start, span.len).unwrap(),
+        ] {
+            assert!(!proof.allows(vmo, 0, span.len));
+        }
+    }
+    #[test]
+    fn both_loader_attestation_and_reserved_page_coverage_are_required() {
+        let (mut boot, mut regions) = fixture();
+        for flags in [
+            0,
+            BootInfo::FLAG_FRAMEBUFFER_PRESENT,
+            BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM,
+        ] {
+            let mut bad = boot;
+            bad.flags = flags;
+            assert!(FramebufferRam::from_boot(&bad, &regions).is_none());
+        }
+        for kind in [
+            MemRegionKind::Usable,
+            MemRegionKind::Acpi,
+            MemRegionKind::Mmio,
+            MemRegionKind::Bootloader,
+            MemRegionKind::Kernel,
+            MemRegionKind::Initrd,
+            MemRegionKind::Unknown,
+        ] {
+            regions[0].kind = kind;
+            assert!(FramebufferRam::from_boot(&boot, &regions).is_none());
+        }
+        regions[0].kind = MemRegionKind::Reserved;
+        regions[0].range.len = 0x57e000;
+        assert!(FramebufferRam::from_boot(&boot, &regions).is_none());
+        regions[0].range.len = 0x580000;
+        assert!(FramebufferRam::from_boot(&boot, &[regions[0], regions[0]]).is_none());
+        boot.framebuffer.phys = 1 << 32;
+        regions[0].range.start = 1 << 32;
+        assert!(FramebufferRam::from_boot(&boot, &regions).is_none());
+    }
+    #[test]
+    fn corrupt_or_protected_boot_spans_cannot_be_enrolled_as_gop() {
+        let (boot, regions) = fixture();
+        for protected in [boot.framebuffer.phys, boot.framebuffer.phys + 0x57e000] {
+            let mut bad = boot;
+            bad.kernel_phys = Range::new(protected, PAGE_SIZE);
+            assert!(FramebufferRam::from_boot(&bad, &regions).is_none());
+            bad.kernel_phys = Range::empty();
+            bad.initrd = Range::new(protected, PAGE_SIZE);
+            assert!(FramebufferRam::from_boot(&bad, &regions).is_none());
+        }
+        for index in 0..3 {
+            let mut bad = boot;
+            match index {
+                0 => bad.framebuffer.len = u64::MAX,
+                1 => bad.framebuffer.format = FramebufferFormat::Unknown,
+                _ => bad.framebuffer.phys += 1,
+            }
+            assert!(FramebufferRam::from_boot(&bad, &regions).is_none());
+        }
+        let mut bad = regions;
+        bad[0].range.len = u64::MAX;
+        assert!(FramebufferRam::from_boot(&boot, &bad).is_none());
     }
 }

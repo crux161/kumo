@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j614
 //j616
 //j619
 //j620
 //j621
+//j622
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -2528,6 +2528,12 @@ fn attempt_sora(
             unit.banks[1].1,
             unit.interrupt
         );
+        // Missing evidence refuses GOP pins, not the already-trusted bypass
+        // bootstrap. Unsupported enrollment never prints a passing proof. — KESTREL
+        match engine.verify_framebuffer_device_pin(&mut process, root_resource_handle) {
+            Ok(()) | Err(Errno::NotSupported) => {}
+            Err(error) => return Err(UsermodeError::DeviceTableMemory(error)),
+        }
     }
     #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
     if matches!(boot.board_id(), "qemu-virt-aarch64" | "orange-pi-5-plus") {

@@ -3,6 +3,7 @@
 
 //j460
 //j467
+//j622
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -105,6 +106,55 @@ pub fn framebuffer_from_gop(
         stride: pixels_per_scan_line,
         format: framebuffer_format_from_efi(pixel_format),
     }
+}
+
+/// One unambiguous EFI Reserved/RuntimeServicesData descriptor must contain the whole GOP page span,
+/// including padding. This proves reservation only; GCD SystemMemory must also
+/// prove RAM before the loader sets the handoff attestation. — KESTREL
+pub fn reserved_framebuffer_span(
+    fb: Framebuffer,
+    descriptors: &[u8],
+    descriptor_size: usize,
+) -> Option<Range> {
+    if !fb.is_plausible()
+        || fb.format == FramebufferFormat::Unknown
+        || descriptor_size < 40
+        || descriptors.is_empty()
+        || descriptors.len() % descriptor_size != 0
+    {
+        return None;
+    }
+    let len = fb.mapping_len()?;
+    let end = fb.phys.checked_add(len)?;
+    if end > 1 << 48 {
+        return None;
+    }
+    let mut found = false;
+    for desc in descriptors.chunks_exact(descriptor_size) {
+        let kind = u32::from_le_bytes(desc[..4].try_into().ok()?);
+        let base = u64::from_le_bytes(desc[8..16].try_into().ok()?);
+        let pages = u64::from_le_bytes(desc[24..32].try_into().ok()?);
+        let attrs = u64::from_le_bytes(desc[32..40].try_into().ok()?);
+        let region_end = base.checked_add(pages.checked_mul(4096)?)?;
+        if pages == 0 || base >= end || region_end <= fb.phys {
+            continue;
+        }
+        if found
+            || !matches!(
+                kind,
+                efi_memory_type::RESERVED | efi_memory_type::RUNTIME_SERVICES_DATA
+            )
+            || (kind == efi_memory_type::RESERVED && attrs & (1 << 63) != 0)
+            || (kind == efi_memory_type::RUNTIME_SERVICES_DATA && attrs & (1 << 63) == 0)
+            || base % 4096 != 0
+            || base > fb.phys
+            || region_end < end
+        {
+            return None;
+        }
+        found = true;
+    }
+    found.then_some(Range::new(fb.phys, len))
 }
 
 /// Does `bytes` begin with the flattened-device-tree magic?
@@ -577,5 +627,96 @@ mod tests {
         let boot = build_boot_info(UefiHandoffSeed::empty());
         assert!(!boot.has_framebuffer());
         assert_eq!(boot.platform.pl011_console_base, 0);
+    }
+}
+
+#[cfg(test)]
+mod framebuffer_tests {
+    use super::*;
+    fn framebuffer() -> Framebuffer {
+        Framebuffer {
+            phys: 0xed0c_0000,
+            len: 0x57e400,
+            width: 1600,
+            height: 900,
+            stride: 1600,
+            format: FramebufferFormat::Bgr,
+        }
+    }
+    fn descriptor(kind: u32, base: u64, pages: u64, attrs: u64) -> [u8; 40] {
+        let mut out = [0; 40];
+        out[..4].copy_from_slice(&kind.to_le_bytes());
+        out[8..16].copy_from_slice(&base.to_le_bytes());
+        out[24..32].copy_from_slice(&pages.to_le_bytes());
+        out[32..40].copy_from_slice(&attrs.to_le_bytes());
+        out
+    }
+    #[test]
+    fn exact_gop_pages_include_only_unavoidable_padding() {
+        let fb = framebuffer();
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        assert_eq!(
+            reserved_framebuffer_span(fb, &map, 40),
+            Some(Range::new(fb.phys, 0x57f000))
+        );
+        assert_eq!(0x57f000 - fb.len, 0xc00);
+        assert_eq!(
+            reserved_framebuffer_span(fb, &descriptor(6, fb.phys, 0x580, 1 << 63), 40),
+            Some(Range::new(fb.phys, 0x57f000))
+        );
+        assert!(reserved_framebuffer_span(fb, &descriptor(6, fb.phys, 0x580, 0), 40).is_none());
+    }
+    #[test]
+    fn lossy_reserved_kinds_and_runtime_attributes_are_not_attestation() {
+        let fb = framebuffer();
+        for kind in (1..=16).filter(|&kind| kind != efi_memory_type::RUNTIME_SERVICES_DATA) {
+            assert!(
+                reserved_framebuffer_span(fb, &descriptor(kind, fb.phys, 0x580, 8), 40).is_none()
+            );
+        }
+        assert!(
+            reserved_framebuffer_span(fb, &descriptor(0, fb.phys, 0x580, 1 << 63), 40).is_none()
+        );
+    }
+    #[test]
+    fn incomplete_padding_conflicts_bad_strides_and_overflow_refuse() {
+        let fb = framebuffer();
+        for (base, pages) in [
+            (fb.phys, 0x57e),
+            (fb.phys + 4096, 0x580),
+            (fb.phys + 1, 0x580),
+            (fb.phys, u64::MAX),
+            (u64::MAX - 4095, 2),
+        ] {
+            assert!(reserved_framebuffer_span(fb, &descriptor(0, base, pages, 8), 40).is_none());
+        }
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        let mut duplicate = [0; 80];
+        duplicate[..40].copy_from_slice(&map);
+        duplicate[40..].copy_from_slice(&map);
+        assert!(reserved_framebuffer_span(fb, &duplicate, 40).is_none());
+        for stride in [0, 1, 32, 39, 41] {
+            assert!(reserved_framebuffer_span(fb, &map, stride).is_none());
+        }
+        assert!(reserved_framebuffer_span(fb, &map[..39], 40).is_none());
+    }
+    #[test]
+    fn corrupt_geometry_never_creates_reserved_ram_evidence() {
+        let fb = framebuffer();
+        let map = descriptor(0, fb.phys, 0x580, 8);
+        for bad in [
+            Framebuffer { phys: 0, ..fb },
+            Framebuffer {
+                len: u64::MAX,
+                ..fb
+            },
+            Framebuffer { stride: 1599, ..fb },
+            Framebuffer {
+                format: FramebufferFormat::Unknown,
+                ..fb
+            },
+        ] {
+            assert!(reserved_framebuffer_span(bad, &map, 40).is_none());
+        }
     }
 }

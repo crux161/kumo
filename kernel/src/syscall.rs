@@ -1,8 +1,8 @@
-//j616
 //j617
 //j618
 //j619
 //j620
+//j622
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -458,8 +458,8 @@ struct VmoEntry {
 }
 
 /// Own the VMO identity and its materialized page list, independent of user handles.
-/// This pin is for unpublished, read-only device tables. It does not authorize MMIO
-/// enrollment or release after live DMA; those remain separate gates. — KESTREL
+/// This pin is for unpublished, read-only device tables. MMIO needs the separate
+/// exact GOP reserved-RAM proof; release after live DMA remains gated. — KESTREL
 #[cfg(feature = "arch_aarch64")]
 pub(crate) struct VmoPin {
     entry: Rc<VmoEntry>,
@@ -474,6 +474,16 @@ impl VmoPin {
         entry: Rc<VmoEntry>,
         offset: u64,
         len: u64,
+        allocate: impl FnMut() -> Result<u64, Errno>,
+    ) -> Result<Self, Errno> {
+        Self::new_inner(entry, offset, len, None, allocate)
+    }
+
+    fn new_inner(
+        entry: Rc<VmoEntry>,
+        offset: u64,
+        len: u64,
+        framebuffer: Option<crate::device_memory::FramebufferRam>,
         mut allocate: impl FnMut() -> Result<u64, Errno>,
     ) -> Result<Self, Errno> {
         use crate::mm::{VmoBacking, PAGE_SIZE};
@@ -498,9 +508,12 @@ impl VmoPin {
                 Some(phys_base)
             }
             VmoBacking::Anonymous => None,
-            // A resource-minted MMIO page is not proof of RAM. Exact GOP admission
-            // needs the recorded framebuffer and reserved-RAM classification. — KESTREL
-            VmoBacking::Mmio { .. } => return Err(Errno::NotSupported),
+            VmoBacking::Mmio { phys_base } => {
+                if !framebuffer.is_some_and(|proof| proof.allows(entry.vmo, offset, len)) {
+                    return Err(Errno::NotSupported);
+                }
+                Some(phys_base)
+            }
         };
         let count = usize::try_from(len / PAGE_SIZE).map_err(|_| Errno::InvalidArgs)?;
         let mut pages = Vec::new();
@@ -822,6 +835,8 @@ pub struct SyscallEngine {
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
+    #[cfg(feature = "arch_aarch64")]
+    framebuffer_ram: Option<crate::device_memory::FramebufferRam>,
     interrupts: Vec<IrqBinding>,
     timers: Vec<TimerBinding>,
     resources: Vec<ResourceBinding>,
@@ -868,6 +883,8 @@ impl SyscallEngine {
             processes: Vec::new(),
             threads: Vec::new(),
             boot_info: None,
+            #[cfg(feature = "arch_aarch64")]
+            framebuffer_ram: None,
             interrupts: Vec::new(),
             timers: Vec::new(),
             resources: Vec::new(),
@@ -1325,6 +1342,19 @@ impl SyscallEngine {
     }
 
     pub fn set_boot_info(&mut self, boot: kumo_abi::BootInfo) {
+        // Only the kernel installs its validated handoff, before entering EL0.
+        // Snapshot classification now; pins never dereference a physical map or
+        // trust a userspace BootInfo copy on an SVC path. — KESTREL
+        #[cfg(feature = "arch_aarch64")]
+        {
+            self.framebuffer_ram = if boot.flags & BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM != 0 {
+                crate::device_memory::FramebufferRam::from_boot(&boot, unsafe {
+                    boot.mem_regions.as_slice()
+                })
+            } else {
+                None
+            };
+        }
         self.boot_info = Some(boot);
         #[cfg(feature = "arch_aarch64")]
         self.table_pages.set_boot_info(boot);
@@ -1406,9 +1436,98 @@ impl SyscallEngine {
             .find(|v| v.koid == handle.koid)
             .ok_or(Errno::BadHandle)?
             .clone();
+        if matches!(entry.vmo.backing(), crate::mm::VmoBacking::Mmio { .. }) {
+            return VmoPin::new_inner(entry, offset, len, self.framebuffer_ram, || {
+                Err(Errno::NotSupported)
+            });
+        }
         VmoPin::new(entry, offset, len, || {
             alloc_anonymous_frame(self.boot_info.as_ref().ok_or(Errno::BadState)?)
         })
+    }
+
+    /// Enroll only the attested GOP pages in an unpublished table. Do not touch
+    /// framebuffer bytes, publish a root or modify either display MMU. — KESTREL
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    pub(crate) fn verify_framebuffer_device_pin(
+        &mut self,
+        process: &mut Process,
+        resource: Handle,
+    ) -> Result<(), Errno> {
+        use kumo_hal::active::DeviceTableAccess as Access;
+        let Some(proof) = self.framebuffer_ram else {
+            crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                "GOP DEVICE PIN    Refuse    loader reserved-RAM attestation absent; no context admitted\n");
+            return Err(Errno::NotSupported);
+        };
+        let span = proof.span();
+        let handle = match self.dispatch(
+            process,
+            KernelCall::ResourceMintMmio {
+                resource,
+                phys_base: span.start,
+                len: span.len,
+            },
+        ) {
+            KernelCallResult::Handle(handle) => handle,
+            _ => return Err(Errno::Internal),
+        };
+        let koid = process
+            .handles()
+            .get(handle)
+            .map_err(errno_from_object)?
+            .koid;
+        let owner = Rc::downgrade(
+            self.vmos
+                .iter()
+                .find(|v| v.koid == koid)
+                .ok_or(Errno::Internal)?,
+        );
+        if self
+            .pin_device_vmo_read_only(process, handle, 0, span.len, Rights::READ | Rights::WRITE)
+            .is_ok()
+            || self
+                .pin_device_vmo_read_only(
+                    process,
+                    handle,
+                    0,
+                    span.len - crate::mm::PAGE_SIZE,
+                    Rights::READ,
+                )
+                .is_ok()
+        {
+            return Err(Errno::Internal);
+        }
+        let pin = self.pin_device_vmo_read_only(process, handle, 0, span.len, Rights::READ)?;
+        let mut mappings = crate::device_memory::OfflineMappings::new(&self.table_pages)?;
+        mappings.map(span.start, pin)?;
+        if self.dispatch(process, KernelCall::HandleClose { handle })
+            != KernelCallResult::Status(Errno::Ok.status())
+        {
+            return Err(Errno::Internal);
+        }
+        self.vmos.retain(|v| v.koid != koid);
+        let end = span.start + span.len;
+        if owner.upgrade().is_none()
+            || mappings.walk(span.start, Access::Read)? != Some(span.start)
+            || mappings.walk(end - 1, Access::Read)? != Some(end - 1)
+            || mappings.walk(end, Access::Read)?.is_some()
+            || mappings.walk(span.start, Access::Write) != Err(Errno::AccessDenied)
+            || mappings.unmap(span.start, span.len - crate::mm::PAGE_SIZE)
+                != Err(Errno::InvalidArgs)
+        {
+            return Err(Errno::Internal);
+        }
+        mappings.unmap(span.start, span.len)?;
+        if owner.upgrade().is_some() || mappings.walk(span.start, Access::Read)?.is_some() {
+            return Err(Errno::Internal);
+        }
+        drop(mappings);
+        let fb = self.boot_info.ok_or(Errno::Internal)?.framebuffer;
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+            "GOP DEVICE PIN    Check     {:#x}, visible {:#x}, mapped {:#x}, padding {:#x}; read-only, closed handle, offline unmap OK; no paging\n",
+            span.start, fb.len, span.len, span.len - fb.len);
+        Ok(())
     }
 
     /// Prove the offline table provider on actual kernel RAM before Sora runs. The data
@@ -4624,6 +4743,198 @@ mod tests {
                 }
                 m.words.get_mut(&page).unwrap()[index] = word;
             }
+        }
+
+        fn gop_fixture() -> (SyscallEngine, Process, Handle, BootInfo) {
+            use kumo_abi::{
+                Framebuffer, FramebufferFormat, MemRegion, MemRegionKind, Range, RawSlice,
+            };
+            static REGIONS: [MemRegion; 1] = [MemRegion {
+                range: Range::new(0x9000_0000, 3 * PAGE_SIZE),
+                kind: MemRegionKind::Reserved,
+                _reserved: 0,
+            }];
+            let mut boot = BootInfo::empty(kumo_abi::ABI_VERSION);
+            boot.flags =
+                BootInfo::FLAG_FRAMEBUFFER_PRESENT | BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM;
+            boot.framebuffer = Framebuffer {
+                phys: 0x9000_0000,
+                len: PAGE_SIZE + 4,
+                width: 1,
+                height: 1025,
+                stride: 1,
+                format: FramebufferFormat::Bgr,
+            };
+            boot.mem_regions = RawSlice::from_slice(&REGIONS);
+            let mut engine = SyscallEngine::new();
+            engine.set_boot_info(boot);
+            let mut process = test_process(&mut engine);
+            let vmo = Vmo::from_mmio_range(boot.framebuffer.phys, boot.framebuffer.len).unwrap();
+            let handle = engine
+                .root_vmo_create(
+                    &mut process,
+                    vmo,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE,
+                )
+                .unwrap();
+            (engine, process, handle, boot)
+        }
+
+        #[test]
+        fn gop_pins_require_read_authority_and_the_exact_attested_vmo() {
+            let (mut engine, mut process, handle, _) = gop_fixture();
+            let pin = engine
+                .pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ)
+                .unwrap();
+            assert_eq!(pin.pages(), [0x9000_0000, 0x9000_1000]);
+            for rights in [
+                Rights::empty(),
+                Rights::WRITE,
+                Rights::READ | Rights::WRITE,
+                Rights::MAP,
+            ] {
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, rights),
+                    Err(Errno::AccessDenied)
+                ));
+            }
+            let no_read = process
+                .handles_mut()
+                .duplicate(handle, Rights::WRITE)
+                .unwrap();
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, no_read, 0, 2 * PAGE_SIZE, Rights::READ),
+                Err(Errno::AccessDenied)
+            ));
+            for (offset, len) in [(0, PAGE_SIZE), (PAGE_SIZE, PAGE_SIZE)] {
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(&process, handle, offset, len, Rights::READ),
+                    Err(Errno::NotSupported)
+                ));
+            }
+            for (base, size, offset) in [
+                (0x9000_0000, 3 * PAGE_SIZE, 0),
+                (0x9000_1000, 2 * PAGE_SIZE, 0),
+                (0x8fff_f000, 3 * PAGE_SIZE, PAGE_SIZE),
+                (0xa000_0000, 2 * PAGE_SIZE, 0),
+            ] {
+                let vmo = Vmo::from_mmio_range(base, size).unwrap();
+                let h = engine
+                    .root_vmo_create(&mut process, vmo, Rights::READ)
+                    .unwrap();
+                assert!(matches!(
+                    engine.pin_device_vmo_read_only(
+                        &process,
+                        h,
+                        offset,
+                        2 * PAGE_SIZE,
+                        Rights::READ
+                    ),
+                    Err(Errno::NotSupported)
+                ));
+            }
+            let entry = engine
+                .vmos
+                .iter()
+                .find(|v| v.koid == pin.koid())
+                .unwrap()
+                .clone();
+            assert!(matches!(
+                VmoPin::new(entry, 0, 2 * PAGE_SIZE, || unreachable!()),
+                Err(Errno::NotSupported)
+            ));
+        }
+
+        #[test]
+        fn framebuffer_claim_and_mutable_boot_copies_do_not_authorize_gop_pins() {
+            let (mut engine, mut process, handle, mut boot) = gop_fixture();
+            let valid = boot;
+            boot.flags &= !BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM;
+            engine.set_boot_info(boot);
+            let resource = engine
+                .root_resource_create(&mut process, 0x9000_0000, 3 * PAGE_SIZE, 0, 0)
+                .unwrap();
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::FramebufferClaim {
+                        resource,
+                        phys_base: 0x9000_0000,
+                        len: 2 * PAGE_SIZE,
+                    }
+                ),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            boot.flags |= BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM;
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ),
+                Err(Errno::NotSupported)
+            ));
+            engine.set_boot_info(valid);
+            boot.framebuffer.phys += PAGE_SIZE;
+            let false_gop = engine
+                .root_vmo_create(
+                    &mut process,
+                    Vmo::from_mmio_range(boot.framebuffer.phys, 2 * PAGE_SIZE).unwrap(),
+                    Rights::READ,
+                )
+                .unwrap();
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(
+                    &process,
+                    false_gop,
+                    0,
+                    2 * PAGE_SIZE,
+                    Rights::READ
+                ),
+                Err(Errno::NotSupported)
+            ));
+            assert!(engine
+                .pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ)
+                .is_ok());
+            boot.flags = 0;
+            engine.set_boot_info(boot);
+            assert!(matches!(
+                engine.pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ),
+                Err(Errno::NotSupported)
+            ));
+        }
+
+        #[test]
+        fn gop_padding_and_identity_remain_pinned_until_exact_offline_unmap() {
+            let (mut engine, mut process, handle, _) = gop_fixture();
+            let pin = engine
+                .pin_device_vmo_read_only(&process, handle, 0, 2 * PAGE_SIZE, Rights::READ)
+                .unwrap();
+            let weak = Rc::downgrade(&pin.entry);
+            let memory = Memory::default();
+            memory.0.borrow_mut().guard = Some(weak.clone());
+            let pool = crate::device_memory::TablePool::new(memory.clone());
+            let mut mappings = crate::device_memory::OfflineMappings::new(&pool).unwrap();
+            mappings.map(0x003f_f000, pin).unwrap();
+            process.handles_mut().close(handle).unwrap();
+            drop(process);
+            drop(engine);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(
+                mappings.walk(0x0040_0fff, Access::Read),
+                Ok(Some(0x9000_1fff))
+            );
+            assert_eq!(mappings.walk(0x0040_1000, Access::Read), Ok(None));
+            assert_eq!(
+                mappings.walk(0x003f_f000, Access::Write),
+                Err(Errno::AccessDenied)
+            );
+            assert_eq!(
+                mappings.unmap(0x003f_f000, PAGE_SIZE),
+                Err(Errno::InvalidArgs)
+            );
+            assert!(weak.upgrade().is_some());
+            mappings.unmap(0x003f_f000, 2 * PAGE_SIZE).unwrap();
+            assert!(weak.upgrade().is_none());
+            memory.0.borrow_mut().guard = None;
+            drop(mappings);
+            assert!(pool.all_free());
         }
 
         fn fixture() -> (SyscallEngine, Process, Handle) {

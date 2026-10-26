@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 //j421
 //j467
 //j480
+//j622
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +196,10 @@ pub struct BootInfo {
 impl BootInfo {
     pub const FLAG_FRAMEBUFFER_PRESENT: u32 = 1 << 0;
     pub const FLAG_VERIFIED_BOOT_PRESENT: u32 = 1 << 1;
+    /// The loader checked the exact page-rounded GOP span against both the final
+    /// EFI reserved allocation and GCD SystemMemory. Absent on older/unsupported loaders;
+    /// Reserved alone is not RAM evidence. Layout/version remain compatible. — KESTREL
+    pub const FLAG_FRAMEBUFFER_RESERVED_RAM: u32 = 1 << 2;
 
     /// Length of the [`BootInfo::board_id`] byte field.
     pub const BOARD_ID_LEN: usize = 32;

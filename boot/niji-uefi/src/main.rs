@@ -4,6 +4,7 @@
 //j434
 //j460
 //j467
+//j622
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -37,7 +38,8 @@ use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
     build_boot_info, efi_memory_type, efi_memory_type_is_firmware_owned, efi_pixel_format,
     fdt_total_size, framebuffer_from_gop, is_fdt_magic, is_plausible_firmware_pointer,
-    mem_region_kind_from_efi, parse_pl011_console, BootConfig, UefiHandoffSeed,
+    mem_region_kind_from_efi, parse_pl011_console, reserved_framebuffer_span, BootConfig,
+    UefiHandoffSeed,
 };
 
 pub type EfiHandle = *mut c_void;
@@ -90,6 +92,12 @@ const GRAPHICS_OUTPUT_GUID: EfiGuid = guid(
     0x4a38,
     [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
 );
+const DXE_SERVICES_GUID: EfiGuid = guid(
+    0x05ad_34ba,
+    0x6f02,
+    0x4214,
+    [0x95, 0x2e, 0x4d, 0xa0, 0x39, 0x8e, 0x2b, 0xb9],
+);
 const LOADED_IMAGE_GUID: EfiGuid = guid(
     0x5b1b_31a1,
     0x9562,
@@ -137,6 +145,41 @@ struct EfiTableHeader {
     header_size: u32,
     crc32: u32,
     reserved: u32,
+}
+
+// PI 1.8A PiDxeCis.h / Guid/DxeServices.h: only the read-only GCD getter
+// prefix is typed. No allocation, attribute or resource mutation is exposed. — KESTREL
+#[repr(C)]
+struct DxeServices {
+    header: EfiTableHeader,
+    unused_memory_services: [usize; 4],
+    get_memory_space_descriptor: usize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct GcdMemoryDescriptor {
+    base: u64,
+    len: u64,
+    capabilities: u64,
+    attributes: u64,
+    kind: u32,
+    image: usize,
+    device: usize,
+}
+
+impl GcdMemoryDescriptor {
+    fn contains_system_ram(&self, span: Range) -> bool {
+        self.kind == 2
+            && self.base <= span.start
+            && self.len != 0
+            && span.len != 0
+            && self
+                .base
+                .checked_add(self.len)
+                .zip(span.start.checked_add(span.len))
+                .is_some_and(|(end, span_end)| span_end <= end)
+    }
 }
 
 #[repr(C)]
@@ -649,10 +692,21 @@ unsafe fn boot_and_jump(
     unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
 
     // Pre-exit summary + validation, using a provisional memory snapshot.
-    if let Some((regions_ptr, regions_len, _key, _raw_map)) =
+    if let Some((regions_ptr, regions_len, _key, raw_map)) =
         unsafe { snapshot_memory(boot_services, &bufs) }
     {
         unsafe { (*boot_ptr).mem_regions = RawSlice::from_raw_parts(regions_ptr, regions_len) };
+        let ram = unsafe { framebuffer_ram(system_table, raw_map, (*boot_ptr).framebuffer, true) };
+        unsafe { stamp_framebuffer_ram(boot_ptr, ram.is_some()) };
+        kprint!(
+            con_out,
+            "GOP RAM      : {}\r\n",
+            if ram.is_some() {
+                "exact page span is reserved RAM (EFI + GCD)"
+            } else {
+                "not proven; device enrollment disabled"
+            }
+        );
     }
     let discovery = unsafe { summarize_platform(&*boot_ptr) };
     kprint!(con_out, "\r\nBootInfo ABI : v{}\r\n", unsafe {
@@ -721,12 +775,16 @@ unsafe fn boot_and_jump(
     // that map produced. Retry if the map shifts under us.
     let mut exited = false;
     for _ in 0..8 {
-        let (regions_ptr, regions_len, map_key, _raw_map) =
+        let (regions_ptr, regions_len, map_key, raw_map) =
             match unsafe { snapshot_memory(boot_services, &bufs) } {
                 Some(snap) => snap,
                 None => break,
             };
         unsafe { (*boot_ptr).mem_regions = RawSlice::from_raw_parts(regions_ptr, regions_len) };
+        // Recompute against each final map; a provisional result cannot survive a
+        // changed ExitBootServices snapshot. The getter performs no GCD writes. — KESTREL
+        let ram = unsafe { framebuffer_ram(system_table, raw_map, (*boot_ptr).framebuffer, false) };
+        unsafe { stamp_framebuffer_ram(boot_ptr, ram.is_some()) };
         let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
         if status == EFI_SUCCESS {
             exited = true;
@@ -1683,6 +1741,155 @@ struct EfiMemoryMapView {
     descriptor_size: usize,
 }
 
+unsafe fn stamp_framebuffer_ram(boot: *mut BootInfo, proven: bool) {
+    unsafe { (*boot).flags &= !BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM };
+    if proven {
+        unsafe { (*boot).flags |= BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM };
+    }
+}
+
+/// Firmware's GCD distinguishes tested system RAM from MMIO and unspecified
+/// reserved resources. An EFI Reserved type or cacheability flag alone cannot.
+/// Validate every table/code pointer before invoking the single getter. — KESTREL
+unsafe fn framebuffer_ram(
+    system: *mut EfiSystemTable,
+    map: EfiMemoryMapView,
+    fb: Framebuffer,
+    diagnose: bool,
+) -> Option<Range> {
+    let bytes = map.count.checked_mul(map.descriptor_size)?;
+    if bytes == 0 || bytes > isize::MAX as usize || map.descriptors.is_null() {
+        return None;
+    }
+    let span = reserved_framebuffer_span(
+        fb,
+        unsafe { core::slice::from_raw_parts(map.descriptors, bytes) },
+        map.descriptor_size,
+    )?;
+    if !is_plausible_firmware_pointer(system as u64, size_of::<EfiSystemTable>() as u64, 8)
+        || !unsafe {
+            map.contains_firmware_owned_range(system as u64, size_of::<EfiSystemTable>() as u64)
+        }
+    {
+        return None;
+    }
+    let count = unsafe { (*system).number_of_table_entries };
+    let tables = unsafe { (*system).configuration_table } as *const EfiConfigurationTable;
+    let len = count.checked_mul(size_of::<EfiConfigurationTable>())? as u64;
+    if count == 0
+        || count > 1024
+        || !is_plausible_firmware_pointer(tables as u64, len, 8)
+        || !unsafe { map.contains_firmware_owned_range(tables as u64, len) }
+    {
+        return None;
+    }
+    let mut service = None;
+    for i in 0..count {
+        let entry = unsafe { &*tables.add(i) };
+        if entry.vendor_guid == DXE_SERVICES_GUID {
+            if service
+                .replace(entry.vendor_table.cast::<DxeServices>())
+                .is_some()
+            {
+                return None;
+            }
+        }
+    }
+    // This EDK2 image places its constant DXE table in BootServicesCode, while
+    // PI specifies BootServicesData. Both are readable, firmware-owned storage
+    // until exit; the getter still requires code backing. — KESTREL
+    let service = service?;
+    let prefix = size_of::<DxeServices>() as u64;
+    if !is_plausible_firmware_pointer(service as u64, prefix, 8)
+        || !unsafe {
+            map.contains_range_matching(service as u64, prefix, |kind| {
+                matches!(
+                    kind,
+                    efi_memory_type::BOOT_SERVICES_DATA | efi_memory_type::BOOT_SERVICES_CODE
+                )
+            })
+        }
+    {
+        if diagnose {
+            unsafe { report_efi_pointer(map, service as u64, b"DXE table", (*system).con_out) };
+        }
+        return None;
+    }
+    let service = unsafe { &*service };
+    let header_len = u64::from(service.header.header_size);
+    if service.header.signature != 0x5652_4553_5f45_5844
+        || !(prefix..=4096).contains(&header_len)
+        || !unsafe {
+            map.contains_range_matching(service as *const _ as u64, header_len, |kind| {
+                matches!(
+                    kind,
+                    efi_memory_type::BOOT_SERVICES_DATA | efi_memory_type::BOOT_SERVICES_CODE
+                )
+            })
+        }
+    {
+        return None;
+    }
+    let getter = service.get_memory_space_descriptor;
+    if !is_plausible_firmware_pointer(getter as u64, 4, 4)
+        || !unsafe {
+            map.contains_range_matching(getter as u64, 4, |kind| {
+                matches!(
+                    kind,
+                    efi_memory_type::BOOT_SERVICES_CODE
+                        | efi_memory_type::RUNTIME_SERVICES_CODE
+                        | efi_memory_type::LOADER_CODE
+                )
+            })
+        }
+    {
+        if diagnose {
+            unsafe { report_efi_pointer(map, getter as u64, b"GCD getter", (*system).con_out) };
+        }
+        return None;
+    }
+    let get: extern "efiapi" fn(u64, *mut GcdMemoryDescriptor) -> EfiStatus =
+        unsafe { core::mem::transmute(getter) };
+    let mut descriptor = GcdMemoryDescriptor::default();
+    let status = get(span.start, &mut descriptor);
+    if status != EFI_SUCCESS || !descriptor.contains_system_ram(span) {
+        return None;
+    }
+    Some(span)
+}
+
+// Diagnostics are requested only for the provisional lookup. Never print after
+// the final map key has been obtained. The raw buffer is internally owned. — KESTREL
+unsafe fn report_efi_pointer(
+    map: EfiMemoryMapView,
+    address: u64,
+    name: &[u8],
+    out: *mut EfiSimpleTextOutputProtocol,
+) {
+    for i in 0..map.count {
+        let p = unsafe { map.descriptors.add(i * map.descriptor_size) };
+        let base = unsafe { ptr::read_unaligned(p.add(8).cast::<u64>()) };
+        let pages = unsafe { ptr::read_unaligned(p.add(24).cast::<u64>()) };
+        let Some(end) = pages
+            .checked_mul(4096)
+            .and_then(|len| base.checked_add(len))
+        else {
+            continue;
+        };
+        if base <= address && address < end {
+            kprint!(
+                out,
+                "GOP RAM refuse: {} {:#x}, EFI type {} at {:#x}+{:#x}\r\n",
+                core::str::from_utf8(name).unwrap_or("pointer"),
+                address,
+                unsafe { ptr::read_unaligned(p.cast::<u32>()) },
+                base,
+                end - base
+            );
+        }
+    }
+}
+
 impl EfiMemoryMapView {
     /// Check a range against raw EFI types before the lossy `MemRegionKind` conversion. This keeps
     /// Conventional and Unusable pages distinct and rejects both before any raw read.
@@ -1691,6 +1898,17 @@ impl EfiMemoryMapView {
     /// # Safety
     /// The descriptor buffer must remain live and contain `count` entries of `descriptor_size`.
     unsafe fn contains_firmware_owned_range(self, address: u64, byte_len: u64) -> bool {
+        unsafe {
+            self.contains_range_matching(address, byte_len, efi_memory_type_is_firmware_owned)
+        }
+    }
+
+    unsafe fn contains_range_matching(
+        self,
+        address: u64,
+        byte_len: u64,
+        accepts: fn(u32) -> bool,
+    ) -> bool {
         let Some(end) = address.checked_add(byte_len) else {
             return false;
         };
@@ -1700,7 +1918,7 @@ impl EfiMemoryMapView {
         for index in 0..self.count {
             let descriptor = unsafe { self.descriptors.add(index * self.descriptor_size) };
             let efi_type = unsafe { ptr::read_unaligned(descriptor as *const u32) };
-            if !efi_memory_type_is_firmware_owned(efi_type) {
+            if !accepts(efi_type) {
                 continue;
             }
             let start = unsafe { ptr::read_unaligned(descriptor.add(8) as *const u64) };
@@ -1808,7 +2026,12 @@ unsafe fn snapshot_memory(
             &mut desc_version,
         )
     };
-    if status != EFI_SUCCESS || desc_size == 0 {
+    if status != EFI_SUCCESS
+        || desc_size < 40
+        || map_size > bufs.desc_cap
+        || map_size % desc_size != 0
+        || map_size / desc_size > bufs.region_cap
+    {
         return None;
     }
 
@@ -2263,6 +2486,135 @@ mod tests {
             core::mem::offset_of!(EfiSystemTable, configuration_table),
             112
         );
+    }
+
+    #[test]
+    fn dxe_gcd_layout_and_system_memory_evidence_match_pi() {
+        assert_eq!(size_of::<DxeServices>(), 64);
+        assert_eq!(
+            core::mem::offset_of!(DxeServices, get_memory_space_descriptor),
+            56
+        );
+        assert_eq!(size_of::<GcdMemoryDescriptor>(), 56);
+        assert_eq!(core::mem::offset_of!(GcdMemoryDescriptor, kind), 32);
+        assert_eq!(core::mem::offset_of!(GcdMemoryDescriptor, image), 40);
+        let span = Range::new(0x9000_0000, 8192);
+        let mut d = GcdMemoryDescriptor {
+            base: span.start,
+            len: 8192,
+            kind: 2,
+            ..Default::default()
+        };
+        assert!(d.contains_system_ram(span));
+        for kind in [0, 1, 3, 4, 5, 6, u32::MAX] {
+            d.kind = kind;
+            assert!(!d.contains_system_ram(span));
+        }
+        d.kind = 2;
+        d.len = 4096;
+        assert!(!d.contains_system_ram(span));
+        d.base = u64::MAX - 4095;
+        d.len = 8192;
+        assert!(!d.contains_system_ram(span));
+    }
+
+    #[test]
+    fn final_ram_attestation_is_cleared_and_preserves_other_boot_flags() {
+        let mut boot = BootInfo::empty(kumo_abi::ABI_VERSION);
+        boot.flags = BootInfo::FLAG_FRAMEBUFFER_PRESENT | BootInfo::FLAG_VERIFIED_BOOT_PRESENT;
+        let original = boot.flags;
+        unsafe { stamp_framebuffer_ram(&mut boot, true) };
+        assert_eq!(
+            boot.flags,
+            original | BootInfo::FLAG_FRAMEBUFFER_RESERVED_RAM
+        );
+        unsafe { stamp_framebuffer_ram(&mut boot, false) };
+        assert_eq!(boot.flags, original);
+    }
+
+    #[test]
+    fn gcd_getter_is_called_only_after_validated_tables_and_code() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "efiapi" fn getter(_address: u64, out: *mut GcdMemoryDescriptor) -> EfiStatus {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                out.write(GcdMemoryDescriptor {
+                    base: 0x9000_0000,
+                    len: 8192,
+                    kind: 2,
+                    ..Default::default()
+                })
+            };
+            EFI_SUCCESS
+        }
+        #[repr(C)]
+        struct Bundle {
+            system: EfiSystemTable,
+            service: DxeServices,
+            configs: [EfiConfigurationTable; 2],
+        }
+        // Only scalar and pointer fields: zero is a valid, inert initial value. — KESTREL
+        let mut bundle: Bundle = unsafe { core::mem::zeroed() };
+        bundle.service.header.signature = 0x5652_4553_5f45_5844;
+        bundle.service.header.header_size = size_of::<DxeServices>() as u32;
+        bundle.service.get_memory_space_descriptor = getter as *const () as usize;
+        bundle.configs[0].vendor_guid = DXE_SERVICES_GUID;
+        bundle.configs[0].vendor_table = (&mut bundle.service as *mut DxeServices).cast();
+        bundle.configs[1].vendor_guid = DXE_SERVICES_GUID;
+        bundle.configs[1].vendor_table = bundle.configs[0].vendor_table;
+        bundle.system.configuration_table = bundle.configs.as_mut_ptr().cast();
+        bundle.system.number_of_table_entries = 1;
+        let mut raw = [0u8; 120];
+        fn desc(out: &mut [u8], kind: u32, base: u64, pages: u64) {
+            out[..4].copy_from_slice(&kind.to_le_bytes());
+            out[8..16].copy_from_slice(&base.to_le_bytes());
+            out[24..32].copy_from_slice(&pages.to_le_bytes());
+        }
+        desc(&mut raw[..40], 0, 0x9000_0000, 2);
+        let start = &bundle as *const Bundle as u64;
+        let base = start & !4095;
+        let pages = (start + size_of::<Bundle>() as u64 - base).div_ceil(4096);
+        desc(&mut raw[40..80], 4, base, pages);
+        desc(&mut raw[80..], 3, (getter as *const () as u64) & !4095, 1);
+        let map = EfiMemoryMapView {
+            descriptors: raw.as_ptr(),
+            count: 3,
+            descriptor_size: 40,
+        };
+        let fb = Framebuffer {
+            phys: 0x9000_0000,
+            len: 4100,
+            width: 1,
+            height: 1025,
+            stride: 1,
+            format: FramebufferFormat::Bgr,
+        };
+        assert_eq!(
+            unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) },
+            Some(Range::new(fb.phys, 8192))
+        );
+        raw[40..44].copy_from_slice(&efi_memory_type::BOOT_SERVICES_CODE.to_le_bytes());
+        assert_eq!(
+            unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) },
+            Some(Range::new(fb.phys, 8192))
+        );
+        raw[40..44].copy_from_slice(&efi_memory_type::BOOT_SERVICES_DATA.to_le_bytes());
+        let before = CALLS.load(Ordering::Relaxed);
+        bundle.system.number_of_table_entries = 2;
+        assert!(unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) }.is_none());
+        bundle.system.number_of_table_entries = 1;
+        bundle.service.header.signature = 0;
+        assert!(unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) }.is_none());
+        bundle.service.header.signature = 0x5652_4553_5f45_5844;
+        bundle.service.get_memory_space_descriptor = 0;
+        assert!(unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) }.is_none());
+        bundle.service.get_memory_space_descriptor = getter as *const () as usize;
+        raw[80..84].copy_from_slice(&efi_memory_type::BOOT_SERVICES_DATA.to_le_bytes());
+        assert!(unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) }.is_none());
+        bundle.system.configuration_table = ptr::null_mut();
+        assert!(unsafe { framebuffer_ram(&mut bundle.system, map, fb, false) }.is_none());
+        assert_eq!(CALLS.load(Ordering::Relaxed), before);
     }
 
     #[test]
