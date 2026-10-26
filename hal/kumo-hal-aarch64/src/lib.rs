@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j609
 //j614
 //j615
 //j621
 //j623
+//j624
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3507,6 +3507,16 @@ pub fn display_mmu_read_state(dtb: u64) -> Result<[display_mmu::BankState; 2], d
 pub fn display_mmu_read_state(
     _dtb: u64,
 ) -> Result<[display_mmu::BankState; 2], display_mmu::Error> {
+    Err(display_mmu::Error::NoUnit)
+}
+
+#[cfg(target_os = "none")]
+pub fn display_mmu_read_routes(dtb: u64) -> Result<display_mmu::Routes, display_mmu::Error> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_mmu::Error::NoUnit)?;
+    display_mmu::read_routes(bytes, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_mmu_read_routes(_dtb: u64) -> Result<display_mmu::Routes, display_mmu::Error> {
     Err(display_mmu::Error::NoUnit)
 }
 

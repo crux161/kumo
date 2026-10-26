@@ -1,12 +1,16 @@
 //j623
+//j624
 
-//! DESIGN/022 D1d-b2h1: bounded stall/drain of the two display translators.
-//! Facts: RK3588 TRM Part 2, MMU0/1, pp. 1047–1048, and the pinned J613 Linux
-//! register oracle. No GPL implementation is imported. Only ENABLE_STALL is written.
+//! DESIGN/022 D1d-b2h1/h2: bounded stall/drain and VOP routing guards.
+//! Facts: RK3588 TRM Part 2, MMU0/1 pp. 1047–1048 and VOP controls
+//! pp. 854, 953, 955, plus the pinned J613 Linux register oracle.
+//! No GPL implementation is imported. Only ENABLE_STALL is written.
 //!
 //! Success describes the translators at this instant. It is not VOP-wide DMA
-//! containment, a table/backing release permit, detach or invalidation. The caller
-//! still needs owned roots, held clocks, sealed bypass routes and the shared fault owner. — KESTREL
+//! containment, a table/backing release permit, detach or invalidation.
+//! The routing guard checks all reviewed bypass fields and automatic MMU reset.
+//! The caller still needs exclusive root/control ownership, held clocks and the
+//! shared fault owner. A readback is not a permanent seal. — KESTREL
 
 use crate::{display_iommu, display_register::RegisterIo, display_unit};
 
@@ -26,6 +30,35 @@ const REPLAY_EMPTY: u32 = 1 << 4;
 const STALL_NOT_ACTIVE: u32 = 1 << 31;
 const TIMEOUT_NS: u64 = 1_000_000;
 const MAX_POLLS: usize = 1024;
+const GLOBAL_ROUTE: u64 = 0xfdd9_0024;
+const CLUSTER_ROUTES: [u64; 4] = [0xfdd9_1100, 0xfdd9_1300, 0xfdd9_1500, 0xfdd9_1700];
+const ESMART_ROUTES: [u64; 4] = [0xfdd9_1808, 0xfdd9_1a08, 0xfdd9_1c08, 0xfdd9_1e08];
+
+/// Unfiltered readback, not an ownership token. Check inactive layers too: a
+/// subsequent checked plane enable must not inherit an unnoticed bypass. — KESTREL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Routes {
+    pub global: u32,
+    pub clusters: [u32; 4],
+    pub esmart: [u32; 4],
+}
+
+impl Routes {
+    pub fn check(&self) -> Result<(), Error> {
+        if self.global & (1 << 31) != 0
+            || self.clusters.iter().any(|word| word & (1 << 14) != 0)
+            || self.esmart.iter().any(|word| word & (1 << 2) != 0)
+        {
+            return Err(Error::Bypass);
+        }
+        // Fault-triggered reset could undo a translated state after observation.
+        // Do not rely on a RID threshold or a supposedly harmless reset mode. — KESTREL
+        if self.global & (1 << 20) != 0 {
+            return Err(Error::AutomaticReset);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BankState {
@@ -43,6 +76,8 @@ pub enum Error {
     RootMismatch,
     Fault,
     Timeout,
+    Bypass,
+    AutomaticReset,
 }
 
 fn unit(bytes: &[u8]) -> Result<(), Error> {
@@ -80,6 +115,33 @@ fn sample(io: &mut impl RegisterIo) -> Result<[BankState; 2], Error> {
 pub fn read_state(bytes: &[u8], io: &mut impl RegisterIo) -> Result<[BankState; 2], Error> {
     unit(bytes)?;
     sample(io)
+}
+
+fn route_word(io: &mut impl RegisterIo, address: u64) -> Result<u32, Error> {
+    ready(io)?;
+    Ok(io.read(address))
+}
+
+fn routes(io: &mut impl RegisterIo) -> Result<Routes, Error> {
+    let mut result = Routes {
+        global: route_word(io, GLOBAL_ROUTE)?,
+        clusters: [0; 4],
+        esmart: [0; 4],
+    };
+    for (word, address) in result.clusters.iter_mut().zip(CLUSTER_ROUTES) {
+        *word = route_word(io, address)?;
+    }
+    for (word, address) in result.esmart.iter_mut().zip(ESMART_ROUTES) {
+        *word = route_word(io, address)?;
+    }
+    Ok(result)
+}
+
+/// Read-only live routing audit under the same topology and PMU/BIU guards.
+/// This does not clear a bypass/reset bit or authorize a context. — KESTREL
+pub fn read_routes(bytes: &[u8], io: &mut impl RegisterIo) -> Result<Routes, Error> {
+    unit(bytes)?;
+    routes(io)
 }
 
 /// Pure request preflight, not a completed-stall check. Command callers supply
@@ -122,11 +184,13 @@ pub fn stall(bytes: &[u8], root: u64, io: &mut impl RegisterIo) -> Result<[BankS
     unit(bytes)?;
     let initial = sample(io)?;
     check_request(&initial, root)?;
+    routes(io)?.check()?;
     if drained(&initial) {
         return Ok(initial);
     }
     let start = io.now_ns();
     for bank in BANKS {
+        routes(io)?.check()?;
         ready(io)?;
         io.write(bank + COMMAND, ENABLE_STALL);
         io.barrier();
@@ -134,6 +198,7 @@ pub fn stall(bytes: &[u8], root: u64, io: &mut impl RegisterIo) -> Result<[BankS
     for _ in 0..MAX_POLLS {
         let states = sample(io)?;
         check_request(&states, root)?;
+        routes(io)?.check()?;
         // A late ready sample is still a timeout. The iteration limit also bounds
         // a stopped timer; a backward timer cannot extend the deadline. — KESTREL
         if io
@@ -186,6 +251,9 @@ mod tests {
         times: VecDeque<u64>,
         last_time: u64,
         power_loss_after_writes: Option<usize>,
+        route_after_writes: Option<(usize, u64, u32)>,
+        route_after_sample: Option<(usize, u64, u32)>,
+        power_loss_after_route: Option<u64>,
         events: Vec<Event>,
         sample_count: usize,
     }
@@ -198,6 +266,9 @@ mod tests {
                 times: VecDeque::new(),
                 last_time: 0,
                 power_loss_after_writes: None,
+                route_after_writes: None,
+                route_after_sample: None,
+                power_loss_after_route: None,
                 events: Vec::new(),
                 sample_count: 0,
             }
@@ -231,6 +302,16 @@ mod tests {
                     self.current = next;
                 }
             }
+            if let Some((n, address, value)) = self.route_after_writes {
+                if p == address && self.writes().len() >= n {
+                    return value;
+                }
+            }
+            if let Some((n, address, value)) = self.route_after_sample {
+                if p == address && self.sample_count >= n {
+                    return value;
+                }
+            }
             for (i, bank) in BANKS.into_iter().enumerate() {
                 match p.checked_sub(bank) {
                     Some(0) => return self.current[i].directory,
@@ -239,7 +320,11 @@ mod tests {
                     _ => {}
                 }
             }
-            *self.regs.get(&p).unwrap_or(&0)
+            let value = *self.regs.get(&p).unwrap_or(&0);
+            if self.power_loss_after_route == Some(p) {
+                self.regs.insert(0xfd8d_8150, 1 << 17);
+            }
+            value
         }
         fn write(&mut self, p: u64, value: u32) {
             self.events.push(Event::Write(p, value));
@@ -259,6 +344,155 @@ mod tests {
     }
     fn commands() -> Vec<(u64, u32)> {
         vec![(0xfdd9_7e08, 2), (0xfdd9_7f08, 2)]
+    }
+
+    fn route_reads(io: &Io) -> Vec<u64> {
+        io.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Read(p)
+                    if *p == GLOBAL_ROUTE
+                        || CLUSTER_ROUTES.contains(p)
+                        || ESMART_ROUTES.contains(p) =>
+                {
+                    Some(*p)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_audit_reads_all_nine_literal_control_words_without_writes() {
+        let mut io = Io::new([]);
+        io.regs.insert(0xfdd9_0024, 0x7c00_0000);
+        for (i, p) in [0xfdd9_1100, 0xfdd9_1300, 0xfdd9_1500, 0xfdd9_1700]
+            .into_iter()
+            .enumerate()
+        {
+            io.regs.insert(p, 0x1000 + i as u32);
+        }
+        for (p, v) in [
+            (0xfdd9_1808, 1),
+            (0xfdd9_1a08, 2),
+            (0xfdd9_1c08, 8),
+            (0xfdd9_1e08, 0x100),
+        ] {
+            io.regs.insert(p, v);
+        }
+        let observed = read_routes(DTB, &mut io).unwrap();
+        assert_eq!(
+            observed,
+            Routes {
+                global: 0x7c00_0000,
+                clusters: [0x1000, 0x1001, 0x1002, 0x1003],
+                esmart: [1, 2, 8, 0x100]
+            }
+        );
+        assert_eq!(observed.check(), Ok(()));
+        assert_eq!(
+            route_reads(&io),
+            [
+                0xfdd9_0024,
+                0xfdd9_1100,
+                0xfdd9_1300,
+                0xfdd9_1500,
+                0xfdd9_1700,
+                0xfdd9_1808,
+                0xfdd9_1a08,
+                0xfdd9_1c08,
+                0xfdd9_1e08
+            ]
+        );
+        assert!(io.writes().is_empty());
+    }
+
+    #[test]
+    fn global_bypass_never_becomes_safe_by_choosing_a_rid_threshold() {
+        for threshold in [0, 1, 31] {
+            let mut io = Io::new([[RUN; 2]]);
+            io.regs.insert(0xfdd9_0024, 0x8000_0000 | (threshold << 26));
+            assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::Bypass));
+            assert!(io.writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn every_cluster_and_esmart_bypass_rejects_even_already_stalled_banks() {
+        for p in [
+            0xfdd9_1100,
+            0xfdd9_1300,
+            0xfdd9_1500,
+            0xfdd9_1700,
+            0xfdd9_1808,
+            0xfdd9_1a08,
+            0xfdd9_1c08,
+            0xfdd9_1e08,
+        ] {
+            for initial in [RUN, DRAINED] {
+                let mut io = Io::new([[initial; 2]]);
+                io.regs
+                    .insert(p, if p < 0xfdd9_1800 { 1 << 14 } else { 1 << 2 });
+                assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::Bypass));
+                assert!(io.writes().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_reset_requires_disable_regardless_of_selected_reset_mode() {
+        for mode in 0..4 {
+            let mut io = Io::new([[DRAINED; 2]]);
+            io.regs.insert(0xfdd9_0024, (1 << 20) | (mode << 24));
+            assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::AutomaticReset));
+            assert!(io.writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn route_changes_after_one_or_both_requests_never_resume_or_report_success() {
+        for (p, value) in [
+            (0xfdd9_0024, 1 << 31),
+            (0xfdd9_1700, 1 << 14),
+            (0xfdd9_1e08, 1 << 2),
+        ] {
+            for after in [1, 2] {
+                let mut io = Io::new([[RUN; 2], [DRAINED; 2]]);
+                io.route_after_writes = Some((after, p, value));
+                assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::Bypass));
+                assert_eq!(io.writes(), commands()[..after]);
+            }
+        }
+        let mut io = Io::new([[RUN; 2], [RUN; 2], [DRAINED; 2]]);
+        io.route_after_sample = Some((3, 0xfdd9_0024, 1 << 20));
+        assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::AutomaticReset));
+        assert_eq!(io.sample_count, 3);
+        assert_eq!(io.writes(), commands());
+    }
+
+    #[test]
+    fn saved_readback_cannot_substitute_for_fresh_route_preflight() {
+        let mut io = Io::new([[RUN; 2]]);
+        let old = read_routes(DTB, &mut io).unwrap();
+        assert_eq!(old.check(), Ok(()));
+        io.regs.insert(0xfdd9_1e08, 1 << 2);
+        assert_eq!(stall(DTB, ROOT, &mut io), Err(Error::Bypass));
+        assert!(io.writes().is_empty());
+    }
+
+    #[test]
+    fn routing_reads_stop_at_power_loss_and_unknown_topology_has_no_io() {
+        let mut io = Io::new([]);
+        assert_eq!(read_routes(&[], &mut io), Err(Error::NoUnit));
+        assert!(io.events.is_empty());
+        io.regs.insert(0xfd8d_8150, 1 << 17);
+        assert_eq!(read_routes(DTB, &mut io), Err(Error::NotReady));
+        assert!(route_reads(&io).is_empty());
+        let mut io = Io::new([]);
+        io.power_loss_after_route = Some(0xfdd9_0024);
+        assert_eq!(read_routes(DTB, &mut io), Err(Error::NotReady));
+        assert_eq!(route_reads(&io), [0xfdd9_0024]);
+        assert!(io.writes().is_empty());
     }
 
     #[test]

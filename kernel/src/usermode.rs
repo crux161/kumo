@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j619
 //j620
 //j621
 //j622
 //j623
+//j624
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -2553,6 +2553,20 @@ fn attempt_sora(
                 crate::klog_at!(
                     kumo_abi::sys::log_level::NOTICE,
                     "DISPLAY STALL     Refuse    {:?}; read-only, no commands\n",
+                    error
+                );
+            }
+        }
+        match kumo_hal::active::display_mmu_read_routes(boot.platform.dtb) {
+            Ok(routes) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY ROUTES    Audit     global {:#x}, clusters {:x?}, esmart {:x?}, guard={:?}; read-only, no commands\n",
+                    routes.global, routes.clusters, routes.esmart, routes.check());
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY ROUTES    Refuse    {:?}; read-only, no commands\n",
                     error
                 );
             }
