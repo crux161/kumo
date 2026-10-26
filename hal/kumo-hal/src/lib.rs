@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j616
 //j619
 //j621
 //j623
 //j624
+//j625
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -37,13 +37,13 @@ pub mod active {
         handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
         interrupted_at_el0, iommu_create_device_context, iommu_destroy_device_context, iommu_init,
         iommu_map_device_page, iommu_unmap_device_range, irq_unmask, mali_g610_status_from_dtb,
-        map_user_device_block, map_user_page, mask_spi_interrupt, mmu600_pcie_status_from_dtb,
+        map_user_device_block, map_user_page, mask_spi_interrupt, mask_tlmm_gpio_interrupt, mmu600_pcie_status_from_dtb,
         monotonic_nanos, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
         render_qr_diag, render_qr_diag_once, run_el0_image, run_el0_smoke, set_fault_hook,
         set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
         set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
-        system_off, system_reset, timer_irq_count, unmask_spi_interrupt, user_device_page_desc,
+        system_off, system_reset, timer_irq_count, unmask_spi_interrupt, mask_tlmm_gpio_interrupt, user_device_page_desc,
         user_entry_context, user_nc_page_desc, user_page_desc, wait_for_timer_irqs,
         AppsSmmuTopology, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
         DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep, ThreadContext,
@@ -73,7 +73,7 @@ pub mod active {
         install_exception_vectors, interrupted_at_el0, io_apic_timer_irq_count,
         iommu_create_device_context, iommu_destroy_device_context, iommu_init,
         iommu_map_device_page, iommu_unmap_device_range, irq_unmask, local_timer_irq_count,
-        map_user_device_block, map_user_page, mask_pic_timer_source, mask_spi_interrupt,
+        map_user_device_block, map_user_page, mask_pic_timer_source, mask_spi_interrupt, mask_tlmm_gpio_interrupt,
         monotonic_nanos, plan_boot_io_apic_timer, prepare_scheduled_fpsimd_smoke,
         prepare_scheduled_ring3_smoke, prepare_scheduled_user_image, probe_io_apic_timer_interrupt,
         prove_fpsimd_boundary, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
@@ -81,7 +81,7 @@ pub mod active {
         set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
         set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
-        system_off, system_reset, timer_irq_count, unmask_boot_io_apic_timer, unmask_spi_interrupt,
+        system_off, system_reset, timer_irq_count, unmask_boot_io_apic_timer, unmask_spi_interrupt, mask_tlmm_gpio_interrupt,
         user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
         wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs, wait_for_timer_irqs,
         AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,

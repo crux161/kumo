@@ -1,8 +1,8 @@
-//j617
 //j618
 //j619
 //j620
 //j622
+//j625
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -263,9 +263,18 @@ pub enum KernelCallResult {
     PortPacket(PortPacket),
 }
 
-/// An interrupt binding: (irq_number, object_koid, fire_count).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrqState {
+    Bound,
+    MaskFailed,
+    Released,
+}
+
+/// One source reservation; only capability owners keep it live. — KESTREL
+#[derive(Clone, Debug)]
 struct IrqBinding {
+    references: HandleReferences,
+    state: Rc<Cell<IrqState>>,
     irq: u32,
     koid: KoId,
     count: u64,
@@ -433,6 +442,14 @@ fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
         return Err(Errno::NotSupported);
     }
     Ok(key)
+}
+
+fn mask_interrupt_source(irq: u32) -> bool {
+    if decode_tlmm_gpio_irq(irq).is_some() {
+        kumo_hal::active::mask_tlmm_gpio_interrupt(irq)
+    } else {
+        irq >= 32 && kumo_hal::active::mask_spi_interrupt(irq)
+    }
 }
 
 fn complete_interrupt_source(irq: u32) -> Result<(), Errno> {
@@ -970,14 +987,35 @@ impl SyscallEngine {
             .find_map(|r| if r.koid == koid { Some(*r) } else { None })
     }
 
-    /// Reclaim the IRQ binding for `koid`. Called at process teardown so a dead or
-    /// restarted driver does not leak a stale binding (DESIGN/002 §3: drivers are
-    /// soft-state — the kernel reclaims their bindings; the new instance re-binds).
-    /// Returns true if a binding was removed.
-    pub fn release_interrupt(&mut self, koid: KoId) -> bool {
-        let before = self.interrupts.len();
-        self.interrupts.retain(|binding| binding.koid != koid);
-        self.interrupts.len() != before
+    /// Final ownership loss masks the source before removing its binding and watches.
+    /// A failed mask retains the reservation without retry; a cloned engine observes
+    /// the same outcome and cannot mask a subsequently rebound source. — KESTREL
+    pub(crate) fn retire_interrupts(&mut self) -> usize {
+        self.retire_interrupts_with(mask_interrupt_source)
+    }
+
+    fn retire_interrupts_with(&mut self, mut mask: impl FnMut(u32) -> bool) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.interrupts.len() {
+            let binding = &self.interrupts[index];
+            if binding.state.get() == IrqState::Bound && !binding.references.is_referenced() {
+                binding.state.set(if mask(binding.irq) {
+                    IrqState::Released
+                } else {
+                    IrqState::MaskFailed
+                });
+            }
+            if binding.state.get() == IrqState::Released {
+                let koid = binding.koid;
+                self.release_port_bindings(koid);
+                self.interrupts.remove(index);
+                removed += 1;
+            } else {
+                index += 1;
+            }
+        }
+        removed
     }
 
     /// Collect the distinct IRQ lines that currently have a live interrupt binding into
@@ -992,6 +1030,9 @@ impl SyscallEngine {
     pub fn bound_interrupt_irqs(&self, out: &mut [u32]) -> usize {
         let mut len = 0;
         for binding in &self.interrupts {
+            if binding.state.get() == IrqState::Released {
+                continue;
+            }
             if len == out.len() {
                 break;
             }
@@ -1173,7 +1214,10 @@ impl SyscallEngine {
         // `interrupts` nor its length, so the index stays valid.
         let mut i = 0;
         while i < self.interrupts.len() {
-            if self.interrupts[i].irq == irq {
+            if self.interrupts[i].irq == irq
+                && self.interrupts[i].state.get() == IrqState::Bound
+                && self.interrupts[i].references.is_referenced()
+            {
                 if self.interrupts[i].requires_complete && self.interrupts[i].outstanding {
                     i += 1;
                     continue;
@@ -2432,6 +2476,7 @@ impl SyscallEngine {
         // The inner call has dropped its removed entries. This also catches grants
         // discarded by IPC before returning to userspace. — KESTREL
         self.retire_device_contexts();
+        self.retire_interrupts();
         result
     }
 
@@ -3234,19 +3279,39 @@ impl SyscallEngine {
                 if !resource_contains_irq(res, irq) {
                     return KernelCallResult::Status(Errno::AccessDenied.status());
                 }
-                let irq = match configure_interrupt_source(irq) {
-                    Ok(irq) => irq,
-                    Err(error) => return KernelCallResult::Status(error.status()),
-                };
+                let key = interrupt_authority_key(irq);
+                if self.interrupts.iter().any(|binding| {
+                    binding.irq == key && binding.state.get() != IrqState::Released
+                }) {
+                    return KernelCallResult::Status(Errno::BadState.status());
+                }
+                // Reserve both allocations before configuring a physical source. No
+                // second owner may reconfigure/unmask an outstanding delivery. — KESTREL
+                if let Err(error) = process.handles_mut().reserve_insert() {
+                    return KernelCallResult::Status(errno_from_object(error).status());
+                }
+                if self.interrupts.try_reserve(1).is_err() {
+                    return KernelCallResult::Status(Errno::NoMemory.status());
+                }
                 let object = self.objects.create(ObjectKind::Interrupt);
-                let handle = match process
-                    .handles_mut()
-                    .insert(object, Rights::READ | Rights::WAIT | Rights::DUPLICATE)
-                {
-                    Ok(h) => h,
+                let (handle, references) = match process.handles_mut().insert_interrupt(
+                    object,
+                    Rights::READ | Rights::WAIT | Rights::DUPLICATE,
+                ) {
+                    Ok(owner) => owner,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
+                let state = Rc::new(Cell::new(IrqState::Bound));
+                let irq = match configure_interrupt_source(irq) {
+                    Ok(irq) => irq,
+                    Err(error) => {
+                        let _ = process.handles_mut().close(handle);
+                        return KernelCallResult::Status(error.status());
+                    }
+                };
                 self.interrupts.push(IrqBinding {
+                    references,
+                    state,
                     irq,
                     koid: object.koid(),
                     count: 0,
@@ -3268,7 +3333,7 @@ impl SyscallEngine {
                 // If 0, return ShouldWait — the caller parks and the IRQ handler
                 // will wake it.
                 for binding in &mut self.interrupts {
-                    if binding.koid == entry.koid {
+                    if binding.koid == entry.koid && binding.state.get() == IrqState::Bound {
                         if binding.count > 0 {
                             let n = binding.count;
                             binding.count = 0;
@@ -3289,7 +3354,7 @@ impl SyscallEngine {
                         Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                     };
                 for binding in &mut self.interrupts {
-                    if binding.koid == entry.koid {
+                    if binding.koid == entry.koid && binding.state.get() == IrqState::Bound {
                         // Releasing a masked device line must NOT depend on `outstanding`.
                         // `signal_irq` masks every device SPI it sees — including a fire that
                         // raced ahead of this binding, which leaves `outstanding` false with the

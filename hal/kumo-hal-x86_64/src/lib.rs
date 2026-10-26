@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j534
 //j571
 //j609
 //j614
 //j619
+//j625
 
 mod fpsimd;
 mod gdt;
@@ -1225,6 +1225,10 @@ pub fn device_power_status(_dtb: u64, _aperture_base: u64) -> Option<DevicePower
 }
 
 pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
+    false
+}
+
+pub fn mask_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
     false
 }
 

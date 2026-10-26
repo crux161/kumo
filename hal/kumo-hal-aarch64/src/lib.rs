@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j614
 //j615
 //j621
 //j623
 //j624
+//j625
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -5169,6 +5169,21 @@ unsafe fn tlmm_gpio_mask_slot(slot: usize) -> Option<u32> {
     let cfg = unsafe { mmio_read32(base + TLMM_GPIO_INTR_CFG) };
     unsafe { mmio_write32(base + TLMM_GPIO_INTR_CFG, tlmm_gpio_masked_cfg(cfg)) };
     Some(irq_key)
+}
+
+/// Mask this pin/PDC route without clearing status or disabling the shared parent.
+/// Final interrupt ownership loss uses the same mask as delivery. — KESTREL
+#[cfg(target_os = "none")]
+pub fn mask_tlmm_gpio_interrupt(irq_key: u32) -> bool {
+    let Some(slot) = tlmm_wake_slot_for_key(irq_key) else {
+        return false;
+    };
+    unsafe { tlmm_gpio_mask_slot(slot) == Some(irq_key) }
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn mask_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
+    true
 }
 
 #[cfg(target_os = "none")]

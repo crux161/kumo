@@ -1,4 +1,5 @@
 //j618
+//j625
 
 use alloc::{
     rc::{Rc, Weak},
@@ -147,9 +148,9 @@ impl HandleTable {
     }
 
     pub fn insert(&mut self, object: KernelObject, rights: Rights) -> Result<Handle, ObjectError> {
-        // Every DeviceCtx must start with one canonical reference lineage. Subsequent
+        // Every DeviceCtx/Interrupt must start with one canonical reference lineage. Subsequent
         // grants clone/move its owner rather than minting from copied metadata. — KESTREL
-        if object.kind == ObjectKind::DeviceCtx {
+        if matches!(object.kind, ObjectKind::DeviceCtx | ObjectKind::Interrupt) {
             return Err(ObjectError::AccessDenied);
         }
         self.insert_parts(object.koid, object.kind, rights, None)
@@ -163,6 +164,25 @@ impl HandleTable {
         if object.kind != ObjectKind::DeviceCtx {
             return Err(ObjectError::WrongType);
         }
+        self.insert_referenced(object, rights)
+    }
+
+    pub(crate) fn insert_interrupt(
+        &mut self,
+        object: KernelObject,
+        rights: Rights,
+    ) -> Result<(Handle, HandleReferences), ObjectError> {
+        if object.kind != ObjectKind::Interrupt {
+            return Err(ObjectError::WrongType);
+        }
+        self.insert_referenced(object, rights)
+    }
+
+    fn insert_referenced(
+        &mut self,
+        object: KernelObject,
+        rights: Rights,
+    ) -> Result<(Handle, HandleReferences), ObjectError> {
         let reference = Rc::new(());
         let observer = HandleReferences(Rc::downgrade(&reference));
         let handle = self.insert_parts(object.koid, object.kind, rights, Some(reference))?;

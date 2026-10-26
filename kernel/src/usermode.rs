@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j620
 //j621
 //j622
 //j623
 //j624
+//j625
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1181,11 +1181,8 @@ fn teardown_process_and_signal(koid: KoId) {
                     }
                 }
                 // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
-                // reclaim its IRQ bindings and Resource grants so a restarted instance
+                // reclaim its Resource grants so a restarted instance
                 // re-binds cleanly instead of stacking orphaned entries in the engine.
-                kumo_abi::ObjectKind::Interrupt => {
-                    sora.engine.release_interrupt(entry.koid);
-                }
                 kumo_abi::ObjectKind::Resource => {
                     sora.engine.release_resource(entry.koid);
                 }
@@ -1193,13 +1190,18 @@ fn teardown_process_and_signal(koid: KoId) {
             }
             // Any object this process owned may have been a port or a watched object;
             // drop port bindings on either side so a dead watch never lingers.
-            if entry.kind != kumo_abi::ObjectKind::DeviceCtx {
+            if !matches!(
+                entry.kind,
+                kumo_abi::ObjectKind::DeviceCtx | kumo_abi::ObjectKind::Interrupt
+            ) {
                 sora.engine.release_port_bindings(entry.koid);
             }
         }
         // Drained entries have now dropped their capability owners. Retain uncertain
-        // contexts before publishing termination; no wake/re-entry in the check. — KESTREL
+        // contexts and retire final IRQ owners before publishing termination; surviving
+        // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
         sora.engine.retire_device_contexts();
+        sora.engine.retire_interrupts();
         if primary {
             sora.process.signal(kumo_abi::Signals::TERMINATED);
         } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {
