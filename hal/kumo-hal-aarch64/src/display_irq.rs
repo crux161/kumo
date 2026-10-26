@@ -1,15 +1,16 @@
 //j626
 //j630
+//j631
 
 //! DESIGN/022 D1d-c2b: boot-retained first refusal, independent of driver/engine life.
 //! Capture both banks on IRQ/timer checks before any Sora borrow, retain the first
 //! observation, and gate checked control writes plus every IRQ enable/completion.
 //! TRM Part2 MMU0/1 pp1047–1049 supplies register facts. No MMU register is written.
-//! This still admits only paging-off/zero-mask diagnostics. A translated root owner,
-//! MMU acknowledgement, verified containment and recovery remain later. — KESTREL
+//! Live admission requires a published root and increasing epoch; detach stays blocked.
+//! Runtime activation and verified fault recovery remain later. — KESTREL
 
 use crate::{display_iommu, display_unit, power_unit::PowerIo};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const IRQ: u32 = 188;
 const BANKS: [u64; 2] = [0xfdd9_7e00, 0xfdd9_7f00];
@@ -18,6 +19,9 @@ const WATCHING: u32 = 1;
 const REFUSED: u32 = 2;
 const UPDATING: u32 = 3;
 const LATCHING: u32 = 4;
+const LIVE: u32 = 5;
+const ARMED: u32 = 6;
+const BLOCKED: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bank {
@@ -36,11 +40,13 @@ pub enum Error {
     Paging,
     Quarantined,
     Busy,
+    RootMismatch,
 }
 
 /// Frozen first refusal, retained independently of IRQ handles or any engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Fault {
+    pub epoch: u64,
     pub error: Error,
     pub banks: Option<[Bank; 2]>,
     pub line_masked: bool,
@@ -55,6 +61,7 @@ impl Fault {
             Error::Paging => 3,
             Error::Quarantined => 4,
             Error::Busy => 5,
+            Error::RootMismatch => 6,
         };
         let base = f::KERNEL_DISPLAY
             | ((reason as u64) << f::REASON_SHIFT)
@@ -534,6 +541,9 @@ pub struct Guard {
     reason: AtomicU32,
     flags: AtomicU32,
     words: [AtomicU32; 10],
+    root: AtomicU32,
+    epoch: AtomicU64,
+    fault_epoch: AtomicU64,
 }
 impl Default for Guard {
     fn default() -> Self {
@@ -544,6 +554,9 @@ impl Guard {
     pub const fn new() -> Self {
         Self {
             state: AtomicU32::new(UNREGISTERED),
+            root: AtomicU32::new(0),
+            epoch: AtomicU64::new(0),
+            fault_epoch: AtomicU64::new(0),
             reason: AtomicU32::new(0),
             flags: AtomicU32::new(0),
             words: [const { AtomicU32::new(0) }; 10],
@@ -566,10 +579,13 @@ impl Guard {
             Error::MmuSource => 2,
             Error::Paging => 3,
             Error::Busy => 5,
+            Error::RootMismatch => 6,
             _ => 4,
         };
         // LATCHING excludes readers until all frozen words precede the Release
         // publication. A later quiet observation cannot overwrite this cause. — KESTREL
+        self.fault_epoch
+            .store(self.epoch.load(Ordering::Acquire), Ordering::Relaxed);
         self.reason.store(reason, Ordering::Relaxed);
         let mut flags = if line_masked { 2 } else { 0 };
         if let Some(banks) = banks {
@@ -599,6 +615,7 @@ impl Guard {
             2 => Error::MmuSource,
             3 => Error::Paging,
             5 => Error::Busy,
+            6 => Error::RootMismatch,
             _ => Error::Quarantined,
         };
         let banks = (flags & 1 != 0).then(|| {
@@ -614,13 +631,17 @@ impl Guard {
             })
         });
         Some(Fault {
+            epoch: self.fault_epoch.load(Ordering::Relaxed),
             error,
             banks,
             line_masked: flags & 2 != 0,
         })
     }
     pub fn control_allowed(&self) -> bool {
-        matches!(self.state.load(Ordering::Acquire), UNREGISTERED | WATCHING)
+        matches!(
+            self.state.load(Ordering::Acquire),
+            UNREGISTERED | WATCHING | LIVE
+        )
     }
     pub fn register(
         &self,
@@ -644,16 +665,121 @@ impl Guard {
         }
         self.observe(io, true)
     }
+    fn inspect_mode(
+        &self,
+        io: &mut impl PowerIo,
+        mode: u32,
+    ) -> Result<[Bank; 2], (Error, Option<[Bank; 2]>)> {
+        if mode == WATCHING {
+            return inspect(io);
+        }
+        let banks = sample(io).map_err(|e| (e, None))?;
+        for base in BANKS {
+            let root = word(io, base).map_err(|e| (e, None))?;
+            if root != self.root.load(Ordering::Acquire) {
+                return Err((Error::RootMismatch, Some(banks)));
+            }
+        }
+        if !display_unit::UNITS[0].ready(io) {
+            return Err((Error::NotReady, None));
+        }
+        if banks.iter().any(|b| b.status & 5 != 1) {
+            return Err((Error::Paging, Some(banks)));
+        }
+        if banks
+            .iter()
+            .any(|b| b.status & 2 != 0 || b.raw != 0 || b.mask != 3 || b.pending != 0)
+        {
+            return Err((Error::MmuSource, Some(banks)));
+        }
+        Ok(banks)
+    }
+    pub fn binding(&self) -> (u64, u64) {
+        (
+            self.root.load(Ordering::Acquire) as u64,
+            self.epoch.load(Ordering::Acquire),
+        )
+    }
+    pub fn power_allowed(&self) -> bool {
+        matches!(self.state.load(Ordering::Acquire), UNREGISTERED | WATCHING)
+    }
+    pub fn claim_update(&self, root: &crate::rockchip_v2::PublishedRoot<'_>, epoch: u64) -> bool {
+        let address = root.physical();
+        if self.state.load(Ordering::Acquire) != UPDATING
+            || address == 0
+            || address & 4095 != 0
+            || address >= 1 << 32
+            || epoch <= self.epoch.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.root.store(address as u32, Ordering::Relaxed);
+        self.epoch.store(epoch, Ordering::Release);
+        true
+    }
+    pub fn arm(&self, io: &mut impl PowerIo) -> bool {
+        if self.state.load(Ordering::Acquire) != UPDATING
+            || self.root.load(Ordering::Acquire) == 0
+            || self.epoch.load(Ordering::Acquire) == 0
+        {
+            return false;
+        }
+        if let Err((e, banks)) = self.inspect_mode(io, ARMED) {
+            self.refuse(e, banks.and_then(|_| capture(io)), true);
+            return false;
+        }
+        self.state
+            .compare_exchange(UPDATING, ARMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    pub fn finish_live(&self, io: &mut impl PowerIo) -> bool {
+        if self.state.load(Ordering::Acquire) != ARMED {
+            return false;
+        }
+        if let Err((e, banks)) = self.inspect_mode(io, ARMED) {
+            self.refuse(e, banks.and_then(|_| capture(io)), false);
+            return false;
+        }
+        self.state
+            .compare_exchange(ARMED, LIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    pub fn finish_blocked(&self, io: &mut impl PowerIo) -> bool {
+        if self.state.load(Ordering::Acquire) != UPDATING {
+            return false;
+        }
+        if let Err((e, banks)) = inspect(io) {
+            self.refuse(e, banks.and_then(|_| capture(io)), true);
+            return false;
+        }
+        for base in BANKS {
+            if word(io, base) != Ok(0) {
+                self.refuse(Error::RootMismatch, None, true);
+                return false;
+            }
+        }
+        if !display_unit::UNITS[0].ready(io) {
+            self.refuse(Error::NotReady, None, true);
+            return false;
+        }
+        self.root.store(0, Ordering::Release);
+        self.state
+            .compare_exchange(UPDATING, BLOCKED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    pub fn fail_control(&self, io: &mut impl PowerIo, masked: bool) {
+        self.refuse(Error::NotReady, capture(io), masked);
+    }
     fn observe(&self, io: &mut impl PowerIo, masked: bool) -> Result<[Bank; 2], Error> {
         let state = self.state.load(Ordering::Acquire);
-        if state == UPDATING {
+        if state == UPDATING || state == BLOCKED {
             return Err(Error::Busy);
         }
-        if state != WATCHING {
+        if !matches!(state, WATCHING | ARMED | LIVE) {
             return Err(Error::Quarantined);
         }
-        match inspect(io) {
-            Ok(banks) if self.state.load(Ordering::Acquire) == WATCHING => Ok(banks),
+        match self.inspect_mode(io, state) {
+            Ok(banks) if self.state.load(Ordering::Acquire) == state => Ok(banks),
             Ok(_) => Err(Error::Quarantined),
             Err((e, banks)) => {
                 self.refuse(e, banks.and_then(|_| capture(io)), masked);
@@ -679,11 +805,11 @@ impl Guard {
             return None;
         }
         match self.state.load(Ordering::Acquire) {
-            UNREGISTERED | UPDATING | LATCHING => return None,
+            UNREGISTERED | UPDATING | LATCHING | BLOCKED => return None,
             REFUSED => return self.fault(),
             _ => {}
         }
-        if let Err((error, banks)) = inspect(io) {
+        if let Err((error, banks)) = self.inspect_mode(io, self.state.load(Ordering::Acquire)) {
             let masked = mask(IRQ);
             self.refuse(error, banks.and_then(|_| capture(io)), masked);
         }
@@ -692,10 +818,12 @@ impl Guard {
     /// Serialize trusted boot probes with checked control/IRQ operations. Drop or
     /// a failed operation never reopens this state automatically. — KESTREL
     pub fn begin_update(&self, mask: impl FnOnce(u32) -> bool) -> bool {
-        if self
-            .state
-            .compare_exchange(WATCHING, UPDATING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, WATCHING | LIVE | BLOCKED)
+            || self
+                .state
+                .compare_exchange(state, UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return false;
         }
@@ -706,6 +834,10 @@ impl Guard {
         true
     }
     pub fn end_update(&self, io: &mut impl PowerIo) -> bool {
+        if self.epoch.load(Ordering::Acquire) != 0 {
+            self.fail_update();
+            return false;
+        }
         if self.state.load(Ordering::Acquire) != UPDATING {
             return false;
         }

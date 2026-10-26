@@ -1,8 +1,8 @@
-//j625
 //j626
 //j628
 //j629
 //j630
+//j631
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -8780,6 +8780,7 @@ mod tests {
             let capacity = e.devices.device_ctx_faults.capacity();
             assert!(e.interrupts.is_empty());
             let fault = DisplayFault {
+                epoch: 0,
                 error: E::MmuSource,
                 line_masked: true,
                 banks: Some([
@@ -8838,6 +8839,7 @@ mod tests {
                 assert_eq!((info.fault_record >> f::BANK_SHIFT) & 3, bank);
             }
             copy.signal_display_fault(DisplayFault {
+                epoch: 0,
                 error: E::NotReady,
                 banks: None,
                 line_masked: false,

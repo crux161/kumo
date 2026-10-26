@@ -1,5 +1,6 @@
 //j615
 //j628
+//j631
 
 //! DESIGN/022 D1d-b1: Rockchip-v2 descriptors and an owning read-only page table.
 //! 1024 directory words × 1024 leaf words × 4 KiB cover a 32-bit IOVA. The descriptor
@@ -175,6 +176,18 @@ impl DetachedRoot {
     }
 }
 
+/// A borrowed root from a publication whose uncertain Drop retains its pages.
+/// This cannot be constructed from a caller-supplied address. — KESTREL
+pub struct PublishedRoot<'a> {
+    physical: u64,
+    owner: core::marker::PhantomData<&'a ()>,
+}
+impl PublishedRoot<'_> {
+    pub(crate) fn physical(&self) -> u64 {
+        self.physical
+    }
+}
+
 /// Own the directory before exposing it. Dropping an uncertain publication retains
 /// every table page and its allocator; only a matching checked reset reclaims it.
 /// VMO pins belong to the kernel's outer owner and must follow the same rule. — KESTREL
@@ -182,6 +195,14 @@ pub struct PublishedTable<M: TableMemory> {
     table: ManuallyDrop<OfflineTable<M>>,
 }
 impl<M: TableMemory> PublishedTable<M> {
+    /// This token can only borrow an owner whose uncertain Drop retains all pages.
+    /// The caller's outer owner must likewise retain its actual VMO pins. — KESTREL
+    pub fn root_ref(&self) -> PublishedRoot<'_> {
+        PublishedRoot {
+            physical: self.table.root,
+            owner: core::marker::PhantomData,
+        }
+    }
     pub fn root(&self) -> u64 {
         self.table.root
     }

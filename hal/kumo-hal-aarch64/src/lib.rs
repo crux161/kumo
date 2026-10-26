@@ -1,15 +1,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j626
 //j627
 //j628
 //j629
 //j630
+//j631
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod display_control;
 pub mod display_dma;
 pub mod display_iommu;
 pub mod display_irq;
@@ -3406,6 +3407,9 @@ pub fn device_power_up(
 ) -> Result<DevicePowerUpOutcome, DevicePowerError> {
     let bytes = unsafe { dtb_bytes(dtb) }.ok_or(DevicePowerError::NoUnit)?;
     let unit = power_unit::live_unit(bytes, aperture_base).ok_or(DevicePowerError::NoUnit)?;
+    if aperture_base == display_unit::VOP && !DISPLAY_INTERRUPT_GUARD.power_allowed() {
+        return Err(DevicePowerError::NoUnit);
+    }
     power_unit::power_up(unit, &mut PhysPowerIo)
 }
 
@@ -3595,6 +3599,16 @@ pub fn display_fault_poll(_irq: u32) -> Option<display_irq::Fault> {
 }
 
 #[cfg(target_os = "none")]
+impl display_control::ControlIo for PhysPowerIo {
+    fn mask_shared(&mut self) -> bool {
+        mask_spi_interrupt(188)
+    }
+    fn enable_shared(&mut self) -> bool {
+        configure_spi_interrupt(188)
+    }
+}
+
+#[cfg(target_os = "none")]
 static DISPLAY_INTERRUPT_GUARD: display_irq::Guard = display_irq::Guard::new();
 
 #[cfg(target_os = "none")]
@@ -3670,6 +3684,9 @@ pub fn device_reset_set(dtb: u64, base: u64, line: u32, asserted: bool) -> bool 
     let Some(bytes) = (unsafe { dtb_bytes(dtb) }) else {
         return false;
     };
+    if base == display_unit::VOP && !DISPLAY_INTERRUPT_GUARD.power_allowed() {
+        return false;
+    }
     display_unit::reset_set(bytes, base, line, asserted, &mut PhysPowerIo)
 }
 #[cfg(not(target_os = "none"))]
