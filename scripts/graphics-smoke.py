@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j573
 #j616
 #j617
 #j618
 #j619
+#j620
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -177,6 +177,8 @@ def main():
             print("DeviceCtx reference smoke green: duplicate, queued transfer, process drain, final drop")
             assert b"checked refusal, final close, backing retained, unit reserved OK" in transcript, f"missing checked context retirement proof; inspect {serial}"
             print("DeviceCtx retirement smoke green: checked refusal, final close, backing retained, unit reserved")
+            assert b"engine replacement, roots/backing held, alias denial, pre-zero gap OK" in transcript, f"missing kernel retention proof; inspect {serial}"
+            print("DeviceCtx retention smoke green: engine replacement, roots/backing held, alias denial, pre-zero gap")
             assert b"sora: VmoCreate SIMD preserved" in transcript, f"missing EL0 vector proof; inspect {serial}"
             print("Device table RAM smoke green: private pages, read-only walk, VMO alias denial, DMA gap, reuse, EL0 SIMD")
             assert transcript.count(client) == 1, f"missing client present; inspect {serial}"

@@ -5,6 +5,7 @@ use kumo_hal::PageFlags;
 
 //j469
 //j616
+//j620
 
 pub mod heap;
 
@@ -46,7 +47,7 @@ pub unsafe fn alloc_zeroed_frame_excluding(boot: &BootInfo, excluded: &[Range]) 
     let framebuffer = boot_framebuffer_range(boot);
     loop {
         let frame = frames.next_frame()?.start;
-        if frame < watermark {
+        if frame < watermark || !crate::syscall::kernel_device_frame_allowed(frame, PAGE_SIZE) {
             continue;
         }
         // The AArch64 permanent identity/physmap is built from 2 MiB blocks. Do not hand a
@@ -113,7 +114,11 @@ pub unsafe fn alloc_contiguous_frames_excluding(
     let mut prev: u64 = 0;
     loop {
         let frame = frames.next_frame()?.start;
-        if frame < watermark {
+        // DMA VMOs can expose a whole uncached 2 MiB CPU block. Skip that actual
+        // alias reach before zeroing, just as for the private-table exclusions. — KESTREL
+        if frame < watermark
+            || !crate::syscall::kernel_device_frame_allowed(frame & !(BLOCK_2M - 1), BLOCK_2M)
+        {
             base = None;
             have = 0;
             continue;

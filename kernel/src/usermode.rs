@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j601
 //j609
 //j614
 //j616
 //j619
+//j620
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -114,6 +114,22 @@ struct SoraCell(UnsafeCell<Option<RefCell<SoraState>>>);
 unsafe impl Sync for SoraCell {}
 static SORA: SoraCell = SoraCell(UnsafeCell::new(None));
 
+/// Retain the stopped runtime's device payload before any replacement allocates RAM.
+/// The serialized boot thread calls this outside Sora borrows; IRQ paths tolerate an
+/// absent runtime. Refuse replacement if a caller still owns its borrow. — KESTREL
+fn discard_previous_runtime() -> Result<(), UsermodeError> {
+    let slot = unsafe { &mut *SORA.0.get() };
+    if slot
+        .as_ref()
+        .is_some_and(|state| state.try_borrow_mut().is_err())
+    {
+        return Err(UsermodeError::ChannelSetup);
+    }
+    let previous = slot.take();
+    drop(previous);
+    Ok(())
+}
+
 pub fn with_sora_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SoraState) -> R,
@@ -145,6 +161,7 @@ pub(crate) fn install_standalone_user_runtime(
     root_vmar: Vmar,
     kernel_ttbr0: u64,
 ) -> Result<Handle, UsermodeError> {
+    discard_previous_runtime()?;
     let mut engine = SyscallEngine::new();
     let job = Job::root(engine.objects_mut());
     let mut process = Process::new(engine.objects_mut(), &job, root_vmar);
@@ -2301,6 +2318,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
 /// synchronous path. The SVC hook reads the `SORA` static, so install a minimal state
 /// for it — there is no prior Sora to preserve on this path.
 pub fn run(boot: &BootInfo) -> UserReport {
+    discard_previous_runtime().expect("stopped previous runtime");
     let mut engine = SyscallEngine::new();
     let job = Job::root(engine.objects_mut());
     let vmar = Vmar::new(USER_ROOT_BASE, USER_ROOT_SIZE).expect("user vmar");
@@ -2415,6 +2433,7 @@ fn attempt_sora(
     recipe: &SoraRecipe,
     initrd_bytes: &[u8],
 ) -> Result<(UserReport, u64), UsermodeError> {
+    discard_previous_runtime()?;
     let mut engine = SyscallEngine::new();
     engine.set_boot_info(*boot);
     let job = Job::root(engine.objects_mut());
