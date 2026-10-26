@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j595
 //j601
 //j609
 //j614
 //j616
+//j619
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1174,8 +1174,13 @@ fn teardown_process_and_signal(koid: KoId) {
             }
             // Any object this process owned may have been a port or a watched object;
             // drop port bindings on either side so a dead watch never lingers.
-            sora.engine.release_port_bindings(entry.koid);
+            if entry.kind != kumo_abi::ObjectKind::DeviceCtx {
+                sora.engine.release_port_bindings(entry.koid);
+            }
         }
+        // Drained entries have now dropped their capability owners. Retain uncertain
+        // contexts before publishing termination; no wake/re-entry in the check. — KESTREL
+        sora.engine.retire_device_contexts();
         if primary {
             sora.process.signal(kumo_abi::Signals::TERMINATED);
         } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j570
 //j571
 //j609
 //j614
 //j616
+//j619
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -213,5 +213,7 @@ pub trait IoMmuController {
         stream_id: u32,
         pgd_phys: u64,
     ) -> Result<(), McErr>;
-    fn destroy_device_context(iommu: &mut Self::Context, stream_id: u32);
+    /// Success requires confirmed DMA block/drain/detach and invalidation. An
+    /// unsupported or uncertain backend must return an error. — KESTREL
+    fn destroy_device_context(iommu: &mut Self::Context, stream_id: u32) -> Result<(), McErr>;
 }

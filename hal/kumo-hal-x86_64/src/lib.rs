@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j493
 //j534
 //j571
 //j609
 //j614
+//j619
 
 mod fpsimd;
 mod gdt;
@@ -1235,6 +1235,13 @@ pub fn complete_tlmm_gpio_interrupt(_irq_key: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_iommu_detach_cannot_authorize_releasing_memory() {
+        for kind in [0, 1, u32::MAX] {
+            assert!(!iommu_destroy_device_context(kind, 0, u32::MAX));
+        }
+    }
     use core::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
@@ -1392,7 +1399,10 @@ pub fn iommu_create_device_context(
     false
 }
 
-pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) {}
+/// No detach/drain proof is implemented. Callers must retain reachable memory. — KESTREL
+pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) -> bool {
+    false
+}
 
 pub fn iommu_map_device_page(
     _kind: u32,

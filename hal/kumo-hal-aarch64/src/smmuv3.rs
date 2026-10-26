@@ -1,5 +1,6 @@
 //j482
 //j483
+//j619
 
 //! ARM SMMUv3 scaffolding and RK3588 MMU600 integration-status discovery.
 //!
@@ -247,8 +248,10 @@ pub fn iommu_create_device_context(
     true
 }
 
-pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) {
-    // TODO: Invalidate STE
+/// True only after DMA is blocked, drained and detached with invalidation confirmed.
+/// This backend has no such implementation; a void/no-op hook was not proof. — KESTREL
+pub fn iommu_destroy_device_context(_kind: u32, _phys_base: u64, _stream_id: u32) -> bool {
+    false
 }
 
 pub fn iommu_map_device_page(
@@ -466,6 +469,13 @@ fn align4(value: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_detach_implementation_cannot_authorize_releasing_memory() {
+        for kind in [0, IOMMU_KIND_SMMUV3, u32::MAX] {
+            assert!(!iommu_destroy_device_context(kind, 0, u32::MAX));
+        }
+    }
     extern crate std;
     use std::format;
 
