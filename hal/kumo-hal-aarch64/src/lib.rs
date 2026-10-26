@@ -1,15 +1,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j621
 //j623
 //j624
 //j625
 //j626
+//j627
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod cjk_font;
+pub mod display_dma;
 pub mod display_iommu;
 pub mod display_irq;
 pub mod display_mmu;
@@ -3497,6 +3498,34 @@ pub fn display_iommu_from_dtb(dtb: u64) -> Option<DisplayIoMmu> {
 #[cfg(not(target_os = "none"))]
 pub fn display_iommu_from_dtb(_dtb: u64) -> Option<DisplayIoMmu> {
     None
+}
+
+#[cfg(target_os = "none")]
+pub fn display_dma_probe(
+    dtb: u64,
+) -> Result<
+    (
+        display_dma::State,
+        display_dma::StopReport,
+        display_dma::State,
+    ),
+    display_dma::Error,
+> {
+    let bytes = unsafe { dtb_bytes(dtb) }.ok_or(display_dma::Error::NoUnit)?;
+    display_dma::probe(bytes, &mut PhysPowerIo)
+}
+#[cfg(not(target_os = "none"))]
+pub fn display_dma_probe(
+    _dtb: u64,
+) -> Result<
+    (
+        display_dma::State,
+        display_dma::StopReport,
+        display_dma::State,
+    ),
+    display_dma::Error,
+> {
+    Err(display_dma::Error::NoUnit)
 }
 
 #[cfg(target_os = "none")]

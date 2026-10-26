@@ -9,11 +9,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j622
 //j623
 //j624
 //j625
 //j626
+//j627
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -450,6 +450,8 @@ pub enum UsermodeError {
     DeviceTableMemory(Errno),
     #[cfg(feature = "arch_aarch64")]
     DisplayIoMmuTopology,
+    #[cfg(feature = "arch_aarch64")]
+    DisplayDmaStop,
     UserThreadInit(crate::user_thread::UserSchedError),
     BadSegmentRange,
     ChannelSetup,
@@ -2438,6 +2440,10 @@ fn attempt_sora(
     recipe: &SoraRecipe,
     initrd_bytes: &[u8],
 ) -> Result<(UserReport, u64), UsermodeError> {
+    // Hardware preflight can fail before Sora exists. Keep the already-safe IRQ
+    // hook polling serial reset in that state too; a busy/missing Sora defers. — KESTREL
+    kumo_hal::active::set_interrupt_hook(signal_irq);
+
     discard_previous_runtime()?;
     let mut engine = SyscallEngine::new();
     engine.set_boot_info(*boot);
@@ -2589,6 +2595,25 @@ fn attempt_sora(
                     "DISPLAY ROUTES    Refuse    {:?}; read-only, no commands\n",
                     error
                 );
+            }
+        }
+    }
+    #[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+    if boot.board_id() == "orange-pi-5-plus" {
+        match kumo_hal::active::display_dma_probe(boot.platform.dtb) {
+            Ok((before, blocked, resumed)) => {
+                crate::klog_at!(kumo_abi::sys::log_level::NOTICE,
+                    "DISPLAY DMA STOP Check     VP2 {:#x}->{:#x}, hold {:#x}, BIU request/ack/idle {:#x}/{:#x}/{:#x}, counter {}->{}; GOP retained; no MMU commands\n",
+                    before.ports[2], resumed.ports[2], blocked.hold,
+                    blocked.bus.request, blocked.bus.ack, blocked.bus.idle, before.counter, resumed.counter);
+            }
+            Err(error) => {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::ERR,
+                    "DISPLAY DMA STOP Refuse    {:?}; no automatic resume or memory release\n",
+                    error
+                );
+                return Err(UsermodeError::DisplayDmaStop);
             }
         }
     }
@@ -2799,8 +2824,6 @@ fn attempt_sora(
 
     kumo_hal::active::set_svc_hook(svc_hook);
     kumo_hal::active::set_fault_hook(fault_hook);
-    #[cfg(target_os = "none")]
-    kumo_hal::active::set_interrupt_hook(signal_irq);
     #[cfg(target_os = "none")]
     crate::user_thread::install_preemption_hook();
     // Returns when Sora *parks* on the (drained) console channel — Sora stays alive as
