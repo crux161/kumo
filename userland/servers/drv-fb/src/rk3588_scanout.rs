@@ -1,8 +1,8 @@
-//j610
 //j612
 //j632
 //j634
 //j635
+//j636
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
@@ -655,5 +655,126 @@ mod tests {
             let x = bar * 200 + 100;
             assert_ne!(pattern(x, 400, w, h), pattern(x + 200, 400, w, h));
         }
+    }
+}
+
+/// Server-placed, unscaled native image in the already-owned known mode. Timing,
+/// output selection, format, clocks, MMUs and bypass fields stay with their owners. — KESTREL
+pub fn image_program(target: &Program, image: kumo_graphics::native::Image) -> Option<Program> {
+    use crate::rk3588_mode::{
+        DMT_1600X900_60_RB as MODE, ESMART2_R0_ACT_INFO, ESMART2_R0_DSP_INFO, ESMART2_R0_DSP_OFFSET,
+    };
+    if !image.valid() {
+        return None;
+    }
+    let mut program = *target;
+    let size = (image.surface.height - 1) << 16 | (image.surface.width - 1);
+    for word in &mut program.words {
+        word.value = match word.offset {
+            ESMART2_R0_MST_YRGB => kumo_graphics::native::IMAGE_IOVA as u32,
+            ESMART2_R0_VIR => image.surface.stride,
+            ESMART2_R0_ACT_INFO | ESMART2_R0_DSP_INFO => size,
+            ESMART2_R0_DSP_OFFSET => {
+                ((MODE.v_active - image.surface.height) / 2) << 16
+                    | ((MODE.h_active - image.surface.width) / 2)
+            }
+            _ => word.value,
+        };
+    }
+    Some(program)
+}
+fn region_word(offset: u32) -> bool {
+    use crate::rk3588_mode::{ESMART2_R0_ACT_INFO, ESMART2_R0_DSP_INFO, ESMART2_R0_DSP_OFFSET};
+    matches!(
+        offset,
+        ESMART2_R0_MST_YRGB
+            | ESMART2_R0_VIR
+            | ESMART2_R0_ACT_INFO
+            | ESMART2_R0_DSP_INFO
+            | ESMART2_R0_DSP_OFFSET
+    )
+}
+/// Stage only the five region geometry/address words and one consumed VP2 load.
+pub fn stage_region(hw: &mut impl Hardware, program: &Program) {
+    for w in program.words.iter().filter(|w| region_word(w.offset)) {
+        hw.write(w.block, w.offset, w.value);
+        hw.barrier();
+    }
+    hw.write(Block::Vop, REG_CFG_DONE, COMMIT_VP2);
+    hw.barrier();
+}
+/// Retirement needs the complete replacement geometry/address, consumed load and a
+/// freshly healthy DeviceCtx. A register match or frame-start alone is insufficient. — KESTREL
+pub fn region_loaded(hw: &mut impl Hardware, program: &Program, dma_ready: bool) -> bool {
+    dma_ready
+        && hw.read(Block::Vop, REG_CFG_DONE) & VP2_LOAD_PENDING == 0
+        && program
+            .words
+            .iter()
+            .filter(|w| region_word(w.offset))
+            .all(|w| hw.read(w.block, w.offset) == w.value)
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::rk3588_mode::{Framebuffer, DMT_1600X900_60_RB};
+    extern crate std;
+    use std::collections::BTreeMap;
+    struct Io(BTreeMap<u32, u32>);
+    impl Hardware for Io {
+        fn read(&mut self, _: Block, p: u32) -> u32 {
+            *self.0.get(&p).unwrap_or(&0)
+        }
+        fn write(&mut self, b: Block, p: u32, v: u32) {
+            assert_eq!(b, Block::Vop);
+            assert!(region_word(p) || p == REG_CFG_DONE);
+            self.0.insert(p, v);
+        }
+        fn barrier(&mut self) {}
+        fn sleep_ms(&mut self, _: u64) {
+            panic!("no dwell in register policy")
+        }
+    }
+    #[test]
+    fn shared_image_changes_only_region_and_retires_only_after_consumed_healthy_console() {
+        let target = Program::build(
+            DMT_1600X900_60_RB,
+            Framebuffer {
+                phys: 0xed9e0000,
+                width: 1600,
+                height: 900,
+                stride: 1600,
+            },
+        )
+        .unwrap();
+        let image = kumo_graphics::native::Image {
+            sequence: 1,
+            surface: kumo_graphics::DEMO,
+            offset: 0x10000,
+            vmo_bytes: 0x30000,
+            gpu_point: 3,
+            checksum: 0,
+        };
+        let native = image_program(&target, image).unwrap();
+        assert_eq!(native.checks, target.checks);
+        for (a, b) in native.words.iter().zip(target.words) {
+            if !region_word(a.offset) {
+                assert_eq!(*a, b);
+            }
+        }
+        let mut io = Io(BTreeMap::new());
+        stage_region(&mut io, &native);
+        assert!(!region_loaded(&mut io, &native, true));
+        io.0.insert(REG_CFG_DONE, 0x8000);
+        assert!(region_loaded(&mut io, &native, true));
+        assert!(!region_loaded(&mut io, &target, true));
+        stage_region(&mut io, &target);
+        assert!(!region_loaded(&mut io, &target, true));
+        io.0.insert(REG_CFG_DONE, 0x8000);
+        assert!(!region_loaded(&mut io, &target, false));
+        assert!(region_loaded(&mut io, &target, true));
+        io.0.insert(ESMART2_R0_VIR, 256);
+        assert!(!region_loaded(&mut io, &target, true));
     }
 }

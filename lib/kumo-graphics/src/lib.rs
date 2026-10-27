@@ -1,11 +1,14 @@
 #![no_std]
 //j567
 //j568
+//j636
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
 //! addresses or screen coordinates. Only one request may be outstanding. Stop writing before
 //! Present, and reuse the buffer only after its matching reply. A reply means copied, not vblank.
+
+pub mod native;
 
 pub const SURFACE_BYTES: usize = 256 * 1024;
 pub const REQUEST_LEN: usize = 24;

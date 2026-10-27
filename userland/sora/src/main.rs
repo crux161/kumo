@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j629
 //j632
 //j633
 //j634
 //j635
+//j636
 
 extern crate alloc;
 
@@ -84,24 +84,32 @@ static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 /// One cooperative G6b lease per boot. It is transferred once and never re-granted after
 /// client/driver failure; a new boot resets the device before any fresh grant. — TIMBERDOODLE
 static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
+static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
 
 fn launch_gpu_client(initrd: Handle) {
     let channel = GPU_CLIENT_CHANNEL.swap(0, Ordering::Relaxed);
     if channel == 0 {
         return;
     }
-    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    let native = GPU_NATIVE_CHANNEL.swap(0, Ordering::Relaxed);
+    let mut flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    if native != 0 {
+        flags |= ProcessRunFlags::TRANSFER_ARG2.bits();
+    }
     if run_elf(
         initrd,
         kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
         u64::from(channel),
-        0,
+        u64::from(native),
         flags,
         b"gpu-client",
     ) {
         log(b"gpu-client: session handed to a separate process\n");
     } else {
         let _ = handle_close(Handle(channel));
+        if native != 0 {
+            let _ = handle_close(Handle(native));
+        }
         log(b"gpu-client: launch failed; session retired\n");
     }
 }
@@ -2473,6 +2481,31 @@ extern "C" fn sora_main(
                         if channel_write_with_handle(srv, b"M".as_ptr(), 1, display_control) != 0 {
                             let _ = channel_write_with_handle(srv, b"M".as_ptr(), 1, Handle(0));
                             transferred = false;
+                        }
+                        // The first native-image lane links only the prepared display and
+                        // the one cooperative GPU client. No Resource reaches that client. — KESTREL
+                        let mut native = Handle(0);
+                        let mut producer = Handle(0);
+                        if transferred
+                            && display_broker.is_some()
+                            && GPU_CLIENT_CHANNEL.load(Ordering::Relaxed) != 0
+                        {
+                            let (a, b) = channel_create_pair();
+                            if let (Some(a), Some(b)) = (syscall_handle(a), syscall_handle(b)) {
+                                native = a;
+                                producer = b;
+                            }
+                        }
+                        if channel_write_with_handle(srv, b"J".as_ptr(), 1, native) == 0 {
+                            GPU_NATIVE_CHANNEL.store(producer.0, Ordering::Relaxed);
+                        } else {
+                            if native.0 != 0 {
+                                let _ = handle_close(native);
+                            }
+                            if producer.0 != 0 {
+                                let _ = handle_close(producer);
+                            }
+                            let _ = channel_write_with_handle(srv, b"J".as_ptr(), 1, Handle(0));
                         }
                         // A queued context keeps DMA backing alive but conveys no MAP
                         // authority to its old process, even with the root Resource. — KESTREL

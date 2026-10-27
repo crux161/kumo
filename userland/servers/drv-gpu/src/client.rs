@@ -1,5 +1,6 @@
 //j595
 //j596
+//j636
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -59,7 +60,10 @@ impl Backend for Hardware<'_> {
         dsb();
         self.reply_grant = valid_handle(kumo_rt::handle_duplicate(
             mapping.handle,
-            kumo_abi::Rights::READ | kumo_abi::Rights::WRITE | kumo_abi::Rights::TRANSFER,
+            kumo_abi::Rights::READ
+                | kumo_abi::Rights::WRITE
+                | kumo_abi::Rights::DUPLICATE
+                | kumo_abi::Rights::TRANSFER,
         ));
         if self.reply_grant.is_none() {
             return Err(GpuStatus::DeviceLost);

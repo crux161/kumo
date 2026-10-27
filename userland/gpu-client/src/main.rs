@@ -2,6 +2,7 @@
 #![no_main]
 //j595
 //j596
+//j636
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -170,7 +171,7 @@ fn submit_wait(
     Err(())
 }
 
-fn run(channel: Handle) -> Result<(), ()> {
+fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     let mut client = Client { channel, id: 0 };
     let Response::Info(info) = client.simple(Command::GetInfo)? else {
         return Err(());
@@ -284,19 +285,70 @@ fn run(channel: Handle) -> Result<(), ()> {
     log(format_args!(
         "gpu-client: client compute frame verified; 32768 pixels match\n"
     ));
+    if presentation.0 != 0 {
+        let image = kumo_graphics::native::Image {
+            sequence: 1,
+            surface: kumo_graphics::DEMO,
+            offset: PAINT_OFFSET,
+            vmo_bytes: BUFFER_BYTES,
+            gpu_point: 3,
+            checksum: check.checksum,
+        };
+        let grant = handle(kumo_rt::handle_duplicate(
+            vmo,
+            kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER,
+        ))
+        .ok_or(())?;
+        let bytes = image.encode();
+        if kumo_rt::channel_write_with_handle(presentation, bytes.as_ptr(), bytes.len(), grant) != 0
+        {
+            let _ = kumo_rt::handle_close(grant);
+            return Err(());
+        }
+        log(format_args!("gpu-client: J0a completed point3 image leased READ-only; frozen until display retirement\n"));
+        let port = handle(kumo_rt::port_create()).ok_or(())?;
+        let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
+        if kumo_rt::port_bind(port, presentation) != 0
+            || kumo_rt::port_bind(port, timer) != 0
+            || kumo_rt::port_wait(port) != kumo_rt::handle_koid(presentation)
+        {
+            return Err(());
+        }
+        let mut bytes = [0; kumo_graphics::native::REPLY_LEN + 1];
+        let (n, extra) =
+            kumo_rt::channel_read_with_handle(presentation, bytes.as_mut_ptr(), bytes.len());
+        let _ = kumo_rt::handle_close(timer);
+        let _ = kumo_rt::handle_close(port);
+        if extra != 0 {
+            let _ = kumo_rt::handle_close(Handle(extra as u32));
+            return Err(());
+        }
+        if !bytes
+            .get(..n)
+            .and_then(kumo_graphics::native::Reply::decode)
+            .is_some_and(|r| r.releases(image))
+        {
+            return Err(());
+        }
+        log(format_args!("gpu-client: J0a native image retired after consumed console replacement and display unmap; reuse permitted\n"));
+    }
     let _ = kumo_rt::handle_close(vmo);
     Ok(())
 }
 
 #[no_mangle]
-extern "C" fn main(channel: u64, _unused: u64) -> ! {
+extern "C" fn main(channel: u64, presentation: u64) -> ! {
     let Some(channel) = handle(channel) else {
         kumo_rt::process_exit(1)
     };
     log(format_args!(
         "gpu-client: separate process starting GPU session\n"
     ));
-    let result = run(channel);
+    let presentation = Handle(presentation as u32);
+    let result = run(channel, presentation);
+    if presentation.0 != 0 {
+        let _ = kumo_rt::handle_close(presentation);
+    }
     if result.is_err() {
         log(format_args!("gpu-client: session failed\n"));
     }

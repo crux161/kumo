@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j607
 //j609
 //j611
 //j632
 //j634
+//j636
 
 mod clock_probe;
 mod display_probe;
@@ -153,6 +153,7 @@ extern "C" fn main(
     let (_, b_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
     let (_, control_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
+    let (_, native_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let power_len = channel_read(bootstrap, buf.as_mut_ptr(), buf.len());
     let power = buf
         .get(..power_len as usize)
@@ -510,10 +511,14 @@ extern "C" fn main(
             mmu_view: vop_view_mapped,
             context: Handle(ctx_raw as u32),
             control: Handle(control_raw as u32),
+            native: Handle(native_raw as u32),
             buffers: [Handle(a_raw as u32), Handle(b_raw as u32)],
         },
         port,
     );
+    if r1.is_none() && native_raw != 0 {
+        let _ = kumo_rt::handle_close(Handle(native_raw as u32));
+    }
     loop {
         let source = Handle(port_wait(port) as u32);
         if r1.as_ref().is_some_and(|pending| pending.owns(source)) {

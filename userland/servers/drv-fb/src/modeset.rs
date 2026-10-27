@@ -1,8 +1,8 @@
-//j625
 //j632
 //j633
 //j634
 //j635
+//j636
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -224,6 +224,8 @@ enum Phase {
     D1bCount,
     D1cReady,
     D1cRun,
+    NativeWait,
+    NativeHold,
 }
 
 /// What D1b needs from the earlier probes.
@@ -235,6 +237,7 @@ pub struct Vblank {
     pub mmu_view: bool,
     pub context: Handle,
     pub control: Handle,
+    pub native: Handle,
     pub buffers: [Handle; 2],
 }
 
@@ -246,6 +249,12 @@ struct OwnedBuffer {
     vmo: Handle,
     address: u32,
     va: u64,
+}
+
+#[derive(Clone, Copy)]
+struct NativeFrame {
+    image: kumo_graphics::native::Image,
+    vmo: Handle,
 }
 
 struct Alternation {
@@ -310,18 +319,26 @@ pub struct Pending {
     meter: vblank::Meter,
     intervals: Option<&'static mut [u64; vblank::FRAMES as usize - 1]>,
     alternation: Option<&'static mut Alternation>,
+    native_frame: Option<NativeFrame>,
+    native_source: u64,
 }
 
 impl Pending {
     /// Whether a port wake belongs to R1-D1b: its timer, or D1b's interrupt.
     pub fn owns(&self, source: Handle) -> bool {
         Handle(self.source as u32) == source
+            || (matches!(self.phase, Phase::NativeWait)
+                && Handle(self.native_source as u32) == source)
             || (self.irq.0 != 0 && Handle(self.irq_source as u32) == source)
     }
 }
 
 /// Route a wake that [`Pending::owns`]: D1b's interrupt, or the phase timer.
 pub fn wake(pending: Pending, source: Handle) -> Option<Pending> {
+    if matches!(pending.phase, Phase::NativeWait) && Handle(pending.native_source as u32) == source
+    {
+        return native_present(pending);
+    }
     if pending.irq.0 != 0 && Handle(pending.irq_source as u32) == source {
         on_vblank(pending)
     } else {
@@ -507,6 +524,8 @@ fn begin(
         meter: vblank::Meter::default(),
         intervals: None,
         alternation: None,
+        native_frame: None,
+        native_source: 0,
     })
 }
 
@@ -686,10 +705,16 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
             d1b_finish(pending, &mut device, true)
         }
         Phase::D1cReady => d1c_start(pending, &mut device),
-        Phase::D1cRun => {
-            d1c_finish(pending, &mut device, false, "watchdog");
+        Phase::D1cRun => d1c_finish(pending, &mut device, false, "watchdog"),
+        Phase::NativeWait => {
+            error(format_args!(
+                "display: J0a image wait timed out; console retained\n"
+            ));
+            let _ = port_unbind(pending.port, pending.vblank.native);
+            close(pending.vblank.native);
             None
         }
+        Phase::NativeHold => native_retire(pending, &mut device),
     }
 }
 
@@ -1126,13 +1151,12 @@ fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
     }
     if finished || stalled {
         disarm(pending.port, pending.timer);
-        d1c_finish(
+        return d1c_finish(
             pending,
             &mut device,
             finished,
             "load unconfirmed or invalid painting target",
         );
-        return None;
     }
     let _ = interrupt_complete(pending.irq);
     Some(pending)
@@ -1140,10 +1164,15 @@ fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
 
 /// The caller has disarmed the timer. Keep both VMO handles/mappings until reboot, including
 /// on recovery failure: an unverified front must never be freed or reused. — KESTREL
-fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: &str) {
+fn d1c_finish(
+    mut pending: Pending,
+    device: &mut Device,
+    success: bool,
+    reason: &str,
+) -> Option<Pending> {
     if !context_ready(pending.vblank.context) {
         recover_interrupted_d1c(&mut pending, device);
-        return;
+        return None;
     }
     vblank::disable(device);
     let state = pending.alternation.as_mut().expect("D1c state");
@@ -1166,6 +1195,8 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
     let _ = interrupt_complete(pending.irq);
     let _ = port_unbind(pending.port, pending.irq);
     close(pending.irq);
+    pending.irq = Handle(0);
+    pending.irq_source = 0;
     let expected = scanout::ALTERNATIONS / 2;
     let verified = success
         && restored
@@ -1195,7 +1226,7 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
                     error(format_args!(
                         "display: D1d retired unmap refused; backing retained\n"
                     ));
-                    return;
+                    return None;
                 }
             }
             log(format_args!("display: D1d both retired buffers unmapped by checked replacements; console domain retained\n"));
@@ -1207,6 +1238,8 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
                 error(format_args!(
                     "display: D1d fault/recovery FAILED; owners retained/blocked\n"
                 ));
+            } else {
+                return native_start(pending);
             }
         }
     } else {
@@ -1217,6 +1250,7 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
             reason, state.pair.confirmed(), u8::from(restored),
             if restored { "" } else { "; VP2 in standby" }));
     }
+    None
 }
 
 fn context_ready(ctx: Handle) -> bool {
@@ -1741,4 +1775,137 @@ fn finish(
         ));
     }
     restored
+}
+
+fn native_start(mut pending: Pending) -> Option<Pending> {
+    let channel = pending.vblank.native;
+    if channel.0 == 0 {
+        return None;
+    }
+    if pending.pixel_order != PixelOrder::Bgr
+        || !context_ready(pending.vblank.context)
+        || port_bind(pending.port, channel) != 0
+    {
+        close(channel);
+        return None;
+    }
+    pending.native_source = handle_koid(channel);
+    log(format_args!(
+        "display: J0a waiting for the completed GPU client image; console remains live\n"
+    ));
+    next(pending, Phase::NativeWait, 10_000)
+}
+fn native_present(mut pending: Pending) -> Option<Pending> {
+    use kumo_graphics::native::{Image, IMAGE_IOVA, REQUEST_LEN};
+    disarm(pending.port, pending.timer);
+    let channel = pending.vblank.native;
+    let _ = port_unbind(pending.port, channel);
+    let mut bytes = [0; REQUEST_LEN + 1];
+    let (n, raw) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
+    let Some(vmo) = syscall_handle(raw) else {
+        close(channel);
+        return None;
+    };
+    let image = bytes.get(..n).and_then(Image::decode);
+    let Some(image) = image.filter(|_| context_ready(pending.vblank.context)) else {
+        close(vmo);
+        close(channel);
+        return None;
+    };
+    let Some(program) = scanout::image_program(&pending.program, image) else {
+        close(vmo);
+        close(channel);
+        return None;
+    };
+    let (status, cpu) = kumo_rt::vmar_map_anywhere(
+        vmo,
+        image.vmo_bytes,
+        (VmarFlags::READ | VmarFlags::UNCACHED).0,
+    );
+    if status != 0 || cpu == 0 {
+        close(vmo);
+        close(channel);
+        return None;
+    }
+    // SAFETY: the validated image lies wholly in the actual READ-only mapping. This
+    // volatile check reads the original pages; there is no CPU copy into scanout. — KESTREL
+    let checksum =
+        image.checksum(|n| unsafe { ((cpu + image.offset + n * 4) as *const u32).read_volatile() });
+    if checksum != image.checksum {
+        error(format_args!(
+            "display: J0a shared image checksum mismatch; nothing staged\n"
+        ));
+        close(vmo);
+        close(channel);
+        return None;
+    }
+    let status = kumo_rt::device_vmar_map(
+        pending.vblank.context,
+        vmo,
+        image.offset,
+        image.bytes(),
+        IMAGE_IOVA,
+        Rights::READ,
+    );
+    if status != 0 {
+        close(vmo);
+        close(channel);
+        return None;
+    }
+    // From publication onward failures retain the handle, mapping and lease. No Drop
+    // cleanup can fabricate retirement or make possibly reachable pages reusable. — KESTREL
+    pending.native_frame = Some(NativeFrame { image, vmo });
+    let mut device = Device(pending.vop.0);
+    scanout::stage_region(&mut device, &program);
+    let latched = scanout::wait_latched(&mut device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
+    if latched.is_none()
+        || !scanout::region_loaded(&mut device, &program, context_ready(pending.vblank.context))
+    {
+        error(format_args!(
+            "display: J0a image load uncertain; owners retained, no retired reply\n"
+        ));
+        close(channel);
+        return None;
+    }
+    log(format_args!("display: J0a ZERO-COPY GPU point{}: original VMO offset{:#x}, display IOVA{:#x}, 256x128 stride256 XRGB8888, checksum{:#x}; consumed load, holding5000ms\n",image.gpu_point,image.offset,IMAGE_IOVA,checksum));
+    next(pending, Phase::NativeHold, 5_000)
+}
+fn native_retire(pending: Pending, device: &mut Device) -> Option<Pending> {
+    use kumo_graphics::native::{Reply, IMAGE_IOVA};
+    let frame = pending.native_frame?;
+    if !context_ready(pending.vblank.context) {
+        error(format_args!(
+            "display: J0a fault prevents retirement; owners retained\n"
+        ));
+        close(pending.vblank.native);
+        return None;
+    }
+    scanout::stage_region(device, &pending.program);
+    let loaded = scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS)
+        .is_some()
+        && scanout::region_loaded(
+            device,
+            &pending.program,
+            context_ready(pending.vblank.context),
+        );
+    if !loaded
+        || kumo_rt::device_vmar_unmap(pending.vblank.context, IMAGE_IOVA, frame.image.bytes()) != 0
+    {
+        error(format_args!(
+            "display: J0a console/unmap uncertain; owners retained, no retired reply\n"
+        ));
+        close(pending.vblank.native);
+        return None;
+    }
+    close(frame.vmo);
+    let reply = Reply {
+        sequence: frame.image.sequence,
+        gpu_point: frame.image.gpu_point,
+        retired: true,
+    }
+    .encode();
+    let status = kumo_rt::channel_write(pending.vblank.native, reply.as_ptr(), reply.len());
+    log(format_args!("display: J0a original GPU image retired: complete GOP geometry/load consumed, checked display unmap finished; reply={}\n",status));
+    close(pending.vblank.native);
+    None
 }
