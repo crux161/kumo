@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j628
 //j629
 //j630
 //j631
 //j632
+//j634
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3638,6 +3638,21 @@ pub fn display_controller_detach(
     {
         let _ = (controller, root, epoch);
         Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_interrupt_last_close(irq: u32) -> Option<bool> {
+    #[cfg(target_os = "none")]
+    {
+        if irq == 188 {
+            DISPLAY_INTERRUPT_GUARD.retire_vblank(&mut PhysPowerIo)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = irq;
+        None
     }
 }
 pub fn display_live_binding() -> Option<(u64, u64)> {

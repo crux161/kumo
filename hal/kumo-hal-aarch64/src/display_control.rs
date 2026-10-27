@@ -1,5 +1,6 @@
 //j631
 //j632
+//j634
 
 //! DESIGN/022: bounded live controller, called only with a published table owner.
 //! The kernel DeviceCtx path supplies the retaining root owner. Uncertain outcomes retain
@@ -545,8 +546,14 @@ mod tests {
                 for a in [p, 0xfd8d8118, 0xfd8d8120] {
                     self.regs.insert(a, value);
                 }
+            } else if p == 0xfdd900c0 {
+                let old = self.regs.get(&p).copied().unwrap_or(0);
+                let mask = v >> 16;
+                self.regs.insert(p, (old & !mask) | (v & mask));
             } else if p == 0xfdd900c4 {
-                *self.regs.entry(0xfdd900cc).or_default() &= !(v & (v >> 16));
+                for a in [0xfdd900cc, 0xfdd900c8] {
+                    *self.regs.entry(a).or_default() &= !(v & (v >> 16));
+                }
             } else if let Some(n) = BANKS.iter().position(|b| p == *b + 8) {
                 if v == 6 && self.resets & (1 << n) != 0 {
                     for offset in [0, 0x14, 0x1c, 0x20, 0x24] {
@@ -592,6 +599,68 @@ mod tests {
         let g = Guard::new();
         g.register(DTB, &mut io, |_| true).unwrap();
         (Controller::discover(DTB).unwrap(), g, io)
+    }
+    #[test]
+    fn final_vblank_close_preserves_kernel_mmu_source_and_neighbors_or_frozen_fault() {
+        for faulted in [false, true] {
+            let (mut c, g, mut io) = setup();
+            let a = table(0x1000);
+            c.activate(a.root_ref(), 1, &g, &mut io).unwrap();
+            io.regs.insert(0xfdd900c0, 9);
+            io.regs.insert(0xfdd900c8, 9);
+            if faulted {
+                io.regs.insert(BANKS[0] + 0x14, 1);
+                io.regs.insert(BANKS[0] + 4, 0x1b);
+                g.poll(27, &mut io, |_| true);
+            }
+            let first = g.fault();
+            io.events.clear();
+            io.writes.clear();
+            assert_eq!(g.retire_vblank(&mut io), Some(true));
+            assert_eq!(io.regs[&0xfdd900c0], 8);
+            assert_eq!(io.regs[&0xfdd900c8], 8);
+            assert_eq!(io.events, std::vec!["mask"]);
+            assert!(io
+                .writes
+                .iter()
+                .all(|(p, _)| *p == 0xfdd900c0 || *p == 0xfdd900c4));
+            assert_eq!(g.fault(), first);
+            for b in BANKS {
+                assert_eq!(io.regs[&(b + 0x1c)], 3);
+            }
+        }
+        let g = Guard::new();
+        let mut io = Io::new();
+        assert_eq!(g.retire_vblank(&mut io), None);
+        assert!(io.events.is_empty() && io.writes.is_empty());
+    }
+    #[test]
+    fn quiet_orphan_line_stays_owned_by_kernel_and_power_loss_never_enables_it() {
+        for power_lost in [false, true] {
+            let (mut c, g, mut io) = setup();
+            let a = table(0x1000);
+            c.activate(a.root_ref(), 1, &g, &mut io).unwrap();
+            io.events.clear();
+            io.writes.clear();
+            io.regs.insert(0xfdd900c0, 1);
+            if power_lost {
+                io.power_after = Some(0xfdd900c0);
+            }
+            assert_eq!(g.retire_vblank(&mut io), Some(!power_lost));
+            assert_eq!(
+                io.events,
+                if power_lost {
+                    std::vec!["mask"]
+                } else {
+                    std::vec!["mask", "enable"]
+                }
+            );
+            assert!(io
+                .writes
+                .iter()
+                .all(|(p, _)| *p == 0xfdd900c0 || *p == 0xfdd900c4));
+            assert_eq!(g.fault().is_some(), power_lost);
+        }
     }
     #[test]
     fn publication_both_resets_paging_sealed_routes_and_irq_precede_resume() {

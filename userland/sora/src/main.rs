@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j614
 //j616
 //j629
 //j632
 //j633
+//j634
 
 extern crate alloc;
 
@@ -901,6 +901,117 @@ fn activate_display_with_vectors(ctx: Handle) -> bool {
 #[cfg(not(target_arch = "aarch64"))]
 fn activate_display_with_vectors(_ctx: Handle) -> bool {
     false
+}
+
+/// Sora's recovery recipe retains IOMMU/GOP authority, never a spare context handle.
+/// The driver chooses presentation; this broker reconstructs only approved GOP mappings. — KESTREL
+struct DisplayBroker {
+    channel: Handle,
+    iommu: Handle,
+    gop: Handle,
+    phys: u64,
+    span: u64,
+}
+impl DisplayBroker {
+    fn new(iommu: Handle, gop: Handle, boot: &BootInfo) -> Option<(Self, Handle)> {
+        let gop = syscall_handle(handle_duplicate(
+            gop,
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+        ))?;
+        let (server, client) = channel_create_pair();
+        let channel = syscall_handle(server)?;
+        let client = syscall_handle(client)?;
+        Some((
+            Self {
+                channel,
+                iommu,
+                gop,
+                phys: boot.framebuffer.phys,
+                span: boot.framebuffer.mapping_len()?,
+            },
+            client,
+        ))
+    }
+    fn recover_gop(&self, front: u64) -> Option<Handle> {
+        let ctx = syscall_handle(kumo_rt::device_ctx_create(self.iommu, 0))?;
+        for iova in [self.phys, front] {
+            if kumo_rt::device_vmar_map(ctx, self.gop, 0, self.span, iova, Rights::READ) != 0 {
+                let _ = handle_close(ctx);
+                return None;
+            }
+        }
+        if kumo_rt::device_ctx_activate(ctx) != 0 {
+            let _ = handle_close(ctx);
+            return None;
+        }
+        Some(ctx)
+    }
+    fn serve(&self, initrd: Handle) {
+        let mut request = [0u8; 8];
+        let (n, raw) =
+            kumo_rt::channel_read_with_handle(self.channel, request.as_mut_ptr(), request.len());
+        let Some(ctx) = syscall_handle(raw).filter(|h| h.0 != 0) else {
+            return;
+        };
+        let next = if n == 1 && request[0] == b'K' {
+            self.kill_holder(initrd, ctx)
+                .and_then(|()| self.recover_gop(0x60000000))
+        } else {
+            let _ = handle_close(ctx);
+            None
+        };
+        let (tag, grant) = if let Some(next) = next {
+            (b"R", next)
+        } else {
+            (b"E", Handle(0))
+        };
+        if channel_write_with_handle(self.channel, tag.as_ptr(), 1, grant) != 0 && grant.0 != 0 {
+            let _ = handle_close(grant);
+        }
+    }
+    fn kill_holder(&self, initrd: Handle, ctx: Handle) -> Option<()> {
+        let (send, child) = channel_create_pair();
+        let send = syscall_handle(send)?;
+        let child = syscall_handle(child)?;
+        if channel_write_with_handle(send, b"H".as_ptr(), 1, ctx) != 0 {
+            let _ = handle_close(ctx);
+            return None;
+        }
+        let mut process = None;
+        let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+        if !run_elf_threads(
+            initrd,
+            kumo_abi::DRV_FB_PATH.as_bytes(),
+            drv_fb::rk3588_scanout::HOLDER_ARG,
+            u64::from(child.0),
+            flags,
+            b"display-holder",
+            0,
+            Some(&mut process),
+        ) {
+            return None;
+        }
+        let process = process?;
+        let mut ack = [0u8; 1];
+        let n = channel_read(send, ack.as_mut_ptr(), 1);
+        if n != 1 || ack[0] != b'H' || handle_koid(ctx) != u64::MAX {
+            let _ = process_kill(process);
+            return None;
+        }
+        // Receipt proves the queued grant is installed in the child. No MAP/WAIT duplicate
+        // remains in Sora or drv-fb; ProcessKill must trigger actual final-holder teardown. — KESTREL
+        if syscall_handle(kumo_rt::device_ctx_create(self.iommu, 0)).is_some() {
+            let _ = process_kill(process);
+            return None;
+        }
+        if process_kill(process) != 0 {
+            return None;
+        }
+        let _ = handle_close(process);
+        let _ = handle_close(send);
+        notice(&[b"display: D1d actual sole context holder killed during DMA; old lineage gone, requesting GOP-only recovery\n"]);
+        Some(())
+    }
 }
 
 /// Prepare the exact three DMA ranges before granting any checked VOP WRITE.
@@ -1814,6 +1925,7 @@ extern "C" fn sora_main(
     let mut hid_keyboard_input: Option<Handle> = None;
     let mut mouse_input: Option<Handle> = None;
     let mut pointer_state = sora::PointerState::default();
+    let mut display_broker: Option<DisplayBroker> = None;
 
     // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8). `_start` captured it
     // into `BOOTINFO_VMO_HANDLE` at entry — reading x8 here would race the compiler's reuse of
@@ -2274,6 +2386,14 @@ extern "C" fn sora_main(
                 let fb = bootinfo.framebuffer;
                 let display_iommu = verify_offline_display_context(res, bootinfo);
                 let prepared = prepare_display_context(res, bootinfo, display_iommu);
+                let mut display_control = Handle(0);
+                if let (Some(iommu), Some(grants)) = (display_iommu, prepared) {
+                    if let Some((broker, client)) = DisplayBroker::new(iommu, grants[1], bootinfo) {
+                        display_broker = Some(broker);
+                        display_control = client;
+                    }
+                }
+
                 // Unconditional pre-gate dump of the geometry read from the BootInfo snapshot, so a
                 // blank boot reveals whether the snapshot is stale/garbage (a coherency bug upstream)
                 // or sane-but-rejected (the is_plausible gate too strict). Fires every boot — unlike
@@ -2317,9 +2437,14 @@ extern "C" fn sora_main(
                                 notice(&[b"display: D1d bootstrap transfer refused; absent record sent, WRITE withheld\n"]);
                             }
                         }
+                        if channel_write_with_handle(srv, b"M".as_ptr(), 1, display_control) != 0 {
+                            let _ = channel_write_with_handle(srv, b"M".as_ptr(), 1, Handle(0));
+                            transferred = false;
+                        }
                         // A queued context keeps DMA backing alive but conveys no MAP
                         // authority to its old process, even with the root Resource. — KESTREL
                         let display_live = transferred
+                            && display_broker.is_some()
                             && kumo_rt::device_register_write(
                                 res,
                                 drv_fb::rk3588::VOP_BASE,
@@ -3151,6 +3276,10 @@ extern "C" fn sora_main(
                 port_bind(port, mouse);
             }
         }
+        let display_koid = display_broker.as_ref().and_then(|b| {
+            let k = handle_koid(b.channel);
+            (k != u64::MAX && port_bind(port, b.channel) == 0).then_some(Handle(k as u32))
+        });
         SERVE_PORT.store(u64::from(port.0), Ordering::Relaxed);
         log(b"sora: ports bound\n");
         // J545: each controller's storage control channel. `PortBind` replays a pending offer,
@@ -3226,6 +3355,12 @@ extern "C" fn sora_main(
         // borrow, leaving the boot floor alive but unable to forward any ordinary console input.
         loop {
             let source = Handle(port_wait(port) as u32);
+            if display_koid == Some(source) {
+                if let Some(b) = display_broker.as_ref() {
+                    b.serve(initrd);
+                }
+                continue;
+            }
             if let Some(index) = storage_koids.iter().position(|koid| *koid == Some(source)) {
                 if media_offered(initrd, port, index, &mut storage_koids) {
                     settle_first_prompt(&mut first_prompt, port, &cwd, b"media");

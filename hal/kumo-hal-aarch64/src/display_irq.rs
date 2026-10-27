@@ -1,6 +1,7 @@
 //j626
 //j630
 //j631
+//j634
 
 //! DESIGN/022 D1d-c2b: boot-retained first refusal, independent of driver/engine life.
 //! Capture both banks on IRQ/timer checks before any Sora borrow, retain the first
@@ -702,6 +703,45 @@ impl Guard {
     }
     pub fn power_allowed(&self) -> bool {
         matches!(self.state.load(Ordering::Acquire), UNREGISTERED | WATCHING)
+    }
+    /// Last vblank capability loss retires only VP2 frame-start. The kernel MMU
+    /// owner keeps the shared line when live/quiet, or keeps a refusal masked. — KESTREL
+    pub fn retire_vblank(&self, io: &mut impl crate::display_control::ControlIo) -> Option<bool> {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        if !io.mask_shared() {
+            self.refuse(Error::NotReady, None, false);
+            return Some(false);
+        }
+        if !display_unit::UNITS[0].ready(io) {
+            self.refuse(Error::NotReady, None, true);
+            return Some(false);
+        }
+        io.write(0xfdd900c0, 0x00010000);
+        io.barrier();
+        if !display_unit::UNITS[0].ready(io) {
+            self.refuse(Error::NotReady, None, true);
+            return Some(false);
+        }
+        io.write(0xfdd900c4, 0x00010001);
+        io.barrier();
+        if !word(io, 0xfdd900c0).is_ok_and(|v| v & 1 == 0)
+            || !word(io, 0xfdd900c8).is_ok_and(|v| v & 1 == 0)
+        {
+            self.refuse(Error::NotReady, None, true);
+            return Some(false);
+        }
+        let quiet = [
+            0xfdd90080, 0xfdd90090, 0xfdd900a0, 0xfdd900b0, 0xfdd900c0, 0xfdd900d0, 0xfdd900e0,
+            0xfdd900f0,
+        ]
+        .into_iter()
+        .all(|p| word(io, p).is_ok_and(|v| v & 0xffff == 0));
+        if quiet && self.state.load(Ordering::Acquire) == LIVE && self.permits(IRQ, io) {
+            let _ = io.enable_shared();
+        }
+        Some(true)
     }
     pub fn claim_update(&self, root: &crate::rockchip_v2::PublishedRoot<'_>, epoch: u64) -> bool {
         let address = root.physical();

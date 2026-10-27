@@ -1,6 +1,7 @@
 //j610
 //j612
 //j632
+//j634
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
@@ -34,6 +35,8 @@ pub const VP2_LOAD_PENDING: u32 = 1 << 2;
 pub const LATCH_TIMEOUT_NS: u64 = 50_000_000;
 /// How long the owned buffer stays on the glass before the console returns.
 pub const HOLD_MS: u64 = 5_000;
+/// Internal bootstrap selector for the actual sole-context-holder death proof.
+pub const HOLDER_ARG: u64 = 0x44314448;
 /// The scanout address is a 32-bit register.
 pub const SCANOUT_LIMIT: u64 = 1 << 32;
 

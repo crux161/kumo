@@ -1,8 +1,8 @@
-//j629
 //j630
 //j631
 //j632
 //j633
+//j634
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -495,6 +495,10 @@ fn configure_interrupt_source(irq: u32) -> Result<u32, Errno> {
 }
 
 fn mask_interrupt_source(irq: u32) -> bool {
+    #[cfg(feature = "arch_aarch64")]
+    if let Some(retired) = kumo_hal::active::display_interrupt_last_close(irq) {
+        return retired;
+    }
     if decode_tlmm_gpio_irq(irq).is_some() {
         kumo_hal::active::mask_tlmm_gpio_interrupt(irq)
     } else {

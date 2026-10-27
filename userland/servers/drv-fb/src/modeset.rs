@@ -1,8 +1,8 @@
-//j612
 //j614
 //j625
 //j632
 //j633
+//j634
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -234,6 +234,7 @@ pub struct Vblank {
     /// Whether D0a's read-only VOP window (with the MMU page) is mapped at `VOP_D0A`.
     pub mmu_view: bool,
     pub context: Handle,
+    pub control: Handle,
     pub buffers: [Handle; 2],
 }
 
@@ -1190,6 +1191,11 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
                 }
             }
             log(format_args!("display: D1d both retired buffers unmapped by checked replacements; console domain retained\n"));
+            if !holder_death_recovery(&mut pending, device) {
+                error(format_args!(
+                    "display: D1d holder-death recovery FAILED; ownership retained/blocked\n"
+                ));
+            }
         }
     } else {
         if !restored {
@@ -1199,6 +1205,79 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
             reason, state.pair.confirmed(), u8::from(restored),
             if restored { "" } else { "; VP2 in standby" }));
     }
+}
+
+/// An actual final context holder dies while the owned front is active. Sora retains
+/// only the recovery recipe; this process loses MAP authority during the handoff. — KESTREL
+fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
+    if pending.vblank.control.0 == 0 {
+        return false;
+    }
+    let (gop, stride) = scanout::target_scanout(&pending.program);
+    let len =
+        (u64::from(stride) * u64::from(DMT_1600X900_60_RB.v_active) * 4).next_multiple_of(4096);
+    if kumo_rt::device_vmar_map(
+        pending.vblank.context,
+        pending.owned.vmo,
+        0,
+        len,
+        0x60000000,
+        kumo_abi::Rights::READ,
+    ) != 0
+    {
+        return false;
+    }
+    scanout::flip(device, 0x60000000);
+    if scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS).is_none()
+        || !scanout::on_glass(device, 0x60000000)
+    {
+        return false;
+    }
+    let sent = kumo_rt::channel_write_with_handle(
+        pending.vblank.control,
+        b"K".as_ptr(),
+        1,
+        pending.vblank.context,
+    );
+    if sent != 0 {
+        return false;
+    }
+    let denied = kumo_rt::device_register_write(
+        pending.vop.0,
+        rk3588::VOP_BASE,
+        kumo_abi::sys::DisplayRegister::Commit as u32,
+        scanout::COMMIT_VP2,
+    ) == kumo_abi::Errno::BadState.status();
+    if !denied {
+        return false;
+    }
+    log(format_args!(
+        "display: D1d live owned front handed to sole holder; stale checked VOP write denied\n"
+    ));
+    let mut reply = [0u8; 1];
+    let (n, ctx) = kumo_rt::channel_read_with_handle(pending.vblank.control, reply.as_mut_ptr(), 1);
+    if n != 1 || reply[0] != b'R' || ctx == 0 {
+        return false;
+    }
+    pending.vblank.context = Handle(ctx as u32);
+    let mut info = kumo_abi::sys::DeviceCtxInfo {
+        fault_record: 0,
+        fault_addr: 0,
+    };
+    if kumo_rt::device_ctx_info(pending.vblank.context, &mut info) != 0
+        || info.fault_record
+            != kumo_abi::sys::device_ctx_state::RECORD | kumo_abi::sys::device_ctx_state::LIVE
+    {
+        return false;
+    }
+    scanout::flip(device, gop);
+    if scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS).is_none()
+        || !scanout::on_glass(device, gop)
+    {
+        return false;
+    }
+    log(format_args!("display: D1d holder killed during live DMA; approved GOP-only generation {} recovered and console latched\n",info.fault_addr));
+    true
 }
 
 /// D1a: allocate, paint and flip to a KUMO-owned buffer. Returns whether it is on the glass;

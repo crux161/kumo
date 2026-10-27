@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j606
 //j607
 //j609
 //j611
 //j632
+//j634
 
 mod clock_probe;
 mod display_probe;
@@ -120,6 +120,19 @@ extern "C" fn main(
     _arg6: u64,
     _arg7: u64,
 ) -> ! {
+    if _arg0 == drv_fb::rk3588_scanout::HOLDER_ARG {
+        let channel = Handle(bootstrap_channel as u32);
+        let mut message = [0u8; 1];
+        let (n, ctx) = channel_read_with_handle(channel, message.as_mut_ptr(), 1);
+        if n != 1 || message[0] != b'H' || ctx == 0 {
+            kumo_rt::process_exit(1);
+        }
+        let _ = kumo_rt::channel_write(channel, b"H".as_ptr(), 1);
+        // The live handle stays solely in this process's table until Sora kills it. — KESTREL
+        loop {
+            let _ = kumo_rt::channel_read(channel, message.as_mut_ptr(), 1);
+        }
+    }
     log_info(b"drv-fb starting\n");
 
     let bootstrap = Handle(bootstrap_channel as u32);
@@ -139,6 +152,7 @@ extern "C" fn main(
     let (_, a_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let (_, b_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
 
+    let (_, control_raw) = channel_read_with_handle(bootstrap, buf.as_mut_ptr(), buf.len());
     let power_len = channel_read(bootstrap, buf.as_mut_ptr(), buf.len());
     let power = buf
         .get(..power_len as usize)
@@ -495,6 +509,7 @@ extern "C" fn main(
             live_irq: live_vop_irq,
             mmu_view: vop_view_mapped,
             context: Handle(ctx_raw as u32),
+            control: Handle(control_raw as u32),
             buffers: [Handle(a_raw as u32), Handle(b_raw as u32)],
         },
         port,
