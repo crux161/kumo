@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j496
 //j497
 //j498
 //j499
 //j500
+//j640
 
 //! `threads` — the D2/D3/D4 proof: futex peers, fair compute, then work queues.
 //!
@@ -33,6 +33,11 @@
 //! work and how many distinct peer runs it observed. The last thread reports both counters and
 //! rejects a ratio worse than 2:1, proving the live timer path schedules equal-priority peers
 //! fairly instead of waiting for a syscall or voluntary yield.
+//!
+//! On AArch64, a separate TLS probe installs distinct per-thread words, checks fresh
+//! entry is zero, then verifies the pointer and word after futex waits and timer-only
+//! peer runs. This is register preservation, not pthread creation or ELF TLS allocation.
+//! — KESTREL
 //!
 //! Finally, thread 0 submits three asynchronous jobs and one synchronous job to an in-process
 //! serial queue while thread 1 is its sole worker. FIFO output `1234` plus the synchronous result
@@ -284,6 +289,86 @@ fn timeline_job(context: usize) -> usize {
     }
 }
 
+// The borrowed word stays on this resident's stack until the probe is removed. Never
+// dereference an unexpected pointer: a failure must report contamination, not fault. — KESTREL
+#[cfg(target_arch = "aarch64")]
+mod tls {
+    use super::{emit, emit_u32, Handle};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static FRESH_BAD: AtomicU32 = AtomicU32::new(0);
+    static BLOCK_BAD: AtomicU32 = AtomicU32::new(0);
+    static PREEMPT_BAD: AtomicU32 = AtomicU32::new(0);
+
+    fn pointer() -> u64 {
+        let value;
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
+    fn set_pointer(value: u64) {
+        unsafe {
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) value, options(nostack, preserves_flags));
+        }
+    }
+    pub struct Probe<'a> {
+        word: &'a u64,
+        expected: u64,
+        bit: u32,
+    }
+    impl<'a> Probe<'a> {
+        pub fn install(word: &'a u64, me: u32) -> Self {
+            let probe = Self {
+                word,
+                expected: *word,
+                bit: 1 << me,
+            };
+            if pointer() != 0 {
+                FRESH_BAD.fetch_or(probe.bit, Ordering::Relaxed);
+            }
+            set_pointer(word as *const u64 as u64);
+            probe
+        }
+        fn matches(&self) -> bool {
+            pointer() == self.word as *const u64 as u64
+                && unsafe { (self.word as *const u64).read_volatile() } == self.expected
+        }
+        pub fn after_block(&self) {
+            if !self.matches() {
+                BLOCK_BAD.fetch_or(self.bit, Ordering::Relaxed);
+            }
+        }
+        pub fn after_preemption(&self) {
+            if !self.matches() {
+                PREEMPT_BAD.fetch_or(self.bit, Ordering::Relaxed);
+            }
+        }
+        pub fn remove(self) {
+            set_pointer(0);
+        }
+    }
+    pub fn report(stdout: Handle) {
+        let fresh = FRESH_BAD.load(Ordering::Acquire);
+        let blocked = BLOCK_BAD.load(Ordering::Acquire);
+        let preempted = PREEMPT_BAD.load(Ordering::Acquire);
+        emit(stdout, b"threads: TLS faults fresh=");
+        emit_u32(stdout, fresh);
+        emit(stdout, b" blocking=");
+        emit_u32(stdout, blocked);
+        emit(stdout, b" preemption=");
+        emit_u32(stdout, preempted);
+        emit(
+            stdout,
+            if fresh | blocked | preempted == 0 {
+                b" -> OK: fresh zero, distinct words survive futex and timer switches\n"
+            } else {
+                b" -> FAIL: thread pointer contamination\n"
+            },
+        );
+    }
+}
+
 #[no_mangle]
 extern "C" fn main(
     index: u64,
@@ -295,6 +380,10 @@ extern "C" fn main(
     _a7: u64,
     _a8: u64,
 ) -> ! {
+    #[cfg(target_arch = "aarch64")]
+    let tls_word = 0x544c_5300_0000_0000u64 | (index & 1);
+    #[cfg(target_arch = "aarch64")]
+    let tls = tls::Probe::install(&tls_word, (index & 1) as u32);
     kumo_rt::init();
     // Sora starts thread 0 with x0 = 0 and thread 1 with x0 = 1. Everything below is symmetric.
     let me = (index & 1) as u32;
@@ -324,6 +413,8 @@ extern "C" fn main(
         }
 
         // Awake and holding the turn. Verify nothing of ours was disturbed while we slept.
+        #[cfg(target_arch = "aarch64")]
+        tls.after_block();
         for (i, slot) in canary.iter().enumerate() {
             if *slot != (i as u8).wrapping_mul(3).wrapping_add(me as u8 * 0x5a) {
                 FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -363,13 +454,20 @@ extern "C" fn main(
         COMPUTE_WORK[me as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let peer_work = COMPUTE_WORK[peer as usize].load(core::sync::atomic::Ordering::Acquire);
         if peer_work != last_peer_work {
+            #[cfg(target_arch = "aarch64")]
+            tls.after_preemption();
             PEER_EPOCHS[me as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             last_peer_work = peer_work;
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    tls.remove();
+
     // The second resident out reports both the blocking D2 proof and compute-bound D3 proof.
     if COMPUTE_DONE.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1 == 2 {
+        #[cfg(target_arch = "aarch64")]
+        tls::report(stdout);
         let faults = FAULTS.load(core::sync::atomic::Ordering::Acquire);
         let a = WROTE[0].load(core::sync::atomic::Ordering::Acquire);
         let b = WROTE[1].load(core::sync::atomic::Ordering::Acquire);

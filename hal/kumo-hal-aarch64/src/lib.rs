@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j630
 //j631
 //j632
 //j634
 //j635
+//j640
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -297,8 +297,17 @@ pub struct ThreadContext {
     x29_fp: u64,
     x30_lr: u64,
     sp: u64,
+    // EL0 may update its own pointer directly. Save it at EVERY scheduler switch,
+    // including switches made inside blocking SVC and timer handlers. — KESTREL
+    user_thread_pointer: u64,
     user: bool,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(ThreadContext, sp) == 96);
+    assert!(core::mem::offset_of!(ThreadContext, user_thread_pointer) == 104);
+    assert!(core::mem::offset_of!(ThreadContext, user) == 112);
+};
 
 impl ThreadContext {
     pub fn new(entry: usize, arg: usize, stack_top: usize, user: bool) -> Self {
@@ -359,6 +368,8 @@ core::arch::global_asm!(
     "  stp x29, x30, [x0, #80]",
     "  mov x2, sp",
     "  str x2, [x0, #96]",
+    "  mrs x2, tpidr_el0",
+    "  str x2, [x0, #{thread_pointer_offset}]",
     "  ldp x19, x20, [x1, #0]",
     "  ldp x21, x22, [x1, #16]",
     "  ldp x23, x24, [x1, #32]",
@@ -367,6 +378,8 @@ core::arch::global_asm!(
     "  ldp x29, x30, [x1, #80]",
     "  ldr x2, [x1, #96]",
     "  mov sp, x2",
+    "  ldr x2, [x1, #{thread_pointer_offset}]",
+    "  msr tpidr_el0, x2",
     "  ret",
     ".global kumo_context_trampoline",
     "kumo_context_trampoline:",
@@ -379,6 +392,7 @@ core::arch::global_asm!(
     "1:",
     "  wfe",
     "  b 1b",
+    thread_pointer_offset = const core::mem::offset_of!(ThreadContext, user_thread_pointer),
 );
 
 #[cfg(target_os = "none")]
@@ -2336,8 +2350,8 @@ pub mod el0 {
         pub extra_mappings: &'a [UserMapping],
     }
 
-    /// Saved kernel callee-saved registers + SP, so the exit SVC can return to the boot
-    /// flow as if `kumo_enter_el0` had returned. Touched only from asm.
+    /// Saved kernel callee-saved registers, SP and thread pointer, so the exit SVC can return
+    /// to the boot flow as if `kumo_enter_el0` had returned. Touched only from asm.
     #[no_mangle]
     #[used]
     static mut KERNEL_RESUME: [u64; 16] = [0; 16];
@@ -2483,8 +2497,11 @@ pub mod el0 {
         "  stp  x29, x30, [x2, #80]",
         "  mov  x3, sp",
         "  str  x3, [x2, #96]",
-        "  msr  elr_el1, x0", // EL0 entry point
-        "  movz x4, #0x3c0",  // SPSR: EL0t, DAIF masked (no preemption during the smoke)
+        "  mrs  x3, tpidr_el0",
+        "  str  x3, [x2, #104]",
+        "  msr  tpidr_el0, xzr", // fresh synchronous entry, as for a fresh ThreadContext
+        "  msr  elr_el1, x0",    // EL0 entry point
+        "  movz x4, #0x3c0",     // SPSR: EL0t, DAIF masked (no preemption during the smoke)
         "  msr  spsr_el1, x4",
         "  msr  sp_el0, x1", // EL0 stack
         "  mov  x0, x9",     // x0 at EL0 = the bootstrap handle (processargs-style)
@@ -2507,6 +2524,8 @@ pub mod el0 {
         "  ldp  x29, x30, [x2, #80]",
         "  ldr  x3, [x2, #96]",
         "  mov  sp, x3",
+        "  ldr  x3, [x2, #104]",
+        "  msr  tpidr_el0, x3",
         "  ret",
     );
 
