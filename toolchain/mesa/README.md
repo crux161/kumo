@@ -1,0 +1,124 @@
+# Native Mesa boundary — G7b
+<!-- j643 -->
+
+This is a compile/link scaffold, not a usable Mesa device or a rendering driver.
+The probe compiles the actual pinned `pan_kmod.h` for **aarch64-unknown-none** against
+KUMO's real relibc headers, links C → Rust → C callbacks into a static KUMO ELF,
+and can run it as a separate process in a disposable full UEFI QEMU image.
+Its transport uses the real GPU `Session`/wire implementation with **modeled hardware**.
+It never connects to a GPU, allocates device memory, submits work or changes a served image.
+
+The deliberately unregistered `pan_kmod_ops` scaffold has a type-checked `dev_create`
+that always refuses. No half-initialized `pan_kmod_dev`, zero-filled feature report,
+FD-to-capability cast, fake mutex or successful unsupported operation is returned.
+Only the native query bridge is implemented. The full G7 gate remains open.
+
+## Reproduce
+
+The source is the same Mesa 26.2.5 original tarball used by the offline shader recipe
+(Debian package 26.2.5-1). SHA256:
+`794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5`.
+The pristine `src/panfrost/lib/kmod/pan_kmod.h` SHA256 is
+`55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4`.
+No Mesa source checkout or Linux driver implementation is vendored. The tarball's
+original copyright/license files remain in the private extraction. `NOTICE` accompanies
+the small header patch; KUMO owns the new C/Rust bridge and probe.
+
+If the shader compiler cache is absent, build it once using the existing pinned recipe:
+`KUMO_MALI_SHADERS_KEEP=1 scripts/build-mali-shaders.sh`. With the existing cache:
+
+```sh
+mkdir -p build/mesa-native
+# Start OrbStack first if needed. Preserve the existing task container/cache.
+docker start kumo-mali-shaders
+docker cp kumo-mali-shaders:/work/mesa_26.2.5.orig.tar.xz build/mesa-native/mesa.tar.xz
+docker stop kumo-mali-shaders
+scripts/relibc-headers.sh
+python3 scripts/mesa-native-probe.py
+# Requires the normal full QEMU image, without modifying it:
+cargo xtask image --arch aarch64 --hardware qemu-virt-aarch64
+python3 scripts/mesa-native-probe.py --run
+```
+
+Alternatively supply that exact original archive with `--source-tar /path/to/archive`.
+The script makes no network requests and rejects the wrong tarball before extraction.
+The local stable Rust toolchain, clang, ld.lld and llvm-nm are required. Their versions,
+the libc archive and all included header hashes are recorded in
+`build/mesa-native/probe/manifest.json`; compiler bytes are not newly pinned by this slice.
+`--run` uses the same local Homebrew QEMU/EDK2 setup as `scripts/thread-tls-smoke.py`.
+The probe replaces only `bin/relibc-smoke` and autoexec in its **disposable ESP copy**.
+
+Acceptance checks real cross-language ABI layout, wrong version/size/null rejection
+before I/O, recoverable Busy followed by two queries with increasing IDs, continued
+Rust use of the same client, rejected-handle closure, and latched loss without replay.
+The output explicitly says `modeled service`. A positive incomplete result is acceptance
+of this scaffold's refusal, not successful Mesa device creation.
+
+## Native seam and runtime closure
+
+`lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
+32-byte result. `with_api` lends an **existing** typed client for synchronous serial
+queries. The opaque context may not be retained, raced, reentered or unwound. It carries
+no FD, OS handle, Rust layout or new authority. The Rust owner keeps endpoint and grant
+cleanup responsibility. G7a's request ID, correlation and loss rules remain authoritative.
+Numeric query errors distinguish invalid arguments, invalid request, transport, protocol,
+loss and server status; the result is cleared on operational failure. No retry occurs.
+
+`native-header.patch` excludes the generic DRM factory/ioctl, FD import/export and
+FD-backed mmap helpers under `__kumo__`, plus their unneeded DRM/mman includes. Missing
+native implementations remain compile/link errors if called. The actual Mesa structures
+and vtable remain unchanged. Generic kmod sources and the Panthor DRM backend are not linked.
+No Linux preprocessor identity or DRM emulation is used.
+
+Compilation uses real relibc pthread declarations because Mesa's embedded lock structures
+require them (`HAVE_PTHREAD`). This does **not** initialize a Mesa lock or prove pthread
+execution. `HAVE_ENDIAN_H` and `HAVE_STRUCT_TIMESPEC` describe actual installed headers.
+The scaffold C object has no unresolved external functions; the final static ELF has no
+unresolved symbols. Recheck these inventories before adding runtime calls. The executable
+also links the real relibc startup/stdio/TLS path, Rust core and compiler builtins.
+
+A probe-private `math.h` copy parenthesizes four existing function declarators
+(`isfinite`, `isinf`, `isnan`, `isnormal`) to avoid expansion by their own function-like
+macros. Types, macros and function bodies are unchanged; the installed sysroot and
+upstream checkout are immutable. The script checks each exact old declaration before
+applying this narrow workaround. A general header-generator repair is separate work.
+
+## Properties and operations still missing
+
+GetInfo supplies only GPU_ID and CS_FEATURES. The bridge additionally reports the
+**service's** admitted VA window and maximum buffer size; these are not hardware MMU,
+coherency, memory-type or shader feature reports. The scaffold never initializes
+`pan_kmod_dev_props` from guesses. The missing-property mask groups its remaining fields:
+
+| Bit | Fields in the pinned Mesa structure |
+|---|---|
+| 0 | gpu_variant |
+| 1 | shader_present, tiler_features |
+| 2 | mem_features, mmu_features, l2_features |
+| 3 | texture_features[4] |
+| 4 | max_threads_per_core, max_tasks_per_core, max_threads_per_wg, num_registers_per_core, max_tls_instance_per_core |
+| 5 | afbc_features |
+| 6 | gpu_can_query_timestamp, timestamp_device_coherent, timestamp_frequency, timestamp_cycles_to_ns_factor |
+| 7 | allowed_group_priorities_mask |
+| 8 | supported_bo_flags, supported_vm_op_flags |
+| 9 | is_io_coherent, pgsize_bitmap |
+
+This inventories the structure, not a promise that the first renderer needs every field
+or that optional timestamp/performance features must be enabled. The next slice must pick
+its first Mesa consumer and obtain/derive exactly its required fields from attested hardware
+or native service policy. Optional features may be explicitly unsupported; do not fabricate
+hardware values. CS_FEATURES also does not replace Panthor's full CSIF property structure.
+
+Required later operations include native BO allocation/CPU mapping/ownership; VM creation,
+VA policy, bind and safe unbind/destroy; native queue/group creation, Submit and observed
+completion; and explicit synchronization/cache visibility. Optional FD/dma-buf import,
+export, performance counters, timestamps, sparse mappings, eviction and asynchronous VM
+operations remain unsupported unless selected and separately implemented. The existing
+service admits one cooperative session with fixed bindings and retains DMA backing to
+reboot. Freeing a C wrapper cannot change that lifetime.
+
+Before Mesa initialization is admitted, compile and implement the required allocator,
+mutex/once, sparse-array/dynarray and runtime-symbol closure. Before G7 closes, show actual
+Mesa-rendered output through the native service and prove quiescence plus a fresh usable
+session after device loss. No pthread creation/join, Shanghai worker/queue or Shinjuku module
+work is included here. — KESTREL 2026-10-27

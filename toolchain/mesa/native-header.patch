@@ -1,0 +1,28 @@
+#j643
+# Hide DRM entry points in the native compile probe; no replacement stubs. — KESTREL
+# Zero context avoids patch-in-patch whitespace; exact pristine header hash is checked. — KESTREL
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -24,0 +25 @@
++#ifndef __kumo__
+@@ -27,0 +29 @@
++#endif
+@@ -33,0 +36 @@
++#ifndef __kumo__
+@@ -34,0 +38 @@
++#endif
+@@ -623,0 +628 @@
++#ifndef __kumo__
+@@ -633,0 +639,2 @@
++#endif
++
+@@ -699,0 +707 @@
++#ifndef __kumo__
+@@ -723,0 +732,2 @@
++#endif
++
+@@ -748,0 +759 @@
++#ifndef __kumo__
+@@ -771,0 +783,2 @@
++
++#endif

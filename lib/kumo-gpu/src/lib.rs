@@ -3,6 +3,7 @@
 //j595
 //j596
 //j641
+//j643
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -19,6 +20,7 @@
 //!
 //! G6b serves this contract from drv-gpu for one brokered client per boot.
 
+pub mod c;
 pub mod client;
 pub mod session;
 pub mod wire;
