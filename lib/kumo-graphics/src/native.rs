@@ -1,6 +1,7 @@
 //j636
+//j638
 
-//! J0a's single cooperative native-image lease. One READ VMO accompanies an exact
+//! J0's bounded serial cooperative native-image leases. One READ VMO accompanies an exact
 //! request, after the producer observes GPU completion and the driver's output clean.
 //! The producer freezes the image until a matching retired reply: Submit acceptance,
 //! scanout admission and IRQ delivery alone never permit reuse. — KESTREL
@@ -11,6 +12,8 @@ pub const REQUEST_LEN: usize = 64;
 pub const REPLY_LEN: usize = 24;
 pub const MAX_VMO_BYTES: u64 = 2 * 1024 * 1024;
 pub const IMAGE_IOVA: u64 = 0x6300_0000;
+/// The repeated-presentation proof is bounded to triangle, bars/ramp, triangle.
+pub const PRESENTATIONS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Image {
@@ -26,7 +29,7 @@ pub struct Image {
 impl Image {
     /// First join: one unscaled 256x128 linear XRGB image, page-exact in a bounded VMO.
     pub fn valid(self) -> bool {
-        self.sequence == 1
+        (1..=PRESENTATIONS).contains(&self.sequence)
             && self.gpu_point != 0
             && self.surface
                 == (Surface {
@@ -136,6 +139,56 @@ impl Reply {
     }
 }
 
+/// One outstanding image, exact next sequence, increasing completed GPU point and a
+/// fixed actual VMO identity/span. Call retire only after the presenter's checked
+/// hardware replacement/unmap or its matching reply; this is not a kernel fence. — KESTREL
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Lease {
+    retired: u32,
+    point: u64,
+    pending: Option<Image>,
+    backing: Option<(u64, u64, u64)>,
+}
+impl Lease {
+    pub fn can_render(&self) -> bool {
+        self.pending.is_none() && self.retired < PRESENTATIONS
+    }
+    pub fn retired(&self) -> u32 {
+        self.retired
+    }
+    pub fn complete(&self) -> bool {
+        self.pending.is_none() && self.retired == PRESENTATIONS
+    }
+    pub fn begin(&mut self, image: Image, vmo_koid: u64) -> bool {
+        let backing = (vmo_koid, image.offset, image.vmo_bytes);
+        if !self.can_render()
+            || !image.valid()
+            || vmo_koid == 0
+            || vmo_koid == u64::MAX
+            || self.retired.checked_add(1) != Some(image.sequence)
+            || image.gpu_point <= self.point
+            || self.backing.is_some_and(|old| old != backing)
+        {
+            return false;
+        }
+        self.backing = Some(backing);
+        self.pending = Some(image);
+        true
+    }
+    pub fn retire(&mut self, reply: Reply) -> bool {
+        let Some(image) = self.pending else {
+            return false;
+        };
+        if !reply.releases(image) {
+            return false;
+        }
+        self.retired = image.sequence;
+        self.point = image.gpu_point;
+        self.pending = None;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +202,125 @@ mod tests {
             checksum: 0x8720cbc5,
         }
     }
+    #[test]
+    fn serial_lease_blocks_gpu_reuse_until_exact_retirement_and_rejects_replay() {
+        let mut producer = Lease::default();
+        let mut presenter = Lease::default();
+        for sequence in 1..=PRESENTATIONS {
+            assert!(producer.can_render());
+            let frame = Image {
+                sequence,
+                gpu_point: u64::from(sequence) + 3,
+                ..image()
+            };
+            assert!(producer.begin(frame, 77));
+            assert!(presenter.begin(frame, 77));
+            assert!(!producer.can_render());
+            assert!(!presenter.can_render());
+            assert!(!producer.begin(frame, 77));
+            let reply = Reply {
+                sequence,
+                gpu_point: frame.gpu_point,
+                retired: true,
+            };
+            for bad in [
+                Reply {
+                    retired: false,
+                    ..reply
+                },
+                Reply {
+                    sequence: sequence + 1,
+                    ..reply
+                },
+                Reply {
+                    gpu_point: frame.gpu_point - 1,
+                    ..reply
+                },
+            ] {
+                assert!(!producer.retire(bad));
+                assert!(!presenter.retire(bad));
+                assert!(!producer.can_render());
+                assert!(!presenter.can_render());
+            }
+            assert!(presenter.retire(reply));
+            assert!(!producer.can_render()); // physical retirement still needs delivery
+            assert!(producer.retire(reply));
+            assert_eq!(producer.retired(), sequence);
+            assert!(!producer.retire(reply));
+            assert!(!presenter.begin(frame, 77));
+        }
+        assert!(producer.complete() && presenter.complete());
+        assert!(!producer.can_render());
+    }
+    #[test]
+    fn serial_lease_rejects_skips_stale_points_and_substituted_backing_without_mutation() {
+        let mut lease = Lease::default();
+        let first = Image {
+            gpu_point: 4,
+            ..image()
+        };
+        for koid in [0, u64::MAX] {
+            assert!(!lease.begin(first, koid));
+        }
+        assert!(!lease.begin(
+            Image {
+                sequence: 2,
+                ..first
+            },
+            77
+        ));
+        assert!(lease.begin(first, 77));
+        assert!(lease.retire(Reply {
+            sequence: 1,
+            gpu_point: 4,
+            retired: true
+        }));
+        let second = Image {
+            sequence: 2,
+            gpu_point: 5,
+            ..first
+        };
+        let before = lease;
+        for (bad, koid) in [
+            (
+                Image {
+                    sequence: 3,
+                    ..second
+                },
+                77,
+            ),
+            (
+                Image {
+                    gpu_point: 4,
+                    ..second
+                },
+                77,
+            ),
+            (
+                Image {
+                    offset: 0,
+                    ..second
+                },
+                77,
+            ),
+            (
+                Image {
+                    vmo_bytes: 0x40000,
+                    ..second
+                },
+                77,
+            ),
+            (second, 78),
+        ] {
+            assert!(!lease.begin(bad, koid));
+            assert_eq!(lease, before);
+        }
+        assert!(lease.begin(second, 77));
+        let mut bytes = second.encode();
+        bytes[4..8].copy_from_slice(&(PRESENTATIONS + 1).to_le_bytes());
+        assert!(Image::decode(&bytes).is_none());
+    }
+
     #[test]
     fn exact_image_and_retirement_frames_reject_truncation_reserved_and_stale_completion() {
         let i = image();

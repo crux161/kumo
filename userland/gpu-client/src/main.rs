@@ -4,6 +4,7 @@
 //j596
 //j636
 //j637
+//j638
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -173,6 +174,55 @@ fn submit_wait(
     Err(())
 }
 
+fn present_image(
+    channel: Handle,
+    vmo: Handle,
+    image: kumo_graphics::native::Image,
+    lease: &mut kumo_graphics::native::Lease,
+) -> Result<(), ()> {
+    if !lease.begin(image, kumo_rt::handle_koid(vmo)) {
+        return Err(());
+    }
+    let grant = handle(kumo_rt::handle_duplicate(
+        vmo,
+        kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER,
+    ))
+    .ok_or(())?;
+    let bytes = image.encode();
+    if kumo_rt::channel_write_with_handle(channel, bytes.as_ptr(), bytes.len(), grant) != 0 {
+        let _ = kumo_rt::handle_close(grant);
+        return Err(());
+    }
+    log(format_args!("gpu-client: J0c sequence{} point{} leased READ-only; GPU/CPU writes blocked until matching retirement\n",image.sequence,image.gpu_point));
+    let port = handle(kumo_rt::port_create()).ok_or(())?;
+    let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
+    if kumo_rt::port_bind(port, channel) != 0
+        || kumo_rt::port_bind(port, timer) != 0
+        || kumo_rt::port_wait(port) != kumo_rt::handle_koid(channel)
+    {
+        return Err(());
+    }
+    let mut bytes = [0; kumo_graphics::native::REPLY_LEN + 1];
+    let (n, extra) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
+    let _ = kumo_rt::port_unbind(port, channel);
+    let _ = kumo_rt::port_unbind(port, timer);
+    let _ = kumo_rt::handle_close(timer);
+    let _ = kumo_rt::handle_close(port);
+    if extra != 0 {
+        let _ = kumo_rt::handle_close(Handle(extra as u32));
+        return Err(());
+    }
+    let reply = bytes
+        .get(..n)
+        .and_then(kumo_graphics::native::Reply::decode)
+        .ok_or(())?;
+    if !lease.retire(reply) {
+        return Err(());
+    }
+    log(format_args!("gpu-client: J0c sequence{} point{} retired after consumed GOP replacement/unmap; next GPU reuse permitted\n",image.sequence,image.gpu_point));
+    Ok(())
+}
+
 fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     let mut client = Client { channel, id: 0 };
     let Response::Info(info) = client.simple(Command::GetInfo)? else {
@@ -290,71 +340,75 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     log(format_args!(
         "gpu-client: client compute frame verified; 32768 pixels match\n"
     ));
-    // Point3 is complete and this image has never been leased to display. Poison
-    // before the distinct triangle dispatch so every output pixel must be GPU-written. — KESTREL
-    for offset in (0..PAINT_BYTES).step_by(4) {
-        unsafe {
-            ((cpu + PAINT_OFFSET + offset) as *mut u32).write_volatile(PIXEL_POISON);
+    let mut lease = kumo_graphics::native::Lease::default();
+    let count = if presentation.0 == 0 {
+        1
+    } else {
+        kumo_graphics::native::PRESENTATIONS
+    };
+    for sequence in 1..=count {
+        // This check precedes EVERY poison/write and GPU submission. Only a verified
+        // previous display retirement reply can reopen the image for production. — KESTREL
+        if !lease.can_render() {
+            return Err(());
         }
-    }
-    submit_wait(&mut client, cpu, group, 4, &triangle)?;
-    let triangle_check = check_triangle(|x, y| unsafe {
-        ((cpu + PAINT_OFFSET + u64::from(y * PAINT_WIDTH + x) * 4) as *const u32).read_volatile()
-    });
-    log(format_args!("gpu-client: J0b triangle compute {}x{}: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",PAINT_WIDTH,PAINT_HEIGHT,triangle_check.mismatches,triangle_check.checksum,triangle_reference_checksum()));
-    if let Some((x, y, got, want)) = triangle_check.first {
-        log(format_args!(
-            "gpu-client: triangle mismatch ({},{}): got0x{:08x} want0x{:08x}\n",
-            x, y, got, want
-        ));
-        return Err(());
+        let point = u64::from(sequence) + 3;
+        let is_triangle = sequence % 2 == 1;
+        for offset in (0..PAINT_BYTES).step_by(4) {
+            unsafe {
+                ((cpu + PAINT_OFFSET + offset) as *mut u32).write_volatile(PIXEL_POISON);
+            }
+        }
+        submit_wait(
+            &mut client,
+            cpu,
+            group,
+            point,
+            if is_triangle { &triangle } else { &compute },
+        )?;
+        let read = |x, y| unsafe {
+            ((cpu + PAINT_OFFSET + u64::from(y * PAINT_WIDTH + x) * 4) as *const u32)
+                .read_volatile()
+        };
+        let check = if is_triangle {
+            check_triangle(read)
+        } else {
+            check_paint(read)
+        };
+        let reference = if is_triangle {
+            triangle_reference_checksum()
+        } else {
+            paint_reference_checksum()
+        };
+        log(format_args!("gpu-client: J0c sequence{} point{} {}: VMO{} mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",sequence,point,if is_triangle {"triangle"}else{"bars/ramp"},kumo_rt::handle_koid(vmo),check.mismatches,check.checksum,reference));
+        if let Some((x, y, got, want)) = check.first {
+            log(format_args!(
+                "gpu-client: J0c mismatch ({},{}): got0x{:08x} want0x{:08x}\n",
+                x, y, got, want
+            ));
+            return Err(());
+        }
+        if presentation.0 != 0 {
+            present_image(
+                presentation,
+                vmo,
+                kumo_graphics::native::Image {
+                    sequence,
+                    surface: kumo_graphics::DEMO,
+                    offset: PAINT_OFFSET,
+                    vmo_bytes: BUFFER_BYTES,
+                    gpu_point: point,
+                    checksum: check.checksum,
+                },
+                &mut lease,
+            )?;
+        }
     }
     if presentation.0 != 0 {
-        let image = kumo_graphics::native::Image {
-            sequence: 1,
-            surface: kumo_graphics::DEMO,
-            offset: PAINT_OFFSET,
-            vmo_bytes: BUFFER_BYTES,
-            gpu_point: 4,
-            checksum: triangle_check.checksum,
-        };
-        let grant = handle(kumo_rt::handle_duplicate(
-            vmo,
-            kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER,
-        ))
-        .ok_or(())?;
-        let bytes = image.encode();
-        if kumo_rt::channel_write_with_handle(presentation, bytes.as_ptr(), bytes.len(), grant) != 0
-        {
-            let _ = kumo_rt::handle_close(grant);
+        if !lease.complete() {
             return Err(());
         }
-        log(format_args!("gpu-client: J0b completed point4 triangle leased READ-only; frozen until display retirement\n"));
-        let port = handle(kumo_rt::port_create()).ok_or(())?;
-        let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
-        if kumo_rt::port_bind(port, presentation) != 0
-            || kumo_rt::port_bind(port, timer) != 0
-            || kumo_rt::port_wait(port) != kumo_rt::handle_koid(presentation)
-        {
-            return Err(());
-        }
-        let mut bytes = [0; kumo_graphics::native::REPLY_LEN + 1];
-        let (n, extra) =
-            kumo_rt::channel_read_with_handle(presentation, bytes.as_mut_ptr(), bytes.len());
-        let _ = kumo_rt::handle_close(timer);
-        let _ = kumo_rt::handle_close(port);
-        if extra != 0 {
-            let _ = kumo_rt::handle_close(Handle(extra as u32));
-            return Err(());
-        }
-        if !bytes
-            .get(..n)
-            .and_then(kumo_graphics::native::Reply::decode)
-            .is_some_and(|r| r.releases(image))
-        {
-            return Err(());
-        }
-        log(format_args!("gpu-client: J0b native triangle retired after consumed console replacement and display unmap; reuse permitted\n"));
+        log(format_args!("gpu-client: J0c complete: 3 native frames, same VMO/image pages, 2 GPU reuses only after display retirement\n"));
     }
     let _ = kumo_rt::handle_close(vmo);
     Ok(())

@@ -1,8 +1,8 @@
-//j632
 //j633
 //j634
 //j635
 //j636
+//j638
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -321,6 +321,8 @@ pub struct Pending {
     alternation: Option<&'static mut Alternation>,
     native_frame: Option<NativeFrame>,
     native_source: u64,
+    native_lease: kumo_graphics::native::Lease,
+    native_cpu: u64,
 }
 
 impl Pending {
@@ -526,6 +528,8 @@ fn begin(
         alternation: None,
         native_frame: None,
         native_source: 0,
+        native_lease: kumo_graphics::native::Lease::default(),
+        native_cpu: 0,
     })
 }
 
@@ -1791,7 +1795,8 @@ fn native_start(mut pending: Pending) -> Option<Pending> {
     }
     pending.native_source = handle_koid(channel);
     log(format_args!(
-        "display: J0a waiting for the completed GPU client image; console remains live\n"
+        "display: J0c waiting for completed GPU image sequence{}; console remains live\n",
+        pending.native_lease.retired() + 1
     ));
     next(pending, Phase::NativeWait, 10_000)
 }
@@ -1812,21 +1817,36 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
         close(channel);
         return None;
     };
+    let koid = handle_koid(vmo);
+    if !pending.native_lease.begin(image, koid) {
+        error(format_args!(
+            "display: J0c stale/overlapping/substituted image refused before mapping\n"
+        ));
+        close(vmo);
+        close(channel);
+        return None;
+    }
     let Some(program) = scanout::image_program(&pending.program, image) else {
         close(vmo);
         close(channel);
         return None;
     };
-    let (status, cpu) = kumo_rt::vmar_map_anywhere(
-        vmo,
-        image.vmo_bytes,
-        (VmarFlags::READ | VmarFlags::UNCACHED).0,
-    );
-    if status != 0 || cpu == 0 {
-        close(vmo);
-        close(channel);
-        return None;
+    // Lease admission proves the same actual VMO/span on every presentation, so
+    // one retained READ-only CPU view suffices to verify all three GPU outputs. — KESTREL
+    if pending.native_cpu == 0 {
+        let (status, cpu) = kumo_rt::vmar_map_anywhere(
+            vmo,
+            image.vmo_bytes,
+            (VmarFlags::READ | VmarFlags::UNCACHED).0,
+        );
+        if status != 0 || cpu == 0 {
+            close(vmo);
+            close(channel);
+            return None;
+        }
+        pending.native_cpu = cpu;
     }
+    let cpu = pending.native_cpu;
     // SAFETY: the validated image lies wholly in the actual READ-only mapping. This
     // volatile check reads the original pages; there is no CPU copy into scanout. — KESTREL
     let checksum =
@@ -1867,10 +1887,10 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
         close(channel);
         return None;
     }
-    log(format_args!("display: J0a ZERO-COPY GPU point{}: original VMO offset{:#x}, display IOVA{:#x}, 256x128 stride256 XRGB8888, checksum{:#x}; consumed load, holding5000ms\n",image.gpu_point,image.offset,IMAGE_IOVA,checksum));
+    log(format_args!("display: J0c sequence{} point{} ZERO-COPY: VMO{} offset{:#x}, display IOVA{:#x}, checksum{:#x}; complete region/load consumed, holding5000ms\n",image.sequence,image.gpu_point,koid,image.offset,IMAGE_IOVA,checksum));
     next(pending, Phase::NativeHold, 5_000)
 }
-fn native_retire(pending: Pending, device: &mut Device) -> Option<Pending> {
+fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
     use kumo_graphics::native::{Reply, IMAGE_IOVA};
     let frame = pending.native_frame?;
     if !context_ready(pending.vblank.context) {
@@ -1897,15 +1917,44 @@ fn native_retire(pending: Pending, device: &mut Device) -> Option<Pending> {
         close(pending.vblank.native);
         return None;
     }
-    close(frame.vmo);
     let reply = Reply {
         sequence: frame.image.sequence,
         gpu_point: frame.image.gpu_point,
         retired: true,
+    };
+    if !pending.native_lease.retire(reply) {
+        close(pending.vblank.native);
+        return None;
     }
-    .encode();
-    let status = kumo_rt::channel_write(pending.vblank.native, reply.as_ptr(), reply.len());
-    log(format_args!("display: J0a original GPU image retired: complete GOP geometry/load consumed, checked display unmap finished; reply={}\n",status));
-    close(pending.vblank.native);
-    None
+    close(frame.vmo);
+    pending.native_frame = None;
+    let channel = pending.vblank.native;
+    let complete = pending.native_lease.complete();
+    // Arm the next bounded wait before releasing the producer, so an immediate
+    // next render/transfer cannot race a missing channel watch. — KESTREL
+    let pending = if complete {
+        pending
+    } else {
+        native_start(pending)?
+    };
+    let bytes = reply.encode();
+    let status = kumo_rt::channel_write(channel, bytes.as_ptr(), bytes.len());
+    log(format_args!("display: J0c sequence{} point{} retired: complete GOP geometry/load consumed, checked image unmap finished; reply={}\n",reply.sequence,reply.gpu_point,status));
+    if status != 0 {
+        if !complete {
+            disarm(pending.port, pending.timer);
+            let _ = port_unbind(pending.port, channel);
+        }
+        close(channel);
+        return None;
+    }
+    if complete {
+        log(format_args!(
+            "display: J0c complete: 3 original-VMO presentations retired, GOP-only console live\n"
+        ));
+        close(channel);
+        None
+    } else {
+        Some(pending)
+    }
 }
