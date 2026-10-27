@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #j592
+#j637
 # build-mali-shaders.sh - rebuild shaders/mali/ from source in a pinned Linux container.
 #
 # Usage:
@@ -13,9 +14,10 @@
 # package set by snapshot.debian.org timestamp, Mesa's source by tarball sha256, and the
 # toolchain versions it then checks. It needs Docker (OrbStack on CRUX's Mac). It builds only
 # Mesa's two offline compilers (mesa_clc: OpenCL C -> SPIR-V; panfrost_compile: SPIR-V ->
-# Valhall), compiles shaders/mali/kumo_paint.cl for arch 10 (Mali-G610), and runs
+# Valhall), compiles the paint and triangle kernels for arch 10 (Mali-G610), and runs
 # shaders/mali/tools/manifest.c against Mesa's headers to write the binary, the manifest and
-# the disassembly. — TIMBERDOODLE 2026-10-24
+# the disassembly. Original recipe — TIMBERDOODLE 2026-10-24;
+# triangle extension and stopped-container reuse — KESTREL 2026-10-26
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,6 +48,9 @@ docker info >/dev/null 2>&1 || { echo "error: the Docker engine is not running" 
 if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
   echo "==> Starting $CONTAINER from $IMAGE"
   docker run -d --name "$CONTAINER" "$IMAGE" sleep infinity >/dev/null
+fi
+if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" != true ]; then
+  docker start "$CONTAINER" >/dev/null
 fi
 cleanup() {
   if [ -z "${KUMO_MALI_SHADERS_KEEP:-}" ]; then
@@ -88,17 +93,20 @@ if [ "$TOOLS" != "$EXPECT_TOOLS" ]; then
   exit 1
 fi
 
-echo "==> Compiling kumo_paint for arch 10"
+rm -rf "$OUT" && mkdir -p "$OUT"
+status=0
+for KERNEL in kumo_paint kumo_triangle; do
+echo "==> Compiling $KERNEL for arch 10"
 docker exec "$CONTAINER" rm -rf /work/kumo && docker exec "$CONTAINER" mkdir -p /work/kumo
-docker cp "$SRC/kumo_paint.cl" "$CONTAINER:/work/kumo/kumo_paint.cl"
+docker cp "$SRC/$KERNEL.cl" "$CONTAINER:/work/kumo/$KERNEL.cl"
 docker cp "$SRC/tools/manifest.c" "$CONTAINER:/work/kumo/manifest.c"
-docker exec -e MESA_VERSION="$MESA_VERSION" "$CONTAINER" bash -euo pipefail -c '
+docker exec -e MESA_VERSION="$MESA_VERSION" -e KERNEL="$KERNEL" "$CONTAINER" bash -euo pipefail -c '
   M="/work/mesa-${MESA_VERSION%-*}"; B=/work/build; cd /work/kumo
-  "$B/src/compiler/clc/mesa_clc" -o kumo_paint_v10.spv --depfile kumo_paint_v10.d kumo_paint.cl \
+  "$B/src/compiler/clc/mesa_clc" -o "${KERNEL}_v10.spv" --depfile "${KERNEL}_v10.d" "$KERNEL.cl" \
     -- -DPAN_ARCH=10 -I"$M/include" -I"$M/src/compiler/libcl" -I"$M/src" -I"$M/src/panfrost" \
     -cl-std=cl2.0 -D__OPENCL_VERSION__=200
-  "$B/src/panfrost/clc/panfrost_compile" kumo_shaders 10 kumo_paint_v10.spv kumo_paint_v10.h \
-    kumo_paint_v10.c
+  "$B/src/panfrost/clc/panfrost_compile" kumo_shaders 10 "${KERNEL}_v10.spv" "${KERNEL}_v10.h" \
+    "${KERNEL}_v10.c"
   # Mesa headers need the defines meson gave its own compiler sources.
   python3 - <<EOF > flags.txt
 import json, os, shlex
@@ -112,35 +120,42 @@ for a in shlex.split(c["command"]):
         out.append(a)
 print(" ".join(out))
 EOF
-  cc -O1 -o manifest manifest.c -I. $(cat flags.txt) -I"$B/src/panfrost/genxml" \
+  extra=()
+  if [ "$KERNEL" = kumo_triangle ]; then extra=(-DBUILD_TRIANGLE); fi
+  cc -O1 "${extra[@]}" -o manifest manifest.c -I. $(cat flags.txt) -I"$B/src/panfrost/genxml" \
     -I"$B/src/panfrost" -I"$M/src/panfrost/compiler/bifrost/valhall" \
     -I"$B/src/panfrost/compiler/bifrost/valhall" \
     "$B/src/panfrost/compiler/bifrost/valhall/libpanfrost_valhall_disasm.a" \
     "$B/src/util/libmesa_util.a" -lm -lpthread -lz -lzstd
-  ./manifest kumo_paint.v10.bin kumo_paint.v10.dis > manifest.txt'
-
-rm -rf "$OUT" && mkdir -p "$OUT"
-docker cp "$CONTAINER:/work/kumo/kumo_paint.v10.bin" "$OUT/kumo_paint.v10.bin"
-docker cp "$CONTAINER:/work/kumo/kumo_paint.v10.dis" "$OUT/kumo_paint.v10.dis"
+  ./manifest "$KERNEL.v10.bin" "$KERNEL.v10.dis" > manifest.txt'
+docker cp "$CONTAINER:/work/kumo/$KERNEL.v10.bin" "$OUT/$KERNEL.v10.bin"
+docker cp "$CONTAINER:/work/kumo/$KERNEL.v10.dis" "$OUT/$KERNEL.v10.dis"
+# Keep legacy assets byte-identical; only the new triangle needs EOF normalization. — KESTREL
+if [ "$KERNEL" = kumo_triangle ]; then
+python3 - "$OUT/$KERNEL.v10.dis" <<'PYDIS'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+p.write_bytes(p.read_bytes().rstrip(b"\n") + b"\n")
+PYDIS
+fi
 docker cp "$CONTAINER:/work/kumo/manifest.txt" "$OUT/manifest.txt"
 
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 {
-  echo "# kumo_paint.v10.manifest: written by scripts/build-mali-shaders.sh; do not edit."
-  echo "# What Mesa's compiler reported for kumo_paint.cl on arch 10, and Mesa's reference"
+  echo "# $KERNEL.v10.manifest: written by scripts/build-mali-shaders.sh; do not edit."
+  echo "# What Mesa's compiler reported for $KERNEL.cl on arch 10, and Mesa's reference"
   echo "# descriptors for it (pan_pack, PAN_ARCH 10), which drv-gpu's packers must match."
   echo "mesa = $MESA_VERSION"
   echo "image = $IMAGE"
   echo "snapshot = $SNAPSHOT"
   echo "$TOOLS" | sed 's/^\([^ ]*\) /tool \1 = /'
-  echo "source_sha256 = $(sha "$SRC/kumo_paint.cl")"
-  echo "binary_sha256 = $(sha "$OUT/kumo_paint.v10.bin")"
+  echo "source_sha256 = $(sha "$SRC/$KERNEL.cl")"
+  echo "binary_sha256 = $(sha "$OUT/$KERNEL.v10.bin")"
   cat "$OUT/manifest.txt"
-} > "$OUT/kumo_paint.v10.manifest"
+} > "$OUT/$KERNEL.v10.manifest"
 rm "$OUT/manifest.txt"
 
-status=0
-for f in kumo_paint.v10.bin kumo_paint.v10.manifest kumo_paint.v10.dis; do
+for f in "$KERNEL.v10.bin" "$KERNEL.v10.manifest" "$KERNEL.v10.dis"; do
   if [ "$UPDATE" -eq 1 ]; then
     cp "$OUT/$f" "$SRC/$f"
     echo "updated shaders/mali/$f"
@@ -150,5 +165,6 @@ for f in kumo_paint.v10.bin kumo_paint.v10.manifest kumo_paint.v10.dis; do
     echo "DIFFER  shaders/mali/$f" >&2
     status=1
   fi
+done
 done
 exit "$status"

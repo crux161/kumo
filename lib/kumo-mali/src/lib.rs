@@ -1,7 +1,8 @@
 #![no_std]
 //j596
+//j637
 
-//! Shared Mali-G610 CSF instructions, vendored compute kernel and descriptor packing. Both
+//! Shared Mali-G610 CSF instructions, vendored compute kernels and descriptor packing. Both
 //! drv-gpu's boot proof and the separate client use these same packers. This library owns
 //! no MMIO, mappings, queue, session or synchronization objects. — TIMBERDOODLE
 
@@ -85,7 +86,13 @@ fn fnv1a(hash: u32, pixel: u32) -> u32 {
 
 /// Compare every pixel `read(x, y)` returns against the reference. The caller reads the
 /// surface with volatile loads; this never sees GPU memory itself.
-pub fn check_paint(mut read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
+pub fn check_paint(read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
+    check_image(paint_pixel, read)
+}
+fn check_image(
+    reference: impl Fn(u32, u32) -> u32,
+    mut read: impl FnMut(u32, u32) -> u32,
+) -> PaintCheck {
     let mut check = PaintCheck {
         checksum: 0x811C_9DC5,
         ..PaintCheck::default()
@@ -93,7 +100,7 @@ pub fn check_paint(mut read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
     for y in 0..PAINT_HEIGHT {
         for x in 0..PAINT_WIDTH {
             let got = read(x, y);
-            let want = paint_pixel(x, y);
+            let want = reference(x, y);
             if got != want {
                 check.mismatches += 1;
                 check.first.get_or_insert((x, y, got, want));
@@ -107,6 +114,31 @@ pub fn check_paint(mut read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
 /// The reference image's checksum, for the boot log beside the measured one.
 pub fn paint_reference_checksum() -> u32 {
     check_paint(paint_pixel).checksum
+}
+
+/// J0b's independent pixel-center edge-equation reference for the compute triangle.
+/// Clockwise vertices are red (128,16), green (32,112), blue (224,112).
+/// This only validates GPU output; it never writes the image. — KESTREL
+pub fn triangle_pixel(x: u32, y: u32) -> u32 {
+    let p = (2 * x as i32 + 1, 2 * y as i32 + 1);
+    let edge = |a: (i32, i32), b: (i32, i32)| (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let vertices = [(256, 32), (64, 224), (448, 224)];
+    let weights = [
+        -edge(vertices[1], vertices[2]) / 384,
+        -edge(vertices[2], vertices[0]) / 384,
+        -edge(vertices[0], vertices[1]) / 384,
+    ];
+    if weights.iter().any(|w| *w < 0) {
+        return 0x00101820;
+    }
+    let [r, g, b] = weights.map(|w| ((w as u32) * 255 + 96) / 192);
+    (r << 16) | (g << 8) | b
+}
+pub fn check_triangle(read: impl FnMut(u32, u32) -> u32) -> PaintCheck {
+    check_image(triangle_pixel, read)
+}
+pub fn triangle_reference_checksum() -> u32 {
+    check_triangle(triangle_pixel).checksum
 }
 
 // ---- G5c: the offline-compiled compute kernel (shaders/mali, PLAN/013 decision 2 option A) ----
@@ -134,6 +166,22 @@ pub struct ComputeKernel {
 /// invocation per pixel. Arguments: `out` (u64) at +0 and `stride` (u32) at +8.
 pub const KUMO_PAINT_V10: ComputeKernel = ComputeKernel {
     binary: include_bytes!("../../../shaders/mali/kumo_paint.v10.bin"),
+    local_size: [16, 16, 1],
+    work_reg_count: 32,
+    preload: 0x3000_0000_0000_0000,
+    tls_size: 0,
+    wls_size: 0,
+    allow_merging_workgroups: false,
+    ftz_fp16: false,
+    ftz_fp32: false,
+    args_offset: 24,
+    args_bytes: 12,
+};
+
+/// J0b's integer barycentric compute rasterizer. It shares only the validated ABI
+/// and 16x16 geometry with the boot painter, not its executable bytes. — KESTREL
+pub const KUMO_TRIANGLE_V10: ComputeKernel = ComputeKernel {
+    binary: include_bytes!("../../../shaders/mali/kumo_triangle.v10.bin"),
     local_size: [16, 16, 1],
     work_reg_count: 32,
     preload: 0x3000_0000_0000_0000,
@@ -254,11 +302,14 @@ pub fn fau_pointer(push_va: u64, push_bytes: u32) -> Result<u64, KernelError> {
 /// The push data for one `kumo_paint` dispatch: the sysvals (workgroup counts, no printf
 /// buffer), then `out` and `stride`, padded to whole 8-byte FAU slots.
 pub fn kumo_paint_push(workgroups: [u32; 3], out: u64, stride: u32) -> [u8; 40] {
+    image_push(&KUMO_PAINT_V10, workgroups, out, stride)
+}
+fn image_push(kernel: &ComputeKernel, workgroups: [u32; 3], out: u64, stride: u32) -> [u8; 40] {
     let mut push = [0u8; 40];
     for (index, count) in workgroups.iter().enumerate() {
         push[index * 4..index * 4 + 4].copy_from_slice(&count.to_le_bytes());
     }
-    let args = KUMO_PAINT_V10.args_offset as usize;
+    let args = kernel.args_offset as usize;
     push[args..args + 8].copy_from_slice(&out.to_le_bytes());
     push[args + 8..args + 12].copy_from_slice(&stride.to_le_bytes());
     push
@@ -273,6 +324,17 @@ pub fn kumo_paint_data(out: u64) -> Result<[u8; 104], KernelError> {
 /// The same pinned descriptor layout at a caller-owned binary/target address. Only the
 /// binary pointer and output argument differ from the boot proof. — TIMBERDOODLE
 pub fn kumo_paint_data_at(binary_va: u64, out: u64) -> Result<[u8; 104], KernelError> {
+    image_data_at(&KUMO_PAINT_V10, binary_va, out)
+}
+/// The triangle's separately pinned shader at a caller-owned binary/output address.
+pub fn kumo_triangle_data_at(binary_va: u64, out: u64) -> Result<[u8; 104], KernelError> {
+    image_data_at(&KUMO_TRIANGLE_V10, binary_va, out)
+}
+fn image_data_at(
+    kernel: &ComputeKernel,
+    binary_va: u64,
+    out: u64,
+) -> Result<[u8; 104], KernelError> {
     if out % 4 != 0
         || out
             .checked_add(PAINT_BYTES)
@@ -281,14 +343,19 @@ pub fn kumo_paint_data_at(binary_va: u64, out: u64) -> Result<[u8; 104], KernelE
         return Err(KernelError::OutputAddress(out));
     }
     let mut data = [0u8; 104];
-    for (index, word) in shader_program_descriptor(&KUMO_PAINT_V10, binary_va)?
+    for (index, word) in shader_program_descriptor(kernel, binary_va)?
         .iter()
-        .chain(local_storage_descriptor(&KUMO_PAINT_V10)?.iter())
+        .chain(local_storage_descriptor(kernel)?.iter())
         .enumerate()
     {
         data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-    data[64..].copy_from_slice(&kumo_paint_push(KUMO_PAINT_WORKGROUPS, out, PAINT_WIDTH));
+    data[64..].copy_from_slice(&image_push(
+        kernel,
+        image_workgroups(kernel),
+        out,
+        PAINT_WIDTH,
+    ));
     Ok(data)
 }
 
@@ -304,6 +371,27 @@ pub fn kumo_paint_stream(features: CsFeatures) -> Result<[u64; 24], KernelError>
 /// A dispatch using the caller's descriptor block (SPD +0, TSD +32, push +64). This is shared
 /// by the privileged boot proof and the unprivileged protocol client. — TIMBERDOODLE
 pub fn kumo_paint_stream_at(features: CsFeatures, data_va: u64) -> Result<[u64; 24], KernelError> {
+    image_stream_at(&KUMO_PAINT_V10, features, data_va)
+}
+/// Dispatch the triangle through its own descriptor block and the same checked ABI.
+pub fn kumo_triangle_stream_at(
+    features: CsFeatures,
+    data_va: u64,
+) -> Result<[u64; 24], KernelError> {
+    image_stream_at(&KUMO_TRIANGLE_V10, features, data_va)
+}
+fn image_workgroups(kernel: &ComputeKernel) -> [u32; 3] {
+    [
+        PAINT_WIDTH / kernel.local_size[0],
+        PAINT_HEIGHT / kernel.local_size[1],
+        1,
+    ]
+}
+fn image_stream_at(
+    kernel: &ComputeKernel,
+    features: CsFeatures,
+    data_va: u64,
+) -> Result<[u64; 24], KernelError> {
     if !(44..=256).contains(&features.work_regs) || !(2..=16).contains(&features.scoreboards) {
         return Err(KernelError::DispatchFeatures(features));
     }
@@ -315,7 +403,7 @@ pub fn kumo_paint_stream_at(features: CsFeatures, data_va: u64) -> Result<[u64; 
         return Err(KernelError::DescriptorAddress(data_va));
     }
     let fau = fau_pointer(data_va + 64, 40)?;
-    let [x, y, z] = KUMO_PAINT_WORKGROUPS;
+    let [x, y, z] = image_workgroups(kernel);
     let wait_all = ((1u32 << features.scoreboards) - 1) as u16;
     Ok([
         (34u64 << 56) | 1, // REQ_RESOURCE compute
@@ -326,7 +414,7 @@ pub fn kumo_paint_stream_at(features: CsFeatures, data_va: u64) -> Result<[u64; 
         move48(16, data_va),
         move48(24, data_va + 32),
         move32(32, 0),
-        move32(33, workgroup_size_word(&KUMO_PAINT_V10)?),
+        move32(33, workgroup_size_word(kernel)?),
         move32(34, 0),
         move32(35, 0),
         move32(36, 0),
@@ -349,6 +437,128 @@ pub fn kumo_paint_stream_at(features: CsFeatures, data_va: u64) -> Result<[u64; 
 mod tests {
     use super::*;
     const METAL: CsFeatures = CsFeatures::decode(0x7085f);
+
+    #[test]
+    fn triangle_pixel_centers_cover_expected_edges_colors_and_all_output_pixels() {
+        for (x, y, c) in [
+            (128, 16, 0x00fe0001),
+            (127, 16, 0x00fe0100),
+            (32, 111, 0x0001fe00),
+            (223, 111, 0x000100fe),
+            (128, 80, 0x00545556),
+        ] {
+            assert_eq!(triangle_pixel(x, y), c);
+        }
+        for (x, y) in [
+            (128, 15),
+            (31, 111),
+            (224, 111),
+            (128, 112),
+            (0, 0),
+            (255, 127),
+        ] {
+            assert_eq!(triangle_pixel(x, y), 0x00101820);
+        }
+        let coverage = (0..PAINT_HEIGHT)
+            .map(|y| {
+                (0..PAINT_WIDTH)
+                    .filter(|x| triangle_pixel(*x, y) != 0x00101820)
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(coverage, 9312);
+        assert_eq!(triangle_reference_checksum(), 0xc3ccc90f);
+        assert_eq!(check_triangle(triangle_pixel).mismatches, 0);
+        let bad = check_triangle(|x, y| {
+            if (x, y) == (128, 80) {
+                0
+            } else {
+                triangle_pixel(x, y)
+            }
+        });
+        assert_eq!(bad.mismatches, 1);
+        assert_eq!(bad.first, Some((128, 80, 0, 0x545556)));
+    }
+    #[test]
+    fn triangle_kernel_abi_and_descriptors_match_pinned_mesa_output() {
+        const MANIFEST: &str = include_str!("../../../shaders/mali/kumo_triangle.v10.manifest");
+        let value = |key: &str| {
+            MANIFEST
+                .lines()
+                .filter_map(|line| line.split_once(" = "))
+                .find(|(k, _)| *k == key)
+                .unwrap()
+                .1
+        };
+        let number = |key: &str| {
+            let s = value(key);
+            s.strip_prefix("0x").map_or_else(
+                || s.parse::<u64>().unwrap(),
+                |s| u64::from_str_radix(s, 16).unwrap(),
+            )
+        };
+        let k = KUMO_TRIANGLE_V10;
+        assert_eq!(value("kernel"), "kumo_triangle");
+        assert_eq!(value("mesa"), "26.2.5-1");
+        assert_eq!(value("local_size"), "16 16 1");
+        assert_eq!(k.local_size, [16, 16, 1]);
+        for (key, actual) in [
+            ("arch", 10),
+            ("stage_compute", 1),
+            ("binary_bytes", k.binary.len() as u64),
+            ("work_reg_count", u64::from(k.work_reg_count)),
+            ("preload", k.preload),
+            ("tls_size", u64::from(k.tls_size)),
+            ("wls_size", u64::from(k.wls_size)),
+            (
+                "allow_merging_workgroups",
+                u64::from(k.allow_merging_workgroups),
+            ),
+            ("ftz_fp16", u64::from(k.ftz_fp16)),
+            ("ftz_fp32", u64::from(k.ftz_fp32)),
+            ("args_offset", u64::from(k.args_offset)),
+            ("args_bytes", u64::from(k.args_bytes)),
+            ("sysvals_bytes", u64::from(KERNEL_SYSVALS_BYTES)),
+            ("fau_reserved_words", 9),
+            ("ubo_count", 0),
+            ("texture_count", 0),
+            ("sampler_count", 0),
+        ] {
+            assert_eq!(number(key), actual, "{key}");
+        }
+        assert_eq!(value("arg_out"), "0 8");
+        assert_eq!(value("arg_stride"), "8 4");
+        let words = |key: &str| {
+            core::array::from_fn::<u32, 8, _>(|i| {
+                u32::from_str_radix(&value(key)[8 * i..8 * i + 8], 16)
+                    .unwrap()
+                    .swap_bytes()
+            })
+        };
+        assert_eq!(
+            shader_program_descriptor(&k, number("reference_binary_va")).unwrap(),
+            words("spd_v10")
+        );
+        assert_eq!(local_storage_descriptor(&k).unwrap(), words("tsd_v10"));
+        assert_eq!(
+            workgroup_size_word(&k).unwrap(),
+            u32::from_str_radix(value("wg_size_v10"), 16)
+                .unwrap()
+                .swap_bytes()
+        );
+        let data = kumo_triangle_data_at(0x20002800, 0x20010000).unwrap();
+        let mut spd = words("spd_v10");
+        spd[2] = 0x20002800;
+        spd[3] = 0;
+        for (i, w) in spd.iter().enumerate() {
+            assert_eq!(&data[i * 4..i * 4 + 4], &w.to_le_bytes());
+        }
+        assert_eq!(&data[88..96], &0x20010000u64.to_le_bytes());
+        assert_eq!(
+            kumo_triangle_stream_at(METAL, 0x20003100).unwrap()[5],
+            move48(16, 0x20003100)
+        );
+    }
 
     #[test]
     fn relocation_changes_only_the_shader_and_output_addresses_in_the_upload() {

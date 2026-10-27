@@ -1,0 +1,78 @@
+   LSHIFT_OR.i32 r0, r61, 0x1000000.b33, 0x0
+   IADD_IMM.i32 r1, 0x0, #0xDF
+   ISUB.s32 r0, r1^, r0^
+   IADD_IMM.i32 r1, r61, #0x70
+   ISUB.s32 r1, r1^, r60
+   IADD_IMM.i32 r2, r61, #0xFFFFFF71
+   IADD.s32 r2, r2^, r60
+   CSEL.s32.lt r3, r2, r1, r2, r1
+   CSEL.s32.lt r3, r3^, r0, r3^, r0
+   IMUL.i32 r0, r0^, 0xFFFFFFFF.b0
+   IADD_IMM.i32 r0, r0^, #0x60
+   U16_TO_U32 r4, r0.h0
+   U16_TO_U32 r0, r0^.h1
+   IADD_IMM.i32 r5, 0x0, #0xAAAB
+   IMUL.i32 r6, r4, r5
+   IADD_IMM.i32 r7, 0x0, #0xAAAA
+   IMUL.i32 r4, r4^, r7
+   IMUL.i32 r8, r0, r5
+   IMUL.i32 r0, r0^, r7
+   U16_TO_U32 r6, r6^.h1
+   IADD.s32 r6, r8^, r6^
+   U16_TO_U32 r8, r6.h0
+   U16_TO_U32 r6, r6^.h1
+   IADD.s32 r4, r4^, r8^
+   U16_TO_U32 r4, r4^.h1
+   IADD.s32 r4, r4^, r6^
+   IADD.s32 r0, r0^, r4^
+   RSHIFT_OR.i32 r0, r0^, 0x7060504.b33, 0x0
+   IMUL.i32 r1, r1^, 0xFFFFFFFF.b0
+   IADD_IMM.i32 r1, r1^, #0x60
+   U16_TO_U32 r4, r1.h0
+   U16_TO_U32 r1, r1^.h1
+   IMUL.i32 r6, r4, r5
+   IMUL.i32 r4, r4^, r7
+   IMUL.i32 r8, r1, r5
+   IMUL.i32 r1, r1^, r7
+   U16_TO_U32 r6, r6^.h1
+   IADD.s32 r6, r8^, r6^
+   U16_TO_U32 r8, r6.h0
+   U16_TO_U32 r6, r6^.h1
+   IADD.s32 r4, r4^, r8^
+   U16_TO_U32 r4, r4^.h1
+   IADD.s32 r4, r4^, r6^
+   IADD.s32 r1, r1^, r4^
+   RSHIFT_OR.i32 r1, r1^, 0x7060504.b33, 0x0
+   IMUL.i32 r2, r2^, 0xFFFFFFFF.b0
+   IADD_IMM.i32 r2, r2^, #0x60
+   U16_TO_U32 r4, r2.h0
+   U16_TO_U32 r2, r2^.h1
+   IMUL.i32 r6, r4, r5
+   IMUL.i32 r4, r4^, r7
+   IMUL.i32 r5, r2, r5^
+   IMUL.i32 r2, r2^, r7^
+   U16_TO_U32 r6, r6^.h1
+   IADD.s32 r5, r5^, r6^
+   U16_TO_U32 r6, r5.h0
+   U16_TO_U32 r5, r5^.h1
+   IADD.s32 r4, r4^, r6^
+   U16_TO_U32 r4, r4^.h1
+   IADD.s32 r4, r4^, r5^
+   IADD.s32 r2, r2^, r4^
+   RSHIFT_OR.i32 r2, r2^, 0x7060504.b33, 0x0
+   MKVEC.v2i16 r0, 0x0.h0, r0^.h0
+   LSHIFT_OR.i32 r1, r1^, 0xB0A0908.b00, 0x0
+   LSHIFT_OR.i32 r0, r0^, 0x0.b00, r1^
+   LSHIFT_OR.i32 r0, r0^, 0x0.b00, r2^
+   ICMP_OR.s32.ge.m1 r1, r3^, 0x0, 0x0
+   IADD_IMM.i32 r2, 0x0, #0x101820
+   CSEL.u32.eq r0, r1^, 0x0, r2^, r0^
+   IMUL.i32 r1, r61^, u4.w0
+   IADD.s32 r1, r1^, r60^
+   LSHIFT_OR.i32 r2, r1, 0x3020100.b22, 0x0
+   RSHIFT_OR.i32 r1, r1^, 0x1F1E1D1C.b22, 0x0
+   MOV.i32 r4, u3.w0
+   MOV.i32 r5, u3.w1
+   MOV.i32 r3, r1^
+   SHADDX.s64 [r2:r3], [r4^:r5^], [r2^:r3^], shift:0x0
+   STORE.i32.slot0.end @r0, [r2^:r3^], offset:0

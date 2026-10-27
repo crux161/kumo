@@ -1,4 +1,5 @@
 //j592
+//j637
 /*
  * SPDX-License-Identifier: MIT OR Apache-2.0
  *
@@ -8,6 +9,9 @@
  * packs Mesa's reference SHADER_PROGRAM, LOCAL_STORAGE and COMPUTE_SIZE_WORKGROUP descriptors
  * the way panvk does for a precompiled kernel, so drv-gpu's packers can be pinned to them byte
  * for byte. It also writes the Valhall disassembly. — TIMBERDOODLE 2026-10-24
+ *
+ * J637 adds compile-time selection of the triangle's own binary/argument metadata,
+ * leaving the paint output byte-identical. — KESTREL 2026-10-26
  *
  * Usage: manifest <binary out> <disassembly out>   (manifest text on stdout)
  */
@@ -20,7 +24,17 @@
 #include "panfrost/compiler/bifrost/valhall/disassemble.h"
 #include "panfrost/lib/pan_shader.h"
 
+#ifdef BUILD_TRIANGLE
+#include "kumo_triangle_v10.c"
+#define KERNEL_ID KUMO_TRIANGLE
+#define KERNEL_ARGS kumo_triangle_args
+#define KERNEL_NAME "kumo_triangle"
+#else
 #include "kumo_paint_v10.c"
+#define KERNEL_ID KUMO_PAINT
+#define KERNEL_ARGS kumo_paint_args
+#define KERNEL_NAME "kumo_paint"
+#endif
 
 /* drv-gpu maps the binary at this GPU VA in G5c-2; the reference SPD carries it. */
 #define REFERENCE_BINARY_VA 0x10040000ull
@@ -40,7 +54,7 @@ int main(int argc, char **argv)
       return 2;
    }
    const struct bifrost_precompiled_kernel_info *k =
-      (const void *)kumo_shaders_default_v10[KUMO_PAINT];
+      (const void *)kumo_shaders_default_v10[KERNEL_ID];
    const struct pan_shader_info *info = &k->info;
    const uint8_t *binary = (const uint8_t *)k + sizeof(*k);
 
@@ -54,7 +68,7 @@ int main(int argc, char **argv)
    disassemble_valhall(dis, binary, k->binary_size, false);
    fclose(dis);
 
-   printf("kernel = kumo_paint\n");
+   printf("kernel = %s\n", KERNEL_NAME);
    printf("arch = 10\n");
    printf("binary_bytes = %u\n", k->binary_size);
    printf("local_size = %u %u %u\n", k->local_size_x, k->local_size_y, k->local_size_z);
@@ -72,11 +86,11 @@ int main(int argc, char **argv)
    printf("sampler_count = %u\n", info->sampler_count);
    printf("sysvals_bytes = %zu\n", (size_t)BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE);
    printf("args_offset = %zu\n", (size_t)BIFROST_PRECOMPILED_KERNEL_ARGS_OFFSET);
-   printf("arg_out = %zu %zu\n", offsetof(struct kumo_paint_args, out),
-          sizeof(((struct kumo_paint_args *)0)->out));
-   printf("arg_stride = %zu %zu\n", offsetof(struct kumo_paint_args, stride),
-          sizeof(((struct kumo_paint_args *)0)->stride));
-   printf("args_bytes = %zu\n", sizeof(struct kumo_paint_args));
+   printf("arg_out = %zu %zu\n", offsetof(struct KERNEL_ARGS, out),
+          sizeof(((struct KERNEL_ARGS *)0)->out));
+   printf("arg_stride = %zu %zu\n", offsetof(struct KERNEL_ARGS, stride),
+          sizeof(((struct KERNEL_ARGS *)0)->stride));
+   printf("args_bytes = %zu\n", sizeof(struct KERNEL_ARGS));
    printf("reference_binary_va = 0x%llx\n", REFERENCE_BINARY_VA);
 
    /* panvk_shader_upload's compute SHADER_PROGRAM, with shader_ftz_mode's choice. */

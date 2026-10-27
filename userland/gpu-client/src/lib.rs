@@ -1,6 +1,7 @@
 #![no_std]
 //j595
 //j596
+//j637
 
 //! The G6b proof client's actual CSF stream, exercised by drv-gpu's host command-stream model.
 //! It stores one value with system scope and waits. Output cache cleaning belongs to the
@@ -11,6 +12,10 @@ pub const VALUES: [u32; 2] = [0xc0de_0001, 0xc0de_0002];
 pub const SCRATCH_OFFSET: u64 = kumo_gpu::PAGE_BYTES;
 pub const BINARY_OFFSET: u64 = 2 * kumo_gpu::PAGE_BYTES;
 pub const DATA_OFFSET: u64 = 3 * kumo_gpu::PAGE_BYTES;
+pub const TRIANGLE_BINARY_OFFSET: u64 = BINARY_OFFSET + 0x800;
+pub const TRIANGLE_DATA_OFFSET: u64 = DATA_OFFSET + 0x100;
+const _: () = assert!(kumo_mali::KUMO_PAINT_V10.binary.len() <= 0x800);
+const _: () = assert!(kumo_mali::KUMO_TRIANGLE_V10.binary.len() <= 0x800);
 pub const PAINT_OFFSET: u64 = 0x1_0000;
 pub const BUFFER_BYTES: u64 = PAINT_OFFSET + kumo_mali::PAINT_BYTES;
 pub const PIXEL_POISON: u32 = 0x00ff_00ff;
@@ -59,6 +64,18 @@ pub fn compute_stream(
     kumo_mali::kumo_paint_stream_at(features, kumo_gpu::VA_START + DATA_OFFSET)
 }
 
+pub fn triangle_data() -> Result<[u8; 104], kumo_mali::KernelError> {
+    kumo_mali::kumo_triangle_data_at(
+        kumo_gpu::VA_START + TRIANGLE_BINARY_OFFSET,
+        kumo_gpu::VA_START + PAINT_OFFSET,
+    )
+}
+pub fn triangle_stream(
+    features: kumo_mali::CsFeatures,
+) -> Result<[u64; 24], kumo_mali::KernelError> {
+    kumo_mali::kumo_triangle_stream_at(features, kumo_gpu::VA_START + TRIANGLE_DATA_OFFSET)
+}
+
 pub fn proof_stream(target: u64, value: u32) -> [u64; 4] {
     [
         (1u64 << 56) | (target & 0x0000_ffff_ffff_ffff), // MOVE48 r0, target
@@ -72,6 +89,38 @@ pub fn proof_stream(target: u64, value: u32) -> [u64; 4] {
 mod tests {
     use super::*;
     use kumo_gpu::{BindFlags as F, PAGE_BYTES, VA_START};
+
+    #[test]
+    fn both_kernel_uploads_fit_distinct_immutable_slots_in_the_frozen_bindings() {
+        let binds = bindings(1, 1);
+        let code = binds[2];
+        let descriptors = binds[3];
+        assert!(
+            BINARY_OFFSET + kumo_mali::KUMO_PAINT_V10.binary.len() as u64 <= TRIANGLE_BINARY_OFFSET
+        );
+        assert!(
+            TRIANGLE_BINARY_OFFSET + kumo_mali::KUMO_TRIANGLE_V10.binary.len() as u64
+                <= code.offset + code.bytes
+        );
+        assert!(DATA_OFFSET + 104 <= TRIANGLE_DATA_OFFSET);
+        assert!(TRIANGLE_DATA_OFFSET + 104 <= descriptors.offset + descriptors.bytes);
+        assert_eq!(TRIANGLE_BINARY_OFFSET % kumo_mali::SHADER_BINARY_ALIGN, 0);
+        let data = triangle_data().unwrap();
+        assert_eq!(
+            &data[8..16],
+            &(VA_START + TRIANGLE_BINARY_OFFSET).to_le_bytes()
+        );
+        assert_eq!(&data[88..96], &(VA_START + PAINT_OFFSET).to_le_bytes());
+        let stream = triangle_stream(kumo_mali::CsFeatures::decode(0x7085f)).unwrap();
+        assert_eq!(
+            stream[5] & 0x0000ffffffffffff,
+            VA_START + TRIANGLE_DATA_OFFSET
+        );
+        assert_eq!(
+            stream[6] & 0x0000ffffffffffff,
+            VA_START + TRIANGLE_DATA_OFFSET + 32
+        );
+    }
 
     #[test]
     fn client_layout_has_distinct_permissions_and_descriptor_pointers_inside_its_bindings() {

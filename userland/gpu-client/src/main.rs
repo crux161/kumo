@@ -3,21 +3,23 @@
 //j595
 //j596
 //j636
+//j637
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
 
 use core::fmt::{self, Write};
 use gpu_client::{
-    bindings, compute_data, compute_stream, proof_stream, BINARY_OFFSET, BUFFER_BYTES, DATA_OFFSET,
-    PAINT_OFFSET, PIXEL_POISON, SCRATCH_OFFSET, VALUES,
+    bindings, compute_data, compute_stream, proof_stream, triangle_data, triangle_stream,
+    BINARY_OFFSET, BUFFER_BYTES, DATA_OFFSET, PAINT_OFFSET, PIXEL_POISON, SCRATCH_OFFSET,
+    TRIANGLE_BINARY_OFFSET, TRIANGLE_DATA_OFFSET, VALUES,
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_gpu::{Command, Reply, Request, Response, Submission, SyncState, REPLY_LEN, VA_START};
 
 use kumo_mali::{
-    check_paint, paint_reference_checksum, CsFeatures, KUMO_PAINT_V10, PAINT_BYTES, PAINT_HEIGHT,
-    PAINT_WIDTH,
+    check_paint, check_triangle, paint_reference_checksum, triangle_reference_checksum, CsFeatures,
+    KUMO_PAINT_V10, KUMO_TRIANGLE_V10, PAINT_BYTES, PAINT_HEIGHT, PAINT_WIDTH,
 };
 
 kumo_rt::entry!(main);
@@ -181,6 +183,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     }
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;
+    let triangle = triangle_stream(features).map_err(|_| ())?;
     log(format_args!(
         "gpu-client: GPU_ID=0x{:08x}, queue registers={} scoreboards={}\n",
         info.gpu_id, features.work_regs, features.scoreboards
@@ -208,6 +211,8 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     }
     upload(cpu, BINARY_OFFSET, KUMO_PAINT_V10.binary)?;
     upload(cpu, DATA_OFFSET, &compute_data().map_err(|_| ())?)?;
+    upload(cpu, TRIANGLE_BINARY_OFFSET, KUMO_TRIANGLE_V10.binary)?;
+    upload(cpu, TRIANGLE_DATA_OFFSET, &triangle_data().map_err(|_| ())?)?;
     for offset in (0..PAINT_BYTES).step_by(4) {
         // SAFETY: each word lies inside the image extent of this retained mapping.
         unsafe {
@@ -285,14 +290,33 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     log(format_args!(
         "gpu-client: client compute frame verified; 32768 pixels match\n"
     ));
+    // Point3 is complete and this image has never been leased to display. Poison
+    // before the distinct triangle dispatch so every output pixel must be GPU-written. — KESTREL
+    for offset in (0..PAINT_BYTES).step_by(4) {
+        unsafe {
+            ((cpu + PAINT_OFFSET + offset) as *mut u32).write_volatile(PIXEL_POISON);
+        }
+    }
+    submit_wait(&mut client, cpu, group, 4, &triangle)?;
+    let triangle_check = check_triangle(|x, y| unsafe {
+        ((cpu + PAINT_OFFSET + u64::from(y * PAINT_WIDTH + x) * 4) as *const u32).read_volatile()
+    });
+    log(format_args!("gpu-client: J0b triangle compute {}x{}: mismatches={} checksum=0x{:08x} (reference 0x{:08x})\n",PAINT_WIDTH,PAINT_HEIGHT,triangle_check.mismatches,triangle_check.checksum,triangle_reference_checksum()));
+    if let Some((x, y, got, want)) = triangle_check.first {
+        log(format_args!(
+            "gpu-client: triangle mismatch ({},{}): got0x{:08x} want0x{:08x}\n",
+            x, y, got, want
+        ));
+        return Err(());
+    }
     if presentation.0 != 0 {
         let image = kumo_graphics::native::Image {
             sequence: 1,
             surface: kumo_graphics::DEMO,
             offset: PAINT_OFFSET,
             vmo_bytes: BUFFER_BYTES,
-            gpu_point: 3,
-            checksum: check.checksum,
+            gpu_point: 4,
+            checksum: triangle_check.checksum,
         };
         let grant = handle(kumo_rt::handle_duplicate(
             vmo,
@@ -305,7 +329,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
             let _ = kumo_rt::handle_close(grant);
             return Err(());
         }
-        log(format_args!("gpu-client: J0a completed point3 image leased READ-only; frozen until display retirement\n"));
+        log(format_args!("gpu-client: J0b completed point4 triangle leased READ-only; frozen until display retirement\n"));
         let port = handle(kumo_rt::port_create()).ok_or(())?;
         let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
         if kumo_rt::port_bind(port, presentation) != 0
@@ -330,7 +354,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
         {
             return Err(());
         }
-        log(format_args!("gpu-client: J0a native image retired after consumed console replacement and display unmap; reuse permitted\n"));
+        log(format_args!("gpu-client: J0b native triangle retired after consumed console replacement and display unmap; reuse permitted\n"));
     }
     let _ = kumo_rt::handle_close(vmo);
     Ok(())
