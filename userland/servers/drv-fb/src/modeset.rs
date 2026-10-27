@@ -1,8 +1,8 @@
-//j633
 //j634
 //j635
 //j636
 //j638
+//j639
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -244,6 +244,35 @@ pub struct Vblank {
 /// Own the grant across timer transitions, including failures before D1b. — KESTREL
 struct VopResource(Handle);
 
+/// The channel outlives every phase move. Drop may cancel only while no native
+/// image is possibly reachable; an uncertain publication closes without a receipt.
+/// No cancellation is sent after successful completion. — KESTREL
+struct NativeChannel {
+    handle: Handle,
+    cancel_safe: bool,
+    finished: bool,
+}
+pub fn cancel_native(handle: Handle) {
+    if handle.0 == 0 {
+        return;
+    }
+    let reply = kumo_graphics::native::Reply::cancelled().encode();
+    let _ = kumo_rt::channel_write(handle, reply.as_ptr(), reply.len());
+    log(format_args!(
+        "display: native diagnostic cancelled with no image reachable; no reuse granted\n"
+    ));
+    close(handle);
+}
+impl Drop for NativeChannel {
+    fn drop(&mut self) {
+        if self.cancel_safe && !self.finished {
+            cancel_native(self.handle);
+        } else {
+            close(self.handle);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OwnedBuffer {
     vmo: Handle,
@@ -317,8 +346,10 @@ pub struct Pending {
     irq: Handle,
     irq_source: u64,
     meter: vblank::Meter,
+    cadence_attempt: u8,
     intervals: Option<&'static mut [u64; vblank::FRAMES as usize - 1]>,
     alternation: Option<&'static mut Alternation>,
+    native_channel: NativeChannel,
     native_frame: Option<NativeFrame>,
     native_source: u64,
     native_lease: kumo_graphics::native::Lease,
@@ -326,6 +357,9 @@ pub struct Pending {
 }
 
 impl Pending {
+    pub fn measuring_vblank(&self) -> bool {
+        matches!(self.phase, Phase::D1bCount)
+    }
     /// Whether a port wake belongs to R1-D1b: its timer, or D1b's interrupt.
     pub fn owns(&self, source: Handle) -> bool {
         Handle(self.source as u32) == source
@@ -524,8 +558,14 @@ fn begin(
         irq: Handle(0),
         irq_source: 0,
         meter: vblank::Meter::default(),
+        cadence_attempt: 0,
         intervals: None,
         alternation: None,
+        native_channel: NativeChannel {
+            handle: vblank.native,
+            cancel_safe: true,
+            finished: false,
+        },
         native_frame: None,
         native_source: 0,
         native_lease: kumo_graphics::native::Lease::default(),
@@ -715,7 +755,6 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
                 "display: J0a image wait timed out; console retained\n"
             ));
             let _ = port_unbind(pending.port, pending.vblank.native);
-            close(pending.vblank.native);
             None
         }
         Phase::NativeHold => native_retire(pending, &mut device),
@@ -821,7 +860,7 @@ fn open_vop_irq(pending: &Pending, device: &mut Device, label: &str) -> Option<(
 }
 
 fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
-    let Some(intervals) = take_samples() else {
+    let Some(intervals) = pending.intervals.take().or_else(take_samples) else {
         error(format_args!(
             "display: D1b sample buffer already claimed; nothing armed\n"
         ));
@@ -843,6 +882,7 @@ fn d1b_start(mut pending: Pending, device: &mut Device) -> Option<Pending> {
     pending.irq = irq;
     pending.irq_source = koid;
     pending.meter = vblank::Meter::default();
+    pending.cadence_attempt += 1;
     pending.intervals = Some(intervals);
     Some(Pending {
         phase: Phase::D1bCount,
@@ -896,12 +936,18 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
     let cadence = pending.intervals.as_mut().and_then(|samples| {
         vblank::cadence(&mut samples[..meter.count.saturating_sub(1) as usize])
     });
+    if vblank::retry_delivery_window(meter, cadence, mode_mhz, pending.cadence_attempt, timed_out) {
+        let rate = cadence.expect("retry requires a cadence");
+        log(format_args!("display: D1b delivery window {}/{} inconclusive: {}/{} stable at {}.{} Hz; fresh120-frame retry, thresholds unchanged\n",pending.cadence_attempt,vblank::MAX_CADENCE_ATTEMPTS,rate.stable,rate.total,rate.millihertz/1000,rate.millihertz%1000));
+        return next(pending, Phase::D1bReady, vblank::SETTLE_MS);
+    }
     let passed = !timed_out
+        && meter.spurious == 0
         && meter.done()
         && cadence
             .is_some_and(|rate| rate.credible() && vblank::matches(rate.millihertz, mode_mhz));
     match cadence {
-        Some(rate) if !timed_out && meter.done() && rate.credible() && vblank::matches(rate.millihertz, mode_mhz) => log(format_args!(
+        Some(rate) if !timed_out && meter.spurious == 0 && meter.done() && rate.credible() && vblank::matches(rate.millihertz, mode_mhz) => log(format_args!(
             "display: D1b vblank: {} IRQs, median {}.{:03} Hz (mode {}.{:03}; {}/{} stable), delivery {}.{:03} Hz, interval min/max {}/{} us, spurious {}; interrupt disarmed; D1b complete\n",
             meter.count,
             rate.millihertz / 1_000,
@@ -1790,7 +1836,6 @@ fn native_start(mut pending: Pending) -> Option<Pending> {
         || !context_ready(pending.vblank.context)
         || port_bind(pending.port, channel) != 0
     {
-        close(channel);
         return None;
     }
     pending.native_source = handle_koid(channel);
@@ -1808,13 +1853,11 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
     let mut bytes = [0; REQUEST_LEN + 1];
     let (n, raw) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
     let Some(vmo) = syscall_handle(raw) else {
-        close(channel);
         return None;
     };
     let image = bytes.get(..n).and_then(Image::decode);
     let Some(image) = image.filter(|_| context_ready(pending.vblank.context)) else {
         close(vmo);
-        close(channel);
         return None;
     };
     let koid = handle_koid(vmo);
@@ -1823,12 +1866,10 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
             "display: J0c stale/overlapping/substituted image refused before mapping\n"
         ));
         close(vmo);
-        close(channel);
         return None;
     }
     let Some(program) = scanout::image_program(&pending.program, image) else {
         close(vmo);
-        close(channel);
         return None;
     };
     // Lease admission proves the same actual VMO/span on every presentation, so
@@ -1841,7 +1882,6 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
         );
         if status != 0 || cpu == 0 {
             close(vmo);
-            close(channel);
             return None;
         }
         pending.native_cpu = cpu;
@@ -1856,9 +1896,11 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
             "display: J0a shared image checksum mismatch; nothing staged\n"
         ));
         close(vmo);
-        close(channel);
         return None;
     }
+    // Even an error may leave a candidate publication retained. Never turn
+    // that uncertainty into the no-image cancellation receipt. — KESTREL
+    pending.native_channel.cancel_safe = false;
     let status = kumo_rt::device_vmar_map(
         pending.vblank.context,
         vmo,
@@ -1869,7 +1911,6 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
     );
     if status != 0 {
         close(vmo);
-        close(channel);
         return None;
     }
     // From publication onward failures retain the handle, mapping and lease. No Drop
@@ -1884,7 +1925,6 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
         error(format_args!(
             "display: J0a image load uncertain; owners retained, no retired reply\n"
         ));
-        close(channel);
         return None;
     }
     log(format_args!("display: J0c sequence{} point{} ZERO-COPY: VMO{} offset{:#x}, display IOVA{:#x}, checksum{:#x}; complete region/load consumed, holding5000ms\n",image.sequence,image.gpu_point,koid,image.offset,IMAGE_IOVA,checksum));
@@ -1897,7 +1937,6 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
         error(format_args!(
             "display: J0a fault prevents retirement; owners retained\n"
         ));
-        close(pending.vblank.native);
         return None;
     }
     scanout::stage_region(device, &pending.program);
@@ -1914,7 +1953,6 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
         error(format_args!(
             "display: J0a console/unmap uncertain; owners retained, no retired reply\n"
         ));
-        close(pending.vblank.native);
         return None;
     }
     let reply = Reply {
@@ -1923,16 +1961,16 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
         retired: true,
     };
     if !pending.native_lease.retire(reply) {
-        close(pending.vblank.native);
         return None;
     }
     close(frame.vmo);
     pending.native_frame = None;
+    pending.native_channel.cancel_safe = true;
     let channel = pending.vblank.native;
     let complete = pending.native_lease.complete();
     // Arm the next bounded wait before releasing the producer, so an immediate
     // next render/transfer cannot race a missing channel watch. — KESTREL
-    let pending = if complete {
+    let mut pending = if complete {
         pending
     } else {
         native_start(pending)?
@@ -1945,14 +1983,13 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
             disarm(pending.port, pending.timer);
             let _ = port_unbind(pending.port, channel);
         }
-        close(channel);
         return None;
     }
     if complete {
+        pending.native_channel.finished = true;
         log(format_args!(
             "display: J0c complete: 3 original-VMO presentations retired, GOP-only console live\n"
         ));
-        close(channel);
         None
     } else {
         Some(pending)

@@ -1,5 +1,6 @@
 //j636
 //j638
+//j639
 
 //! J0's bounded serial cooperative native-image leases. One READ VMO accompanies an exact
 //! request, after the producer observes GPU completion and the driver's output clean.
@@ -112,6 +113,18 @@ pub struct Reply {
     pub retired: bool,
 }
 impl Reply {
+    /// A presenter that proves no image can still be scanned out may decline the
+    /// diagnostic. Cancellation ends the session and NEVER authorizes image reuse. — KESTREL
+    pub const fn cancelled() -> Self {
+        Self {
+            sequence: 0,
+            gpu_point: 0,
+            retired: false,
+        }
+    }
+    pub fn is_cancelled(self) -> bool {
+        self == Self::cancelled()
+    }
     pub fn encode(self) -> [u8; REPLY_LEN] {
         let mut out = [0; REPLY_LEN];
         out[..4].copy_from_slice(b"KNR1");
@@ -202,6 +215,35 @@ mod tests {
             checksum: 0x8720cbc5,
         }
     }
+    #[test]
+    fn explicit_cancellation_is_canonical_and_never_retires_an_active_lease() {
+        let cancel = Reply::cancelled();
+        assert_eq!(Reply::decode(&cancel.encode()), Some(cancel));
+        assert!(cancel.is_cancelled());
+        let frame = image();
+        assert!(!cancel.releases(frame));
+        let mut lease = Lease::default();
+        assert!(lease.begin(frame, 77));
+        assert!(!lease.retire(cancel));
+        assert!(!lease.can_render());
+        assert!(!lease.complete());
+        assert!(!Reply {
+            sequence: 1,
+            ..cancel
+        }
+        .is_cancelled());
+        assert!(!Reply {
+            gpu_point: 1,
+            ..cancel
+        }
+        .is_cancelled());
+        assert!(!Reply {
+            retired: true,
+            ..cancel
+        }
+        .is_cancelled());
+    }
+
     #[test]
     fn serial_lease_blocks_gpu_reuse_until_exact_retirement_and_rejects_replay() {
         let mut producer = Lease::default();

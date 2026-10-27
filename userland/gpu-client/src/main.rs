@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j595
 //j596
 //j636
 //j637
 //j638
+//j639
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -174,14 +174,25 @@ fn submit_wait(
     Err(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Failure {
+    Failed,
+    Cancelled,
+}
+impl From<()> for Failure {
+    fn from(_: ()) -> Self {
+        Self::Failed
+    }
+}
+
 fn present_image(
     channel: Handle,
     vmo: Handle,
     image: kumo_graphics::native::Image,
     lease: &mut kumo_graphics::native::Lease,
-) -> Result<(), ()> {
+) -> Result<(), Failure> {
     if !lease.begin(image, kumo_rt::handle_koid(vmo)) {
-        return Err(());
+        return Err(Failure::Failed);
     }
     let grant = handle(kumo_rt::handle_duplicate(
         vmo,
@@ -191,7 +202,7 @@ fn present_image(
     let bytes = image.encode();
     if kumo_rt::channel_write_with_handle(channel, bytes.as_ptr(), bytes.len(), grant) != 0 {
         let _ = kumo_rt::handle_close(grant);
-        return Err(());
+        return Err(Failure::Failed);
     }
     log(format_args!("gpu-client: J0c sequence{} point{} leased READ-only; GPU/CPU writes blocked until matching retirement\n",image.sequence,image.gpu_point));
     let port = handle(kumo_rt::port_create()).ok_or(())?;
@@ -200,7 +211,7 @@ fn present_image(
         || kumo_rt::port_bind(port, timer) != 0
         || kumo_rt::port_wait(port) != kumo_rt::handle_koid(channel)
     {
-        return Err(());
+        return Err(Failure::Failed);
     }
     let mut bytes = [0; kumo_graphics::native::REPLY_LEN + 1];
     let (n, extra) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
@@ -210,26 +221,29 @@ fn present_image(
     let _ = kumo_rt::handle_close(port);
     if extra != 0 {
         let _ = kumo_rt::handle_close(Handle(extra as u32));
-        return Err(());
+        return Err(Failure::Failed);
     }
     let reply = bytes
         .get(..n)
         .and_then(kumo_graphics::native::Reply::decode)
         .ok_or(())?;
+    if reply.is_cancelled() {
+        return Err(Failure::Cancelled);
+    }
     if !lease.retire(reply) {
-        return Err(());
+        return Err(Failure::Failed);
     }
     log(format_args!("gpu-client: J0c sequence{} point{} retired after consumed GOP replacement/unmap; next GPU reuse permitted\n",image.sequence,image.gpu_point));
     Ok(())
 }
 
-fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
+fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
     let mut client = Client { channel, id: 0 };
     let Response::Info(info) = client.simple(Command::GetInfo)? else {
-        return Err(());
+        return Err(Failure::Failed);
     };
     if info.gpu_id & 0xffff_0000 != 0xa867_0000 {
-        return Err(());
+        return Err(Failure::Failed);
     }
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;
@@ -239,16 +253,16 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
         info.gpu_id, features.work_regs, features.scoreboards
     ));
     let Response::VmCreated { vm } = client.simple(Command::VmCreate)? else {
-        return Err(());
+        return Err(Failure::Failed);
     };
     let (response, grant) = client.call(Command::BufferCreate {
         bytes: BUFFER_BYTES,
     })?;
     let Response::BufferCreated { buffer, bytes } = response else {
-        return Err(());
+        return Err(Failure::Failed);
     };
     if bytes != BUFFER_BYTES {
-        return Err(());
+        return Err(Failure::Failed);
     }
     let vmo = grant.ok_or(())?;
     let (status, cpu) = kumo_rt::vmar_map_anywhere(
@@ -257,7 +271,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
         (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
     );
     if status != 0 || cpu == 0 {
-        return Err(());
+        return Err(Failure::Failed);
     }
     upload(cpu, BINARY_OFFSET, KUMO_PAINT_V10.binary)?;
     upload(cpu, DATA_OFFSET, &compute_data().map_err(|_| ())?)?;
@@ -272,11 +286,11 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     barrier();
     for binding in bindings(vm, buffer) {
         if client.simple(Command::VmBind(binding))? != Response::VmBound {
-            return Err(());
+            return Err(Failure::Failed);
         }
     }
     let Response::GroupCreated { group } = client.simple(Command::GroupCreate { vm })? else {
-        return Err(());
+        return Err(Failure::Failed);
     };
     for (index, value) in VALUES.into_iter().enumerate() {
         let point = index as u64 + 1;
@@ -298,7 +312,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
                 "gpu-client: point {} wrong value 0x{:08x}, expected 0x{:08x}\n",
                 point, got, value
             ));
-            return Err(());
+            return Err(Failure::Failed);
         }
         log(format_args!(
             "gpu-client: point {} complete, GPU wrote 0x{:08x} into shared VMO\n",
@@ -335,7 +349,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
             "gpu-client: first wrong pixel ({}, {}): got 0x{:08x}, want 0x{:08x}\n",
             x, y, got, want
         ));
-        return Err(());
+        return Err(Failure::Failed);
     }
     log(format_args!(
         "gpu-client: client compute frame verified; 32768 pixels match\n"
@@ -350,7 +364,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
         // This check precedes EVERY poison/write and GPU submission. Only a verified
         // previous display retirement reply can reopen the image for production. — KESTREL
         if !lease.can_render() {
-            return Err(());
+            return Err(Failure::Failed);
         }
         let point = u64::from(sequence) + 3;
         let is_triangle = sequence % 2 == 1;
@@ -386,7 +400,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
                 "gpu-client: J0c mismatch ({},{}): got0x{:08x} want0x{:08x}\n",
                 x, y, got, want
             ));
-            return Err(());
+            return Err(Failure::Failed);
         }
         if presentation.0 != 0 {
             present_image(
@@ -406,7 +420,7 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), ()> {
     }
     if presentation.0 != 0 {
         if !lease.complete() {
-            return Err(());
+            return Err(Failure::Failed);
         }
         log(format_args!("gpu-client: J0c complete: 3 native frames, same VMO/image pages, 2 GPU reuses only after display retirement\n"));
     }
@@ -427,9 +441,17 @@ extern "C" fn main(channel: u64, presentation: u64) -> ! {
     if presentation.0 != 0 {
         let _ = kumo_rt::handle_close(presentation);
     }
-    if result.is_err() {
-        log(format_args!("gpu-client: session failed\n"));
-    }
+    let failed = match result {
+        Ok(()) => false,
+        Err(Failure::Cancelled) => {
+            log(format_args!("gpu-client: presenter cancelled diagnostic; stopping without image reuse or fabricated completion\n"));
+            false
+        }
+        Err(Failure::Failed) => {
+            log(format_args!("gpu-client: session failed\n"));
+            true
+        }
+    };
     let _ = kumo_rt::handle_close(channel);
-    kumo_rt::process_exit(u64::from(result.is_err()))
+    kumo_rt::process_exit(u64::from(failed))
 }

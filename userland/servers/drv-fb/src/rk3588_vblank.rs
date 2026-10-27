@@ -1,6 +1,7 @@
 //j611
 //j614
 //j632
+//j639
 
 //! D1b: VP2's frame-start interrupt, delivered to drv-fb, and a measurement of its rate.
 //!
@@ -232,6 +233,29 @@ pub fn cadence(intervals: &mut [u64]) -> Option<Cadence> {
     })
 }
 
+/// One fresh full window may resolve startup delivery interference. This never
+/// retries a wrong refresh rate, spurious source, timeout or incomplete sample,
+/// and never changes the per-window credibility/tolerance thresholds. — KESTREL
+pub const MAX_CADENCE_ATTEMPTS: u8 = 2;
+pub fn retry_delivery_window(
+    meter: Meter,
+    cadence: Option<Cadence>,
+    mode_mhz: u64,
+    attempt: u8,
+    timed_out: bool,
+) -> bool {
+    attempt > 0
+        && attempt < MAX_CADENCE_ATTEMPTS
+        && !timed_out
+        && meter.count == FRAMES
+        && meter.spurious == 0
+        && cadence.is_some_and(|rate| {
+            rate.total == FRAMES as usize - 1
+                && !rate.credible()
+                && matches(rate.millihertz, mode_mhz)
+        })
+}
+
 /// The frame rate a mode implies, in millihertz.
 pub fn mode_millihertz(mode: &Mode) -> u64 {
     let frame = u64::from(mode.h_total()) * u64::from(mode.v_total());
@@ -286,6 +310,61 @@ mod tests {
         }
 
         fn sleep_ms(&mut self, _ms: u64) {}
+    }
+
+    #[test]
+    fn retry_is_bounded_to_a_full_correct_rate_but_noisy_delivery_window() {
+        let meter = Meter {
+            count: FRAMES,
+            ..Meter::default()
+        };
+        let rate = Cadence {
+            millihertz: 59999,
+            stable: 81,
+            total: 119,
+        };
+        assert!(retry_delivery_window(meter, Some(rate), 60000, 1, false));
+        for attempt in [0, 2, 3, u8::MAX] {
+            assert!(!retry_delivery_window(
+                meter,
+                Some(rate),
+                60000,
+                attempt,
+                false
+            ));
+        }
+        assert!(!retry_delivery_window(meter, Some(rate), 60000, 1, true));
+        assert!(!retry_delivery_window(
+            Meter {
+                count: 119,
+                ..meter
+            },
+            Some(rate),
+            60000,
+            1,
+            false
+        ));
+        assert!(!retry_delivery_window(
+            Meter {
+                spurious: 1,
+                ..meter
+            },
+            Some(rate),
+            60000,
+            1,
+            false
+        ));
+        for bad in [
+            Cadence {
+                millihertz: 50000,
+                ..rate
+            },
+            Cadence { stable: 90, ..rate },
+            Cadence { total: 118, ..rate },
+        ] {
+            assert!(!retry_delivery_window(meter, Some(bad), 60000, 1, false));
+        }
+        assert!(!retry_delivery_window(meter, None, 60000, 1, false));
     }
 
     #[test]

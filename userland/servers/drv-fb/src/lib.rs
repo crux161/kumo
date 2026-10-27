@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j607
 //j608
 //j609
 //j610
 //j611
+//j639
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -145,6 +145,7 @@ unsafe fn blit_glyph(
 /// console grid is derivable, never critical private RAM (`DESIGN/002`).
 pub struct Console {
     base: *mut u32,
+    glass: *mut u32,
     /// A copy of every pixel in ordinary cached memory, which every draw writes beside `base`
     /// and every read uses instead (J554). The glass is mapped non-cacheable, and a read there
     /// is a full memory round trip per pixel: scrolling a 1600x900 screen by reading it back
@@ -217,6 +218,7 @@ impl Console {
         let stride = if stride == 0 { width_px } else { stride };
         let mut con = Console {
             base,
+            glass: base,
             shadow,
             len_px: stride.saturating_mul(height_px),
             stride,
@@ -242,6 +244,34 @@ impl Console {
         };
         con.clear();
         con
+    }
+
+    /// Briefly render only into the cached shadow while measuring vblank. Every
+    /// parser/cursor/scroll operation still runs; the old glass stays valid. Leaving
+    /// the window copies the final shadow once. No-shadow consoles decline deferral.
+    /// The caller must bound the window and restore output afterward. — KESTREL
+    pub fn defer_output(&mut self, defer: bool) -> bool {
+        if defer {
+            if self.is_renderable() && self.shadow != self.glass {
+                self.base = self.shadow;
+            }
+        } else if self.base != self.glass {
+            self.base = self.glass;
+            unsafe {
+                self.flush_shadow(self.len_px);
+            }
+            #[cfg(target_os = "none")]
+            unsafe {
+                for i in (0..self.len_px).step_by(16) {
+                    fb_clean_line(self.base.add(i) as usize);
+                }
+                core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+            }
+        }
+        self.output_deferred()
+    }
+    pub fn output_deferred(&self) -> bool {
+        self.base != self.glass
     }
 
     /// True when this console can actually paint: a non-null base over a non-empty extent
@@ -1452,6 +1482,55 @@ mod tests {
         con.write(b"\x1b[44m\x1b[2J");
         let blue = con.ansi_color(4);
         assert!(buf.iter().all(|&pixel| pixel == blue));
+    }
+
+    #[test]
+    fn deferred_console_keeps_glass_unchanged_and_restores_complete_terminal_state() {
+        let mut glass = [0u32; ED_W * ED_H];
+        let mut shadow = [0u32; ED_W * ED_H];
+        let mut reference = [0u32; ED_W * ED_H];
+        let mut con = unsafe {
+            Console::new_shadowed(
+                glass.as_mut_ptr(),
+                shadow.as_mut_ptr(),
+                ED_W,
+                ED_H,
+                ED_W,
+                PixelOrder::Bgr,
+            )
+        };
+        let mut expected = unsafe { Console::new(reference.as_mut_ptr(), ED_W, ED_H, ED_W) };
+        con.write(b"before");
+        expected.write(b"before");
+        let frozen = glass;
+        assert!(con.defer_output(true));
+        assert!(con.defer_output(true));
+        for bytes in [
+            b"\r\nline1\r\nline2\r\nline3\r\nline4".as_slice(),
+            b"\x1b[2J\x1b[H",
+            b"UTF8 \xe4\xb8\xad\x1b[?25h\x1b[7m!\x1b[0m\x1b[K",
+            b"\r\nlast",
+        ] {
+            con.write(bytes);
+            expected.write(bytes);
+            assert_eq!(glass, frozen);
+        }
+        assert!(!con.defer_output(false));
+        assert_eq!(glass, reference);
+        assert_eq!(shadow, reference);
+        assert!(!con.defer_output(false));
+        con.write(b"again");
+        expected.write(b"again");
+        assert_eq!(glass, reference);
+    }
+    #[test]
+    fn consoles_without_a_separate_shadow_never_claim_deferred_output() {
+        let mut glass = [0u32; ED_W * ED_H];
+        let mut con = unsafe { Console::new(glass.as_mut_ptr(), ED_W, ED_H, ED_W) };
+        assert!(!con.defer_output(true));
+        con.write(b"live");
+        assert!(glass.iter().any(|p| *p != BG));
+        assert!(!con.defer_output(false));
     }
 
     /// The same bytes through an unshadowed console (the reference) and a shadowed one.

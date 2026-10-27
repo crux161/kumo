@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j609
 //j611
 //j632
 //j634
 //j636
+//j639
 
 mod clock_probe;
 mod display_probe;
@@ -517,9 +517,27 @@ extern "C" fn main(
         port,
     );
     if r1.is_none() && native_raw != 0 {
-        let _ = kumo_rt::handle_close(Handle(native_raw as u32));
+        modeset::cancel_native(Handle(native_raw as u32));
     }
+    let mut was_deferred = false;
+    let (mut deferred_bytes, mut deferred_max_ns) = (0u64, 0u64);
     loop {
+        let measuring = r1.as_ref().is_some_and(|p| p.measuring_vblank());
+        let deferred = con.defer_output(measuring);
+        if deferred && !was_deferred {
+            deferred_bytes = 0;
+            deferred_max_ns = 0;
+        }
+        if !deferred && was_deferred {
+            let mut line = Line::new();
+            line.push(b"display: D1b cached console bytes=");
+            line.push_decimal(deferred_bytes as usize);
+            line.push(b", max burst us=");
+            line.push_decimal((deferred_max_ns / 1000) as usize);
+            line.push(b"\n");
+            let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+        }
+        was_deferred = deferred;
         let source = Handle(port_wait(port) as u32);
         if r1.as_ref().is_some_and(|pending| pending.owns(source)) {
             r1 = r1.take().and_then(|pending| modeset::wake(pending, source));
@@ -528,7 +546,13 @@ extern "C" fn main(
         if source == console_source {
             let n = channel_read(console, rx.as_mut_ptr(), rx.len()) as usize;
             if n > 0 && n <= rx.len() {
+                let started = if deferred { kumo_rt::clock_get() } else { 0 };
                 con.write(&rx[..n]);
+                if deferred {
+                    deferred_bytes += n as u64;
+                    deferred_max_ns =
+                        deferred_max_ns.max(kumo_rt::clock_get().saturating_sub(started));
+                }
             }
         } else if let Some(index) = lanes
             .iter()
