@@ -1,8 +1,8 @@
-//j614
 //j625
 //j632
 //j633
 //j634
+//j635
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -1065,6 +1065,10 @@ fn d1c_paint(
 fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
     let mut device = Device(pending.vop.0);
     let _ = interrupt_wait(pending.irq);
+    if !context_ready(pending.vblank.context) {
+        recover_interrupted_d1c(&mut pending, &mut device);
+        return None;
+    }
     let status = vblank::acknowledge(&mut device);
     if status & vblank::FS == 0 {
         let _ = interrupt_complete(pending.irq);
@@ -1076,7 +1080,7 @@ fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
     state.irqs += 1;
     let mut finished = false;
     let mut stalled = false;
-    if let Some((_, front)) = state.pair.observe(&mut device) {
+    if let Some((_, front)) = state.pair.observe(&mut device, true) {
         state.front_since = now;
         state.submitted = 0;
         finished = front == scanout::CONSOLE;
@@ -1137,6 +1141,10 @@ fn d1c_vblank(mut pending: Pending) -> Option<Pending> {
 /// The caller has disarmed the timer. Keep both VMO handles/mappings until reboot, including
 /// on recovery failure: an unverified front must never be freed or reused. — KESTREL
 fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: &str) {
+    if !context_ready(pending.vblank.context) {
+        recover_interrupted_d1c(&mut pending, device);
+        return;
+    }
     vblank::disable(device);
     let state = pending.alternation.as_mut().expect("D1c state");
     let (gop, _) = scanout::target_scanout(&pending.program);
@@ -1148,7 +1156,7 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
             state.pair.restore_console(device);
             let latched =
                 scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
-            if latched.is_some() && state.pair.observe(device).is_some() {
+            if latched.is_some() && state.pair.observe(device, true).is_some() {
                 restored = true;
                 break;
             }
@@ -1195,6 +1203,10 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
                 error(format_args!(
                     "display: D1d holder-death recovery FAILED; ownership retained/blocked\n"
                 ));
+            } else if !fault_probes(&mut pending, device) {
+                error(format_args!(
+                    "display: D1d fault/recovery FAILED; owners retained/blocked\n"
+                ));
             }
         }
     } else {
@@ -1205,6 +1217,259 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
             reason, state.pair.confirmed(), u8::from(restored),
             if restored { "" } else { "; VP2 in standby" }));
     }
+}
+
+fn context_ready(ctx: Handle) -> bool {
+    if ctx.0 == 0 {
+        return true;
+    }
+    let mut info = kumo_abi::sys::DeviceCtxInfo {
+        fault_record: 0,
+        fault_addr: 0,
+    };
+    kumo_rt::device_ctx_info(ctx, &mut info) == 0
+        && info.fault_record
+            == kumo_abi::sys::device_ctx_state::RECORD | kumo_abi::sys::device_ctx_state::LIVE
+}
+fn recover_fault(pending: &mut Pending, device: &mut Device, front: u32) -> bool {
+    let mut request = [b'F', 0, 0, 0, 0];
+    request[1..].copy_from_slice(&front.to_le_bytes());
+    if kumo_rt::channel_write_with_handle(
+        pending.vblank.control,
+        request.as_ptr(),
+        request.len(),
+        pending.vblank.context,
+    ) != 0
+    {
+        return false;
+    }
+    let mut reply = [0u8; 1];
+    let (n, ctx) = kumo_rt::channel_read_with_handle(pending.vblank.control, reply.as_mut_ptr(), 1);
+    if n != 1 || reply[0] != b'R' || ctx == 0 {
+        return false;
+    }
+    pending.vblank.context = Handle(ctx as u32);
+    if !context_ready(pending.vblank.context) {
+        return false;
+    }
+    let (gop, _) = scanout::target_scanout(&pending.program);
+    scanout::flip(device, gop);
+    scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS).is_some()
+        && scanout::on_glass(device, gop)
+}
+fn recover_interrupted_d1c(pending: &mut Pending, device: &mut Device) {
+    let (gop, _) = scanout::target_scanout(&pending.program);
+    let state = pending.alternation.as_ref().expect("D1c state");
+    let slot = state.pair.pending().unwrap_or(state.pair.front());
+    let front = if slot == scanout::CONSOLE {
+        gop
+    } else {
+        state.buffers[slot].address
+    };
+    close(pending.irq);
+    let recovered = recover_fault(pending, device, front);
+    error(format_args!(
+        "display: D1c fault bypassed retirement; buffers retained, GOP recovery={}\n",
+        u8::from(recovered)
+    ));
+}
+/// The canary's physical address is deliberately an unmapped device address. A
+/// bypass would read that allocation; a confined read must fault instead. — KESTREL
+fn fault_probes(pending: &mut Pending, device: &mut Device) -> bool {
+    use kumo_abi::sys::device_ctx_fault as f;
+    let (_, stride) = scanout::target_scanout(&pending.program);
+    let len =
+        (u64::from(stride) * u64::from(DMT_1600X900_60_RB.v_active) * 4).next_multiple_of(4096);
+    let (raw, phys) = kumo_rt::vmo_create_contiguous(len);
+    let Some(canary) = syscall_handle(raw) else {
+        return false;
+    };
+    let Some(address) = (scanout::Buffer {
+        address: phys,
+        len,
+        stride,
+        height: DMT_1600X900_60_RB.v_active,
+    })
+    .scanout() else {
+        return false;
+    };
+    let (status, va) = kumo_rt::vmar_map_anywhere(
+        canary,
+        len,
+        (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+    );
+    if status != 0 || va == 0 {
+        return false;
+    }
+    for i in 0..len / 4 {
+        unsafe {
+            ((va + i * 4) as *mut u32).write_volatile(0xc0ffee00 ^ (i as u32));
+        }
+    }
+    device.barrier();
+    for masked in [false, true] {
+        let Some(port) = syscall_handle(kumo_rt::port_create()) else {
+            return false;
+        };
+        if port_bind(port, pending.vblank.context) != 0 {
+            return false;
+        }
+        let ctx_source = handle_koid(pending.vblank.context);
+        let Some((timer, timeout)) = arm(port, 2000) else {
+            return false;
+        };
+        let mut irq = Handle(0);
+        let mut irq_source = 0;
+        if masked {
+            let Some(handle) =
+                syscall_handle(kumo_rt::interrupt_create(pending.vop.0, rk3588::VOP_INTID))
+            else {
+                return false;
+            };
+            irq = handle;
+            irq_source = handle_koid(irq);
+            if port_bind(port, irq) != 0 {
+                return false;
+            }
+            vblank::enable(device);
+            let source = kumo_rt::port_wait(port);
+            if source != irq_source {
+                return false;
+            }
+            let fired = interrupt_wait(irq);
+            if fired == 0
+                || fired > 1024
+                || device.read(Block::Vop, vblank::PORT2_INTR_STATUS) & vblank::FS == 0
+            {
+                return false;
+            }
+        }
+        let before = pending.alternation.as_ref().unwrap().pair.retirements();
+        let (gop, _) = scanout::target_scanout(&pending.program);
+        let Some(mut probe) = scanout::Pair::new(
+            [
+                scanout::Buffer {
+                    address: phys,
+                    len,
+                    stride,
+                    height: DMT_1600X900_60_RB.v_active,
+                },
+                scanout::Buffer {
+                    address: 0x61000000,
+                    len,
+                    stride,
+                    height: DMT_1600X900_60_RB.v_active,
+                },
+            ],
+            gop,
+        ) else {
+            return false;
+        };
+        if !probe.stage(device, 0) {
+            return false;
+        }
+        loop {
+            let source = kumo_rt::port_wait(port);
+            if source == ctx_source {
+                break;
+            }
+            if source == timeout || source == irq_source {
+                return false;
+            }
+        }
+        let mut found = false;
+        for _ in 0..2 {
+            let mut info = kumo_abi::sys::DeviceCtxInfo {
+                fault_record: 0,
+                fault_addr: 0,
+            };
+            if kumo_rt::device_ctx_info(pending.vblank.context, &mut info) != 0 {
+                return false;
+            }
+            log(format_args!(
+                "display: D1d fault snapshot record={:#x} address={:#x}\n",
+                info.fault_record, info.fault_addr
+            ));
+            let raw = (info.fault_record >> f::IRQ_SHIFT) & 3;
+            if raw & 1 != 0 {
+                let status = info.fault_record as u32;
+                if info.fault_record & (f::KERNEL_DISPLAY | f::SNAPSHOT_VALID | f::LINE_MASKED)
+                    != (f::KERNEL_DISPLAY | f::SNAPSHOT_VALID | f::LINE_MASKED)
+                    || raw != 1
+                    || status & 0x22 != 2
+                    || info.fault_addr < phys
+                    || info.fault_addr >= phys + len
+                {
+                    return false;
+                }
+                log(format_args!("display: D1d {} READ fault bank {} master {} status {:#x} IOVA {:#x}; canary outside domain\n",if masked {"masked-completion"}else{"orphan"},(info.fault_record>>f::BANK_SHIFT)&3,(status>>6)&31,status,info.fault_addr));
+                found = true;
+            }
+        }
+        if !found {
+            return false;
+        }
+        if kumo_rt::device_register_write(
+            pending.vop.0,
+            rk3588::VOP_BASE,
+            kumo_abi::sys::DisplayRegister::Commit as u32,
+            scanout::COMMIT_VP2,
+        ) != kumo_abi::Errno::BadState.status()
+        {
+            return false;
+        }
+        if masked {
+            if interrupt_complete(irq) != kumo_abi::Errno::BadState.status()
+                || interrupt_complete(irq) != kumo_abi::Errno::BadState.status()
+            {
+                return false;
+            }
+            let Some((quiet, qsource)) = arm(port, 50) else {
+                return false;
+            };
+            if kumo_rt::port_wait(port) != qsource {
+                return false;
+            }
+            disarm(port, quiet);
+            let _ = port_unbind(port, irq);
+            close(irq);
+        }
+        let ready = context_ready(pending.vblank.context);
+        let state = pending.alternation.as_mut().unwrap();
+        if ready
+            || probe.observe(device, ready).is_some()
+            || probe.front() != scanout::CONSOLE
+            || probe.pending() != Some(0)
+            || probe.confirmed() != 0
+            || state.pair.observe(device, ready).is_some()
+            || state.pair.retirements() != before
+        {
+            return false;
+        }
+        disarm(port, timer);
+        let _ = port_unbind(port, pending.vblank.context);
+        close(port);
+        for i in 0..len / 4 {
+            if unsafe { ((va + i * 4) as *const u32).read_volatile() } != 0xc0ffee00 ^ (i as u32) {
+                return false;
+            }
+        }
+        if !recover_fault(pending, device, address) {
+            return false;
+        }
+        if kumo_rt::device_vmar_unmap(pending.vblank.context, phys, len) != 0 {
+            return false;
+        }
+        log(format_args!("display: D1d {} fault: canary unchanged, no retirement/stale write; {}approved GOP-only recovery, console latched, alias unmapped\n",if masked {"masked-completion"}else{"orphan"},if masked {"completion twice refused, no IRQ storm; "}else{""}));
+    }
+    for i in 0..len / 4 {
+        if unsafe { ((va + i * 4) as *const u32).read_volatile() } != 0xc0ffee00 ^ (i as u32) {
+            return false;
+        }
+    }
+    close(canary);
+    log(format_args!("display: D1d negative/final-holder/recovery gates complete; GOP-only console live, canary intact\n"));
+    true
 }
 
 /// An actual final context holder dies while the owned front is active. Sora retains

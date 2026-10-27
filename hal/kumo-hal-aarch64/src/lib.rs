@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j629
 //j630
 //j631
 //j632
 //j634
+//j635
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3622,6 +3622,32 @@ pub fn display_controller_activate(
     #[cfg(not(target_os = "none"))]
     {
         let _ = (controller, root, epoch);
+        Err(display_control::Error::NoUnit)
+    }
+}
+pub fn display_latched_fault() -> Option<display_irq::Fault> {
+    #[cfg(target_os = "none")]
+    {
+        DISPLAY_INTERRUPT_GUARD.fault()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
+}
+pub fn display_controller_recover(
+    control: &mut display_control::Controller,
+    old: rockchip_v2::PublishedRoot<'_>,
+    new: rockchip_v2::PublishedRoot<'_>,
+    epoch: u64,
+) -> Result<display_control::Activation, display_control::Error> {
+    #[cfg(target_os = "none")]
+    {
+        control.recover(old, new, epoch, &DISPLAY_INTERRUPT_GUARD, &mut PhysPowerIo)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (control, old, new, epoch);
         Err(display_control::Error::NoUnit)
     }
 }

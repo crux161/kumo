@@ -1,6 +1,7 @@
 //j631
 //j632
 //j634
+//j635
 
 //! DESIGN/022: bounded live controller, called only with a published table owner.
 //! The kernel DeviceCtx path supplies the retaining root owner. Uncertain outcomes retain
@@ -42,6 +43,7 @@ pub enum Phase {
 pub enum Stage {
     Reset,
     Enable,
+    Repair,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -57,6 +59,7 @@ pub enum Error {
     Fault([Bank; 2]),
     Timeout(Stage, [Bank; 2]),
     Routes,
+    Config(u32),
 }
 pub struct Activation {
     pub previous: Option<DetachedRoot>,
@@ -143,7 +146,7 @@ fn require(banks: [Bank; 2], root: u64, paging: bool, mask: u32) -> Result<(), E
     }
     Ok(())
 }
-fn wait(io: &mut impl RegisterIo, stage: Stage, root: u64) -> Result<[Bank; 2], Error> {
+fn wait(io: &mut impl RegisterIo, stage: Stage, roots: [u64; 2]) -> Result<[Bank; 2], Error> {
     let start = io.now_ns();
     let mut last = sample(io)?;
     for _ in 0..MAX_POLLS {
@@ -160,12 +163,21 @@ fn wait(io: &mut impl RegisterIo, stage: Stage, root: u64) -> Result<[Bank; 2], 
                 {
                     return Ok(last);
                 }
-                if last.iter().any(|b| b.root != 0 && b.root != root as u32) {
+                if last
+                    .iter()
+                    .zip(roots)
+                    .any(|(b, root)| b.root != 0 && b.root != root as u32)
+                {
                     return Err(Error::Root(last));
                 }
             }
+            Stage::Repair => return Err(Error::State),
             Stage::Enable => {
-                if last.iter().any(|b| b.root != root as u32 || b.mask != 3) {
+                if last
+                    .iter()
+                    .zip(roots)
+                    .any(|(b, root)| b.root != root as u32 || b.mask != 3)
+                {
                     return Err(Error::Root(last));
                 }
                 if last.iter().all(|b| b.status & 1 != 0) {
@@ -176,15 +188,19 @@ fn wait(io: &mut impl RegisterIo, stage: Stage, root: u64) -> Result<[Bank; 2], 
     }
     Err(Error::Timeout(stage, last))
 }
-fn force_reset(io: &mut impl RegisterIo, root: u64) -> Result<(), Error> {
-    if sample(io)?.iter().any(|b| b.root != root as u32) {
+fn force_reset(io: &mut impl RegisterIo, roots: [u64; 2]) -> Result<(), Error> {
+    if sample(io)?
+        .iter()
+        .zip(roots)
+        .any(|(b, root)| b.root != root as u32)
+    {
         return Err(Error::State);
     }
     for b in BANKS {
         write(io, b + 8, 6)?;
     }
     io.barrier();
-    wait(io, Stage::Reset, root)?;
+    wait(io, Stage::Reset, roots)?;
     Ok(())
 }
 fn routes(io: &mut impl RegisterIo) -> Result<display_mmu::Routes, Error> {
@@ -329,11 +345,20 @@ impl Controller {
             }
             io.barrier();
             require(sample(io)?, new_root.physical(), false, 0)?;
-            force_reset(io, new_root.physical())?;
+            force_reset(io, [new_root.physical(); 2])?;
         } else {
-            force_reset(io, self.root)?;
+            force_reset(io, [self.root; 2])?;
             self.detached = Some(DetachedRoot::after_reset(self.root));
         }
+        self.install(new_root, epoch, guard, io)
+    }
+    fn install(
+        &mut self,
+        new_root: PublishedRoot<'_>,
+        epoch: u64,
+        guard: &Guard,
+        io: &mut impl ControlIo,
+    ) -> Result<Activation, Error> {
         if !guard.claim_update(&new_root, epoch) {
             return Err(Error::Guard);
         }
@@ -359,7 +384,7 @@ impl Controller {
             write(io, b + 8, 0)?;
         }
         io.barrier();
-        wait(io, Stage::Enable, new_root.physical())?;
+        wait(io, Stage::Enable, [new_root.physical(); 2])?;
         seal(io)?;
         self.held
             .as_mut()
@@ -395,6 +420,151 @@ impl Controller {
             resumed,
         })
     }
+    /// Repair only a stable active READ page fault. Old/candidate tables and pins
+    /// must remain owned throughout retry; only later fresh drain/reset releases old.
+    /// The kernel separately proves that every candidate mapping is approved GOP. — KESTREL
+    pub fn recover(
+        &mut self,
+        old: PublishedRoot<'_>,
+        new: PublishedRoot<'_>,
+        epoch: u64,
+        guard: &Guard,
+        io: &mut impl ControlIo,
+    ) -> Result<Activation, Error> {
+        let fault = guard.fault().ok_or(Error::Guard)?;
+        let banks = fault.banks.ok_or(Error::State)?;
+        if self.phase != Phase::Live
+            || self.pending_root != 0
+            || self.detached.is_some()
+            || old.physical() != self.root
+            || guard.binding() != self.binding()
+            || fault.epoch != self.epoch
+            || epoch != self.next_epoch()?
+        {
+            return Err(Error::State);
+        }
+        if new.physical() == 0
+            || new.physical() & 4095 != 0
+            || new.physical() >= 1 << 32
+            || new.physical() == self.root
+        {
+            return Err(Error::InvalidRoot);
+        }
+        if !banks.iter().any(|b| b.raw & 1 != 0)
+            || banks.iter().any(|b| {
+                b.status & 5 != 1
+                    || b.raw & !1 != 0
+                    || b.mask != 3
+                    || b.pending & !1 != 0
+                    || (b.status & 2 != 0) != (b.raw & 1 != 0)
+                    || (b.raw & 1 != 0 && b.status & 0x20 != 0)
+            })
+        {
+            return Err(Error::Fault(banks.map(|b| Bank {
+                root: self.root as u32,
+                status: b.status,
+                raw: b.raw,
+                mask: b.mask,
+                pending: b.pending,
+            })));
+        }
+        if !guard.begin_recovery(self.epoch, |_| io.mask_shared()) {
+            return Err(Error::Guard);
+        }
+        self.pending_root = new.physical();
+        let result = (|| {
+            let current = sample(io)?;
+            for n in 0..2 {
+                let b = current[n];
+                let frozen = banks[n];
+                if b.root != self.root as u32
+                    || b.status & 7 != (frozen.status & 7)
+                    || b.raw != frozen.raw
+                    || b.mask != 3
+                    || b.pending != b.raw
+                    || (b.raw & 1 != 0 && (b.status & 0x7e0) != (frozen.status & 0x7e0))
+                {
+                    return Err(Error::Fault(current));
+                }
+                if b.raw & 1 != 0 && word(io, BANKS[n] + 0xc)? != frozen.fault_address {
+                    return Err(Error::Fault(current));
+                }
+                let config = word(io, BANKS[n] + 0x24)?;
+                if config & 2 == 0 {
+                    return Err(Error::Config(config));
+                }
+            }
+            if routes(io)?.check().is_err() {
+                return Err(Error::Routes);
+            }
+            for b in BANKS {
+                write(io, b + 0x1c, 0)?;
+                write(io, b, new.physical() as u32)?;
+            }
+            io.barrier();
+            // A quiet bank may defer its root latch until the blocked frame advances.
+            // Both publications stay owned; the faulting bank must select the repair root.
+            // Neither bank's old ownership is released before a fresh drain/full reset. — KESTREL
+            let old_root = self.root as u32;
+            let owned_roots = |observed: [Bank; 2]| {
+                observed.iter().enumerate().all(|(n, b)| {
+                    b.root == new.physical() as u32 || (banks[n].raw == 0 && b.root == old_root)
+                })
+            };
+            let selected = sample(io)?;
+            if !owned_roots(selected) || selected.iter().any(|b| b.mask != 0) {
+                return Err(Error::Root(selected));
+            }
+            for (n, b) in BANKS.into_iter().enumerate() {
+                if banks[n].raw & 1 != 0 {
+                    write(io, b + 0x18, 1)?;
+                }
+                write(io, b + 8, 4)?;
+            }
+            io.barrier();
+            for (n, b) in BANKS.into_iter().enumerate() {
+                if banks[n].raw & 1 != 0 {
+                    write(io, b + 8, 5)?;
+                }
+            }
+            io.barrier();
+            let start = io.now_ns();
+            let mut repaired = false;
+            for _ in 0..MAX_POLLS {
+                let observed = sample(io)?;
+                if !owned_roots(observed)
+                    || observed.iter().any(|b| {
+                        b.status & 5 != 1 || b.mask != 0 || b.raw & !1 != 0 || b.pending != 0
+                    })
+                {
+                    return Err(Error::Fault(observed));
+                }
+                if io.now_ns().checked_sub(start).is_none_or(|n| n >= LIMIT_NS) {
+                    return Err(Error::Timeout(Stage::Repair, observed));
+                }
+                if observed.iter().all(|b| b.status & 2 == 0 && b.raw == 0) {
+                    repaired = true;
+                    break;
+                }
+            }
+            if !repaired {
+                return Err(Error::Timeout(Stage::Repair, sample(io)?));
+            }
+            self.hold(io)?;
+            let drained = sample(io)?;
+            no_fault(drained)?;
+            if !owned_roots(drained) || drained.iter().any(|b| b.status & 1 == 0 || b.mask != 0) {
+                return Err(Error::Root(drained));
+            }
+            force_reset(io, drained.map(|b| u64::from(b.root)))?;
+            self.detached = Some(DetachedRoot::after_reset(self.root));
+            self.install(new, epoch, guard, io)
+        })();
+        if result.is_err() {
+            self.failed(guard, io);
+        }
+        result
+    }
     pub fn detach(
         &mut self,
         root: PublishedRoot<'_>,
@@ -416,7 +586,7 @@ impl Controller {
         let result = (|| {
             self.hold(io)?;
             require(sample(io)?, self.root, true, 3)?;
-            force_reset(io, self.root)?;
+            force_reset(io, [self.root; 2])?;
             let proof = DetachedRoot::after_reset(self.root);
             if !guard.finish_blocked(io) {
                 return Err(Error::Guard);
@@ -470,6 +640,8 @@ mod tests {
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,
         events: Vec<&'static str>,
+        replay: bool,
+        defer_quiet_root: bool,
         resets: u32,
         enables: u32,
         ignore: Option<u64>,
@@ -501,6 +673,8 @@ mod tests {
                 regs,
                 writes: Vec::new(),
                 events: Vec::new(),
+                replay: true,
+                defer_quiet_root: false,
                 resets: 3,
                 enables: 3,
                 ignore: None,
@@ -533,6 +707,10 @@ mod tests {
             if p == 0xfdd90068 && self.regs[&0xfdd90e00] >> 31 == 0 {
                 *self.regs.entry(p).or_default() += 1 << 16;
             }
+            if let Some(b) = BANKS.iter().find(|b| p == **b + 0x20) {
+                return self.regs.get(&(*b + 0x14)).copied().unwrap_or(0)
+                    & self.regs.get(&(*b + 0x1c)).copied().unwrap_or(0);
+            }
             *self.regs.get(&p).unwrap_or(&0)
         }
         fn write(&mut self, p: u64, v: u32) {
@@ -554,7 +732,20 @@ mod tests {
                 for a in [0xfdd900cc, 0xfdd900c8] {
                     *self.regs.entry(a).or_default() &= !(v & (v >> 16));
                 }
+            } else if let Some(b) = BANKS.iter().find(|b| p == **b + 0x18) {
+                *self.regs.entry(*b + 0x14).or_default() &= !v;
+            } else if self.defer_quiet_root
+                && BANKS
+                    .iter()
+                    .any(|b| p == *b && self.regs[&(*b + 4)] & 3 == 1)
+            {
+                // The old quiet root remains reachable until the checked full reset. — KESTREL
             } else if let Some(n) = BANKS.iter().position(|b| p == *b + 8) {
+                if v == 5 && self.replay {
+                    *self.regs.entry(BANKS[n] + 4).or_default() &= !2;
+                    *self.regs.entry(BANKS[n] + 0x14).or_default() &= !1;
+                    self.events.push("retry");
+                }
                 if v == 6 && self.resets & (1 << n) != 0 {
                     for offset in [0, 0x14, 0x1c, 0x20, 0x24] {
                         self.regs.insert(BANKS[n] + offset, 0);
@@ -660,6 +851,111 @@ mod tests {
                 .iter()
                 .all(|(p, _)| *p == 0xfdd900c0 || *p == 0xfdd900c4));
             assert_eq!(g.fault().is_some(), power_lost);
+        }
+    }
+    fn page_fault(g: &Guard, io: &mut Io, n: usize) -> crate::display_irq::Fault {
+        io.regs.insert(BANKS[n] + 4, 0x1b);
+        io.regs.insert(BANKS[n] + 0x14, 1);
+        io.regs.insert(BANKS[n] + 0xc, 0x70000000);
+        g.poll(27, io, |_| true).unwrap()
+    }
+    #[test]
+    fn read_fault_repair_retries_with_both_owners_then_resets_before_releasing_old_epoch() {
+        for n in 0..2 {
+            let (mut c, g, mut io) = setup();
+            let a = table(0x1000);
+            let b = table(0x2000);
+            c.activate(a.root_ref(), 1, &g, &mut io).unwrap();
+            page_fault(&g, &mut io, n);
+            io.defer_quiet_root = true;
+            io.events.clear();
+            io.writes.clear();
+            let report = c
+                .recover(a.root_ref(), b.root_ref(), 2, &g, &mut io)
+                .unwrap();
+            assert!(a.reclaim(report.previous.unwrap()).is_ok());
+            assert_eq!(
+                io.events,
+                ["mask", "retry", "reset", "reset", "paging", "paging", "enable", "resume"]
+            );
+            assert_eq!(c.binding(), (0x2000, 2));
+            assert_eq!(g.binding(), c.binding());
+            assert!(g.fault().is_none());
+            assert!(g.control_allowed());
+            let next = page_fault(&g, &mut io, n);
+            assert_eq!(next.epoch, 2);
+        }
+    }
+    #[test]
+    fn failed_retry_or_partial_reset_never_reclaims_resumes_or_overwrites_first_fault() {
+        for partial_reset in [false, true] {
+            let (mut c, g, mut io) = setup();
+            let a = table(0x1000);
+            let b = table(0x2000);
+            c.activate(a.root_ref(), 1, &g, &mut io).unwrap();
+            let first = page_fault(&g, &mut io, 0);
+            if partial_reset {
+                io.resets = 1;
+            } else {
+                io.replay = false;
+            }
+            io.events.clear();
+            io.writes.clear();
+            assert!(c
+                .recover(a.root_ref(), b.root_ref(), 2, &g, &mut io)
+                .is_err());
+            assert_eq!(c.phase(), Phase::Quarantined);
+            assert_eq!(c.pending_root, 0x2000);
+            assert_eq!(g.fault(), Some(first));
+            assert!(!io.events.contains(&"resume"));
+            assert!(!g.control_allowed());
+            if !partial_reset {
+                assert!(io
+                    .writes
+                    .iter()
+                    .all(|(p, v)| !BANKS.iter().any(|b| *p == *b + 8 && *v == 6)));
+            }
+        }
+    }
+    #[test]
+    fn changed_fault_metadata_write_fault_and_wrong_epoch_are_rejected_without_repair_writes() {
+        for mode in 0..5 {
+            let (mut c, g, mut io) = setup();
+            let a = table(0x1000);
+            let b = table(0x2000);
+            c.activate(a.root_ref(), 1, &g, &mut io).unwrap();
+            if mode == 1 {
+                io.regs.insert(BANKS[0] + 4, 0x3b);
+                io.regs.insert(BANKS[0] + 0x14, 1);
+                g.poll(27, &mut io, |_| true);
+            } else {
+                page_fault(&g, &mut io, 0);
+            }
+            if mode == 0 {
+                io.regs.insert(BANKS[0] + 0xc, 0x71000000);
+            } else if mode == 3 {
+                io.regs.insert(BANKS[1], 0x3000);
+            } else if mode == 4 {
+                io.ignore = Some(BANKS[0]);
+            }
+            let first = g.fault();
+            io.writes.clear();
+            assert!(c
+                .recover(
+                    a.root_ref(),
+                    b.root_ref(),
+                    if mode == 2 { 3 } else { 2 },
+                    &g,
+                    &mut io
+                )
+                .is_err());
+            if mode != 4 {
+                assert!(io.writes.is_empty());
+            } else {
+                assert!(!io.events.contains(&"retry"));
+                assert_eq!(c.phase(), Phase::Quarantined);
+            }
+            assert_eq!(g.fault(), first);
         }
     }
     #[test]

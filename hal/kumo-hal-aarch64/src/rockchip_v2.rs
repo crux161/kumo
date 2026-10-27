@@ -1,6 +1,7 @@
 //j615
 //j628
 //j631
+//j635
 
 //! DESIGN/022 D1d-b1: Rockchip-v2 descriptors and an owning read-only page table.
 //! 1024 directory words × 1024 leaf words × 4 KiB cover a 32-bit IOVA. The descriptor
@@ -164,7 +165,8 @@ pub struct OfflineTable<M: TableMemory> {
 }
 
 /// A single-use checked reset result. Only the hardware mechanism can construct
-/// this evidence; it names the owned directory observed before both banks reset.
+/// this evidence; it names a previously reachable owned directory after verified
+/// producer/bus drain and both-bank reset, including a retaining repair prefix.
 /// It is deliberately neither Copy nor Clone. — KESTREL
 #[derive(Debug)]
 pub struct DetachedRoot {

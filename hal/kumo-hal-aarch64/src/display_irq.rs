@@ -2,13 +2,14 @@
 //j630
 //j631
 //j634
+//j635
 
 //! DESIGN/022 D1d-c2b: boot-retained first refusal, independent of driver/engine life.
 //! Capture both banks on IRQ/timer checks before any Sora borrow, retain the first
 //! observation, and gate checked control writes plus every IRQ enable/completion.
 //! TRM Part2 MMU0/1 pp1047–1049 supplies register facts. No MMU register is written.
 //! Live admission requires a published root and increasing epoch; detach stays blocked.
-//! Runtime activation and verified fault recovery remain later. — KESTREL
+//! Checked recovery preserves the first refusal until a verified fresh live epoch. — KESTREL
 
 use crate::{display_iommu, display_unit, power_unit::PowerIo};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -568,6 +569,14 @@ impl Guard {
         if old == REFUSED || old == LATCHING {
             return;
         }
+        // A checked repair temporarily excludes polling, but cannot replace the
+        // original observation if any repair step fails. — KESTREL
+        if self.reason.load(Ordering::Acquire) != 0 {
+            let _ = self
+                .state
+                .compare_exchange(old, REFUSED, Ordering::AcqRel, Ordering::Acquire);
+            return;
+        }
         if self
             .state
             .compare_exchange(old, LATCHING, Ordering::AcqRel, Ordering::Acquire)
@@ -780,9 +789,26 @@ impl Guard {
             self.refuse(e, banks.and_then(|_| capture(io)), false);
             return false;
         }
-        self.state
-            .compare_exchange(ARMED, LIVE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        if self.reason.load(Ordering::Acquire) != 0 {
+            // Only the verified new epoch can retire the old refusal. LATCHING
+            // excludes readers while that old observation is removed. — KESTREL
+            if self
+                .state
+                .compare_exchange(ARMED, LATCHING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return false;
+            }
+            self.flags.store(0, Ordering::Relaxed);
+            self.fault_epoch.store(0, Ordering::Relaxed);
+            self.reason.store(0, Ordering::Relaxed);
+            self.state.store(LIVE, Ordering::Release);
+            true
+        } else {
+            self.state
+                .compare_exchange(ARMED, LIVE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
     }
     pub fn finish_blocked(&self, io: &mut impl PowerIo) -> bool {
         if self.state.load(Ordering::Acquire) != UPDATING {
@@ -857,6 +883,23 @@ impl Guard {
     }
     /// Serialize trusted boot probes with checked control/IRQ operations. Drop or
     /// a failed operation never reopens this state automatically. — KESTREL
+    pub fn begin_recovery(&self, epoch: u64, mask: impl FnOnce(u32) -> bool) -> bool {
+        if self.fault_epoch.load(Ordering::Acquire) != epoch
+            || self.epoch.load(Ordering::Acquire) != epoch
+            || self.root.load(Ordering::Acquire) == 0
+            || self
+                .state
+                .compare_exchange(REFUSED, UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        if !mask(IRQ) {
+            self.refuse(Error::NotReady, None, false);
+            return false;
+        }
+        true
+    }
     pub fn begin_update(&self, mask: impl FnOnce(u32) -> bool) -> bool {
         let state = self.state.load(Ordering::Acquire);
         if !matches!(state, WATCHING | LIVE | BLOCKED)

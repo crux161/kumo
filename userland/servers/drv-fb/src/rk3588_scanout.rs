@@ -2,6 +2,7 @@
 //j612
 //j632
 //j634
+//j635
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
@@ -187,7 +188,10 @@ impl Pair {
 
     /// Observe a consumed load, returning (retired slot, new front). Repeated or coalesced
     /// notifications cannot retire a second buffer without another consumed load. — KESTREL
-    pub fn observe(&mut self, hw: &mut impl Hardware) -> Option<(usize, usize)> {
+    pub fn observe(&mut self, hw: &mut impl Hardware, dma_ready: bool) -> Option<(usize, usize)> {
+        if !dma_ready {
+            return None;
+        }
         let target = self.pending?;
         if !on_glass(hw, self.addresses[target]) {
             return None;
@@ -360,6 +364,20 @@ mod tests {
     }
 
     #[test]
+    fn fault_only_observation_cannot_retire_even_a_consumed_address() {
+        let mut hw = Vop::new(0xed0c0000);
+        let buffers = pair_buffers();
+        let mut pair = Pair::new(buffers, 0xed0c0000).unwrap();
+        assert!(pair.stage(&mut hw, 0));
+        hw.active = buffers[0].address as u32;
+        hw.pending = false;
+        let before = pair.retirements();
+        assert_eq!(pair.observe(&mut hw, false), None);
+        assert_eq!(pair.retirements(), before);
+        assert_eq!(pair.front(), CONSOLE);
+        assert!(pair.pending().is_some());
+    }
+    #[test]
     fn a_pair_refuses_aliasing_console_overlap_or_incompatible_geometry() {
         let good = pair_buffers();
         assert!(Pair::new(good, 0xed0c_0000).is_some());
@@ -385,15 +403,15 @@ mod tests {
         assert!(pair.stage(&mut hw, 0));
         hw.active = pair_buffers()[0].address as u32;
         for _ in 0..20 {
-            assert_eq!(pair.observe(&mut hw), None);
+            assert_eq!(pair.observe(&mut hw, true), None);
             assert!(!pair.can_paint(0) && !pair.can_paint(1));
             assert!(!pair.stage(&mut hw, 1));
         }
         assert_eq!(pair.confirmed(), 0);
         hw.pending = false;
-        assert_eq!(pair.observe(&mut hw), Some((CONSOLE, 0)));
+        assert_eq!(pair.observe(&mut hw, true), Some((CONSOLE, 0)));
         assert!(!pair.can_paint(0) && pair.can_paint(1));
-        assert_eq!(pair.observe(&mut hw), None);
+        assert_eq!(pair.observe(&mut hw, true), None);
         assert_eq!(pair.confirmed(), 1);
     }
 
@@ -404,7 +422,7 @@ mod tests {
         assert!(pair.stage(&mut hw, 0));
         hw.pending = false;
         hw.active = pair_buffers()[1].address as u32;
-        assert_eq!(pair.observe(&mut hw), None);
+        assert_eq!(pair.observe(&mut hw, true), None);
         assert_eq!(pair.pending(), Some(0));
         assert!(!pair.can_paint(0) && !pair.can_paint(1));
         assert_eq!(pair.retirements(), [0, 0]);
@@ -426,22 +444,22 @@ mod tests {
             painted[slot] += 1;
             assert!(pair.stage(&mut hw, slot));
             assert!(!pair.stage(&mut hw, 1 - slot));
-            assert_eq!(pair.observe(&mut hw), None);
+            assert_eq!(pair.observe(&mut hw, true), None);
             // Several frame starts before one delivery still acknowledge exactly one load.
             for _ in 0..(80 + generation) {
                 hw.tick();
             }
             let old = if generation == 0 { CONSOLE } else { 1 - slot };
-            assert_eq!(pair.observe(&mut hw), Some((old, slot)));
+            assert_eq!(pair.observe(&mut hw, true), Some((old, slot)));
             assert_eq!(pair.confirmed(), generation + 1);
-            assert_eq!(pair.observe(&mut hw), None);
+            assert_eq!(pair.observe(&mut hw, true), None);
         }
         pair.restore_console(&mut hw);
         assert!(!pair.can_paint(0) && !pair.can_paint(1));
         while hw.pending {
             hw.tick();
         }
-        assert_eq!(pair.observe(&mut hw), Some((1, CONSOLE)));
+        assert_eq!(pair.observe(&mut hw, true), Some((1, CONSOLE)));
         assert_eq!(painted, [12, 12]);
         assert_eq!(pair.retirements(), [12, 12]);
         assert!(pair.can_paint(0) && pair.can_paint(1));
@@ -459,12 +477,12 @@ mod tests {
                 }
             }
             pair.restore_console(&mut hw);
-            assert_eq!(pair.observe(&mut hw), None);
+            assert_eq!(pair.observe(&mut hw, true), None);
             assert!(!pair.can_paint(0) && !pair.can_paint(1));
             while hw.pending {
                 hw.tick();
             }
-            assert!(pair.observe(&mut hw).is_some());
+            assert!(pair.observe(&mut hw, true).is_some());
             assert_eq!(pair.front(), CONSOLE);
             assert!(pair.can_paint(0) && pair.can_paint(1));
         }

@@ -1,8 +1,8 @@
-//j630
 //j631
 //j632
 //j633
 //j634
+//j635
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -1220,6 +1220,64 @@ impl SyscallEngine {
         {
             cfg!(test)
         }
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    fn display_recovery_context(&self, iommu: KoId) -> Option<DisplayContext> {
+        let unit = self.devices.iommus.iter().find(|u| {
+            u.koid == iommu && u.iommu_kind == kumo_abi::sys::IoMmuKind::RockchipV2 as u32
+        })?;
+        if !self.device_owner.unit_allowed(unit.phys_base, unit.len) {
+            return None;
+        }
+        let control = self.device_owner.0.display_controller.try_borrow().ok()?;
+        let control = control.as_ref()?;
+        if control.phase() != kumo_hal::active::DisplayPhase::Live {
+            return None;
+        }
+        let fault = kumo_hal::active::display_latched_fault()?;
+        self.display_recovery_candidate(iommu, control.binding(), fault)
+    }
+    #[cfg(feature = "arch_aarch64")]
+    fn display_recovery_candidate(
+        &self,
+        iommu: KoId,
+        binding: (u64, u64),
+        fault: kumo_hal::active::DisplayFault,
+    ) -> Option<DisplayContext> {
+        if binding.0 == 0 || fault.epoch != binding.1 || fault.banks.is_none() {
+            return None;
+        }
+        let mut result = None;
+        for c in self
+            .devices
+            .device_ctxs
+            .iter()
+            .filter(|c| c.iommu_koid == iommu && c.state.get() == DeviceCtxState::Quarantined)
+        {
+            if result.is_some() || c.references.is_referenced() {
+                return None;
+            }
+            let d = self.display_context(c.koid)?;
+            if d.pending_epoch.get() != 0
+                || d.epoch.get() != binding.1
+                || d.published.try_borrow().ok()?.as_ref()?.root() != binding.0
+            {
+                return None;
+            }
+            result = Some(d);
+        }
+        result
+    }
+    #[cfg(feature = "arch_aarch64")]
+    fn display_preparing_recovery(&self, ctx: &DeviceCtxBinding) -> bool {
+        self.display_context(ctx.koid).is_some_and(|d| {
+            d.epoch.get() == 0
+                && d.pending_epoch.get() == 0
+                && d.published.try_borrow().is_ok_and(|p| p.is_none())
+        }) && self
+            .display_recovery_context(ctx.iommu_koid)
+            .is_some_and(|d| d.koid != ctx.koid)
     }
 
     fn physical_access_allowed(
@@ -3976,15 +4034,23 @@ impl SyscallEngine {
                 {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 }
-                if self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len) {
+                #[cfg(feature = "arch_aarch64")]
+                let recovery = self
+                    .display_recovery_context(_iommu_entry.koid)
+                    .map(|d| d.koid);
+                #[cfg(not(feature = "arch_aarch64"))]
+                let recovery: Option<KoId> = None;
+                if self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len)
+                    && recovery.is_none()
+                {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
-                if self
-                    .devices
-                    .device_ctxs
-                    .iter()
-                    .any(|ctx| ctx.iommu_koid == _iommu_entry.koid && ctx.stream_id == stream_id)
-                {
+                if self.devices.device_ctxs.iter().any(|ctx| {
+                    ctx.iommu_koid == _iommu_entry.koid
+                        && ctx.stream_id == stream_id
+                        && Some(ctx.koid) != recovery
+                        && ctx.state.get() != DeviceCtxState::Released
+                }) {
                     return KernelCallResult::Status(Errno::InvalidArgs.status());
                 }
 
@@ -4103,8 +4169,13 @@ impl SyscallEngine {
                 else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
+                #[cfg(feature = "arch_aarch64")]
+                let preparing = self.display_preparing_recovery(&ctx_binding);
+                #[cfg(not(feature = "arch_aarch64"))]
+                let preparing = false;
                 if ctx_binding.state.get() != DeviceCtxState::Bound
-                    || self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len)
+                    || (self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len)
+                        && !preparing)
                 {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
@@ -4232,8 +4303,13 @@ impl SyscallEngine {
                 else {
                     return KernelCallResult::Status(Errno::BadHandle.status());
                 };
+                #[cfg(feature = "arch_aarch64")]
+                let preparing = self.display_preparing_recovery(&ctx_binding);
+                #[cfg(not(feature = "arch_aarch64"))]
+                let preparing = false;
                 if ctx_binding.state.get() != DeviceCtxState::Bound
-                    || self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len)
+                    || (self.iommu_unit_quarantined(iommu_binding.phys_base, iommu_binding.len)
+                        && !preparing)
                 {
                     return KernelCallResult::Status(Errno::BadState.status());
                 }
@@ -4583,6 +4659,136 @@ impl SyscallEngine {
         Ok(())
     }
 
+    #[cfg(feature = "arch_aarch64")]
+    fn check_display_recovery(
+        &self,
+        prepared: &crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>,
+        old_owner: &crate::device_memory::PublishedMappings<crate::device_memory::KernelPages>,
+        fault: kumo_hal::active::DisplayFault,
+    ) -> Result<(), Errno> {
+        use kumo_hal::active::DeviceTableAccess as Access;
+        let proof = self.framebuffer_ram.ok_or(Errno::NotSupported)?;
+        let canonical = old_owner
+            .pins()
+            .find(|p| proof.allows(p.entry.vmo, p.offset, p.len))
+            .ok_or(Errno::AccessDenied)?;
+        if prepared.pins().next().is_none()
+            || prepared.pins().any(|p| {
+                !proof.allows(p.entry.vmo, p.offset, p.len)
+                    || !Rc::ptr_eq(&p.entry, &canonical.entry)
+            })
+        {
+            return Err(Errno::AccessDenied);
+        }
+        if prepared.walk(proof.span().start, Access::Read)? != Some(proof.span().start) {
+            return Err(Errno::InvalidArgs);
+        }
+        let banks = fault.banks.ok_or(Errno::BadState)?;
+        let mut active = false;
+        for bank in banks {
+            if bank.raw & 1 != 0 {
+                active = true;
+                let address = prepared
+                    .walk(u64::from(bank.fault_address), Access::Read)?
+                    .ok_or(Errno::InvalidArgs)?;
+                if address < proof.span().start || address >= proof.span().start + proof.span().len
+                {
+                    return Err(Errno::AccessDenied);
+                }
+            }
+        }
+        if !active {
+            return Err(Errno::BadState);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    fn recover_display_context(
+        &self,
+        binding: &DeviceCtxBinding,
+        old: &DisplayContext,
+    ) -> Result<(), Errno> {
+        let old_binding = self
+            .devices
+            .device_ctxs
+            .iter()
+            .find(|c| c.koid == old.koid)
+            .ok_or(Errno::BadState)?;
+        if old_binding.references.is_referenced()
+            || old_binding.state.get() != DeviceCtxState::Quarantined
+        {
+            return Err(Errno::BadState);
+        }
+        let domain = self.display_context(binding.koid).ok_or(Errno::BadState)?;
+        let mut old_published = old
+            .published
+            .try_borrow_mut()
+            .map_err(|_| Errno::BadState)?;
+        let old_owner = old_published.as_ref().ok_or(Errno::BadState)?;
+        let mut maps = domain
+            .mappings
+            .try_borrow_mut()
+            .map_err(|_| Errno::BadState)?;
+        let mut published = domain
+            .published
+            .try_borrow_mut()
+            .map_err(|_| Errno::BadState)?;
+        if published.is_some() || domain.epoch.get() != 0 || domain.pending_epoch.get() != 0 {
+            return Err(Errno::BadState);
+        }
+        let fault = kumo_hal::active::display_latched_fault().ok_or(Errno::BadState)?;
+        self.check_display_recovery(maps.as_ref().ok_or(Errno::BadState)?, old_owner, fault)?;
+        let mut control = self
+            .device_owner
+            .0
+            .display_controller
+            .try_borrow_mut()
+            .map_err(|_| Errno::BadState)?;
+        let control = control.as_mut().ok_or(Errno::BadState)?;
+        let epoch = control.next_epoch().map_err(|_| Errno::BadState)?;
+        *published = Some(maps.take().ok_or(Errno::BadState)?.publish(|p| {
+            kumo_hal::active::clean_dcache_to_poc(
+                phys_ptr_mut(p) as usize,
+                crate::mm::PAGE_SIZE as usize,
+            )
+        }));
+        domain.epoch.set(epoch);
+        binding.state.set(DeviceCtxState::Quarantined);
+        // The repair prefix retains BOTH complete publications. Fresh producer/bus
+        // drain and a full unit reset are still mandatory before any old release. — KESTREL
+        let report = kumo_hal::active::display_controller_recover(
+            control,
+            old_owner.root_ref(),
+            published.as_ref().ok_or(Errno::BadState)?.root_ref(),
+            epoch,
+        )
+        .map_err(|e| {
+            #[cfg(target_os = "none")]
+            crate::klog_at!(
+                kumo_abi::sys::log_level::ERR,
+                "DISPLAY RECOVERY Refuse   {:?}; old/candidate owners retained\n",
+                e
+            );
+            let _ = e;
+            Errno::BadState
+        })?;
+        let detached = report.previous.ok_or(Errno::BadState)?;
+        let previous = old_published.take().ok_or(Errno::BadState)?;
+        match previous.reclaim(detached) {
+            Ok(m) => drop(m),
+            Err(m) => {
+                *old_published = Some(m);
+                return Err(Errno::BadState);
+            }
+        }
+        old_binding.state.set(DeviceCtxState::Released);
+        binding.state.set(DeviceCtxState::Bound);
+        #[cfg(target_os = "none")]
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,"DISPLAY RECOVERY Check    generation {}, canonical GOP only, retry then fresh hold/drain/reset; old owner released, paging/seals verified\n",epoch);
+        Ok(())
+    }
+
     fn activate_display_context(&mut self, process: &Process, ctx: Handle) -> Result<(), Errno> {
         let entry = process
             .handles()
@@ -4600,6 +4806,9 @@ impl SyscallEngine {
         }
         #[cfg(feature = "arch_aarch64")]
         {
+            if let Some(old) = self.display_recovery_context(binding.iommu_koid) {
+                return self.recover_display_context(&binding, &old);
+            }
             let domain = self
                 .display_context(entry.koid)
                 .ok_or(Errno::NotSupported)?;
@@ -5583,6 +5792,78 @@ mod tests {
                 .unwrap()
                 .rights
                 .contains(Rights::TRANSFER));
+        }
+
+        #[test]
+        fn recovery_accepts_only_original_attested_gop_identity_and_complete_fault_coverage() {
+            let (mut e, mut p, h, boot) = gop_fixture();
+            let span = boot.framebuffer.mapping_len().unwrap();
+            let mut old = OfflineMappings::new(&e.table_pages).unwrap();
+            old.map(
+                boot.framebuffer.phys,
+                e.pin_device_vmo_read_only(&p, h, 0, span, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            let old = old.publish(|_| {});
+            let bank = kumo_hal::active::DisplayInterruptBank {
+                status: 0x1b,
+                fault_address: 0x70001000,
+                raw: 1,
+                mask: 3,
+                pending: 1,
+            };
+            let fault = kumo_hal::active::DisplayFault {
+                epoch: 1,
+                error: kumo_hal::active::DisplayInterruptError::MmuSource,
+                banks: Some([bank, bank]),
+                line_masked: true,
+            };
+            let mut good = old.replacement(&e.table_pages, None).unwrap();
+            good.map(
+                0x70000000,
+                e.pin_device_vmo_read_only(&p, h, 0, span, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(e.check_display_recovery(&good, &old, fault), Ok(()));
+            let identity = old.replacement(&e.table_pages, None).unwrap();
+            assert_eq!(
+                e.check_display_recovery(&identity, &old, fault),
+                Err(Errno::InvalidArgs)
+            );
+            let alias = e
+                .root_vmo_create(
+                    &mut p,
+                    Vmo::from_mmio_range(boot.framebuffer.phys, span).unwrap(),
+                    Rights::READ,
+                )
+                .unwrap();
+            let mut forged = OfflineMappings::new(&e.table_pages).unwrap();
+            for iova in [boot.framebuffer.phys, 0x70000000] {
+                forged
+                    .map(
+                        iova,
+                        e.pin_device_vmo_read_only(&p, alias, 0, span, Rights::READ)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                e.check_display_recovery(&forged, &old, fault),
+                Err(Errno::AccessDenied)
+            );
+            let foreign = create_physical_vmo(&mut e, &mut p, 0x30000000, 4096);
+            good.map(
+                0x60000000,
+                e.pin_device_vmo_read_only(&p, foreign, 0, 4096, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                e.check_display_recovery(&good, &old, fault),
+                Err(Errno::AccessDenied)
+            );
         }
 
         #[test]
@@ -8928,6 +9209,78 @@ mod tests {
                     rights,
                 },
             )
+        }
+        #[test]
+        fn recovery_admission_needs_dead_original_lineage_exact_root_epoch_and_no_pending_owner() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let h = create_physical_vmo(&mut e, &mut p, 0x10000000, 4096);
+            assert_eq!(
+                map(&mut e, &mut p, ctx, h, 0x60000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let koid = p.handles().get(ctx).unwrap().koid;
+            let d = e.display_context(koid).unwrap();
+            *d.published.borrow_mut() =
+                Some(d.mappings.borrow_mut().take().unwrap().publish(|_| {}));
+            d.epoch.set(1);
+            let binding = e
+                .devices
+                .device_ctxs
+                .iter()
+                .find(|c| c.koid == koid)
+                .unwrap()
+                .clone();
+            binding.state.set(DeviceCtxState::Quarantined);
+            let root = d.published.borrow().as_ref().unwrap().root();
+            let bank = kumo_hal::active::DisplayInterruptBank {
+                status: 0x1b,
+                fault_address: 0x70000000,
+                raw: 1,
+                mask: 3,
+                pending: 1,
+            };
+            let fault = kumo_hal::active::DisplayFault {
+                epoch: 1,
+                error: kumo_hal::active::DisplayInterruptError::MmuSource,
+                banks: Some([bank, bank]),
+                line_masked: true,
+            };
+            assert!(e
+                .display_recovery_candidate(binding.iommu_koid, (root, 1), fault)
+                .is_none());
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: ctx });
+            assert_eq!(
+                e.display_recovery_candidate(binding.iommu_koid, (root, 1), fault)
+                    .unwrap()
+                    .koid,
+                koid
+            );
+            assert!(e
+                .display_recovery_candidate(binding.iommu_koid, (root + 4096, 1), fault)
+                .is_none());
+            assert!(e
+                .display_recovery_candidate(binding.iommu_koid, (root, 2), fault)
+                .is_none());
+            d.pending_epoch.set(2);
+            assert!(e
+                .display_recovery_candidate(binding.iommu_koid, (root, 1), fault)
+                .is_none());
+            d.pending_epoch.set(0);
+            // Pure admission facts do not mint a new context on a host without the
+            // real boot-owned fault/controller. No new koid clears quarantine. — KESTREL
+            assert_eq!(
+                e.dispatch(
+                    &mut p,
+                    KernelCall::DeviceCtxCreate {
+                        iommu: io,
+                        stream_or_rid: 0
+                    }
+                ),
+                KernelCallResult::Status(Errno::BadState.status())
+            );
+            assert!(d.published.borrow().is_some());
         }
         #[test]
         fn failed_live_replacement_keeps_old_and_pending_pins_and_both_fault_epochs() {

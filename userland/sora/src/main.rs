@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j616
 //j629
 //j632
 //j633
 //j634
+//j635
 
 extern crate alloc;
 
@@ -933,14 +933,33 @@ impl DisplayBroker {
         ))
     }
     fn recover_gop(&self, front: u64) -> Option<Handle> {
-        let ctx = syscall_handle(kumo_rt::device_ctx_create(self.iommu, 0))?;
+        let raw = kumo_rt::device_ctx_create(self.iommu, 0);
+        let Some(ctx) = syscall_handle(raw) else {
+            notice(&[alloc::format!(
+                "display: GOP recovery context create refused {}\n",
+                raw as u32 as i32
+            )
+            .as_bytes()]);
+            return None;
+        };
         for iova in [self.phys, front] {
-            if kumo_rt::device_vmar_map(ctx, self.gop, 0, self.span, iova, Rights::READ) != 0 {
+            let status = kumo_rt::device_vmar_map(ctx, self.gop, 0, self.span, iova, Rights::READ);
+            if status != 0 {
+                notice(&[alloc::format!(
+                    "display: GOP recovery map {:#x} refused {}\n",
+                    iova,
+                    status
+                )
+                .as_bytes()]);
                 let _ = handle_close(ctx);
                 return None;
             }
         }
-        if kumo_rt::device_ctx_activate(ctx) != 0 {
+        let status = kumo_rt::device_ctx_activate(ctx);
+        if status != 0 {
+            notice(&[
+                alloc::format!("display: GOP recovery activation refused {}\n", status).as_bytes(),
+            ]);
             let _ = handle_close(ctx);
             return None;
         }
@@ -956,6 +975,20 @@ impl DisplayBroker {
         let next = if n == 1 && request[0] == b'K' {
             self.kill_holder(initrd, ctx)
                 .and_then(|()| self.recover_gop(0x60000000))
+        } else if n == 5 && request[0] == b'F' {
+            let front = u64::from(u32::from_le_bytes(request[1..5].try_into().unwrap()));
+            let closed = handle_close(ctx) == 0;
+            if closed
+                && front != 0
+                && front & 4095 == 0
+                && front
+                    .checked_add(self.span)
+                    .is_some_and(|end| end <= 1 << 32)
+            {
+                self.recover_gop(front)
+            } else {
+                None
+            }
         } else {
             let _ = handle_close(ctx);
             None
