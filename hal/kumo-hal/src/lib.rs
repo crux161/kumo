@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j627
 //j628
 //j629
 //j630
 //j632
+//j633
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -18,7 +18,8 @@ compile_error!("select a HAL backend");
 #[cfg(feature = "arch_aarch64")]
 pub mod active {
     pub use kumo_hal_aarch64::display_control::{
-        Controller as DisplayController, Phase as DisplayPhase,
+        Activation as DisplayActivation, Controller as DisplayController,
+        Error as DisplayControlError, Phase as DisplayPhase,
     };
     pub use kumo_hal_aarch64::display_irq::{
         Bank as DisplayInterruptBank, Error as DisplayInterruptError, Fault as DisplayFault,

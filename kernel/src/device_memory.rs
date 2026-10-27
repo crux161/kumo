@@ -1,8 +1,8 @@
-//j617
 //j622
 //j628
 //j629
 //j632
+//j633
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
@@ -91,8 +91,8 @@ pub(crate) struct OfflineMappings<A: PageMemory> {
     mappings: Vec<PinnedMapping>,
 }
 
-/// Tables and all actual VMO pins survive even an unexpected owner drop. No live
-/// mutation/unmap is exposed. A matching two-bank reset must precede reclamation.
+/// Tables and all actual VMO pins survive even an unexpected owner drop. Mutation
+/// builds a separate private owner. A matching two-bank reset precedes reclamation.
 /// Keeping the allocator alive also preserves every private-RAM reservation. — KESTREL
 pub(crate) struct PublishedMappings<A: PageMemory> {
     table: kumo_hal::active::PublishedDeviceTable<TableLease<A>>,
@@ -100,6 +100,30 @@ pub(crate) struct PublishedMappings<A: PageMemory> {
 }
 
 impl<A: PageMemory> PublishedMappings<A> {
+    /// Construct privately; a partial allocation failure cannot mutate the reachable
+    /// root or free its pins. Records keep the exact VMO identity and pages. — KESTREL
+    pub fn replacement(
+        &self,
+        pool: &TablePool<A>,
+        remove: Option<(u64, u64)>,
+    ) -> Result<OfflineMappings<A>, kumo_abi::Errno> {
+        if remove.is_some_and(|(iova, len)| {
+            !self
+                .mappings
+                .iter()
+                .any(|m| m.iova == iova && m.pin.len() == len)
+        }) {
+            return Err(kumo_abi::Errno::InvalidArgs);
+        }
+        let mut next = OfflineMappings::new(pool)?;
+        for m in self.mappings.iter() {
+            if remove == Some((m.iova, m.pin.len())) {
+                continue;
+            }
+            next.map(m.iova, m.pin.try_clone()?)?;
+        }
+        Ok(next)
+    }
     pub fn root_ref(&self) -> kumo_hal::active::PublishedDeviceRoot<'_> {
         self.table.root_ref()
     }

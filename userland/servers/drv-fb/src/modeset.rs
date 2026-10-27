@@ -1,8 +1,8 @@
-//j611
 //j612
 //j614
 //j625
 //j632
+//j633
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -1172,6 +1172,25 @@ fn d1c_finish(mut pending: Pending, device: &mut Device, success: bool, reason: 
             state.painted[0] - 1, state.painted[1] - 1
         ));
         log(format_args!("display: D1c console {:#x} latched; both owned buffers retired; interrupt disarmed; D1c complete\n", gop));
+        let (_, stride) = scanout::target_scanout(&pending.program);
+        let len =
+            (u64::from(stride) * u64::from(DMT_1600X900_60_RB.v_active) * 4).next_multiple_of(4096);
+        if pending.vblank.context.0 != 0 {
+            for buffer in state.buffers {
+                if kumo_rt::device_vmar_unmap(
+                    pending.vblank.context,
+                    u64::from(buffer.address),
+                    len,
+                ) != 0
+                {
+                    error(format_args!(
+                        "display: D1d retired unmap refused; backing retained\n"
+                    ));
+                    return;
+                }
+            }
+            log(format_args!("display: D1d both retired buffers unmapped by checked replacements; console domain retained\n"));
+        }
     } else {
         if !restored {
             latch::stop(device, &pending.program);

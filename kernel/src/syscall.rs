@@ -1,8 +1,8 @@
-//j628
 //j629
 //j630
 //j631
 //j632
+//j633
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -352,6 +352,10 @@ struct DisplayContext {
     koid: KoId,
     faults: Rc<DisplayFaults>,
     epoch: Rc<Cell<u64>>,
+    pending_epoch: Rc<Cell<u64>>,
+    pending: Rc<
+        RefCell<Option<crate::device_memory::PublishedMappings<crate::device_memory::KernelPages>>>,
+    >,
     published: Rc<
         RefCell<Option<crate::device_memory::PublishedMappings<crate::device_memory::KernelPages>>>,
     >,
@@ -523,8 +527,8 @@ struct VmoEntry {
 }
 
 /// Own the VMO identity and its materialized page list, independent of user handles.
-/// This pin is for unpublished, read-only device tables. MMIO needs the separate
-/// exact GOP reserved-RAM proof; release after live DMA remains gated. — KESTREL
+/// Read-only device tables retain this pin before publication. MMIO needs the separate
+/// exact GOP reserved-RAM proof; live release requires checked detach/reset. — KESTREL
 #[cfg(feature = "arch_aarch64")]
 pub(crate) struct VmoPin {
     entry: Rc<VmoEntry>,
@@ -535,6 +539,19 @@ pub(crate) struct VmoPin {
 
 #[cfg(feature = "arch_aarch64")]
 impl VmoPin {
+    pub(crate) fn try_clone(&self) -> Result<Self, Errno> {
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(self.pages.len())
+            .map_err(|_| Errno::NoMemory)?;
+        pages.extend_from_slice(&self.pages);
+        Ok(Self {
+            entry: self.entry.clone(),
+            offset: self.offset,
+            len: self.len,
+            pages,
+        })
+    }
     fn new(
         entry: Rc<VmoEntry>,
         offset: u64,
@@ -742,10 +759,14 @@ impl DeviceState {
                 let Ok(published) = domain.published.try_borrow() else {
                     return false;
                 };
+                let Ok(pending) = domain.pending.try_borrow() else {
+                    return false;
+                };
+                let pending_pins = pending.as_ref().into_iter().flat_map(|m| m.pins());
                 let offline_pins = maps.as_ref().into_iter().flat_map(|m| m.pins());
                 let live_pins = published.as_ref().into_iter().flat_map(|m| m.pins());
                 {
-                    for pin in offline_pins.chain(live_pins) {
+                    for pin in offline_pins.chain(live_pins).chain(pending_pins) {
                         if authorized.is_some_and(|entry| core::ptr::eq(entry, pin.entry.as_ref()))
                         {
                             continue;
@@ -1288,6 +1309,7 @@ impl SyscallEngine {
                                 let Ok(mut published) = d.published.try_borrow_mut() else {
                                     return false;
                                 };
+                                if d.pending_epoch.get()!=0 {return false;}
                                 if let Some(live) = published.as_ref() {
                                     let Ok(mut controller) =
                                         self.device_owner.0.display_controller.try_borrow_mut()
@@ -1431,7 +1453,10 @@ impl SyscallEngine {
             else {
                 continue;
             };
-            if fault.epoch != 0 && domain.epoch.get() != fault.epoch {
+            if fault.epoch != 0
+                && domain.epoch.get() != fault.epoch
+                && domain.pending_epoch.get() != fault.epoch
+            {
                 continue;
             }
             if ctx.state.get() == DeviceCtxState::Released || domain.faults.latched.replace(true) {
@@ -4032,6 +4057,8 @@ impl SyscallEngine {
                         koid: object.koid(),
                         faults: Rc::new(DisplayFaults::default()),
                         epoch: Rc::new(Cell::new(0)),
+                        pending_epoch: Rc::new(Cell::new(0)),
+                        pending: Rc::new(RefCell::new(None)),
                         published: Rc::new(RefCell::new(None)),
                         mappings: Rc::new(RefCell::new(Some(mappings))),
                     });
@@ -4099,11 +4126,24 @@ impl SyscallEngine {
                         let domain = self
                             .display_context(ctx_entry.koid)
                             .ok_or(Errno::BadState)?;
-                        let mut maps = domain
-                            .mappings
-                            .try_borrow_mut()
-                            .map_err(|_| Errno::BadState)?;
-                        maps.as_mut().ok_or(Errno::BadState)?.map(iova_hint, pin)
+                        let candidate = {
+                            let published =
+                                domain.published.try_borrow().map_err(|_| Errno::BadState)?;
+                            if let Some(live) = published.as_ref() {
+                                let mut next = live.replacement(&self.table_pages, None)?;
+                                next.map(iova_hint, pin)?;
+                                next
+                            } else {
+                                return domain
+                                    .mappings
+                                    .try_borrow_mut()
+                                    .map_err(|_| Errno::BadState)?
+                                    .as_mut()
+                                    .ok_or(Errno::BadState)?
+                                    .map(iova_hint, pin);
+                            }
+                        };
+                        self.replace_display_mappings(&domain, candidate)
                     })();
                     return KernelCallResult::Status(
                         result.err().map_or(Errno::Ok.status(), Errno::status),
@@ -4208,11 +4248,22 @@ impl SyscallEngine {
                         let domain = self
                             .display_context(ctx_entry.koid)
                             .ok_or(Errno::BadState)?;
-                        let mut maps = domain
-                            .mappings
-                            .try_borrow_mut()
-                            .map_err(|_| Errno::BadState)?;
-                        maps.as_mut().ok_or(Errno::BadState)?.unmap(iova, len)
+                        let candidate = {
+                            let published =
+                                domain.published.try_borrow().map_err(|_| Errno::BadState)?;
+                            if let Some(live) = published.as_ref() {
+                                live.replacement(&self.table_pages, Some((iova, len)))?
+                            } else {
+                                return domain
+                                    .mappings
+                                    .try_borrow_mut()
+                                    .map_err(|_| Errno::BadState)?
+                                    .as_mut()
+                                    .ok_or(Errno::BadState)?
+                                    .unmap(iova, len);
+                            }
+                        };
+                        self.replace_display_mappings(&domain, candidate)
                     })();
                     return KernelCallResult::Status(
                         result.err().map_or(Errno::Ok.status(), Errno::status),
@@ -4422,6 +4473,9 @@ impl SyscallEngine {
 
     #[cfg(feature = "arch_aarch64")]
     fn display_context_live(&self, d: &DisplayContext) -> bool {
+        if d.pending_epoch.get() != 0 {
+            return false;
+        }
         if !self
             .devices
             .device_ctxs
@@ -4437,6 +4491,94 @@ impl SyscallEngine {
             kumo_hal::active::display_live_binding() == Some((p.root(), d.epoch.get()))
         })
     }
+    #[cfg(feature = "arch_aarch64")]
+    fn replace_display_mappings(
+        &self,
+        d: &DisplayContext,
+        next: crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>,
+    ) -> Result<(), Errno> {
+        let mut control = self
+            .device_owner
+            .0
+            .display_controller
+            .try_borrow_mut()
+            .map_err(|_| Errno::BadState)?;
+        let control = control.as_mut().ok_or(Errno::BadState)?;
+        let root = d
+            .published
+            .try_borrow()
+            .map_err(|_| Errno::BadState)?
+            .as_ref()
+            .ok_or(Errno::BadState)?
+            .root();
+        if control.binding() != (root, d.epoch.get()) {
+            return Err(Errno::BadState);
+        }
+        let epoch = control.next_epoch().map_err(|_| Errno::BadState)?;
+        self.replace_display_mappings_with(d, next, epoch, |root, epoch| {
+            kumo_hal::active::display_controller_activate(control, root, epoch)
+        })
+    }
+    #[cfg(feature = "arch_aarch64")]
+    fn replace_display_mappings_with(
+        &self,
+        d: &DisplayContext,
+        next: crate::device_memory::OfflineMappings<crate::device_memory::KernelPages>,
+        epoch: u64,
+        activate: impl FnOnce(
+            kumo_hal::active::PublishedDeviceRoot<'_>,
+            u64,
+        ) -> Result<
+            kumo_hal::active::DisplayActivation,
+            kumo_hal::active::DisplayControlError,
+        >,
+    ) -> Result<(), Errno> {
+        let binding = self
+            .devices
+            .device_ctxs
+            .iter()
+            .find(|c| c.koid == d.koid)
+            .ok_or(Errno::BadState)?;
+        let mut old = d.published.try_borrow_mut().map_err(|_| Errno::BadState)?;
+        let mut pending = d.pending.try_borrow_mut().map_err(|_| Errno::BadState)?;
+        if binding.state.get() != DeviceCtxState::Bound
+            || old.is_none()
+            || pending.is_some()
+            || d.pending_epoch.get() != 0
+            || d.epoch.get().checked_add(1) != Some(epoch)
+        {
+            return Err(Errno::BadState);
+        }
+        *pending = Some(next.publish(|page| {
+            kumo_hal::active::clean_dcache_to_poc(
+                phys_ptr_mut(page) as usize,
+                crate::mm::PAGE_SIZE as usize,
+            )
+        }));
+        d.pending_epoch.set(epoch);
+        // Both complete owners precede exposure. Every failure retains both; only the
+        // exact old root's checked reset witness authorizes its reclamation. — KESTREL
+        binding.state.set(DeviceCtxState::Quarantined);
+        let report = activate(pending.as_ref().ok_or(Errno::BadState)?.root_ref(), epoch)
+            .map_err(|_| Errno::BadState)?;
+        let proof = report.previous.ok_or(Errno::BadState)?;
+        let owned = old.take().ok_or(Errno::BadState)?;
+        match owned.reclaim(proof) {
+            Ok(offline) => drop(offline),
+            Err(owned) => {
+                *old = Some(owned);
+                return Err(Errno::BadState);
+            }
+        }
+        *old = pending.take();
+        d.epoch.set(epoch);
+        d.pending_epoch.set(0);
+        binding.state.set(DeviceCtxState::Bound);
+        #[cfg(target_os = "none")]
+        crate::klog_at!(kumo_abi::sys::log_level::NOTICE,"DISPLAY MAP UPDATE Check   generation {}, root {:#x}, both banks paging; old tables/pins reclaimed after hold/drain/reset\n",epoch,old.as_ref().unwrap().root());
+        Ok(())
+    }
+
     fn activate_display_context(&mut self, process: &Process, ctx: Handle) -> Result<(), Errno> {
         let entry = process
             .handles()
@@ -5852,6 +5994,77 @@ mod tests {
             assert_eq!(maps.walk(0x1000, Access::Read), Ok(Some(0x1000_0000)));
         }
 
+        #[test]
+        fn published_replacement_is_private_exact_and_retains_the_same_pin_identity() {
+            let (e, p, h) = fixture();
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x3ff000,
+                e.pin_device_vmo_read_only(&p, h, PAGE_SIZE, 2 * PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            let published = maps.publish(|_| {});
+            let before = memory.0.borrow().words.clone();
+            let frames = memory.0.borrow().words.len();
+            assert!(matches!(
+                published.replacement(&pool, Some((0x3ff000, PAGE_SIZE))),
+                Err(Errno::InvalidArgs)
+            ));
+            assert_eq!(memory.0.borrow().words.len(), frames);
+            let next = published.replacement(&pool, None).unwrap();
+            let pin = next.mapping(0x3ff000).unwrap();
+            let old = published.pins().next().unwrap();
+            assert!(Rc::ptr_eq(&pin.entry, &old.entry));
+            assert_eq!(pin.offset, old.offset);
+            assert_eq!(pin.pages(), old.pages());
+            assert_eq!(next.walk(0x400123, Access::Read), Ok(Some(0x10002123)));
+            assert_eq!(next.walk(0x400123, Access::Write), Err(Errno::AccessDenied));
+            for (phys, words) in &before {
+                assert_eq!(&memory.0.borrow().words[phys], words);
+            }
+            drop(next);
+            let removed = published
+                .replacement(&pool, Some((0x3ff000, 2 * PAGE_SIZE)))
+                .unwrap();
+            assert!(removed.pins().next().is_none());
+            assert_eq!(removed.walk(0x400123, Access::Read), Ok(None));
+            for (phys, words) in &before {
+                assert_eq!(&memory.0.borrow().words[phys], words);
+            }
+        }
+        #[test]
+        fn replacement_allocation_failure_rolls_back_without_mutating_live_pages_or_pin() {
+            let (e, p, h) = fixture();
+            let memory = Memory::default();
+            let pool = TablePool::new(memory.clone());
+            let mut maps = OfflineMappings::new(&pool).unwrap();
+            maps.map(
+                0x3ff000,
+                e.pin_device_vmo_read_only(&p, h, 0, 2 * PAGE_SIZE, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            let published = maps.publish(|_| {});
+            let before = memory.0.borrow().words.clone();
+            let refs = Rc::strong_count(&published.pins().next().unwrap().entry);
+            memory.0.borrow_mut().limit = Some(before.len() + 2);
+            assert!(matches!(
+                published.replacement(&pool, None),
+                Err(Errno::NoMemory)
+            ));
+            for (phys, words) in &before {
+                assert_eq!(&memory.0.borrow().words[phys], words);
+            }
+            assert_eq!(
+                Rc::strong_count(&published.pins().next().unwrap().entry),
+                refs
+            );
+            memory.0.borrow_mut().limit = None;
+            assert!(published.replacement(&pool, None).is_ok());
+        }
         #[test]
         fn offline_drop_removes_table_descriptors_while_backing_is_still_owned() {
             let (engine, process, handle) = fixture();
@@ -8711,6 +8924,64 @@ mod tests {
                     rights,
                 },
             )
+        }
+        #[test]
+        fn failed_live_replacement_keeps_old_and_pending_pins_and_both_fault_epochs() {
+            let (mut e, mut p, res) = fixture();
+            let io = unit(&mut e, &mut p, res);
+            let ctx = context(&mut e, &mut p, io);
+            let a = create_physical_vmo(&mut e, &mut p, 0x10000000, 4096);
+            let b = create_physical_vmo(&mut e, &mut p, 0x20000000, 4096);
+            assert_eq!(
+                map(&mut e, &mut p, ctx, a, 0x60000000, 4096, Rights::READ),
+                KernelCallResult::Status(0)
+            );
+            let d = e
+                .display_context(p.handles().get(ctx).unwrap().koid)
+                .unwrap();
+            *d.published.borrow_mut() =
+                Some(d.mappings.borrow_mut().take().unwrap().publish(|_| {}));
+            d.epoch.set(1);
+            let mut next = d
+                .published
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .replacement(&e.table_pages, None)
+                .unwrap();
+            next.map(
+                0x61000000,
+                e.pin_device_vmo_read_only(&p, b, 0, 4096, Rights::READ)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                e.replace_display_mappings_with(&d, next, 2, |_, epoch| {
+                    assert_eq!(epoch, 2);
+                    Err(kumo_hal::active::DisplayControlError::NoUnit)
+                }),
+                Err(Errno::BadState)
+            );
+            assert_eq!(d.epoch.get(), 1);
+            assert_eq!(d.pending_epoch.get(), 2);
+            assert_eq!(d.published.borrow().as_ref().unwrap().pins().count(), 1);
+            assert_eq!(d.pending.borrow().as_ref().unwrap().pins().count(), 2);
+            assert!(!e.devices.ram_allowed(0x10000000, 4096, None));
+            assert!(!e.devices.ram_allowed(0x20000000, 4096, None));
+            e.signal_display_fault(kumo_hal::active::DisplayFault {
+                epoch: 2,
+                error: kumo_hal::active::DisplayInterruptError::NotReady,
+                banks: None,
+                line_masked: true,
+            });
+            assert!(d.faults.latched.get());
+            assert!(!e.display_context_live(&d));
+            e.dispatch(&mut p, KernelCall::HandleClose { handle: ctx });
+            assert!(d.published.borrow().is_some() && d.pending.borrow().is_some());
+            let owner = e.device_owner.clone();
+            drop(e);
+            assert!(!owner.ram_allowed(0x10000000, 4096, None));
+            assert!(!owner.ram_allowed(0x20000000, 4096, None));
         }
         #[test]
         fn activation_checks_map_rights_prepared_state_and_preserves_offline_on_unsupported_host() {

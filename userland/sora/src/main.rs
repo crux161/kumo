@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j611
 //j614
 //j616
 //j629
 //j632
+//j633
 
 extern crate alloc;
 
@@ -959,6 +959,12 @@ fn prepare_display_context(
         if !activate_display_with_vectors(ctx) {
             return None;
         }
+        if kumo_rt::device_vmar_map(ctx, grants[1], 0, span, 0x62000000, Rights::READ) != 0
+            || kumo_rt::device_vmar_unmap(ctx, 0x62000000, span) != 0
+        {
+            return None;
+        }
+        notice(&[b"display: D1d live GOP alias map/unmap passed; both replacements checked while GOP scans out\n"]);
         let mut info = kumo_abi::sys::DeviceCtxInfo {
             fault_record: 0,
             fault_addr: 0,
