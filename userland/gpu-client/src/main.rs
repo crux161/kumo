@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j596
 //j636
 //j637
 //j638
 //j639
+//j641
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -16,7 +16,10 @@ use gpu_client::{
     TRIANGLE_BINARY_OFFSET, TRIANGLE_DATA_OFFSET, VALUES,
 };
 use kumo_abi::{Handle, VmarFlags};
-use kumo_gpu::{Command, Reply, Request, Response, Submission, SyncState, REPLY_LEN, VA_START};
+use kumo_gpu::{
+    client::{Client, Error as ClientError, Transport, TransportError},
+    Status as GpuStatus, Submission, SyncState, REPLY_LEN, REQUEST_LEN, VA_START,
+};
 
 use kumo_mali::{
     check_paint, check_triangle, paint_reference_checksum, triangle_reference_checksum, CsFeatures,
@@ -58,55 +61,42 @@ fn barrier() {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
-struct Client {
+struct Channel {
     channel: Handle,
-    id: u32,
 }
-impl Client {
-    fn call(&mut self, command: Command) -> Result<(Response, Option<Handle>), ()> {
-        self.id += 1;
-        let bytes = Request {
-            id: self.id,
-            command,
+impl Transport for Channel {
+    type Handle = Handle;
+    fn send(&mut self, bytes: &[u8; REQUEST_LEN]) -> Result<(), TransportError> {
+        let status = kumo_rt::channel_write(self.channel, bytes.as_ptr(), bytes.len());
+        if status == 0 {
+            Ok(())
+        } else if status == kumo_abi::Errno::PeerClosed.status() {
+            Err(TransportError::Closed)
+        } else {
+            Err(TransportError::Failed)
         }
-        .encode();
-        if kumo_rt::channel_write(self.channel, bytes.as_ptr(), bytes.len()) != 0 {
-            return Err(());
-        }
-        let mut bytes = [0u8; REPLY_LEN + 1];
+    }
+    fn receive(
+        &mut self,
+        bytes: &mut [u8; REPLY_LEN + 1],
+    ) -> Result<(usize, Option<Handle>), TransportError> {
         let (len, raw) =
             kumo_rt::channel_read_with_handle(self.channel, bytes.as_mut_ptr(), bytes.len());
         let grant = handle(raw);
-        let decoded = bytes.get(..len).and_then(Reply::decode);
-        match decoded {
-            Some(Reply {
-                id,
-                result: Ok(response),
-            }) if id == self.id && response.handle_count() == usize::from(grant.is_some()) => {
-                Ok((response, grant))
+        if len == 0 || (len as isize) < 0 || (raw != 0 && grant.is_none()) {
+            if let Some(grant) = grant {
+                let _ = kumo_rt::handle_close(grant);
             }
-            _ => {
-                log(format_args!(
-                    "gpu-client: request {} reply {:?} ({} bytes, handle={})\n",
-                    self.id,
-                    decoded,
-                    len,
-                    grant.is_some()
-                ));
-                if let Some(h) = grant {
-                    let _ = kumo_rt::handle_close(h);
-                }
-                Err(())
-            }
+            return Err(if len == 0 {
+                TransportError::Closed
+            } else {
+                TransportError::Failed
+            });
         }
+        Ok((len, grant))
     }
-    fn simple(&mut self, command: Command) -> Result<Response, ()> {
-        let (response, grant) = self.call(command)?;
-        if let Some(h) = grant {
-            let _ = kumo_rt::handle_close(h);
-            return Err(());
-        }
-        Ok(response)
+    fn close_handle(&mut self, handle: Handle) {
+        let _ = kumo_rt::handle_close(handle);
     }
 }
 
@@ -128,14 +118,14 @@ fn upload(cpu: u64, offset: u64, bytes: &[u8]) -> Result<(), ()> {
 }
 
 fn submit_wait(
-    client: &mut Client,
+    client: &mut Client<Channel>,
     cpu: u64,
     group: u32,
     point: u64,
     stream: &[u64],
-) -> Result<(), ()> {
+) -> Result<(), Failure> {
     if stream.len() * 8 > kumo_gpu::PAGE_BYTES as usize {
-        return Err(());
+        return Err(Failure::Failed);
     }
     for (i, word) in stream.iter().enumerate() {
         // SAFETY: the validated command page, reused only after the last completed point.
@@ -144,34 +134,25 @@ fn submit_wait(
         }
     }
     barrier();
-    if client.simple(Command::Submit(Submission {
+    client.submit(Submission {
         group,
         stream_va: VA_START,
         stream_bytes: (stream.len() * 8) as u32,
         signal_point: point,
-    }))? != (Response::Submitted { point })
-    {
-        return Err(());
-    }
+    })?;
     for _ in 0..1000 {
-        match client.simple(Command::SyncRead { group, point })? {
-            Response::Sync {
-                point: p,
-                state: SyncState::Complete { gpu_status: 0 },
-            } if p == point => {
+        match client.sync_read(group, point)? {
+            SyncState::Complete { gpu_status: 0 } => {
                 barrier();
                 return Ok(());
             }
-            Response::Sync {
-                point: p,
-                state: SyncState::Pending,
-            } if p == point => {
+            SyncState::Pending => {
                 let _ = kumo_rt::sleep_ns(1_000_000);
             }
-            _ => return Err(()),
+            _ => return Err(Failure::Failed),
         }
     }
-    Err(())
+    Err(Failure::Failed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +162,15 @@ enum Failure {
 }
 impl From<()> for Failure {
     fn from(_: ()) -> Self {
+        Self::Failed
+    }
+}
+impl From<ClientError> for Failure {
+    fn from(error: ClientError) -> Self {
+        log(format_args!(
+            "gpu-client: native GPU API failed: {:?}\n",
+            error
+        ));
         Self::Failed
     }
 }
@@ -238,10 +228,8 @@ fn present_image(
 }
 
 fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
-    let mut client = Client { channel, id: 0 };
-    let Response::Info(info) = client.simple(Command::GetInfo)? else {
-        return Err(Failure::Failed);
-    };
+    let mut client = Client::new(Channel { channel });
+    let info = client.info()?;
     if info.gpu_id & 0xffff_0000 != 0xa867_0000 {
         return Err(Failure::Failed);
     }
@@ -252,19 +240,16 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
         "gpu-client: GPU_ID=0x{:08x}, queue registers={} scoreboards={}\n",
         info.gpu_id, features.work_regs, features.scoreboards
     ));
-    let Response::VmCreated { vm } = client.simple(Command::VmCreate)? else {
-        return Err(Failure::Failed);
-    };
-    let (response, grant) = client.call(Command::BufferCreate {
-        bytes: BUFFER_BYTES,
-    })?;
-    let Response::BufferCreated { buffer, bytes } = response else {
-        return Err(Failure::Failed);
-    };
-    if bytes != BUFFER_BYTES {
+    let vm = client.create_vm()?;
+    // A normal server refusal must consume its request ID without killing the channel.
+    // The next real query proves the shared API can continue after that refusal. — KESTREL
+    if client.create_vm() != Err(ClientError::Server(GpuStatus::BadState)) || client.info()? != info
+    {
         return Err(Failure::Failed);
     }
-    let vmo = grant.ok_or(())?;
+    log(format_args!("gpu-client: G7a shared API: duplicate VM refused, next query live; unique request IDs, no replay\n"));
+    let buffer = client.create_buffer(BUFFER_BYTES)?;
+    let (vmo, bytes) = (buffer.handle, buffer.bytes);
     let (status, cpu) = kumo_rt::vmar_map_anywhere(
         vmo,
         bytes,
@@ -284,14 +269,10 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
         }
     }
     barrier();
-    for binding in bindings(vm, buffer) {
-        if client.simple(Command::VmBind(binding))? != Response::VmBound {
-            return Err(Failure::Failed);
-        }
+    for binding in bindings(vm, buffer.id) {
+        client.bind(binding)?;
     }
-    let Response::GroupCreated { group } = client.simple(Command::GroupCreate { vm })? else {
-        return Err(Failure::Failed);
-    };
+    let group = client.create_group(vm)?;
     for (index, value) in VALUES.into_iter().enumerate() {
         let point = index as u64 + 1;
         // SAFETY: the scratch word is in its own mapped page, outside the image and code.
