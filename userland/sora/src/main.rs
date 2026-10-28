@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j634
 //j635
 //j636
 //j648
 //j649
+//j654
 
 extern crate alloc;
 
@@ -546,6 +546,73 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
             let _ = handle_close(argument);
             let _ = handle_close(vmo);
         }
+        fail_status(1);
+    }
+}
+
+/// Admit one presentation client per supervisor-held view, concurrently (F2a-1). Each child
+/// is launched ASYNC, so the builtin returns only after every admission is staged; the
+/// children then paint their own server-owned views and exit on their own. This reports
+/// admission only: a child's later failure is its own log line, not this command's status.
+/// Clients never choose a view and never name coordinates. On a board where drv-gpu owns one
+/// view, only the remaining view is admitted; the QEMU proof uses both. — TIMBERDOODLE
+fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
+    use kumo_graphics::VIEW_COUNT;
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-clients\n");
+        return;
+    }
+    let mut launched = 0usize;
+    let mut failed = false;
+    for view in 0..VIEW_COUNT {
+        let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
+        if channel.0 == 0 {
+            continue;
+        }
+        let vmo = Handle(GRAPHICS_VMO[view].swap(0, Ordering::Relaxed));
+        if vmo.0 == 0 {
+            let _ = handle_close(channel);
+            log(b"gfx-clients: a view has no surface\n");
+            failed = true;
+            continue;
+        }
+        let flags = (ProcessRunFlags::ASYNC
+            | ProcessRunFlags::TRANSFER_ARG
+            | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+        let ran = run_elf_threads(
+            initrd,
+            GFX_CLIENT_PATH.as_bytes(),
+            channel.0 as u64,
+            vmo.0 as u64,
+            flags,
+            b"gfx-client",
+            0,
+            None,
+        );
+        if ran {
+            launched += 1;
+            // One log record, so the handoff line is contiguous in the console transcript
+            // and the smoke's exact-marker check can see it. — TIMBERDOODLE
+            notice(&[
+                b"gfx-clients: view ",
+                &[b'0' + view as u8],
+                b" handed to an async client process\n",
+            ]);
+        } else {
+            // An admitted child owns the handles even if it exits non-zero; only an admission
+            // failure leaves them with Sora.
+            if handle_koid(channel) != u64::MAX {
+                let _ = handle_close(channel);
+                let _ = handle_close(vmo);
+            }
+            failed = true;
+        }
+    }
+    if launched == 0 {
+        log(b"gfx-clients: no graphics view available\n");
+        fail_status(1);
+    } else if failed {
         fail_status(1);
     }
 }
@@ -3998,6 +4065,10 @@ fn eval_command(
     }
     if matches!(cmd.name.as_str(), "gfx-client" | "bmp-view") {
         graphics_client(cmd, initrd, cwd);
+        return true;
+    }
+    if cmd.name == "gfx-clients" {
+        graphics_clients(cmd, initrd);
         return true;
     }
     if cmd.name == "dmesg" {

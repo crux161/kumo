@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j618
 #j619
 #j620
 #j648
 #j649
+#j654
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -46,6 +46,8 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None):
     for index, (name, data) in enumerate(files):
         if name == b"etc/autoexec":
             data = b"dmesg -n 6\ngfx-client\ngfx-demo\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if two_clients:
+                data = b"dmesg -n 6\ngfx-clients\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -151,7 +153,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -174,7 +176,8 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False):
 
     # View 0 is painted by the separate client process; view 1 by the supervisor demo,
     # which presents an over-sized surface whose visible corner is solid. Both are copied by
-    # the server into server-owned rectangles.
+    # the server into server-owned rectangles. In two-client mode each view is painted by its
+    # own separate client process, so both carry the demo image.
     expected = bitmap_reference(bitmap_file, scratch) if bitmap else demo_pixel
     vx, vy = rects[0]
     for y in range(VIEW_H):
@@ -183,7 +186,8 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False):
     vx, vy = rects[1]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
-            assert at(vx + x, vy + y) == VIEW_SOLID, f"view 1 pixel {(x, y)}"
+            want = demo_pixel(x, y) if two_clients else VIEW_SOLID
+            assert at(vx + x, vy + y) == want, f"view 1 pixel {(x, y)}"
 
     # The clipped surface's out-of-view poison must never reach the glass.
     poison = sum(1 for y in range(height) for x in range(width) if at(x, y) == POISON)
@@ -207,6 +211,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--with-dtb", action="store_true", help="exercise drv-gpu with a staged QEMU DTB; requires image log level >=6")
     parser.add_argument("--bitmap", action="store_true", help="display and verify bmp-view instead of gfx-client")
+    parser.add_argument("--two-clients", action="store_true", help="run two concurrent separate gfx-client processes, one per view")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -214,6 +219,8 @@ def main():
         args.bitmap_path = "input.bmp"
     if args.bitmap_path:
         args.bitmap = True
+    if args.two_clients and args.bitmap:
+        parser.error("--two-clients and --bitmap are separate proofs")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -227,7 +234,8 @@ def main():
             "-cpu", "cortex-a72", "-m", "512", "-display", "none", "-device", "ramfb",
             "-net", "none",
         ], check=True, capture_output=True, timeout=15)
-    replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file)
+    replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
+                     args.two_clients)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -248,7 +256,16 @@ def main():
                 transcript = serial.read_bytes() if serial.exists() else b""
                 if args.with_dtb and b"TOWER: CPU EXCEPTION" in transcript:
                     raise RuntimeError(f"kernel fault during DTB syscall smoke; inspect {serial}")
-                if b"INDRA login:" in transcript and (b"g-ok" if args.bitmap_path else b"graphics-smoke-after-present") in transcript:
+                ready = b"INDRA login:" in transcript and (
+                    b"g-ok" if args.bitmap_path else b"graphics-smoke-after-present"
+                ) in transcript
+                if args.two_clients:
+                    # The clients are admitted ASYNC after the marker; wait for both
+                    # separate processes to present before the screenshot.
+                    ready = ready and transcript.count(
+                        b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
+                    ) >= 2
+                if ready:
                     break
                 time.sleep(0.1)
             else:
@@ -271,10 +288,17 @@ def main():
             print("DeviceCtx retention smoke green: engine replacement, roots/backing held, alias denial, pre-zero gap")
             assert b"sora: VmoCreate SIMD preserved" in transcript, f"missing EL0 vector proof; inspect {serial}"
             print("Device table RAM smoke green: private pages, read-only walk, VMO alias denial, DMA gap, reuse, EL0 SIMD")
-            assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
-            demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
-            assert transcript.count(demo) == 2, f"missing view 1 replies; inspect {serial}"
-            assert b"gfx-demo: one or more views failed" not in transcript
+            if args.two_clients:
+                assert transcript.count(client) == 2, f"missing two client presents; inspect {serial}"
+                for view in (0, 1):
+                    marker = f"gfx-clients: view {view} handed to an async client process".encode()
+                    assert marker in transcript, f"missing view {view} handoff; inspect {serial}"
+                assert b"gfx-demo:" not in transcript, f"supervisor painted a view; inspect {serial}"
+            else:
+                assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
+                demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
+                assert transcript.count(demo) == 2, f"missing view 1 replies; inspect {serial}"
+                assert b"gfx-demo: one or more views failed" not in transcript
             assert b"gfx-client: presenter rejected surface" not in transcript
             if args.with_dtb:
                 assert b" declared / " in transcript, f"staged DTB was not loaded; inspect {serial}"
@@ -304,9 +328,12 @@ def main():
 
             command("qmp_capabilities")
             command("screendump", {"filename": str(work / "screen.ppm")})
-            check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file, args.bitmap_path == "/tmp/INPUT.BMP")
+            check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
+                         args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
+            if args.two_clients:
+                print("Two-client UEFI smoke green: two separate client processes, one per view, chrome, console, login")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()
