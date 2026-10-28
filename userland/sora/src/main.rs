@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j654
 //j655
 //j657
 //j658
 //j659
+//j663
 
 extern crate alloc;
 
@@ -4283,6 +4283,11 @@ extern "C" fn sora_main(
                         if let Some(report) = drv_i2c_hid::decode_mouse_event(&serve_buf[..n]) {
                             mouse_events_seen = mouse_events_seen.saturating_add(1);
                             pointer_state.apply_boot_mouse(report);
+                            // One NOTICE record proves the physical pointer path on metal
+                            // without needing dmesg's INFO level. — TIMBERDOODLE
+                            if mouse_events_seen == 1 {
+                                notice(&[b"sora: pointer ready\n"]);
+                            }
                             if mouse_events_seen <= 8 {
                                 let position = pointer_state.position();
                                 diag(b"sora: mouse pointer x=");
