@@ -3,13 +3,15 @@
 //j645
 //j646
 //j647
+//j650
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
-    DeviceTopology, Request, RequestIds, Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
+    DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission, Timeline,
+    MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -39,6 +41,10 @@ pub trait Backend {
     }
     /// Optional read-only extension. An unimplemented backend must not invent texture formats.
     fn texture_features(&mut self) -> Result<DeviceTexture, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Optional read-only extension. An unimplemented backend must not invent core features.
+    fn core_features(&mut self) -> Result<DeviceCore, Status> {
         Err(Status::NotSupported)
     }
     fn create_vm(&mut self) -> Result<(), Status>;
@@ -122,6 +128,13 @@ impl Session {
                     return Err(Status::NotSupported);
                 }
                 Ok(Response::Texture(texture))
+            }
+            Command::GetCoreFeatures => {
+                // Required in the query sense — any failure aborts the report — but the word
+                // crosses verbatim, zero included: the Orange Pi 5 Plus measures exactly
+                // 0x00000000 (J650), and variant byte 0 is the pinned Mesa table's G610 entry,
+                // so zero is a valid attestation, not a failed read. — TIMBERDOODLE
+                Ok(Response::Core(backend.core_features()?))
             }
             Command::VmCreate => {
                 if self.vm {
@@ -253,6 +266,7 @@ mod tests {
         mmu_features: Option<u32>,
         tiler_features: Option<u32>,
         texture_features_0: Option<u32>,
+        core_features: Option<u32>,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -283,6 +297,12 @@ mod tests {
             self.record(Command::GetTextureFeatures)?;
             self.texture_features_0
                 .map(|texture_features_0| DeviceTexture { texture_features_0 })
+                .ok_or(Status::NotSupported)
+        }
+        fn core_features(&mut self) -> Result<DeviceCore, Status> {
+            self.record(Command::GetCoreFeatures)?;
+            self.core_features
+                .map(|core_features| DeviceCore { core_features })
                 .ok_or(Status::NotSupported)
         }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -427,6 +447,58 @@ mod tests {
             Err(Status::DeviceLost)
         );
         assert_eq!(backend.calls.len(), calls);
+    }
+
+    #[test]
+    fn core_features_are_read_only_unsupported_is_recoverable_and_zero_is_a_valid_attestation() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetCoreFeatures),
+            Err(Status::NotSupported)
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        // The register word crosses undecoded. The modeled word carries variant byte 0 — the
+        // pinned Mesa table's requirement for a G610 entry to resolve — plus an unrelated bit
+        // above the byte so nothing on this side selects [7:0]. — TIMBERDOODLE
+        backend.core_features = Some(0x0000_1000);
+        let core = Response::Core(DeviceCore {
+            core_features: 0x0000_1000,
+        });
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetCoreFeatures),
+            Ok(core)
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetCoreFeatures),
+            Ok(core)
+        );
+        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.bindings.iter().all(Option::is_none));
+        // The board's measured word is exactly zero: variant byte 0 is the pinned table's
+        // G610 entry, so zero is a valid attestation, not a failed read, and the session
+        // stays live. — TIMBERDOODLE
+        backend.core_features = Some(0);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetCoreFeatures),
+            Ok(Response::Core(DeviceCore { core_features: 0 }))
+        );
+        let calls = backend.calls.len();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetInfo),
+            Ok(Response::Info(DeviceInfo {
+                gpu_id: 0xa8670005,
+                cs_features: 0x7085f,
+            }))
+        );
+        assert_eq!(backend.calls.len(), calls + 1);
     }
 
     #[test]

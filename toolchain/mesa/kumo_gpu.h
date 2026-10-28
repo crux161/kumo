@@ -4,6 +4,7 @@
 /*j645*/
 /*j646*/
 /*j647*/
+/*j650*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -14,7 +15,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 5u
+#define KUMO_GPU_API_VERSION 6u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -33,6 +34,9 @@ struct kumo_gpu_info {
     uint32_t mmu_features;   /* attested MMU_FEATURES; [7:0] is the VA width — SAKER */
     uint32_t tiler_features; /* attested TILER_FEATURES, or 0 when absent — SAKER */
     uint32_t texture_features_0; /* attested TEXTURE_FEATURES[0] only, or 0 when absent — SAKER */
+    uint32_t core_features; /* attested CORE_FEATURES, verbatim; [7:0] is the variant. The
+                             * query is required, but a zero word is a valid value: the opi5
+                             * measures exactly 0x00000000. — TIMBERDOODLE */
 };
 struct kumo_gpu_api {
     uint32_t version;
@@ -82,6 +86,12 @@ struct kumo_mesa_report {
      * TEXTURE_FEATURES[0] and GPU_ID, and left zero when that word is absent. — SAKER */
     uint32_t compressed_formats;
     uint32_t has_afrc;
+    /* The variant is derived with upstream's own expression (`core_features & 0xff`,
+     * panthor_kmod.c) and model_resolved records whether pan_get_model found a table entry
+     * for (gpu_id, variant). Appended last so every earlier field keeps its version5 offset.
+     * — TIMBERDOODLE */
+    uint32_t gpu_variant;
+    uint32_t model_resolved;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
@@ -92,7 +102,8 @@ _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment")
 _Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, tiler_features) == 44, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_0) == 48, "query tail alignment");
-_Static_assert(sizeof(struct kumo_mesa_report) == 112, "report layout");
+_Static_assert(offsetof(struct kumo_gpu_info, core_features) == 52, "query tail alignment");
+_Static_assert(sizeof(struct kumo_mesa_report) == 120, "report layout");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

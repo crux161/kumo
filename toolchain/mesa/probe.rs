@@ -3,6 +3,7 @@
 //j645
 //j646
 //j647
+//j650
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -13,8 +14,8 @@ use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    Binding, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler, DeviceTopology, Reply, Request,
-    Status, Submission, REPLY_LEN, REQUEST_LEN,
+    Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler, DeviceTopology, Reply,
+    Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
 };
 
 #[cfg(target_os = "none")]
@@ -40,11 +41,13 @@ struct Report {
     tiler_max_levels: u32,
     compressed_formats: u32,
     has_afrc: u32,
+    gpu_variant: u32,
+    model_resolved: u32,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 112);
+const _: () = assert!(core::mem::size_of::<Report>() == 120);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -67,8 +70,21 @@ const TILER_LEVELS: u32 = 8;
 const TEXTURE_FEATURES_0: u32 = 0x0200_0001;
 /// Measured on the Orange Pi 5 Plus in J647; RESEARCH/009 §15 had only ever said "measure".
 const TEXTURE_FEATURES_0_MEASURED: u32 = 0xc1ff_ff9e;
+/// RESEARCH/009 §15 has never predicted a CORE_FEATURES word either, and J647 warns the variant
+/// byte is unrecorded. The modeled word uses variant 0 — the pinned Mesa table's requirement for
+/// its G610 entry to resolve — plus an unrelated bit above the byte so nothing on the KUMO side
+/// selects [7:0]. The board's real word is measured on metal and pinned separately. — TIMBERDOODLE
+const CORE_FEATURES: u32 = 0x0000_1000;
+/// Measured on the Orange Pi 5 Plus in J650: CORE_FEATURES reads exactly zero, and variant
+/// byte 0 is the pinned table's G610 entry, so the measured word is the resolving one.
+/// A zero word is a valid attestation, not a failed read. — TIMBERDOODLE
+const CORE_FEATURES_MEASURED: u32 = 0x0000_0000;
 const MISSING_ALL: u64 = 1023;
 const MISSING_WITH_TILER: u64 = MISSING_ALL & !(1 << 1);
+/// Core features are required, so bit 0 clears on every successful query, whether or not the
+/// derived variant lands in Mesa's model table. — TIMBERDOODLE
+const MISSING_WITH_VARIANT: u64 = MISSING_ALL & !(1 << 0);
+const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_WITH_TILER & !(1 << 0);
 
 struct Hardware {
     busy_once: bool,
@@ -76,6 +92,7 @@ struct Hardware {
     mmu_features: u32,
     tiler_features: u32,
     texture_features_0: u32,
+    core_features: u32,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -110,6 +127,13 @@ impl Backend for Hardware {
         }
         Ok(DeviceTexture {
             texture_features_0: self.texture_features_0,
+        })
+    }
+    fn core_features(&mut self) -> Result<DeviceCore, Status> {
+        // Mirrors the driver: the word is required, and the session maps a zero attestation
+        // to DeviceLost rather than degrading. — TIMBERDOODLE
+        Ok(DeviceCore {
+            core_features: self.core_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), Status> {
@@ -179,6 +203,7 @@ fn transport<'a>(
             mmu_features: MMU_FEATURES,
             tiler_features: TILER_FEATURES,
             texture_features_0: TEXTURE_FEATURES_0,
+            core_features: CORE_FEATURES,
         },
         reply: [0; REPLY_LEN],
         sends,
@@ -239,7 +264,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         {
             return 3;
         }
-        for n in [6, 11] {
+        for n in [7, 13] {
             if unsafe { kumo_mesa_probe(api, &mut report) } != 1
                 || report.info.gpu_id != INFO.gpu_id
                 || report.info.cs_features != INFO.cs_features
@@ -250,6 +275,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.info.mmu_features != MMU_FEATURES
                 || report.info.tiler_features != TILER_FEATURES
                 || report.info.texture_features_0 != TEXTURE_FEATURES_0
+                || report.info.core_features != CORE_FEATURES
                 || report.compressed_formats != TEXTURE_FEATURES_0
                 || report.has_afrc != 1
                 || report.core_count != 4
@@ -258,7 +284,9 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.va_range_size != MMU_VA_SIZE
                 || report.tiler_bin_size != TILER_BIN
                 || report.tiler_max_levels != TILER_LEVELS
-                || report.missing_properties != MISSING_WITH_TILER
+                || report.gpu_variant != (CORE_FEATURES & 0xff)
+                || report.model_resolved != 1
+                || report.missing_properties != MISSING_WITH_VARIANT_AND_TILER
                 || report.query_status != 0
                 || report.reserved != 0
                 || sends.get() != n
@@ -271,7 +299,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     if result != 0 {
         return result;
     }
-    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 12 || closed.get() != 0 {
+    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 14 || closed.get() != 0 {
         return 5;
     }
 
@@ -292,7 +320,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.core_count == count
                 && report.core_id_range == range
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 5
+                && sends.get() == 6
         });
         if !ok {
             return 9;
@@ -318,7 +346,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             let status = unsafe { kumo_mesa_probe(api, &mut report) };
-            if status != code || sends.get() != 5 {
+            if status != code || sends.get() != 6 {
                 return false;
             }
             if code == 1 {
@@ -328,6 +356,9 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             } else {
                 report.info.gpu_id == 0
                     && report.info.mmu_features == 0
+                    && report.info.core_features == 0
+                    && report.gpu_variant == 0
+                    && report.model_resolved == 0
                     && report.core_count == 0
                     && report.va_range_start == 0
                     && report.va_range_size == 0
@@ -341,13 +372,18 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     // Upstream decodes the tiler word; KUMO only attests it. These pin the field extraction,
     // that bits above [11:0] are ignored, and that the missing mask tracks reality. — SAKER
     for (features, bin, levels, missing) in [
-        (TILER_FEATURES, TILER_BIN, TILER_LEVELS, MISSING_WITH_TILER),
-        (0x0014u32, 1u32 << 20, 0u32, MISSING_WITH_TILER),
-        (0x0f00u32, 1u32, 15u32, MISSING_WITH_TILER),
-        (0xffff_ff00u32, 1u32, 15u32, MISSING_WITH_TILER),
+        (
+            TILER_FEATURES,
+            TILER_BIN,
+            TILER_LEVELS,
+            MISSING_WITH_VARIANT_AND_TILER,
+        ),
+        (0x0014u32, 1u32 << 20, 0u32, MISSING_WITH_VARIANT_AND_TILER),
+        (0x0f00u32, 1u32, 15u32, MISSING_WITH_VARIANT_AND_TILER),
+        (0xffff_ff00u32, 1u32, 15u32, MISSING_WITH_VARIANT_AND_TILER),
         // A bin-size field of 31 would overflow the signed shift inside upstream's own
         // helper, so the shape degrades to unknown instead of being derived. — SAKER
-        (0x001fu32, 0u32, 0u32, MISSING_ALL),
+        (0x001fu32, 0u32, 0u32, MISSING_WITH_VARIANT),
     ] {
         sends.set(0);
         let mut wire = transport(&sends, &closed, false, false);
@@ -360,7 +396,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.tiler_bin_size == bin
                 && report.tiler_max_levels == levels
                 && report.missing_properties == missing
-                && sends.get() == 5
+                && sends.get() == 6
         });
         if !ok {
             return 14;
@@ -380,13 +416,15 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.info.tiler_features == 0
             && report.tiler_bin_size == 0
             && report.tiler_max_levels == 0
-            && report.missing_properties == MISSING_ALL
+            && report.missing_properties == MISSING_WITH_VARIANT
             && report.info.mmu_features == MMU_FEATURES
             && report.va_range_size == MMU_VA_SIZE
             && report.core_count == 4
             && report.compressed_formats == TEXTURE_FEATURES_0
             && report.has_afrc == 1
-            && sends.get() == 5
+            && report.info.core_features == CORE_FEATURES
+            && report.model_resolved == 1
+            && sends.get() == 6
     });
     if !ok || client.is_lost() {
         return 15;
@@ -414,10 +452,43 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.info.texture_features_0 == word
                 && report.compressed_formats == word
                 && report.has_afrc == afrc
-                && sends.get() == 5
+                && sends.get() == 6
         });
         if !ok {
             return 16;
+        }
+    }
+
+    // Upstream derives the variant from bits [7:0] of the attested word and matches
+    // (gpu_prod_id, variant) against its static model table; KUMO only attests the word. The
+    // modeled word carries variant 0 — the pinned table's requirement for its G610 entry — plus
+    // a bit above the byte to prove [7:0] selection stays upstream's. The measured word (zero)
+    // is pinned as its own row: variant byte 0 is the G610 entry, so it resolves. A table miss
+    // resolves to false without failing the query: the word is attested, only the entry is
+    // absent. — TIMBERDOODLE
+    for (word, variant, resolved) in [
+        (CORE_FEATURES, 0u32, 1u32),
+        (CORE_FEATURES_MEASURED, 0u32, 1u32),
+        (0x0000_1001u32, 1u32, 0u32),
+        (0xffff_ffffu32, 255u32, 0u32),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.core_features = word;
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+                && report.info.core_features == word
+                && report.gpu_variant == variant
+                && report.model_resolved == resolved
+                && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER
+                && report.info.mmu_features == MMU_FEATURES
+                && report.va_range_size == MMU_VA_SIZE
+                && sends.get() == 6
+        });
+        if !ok {
+            return 17;
         }
     }
 

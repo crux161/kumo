@@ -3,6 +3,7 @@
 //j645
 //j646
 //j647
+//j650
 
 extern crate std;
 
@@ -36,6 +37,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetMmuFeatures,
         Command::GetTilerFeatures,
         Command::GetTextureFeatures,
+        Command::GetCoreFeatures,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -573,6 +575,53 @@ fn mmu_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_byte
     // reject the frame rather than accept a truncated value. — SAKER
     let mut widened = zero.encode();
     widened[16..24].copy_from_slice(&0x1_0000_2830u64.to_le_bytes());
+    assert_eq!(Reply::decode(&widened), None);
+}
+
+#[test]
+fn core_features_preserve_all_32_bits_including_the_measured_zero_word_and_reject_truncation_or_reserved_bytes(
+) {
+    let request = Request {
+        id: 15,
+        command: Command::GetCoreFeatures,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &12u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    // The modeled word carries variant byte 0 (the pinned Mesa table's G610 requirement) plus
+    // an unrelated bit above the byte, so the whole word must cross: [7:0] selection is the
+    // consumer's job, and bits above the field would narrow silently. Zero is the board's
+    // measured word (J650 metal: CORE_FEATURES=0x00000000), so it must round-trip too.
+    // — TIMBERDOODLE
+    for core_features in [0, 1, 0x0000_1000, 0x8000_0000, u32::MAX] {
+        let response = Response::Core(DeviceCore { core_features });
+        let reply = Reply {
+            id: 15,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &12u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(core_features).to_le_bytes());
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+        for at in 24..REPLY_LEN {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    // A word wider than 32 bits is a truncated frame, whatever the low bits say: the reply
+    // re-encodes differently, so decode refuses it. — TIMBERDOODLE
+    let zero = Reply {
+        id: 15,
+        result: Ok(Response::Core(DeviceCore { core_features: 0 })),
+    };
+    let mut widened = zero.encode();
+    widened[16..24].copy_from_slice(&0x1_0000_1000u64.to_le_bytes());
     assert_eq!(Reply::decode(&widened), None);
 }
 

@@ -10,8 +10,9 @@
 //! reset, DMA reclamation, a GPU fence or a Mesa/DRM implementation. — KESTREL
 
 use crate::{
-    Binding, Command, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler, DeviceTopology, Reply,
-    Request, Response, Status, Submission, SyncState, REPLY_LEN, REQUEST_LEN,
+    Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
+    DeviceTopology, Reply, Request, Response, Status, Submission, SyncState, REPLY_LEN,
+    REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,12 @@ impl<T: Transport> Client<T> {
             unreachable!()
         };
         Ok(texture)
+    }
+    pub fn core(&mut self) -> Result<DeviceCore, Error> {
+        let (Response::Core(core), _) = self.call(Command::GetCoreFeatures)? else {
+            unreachable!()
+        };
+        Ok(core)
     }
     pub fn create_vm(&mut self) -> Result<u32, Error> {
         let (Response::VmCreated { vm }, _) = self.call(Command::VmCreate)? else {
@@ -216,6 +223,7 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::GetMmuFeatures, Response::Mmu(_))
         | (Command::GetTilerFeatures, Response::Tiler(_))
         | (Command::GetTextureFeatures, Response::Texture(_))
+        | (Command::GetCoreFeatures, Response::Core(_))
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,

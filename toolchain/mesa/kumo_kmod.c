@@ -4,8 +4,10 @@
 /*j645*/
 /*j646*/
 /*j647*/
+/*j650*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
+#include "model/pan_model.h"
 
 /* This table is deliberately unregistered and incomplete. A DRM fd is never
  * reinterpreted as a capability. No pan_kmod_dev is published until native
@@ -31,6 +33,7 @@ _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->gpu_id) == 8, "Mesa GPU 
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->shader_present) == 8, "Mesa topology");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->mmu_features) == 4, "Mesa MMU properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->texture_features) == 16, "Mesa texture properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->gpu_variant) == 4, "Mesa GPU variant");
 
 uint32_t
 kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
@@ -62,9 +65,20 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
          * this partial input for upstream's own arch test to run. — SAKER */
         .gpu_id = out->info.gpu_id,
         .texture_features[0] = out->info.texture_features_0,
+        /* Upstream's own derivation, verbatim from panthor_kmod.c: the variant is bits [7:0]
+         * of the attested word. The opi5's measured word is exactly zero, and variant byte 0
+         * is the pinned table's G610 entry, so zero here is the expected outcome, not a
+         * failed read. — TIMBERDOODLE */
+        .gpu_variant = out->info.core_features & 0xff,
     };
     out->core_count = pan_query_core_count(&props);
     out->core_id_range = pan_query_core_id_range(&props);
+    /* pan_get_model matches (gpu_prod_id, gpu_variant) against Mesa's static table; the
+     * pinned tree's G610 entry carries variant 0. Resolution is the point of attesting this
+     * word: it is what unlocks the model-name and TIB-size paths, but it is recorded, not
+     * required — a table miss is a real, reportable outcome. — TIMBERDOODLE */
+    out->gpu_variant = props.gpu_variant;
+    out->model_resolved = pan_get_model(props.gpu_id, props.gpu_variant) != NULL;
     /* Derived only from an attested word, and only when the bin-size field cannot make
      * upstream's `1 << (raw & 0x1f)` shift overflow a signed int. Either way this degrades to
      * "shape unknown" rather than failing the query: tiler properties are optional and the
@@ -113,10 +127,13 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     /* The mask tracks what is actually attested instead of staying a constant: bit 1 is the
      * tiler group, so it clears only when the shape was genuinely derived. Bit 3 stays set even
      * now, because only element 0 of the four-word texture_features array is attested and
-     * claiming the group would overstate it. — SAKER */
+     * claiming the group would overstate it. Bit 0 (the variant) clears unconditionally once
+     * the query succeeded, because core features are required: the word is attested or the
+     * session died before publication. — SAKER, TIMBERDOODLE */
     out->missing_properties = tiler_derived
                                   ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
                                   : KUMO_MESA_MISSING_ALL;
+    out->missing_properties &= ~KUMO_MESA_MISSING_VARIANT;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)

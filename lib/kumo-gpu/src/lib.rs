@@ -73,6 +73,17 @@ pub struct DeviceTexture {
     pub texture_features_0: u32,
 }
 
+/// The raw `CORE_FEATURES` word, crossed undecoded like its siblings. This is a *required*
+/// property in the query sense: upstream derives the GPU variant from bits [7:0] (`core_features
+/// & 0xff` in `panthor_kmod.c`) and matches it against its model table, so a failed query
+/// aborts the report. The word itself is attested verbatim, zero included — the Orange Pi 5
+/// Plus measures exactly 0x00000000, and variant byte 0 is the pinned table's G610 entry.
+/// The derivation stays the consumer's; this channel never invents a variant. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCore {
+    pub core_features: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Status {

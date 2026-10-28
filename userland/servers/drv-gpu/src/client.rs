@@ -3,6 +3,7 @@
 //j645
 //j646
 //j647
+//j650
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -29,6 +30,7 @@ struct Hardware<'a> {
     mmu_features: u32,
     tiler_features: u32,
     texture_features_0: u32,
+    core_features: u32,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -84,6 +86,15 @@ impl Backend for Hardware<'_> {
         }
         Ok(protocol::DeviceTexture {
             texture_features_0: self.texture_features_0,
+        })
+    }
+    fn core_features(&mut self) -> Result<protocol::DeviceCore, GpuStatus> {
+        // Required in the query sense: bits [7:0] are the GPU variant upstream derives to
+        // pick its model table entry, so the query must succeed. The word crosses verbatim,
+        // zero included — the board measures exactly 0x00000000, and variant byte 0 is the
+        // pinned table's G610 entry. — TIMBERDOODLE
+        Ok(protocol::DeviceCore {
+            core_features: self.core_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
@@ -305,6 +316,7 @@ pub(super) fn serve(
     mmu_features: u32,
     tiler_features: u32,
     texture_features_0: u32,
+    core_features: u32,
 ) -> ! {
     let mut hw = Hardware {
         device,
@@ -312,6 +324,7 @@ pub(super) fn serve(
         mmu_features,
         tiler_features,
         texture_features_0,
+        core_features,
         tables,
         arena,
         root,

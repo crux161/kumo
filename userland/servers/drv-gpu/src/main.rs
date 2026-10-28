@@ -6,6 +6,7 @@
 //j645
 //j646
 //j647
+//j650
 
 mod client;
 
@@ -94,6 +95,9 @@ const TILER_FEATURES: u32 = 0x00C;
 /// RESEARCH/009 §4.3: `TEXTURE_FEATURES[0..3]` at GPU_CONTROL +0x0B0..0x0BC. Only element 0
 /// is read, because that is the only element upstream's discovery path consumes. — SAKER
 const TEXTURE_FEATURES_0: u32 = 0x0B0;
+/// RESEARCH/009 §4.3: `CORE_FEATURES` at GPU_CONTROL +0x008, `[7:0]` the GPU variant upstream
+/// derives to select its model table entry. Read-only, same powered block as the reads above.
+const CORE_FEATURES: u32 = 0x008;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -1237,11 +1241,12 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             // client, which is what RESEARCH/009's oracle table asks for. — SAKER
             let tiler_features = read_aperture(TILER_FEATURES);
             let texture_features_0 = read_aperture(TEXTURE_FEATURES_0);
+            let core_features = read_aperture(CORE_FEATURES);
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: TILER_FEATURES=0x{:08x} TEXTURE_FEATURES0=0x{:08x}; attested raw, not decoded\n",
-                    tiler_features, texture_features_0
+                    "drv-gpu: CORE_FEATURES=0x{:08x} TILER_FEATURES=0x{:08x} TEXTURE_FEATURES0=0x{:08x}; attested raw, not decoded\n",
+                    core_features, tiler_features, texture_features_0
                 ),
             );
             let windows = [
@@ -1792,6 +1797,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 mmu.features,
                 tiler_features,
                 texture_features_0,
+                core_features,
             )
         }
         Err(error) => {

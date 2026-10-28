@@ -2,6 +2,7 @@
 //j645
 //j646
 //j647
+//j650
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -10,7 +11,7 @@ use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -38,6 +39,11 @@ pub struct Info {
     /// Raw `TEXTURE_FEATURES[0]`, or zero when absent. Only element 0 of the four-word array
     /// is attested; C must not read this as the complete set. — SAKER
     pub texture_features_0: u32,
+    /// Raw `CORE_FEATURES`, crossed verbatim, zero included: the Orange Pi 5 Plus measures
+    /// exactly 0x00000000, whose variant byte 0 is the pinned Mesa table's G610 entry. The
+    /// query is required — any failure aborts the report — but a zero word is a valid
+    /// attestation, not a failed read. — TIMBERDOODLE
+    pub core_features: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +92,10 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             Err(Error::Server(crate::Status::NotSupported)) => 0,
             Err(error) => return Err(error),
         };
+        // Core features are required, so any failure — NotSupported included — aborts the
+        // whole query and publishes nothing, exactly like MMU features; the word itself
+        // crosses verbatim, zero included. — TIMBERDOODLE
+        let core = client.core()?;
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -96,6 +106,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             mmu_features: mmu.mmu_features,
             tiler_features,
             texture_features_0,
+            core_features: core.core_features,
         })
     })();
     match result {
@@ -118,13 +129,14 @@ const _: () = assert!(size_of::<Info>() == 56);
 const _: () = assert!(core::mem::offset_of!(Info, mmu_features) == 40);
 const _: () = assert!(core::mem::offset_of!(Info, tiler_features) == 44);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_0) == 48);
+const _: () = assert!(core::mem::offset_of!(Info, core_features) == 52);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, Command, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
-        DeviceTopology, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
+        client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
+        DeviceTiler, DeviceTopology, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -136,6 +148,7 @@ mod tests {
         mmu_failure: bool,
         tiler_unsupported: bool,
         texture_unsupported: bool,
+        core_failure: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -177,6 +190,14 @@ mod tests {
                 } else {
                     Ok(Response::Texture(DeviceTexture {
                         texture_features_0: 0x0200_0001,
+                    }))
+                }
+            } else if self.command == Some(Command::GetCoreFeatures) {
+                if self.core_failure {
+                    Err(Status::Busy)
+                } else {
+                    Ok(Response::Core(DeviceCore {
+                        core_features: 0x0000_1000,
                     }))
                 }
             } else {
@@ -231,6 +252,7 @@ mod tests {
                 assert_eq!(out.mmu_features, 0x2830);
                 assert_eq!(out.tiler_features, 0x809);
                 assert_eq!(out.texture_features_0, 0x0200_0001);
+                assert_eq!(out.core_features, 0x0000_1000);
             }
         });
         assert!(client.info().is_ok());
@@ -255,6 +277,7 @@ mod tests {
             assert_eq!(unsafe { query(api.context, &mut out) }, OK);
             assert_eq!(out.tiler_features, 0);
             assert_eq!(out.texture_features_0, 0);
+            assert_eq!(out.core_features, 0x0000_1000);
             assert_eq!(out.gpu_id, 0xa8670005);
             assert_eq!(out.mmu_features, 0x2830);
             assert_eq!(out.shader_present, 0x500000005);
@@ -286,6 +309,41 @@ mod tests {
             assert_eq!(
                 (out.gpu_id, out.shader_present, out.mmu_features),
                 (0, 0, 0)
+            );
+            assert_eq!((out.va_start, out.va_end), (0, 0));
+        });
+        // Busy is recoverable: the client stays live and the next full query succeeds.
+        assert!(!client.is_lost());
+        assert!(client.info().is_ok());
+    }
+
+    #[test]
+    fn a_failing_core_query_publishes_no_partially_filled_report() {
+        let mut client = Client::new(Wire {
+            core_failure: true,
+            ..Wire::default()
+        });
+        with_api(&mut client, |api| {
+            let mut out = Info {
+                gpu_id: 99,
+                core_features: 99,
+                ..Info::default()
+            };
+            let query = api.query.unwrap();
+            // All five earlier queries succeed, so a naive implementation would already have
+            // written identity, topology, MMU, tiler and texture. Nothing may be published. — TIMBERDOODLE
+            assert_eq!(
+                unsafe { query(api.context, &mut out) },
+                SERVER_ERROR + Status::Busy as u32
+            );
+            assert_eq!(
+                (
+                    out.gpu_id,
+                    out.shader_present,
+                    out.mmu_features,
+                    out.core_features
+                ),
+                (0, 0, 0, 0)
             );
             assert_eq!((out.va_start, out.va_end), (0, 0));
         });
