@@ -2,6 +2,7 @@
 /*j643*/
 /*j644*/
 /*j645*/
+/*j646*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -12,7 +13,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 3u
+#define KUMO_GPU_API_VERSION 4u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -29,6 +30,7 @@ struct kumo_gpu_info {
     uint64_t max_buffer_bytes;
     uint64_t shader_present; /* attested shader core-ID mask */
     uint32_t mmu_features;   /* attested MMU_FEATURES; [7:0] is the VA width — SAKER */
+    uint32_t tiler_features; /* attested TILER_FEATURES, or 0 when absent — SAKER */
 };
 struct kumo_gpu_api {
     uint32_t version;
@@ -69,6 +71,11 @@ struct kumo_mesa_report {
      * mmu_features, never computed by KUMO. — SAKER */
     uint64_t va_range_start;
     uint64_t va_range_size;
+    /* Derived by upstream pan_query_tiler_features from the attested word, and left zero
+     * when that word is absent. Appended last so every earlier field keeps its version3
+     * offset. — SAKER */
+    uint32_t tiler_bin_size;
+    uint32_t tiler_max_levels;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
@@ -77,7 +84,8 @@ uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
 _Static_assert(sizeof(struct kumo_gpu_info) == 48, "query layout");
 _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
-_Static_assert(sizeof(struct kumo_mesa_report) == 88, "report layout");
+_Static_assert(offsetof(struct kumo_gpu_info, tiler_features) == 44, "query tail alignment");
+_Static_assert(sizeof(struct kumo_mesa_report) == 96, "report layout");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

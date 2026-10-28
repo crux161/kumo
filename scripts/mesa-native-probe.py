@@ -2,6 +2,7 @@
 #j643
 #j644
 #j645
+#j646
 """Compile/link the native Mesa property boundary; optionally run a modeled-service UEFI proof.
 
 No download, image installation or hardware reset. See toolchain/mesa/README.md.
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "toolchain/mesa"
 TAR_SHA = "794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5"
 HEADER_SHA = "55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4"
-GREEN = b"G7d native Mesa properties green: upstream topology and VA-range derivation, refusal, loss; modeled service"
+GREEN = b"G7e native Mesa properties green: upstream topology, VA-range and tiler derivation, refusal, loss; modeled service"
 
 
 def sha(path):
@@ -45,7 +46,7 @@ def copy_initrd(path, probe):
         offset, size = struct.unpack_from("<QQ", original, entry + 64)
         data = original[offset:offset + size]
         if name == b"etc/autoexec":
-            data = b"dmesg -n 6\nrelibc g7d\necho G7d-after-launch\n"
+            data = b"dmesg -n 6\nrelibc g7e\necho G7e-after-launch\n"
             replaced.add(name)
         elif name == b"bin/relibc-smoke":
             data = probe.read_bytes()
@@ -85,14 +86,14 @@ def boot(out, probe):
             while time.monotonic() < deadline:
                 assert process.poll() is None, f"QEMU exited; inspect {work}"
                 transcript = serial.read_bytes() if serial.exists() else b""
-                if all(marker in transcript for marker in [GREEN, b"G7d-after-launch", b"INDRA login:"]):
+                if all(marker in transcript for marker in [GREEN, b"G7e-after-launch", b"INDRA login:"]):
                     break
-                if b"G7d native Mesa properties FAILED" in transcript:
+                if b"G7e native Mesa properties FAILED" in transcript:
                     raise RuntimeError(f"native proof failed; inspect {serial}")
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"native proof timed out; inspect {serial}")
-            before, proof = transcript.split(b"G7d native Mesa properties begin", 1)
+            before, proof = transcript.split(b"G7e native Mesa properties begin", 1)
             assert proof.count(GREEN) == 1 and b"TOWER" not in proof and b"FAILED" not in proof
             # Same narrow standing QEMU UART exception allowance as thread-tls-smoke;
             # it applies only before this separate process starts. — KESTREL
@@ -175,7 +176,7 @@ def main():
     symbols = run([nm, "--undefined-only", out / "kumo_kmod.o"], capture_output=True, text=True).stdout
     (out / "backend-undefined.txt").write_text(symbols)
     assert not re.search(r"\b(?:drm\w*|ioctl|mmap|pthread\w*|mtx_\w*|ralloc\w*|util_\w*)\b", symbols), "unexpected backend runtime expansion"
-    expected = {"pan_query_core_count", "pan_query_core_id_range"}
+    expected = {"pan_query_core_count", "pan_query_core_id_range", "pan_query_tiler_features"}
     assert {line.split()[-1] for line in symbols.splitlines() if line.strip()} == expected, "unexpected C backend dependency"
     linked = run([nm, "--defined-only", elf], capture_output=True, text=True).stdout
     (out / "elf-defined.txt").write_text(linked)
@@ -196,7 +197,7 @@ def main():
     versions = {tool: run([tool, "--version"], capture_output=True, text=True).stdout for tool in [cc, ld, "rustc"]}
     (out / "manifest.json").write_text(json.dumps({"mesa_tar_sha256": TAR_SHA, "tools": versions,
         "input_sha256": {str(p): sha(p) for p in sorted(inputs) if p.is_file()}}, indent=2) + "\n")
-    print(f"G7d native compile/link green: {elf}; dependency hashes and runtime symbols in {out}", flush=True)
+    print(f"G7e native compile/link green: {elf}; dependency hashes and runtime symbols in {out}", flush=True)
     if args.run:
         boot(out, elf)
 

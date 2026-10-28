@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j591
 //j593
 //j595
 //j644
 //j645
+//j646
 
 mod client;
 
@@ -88,6 +88,9 @@ const DRAIN_TIMEOUT_NS: u64 = 100_000_000;
 const FIRST_WORK_VALUE: u32 = 0x00C0_FFEE;
 const TILER_PRESENT_LO: u32 = 0x110;
 const TILER_PRESENT_HI: u32 = 0x114;
+/// RESEARCH/009 §4.3: `TILER_FEATURES` at GPU_CONTROL +0x00C, `[4:0]` a log2 bin size and
+/// `[11:8]` the level count. Read-only, in the same powered block as the identity registers.
+const TILER_FEATURES: u32 = 0x00C;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -1226,6 +1229,17 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
 
             let tiler_present = u64::from(read_aperture(TILER_PRESENT_LO))
                 | (u64::from(read_aperture(TILER_PRESENT_HI)) << 32);
+            // Attested raw and never interpreted here; upstream decodes the bin size and level
+            // count. Logged so the board's measurement is on record independently of any
+            // client, which is what RESEARCH/009's oracle table asks for. — SAKER
+            let tiler_features = read_aperture(TILER_FEATURES);
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: TILER_FEATURES=0x{:08x}; attested raw, not decoded\n",
+                    tiler_features
+                ),
+            );
             let windows = [
                 McuWindow {
                     mcu: shared.va,
@@ -1772,6 +1786,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 cs,
                 shader_present,
                 mmu.features,
+                tiler_features,
             )
         }
         Err(error) => {

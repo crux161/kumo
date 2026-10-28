@@ -2,6 +2,7 @@
 //j596
 //j644
 //j645
+//j646
 
 extern crate std;
 
@@ -33,6 +34,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetInfo,
         Command::GetTopology,
         Command::GetMmuFeatures,
+        Command::GetTilerFeatures,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -570,5 +572,49 @@ fn mmu_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_byte
     // reject the frame rather than accept a truncated value. — SAKER
     let mut widened = zero.encode();
     widened[16..24].copy_from_slice(&0x1_0000_2830u64.to_le_bytes());
+    assert_eq!(Reply::decode(&widened), None);
+}
+
+#[test]
+fn tiler_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_bytes() {
+    let request = Request {
+        id: 13,
+        command: Command::GetTilerFeatures,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &10u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    // 0x809 is RESEARCH/009's predicted G610 word; upstream reads [4:0] as a log2 bin size
+    // and [11:8] as the level count, so it must cross with every bit intact. — SAKER
+    for tiler_features in [1, 0x809, 0x8000_0000, u32::MAX] {
+        let response = Response::Tiler(DeviceTiler { tiler_features });
+        let reply = Reply {
+            id: 13,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &10u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(tiler_features).to_le_bytes());
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+        for at in 24..REPLY_LEN {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    // Zero never crosses as a success: the backend degrades to NotSupported instead, so a
+    // zero-word reply is a malformed frame rather than an "unknown tiler" answer. — SAKER
+    let zero = Reply {
+        id: 13,
+        result: Ok(Response::Tiler(DeviceTiler { tiler_features: 0 })),
+    };
+    assert_eq!(Reply::decode(&zero.encode()), None);
+    let mut widened = zero.encode();
+    widened[16..24].copy_from_slice(&0x1_0000_0809u64.to_le_bytes());
     assert_eq!(Reply::decode(&widened), None);
 }

@@ -1,6 +1,7 @@
 //j643
 //j644
 //j645
+//j646
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -11,8 +12,8 @@ use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    Binding, DeviceInfo, DeviceMmu, DeviceTopology, Reply, Request, Status, Submission, REPLY_LEN,
-    REQUEST_LEN,
+    Binding, DeviceInfo, DeviceMmu, DeviceTiler, DeviceTopology, Reply, Request, Status,
+    Submission, REPLY_LEN, REQUEST_LEN,
 };
 
 #[cfg(target_os = "none")]
@@ -34,11 +35,13 @@ struct Report {
     core_id_range: u32,
     va_range_start: u64,
     va_range_size: u64,
+    tiler_bin_size: u32,
+    tiler_max_levels: u32,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 88);
+const _: () = assert!(core::mem::size_of::<Report>() == 96);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -49,11 +52,20 @@ const INFO: DeviceInfo = DeviceInfo {
 const MMU_FEATURES: u32 = 0x2830;
 const MMU_VA_BITS: u32 = 48;
 const MMU_VA_SIZE: u64 = 1 << 48;
+/// RESEARCH/009's predicted G610 word: `[4:0]` log2 bin size 9 and `[11:8]` 8 levels, so
+/// upstream should derive a 512-byte bin and 8 levels. The board measures the real value. — SAKER
+const TILER_FEATURES: u32 = 0x809;
+const TILER_BIN: u32 = 512;
+const TILER_LEVELS: u32 = 8;
+/// Bit 1 is the tiler group, so it clears once TILER_FEATURES is attested.
+const MISSING_ALL: u64 = 1023;
+const MISSING_WITH_TILER: u64 = MISSING_ALL & !(1 << 1);
 
 struct Hardware {
     busy_once: bool,
     shader_present: u64,
     mmu_features: u32,
+    tiler_features: u32,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -71,6 +83,15 @@ impl Backend for Hardware {
     fn mmu_features(&mut self) -> Result<DeviceMmu, Status> {
         Ok(DeviceMmu {
             mmu_features: self.mmu_features,
+        })
+    }
+    fn tiler_features(&mut self) -> Result<DeviceTiler, Status> {
+        // Mirrors the driver: an absent word degrades rather than retiring the session. — SAKER
+        if self.tiler_features == 0 {
+            return Err(Status::NotSupported);
+        }
+        Ok(DeviceTiler {
+            tiler_features: self.tiler_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), Status> {
@@ -138,6 +159,7 @@ fn transport<'a>(
             busy_once,
             shader_present: 0x500000005,
             mmu_features: MMU_FEATURES,
+            tiler_features: TILER_FEATURES,
         },
         reply: [0; REPLY_LEN],
         sends,
@@ -153,11 +175,11 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let mut client = Client::new(transport(&sends, &closed, true, false));
     let result = with_api(&mut client, |api| {
         let mut report = Report::default();
-        // A rejected old ABI must not write the larger version3 report into an
+        // A rejected old ABI must not write the larger version4 report into an
         // old caller's allocation. The extra sentinel words are guard storage, and they
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
-        let old_api = Api { version: 2, ..*api };
+        let old_api = Api { version: 3, ..*api };
         let mut guarded = [0xfeedbeefcafebabeu64; 16];
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
             || guarded != [0xfeedbeefcafebabeu64; 16]
@@ -167,7 +189,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 2, ..*api },
+            Api { version: 3, ..*api },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -198,7 +220,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         {
             return 3;
         }
-        for n in [4, 7] {
+        for n in [5, 9] {
             if unsafe { kumo_mesa_probe(api, &mut report) } != 1
                 || report.info.gpu_id != INFO.gpu_id
                 || report.info.cs_features != INFO.cs_features
@@ -207,11 +229,14 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.info.max_buffer_bytes != kumo_gpu::MAX_BUFFER_BYTES
                 || report.info.shader_present != 0x500000005
                 || report.info.mmu_features != MMU_FEATURES
+                || report.info.tiler_features != TILER_FEATURES
                 || report.core_count != 4
                 || report.core_id_range != 35
                 || report.va_range_start != 0
                 || report.va_range_size != MMU_VA_SIZE
-                || report.missing_properties != 1023
+                || report.tiler_bin_size != TILER_BIN
+                || report.tiler_max_levels != TILER_LEVELS
+                || report.missing_properties != MISSING_WITH_TILER
                 || report.query_status != 0
                 || report.reserved != 0
                 || sends.get() != n
@@ -224,7 +249,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     if result != 0 {
         return result;
     }
-    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 8 || closed.get() != 0 {
+    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 10 || closed.get() != 0 {
         return 5;
     }
 
@@ -245,7 +270,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.core_count == count
                 && report.core_id_range == range
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 3
+                && sends.get() == 4
         });
         if !ok {
             return 9;
@@ -271,7 +296,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             let status = unsafe { kumo_mesa_probe(api, &mut report) };
-            if status != code || sends.get() != 3 {
+            if status != code || sends.get() != 4 {
                 return false;
             }
             if code == 1 {
@@ -289,6 +314,58 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         if !ok {
             return 12;
         }
+    }
+
+    // Upstream decodes the tiler word; KUMO only attests it. These pin the field extraction,
+    // that bits above [11:0] are ignored, and that the missing mask tracks reality. — SAKER
+    for (features, bin, levels, missing) in [
+        (TILER_FEATURES, TILER_BIN, TILER_LEVELS, MISSING_WITH_TILER),
+        (0x0014u32, 1u32 << 20, 0u32, MISSING_WITH_TILER),
+        (0x0f00u32, 1u32, 15u32, MISSING_WITH_TILER),
+        (0xffff_ff00u32, 1u32, 15u32, MISSING_WITH_TILER),
+        // A bin-size field of 31 would overflow the signed shift inside upstream's own
+        // helper, so the shape degrades to unknown instead of being derived. — SAKER
+        (0x001fu32, 0u32, 0u32, MISSING_ALL),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.tiler_features = features;
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+                && report.info.tiler_features == features
+                && report.tiler_bin_size == bin
+                && report.tiler_max_levels == levels
+                && report.missing_properties == missing
+                && sends.get() == 4
+        });
+        if !ok {
+            return 14;
+        }
+    }
+
+    // The case the board could actually present, since RESEARCH/009 has never measured this
+    // register: an absent word must still yield a successful query with zero shape, the tiler
+    // group left missing, every other property intact and the client still live. — SAKER
+    sends.set(0);
+    let mut wire = transport(&sends, &closed, false, false);
+    wire.hardware.tiler_features = 0;
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+            && report.info.tiler_features == 0
+            && report.tiler_bin_size == 0
+            && report.tiler_max_levels == 0
+            && report.missing_properties == MISSING_ALL
+            && report.info.mmu_features == MMU_FEATURES
+            && report.va_range_size == MMU_VA_SIZE
+            && report.core_count == 4
+            && sends.get() == 4
+    });
+    if !ok || client.is_lost() {
+        return 15;
     }
 
     // A zero MMU attestation retires the session exactly as a zero topology does: C sees

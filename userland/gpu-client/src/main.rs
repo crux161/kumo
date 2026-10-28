@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j638
 //j639
 //j641
 //j644
 //j645
+//j646
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -255,6 +255,25 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
         "gpu-client: G7d attested MMU: features0x{:08x}, va bits={}, hardware range0..0x{:x} holds service window0x{:x}..0x{:x}\n",
         mmu.mmu_features, va_bits, hardware_va_bytes, VA_START, VA_END
     ));
+    // Tiler properties are optional. An unknown shape must not fail an otherwise healthy
+    // session, so NotSupported is reported and the compute path continues. The two fields are
+    // decoded exactly as upstream's pan_query_tiler_features does: [4:0] is a log2 bin size
+    // and [11:8] the level count. — SAKER
+    match client.tiler() {
+        Ok(tiler) => {
+            let raw = tiler.tiler_features;
+            log(format_args!(
+                "gpu-client: G7e attested tiler: features0x{:08x}, bin={} bytes, max levels={}\n",
+                raw,
+                1u32 << (raw & 0x1f),
+                (raw >> 8) & 0xf
+            ));
+        }
+        Err(ClientError::Server(GpuStatus::NotSupported)) => log(format_args!(
+            "gpu-client: G7e tiler properties unavailable; compute path unaffected\n"
+        )),
+        Err(_) => return Err(Failure::Failed),
+    }
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;
     let triangle = triangle_stream(features).map_err(|_| ())?;

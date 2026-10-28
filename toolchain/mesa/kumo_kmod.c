@@ -2,6 +2,7 @@
 /*j643*/
 /*j644*/
 /*j645*/
+/*j646*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 
@@ -55,9 +56,21 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     const struct pan_kmod_dev_props props = {
         .shader_present = out->info.shader_present,
         .mmu_features = out->info.mmu_features,
+        .tiler_features = out->info.tiler_features,
     };
     out->core_count = pan_query_core_count(&props);
     out->core_id_range = pan_query_core_id_range(&props);
+    /* Derived only from an attested word, and only when the bin-size field cannot make
+     * upstream's `1 << (raw & 0x1f)` shift overflow a signed int. Either way this degrades to
+     * "shape unknown" rather than failing the query: tiler properties are optional and the
+     * compute path this scaffold serves never depended on them. — SAKER */
+    const int tiler_derived = out->info.tiler_features &&
+                              (out->info.tiler_features & 0x1f) < 31;
+    if (tiler_derived) {
+        const struct pan_tiler_features tiler = pan_query_tiler_features(&props);
+        out->tiler_bin_size = tiler.bin_size;
+        out->tiler_max_levels = tiler.max_levels;
+    }
 
     /* Upstream derives the range by shifting 1ull by this field, so an attested width of
      * 64 or more would be undefined behaviour inside Mesa's own helper. Refuse before
@@ -85,7 +98,11 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     }
     out->va_range_start = range.start;
     out->va_range_size = range.size;
-    out->missing_properties = KUMO_MESA_MISSING_ALL;
+    /* The mask tracks what is actually attested instead of staying a constant: bit 1 is the
+     * tiler group, so it clears only when the shape was genuinely derived. — SAKER */
+    out->missing_properties = tiler_derived
+                                  ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
+                                  : KUMO_MESA_MISSING_ALL;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)

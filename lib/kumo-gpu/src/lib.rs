@@ -1,9 +1,9 @@
 #![no_std]
-//j596
 //j641
 //j643
 //j644
 //j645
+//j646
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -55,6 +55,14 @@ pub struct DeviceTopology {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceMmu {
     pub mmu_features: u32,
+}
+
+/// The raw `TILER_FEATURES` word, also crossed undecoded. Unlike the two properties above, a
+/// zero here means the tiler's shape is unknown rather than the device unusable, so backends
+/// report it as `NotSupported` and the session survives. — SAKER
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceTiler {
+    pub tiler_features: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

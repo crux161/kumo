@@ -2,13 +2,14 @@
 //j596
 //j644
 //j645
+//j646
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceMmu, DeviceTopology, Request,
-    RequestIds, Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceMmu, DeviceTiler, DeviceTopology,
+    Request, RequestIds, Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -30,6 +31,10 @@ pub trait Backend {
     }
     /// Optional read-only extension. An unimplemented backend must not invent MMU properties.
     fn mmu_features(&mut self) -> Result<DeviceMmu, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Optional read-only extension. An unimplemented backend must not invent tiler properties.
+    fn tiler_features(&mut self) -> Result<DeviceTiler, Status> {
         Err(Status::NotSupported)
     }
     fn create_vm(&mut self) -> Result<(), Status>;
@@ -94,6 +99,16 @@ impl Session {
                     return Err(Status::DeviceLost);
                 }
                 Ok(Response::Mmu(mmu))
+            }
+            Command::GetTilerFeatures => {
+                let tiler = backend.tiler_features()?;
+                // A zero word cannot cross the wire. Unlike topology or MMU features it means
+                // the tiler's shape is unknown rather than the device unusable, so it degrades
+                // to a recoverable refusal instead of retiring the session. — SAKER
+                if tiler.tiler_features == 0 {
+                    return Err(Status::NotSupported);
+                }
+                Ok(Response::Tiler(tiler))
             }
             Command::VmCreate => {
                 if self.vm {
@@ -223,6 +238,7 @@ mod tests {
         submit_error: Option<SubmitError>,
         topology: Option<u64>,
         mmu_features: Option<u32>,
+        tiler_features: Option<u32>,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -241,6 +257,12 @@ mod tests {
             self.record(Command::GetMmuFeatures)?;
             self.mmu_features
                 .map(|mmu_features| DeviceMmu { mmu_features })
+                .ok_or(Status::NotSupported)
+        }
+        fn tiler_features(&mut self) -> Result<DeviceTiler, Status> {
+            self.record(Command::GetTilerFeatures)?;
+            self.tiler_features
+                .map(|tiler_features| DeviceTiler { tiler_features })
                 .ok_or(Status::NotSupported)
         }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -385,6 +407,42 @@ mod tests {
             Err(Status::DeviceLost)
         );
         assert_eq!(backend.calls.len(), calls);
+    }
+
+    #[test]
+    fn tiler_features_refuse_zero_recoverably_instead_of_retiring_the_session() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTilerFeatures),
+            Err(Status::NotSupported)
+        );
+        // RESEARCH/009 predicts 0x809: a 512-byte bin and 8 levels. The session only carries
+        // the word; upstream decodes it. — SAKER
+        backend.tiler_features = Some(0x809);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTilerFeatures),
+            Ok(Response::Tiler(DeviceTiler {
+                tiler_features: 0x809
+            }))
+        );
+        // What separates this opcode from topology and MMU: an unknown tiler shape degrades
+        // instead of killing the session, and later work still proceeds. — SAKER
+        backend.tiler_features = Some(0);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTilerFeatures),
+            Err(Status::NotSupported)
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.bindings.iter().all(Option::is_none));
     }
 
     #[test]
