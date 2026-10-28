@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j592
 //j593
 //j594
 //j595
 //j596
+//j655
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -5296,6 +5296,7 @@ mod g5b_tests {
         let frame = Present {
             sequence: 1,
             surface: PAINT_SURFACE,
+            damage: kumo_graphics::DamageSet::FULL,
         };
         assert_eq!(Present::decode(&frame.encode()), Some(frame));
         let tags = [

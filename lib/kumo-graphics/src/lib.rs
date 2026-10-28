@@ -2,6 +2,7 @@
 //j567
 //j568
 //j636
+//j655
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -11,8 +12,11 @@
 pub mod native;
 
 pub const SURFACE_BYTES: usize = 256 * 1024;
-pub const REQUEST_LEN: usize = 24;
+/// `KGP2` frame: magic, sequence, surface (four words), damage count, four 16-byte rects.
+pub const REQUEST_LEN: usize = 92;
 pub const REPLY_LEN: usize = 12;
+/// At most four damaged rectangles per present; zero rectangles means the whole surface.
+pub const DAMAGE_MAX: usize = 4;
 /// Linear little-endian pixels: B, G, R, ignored. No alpha, tiling, or compression.
 pub const XRGB8888: u32 = 1;
 
@@ -136,33 +140,142 @@ impl Surface {
     }
 }
 
+/// One client-declared damaged rectangle in surface coordinates. The presenter clips it to
+/// the surface and then to its server-owned view; clients never name screen coordinates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Damage {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Damage {
+    /// Nonzero area and no u32 overflow in either extent.
+    pub const fn valid(self) -> bool {
+        self.width != 0
+            && self.height != 0
+            && matches!(self.x.checked_add(self.width), Some(_))
+            && matches!(self.y.checked_add(self.height), Some(_))
+    }
+
+    /// Clip to the surface's pixel extent; `None` when nothing of the rectangle remains.
+    pub fn clipped_to(self, surface: Surface) -> Option<Self> {
+        let x0 = self.x.min(surface.width);
+        let y0 = self.y.min(surface.height);
+        let x1 = self.x.checked_add(self.width)?.min(surface.width);
+        let y1 = self.y.checked_add(self.height)?.min(surface.height);
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        Some(Self {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
+}
+
+/// A bounded, ordered set of damaged rectangles. An empty set means "the whole surface":
+/// the first present on a view must be full, and a client that does not track damage keeps
+/// sending the full set. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DamageSet {
+    count: u32,
+    rects: [Damage; DAMAGE_MAX],
+}
+
+impl DamageSet {
+    pub const FULL: Self = Self {
+        count: 0,
+        rects: [Damage {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }; DAMAGE_MAX],
+    };
+
+    pub fn single(rect: Damage) -> Option<Self> {
+        if !rect.valid() {
+            return None;
+        }
+        let mut set = Self::FULL;
+        set.count = 1;
+        set.rects[0] = rect;
+        Some(set)
+    }
+
+    pub fn is_full(self) -> bool {
+        self.count == 0
+    }
+
+    pub fn count(self) -> u32 {
+        self.count
+    }
+
+    /// Validated sets only; decoding rejects everything else.
+    pub fn rects(&self) -> &[Damage] {
+        &self.rects[..(self.count as usize).min(DAMAGE_MAX)]
+    }
+
+    pub fn valid(self) -> bool {
+        self.count as usize <= DAMAGE_MAX && self.rects().iter().all(|rect| rect.valid())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Present {
     pub sequence: u32,
     pub surface: Surface,
+    pub damage: DamageSet,
 }
 
 impl Present {
     pub fn encode(self) -> [u8; REQUEST_LEN] {
         let mut out = [0; REQUEST_LEN];
-        out[..4].copy_from_slice(b"KGP1");
-        for (chunk, word) in out[4..].chunks_exact_mut(4).zip([
+        out[..4].copy_from_slice(b"KGP2");
+        let words = [
             self.sequence,
             self.surface.width,
             self.surface.height,
             self.surface.stride,
             self.surface.format,
-        ]) {
+            self.damage.count,
+        ];
+        for (chunk, word) in out[4..28].chunks_exact_mut(4).zip(words) {
             chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        for (slot, rect) in out[28..].chunks_exact_mut(16).zip(self.damage.rects()) {
+            for (chunk, word) in
+                slot.chunks_exact_mut(4)
+                    .zip([rect.x, rect.y, rect.width, rect.height])
+            {
+                chunk.copy_from_slice(&word.to_le_bytes());
+            }
         }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != REQUEST_LEN || &bytes[..4] != b"KGP1" {
+        if bytes.len() != REQUEST_LEN || &bytes[..4] != b"KGP2" {
             return None;
         }
-        Some(Self {
+        let count = word(bytes, 24);
+        if count as usize > DAMAGE_MAX {
+            return None;
+        }
+        let mut rects = [Damage::default(); DAMAGE_MAX];
+        for (slot, rect) in bytes[28..].chunks_exact(16).zip(rects.iter_mut()) {
+            *rect = Damage {
+                x: word(slot, 0),
+                y: word(slot, 4),
+                width: word(slot, 8),
+                height: word(slot, 12),
+            };
+        }
+        let request = Self {
             sequence: word(bytes, 4),
             surface: Surface {
                 width: word(bytes, 8),
@@ -170,7 +283,10 @@ impl Present {
                 stride: word(bytes, 16),
                 format: word(bytes, 20),
             },
-        })
+            damage: DamageSet { count, rects },
+        };
+        // Canonical re-encoding also refuses nonzero unused rect slots.
+        (request.damage.valid() && request.encode() == bytes).then_some(request)
     }
 }
 
@@ -256,6 +372,44 @@ pub fn clip_demo_pixel(x: u32, y: u32) -> u32 {
     }
 }
 
+/// The damage proof's rectangle in surface coordinates and the colour the damaged copy
+/// paints. The client poisons every pixel outside this rectangle after its full present, so
+/// a presenter that copies more than the declared damage shows magenta on the glass.
+/// — TIMBERDOODLE
+pub const DAMAGE_RECT: Damage = Damage {
+    x: 64,
+    y: 32,
+    width: 64,
+    height: 64,
+};
+pub const DAMAGE_COLOR: u32 = 0x00ff_8000;
+
+pub fn damage_demo_pixel(x: u32, y: u32) -> u32 {
+    let inside = x >= DAMAGE_RECT.x
+        && x < DAMAGE_RECT.x + DAMAGE_RECT.width
+        && y >= DAMAGE_RECT.y
+        && y < DAMAGE_RECT.y + DAMAGE_RECT.height;
+    if inside {
+        DAMAGE_COLOR
+    } else {
+        demo_pixel(x, y)
+    }
+}
+
+/// What the proof client writes after its full present: poison everywhere except the
+/// declared damage. — TIMBERDOODLE
+pub fn damage_poison_pixel(x: u32, y: u32) -> u32 {
+    let inside = x >= DAMAGE_RECT.x
+        && x < DAMAGE_RECT.x + DAMAGE_RECT.width
+        && y >= DAMAGE_RECT.y
+        && y < DAMAGE_RECT.y + DAMAGE_RECT.height;
+    if inside {
+        DAMAGE_COLOR
+    } else {
+        CLIP_POISON
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,16 +451,17 @@ mod tests {
         let request = Present {
             sequence: 0x12345678,
             surface: DEMO,
+            damage: DamageSet::FULL,
         };
         let wire = request.encode();
-        assert_eq!(&wire[..8], b"KGP1\x78\x56\x34\x12");
+        assert_eq!(&wire[..8], b"KGP2\x78\x56\x34\x12");
         assert_eq!(Present::decode(&wire), Some(request));
         for len in 0..REQUEST_LEN {
             assert_eq!(Present::decode(&wire[..len]), None);
         }
         assert_eq!(Present::decode(&[0; REQUEST_LEN + 1]), None);
         let mut invalid = wire;
-        invalid[3] = b'2';
+        invalid[3] = b'3';
         assert_eq!(Present::decode(&invalid), None);
         for status in [Status::Copied, Status::BadRequest, Status::BadSurface] {
             let reply = Reply {
@@ -371,5 +526,119 @@ mod tests {
         assert_eq!(clip_demo_pixel(VIEW_WIDTH - 1, VIEW_HEIGHT - 1), VIEW_SOLID);
         assert_eq!(clip_demo_pixel(VIEW_WIDTH, VIEW_HEIGHT / 2), CLIP_POISON);
         assert_eq!(clip_demo_pixel(VIEW_WIDTH / 2, VIEW_HEIGHT), CLIP_POISON);
+    }
+
+    #[test]
+    fn damage_frames_round_trip_and_reject_malformed_sets() {
+        let rect = Damage {
+            x: 16,
+            y: 8,
+            width: 32,
+            height: 24,
+        };
+        let request = Present {
+            sequence: 7,
+            surface: DEMO,
+            damage: DamageSet::single(rect).unwrap(),
+        };
+        let wire = request.encode();
+        assert_eq!(&wire[..4], b"KGP2");
+        assert_eq!(Present::decode(&wire), Some(request));
+        let full = Present {
+            damage: DamageSet::FULL,
+            ..request
+        };
+        assert_eq!(Present::decode(&full.encode()), Some(full));
+        for len in 0..REQUEST_LEN {
+            assert_eq!(Present::decode(&wire[..len]), None);
+        }
+        // count beyond the fixed capacity
+        let mut bad = wire;
+        bad[24..28].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(Present::decode(&bad), None);
+        // zero-area rectangle
+        let mut bad = wire;
+        bad[36..40].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Present::decode(&bad), None);
+        // overflowing rectangle
+        let mut bad = wire;
+        bad[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Present::decode(&bad), None);
+        // unused rect slots are not an extension point
+        let mut bad = wire;
+        bad[44..48].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(Present::decode(&bad), None);
+        assert!(DamageSet::single(Damage { width: 0, ..rect }).is_none());
+        assert!(!Damage {
+            x: u32::MAX,
+            width: 2,
+            ..rect
+        }
+        .valid());
+    }
+
+    #[test]
+    fn damage_clips_to_the_surface_and_keeps_its_extent_rules() {
+        let surface = Surface {
+            width: 100,
+            height: 50,
+            stride: 100,
+            format: XRGB8888,
+        };
+        assert_eq!(
+            Damage {
+                x: 90,
+                y: 40,
+                width: 20,
+                height: 20
+            }
+            .clipped_to(surface),
+            Some(Damage {
+                x: 90,
+                y: 40,
+                width: 10,
+                height: 10
+            })
+        );
+        assert_eq!(
+            Damage {
+                x: 200,
+                y: 0,
+                width: 10,
+                height: 10
+            }
+            .clipped_to(surface),
+            None
+        );
+        assert_eq!(
+            Damage {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1
+            }
+            .clipped_to(surface),
+            None
+        );
+    }
+
+    #[test]
+    fn damage_demo_differs_only_inside_the_rect_and_poison_is_outside() {
+        let rect = DAMAGE_RECT;
+        assert_eq!(damage_demo_pixel(rect.x, rect.y), DAMAGE_COLOR);
+        assert_eq!(
+            damage_demo_pixel(rect.x + rect.width - 1, rect.y + rect.height - 1),
+            DAMAGE_COLOR
+        );
+        assert_eq!(
+            damage_demo_pixel(rect.x - 1, rect.y),
+            demo_pixel(rect.x - 1, rect.y)
+        );
+        assert_eq!(
+            damage_demo_pixel(rect.x, rect.y - 1),
+            demo_pixel(rect.x, rect.y - 1)
+        );
+        assert_eq!(damage_poison_pixel(rect.x, rect.y), DAMAGE_COLOR);
+        assert_eq!(damage_poison_pixel(0, 0), CLIP_POISON);
     }
 }

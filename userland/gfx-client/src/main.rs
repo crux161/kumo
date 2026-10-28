@@ -1,13 +1,14 @@
 #![no_std]
 #![no_main]
 //j569
+//j655
 
 //! A separate-process presentation client (F1b): Sora transfers one presentation channel in
 //! `x0` and its surface VMO in `x1`. The client writes the diagnostic image, presents, waits
 //! for the matching reply, and exits. It never names a screen coordinate or framebuffer address.
 
 use kumo_abi::Handle;
-use kumo_graphics::{demo_pixel, Present, Reply, Status, DEMO, REPLY_LEN};
+use kumo_graphics::{demo_pixel, DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
 use kumo_rt::{channel_read, channel_write, log_write, process_exit, vmo_write};
 
 kumo_rt::entry!(main);
@@ -47,6 +48,7 @@ extern "C" fn main(
     let frame = Present {
         sequence,
         surface: DEMO,
+        damage: DamageSet::FULL,
     }
     .encode();
     if channel_write(channel, frame.as_ptr(), frame.len()) != 0 {

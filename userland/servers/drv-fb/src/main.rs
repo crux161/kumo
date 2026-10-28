@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j611
 //j632
 //j634
 //j636
 //j639
+//j655
 
 mod clock_probe;
 mod display_probe;
@@ -83,6 +83,8 @@ struct GraphicsLane {
     channel: Handle,
     surface: u64,
     view: usize,
+    /// A complete image has reached this view; a partial first present is refused. — TIMBERDOODLE
+    full_seen: bool,
 }
 
 /// Log `label` then `v` in decimal and a newline. The bootstrap path offers no `core::fmt` and no
@@ -482,6 +484,7 @@ extern "C" fn main(
                 channel: graphics[view],
                 surface: surface_bases[view],
                 view,
+                full_seen: false,
             });
         } else {
             let _ = kumo_rt::handle_close(graphics[view]);
@@ -577,21 +580,50 @@ extern "C" fn main(
             let reply = match (request, &layout) {
                 (Some(request), Some(band)) if extra_handle == 0 && lane.surface != 0 => {
                     let view = &band.views[lane.view];
-                    let result = present_view(
-                        view,
-                        stride,
-                        request.surface,
-                        SURFACE_BYTES,
-                        pixel_order,
-                        |index| unsafe {
-                            // SAFETY: the permanent mapping covers SURFACE_BYTES; present_view
-                            // checks the extent and never reads beyond the view.
-                            (lane.surface as *const u32).add(index).read_volatile()
-                        },
-                        |index, color| unsafe {
-                            (fb_va as *mut u32).add(index).write_volatile(color)
-                        },
-                    );
+                    let result = if !request.damage.is_full() && !lane.full_seen {
+                        // The view has no complete image yet; a partial first present would
+                        // leave undeclared pixels uninitialized.
+                        Err(Status::BadRequest)
+                    } else if request.damage.is_full() {
+                        present_view(
+                            view,
+                            stride,
+                            request.surface,
+                            SURFACE_BYTES,
+                            pixel_order,
+                            |index| unsafe {
+                                // SAFETY: the permanent mapping covers SURFACE_BYTES;
+                                // present_view checks the extent and never reads beyond the
+                                // view.
+                                (lane.surface as *const u32).add(index).read_volatile()
+                            },
+                            |index, color| unsafe {
+                                (fb_va as *mut u32).add(index).write_volatile(color)
+                            },
+                        )
+                    } else {
+                        drv_fb::present_damage(
+                            view,
+                            stride,
+                            request.surface,
+                            SURFACE_BYTES,
+                            pixel_order,
+                            request.damage,
+                            |index| unsafe {
+                                // SAFETY: as above; present_damage clips every rectangle to
+                                // the validated surface and the view before reading.
+                                (lane.surface as *const u32).add(index).read_volatile()
+                            },
+                            |index, color| unsafe {
+                                (fb_va as *mut u32).add(index).write_volatile(color)
+                            },
+                        )
+                    };
+                    if result.is_ok() && request.damage.is_full() {
+                        if let Some(entry) = lanes[index].as_mut() {
+                            entry.full_seen = true;
+                        }
+                    }
                     unsafe {
                         clean_pixels(
                             fb_va as *mut u32,

@@ -2,13 +2,14 @@
 #![no_main]
 //j648
 //j649
+//j655
 
 //! Sora transfers a finite bootstrap channel (x0) and a writable surface VMO (x1).
 //! Bootstrap grants one presenter and, optionally, the selected file as a read-only VMO.
 
 use bmp_view::{file_length, Bitmap, FILE_HEADER_LEN, PRESENTER_TAG, ROW_BYTES, SAMPLE};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_graphics::{Present, Reply, Status, DEMO, REPLY_LEN};
+use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, handle_close, log_write, process_exit,
     vmar_map_anywhere, vmo_write,
@@ -76,6 +77,7 @@ extern "C" fn main(
     let request = Present {
         sequence,
         surface: DEMO,
+        damage: DamageSet::FULL,
     }
     .encode();
     if channel_write(channel, request.as_ptr(), request.len()) != 0 {

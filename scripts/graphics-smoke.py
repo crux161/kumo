@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j619
 #j620
 #j648
 #j649
 #j654
+#j655
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -48,6 +48,8 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
             data = b"dmesg -n 6\ngfx-client\ngfx-demo\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if two_clients:
                 data = b"dmesg -n 6\ngfx-clients\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if damage:
+                data = b"dmesg -n 6\ngfx-damage\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -122,6 +124,16 @@ def demo_pixel(x, y):
     return (x & 255, (y * 2) & 255, blue)
 
 
+DAMAGE_X, DAMAGE_Y, DAMAGE_W, DAMAGE_H = 64, 32, 64, 64
+DAMAGE_COLOR = (0xFF, 0x80, 0x00)
+
+
+def damage_demo_pixel(x, y):
+    if DAMAGE_X <= x < DAMAGE_X + DAMAGE_W and DAMAGE_Y <= y < DAMAGE_Y + DAMAGE_H:
+        return DAMAGE_COLOR
+    return demo_pixel(x, y)
+
+
 def bitmap_reference(source=None, scratch=False):
     if scratch:
         colors = [[(255,0,0), (0,255,0), (0,0,255)],
@@ -153,7 +165,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -178,7 +190,12 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     # which presents an over-sized surface whose visible corner is solid. Both are copied by
     # the server into server-owned rectangles. In two-client mode each view is painted by its
     # own separate client process, so both carry the demo image.
-    expected = bitmap_reference(bitmap_file, scratch) if bitmap else demo_pixel
+    if damage:
+        expected = damage_demo_pixel
+    elif bitmap:
+        expected = bitmap_reference(bitmap_file, scratch)
+    else:
+        expected = demo_pixel
     vx, vy = rects[0]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
@@ -186,7 +203,7 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     vx, vy = rects[1]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
-            want = demo_pixel(x, y) if two_clients else VIEW_SOLID
+            want = demo_pixel(x, y) if two_clients else (VIEW_BG if damage else VIEW_SOLID)
             assert at(vx + x, vy + y) == want, f"view 1 pixel {(x, y)}"
 
     # The clipped surface's out-of-view poison must never reach the glass.
@@ -212,6 +229,7 @@ def main():
     parser.add_argument("--with-dtb", action="store_true", help="exercise drv-gpu with a staged QEMU DTB; requires image log level >=6")
     parser.add_argument("--bitmap", action="store_true", help="display and verify bmp-view instead of gfx-client")
     parser.add_argument("--two-clients", action="store_true", help="run two concurrent separate gfx-client processes, one per view")
+    parser.add_argument("--damage", action="store_true", help="prove damage tracking with the supervisor client's full-then-partial present")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -221,6 +239,8 @@ def main():
         args.bitmap = True
     if args.two_clients and args.bitmap:
         parser.error("--two-clients and --bitmap are separate proofs")
+    if args.damage and (args.bitmap or args.two_clients):
+        parser.error("--damage is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -235,7 +255,7 @@ def main():
             "-net", "none",
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
-                     args.two_clients)
+                     args.two_clients, args.damage)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -265,6 +285,8 @@ def main():
                     ready = ready and transcript.count(
                         b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
                     ) >= 2
+                if args.damage:
+                    ready = ready and b"gfx-damage: full then partial damage copied" in transcript
                 if ready:
                     break
                 time.sleep(0.1)
@@ -294,6 +316,10 @@ def main():
                     marker = f"gfx-clients: view {view} handed to an async client process".encode()
                     assert marker in transcript, f"missing view {view} handoff; inspect {serial}"
                 assert b"gfx-demo:" not in transcript, f"supervisor painted a view; inspect {serial}"
+            elif args.damage:
+                assert b"gfx-damage: full then partial damage copied" in transcript, f"missing damage proof; inspect {serial}"
+                assert b"gfx-damage: damage proof failed" not in transcript
+                assert b"gfx-demo:" not in transcript
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -329,11 +355,13 @@ def main():
             command("qmp_capabilities")
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
-                         args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients)
+                         args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
                 print("Two-client UEFI smoke green: two separate client processes, one per view, chrome, console, login")
+            if args.damage:
+                print("Damage UEFI smoke green: full then partial copy, undeclared surface poison never reached the glass")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()

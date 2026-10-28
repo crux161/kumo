@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j608
 //j609
 //j610
 //j611
 //j639
+//j655
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -873,6 +873,54 @@ pub fn present_view<R: FnMut(usize) -> u32, W: FnMut(usize, u32)>(
     Ok(())
 }
 
+/// Present only the declared damage. An empty set is the whole surface and delegates to
+/// `present_view`. Each rectangle is clipped to the surface and then to the view; no pixel
+/// outside the damage is read or written, so a client's undeclared changes never reach the
+/// glass. Overlapping rectangles may copy the same pixel twice. The caller must pass a
+/// decoded (validated) set and enforce the first-present rule. — TIMBERDOODLE
+pub fn present_damage<R: FnMut(usize) -> u32, W: FnMut(usize, u32)>(
+    view: &kumo_graphics::View,
+    stride: usize,
+    surface: kumo_graphics::Surface,
+    backing_bytes: usize,
+    order: PixelOrder,
+    damage: kumo_graphics::DamageSet,
+    mut read_pixel: R,
+    mut write_pixel: W,
+) -> Result<(), kumo_graphics::Status> {
+    if !surface.fits(backing_bytes) || view.width == 0 || view.height == 0 {
+        return Err(kumo_graphics::Status::BadSurface);
+    }
+    if damage.is_full() {
+        return present_view(
+            view,
+            stride,
+            surface,
+            backing_bytes,
+            order,
+            read_pixel,
+            write_pixel,
+        );
+    }
+    for rect in damage.rects() {
+        let Some(rect) = rect.clipped_to(surface) else {
+            continue;
+        };
+        let x1 = rect.x.saturating_add(rect.width).min(view.width);
+        let y1 = rect.y.saturating_add(rect.height).min(view.height);
+        for y in rect.y..y1 {
+            for x in rect.x..x1 {
+                let pixel = read_pixel(y as usize * surface.stride as usize + x as usize);
+                write_pixel(
+                    (view.y as usize + y as usize) * stride + view.x as usize + x as usize,
+                    order.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Clean the cache lines covering `start..start + len` pixels, then DSB. No-op off target.
 ///
 /// # Safety
@@ -1042,6 +1090,157 @@ mod tests {
             assert_eq!(reads, 0);
             assert_eq!(glass, before);
         }
+    }
+
+    #[test]
+    fn damage_presents_only_the_declared_rectangles() {
+        let view = kumo_graphics::View {
+            x: 8,
+            y: 4,
+            width: 8,
+            height: 4,
+        };
+        const STRIDE: usize = 20;
+        let mut glass = [0xdead_beef_u32; STRIDE * 16];
+        let surface = kumo_graphics::Surface {
+            width: 12,
+            height: 6,
+            stride: 12,
+            format: kumo_graphics::XRGB8888,
+        };
+        let mut source = [kumo_graphics::CLIP_POISON; 12 * 6];
+        let rect = kumo_graphics::Damage {
+            x: 2,
+            y: 1,
+            width: 3,
+            height: 2,
+        };
+        for y in 1..3 {
+            for x in 2..5 {
+                source[y * 12 + x] = 0x0012_3456;
+            }
+        }
+        let mut reads = 0;
+        present_damage(
+            &view,
+            STRIDE,
+            surface,
+            source.len() * 4,
+            PixelOrder::Rgb,
+            kumo_graphics::DamageSet::single(rect).unwrap(),
+            |index| {
+                reads += 1;
+                source[index]
+            },
+            |index, color| glass[index] = color,
+        )
+        .unwrap();
+        assert_eq!(reads, 3 * 2);
+        let expected = PixelOrder::Rgb.pixel(0x12, 0x34, 0x56);
+        for y in 1..3 {
+            for x in 2..5 {
+                assert_eq!(glass[(4 + y) * STRIDE + 8 + x], expected);
+            }
+        }
+        let mut intact = 0;
+        for y in 0..4 {
+            for x in 0..8 {
+                if !(2..5).contains(&x) || !(1..3).contains(&y) {
+                    assert_eq!(glass[(4 + y) * STRIDE + 8 + x], 0xdead_beef);
+                    intact += 1;
+                }
+            }
+        }
+        assert_eq!(intact, 8 * 4 - 6);
+    }
+
+    #[test]
+    fn damage_clips_to_the_view_and_the_surface() {
+        let view = kumo_graphics::View {
+            x: 8,
+            y: 4,
+            width: 8,
+            height: 4,
+        };
+        const STRIDE: usize = 20;
+        let mut glass = [0xdead_beef_u32; STRIDE * 16];
+        let surface = kumo_graphics::Surface {
+            width: 12,
+            height: 6,
+            stride: 12,
+            format: kumo_graphics::XRGB8888,
+        };
+        let mut source = [kumo_graphics::CLIP_POISON; 12 * 6];
+        source[3 * 12 + 6] = 0x0012_3456;
+        source[3 * 12 + 7] = 0x0012_3456;
+        let rect = kumo_graphics::Damage {
+            x: 6,
+            y: 3,
+            width: 10,
+            height: 10,
+        };
+        let mut reads = 0;
+        present_damage(
+            &view,
+            STRIDE,
+            surface,
+            source.len() * 4,
+            PixelOrder::Rgb,
+            kumo_graphics::DamageSet::single(rect).unwrap(),
+            |index| {
+                reads += 1;
+                source[index]
+            },
+            |index, color| glass[index] = color,
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        let expected = PixelOrder::Rgb.pixel(0x12, 0x34, 0x56);
+        assert_eq!(glass[7 * STRIDE + 14], expected);
+        assert_eq!(glass[7 * STRIDE + 15], expected);
+        assert_eq!(glass[7 * STRIDE + 13], 0xdead_beef);
+        assert_eq!(glass[8 * STRIDE + 14], 0xdead_beef);
+    }
+
+    #[test]
+    fn empty_damage_is_the_whole_surface() {
+        let view = kumo_graphics::View {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let surface = kumo_graphics::Surface {
+            width: 4,
+            height: 4,
+            stride: 4,
+            format: kumo_graphics::XRGB8888,
+        };
+        let source = [0x0012_3456_u32; 16];
+        let mut full = [0u32; 16];
+        present_damage(
+            &view,
+            4,
+            surface,
+            source.len() * 4,
+            PixelOrder::Rgb,
+            kumo_graphics::DamageSet::FULL,
+            |index| source[index],
+            |index, color| full[index] = color,
+        )
+        .unwrap();
+        let mut reference = [0u32; 16];
+        present_view(
+            &view,
+            4,
+            surface,
+            source.len() * 4,
+            PixelOrder::Rgb,
+            |index| source[index],
+            |index, color| reference[index] = color,
+        )
+        .unwrap();
+        assert_eq!(full, reference);
     }
 
     #[test]

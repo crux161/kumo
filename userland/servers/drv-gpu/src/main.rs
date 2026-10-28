@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j647
 //j650
 //j651
 //j652
 //j653
+//j655
 
 mod client;
 
@@ -1929,6 +1929,7 @@ fn present_paint(bootstrap: Handle, paint_va: u64) {
     let frame = Present {
         sequence,
         surface: PAINT_SURFACE,
+        damage: kumo_graphics::DamageSet::FULL,
     }
     .encode();
     if kumo_rt::channel_write(channel, frame.as_ptr(), frame.len()) != 0 {

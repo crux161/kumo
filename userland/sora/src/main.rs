@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j635
 //j636
 //j648
 //j649
 //j654
+//j655
 
 extern crate alloc;
 
@@ -207,8 +207,8 @@ fn bootstrap_graphics(
 
 fn graphics_demo(cmd: &kumoza::Command) {
     use kumo_graphics::{
-        clip_demo_pixel, demo_pixel, Present, Reply, Status, Surface, CLIP_DEMO, DEMO, REPLY_LEN,
-        VIEW_COUNT,
+        clip_demo_pixel, demo_pixel, DamageSet, Present, Reply, Status, Surface, CLIP_DEMO, DEMO,
+        REPLY_LEN, VIEW_COUNT,
     };
     if !cmd.args.is_empty() {
         usage(b"usage: gfx-demo\n");
@@ -253,7 +253,12 @@ fn graphics_demo(cmd: &kumoza::Command) {
                 }
             }
             let sequence = GRAPHICS_SEQUENCE[view].fetch_add(1, Ordering::Relaxed);
-            let frame = Present { sequence, surface }.encode();
+            let frame = Present {
+                sequence,
+                surface,
+                damage: DamageSet::FULL,
+            }
+            .encode();
             if channel_write(channel, frame.as_ptr(), frame.len()) != 0
                 || !child_parked(process_wait())
             {
@@ -289,6 +294,131 @@ fn graphics_demo(cmd: &kumoza::Command) {
     } else if !copied.iter().any(|value| *value) {
         log(b"gfx-demo: no graphics view held\n");
         fail_status(1);
+    }
+}
+
+/// Write one whole surface in 256-byte VMO chunks. Shared by the damage proof; the syscall's
+/// per-write cap is 256 bytes. — TIMBERDOODLE
+fn write_surface(vmo: Handle, surface: kumo_graphics::Surface, pixel: fn(u32, u32) -> u32) -> bool {
+    let mut row = [0u8; 320 * 4];
+    let row_bytes = surface.stride as usize * 4;
+    for y in 0..surface.height {
+        for x in 0..surface.width {
+            let offset = x as usize * 4;
+            row[offset..offset + 4].copy_from_slice(&pixel(x, y).to_le_bytes());
+        }
+        for (chunk_index, chunk) in row[..row_bytes].chunks(256).enumerate() {
+            let offset = u64::from(y * surface.stride * 4) + (chunk_index * 256) as u64;
+            if vmo_write(vmo, offset, chunk.as_ptr(), chunk.len()) != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Send one Present and wait for the reply with the same sequence. — TIMBERDOODLE
+fn present_and_wait(
+    channel: Handle,
+    present: kumo_graphics::Present,
+) -> Option<kumo_graphics::Status> {
+    if !child_parked(process_wait()) {
+        return None;
+    }
+    let frame = present.encode();
+    if channel_write(channel, frame.as_ptr(), frame.len()) != 0 || !child_parked(process_wait()) {
+        return None;
+    }
+    let mut reply = [0u8; kumo_graphics::REPLY_LEN + 1];
+    let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+    let reply = kumo_graphics::Reply::decode(reply.get(..len)?)?;
+    (reply.sequence == present.sequence).then_some(reply.status)
+}
+
+/// F2a-2 damage proof: present a complete demo image, then poison every undeclared pixel and
+/// present exactly one damaged rectangle. A presenter that honours the set leaves the first
+/// image outside the rectangle and shows no poison. — TIMBERDOODLE
+fn graphics_damage(cmd: &kumoza::Command) {
+    use kumo_graphics::{
+        damage_poison_pixel, demo_pixel, DamageSet, Present, Status, DAMAGE_RECT, DEMO,
+    };
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-damage\n");
+        return;
+    }
+    let mut selected = None;
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
+        if channel.0 == 0 {
+            continue;
+        }
+        selected = Some((
+            view,
+            channel,
+            Handle(GRAPHICS_VMO[view].load(Ordering::Relaxed)),
+        ));
+        break;
+    }
+    let Some((view, channel, vmo)) = selected else {
+        log(b"gfx-damage: no graphics view available\n");
+        fail_status(1);
+        return;
+    };
+    if vmo.0 == 0 {
+        let _ = handle_close(channel);
+        log(b"gfx-damage: no surface available\n");
+        fail_status(1);
+        return;
+    }
+    let Some(damage) = DamageSet::single(DAMAGE_RECT) else {
+        let _ = handle_close(channel);
+        log(b"gfx-damage: invalid proof rectangle\n");
+        fail_status(1);
+        return;
+    };
+    let result = (|| {
+        if !write_surface(vmo, DEMO, demo_pixel) {
+            return None;
+        }
+        let sequence = GRAPHICS_SEQUENCE[view].fetch_add(1, Ordering::Relaxed);
+        if present_and_wait(
+            channel,
+            Present {
+                sequence,
+                surface: DEMO,
+                damage: DamageSet::FULL,
+            },
+        ) != Some(Status::Copied)
+        {
+            return None;
+        }
+        if !write_surface(vmo, DEMO, damage_poison_pixel) {
+            return None;
+        }
+        let sequence = GRAPHICS_SEQUENCE[view].fetch_add(1, Ordering::Relaxed);
+        if present_and_wait(
+            channel,
+            Present {
+                sequence,
+                surface: DEMO,
+                damage,
+            },
+        ) != Some(Status::Copied)
+        {
+            return None;
+        }
+        Some(())
+    })();
+    match result {
+        Some(()) => {
+            GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
+            notice(&[b"gfx-damage: full then partial damage copied\n"]);
+        }
+        None => {
+            let _ = handle_close(channel);
+            log(b"gfx-damage: damage proof failed\n");
+            fail_status(1);
+        }
     }
 }
 
@@ -4069,6 +4199,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-clients" {
         graphics_clients(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gfx-damage" {
+        graphics_damage(cmd);
         return true;
     }
     if cmd.name == "dmesg" {
