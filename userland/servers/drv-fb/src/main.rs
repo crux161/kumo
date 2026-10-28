@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j655
 //j656
 //j657
 //j658
 //j660
+//j662
 
 mod clock_probe;
 mod display_probe;
@@ -742,12 +742,14 @@ extern "C" fn main(
                         if let Some(entry) = lanes[index].as_mut() {
                             entry.full_seen |= request.damage.is_full();
                         }
-                    }
-                    unsafe {
-                        clean_pixels(
-                            fb_va as *mut u32,
-                            view.y as usize * stride,
-                            view.height as usize * stride,
+                        // Clean only what the accepted present wrote. A refused present wrote
+                        // nothing, and a partial one wrote just its declared spans. — TIMBERDOODLE
+                        drv_fb::clean_present(
+                            view,
+                            stride,
+                            request.surface,
+                            request.damage,
+                            |start, len| unsafe { clean_pixels(fb_va as *mut u32, start, len) },
                         );
                     }
                     Reply {

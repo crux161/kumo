@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j610
 //j611
 //j639
 //j655
 //j656
+//j662
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -1018,6 +1018,46 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
     Ok(())
 }
 
+/// Emit the framebuffer cache spans a Present wrote, so the server cleans only the accepted
+/// damage instead of the whole view. A full set is the surface rectangle; partial sets are
+/// each rectangle clipped to the surface and then to the view. Each row is one linear span
+/// at the view's framebuffer origin. — TIMBERDOODLE
+pub fn clean_present<F: FnMut(usize, usize)>(
+    view: &kumo_graphics::View,
+    stride: usize,
+    surface: kumo_graphics::Surface,
+    damage: kumo_graphics::DamageSet,
+    mut clean: F,
+) {
+    let full;
+    let targets: &[kumo_graphics::Damage] = if damage.is_full() {
+        full = [kumo_graphics::Damage {
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height,
+        }];
+        &full
+    } else {
+        damage.rects()
+    };
+    for rect in targets {
+        let Some(rect) = rect.clipped_to(surface) else {
+            continue;
+        };
+        let x1 = rect.x.saturating_add(rect.width).min(view.width);
+        let y1 = rect.y.saturating_add(rect.height).min(view.height);
+        if rect.x >= x1 || rect.y >= y1 {
+            continue;
+        }
+        let len = (x1 - rect.x) as usize;
+        for y in rect.y..y1 {
+            let start = (view.y as usize + y as usize) * stride + view.x as usize + rect.x as usize;
+            clean(start, len);
+        }
+    }
+}
+
 /// Clean the cache lines covering `start..start + len` pixels, then DSB. No-op off target.
 ///
 /// # Safety
@@ -1508,6 +1548,80 @@ mod tests {
         assert_eq!(glass[7 * STRIDE + 15], expected);
         assert_eq!(glass[7 * STRIDE + 13], 0xdead_beef);
         assert_eq!(glass[8 * STRIDE + 14], 0xdead_beef);
+    }
+
+    #[test]
+    fn clean_present_emits_only_the_damaged_view_spans() {
+        let view = kumo_graphics::View {
+            x: 8,
+            y: 4,
+            width: 8,
+            height: 4,
+        };
+        let surface = kumo_graphics::Surface {
+            width: 12,
+            height: 6,
+            stride: 12,
+            format: kumo_graphics::XRGB8888,
+        };
+        const STRIDE: usize = 20;
+        let mut spans = [(0usize, 0usize); 8];
+        let mut count = 0;
+        clean_present(
+            &view,
+            STRIDE,
+            surface,
+            kumo_graphics::DamageSet::FULL,
+            |start, len| {
+                spans[count] = (start, len);
+                count += 1;
+            },
+        );
+        assert_eq!(count, 4);
+        for (index, y) in (4..8).enumerate() {
+            assert_eq!(spans[index], (y * STRIDE + 8, 8));
+        }
+
+        let rect = kumo_graphics::DamageSet::single(kumo_graphics::Damage {
+            x: 6,
+            y: 3,
+            width: 10,
+            height: 10,
+        })
+        .unwrap();
+        count = 0;
+        clean_present(&view, STRIDE, surface, rect, |start, len| {
+            spans[count] = (start, len);
+            count += 1;
+        });
+        assert_eq!(count, 1);
+        assert_eq!(spans[0], (7 * STRIDE + 8 + 6, 2));
+
+        let outside = kumo_graphics::DamageSet::single(kumo_graphics::Damage {
+            x: 20,
+            y: 20,
+            width: 2,
+            height: 2,
+        })
+        .unwrap();
+        count = 0;
+        clean_present(&view, STRIDE, surface, outside, |_, _| count += 1);
+        assert_eq!(count, 0);
+
+        let wide = kumo_graphics::DamageSet::single(kumo_graphics::Damage {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 6,
+        })
+        .unwrap();
+        count = 0;
+        clean_present(&view, STRIDE, surface, wide, |start, len| {
+            spans[count] = (start, len);
+            count += 1;
+        });
+        assert_eq!(count, 4);
+        assert!(spans[..count].iter().all(|&(_, len)| len == 8));
     }
 
     #[test]
