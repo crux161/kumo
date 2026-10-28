@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j653
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -12,7 +12,7 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j646*/
 /*j647*/
 /*j650*/
 /*j651*/
 /*j652*/
+/*j653*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 #include "model/pan_model.h"
@@ -38,6 +38,7 @@ _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_threads_per_wg) == 4
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_tasks_per_core) == 1, "Mesa thread properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->num_registers_per_core) == 4, "Mesa thread properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_tls_instance_per_core) == 4, "Mesa thread properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->afbc_features) == 4, "Mesa AFBC properties");
 
 uint32_t
 kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
@@ -79,6 +80,11 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
          * is the pinned table's G610 entry, so zero here is the expected outcome, not a
          * failed read. — TIMBERDOODLE */
         .gpu_variant = out->info.core_features & 0xff,
+        /* Upstream's constant, verbatim from panthor_kmod.c: "This register does not exist
+         * because AFBC is no longer optional." AFBC is claimed the way upstream claims it,
+         * from service-side knowledge rather than from an attested register word. The same
+         * constant reaches the real pan_query_afbc below. — TIMBERDOODLE */
+        .afbc_features = 0,
     };
     out->core_count = pan_query_core_count(&props);
     out->core_id_range = pan_query_core_id_range(&props);
@@ -125,6 +131,11 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
      * group is safely usable; it never gates the report. — TIMBERDOODLE */
     const int threads_derived = out->max_threads_per_core && out->max_threads_per_wg &&
                                 out->max_tasks_per_core && out->num_registers_per_core;
+    /* AFBC is the one discovery group with no register at all, so the pinned upstream
+     * constant is consumed through upstream's own helper instead of being copied by hand:
+     * pan_query_afbc returns true for pan_arch(gpu_id) >= 5 when afbc_features is 0.
+     * Recorded for the report and used for the missing mask below. — TIMBERDOODLE */
+    out->has_afbc = pan_query_afbc(&props) ? 1u : 0u;
 
     /* Upstream derives the range by shifting 1ull by this field, so an attested width of
      * 64 or more would be undefined behaviour inside Mesa's own helper. Refuse before
@@ -158,9 +169,11 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
      * the same powered block and crossed verbatim — and stays when element 0 reported the
      * group absent. Bit 4 clears only when the query succeeded and all four upstream-asserted
      * thread fields are nonzero; a zero derivation keeps it set rather than aborting, so the
-     * rest of the report survives. Bit 0 (the variant) clears unconditionally once the query
-     * succeeded, because core features are required: the word is attested or the session died
-     * before publication. — SAKER, TIMBERDOODLE */
+     * rest of the report survives. Bit 5 clears only when upstream's own pan_query_afbc
+     * returned true for the constant afbc_features 0; it is never cleared merely because the
+     * query succeeded. Bit 0 (the variant) clears unconditionally once the query succeeded,
+     * because core features are required: the word is attested or the session died before
+     * publication. — SAKER, TIMBERDOODLE */
     out->missing_properties = tiler_derived
                                   ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
                                   : KUMO_MESA_MISSING_ALL;
@@ -169,6 +182,8 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     out->missing_properties &= ~KUMO_MESA_MISSING_VARIANT;
     if (out->info.texture_features_0)
         out->missing_properties &= ~KUMO_MESA_MISSING_TEXTURE;
+    if (out->has_afbc)
+        out->missing_properties &= ~KUMO_MESA_MISSING_COMPRESSION;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j646*/
 /*j647*/
 /*j650*/
 /*j651*/
 /*j652*/
+/*j653*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -14,7 +14,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 8u
+#define KUMO_GPU_API_VERSION 9u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -114,6 +114,12 @@ struct kumo_mesa_report {
     uint32_t max_tasks_per_core;
     uint32_t num_registers_per_core;
     uint32_t max_tls_instance_per_core;
+    /* Upstream's constant, not a hardware attestation: the pinned panthor_kmod.c sets
+     * `.afbc_features = 0` with "This register does not exist because AFBC is no longer
+     * optional", and the real pan_query_afbc() consumes it. Appended last after the thread
+     * block; it occupies the four bytes that were tail padding, so the report stays 168 bytes.
+     * — TIMBERDOODLE */
+    uint32_t has_afbc;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
@@ -131,9 +137,10 @@ _Static_assert(offsetof(struct kumo_gpu_info, thread_features) == 64, "query thr
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_1) == 68, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_2) == 72, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_3) == 76, "query tail alignment");
-/* Version8 appends the remaining texture words to the embedded info, so the private report
- * grows with it: 80-byte info, 168-byte report, thread block starting at 144. Field order is
- * unchanged; only the trailing layout moves. — TIMBERDOODLE */
+/* Version8 appended the remaining texture words to the embedded info, so the private report
+ * grew with it: 80-byte info, 168-byte report, thread block starting at 144. Version9 adds
+ * has_afbc in the four bytes that were tail padding, so the size does not move again. Field
+ * order is unchanged; only the trailing layout moves. — TIMBERDOODLE */
 _Static_assert(sizeof(struct kumo_mesa_report) == 168, "report layout");
 _Static_assert(offsetof(struct kumo_mesa_report, missing_properties) == 80, "report layout");
 _Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 144, "report thread offset");
@@ -141,6 +148,7 @@ _Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 148, "re
 _Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 152, "report thread offset");
 _Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 156, "report thread offset");
 _Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 160, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, has_afbc) == 164, "report tail alignment");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

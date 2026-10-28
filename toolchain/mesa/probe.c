@@ -1,21 +1,21 @@
 /* SPDX-License-Identifier: MIT */
-/*j646*/
 /*j647*/
 /*j650*/
 /*j651*/
 /*j652*/
+/*j653*/
 #include <stdio.h>
 
 extern unsigned kumo_mesa_bridge_proof(void);
 
 int main(void)
 {
-    puts("G7i texture array begin: modeled service");
+    puts("G7j native Mesa properties begin: modeled service");
     unsigned failed = kumo_mesa_bridge_proof();
     if (failed) {
-        printf("G7i texture array FAILED at case %u\n", failed);
+        printf("G7j native Mesa properties FAILED at case %u\n", failed);
         return 1;
     }
-    puts("G7i texture array green: four-word TEXTURE_FEATURES, absence gate, version guard; modeled service");
+    puts("G7j native Mesa properties green: upstream variant resolution, model match, refusal, loss; modeled service");
     return 0;
 }

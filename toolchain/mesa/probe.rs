@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j653
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -47,14 +47,15 @@ struct Report {
     max_tasks_per_core: u32,
     num_registers_per_core: u32,
     max_tls_instance_per_core: u32,
+    has_afbc: u32,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
 const _: () = assert!(core::mem::size_of::<Report>() == 168);
 // The enlarged 80-byte Info shifts every report field, so the thread block starts at 144,
-// not at version6's 120. These pin the C mirror's offsets from the Rust side too.
-// — TIMBERDOODLE
+// not at version6's 120. has_afbc fills the four bytes that were tail padding after it.
+// These pin the C mirror's offsets from the Rust side too. — TIMBERDOODLE
 const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 80);
 const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 140);
 const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 144);
@@ -62,6 +63,7 @@ const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 148);
 const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 152);
 const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 156);
 const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 160);
+const _: () = assert!(core::mem::offset_of!(Report, has_afbc) == 164);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -119,16 +121,20 @@ const MISSING_ALL: u64 = 1023;
 /// Core features are required, so bit 0 clears on every successful query, whether or not the
 /// derived variant lands in Mesa's model table. Bits 3 and 4 clear on the same successful
 /// query: G7i attests all four texture words together, and the modeled thread group satisfies
-/// upstream's nonzero assumption. Bit 1 clears only when the tiler shape was derived.
-/// — TIMBERDOODLE
+/// upstream's nonzero assumption. Bit 5 clears because AFBC has no hardware register: the
+/// bridge supplies upstream's constant and pan_query_afbc returns true for the pinned G610.
+/// Bit 1 clears only when the tiler shape was derived. — TIMBERDOODLE
 const MISSING_WITH_VARIANT_AND_TILER_AND_THREADS: u64 =
-    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 4);
+    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 4) & !(1 << 5);
 /// A tiler word that is absent or cannot be decoded leaves bit 1 set.
-const MISSING_WITH_VARIANT_AND_THREADS: u64 = MISSING_ALL & !(1 << 0) & !(1 << 3) & !(1 << 4);
+const MISSING_WITH_VARIANT_AND_THREADS: u64 =
+    MISSING_ALL & !(1 << 0) & !(1 << 3) & !(1 << 4) & !(1 << 5);
 /// A thread group whose derivations contradict upstream's nonzero assumption leaves bit 4 set.
-const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3);
+const MISSING_WITH_VARIANT_AND_TILER: u64 =
+    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 5);
 /// An absent texture group (element 0 zero) leaves bit 3 set.
-const MISSING_WITH_VARIANT_NO_TEXTURE: u64 = MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 4);
+const MISSING_WITH_VARIANT_NO_TEXTURE: u64 =
+    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 4) & !(1 << 5);
 
 struct Hardware {
     busy_once: bool,
@@ -283,11 +289,11 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let mut client = Client::new(transport(&sends, &closed, true, false));
     let result = with_api(&mut client, |api| {
         let mut report = Report::default();
-        // A rejected old ABI must not write the larger version7 report into an
+        // A rejected old ABI must not write the larger version9 report into an
         // old caller's allocation. The extra sentinel words are guard storage, and they
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
-        let old_api = Api { version: 7, ..*api };
+        let old_api = Api { version: 8, ..*api };
         let mut guarded = [0xfeedbeefcafebabeu64; 16];
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
             || guarded != [0xfeedbeefcafebabeu64; 16]
@@ -297,7 +303,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 7, ..*api },
+            Api { version: 8, ..*api },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -783,6 +789,62 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         return 18;
     }
 
+    // G7j: AFBC is the last discovery group and the only one with no hardware register. The
+    // pinned bridge supplies upstream's constant (panthor_kmod.c: ".afbc_features = 0" because
+    // "AFBC is no longer optional") and consumes it through the real pan_query_afbc, so the
+    // modeled service must report has_afbc 1 and clear missing bit 5 while every earlier
+    // property and every other mask bit stay unchanged. The seven-request chain and the full
+    // success mask are pinned here; version 8 is refused before any I/O and version 9 is the
+    // one accepted. pan_query_afbc's false branch needs pan_arch(gpu_id) < 5, which the pinned
+    // Mali-G610 identity cannot produce; it is unreachable here, documented rather than
+    // simulated with a fabricated device. — TIMBERDOODLE
+    sends.set(0);
+    let wire = transport(&sends, &closed, false, false);
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        if api.version != 9 {
+            return false;
+        }
+        let mut guarded = [0xfeedbeefcafebabeu64; 16];
+        let old_api = Api { version: 8, ..*api };
+        if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
+            || guarded != [0xfeedbeefcafebabeu64; 16]
+            || sends.get() != 0
+        {
+            return false;
+        }
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+            && report.has_afbc == 1
+            && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
+            && report.info.gpu_id == INFO.gpu_id
+            && report.info.cs_features == INFO.cs_features
+            && report.info.va_start == kumo_gpu::VA_START
+            && report.info.va_end == kumo_gpu::VA_END
+            && report.info.max_buffer_bytes == kumo_gpu::MAX_BUFFER_BYTES
+            && report.info.shader_present == 0x500000005
+            && report.info.mmu_features == MMU_FEATURES
+            && report.info.tiler_features == TILER_FEATURES
+            && report.info.texture_features_0 == TEXTURE_FEATURES_0
+            && report.info.core_features == CORE_FEATURES
+            && report.core_count == 4
+            && report.core_id_range == 35
+            && report.va_range_start == 0
+            && report.va_range_size == MMU_VA_SIZE
+            && report.tiler_bin_size == TILER_BIN
+            && report.tiler_max_levels == TILER_LEVELS
+            && report.compressed_formats == TEXTURE_FEATURES_0
+            && report.has_afrc == 1
+            && report.gpu_variant == (CORE_FEATURES & 0xff)
+            && report.model_resolved == 1
+            && report.query_status == 0
+            && report.reserved == 0
+            && sends.get() == 7
+    });
+    if !ok || client.is_lost() {
+        return 20;
+    }
+
     // A zero MMU attestation retires the session exactly as a zero topology does: C sees
     // the failure with cleared output and cannot issue another request. — SAKER
     sends.set(0);
@@ -911,16 +973,16 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
     }
 
-    // Check 19's version guard: version 7 is refused before any I/O, and this report's own
-    // version 8 is the one that is queried. — TIMBERDOODLE
+    // Check 19's version guard: version 8 is refused before any I/O, and this report's own
+    // version 9 is the one that is queried. — TIMBERDOODLE
     sends.set(0);
     let mut client = Client::new(transport(&sends, &closed, false, false));
     let ok = with_api(&mut client, |api| {
         let mut report = Report::default();
-        let old = Api { version: 7, ..*api };
+        let old = Api { version: 8, ..*api };
         (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
             && sends.get() == 0
-            && api.version == 8
+            && api.version == 9
             && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
             && sends.get() == 7
     });

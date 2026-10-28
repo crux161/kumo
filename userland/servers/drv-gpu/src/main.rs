@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j646
 //j647
 //j650
 //j651
 //j652
+//j653
 
 mod client;
 
@@ -108,6 +108,17 @@ const CORE_FEATURES: u32 = 0x008;
 const THREAD_MAX_THREADS: u32 = 0x0A0;
 const THREAD_MAX_WORKGROUP_SIZE: u32 = 0x0A4;
 const THREAD_FEATURES: u32 = 0x0AC;
+/// RESEARCH/009 §4.2/§15: `L2_FEATURES` at +0x004 and `MEM_FEATURES` at +0x010. Both are oracle
+/// cells with expected [R] values (0x0712_0306 / 0x301) that have never been measured. Read-only,
+/// in the same powered block, attested raw so one boot records them. — TIMBERDOODLE
+const L2_FEATURES: u32 = 0x004;
+const MEM_FEATURES: u32 = 0x010;
+/// RESEARCH/009 §4.2/§4.3: `CSF_ID` at +0x01C carries the command-stream and MCU hardware
+/// revisions; `GPU_REVID` at +0x280 and `COHERENCY_FEATURES` at +0x300 have no [R] value at all.
+/// Read-only, same powered block, attested raw for the remaining §15 oracle cells. — TIMBERDOODLE
+const CSF_ID: u32 = 0x01C;
+const GPU_REVID: u32 = 0x280;
+const COHERENCY_FEATURES: u32 = 0x300;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -1285,6 +1296,21 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 format_args!(
                     "drv-gpu: THREAD_MAX_THREADS=0x{:08x} THREAD_MAX_WORKGROUP_SIZE=0x{:08x} THREAD_FEATURES=0x{:08x}; attested raw, not decoded\n",
                     thread_max_threads, thread_max_workgroup_size, thread_features
+                ),
+            );
+            // The remaining RESEARCH/009 §15 oracle words, read in the same powered block and
+            // logged raw so one boot records every open cell. These are measurements, not
+            // decoded policy: no driver path selects on them. — TIMBERDOODLE
+            let l2_features = read_aperture(L2_FEATURES);
+            let mem_features = read_aperture(MEM_FEATURES);
+            let csf_id = read_aperture(CSF_ID);
+            let gpu_revid = read_aperture(GPU_REVID);
+            let coherency_features = read_aperture(COHERENCY_FEATURES);
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: L2_FEATURES=0x{:08x} MEM_FEATURES=0x{:08x} CSF_ID=0x{:08x} GPU_REVID=0x{:08x} COHERENCY_FEATURES=0x{:08x}; attested raw, not decoded\n",
+                    l2_features, mem_features, csf_id, gpu_revid, coherency_features
                 ),
             );
             let windows = [
