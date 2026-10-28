@@ -1,4 +1,5 @@
 //j641
+//j644
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -7,8 +8,8 @@
 //! reset, DMA reclamation, a GPU fence or a Mesa/DRM implementation. — KESTREL
 
 use crate::{
-    Binding, Command, DeviceInfo, Reply, Request, Response, Status, Submission, SyncState,
-    REPLY_LEN, REQUEST_LEN,
+    Binding, Command, DeviceInfo, DeviceTopology, Reply, Request, Response, Status, Submission,
+    SyncState, REPLY_LEN, REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,12 @@ impl<T: Transport> Client<T> {
             unreachable!()
         };
         Ok(info)
+    }
+    pub fn topology(&mut self) -> Result<DeviceTopology, Error> {
+        let (Response::Topology(topology), _) = self.call(Command::GetTopology)? else {
+            unreachable!()
+        };
+        Ok(topology)
     }
     pub fn create_vm(&mut self) -> Result<u32, Error> {
         let (Response::VmCreated { vm }, _) = self.call(Command::VmCreate)? else {
@@ -185,6 +192,7 @@ impl<T: Transport> Client<T> {
 fn matches_response(command: Command, response: Response) -> bool {
     match (command, response) {
         (Command::GetInfo, Response::Info(_))
+        | (Command::GetTopology, Response::Topology(_))
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,

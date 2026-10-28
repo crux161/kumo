@@ -1,9 +1,9 @@
 #![no_std]
-//j594
 //j595
 //j596
 //j641
 //j643
+//j644
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -40,6 +40,13 @@ pub const RING_BYTES: u32 = 4096;
 pub struct DeviceInfo {
     pub gpu_id: u32,
     pub cs_features: u32,
+}
+
+/// Stable shader topology attested during driver bring-up, also used for its group masks.
+/// This is a core-ID bitmap, not a count or a device-memory/firmware address. — KESTREL
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceTopology {
+    pub shader_present: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,6 +1,7 @@
 //j595
 //j596
 //j636
+//j644
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -23,6 +24,7 @@ struct Pending {
 
 struct Hardware<'a> {
     device: &'a mut Device,
+    shader_present: u64,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -43,6 +45,13 @@ impl Backend for Hardware<'_> {
         Ok(protocol::DeviceInfo {
             gpu_id: read_aperture(0),
             cs_features: self.cs.features,
+        })
+    }
+    fn topology(&mut self) -> Result<protocol::DeviceTopology, GpuStatus> {
+        // The exact probe-attested mask also configured this session's CSG. No client
+        // field selects a register, core mask or hardware slot. — KESTREL
+        Ok(protocol::DeviceTopology {
+            shader_present: self.shader_present,
         })
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
@@ -260,9 +269,11 @@ pub(super) fn serve(
     windows: [McuWindow; 3],
     csg: CsgControl,
     cs: CsControl,
+    shader_present: u64,
 ) -> ! {
     let mut hw = Hardware {
         device,
+        shader_present,
         tables,
         arena,
         root,

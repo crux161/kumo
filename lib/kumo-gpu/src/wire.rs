@@ -1,12 +1,16 @@
 //j594
 //j596
+//j644
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
 //! time; request IDs are nonzero and strictly increase for the channel's lifetime. Exhaustion
 //! requires a fresh session. The server must reject duplicate/stale IDs before any mutation.
 
-use crate::{valid_buffer_bytes, BindFlags, Binding, DeviceInfo, Status, Submission, SyncState};
+use crate::{
+    valid_buffer_bytes, BindFlags, Binding, DeviceInfo, DeviceTopology, Status, Submission,
+    SyncState,
+};
 
 pub const REQUEST_LEN: usize = 64;
 pub const REPLY_LEN: usize = 48;
@@ -14,6 +18,7 @@ pub const REPLY_LEN: usize = 48;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     GetInfo,
+    GetTopology,
     VmCreate,
     BufferCreate {
         bytes: u64,
@@ -41,6 +46,7 @@ impl Request {
     pub fn encode(self) -> [u8; REQUEST_LEN] {
         let (op, args) = match self.command {
             Command::GetInfo => (7, [0; 6]),
+            Command::GetTopology => (8, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
@@ -87,6 +93,7 @@ impl Request {
         let a = args::<6>(&bytes[16..]);
         let command = match word(bytes, 8) {
             7 => Command::GetInfo,
+            8 => Command::GetTopology,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             3 => {
@@ -130,6 +137,7 @@ impl Request {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Response {
     Info(DeviceInfo),
+    Topology(DeviceTopology),
     VmCreated {
         vm: u32,
     },
@@ -183,6 +191,7 @@ impl Reply {
                 bytes[8..12].copy_from_slice(&(status as u32).to_le_bytes());
                 (0, [0; 4])
             }
+            Ok(Response::Topology(topology)) => (8, [topology.shader_present, 0, 0, 0]),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
@@ -222,6 +231,9 @@ impl Reply {
                 7 => Response::Info(DeviceInfo {
                     gpu_id: a[0] as u32,
                     cs_features: a[1] as u32,
+                }),
+                8 if a[0] != 0 => Response::Topology(DeviceTopology {
+                    shader_present: a[0],
                 }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {

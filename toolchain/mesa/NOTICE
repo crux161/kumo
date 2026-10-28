@@ -1,8 +1,10 @@
-Mesa pan_kmod.h: original copyright and MIT notice for native-header.patch.
+Mesa pan_kmod.h and pan_props.c: original copyright and MIT notice for the
+header patch and the source compiled by the native topology probe.
 Other unvendored header notices remain in the extracted source archive.
 
 MIT License
 
+Copyright (C) 2019 Collabora, Ltd.
 Copyright © 2023 Collabora, Ltd.
 Copyright © 2026 Arm Ltd.
 

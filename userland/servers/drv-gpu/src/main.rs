@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j589
 //j590
 //j591
 //j593
 //j595
+//j644
 
 mod client;
 
@@ -1770,6 +1770,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 windows,
                 csg,
                 cs,
+                shader_present,
             )
         }
         Err(error) => {

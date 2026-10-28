@@ -1,4 +1,5 @@
 //j643
+//j644
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -9,7 +10,8 @@ use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    Binding, DeviceInfo, Reply, Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
+    Binding, DeviceInfo, DeviceTopology, Reply, Request, Status, Submission, REPLY_LEN,
+    REQUEST_LEN,
 };
 
 #[cfg(target_os = "none")]
@@ -27,11 +29,13 @@ struct Report {
     missing_properties: u64,
     query_status: u32,
     reserved: u32,
+    core_count: u32,
+    core_id_range: u32,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 48);
+const _: () = assert!(core::mem::size_of::<Report>() == 64);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -40,6 +44,7 @@ const INFO: DeviceInfo = DeviceInfo {
 
 struct Hardware {
     busy_once: bool,
+    shader_present: u64,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -48,6 +53,11 @@ impl Backend for Hardware {
         } else {
             Ok(INFO)
         }
+    }
+    fn topology(&mut self) -> Result<DeviceTopology, Status> {
+        Ok(DeviceTopology {
+            shader_present: self.shader_present,
+        })
     }
     fn create_vm(&mut self) -> Result<(), Status> {
         Err(Status::NotSupported)
@@ -110,7 +120,10 @@ fn transport<'a>(
 ) -> Loopback<'a> {
     Loopback {
         session: Session::default(),
-        hardware: Hardware { busy_once },
+        hardware: Hardware {
+            busy_once,
+            shader_present: 0x500000005,
+        },
         reply: [0; REPLY_LEN],
         sends,
         closed,
@@ -125,9 +138,19 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let mut client = Client::new(transport(&sends, &closed, true, false));
     let result = with_api(&mut client, |api| {
         let mut report = Report::default();
+        // A rejected old ABI must not write the larger version2 report into an
+        // old caller's allocation. The extra sentinel words are guard storage. — KESTREL
+        let old_api = Api { version: 1, ..*api };
+        let mut guarded = [0xfeedbeefcafebabeu64; 8];
+        if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
+            || guarded != [0xfeedbeefcafebabeu64; 8]
+            || sends.get() != 0
+        {
+            return 11;
+        }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 2, ..*api },
+            Api { version: 1, ..*api },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -158,13 +181,16 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         {
             return 3;
         }
-        for n in 2..=3 {
+        for n in [3, 5] {
             if unsafe { kumo_mesa_probe(api, &mut report) } != 1
                 || report.info.gpu_id != INFO.gpu_id
                 || report.info.cs_features != INFO.cs_features
                 || report.info.va_start != kumo_gpu::VA_START
                 || report.info.va_end != kumo_gpu::VA_END
                 || report.info.max_buffer_bytes != kumo_gpu::MAX_BUFFER_BYTES
+                || report.info.shader_present != 0x500000005
+                || report.core_count != 4
+                || report.core_id_range != 35
                 || report.missing_properties != 1023
                 || report.query_status != 0
                 || report.reserved != 0
@@ -178,8 +204,50 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     if result != 0 {
         return result;
     }
-    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 4 || closed.get() != 0 {
+    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 6 || closed.get() != 0 {
         return 5;
+    }
+
+    for (mask, count, range) in [
+        (1, 1, 1),
+        (0xf, 4, 4),
+        (0x8000000000000001, 2, 64),
+        (u64::MAX, 64, 64),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.shader_present = mask;
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+                && report.info.shader_present == mask
+                && report.core_count == count
+                && report.core_id_range == range
+                && sends.get() == 2
+        });
+        if !ok {
+            return 9;
+        }
+    }
+
+    // Zero is an invalid attestation, not a one-core fallback. The server retires;
+    // C sees failure with cleared output and cannot issue another request. — KESTREL
+    sends.set(0);
+    let mut wire = transport(&sends, &closed, false, false);
+    wire.hardware.shader_present = 0;
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 3
+            && report.query_status == SERVER_ERROR + Status::DeviceLost as u32
+            && report.info.gpu_id == 0
+            && report.info.shader_present == 0
+            && report.core_count == 0
+            && report.core_id_range == 0
+    });
+    if !ok || !client.is_lost() || sends.get() != 2 {
+        return 10;
     }
 
     sends.set(0);

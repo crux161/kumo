@@ -1,5 +1,6 @@
 //j594
 //j596
+//j644
 
 extern crate std;
 
@@ -29,6 +30,7 @@ fn submission() -> Submission {
 fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
     for command in [
         Command::GetInfo,
+        Command::GetTopology,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -487,4 +489,41 @@ fn request_ids_reject_replay_and_never_wrap_into_an_old_session() {
         gpu_status: 0,
     };
     assert_eq!(timeline.reserve(0), Err(Status::BadRequest));
+}
+
+#[test]
+fn topology_preserves_all_64_core_ids_and_rejects_zero_or_noncanonical_frames() {
+    let request = Request {
+        id: 11,
+        command: Command::GetTopology,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &8u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    for shader_present in [1, 0xf, 0x500000005, 0x8000000000000001, u64::MAX] {
+        let response = Response::Topology(DeviceTopology { shader_present });
+        let reply = Reply {
+            id: 11,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &8u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &shader_present.to_le_bytes());
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+        for at in 24..REPLY_LEN {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    let zero = Reply {
+        id: 11,
+        result: Ok(Response::Topology(DeviceTopology { shader_present: 0 })),
+    };
+    assert_eq!(Reply::decode(&zero.encode()), None);
 }

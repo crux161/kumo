@@ -1,12 +1,13 @@
 //j595
 //j596
+//j644
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, DeviceInfo, Request, RequestIds, Response, Status,
-    Submission, Timeline, MAX_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceTopology, Request, RequestIds,
+    Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -22,6 +23,10 @@ pub enum SubmitError {
 
 pub trait Backend {
     fn info(&mut self) -> Result<DeviceInfo, Status>;
+    /// Optional read-only extension. An unimplemented backend must not invent topology.
+    fn topology(&mut self) -> Result<DeviceTopology, Status> {
+        Err(Status::NotSupported)
+    }
     fn create_vm(&mut self) -> Result<(), Status>;
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), Status>;
     fn bind(&mut self, binding: Binding) -> Result<(), Status>;
@@ -71,6 +76,13 @@ impl Session {
     ) -> Result<Response, Status> {
         match command {
             Command::GetInfo => backend.info().map(Response::Info),
+            Command::GetTopology => {
+                let topology = backend.topology()?;
+                if topology.shader_present == 0 {
+                    return Err(Status::DeviceLost);
+                }
+                Ok(Response::Topology(topology))
+            }
             Command::VmCreate => {
                 if self.vm {
                     return Err(Status::BadState);
@@ -197,6 +209,7 @@ mod tests {
         calls: Vec<Command>,
         fail: Option<Status>,
         submit_error: Option<SubmitError>,
+        topology: Option<u64>,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -205,6 +218,12 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn topology(&mut self) -> Result<DeviceTopology, Status> {
+            self.record(Command::GetTopology)?;
+            self.topology
+                .map(|shader_present| DeviceTopology { shader_present })
+                .ok_or(Status::NotSupported)
+        }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
             self.record(Command::GetInfo)?;
             Ok(DeviceInfo {
@@ -261,6 +280,49 @@ mod tests {
         send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
         (s, b)
     }
+    #[test]
+    fn topology_is_read_only_unsupported_is_recoverable_and_zero_retires() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTopology),
+            Err(Status::NotSupported)
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        backend.topology = Some(0x8000000000000001);
+        let topology = Response::Topology(DeviceTopology {
+            shader_present: 0x8000000000000001,
+        });
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTopology),
+            Ok(topology)
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTopology),
+            Ok(topology)
+        );
+        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.bindings.iter().all(Option::is_none));
+        backend.topology = Some(0);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTopology),
+            Err(Status::DeviceLost)
+        );
+        let calls = backend.calls.len();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetInfo),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(backend.calls.len(), calls);
+    }
+
     #[test]
     fn info_query_is_available_before_vm_creation_and_does_not_consume_objects() {
         let (mut s, mut b) = (Session::default(), Fake::default());

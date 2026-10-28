@@ -1,10 +1,11 @@
 //j641
+//j644
 
 extern crate std;
 use super::*;
 use crate::{
     session::{Backend, Session, SubmitError},
-    BindFlags, PAGE_BYTES, VA_START,
+    BindFlags, DeviceTopology, PAGE_BYTES, VA_START,
 };
 use std::{collections::VecDeque, vec::Vec};
 
@@ -285,6 +286,11 @@ fn invalid_local_requests_use_no_id_and_exhaustion_never_wraps_to_zero() {
 #[derive(Default)]
 struct Model;
 impl Backend for Model {
+    fn topology(&mut self) -> Result<DeviceTopology, Status> {
+        Ok(DeviceTopology {
+            shader_present: 0x500000005,
+        })
+    }
     fn info(&mut self) -> Result<DeviceInfo, Status> {
         Ok(INFO)
     }
@@ -335,6 +341,12 @@ impl Transport for Loopback {
 fn all_typed_operations_use_the_real_server_contract_and_preserve_pending_completion() {
     let mut client = Client::new(Loopback::default());
     assert_eq!(client.info(), Ok(INFO));
+    assert_eq!(
+        client.topology(),
+        Ok(DeviceTopology {
+            shader_present: 0x500000005
+        })
+    );
     let vm = client.create_vm().unwrap();
     assert_eq!(client.create_vm(), Err(Error::Server(Status::BadState)));
     let buffer = client.create_buffer(PAGE_BYTES).unwrap();
@@ -375,4 +387,39 @@ fn all_typed_operations_use_the_real_server_contract_and_preserve_pending_comple
         .map(|r| r.id)
         .collect();
     assert_eq!(ids, (1..=ids.len() as u32).collect::<Vec<_>>());
+}
+
+#[test]
+fn topology_rejects_wrong_kind_id_zero_and_grants_without_replay() {
+    let good = Response::Topology(DeviceTopology {
+        shader_present: 0x8000000000000001,
+    });
+    for (id, response, grant) in [
+        (1, Response::Info(INFO), None),
+        (2, good, None),
+        (
+            1,
+            Response::Topology(DeviceTopology { shader_present: 0 }),
+            None,
+        ),
+        (1, good, Some(88)),
+    ] {
+        let mut wire = Script::default();
+        wire.reply(id, Ok(response), grant);
+        let mut client = Client::new(wire);
+        assert_eq!(client.topology(), Err(Error::Protocol));
+        assert_eq!(client.topology(), Err(Error::DeviceLost));
+        assert_eq!(client.transport.sent.len(), 1);
+        assert_eq!(
+            client.transport.closed,
+            grant.into_iter().collect::<Vec<_>>()
+        );
+    }
+    let mut wire = Script::default();
+    wire.reply(1, Err(Status::NotSupported), None);
+    wire.reply(2, Ok(Response::Info(INFO)), None);
+    let mut client = Client::new(wire);
+    assert_eq!(client.topology(), Err(Error::Server(Status::NotSupported)));
+    assert_eq!(client.info(), Ok(INFO));
+    assert!(!client.is_lost());
 }

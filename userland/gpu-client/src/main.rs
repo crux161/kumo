@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j636
 //j637
 //j638
 //j639
 //j641
+//j644
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -233,6 +233,13 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
     if info.gpu_id & 0xffff_0000 != 0xa867_0000 {
         return Err(Failure::Failed);
     }
+    let topology = client.topology()?;
+    log(format_args!(
+        "gpu-client: G7c attested topology: shader mask0x{:016x}, cores={}, core-ID range={}\n",
+        topology.shader_present,
+        topology.shader_present.count_ones(),
+        64 - topology.shader_present.leading_zeros(),
+    ));
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;
     let triangle = triangle_stream(features).map_err(|_| ())?;

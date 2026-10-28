@@ -1,4 +1,5 @@
 //j643
+//j644
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -7,7 +8,7 @@ use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -25,6 +26,7 @@ pub struct Info {
     pub va_start: u64,
     pub va_end: u64,
     pub max_buffer_bytes: u64,
+    pub shader_present: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -56,17 +58,21 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     // Clear the result even on failure so an old identity cannot look successful. — KESTREL
     unsafe { out.write(Info::default()) };
     let client = unsafe { &mut *context.cast::<Client<T>>() };
-    match client.info() {
+    let result: Result<Info, Error> = (|| {
+        let info = client.info()?;
+        let topology = client.topology()?;
+        Ok(Info {
+            gpu_id: info.gpu_id,
+            cs_features: info.cs_features,
+            va_start: crate::VA_START,
+            va_end: crate::VA_END,
+            max_buffer_bytes: crate::MAX_BUFFER_BYTES,
+            shader_present: topology.shader_present,
+        })
+    })();
+    match result {
         Ok(info) => {
-            unsafe {
-                out.write(Info {
-                    gpu_id: info.gpu_id,
-                    cs_features: info.cs_features,
-                    va_start: crate::VA_START,
-                    va_end: crate::VA_END,
-                    max_buffer_bytes: crate::MAX_BUFFER_BYTES,
-                })
-            };
+            unsafe { out.write(info) };
             OK
         }
         Err(Error::InvalidRequest) => INVALID_REQUEST,
@@ -77,19 +83,20 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 32);
+const _: () = assert!(size_of::<Info>() == 40);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, DeviceInfo, Reply, Request, Response, Status, REPLY_LEN,
-        REQUEST_LEN,
+        client::TransportError, Command, DeviceInfo, DeviceTopology, Reply, Request, Response,
+        Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
     struct Wire {
         sent: u32,
+        command: Option<Command>,
         closed: u32,
         failure: bool,
         grant: bool,
@@ -100,6 +107,7 @@ mod tests {
             let request = Request::decode(bytes).unwrap();
             assert_eq!(request.id, self.sent + 1);
             self.sent = request.id;
+            self.command = Some(request.command);
             Ok(())
         }
         fn receive(
@@ -108,6 +116,10 @@ mod tests {
         ) -> Result<(usize, Option<u32>), TransportError> {
             let result = if self.failure {
                 Err(Status::Busy)
+            } else if self.command == Some(Command::GetTopology) {
+                Ok(Response::Topology(DeviceTopology {
+                    shader_present: 0x500000005,
+                }))
             } else {
                 Ok(Response::Info(DeviceInfo {
                     gpu_id: 0xa8670005,
