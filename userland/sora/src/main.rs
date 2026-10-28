@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j632
 //j633
 //j634
 //j635
 //j636
+//j648
 
 extern crate alloc;
 
@@ -13,9 +13,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
-    CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH, GFX_CLIENT_PATH, GROUP_PATH,
-    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
+    GFX_CLIENT_PATH, GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -297,8 +297,14 @@ fn graphics_demo(cmd: &kumoza::Command) {
 /// child's table. A grant that is not admitted stays with Sora and is closed.
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
     use kumo_graphics::VIEW_COUNT;
+    let bitmap = cmd.name == "bmp-view";
+    let name = cmd.name.as_bytes();
     if !cmd.args.is_empty() {
-        usage(b"usage: gfx-client\n");
+        usage(if bitmap {
+            b"usage: bmp-view\n"
+        } else {
+            b"usage: gfx-client\n"
+        });
         return;
     }
     let mut selected = None;
@@ -312,27 +318,35 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
         break;
     }
     let Some((view, channel, vmo)) = selected else {
-        log(b"gfx-client: no graphics view available\n");
+        log(name);
+        log(b": no graphics view available\n");
         fail_status(1);
         return;
     };
     if vmo.0 == 0 {
         let _ = handle_close(channel);
-        log(b"gfx-client: no surface available\n");
+        log(name);
+        log(b": no surface available\n");
         fail_status(1);
         return;
     }
-    log(b"gfx-client: view ");
+    log(name);
+    log(b": view ");
     log(&[b'0' + view as u8]);
     log(b" handed to a client process\n");
     let flags = (ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2).bits();
     let ran = run_elf_threads(
         initrd,
-        GFX_CLIENT_PATH.as_bytes(),
+        if bitmap {
+            BMP_VIEW_PATH
+        } else {
+            GFX_CLIENT_PATH
+        }
+        .as_bytes(),
         channel.0 as u64,
         vmo.0 as u64,
         flags,
-        b"gfx-client",
+        name,
         0,
         None,
     );
@@ -3793,7 +3807,7 @@ fn eval_command(
         graphics_demo(cmd);
         return true;
     }
-    if cmd.name == "gfx-client" {
+    if matches!(cmd.name.as_str(), "gfx-client" | "bmp-view") {
         graphics_client(cmd, initrd);
         return true;
     }

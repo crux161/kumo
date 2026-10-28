@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j616
 #j617
 #j618
 #j619
 #j620
+#j648
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path):
+def replace_autoexec(path, bitmap=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -38,6 +38,8 @@ def replace_autoexec(path):
         data = original[offset:offset + size]
         if name == b"etc/autoexec":
             data = b"dmesg -n 6\ngfx-client\ngfx-demo\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if bitmap:
+                data = data.replace(b"gfx-client\n", b"bmp-view\n")
             found = True
         struct.pack_into("<QQ", out, entry + 64, len(out), len(data))
         out.extend(data)
@@ -75,7 +77,26 @@ def demo_pixel(x, y):
     return (x & 255, (y * 2) & 255, blue)
 
 
-def check_pixels(path):
+def bitmap_reference():
+    # Independent 24-bit BMP reference for the bundled, bottom-up 240x320 sample.
+    sample = Path(__file__).resolve().parent.parent / "userland/bmp-view/assets/sample.bmp"
+    data = sample.read_bytes()
+    offset = struct.unpack_from("<I", data, 10)[0]
+    width, height = struct.unpack_from("<ii", data, 18)
+    assert (width, height) == (240, 320) and data[:2] == b"BM"
+
+    def pixel(x, y):
+        if not 80 <= x < 176:
+            return (0, 0, 0)
+        sx, sy = (x - 80) * width // 96, y * height // 128
+        index = offset + (height - 1 - sy) * ((width * 3 + 3) // 4 * 4) + sx * 3
+        b, g, r = data[index:index + 3]
+        return (r, g, b)
+
+    return pixel
+
+
+def check_pixels(path, bitmap=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -96,13 +117,14 @@ def check_pixels(path):
                 if border:
                     assert at(x, y) == CHROME_COLOR, f"chrome at {(x, y)} is {at(x, y)}"
 
-    # View 0 is painted by the separate gfx-client process; view 1 by the supervisor demo,
+    # View 0 is painted by the separate client process; view 1 by the supervisor demo,
     # which presents an over-sized surface whose visible corner is solid. Both are copied by
     # the server into server-owned rectangles.
+    expected = bitmap_reference() if bitmap else demo_pixel
     vx, vy = rects[0]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
-            assert at(vx + x, vy + y) == demo_pixel(x, y), f"view 0 pixel {(x, y)}"
+            assert at(vx + x, vy + y) == expected(x, y), f"view 0 pixel {(x, y)}"
     vx, vy = rects[1]
     for y in range(VIEW_H):
         for x in range(VIEW_W):
@@ -129,6 +151,7 @@ def main():
     parser.add_argument("--firmware-vars", type=Path, default=Path("/opt/homebrew/share/qemu/edk2-arm-vars.fd"))
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--with-dtb", action="store_true", help="exercise drv-gpu with a staged QEMU DTB; requires image log level >=6")
+    parser.add_argument("--bitmap", action="store_true", help="display and verify bmp-view instead of gfx-client")
     args = parser.parse_args()
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
@@ -143,7 +166,7 @@ def main():
             "-cpu", "cortex-a72", "-m", "512", "-display", "none", "-device", "ramfb",
             "-net", "none",
         ], check=True, capture_output=True, timeout=15)
-    replace_autoexec(work / "esp/EFI/KUMO/initrd.img")
+    replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -170,6 +193,8 @@ def main():
             else:
                 raise RuntimeError(f"boot timed out; inspect {serial}")
             client = b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
+            if args.bitmap:
+                client = b"bmp-view: bitmap copied; buffer released (software GOP)"
             assert b"private RAM, read-only walk, VMO denial, DMA gap, reuse OK" in transcript, f"missing kernel device-table RAM proof; inspect {serial}"
             assert b"VMO identity, closed handle, exact unmap, offline release OK" in transcript, f"missing kernel VMO pin proof; inspect {serial}"
             print("Device VMO pin smoke green: identity, closed handle, exact unmap, offline release")
@@ -214,7 +239,9 @@ def main():
 
             command("qmp_capabilities")
             command("screendump", {"filename": str(work / "screen.ppm")})
-            check_pixels(work / "screen.ppm")
+            check_pixels(work / "screen.ppm", args.bitmap)
+            if args.bitmap:
+                print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()

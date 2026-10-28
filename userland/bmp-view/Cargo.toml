@@ -1,0 +1,26 @@
+#j648
+[package]
+name = "bmp-view"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+embedded-graphics = "=0.8.2"
+kumo-graphics = { path = "../../lib/kumo-graphics" }
+tinybmp = { path = "../../vendor/tinybmp" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "bmp-view"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

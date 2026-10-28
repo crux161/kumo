@@ -1,8 +1,8 @@
-#j572
 #j594
 #j595
 #j596
 #j598
+#j648
 [workspace]
 members = [
     "boot/niji-loader",
@@ -32,6 +32,7 @@ members = [
     "tools/stage-a-smoke",
     "userland/args",
     "userland/cat",
+    "userland/bmp-view",
     "userland/wc",
     "userland/hello",
     "userland/gfx-client",
@@ -60,6 +61,7 @@ members = [
 ]
 resolver = "2"
 exclude = [
+    "vendor/tinybmp",
     "vendor/cargo/gc-arena-0.5.3",
     "vendor/cargo/libm-0.2.16",
     "vendor/cargo/piccolo-0.3.3",

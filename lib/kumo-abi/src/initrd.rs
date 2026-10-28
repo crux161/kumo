@@ -1,8 +1,8 @@
-//j563
 //j569
 //j572
 //j578
 //j595
+//j648
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -42,6 +42,8 @@ pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// template a program author copies, and the exec-vertical proof binary.
 pub const HELLO_PATH: &str = "bin/hello";
 
+/// A bundled BMP viewer using the software presentation channel and surface VMO.
+pub const BMP_VIEW_PATH: &str = "bin/bmp-view";
 /// A separate-process presentation client (F1b): Sora transfers one presentation channel and
 /// one surface VMO in `x0`/`x1`; the client writes the diagnostic image, presents, and exits.
 pub const GFX_CLIENT_PATH: &str = "bin/gfx-client";

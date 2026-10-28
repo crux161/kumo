@@ -1,0 +1,10 @@
+[package]
+name = "tinybmp"
+version = "0.7.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "No-std, low memory footprint BMP image loader"
+repository = "https://github.com/embedded-graphics/tinybmp"
+
+[dependencies]
+embedded-graphics = "=0.8.2"

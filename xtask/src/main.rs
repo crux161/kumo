@@ -1,8 +1,8 @@
-//j563
 //j569
 //j572
 //j578
 //j595
+//j648
 
 use std::env;
 use std::fmt;
@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    ARGS_PATH, AUTOEXEC_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH, DRV_I2C_HID_PATH,
-    DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
-    INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
-    KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    ARGS_PATH, AUTOEXEC_PATH, BMP_VIEW_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH,
+    DRV_I2C_HID_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH,
+    INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
+    INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
+    TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -849,7 +850,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
-            let gfx_client = build_gfx_client_image(&workspace_root()?)?;
+            let gfx_client = build_graphics_client_image(&workspace_root()?, "gfx-client")?;
+            let bmp_view = build_graphics_client_image(&workspace_root()?, "bmp-view")?;
             let gpu_client = build_gpu_client_image(&workspace_root()?)?;
             let ls = build_ls_image(&workspace_root()?)?;
             let args = build_args_image(&workspace_root()?)?;
@@ -878,6 +880,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
+                (BMP_VIEW_PATH, bmp_view.as_slice()),
                 (kumo_abi::initrd::GPU_CLIENT_PATH, gpu_client.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),
@@ -1040,15 +1043,15 @@ fn build_hello_image(root: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn build_gfx_client_image(root: &Path) -> Result<Vec<u8>, String> {
+fn build_graphics_client_image(root: &Path, program: &str) -> Result<Vec<u8>, String> {
     run_cargo(
         root,
         &[
             "build",
             "-p",
-            "gfx-client",
+            program,
             "--bin",
-            "gfx-client",
+            program,
             "--target",
             "aarch64-unknown-none",
             "--release",
@@ -1057,15 +1060,11 @@ fn build_gfx_client_image(root: &Path) -> Result<Vec<u8>, String> {
 
     let source_path = root
         .join("target/aarch64-unknown-none/release")
-        .join("gfx-client");
+        .join(program);
     let bytes =
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
-    validate_aarch64_kernel_elf(&bytes).map_err(|err| {
-        format!(
-            "validate {} as gfx-client ELF: {err}",
-            source_path.display()
-        )
-    })?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as {program} ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 
