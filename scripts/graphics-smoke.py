@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j649
 #j654
 #j655
 #j656
 #j657
+#j658
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -58,6 +58,10 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # Both supervisors-held views are consumed and released first; the third
                 # client must be granted a fresh channel and surface for view 0.
                 data = b"dmesg -n 6\ngfx-client\ngfx-client\nbmp-view\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if async_regrant:
+                # Both views are leased to ASYNC clients; bmp-view must wait for both
+                # releases and regrant view 0.
+                data = b"dmesg -n 6\ngfx-clients\nbmp-view\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -188,7 +192,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -206,7 +210,7 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     # the same model proves the overlap and z-order, not only the two wells.
     if damage:
         images = [damage_demo_pixel, None]
-    elif regrant:
+    elif regrant or async_regrant:
         images = [bitmap_reference(None), demo_pixel]
     elif bitmap:
         images = [bitmap_reference(bitmap_file, scratch), lambda x, y: VIEW_SOLID]
@@ -245,6 +249,7 @@ def main():
     parser.add_argument("--damage", action="store_true", help="prove damage tracking with the supervisor client's full-then-partial present")
     parser.add_argument("--zorder", action="store_true", help="prove server z-order: the lower client presents after the upper view")
     parser.add_argument("--regrant", action="store_true", help="prove a released view accepts a fresh client and surface")
+    parser.add_argument("--async-regrant", action="store_true", help="prove ASYNC client exits release views for a later regrant")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -260,6 +265,8 @@ def main():
         parser.error("--zorder is a separate proof")
     if args.regrant and (args.bitmap or args.two_clients or args.damage or args.zorder):
         parser.error("--regrant is a separate proof")
+    if args.async_regrant and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant):
+        parser.error("--async-regrant is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -274,7 +281,7 @@ def main():
             "-net", "none",
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
-                     args.two_clients, args.damage, args.zorder, args.regrant)
+                     args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -306,6 +313,10 @@ def main():
                     ) >= 2
                 if args.damage:
                     ready = ready and b"gfx-damage: full then partial damage copied" in transcript
+                if args.async_regrant:
+                    ready = ready and transcript.count(
+                        b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
+                    ) >= 2 and b"bmp-view: bitmap copied; buffer released (software GOP)" in transcript
                 if ready:
                     break
                 time.sleep(0.1)
@@ -353,6 +364,14 @@ def main():
                 assert transcript.count(bmp) == 1, f"missing regranted bitmap; inspect {serial}"
                 assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
                 assert b"drv-fb: view regrant refused" not in transcript
+            elif args.async_regrant:
+                bmp = b"bmp-view: bitmap copied; buffer released (software GOP)"
+                assert transcript.count(client) == 2, f"missing two async client presents; inspect {serial}"
+                assert transcript.count(bmp) == 1, f"missing regranted bitmap; inspect {serial}"
+                assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
+                assert b"sora: view 0 released by drv-fb" in transcript
+                assert b"sora: view 1 released by drv-fb" in transcript
+                assert b"drv-fb: view regrant refused" not in transcript
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -389,7 +408,7 @@ def main():
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
                          args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage,
-                         args.regrant)
+                         args.regrant, args.async_regrant)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
@@ -400,6 +419,8 @@ def main():
                 print("Z-order UEFI smoke green: lower client presented after the upper view; overlap kept the upper content")
             if args.regrant:
                 print("Regrant UEFI smoke green: a released view accepted a fresh client and surface")
+            if args.async_regrant:
+                print("Async-regrant UEFI smoke green: both ASYNC client exits released their views for a fresh client")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()

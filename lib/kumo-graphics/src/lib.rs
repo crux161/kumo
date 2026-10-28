@@ -1,9 +1,9 @@
 #![no_std]
-//j568
 //j636
 //j655
 //j656
 //j657
+//j658
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -352,6 +352,24 @@ pub fn parse_regrant(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// A release query on the same control lane: Sora asks drv-fb which views' clients have
+/// closed. The reply carries one bit per view; bit N means view N is released. — TIMBERDOODLE
+pub const RELEASE_QUERY_TAG: u8 = b'Q';
+pub const RELEASE_REPLY_TAG: u8 = b'S';
+pub const RELEASE_QUERY: [u8; 1] = [RELEASE_QUERY_TAG];
+
+pub fn release_reply(mask: u8) -> [u8; 2] {
+    [RELEASE_REPLY_TAG, mask]
+}
+
+pub fn parse_release_reply(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() == 2 && bytes[0] == RELEASE_REPLY_TAG {
+        Some(bytes[1])
+    } else {
+        None
+    }
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -675,5 +693,16 @@ mod tests {
         assert_eq!(parse_regrant(&[REGRANT_TAG, VIEW_COUNT as u8]), None);
         assert_eq!(parse_regrant(&[b'X', 0]), None);
         assert_eq!(parse_regrant(&[REGRANT_TAG, 0, 0]), None);
+    }
+
+    #[test]
+    fn release_query_and_reply_are_exact() {
+        assert_eq!(RELEASE_QUERY, [b'Q']);
+        assert_eq!(release_reply(0b101), [b'S', 0b101]);
+        assert_eq!(parse_release_reply(&release_reply(0)), Some(0));
+        assert_eq!(parse_release_reply(&release_reply(0xff)), Some(0xff));
+        assert_eq!(parse_release_reply(&[b'S']), None);
+        assert_eq!(parse_release_reply(&[b'X', 0]), None);
+        assert_eq!(parse_release_reply(&[b'S', 0, 0]), None);
     }
 }

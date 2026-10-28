@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j648
 //j649
 //j654
 //j655
 //j657
+//j658
 
 extern crate alloc;
 
@@ -84,6 +84,14 @@ static DRV_FB_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 /// gfx-client/bmp-view may be given a fresh channel and surface for the same view.
 /// — TIMBERDOODLE
 static GRAPHICS_RELEASED: [AtomicBool; kumo_graphics::VIEW_COUNT] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
+/// Views Sora may grant or regrant: the ones it kept at bootstrap. A view handed to
+/// drv-gpu is never granted by Sora. — TIMBERDOODLE
+static GRAPHICS_GRANTABLE: [AtomicBool; kumo_graphics::VIEW_COUNT] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
+/// Views currently leased to an ASYNC client. A later synchronous client waits for these
+/// to be reported released before regranting. — TIMBERDOODLE
+static GRAPHICS_ASYNC: [AtomicBool; kumo_graphics::VIEW_COUNT] =
     [AtomicBool::new(false), AtomicBool::new(false)];
 
 /// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
@@ -591,6 +599,69 @@ fn regrant_view(view: usize) -> Option<(Handle, Handle)> {
     None
 }
 
+/// Ask drv-fb which views' clients have closed. The control lane is the retained drv-fb
+/// bootstrap channel; drv-fb answers from its lane state. — TIMBERDOODLE
+fn query_released() -> Option<u8> {
+    let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+    if control.0 == 0 {
+        return None;
+    }
+    if channel_write(
+        control,
+        kumo_graphics::RELEASE_QUERY.as_ptr(),
+        kumo_graphics::RELEASE_QUERY.len(),
+    ) != 0
+    {
+        return None;
+    }
+    let mut reply = [0u8; 8];
+    let n = channel_read(control, reply.as_mut_ptr(), reply.len()) as usize;
+    kumo_graphics::parse_release_reply(reply.get(..n)?)
+}
+
+/// Fold drv-fb's release mask into Sora's released views, logging each newly observed one.
+fn refresh_released() {
+    let Some(mask) = query_released() else {
+        return;
+    };
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        if !GRAPHICS_GRANTABLE[view].load(Ordering::Relaxed)
+            || mask & (1u8 << view) == 0
+            || GRAPHICS_RELEASED[view].load(Ordering::Relaxed)
+        {
+            continue;
+        }
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+        GRAPHICS_ASYNC[view].store(false, Ordering::Relaxed);
+        notice(&[
+            b"sora: view ",
+            &[b'0' + view as u8],
+            b" released by drv-fb\n",
+        ]);
+    }
+}
+
+/// Wait for a released view. If ASYNC clients are still leased, pump the scheduler and
+/// re-query until every one of them is released (bounded), then pick the lowest released
+/// grantable view. — TIMBERDOODLE
+fn wait_for_released() -> Option<usize> {
+    for _ in 0..64 {
+        refresh_released();
+        let pending = (0..kumo_graphics::VIEW_COUNT).any(|view| {
+            GRAPHICS_ASYNC[view].load(Ordering::Relaxed)
+                && !GRAPHICS_RELEASED[view].load(Ordering::Relaxed)
+        });
+        if !pending || !child_parked(process_wait()) {
+            break;
+        }
+    }
+    refresh_released();
+    (0..kumo_graphics::VIEW_COUNT).find(|view| {
+        GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed)
+            && GRAPHICS_RELEASED[*view].load(Ordering::Relaxed)
+    })
+}
+
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
     use kumo_graphics::VIEW_COUNT;
     let bitmap = cmd.name == "bmp-view";
@@ -661,14 +732,11 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
         break;
     }
     if selected.is_none() {
-        for view in 0..VIEW_COUNT {
-            if !GRAPHICS_RELEASED[view].load(Ordering::Relaxed) {
-                continue;
-            }
+        if let Some(view) = wait_for_released() {
             if let Some((channel, vmo)) = regrant_view(view) {
                 GRAPHICS_RELEASED[view].store(false, Ordering::Relaxed);
+                GRAPHICS_ASYNC[view].store(false, Ordering::Relaxed);
                 selected = Some((view, channel, vmo));
-                break;
             }
         }
     }
@@ -798,6 +866,7 @@ fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
         );
         if ran {
             launched += 1;
+            GRAPHICS_ASYNC[view].store(true, Ordering::Relaxed);
             // One log record, so the handoff line is contiguous in the console transcript
             // and the smoke's exact-marker check can see it. — TIMBERDOODLE
             notice(&[
@@ -812,6 +881,7 @@ fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
                 let _ = handle_close(channel);
                 let _ = handle_close(vmo);
             }
+            GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
             failed = true;
         }
     }
@@ -3033,6 +3103,7 @@ extern "C" fn sora_main(
                                     }
                                     GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
                                     GRAPHICS_VMO[view].store(vmo.0, Ordering::Relaxed);
+                                    GRAPHICS_GRANTABLE[view].store(true, Ordering::Relaxed);
                                 }
                             }
                             if let Some(size) = sora::console_window(fb.width, fb.height) {

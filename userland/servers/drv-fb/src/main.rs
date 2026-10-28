@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j636
 //j639
 //j655
 //j656
 //j657
+//j658
 
 mod clock_probe;
 mod display_probe;
@@ -496,6 +496,8 @@ extern "C" fn main(
     // server-assigned order. — TIMBERDOODLE
     let mut view_content: [Option<(u64, kumo_graphics::Surface)>; kumo_graphics::VIEW_COUNT] =
         [None; kumo_graphics::VIEW_COUNT];
+    // True when a client closed the lane and left the view available to a regrant. — TIMBERDOODLE
+    let mut view_released = [false; kumo_graphics::VIEW_COUNT];
 
     // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
     // view with a fresh presentation channel and surface. — TIMBERDOODLE
@@ -571,6 +573,20 @@ extern "C" fn main(
         if control_bound && source == control_source {
             let (n, regrant_raw) = channel_read_with_handle(bootstrap, rx.as_mut_ptr(), rx.len());
             let channel = Handle(regrant_raw as u32);
+            if n == 1 && rx[0] == kumo_graphics::RELEASE_QUERY_TAG {
+                if channel.0 != 0 {
+                    let _ = kumo_rt::handle_close(channel);
+                }
+                let mut mask = 0u8;
+                for (index, released) in view_released.iter().enumerate() {
+                    if *released {
+                        mask |= 1u8 << index;
+                    }
+                }
+                let reply = kumo_graphics::release_reply(mask);
+                let _ = kumo_rt::channel_write(bootstrap, reply.as_ptr(), reply.len());
+                continue;
+            }
             let _ = kumo_rt::log_write(
                 kumo_abi::sys::log_level::NOTICE,
                 b"drv-fb: view control record\n",
@@ -611,6 +627,7 @@ extern "C" fn main(
                             view,
                             full_seen: false,
                         });
+                        view_released[view] = false;
                         view_content[view] = None;
                         let mut line = Line::new();
                         line.push(b"drv-fb: view ");
@@ -657,6 +674,7 @@ extern "C" fn main(
                 let _ = kumo_rt::port_unbind(port, lane.channel);
                 let _ = kumo_rt::handle_close(lane.channel);
                 lanes[index] = None;
+                view_released[index] = true;
                 log_info(b"drv-fb: presentation client closed\n");
                 continue;
             }
