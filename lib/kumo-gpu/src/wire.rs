@@ -1,8 +1,8 @@
-//j594
 //j596
 //j644
 //j645
 //j646
+//j647
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -10,8 +10,8 @@
 //! requires a fresh session. The server must reject duplicate/stale IDs before any mutation.
 
 use crate::{
-    valid_buffer_bytes, BindFlags, Binding, DeviceInfo, DeviceMmu, DeviceTiler, DeviceTopology,
-    Status, Submission, SyncState,
+    valid_buffer_bytes, BindFlags, Binding, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
+    DeviceTopology, Status, Submission, SyncState,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -23,6 +23,7 @@ pub enum Command {
     GetTopology,
     GetMmuFeatures,
     GetTilerFeatures,
+    GetTextureFeatures,
     VmCreate,
     BufferCreate {
         bytes: u64,
@@ -53,6 +54,7 @@ impl Request {
             Command::GetTopology => (8, [0; 6]),
             Command::GetMmuFeatures => (9, [0; 6]),
             Command::GetTilerFeatures => (10, [0; 6]),
+            Command::GetTextureFeatures => (11, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
@@ -102,6 +104,7 @@ impl Request {
             8 => Command::GetTopology,
             9 => Command::GetMmuFeatures,
             10 => Command::GetTilerFeatures,
+            11 => Command::GetTextureFeatures,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             3 => {
@@ -148,6 +151,7 @@ pub enum Response {
     Topology(DeviceTopology),
     Mmu(DeviceMmu),
     Tiler(DeviceTiler),
+    Texture(DeviceTexture),
     VmCreated {
         vm: u32,
     },
@@ -204,6 +208,9 @@ impl Reply {
             Ok(Response::Topology(topology)) => (8, [topology.shader_present, 0, 0, 0]),
             Ok(Response::Mmu(mmu)) => (9, [u64::from(mmu.mmu_features), 0, 0, 0]),
             Ok(Response::Tiler(tiler)) => (10, [u64::from(tiler.tiler_features), 0, 0, 0]),
+            Ok(Response::Texture(texture)) => {
+                (11, [u64::from(texture.texture_features_0), 0, 0, 0])
+            }
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
@@ -252,6 +259,9 @@ impl Reply {
                 }),
                 10 if a[0] != 0 => Response::Tiler(DeviceTiler {
                     tiler_features: a[0] as u32,
+                }),
+                11 if a[0] != 0 => Response::Texture(DeviceTexture {
+                    texture_features_0: a[0] as u32,
                 }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {

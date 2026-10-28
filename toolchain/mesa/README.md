@@ -1,8 +1,9 @@
-# Native Mesa boundary — G7b/G7c/G7d/G7e
+# Native Mesa boundary — G7b/G7c/G7d/G7e/G7f
 <!-- j643 -->
 <!-- j644 -->
 <!-- j645 -->
 <!-- j646 -->
+<!-- j647 -->
 
 This is a compile/link scaffold, not a usable Mesa device or a rendering driver.
 The probe compiles the actual pinned `pan_kmod.h` and `pan_props.c` for
@@ -69,11 +70,11 @@ separately from hardware evidence.
 ## Native seam and runtime closure
 
 `lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
-48-byte result (private C ABI version4; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
-queries. Each callback performs GetInfo, then GetTopology, then GetMmuFeatures, then
-GetTilerFeatures, preserving the same client and consuming four request IDs on success. The
-result is published only after all four succeed; a failed later query leaves no partial
-identity. NotSupported from the tiler query is the one status that does not abort it. The opaque context may not be retained, raced, reentered or unwound. It carries
+56-byte result (private C ABI version5; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
+queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures, GetTilerFeatures then
+GetTextureFeatures, preserving the same client and consuming five request IDs on success. The
+result is published only after all five succeed; a failed later query leaves no partial
+identity. NotSupported from either optional query is the one status that does not abort it. The opaque context may not be retained, raced, reentered or unwound. It carries
 no FD, OS handle, Rust layout or new authority. The Rust owner keeps endpoint and grant
 cleanup responsibility. G7a's request ID, correlation and loss rules remain authoritative.
 Numeric query errors distinguish invalid arguments, invalid request, transport, protocol,
@@ -88,9 +89,10 @@ No Linux preprocessor identity or DRM emulation is used.
 Compilation uses real relibc pthread declarations because Mesa's embedded lock structures
 require them (`HAVE_PTHREAD`). This does **not** initialize a Mesa lock or prove pthread
 execution. `HAVE_ENDIAN_H` and `HAVE_STRUCT_TIMESPEC` describe actual installed headers.
-The scaffold C object refers to exactly `pan_query_core_count`,
-`pan_query_core_id_range` and, since G7e, `pan_query_tiler_features`. All three must appear
-defined in the final native ELF, which has no unresolved symbols. G7d's
+The scaffold C object refers to exactly five upstream functions: `pan_query_core_count`,
+`pan_query_core_id_range`, `pan_query_tiler_features` and, since G7f,
+`pan_query_compressed_formats` and `pan_query_afrc`. All five must appear defined in the final
+native ELF, which has no unresolved symbols. G7d's
 `pan_kmod_dev_query_user_va_range` is `static inline` in the pinned header, so it adds no
 entry to that inventory; G7e's tiler helper is a real function in the already-compiled
 `pan_props.c`, which is why the asserted set grew from two to three and no new translation
@@ -117,7 +119,11 @@ undecoded so the derivation stays upstream's. Additive GetTilerFeatures (opcode1
 the nonzero raw TILER_FEATURES word from GPU_CONTROL +0x00C, whose [4:0] field is a log2 bin
 size and [11:8] the level count. Unlike the other properties this one is **optional**: an
 absent word is reported as NotSupported, the query still succeeds with `tiler_features` 0,
-and the tiler group stays in the missing mask.
+and the tiler group stays in the missing mask. Additive GetTextureFeatures (opcode11) supplies
+the nonzero raw `TEXTURE_FEATURES[0]` from GPU_CONTROL +0x0B0 under the same optional rule.
+Upstream returns it verbatim as the compressed-format mask and tests bit 25, behind its own
+arch check, for AFRC. Only element 0 of the four-word array is attested, so missing-property
+bit 3 deliberately stays set rather than claiming the whole group.
 No additional MMIO read or client-selectable register is introduced. The bridge also reports the
 **service's** admitted VA window and maximum buffer size. Those remain service policy rather
 than hardware reports, and are now distinct from the attested MMU_FEATURES word the consumer

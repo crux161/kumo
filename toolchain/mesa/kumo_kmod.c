@@ -3,6 +3,7 @@
 /*j644*/
 /*j645*/
 /*j646*/
+/*j647*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 
@@ -57,6 +58,10 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
         .shader_present = out->info.shader_present,
         .mmu_features = out->info.mmu_features,
         .tiler_features = out->info.tiler_features,
+        /* pan_query_afrc reads gpu_id as well as texture_features[0], so the ID must be in
+         * this partial input for upstream's own arch test to run. — SAKER */
+        .gpu_id = out->info.gpu_id,
+        .texture_features[0] = out->info.texture_features_0,
     };
     out->core_count = pan_query_core_count(&props);
     out->core_id_range = pan_query_core_id_range(&props);
@@ -70,6 +75,13 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
         const struct pan_tiler_features tiler = pan_query_tiler_features(&props);
         out->tiler_bin_size = tiler.bin_size;
         out->tiler_max_levels = tiler.max_levels;
+    }
+    /* Both are pure reads of the attested word with no shift hazard: compressed_formats
+     * returns it verbatim and afrc tests bit 25 behind upstream's own arch check. Absence
+     * leaves both zero rather than reporting "no formats". — SAKER */
+    if (out->info.texture_features_0) {
+        out->compressed_formats = pan_query_compressed_formats(&props);
+        out->has_afrc = pan_query_afrc(&props) ? 1u : 0u;
     }
 
     /* Upstream derives the range by shifting 1ull by this field, so an attested width of
@@ -99,7 +111,9 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     out->va_range_start = range.start;
     out->va_range_size = range.size;
     /* The mask tracks what is actually attested instead of staying a constant: bit 1 is the
-     * tiler group, so it clears only when the shape was genuinely derived. — SAKER */
+     * tiler group, so it clears only when the shape was genuinely derived. Bit 3 stays set even
+     * now, because only element 0 of the four-word texture_features array is attested and
+     * claiming the group would overstate it. — SAKER */
     out->missing_properties = tiler_derived
                                   ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
                                   : KUMO_MESA_MISSING_ALL;

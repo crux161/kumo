@@ -1,15 +1,15 @@
-//j595
 //j596
 //j644
 //j645
 //j646
+//j647
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceMmu, DeviceTiler, DeviceTopology,
-    Request, RequestIds, Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
+    DeviceTopology, Request, RequestIds, Response, Status, Submission, Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -35,6 +35,10 @@ pub trait Backend {
     }
     /// Optional read-only extension. An unimplemented backend must not invent tiler properties.
     fn tiler_features(&mut self) -> Result<DeviceTiler, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Optional read-only extension. An unimplemented backend must not invent texture formats.
+    fn texture_features(&mut self) -> Result<DeviceTexture, Status> {
         Err(Status::NotSupported)
     }
     fn create_vm(&mut self) -> Result<(), Status>;
@@ -109,6 +113,15 @@ impl Session {
                     return Err(Status::NotSupported);
                 }
                 Ok(Response::Tiler(tiler))
+            }
+            Command::GetTextureFeatures => {
+                let texture = backend.texture_features()?;
+                // Same optional-property rule as tiler: an absent word is unknown capability,
+                // not an unusable device, so it degrades instead of retiring. — SAKER
+                if texture.texture_features_0 == 0 {
+                    return Err(Status::NotSupported);
+                }
+                Ok(Response::Texture(texture))
             }
             Command::VmCreate => {
                 if self.vm {
@@ -239,6 +252,7 @@ mod tests {
         topology: Option<u64>,
         mmu_features: Option<u32>,
         tiler_features: Option<u32>,
+        texture_features_0: Option<u32>,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -263,6 +277,12 @@ mod tests {
             self.record(Command::GetTilerFeatures)?;
             self.tiler_features
                 .map(|tiler_features| DeviceTiler { tiler_features })
+                .ok_or(Status::NotSupported)
+        }
+        fn texture_features(&mut self) -> Result<DeviceTexture, Status> {
+            self.record(Command::GetTextureFeatures)?;
+            self.texture_features_0
+                .map(|texture_features_0| DeviceTexture { texture_features_0 })
                 .ok_or(Status::NotSupported)
         }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -433,6 +453,41 @@ mod tests {
             send(&mut session, &mut backend, Command::GetTilerFeatures),
             Err(Status::NotSupported)
         );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.bindings.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn texture_features_follow_the_same_optional_rule_as_tiler_features() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTextureFeatures),
+            Err(Status::NotSupported)
+        );
+        // Bit 25 is AFRC presence on arch 10, so the word must cross with every bit intact
+        // rather than being reduced to a boolean on this side. — SAKER
+        backend.texture_features_0 = Some(0x0200_0001);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTextureFeatures),
+            Ok(Response::Texture(DeviceTexture {
+                texture_features_0: 0x0200_0001
+            }))
+        );
+        backend.texture_features_0 = Some(0);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTextureFeatures),
+            Err(Status::NotSupported)
+        );
+        // Absence degrades: the session still creates its VM and group afterwards. — SAKER
         assert_eq!(
             send(&mut session, &mut backend, Command::VmCreate),
             Ok(Response::VmCreated { vm: 1 })

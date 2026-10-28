@@ -1,8 +1,8 @@
-//j596
 //j636
 //j644
 //j645
 //j646
+//j647
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -28,6 +28,7 @@ struct Hardware<'a> {
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
+    texture_features_0: u32,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -74,6 +75,15 @@ impl Backend for Hardware<'_> {
         }
         Ok(protocol::DeviceTiler {
             tiler_features: self.tiler_features,
+        })
+    }
+    fn texture_features(&mut self) -> Result<protocol::DeviceTexture, GpuStatus> {
+        // Same optional rule as tiler features. — SAKER
+        if self.texture_features_0 == 0 {
+            return Err(GpuStatus::NotSupported);
+        }
+        Ok(protocol::DeviceTexture {
+            texture_features_0: self.texture_features_0,
         })
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
@@ -294,12 +304,14 @@ pub(super) fn serve(
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
+    texture_features_0: u32,
 ) -> ! {
     let mut hw = Hardware {
         device,
         shader_present,
         mmu_features,
         tiler_features,
+        texture_features_0,
         tables,
         arena,
         root,

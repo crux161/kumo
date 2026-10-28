@@ -1,9 +1,9 @@
 #![no_std]
-//j641
 //j643
 //j644
 //j645
 //j646
+//j647
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -63,6 +63,14 @@ pub struct DeviceMmu {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceTiler {
     pub tiler_features: u32,
+}
+
+/// Element 0 of `TEXTURE_FEATURES`, crossed undecoded like the others. Only this element is
+/// attested, so the name says so rather than implying the full four-word array. Upstream reads
+/// it as the compressed-format bitmask and, at bit 25, as AFRC presence. — SAKER
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceTexture {
+    pub texture_features_0: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

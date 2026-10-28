@@ -1,7 +1,7 @@
-//j643
 //j644
 //j645
 //j646
+//j647
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -10,7 +10,7 @@ use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -35,6 +35,9 @@ pub struct Info {
     /// Raw `TILER_FEATURES`, or zero when the backend reports it unsupported. Zero is the
     /// only field here with an "absent" meaning, so C must not decode it as a shape. — SAKER
     pub tiler_features: u32,
+    /// Raw `TEXTURE_FEATURES[0]`, or zero when absent. Only element 0 of the four-word array
+    /// is attested; C must not read this as the complete set. — SAKER
+    pub texture_features_0: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +81,11 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             Err(Error::Server(crate::Status::NotSupported)) => 0,
             Err(error) => return Err(error),
         };
+        let texture_features_0 = match client.texture() {
+            Ok(texture) => texture.texture_features_0,
+            Err(Error::Server(crate::Status::NotSupported)) => 0,
+            Err(error) => return Err(error),
+        };
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -87,6 +95,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             shader_present: topology.shader_present,
             mmu_features: mmu.mmu_features,
             tiler_features,
+            texture_features_0,
         })
     })();
     match result {
@@ -102,19 +111,20 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 48);
+const _: () = assert!(size_of::<Info>() == 56);
 // Pin both tail offsets. `tiler_features` exactly fills the padding that followed
 // `mmu_features`, so version4's Info is the same *size* as version3's and a size check alone
 // cannot distinguish them — only the version field and these offsets can. — SAKER
 const _: () = assert!(core::mem::offset_of!(Info, mmu_features) == 40);
 const _: () = assert!(core::mem::offset_of!(Info, tiler_features) == 44);
+const _: () = assert!(core::mem::offset_of!(Info, texture_features_0) == 48);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, Command, DeviceInfo, DeviceMmu, DeviceTiler, DeviceTopology, Reply,
-        Request, Response, Status, REPLY_LEN, REQUEST_LEN,
+        client::TransportError, Command, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler,
+        DeviceTopology, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -125,6 +135,7 @@ mod tests {
         failure: bool,
         mmu_failure: bool,
         tiler_unsupported: bool,
+        texture_unsupported: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -158,6 +169,14 @@ mod tests {
                 } else {
                     Ok(Response::Tiler(DeviceTiler {
                         tiler_features: 0x809,
+                    }))
+                }
+            } else if self.command == Some(Command::GetTextureFeatures) {
+                if self.texture_unsupported {
+                    Err(Status::NotSupported)
+                } else {
+                    Ok(Response::Texture(DeviceTexture {
+                        texture_features_0: 0x0200_0001,
                     }))
                 }
             } else {
@@ -211,20 +230,23 @@ mod tests {
                 assert_eq!(out.shader_present, 0x500000005);
                 assert_eq!(out.mmu_features, 0x2830);
                 assert_eq!(out.tiler_features, 0x809);
+                assert_eq!(out.texture_features_0, 0x0200_0001);
             }
         });
         assert!(client.info().is_ok());
     }
 
     #[test]
-    fn an_unsupported_tiler_query_degrades_to_zero_without_failing_the_report() {
+    fn unsupported_optional_queries_degrade_to_zero_without_failing_the_report() {
         let mut client = Client::new(Wire {
             tiler_unsupported: true,
+            texture_unsupported: true,
             ..Wire::default()
         });
         with_api(&mut client, |api| {
             let mut out = Info {
                 tiler_features: 99,
+                texture_features_0: 99,
                 ..Info::default()
             };
             let query = api.query.unwrap();
@@ -232,6 +254,7 @@ mod tests {
             // so the rest of the report is still published and the client stays live. — SAKER
             assert_eq!(unsafe { query(api.context, &mut out) }, OK);
             assert_eq!(out.tiler_features, 0);
+            assert_eq!(out.texture_features_0, 0);
             assert_eq!(out.gpu_id, 0xa8670005);
             assert_eq!(out.mmu_features, 0x2830);
             assert_eq!(out.shader_present, 0x500000005);

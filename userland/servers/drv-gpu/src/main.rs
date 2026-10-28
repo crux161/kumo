@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j593
 //j595
 //j644
 //j645
 //j646
+//j647
 
 mod client;
 
@@ -91,6 +91,9 @@ const TILER_PRESENT_HI: u32 = 0x114;
 /// RESEARCH/009 §4.3: `TILER_FEATURES` at GPU_CONTROL +0x00C, `[4:0]` a log2 bin size and
 /// `[11:8]` the level count. Read-only, in the same powered block as the identity registers.
 const TILER_FEATURES: u32 = 0x00C;
+/// RESEARCH/009 §4.3: `TEXTURE_FEATURES[0..3]` at GPU_CONTROL +0x0B0..0x0BC. Only element 0
+/// is read, because that is the only element upstream's discovery path consumes. — SAKER
+const TEXTURE_FEATURES_0: u32 = 0x0B0;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -1233,11 +1236,12 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             // count. Logged so the board's measurement is on record independently of any
             // client, which is what RESEARCH/009's oracle table asks for. — SAKER
             let tiler_features = read_aperture(TILER_FEATURES);
+            let texture_features_0 = read_aperture(TEXTURE_FEATURES_0);
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: TILER_FEATURES=0x{:08x}; attested raw, not decoded\n",
-                    tiler_features
+                    "drv-gpu: TILER_FEATURES=0x{:08x} TEXTURE_FEATURES0=0x{:08x}; attested raw, not decoded\n",
+                    tiler_features, texture_features_0
                 ),
             );
             let windows = [
@@ -1787,6 +1791,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 shader_present,
                 mmu.features,
                 tiler_features,
+                texture_features_0,
             )
         }
         Err(error) => {

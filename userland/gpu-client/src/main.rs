@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j639
 //j641
 //j644
 //j645
 //j646
+//j647
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -271,6 +271,19 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
         }
         Err(ClientError::Server(GpuStatus::NotSupported)) => log(format_args!(
             "gpu-client: G7e tiler properties unavailable; compute path unaffected\n"
+        )),
+        Err(_) => return Err(Failure::Failed),
+    }
+    // Same optional rule: upstream reads this word whole as the compressed-format mask and
+    // reads bit 25 as AFRC presence on arch 10, so KUMO reduces it to neither. — SAKER
+    match client.texture() {
+        Ok(texture) => log(format_args!(
+            "gpu-client: G7f attested texture: features0=0x{:08x}, AFRC bit25={}\n",
+            texture.texture_features_0,
+            (texture.texture_features_0 >> 25) & 1
+        )),
+        Err(ClientError::Server(GpuStatus::NotSupported)) => log(format_args!(
+            "gpu-client: G7f texture features unavailable; compute path unaffected\n"
         )),
         Err(_) => return Err(Failure::Failed),
     }
