@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j655
 #j656
 #j657
 #j658
 #j659
+#j660
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -363,12 +363,14 @@ def main():
                 assert transcript.count(client) == 2, f"missing two client presents; inspect {serial}"
                 assert transcript.count(bmp) == 1, f"missing regranted bitmap; inspect {serial}"
                 assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
+                assert b"drv-fb: view 0 surface reclaimed" in transcript, f"missing surface reclaim record; inspect {serial}"
                 assert b"drv-fb: view regrant refused" not in transcript
             elif args.async_regrant:
                 bmp = b"bmp-view: bitmap copied; buffer released (software GOP)"
                 assert transcript.count(client) == 2, f"missing two async client presents; inspect {serial}"
                 assert transcript.count(bmp) == 1, f"missing regranted bitmap; inspect {serial}"
                 assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
+                assert b"drv-fb: view 0 surface reclaimed" in transcript, f"missing surface reclaim record; inspect {serial}"
                 assert b"sora: view 0 released by drv-fb" in transcript
                 assert b"sora: view 1 released by drv-fb" in transcript
                 assert b"sora: view 0 client process exited (TERMINATED)" in transcript
@@ -381,6 +383,7 @@ def main():
                 assert transcript.count(demo) == 2, f"missing view 1 replies; inspect {serial}"
                 assert b"gfx-demo: one or more views failed" not in transcript
             assert b"gfx-client: presenter rejected surface" not in transcript
+            assert b"surface reclaim failed" not in transcript
             if args.with_dtb:
                 assert b" declared / " in transcript, f"staged DTB was not loaded; inspect {serial}"
                 marker = b"drv-gpu: DevicePowerUp NotSupported; aperture untouched"

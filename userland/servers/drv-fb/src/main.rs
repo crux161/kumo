@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j639
 //j655
 //j656
 //j657
 //j658
+//j660
 
 mod clock_probe;
 mod display_probe;
@@ -456,7 +456,9 @@ extern "C" fn main(
     // Map each view's read-only surface after the fixed framebuffer and shadow mappings, so
     // the kernel's placement cannot be overwritten by them. Mapping failure disables only
     // that view; the console survives.
-    let mut surface_bases = [0u64; kumo_graphics::VIEW_COUNT];
+    // The live surface base per view. It outlives a closed lane (retained content) and is
+    // reclaimed only when a regrant replaces it. — TIMBERDOODLE
+    let mut view_surface = [0u64; kumo_graphics::VIEW_COUNT];
     for view in 0..kumo_graphics::VIEW_COUNT {
         let handle = surface_handles[view];
         if handle.0 != 0 {
@@ -464,7 +466,7 @@ extern "C" fn main(
                 kumo_rt::vmar_map_anywhere(handle, SURFACE_BYTES as u64, VmarFlags::READ.0);
             let _ = kumo_rt::handle_close(handle);
             if status == 0 {
-                surface_bases[view] = addr;
+                view_surface[view] = addr;
             }
         }
     }
@@ -482,7 +484,7 @@ extern "C" fn main(
             lanes[view] = Some(GraphicsLane {
                 source: Handle(koid as u32),
                 channel: graphics[view],
-                surface: surface_bases[view],
+                surface: view_surface[view],
                 view,
                 full_seen: false,
             });
@@ -616,6 +618,8 @@ extern "C" fn main(
                     let bound =
                         mapped.is_some() && koid != u64::MAX && port_bind(port, channel) == 0;
                     if bound {
+                        let old_surface = view_surface[view];
+                        let new_surface = mapped.unwrap_or(0);
                         if let Some(old) = lanes[view].take() {
                             let _ = kumo_rt::port_unbind(port, old.channel);
                             let _ = kumo_rt::handle_close(old.channel);
@@ -623,12 +627,25 @@ extern "C" fn main(
                         lanes[view] = Some(GraphicsLane {
                             source: Handle(koid as u32),
                             channel,
-                            surface: mapped.unwrap_or(0),
+                            surface: new_surface,
                             view,
                             full_seen: false,
                         });
+                        view_surface[view] = new_surface;
                         view_released[view] = false;
                         view_content[view] = None;
+                        if old_surface != 0 {
+                            let mut line = Line::new();
+                            line.push(b"drv-fb: view ");
+                            line.push_decimal(view);
+                            if kumo_rt::vmar_unmap(old_surface, SURFACE_BYTES as u64) == 0 {
+                                line.push(b" surface reclaimed\n");
+                            } else {
+                                line.push(b" surface reclaim failed\n");
+                            }
+                            let _ =
+                                kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+                        }
                         let mut line = Line::new();
                         line.push(b"drv-fb: view ");
                         line.push_decimal(view);

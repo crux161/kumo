@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j630
 //j632
 //j633
 //j634
 //j635
+//j660
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -51,12 +51,12 @@ pub mod active {
         run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook,
         set_svc_hook, set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
-        system_off, system_reset, timer_irq_count, unmask_spi_interrupt, user_device_page_desc,
-        user_entry_context, user_nc_page_desc, user_page_desc, wait_for_timer_irqs,
-        AppsSmmuTopology, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
-        DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep, ThreadContext,
-        TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment, UserMapping,
-        UserState, ARCH,
+        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_spi_interrupt,
+        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
+        wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError, DevicePowerReadout,
+        DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep,
+        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
+        UserMapping, UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
         display_controller_activate, display_controller_detach, display_controller_new,
@@ -94,10 +94,10 @@ pub mod active {
         set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
         set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
-        system_off, system_reset, timer_irq_count, unmask_boot_io_apic_timer, unmask_spi_interrupt,
-        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
-        wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs, wait_for_timer_irqs,
-        AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
+        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_boot_io_apic_timer,
+        unmask_spi_interrupt, user_device_page_desc, user_entry_context, user_nc_page_desc,
+        user_page_desc, wait_for_io_apic_timer_irqs, wait_for_local_timer_irqs,
+        wait_for_timer_irqs, AcpiLegacyIrqRoute, AcpiMadtReport, AcpiRootReport, AppsSmmuTopology,
         DescriptorTableReport, DevicePowerError, DevicePowerReadout, DevicePowerUnitInfo,
         DevicePowerUpOutcome, El0Report, FpSimdReport, GicTimerGateReport, IoApicRedirectionEntry,
         IoApicReport, IoApicTimerApplied, IoApicTimerPlan, PowerStep, Ring3Error, Ring3Report,

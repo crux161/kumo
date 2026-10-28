@@ -1,12 +1,13 @@
-//j601
 //j606
 //j607
 //j609
+//j660
 
 //! Fixed user virtual-address windows for drv-fb's D0 display probes.
 //!
-//! drv-fb has no `VmarUnmap`; every probe mapping lives for the rest of the process. The D0
-//! hands ran as three parallel slices, and the integrated tree mapped D0c's 0x31000-byte CRU
+//! drv-fb keeps every probe mapping for the rest of the process: the windows are fixed,
+//! disjoint slots in this table, and only the presentation surfaces are reclaimed on regrant.
+//! The D0 hands ran as three parallel slices, and the integrated tree mapped D0c's 0x31000-byte CRU
 //! span at `0x1502_0000` while D0d tried to put HDMI0 at the same base, so `VmarMap` refused
 //! it and the probe could report only "mapping failed" (J601). Keep every window disjoint,
 //! 64 KiB aligned, and inside the child VMAR's fixed region; the host test below holds the

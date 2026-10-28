@@ -1,8 +1,8 @@
-//j601
 //j609
 //j614
 //j629
 //j632
+//j660
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -704,6 +704,18 @@ pub fn vmar_map(
     _len: u64,
     _flags: u64,
 ) -> u64 {
+    u64::MAX
+}
+
+/// Remove an exact mapping from this process's address space (syscall `VmarUnmap`).
+/// The range must match one recorded mapping exactly; returns 0 on success. (J660)
+#[cfg(target_arch = "aarch64")]
+pub fn vmar_unmap(virt: u64, len: u64) -> u64 {
+    syscall(Syscall::VmarUnmap, 0, virt, len, 0)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmar_unmap(_virt: u64, _len: u64) -> u64 {
     u64::MAX
 }
 

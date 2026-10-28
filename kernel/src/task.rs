@@ -1,4 +1,5 @@
 //j659
+//j660
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -100,6 +101,24 @@ impl Process {
 
     pub fn add_mapping(&mut self, mapping: Mapping, vmo_koid: KoId) {
         self.mappings.push((mapping, vmo_koid));
+    }
+
+    /// The mapping whose recorded range exactly matches `[virt, virt + len)`. A subrange is
+    /// deliberately not a match: `VmarUnmap` reclaims whole records, never a prefix. (J660)
+    pub fn mapping_exact(&self, virt: u64, len: u64) -> Option<(Mapping, KoId)> {
+        self.mappings
+            .iter()
+            .find(|(mapping, _)| mapping.virt == virt && mapping.len == len)
+            .copied()
+    }
+
+    /// Remove the mapping `mapping_exact` would find, returning it. (J660)
+    pub fn remove_mapping_exact(&mut self, virt: u64, len: u64) -> Option<(Mapping, KoId)> {
+        let index = self
+            .mappings
+            .iter()
+            .position(|(mapping, _)| mapping.virt == virt && mapping.len == len)?;
+        Some(self.mappings.remove(index))
     }
 
     /// Whether `[start, start + len)` is unused by both VMO mappings and the user stack.
@@ -484,6 +503,35 @@ mod tests {
         let span = process.find_free_span(PAGE_SIZE, PAGE_SIZE).expect("span");
         assert_eq!(span, base + PAGE_SIZE * 12);
         assert!(process.user_range_is_free(span, PAGE_SIZE));
+    }
+
+    #[test]
+    fn exact_mapping_removal_does_not_match_a_subrange() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let base = test_vmar().base();
+        process.add_mapping(
+            Mapping {
+                virt: base,
+                len: PAGE_SIZE * 2,
+                vmo_offset: 0,
+                flags: PageFlags::READ,
+            },
+            KoId(99),
+        );
+
+        assert!(process.mapping_exact(base + PAGE_SIZE, PAGE_SIZE).is_none());
+        assert!(process
+            .remove_mapping_exact(base + PAGE_SIZE, PAGE_SIZE)
+            .is_none());
+        let (mapping, koid) = process
+            .mapping_exact(base, PAGE_SIZE * 2)
+            .expect("exact mapping");
+        assert_eq!(mapping.virt, base);
+        assert_eq!(koid, KoId(99));
+        assert!(process.remove_mapping_exact(base, PAGE_SIZE * 2).is_some());
+        assert!(process.mappings().is_empty());
     }
 
     #[test]

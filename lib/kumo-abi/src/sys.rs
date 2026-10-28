@@ -1,8 +1,8 @@
-//j609
 //j614
 //j629
 //j630
 //j632
+//j660
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +24,10 @@ pub enum Syscall {
     VmoWrite = 14,
     VmarMap = 15,
     VmarProtect = 16,
+    /// Remove an exact, page-aligned mapping from the calling process's address space:
+    /// `(process, virt, len)`. `process` must be `INVALID_HANDLE` (self) in this slice; a
+    /// real process handle is refused. The range must match one recorded mapping exactly,
+    /// and the live user page tables are cleared before the record is removed. (J660)
     VmarUnmap = 17,
     ProcessCreate = 18,
     ThreadCreate = 19,
@@ -343,6 +347,11 @@ mod tests {
     fn interrupt_complete_occupies_the_designated_syscall_slot() {
         assert_eq!(Syscall::InterruptComplete as usize, 25);
         assert_eq!(Syscall::TimerCreate as usize, 27);
+    }
+
+    #[test]
+    fn vmar_unmap_keeps_its_reserved_slot() {
+        assert_eq!(Syscall::VmarUnmap as usize, 17);
     }
 
     #[test]

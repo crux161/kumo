@@ -10,11 +10,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j626
 //j627
 //j628
 //j629
 //j630
+//j660
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1720,6 +1720,21 @@ fn dispatch_object_syscall(
             KernelCallResult::Status(status) => r[0] = status as u32 as u64,
             _ => r[0] = u64::MAX,
         }
+    } else if num == Syscall::VmarUnmap as u64 {
+        let process_handle = Handle(r[0] as u32);
+        let virt = r[1];
+        let len = r[2];
+        match engine.dispatch(
+            target,
+            KernelCall::VmarUnmap {
+                process_handle,
+                virt,
+                len,
+            },
+        ) {
+            KernelCallResult::Status(status) => r[0] = status as u32 as u64,
+            _ => r[0] = u64::MAX,
+        }
     } else if num == Syscall::ResourceMintMmio as u64 {
         let resource = Handle(r[0] as u32);
         let phys_base = r[1];
@@ -2263,7 +2278,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
         } else if dispatch_object_syscall(&mut sora.engine, &mut sora.process, num, r) {
             // Handled by the shared target-agnostic dispatcher (HandleClose, VmoRead/Write,
             // VmoCreate, Handle{Koid,Duplicate}, Port{Create,Bind,Unbind}, TimerCreate,
-            // VmarMap, ResourceMintMmio/CreateChild, InterruptCreate, AddressSpaceCreate,
+            // VmarMap/VmarUnmap, ResourceMintMmio/CreateChild, InterruptCreate, AddressSpaceCreate,
             // Thread{Create,Start}, ChannelCreate, ProcessWait). One shared list — the async
             // chain above and this Sora chain can no longer drift on these arms.
         } else if num == Syscall::FramebufferClaim as u64 {

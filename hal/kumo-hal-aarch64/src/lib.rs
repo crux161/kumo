@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j631
 //j632
 //j634
 //j635
 //j640
+//j660
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -1870,6 +1870,64 @@ pub mod mmu {
         Ok(())
     }
 
+    /// Clear the 4 KiB user leaves covering `[va, va + len)` and flush the TLB. Every page is
+    /// preflighted before any is cleared, so a hole, block descriptor or missing table leaves
+    /// the mapping untouched. The kernel calls this with its identity map active and `root`
+    /// naming the user tree, mirroring `map_user_page`. — TIMBERDOODLE
+    ///
+    /// # Safety
+    /// `root` must be a live L0 table; the kernel identity map must be active; the whole range
+    /// must lie in this tree and be page-granular.
+    pub unsafe fn unmap_user_span(root: u64, va: u64, len: u64) -> Result<(), ()> {
+        if len == 0
+            || va & (PAGE_4K - 1) != 0
+            || len & (PAGE_4K - 1) != 0
+            || va.checked_add(len).is_none()
+        {
+            return Err(());
+        }
+        let mut page = 0;
+        while page < len {
+            let at = va + page;
+            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            if l1 & DESC_VALID == 0 || l1 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let l2 = read_desc(l1 & ADDR_MASK, ((at >> 30) & 0x1ff) as usize);
+            if l2 & DESC_VALID == 0 || l2 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let l3 = read_desc(l2 & ADDR_MASK, ((at >> 21) & 0x1ff) as usize);
+            if l3 & DESC_VALID == 0 || l3 & DESC_TABLE == 0 {
+                return Err(());
+            }
+            let leaf = read_desc(l3 & ADDR_MASK, ((at >> 12) & 0x1ff) as usize);
+            if leaf & DESC_VALID == 0 || leaf & DESC_TABLE == 0 {
+                return Err(());
+            }
+            page += PAGE_4K;
+        }
+        let mut page = 0;
+        while page < len {
+            let at = va + page;
+            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            let l2 = read_desc(l1 & ADDR_MASK, ((at >> 30) & 0x1ff) as usize);
+            let l3 = read_desc(l2 & ADDR_MASK, ((at >> 21) & 0x1ff) as usize);
+            write_desc(l3 & ADDR_MASK, ((at >> 12) & 0x1ff) as usize, 0);
+            page += PAGE_4K;
+        }
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+        Ok(())
+    }
+
     fn parange() -> u64 {
         let mmfr0: u64;
         unsafe {
@@ -2159,7 +2217,8 @@ pub mod mmu {
 pub use mmu::enable_kernel as enable_kernel_mmu;
 #[cfg(target_os = "none")]
 pub use mmu::{
-    map_user_device_block, map_user_page, user_device_page_desc, user_nc_page_desc, user_page_desc,
+    map_user_device_block, map_user_page, unmap_user_span, user_device_page_desc,
+    user_nc_page_desc, user_page_desc,
 };
 #[cfg(target_os = "none")]
 pub use mmu::{read_ttbr0, set_ttbr0};
@@ -2197,6 +2256,15 @@ pub unsafe fn map_user_page(
     _alloc: &mut dyn FnMut() -> Option<u64>,
     _tables: &mut usize,
 ) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Host stub: clear a 4 KiB user span.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn unmap_user_span(_root: u64, _va: u64, _len: u64) -> Result<(), ()> {
     Ok(())
 }
 

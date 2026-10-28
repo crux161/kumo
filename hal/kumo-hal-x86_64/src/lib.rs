@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j571
 //j609
 //j614
 //j619
 //j625
+//j660
 
 mod fpsimd;
 mod gdt;
@@ -1011,6 +1011,14 @@ pub unsafe fn map_user_page(
     tables: &mut usize,
 ) -> Result<(), ()> {
     unsafe { paging::map_user_page(root, va, pa, desc, alloc, tables) }
+}
+
+/// Clear the 4 KiB user leaves covering `[va, va + len)` and flush the TLB.
+///
+/// # Safety
+/// `root` must identify a live, identity-accessible PML4; the range must lie in its user space.
+pub unsafe fn unmap_user_span(root: u64, va: u64, len: u64) -> Result<(), ()> {
+    unsafe { paging::unmap_user_span(root, va, len) }
 }
 
 /// Map a 2 MiB device window using page-granular uncached user leaves.

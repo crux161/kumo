@@ -1,8 +1,8 @@
-//j632
 //j633
 //j634
 //j635
 //j659
+//j660
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -72,6 +72,11 @@ pub enum KernelCall<'a> {
         virt: u64,
         len: u64,
         flags: PageFlags,
+    },
+    VmarUnmap {
+        process_handle: Handle,
+        virt: u64,
+        len: u64,
     },
     ThreadCreate {
         process_handle: Handle,
@@ -2737,6 +2742,17 @@ impl SyscallEngine {
         Ok(())
     }
 
+    /// Clear an exact live user mapping after its record has been validated. The caller has
+    /// switched to the kernel identity map; the HAL preflights every page before clearing any,
+    /// so a hole or block leaves the tree untouched. The root switch back flushes the TLB; the
+    /// HAL also flushes after the clear. — TIMBERDOODLE
+    fn clear_from_live_tree(&self, ttbr0: u64, mapping: Mapping) -> Result<(), Errno> {
+        // SAFETY: caller switched TTBR0 to the kernel identity map; `ttbr0` is the user tree
+        // root and the range was validated against the process's own mapping record.
+        unsafe { kumo_hal::active::unmap_user_span(ttbr0, mapping.virt, mapping.len) }
+            .map_err(|_| Errno::InvalidArgs)
+    }
+
     /// Look up a process by koid. Returns `None` if not found.
     pub fn process_by_koid(&self, koid: KoId) -> Option<&Process> {
         self.processes.iter().find(|p| p.koid() == koid)
@@ -3252,6 +3268,43 @@ impl SyscallEngine {
                     }
                 }
                 KernelCallResult::Status(status)
+            }
+            KernelCall::VmarUnmap {
+                process_handle,
+                virt,
+                len,
+            } => {
+                // Self-only in this slice: a supervisor cannot unmap a child's space through
+                // this call yet. The caller owns its address space; no new authority is added.
+                if process_handle != kumo_abi::INVALID_HANDLE {
+                    return KernelCallResult::Status(Errno::NotSupported.status());
+                }
+                let Some(mapping) = process.mapping_exact(virt, len).map(|(mapping, _)| mapping)
+                else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+                if let Some(ttbr0) = process.ttbr0 {
+                    #[cfg(target_os = "none")]
+                    {
+                        let saved = kumo_hal::active::read_user_aspace_root();
+                        unsafe {
+                            kumo_hal::active::set_user_aspace_root(
+                                crate::user_thread::kernel_ttbr0(),
+                            )
+                        };
+                        let result = self.clear_from_live_tree(ttbr0, mapping);
+                        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+                        if let Err(errno) = result {
+                            return KernelCallResult::Status(errno.status());
+                        }
+                    }
+                    #[cfg(not(target_os = "none"))]
+                    {
+                        let _ = self.clear_from_live_tree(ttbr0, mapping);
+                    }
+                }
+                let _ = process.remove_mapping_exact(virt, len);
+                KernelCallResult::Status(Errno::Ok.status())
             }
             KernelCall::ThreadCreate { process_handle } => {
                 let proc_koid = match process.handles().require(
@@ -6803,6 +6856,82 @@ mod tests {
         assert_eq!(
             engine.dispatch(&mut parent, KernelCall::PortWait { port: late }),
             KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+    }
+
+    #[test]
+    fn vmar_unmap_removes_an_exact_mapping_and_permits_reuse() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let vmo = create_physical_vmo(&mut engine, &mut process, 0x9300_0000, crate::mm::PAGE_SIZE);
+        let base = 0xffff_0000_0000_0000;
+        assert!(mapped(map_page(
+            &mut engine,
+            &mut process,
+            kumo_abi::INVALID_HANDLE,
+            vmo,
+            base,
+            PageFlags::READ,
+        )));
+        assert_eq!(process.mappings().len(), 1);
+
+        let unmap = |engine: &mut SyscallEngine, process: &mut Process, virt: u64, len: u64| {
+            engine.dispatch(
+                process,
+                KernelCall::VmarUnmap {
+                    process_handle: kumo_abi::INVALID_HANDLE,
+                    virt,
+                    len,
+                },
+            )
+        };
+        // A subrange is not the recorded mapping.
+        assert_eq!(
+            unmap(&mut engine, &mut process, base, crate::mm::PAGE_SIZE / 2),
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+        assert_eq!(process.mappings().len(), 1);
+        // An exact self unmap removes it; a repeat finds nothing.
+        assert_eq!(
+            unmap(&mut engine, &mut process, base, crate::mm::PAGE_SIZE),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert!(process.mappings().is_empty());
+        assert_eq!(
+            unmap(&mut engine, &mut process, base, crate::mm::PAGE_SIZE),
+            KernelCallResult::Status(Errno::InvalidArgs.status())
+        );
+
+        // The VA is free again: map it once more, then exercise the live-tree branch.
+        assert!(mapped(map_page(
+            &mut engine,
+            &mut process,
+            kumo_abi::INVALID_HANDLE,
+            vmo,
+            base,
+            PageFlags::READ,
+        )));
+        process.ttbr0 = Some(0x1000);
+        assert_eq!(
+            unmap(&mut engine, &mut process, base, crate::mm::PAGE_SIZE),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert!(process.mappings().is_empty());
+
+        // A real process handle is not a self unmap in this slice.
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x1000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let child = engine.process_create(&mut process, &job, vmar).unwrap();
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::VmarUnmap {
+                    process_handle: child,
+                    virt: base,
+                    len: crate::mm::PAGE_SIZE,
+                },
+            ),
+            KernelCallResult::Status(Errno::NotSupported.status())
         );
     }
 

@@ -1,3 +1,4 @@
+//j660
 //! x86_64 user page-table construction primitives.
 //!
 //! KUMO is still linked in the low identity map on this bring-up path. Process roots therefore
@@ -178,6 +179,68 @@ pub unsafe fn map_user_page(
     Ok(())
 }
 
+/// Clear the 4 KiB user leaves covering `[va, va + len)` and flush the TLB. Every page is
+/// preflighted before any is cleared, so a hole or missing table leaves the mapping untouched.
+///
+/// # Safety
+/// `root` must identify a live, identity-accessible PML4; the range must lie in its user space.
+#[cfg(target_os = "none")]
+pub unsafe fn unmap_user_span(root: u64, va: u64, len: u64) -> Result<(), ()> {
+    if len == 0
+        || va & (PAGE_SIZE - 1) != 0
+        || len & (PAGE_SIZE - 1) != 0
+        || va.checked_add(len).is_none()
+    {
+        return Err(());
+    }
+    let page_indices = |at: u64| {
+        [
+            ((at >> 39) & 0x1ff) as usize,
+            ((at >> 30) & 0x1ff) as usize,
+            ((at >> 21) & 0x1ff) as usize,
+            ((at >> 12) & 0x1ff) as usize,
+        ]
+    };
+    let mut page = 0;
+    while page < len {
+        let at = va + page;
+        if !valid_user_range(at, PAGE_SIZE) {
+            return Err(());
+        }
+        let indices = page_indices(at);
+        let mut table = root;
+        let mut level = 0;
+        while level < 3 {
+            let value = unsafe { (table as *const u64).add(indices[level]).read_volatile() };
+            if value & PRESENT == 0 || value & USER == 0 {
+                return Err(());
+            }
+            table = value & ADDRESS;
+            level += 1;
+        }
+        if unsafe { (table as *const u64).add(indices[3]).read_volatile() } & PRESENT == 0 {
+            return Err(());
+        }
+        page += PAGE_SIZE;
+    }
+    let mut page = 0;
+    while page < len {
+        let at = va + page;
+        let indices = page_indices(at);
+        let mut table = root;
+        let mut level = 0;
+        while level < 3 {
+            let value = unsafe { (table as *const u64).add(indices[level]).read_volatile() };
+            table = value & ADDRESS;
+            level += 1;
+        }
+        unsafe { (table as *mut u64).add(indices[3]).write_volatile(0) };
+        page += PAGE_SIZE;
+    }
+    unsafe { set_root(read_root()) };
+    Ok(())
+}
+
 #[cfg(not(target_os = "none"))]
 pub unsafe fn map_user_page(
     _root: u64,
@@ -187,6 +250,15 @@ pub unsafe fn map_user_page(
     _alloc: &mut dyn FnMut() -> Option<u64>,
     _tables: &mut usize,
 ) -> Result<(), ()> {
+    Ok(())
+}
+
+/// Host stub: clear a 4 KiB user span.
+///
+/// # Safety
+/// Stub; `unsafe` to match the hardware contract.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn unmap_user_span(_root: u64, _va: u64, _len: u64) -> Result<(), ()> {
     Ok(())
 }
 
