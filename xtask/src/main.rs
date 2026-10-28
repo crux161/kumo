@@ -1,8 +1,8 @@
-//j569
 //j572
 //j578
 //j595
 //j648
+//j649
 
 use std::env;
 use std::fmt;
@@ -881,6 +881,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
                 (BMP_VIEW_PATH, bmp_view.as_slice()),
+                (
+                    "share/images/sample.bmp",
+                    include_bytes!("../../userland/bmp-view/assets/sample.bmp"),
+                ),
                 (kumo_abi::initrd::GPU_CLIENT_PATH, gpu_client.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),

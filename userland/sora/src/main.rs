@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j633
 //j634
 //j635
 //j636
 //j648
+//j649
 
 extern crate alloc;
 
@@ -292,21 +292,175 @@ fn graphics_demo(cmd: &kumoza::Command) {
     }
 }
 
-/// Hand one supervisor-held presentation grant to a separate process (F1b). The child receives
-/// the client end of the channel in x0 and the surface VMO in x1; both handles move into the
-/// child's table. A grant that is not admitted stays with Sora and is closed.
-fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
+/// Snapshot one selected file into its own immutable VMO; the viewer gets no namespace. — SAKER
+fn bitmap_snapshot(
+    len: u64,
+    read: impl FnMut(u64, &mut [u8]) -> Option<usize>,
+) -> Result<(Handle, u64), &'static [u8]> {
+    if len == 0 || len > bmp_view::MAX_FILE_BYTES {
+        return Err(b"bmp-view: file must be 1..16777216 bytes\n");
+    }
+    let raw = vmo_create((len + 4095) & !4095);
+    if raw == 0 || raw == u64::MAX {
+        return Err(b"bmp-view: file VMO unavailable\n");
+    }
+    let writer = Handle(raw as u32);
+    let copied = bmp_view::copy_file(len, read, |offset, bytes| {
+        vmo_write(writer, offset, bytes.as_ptr(), bytes.len()) == 0
+    });
+    let grant = if copied {
+        handle_duplicate(writer, Rights::READ | Rights::TRANSFER)
+    } else {
+        0
+    };
+    let _ = handle_close(writer);
+    if grant == 0 || grant == u64::MAX {
+        return Err(b"bmp-view: file read failed\n");
+    }
+    Ok((Handle(grant as u32), len))
+}
+
+fn bitmap_volume_file(fs: Handle, path: &[u8]) -> Result<(Handle, u64), &'static [u8]> {
+    let result = (|| {
+        let mut request = [0; 4 + kumo_vfs::MAX_PATH];
+        let mut reply = [0; 257];
+        let mut call = |request: &[u8]| -> Result<usize, &'static [u8]> {
+            if channel_write(fs, request.as_ptr(), request.len()) != 0 {
+                return Err(b"bmp-view: filesystem unavailable\n");
+            }
+            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
+            if n == 0 || n > reply.len() as u64 {
+                return Err(b"bmp-view: filesystem read failed\n");
+            }
+            Ok(n as usize)
+        };
+        let n = kumo_vfs::Request::open(path)
+            .encode_into(&mut request)
+            .ok_or(b"bmp-view: path too long\n".as_slice())?;
+        let n = call(&request[..n])?;
+        drop(call);
+        let (file, len) = kumo_vfs::parse_open_reply(&reply[..n]).map_err(|error| match error {
+            kumo_vfs::VfsError::Status(kumo_vfs::VFS_NOT_FOUND) => {
+                b"bmp-view: not found\n".as_slice()
+            }
+            kumo_vfs::VfsError::Status(kumo_vfs::VFS_IS_DIR) => {
+                b"bmp-view: is a directory\n".as_slice()
+            }
+            _ => b"bmp-view: open failed\n".as_slice(),
+        })?;
+        bitmap_snapshot(len, |offset, bytes| {
+            let n = kumo_vfs::Request::read(file, offset, bytes.len() as u32)
+                .encode_into(&mut request)?;
+            if channel_write(fs, request.as_ptr(), n) != 0 {
+                return None;
+            }
+            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
+            if n == 0 || n > reply.len() as u64 {
+                return None;
+            }
+            let data = kumo_vfs::read_payload(&reply[..n as usize]).ok()?;
+            if data.len() > bytes.len() {
+                return None;
+            }
+            bytes[..data.len()].copy_from_slice(data);
+            Some(data.len())
+        })
+    })();
+    let _ = handle_close(fs);
+    let _ = process_wait();
+    result
+}
+
+fn bitmap_file(initrd: Handle, path: &[u8]) -> Result<(Handle, u64), &'static [u8]> {
+    if !sora::shell_may_read(path) {
+        return Err(b"bmp-view: permission denied\n");
+    }
+    if let Some(path) = sora::scratch_path(path) {
+        let fs = spawn_fatfs(initrd).ok_or(b"bmp-view: filesystem unavailable\n".as_slice())?;
+        return bitmap_volume_file(fs, path);
+    }
+    match sora::media_route(path) {
+        sora::MediaRoute::Root => return Err(b"bmp-view: is a directory\n"),
+        sora::MediaRoute::Volume { name, path } => {
+            if !media().is_some_and(|media| media.name.as_bytes() == name) {
+                return Err(b"bmp-view: no such volume\n");
+            }
+            let fs = spawn_media_fatfs(initrd, BlockAccess::ReadOnly)
+                .ok_or(b"bmp-view: filesystem unavailable\n".as_slice())?;
+            return bitmap_volume_file(fs, path);
+        }
+        sora::MediaRoute::Elsewhere => {}
+    }
+    let path = path.strip_prefix(b"/").unwrap_or(path);
+    let (base, len) = initrd_find(initrd, path).ok_or(b"bmp-view: not found\n".as_slice())?;
+    bitmap_snapshot(len, |offset, bytes| {
+        (vmo_read(initrd, base + offset, bytes.as_mut_ptr(), bytes.len()) == 0)
+            .then_some(bytes.len())
+    })
+}
+
+/// Hand one supervisor-held presentation grant to a separate process (F1b). gfx-client
+/// receives the presenter directly; bmp-view receives it through its finite bootstrap,
+/// alongside an optional read-only file snapshot. Both receive the surface VMO in x1.
+fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
     use kumo_graphics::VIEW_COUNT;
     let bitmap = cmd.name == "bmp-view";
     let name = cmd.name.as_bytes();
-    if !cmd.args.is_empty() {
+    if cmd.args.len() > usize::from(bitmap) {
         usage(if bitmap {
-            b"usage: bmp-view\n"
+            b"usage: bmp-view [path]\n"
         } else {
             b"usage: gfx-client\n"
         });
         return;
     }
+    let file = if let Some(path) = cmd.args.first() {
+        let path = match cwd.resolve(path) {
+            Ok(path) => path,
+            Err(_) => {
+                usage(b"bmp-view: invalid path\n");
+                return;
+            }
+        };
+        match bitmap_file(initrd, path.as_bytes()) {
+            Ok(file) => Some(file),
+            Err(message) => {
+                log(message);
+                fail_status(1);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let bootstrap = if bitmap {
+        let (send, child) = channel_create_pair();
+        if send == u64::MAX || child == u64::MAX {
+            for raw in [send, child] {
+                if raw != u64::MAX {
+                    let _ = handle_close(Handle(raw as u32));
+                }
+            }
+            if let Some((file, _)) = file {
+                let _ = handle_close(file);
+            }
+            log(b"bmp-view: bootstrap unavailable\n");
+            fail_status(1);
+            return;
+        }
+        Some((Handle(send as u32), Handle(child as u32)))
+    } else {
+        None
+    };
+    let close_inputs = || {
+        if let Some((file, _)) = file {
+            let _ = handle_close(file);
+        }
+        if let Some((send, child)) = bootstrap {
+            let _ = handle_close(send);
+            let _ = handle_close(child);
+        }
+    };
     let mut selected = None;
     for view in 0..VIEW_COUNT {
         let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
@@ -320,6 +474,7 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
     let Some((view, channel, vmo)) = selected else {
         log(name);
         log(b": no graphics view available\n");
+        close_inputs();
         fail_status(1);
         return;
     };
@@ -327,6 +482,7 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
         let _ = handle_close(channel);
         log(name);
         log(b": no surface available\n");
+        close_inputs();
         fail_status(1);
         return;
     }
@@ -334,6 +490,39 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
     log(b": view ");
     log(&[b'0' + view as u8]);
     log(b" handed to a client process\n");
+    let argument = if let Some((send, child)) = bootstrap {
+        let header = bmp_view::file_header(file.map_or(0, |(_, len)| len)).unwrap();
+        let queued = if let Some((file, _)) = file {
+            channel_write_with_handle(send, header.as_ptr(), header.len(), file) == 0
+        } else {
+            channel_write(send, header.as_ptr(), header.len()) == 0
+        };
+        let presenter_queued = queued
+            && channel_write_with_handle(
+                send,
+                bmp_view::PRESENTER_TAG.as_ptr(),
+                bmp_view::PRESENTER_TAG.len(),
+                channel,
+            ) == 0;
+        if !presenter_queued {
+            if !queued {
+                if let Some((file, _)) = file {
+                    let _ = handle_close(file);
+                }
+            }
+            let _ = handle_close(send);
+            let _ = handle_close(child);
+            let _ = handle_close(channel);
+            let _ = handle_close(vmo);
+            log(b"bmp-view: bootstrap queue failed\n");
+            fail_status(1);
+            return;
+        }
+        let _ = handle_close(send);
+        child
+    } else {
+        channel
+    };
     let flags = (ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2).bits();
     let ran = run_elf_threads(
         initrd,
@@ -343,7 +532,7 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
             GFX_CLIENT_PATH
         }
         .as_bytes(),
-        channel.0 as u64,
+        argument.0 as u64,
         vmo.0 as u64,
         flags,
         name,
@@ -353,8 +542,8 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle) {
     if !ran {
         // An admitted child owns the handles even if it exited non-zero; only an admission
         // failure leaves them with Sora.
-        if handle_koid(channel) != u64::MAX {
-            let _ = handle_close(channel);
+        if handle_koid(argument) != u64::MAX {
+            let _ = handle_close(argument);
             let _ = handle_close(vmo);
         }
         fail_status(1);
@@ -3808,7 +3997,7 @@ fn eval_command(
         return true;
     }
     if matches!(cmd.name.as_str(), "gfx-client" | "bmp-view") {
-        graphics_client(cmd, initrd);
+        graphics_client(cmd, initrd, cwd);
         return true;
     }
     if cmd.name == "dmesg" {

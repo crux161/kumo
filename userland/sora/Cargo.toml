@@ -1,8 +1,8 @@
-#j558
 #j563
 #j567
 #j572
 #j597
+#j649
 
 [package]
 name = "sora"
@@ -12,6 +12,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+bmp-view = { path = "../bmp-view" }
 drv-fb = { path = "../servers/drv-fb" }
 drv-gpu = { path = "../servers/drv-gpu" }
 drv-blk = { path = "../servers/drv-blk" }

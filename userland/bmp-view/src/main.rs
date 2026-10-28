@@ -1,13 +1,18 @@
 #![no_std]
 #![no_main]
 //j648
+//j649
 
-//! Sora transfers only a presentation channel (x0) and its writable surface VMO (x1).
+//! Sora transfers a finite bootstrap channel (x0) and a writable surface VMO (x1).
+//! Bootstrap grants one presenter and, optionally, the selected file as a read-only VMO.
 
-use bmp_view::{Bitmap, ROW_BYTES, SAMPLE};
-use kumo_abi::Handle;
+use bmp_view::{file_length, Bitmap, FILE_HEADER_LEN, PRESENTER_TAG, ROW_BYTES, SAMPLE};
+use kumo_abi::{Handle, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, DEMO, REPLY_LEN};
-use kumo_rt::{channel_read, channel_write, log_write, process_exit, vmo_write};
+use kumo_rt::{
+    channel_read, channel_read_with_handle, channel_write, handle_close, log_write, process_exit,
+    vmar_map_anywhere, vmo_write,
+};
 
 kumo_rt::entry!(main);
 
@@ -27,9 +32,34 @@ extern "C" fn main(
     _a6: u64,
     _a7: u64,
 ) -> ! {
-    let channel = Handle(channel as u32);
+    let bootstrap = Handle(channel as u32);
+    let mut header = [0; FILE_HEADER_LEN + 1];
+    let (n, file) = channel_read_with_handle(bootstrap, header.as_mut_ptr(), header.len());
+    let len = header
+        .get(..n)
+        .and_then(file_length)
+        .unwrap_or_else(|| fail(b"bmp-view: bad file grant\n"));
+    let source = if len == 0 && file == 0 {
+        SAMPLE
+    } else if len != 0 && file != 0 && file != u64::MAX {
+        let map_len = (len + 4095) & !4095;
+        let (status, address) = vmar_map_anywhere(Handle(file as u32), map_len, VmarFlags::READ.0);
+        if status != 0 || address == 0 {
+            fail(b"bmp-view: file map failed\n");
+        }
+        // The selected file has no remaining writer; the read-only mapping lives until exit. — SAKER
+        unsafe { core::slice::from_raw_parts(address as *const u8, len as usize) }
+    } else {
+        fail(b"bmp-view: bad file handle\n");
+    };
+    let (n, presenter) = channel_read_with_handle(bootstrap, header.as_mut_ptr(), header.len());
+    if header.get(..n) != Some(PRESENTER_TAG) || presenter == 0 || presenter == u64::MAX {
+        fail(b"bmp-view: no presentation channel\n");
+    }
+    let _ = handle_close(bootstrap);
+    let channel = Handle(presenter as u32);
     let vmo = Handle(surface as u32);
-    let bitmap = Bitmap::new(SAMPLE).unwrap_or_else(|_| fail(b"bmp-view: invalid BMP\n"));
+    let bitmap = Bitmap::new(source).unwrap_or_else(|_| fail(b"bmp-view: invalid BMP\n"));
     let mut row = [0u8; ROW_BYTES];
     for y in 0..DEMO.height {
         bitmap
