@@ -1,9 +1,9 @@
 #![no_std]
-//j567
 //j568
 //j636
 //j655
 //j656
+//j657
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -335,6 +335,23 @@ impl Reply {
     }
 }
 
+/// One runtime view regrant on Sora's retained drv-fb bootstrap channel: the tag, the view
+/// index, and one transferred presentation-channel handle. Clients never see this frame.
+/// — TIMBERDOODLE
+pub const REGRANT_TAG: u8 = b'R';
+
+pub fn regrant_request(view: usize) -> Option<[u8; 2]> {
+    (view < VIEW_COUNT).then_some([REGRANT_TAG, view as u8])
+}
+
+pub fn parse_regrant(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() == 2 && bytes[0] == REGRANT_TAG && (bytes[1] as usize) < VIEW_COUNT {
+        Some(bytes[1] as usize)
+    } else {
+        None
+    }
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -644,5 +661,19 @@ mod tests {
         );
         assert_eq!(damage_poison_pixel(rect.x, rect.y), DAMAGE_COLOR);
         assert_eq!(damage_poison_pixel(0, 0), CLIP_POISON);
+    }
+
+    #[test]
+    fn regrant_frames_round_trip_and_reject_out_of_range_views() {
+        for view in 0..VIEW_COUNT {
+            let frame = regrant_request(view).unwrap();
+            assert_eq!(frame[0], REGRANT_TAG);
+            assert_eq!(parse_regrant(&frame), Some(view));
+        }
+        assert_eq!(regrant_request(VIEW_COUNT), None);
+        assert_eq!(parse_regrant(&[REGRANT_TAG]), None);
+        assert_eq!(parse_regrant(&[REGRANT_TAG, VIEW_COUNT as u8]), None);
+        assert_eq!(parse_regrant(&[b'X', 0]), None);
+        assert_eq!(parse_regrant(&[REGRANT_TAG, 0, 0]), None);
     }
 }

@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j634
 //j636
 //j639
 //j655
 //j656
+//j657
 
 mod clock_probe;
 mod display_probe;
@@ -497,6 +497,22 @@ extern "C" fn main(
     let mut view_content: [Option<(u64, kumo_graphics::Surface)>; kumo_graphics::VIEW_COUNT] =
         [None; kumo_graphics::VIEW_COUNT];
 
+    // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
+    // view with a fresh presentation channel and surface. — TIMBERDOODLE
+    let control_koid = handle_koid(bootstrap);
+    let control_source = Handle(if control_koid == u64::MAX {
+        0
+    } else {
+        control_koid as u32
+    });
+    let control_bound = control_source.0 != 0 && port_bind(port, bootstrap) == 0;
+    let control_message: &[u8] = if control_bound {
+        b"drv-fb: view control armed\n"
+    } else {
+        b"drv-fb: view control unavailable\n"
+    };
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, control_message);
+
     // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
     // Output-only — no keyboard device sits behind the framebuffer yet. A read takes a whole
     // message and drops what does not fit, so the buffer is a whole message (J559: a 256-byte
@@ -550,6 +566,71 @@ extern "C" fn main(
         let source = Handle(port_wait(port) as u32);
         if r1.as_ref().is_some_and(|pending| pending.owns(source)) {
             r1 = r1.take().and_then(|pending| modeset::wake(pending, source));
+            continue;
+        }
+        if control_bound && source == control_source {
+            let (n, regrant_raw) = channel_read_with_handle(bootstrap, rx.as_mut_ptr(), rx.len());
+            let channel = Handle(regrant_raw as u32);
+            let _ = kumo_rt::log_write(
+                kumo_abi::sys::log_level::NOTICE,
+                b"drv-fb: view control record\n",
+            );
+            let view = (n <= rx.len())
+                .then(|| kumo_graphics::parse_regrant(&rx[..n]))
+                .flatten();
+            match view {
+                Some(view) => {
+                    let mut sbuf = [0u8; 32];
+                    let (sn, surface_raw) =
+                        channel_read_with_handle(channel, sbuf.as_mut_ptr(), sbuf.len());
+                    let surface = Handle(surface_raw as u32);
+                    let mut mapped = None;
+                    if sn == 1 && surface.0 != 0 {
+                        let (status, addr) = kumo_rt::vmar_map_anywhere(
+                            surface,
+                            SURFACE_BYTES as u64,
+                            VmarFlags::READ.0,
+                        );
+                        if status == 0 && addr != 0 {
+                            mapped = Some(addr);
+                        }
+                        let _ = kumo_rt::handle_close(surface);
+                    }
+                    let koid = handle_koid(channel);
+                    let bound =
+                        mapped.is_some() && koid != u64::MAX && port_bind(port, channel) == 0;
+                    if bound {
+                        if let Some(old) = lanes[view].take() {
+                            let _ = kumo_rt::port_unbind(port, old.channel);
+                            let _ = kumo_rt::handle_close(old.channel);
+                        }
+                        lanes[view] = Some(GraphicsLane {
+                            source: Handle(koid as u32),
+                            channel,
+                            surface: mapped.unwrap_or(0),
+                            view,
+                            full_seen: false,
+                        });
+                        view_content[view] = None;
+                        let mut line = Line::new();
+                        line.push(b"drv-fb: view ");
+                        line.push_decimal(view);
+                        line.push(b" regranted\n");
+                        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+                    } else {
+                        let _ = kumo_rt::handle_close(channel);
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            b"drv-fb: view regrant refused\n",
+                        );
+                    }
+                }
+                None => {
+                    if channel.0 != 0 {
+                        let _ = kumo_rt::handle_close(channel);
+                    }
+                }
+            }
             continue;
         }
         if source == console_source {

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j636
 //j648
 //j649
 //j654
 //j655
+//j657
 
 extern crate alloc;
 
@@ -76,6 +76,15 @@ static GRAPHICS_VMO: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 static GRAPHICS_SEQUENCE: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(1), AtomicU32::new(1)];
+
+/// Sora's write end of drv-fb's bootstrap channel, retained after startup so a released view
+/// can be regranted with a fresh presentation channel. — TIMBERDOODLE
+static DRV_FB_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
+/// Views whose synchronous client exited (or whose taken grant failed), so a later
+/// gfx-client/bmp-view may be given a fresh channel and surface for the same view.
+/// — TIMBERDOODLE
+static GRAPHICS_RELEASED: [AtomicBool; kumo_graphics::VIEW_COUNT] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
 
 /// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
 /// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
@@ -532,6 +541,56 @@ fn bitmap_file(initrd: Handle, path: &[u8]) -> Result<(Handle, u64), &'static [u
 /// Hand one supervisor-held presentation grant to a separate process (F1b). gfx-client
 /// receives the presenter directly; bmp-view receives it through its finite bootstrap,
 /// alongside an optional read-only file snapshot. Both receive the surface VMO in x1.
+/// Re-grant a released view: a fresh channel pair and surface, announced on the retained
+/// drv-fb bootstrap channel. Returns the client end and its VMO, or None after closing every
+/// handle when the request cannot be staged. — TIMBERDOODLE
+fn regrant_view(view: usize) -> Option<(Handle, Handle)> {
+    let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+    let frame = kumo_graphics::regrant_request(view)?;
+    if control.0 == 0 {
+        log(b"gfx: regrant without a control channel\n");
+        return None;
+    }
+    let valid = |raw: u64| raw != 0 && raw != u64::MAX;
+    let (client, server) = channel_create_pair();
+    let vmo = vmo_create(kumo_graphics::SURFACE_BYTES as u64);
+    let surface = if valid(vmo) {
+        handle_duplicate(Handle(vmo as u32), Rights::READ | Rights::TRANSFER)
+    } else {
+        0
+    };
+    let queued = valid(client)
+        && valid(server)
+        && valid(surface)
+        && channel_write_with_handle(
+            Handle(client as u32),
+            b"S".as_ptr(),
+            1,
+            Handle(surface as u32),
+        ) == 0;
+    if !queued {
+        log(b"gfx: regrant surface queue failed\n");
+    }
+    let sent = queued
+        && channel_write_with_handle(control, frame.as_ptr(), frame.len(), Handle(server as u32))
+            == 0;
+    if queued && !sent {
+        log(b"gfx: regrant control write failed\n");
+    }
+    if sent {
+        return Some((Handle(client as u32), Handle(vmo as u32)));
+    }
+    for raw in [client, server, vmo] {
+        if valid(raw) {
+            let _ = handle_close(Handle(raw as u32));
+        }
+    }
+    if valid(surface) && !queued {
+        let _ = handle_close(Handle(surface as u32));
+    }
+    None
+}
+
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
     use kumo_graphics::VIEW_COUNT;
     let bitmap = cmd.name == "bmp-view";
@@ -601,6 +660,18 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
         selected = Some((view, channel, vmo));
         break;
     }
+    if selected.is_none() {
+        for view in 0..VIEW_COUNT {
+            if !GRAPHICS_RELEASED[view].load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Some((channel, vmo)) = regrant_view(view) {
+                GRAPHICS_RELEASED[view].store(false, Ordering::Relaxed);
+                selected = Some((view, channel, vmo));
+                break;
+            }
+        }
+    }
     let Some((view, channel, vmo)) = selected else {
         log(name);
         log(b": no graphics view available\n");
@@ -610,6 +681,7 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
     };
     if vmo.0 == 0 {
         let _ = handle_close(channel);
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
         log(name);
         log(b": no surface available\n");
         close_inputs();
@@ -645,6 +717,7 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
             let _ = handle_close(channel);
             let _ = handle_close(vmo);
             log(b"bmp-view: bootstrap queue failed\n");
+            GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
             fail_status(1);
             return;
         }
@@ -678,6 +751,9 @@ fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory
         }
         fail_status(1);
     }
+    // The synchronous child has exited (or admission failed); the grant is gone, so a later
+    // invocation may regrant this view. — TIMBERDOODLE
+    GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
 }
 
 /// Admit one presentation client per supervisor-held view, concurrently (F2a-1). Each child
@@ -2937,6 +3013,8 @@ extern "C" fn sora_main(
                         );
                         let graphics_enabled = kumo_graphics::band(fb.width, fb.height).is_some();
                         let graphics = bootstrap_graphics(srv, graphics_enabled);
+                        DRV_FB_BOOTSTRAP.store(srv.0, Ordering::Relaxed);
+                        notice(&[b"sora: drv-fb bootstrap retained for view regrant\n"]);
                         if run_elf(
                             initrd,
                             kumo_abi::DRV_FB_PATH.as_bytes(),
@@ -2971,6 +3049,8 @@ extern "C" fn sora_main(
                                     let _ = handle_close(*vmo);
                                 }
                             }
+                            let _ = handle_close(srv);
+                            DRV_FB_BOOTSTRAP.store(0, Ordering::Relaxed);
                         }
                     } else {
                         log(b"drv-fb: channel fail\n");
