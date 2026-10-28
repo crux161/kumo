@@ -2,6 +2,7 @@
 //j596
 //j636
 //j644
+//j645
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -25,6 +26,7 @@ struct Pending {
 struct Hardware<'a> {
     device: &'a mut Device,
     shader_present: u64,
+    mmu_features: u32,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -52,6 +54,14 @@ impl Backend for Hardware<'_> {
         // field selects a register, core mask or hardware slot. — KESTREL
         Ok(protocol::DeviceTopology {
             shader_present: self.shader_present,
+        })
+    }
+    fn mmu_features(&mut self) -> Result<protocol::DeviceMmu, GpuStatus> {
+        // The same MMU_FEATURES word bring-up read, and already required to report 48 virtual
+        // address bits before this server ran. No client field selects a register, address
+        // space or translation policy. — SAKER
+        Ok(protocol::DeviceMmu {
+            mmu_features: self.mmu_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
@@ -270,10 +280,12 @@ pub(super) fn serve(
     csg: CsgControl,
     cs: CsControl,
     shader_present: u64,
+    mmu_features: u32,
 ) -> ! {
     let mut hw = Hardware {
         device,
         shader_present,
+        mmu_features,
         tables,
         arena,
         root,

@@ -1,6 +1,7 @@
 //j594
 //j596
 //j644
+//j645
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -8,8 +9,8 @@
 //! requires a fresh session. The server must reject duplicate/stale IDs before any mutation.
 
 use crate::{
-    valid_buffer_bytes, BindFlags, Binding, DeviceInfo, DeviceTopology, Status, Submission,
-    SyncState,
+    valid_buffer_bytes, BindFlags, Binding, DeviceInfo, DeviceMmu, DeviceTopology, Status,
+    Submission, SyncState,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -19,6 +20,7 @@ pub const REPLY_LEN: usize = 48;
 pub enum Command {
     GetInfo,
     GetTopology,
+    GetMmuFeatures,
     VmCreate,
     BufferCreate {
         bytes: u64,
@@ -47,6 +49,7 @@ impl Request {
         let (op, args) = match self.command {
             Command::GetInfo => (7, [0; 6]),
             Command::GetTopology => (8, [0; 6]),
+            Command::GetMmuFeatures => (9, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
@@ -94,6 +97,7 @@ impl Request {
         let command = match word(bytes, 8) {
             7 => Command::GetInfo,
             8 => Command::GetTopology,
+            9 => Command::GetMmuFeatures,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             3 => {
@@ -138,6 +142,7 @@ impl Request {
 pub enum Response {
     Info(DeviceInfo),
     Topology(DeviceTopology),
+    Mmu(DeviceMmu),
     VmCreated {
         vm: u32,
     },
@@ -192,6 +197,7 @@ impl Reply {
                 (0, [0; 4])
             }
             Ok(Response::Topology(topology)) => (8, [topology.shader_present, 0, 0, 0]),
+            Ok(Response::Mmu(mmu)) => (9, [u64::from(mmu.mmu_features), 0, 0, 0]),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
@@ -234,6 +240,9 @@ impl Reply {
                 }),
                 8 if a[0] != 0 => Response::Topology(DeviceTopology {
                     shader_present: a[0],
+                }),
+                9 if a[0] != 0 => Response::Mmu(DeviceMmu {
+                    mmu_features: a[0] as u32,
                 }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {

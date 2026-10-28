@@ -1,9 +1,9 @@
 #![no_std]
-//j595
 //j596
 //j641
 //j643
 //j644
+//j645
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -47,6 +47,14 @@ pub struct DeviceInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceTopology {
     pub shader_present: u64,
+}
+
+/// The raw `MMU_FEATURES` word attested during driver bring-up. It crosses the channel
+/// undecoded on purpose: bits [7:0] are the hardware virtual-address width, and deriving a
+/// range from them is the consumer's job, so this channel never invents an address space. — SAKER
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceMmu {
+    pub mmu_features: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

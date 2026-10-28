@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*j643*/
 /*j644*/
+/*j645*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -11,7 +12,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 2u
+#define KUMO_GPU_API_VERSION 3u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -23,10 +24,11 @@
 struct kumo_gpu_info {
     uint32_t gpu_id;
     uint32_t cs_features;
-    uint64_t va_start; /* service limits, not full hardware MMU properties */
+    uint64_t va_start; /* this service's window, not the hardware MMU range */
     uint64_t va_end;
     uint64_t max_buffer_bytes;
     uint64_t shader_present; /* attested shader core-ID mask */
+    uint32_t mmu_features;   /* attested MMU_FEATURES; [7:0] is the VA width — SAKER */
 };
 struct kumo_gpu_api {
     uint32_t version;
@@ -38,6 +40,8 @@ struct kumo_gpu_api {
 #define KUMO_MESA_INCOMPLETE 1u
 #define KUMO_MESA_BAD_ABI 2u
 #define KUMO_MESA_QUERY_FAILED 3u
+/* The attested hardware VA range cannot hold this service's own window. — SAKER */
+#define KUMO_MESA_VA_RANGE 4u
 
 /* Complete pan_kmod_dev_props groups still unavailable over GetInfo. See README.
  * This mask records missing information; zero-filled properties are never a device.
@@ -61,14 +65,19 @@ struct kumo_mesa_report {
     uint32_t reserved;
     uint32_t core_count;
     uint32_t core_id_range;
+    /* Derived by upstream pan_kmod_dev_query_user_va_range from the attested
+     * mmu_features, never computed by KUMO. — SAKER */
+    uint64_t va_range_start;
+    uint64_t va_range_size;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
                          struct kumo_mesa_report *out);
 
-_Static_assert(sizeof(struct kumo_gpu_info) == 40, "query layout");
+_Static_assert(sizeof(struct kumo_gpu_info) == 48, "query layout");
 _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment");
-_Static_assert(sizeof(struct kumo_mesa_report) == 64, "report layout");
+_Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
+_Static_assert(sizeof(struct kumo_mesa_report) == 88, "report layout");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

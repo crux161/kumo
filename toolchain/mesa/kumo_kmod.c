@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*j643*/
 /*j644*/
+/*j645*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 
@@ -26,6 +27,7 @@ static const struct pan_kmod_ops native_scaffold = {
  * header closure. Do not mirror a hand-written pan_kmod_ops definition. — KESTREL */
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->gpu_id) == 8, "Mesa GPU ID");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->shader_present) == 8, "Mesa topology");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->mmu_features) == 4, "Mesa MMU properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->texture_features) == 16, "Mesa texture properties");
 
 uint32_t
@@ -48,9 +50,41 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     /* A private partial input for these two pure upstream helpers only. Both read
      * shader_present; it is never published as a complete device property set.
      * Tiler features are still absent, so the topology group stays missing. — KESTREL */
-    const struct pan_kmod_dev_props props = { .shader_present = out->info.shader_present };
+    /* It now also carries mmu_features for the VA-range helper below. The set is still
+     * partial and still never published as a device. — SAKER */
+    const struct pan_kmod_dev_props props = {
+        .shader_present = out->info.shader_present,
+        .mmu_features = out->info.mmu_features,
+    };
     out->core_count = pan_query_core_count(&props);
     out->core_id_range = pan_query_core_id_range(&props);
+
+    /* Upstream derives the range by shifting 1ull by this field, so an attested width of
+     * 64 or more would be undefined behaviour inside Mesa's own helper. Refuse before
+     * calling it rather than let a bogus attestation reach the shift. — SAKER */
+    if ((out->info.mmu_features & 0xff) >= 64) {
+        *out = (struct kumo_mesa_report){0};
+        return KUMO_MESA_VA_RANGE;
+    }
+
+    /* Upstream derives the user VA range itself. The scaffold table leaves
+     * dev_query_user_va_range NULL, so the header's fallback reads the attested
+     * MMU_FEATURES word. This partial device is an input to that one inline helper;
+     * it is never returned, stored or published as a device. — SAKER */
+    const struct pan_kmod_dev attesting = {
+        .props = props,
+        .ops = &native_scaffold,
+    };
+    const struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(&attesting);
+    /* An attested range that cannot hold this service's own window is a contradiction,
+     * not a narrower device: refuse rather than clamp, and publish nothing. — SAKER */
+    if (range.start > out->info.va_start ||
+        out->info.va_end - range.start > range.size) {
+        *out = (struct kumo_mesa_report){0};
+        return KUMO_MESA_VA_RANGE;
+    }
+    out->va_range_start = range.start;
+    out->va_range_size = range.size;
     out->missing_properties = KUMO_MESA_MISSING_ALL;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */

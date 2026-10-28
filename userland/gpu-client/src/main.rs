@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j637
 //j638
 //j639
 //j641
 //j644
+//j645
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -18,7 +18,7 @@ use gpu_client::{
 use kumo_abi::{Handle, VmarFlags};
 use kumo_gpu::{
     client::{Client, Error as ClientError, Transport, TransportError},
-    Status as GpuStatus, Submission, SyncState, REPLY_LEN, REQUEST_LEN, VA_START,
+    Status as GpuStatus, Submission, SyncState, REPLY_LEN, REQUEST_LEN, VA_END, VA_START,
 };
 
 use kumo_mali::{
@@ -239,6 +239,21 @@ fn run(channel: Handle, presentation: Handle) -> Result<(), Failure> {
         topology.shader_present,
         topology.shader_present.count_ones(),
         64 - topology.shader_present.leading_zeros(),
+    ));
+    let mmu = client.mmu()?;
+    // Derive the width exactly as the pinned Mesa helper does, then require this service's own
+    // window to fit inside the attested hardware range. An attestation that could not hold the
+    // window is a contradiction, not a usable property, so it fails the session. — SAKER
+    let va_bits = mmu.mmu_features & 0xff;
+    let Some(hardware_va_bytes) = 1u64.checked_shl(va_bits) else {
+        return Err(Failure::Failed);
+    };
+    if hardware_va_bytes < VA_END {
+        return Err(Failure::Failed);
+    }
+    log(format_args!(
+        "gpu-client: G7d attested MMU: features0x{:08x}, va bits={}, hardware range0..0x{:x} holds service window0x{:x}..0x{:x}\n",
+        mmu.mmu_features, va_bits, hardware_va_bytes, VA_START, VA_END
     ));
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;

@@ -1,5 +1,6 @@
 //j643
 //j644
+//j645
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -8,7 +9,7 @@ use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -22,11 +23,14 @@ pub const SERVER_ERROR: u32 = 16;
 pub struct Info {
     pub gpu_id: u32,
     pub cs_features: u32,
-    /// Service limits, not the hardware MMU's complete address range.
+    /// This service's own window, not the hardware MMU's address range. `mmu_features`
+    /// carries the attested register word the consumer derives that range from. — SAKER
     pub va_start: u64,
     pub va_end: u64,
     pub max_buffer_bytes: u64,
     pub shader_present: u64,
+    /// Raw `MMU_FEATURES`; bits [7:0] are the hardware virtual-address width.
+    pub mmu_features: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +65,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     let result: Result<Info, Error> = (|| {
         let info = client.info()?;
         let topology = client.topology()?;
+        let mmu = client.mmu()?;
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -68,6 +73,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             va_end: crate::VA_END,
             max_buffer_bytes: crate::MAX_BUFFER_BYTES,
             shader_present: topology.shader_present,
+            mmu_features: mmu.mmu_features,
         })
     })();
     match result {
@@ -83,14 +89,17 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 40);
+const _: () = assert!(size_of::<Info>() == 48);
+// Pin the tail field's offset too: `mmu_features` is followed by padding, so a size check
+// alone would not catch the two sides disagreeing about where it sits. — SAKER
+const _: () = assert!(core::mem::offset_of!(Info, mmu_features) == 40);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, Command, DeviceInfo, DeviceTopology, Reply, Request, Response,
-        Status, REPLY_LEN, REQUEST_LEN,
+        client::TransportError, Command, DeviceInfo, DeviceMmu, DeviceTopology, Reply, Request,
+        Response, Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -99,6 +108,7 @@ mod tests {
         command: Option<Command>,
         closed: u32,
         failure: bool,
+        mmu_failure: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -116,9 +126,15 @@ mod tests {
         ) -> Result<(usize, Option<u32>), TransportError> {
             let result = if self.failure {
                 Err(Status::Busy)
+            } else if self.mmu_failure && self.command == Some(Command::GetMmuFeatures) {
+                Err(Status::Busy)
             } else if self.command == Some(Command::GetTopology) {
                 Ok(Response::Topology(DeviceTopology {
                     shader_present: 0x500000005,
+                }))
+            } else if self.command == Some(Command::GetMmuFeatures) {
+                Ok(Response::Mmu(DeviceMmu {
+                    mmu_features: 0x2830,
                 }))
             } else {
                 Ok(Response::Info(DeviceInfo {
@@ -168,8 +184,41 @@ mod tests {
                     (out.va_start, out.va_end, out.max_buffer_bytes),
                     (crate::VA_START, crate::VA_END, crate::MAX_BUFFER_BYTES)
                 );
+                assert_eq!(out.shader_present, 0x500000005);
+                assert_eq!(out.mmu_features, 0x2830);
             }
         });
+        assert!(client.info().is_ok());
+    }
+
+    #[test]
+    fn a_failing_final_query_publishes_no_partially_filled_report() {
+        let mut client = Client::new(Wire {
+            mmu_failure: true,
+            ..Wire::default()
+        });
+        with_api(&mut client, |api| {
+            let mut out = Info {
+                gpu_id: 99,
+                shader_present: 99,
+                mmu_features: 99,
+                ..Info::default()
+            };
+            let query = api.query.unwrap();
+            // GetInfo and GetTopology both succeed, so a naive implementation would already
+            // have written identity and topology. Nothing may be published. — SAKER
+            assert_eq!(
+                unsafe { query(api.context, &mut out) },
+                SERVER_ERROR + Status::Busy as u32
+            );
+            assert_eq!(
+                (out.gpu_id, out.shader_present, out.mmu_features),
+                (0, 0, 0)
+            );
+            assert_eq!((out.va_start, out.va_end), (0, 0));
+        });
+        // Busy is recoverable: the client stays live and the next full query succeeds.
+        assert!(!client.is_lost());
         assert!(client.info().is_ok());
     }
 

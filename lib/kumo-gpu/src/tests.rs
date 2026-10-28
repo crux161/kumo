@@ -1,6 +1,7 @@
 //j594
 //j596
 //j644
+//j645
 
 extern crate std;
 
@@ -31,6 +32,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
     for command in [
         Command::GetInfo,
         Command::GetTopology,
+        Command::GetMmuFeatures,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -526,4 +528,47 @@ fn topology_preserves_all_64_core_ids_and_rejects_zero_or_noncanonical_frames() 
         result: Ok(Response::Topology(DeviceTopology { shader_present: 0 })),
     };
     assert_eq!(Reply::decode(&zero.encode()), None);
+}
+
+#[test]
+fn mmu_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_bytes() {
+    let request = Request {
+        id: 12,
+        command: Command::GetMmuFeatures,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &9u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    for mmu_features in [1, 0x2830, 0x8000_0000, u32::MAX] {
+        let response = Response::Mmu(DeviceMmu { mmu_features });
+        let reply = Reply {
+            id: 12,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &9u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(mmu_features).to_le_bytes());
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+        for at in 24..REPLY_LEN {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    // A zero attestation is not a fallback address width; the frame must not decode. — SAKER
+    let zero = Reply {
+        id: 12,
+        result: Ok(Response::Mmu(DeviceMmu { mmu_features: 0 })),
+    };
+    assert_eq!(Reply::decode(&zero.encode()), None);
+    // Bits above the u32 field would narrow silently, so the canonical re-encode check must
+    // reject the frame rather than accept a truncated value. — SAKER
+    let mut widened = zero.encode();
+    widened[16..24].copy_from_slice(&0x1_0000_2830u64.to_le_bytes());
+    assert_eq!(Reply::decode(&widened), None);
 }
