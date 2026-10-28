@@ -1,8 +1,8 @@
-//j631
 //j632
 //j633
 //j634
 //j635
+//j659
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -1619,6 +1619,16 @@ impl SyscallEngine {
             .any(|fault| fault.ctx_koid == object_koid)
         {
             self.signal_ports(object_koid, kumo_abi::Signals::DEVICE_FAULT);
+        }
+        // A supervisor may bind a child's process handle after that child has already exited:
+        // the ASYNC launch window can close before Sora creates its wait port. `TERMINATED` is
+        // a level retained on the process object, exactly like a fired timer's, so replay it
+        // here instead of losing the exit. — TIMBERDOODLE
+        let terminated = self
+            .process_by_koid(object_koid)
+            .is_some_and(|process| process.signals().contains(kumo_abi::Signals::TERMINATED));
+        if terminated {
+            self.signal_ports(object_koid, kumo_abi::Signals::TERMINATED);
         }
     }
 
@@ -6728,6 +6738,71 @@ mod tests {
         assert_eq!(
             engine.process_kill_target(&parent, me),
             Err(Errno::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn port_bind_replays_a_process_that_already_terminated() {
+        let mut engine = SyscallEngine::new();
+        let mut parent = test_process(&mut engine);
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x2000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let child = engine.process_create(&mut parent, &job, vmar).unwrap();
+        let child_koid = parent.handles().get(child).unwrap().koid;
+        let early = create_port(&mut engine, &mut parent);
+
+        // A live process is a binding, not a signal: nothing is queued yet.
+        assert_eq!(
+            engine.dispatch(
+                &mut parent,
+                KernelCall::PortBind {
+                    port: early,
+                    object: child,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.dispatch(&mut parent, KernelCall::PortWait { port: early }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
+        );
+
+        // Teardown signals the object and then the bound ports. The already-bound port sees it.
+        engine
+            .process_by_koid_mut(child_koid)
+            .expect("child process")
+            .signal(kumo_abi::Signals::TERMINATED);
+        engine.signal_ports(child_koid, kumo_abi::Signals::TERMINATED);
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut parent, KernelCall::PortWait { port: early })
+        else {
+            panic!("expected a TERMINATED packet on the early port");
+        };
+        assert_eq!(packet.source, child_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::TERMINATED));
+
+        // A port created and bound after the exit must observe the retained level too.
+        let late = create_port(&mut engine, &mut parent);
+        assert_eq!(
+            engine.dispatch(
+                &mut parent,
+                KernelCall::PortBind {
+                    port: late,
+                    object: child,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let KernelCallResult::PortPacket(packet) =
+            engine.dispatch(&mut parent, KernelCall::PortWait { port: late })
+        else {
+            panic!("expected a replayed TERMINATED packet on the late port");
+        };
+        assert_eq!(packet.source, child_koid);
+        assert!(packet.signals.contains(kumo_abi::Signals::TERMINATED));
+        assert_eq!(
+            engine.dispatch(&mut parent, KernelCall::PortWait { port: late }),
+            KernelCallResult::Status(Errno::ShouldWait.status())
         );
     }
 

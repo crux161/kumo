@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j649
 //j654
 //j655
 //j657
 //j658
+//j659
 
 extern crate alloc;
 
@@ -93,6 +93,11 @@ static GRAPHICS_GRANTABLE: [AtomicBool; kumo_graphics::VIEW_COUNT] =
 /// to be reported released before regranting. — TIMBERDOODLE
 static GRAPHICS_ASYNC: [AtomicBool; kumo_graphics::VIEW_COUNT] =
     [AtomicBool::new(false), AtomicBool::new(false)];
+/// The retained process handle of each view's ASYNC client, or 0. It stays open until drv-fb
+/// reports the view released, so a second wait can bind it again and the kernel replays the
+/// retained exit. — TIMBERDOODLE
+static GRAPHICS_ASYNC_PROCESS: [AtomicU32; kumo_graphics::VIEW_COUNT] =
+    [AtomicU32::new(0), AtomicU32::new(0)];
 
 /// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
 /// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
@@ -633,6 +638,10 @@ fn refresh_released() {
         }
         GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
         GRAPHICS_ASYNC[view].store(false, Ordering::Relaxed);
+        let process = GRAPHICS_ASYNC_PROCESS[view].swap(0, Ordering::Relaxed);
+        if process != 0 {
+            let _ = handle_close(Handle(process));
+        }
         notice(&[
             b"sora: view ",
             &[b'0' + view as u8],
@@ -641,20 +650,134 @@ fn refresh_released() {
     }
 }
 
-/// Wait for a released view. If ASYNC clients are still leased, pump the scheduler and
-/// re-query until every one of them is released (bounded), then pick the lowest released
-/// grantable view. — TIMBERDOODLE
-fn wait_for_released() -> Option<usize> {
-    for _ in 0..64 {
-        refresh_released();
-        let pending = (0..kumo_graphics::VIEW_COUNT).any(|view| {
-            GRAPHICS_ASYNC[view].load(Ordering::Relaxed)
-                && !GRAPHICS_RELEASED[view].load(Ordering::Relaxed)
-        });
-        if !pending || !child_parked(process_wait()) {
+/// How long Sora waits for one ASYNC client to exit before giving up on its view. The old
+/// pump bound was 64 scheduler calls; a wall-clock bound does not depend on scheduler speed.
+const ASYNC_CLIENT_WAIT_NS: u64 = 5_000_000_000;
+
+/// Wait for every view still leased to an ASYNC client to signal its process `TERMINATED`.
+/// One private port carries the retained process signals and a one-shot timeout; a packet's
+/// source koid names the view. A late bind is safe: the kernel replays a process's retained
+/// `TERMINATED` level, as it already does for a fired timer. — TIMBERDOODLE
+fn wait_for_async_clients() -> bool {
+    use kumo_graphics::VIEW_COUNT;
+    let mut pending = [false; VIEW_COUNT];
+    let mut any = false;
+    for view in 0..VIEW_COUNT {
+        pending[view] = GRAPHICS_GRANTABLE[view].load(Ordering::Relaxed)
+            && GRAPHICS_ASYNC[view].load(Ordering::Relaxed)
+            && !GRAPHICS_RELEASED[view].load(Ordering::Relaxed);
+        any |= pending[view];
+    }
+    if !any {
+        return true;
+    }
+
+    let Some(port) = syscall_handle(port_create()) else {
+        log(b"sora: async client wait port unavailable\n");
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(ASYNC_CLIENT_WAIT_NS)) else {
+        let _ = handle_close(port);
+        log(b"sora: async client wait timer unavailable\n");
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    if timer_koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        let _ = handle_close(port);
+        log(b"sora: async client wait timer bind failed\n");
+        return false;
+    }
+
+    let mut bound = [false; VIEW_COUNT];
+    let mut sources = [0u64; VIEW_COUNT];
+    let mut remaining = 0usize;
+    let mut ok = true;
+    for view in 0..VIEW_COUNT {
+        if !pending[view] {
+            continue;
+        }
+        let Some(process) =
+            syscall_handle(GRAPHICS_ASYNC_PROCESS[view].load(Ordering::Relaxed) as u64)
+        else {
+            log(b"sora: async client has no retained process handle\n");
+            ok = false;
+            break;
+        };
+        let koid = handle_koid(process);
+        if koid == u64::MAX || port_bind(port, process) != 0 {
+            log(b"sora: async client process bind failed\n");
+            ok = false;
             break;
         }
+        bound[view] = true;
+        sources[view] = koid;
+        remaining += 1;
     }
+
+    while ok && remaining > 0 {
+        let source = port_wait(port);
+        if source == 0 {
+            log(b"sora: async client wait failed\n");
+            ok = false;
+            break;
+        }
+        if source == timer_koid {
+            for view in 0..VIEW_COUNT {
+                if pending[view] {
+                    notice(&[
+                        b"sora: view ",
+                        &[b'0' + view as u8],
+                        b" client process wait timed out\n",
+                    ]);
+                }
+            }
+            ok = false;
+            break;
+        }
+        let Some(view) = (0..VIEW_COUNT).find(|&view| bound[view] && sources[view] == source)
+        else {
+            continue;
+        };
+        if !pending[view] {
+            continue;
+        }
+        pending[view] = false;
+        remaining -= 1;
+        notice(&[
+            b"sora: view ",
+            &[b'0' + view as u8],
+            b" client process exited (TERMINATED)\n",
+        ]);
+    }
+
+    for view in 0..VIEW_COUNT {
+        if bound[view] {
+            if let Some(process) =
+                syscall_handle(GRAPHICS_ASYNC_PROCESS[view].load(Ordering::Relaxed) as u64)
+            {
+                let _ = port_unbind(port, process);
+            }
+        }
+    }
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    let _ = handle_close(port);
+    ok
+}
+
+/// Wait for a released view. A leased ASYNC view is waited on by its client's process object,
+/// one exit at a time; then one scheduler pump lets drv-fb drain every closed presentation lane
+/// and park before the release mask is read. The result is the lowest released grantable view.
+/// — TIMBERDOODLE
+fn wait_for_released() -> Option<usize> {
+    if !wait_for_async_clients() {
+        refresh_released();
+        return None;
+    }
+    // One pump, not a spin: this is what lets drv-fb observe each closed lane before its
+    // release query is answered. The per-process waits above are what establish the exits.
+    let _ = process_wait();
     refresh_released();
     (0..kumo_graphics::VIEW_COUNT).find(|view| {
         GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed)
@@ -854,6 +977,7 @@ fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
             | ProcessRunFlags::TRANSFER_ARG
             | ProcessRunFlags::TRANSFER_ARG2)
             .bits();
+        let mut kept = None;
         let ran = run_elf_threads(
             initrd,
             GFX_CLIENT_PATH.as_bytes(),
@@ -862,18 +986,26 @@ fn graphics_clients(cmd: &kumoza::Command, initrd: Handle) {
             flags,
             b"gfx-client",
             0,
-            None,
+            Some(&mut kept),
         );
         if ran {
             launched += 1;
             GRAPHICS_ASYNC[view].store(true, Ordering::Relaxed);
-            // One log record, so the handoff line is contiguous in the console transcript
-            // and the smoke's exact-marker check can see it. — TIMBERDOODLE
-            notice(&[
-                b"gfx-clients: view ",
-                &[b'0' + view as u8],
-                b" handed to an async client process\n",
-            ]);
+            if let Some(process) = kept {
+                GRAPHICS_ASYNC_PROCESS[view].store(process.0, Ordering::Relaxed);
+                // One log record, so the handoff line is contiguous in the console transcript
+                // and the smoke's exact-marker check can see it. — TIMBERDOODLE
+                notice(&[
+                    b"gfx-clients: view ",
+                    &[b'0' + view as u8],
+                    b" handed to an async client process\n",
+                ]);
+            } else {
+                // The child is admitted but Sora has no handle to wait on. Keep the view
+                // leased rather than stealing a live grant; the command reports the failure.
+                log(b"gfx-clients: async client handle unavailable\n");
+                failed = true;
+            }
         } else {
             // An admitted child owns the handles even if it exits non-zero; only an admission
             // failure leaves them with Sora.

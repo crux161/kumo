@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j654
 #j655
 #j656
 #j657
 #j658
+#j659
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -371,6 +371,9 @@ def main():
                 assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
                 assert b"sora: view 0 released by drv-fb" in transcript
                 assert b"sora: view 1 released by drv-fb" in transcript
+                assert b"sora: view 0 client process exited (TERMINATED)" in transcript
+                assert b"sora: view 1 client process exited (TERMINATED)" in transcript
+                assert b"client process wait timed out" not in transcript
                 assert b"drv-fb: view regrant refused" not in transcript
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"

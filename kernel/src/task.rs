@@ -1,3 +1,4 @@
+//j659
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -190,6 +191,12 @@ impl Process {
 
     pub fn signal(&mut self, signals: kumo_abi::Signals) {
         self.object.signal(signals);
+    }
+
+    /// The signals set on the process object. `TERMINATED` is retained from the teardown that
+    /// sets it, so a port bound after the exit can still observe it. — TIMBERDOODLE
+    pub const fn signals(&self) -> Signals {
+        self.object.signals()
     }
 }
 
