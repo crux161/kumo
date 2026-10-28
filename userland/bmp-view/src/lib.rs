@@ -1,6 +1,7 @@
 #![no_std]
 //j648
 //j649
+//j661
 
 //! Decode a BMP into the existing software presentation surface.
 
@@ -17,6 +18,17 @@ pub enum Error {
     UnsupportedCompression,
     MissingPixel,
     InvalidRow,
+}
+
+/// The message for a rejected file, naming a mislabeled image plainly. (J661)
+pub fn refusal(error: Error, bytes: &[u8]) -> &'static [u8] {
+    if !bytes.starts_with(b"BM") {
+        b"bmp-view: not a BMP file\n"
+    } else if error == Error::UnsupportedCompression {
+        b"bmp-view: unsupported BMP compression\n"
+    } else {
+        b"bmp-view: invalid BMP\n"
+    }
 }
 
 /// Bounded file intake; large enough for a 1024x1024 32-bit BMP plus its header.
@@ -224,6 +236,22 @@ impl<'a> Bitmap<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_name_a_mislabeled_image_and_unsupported_compression() {
+        assert_eq!(
+            refusal(Error::InvalidBitmap, b"\x89PNG\r\n"),
+            b"bmp-view: not a BMP file\n".as_slice()
+        );
+        assert_eq!(
+            refusal(Error::UnsupportedCompression, b"BM-data"),
+            b"bmp-view: unsupported BMP compression\n".as_slice()
+        );
+        assert_eq!(
+            refusal(Error::InvalidBitmap, b"BM-data"),
+            b"bmp-view: invalid BMP\n".as_slice()
+        );
+    }
 
     #[test]
     fn file_intake_rejects_oversize_truncation_and_bad_metadata() {

@@ -1,5 +1,6 @@
 <!-- j648 -->
 <!-- j649 -->
+<!-- j661 -->
 # bmp-view
 
 Run `bmp-view [path]` in KUMO. With no path it displays the built-in sample.
@@ -31,6 +32,11 @@ Standard 32-bit BGRA bitfield images are displayed opaquely, ignoring alpha.
 RLE is not supported. The presenter consumes a view grant on process exit, so repeated
 successful launches require another available view or a reboot. Serial-only boots
 report no graphics view.
+
+A file that is not really a BMP, for example a PNG renamed with a `.bmp` extension, is
+reported as `bmp-view: not a BMP file` and exits cleanly without taking the view.
+`scripts/bmp-convert.sh IMAGE...` converts arbitrary images on the host into the fast
+form: a 256x128, 24-bit, uncompressed BMP with the image centered on black.
 
 Build with `cargo xtask image --arch aarch64 --hardware qemu-virt-aarch64`
 (or the existing X13s/Orange Pi hardware names). Verify with:

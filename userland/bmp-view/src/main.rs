@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
-//j648
 //j649
 //j655
+//j661
 
 //! Sora transfers a finite bootstrap channel (x0) and a writable surface VMO (x1).
 //! Bootstrap grants one presenter and, optionally, the selected file as a read-only VMO.
 
-use bmp_view::{file_length, Bitmap, FILE_HEADER_LEN, PRESENTER_TAG, ROW_BYTES, SAMPLE};
+use bmp_view::{file_length, refusal, Bitmap, FILE_HEADER_LEN, PRESENTER_TAG, ROW_BYTES, SAMPLE};
 use kumo_abi::{Handle, VmarFlags};
 use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
 use kumo_rt::{
@@ -20,6 +20,13 @@ kumo_rt::entry!(main);
 fn fail(message: &[u8]) -> ! {
     let _ = log_write(kumo_abi::sys::log_level::ERR, message);
     process_exit(1)
+}
+
+/// A user-file refusal exits cleanly: a mislabeled or unsupported image is not a
+/// microservice abend, so no TOWER is raised for it. (J661)
+fn fail_input(message: &[u8]) -> ! {
+    let _ = log_write(kumo_abi::sys::log_level::ERR, message);
+    process_exit(0)
 }
 
 #[no_mangle]
@@ -60,12 +67,15 @@ extern "C" fn main(
     let _ = handle_close(bootstrap);
     let channel = Handle(presenter as u32);
     let vmo = Handle(surface as u32);
-    let bitmap = Bitmap::new(source).unwrap_or_else(|_| fail(b"bmp-view: invalid BMP\n"));
+    let bitmap = match Bitmap::new(source) {
+        Ok(bitmap) => bitmap,
+        Err(error) => fail_input(refusal(error, source)),
+    };
     let mut row = [0u8; ROW_BYTES];
     for y in 0..DEMO.height {
         bitmap
             .row(y, &mut row)
-            .unwrap_or_else(|_| fail(b"bmp-view: decode failed\n"));
+            .unwrap_or_else(|_| fail_input(b"bmp-view: decode failed\n"));
         for (index, chunk) in row.chunks(256).enumerate() {
             let offset = u64::from(y) * ROW_BYTES as u64 + (index * 256) as u64;
             if vmo_write(vmo, offset, chunk.as_ptr(), chunk.len()) != 0 {
