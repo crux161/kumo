@@ -3,6 +3,7 @@
 //j568
 //j636
 //j655
+//j656
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -29,7 +30,9 @@ pub const VIEW_WIDTH: u32 = 256;
 pub const VIEW_HEIGHT: u32 = 128;
 /// Server-drawn border around each view; client pixels never reach it.
 pub const VIEW_CHROME: u32 = 2;
-pub const VIEW_GAP: u32 = 16;
+/// Horizontal overlap between adjacent server-owned views. The server chooses the order;
+/// clients never see either value. — TIMBERDOODLE
+pub const VIEW_OVERLAP: u32 = 64;
 pub const BAND_MARGIN: u32 = 8;
 /// A whole number of 8x16 text rows, so the console starts on a cell row.
 pub const BAND_HEIGHT: u32 = 160;
@@ -55,6 +58,8 @@ pub struct View {
 pub struct Band {
     pub height: u32,
     pub views: [View; VIEW_COUNT],
+    /// Back-to-front view indices; later entries paint above earlier ones. — TIMBERDOODLE
+    pub order: [usize; VIEW_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,11 +69,11 @@ pub struct ConsoleRegion {
     pub height: u32,
 }
 
-/// Place the two views in a centered band, or decline when the framebuffer cannot also hold
-/// a usable text console. Declining leaves the whole display to the console.
+/// Place the two overlapping views in a centered band, or decline when the framebuffer
+/// cannot also hold a usable text console. Declining leaves the whole display to the console.
 pub fn band(width: u32, height: u32) -> Option<Band> {
     let content =
-        (VIEW_WIDTH + 2 * VIEW_CHROME) * VIEW_COUNT as u32 + VIEW_GAP * (VIEW_COUNT as u32 - 1);
+        VIEW_WIDTH + (VIEW_COUNT as u32 - 1) * (VIEW_WIDTH - VIEW_OVERLAP) + 2 * VIEW_CHROME;
     if width < content + 2 * BAND_MARGIN || height < BAND_HEIGHT + MIN_CONSOLE_ROWS * CONSOLE_CELL_H
     {
         return None;
@@ -82,12 +87,13 @@ pub fn band(width: u32, height: u32) -> Option<Band> {
         height: VIEW_HEIGHT,
     }; VIEW_COUNT];
     for (index, view) in views.iter_mut().enumerate() {
-        view.x = left + index as u32 * (VIEW_WIDTH + 2 * VIEW_CHROME + VIEW_GAP) + VIEW_CHROME;
+        view.x = left + VIEW_CHROME + index as u32 * (VIEW_WIDTH - VIEW_OVERLAP);
         view.y = top + VIEW_CHROME;
     }
     Some(Band {
         height: BAND_HEIGHT,
         views,
+        order: core::array::from_fn(|index| index),
     })
 }
 
@@ -480,34 +486,32 @@ mod tests {
     }
 
     #[test]
-    fn band_places_two_views_above_the_console() {
-        for (width, height) in [(800, 600), (640, 480), (1600, 900), (552, 288)] {
+    fn band_places_two_overlapping_views_above_the_console() {
+        for (width, height) in [(800, 600), (640, 480), (1600, 900), (552, 288), (468, 600)] {
             let layout = band(width, height).expect("views fit");
             assert_eq!(layout.height, BAND_HEIGHT);
             assert_eq!(layout.views.len(), VIEW_COUNT);
+            assert_eq!(layout.order, [0, 1]);
             let console = console_region(width, height);
             assert_eq!(console.y, BAND_HEIGHT);
             assert_eq!(console.height, height - BAND_HEIGHT);
             assert!(console.height >= MIN_CONSOLE_ROWS * CONSOLE_CELL_H);
-            for (index, view) in layout.views.iter().enumerate() {
+            let first = layout.views[0];
+            let second = layout.views[1];
+            for view in [first, second] {
                 assert_eq!((view.width, view.height), (VIEW_WIDTH, VIEW_HEIGHT));
                 assert!(view.x >= VIEW_CHROME && view.y >= VIEW_CHROME);
                 assert!(view.x + view.width + VIEW_CHROME <= width);
                 assert!(view.y + view.height + VIEW_CHROME <= BAND_HEIGHT);
-                if index > 0 {
-                    let previous = layout.views[index - 1];
-                    assert_eq!(
-                        view.x,
-                        previous.x + previous.width + 2 * VIEW_CHROME + VIEW_GAP
-                    );
-                }
             }
+            assert_eq!(first.y, second.y);
+            assert_eq!(second.x, first.x + VIEW_WIDTH - VIEW_OVERLAP);
         }
     }
 
     #[test]
     fn band_declines_when_the_console_would_not_fit() {
-        assert_eq!(band(551, 600), None);
+        assert_eq!(band(467, 600), None);
         assert_eq!(band(800, 287), None);
         assert_eq!(
             console_region(800, 287),
@@ -517,7 +521,7 @@ mod tests {
                 height: 287
             }
         );
-        assert_eq!(console_region(551, 600).y, 0);
+        assert_eq!(console_region(467, 600).y, 0);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j609
 //j610
 //j611
 //j639
 //j655
+//j656
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -801,9 +801,11 @@ impl Console {
     }
 }
 
-/// Paint the server-owned band: background, a chrome frame per view, and each view's well.
-/// `write` receives absolute framebuffer indices (`row * stride + x`); callers write through
-/// volatile pointers because this is device memory. Client pixels never reach the chrome.
+/// Paint the server-owned band: background, then each view's chrome frame and well in the
+/// server's back-to-front order, so an upper view's chrome and well cover a lower view where
+/// they overlap. `write` receives absolute framebuffer indices (`row * stride + x`); callers
+/// write through volatile pointers because this is device memory. Client pixels never reach
+/// the chrome. — TIMBERDOODLE
 pub fn paint_band<F: FnMut(usize, u32)>(
     band: &kumo_graphics::Band,
     width: usize,
@@ -819,19 +821,18 @@ pub fn paint_band<F: FnMut(usize, u32)>(
         }
     }
     let chrome = rgb(kumo_graphics::VIEW_CHROME_COLOR);
-    for view in &band.views {
+    let well = rgb(kumo_graphics::VIEW_BG);
+    for &index in &band.order {
+        let view = &band.views[index];
         let left = view.x as usize - kumo_graphics::VIEW_CHROME as usize;
         let top = view.y as usize - kumo_graphics::VIEW_CHROME as usize;
-        let width = view.width as usize + 2 * kumo_graphics::VIEW_CHROME as usize;
-        let height = view.height as usize + 2 * kumo_graphics::VIEW_CHROME as usize;
-        for y in 0..height {
-            for x in 0..width {
+        let chrome_width = view.width as usize + 2 * kumo_graphics::VIEW_CHROME as usize;
+        let chrome_height = view.height as usize + 2 * kumo_graphics::VIEW_CHROME as usize;
+        for y in 0..chrome_height {
+            for x in 0..chrome_width {
                 write((top + y) * stride + left + x, chrome);
             }
         }
-    }
-    let well = rgb(kumo_graphics::VIEW_BG);
-    for view in &band.views {
         for y in 0..view.height as usize {
             for x in 0..view.width as usize {
                 write((view.y as usize + y) * stride + view.x as usize + x, well);
@@ -921,6 +922,102 @@ pub fn present_damage<R: FnMut(usize) -> u32, W: FnMut(usize, u32)>(
     Ok(())
 }
 
+/// Compose one present into the server-owned band. The affected screen region is the whole
+/// presenting view content for a full present, or each surface-clipped damage rectangle for a
+/// partial one. Every pixel in that region is recomposed from all layers in the band's
+/// back-to-front order: each covering view draws its chrome, its client content (when a
+/// retained surface is supplied and covers the pixel), or its well. The presenting view's
+/// content is supplied by the caller even on its first full present. Pixels outside the
+/// region are not touched, so a lower view's present cannot erase an upper view outside its
+/// own region and a closed client's retained content stays composed. — TIMBERDOODLE
+pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
+    band: &kumo_graphics::Band,
+    stride: usize,
+    presenting: usize,
+    damage: kumo_graphics::DamageSet,
+    surface: kumo_graphics::Surface,
+    backing_bytes: usize,
+    content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
+    order: PixelOrder,
+    mut read: R,
+    mut write: W,
+) -> Result<(), kumo_graphics::Status> {
+    if !surface.fits(backing_bytes) || presenting >= kumo_graphics::VIEW_COUNT {
+        return Err(kumo_graphics::Status::BadSurface);
+    }
+    let view = &band.views[presenting];
+    if view.width == 0 || view.height == 0 {
+        return Err(kumo_graphics::Status::BadSurface);
+    }
+    let full;
+    let targets: &[kumo_graphics::Damage] = if damage.is_full() {
+        full = [kumo_graphics::Damage {
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height,
+        }];
+        &full
+    } else {
+        damage.rects()
+    };
+    let rgb = |pixel: u32| order.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
+    let band_bg = rgb(kumo_graphics::BAND_BG);
+    let chrome = rgb(kumo_graphics::VIEW_CHROME_COLOR);
+    let well = rgb(kumo_graphics::VIEW_BG);
+    let border = kumo_graphics::VIEW_CHROME;
+    for rect in targets {
+        let Some(rect) = rect.clipped_to(surface) else {
+            continue;
+        };
+        let x1 = rect.x.saturating_add(rect.width).min(view.width);
+        let y1 = rect.y.saturating_add(rect.height).min(view.height);
+        for y in rect.y..y1 {
+            for x in rect.x..x1 {
+                let sx = view.x + x;
+                let sy = view.y + y;
+                let mut color = band_bg;
+                for &layer in &band.order {
+                    let other = &band.views[layer];
+                    if sx < other.x.saturating_sub(border)
+                        || sy < other.y.saturating_sub(border)
+                        || sx >= other.x.saturating_add(other.width).saturating_add(border)
+                        || sy >= other.y.saturating_add(other.height).saturating_add(border)
+                    {
+                        continue;
+                    }
+                    if sx < other.x
+                        || sx >= other.x.saturating_add(other.width)
+                        || sy < other.y
+                        || sy >= other.y.saturating_add(other.height)
+                    {
+                        color = chrome;
+                        continue;
+                    }
+                    match content[layer] {
+                        Some(description) => {
+                            let lx = sx - other.x;
+                            let ly = sy - other.y;
+                            if lx < description.width && ly < description.height {
+                                let pixel = read(
+                                    layer,
+                                    ly as usize * description.stride as usize + lx as usize,
+                                );
+                                color = rgb(pixel);
+                            } else {
+                                color = well;
+                            }
+                        }
+                        None => color = well,
+                    }
+                }
+                write(sy as usize * stride + sx as usize, color);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Clean the cache lines covering `start..start + len` pixels, then DSB. No-op off target.
 ///
 /// # Safety
@@ -977,6 +1074,7 @@ mod tests {
                     height: 24,
                 },
             ],
+            order: [0, 1],
         };
         let width = 96;
         const STRIDE: usize = 100;
@@ -994,6 +1092,216 @@ mod tests {
             assert_eq!(glass[4 * STRIDE + 96], 0xf00d);
             assert_eq!(glass[STRIDE * 64], 0xf00d);
         }
+    }
+
+    #[test]
+    fn overlapping_views_paint_in_the_server_order() {
+        let layout = kumo_graphics::Band {
+            height: 16,
+            views: [
+                kumo_graphics::View {
+                    x: 4,
+                    y: 2,
+                    width: 8,
+                    height: 8,
+                },
+                kumo_graphics::View {
+                    x: 8,
+                    y: 2,
+                    width: 8,
+                    height: 8,
+                },
+            ],
+            order: [0, 1],
+        };
+        let mut glass = [0u32; 32 * 16];
+        paint_band(&layout, 32, 32, PixelOrder::Rgb, |index, color| {
+            glass[index] = color
+        });
+        let rgb = |pixel: u32| {
+            PixelOrder::Rgb.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8)
+        };
+        // The upper view's left chrome border overwrites the lower view's content.
+        assert_eq!(glass[5 * 32 + 6], rgb(kumo_graphics::VIEW_CHROME_COLOR));
+        // Inside the overlap, the upper view's well is above the lower view's well.
+        assert_eq!(glass[5 * 32 + 10], rgb(kumo_graphics::VIEW_BG));
+        assert_eq!(glass[5 * 32 + 5], rgb(kumo_graphics::VIEW_BG));
+        assert_eq!(glass[0], rgb(kumo_graphics::BAND_BG));
+    }
+
+    #[test]
+    fn compose_present_keeps_upper_content_and_chrome_over_a_lower_present() {
+        let layout = kumo_graphics::Band {
+            height: 16,
+            views: [
+                kumo_graphics::View {
+                    x: 4,
+                    y: 4,
+                    width: 8,
+                    height: 4,
+                },
+                kumo_graphics::View {
+                    x: 8,
+                    y: 4,
+                    width: 8,
+                    height: 4,
+                },
+            ],
+            order: [0, 1],
+        };
+        const STRIDE: usize = 32;
+        let mut glass = [0xdead_beef_u32; STRIDE * 16];
+        let surface = kumo_graphics::Surface {
+            width: 8,
+            height: 4,
+            stride: 8,
+            format: kumo_graphics::XRGB8888,
+        };
+        let red = [0x00ff_0000_u32; 32];
+        let blue = [0x0000_00ff_u32; 32];
+        let content = [Some(surface), Some(surface)];
+        let read = |layer: usize, at: usize| if layer == 0 { red[at] } else { blue[at] };
+        compose_present(
+            &layout,
+            STRIDE,
+            0,
+            kumo_graphics::DamageSet::FULL,
+            surface,
+            red.len() * 4,
+            &content,
+            PixelOrder::Rgb,
+            read,
+            |at, color| glass[at] = color,
+        )
+        .unwrap();
+        let rgb = |pixel: u32| {
+            PixelOrder::Rgb.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8)
+        };
+        // Lower-only pixels show the presenting content; the overlap shows the upper content.
+        assert_eq!(glass[5 * STRIDE + 5], rgb(red[0]));
+        assert_eq!(glass[5 * STRIDE + 10], rgb(blue[0]));
+        // The upper view's chrome border is above the lower content.
+        assert_eq!(glass[5 * STRIDE + 7], rgb(kumo_graphics::VIEW_CHROME_COLOR));
+        // Nothing outside the presenting view's content region is touched.
+        assert_eq!(glass[5 * STRIDE + 14], 0xdead_beef);
+        // The upper view's own present leaves the lower view's visible pixels intact.
+        compose_present(
+            &layout,
+            STRIDE,
+            1,
+            kumo_graphics::DamageSet::FULL,
+            surface,
+            blue.len() * 4,
+            &content,
+            PixelOrder::Rgb,
+            read,
+            |at, color| glass[at] = color,
+        )
+        .unwrap();
+        assert_eq!(glass[5 * STRIDE + 5], rgb(red[0]));
+        assert_eq!(glass[5 * STRIDE + 14], rgb(blue[0]));
+    }
+
+    #[test]
+    fn compose_present_honors_damage_wells_and_the_surface_extent() {
+        let layout = kumo_graphics::Band {
+            height: 16,
+            views: [
+                kumo_graphics::View {
+                    x: 4,
+                    y: 4,
+                    width: 8,
+                    height: 4,
+                },
+                kumo_graphics::View {
+                    x: 8,
+                    y: 4,
+                    width: 8,
+                    height: 4,
+                },
+            ],
+            order: [0, 1],
+        };
+        const STRIDE: usize = 32;
+        let mut glass = [0xdead_beef_u32; STRIDE * 16];
+        let surface = kumo_graphics::Surface {
+            width: 8,
+            height: 4,
+            stride: 8,
+            format: kumo_graphics::XRGB8888,
+        };
+        let red = [0x00ff_0000_u32; 32];
+        let content = [Some(surface), None];
+        let damage = kumo_graphics::DamageSet::single(kumo_graphics::Damage {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        })
+        .unwrap();
+        let mut writes = 0;
+        compose_present(
+            &layout,
+            STRIDE,
+            0,
+            damage,
+            surface,
+            red.len() * 4,
+            &content,
+            PixelOrder::Rgb,
+            |_, at| red[at],
+            |at, color| {
+                writes += 1;
+                glass[at] = color;
+            },
+        )
+        .unwrap();
+        assert_eq!(writes, 2);
+        let red_pixel = PixelOrder::Rgb.pixel(0xff, 0, 0);
+        assert_eq!(glass[4 * STRIDE + 4], red_pixel);
+        assert_eq!(glass[4 * STRIDE + 5], red_pixel);
+        assert_eq!(glass[4 * STRIDE + 6], 0xdead_beef);
+        // A damage rectangle inside the upper view's well shows the well, not the lower client.
+        let damage = kumo_graphics::DamageSet::single(kumo_graphics::Damage {
+            x: 4,
+            y: 0,
+            width: 2,
+            height: 1,
+        })
+        .unwrap();
+        compose_present(
+            &layout,
+            STRIDE,
+            0,
+            damage,
+            surface,
+            red.len() * 4,
+            &content,
+            PixelOrder::Rgb,
+            |_, at| red[at],
+            |at, color| glass[at] = color,
+        )
+        .unwrap();
+        assert_eq!(glass[4 * STRIDE + 8], 0x0000_0000);
+        let invalid = kumo_graphics::Surface {
+            width: 9,
+            ..surface
+        };
+        assert_eq!(
+            compose_present(
+                &layout,
+                STRIDE,
+                0,
+                kumo_graphics::DamageSet::FULL,
+                invalid,
+                8,
+                &content,
+                PixelOrder::Rgb,
+                |_, _| 0,
+                |_, _| {}
+            ),
+            Err(kumo_graphics::Status::BadSurface)
+        );
     }
 
     #[test]

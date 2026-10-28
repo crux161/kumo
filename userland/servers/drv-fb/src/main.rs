@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j632
 //j634
 //j636
 //j639
 //j655
+//j656
 
 mod clock_probe;
 mod display_probe;
@@ -491,6 +491,12 @@ extern "C" fn main(
         }
     }
 
+    // Retained per-view content from the last accepted present. The read-only surface
+    // mapping outlives a client channel, so a closed client's view keeps composing in its
+    // server-assigned order. — TIMBERDOODLE
+    let mut view_content: [Option<(u64, kumo_graphics::Surface)>; kumo_graphics::VIEW_COUNT] =
+        [None; kumo_graphics::VIEW_COUNT];
+
     // Pump the console channel: the bytes Sora writes become glyphs on the framebuffer.
     // Output-only — no keyboard device sits behind the framebuffer yet. A read takes a whole
     // message and drops what does not fit, so the buffer is a whole message (J559: a 256-byte
@@ -584,44 +590,41 @@ extern "C" fn main(
                         // The view has no complete image yet; a partial first present would
                         // leave undeclared pixels uninitialized.
                         Err(Status::BadRequest)
-                    } else if request.damage.is_full() {
-                        present_view(
-                            view,
-                            stride,
-                            request.surface,
-                            SURFACE_BYTES,
-                            pixel_order,
-                            |index| unsafe {
-                                // SAFETY: the permanent mapping covers SURFACE_BYTES;
-                                // present_view checks the extent and never reads beyond the
-                                // view.
-                                (lane.surface as *const u32).add(index).read_volatile()
-                            },
-                            |index, color| unsafe {
-                                (fb_va as *mut u32).add(index).write_volatile(color)
-                            },
-                        )
                     } else {
-                        drv_fb::present_damage(
-                            view,
+                        let mut content = [None; kumo_graphics::VIEW_COUNT];
+                        let mut bases = [0u64; kumo_graphics::VIEW_COUNT];
+                        for (other, entry) in view_content.iter().enumerate() {
+                            if let Some((base, description)) = entry {
+                                bases[other] = *base;
+                                content[other] = Some(*description);
+                            }
+                        }
+                        // The presenting view's new surface applies before it is stored.
+                        bases[index] = lane.surface;
+                        content[index] = Some(request.surface);
+                        drv_fb::compose_present(
+                            band,
                             stride,
+                            index,
+                            request.damage,
                             request.surface,
                             SURFACE_BYTES,
+                            &content,
                             pixel_order,
-                            request.damage,
-                            |index| unsafe {
-                                // SAFETY: as above; present_damage clips every rectangle to
-                                // the validated surface and the view before reading.
-                                (lane.surface as *const u32).add(index).read_volatile()
+                            |layer, at| unsafe {
+                                // SAFETY: every Some(description) in `content` came from an
+                                // accepted present backed by this retained mapping.
+                                (bases[layer] as *const u32).add(at).read_volatile()
                             },
-                            |index, color| unsafe {
-                                (fb_va as *mut u32).add(index).write_volatile(color)
+                            |at, color| unsafe {
+                                (fb_va as *mut u32).add(at).write_volatile(color)
                             },
                         )
                     };
-                    if result.is_ok() && request.damage.is_full() {
+                    if result.is_ok() {
+                        view_content[index] = Some((lane.surface, request.surface));
                         if let Some(entry) = lanes[index].as_mut() {
-                            entry.full_seen = true;
+                            entry.full_seen |= request.damage.is_full();
                         }
                     }
                     unsafe {

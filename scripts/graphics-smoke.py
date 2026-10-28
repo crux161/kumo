@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j620
 #j648
 #j649
 #j654
 #j655
+#j656
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -50,6 +50,10 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 data = b"dmesg -n 6\ngfx-clients\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if damage:
                 data = b"dmesg -n 6\ngfx-damage\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if zorder:
+                # Paint both views first, then repaint the lower one: if the server did not
+                # compose in its order, the lower copy would erase the overlap.
+                data = b"dmesg -n 6\ngfx-demo\ngfx-client\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -95,7 +99,8 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
 
 
 VIEW_W, VIEW_H = 256, 128
-CHROME, GAP, BAND_H, MARGIN = 2, 16, 160, 8
+VIEW_OVERLAP = 64
+CHROME, BAND_H, MARGIN = 2, 160, 8
 BAND_BG = (0x16, 0x1B, 0x22)
 VIEW_BG = (0, 0, 0)
 CHROME_COLOR = (0x5A, 0x8F, 0xC8)
@@ -105,16 +110,30 @@ FG = (0, 0xFF, 0)
 
 
 def view_rects(width, height):
-    # Server-owned layout; must match kumo-graphics::band.
-    content = 2 * (VIEW_W + 2 * CHROME) + GAP
+    # Server-owned overlapping layout; must match kumo-graphics::band.
+    content = VIEW_W + (VIEW_W - VIEW_OVERLAP) + 2 * CHROME
     assert width >= content + 2 * MARGIN, f"screen {width}x{height} cannot hold the view band"
     assert height >= BAND_H + 8 * 16, f"screen {width}x{height} cannot hold a console"
     left = (width - content) // 2
     top = (BAND_H - (VIEW_H + 2 * CHROME)) // 2
-    return [
-        (left + index * (VIEW_W + 2 * CHROME + GAP) + CHROME, top + CHROME)
-        for index in range(2)
-    ]
+    first = left + CHROME
+    return [(first, top + CHROME), (first + VIEW_W - VIEW_OVERLAP, top + CHROME)]
+
+
+def compose_expected(x, y, rects, images):
+    # Server order [0, 1]: the later view is above the earlier one. Each covering view
+    # draws its chrome, its client content (or well), or nothing.
+    color = BAND_BG
+    for index in (0, 1):
+        vx, vy = rects[index]
+        if not (vx - CHROME <= x < vx + VIEW_W + CHROME and vy - CHROME <= y < vy + VIEW_H + CHROME):
+            continue
+        if vx <= x < vx + VIEW_W and vy <= y < vy + VIEW_H:
+            image = images[index]
+            color = image(x - vx, y - vy) if image else VIEW_BG
+        else:
+            color = CHROME_COLOR
+    return color
 
 
 def demo_pixel(x, y):
@@ -178,33 +197,21 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
         offset = (y * width + x) * 3
         return tuple(pixels[offset:offset + 3])
 
-    assert at(0, 0) == BAND_BG, f"band background {at(0, 0)} != {BAND_BG}"
-    for vx, vy in rects:
-        for y in range(vy - CHROME, vy + VIEW_H + CHROME):
-            for x in range(vx - CHROME, vx + VIEW_W + CHROME):
-                border = x < vx or x >= vx + VIEW_W or y < vy or y >= vy + VIEW_H
-                if border:
-                    assert at(x, y) == CHROME_COLOR, f"chrome at {(x, y)} is {at(x, y)}"
-
-    # View 0 is painted by the separate client process; view 1 by the supervisor demo,
-    # which presents an over-sized surface whose visible corner is solid. Both are copied by
-    # the server into server-owned rectangles. In two-client mode each view is painted by its
-    # own separate client process, so both carry the demo image.
+    # The band is a composed server surface: background, then each view's chrome, well and
+    # client content in the server's back-to-front order. Checking every band pixel against
+    # the same model proves the overlap and z-order, not only the two wells.
     if damage:
-        expected = damage_demo_pixel
+        images = [damage_demo_pixel, None]
     elif bitmap:
-        expected = bitmap_reference(bitmap_file, scratch)
+        images = [bitmap_reference(bitmap_file, scratch), lambda x, y: VIEW_SOLID]
+    elif two_clients:
+        images = [demo_pixel, demo_pixel]
     else:
-        expected = demo_pixel
-    vx, vy = rects[0]
-    for y in range(VIEW_H):
-        for x in range(VIEW_W):
-            assert at(vx + x, vy + y) == expected(x, y), f"view 0 pixel {(x, y)}"
-    vx, vy = rects[1]
-    for y in range(VIEW_H):
-        for x in range(VIEW_W):
-            want = demo_pixel(x, y) if two_clients else (VIEW_BG if damage else VIEW_SOLID)
-            assert at(vx + x, vy + y) == want, f"view 1 pixel {(x, y)}"
+        images = [demo_pixel, lambda x, y: VIEW_SOLID]
+    for y in range(BAND_H):
+        for x in range(width):
+            want = compose_expected(x, y, rects, images)
+            assert at(x, y) == want, f"band pixel {(x, y)} is {at(x, y)}, want {want}"
 
     # The clipped surface's out-of-view poison must never reach the glass.
     poison = sum(1 for y in range(height) for x in range(width) if at(x, y) == POISON)
@@ -230,6 +237,7 @@ def main():
     parser.add_argument("--bitmap", action="store_true", help="display and verify bmp-view instead of gfx-client")
     parser.add_argument("--two-clients", action="store_true", help="run two concurrent separate gfx-client processes, one per view")
     parser.add_argument("--damage", action="store_true", help="prove damage tracking with the supervisor client's full-then-partial present")
+    parser.add_argument("--zorder", action="store_true", help="prove server z-order: the lower client presents after the upper view")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -241,6 +249,8 @@ def main():
         parser.error("--two-clients and --bitmap are separate proofs")
     if args.damage and (args.bitmap or args.two_clients):
         parser.error("--damage is a separate proof")
+    if args.zorder and (args.bitmap or args.two_clients or args.damage):
+        parser.error("--zorder is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -255,7 +265,7 @@ def main():
             "-net", "none",
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
-                     args.two_clients, args.damage)
+                     args.two_clients, args.damage, args.zorder)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -320,6 +330,14 @@ def main():
                 assert b"gfx-damage: full then partial damage copied" in transcript, f"missing damage proof; inspect {serial}"
                 assert b"gfx-damage: damage proof failed" not in transcript
                 assert b"gfx-demo:" not in transcript
+            elif args.zorder:
+                demo0 = b"gfx-demo: view 0 copied; buffer released (software GOP)"
+                demo1 = b"gfx-demo: view 1 copied; buffer released (software GOP)"
+                assert transcript.count(demo0) == 1, f"missing view 0 demo; inspect {serial}"
+                assert transcript.count(demo1) == 1, f"missing view 1 demo; inspect {serial}"
+                assert transcript.count(client) == 1, f"missing lower client present; inspect {serial}"
+                assert transcript.index(demo1) < transcript.index(client), f"lower client did not present last; inspect {serial}"
+                assert b"gfx-demo: one or more views failed" not in transcript
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -362,6 +380,8 @@ def main():
                 print("Two-client UEFI smoke green: two separate client processes, one per view, chrome, console, login")
             if args.damage:
                 print("Damage UEFI smoke green: full then partial copy, undeclared surface poison never reached the glass")
+            if args.zorder:
+                print("Z-order UEFI smoke green: lower client presented after the upper view; overlap kept the upper content")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             process.terminate()
