@@ -1,8 +1,8 @@
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -218,9 +218,15 @@ impl Reply {
             Ok(Response::Topology(topology)) => (8, [topology.shader_present, 0, 0, 0]),
             Ok(Response::Mmu(mmu)) => (9, [u64::from(mmu.mmu_features), 0, 0, 0]),
             Ok(Response::Tiler(tiler)) => (10, [u64::from(tiler.tiler_features), 0, 0, 0]),
-            Ok(Response::Texture(texture)) => {
-                (11, [u64::from(texture.texture_features_0), 0, 0, 0])
-            }
+            Ok(Response::Texture(texture)) => (
+                11,
+                [
+                    u64::from(texture.texture_features[0]),
+                    u64::from(texture.texture_features[1]),
+                    u64::from(texture.texture_features[2]),
+                    u64::from(texture.texture_features[3]),
+                ],
+            ),
             Ok(Response::Core(core)) => (12, [u64::from(core.core_features), 0, 0, 0]),
             Ok(Response::Threads(threads)) => (
                 13,
@@ -280,8 +286,12 @@ impl Reply {
                 10 if a[0] != 0 => Response::Tiler(DeviceTiler {
                     tiler_features: a[0] as u32,
                 }),
+                // Element 0 is the optional-absence gate, so a zero there is never a success
+                // on this channel; the session maps it to NotSupported. Elements 1..3 are
+                // unrestricted, zero included, and the re-encode round-trip below refuses
+                // any high bits a 32-bit element cannot carry. — TIMBERDOODLE
                 11 if a[0] != 0 => Response::Texture(DeviceTexture {
-                    texture_features_0: a[0] as u32,
+                    texture_features: [a[0] as u32, a[1] as u32, a[2] as u32, a[3] as u32],
                 }),
                 12 => Response::Core(DeviceCore {
                     core_features: a[0] as u32,

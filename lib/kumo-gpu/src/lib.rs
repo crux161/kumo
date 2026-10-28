@@ -1,9 +1,9 @@
 #![no_std]
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -65,12 +65,15 @@ pub struct DeviceTiler {
     pub tiler_features: u32,
 }
 
-/// Element 0 of `TEXTURE_FEATURES`, crossed undecoded like the others. Only this element is
-/// attested, so the name says so rather than implying the full four-word array. Upstream reads
-/// it as the compressed-format bitmask and, at bit 25, as AFRC presence. — SAKER
+/// The complete raw `TEXTURE_FEATURES[0..3]` array from GPU_CONTROL +0x0B0..+0x0BC,
+/// crossed undecoded like the other properties. Element 0 is the optional-absence gate:
+/// upstream reads it as the compressed-format bitmask and, at bit 25, as AFRC presence, and
+/// a zero there means the backend has no attestation at all, so it degrades to
+/// `NotSupported`. Elements 1..3 cross verbatim, zero included — they are attested by the
+/// same register read, not derived, and no consumer here decodes them. — TIMBERDOODLE
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceTexture {
-    pub texture_features_0: u32,
+    pub texture_features: [u32; 4],
 }
 
 /// The raw `CORE_FEATURES` word, crossed undecoded like its siblings. This is a *required*

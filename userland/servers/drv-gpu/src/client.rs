@@ -1,8 +1,8 @@
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -28,7 +28,7 @@ struct Hardware<'a> {
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
-    texture_features_0: u32,
+    texture_features: [u32; 4],
     core_features: u32,
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
@@ -82,12 +82,14 @@ impl Backend for Hardware<'_> {
         })
     }
     fn texture_features(&mut self) -> Result<protocol::DeviceTexture, GpuStatus> {
-        // Same optional rule as tiler features. — SAKER
-        if self.texture_features_0 == 0 {
+        // Element 0 is the optional-absence gate, exactly as in the tiler word; the other three
+        // words were attested by the same powered read, so they cross verbatim, zero included.
+        // — TIMBERDOODLE
+        if self.texture_features[0] == 0 {
             return Err(GpuStatus::NotSupported);
         }
         Ok(protocol::DeviceTexture {
-            texture_features_0: self.texture_features_0,
+            texture_features: self.texture_features,
         })
     }
     fn core_features(&mut self) -> Result<protocol::DeviceCore, GpuStatus> {
@@ -334,7 +336,7 @@ pub(super) fn serve(
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
-    texture_features_0: u32,
+    texture_features: [u32; 4],
     core_features: u32,
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
@@ -345,7 +347,7 @@ pub(super) fn serve(
         shader_present,
         mmu_features,
         tiler_features,
-        texture_features_0,
+        texture_features,
         core_features,
         thread_max_threads,
         thread_max_workgroup_size,

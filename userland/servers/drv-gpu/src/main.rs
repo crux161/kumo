@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 mod client;
 
@@ -91,9 +91,13 @@ const TILER_PRESENT_HI: u32 = 0x114;
 /// RESEARCH/009 §4.3: `TILER_FEATURES` at GPU_CONTROL +0x00C, `[4:0]` a log2 bin size and
 /// `[11:8]` the level count. Read-only, in the same powered block as the identity registers.
 const TILER_FEATURES: u32 = 0x00C;
-/// RESEARCH/009 §4.3: `TEXTURE_FEATURES[0..3]` at GPU_CONTROL +0x0B0..0x0BC. Only element 0
-/// is read, because that is the only element upstream's discovery path consumes. — SAKER
+/// RESEARCH/009 §4.3: `TEXTURE_FEATURES[0..3]` at GPU_CONTROL +0x0B0..0x0BC. All four words
+/// are read in the same powered block: element 0 is upstream's compressed-format mask and
+/// AFRC gate, while elements 1..3 are attested verbatim and never decoded here. — TIMBERDOODLE
 const TEXTURE_FEATURES_0: u32 = 0x0B0;
+const TEXTURE_FEATURES_1: u32 = 0x0B4;
+const TEXTURE_FEATURES_2: u32 = 0x0B8;
+const TEXTURE_FEATURES_3: u32 = 0x0BC;
 /// RESEARCH/009 §4.3: `CORE_FEATURES` at GPU_CONTROL +0x008, `[7:0]` the GPU variant upstream
 /// derives to select its model table entry. Read-only, same powered block as the reads above.
 const CORE_FEATURES: u32 = 0x008;
@@ -1246,7 +1250,12 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             // count. Logged so the board's measurement is on record independently of any
             // client, which is what RESEARCH/009's oracle table asks for. — SAKER
             let tiler_features = read_aperture(TILER_FEATURES);
-            let texture_features_0 = read_aperture(TEXTURE_FEATURES_0);
+            let texture_features = [
+                read_aperture(TEXTURE_FEATURES_0),
+                read_aperture(TEXTURE_FEATURES_1),
+                read_aperture(TEXTURE_FEATURES_2),
+                read_aperture(TEXTURE_FEATURES_3),
+            ];
             let core_features = read_aperture(CORE_FEATURES);
             let thread_max_threads = read_aperture(THREAD_MAX_THREADS);
             let thread_max_workgroup_size = read_aperture(THREAD_MAX_WORKGROUP_SIZE);
@@ -1255,7 +1264,17 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::NOTICE,
                 format_args!(
                     "drv-gpu: CORE_FEATURES=0x{:08x} TILER_FEATURES=0x{:08x} TEXTURE_FEATURES0=0x{:08x}; attested raw, not decoded\n",
-                    core_features, tiler_features, texture_features_0
+                    core_features, tiler_features, texture_features[0]
+                ),
+            );
+            // The rest of the same four-word group. Element 0 above remains the absence gate;
+            // these three were read in the same powered block, so a zero here is an attested
+            // value and is never reinterpreted. — TIMBERDOODLE
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: TEXTURE_FEATURES1=0x{:08x} TEXTURE_FEATURES2=0x{:08x} TEXTURE_FEATURES3=0x{:08x}; attested raw, not decoded\n",
+                    texture_features[1], texture_features[2], texture_features[3]
                 ),
             );
             // A separate line, so the earlier measurement keeps its exact words. All three
@@ -1815,7 +1834,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 shader_present,
                 mmu.features,
                 tiler_features,
-                texture_features_0,
+                texture_features,
                 core_features,
                 thread_max_threads,
                 thread_max_workgroup_size,

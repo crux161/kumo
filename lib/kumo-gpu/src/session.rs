@@ -1,8 +1,8 @@
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -125,9 +125,11 @@ impl Session {
             }
             Command::GetTextureFeatures => {
                 let texture = backend.texture_features()?;
-                // Same optional-property rule as tiler: an absent word is unknown capability,
-                // not an unusable device, so it degrades instead of retiring. — SAKER
-                if texture.texture_features_0 == 0 {
+                // Same optional-property rule as tiler, applied to element 0 only: a zero
+                // there is unknown capability, not an unusable device, so it degrades instead
+                // of retiring. Elements 1..3 cross verbatim, zero included — they were read
+                // in the same powered block, so a zero is an attested value. — TIMBERDOODLE
+                if texture.texture_features[0] == 0 {
                     return Err(Status::NotSupported);
                 }
                 Ok(Response::Texture(texture))
@@ -276,7 +278,7 @@ mod tests {
         topology: Option<u64>,
         mmu_features: Option<u32>,
         tiler_features: Option<u32>,
-        texture_features_0: Option<u32>,
+        texture_features: Option<[u32; 4]>,
         core_features: Option<u32>,
         threads: Option<DeviceThreads>,
     }
@@ -307,8 +309,8 @@ mod tests {
         }
         fn texture_features(&mut self) -> Result<DeviceTexture, Status> {
             self.record(Command::GetTextureFeatures)?;
-            self.texture_features_0
-                .map(|texture_features_0| DeviceTexture { texture_features_0 })
+            self.texture_features
+                .map(|texture_features| DeviceTexture { texture_features })
                 .ok_or(Status::NotSupported)
         }
         fn core_features(&mut self) -> Result<DeviceCore, Status> {
@@ -561,16 +563,25 @@ mod tests {
             send(&mut session, &mut backend, Command::GetTextureFeatures),
             Err(Status::NotSupported)
         );
-        // Bit 25 is AFRC presence on arch 10, so the word must cross with every bit intact
-        // rather than being reduced to a boolean on this side. — SAKER
-        backend.texture_features_0 = Some(0x0200_0001);
+        // Bit 25 of element 0 is AFRC presence on arch 10, and elements 1..3 are attested by
+        // the same register read, so the whole array must cross with every bit intact rather
+        // than being reduced to one boolean on this side. — TIMBERDOODLE
+        backend.texture_features = Some([0x0200_0001, 0, 0x8000_0000, 0]);
         assert_eq!(
             send(&mut session, &mut backend, Command::GetTextureFeatures),
             Ok(Response::Texture(DeviceTexture {
-                texture_features_0: 0x0200_0001
+                texture_features: [0x0200_0001, 0, 0x8000_0000, 0]
             }))
         );
-        backend.texture_features_0 = Some(0);
+        // Only element 0 is the absence gate; zeroes in elements 1..3 are attested values.
+        backend.texture_features = Some([0x0200_0000, 0, 0, 0]);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetTextureFeatures),
+            Ok(Response::Texture(DeviceTexture {
+                texture_features: [0x0200_0000, 0, 0, 0]
+            }))
+        );
+        backend.texture_features = Some([0, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
         assert_eq!(
             send(&mut session, &mut backend, Command::GetTextureFeatures),
             Err(Status::NotSupported)

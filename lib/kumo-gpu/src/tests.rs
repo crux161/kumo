@@ -1,8 +1,8 @@
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 extern crate std;
 
@@ -218,6 +218,9 @@ fn replies_distinguish_acceptance_pending_success_and_gpu_error() {
             point: 1,
             state: SyncState::Complete { gpu_status: 0x58 },
         },
+        Response::Texture(DeviceTexture {
+            texture_features: [0x0200_0001, 0, 0x8000_0000, 0xffff_ffff],
+        }),
     ];
     for response in responses {
         let reply = Reply {
@@ -670,7 +673,7 @@ fn tiler_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_by
 }
 
 #[test]
-fn texture_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_bytes() {
+fn texture_features_carry_all_four_words_and_reject_zero_element_0_or_high_bits() {
     let request = Request {
         id: 14,
         command: Command::GetTextureFeatures,
@@ -682,35 +685,59 @@ fn texture_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_
         bad[at] = 1;
         assert_eq!(Request::decode(&bad), None);
     }
-    // Bit 25 is AFRC on arch 10 and the low bits are the compressed-format mask, so both ends
-    // of the word must survive; upstream reads it whole. — SAKER
-    for texture_features_0 in [1, 0x0200_0000, 0x0200_0001, 0x8000_0000, u32::MAX] {
-        let response = Response::Texture(DeviceTexture { texture_features_0 });
+    // The reply carries the whole array, one word per u64 result slot. Element 0 is the
+    // compressed-format mask with bit 25 as AFRC; elements 1..3 are attested verbatim, so a
+    // zero among them is a real value, not absence, and both ends of every word must survive.
+    // — TIMBERDOODLE
+    for texture_features in [
+        [1, 0, 0, 0],
+        [0x0200_0000, 0xffff_ffff, 0, 0x8000_0000],
+        [0x0200_0001, 0, 0x4000_0000, 0],
+        [0x8000_0000, 1, 2, 3],
+        [u32::MAX; 4],
+    ] {
+        let response = Response::Texture(DeviceTexture { texture_features });
         let reply = Reply {
             id: 14,
             result: Ok(response),
         };
         let bytes = reply.encode();
         assert_eq!(&bytes[12..16], &11u32.to_le_bytes());
-        assert_eq!(&bytes[16..24], &u64::from(texture_features_0).to_le_bytes());
+        for (slot, word) in texture_features.iter().enumerate() {
+            assert_eq!(
+                &bytes[16 + slot * 8..24 + slot * 8],
+                &u64::from(*word).to_le_bytes()
+            );
+        }
         assert_eq!(Reply::decode(&bytes), Some(reply));
         assert_eq!(response.handle_count(), 0);
-        for at in 24..REPLY_LEN {
-            let mut bad = bytes;
-            bad[at] = 1;
-            assert_eq!(Reply::decode(&bad), None);
-        }
     }
+    // Every element occupies a u32 inside a u64 slot: a nonzero high half is a truncated
+    // frame the re-encode guard refuses, wherever in the array it appears. — TIMBERDOODLE
+    let reply = Reply {
+        id: 14,
+        result: Ok(Response::Texture(DeviceTexture {
+            texture_features: [0x0200_0001, 0, 0x8000_0000, 0],
+        })),
+    };
+    let bytes = reply.encode();
+    for at in [20, 28, 36, 44] {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "high byte {at}");
+    }
+    let mut widened = bytes;
+    widened[40..48].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    assert_eq!(Reply::decode(&widened), None);
+    // Element 0 is the session's optional-absence gate, so a zero there never crosses as a
+    // success, even when elements 1..3 look attested. — TIMBERDOODLE
     let zero = Reply {
         id: 14,
         result: Ok(Response::Texture(DeviceTexture {
-            texture_features_0: 0,
+            texture_features: [0, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff],
         })),
     };
     assert_eq!(Reply::decode(&zero.encode()), None);
-    let mut widened = zero.encode();
-    widened[16..24].copy_from_slice(&0x1_0200_0001u64.to_le_bytes());
-    assert_eq!(Reply::decode(&widened), None);
 }
 
 #[test]

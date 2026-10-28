@@ -1,8 +1,8 @@
-//j645
 //j646
 //j647
 //j650
 //j651
+//j652
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -51,17 +51,17 @@ struct Report {
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 160);
-// The enlarged 72-byte Info shifts every report field by 16, so the thread block starts at
-// 136, not at version6's 120. These pin the C mirror's offsets from the Rust side too.
+const _: () = assert!(core::mem::size_of::<Report>() == 168);
+// The enlarged 80-byte Info shifts every report field, so the thread block starts at 144,
+// not at version6's 120. These pin the C mirror's offsets from the Rust side too.
 // — TIMBERDOODLE
-const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 72);
-const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 132);
-const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 136);
-const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 140);
-const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 144);
-const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 148);
-const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 152);
+const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 80);
+const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 140);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 144);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 148);
+const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 152);
+const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 156);
+const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 160);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -77,13 +77,25 @@ const MMU_VA_SIZE: u64 = 1 << 48;
 const TILER_FEATURES: u32 = 0x809;
 const TILER_BIN: u32 = 512;
 const TILER_LEVELS: u32 = 8;
-/// Bit 1 is the tiler group, so it clears once TILER_FEATURES is attested.
-/// A modeled word with bit 25 set so upstream's AFRC branch is actually exercised. The board
-/// attests 0xc1ffff9e, which clears that bit, so the measured word is covered separately in the
-/// matrix below rather than being assumed here. — SAKER
+/// A modeled element 0 word with bit 25 set so upstream's AFRC branch is actually exercised.
+/// The board attests 0xc1ffff9e, which clears that bit, so the measured word is covered
+/// separately in the matrix below rather than being assumed here. — SAKER
 const TEXTURE_FEATURES_0: u32 = 0x0200_0001;
 /// Measured on the Orange Pi 5 Plus in J647; RESEARCH/009 §15 had only ever said "measure".
 const TEXTURE_FEATURES_0_MEASURED: u32 = 0xc1ff_ff9e;
+/// Modeled elements 1..3. They are read from the same powered register block as element 0 and
+/// cross verbatim, zero included, so the modeled array carries a zero, a high bit and a
+/// full-width word to prove nothing on the KUMO side narrows or decodes them. The board's real
+/// values are metal pending. — TIMBERDOODLE
+const TEXTURE_FEATURES_1: u32 = 0;
+const TEXTURE_FEATURES_2: u32 = 0x8000_0000;
+const TEXTURE_FEATURES_3: u32 = 0xffff_ffff;
+const TEXTURE_FEATURES: [u32; 4] = [
+    TEXTURE_FEATURES_0,
+    TEXTURE_FEATURES_1,
+    TEXTURE_FEATURES_2,
+    TEXTURE_FEATURES_3,
+];
 /// RESEARCH/009 §15 has never predicted a CORE_FEATURES word either, and J647 warns the variant
 /// byte is unrecorded. The modeled word uses variant 0 — the pinned Mesa table's requirement for
 /// its G610 entry to resolve — plus an unrelated bit above the byte so nothing on the KUMO side
@@ -104,22 +116,26 @@ const THREAD_FEATURES: u32 = 0x0310_0005;
 const MAX_TASKS_PER_CORE: u32 = THREAD_FEATURES >> 24;
 const REGISTERS_PER_CORE: u32 = THREAD_FEATURES & 0x3fffff;
 const MISSING_ALL: u64 = 1023;
-const MISSING_WITH_TILER: u64 = MISSING_ALL & !(1 << 1);
 /// Core features are required, so bit 0 clears on every successful query, whether or not the
-/// derived variant lands in Mesa's model table. — TIMBERDOODLE
-const MISSING_WITH_VARIANT: u64 = MISSING_ALL & !(1 << 0);
-const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_WITH_TILER & !(1 << 0);
-/// Bit 4 clears only when the query succeeded and all four upstream-asserted thread fields
-/// are nonzero; a zero derivation keeps the whole group missing. — TIMBERDOODLE
-const MISSING_WITH_VARIANT_AND_TILER_AND_THREADS: u64 = MISSING_WITH_VARIANT_AND_TILER & !(1 << 4);
-const MISSING_WITH_VARIANT_AND_THREADS: u64 = MISSING_WITH_VARIANT & !(1 << 4);
+/// derived variant lands in Mesa's model table. Bits 3 and 4 clear on the same successful
+/// query: G7i attests all four texture words together, and the modeled thread group satisfies
+/// upstream's nonzero assumption. Bit 1 clears only when the tiler shape was derived.
+/// — TIMBERDOODLE
+const MISSING_WITH_VARIANT_AND_TILER_AND_THREADS: u64 =
+    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 4);
+/// A tiler word that is absent or cannot be decoded leaves bit 1 set.
+const MISSING_WITH_VARIANT_AND_THREADS: u64 = MISSING_ALL & !(1 << 0) & !(1 << 3) & !(1 << 4);
+/// A thread group whose derivations contradict upstream's nonzero assumption leaves bit 4 set.
+const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3);
+/// An absent texture group (element 0 zero) leaves bit 3 set.
+const MISSING_WITH_VARIANT_NO_TEXTURE: u64 = MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 4);
 
 struct Hardware {
     busy_once: bool,
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
-    texture_features_0: u32,
+    texture_features: [u32; 4],
     core_features: u32,
     max_threads: u32,
     max_workgroup_size: u32,
@@ -153,11 +169,13 @@ impl Backend for Hardware {
         })
     }
     fn texture_features(&mut self) -> Result<DeviceTexture, Status> {
-        if self.texture_features_0 == 0 {
+        // Mirrors the driver: only element 0 is the absence gate, and elements 1..3 cross
+        // verbatim, zero included. — TIMBERDOODLE
+        if self.texture_features[0] == 0 {
             return Err(Status::NotSupported);
         }
         Ok(DeviceTexture {
-            texture_features_0: self.texture_features_0,
+            texture_features: self.texture_features,
         })
     }
     fn core_features(&mut self) -> Result<DeviceCore, Status> {
@@ -245,7 +263,7 @@ fn transport<'a>(
             shader_present: 0x500000005,
             mmu_features: MMU_FEATURES,
             tiler_features: TILER_FEATURES,
-            texture_features_0: TEXTURE_FEATURES_0,
+            texture_features: TEXTURE_FEATURES,
             core_features: CORE_FEATURES,
             max_threads: THREAD_MAX_THREADS,
             max_workgroup_size: THREAD_MAX_WORKGROUP_SIZE,
@@ -265,11 +283,11 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let mut client = Client::new(transport(&sends, &closed, true, false));
     let result = with_api(&mut client, |api| {
         let mut report = Report::default();
-        // A rejected old ABI must not write the larger version4 report into an
+        // A rejected old ABI must not write the larger version7 report into an
         // old caller's allocation. The extra sentinel words are guard storage, and they
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
-        let old_api = Api { version: 4, ..*api };
+        let old_api = Api { version: 7, ..*api };
         let mut guarded = [0xfeedbeefcafebabeu64; 16];
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
             || guarded != [0xfeedbeefcafebabeu64; 16]
@@ -279,7 +297,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 4, ..*api },
+            Api { version: 7, ..*api },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -321,6 +339,9 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.info.mmu_features != MMU_FEATURES
                 || report.info.tiler_features != TILER_FEATURES
                 || report.info.texture_features_0 != TEXTURE_FEATURES_0
+                || report.info.texture_features_1 != TEXTURE_FEATURES_1
+                || report.info.texture_features_2 != TEXTURE_FEATURES_2
+                || report.info.texture_features_3 != TEXTURE_FEATURES_3
                 || report.info.core_features != CORE_FEATURES
                 || report.info.thread_max_threads != THREAD_MAX_THREADS
                 || report.info.thread_max_workgroup_size != THREAD_MAX_WORKGROUP_SIZE
@@ -503,8 +524,11 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     }
 
     // AFRC is bit 25 behind upstream's own arch test, and compressed_formats is the word
-    // verbatim, so both ends of the word matter and neither is reduced early. An absent word
-    // still succeeds with both zero, exactly as for tiler features. — SAKER
+    // verbatim, so both ends of element 0 matter and neither is reduced early. Elements 1..3
+    // are modeled with words that would change both derived fields if anyone decoded them, so
+    // this also proves the derivation still reads element 0 only. An absent element 0 still
+    // succeeds with both zero and the whole array zero, exactly as for tiler features.
+    // — SAKER, TIMBERDOODLE
     for (word, afrc) in [
         (TEXTURE_FEATURES_0, 1u32),
         (TEXTURE_FEATURES_0_MEASURED, 0u32),
@@ -514,16 +538,30 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         (0xffff_ffffu32, 1u32),
         (0u32, 0u32),
     ] {
+        let array = if word == 0 {
+            [0; 4]
+        } else {
+            [word, 0x0200_0000, 0x0000_0001, 0xffff_ffff]
+        };
         sends.set(0);
         let mut wire = transport(&sends, &closed, false, false);
-        wire.hardware.texture_features_0 = word;
+        wire.hardware.texture_features = array;
         let mut client = Client::new(wire);
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
                 && report.info.texture_features_0 == word
+                && report.info.texture_features_1 == array[1]
+                && report.info.texture_features_2 == array[2]
+                && report.info.texture_features_3 == array[3]
                 && report.compressed_formats == word
                 && report.has_afrc == afrc
+                && report.missing_properties
+                    == if word == 0 {
+                        MISSING_WITH_VARIANT_NO_TEXTURE
+                    } else {
+                        MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
+                    }
                 && sends.get() == 7
         });
         if !ok {
@@ -808,6 +846,86 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     }
     if !client.is_lost() {
         return 8;
+    }
+
+    // Check 19: the whole four-word TEXTURE_FEATURES array crosses, and missing bit 3 tracks
+    // whether it was attested. The driver reads all four words in one powered block, so a
+    // successful texture query supplies the group; elements 1..3 cross verbatim, zero
+    // included, and only element 0 is the absence gate. — TIMBERDOODLE
+    for (array, attested) in [
+        // Full pass-through: element 1 is a zero the driver really measured, element 2 carries
+        // the top bit and element 3 is full width, so nothing narrows or decodes them.
+        ([0x0200_0001u32, 0, 0x8000_0000, 0xffff_ffff], true),
+        // A nonzero element 0 with every other word zero is still a complete attestation.
+        ([0x0000_0001u32, 0, 0, 0], true),
+        // Element 0 zero means the group is absent: the query still succeeds, the array is
+        // zero, bit 3 stays, and every other property is intact.
+        ([0u32, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff], false),
+        ([0u32, 0, 0, 0], false),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.texture_features = array;
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            let status = unsafe { kumo_mesa_probe(api, &mut report) };
+            if status != 1 || sends.get() != 7 {
+                return false;
+            }
+            let words = if attested { array } else { [0; 4] };
+            let derived_afrc = if words[0] & (1 << 25) != 0 { 1 } else { 0 };
+            let missing = if attested {
+                MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
+            } else {
+                MISSING_WITH_VARIANT_NO_TEXTURE
+            };
+            report.info.texture_features_0 == words[0]
+                && report.info.texture_features_1 == words[1]
+                && report.info.texture_features_2 == words[2]
+                && report.info.texture_features_3 == words[3]
+                && report.compressed_formats == words[0]
+                && report.has_afrc == derived_afrc
+                && report.missing_properties == missing
+                && (report.missing_properties & (1 << 3) != 0) == !attested
+                && report.info.gpu_id == INFO.gpu_id
+                && report.info.shader_present == 0x500000005
+                && report.info.mmu_features == MMU_FEATURES
+                && report.va_range_size == MMU_VA_SIZE
+                && report.info.tiler_features == TILER_FEATURES
+                && report.tiler_bin_size == TILER_BIN
+                && report.tiler_max_levels == TILER_LEVELS
+                && report.info.core_features == CORE_FEATURES
+                && report.gpu_variant == (CORE_FEATURES & 0xff)
+                && report.model_resolved == 1
+                && report.core_count == 4
+        });
+        if !ok {
+            return 19;
+        }
+        // An absent texture group is recoverable exactly as an absent tiler word is: the client
+        // stays live and one more query costs one more request ID. The merged chain consumes
+        // seven IDs per query (the thread query is last), so the follow-up query lands at eight.
+        if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 8 {
+            return 19;
+        }
+    }
+
+    // Check 19's version guard: version 7 is refused before any I/O, and this report's own
+    // version 8 is the one that is queried. — TIMBERDOODLE
+    sends.set(0);
+    let mut client = Client::new(transport(&sends, &closed, false, false));
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        let old = Api { version: 7, ..*api };
+        (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
+            && sends.get() == 0
+            && api.version == 8
+            && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+            && sends.get() == 7
+    });
+    if !ok || client.is_lost() {
+        return 19;
     }
     0
 }

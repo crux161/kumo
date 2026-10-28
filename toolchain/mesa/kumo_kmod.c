@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j645*/
 /*j646*/
 /*j647*/
 /*j650*/
 /*j651*/
+/*j652*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 #include "model/pan_model.h"
@@ -66,9 +66,14 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
         .mmu_features = out->info.mmu_features,
         .tiler_features = out->info.tiler_features,
         /* pan_query_afrc reads gpu_id as well as texture_features[0], so the ID must be in
-         * this partial input for upstream's own arch test to run. — SAKER */
+         * this partial input for upstream's own arch test to run. All four attested words go
+         * in; upstream's helpers read only element 0, and a zero it sees there leaves the
+         * derived fields zero because the query reported the group absent. — SAKER, TIMBERDOODLE */
         .gpu_id = out->info.gpu_id,
         .texture_features[0] = out->info.texture_features_0,
+        .texture_features[1] = out->info.texture_features_1,
+        .texture_features[2] = out->info.texture_features_2,
+        .texture_features[3] = out->info.texture_features_3,
         /* Upstream's own derivation, verbatim from panthor_kmod.c: the variant is bits [7:0]
          * of the attested word. The opi5's measured word is exactly zero, and variant byte 0
          * is the pinned table's G610 entry, so zero here is the expected outcome, not a
@@ -96,7 +101,9 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     }
     /* Both are pure reads of the attested word with no shift hazard: compressed_formats
      * returns it verbatim and afrc tests bit 25 behind upstream's own arch check. Absence
-     * leaves both zero rather than reporting "no formats". — SAKER */
+     * leaves both zero rather than reporting "no formats". These derivations read element 0
+     * only; elements 1..3 are attested and carried in the partial input but not decoded.
+     * — SAKER, TIMBERDOODLE */
     if (out->info.texture_features_0) {
         out->compressed_formats = pan_query_compressed_formats(&props);
         out->has_afrc = pan_query_afrc(&props) ? 1u : 0u;
@@ -146,19 +153,22 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     out->va_range_start = range.start;
     out->va_range_size = range.size;
     /* The mask tracks what is actually attested instead of staying a constant: bit 1 is the
-     * tiler group, so it clears only when the shape was genuinely derived. Bit 3 stays set even
-     * now, because only element 0 of the four-word texture_features array is attested and
-     * claiming the group would overstate it. Bit 4 clears only when the query succeeded and all
-     * four upstream-asserted thread fields are nonzero; a zero derivation keeps it set rather
-     * than aborting, so the rest of the report survives. Bit 0 (the variant) clears
-     * unconditionally once the query succeeded, because core features are required: the word is
-     * attested or the session died before publication. — SAKER, TIMBERDOODLE */
+     * tiler group, so it clears only when the shape was genuinely derived. Bit 3 is the
+     * texture group, so it clears only when the query succeeded — all four words were read in
+     * the same powered block and crossed verbatim — and stays when element 0 reported the
+     * group absent. Bit 4 clears only when the query succeeded and all four upstream-asserted
+     * thread fields are nonzero; a zero derivation keeps it set rather than aborting, so the
+     * rest of the report survives. Bit 0 (the variant) clears unconditionally once the query
+     * succeeded, because core features are required: the word is attested or the session died
+     * before publication. — SAKER, TIMBERDOODLE */
     out->missing_properties = tiler_derived
                                   ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
                                   : KUMO_MESA_MISSING_ALL;
     if (threads_derived)
         out->missing_properties &= ~KUMO_MESA_MISSING_THREADS;
     out->missing_properties &= ~KUMO_MESA_MISSING_VARIANT;
+    if (out->info.texture_features_0)
+        out->missing_properties &= ~KUMO_MESA_MISSING_TEXTURE;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)

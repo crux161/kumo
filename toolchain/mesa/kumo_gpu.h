@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j645*/
 /*j646*/
 /*j647*/
 /*j650*/
 /*j651*/
+/*j652*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -14,7 +14,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 7u
+#define KUMO_GPU_API_VERSION 8u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -32,7 +32,8 @@ struct kumo_gpu_info {
     uint64_t shader_present; /* attested shader core-ID mask */
     uint32_t mmu_features;   /* attested MMU_FEATURES; [7:0] is the VA width — SAKER */
     uint32_t tiler_features; /* attested TILER_FEATURES, or 0 when absent — SAKER */
-    uint32_t texture_features_0; /* attested TEXTURE_FEATURES[0] only, or 0 when absent — SAKER */
+    uint32_t texture_features_0; /* attested TEXTURE_FEATURES[0]; zero means the whole
+                                 * array is absent — TIMBERDOODLE */
     uint32_t core_features; /* attested CORE_FEATURES, verbatim; [7:0] is the variant. The
                              * query is required, but a zero word is a valid value: the opi5
                              * measures exactly 0x00000000. — TIMBERDOODLE */
@@ -42,6 +43,11 @@ struct kumo_gpu_info {
                                          * absent; upstream's max_threads_per_wg. */
     uint32_t thread_features; /* THREAD_FEATURES (+0x0ac), or 0 when absent: [21:0] is
                                * registers per core, [31:24] maximum tasks per core. */
+    /* Attested TEXTURE_FEATURES[1..3], verbatim, zero included. Appended in version8 after
+     * the thread words so every earlier field keeps its version7 offset. — TIMBERDOODLE */
+    uint32_t texture_features_1;
+    uint32_t texture_features_2;
+    uint32_t texture_features_3;
 };
 struct kumo_gpu_api {
     uint32_t version;
@@ -101,7 +107,7 @@ struct kumo_mesa_report {
      * zero when the thread group is absent. Upstream asserts all four nonzero; KUMO does not,
      * because a zero derivation is a reportable attestation, not a reason to abort: the group
      * stays missing (bit 4) and C must not use it. The enlarged kumo_gpu_info shifts the whole
-     * report by 16 bytes, so these sit after its new 136-byte body, not after version6's 120.
+     * report, so these sit after its new 144-byte body, not after version6's 120.
      * — TIMBERDOODLE */
     uint32_t max_threads_per_core;
     uint32_t max_threads_per_wg;
@@ -113,7 +119,7 @@ struct kumo_mesa_report {
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
                          struct kumo_mesa_report *out);
 
-_Static_assert(sizeof(struct kumo_gpu_info) == 72, "query layout");
+_Static_assert(sizeof(struct kumo_gpu_info) == 80, "query layout");
 _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, tiler_features) == 44, "query tail alignment");
@@ -122,12 +128,19 @@ _Static_assert(offsetof(struct kumo_gpu_info, core_features) == 52, "query tail 
 _Static_assert(offsetof(struct kumo_gpu_info, thread_max_threads) == 56, "query thread offset");
 _Static_assert(offsetof(struct kumo_gpu_info, thread_max_workgroup_size) == 60, "query thread offset");
 _Static_assert(offsetof(struct kumo_gpu_info, thread_features) == 64, "query thread offset");
-_Static_assert(sizeof(struct kumo_mesa_report) == 160, "report layout");
-_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 136, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 140, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 144, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 148, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 152, "report thread offset");
+_Static_assert(offsetof(struct kumo_gpu_info, texture_features_1) == 68, "query tail alignment");
+_Static_assert(offsetof(struct kumo_gpu_info, texture_features_2) == 72, "query tail alignment");
+_Static_assert(offsetof(struct kumo_gpu_info, texture_features_3) == 76, "query tail alignment");
+/* Version8 appends the remaining texture words to the embedded info, so the private report
+ * grows with it: 80-byte info, 168-byte report, thread block starting at 144. Field order is
+ * unchanged; only the trailing layout moves. — TIMBERDOODLE */
+_Static_assert(sizeof(struct kumo_mesa_report) == 168, "report layout");
+_Static_assert(offsetof(struct kumo_mesa_report, missing_properties) == 80, "report layout");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 144, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 148, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 152, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 156, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 160, "report thread offset");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

@@ -1,9 +1,9 @@
-# Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h
-<!-- j645 -->
+# Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i
 <!-- j646 -->
 <!-- j647 -->
 <!-- j650 -->
 <!-- j651 -->
+<!-- j652 -->
 
 This is a compile/link scaffold, not a usable Mesa device or a rendering driver.
 The probe compiles the actual pinned `pan_kmod.h` and `pan_props.c` for
@@ -70,7 +70,7 @@ separately from hardware evidence.
 ## Native seam and runtime closure
 
 `lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
-72-byte result (private C ABI version7; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
+80-byte result (private C ABI version8; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
 queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures, GetTilerFeatures,
 GetTextureFeatures, GetCoreFeatures then GetThreadProperties, preserving the same client and
 consuming seven request IDs on success. The
@@ -130,10 +130,14 @@ the nonzero raw TILER_FEATURES word from GPU_CONTROL +0x00C, whose [4:0] field i
 size and [11:8] the level count. Unlike the other properties this one is **optional**: an
 absent word is reported as NotSupported, the query still succeeds with `tiler_features` 0,
 and the tiler group stays in the missing mask. Additive GetTextureFeatures (opcode11) supplies
-the nonzero raw `TEXTURE_FEATURES[0]` from GPU_CONTROL +0x0B0 under the same optional rule.
-Upstream returns it verbatim as the compressed-format mask and tests bit 25, behind its own
-arch check, for AFRC. Only element 0 of the four-word array is attested, so missing-property
-bit 3 deliberately stays set rather than claiming the whole group. Additive GetCoreFeatures
+the raw four-word `TEXTURE_FEATURES[0..3]` array from GPU_CONTROL +0x0B0..+0x0BC under the same
+optional rule; the driver reads all four words in the same powered block and the wire carries
+them verbatim. Only element 0 is an absence gate: upstream returns it as the compressed-format
+mask and tests bit 25, behind its own arch check, for AFRC, so a zero there means the backend
+has no attestation, the query still succeeds with all four words zero, and the group stays in
+the missing mask. Elements 1..3 cross verbatim, zero included — they are attested values, not
+derived, and no consumer here decodes them. A successful query therefore attests the whole
+group and missing-property bit 3 clears. Additive GetCoreFeatures
 (opcode12) supplies the raw CORE_FEATURES word from GPU_CONTROL +0x008 under the **required**
 rule of topology and MMU features: the query must succeed — bits [7:0] are the GPU variant —
 but the word crosses verbatim, zero included. The Orange Pi 5 Plus measures exactly
@@ -154,9 +158,9 @@ become `max_threads_per_core` and `max_threads_per_wg`, `max_tasks_per_core` is
 `max_tls_instance_per_core` copies `max_threads_per_core` because there is no TLS register on
 v10+. Upstream answers a zero derivation with an assert; KUMO deliberately does not. Aborting
 would discard every other attested property, so the derived values are reported verbatim and
-bit 4 stays set, marking the group unusable instead. The report grew to 160 bytes: the
-enlarged 72-byte `kumo_gpu_info` shifts the whole report by 16 bytes, so the five new fields
-sit at offsets 136–152 with four bytes of zero tail padding, not at version6's 120–136.
+bit 4 stays set, marking the group unusable instead. The report grew to 168 bytes: the
+enlarged 80-byte `kumo_gpu_info` shifts the whole report, so the five new fields sit at
+offsets 144–160 with four bytes of zero tail padding, not at version6's 120–136.
 No additional MMIO read or client-selectable register is introduced. The bridge also reports the
 **service's** admitted VA window and maximum buffer size. Those remain service policy rather
 than hardware reports, and are now distinct from the attested MMU_FEATURES word the consumer
@@ -169,7 +173,7 @@ absent. The scaffold never initializes
 | 0 | gpu_variant |
 | 1 | ~~tiler_features~~ supplied by G7e; shader_present by G7c — cleared only when a shape is derived |
 | 2 | mem_features, l2_features (mmu_features supplied by G7d) |
-| 3 | texture_features[4] |
+| 3 | ~~texture_features[4]~~ supplied by G7i — all four words read in one powered block; bit clears only when the query succeeded |
 | 4 | ~~max_threads_per_core, max_tasks_per_core, max_threads_per_wg, num_registers_per_core, max_tls_instance_per_core~~ supplied by G7h; cleared only when all four upstream-asserted derivations are nonzero |
 | 5 | afbc_features |
 | 6 | gpu_can_query_timestamp, timestamp_device_coherent, timestamp_frequency, timestamp_cycles_to_ns_factor |
