@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j643*/
-/*j644*/
 /*j645*/
 /*j646*/
 /*j647*/
 /*j650*/
+/*j651*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -15,7 +14,7 @@
  * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
  * synchronously within with_api only; do not retain, reenter, race or unwind it.
  * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 6u
+#define KUMO_GPU_API_VERSION 7u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -37,6 +36,12 @@ struct kumo_gpu_info {
     uint32_t core_features; /* attested CORE_FEATURES, verbatim; [7:0] is the variant. The
                              * query is required, but a zero word is a valid value: the opi5
                              * measures exactly 0x00000000. — TIMBERDOODLE */
+    uint32_t thread_max_threads;      /* THREAD_MAX_THREADS (+0x0a0), or 0 when absent;
+                                       * upstream's max_threads_per_core. — TIMBERDOODLE */
+    uint32_t thread_max_workgroup_size; /* THREAD_MAX_WORKGROUP_SIZE (+0x0a4), or 0 when
+                                         * absent; upstream's max_threads_per_wg. */
+    uint32_t thread_features; /* THREAD_FEATURES (+0x0ac), or 0 when absent: [21:0] is
+                               * registers per core, [31:24] maximum tasks per core. */
 };
 struct kumo_gpu_api {
     uint32_t version;
@@ -92,18 +97,37 @@ struct kumo_mesa_report {
      * — TIMBERDOODLE */
     uint32_t gpu_variant;
     uint32_t model_resolved;
+    /* Derived with upstream's exact expressions from panthor_dev_query_thread_props, and left
+     * zero when the thread group is absent. Upstream asserts all four nonzero; KUMO does not,
+     * because a zero derivation is a reportable attestation, not a reason to abort: the group
+     * stays missing (bit 4) and C must not use it. The enlarged kumo_gpu_info shifts the whole
+     * report by 16 bytes, so these sit after its new 136-byte body, not after version6's 120.
+     * — TIMBERDOODLE */
+    uint32_t max_threads_per_core;
+    uint32_t max_threads_per_wg;
+    uint32_t max_tasks_per_core;
+    uint32_t num_registers_per_core;
+    uint32_t max_tls_instance_per_core;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
                          struct kumo_mesa_report *out);
 
-_Static_assert(sizeof(struct kumo_gpu_info) == 56, "query layout");
+_Static_assert(sizeof(struct kumo_gpu_info) == 72, "query layout");
 _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, tiler_features) == 44, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_0) == 48, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, core_features) == 52, "query tail alignment");
-_Static_assert(sizeof(struct kumo_mesa_report) == 120, "report layout");
+_Static_assert(offsetof(struct kumo_gpu_info, thread_max_threads) == 56, "query thread offset");
+_Static_assert(offsetof(struct kumo_gpu_info, thread_max_workgroup_size) == 60, "query thread offset");
+_Static_assert(offsetof(struct kumo_gpu_info, thread_features) == 64, "query thread offset");
+_Static_assert(sizeof(struct kumo_mesa_report) == 160, "report layout");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 136, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 140, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 144, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 148, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 152, "report thread offset");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");

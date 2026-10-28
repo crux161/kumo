@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j595
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 mod client;
 
@@ -98,6 +97,13 @@ const TEXTURE_FEATURES_0: u32 = 0x0B0;
 /// RESEARCH/009 §4.3: `CORE_FEATURES` at GPU_CONTROL +0x008, `[7:0]` the GPU variant upstream
 /// derives to select its model table entry. Read-only, same powered block as the reads above.
 const CORE_FEATURES: u32 = 0x008;
+/// RESEARCH/009 §4.3: `THREAD_MAX_THREADS` at GPU_CONTROL +0x0A0,
+/// `THREAD_MAX_WORKGROUP_SIZE` at +0x0A4 and `THREAD_FEATURES` at +0x0AC, whose `[21:0]`
+/// field is registers per core and `[31:24]` maximum tasks per core. Read-only, in the same
+/// powered block as the reads above; the upstream derivations are the consumer's. — TIMBERDOODLE
+const THREAD_MAX_THREADS: u32 = 0x0A0;
+const THREAD_MAX_WORKGROUP_SIZE: u32 = 0x0A4;
+const THREAD_FEATURES: u32 = 0x0AC;
 
 static mut FIRMWARE_IMAGE: [u8; FIRMWARE_MAX] = [0; FIRMWARE_MAX];
 
@@ -1242,11 +1248,24 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             let tiler_features = read_aperture(TILER_FEATURES);
             let texture_features_0 = read_aperture(TEXTURE_FEATURES_0);
             let core_features = read_aperture(CORE_FEATURES);
+            let thread_max_threads = read_aperture(THREAD_MAX_THREADS);
+            let thread_max_workgroup_size = read_aperture(THREAD_MAX_WORKGROUP_SIZE);
+            let thread_features = read_aperture(THREAD_FEATURES);
             log(
                 log_level::NOTICE,
                 format_args!(
                     "drv-gpu: CORE_FEATURES=0x{:08x} TILER_FEATURES=0x{:08x} TEXTURE_FEATURES0=0x{:08x}; attested raw, not decoded\n",
                     core_features, tiler_features, texture_features_0
+                ),
+            );
+            // A separate line, so the earlier measurement keeps its exact words. All three
+            // zero means the group is absent, which the client boundary reports as
+            // NotSupported; nothing is derived here. — TIMBERDOODLE
+            log(
+                log_level::NOTICE,
+                format_args!(
+                    "drv-gpu: THREAD_MAX_THREADS=0x{:08x} THREAD_MAX_WORKGROUP_SIZE=0x{:08x} THREAD_FEATURES=0x{:08x}; attested raw, not decoded\n",
+                    thread_max_threads, thread_max_workgroup_size, thread_features
                 ),
             );
             let windows = [
@@ -1798,6 +1817,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 tiler_features,
                 texture_features_0,
                 core_features,
+                thread_max_threads,
+                thread_max_workgroup_size,
+                thread_features,
             )
         }
         Err(error) => {

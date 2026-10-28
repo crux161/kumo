@@ -1,17 +1,16 @@
-//j596
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
 use crate::{
     valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission, Timeline,
-    MAX_BUFFER_BYTES,
+    DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission,
+    Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
@@ -45,6 +44,10 @@ pub trait Backend {
     }
     /// Optional read-only extension. An unimplemented backend must not invent core features.
     fn core_features(&mut self) -> Result<DeviceCore, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Optional read-only extension. An unimplemented backend must not invent thread properties.
+    fn thread_properties(&mut self) -> Result<DeviceThreads, Status> {
         Err(Status::NotSupported)
     }
     fn create_vm(&mut self) -> Result<(), Status>;
@@ -135,6 +138,14 @@ impl Session {
                 // 0x00000000 (J650), and variant byte 0 is the pinned Mesa table's G610 entry,
                 // so zero is a valid attestation, not a failed read. — TIMBERDOODLE
                 Ok(Response::Core(backend.core_features()?))
+            }
+            Command::GetThreadProperties => {
+                // Crossed verbatim, all three words zero included: unlike tiler and texture
+                // features, an all-zero group is a legitimate absence the consumer records by
+                // keeping missing-property bit 4, not a refusal this layer invents. Only the
+                // backend's own NotSupported crosses as the recoverable NotSupported error,
+                // exactly as the tiler and texture arms do. — TIMBERDOODLE
+                Ok(Response::Threads(backend.thread_properties()?))
             }
             Command::VmCreate => {
                 if self.vm {
@@ -267,6 +278,7 @@ mod tests {
         tiler_features: Option<u32>,
         texture_features_0: Option<u32>,
         core_features: Option<u32>,
+        threads: Option<DeviceThreads>,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -304,6 +316,10 @@ mod tests {
             self.core_features
                 .map(|core_features| DeviceCore { core_features })
                 .ok_or(Status::NotSupported)
+        }
+        fn thread_properties(&mut self) -> Result<DeviceThreads, Status> {
+            self.record(Command::GetThreadProperties)?;
+            self.threads.ok_or(Status::NotSupported)
         }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
             self.record(Command::GetInfo)?;
@@ -564,6 +580,56 @@ mod tests {
             send(&mut session, &mut backend, Command::VmCreate),
             Ok(Response::VmCreated { vm: 1 })
         );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.bindings.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn thread_properties_cross_verbatim_unsupported_is_recoverable_and_zero_words_are_an_absence() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetThreadProperties),
+            Err(Status::NotSupported)
+        );
+        // A modeled G610-shaped group: 1024 threads/core, 1024 threads/workgroup, and a
+        // THREAD_FEATURES word carrying 3 tasks/core in [31:24] and 0x100005 registers in
+        // [21:0]. Upstream derives those fields; this layer must not. — TIMBERDOODLE
+        let threads = DeviceThreads {
+            max_threads: 1024,
+            max_workgroup_size: 1024,
+            thread_features: 0x0310_0005,
+        };
+        backend.threads = Some(threads);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetThreadProperties),
+            Ok(Response::Threads(threads))
+        );
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
+        );
+        // All-zero words are a legitimate absence, not a refusal: the backend owns that
+        // decision, and the words still cross verbatim so the consumer can keep its missing
+        // bit. — TIMBERDOODLE
+        backend.threads = Some(DeviceThreads {
+            max_threads: 0,
+            max_workgroup_size: 0,
+            thread_features: 0,
+        });
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetThreadProperties),
+            Ok(Response::Threads(DeviceThreads {
+                max_threads: 0,
+                max_workgroup_size: 0,
+                thread_features: 0
+            }))
+        );
+        // The session is still live afterwards. — TIMBERDOODLE
         assert_eq!(
             send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
             Ok(Response::GroupCreated { group: 1 })

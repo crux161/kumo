@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j643*/
-/*j644*/
 /*j645*/
 /*j646*/
 /*j647*/
 /*j650*/
+/*j651*/
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
 #include "model/pan_model.h"
@@ -34,6 +33,11 @@ _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->shader_present) == 8, "M
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->mmu_features) == 4, "Mesa MMU properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->texture_features) == 16, "Mesa texture properties");
 _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->gpu_variant) == 4, "Mesa GPU variant");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_threads_per_core) == 4, "Mesa thread properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_threads_per_wg) == 4, "Mesa thread properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_tasks_per_core) == 1, "Mesa thread properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->num_registers_per_core) == 4, "Mesa thread properties");
+_Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->max_tls_instance_per_core) == 4, "Mesa thread properties");
 
 uint32_t
 kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
@@ -97,6 +101,23 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
         out->compressed_formats = pan_query_compressed_formats(&props);
         out->has_afrc = pan_query_afrc(&props) ? 1u : 0u;
     }
+    /* Upstream's own expressions, verbatim from panthor_dev_query_thread_props: the two
+     * workgroup/thread words copy straight across, tasks per core is THREAD_FEATURES >> 24
+     * and registers per core is THREAD_FEATURES & 0x3fffff. The TLS instance count is not a
+     * register: upstream assumes it equals max_threads_per_core on v10+. Everything is
+     * recorded verbatim, zero included — upstream answers a zero field with an assert, but
+     * KUMO is an attestation channel and a zero derivation is data, not a fault. Aborting
+     * here would hide every other attested property, so the group is instead marked missing
+     * (bit 4 stays set) and left unusable downstream. — TIMBERDOODLE */
+    out->max_threads_per_core = out->info.thread_max_threads;
+    out->max_threads_per_wg = out->info.thread_max_workgroup_size;
+    out->max_tasks_per_core = out->info.thread_features >> 24;
+    out->num_registers_per_core = out->info.thread_features & 0x3fffff;
+    out->max_tls_instance_per_core = out->max_threads_per_core;
+    /* The same four fields upstream asserts nonzero. This predicate decides only whether the
+     * group is safely usable; it never gates the report. — TIMBERDOODLE */
+    const int threads_derived = out->max_threads_per_core && out->max_threads_per_wg &&
+                                out->max_tasks_per_core && out->num_registers_per_core;
 
     /* Upstream derives the range by shifting 1ull by this field, so an attested width of
      * 64 or more would be undefined behaviour inside Mesa's own helper. Refuse before
@@ -127,12 +148,16 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     /* The mask tracks what is actually attested instead of staying a constant: bit 1 is the
      * tiler group, so it clears only when the shape was genuinely derived. Bit 3 stays set even
      * now, because only element 0 of the four-word texture_features array is attested and
-     * claiming the group would overstate it. Bit 0 (the variant) clears unconditionally once
-     * the query succeeded, because core features are required: the word is attested or the
-     * session died before publication. — SAKER, TIMBERDOODLE */
+     * claiming the group would overstate it. Bit 4 clears only when the query succeeded and all
+     * four upstream-asserted thread fields are nonzero; a zero derivation keeps it set rather
+     * than aborting, so the rest of the report survives. Bit 0 (the variant) clears
+     * unconditionally once the query succeeded, because core features are required: the word is
+     * attested or the session died before publication. — SAKER, TIMBERDOODLE */
     out->missing_properties = tiler_derived
                                   ? KUMO_MESA_MISSING_ALL & ~KUMO_MESA_MISSING_TOPOLOGY
                                   : KUMO_MESA_MISSING_ALL;
+    if (threads_derived)
+        out->missing_properties &= ~KUMO_MESA_MISSING_THREADS;
     out->missing_properties &= ~KUMO_MESA_MISSING_VARIANT;
     /* No generic FD entry point or Mesa runtime initialization is called. The
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */

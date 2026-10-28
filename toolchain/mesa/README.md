@@ -1,9 +1,9 @@
-# Native Mesa boundary — G7b/G7c/G7d/G7e/G7f
-<!-- j643 -->
-<!-- j644 -->
+# Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h
 <!-- j645 -->
 <!-- j646 -->
 <!-- j647 -->
+<!-- j650 -->
+<!-- j651 -->
 
 This is a compile/link scaffold, not a usable Mesa device or a rendering driver.
 The probe compiles the actual pinned `pan_kmod.h` and `pan_props.c` for
@@ -70,13 +70,15 @@ separately from hardware evidence.
 ## Native seam and runtime closure
 
 `lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
-56-byte result (private C ABI version6; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
+72-byte result (private C ABI version7; older versions are refused). `with_api` lends an **existing** typed client for synchronous serial
 queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures, GetTilerFeatures,
-GetTextureFeatures then GetCoreFeatures, preserving the same client and consuming six request
-IDs on success. The
-result is published only after all six succeed; a failed later query leaves no partial
-identity. NotSupported from either optional query is the one status that does not abort it;
-core features are required, so any failure of that sixth query aborts the whole report. The opaque context may not be retained, raced, reentered or unwound. It carries
+GetTextureFeatures, GetCoreFeatures then GetThreadProperties, preserving the same client and
+consuming seven request IDs on success. The
+result is published only after all seven succeed; a failed later query leaves no partial
+identity. NotSupported from an optional query is the one status that does not abort it;
+core features are required, so any failure of that sixth query aborts the whole report, and
+any thread-query failure other than NotSupported aborts it too. The thread group is optional:
+NotSupported leaves its three words zero and missing-property bit 4 set. The opaque context may not be retained, raced, reentered or unwound. It carries
 no FD, OS handle, Rust layout or new authority. The Rust owner keeps endpoint and grant
 cleanup responsibility. G7a's request ID, correlation and loss rules remain authoritative.
 Numeric query errors distinguish invalid arguments, invalid request, transport, protocol,
@@ -94,7 +96,11 @@ execution. `HAVE_ENDIAN_H` and `HAVE_STRUCT_TIMESPEC` describe actual installed 
 The scaffold C object refers to exactly six upstream functions: `pan_query_core_count`,
 `pan_query_core_id_range`, `pan_query_tiler_features`, `pan_query_compressed_formats`,
 `pan_query_afrc` and, since G7g, `pan_get_model`. All six must appear defined in the final
-native ELF, which has no unresolved symbols. G7d's
+native ELF, which has no unresolved symbols. G7h deliberately adds none: the thread
+derivations are upstream's expressions applied to the attested words, and the optional
+`pan_query_thread_tls_alloc` helper is not called, because the report already records its
+value (`max_tls_instance_per_core`, the documented fallback to `max_threads_per_core`) as a
+field rather than a returned device property. G7d's
 `pan_kmod_dev_query_user_va_range` is `static inline` in the pinned header, so it adds no
 entry to that inventory; G7e's tiler helper is a real function in the already-compiled
 `pan_props.c`, which is why the asserted set grew from two to three and no new translation
@@ -137,6 +143,20 @@ expression (`core_features & 0xff`, verbatim from `panthor_kmod.c`) and records 
 `pan_get_model` finds a table entry for `(gpu_id, variant)` in `model_resolved`; the pinned
 tree's G610 entry carries variant 0, and a table miss is reported, not failed. Missing-mask
 bit 0 clears on every successful query because the word is required.
+Additive GetThreadProperties (opcode13) supplies the raw `THREAD_MAX_THREADS` (GPU_CONTROL
++0x0A0), `THREAD_MAX_WORKGROUP_SIZE` (+0x0A4) and `THREAD_FEATURES` (+0x0AC) words under the
+same optional rule as tiler and texture features: all three zero means the group is absent,
+the backend reports NotSupported, the query still succeeds with three zero words and
+missing-property bit 4 stays set. The bridge derives the five `pan_kmod_dev_props` fields
+with upstream's exact expressions from `panthor_dev_query_thread_props`: the first two words
+become `max_threads_per_core` and `max_threads_per_wg`, `max_tasks_per_core` is
+`THREAD_FEATURES >> 24`, `num_registers_per_core` is `THREAD_FEATURES & 0x3fffff`, and
+`max_tls_instance_per_core` copies `max_threads_per_core` because there is no TLS register on
+v10+. Upstream answers a zero derivation with an assert; KUMO deliberately does not. Aborting
+would discard every other attested property, so the derived values are reported verbatim and
+bit 4 stays set, marking the group unusable instead. The report grew to 160 bytes: the
+enlarged 72-byte `kumo_gpu_info` shifts the whole report by 16 bytes, so the five new fields
+sit at offsets 136–152 with four bytes of zero tail padding, not at version6's 120–136.
 No additional MMIO read or client-selectable register is introduced. The bridge also reports the
 **service's** admitted VA window and maximum buffer size. Those remain service policy rather
 than hardware reports, and are now distinct from the attested MMU_FEATURES word the consumer
@@ -150,7 +170,7 @@ absent. The scaffold never initializes
 | 1 | ~~tiler_features~~ supplied by G7e; shader_present by G7c — cleared only when a shape is derived |
 | 2 | mem_features, l2_features (mmu_features supplied by G7d) |
 | 3 | texture_features[4] |
-| 4 | max_threads_per_core, max_tasks_per_core, max_threads_per_wg, num_registers_per_core, max_tls_instance_per_core |
+| 4 | ~~max_threads_per_core, max_tasks_per_core, max_threads_per_wg, num_registers_per_core, max_tls_instance_per_core~~ supplied by G7h; cleared only when all four upstream-asserted derivations are nonzero |
 | 5 | afbc_features |
 | 6 | gpu_can_query_timestamp, timestamp_device_coherent, timestamp_frequency, timestamp_cycles_to_ns_factor |
 | 7 | allowed_group_priorities_mask |

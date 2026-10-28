@@ -1,8 +1,8 @@
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -10,8 +10,9 @@
 use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
+use crate::DeviceThreads;
 
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -44,6 +45,16 @@ pub struct Info {
     /// query is required — any failure aborts the report — but a zero word is a valid
     /// attestation, not a failed read. — TIMBERDOODLE
     pub core_features: u32,
+    /// Raw `THREAD_MAX_THREADS` (GPU_CONTROL +0x0A0), or zero when the thread group is
+    /// absent. Upstream copies it to `max_threads_per_core`. — TIMBERDOODLE
+    pub thread_max_threads: u32,
+    /// Raw `THREAD_MAX_WORKGROUP_SIZE` (+0x0A4), or zero when absent. Upstream copies it to
+    /// `max_threads_per_wg`. — TIMBERDOODLE
+    pub thread_max_workgroup_size: u32,
+    /// Raw `THREAD_FEATURES` (+0x0AC), or zero when absent: `[21:0]` registers per core and
+    /// `[31:24]` maximum tasks per core. The derivations are upstream's, not KUMO's.
+    /// — TIMBERDOODLE
+    pub thread_features: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +107,19 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
         // whole query and publishes nothing, exactly like MMU features; the word itself
         // crosses verbatim, zero included. — TIMBERDOODLE
         let core = client.core()?;
+        // Thread properties are optional. NotSupported means the group is absent, not that
+        // the device is unusable, so the query still succeeds with three zero words and C
+        // leaves missing-property bit 4 set; any other failure aborts and publishes nothing.
+        // — TIMBERDOODLE
+        let threads = match client.threads() {
+            Ok(threads) => threads,
+            Err(Error::Server(crate::Status::NotSupported)) => DeviceThreads {
+                max_threads: 0,
+                max_workgroup_size: 0,
+                thread_features: 0,
+            },
+            Err(error) => return Err(error),
+        };
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -107,6 +131,9 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             tiler_features,
             texture_features_0,
             core_features: core.core_features,
+            thread_max_threads: threads.max_threads,
+            thread_max_workgroup_size: threads.max_workgroup_size,
+            thread_features: threads.thread_features,
         })
     })();
     match result {
@@ -122,7 +149,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 56);
+const _: () = assert!(size_of::<Info>() == 72);
 // Pin both tail offsets. `tiler_features` exactly fills the padding that followed
 // `mmu_features`, so version4's Info is the same *size* as version3's and a size check alone
 // cannot distinguish them — only the version field and these offsets can. — SAKER
@@ -130,13 +157,19 @@ const _: () = assert!(core::mem::offset_of!(Info, mmu_features) == 40);
 const _: () = assert!(core::mem::offset_of!(Info, tiler_features) == 44);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_0) == 48);
 const _: () = assert!(core::mem::offset_of!(Info, core_features) == 52);
+// Version7's three thread words follow core_features; the struct's 8-byte alignment leaves
+// four bytes of zero tail padding after them. — TIMBERDOODLE
+const _: () = assert!(core::mem::offset_of!(Info, thread_max_threads) == 56);
+const _: () = assert!(core::mem::offset_of!(Info, thread_max_workgroup_size) == 60);
+const _: () = assert!(core::mem::offset_of!(Info, thread_features) == 64);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-        DeviceTiler, DeviceTopology, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
+        DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response, Status, REPLY_LEN,
+        REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -149,6 +182,8 @@ mod tests {
         tiler_unsupported: bool,
         texture_unsupported: bool,
         core_failure: bool,
+        threads_unsupported: bool,
+        threads_failure: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -198,6 +233,18 @@ mod tests {
                 } else {
                     Ok(Response::Core(DeviceCore {
                         core_features: 0x0000_1000,
+                    }))
+                }
+            } else if self.command == Some(Command::GetThreadProperties) {
+                if self.threads_failure {
+                    Err(Status::Busy)
+                } else if self.threads_unsupported {
+                    Err(Status::NotSupported)
+                } else {
+                    Ok(Response::Threads(DeviceThreads {
+                        max_threads: 1024,
+                        max_workgroup_size: 512,
+                        thread_features: 0x0310_0005,
                     }))
                 }
             } else {
@@ -253,6 +300,9 @@ mod tests {
                 assert_eq!(out.tiler_features, 0x809);
                 assert_eq!(out.texture_features_0, 0x0200_0001);
                 assert_eq!(out.core_features, 0x0000_1000);
+                assert_eq!(out.thread_max_threads, 1024);
+                assert_eq!(out.thread_max_workgroup_size, 512);
+                assert_eq!(out.thread_features, 0x0310_0005);
             }
         });
         assert!(client.info().is_ok());
@@ -263,12 +313,16 @@ mod tests {
         let mut client = Client::new(Wire {
             tiler_unsupported: true,
             texture_unsupported: true,
+            threads_unsupported: true,
             ..Wire::default()
         });
         with_api(&mut client, |api| {
             let mut out = Info {
                 tiler_features: 99,
                 texture_features_0: 99,
+                thread_max_threads: 99,
+                thread_max_workgroup_size: 99,
+                thread_features: 99,
                 ..Info::default()
             };
             let query = api.query.unwrap();
@@ -277,6 +331,9 @@ mod tests {
             assert_eq!(unsafe { query(api.context, &mut out) }, OK);
             assert_eq!(out.tiler_features, 0);
             assert_eq!(out.texture_features_0, 0);
+            assert_eq!(out.thread_max_threads, 0);
+            assert_eq!(out.thread_max_workgroup_size, 0);
+            assert_eq!(out.thread_features, 0);
             assert_eq!(out.core_features, 0x0000_1000);
             assert_eq!(out.gpu_id, 0xa8670005);
             assert_eq!(out.mmu_features, 0x2830);
@@ -344,6 +401,48 @@ mod tests {
                     out.core_features
                 ),
                 (0, 0, 0, 0)
+            );
+            assert_eq!((out.va_start, out.va_end), (0, 0));
+        });
+        // Busy is recoverable: the client stays live and the next full query succeeds.
+        assert!(!client.is_lost());
+        assert!(client.info().is_ok());
+    }
+
+    #[test]
+    fn a_failing_thread_query_publishes_no_partially_filled_report() {
+        let mut client = Client::new(Wire {
+            threads_failure: true,
+            ..Wire::default()
+        });
+        with_api(&mut client, |api| {
+            let mut out = Info {
+                gpu_id: 99,
+                core_features: 99,
+                thread_max_threads: 99,
+                thread_max_workgroup_size: 99,
+                thread_features: 99,
+                ..Info::default()
+            };
+            let query = api.query.unwrap();
+            // All six earlier queries succeed, so a naive implementation would already have
+            // written every earlier field. A non-NotSupported thread failure must publish
+            // nothing, unlike the absent-group NotSupported path. — TIMBERDOODLE
+            assert_eq!(
+                unsafe { query(api.context, &mut out) },
+                SERVER_ERROR + Status::Busy as u32
+            );
+            assert_eq!(
+                (
+                    out.gpu_id,
+                    out.shader_present,
+                    out.mmu_features,
+                    out.core_features,
+                    out.thread_max_threads,
+                    out.thread_max_workgroup_size,
+                    out.thread_features
+                ),
+                (0, 0, 0, 0, 0, 0, 0)
             );
             assert_eq!((out.va_start, out.va_end), (0, 0));
         });

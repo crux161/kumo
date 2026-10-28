@@ -1,9 +1,9 @@
 #![no_std]
-//j643
-//j644
 //j645
 //j646
 //j647
+//j650
+//j651
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -82,6 +82,22 @@ pub struct DeviceTexture {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCore {
     pub core_features: u32,
+}
+
+/// Three raw thread-property words, crossed undecoded like their siblings:
+/// `THREAD_MAX_THREADS` (GPU_CONTROL +0x0A0), `THREAD_MAX_WORKGROUP_SIZE` (+0x0A4) and
+/// `THREAD_FEATURES` (+0x0AC), whose `[21:0]` field is registers per core and `[31:24]`
+/// maximum tasks per core. Upstream's `panthor_dev_query_thread_props` copies the first two
+/// into `max_threads_per_core` and `max_threads_per_wg`, shifts and masks the third into
+/// `max_tasks_per_core` and `num_registers_per_core`, and assumes the TLS instance count
+/// equals the thread count. The derivations stay the consumer's; this channel attests only
+/// the words. All three may be zero together, which means the group is absent, not that the
+/// device is unusable. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceThreads {
+    pub max_threads: u32,
+    pub max_workgroup_size: u32,
+    pub thread_features: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

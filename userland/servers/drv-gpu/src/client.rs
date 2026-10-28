@@ -1,9 +1,8 @@
-//j636
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -31,6 +30,9 @@ struct Hardware<'a> {
     tiler_features: u32,
     texture_features_0: u32,
     core_features: u32,
+    thread_max_threads: u32,
+    thread_max_workgroup_size: u32,
+    thread_features: u32,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -95,6 +97,23 @@ impl Backend for Hardware<'_> {
         // pinned table's G610 entry. — TIMBERDOODLE
         Ok(protocol::DeviceCore {
             core_features: self.core_features,
+        })
+    }
+    fn thread_properties(&mut self) -> Result<protocol::DeviceThreads, GpuStatus> {
+        // All three zero means the thread group is absent, which is the recoverable
+        // NotSupported status; any other combination crosses verbatim, zeros included, and
+        // the consumer decides whether the derivation is usable. Nothing is derived here.
+        // — TIMBERDOODLE
+        if self.thread_max_threads == 0
+            && self.thread_max_workgroup_size == 0
+            && self.thread_features == 0
+        {
+            return Err(GpuStatus::NotSupported);
+        }
+        Ok(protocol::DeviceThreads {
+            max_threads: self.thread_max_threads,
+            max_workgroup_size: self.thread_max_workgroup_size,
+            thread_features: self.thread_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
@@ -317,6 +336,9 @@ pub(super) fn serve(
     tiler_features: u32,
     texture_features_0: u32,
     core_features: u32,
+    thread_max_threads: u32,
+    thread_max_workgroup_size: u32,
+    thread_features: u32,
 ) -> ! {
     let mut hw = Hardware {
         device,
@@ -325,6 +347,9 @@ pub(super) fn serve(
         tiler_features,
         texture_features_0,
         core_features,
+        thread_max_threads,
+        thread_max_workgroup_size,
+        thread_features,
         tables,
         arena,
         root,

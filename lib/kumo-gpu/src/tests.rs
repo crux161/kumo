@@ -1,9 +1,8 @@
-//j596
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 extern crate std;
 
@@ -38,6 +37,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetTilerFeatures,
         Command::GetTextureFeatures,
         Command::GetCoreFeatures,
+        Command::GetThreadProperties,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::VmBind(binding()),
@@ -711,4 +711,88 @@ fn texture_features_preserve_all_32_bits_and_reject_zero_truncation_or_reserved_
     let mut widened = zero.encode();
     widened[16..24].copy_from_slice(&0x1_0200_0001u64.to_le_bytes());
     assert_eq!(Reply::decode(&widened), None);
+}
+
+#[test]
+fn thread_properties_cross_three_raw_words_accept_all_zero_and_reject_truncation_or_reserved_slots()
+{
+    let request = Request {
+        id: 16,
+        command: Command::GetThreadProperties,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &13u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    // Unlike tiler and texture features, all three words zero is a legitimate absence: the
+    // backend decides the group is missing, the frame carries it verbatim, and C keeps
+    // missing-property bit 4. So the zero triple must round-trip as a success here; only an
+    // out-of-range word or a nonzero reserved slot is malformed. The other rows pin each
+    // word independently, including 0x3fffff (the whole registers-per-core field), 255
+    // (the whole tasks-per-core field shifted up) and both ends of u32. — TIMBERDOODLE
+    for (max_threads, max_workgroup_size, thread_features) in [
+        (0, 0, 0),
+        (1024, 512, 0x0310_0005),
+        (0, 512, 0x0310_0005),
+        (1024, 0, 0x0310_0005),
+        (1024, 512, 0),
+        (1, 1, 0x003f_ffff),
+        (u32::MAX, u32::MAX, u32::MAX),
+        (0, 0, 0x8000_0000),
+    ] {
+        let response = Response::Threads(DeviceThreads {
+            max_threads,
+            max_workgroup_size,
+            thread_features,
+        });
+        let reply = Reply {
+            id: 16,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &13u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(max_threads).to_le_bytes());
+        assert_eq!(&bytes[24..32], &u64::from(max_workgroup_size).to_le_bytes());
+        assert_eq!(&bytes[32..40], &u64::from(thread_features).to_le_bytes());
+        assert_eq!(&bytes[40..48], &0u64.to_le_bytes());
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+        // Only slot 3 is reserved; slots 0..2 may carry any word, zero included.
+        for at in 40..REPLY_LEN {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    // A word wider than 32 bits would narrow silently, so the canonical re-encode check must
+    // refuse each of the three slots separately. — TIMBERDOODLE
+    for slot in 0..3 {
+        let mut widened = Reply {
+            id: 16,
+            result: Ok(Response::Threads(DeviceThreads {
+                max_threads: 1024,
+                max_workgroup_size: 512,
+                thread_features: 0x0310_0005,
+            })),
+        }
+        .encode();
+        let at = 16 + slot * 8;
+        widened[at..at + 8].copy_from_slice(&(0x1_0000_0000u64 + 0x1234).to_le_bytes());
+        assert_eq!(Reply::decode(&widened), None);
+    }
+    // A nonzero reserved slot is not an extension point; decode refuses it. — TIMBERDOODLE
+    let mut reserved = Reply {
+        id: 16,
+        result: Ok(Response::Threads(DeviceThreads {
+            max_threads: 1024,
+            max_workgroup_size: 512,
+            thread_features: 0x0310_0005,
+        })),
+    }
+    .encode();
+    reserved[40..48].copy_from_slice(&1u64.to_le_bytes());
+    assert_eq!(Reply::decode(&reserved), None);
 }

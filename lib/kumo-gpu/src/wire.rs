@@ -1,9 +1,8 @@
-//j596
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -12,7 +11,7 @@
 
 use crate::{
     valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceTiler, DeviceTopology, Status, Submission, SyncState,
+    DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -26,6 +25,7 @@ pub enum Command {
     GetTilerFeatures,
     GetTextureFeatures,
     GetCoreFeatures,
+    GetThreadProperties,
     VmCreate,
     BufferCreate {
         bytes: u64,
@@ -58,6 +58,7 @@ impl Request {
             Command::GetTilerFeatures => (10, [0; 6]),
             Command::GetTextureFeatures => (11, [0; 6]),
             Command::GetCoreFeatures => (12, [0; 6]),
+            Command::GetThreadProperties => (13, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
@@ -109,6 +110,7 @@ impl Request {
             10 => Command::GetTilerFeatures,
             11 => Command::GetTextureFeatures,
             12 => Command::GetCoreFeatures,
+            13 => Command::GetThreadProperties,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             3 => {
@@ -157,6 +159,9 @@ pub enum Response {
     Tiler(DeviceTiler),
     Texture(DeviceTexture),
     Core(DeviceCore),
+    /// Three raw thread-property words in slots 0..2; slot 3 is zero. No word is
+    /// special-cased here: all three may legitimately be zero when the group is absent. — TIMBERDOODLE
+    Threads(DeviceThreads),
     VmCreated {
         vm: u32,
     },
@@ -217,6 +222,15 @@ impl Reply {
                 (11, [u64::from(texture.texture_features_0), 0, 0, 0])
             }
             Ok(Response::Core(core)) => (12, [u64::from(core.core_features), 0, 0, 0]),
+            Ok(Response::Threads(threads)) => (
+                13,
+                [
+                    u64::from(threads.max_threads),
+                    u64::from(threads.max_workgroup_size),
+                    u64::from(threads.thread_features),
+                    0,
+                ],
+            ),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
@@ -271,6 +285,15 @@ impl Reply {
                 }),
                 12 => Response::Core(DeviceCore {
                     core_features: a[0] as u32,
+                }),
+                // Unlike tiler and texture features there is no nonzero guard: absence is the
+                // backend's decision, so the frame must round-trip zero words unchanged. The
+                // re-encode check still refuses truncated words and a nonzero reserved slot.
+                // — TIMBERDOODLE
+                13 => Response::Threads(DeviceThreads {
+                    max_threads: a[0] as u32,
+                    max_workgroup_size: a[1] as u32,
+                    thread_features: a[2] as u32,
                 }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {

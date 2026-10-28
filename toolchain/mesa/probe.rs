@@ -1,9 +1,8 @@
-//j643
-//j644
 //j645
 //j646
 //j647
 //j650
+//j651
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -14,8 +13,8 @@ use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceTiler, DeviceTopology, Reply,
-    Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
+    Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
+    DeviceTopology, Reply, Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
 };
 
 #[cfg(target_os = "none")]
@@ -43,11 +42,26 @@ struct Report {
     has_afrc: u32,
     gpu_variant: u32,
     model_resolved: u32,
+    max_threads_per_core: u32,
+    max_threads_per_wg: u32,
+    max_tasks_per_core: u32,
+    num_registers_per_core: u32,
+    max_tls_instance_per_core: u32,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 120);
+const _: () = assert!(core::mem::size_of::<Report>() == 160);
+// The enlarged 72-byte Info shifts every report field by 16, so the thread block starts at
+// 136, not at version6's 120. These pin the C mirror's offsets from the Rust side too.
+// — TIMBERDOODLE
+const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 72);
+const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 132);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 136);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 140);
+const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 144);
+const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 148);
+const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 152);
 const _: () = assert!(core::mem::size_of::<Api>() == 24);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
@@ -79,12 +93,26 @@ const CORE_FEATURES: u32 = 0x0000_1000;
 /// byte 0 is the pinned table's G610 entry, so the measured word is the resolving one.
 /// A zero word is a valid attestation, not a failed read. — TIMBERDOODLE
 const CORE_FEATURES_MEASURED: u32 = 0x0000_0000;
+/// Modeled thread words shaped like a G610 group: 1024 threads per core and per workgroup,
+/// and a THREAD_FEATURES word whose `[21:0]` registers field is 0x0010_0005 and whose
+/// `[31:24]` tasks field is 3. RESEARCH/009 §15 has never measured these registers, so the
+/// board's real words are metal pending and nothing here is claimed as measured.
+/// — TIMBERDOODLE
+const THREAD_MAX_THREADS: u32 = 1024;
+const THREAD_MAX_WORKGROUP_SIZE: u32 = 1024;
+const THREAD_FEATURES: u32 = 0x0310_0005;
+const MAX_TASKS_PER_CORE: u32 = THREAD_FEATURES >> 24;
+const REGISTERS_PER_CORE: u32 = THREAD_FEATURES & 0x3fffff;
 const MISSING_ALL: u64 = 1023;
 const MISSING_WITH_TILER: u64 = MISSING_ALL & !(1 << 1);
 /// Core features are required, so bit 0 clears on every successful query, whether or not the
 /// derived variant lands in Mesa's model table. — TIMBERDOODLE
 const MISSING_WITH_VARIANT: u64 = MISSING_ALL & !(1 << 0);
 const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_WITH_TILER & !(1 << 0);
+/// Bit 4 clears only when the query succeeded and all four upstream-asserted thread fields
+/// are nonzero; a zero derivation keeps the whole group missing. — TIMBERDOODLE
+const MISSING_WITH_VARIANT_AND_TILER_AND_THREADS: u64 = MISSING_WITH_VARIANT_AND_TILER & !(1 << 4);
+const MISSING_WITH_VARIANT_AND_THREADS: u64 = MISSING_WITH_VARIANT & !(1 << 4);
 
 struct Hardware {
     busy_once: bool,
@@ -93,6 +121,9 @@ struct Hardware {
     tiler_features: u32,
     texture_features_0: u32,
     core_features: u32,
+    max_threads: u32,
+    max_workgroup_size: u32,
+    thread_features: u32,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -134,6 +165,18 @@ impl Backend for Hardware {
         // to DeviceLost rather than degrading. — TIMBERDOODLE
         Ok(DeviceCore {
             core_features: self.core_features,
+        })
+    }
+    fn thread_properties(&mut self) -> Result<DeviceThreads, Status> {
+        // Mirrors the driver: all three words zero means the group is absent, which the
+        // session maps to the recoverable NotSupported status. — TIMBERDOODLE
+        if self.max_threads == 0 && self.max_workgroup_size == 0 && self.thread_features == 0 {
+            return Err(Status::NotSupported);
+        }
+        Ok(DeviceThreads {
+            max_threads: self.max_threads,
+            max_workgroup_size: self.max_workgroup_size,
+            thread_features: self.thread_features,
         })
     }
     fn create_vm(&mut self) -> Result<(), Status> {
@@ -204,6 +247,9 @@ fn transport<'a>(
             tiler_features: TILER_FEATURES,
             texture_features_0: TEXTURE_FEATURES_0,
             core_features: CORE_FEATURES,
+            max_threads: THREAD_MAX_THREADS,
+            max_workgroup_size: THREAD_MAX_WORKGROUP_SIZE,
+            thread_features: THREAD_FEATURES,
         },
         reply: [0; REPLY_LEN],
         sends,
@@ -264,7 +310,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         {
             return 3;
         }
-        for n in [7, 13] {
+        for n in [8, 15] {
             if unsafe { kumo_mesa_probe(api, &mut report) } != 1
                 || report.info.gpu_id != INFO.gpu_id
                 || report.info.cs_features != INFO.cs_features
@@ -276,6 +322,9 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.info.tiler_features != TILER_FEATURES
                 || report.info.texture_features_0 != TEXTURE_FEATURES_0
                 || report.info.core_features != CORE_FEATURES
+                || report.info.thread_max_threads != THREAD_MAX_THREADS
+                || report.info.thread_max_workgroup_size != THREAD_MAX_WORKGROUP_SIZE
+                || report.info.thread_features != THREAD_FEATURES
                 || report.compressed_formats != TEXTURE_FEATURES_0
                 || report.has_afrc != 1
                 || report.core_count != 4
@@ -286,7 +335,12 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.tiler_max_levels != TILER_LEVELS
                 || report.gpu_variant != (CORE_FEATURES & 0xff)
                 || report.model_resolved != 1
-                || report.missing_properties != MISSING_WITH_VARIANT_AND_TILER
+                || report.max_threads_per_core != THREAD_MAX_THREADS
+                || report.max_threads_per_wg != THREAD_MAX_WORKGROUP_SIZE
+                || report.max_tasks_per_core != MAX_TASKS_PER_CORE
+                || report.num_registers_per_core != REGISTERS_PER_CORE
+                || report.max_tls_instance_per_core != THREAD_MAX_THREADS
+                || report.missing_properties != MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
                 || report.query_status != 0
                 || report.reserved != 0
                 || sends.get() != n
@@ -299,7 +353,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     if result != 0 {
         return result;
     }
-    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 14 || closed.get() != 0 {
+    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 16 || closed.get() != 0 {
         return 5;
     }
 
@@ -320,7 +374,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.core_count == count
                 && report.core_id_range == range
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 6
+                && sends.get() == 7
         });
         if !ok {
             return 9;
@@ -346,7 +400,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             let status = unsafe { kumo_mesa_probe(api, &mut report) };
-            if status != code || sends.get() != 6 {
+            if status != code || sends.get() != 7 {
                 return false;
             }
             if code == 1 {
@@ -376,14 +430,30 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             TILER_FEATURES,
             TILER_BIN,
             TILER_LEVELS,
-            MISSING_WITH_VARIANT_AND_TILER,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
         ),
-        (0x0014u32, 1u32 << 20, 0u32, MISSING_WITH_VARIANT_AND_TILER),
-        (0x0f00u32, 1u32, 15u32, MISSING_WITH_VARIANT_AND_TILER),
-        (0xffff_ff00u32, 1u32, 15u32, MISSING_WITH_VARIANT_AND_TILER),
+        (
+            0x0014u32,
+            1u32 << 20,
+            0u32,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
+        ),
+        (
+            0x0f00u32,
+            1u32,
+            15u32,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
+        ),
+        (
+            0xffff_ff00u32,
+            1u32,
+            15u32,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
+        ),
         // A bin-size field of 31 would overflow the signed shift inside upstream's own
-        // helper, so the shape degrades to unknown instead of being derived. — SAKER
-        (0x001fu32, 0u32, 0u32, MISSING_WITH_VARIANT),
+        // helper, so the shape degrades to unknown instead of being derived. Threads are
+        // still attested in this row, so only bits 0, 1 and 4 are clear. — SAKER
+        (0x001fu32, 0u32, 0u32, MISSING_WITH_VARIANT_AND_THREADS),
     ] {
         sends.set(0);
         let mut wire = transport(&sends, &closed, false, false);
@@ -396,7 +466,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.tiler_bin_size == bin
                 && report.tiler_max_levels == levels
                 && report.missing_properties == missing
-                && sends.get() == 6
+                && sends.get() == 7
         });
         if !ok {
             return 14;
@@ -416,7 +486,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.info.tiler_features == 0
             && report.tiler_bin_size == 0
             && report.tiler_max_levels == 0
-            && report.missing_properties == MISSING_WITH_VARIANT
+            && report.missing_properties == MISSING_WITH_VARIANT_AND_THREADS
             && report.info.mmu_features == MMU_FEATURES
             && report.va_range_size == MMU_VA_SIZE
             && report.core_count == 4
@@ -424,7 +494,9 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.has_afrc == 1
             && report.info.core_features == CORE_FEATURES
             && report.model_resolved == 1
-            && sends.get() == 6
+            && report.max_threads_per_core == THREAD_MAX_THREADS
+            && report.max_threads_per_wg == THREAD_MAX_WORKGROUP_SIZE
+            && sends.get() == 7
     });
     if !ok || client.is_lost() {
         return 15;
@@ -452,7 +524,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.info.texture_features_0 == word
                 && report.compressed_formats == word
                 && report.has_afrc == afrc
-                && sends.get() == 6
+                && sends.get() == 7
         });
         if !ok {
             return 16;
@@ -482,14 +554,195 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.info.core_features == word
                 && report.gpu_variant == variant
                 && report.model_resolved == resolved
-                && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER
+                && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
                 && report.info.mmu_features == MMU_FEATURES
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 6
+                && sends.get() == 7
         });
         if !ok {
             return 17;
         }
+    }
+
+    // G7h: upstream's thread derivations, except that KUMO never mirrors upstream's nonzero
+    // assert. Each row pins the four upstream-asserted fields, the TLS rule (which copies
+    // max_threads_per_core) and bit 4. Zero words are an absence the report can state, not a
+    // reason to abort, so every row still succeeds and every other property survives.
+    // — TIMBERDOODLE
+    for (
+        max_threads,
+        max_workgroup_size,
+        thread_features,
+        per_core,
+        per_wg,
+        tasks,
+        registers,
+        tls,
+        missing,
+    ) in [
+        (
+            THREAD_MAX_THREADS,
+            THREAD_MAX_WORKGROUP_SIZE,
+            THREAD_FEATURES,
+            THREAD_MAX_THREADS,
+            THREAD_MAX_WORKGROUP_SIZE,
+            MAX_TASKS_PER_CORE,
+            REGISTERS_PER_CORE,
+            THREAD_MAX_THREADS,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
+        ),
+        // Every field at its maximum: 255 tasks from the top byte and 0x3fffff registers from
+        // the whole low field. This is the derivation boundary, not an error, so bit 4 clears.
+        (
+            1024,
+            1024,
+            0xffff_ffff,
+            1024,
+            1024,
+            255,
+            0x3fffff,
+            1024,
+            MISSING_WITH_VARIANT_AND_TILER_AND_THREADS,
+        ),
+        // Zero tasks with nonzero registers: upstream would assert, because the group is not
+        // safely usable. KUMO reports the derivation verbatim and keeps bit 4.
+        (
+            1024,
+            1024,
+            0x003f_ffff,
+            1024,
+            1024,
+            0,
+            0x3fffff,
+            1024,
+            MISSING_WITH_VARIANT_AND_TILER,
+        ),
+        // The inverse contradiction: a full tasks byte and zero registers.
+        (
+            1024,
+            1024,
+            0x0300_0000,
+            1024,
+            1024,
+            3,
+            0,
+            1024,
+            MISSING_WITH_VARIANT_AND_TILER,
+        ),
+        // A zero thread count zeroes the TLS derivation with it, because TLS copies it.
+        (
+            0,
+            1024,
+            THREAD_FEATURES,
+            0,
+            1024,
+            MAX_TASKS_PER_CORE,
+            REGISTERS_PER_CORE,
+            0,
+            MISSING_WITH_VARIANT_AND_TILER,
+        ),
+        (
+            1024,
+            0,
+            THREAD_FEATURES,
+            1024,
+            0,
+            MAX_TASKS_PER_CORE,
+            REGISTERS_PER_CORE,
+            1024,
+            MISSING_WITH_VARIANT_AND_TILER,
+        ),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.max_threads = max_threads;
+        wire.hardware.max_workgroup_size = max_workgroup_size;
+        wire.hardware.thread_features = thread_features;
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+                && report.info.thread_max_threads == max_threads
+                && report.info.thread_max_workgroup_size == max_workgroup_size
+                && report.info.thread_features == thread_features
+                && report.max_threads_per_core == per_core
+                && report.max_threads_per_wg == per_wg
+                && report.max_tasks_per_core == tasks
+                && report.num_registers_per_core == registers
+                && report.max_tls_instance_per_core == tls
+                && report.missing_properties == missing
+                && sends.get() == 7
+        });
+        if !ok || client.is_lost() {
+            return 18;
+        }
+    }
+
+    // The board's plausible case while RESEARCH/009 §15 stays unmeasured: all three words
+    // zero means the group is absent. The backend answers NotSupported, the query still
+    // succeeds with zero words, bit 4 stays set, and every other property and the client
+    // survive. — TIMBERDOODLE
+    sends.set(0);
+    let mut wire = transport(&sends, &closed, false, false);
+    wire.hardware.max_threads = 0;
+    wire.hardware.max_workgroup_size = 0;
+    wire.hardware.thread_features = 0;
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+            && report.info.thread_max_threads == 0
+            && report.info.thread_max_workgroup_size == 0
+            && report.info.thread_features == 0
+            && report.max_threads_per_core == 0
+            && report.max_threads_per_wg == 0
+            && report.max_tasks_per_core == 0
+            && report.num_registers_per_core == 0
+            && report.max_tls_instance_per_core == 0
+            && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER
+            && report.info.gpu_id == INFO.gpu_id
+            && report.info.mmu_features == MMU_FEATURES
+            && report.va_range_size == MMU_VA_SIZE
+            && report.info.tiler_features == TILER_FEATURES
+            && report.tiler_bin_size == TILER_BIN
+            && report.info.texture_features_0 == TEXTURE_FEATURES_0
+            && report.compressed_formats == TEXTURE_FEATURES_0
+            && report.info.core_features == CORE_FEATURES
+            && report.model_resolved == 1
+            && report.core_count == 4
+            && sends.get() == 7
+    });
+    if !ok || client.is_lost() {
+        return 18;
+    }
+
+    // A contradicted upstream assumption, stated on its own: the words are nonzero, so the
+    // group looks present, but registers per core is zero. Upstream's assert would abort
+    // device creation; KUMO publishes every other property, records the zero derivation and
+    // keeps bit 4 so no consumer mistakes the group for usable. — TIMBERDOODLE
+    sends.set(0);
+    let mut wire = transport(&sends, &closed, false, false);
+    wire.hardware.thread_features = 0x0300_0000;
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+            && report.info.thread_max_threads == THREAD_MAX_THREADS
+            && report.info.thread_max_workgroup_size == THREAD_MAX_WORKGROUP_SIZE
+            && report.info.thread_features == 0x0300_0000
+            && report.max_threads_per_core == THREAD_MAX_THREADS
+            && report.max_threads_per_wg == THREAD_MAX_WORKGROUP_SIZE
+            && report.max_tasks_per_core == 3
+            && report.num_registers_per_core == 0
+            && report.max_tls_instance_per_core == THREAD_MAX_THREADS
+            && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER
+            && report.info.core_features == CORE_FEATURES
+            && report.model_resolved == 1
+            && report.va_range_size == MMU_VA_SIZE
+            && sends.get() == 7
+    });
+    if !ok || client.is_lost() {
+        return 18;
     }
 
     // A zero MMU attestation retires the session exactly as a zero topology does: C sees
