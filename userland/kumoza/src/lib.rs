@@ -7,6 +7,7 @@
 //j569
 //j648
 //j691
+//j698
 
 extern crate alloc;
 
@@ -261,7 +262,7 @@ pub const HELP_TEXT: &[u8] = b"KUMO Sora userspace shell (scaffold)\n\
               whoami\n\
     power: halt, reboot, shutdown\n\
     editor: kilo /tmp/<file> or /media/<volume>/<file> (relative paths use cwd)\n\
-    diag: dmesg [-n level], bmp-view, gfx-client, gfx-demo, gfx-log, heap, ipcstat, relibc [args], threads\n\
+    diag: dmesg [-n level], bmp-view, gfx-client, gfx-demo, gfx-log, gfx-term, heap, ipcstat, relibc [args], threads\n\
     other commands run via kernel shell\n";
 
 /// Tokenize a line into a single `Command`. Splits on ASCII whitespace, except inside

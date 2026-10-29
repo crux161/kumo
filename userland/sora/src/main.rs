@@ -12,6 +12,7 @@
 //j693
 //j694
 //j697
+//j698
 
 extern crate alloc;
 
@@ -119,6 +120,12 @@ static LOG_MIRROR: AtomicBool = AtomicBool::new(false);
 /// `shell_write`; Sora's own notices never do. — TIMBERDOODLE
 static SHELL_RING: [AtomicU8; 1024] = [const { AtomicU8::new(0) }; 1024];
 static SHELL_RING_SEQ: AtomicU32 = AtomicU32::new(0);
+/// C3 S3-b: while set, the terminal view owns the keyboard like a shell itself. Keys typed
+/// while it holds focus go to ttyd even if an input consumer was admitted, and no consumer
+/// may be admitted on it. Default off, so the F2 acceptance proof's two consumer views
+/// stay valid. — TIMBERDOODLE
+static TERMINAL_MODE: AtomicBool = AtomicBool::new(false);
+const TERMINAL_VIEW: usize = 1;
 /// Which stream each console view shows: view 0 the kernel log ring, view 1 the interactive
 /// terminal's shell stream. — TIMBERDOODLE
 const CONSOLE_SOURCES: [u8; kumo_graphics::VIEW_COUNT] = [0, 2];
@@ -936,6 +943,7 @@ fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
     let view = (0..kumo_graphics::VIEW_COUNT).find(|view| {
         GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed)
             && GRAPHICS_INPUT[*view].load(Ordering::Relaxed) == 0
+            && !(TERMINAL_MODE.load(Ordering::Relaxed) && *view == TERMINAL_VIEW)
     });
     let Some(view) = view else {
         log(b"gfx-keys: no view free for an input consumer\n");
@@ -1437,6 +1445,22 @@ fn gfx_log(cmd: &kumoza::Command) {
             term(b"gfx-log: mirror off\n");
         }
         _ => usage(b"usage: gfx-log [on|off]\n"),
+    }
+}
+
+/// C3 S3-b: hand the keyboard to the terminal view while it holds focus. Flag-gated so the
+/// F2 acceptance proof (two input consumers) keeps working unchanged. — TIMBERDOODLE
+fn gfx_term(cmd: &kumoza::Command) {
+    match cmd.args.first().map(|arg| arg.as_str()) {
+        Some("on") => {
+            TERMINAL_MODE.store(true, Ordering::Relaxed);
+            term(b"gfx-term: on\n");
+        }
+        Some("off") => {
+            TERMINAL_MODE.store(false, Ordering::Relaxed);
+            term(b"gfx-term: off\n");
+        }
+        _ => usage(b"usage: gfx-term on|off\n"),
     }
 }
 
@@ -5104,6 +5128,7 @@ extern "C" fn sora_main(
                 } else if n > 0
                     && focus_view
                         .is_some_and(|view| GRAPHICS_INPUT[view].load(Ordering::Relaxed) != 0)
+                    && !(TERMINAL_MODE.load(Ordering::Relaxed) && focus_view == Some(TERMINAL_VIEW))
                 {
                     // F2b focus routing: the focused view's input consumer owns the keyboard.
                     // A write that finds the consumer gone retires the channel and hands the
@@ -5302,6 +5327,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-log" {
         gfx_log(cmd);
+        return true;
+    }
+    if cmd.name == "gfx-term" {
+        gfx_term(cmd);
         return true;
     }
     if cmd.name == "gfx-damage" {

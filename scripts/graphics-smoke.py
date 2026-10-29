@@ -27,7 +27,7 @@ import threading
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False, term=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -87,6 +87,10 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # mirror left on so the serve loop keeps refreshing the view through the
                 # rest of boot.
                 data = b"dmesg -n 6\ngfx-log\nrun hello\ngfx-log\ngfx-log\ngfx-log on\nrun args alpha beta\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if term:
+                # C3 S3-b: the mirror keeps both views live and the terminal view owns the
+                # keyboard; the host focuses it and types at the login prompt.
+                data = b"dmesg -n 6\ngfx-log on\ngfx-term on\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -222,7 +226,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False, term=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -275,7 +279,7 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
                 continue
             if titles and in_label(x, y):
                 continue
-            if log and in_rects(
+            if (log or term) and in_rects(
                 x,
                 y,
                 [(rx, ry, VIEW_W, VIEW_H) for rx, ry in rects],
@@ -283,9 +287,9 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
                 continue
             want = compose_expected(x, y, rects, images)
             assert at(x, y) == want, f"band pixel {(x, y)} is {at(x, y)}, want {want}"
-    if log:
+    if log or term:
         # C3 slices 1-4: each view's client rect holds its presented console text (view 0
-        # the kernel log, view 1 the userland stream). The server's title strip overlays
+        # the kernel log, view 1 the shell stream). The server's title strip overlays
         # the top rows and is asserted with the other strips.
         for index, (vx, vy) in enumerate(rects):
             ink = 0
@@ -375,6 +379,7 @@ def main():
     parser.add_argument("--acceptance", action="store_true", help="prove the F2 acceptance clause: two clients, keyboard focus switching between their consumers")
     parser.add_argument("--titles", action="store_true", help="prove server-drawn band labels through the glyph atlas")
     parser.add_argument("--log", action="store_true", help="prove the kernel log presented as a client surface through the damage path")
+    parser.add_argument("--term", action="store_true", help="prove the terminal view owns the keyboard while focused")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -400,6 +405,8 @@ def main():
         parser.error("--titles is a separate proof")
     if args.log and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance or args.titles):
         parser.error("--log is a separate proof")
+    if args.term and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance or args.titles or args.log):
+        parser.error("--term is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -415,7 +422,7 @@ def main():
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
                      args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant,
-                     args.recover, args.acceptance, args.titles, args.log)
+                     args.recover, args.acceptance, args.titles, args.log, args.term)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     serial_sock = work / "serial.sock"
@@ -426,15 +433,19 @@ def main():
             "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a72",
             "-m", "512", "-display", "none", "-device", "ramfb", "-monitor", "none",
             "-serial",
-            (f"unix:{serial_sock},server=on,wait=off" if args.acceptance else f"file:{serial}"),
+            (
+                f"unix:{serial_sock},server=on,wait=off"
+                if (args.acceptance or args.term)
+                else f"file:{serial}"
+            ),
             "-qmp", "stdio",
             "-drive", f"if=pflash,format=raw,file={args.firmware_code},readonly=on",
             "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",
             "-drive", f"file=fat:rw:{work / 'esp'},format=raw,if=virtio",
             "-net", "none",
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
-        if args.acceptance:
-            # The acceptance gate types keys from the host, so the serial line is a unix
+        if args.acceptance or args.term:
+            # The typed gates drive keys from the host, so the serial line is a unix
             # socket; a reader thread keeps the transcript live and mirrors it to the log.
             serial_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             for _ in range(200):
@@ -465,7 +476,7 @@ def main():
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError((work / "qemu.log").read_text())
-                transcript = bytes(transcript_buf) if args.acceptance else (
+                transcript = bytes(transcript_buf) if (args.acceptance or args.term) else (
                     serial.read_bytes() if serial.exists() else b""
                 )
                 if args.with_dtb and b"TOWER: CPU EXCEPTION" in transcript:
@@ -487,6 +498,12 @@ def main():
                     ) >= 2 and b"bmp-view: bitmap copied; buffer released (software GOP)" in transcript
                 if args.titles:
                     ready = ready and b"drv-fb: titles on" in transcript
+                if args.term:
+                    ready = (
+                        ready
+                        and b"gfx-term: on" in transcript
+                        and b"gfx-log: mirror on" in transcript
+                    )
                 if args.acceptance:
                     ready = (ready
                              and b"sora: keys view 0" in transcript
@@ -500,6 +517,28 @@ def main():
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"boot timed out; inspect {serial}")
+            if args.term:
+                # Focus the terminal view (none -> 0 -> 1) and type at the login prompt;
+                # the echo must reach the terminal view's stream, so the mirror presents
+                # view 1 again after the focus record.
+                mark = len(bytes(transcript_buf))
+                # Type the marker without Enter (the login prompt keeps its state) and
+                # cycle focus back to none so the band's exact no-focus model still holds
+                # at capture time, as the acceptance mode does. — TIMBERDOODLE
+                for data in (b"\x1d", b"\x1d", b"s", b"3", b"b", b"\x1d"):
+                    serial_conn.sendall(data)
+                    time.sleep(0.25)
+                deadline_keys = time.monotonic() + 15
+                while time.monotonic() < deadline_keys:
+                    fresh = bytes(transcript_buf)[mark:]
+                    if (b"sora: focus view 1" in bytes(transcript_buf)
+                            and (b"gfx-log: view 1 retired" in fresh
+                                 or b"gfx-log: view 1 copied" in fresh)):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(f"terminal focus typing did not refresh the view; inspect {serial}")
+                transcript = bytes(transcript_buf)
             if args.acceptance:
                 # Drive the keyboard over the serial socket: Ctrl-] cycles focus
                 # none to 0 to 1 to none twice, and only the focused view's consumer
@@ -622,6 +661,12 @@ def main():
                 assert transcript.count(demo) == 1, f"missing view 1 reply; inspect {serial}"
                 assert b"gfx-demo: one or more views failed" not in transcript
                 assert b"drv-fb: titles on" in transcript
+            elif args.term:
+                assert b"gfx-term: on" in transcript, f"missing terminal-mode record; inspect {serial}"
+                assert b"sora: focus view 1" in transcript, f"missing terminal focus record; inspect {serial}"
+                assert transcript.rindex(b"gfx-log: view 1") > transcript.index(b"sora: focus view 1"), (
+                    f"terminal view never refreshed after focus; inspect {serial}"
+                )
             elif args.log:
                 assert b"gfx-log: view 0 retired" in transcript or b"gfx-log: view 0 copied" in transcript, (
                     f"missing log-view reply; inspect {serial}"
@@ -678,7 +723,7 @@ def main():
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
                          args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage,
                          args.regrant, args.async_regrant, args.recover, args.acceptance,
-                         args.titles, args.log)
+                         args.titles, args.log, args.term)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
@@ -699,6 +744,8 @@ def main():
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             if args.log:
                 print("Log UEFI smoke green: per-view console surfaces (kernel log, shell stream), only changed rows damaged, kept live by the mirror")
+            if args.term:
+                print("Term UEFI smoke green: the terminal view owned the keyboard and the typed line echoed into its presented surface")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:
