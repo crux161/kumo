@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j548
 //j549
 //j550
 //j559
 //j664
+//j665
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -125,6 +125,9 @@ const EVENT_POLL_LIMIT: u32 = 2_000_000;
 /// preempts Sora, so the enumeration-time budget here would starve the system on any wake that
 /// carries no matching event.
 const IRQ_EVENT_DRAIN_LIMIT: u32 = 4096;
+/// Transfer completions serviced per interrupt wake. Two HID lanes at their polling intervals
+/// complete at most twice per wake in normal use; the bound only caps a pathological burst.
+const HID_EVENTS_PER_WAKE: usize = 4;
 
 // Slice C: a second contiguous DMA page holds the enumeration structures for the device on the
 // first connected+enabled port. 64-byte context stride (caps ctx=0x40).
@@ -138,6 +141,14 @@ const OFF_EP0_RING: usize = 0xc00; // 16-TRB EP0 default-control transfer ring (
 const OFF_DATA: usize = 0xd00; // control-transfer data buffer (256 B)
 const OFF_INT_RING: usize = 0xe00; // 16-TRB interrupt-IN transfer ring (256 B)
 const OFF_REPORT: usize = 0xf00; // HID report buffer (256 B)
+
+// A composite boot HID device needs a second interrupt-IN ring and report buffer. They live in
+// the spare window between the input context (whose highest boot-HID DCI is 4, ending at 0x180)
+// and the controller-written output context at OFF_OUTPUT_CTX, so the page needs no growth.
+const OFF_HID2_RING: usize = 0x180; // composite boot HID: mouse interrupt-IN ring (256 B)
+const OFF_HID2_REPORT: usize = 0x280; // composite boot HID: mouse report buffer (8 B)
+const _: () = assert!(OFF_HID2_RING + INT_RING_TRBS * 16 <= OFF_HID2_REPORT);
+const _: () = assert!(OFF_HID2_REPORT + 8 <= OFF_OUTPUT_CTX);
 const EP0_RING_TRBS: usize = 16;
 const INT_RING_TRBS: usize = 16;
 const DEVICE_DESCRIPTOR_LEN: u32 = 18;
@@ -1169,43 +1180,52 @@ fn enumerate_root_device(
     if role == RootRole::SuperSpeedSide {
         return log(b"drv-xhci: ss side device is neither hub nor storage; left alone\n");
     }
-    let config_bytes = &config[..read_len as usize];
-    let hid = kumo_hid::find_hid_boot_keyboard(config_bytes)
-        .or_else(|| kumo_hid::find_hid_boot_mouse(config_bytes));
-    match hid {
-        Some(hid) => {
-            log(b"drv-xhci: hid if=");
-            log_hex(hid.interface_number as u64);
-            log(b" proto=");
-            log_hex(hid.protocol as u64);
-            log(b" ep=");
-            log_hex(hid.in_endpoint_address as u64);
-            log(b" mps=");
-            log_hex(hid.max_packet_size as u64);
-            log(b" interval=");
-            log_hex(hid.interval as u64);
-            log(b"\n");
-            if hid.is_keyboard() || hid.is_mouse() {
-                configure_and_read_keyboard(
-                    io,
-                    layout,
-                    &mut *image,
-                    &mut *cmd,
-                    evt,
-                    &mut ep0_ring,
-                    &mut *ep0_seg,
-                    slot_id,
-                    page_va,
-                    page_phys,
-                    speed_raw,
-                    slot_context_words(0, speed_raw, 1, port_number, 0, 0),
-                    config_value,
-                    hid,
-                );
-            }
-        }
-        None => log(b"drv-xhci: no hid boot iface\n"),
+    let Some(plan) = HidPlan::from_config(&config[..read_len as usize]) else {
+        return log(b"drv-xhci: no hid boot iface\n");
+    };
+    let Some(primary) = plan.primary() else {
+        return log(b"drv-xhci: no hid boot iface\n");
+    };
+    log(b"drv-xhci: hid if=");
+    log_hex(primary.interface_number as u64);
+    log(b" proto=");
+    log_hex(primary.protocol as u64);
+    log(b" ep=");
+    log_hex(primary.in_endpoint_address as u64);
+    log(b" mps=");
+    log_hex(primary.max_packet_size as u64);
+    log(b" interval=");
+    log_hex(primary.interval as u64);
+    log(b"\n");
+    if let Some(mouse) = plan.mouse.filter(|_| plan.keyboard.is_some()) {
+        log(b"drv-xhci: hid mouse if=");
+        log_hex(mouse.interface_number as u64);
+        log(b" proto=");
+        log_hex(mouse.protocol as u64);
+        log(b" ep=");
+        log_hex(mouse.in_endpoint_address as u64);
+        log(b" mps=");
+        log_hex(mouse.max_packet_size as u64);
+        log(b" interval=");
+        log_hex(mouse.interval as u64);
+        log(b"\n");
     }
+    configure_and_read_keyboard(
+        io,
+        layout,
+        &mut *image,
+        &mut *cmd,
+        evt,
+        &mut ep0_ring,
+        &mut *ep0_seg,
+        slot_id,
+        page_va,
+        page_phys,
+        speed_raw,
+        slot_context_words(0, speed_raw, 1, port_number, 0, 0),
+        config_value,
+        plan,
+    );
 }
 
 /// J525: select a root-attached SCSI/BOT interface, identify its geometry, and discover a GPT ESP
@@ -2567,10 +2587,205 @@ fn log_ascii(bytes: &[u8]) {
     log(&safe[..length]);
 }
 
-/// Bring one boot HID interface online, keyboard or mouse: SET_CONFIGURATION, Configure Endpoint
-/// for its interrupt-IN endpoint, SET_PROTOCOL(boot), then arm the interrupt ring and forward its
-/// reports. The keyboard loop is resident; a mouse forwards the 3-byte wire to Sora's pointer
-/// pipeline. Bounded only when the controller has no IRQ.
+/// The boot HID interfaces a configuration publishes: a keyboard, a mouse, or both. A composite
+/// receiver needs both endpoints added by one Configure Endpoint command, so the pair travels
+/// together.
+#[derive(Clone, Copy)]
+struct HidPlan {
+    keyboard: Option<kumo_hid::HidBootInterface>,
+    mouse: Option<kumo_hid::HidBootInterface>,
+}
+
+impl HidPlan {
+    fn from_config(config: &[u8]) -> Option<Self> {
+        let (keyboard, mouse) = kumo_hid::find_hid_boot_pair(config);
+        if keyboard.is_none() && mouse.is_none() {
+            None
+        } else {
+            Some(Self { keyboard, mouse })
+        }
+    }
+
+    /// The interface logged first and served alone when the pair cannot be configured: the
+    /// keyboard when present, else the mouse.
+    fn primary(self) -> Option<kumo_hid::HidBootInterface> {
+        self.keyboard.or(self.mouse)
+    }
+}
+
+/// One boot HID interface's report lane: its own ring, report buffer, and one outstanding
+/// transfer. The keyboard keeps the historical OFF_INT_RING/OFF_REPORT regions; a composite
+/// mouse takes the spare window above the input context.
+struct HidLane {
+    hid: kumo_hid::HidBootInterface,
+    ring: TransferRing,
+    ring_va: u64,
+    report: DmaBuf,
+    report_phys: u64,
+    dci: u8,
+    pending: bool,
+    token: u64,
+    armed_logged: bool,
+}
+
+impl HidLane {
+    /// Create the lane over its page regions. Both offsets are 64-byte aligned for the xHCI
+    /// ring rules, and the lane reaches the page only through the DMA views.
+    fn new(
+        hid: kumo_hid::HidBootInterface,
+        dci: u8,
+        ring_off: usize,
+        report_off: usize,
+        base_va: u64,
+        enum_phys: u64,
+    ) -> Option<Self> {
+        // SAFETY: both regions live inside this device's mapped page.
+        let mut ring_seg =
+            unsafe { DmaTrbs::new((base_va as usize + ring_off) as *mut Trb, INT_RING_TRBS) };
+        let ring = TransferRing::new(&mut ring_seg, enum_phys + ring_off as u64).ok()?;
+        // SAFETY: the report buffer is inside the same page, reached only through `DmaBuf`.
+        let report = unsafe {
+            DmaBuf::new(
+                (base_va as usize + report_off) as *mut u8,
+                enum_phys + report_off as u64,
+                8,
+            )
+        };
+        Some(Self {
+            hid,
+            ring,
+            ring_va: base_va + ring_off as u64,
+            report,
+            report_phys: enum_phys + report_off as u64,
+            dci,
+            pending: false,
+            token: 0,
+            armed_logged: false,
+        })
+    }
+
+    /// Arm this lane's one outstanding interrupt-IN transfer. Re-arming only after the previous
+    /// event is reclaimed is the J425/J632 rule: a wake without a match used to leak a ring slot
+    /// until enqueue failed and the driver exited.
+    fn arm(&mut self, io: &mut Mmio, layout: RegisterLayout, slot_id: u8) {
+        self.report.zero();
+        dsb();
+        let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(
+            self.report_phys,
+            self.hid.max_packet_size as u32,
+        )) else {
+            return log(b"drv-xhci: normal trb fail\n");
+        };
+        let mut seg = unsafe { DmaTrbs::new(self.ring_va as *mut Trb, INT_RING_TRBS) };
+        match self.ring.enqueue(&mut seg, normal) {
+            Err(_) => {
+                // Never exit on a full ring: exiting quiesces the controller and the device
+                // never comes back. Retry on the next interrupt.
+                log(b"drv-xhci: int ring full; draining\n");
+            }
+            Ok(token) => {
+                self.pending = true;
+                self.token = token.iova;
+                dsb();
+                ring_slot_doorbell(io, layout, slot_id, self.dci);
+                if !self.armed_logged {
+                    log(b"drv-xhci: hid transfer armed dci=");
+                    log_hex(self.dci as u64);
+                    log(b" trb=");
+                    log_hex(token.iova);
+                    log(b"\n");
+                    self.armed_logged = true;
+                }
+            }
+        }
+    }
+}
+
+/// Configure BOTH boot-HID endpoints of a composite device in one Configure Endpoint command.
+/// A Configure Endpoint command replaces the device's endpoint set, so adding the mouse with a
+/// second command would drop the keyboard. The keyboard's ring is OFF_INT_RING; the mouse's is
+/// the spare window at OFF_HID2_RING. Refuses when the input context's highest context slot
+/// would run into that window.
+#[allow(clippy::too_many_arguments)]
+fn configure_hid_endpoint_pair(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
+    evt: &DmaTrbs,
+    slot_id: u8,
+    base_va: u64,
+    enum_phys: u64,
+    slot_words: [u32; 8],
+    keyboard: kumo_hid::HidBootInterface,
+    mouse: kumo_hid::HidBootInterface,
+    speed_raw: u8,
+) -> Option<(u8, u8)> {
+    let keyboard_dci = endpoint_context_index(keyboard.in_endpoint_address & 0x0f, true)?;
+    let mouse_dci = endpoint_context_index(mouse.in_endpoint_address & 0x0f, true)?;
+    if keyboard_dci == mouse_dci {
+        return None;
+    }
+    let max_dci = keyboard_dci.max(mouse_dci);
+    let stride = ContextSize::Bytes64;
+    if stride.input_offset(max_dci)? + stride.bytes() > OFF_HID2_RING {
+        log(b"drv-xhci: composite hid dci=");
+        log_hex(max_dci as u64);
+        log(b" would overlap the second ring\n");
+        return None;
+    }
+    let mut icc = InputControlContext::default();
+    icc.add(0).ok()?; // slot (to raise Context Entries)
+    icc.add(keyboard_dci).ok()?;
+    icc.add(mouse_dci).ok()?;
+    let mut slot = slot_words;
+    slot[0] = (slot[0] & !(0x1f << 27)) | ((max_dci as u32) << 27);
+    let keyboard_ctx = EndpointContext::interrupt_in(
+        keyboard.max_packet_size,
+        xhci_interval(speed_raw, keyboard.interval),
+        enum_phys + OFF_INT_RING as u64,
+        keyboard.max_packet_size.max(1),
+    )
+    .ok()?;
+    let mouse_ctx = EndpointContext::interrupt_in(
+        mouse.max_packet_size,
+        xhci_interval(speed_raw, mouse.interval),
+        enum_phys + OFF_HID2_RING as u64,
+        mouse.max_packet_size.max(1),
+    )
+    .ok()?;
+    write_ctx(base_va + OFF_INPUT_CTX as u64, icc.words());
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + stride.input_offset(0)? as u64,
+        slot,
+    );
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + stride.input_offset(keyboard_dci)? as u64,
+        keyboard_ctx.words(),
+    );
+    write_ctx(
+        base_va + OFF_INPUT_CTX as u64 + stride.input_offset(mouse_dci)? as u64,
+        mouse_ctx.words(),
+    );
+    dsb();
+    let configure = Trb::configure_endpoint(enum_phys + OFF_INPUT_CTX as u64, slot_id).ok()?;
+    match submit_command(io, layout, image, cmd, evt, configure) {
+        Some((1, _, _)) => Some((keyboard_dci, mouse_dci)),
+        Some((cc, _, _)) => {
+            log_cc(b"drv-xhci: config hid pair cc=", cc);
+            None
+        }
+        None => {
+            log(b"drv-xhci: config hid pair timeout\n");
+            None
+        }
+    }
+}
+
+/// Bring a device's boot HID interface or interfaces online: SET_CONFIGURATION, Configure
+/// Endpoint for each lane's interrupt-IN endpoint, SET_PROTOCOL(boot), then arm each ring and
+/// forward its reports. The loop is resident; a mouse forwards the 3-byte wire to Sora's
+/// pointer pipeline. Bounded only when the controller has no IRQ.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_read_keyboard(
     io: &mut Mmio,
@@ -2586,12 +2801,8 @@ fn configure_and_read_keyboard(
     speed_raw: u8,
     slot_words: [u32; 8],
     config_value: u8,
-    hid: kumo_hid::HidBootInterface,
+    plan: HidPlan,
 ) {
-    let int_ring_phys = enum_phys + OFF_INT_RING as u64;
-    let report_phys = enum_phys + OFF_REPORT as u64;
-    let mps = hid.max_packet_size;
-
     // --- SET_CONFIGURATION(config_value) --- bmRequestType=0, bRequest=9, wValue=config, no data.
     let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
     match control_no_data(
@@ -2609,62 +2820,97 @@ fn configure_and_read_keyboard(
         None => return log(b"drv-xhci: set config timeout\n"),
     }
 
-    // --- Configure Endpoint for the keyboard's interrupt-IN endpoint ---
-    let Some(dci) = configure_interrupt_endpoint(
-        io,
-        layout,
-        image,
-        cmd,
-        evt,
-        slot_id,
-        base_va,
-        enum_phys,
-        slot_words,
-        hid.in_endpoint_address,
-        hid.max_packet_size,
-        hid.interval,
-        speed_raw,
-    ) else {
-        return;
-    };
-    log(b"drv-xhci: config ep cc=0x1\n");
-
-    // --- SET_PROTOCOL(boot) --- HID class request to the interface: bmRequestType=0x21,
-    // bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data.
-    let set_proto = [
-        0x21,
-        0x0b,
-        0x00,
-        0x00,
-        hid.interface_number,
-        0x00,
-        0x00,
-        0x00,
-    ];
-    match control_no_data(
-        io,
-        layout,
-        image,
-        evt,
-        ep0_ring,
-        &mut *ep0_seg,
-        slot_id,
-        set_proto,
-    ) {
-        Some((1, _)) => log(b"drv-xhci: set proto cc=0x1\n"),
-        Some((cc, _)) => return log_cc(b"drv-xhci: set proto cc=", cc),
-        None => return log(b"drv-xhci: set proto timeout\n"),
+    // --- Configure Endpoint for the device's boot HID lane(s) ---
+    // A composite receiver publishes a keyboard and a mouse in one configuration; a Configure
+    // Endpoint command replaces the endpoint set, so both endpoints must be added together.
+    // When the pair cannot be configured, fall back to the primary interface alone.
+    let mut lanes: [Option<HidLane>; 2] = [None, None];
+    if let (Some(keyboard), Some(mouse)) = (plan.keyboard, plan.mouse) {
+        match configure_hid_endpoint_pair(
+            io, layout, image, cmd, evt, slot_id, base_va, enum_phys, slot_words, keyboard, mouse,
+            speed_raw,
+        ) {
+            Some((keyboard_dci, mouse_dci)) => {
+                log(b"drv-xhci: config ep pair cc=0x1\n");
+                lanes[0] = HidLane::new(
+                    keyboard,
+                    keyboard_dci,
+                    OFF_INT_RING,
+                    OFF_REPORT,
+                    base_va,
+                    enum_phys,
+                );
+                lanes[1] = HidLane::new(
+                    mouse,
+                    mouse_dci,
+                    OFF_HID2_RING,
+                    OFF_HID2_REPORT,
+                    base_va,
+                    enum_phys,
+                );
+                if lanes[0].is_none() || lanes[1].is_none() {
+                    return log(b"drv-xhci: hid lane ring fail\n");
+                }
+            }
+            None => log(b"drv-xhci: composite hid refused; primary only\n"),
+        }
+    }
+    if lanes[0].is_none() {
+        let Some(primary) = plan.primary() else {
+            return log(b"drv-xhci: hid plan empty\n");
+        };
+        let Some(dci) = configure_interrupt_endpoint(
+            io,
+            layout,
+            image,
+            cmd,
+            evt,
+            slot_id,
+            base_va,
+            enum_phys,
+            slot_words,
+            primary.in_endpoint_address,
+            primary.max_packet_size,
+            primary.interval,
+            speed_raw,
+        ) else {
+            return;
+        };
+        log(b"drv-xhci: config ep cc=0x1\n");
+        lanes[0] = HidLane::new(primary, dci, OFF_INT_RING, OFF_REPORT, base_va, enum_phys);
+        if lanes[0].is_none() {
+            return log(b"drv-xhci: hid lane ring fail\n");
+        }
     }
 
-    // --- Interrupt transfer ring + bounded report-read window ---
-    let int_seg =
-        &mut unsafe { DmaTrbs::new((base_va as usize + OFF_INT_RING) as *mut Trb, INT_RING_TRBS) };
-    let Ok(mut int_ring) = TransferRing::new(&mut *int_seg, int_ring_phys) else {
-        return log(b"drv-xhci: int ring fail\n");
-    };
-    // SAFETY: inside this device's mapped page, and only reached through `DmaBuf`.
-    let report_buf =
-        unsafe { DmaBuf::new((base_va as usize + OFF_REPORT) as *mut u8, report_phys, 8) };
+    // --- SET_PROTOCOL(boot) per lane --- HID class request to the interface: bmRequestType=0x21,
+    // bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data.
+    for lane in lanes.iter().flatten() {
+        let set_proto = [
+            0x21,
+            0x0b,
+            0x00,
+            0x00,
+            lane.hid.interface_number,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        match control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            ep0_ring,
+            &mut *ep0_seg,
+            slot_id,
+            set_proto,
+        ) {
+            Some((1, _)) => log(b"drv-xhci: set proto cc=0x1\n"),
+            Some((cc, _)) => return log_cc(b"drv-xhci: set proto cc=", cc),
+            None => return log(b"drv-xhci: set proto timeout\n"),
+        }
+    }
 
     let mut decoder = kumo_hid::Decoder::new();
     let mut mouse_decoder = kumo_hid::MouseDecoder::new();
@@ -2710,56 +2956,32 @@ fn configure_and_read_keyboard(
             // the same port. Wakes are told apart by their source's koid.
             let interrupt_koid = handle_koid(interrupt);
             let storage_control_koid = irq_port.and_then(offer_storage);
-            log(if hid.is_mouse() {
-                b"drv-xhci: mouse irq-driven port=" as &[u8]
-            } else {
-                b"drv-xhci: keyboard irq-driven port=" as &[u8]
-            });
-            log_hex(irq_port.is_some() as u64);
-            log(b"; type at the shell\n");
-            notice(&[if hid.is_mouse() {
-                b"usb: mouse ready\n" as &[u8]
-            } else {
-                b"usb: keyboard ready\n"
-            }]);
-            // Exactly ONE transfer may be outstanding at a time. The previous shape enqueued a
-            // TRB on every iteration but only reclaimed one when a MATCHING transfer event was
-            // found, so every wake without a match (spurious interrupt, port-change event) leaked
-            // a ring slot. After ~15 the 16-entry ring was full, `enqueue` failed, and the driver
-            // RETURNED — running `quiesce_controller` and killing the keyboard for good. That is
-            // the observed "window": input works for a while, then stops accepting keystrokes
-            // entirely. Re-arm only once the outstanding transfer has actually completed.
-            let mut pending = false;
-            let mut first_transfer_logged = false;
+            for lane in lanes.iter().flatten() {
+                log(if lane.hid.is_mouse() {
+                    b"drv-xhci: mouse irq-driven port=" as &[u8]
+                } else {
+                    b"drv-xhci: keyboard irq-driven port=" as &[u8]
+                });
+                log_hex(irq_port.is_some() as u64);
+                if !lane.hid.is_mouse() {
+                    log(b"; type at the shell");
+                }
+                log(b"\n");
+                notice(&[if lane.hid.is_mouse() {
+                    b"usb: mouse ready\n" as &[u8]
+                } else {
+                    b"usb: keyboard ready\n"
+                }]);
+            }
+            // Exactly ONE transfer per lane outstanding at a time, re-armed only after its own
+            // event is reclaimed: the previous shape enqueued a TRB on every iteration and
+            // leaked a slot on every wake without a match, until enqueue failed and the driver
+            // exited (J425/J632). Each wake drains up to HID_EVENTS_PER_WAKE completions so a
+            // second lane's event cannot wait for an interrupt the controller already raised.
             loop {
-                if !pending {
-                    report_buf.zero();
-                    dsb();
-                    let Ok(normal) =
-                        Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, mps as u32))
-                    else {
-                        return log(b"drv-xhci: normal trb fail\n");
-                    };
-                    match int_ring.enqueue(&mut *int_seg, normal) {
-                        Err(_) => {
-                            // Never exit on a full ring: exiting quiesces the controller and the
-                            // keyboard never comes back. Drain what the controller has finished
-                            // and retry on the next interrupt instead.
-                            log(b"drv-xhci: int ring full; draining\n");
-                        }
-                        Ok(token) => {
-                            pending = true;
-                            dsb();
-                            ring_slot_doorbell(io, layout, slot_id, dci);
-                            if !first_transfer_logged {
-                                log(b"drv-xhci: hid transfer armed trb=");
-                                log_hex(token.iova);
-                                log(b" erdp=");
-                                log_hex(image.event_ring.dequeue_iova());
-                                log(b"\n");
-                                first_transfer_logged = true;
-                            }
-                        }
+                for lane in lanes.iter_mut().flatten() {
+                    if !lane.pending {
+                        lane.arm(io, layout, slot_id);
                     }
                 }
                 // Block until the controller raises its interrupt (a report completed).
@@ -2792,51 +3014,57 @@ fn configure_and_read_keyboard(
                 clear_interrupt_pending(io, layout);
                 // ERDP must be re-written on EVERY serviced interrupt, not only when a matching
                 // transfer event is found: the write clears EHB (Event Handler Busy), and the
-                // controller will not raise another interrupt while EHB is set. Boot showed 12
-                // interrupts for 5 keys — each unmatched one (port-change/spurious) previously
-                // skipped the ERDP write, and after the last one the controller went silent for
-                // good, which is exactly why input died once the system went idle.
+                // controller will not raise another interrupt while EHB is set.
                 write_erdp(io, layout, image.event_ring.dequeue_iova());
-                if let Some((_cc, _, trb_iova)) = poll_transfer_event_limited(
-                    io,
-                    layout,
-                    &mut *image,
-                    evt,
-                    slot_id,
-                    IRQ_EVENT_DRAIN_LIMIT,
-                ) {
-                    let _ = int_ring.reclaim_through(trb_iova);
-                    pending = false;
-                    dsb();
-                    let report: [u8; kumo_hid::REPORT_BYTES] = report_buf.read(0);
-                    if hid.is_mouse() {
-                        // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
-                        // pointer pipeline already consumes. Idle reports repeat at the polling
-                        // interval, so drop them rather than waking Sora for nothing.
-                        if let Some((motion, _edges)) =
-                            mouse_decoder.decode(&report[..mps.min(8) as usize], None)
-                        {
-                            let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
-                            if mouse != 0 && !motion.is_idle() {
-                                let wire = motion.to_wire();
-                                let _ = channel_write(Handle(mouse), wire.as_ptr(), wire.len());
-                            }
+                for _ in 0..HID_EVENTS_PER_WAKE {
+                    let Some((_cc, _, trb_iova)) = poll_transfer_event_limited(
+                        io,
+                        layout,
+                        &mut *image,
+                        evt,
+                        slot_id,
+                        IRQ_EVENT_DRAIN_LIMIT,
+                    ) else {
+                        break;
+                    };
+                    for lane in lanes.iter_mut().flatten() {
+                        if !lane.pending || lane.token != trb_iova {
+                            continue;
                         }
-                    } else if let Ok(events) = decoder.decode(report) {
-                        let keyboard = KEYBOARD_CHANNEL.load(Ordering::Relaxed);
-                        for event in events.as_slice() {
-                            if event.state == kumo_hid::KeyState::Pressed {
-                                let bytes = event.symbol.terminal_bytes();
-                                let slice = bytes.as_slice();
-                                if keyboard != 0 && !slice.is_empty() {
-                                    let _ = channel_write(
-                                        Handle(keyboard),
-                                        slice.as_ptr(),
-                                        slice.len(),
-                                    );
+                        let _ = lane.ring.reclaim_through(trb_iova);
+                        lane.pending = false;
+                        dsb();
+                        let report: [u8; kumo_hid::REPORT_BYTES] = lane.report.read(0);
+                        if lane.hid.is_mouse() {
+                            // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
+                            // pointer pipeline already consumes. Idle reports repeat at the
+                            // polling interval, so drop them rather than waking Sora for nothing.
+                            if let Some((motion, _edges)) = mouse_decoder
+                                .decode(&report[..lane.hid.max_packet_size.min(8) as usize], None)
+                            {
+                                let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
+                                if mouse != 0 && !motion.is_idle() {
+                                    let wire = motion.to_wire();
+                                    let _ = channel_write(Handle(mouse), wire.as_ptr(), wire.len());
+                                }
+                            }
+                        } else if let Ok(events) = decoder.decode(report) {
+                            let keyboard = KEYBOARD_CHANNEL.load(Ordering::Relaxed);
+                            for event in events.as_slice() {
+                                if event.state == kumo_hid::KeyState::Pressed {
+                                    let bytes = event.symbol.terminal_bytes();
+                                    let slice = bytes.as_slice();
+                                    if keyboard != 0 && !slice.is_empty() {
+                                        let _ = channel_write(
+                                            Handle(keyboard),
+                                            slice.as_ptr(),
+                                            slice.len(),
+                                        );
+                                    }
                                 }
                             }
                         }
+                        break;
                     }
                 }
                 interrupt_complete(interrupt);
@@ -2849,8 +3077,8 @@ fn configure_and_read_keyboard(
         return log(b"drv-xhci: interrupt create fail; not serving\n");
     }
 
-    // A resident keyboard without an interrupt cannot be served safely at this priority.
-    log(b"drv-xhci: keyboard found but no irq granted; not serving\n");
+    // A resident HID device without an interrupt cannot be served safely at this priority.
+    log(b"drv-xhci: hid found but no irq granted; not serving\n");
 }
 
 /// Issue a no-data control transfer over EP0 (Setup + IN Status), for SET_CONFIGURATION and
@@ -3544,8 +3772,8 @@ fn configure_and_read_hub(
     }
 }
 
-/// One boot HID interface behind a hub, addressed and described. Its report loop never returns,
-/// so it waits here until every other downstream device has been enumerated (J541).
+/// A hub-downstream boot HID device, addressed and described. Its report loop never returns, so
+/// it waits here until every other downstream device has been enumerated (J541).
 #[derive(Clone, Copy)]
 struct KeyboardHandoff {
     slot_id: u8,
@@ -3554,7 +3782,7 @@ struct KeyboardHandoff {
     speed_raw: u8,
     slot_words: [u32; 8],
     config_value: u8,
-    hid: kumo_hid::HidBootInterface,
+    plan: HidPlan,
     ep0_ring: TransferRing,
 }
 
@@ -3588,7 +3816,7 @@ impl KeyboardHandoff {
             self.speed_raw,
             self.slot_words,
             self.config_value,
-            self.hid,
+            self.plan,
         );
     }
 }
@@ -3731,20 +3959,27 @@ fn enumerate_hub_downstream(
         Err(_) => log(b"drv-xhci: malformed storage interface\n"),
         Ok(None) => {}
     }
-    let hid = kumo_hid::find_hid_boot_keyboard(config.bytes())
-        .or_else(|| kumo_hid::find_hid_boot_mouse(config.bytes()));
-    let Some(hid) = hid else {
+    let Some(plan) = HidPlan::from_config(config.bytes()) else {
+        return skipped(b"drv-xhci: dev no hid boot iface\n");
+    };
+    let Some(primary) = plan.primary() else {
         return skipped(b"drv-xhci: dev no hid boot iface\n");
     };
     log(b"drv-xhci: dev hid if=");
-    log_hex(hid.interface_number as u64);
+    log_hex(primary.interface_number as u64);
     log(b" proto=");
-    log_hex(hid.protocol as u64);
+    log_hex(primary.protocol as u64);
     log(b" ep=");
-    log_hex(hid.in_endpoint_address as u64);
+    log_hex(primary.in_endpoint_address as u64);
     log(b"\n");
-    if !(hid.is_keyboard() || hid.is_mouse()) {
-        return skipped(b"drv-xhci: hub dev not a boot hid interface\n");
+    if let Some(mouse) = plan.mouse.filter(|_| plan.keyboard.is_some()) {
+        log(b"drv-xhci: dev hid mouse if=");
+        log_hex(mouse.interface_number as u64);
+        log(b" proto=");
+        log_hex(mouse.protocol as u64);
+        log(b" ep=");
+        log_hex(mouse.in_endpoint_address as u64);
+        log(b"\n");
     }
     Some(KeyboardHandoff {
         slot_id: dev_slot,
@@ -3753,7 +3988,7 @@ fn enumerate_hub_downstream(
         speed_raw: down_speed,
         slot_words,
         config_value: config.config_value,
-        hid,
+        plan,
         ep0_ring,
     })
 }

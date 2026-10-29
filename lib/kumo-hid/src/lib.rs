@@ -1,6 +1,7 @@
 #![no_std]
 //j383
 //j555
+//j665
 
 //! Allocation-free USB HID boot-keyboard report decoding.
 //!
@@ -447,6 +448,19 @@ pub fn find_hid_boot_keyboard(config: &[u8]) -> Option<HidBootInterface> {
 /// The boot-mouse counterpart of [`find_hid_boot_keyboard`].
 pub fn find_hid_boot_mouse(config: &[u8]) -> Option<HidBootInterface> {
     find_hid_boot_interface_matching(config, Some(HID_PROTOCOL_MOUSE))
+}
+
+/// Both boot-HID interfaces of one configuration: the keyboard and the mouse, when the device
+/// publishes either. A composite receiver puts both in one configuration, and its driver must
+/// configure both endpoints in one Configure Endpoint command, so look them up together. A mouse
+/// that shares the keyboard's interface number is dropped: one interface cannot be two boot
+/// protocols at once.
+pub fn find_hid_boot_pair(config: &[u8]) -> (Option<HidBootInterface>, Option<HidBootInterface>) {
+    let keyboard = find_hid_boot_keyboard(config);
+    let mouse = find_hid_boot_mouse(config).filter(|mouse| {
+        keyboard.is_none_or(|keyboard| keyboard.interface_number != mouse.interface_number)
+    });
+    (keyboard, mouse)
 }
 
 /// Shared walk. `wanted == None` accepts any boot-HID protocol (the historical behaviour).
@@ -1037,6 +1051,46 @@ mod tests {
         let config = boot_hid_config(HID_PROTOCOL_MOUSE, 0x81, 0x03, 4);
         assert_eq!(find_hid_boot_keyboard(&config), None);
         assert_eq!(find_hid_boot_interface(&[]), None);
+    }
+
+    #[test]
+    fn pair_finds_both_interfaces_of_a_composite() {
+        let config = composite_mouse_then_keyboard();
+        let (keyboard, mouse) = find_hid_boot_pair(&config);
+        let keyboard = keyboard.expect("keyboard interface");
+        let mouse = mouse.expect("mouse interface");
+        assert_eq!(keyboard.in_endpoint_address, 0x82);
+        assert!(keyboard.is_keyboard());
+        assert_eq!(mouse.in_endpoint_address, 0x81);
+        assert!(mouse.is_mouse());
+        assert_ne!(keyboard.interface_number, mouse.interface_number);
+    }
+
+    #[test]
+    fn pair_reports_a_lone_interface_on_the_side_it_appears() {
+        let only_keyboard = boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x81, 0x03, 8);
+        let (keyboard, mouse) = find_hid_boot_pair(&only_keyboard);
+        assert!(keyboard.is_some());
+        assert_eq!(mouse, None);
+
+        let only_mouse = boot_hid_config(HID_PROTOCOL_MOUSE, 0x81, 0x03, 4);
+        let (keyboard, mouse) = find_hid_boot_pair(&only_mouse);
+        assert_eq!(keyboard, None);
+        assert!(mouse.is_some());
+    }
+
+    #[test]
+    fn pair_drops_a_mouse_sharing_the_keyboards_interface_number() {
+        // Two configuration blobs concatenated without renumbering: both name interface 0, so
+        // the device cannot be served as a composite and the mouse is dropped.
+        let mouse = boot_hid_config(HID_PROTOCOL_MOUSE, 0x81, 0x03, 4);
+        let keyboard = boot_hid_config(HID_PROTOCOL_KEYBOARD, 0x82, 0x03, 8);
+        let mut config = [0u8; 68];
+        config[..34].copy_from_slice(&mouse);
+        config[34..].copy_from_slice(&keyboard);
+        let (found_keyboard, found_mouse) = find_hid_boot_pair(&config);
+        assert!(found_keyboard.is_some());
+        assert_eq!(found_mouse, None);
     }
 
     #[test]
