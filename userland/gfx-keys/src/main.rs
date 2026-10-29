@@ -2,6 +2,7 @@
 #![no_main]
 //j669
 //j677
+//j690
 
 //! An input consumer for the focused view (F2b focus routing). Sora transfers one input
 //! channel in `x0` and names the view as the channel's first record; this program blocks on
@@ -34,7 +35,7 @@ extern "C" fn main(
     _a7: u64,
 ) -> ! {
     let channel = Handle(channel as u32);
-    let _ = log_write(kumo_abi::sys::log_level::NOTICE, b"gfx-keys: online\n");
+    kumo_rt::boot_ok(&[b"gfx-keys: online\n"]);
     // Sora names the view as the first record on the channel; a plain ProcessRun argument
     // cannot carry it safely (a value colliding with a live handle is staged as a handle
     // and arrives as the child-side value). — TIMBERDOODLE

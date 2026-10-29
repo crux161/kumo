@@ -24,6 +24,70 @@ pub fn init() {
     // for future explicit initialization if we switch to VMO-backed heaps.
 }
 
+/// PLAN/016 C2: the fixed-width markers userland boot milestones carry, so the boot screen
+/// reads as a status list. The kernel POST table keeps its own `NAME Check … OK` form.
+/// — TIMBERDOODLE
+pub const BOOT_OK: &[u8] = b"[  OK  ] ";
+/// A failed milestone; the same nine-column marker width as [`BOOT_OK`].
+pub const BOOT_FAILED: &[u8] = b"[FAILED] ";
+
+/// Compose `tag` plus `parts` into `out`, truncating at the end. Returns the used length.
+fn boot_line(out: &mut [u8], tag: &[u8], parts: &[&[u8]]) -> usize {
+    let mut n = tag.len().min(out.len());
+    out[..n].copy_from_slice(&tag[..n]);
+    for part in parts {
+        let take = part.len().min(out.len() - n);
+        out[n..n + take].copy_from_slice(&part[..take]);
+        n += take;
+    }
+    n
+}
+
+/// Write one boot-status milestone at NOTICE: [`BOOT_OK`] then the concatenated parts.
+pub fn boot_ok(parts: &[&[u8]]) {
+    let mut line = [0u8; 256];
+    let n = boot_line(&mut line, BOOT_OK, parts);
+    let _ = log_write(kumo_abi::sys::log_level::NOTICE, &line[..n]);
+}
+
+/// The formatted form of [`boot_ok`] for `format_args!` callers.
+pub fn boot_ok_fmt(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    let mut line = BootLine::new();
+    let _ = write!(line, "{}", args);
+    let _ = log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+}
+
+/// [`BOOT_OK`]-tagged assembly for the formatted callers; `core::fmt::Write`-shaped.
+struct BootLine {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl BootLine {
+    fn new() -> Self {
+        let mut line = Self {
+            buf: [0u8; 256],
+            len: 0,
+        };
+        line.len = boot_line(&mut line.buf, BOOT_OK, &[]);
+        line
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl core::fmt::Write for BootLine {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let take = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
@@ -109,6 +173,37 @@ mod tests {
         fn dispatch(&mut self, _channel: Handle, _message: &[u8]) -> Status {
             kumo_abi::Errno::Ok.status()
         }
+    }
+
+    #[test]
+    fn boot_markers_are_one_nine_column_width() {
+        assert_eq!(BOOT_OK, b"[  OK  ] ");
+        assert_eq!(BOOT_FAILED, b"[FAILED] ");
+        assert_eq!(BOOT_OK.len(), BOOT_FAILED.len());
+    }
+
+    #[test]
+    fn boot_lines_tag_and_truncate() {
+        let mut line = [0u8; 16];
+        let n = boot_line(&mut line, BOOT_OK, &[b"ab", b"cd\n"]);
+        assert_eq!(&line[..n], b"[  OK  ] abcd\n");
+        let mut tiny = [0u8; 12];
+        let n = boot_line(&mut tiny, BOOT_OK, &[b"0123456789"]);
+        assert_eq!(n, 12);
+        assert_eq!(&tiny[..12], b"[  OK  ] 012");
+    }
+
+    #[test]
+    fn formatted_boot_lines_keep_the_tag_and_cap_at_256() {
+        use core::fmt::Write;
+        let mut line = BootLine::new();
+        write!(line, "drv-gpu: online {}", 7).unwrap();
+        assert_eq!(line.bytes(), b"[  OK  ] drv-gpu: online 7");
+        let mut long = BootLine::new();
+        for _ in 0..400 {
+            write!(long, "x").unwrap();
+        }
+        assert_eq!(long.bytes().len(), 256);
     }
 
     #[test]

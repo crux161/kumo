@@ -2,6 +2,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j563
+//j690
 
 //! The resident `identityd`: the serve loop in this crate's library over a channel.
 //!
@@ -122,6 +123,7 @@ extern "C" fn main(
     let mut line = [0u8; 64];
     let mut at = 0;
     for piece in [
+        kumo_rt::BOOT_OK,
         &b"identityd: online, "[..],
         decimal(accounts as u64, &mut [0u8; 20]),
         b" accounts\n",

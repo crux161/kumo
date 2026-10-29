@@ -6,6 +6,7 @@
 //j664
 //j665
 //j666
+//j690
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -389,7 +390,7 @@ extern "C" fn main(
     log_hex(caps.extended_capabilities_offset() as u64);
     log(b"\n");
     let (mut base, mut ports) = ([0u8; 18], [0u8; 20]);
-    notice(&[
+    kumo_rt::boot_ok(&[
         b"drv-xhci: online, controller ",
         hex(config.mmio_base, &mut base),
         b", ",

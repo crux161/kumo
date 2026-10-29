@@ -8,6 +8,7 @@
 //j685
 //j686
 //j687
+//j690
 
 mod clock_probe;
 mod display_probe;
@@ -436,6 +437,7 @@ extern "C" fn main(
     // The glass starts blank: first light is a log line (`dmesg`), not text on the screen. The
     // console's size is the boot milestone the default level shows (J559).
     let mut line = Line::new();
+    line.push(kumo_rt::BOOT_OK);
     line.push(b"drv-fb: online, console ");
     line.push_decimal(region.width as usize);
     line.push(b"x");

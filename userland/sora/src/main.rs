@@ -6,6 +6,7 @@
 //j677
 //j684
 //j686
+//j690
 
 extern crate alloc;
 
@@ -2987,7 +2988,7 @@ extern "C" fn sora_main(
 
     // Greeting.
     debug_write(b"hello from Sora via SVC\n".as_ptr(), 24);
-    notice(&[b"sora: supervisor online\n"]);
+    kumo_rt::boot_ok(&[b"sora: supervisor online\n"]);
     #[cfg(target_arch = "aarch64")]
     verify_vmo_factory_vectors();
 
@@ -7391,7 +7392,7 @@ fn spawn_ttyd_session(
         return None;
     }
     log(b"ttyd: interactive ok\n");
-    notice(&[b"ttyd: online, console line discipline\n"]);
+    kumo_rt::boot_ok(&[b"ttyd: online, console line discipline\n"]);
     Some(sora::SupervisedService { recipe, instance })
 }
 

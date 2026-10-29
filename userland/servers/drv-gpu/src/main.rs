@@ -6,6 +6,7 @@
 //j652
 //j653
 //j655
+//j690
 
 mod client;
 
@@ -2009,14 +2010,11 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
     );
     let exit_code = match probe(&mut device) {
         Ok(identity) => {
-            log(
-                log_level::NOTICE,
-                format_args!(
-                    "drv-gpu: online, Mali-G610 GPU_ID=0x{:08x}, {} cores\n",
-                    identity.gpu_id,
-                    identity.cores()
-                ),
-            );
+            kumo_rt::boot_ok_fmt(format_args!(
+                "drv-gpu: online, Mali-G610 GPU_ID=0x{:08x}, {} cores\n",
+                identity.gpu_id,
+                identity.cores()
+            ));
             log(
                 log_level::INFO,
                 format_args!(

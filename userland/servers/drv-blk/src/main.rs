@@ -6,6 +6,7 @@
 //j413
 //j414
 //j559
+//j690
 
 use drv_blk::{
     split_write_frame, BlockDevice, Request, CMD_FLUSH, CMD_READ, CMD_WRITE, STATUS_BAD_LBA,
@@ -121,10 +122,7 @@ extern "C" fn main(
     // mapped extent is a clean STATUS_BAD_LBA, never a fault.
     let store = unsafe { core::slice::from_raw_parts_mut(rw_va as *mut u8, map_len as usize) };
     log_info(b"drv-blk: initialized (writable)\n");
-    let _ = kumo_rt::log_write(
-        kumo_abi::sys::log_level::NOTICE,
-        b"drv-blk: online, initrd block device\n",
-    );
+    kumo_rt::boot_ok(&[b"drv-blk: online, initrd block device\n"]);
 
     // Serve loop: read the request frame, perform block I/O, write the response. One buffer
     // holds either an inbound write frame (`[header][data]`) or an outbound read response;
