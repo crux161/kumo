@@ -4,6 +4,7 @@
 //j674
 //j675
 //j684
+//j687
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -34,10 +35,12 @@ pub const VIEW_CHROME: u32 = 2;
 /// clients never see either value. — TIMBERDOODLE
 pub const VIEW_OVERLAP: u32 = 64;
 pub const BAND_MARGIN: u32 = 8;
-/// A whole number of 8x16 text rows, so the console starts on a cell row.
+/// A whole number of text rows, so the console starts on a cell row.
 pub const BAND_HEIGHT: u32 = 160;
-pub const CONSOLE_CELL_W: u32 = 8;
-pub const CONSOLE_CELL_H: u32 = 16;
+/// The text cell every console component must agree on: drv-fb draws it, Sora reports it
+/// as the tty grid, and this crate places the band above it. One source, no drift.
+pub const CONSOLE_CELL_W: u32 = 10;
+pub const CONSOLE_CELL_H: u32 = 20;
 pub const MIN_CONSOLE_ROWS: u32 = 8;
 pub const VIEW_BG: u32 = 0x0000_0000;
 pub const BAND_BG: u32 = 0x0016_1b22;
@@ -668,7 +671,7 @@ mod tests {
 
     #[test]
     fn band_places_two_overlapping_views_above_the_console() {
-        for (width, height) in [(800, 600), (640, 480), (1600, 900), (552, 288), (468, 600)] {
+        for (width, height) in [(800, 600), (640, 480), (1600, 900), (552, 320), (468, 600)] {
             let layout = band(width, height).expect("views fit");
             assert_eq!(layout.height, BAND_HEIGHT);
             assert_eq!(layout.views.len(), VIEW_COUNT);

@@ -7,6 +7,7 @@
 //j684
 //j685
 //j686
+//j687
 
 mod clock_probe;
 mod display_probe;
@@ -454,10 +455,13 @@ extern "C" fn main(
     log_info(b"drv-fb: initialized\n");
     log_info(b"drv-fb: console ready\n");
     if drv_fb::font_face_ascii_ready() {
-        let _ = kumo_rt::log_write(
-            kumo_abi::sys::log_level::NOTICE,
-            b"drv-fb: console face maple-mono 13.3px\n",
-        );
+        let mut line = Line::new();
+        line.push(b"drv-fb: console face maple-mono ");
+        line.push_decimal(GLYPH_W);
+        line.push(b"x");
+        line.push_decimal(GLYPH_H);
+        line.push(b" cells\n");
+        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
     }
     let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, b"drv-fb: title bars on\n");
 

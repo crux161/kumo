@@ -134,8 +134,10 @@ CHROME_COLOR = (0x5A, 0x8F, 0xC8)
 VIEW_SOLID = (0x00, 0xA0, 0xFF)
 POISON = (0xFF, 0x00, 0xFF)
 FG = (0, 0xFF, 0)
-# F2c titles mode: the server-drawn band labels (two 6x1-cell rows) and their ink colour.
-LABEL_RECTS = [(8, 8, 48, 16), (8, 32, 48, 16)]
+# F2c titles mode: the server-drawn band labels (two six-character rows scaled to the
+# console cell, 10x20) and their ink colour. The boxes bound the real ink; exact pixels
+# outside them are still asserted.
+LABEL_RECTS = [(8, 8, 80, 20), (8, 32, 80, 20)]
 WHITE = (255, 255, 255)
 
 

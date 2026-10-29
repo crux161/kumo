@@ -1,7 +1,9 @@
 //j552
 //j673
+//j687
 
-//! Fixed console bitmaps: ASCII 8x16, CJK 16x16, and single-cell box drawing.
+//! Fixed console bitmaps: ASCII and box drawing in one GLYPH_W x GLYPH_H cell; CJK in a
+//! 16x16 bitmap within a double-width cell.
 
 use super::{GLYPH_H, GLYPH_W};
 
@@ -94,28 +96,35 @@ fn box_glyph(scalar: u32) -> Option<Glyph> {
         0x254b => (UP | DOWN | LEFT | RIGHT, true),
         _ => return None,
     };
-    // Arms reach the cell edges so neighbouring cells join without seams. The
-    // heavy forms used by the boot banner stay one column, like ASCII. — KESTREL
-    let (vertical, left, right, first, end) = if heavy {
-        (0x3c, 0xfc, 0x3f, 6, 10)
+    // Arms reach the cell edges so neighbouring cells join without seams. Rows are built
+    // directly across the cell's GLYPH_W columns: each arm reaches past the middle so
+    // adjacent cells overlap at the join, and heavy forms are two columns heavier and
+    // two rows taller. — TIMBERDOODLE
+    let (first, end) = if heavy {
+        (GLYPH_H / 2 - 2, GLYPH_H / 2 + 2)
     } else {
-        (0x18, 0xf8, 0x1f, 7, 9)
+        (GLYPH_H / 2 - 1, GLYPH_H / 2 + 1)
     };
-    let mut rows = [0u8; GLYPH_H];
+    let (vertical_first, vertical_end) = if heavy {
+        ((GLYPH_W - 4) / 2, (GLYPH_W - 4) / 2 + 4)
+    } else {
+        ((GLYPH_W - 2) / 2, (GLYPH_W - 2) / 2 + 2)
+    };
+    let mut rows = [0u16; GLYPH_H];
     for (y, row) in rows.iter_mut().enumerate() {
-        if (arms & UP != 0 && y < end) || (arms & DOWN != 0 && y >= first) {
-            *row |= vertical;
-        }
-        if (first..end).contains(&y) {
-            if arms & LEFT != 0 {
-                *row |= left;
-            }
-            if arms & RIGHT != 0 {
-                *row |= right;
+        for column in 0..GLYPH_W {
+            let vertical = column >= vertical_first && column < vertical_end;
+            let up = arms & UP != 0 && vertical && y < end;
+            let down = arms & DOWN != 0 && vertical && y >= first;
+            let horizontal = (first..end).contains(&y);
+            let left = arms & LEFT != 0 && column <= GLYPH_W / 2;
+            let right = arms & RIGHT != 0 && column + 1 >= GLYPH_W / 2;
+            if up || down || (horizontal && (left || right)) {
+                *row |= 0x8000 >> column;
             }
         }
     }
-    Some(Glyph::narrow(&rows))
+    Some(Glyph { columns: 1, rows })
 }
 
 /// ASCII glyphs now come from the vendored face at a scale whose advance is one cell (8 px),
@@ -172,7 +181,12 @@ pub(super) fn glyph(scalar: u32) -> Glyph {
     let rows = cjk_rows(scalar).unwrap_or(&MISSING);
     Glyph {
         columns: 2,
-        rows: core::array::from_fn(|y| u16::from_be_bytes([rows[2 * y], rows[2 * y + 1]])),
+        // The bitmap is 16 rows tall in a GLYPH_H-row cell; blank-pad rather than index
+        // past the record. — TIMBERDOODLE
+        rows: core::array::from_fn(|y| match (rows.get(2 * y), rows.get(2 * y + 1)) {
+            (Some(high), Some(low)) => u16::from_be_bytes([*high, *low]),
+            _ => 0,
+        }),
     }
 }
 
@@ -203,8 +217,9 @@ mod tests {
         let glyph = glyph(b'A' as u32);
         assert_eq!(glyph.columns, 1);
         assert!(glyph.rows.iter().any(|&bits| bits != 0), "no ink in A");
-        // Every set bit is inside the eight columns of one cell.
-        assert!(glyph.rows.iter().all(|&bits| bits & 0x00ff == 0));
+        // Every set bit is inside the GLYPH_W columns of one cell.
+        let outside_cell = 0xffffu16 >> GLYPH_W;
+        assert!(glyph.rows.iter().all(|&bits| bits & outside_cell == 0));
         // The face's outline differs from the PSF bitmap in at least one row.
         let psf = Glyph::narrow(ascii_rows(b'A'));
         assert!(glyph.rows.iter().zip(psf.rows.iter()).any(|(a, b)| a != b));
@@ -212,8 +227,11 @@ mod tests {
 
     #[test]
     fn light_and_heavy_box_arms_join_at_cell_edges() {
+        let left_edge = 0x8000u16;
+        let right_edge = 0x8000u16 >> (GLYPH_W - 1);
+        let full_row = (((1u32 << GLYPH_W) - 1) as u16) << (16 - GLYPH_W);
         for (left, horizontal, right, vertical, first, end) in
-            [('┌', '─', '┐', '│', 7, 9), ('┏', '━', '┓', '┃', 6, 10)]
+            [('┌', '─', '┐', '│', 9, 11), ('┏', '━', '┓', '┃', 8, 12)]
         {
             let l = glyph(left as u32);
             let h = glyph(horizontal as u32);
@@ -221,12 +239,12 @@ mod tests {
             let v = glyph(vertical as u32);
             assert_eq!((l.columns, h.columns, r.columns, v.columns), (1, 1, 1, 1));
             for y in first..end {
-                assert_ne!(l.rows[y] & 0x0100, 0);
-                assert_eq!(h.rows[y], 0xff00);
-                assert_ne!(r.rows[y] & 0x8000, 0);
+                assert_ne!(l.rows[y] & right_edge, 0);
+                assert_eq!(h.rows[y], full_row);
+                assert_ne!(r.rows[y] & left_edge, 0);
             }
-            assert_eq!(l.rows[15], v.rows[0]);
-            assert_eq!(r.rows[15], v.rows[0]);
+            assert_eq!(l.rows[GLYPH_H - 1], v.rows[0]);
+            assert_eq!(r.rows[GLYPH_H - 1], v.rows[0]);
             assert_eq!(l.rows[0], 0);
             assert_eq!(r.rows[0], 0);
         }

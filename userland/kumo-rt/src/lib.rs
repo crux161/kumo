@@ -26,7 +26,33 @@ pub fn init() {
 
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    // A panic is a slice-ending failure, and a silent exit(1) turns it into an anonymous
+    // ABEND in the TOWER report. Name it on the kernel log before ending, best-effort. — TIMBERDOODLE
+    use core::fmt::Write;
+    struct Log;
+    impl Write for Log {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let _ = sys::log_write(kumo_abi::sys::log_level::ERR, s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut log = Log;
+    let _ = write!(
+        log,
+        "PANIC: {}
+",
+        info.message()
+    );
+    if let Some(location) = info.location() {
+        let _ = write!(
+            log,
+            "PANIC AT: {}:{}
+",
+            location.file(),
+            location.line()
+        );
+    }
     sys::process_exit(1);
 }
 

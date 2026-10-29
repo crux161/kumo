@@ -5,9 +5,11 @@
 //j672
 //j673
 //j674
+//j687
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
-//! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
+//! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
+//! CJK occupies a 16x16 bitmap in a double-width cell.
 //!
 //! Per `PLAN §9` (server logic is arch-neutral and host-testable before it ever runs
 //! on metal) the load-bearing content lives here, not in the bin: a [`Console`] that
@@ -34,16 +36,17 @@ pub mod rk3588_shared;
 pub mod rk3588_vblank;
 
 #[cfg(test)]
-/// The console's ASCII glyph rows in the low-byte form the layout tests read, backed by the
-/// same glyph source the console draws (the vendored face, with the PSF fallback inside
-/// `font::glyph`). — TIMBERDOODLE
+/// The console's ASCII glyph rows as the tests read them, backed by the same glyph source
+/// the console draws (the vendored face, with the PSF fallback inside `font::glyph`).
+/// — TIMBERDOODLE
 fn glyph_rows(ch: u8) -> [u16; GLYPH_H] {
-    core::array::from_fn(|y| font::glyph(ch as u32).rows[y] >> 8)
+    font::glyph(ch as u32).rows
 }
 
-/// Glyph cell dimensions of the embedded PSF2 font.
-pub const GLYPH_W: usize = 8;
-pub const GLYPH_H: usize = 16;
+/// Glyph cell dimensions, shared with the layout crate so the band, the winsize and the
+/// console pixels cannot drift apart.
+pub const GLYPH_W: usize = kumo_graphics::CONSOLE_CELL_W as usize;
+pub const GLYPH_H: usize = kumo_graphics::CONSOLE_CELL_H as usize;
 
 /// Phosphor green on black. Green is the middle byte, so this single constant is the
 /// same pixel under both RGB888x and BGR888x — the renderer never needs to know the
@@ -117,7 +120,9 @@ unsafe fn blit_glyph(
         let py = y_px + ry;
         let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
         for rx in 0..width {
-            let on = (bits >> (15 - rx)) & 1 != 0;
+            // Rows are 16 bits; a wide glyph's 20-px span stays blank past bit 15.
+            // — TIMBERDOODLE
+            let on = rx < 16 && (bits >> (15 - rx)) & 1 != 0;
             let idx = row_start.wrapping_add(rx);
             if idx < len_px {
                 let color = if on { fg } else { bg };
@@ -961,7 +966,7 @@ pub fn blit_ascii<W: FnMut(usize, u32)>(
             if py >= height {
                 break;
             }
-            let columns = glyph.columns * GLYPH_W;
+            let columns = (glyph.columns * GLYPH_W).min(16);
             for column in 0..columns {
                 if bits & (0x8000 >> column) == 0 {
                     continue;
@@ -1070,9 +1075,10 @@ pub fn blend_ink(background: u32, ink: u32, coverage: f32) -> u32 {
 }
 
 /// Draw one line of ASCII at `(x, y)` rasterized from the vendored face, alpha-blending each
-/// covered pixel against the pixel already on the glass. `read` supplies the background for
-/// that pixel; the framebuffer is non-cacheable, so no cache maintenance is needed. Returns
-/// false when the face cannot be parsed. — TIMBERDOODLE
+/// covered pixel against the pixel already on the glass. The scale follows the console cell
+/// height, so the band labels and the chrome titles grow with the console font. `read`
+/// supplies the background for that pixel; the framebuffer is non-cacheable, so no cache
+/// maintenance is needed. Returns false when the face cannot be parsed. — TIMBERDOODLE
 #[allow(clippy::too_many_arguments)]
 pub fn blit_face_alpha<R: Fn(usize) -> u32, W: FnMut(usize, u32)>(
     text: &[u8],
@@ -1492,9 +1498,9 @@ pub unsafe fn clean_pixels(base: *mut u32, start: usize, len: usize) {
 mod tests {
     use super::*;
 
-    // A small in-memory framebuffer: 24x32 px (3 cols x 2 rows of 8x16 cells).
-    const W: usize = 24;
-    const H: usize = 32;
+    // A small in-memory framebuffer: three cells wide by two cells tall.
+    const W: usize = 3 * GLYPH_W;
+    const H: usize = 2 * GLYPH_H;
     const STRIDE: usize = W;
 
     fn fresh() -> [u32; W * H] {
@@ -2512,7 +2518,7 @@ mod tests {
         for ry in 0..GLYPH_H {
             for rx in 0..GLYPH_W {
                 let got = buf[(cy * GLYPH_H + ry) * stride + (cx * GLYPH_W + rx)];
-                let want = if (rows[ry] >> (7 - rx)) & 1 != 0 {
+                let want = if (rows[ry] >> (15 - rx)) & 1 != 0 {
                     foreground
                 } else {
                     background
@@ -2526,7 +2532,7 @@ mod tests {
         }
     }
 
-    fn assert_wide_cell(buf: &[u32], stride: usize, rows: &[u16; 16], cx: usize, cy: usize) {
+    fn assert_wide_cell(buf: &[u32], stride: usize, rows: &[u16; GLYPH_H], cx: usize, cy: usize) {
         for (y, &bits) in rows.iter().enumerate() {
             for x in 0..16 {
                 let want = if bits & (1 << (15 - x)) != 0 { FG } else { BG };
@@ -2544,9 +2550,9 @@ mod tests {
 
         // Golden U+3042 rows from the existing Unifont asset, independent of
         // the new lookup and width-aware blitter. — KESTREL
-        const HIRAGANA_A: [u16; 16] = [
+        const HIRAGANA_A: [u16; GLYPH_H] = [
             0x0000, 0x0400, 0x0200, 0x02c0, 0x1f00, 0x0480, 0x0480, 0x07e0, 0x0d10, 0x1508, 0x2208,
-            0x2608, 0x2a10, 0x1060, 0x0000, 0x0000,
+            0x2608, 0x2a10, 0x1060, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
         ];
         assert_cell_colors(&buf, WIDTH, b'A', 0, 0, FG, BG);
         assert_wide_cell(&buf, WIDTH, &HIRAGANA_A, 1, 0);
@@ -2587,7 +2593,8 @@ mod tests {
 
     #[test]
     fn malformed_utf8_cannot_hide_the_next_ascii_or_ansi_control() {
-        const WIDTH: usize = 192;
+        // 24 cells wide, so the 23-column stream never wraps.
+        const WIDTH: usize = 24 * GLYPH_W;
         let mut buf = [BG; WIDTH * GLYPH_H];
         let mut con = unsafe { Console::new(buf.as_mut_ptr(), WIDTH, GLYPH_H, WIDTH) };
         con.write(&[
@@ -2634,13 +2641,13 @@ mod tests {
         const STRIDE: usize = 16;
         const CANARY: u32 = 0x1234_5678;
         let mut buf = [CANARY; STRIDE * GLYPH_H + 16];
-        let mut con = unsafe { Console::new(buf.as_mut_ptr(), 8, GLYPH_H, STRIDE) };
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), GLYPH_W, GLYPH_H, STRIDE) };
         for y in 0..GLYPH_H {
-            buf[y * STRIDE + 8..(y + 1) * STRIDE].fill(CANARY);
+            buf[y * STRIDE + GLYPH_W..(y + 1) * STRIDE].fill(CANARY);
         }
         con.write("あ".as_bytes());
         for y in 0..GLYPH_H {
-            assert!(buf[y * STRIDE + 8..(y + 1) * STRIDE]
+            assert!(buf[y * STRIDE + GLYPH_W..(y + 1) * STRIDE]
                 .iter()
                 .all(|&p| p == CANARY));
         }
@@ -2766,7 +2773,7 @@ mod tests {
                 let rows = glyph_rows(letter);
                 let holds = (0..GLYPH_H).all(|ry| {
                     (0..GLYPH_W).all(|rx| {
-                        let on = (rows[ry] >> (7 - rx)) & 1 != 0;
+                        let on = (rows[ry] >> (15 - rx)) & 1 != 0;
                         buf[(row * GLYPH_H + ry) * ED_W + col * GLYPH_W + rx]
                             == if on { FG } else { BG }
                     })
@@ -3068,8 +3075,9 @@ mod tests {
 
     #[test]
     fn kilo_repaint_transcript_produces_cells_not_escape_glyphs() {
-        const KILO_W: usize = 40;
-        const KILO_H: usize = 48;
+        // Five columns by three rows of cells; the asserts address cells up to (4, 2).
+        const KILO_W: usize = 5 * GLYPH_W;
+        const KILO_H: usize = 3 * GLYPH_H;
         let mut buf = [BG; KILO_W * KILO_H];
         let mut con = unsafe { Console::new(buf.as_mut_ptr(), KILO_W, KILO_H, KILO_W) };
 

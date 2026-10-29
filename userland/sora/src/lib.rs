@@ -6,6 +6,7 @@
 //j563
 //j564
 //j568
+//j687
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -685,8 +686,10 @@ pub fn log_level_name(level: u64) -> Option<&'static [u8]> {
         .copied()
 }
 
-/// The text cell drv-fb draws: 8x16 pixels (`drv_fb::GLYPH_W`/`GLYPH_H`, pinned by a test).
-pub const CONSOLE_CELL_PX: (u32, u32) = (8, 16);
+/// The text cell drv-fb draws, taken from the shared layout crate (pinned to
+/// `drv_fb::GLYPH_W`/`GLYPH_H` by a test).
+pub const CONSOLE_CELL_PX: (u32, u32) =
+    (kumo_graphics::CONSOLE_CELL_W, kumo_graphics::CONSOLE_CELL_H);
 
 /// Restore default colors, clear the entire display, and show the cursor at home.
 pub const CONSOLE_SESSION_RESET: &[u8] = b"\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[?25h";
@@ -1135,13 +1138,13 @@ mod tests {
         // J557: the size Kilo is told must be the grid drv-fb actually draws.
         assert_eq!(CONSOLE_CELL_PX, (GLYPH_W as u32, GLYPH_H as u32));
         let window = |w, h| console_window(w, h).map(|s| (s.rows, s.columns));
-        assert_eq!(window(1600, 900), Some((46, 200)));
-        assert_eq!(window(800, 600), Some((27, 100)));
-        assert_eq!(window(640, 480), Some((20, 80)));
+        assert_eq!(window(1600, 900), Some((37, 160)));
+        assert_eq!(window(800, 600), Some((22, 80)));
+        assert_eq!(window(640, 480), Some((16, 64)));
         assert_eq!(window(7, 900), None);
         assert_eq!(window(u32::MAX, 900), None);
         // Too short for the view band: the console keeps the whole display.
-        assert_eq!(window(800, 287), Some((17, 100)));
+        assert_eq!(window(800, 287), Some((14, 80)));
     }
 
     #[test]
