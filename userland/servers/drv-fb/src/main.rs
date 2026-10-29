@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j672
 //j673
 //j674
 //j675
 //j684
+//j685
 
 mod clock_probe;
 mod display_probe;
@@ -20,8 +20,9 @@ use drv_fb::{clean_pixels, paint_band, Console, PixelOrder, BG, GLYPH_H, GLYPH_W
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
-    channel_read, channel_read_with_handle, framebuffer_claim, handle_duplicate, handle_koid,
-    port_bind, port_create, port_wait, resource_mint_mmio, syscall_handle, vmar_map, vmo_create,
+    channel_read, channel_read_with_handle, framebuffer_claim, handle_close, handle_duplicate,
+    handle_koid, interrupt_complete, interrupt_create, port_bind, port_create, port_wait,
+    resource_mint_mmio, syscall_handle, timer_create, vmar_map, vmo_create,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559: shown on the console only when its level
@@ -519,6 +520,38 @@ extern "C" fn main(
         #[allow(dead_code)]
         buttons: u8,
     }
+    // G8c-c2: the production vblank gate. Once the diagnostic has completed, the serving
+    // loop owns the VP2 frame-start interrupt and answers `Retired` for a present only
+    // when a frame start was observed after the copy, bounded by two frame periods. Any
+    // failure leaves the honest `Copied` fallback in place. — TIMBERDOODLE
+    #[derive(Clone, Copy)]
+    struct Gate {
+        irq: Handle,
+        source: u64,
+        port: Handle,
+    }
+    impl Gate {
+        /// Wait at most two 60 Hz periods for one frame start and acknowledge it. A timer
+        /// miss or binding failure answers false, which keeps the reply honest.
+        fn frame_started(self) -> bool {
+            let Some(timer) = syscall_handle(timer_create(33_000_000)) else {
+                return false;
+            };
+            if port_bind(self.port, timer) != 0 {
+                let _ = handle_close(timer);
+                return false;
+            }
+            let started = port_wait(self.port) == self.source;
+            if started {
+                let _ = interrupt_complete(self.irq);
+            }
+            let _ = kumo_rt::port_unbind(self.port, timer);
+            let _ = handle_close(timer);
+            started
+        }
+    }
+    let mut gate: Option<Gate> = None;
+
     let mut cursor: Option<Cursor> = None;
     let mut pointer_records: u32 = 0;
     // F2b focus: the view Sora last named as the keyboard owner, painted with highlighted
@@ -613,6 +646,31 @@ extern "C" fn main(
     // R1: blank and scrub now, once the console drains through the port; the rebuild and its
     // verification run from one-shot timers on the same port, so the console never stalls
     // behind the deliberate blank. — TIMBERDOODLE
+    // G8c-c2: keep a duplicate of the VOP Resource so the serving loop can create its own
+    // frame-start interrupt after the diagnostic closes its one. One owner at a time: the
+    // diagnostic's interrupt is closed on every terminal path before this duplicate is
+    // used. — TIMBERDOODLE
+    let mut gate_vop = if vop_rw_raw != 0 {
+        // InterruptCreate requires WRITE on the Resource; the diagnostic's own grant
+        // carries it, so the duplicate must not narrow it away. — TIMBERDOODLE
+        match syscall_handle(handle_duplicate(
+            Handle(vop_rw_raw as u32),
+            kumo_abi::Rights::WRITE | kumo_abi::Rights::READ,
+        )) {
+            Some(duplicate) => duplicate,
+            None => {
+                // The first metal run found this failure completely silent; every path
+                // that cannot arm the gate must say why. — TIMBERDOODLE
+                let _ = kumo_rt::log_write(
+                    kumo_abi::sys::log_level::NOTICE,
+                    b"display: present gate skipped: VOP duplicate refused\n",
+                );
+                Handle(0)
+            }
+        }
+    } else {
+        Handle(0)
+    };
     let mut r1 = modeset::start(
         bootinfo,
         power,
@@ -764,6 +822,56 @@ extern "C" fn main(
         let source = Handle(port_wait(port) as u32);
         if r1.as_ref().is_some_and(|pending| pending.owns(source)) {
             r1 = r1.take().and_then(|pending| modeset::wake(pending, source));
+            // G8c-c2: arm the production vblank gate only after a completed diagnostic;
+            // the resource duplicate and a dedicated port keep the serving port's other
+            // sources untouched. — TIMBERDOODLE
+            if r1.is_none() && gate.is_none() && gate_vop.0 != 0 {
+                if !modeset::completed() {
+                    let _ = kumo_rt::log_write(
+                        kumo_abi::sys::log_level::NOTICE,
+                        b"display: present gate skipped: diagnostic did not complete\n",
+                    );
+                    let _ = handle_close(gate_vop);
+                    gate_vop = Handle(0);
+                } else {
+                    let raw = interrupt_create(gate_vop, drv_fb::rk3588::VOP_INTID);
+                    let irq = Handle(raw as u32);
+                    if raw == 0 || raw == u64::MAX {
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            b"display: present gate skipped: frame-start interrupt refused\n",
+                        );
+                        let _ = handle_close(gate_vop);
+                    } else if let Some(port) = syscall_handle(port_create()) {
+                        if port_bind(port, irq) == 0 {
+                            gate = Some(Gate {
+                                irq,
+                                source: handle_koid(irq),
+                                port,
+                            });
+                            let _ = kumo_rt::log_write(
+                                kumo_abi::sys::log_level::NOTICE,
+                                b"display: present gate armed, answering Retired on frame starts\n",
+                            );
+                        } else {
+                            let _ = kumo_rt::log_write(
+                                kumo_abi::sys::log_level::NOTICE,
+                                b"display: present gate skipped: port bind refused\n",
+                            );
+                            let _ = handle_close(irq);
+                            let _ = handle_close(port);
+                        }
+                    } else {
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            b"display: present gate skipped: gate port unavailable\n",
+                        );
+                        let _ = handle_close(irq);
+                    }
+                    let _ = handle_close(gate_vop);
+                    gate_vop = Handle(0);
+                }
+            }
             continue;
         }
         if control_bound && source == control_source {
@@ -1205,12 +1313,18 @@ extern "C" fn main(
                             |start, len| unsafe { clean_pixels(fb_va as *mut u32, start, len) },
                         );
                     }
-                    // Until the production vblank gate exists (G8c-c2), the software path
-                    // can only prove the copy, so it answers the honest fallback status.
-                    // — TIMBERDOODLE
+                    // G8c-c2: a successful present answers Retired only when the gate
+                    // observed a frame start after the copy; otherwise the honest copy
+                    // fallback stands. — TIMBERDOODLE
+                    let mut status = result.err().unwrap_or(Status::Copied);
+                    if status == Status::Copied {
+                        if gate.is_some_and(Gate::frame_started) {
+                            status = Status::Retired;
+                        }
+                    }
                     Reply {
                         sequence: request.sequence,
-                        status: result.err().unwrap_or(Status::Copied),
+                        status,
                     }
                 }
                 _ => Reply {

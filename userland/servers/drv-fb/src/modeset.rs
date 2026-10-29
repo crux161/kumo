@@ -1,8 +1,8 @@
-//j635
 //j636
 //j638
 //j639
 //j683
+//j685
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -250,6 +250,15 @@ struct VopResource(Handle);
 /// Bounded frame-retired waits armed on the native channel; the presentations are bounded
 /// the same way, and one outstanding wait per present is the client's shape. — TIMBERDOODLE
 pub const MAX_NATIVE_WAITS: usize = 4;
+
+/// True once the diagnostic completed through its retirement path. The serving loop arms
+/// the production vblank gate only on this signal: a refused or timed-out diagnostic must
+/// not leave a claimed frame-start authority behind. — TIMBERDOODLE
+static DIAGNOSTIC_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+pub fn completed() -> bool {
+    DIAGNOSTIC_COMPLETED.load(Ordering::Relaxed)
+}
 
 struct NativeChannel {
     handle: Handle,
@@ -2098,6 +2107,7 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
     }
     if complete {
         pending.native_channel.finished = true;
+        DIAGNOSTIC_COMPLETED.store(true, Ordering::Relaxed);
         log(format_args!(
             "display: J0c complete: 3 original-VMO presentations retired, GOP-only console live\n"
         ));
