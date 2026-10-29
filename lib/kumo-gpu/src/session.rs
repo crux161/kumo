@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -10,11 +10,14 @@
 use crate::{
     valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
     DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission,
-    Timeline, MAX_BUFFER_BYTES,
+    SyncState, Timeline, MAX_BUFFER_BYTES,
 };
 
 pub const MAX_BUFFERS: usize = 4;
 pub const MAX_BINDINGS: usize = 8;
+/// Bounded armed-fence points per session. Completed points are pruned before the bound is
+/// enforced, so the table holds only waits that are still pending. — TIMBERDOODLE
+pub const MAX_WAITS: usize = 4;
 
 /// Backend submission failures distinguish work that never reached the ring from work whose
 /// ownership is uncertain. The latter retires the whole session without inventing completion.
@@ -66,6 +69,7 @@ pub struct Session {
     buffers: [u64; MAX_BUFFERS],
     bindings: [Option<Binding>; MAX_BINDINGS],
     timeline: Timeline,
+    waits: [Option<u64>; MAX_WAITS],
 }
 
 impl Session {
@@ -90,6 +94,18 @@ impl Session {
             return Err(Status::DeviceLost);
         }
         self.timeline.complete(point, status)
+    }
+
+    /// Read-only completion state for an armed fence; the server's wake drain consults it
+    /// after each completion. — TIMBERDOODLE
+    pub fn fence_state(&self, point: u64) -> Result<SyncState, Status> {
+        if self.retired {
+            return Err(Status::DeviceLost);
+        }
+        if !self.group {
+            return Err(Status::BadState);
+        }
+        self.timeline.query(point)
     }
 
     fn execute(
@@ -259,6 +275,39 @@ impl Session {
                     state: self.timeline.query(point)?,
                 })
             }
+            Command::FenceWait { group, point } => {
+                if !self.group {
+                    return Err(Status::BadState);
+                }
+                if group != 1 {
+                    return Err(Status::NotFound);
+                }
+                match self.timeline.query(point)? {
+                    SyncState::Complete { gpu_status } => {
+                        Ok(Response::WaitDone { point, gpu_status })
+                    }
+                    SyncState::Pending => {
+                        // Completed points do not hold a slot: the server's wake drain
+                        // re-queries `fence_state`, so pruning loses nothing. — TIMBERDOODLE
+                        for slot in &mut self.waits {
+                            if let Some(armed) = *slot {
+                                if matches!(self.timeline.query(armed)?, SyncState::Complete { .. })
+                                {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                        if !self.waits.iter().any(|slot| *slot == Some(point)) {
+                            let Some(free) = self.waits.iter_mut().find(|slot| slot.is_none())
+                            else {
+                                return Err(Status::Busy);
+                            };
+                            *free = Some(point);
+                        }
+                        Ok(Response::WaitArmed { point })
+                    }
+                }
+            }
         }
     }
 }
@@ -378,6 +427,60 @@ mod tests {
         send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
         send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
         (s, b)
+    }
+
+    #[test]
+    fn fence_wait_arms_dedups_prunes_and_reports_completion() {
+        let (mut s, mut b) = ready();
+        send(&mut s, &mut b, job(1)).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }),
+            Ok(Response::WaitArmed { point: 1 })
+        );
+        // Idempotent arm: the same pending point occupies one slot and still replies armed.
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }),
+            Ok(Response::WaitArmed { point: 1 })
+        );
+        assert_eq!(s.waits.iter().flatten().count(), 1);
+        assert_eq!(s.fence_state(1), Ok(SyncState::Pending));
+        s.complete(1, 0).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }),
+            Ok(Response::WaitDone {
+                point: 1,
+                gpu_status: 0
+            })
+        );
+        assert_eq!(s.fence_state(1), Ok(SyncState::Complete { gpu_status: 0 }));
+        // A completed arm's slot is pruned when the next point arms.
+        send(&mut s, &mut b, job(2)).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 2 }),
+            Ok(Response::WaitArmed { point: 2 })
+        );
+        assert_eq!(s.waits.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn fence_wait_requires_a_group_and_rejects_unknown_points() {
+        let mut b = Fake::default();
+        let mut s = Session::default();
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }),
+            Err(Status::BadState)
+        );
+        let (mut s, mut b) = ready();
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 2, point: 1 }),
+            Err(Status::NotFound)
+        );
+        // Point 0 is rejected by the wire layer itself, exactly as SyncRead's frame is, so
+        // only points above `submitted` reach the session's NotFound path.
+        assert_eq!(
+            send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }),
+            Err(Status::NotFound)
+        );
     }
     #[test]
     fn topology_is_read_only_unsupported_is_recoverable_and_zero_retires() {

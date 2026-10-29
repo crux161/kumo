@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -12,7 +12,7 @@
 
 use crate::{
     Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
-    DeviceTopology, Reply, Request, Response, Status, Submission, SyncState, REPLY_LEN,
+    DeviceTopology, Fence, Reply, Request, Response, Status, Submission, SyncState, REPLY_LEN,
     REQUEST_LEN,
 };
 
@@ -52,6 +52,14 @@ pub struct Buffer<H> {
     pub id: u32,
     pub bytes: u64,
     pub handle: H,
+}
+
+/// The outcome of a fence wait registration (G8c-a). `Armed` carries the wake-channel read
+/// end, owned by the caller. A failed completion latches session loss, exactly as SyncRead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceStatus<H> {
+    Done { gpu_status: u32 },
+    Armed(H),
 }
 
 pub struct Client<T: Transport> {
@@ -149,6 +157,18 @@ impl<T: Transport> Client<T> {
         self.call(Command::Submit(submission))?;
         Ok(())
     }
+    /// Submit and keep the accepted point as a fence. Acceptance is still not completion:
+    /// `fence_wait` (or the SyncRead fallback) must report Done before reusing backing.
+    /// — TIMBERDOODLE
+    pub fn submit_fence(&mut self, submission: Submission) -> Result<Fence, Error> {
+        let (Response::Submitted { point }, _) = self.call(Command::Submit(submission))? else {
+            unreachable!()
+        };
+        Ok(Fence {
+            group: submission.group,
+            point,
+        })
+    }
     /// Preserve the observed GPU status. A failed completion is returned once and latches
     /// loss; subsequent calls perform no transport I/O. Pending never releases an image.
     pub fn sync_read(&mut self, group: u32, point: u64) -> Result<SyncState, Error> {
@@ -157,6 +177,22 @@ impl<T: Transport> Client<T> {
             unreachable!()
         };
         Ok(state)
+    }
+
+    /// Register a wait on `fence`'s timeline. `Done` means the point was already complete.
+    /// `Armed` returns the wake-channel read end: the caller owns it, blocks on it under its
+    /// own timeout policy, and the driver writes one byte at completion. SyncRead stays the
+    /// polling fallback for one journal. — TIMBERDOODLE
+    pub fn fence_wait(&mut self, fence: Fence) -> Result<FenceStatus<T::Handle>, Error> {
+        let (response, handle) = self.call(Command::FenceWait {
+            group: fence.group,
+            point: fence.point,
+        })?;
+        match (response, handle) {
+            (Response::WaitDone { gpu_status, .. }, None) => Ok(FenceStatus::Done { gpu_status }),
+            (Response::WaitArmed { .. }, Some(handle)) => Ok(FenceStatus::Armed(handle)),
+            _ => Err(self.fail(Error::Protocol)),
+        }
     }
 
     fn fail(&mut self, error: Error) -> Error {
@@ -217,6 +253,9 @@ impl<T: Transport> Client<T> {
                 {
                     self.lost = true;
                 }
+                if matches!(response, Response::WaitDone { gpu_status, .. } if gpu_status != 0) {
+                    self.lost = true;
+                }
                 Ok((response, handle))
             }
         }
@@ -248,6 +287,15 @@ fn matches_response(command: Command, response: Response) -> bool {
                 point: received, ..
             },
         ) => point == received,
+        (
+            Command::FenceWait { point, .. },
+            Response::WaitDone {
+                point: received, ..
+            },
+        ) => point == received,
+        (Command::FenceWait { point, .. }, Response::WaitArmed { point: received }) => {
+            point == received
+        }
         _ => false,
     }
 }

@@ -1,5 +1,6 @@
 //j641
 //j644
+//j681
 
 extern crate std;
 use super::*;
@@ -63,6 +64,40 @@ fn job(point: u64) -> Submission {
         stream_bytes: 32,
         signal_point: point,
     }
+}
+
+#[test]
+fn fence_wait_reports_done_or_armed_and_owns_the_wake_handle() {
+    let mut transport = Script::default();
+    transport.reply(
+        1,
+        Ok(Response::WaitDone {
+            point: 1,
+            gpu_status: 0,
+        }),
+        None,
+    );
+    transport.reply(2, Ok(Response::WaitArmed { point: 1 }), Some(9));
+    let mut client = Client::new(transport);
+    assert_eq!(
+        client.fence_wait(Fence { group: 1, point: 1 }),
+        Ok(FenceStatus::Done { gpu_status: 0 })
+    );
+    assert_eq!(
+        client.fence_wait(Fence { group: 1, point: 1 }),
+        Ok(FenceStatus::Armed(9))
+    );
+    // The armed handle belongs to the caller; nothing was closed behind its back.
+    assert!(client.transport.closed.is_empty());
+    assert_eq!(client.transport.sent.len(), 2);
+    assert_eq!(
+        client.transport.sent[0].command,
+        Command::FenceWait { group: 1, point: 1 }
+    );
+    assert_eq!(
+        client.transport.sent[1].command,
+        Command::FenceWait { group: 1, point: 1 }
+    );
 }
 
 #[test]

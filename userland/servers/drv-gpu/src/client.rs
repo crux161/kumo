@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -11,8 +11,9 @@
 use super::*;
 use drv_gpu::{client_job_wrapper, protocol, JobSlot, JOB_WRAPPER_WORDS};
 use protocol::{
-    session::{Backend, Session, SubmitError, MAX_BUFFERS},
-    Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, REQUEST_LEN,
+    session::{Backend, Session, SubmitError, MAX_BUFFERS, MAX_WAITS},
+    Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, SyncState,
+    REQUEST_LEN,
 };
 
 struct Pending {
@@ -45,6 +46,7 @@ struct Hardware<'a> {
     buffers: [Option<Mapping>; MAX_BUFFERS],
     reply_grant: Option<Handle>,
     pending: Option<Pending>,
+    waiters: [Option<(u64, Handle)>; MAX_WAITS],
 }
 
 impl Backend for Hardware<'_> {
@@ -225,6 +227,50 @@ impl Backend for Hardware<'_> {
 }
 
 impl Hardware<'_> {
+    /// Arm a wait for `point`: create the wake-channel pair and hand the read end back for
+    /// the reply. None means the pair could not be created or the bounded table is full; the
+    /// caller reports NoMemory rather than an armed reply without its handle. — TIMBERDOODLE
+    fn arm_fence_wait(&mut self, point: u64) -> Option<Handle> {
+        if !self.waiters.iter().any(|slot| slot.is_none()) {
+            return None;
+        }
+        let (read_raw, write_raw) = kumo_rt::channel_create_pair();
+        let (Some(read), Some(write)) = (valid_handle(read_raw), valid_handle(write_raw)) else {
+            for raw in [read_raw, write_raw] {
+                if let Some(handle) = valid_handle(raw) {
+                    let _ = kumo_rt::handle_close(handle);
+                }
+            }
+            return None;
+        };
+        let free = self
+            .waiters
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("free slot checked above");
+        *free = Some((point, write));
+        Some(read)
+    }
+
+    /// Wake and release every armed waiter whose point has completed. — TIMBERDOODLE
+    fn drain_fence_waits(&mut self, session: &Session) {
+        for slot in &mut self.waiters {
+            let satisfied = match slot {
+                Some((point, _)) => {
+                    matches!(session.fence_state(*point), Ok(SyncState::Complete { .. }))
+                }
+                None => false,
+            };
+            if satisfied {
+                if let Some((_, handle)) = slot.take() {
+                    let byte = [1u8];
+                    let _ = kumo_rt::channel_write(handle, byte.as_ptr(), 1);
+                    let _ = kumo_rt::handle_close(handle);
+                }
+            }
+        }
+    }
+
     fn finish_pending(&mut self) -> Result<Option<u64>, GpuStatus> {
         let Some(job) = self.pending.take() else {
             return Ok(None);
@@ -364,6 +410,7 @@ pub(super) fn serve(
         buffers: [None; MAX_BUFFERS],
         reply_grant: None,
         pending: None,
+        waiters: [None; MAX_WAITS],
     };
     let mut session = Session::default();
     log(
@@ -382,18 +429,28 @@ pub(super) fn serve(
             break;
         }
         let request = bytes.get(..len).and_then(Request::decode);
-        let (id, result) = match request {
+        let (id, mut result) = match request {
             Some(request) if unexpected.is_none() => {
                 (request.id, session.dispatch(request, &mut hw))
             }
             _ => (0, Err(GpuStatus::BadRequest)),
         };
-        let retired = result == Err(GpuStatus::DeviceLost);
-        let grant = if matches!(result, Ok(Response::BufferCreated { .. })) {
+        let mut grant = if matches!(result, Ok(Response::BufferCreated { .. })) {
             hw.reply_grant.take()
         } else {
             None
         };
+        let armed_point = match result {
+            Ok(Response::WaitArmed { point }) => Some(point),
+            _ => None,
+        };
+        if let Some(point) = armed_point {
+            match hw.arm_fence_wait(point) {
+                Some(read) => grant = Some(read),
+                None => result = Err(GpuStatus::NoMemory),
+            }
+        }
+        let retired = result == Err(GpuStatus::DeviceLost);
         let frame = GpuReply { id, result }.encode();
         let sent = kumo_rt::channel_write_with_handle(
             channel,
@@ -415,6 +472,7 @@ pub(super) fn serve(
                 if session.complete(point, 0).is_err() {
                     break;
                 }
+                hw.drain_fence_waits(&session);
             }
             Ok(None) => (),
             Err(_) => break,
@@ -428,6 +486,11 @@ pub(super) fn serve(
     }
     if let Some(handle) = hw.reply_grant.take() {
         let _ = kumo_rt::handle_close(handle);
+    }
+    for slot in &mut hw.waiters {
+        if let Some((_, handle)) = slot.take() {
+            let _ = kumo_rt::handle_close(handle);
+        }
     }
     let _ = kumo_rt::handle_close(channel);
     park()

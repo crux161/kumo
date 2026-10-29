@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 extern crate std;
 
@@ -44,6 +44,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GroupCreate { vm: 1 },
         Command::Submit(submission()),
         Command::SyncRead { group: 3, point: 1 },
+        Command::FenceWait { group: 3, point: 1 },
     ] {
         let request = Request {
             id: 0x1234_5678,

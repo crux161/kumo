@@ -1,8 +1,8 @@
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -38,6 +38,14 @@ pub enum Command {
     Submit(Submission),
     /// Query is nonblocking; Pending never implies completion or permission to reuse backing.
     SyncRead {
+        group: u32,
+        point: u64,
+    },
+    /// Register a wait on the gpu-done timeline (DESIGN/023 G8c-a). The reply is `WaitDone`
+    /// when the point is already complete, or `WaitArmed` carrying one transferred
+    /// wake-channel read end; the driver writes one byte when the point completes. SyncRead
+    /// remains the polling fallback. — TIMBERDOODLE
+    FenceWait {
         group: u32,
         point: u64,
     },
@@ -85,6 +93,7 @@ impl Request {
                 ],
             ),
             Command::SyncRead { group, point } => (6, [u64::from(group), point, 0, 0, 0, 0]),
+            Command::FenceWait { group, point } => (16, [u64::from(group), point, 0, 0, 0, 0]),
         };
         let mut bytes = [0; REQUEST_LEN];
         bytes[..4].copy_from_slice(b"KGQ1");
@@ -143,6 +152,10 @@ impl Request {
                 group: a[0] as u32,
                 point: a[1],
             },
+            16 if a[0] != 0 && a[1] != 0 => Command::FenceWait {
+                group: a[0] as u32,
+                point: a[1],
+            },
             _ => return None,
         };
         let request = Self { id, command };
@@ -183,12 +196,22 @@ pub enum Response {
         point: u64,
         state: SyncState,
     },
+    /// The point was already complete when the wait was registered; no handle accompanies.
+    WaitDone {
+        point: u64,
+        gpu_status: u32,
+    },
+    /// Armed; exactly one transferred wake-channel read end accompanies this reply. The
+    /// driver writes one byte to it and closes its end when the point completes.
+    WaitArmed {
+        point: u64,
+    },
 }
 
 impl Response {
     pub const fn handle_count(self) -> usize {
         match self {
-            Self::BufferCreated { .. } => 1,
+            Self::BufferCreated { .. } | Self::WaitArmed { .. } => 1,
             _ => 0,
         }
     }
@@ -246,6 +269,10 @@ impl Reply {
                 SyncState::Pending => (6, [point, 0, 0, 0]),
                 SyncState::Complete { gpu_status } => (6, [point, 1, u64::from(gpu_status), 0]),
             },
+            Ok(Response::WaitDone { point, gpu_status }) => {
+                (16, [point, 0, u64::from(gpu_status), 0])
+            }
+            Ok(Response::WaitArmed { point }) => (16, [point, 1, 0, 0]),
         };
         bytes[12..16].copy_from_slice(&u32::to_le_bytes(op));
         put_args(&mut bytes[16..], &a);
@@ -323,6 +350,13 @@ impl Reply {
                         _ => return None,
                     },
                 },
+                16 if a[0] != 0 && a[1] == 0 && a[3] == 0 => Response::WaitDone {
+                    point: a[0],
+                    gpu_status: a[2] as u32,
+                },
+                16 if a[0] != 0 && a[1] == 1 && a[2] == 0 && a[3] == 0 => {
+                    Response::WaitArmed { point: a[0] }
+                }
                 _ => return None,
             })
         };

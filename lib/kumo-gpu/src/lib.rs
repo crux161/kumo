@@ -1,9 +1,9 @@
 #![no_std]
-//j646
 //j647
 //j650
 //j651
 //j652
+//j681
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -231,6 +231,14 @@ fn in_window(va: u64, bytes: u64) -> bool {
 pub enum SyncState {
     Pending,
     Complete { gpu_status: u32 },
+}
+
+/// A point on a driver-owned completion timeline (DESIGN/023). `gpu-done` points are queue
+/// seqnos. A fence is a value until G8c-b adds capability tokens. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fence {
+    pub group: u32,
+    pub point: u64,
 }
 
 /// Consume a decoded request ID before executing its mutation, including failed operations.
