@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j549
 //j550
 //j559
 //j664
 //j665
+//j666
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -128,6 +128,10 @@ const IRQ_EVENT_DRAIN_LIMIT: u32 = 4096;
 /// Transfer completions serviced per interrupt wake. Two HID lanes at their polling intervals
 /// complete at most twice per wake in normal use; the bound only caps a pathological burst.
 const HID_EVENTS_PER_WAKE: usize = 4;
+/// Boot HID devices served together from one resident loop: the keyboard and the composite
+/// receiver behind the same hub. Each device contributes one lane, or two for a pair.
+const MAX_HID_DEVICES: usize = 2;
+const MAX_HID_LANES: usize = 4;
 
 // Slice C: a second contiguous DMA page holds the enumeration structures for the device on the
 // first connected+enabled port. 64-byte context stride (caps ctx=0x40).
@@ -143,10 +147,12 @@ const OFF_INT_RING: usize = 0xe00; // 16-TRB interrupt-IN transfer ring (256 B)
 const OFF_REPORT: usize = 0xf00; // HID report buffer (256 B)
 
 // A composite boot HID device needs a second interrupt-IN ring and report buffer. They live in
-// the spare window between the input context (whose highest boot-HID DCI is 4, ending at 0x180)
-// and the controller-written output context at OFF_OUTPUT_CTX, so the page needs no growth.
-const OFF_HID2_RING: usize = 0x180; // composite boot HID: mouse interrupt-IN ring (256 B)
-const OFF_HID2_REPORT: usize = 0x280; // composite boot HID: mouse report buffer (8 B)
+// the spare window between the input context and the controller-written output context at
+// OFF_OUTPUT_CTX, so the page needs no growth. A boot receiver's mouse sits on EP2 IN, DCI 5,
+// whose input context ends at 0x1c0; the ring starts above a DCI-7 span (0x240) so every boot
+// HID endpoint this driver will pair clears it.
+const OFF_HID2_RING: usize = 0x240; // composite boot HID: mouse interrupt-IN ring (256 B)
+const OFF_HID2_REPORT: usize = 0x340; // composite boot HID: mouse report buffer (8 B)
 const _: () = assert!(OFF_HID2_RING + INT_RING_TRBS * 16 <= OFF_HID2_REPORT);
 const _: () = assert!(OFF_HID2_REPORT + 8 <= OFF_OUTPUT_CTX);
 const EP0_RING_TRBS: usize = 16;
@@ -1210,22 +1216,20 @@ fn enumerate_root_device(
         log_hex(mouse.interval as u64);
         log(b"\n");
     }
-    configure_and_read_keyboard(
-        io,
-        layout,
-        &mut *image,
-        &mut *cmd,
-        evt,
-        &mut ep0_ring,
-        &mut *ep0_seg,
-        slot_id,
-        page_va,
-        page_phys,
-        speed_raw,
-        slot_context_words(0, speed_raw, 1, port_number, 0, 0),
-        config_value,
-        plan,
-    );
+    let mut devices = [
+        Some(KeyboardHandoff {
+            slot_id,
+            page_va,
+            page_phys,
+            speed_raw,
+            slot_words: slot_context_words(0, speed_raw, 1, port_number, 0, 0),
+            config_value,
+            plan,
+            ep0_ring,
+        }),
+        None,
+    ];
+    run_hid_devices(&mut devices, io, layout, image, cmd, evt);
 }
 
 /// J525: select a root-attached SCSI/BOT interface, identify its geometry, and discover a GPT ESP
@@ -2613,9 +2617,11 @@ impl HidPlan {
     }
 }
 
-/// One boot HID interface's report lane: its own ring, report buffer, and one outstanding
-/// transfer. The keyboard keeps the historical OFF_INT_RING/OFF_REPORT regions; a composite
-/// mouse takes the spare window above the input context.
+/// One boot HID interface's report lane: its own ring, report buffer, decoders, and one
+/// outstanding transfer. The keyboard keeps the historical OFF_INT_RING/OFF_REPORT regions; a
+/// composite mouse takes the spare window above the input context. A lane names its device slot
+/// and owns its report decoders, so one resident loop can serve several devices without their
+/// key or button edges interfering.
 struct HidLane {
     hid: kumo_hid::HidBootInterface,
     ring: TransferRing,
@@ -2623,9 +2629,12 @@ struct HidLane {
     report: DmaBuf,
     report_phys: u64,
     dci: u8,
+    slot_id: u8,
     pending: bool,
     token: u64,
     armed_logged: bool,
+    decoder: kumo_hid::Decoder,
+    mouse_decoder: kumo_hid::MouseDecoder,
 }
 
 impl HidLane {
@@ -2634,6 +2643,7 @@ impl HidLane {
     fn new(
         hid: kumo_hid::HidBootInterface,
         dci: u8,
+        slot_id: u8,
         ring_off: usize,
         report_off: usize,
         base_va: u64,
@@ -2658,16 +2668,19 @@ impl HidLane {
             report,
             report_phys: enum_phys + report_off as u64,
             dci,
+            slot_id,
             pending: false,
             token: 0,
             armed_logged: false,
+            decoder: kumo_hid::Decoder::new(),
+            mouse_decoder: kumo_hid::MouseDecoder::new(),
         })
     }
 
     /// Arm this lane's one outstanding interrupt-IN transfer. Re-arming only after the previous
     /// event is reclaimed is the J425/J632 rule: a wake without a match used to leak a ring slot
     /// until enqueue failed and the driver exited.
-    fn arm(&mut self, io: &mut Mmio, layout: RegisterLayout, slot_id: u8) {
+    fn arm(&mut self, io: &mut Mmio, layout: RegisterLayout) {
         self.report.zero();
         dsb();
         let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(
@@ -2687,7 +2700,7 @@ impl HidLane {
                 self.pending = true;
                 self.token = token.iova;
                 dsb();
-                ring_slot_doorbell(io, layout, slot_id, self.dci);
+                ring_slot_doorbell(io, layout, self.slot_id, self.dci);
                 if !self.armed_logged {
                     log(b"drv-xhci: hid transfer armed dci=");
                     log_hex(self.dci as u64);
@@ -2783,11 +2796,10 @@ fn configure_hid_endpoint_pair(
 }
 
 /// Bring a device's boot HID interface or interfaces online: SET_CONFIGURATION, Configure
-/// Endpoint for each lane's interrupt-IN endpoint, SET_PROTOCOL(boot), then arm each ring and
-/// forward its reports. The loop is resident; a mouse forwards the 3-byte wire to Sora's
-/// pointer pipeline. Bounded only when the controller has no IRQ.
+/// Endpoint for each lane's interrupt-IN endpoint, and SET_PROTOCOL(boot), appending the device's
+/// lanes to `lanes`. [`run_hid_lanes`] then serves every device's lanes from one resident loop.
 #[allow(clippy::too_many_arguments)]
-fn configure_and_read_keyboard(
+fn bring_up_hid_device(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
@@ -2802,6 +2814,8 @@ fn configure_and_read_keyboard(
     slot_words: [u32; 8],
     config_value: u8,
     plan: HidPlan,
+    lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+    count: &mut usize,
 ) {
     // --- SET_CONFIGURATION(config_value) --- bmRequestType=0, bRequest=9, wValue=config, no data.
     let set_config = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -2823,39 +2837,56 @@ fn configure_and_read_keyboard(
     // --- Configure Endpoint for the device's boot HID lane(s) ---
     // A composite receiver publishes a keyboard and a mouse in one configuration; a Configure
     // Endpoint command replaces the endpoint set, so both endpoints must be added together.
-    // When the pair cannot be configured, fall back to the primary interface alone.
-    let mut lanes: [Option<HidLane>; 2] = [None, None];
+    // When the pair cannot be configured, fall back to the primary interface alone. Lanes are
+    // appended to the shared table; a device that fails keeps its lanes out of it.
+    let first = *count;
+    let mut paired = false;
     if let (Some(keyboard), Some(mouse)) = (plan.keyboard, plan.mouse) {
+        if *count + 2 > lanes.len() {
+            return log(b"drv-xhci: hid lane table full\n");
+        }
         match configure_hid_endpoint_pair(
             io, layout, image, cmd, evt, slot_id, base_va, enum_phys, slot_words, keyboard, mouse,
             speed_raw,
         ) {
             Some((keyboard_dci, mouse_dci)) => {
                 log(b"drv-xhci: config ep pair cc=0x1\n");
-                lanes[0] = HidLane::new(
+                let keyboard_lane = HidLane::new(
                     keyboard,
                     keyboard_dci,
+                    slot_id,
                     OFF_INT_RING,
                     OFF_REPORT,
                     base_va,
                     enum_phys,
                 );
-                lanes[1] = HidLane::new(
+                let mouse_lane = HidLane::new(
                     mouse,
                     mouse_dci,
+                    slot_id,
                     OFF_HID2_RING,
                     OFF_HID2_REPORT,
                     base_va,
                     enum_phys,
                 );
-                if lanes[0].is_none() || lanes[1].is_none() {
-                    return log(b"drv-xhci: hid lane ring fail\n");
+                match (keyboard_lane, mouse_lane) {
+                    (Some(keyboard_lane), Some(mouse_lane)) => {
+                        lanes[*count] = Some(keyboard_lane);
+                        *count += 1;
+                        lanes[*count] = Some(mouse_lane);
+                        *count += 1;
+                        paired = true;
+                    }
+                    _ => return log(b"drv-xhci: hid lane ring fail\n"),
                 }
             }
             None => log(b"drv-xhci: composite hid refused; primary only\n"),
         }
     }
-    if lanes[0].is_none() {
+    if !paired {
+        if *count >= lanes.len() {
+            return log(b"drv-xhci: hid lane table full\n");
+        }
         let Some(primary) = plan.primary() else {
             return log(b"drv-xhci: hid plan empty\n");
         };
@@ -2877,15 +2908,25 @@ fn configure_and_read_keyboard(
             return;
         };
         log(b"drv-xhci: config ep cc=0x1\n");
-        lanes[0] = HidLane::new(primary, dci, OFF_INT_RING, OFF_REPORT, base_va, enum_phys);
-        if lanes[0].is_none() {
+        let Some(lane) = HidLane::new(
+            primary,
+            dci,
+            slot_id,
+            OFF_INT_RING,
+            OFF_REPORT,
+            base_va,
+            enum_phys,
+        ) else {
             return log(b"drv-xhci: hid lane ring fail\n");
-        }
+        };
+        lanes[*count] = Some(lane);
+        *count += 1;
     }
 
-    // --- SET_PROTOCOL(boot) per lane --- HID class request to the interface: bmRequestType=0x21,
-    // bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data.
-    for lane in lanes.iter().flatten() {
+    // --- SET_PROTOCOL(boot) per new lane --- HID class request to the interface:
+    // bmRequestType=0x21, bRequest=0x0B, wValue=0 (boot), wIndex=interface, no data. A device
+    // that fails here drops its lanes rather than serving misparsed reports.
+    for lane in lanes[first..*count].iter().flatten() {
         let set_proto = [
             0x21,
             0x0b,
@@ -2907,17 +2948,41 @@ fn configure_and_read_keyboard(
             set_proto,
         ) {
             Some((1, _)) => log(b"drv-xhci: set proto cc=0x1\n"),
-            Some((cc, _)) => return log_cc(b"drv-xhci: set proto cc=", cc),
-            None => return log(b"drv-xhci: set proto timeout\n"),
+            Some((cc, _)) => {
+                *count = first;
+                return log_cc(b"drv-xhci: set proto cc=", cc);
+            }
+            None => {
+                *count = first;
+                return log(b"drv-xhci: set proto timeout\n");
+            }
+        }
+    }
+}
+
+/// Serve every lane in `lanes` from one resident loop. The controller grants one interrupt for
+/// all its slots, so a keyboard and a composite receiver behind the same hub share a wake; each
+/// completion is matched to its lane by TRB address. Bounded only when the controller has no IRQ.
+fn run_hid_lanes(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+) {
+    let mut slots = [0u8; MAX_HID_LANES];
+    let mut slot_count = 0usize;
+    for lane in lanes.iter().flatten() {
+        if !slots[..slot_count].contains(&lane.slot_id) {
+            slots[slot_count] = lane.slot_id;
+            slot_count += 1;
         }
     }
 
-    let mut decoder = kumo_hid::Decoder::new();
-    let mut mouse_decoder = kumo_hid::MouseDecoder::new();
-
     // U4: IRQ-driven persistent path. A busy-poll at our priority (63) would starve Sora (64), so
     // if this controller was granted its IRQ, enable the controller interrupter and block on the
-    // xHCI interrupt between reports — the driver stays resident and services the keyboard forever.
+    // xHCI interrupt between reports — the driver stays resident and services the HID devices
+    // forever.
     let irq = DEVICE_IRQ.load(Ordering::Relaxed);
     if irq != 0 {
         let raw = interrupt_create(Handle(RESOURCE_HANDLE.load(Ordering::Relaxed)), irq);
@@ -2981,7 +3046,7 @@ fn configure_and_read_keyboard(
             loop {
                 for lane in lanes.iter_mut().flatten() {
                     if !lane.pending {
-                        lane.arm(io, layout, slot_id);
+                        lane.arm(io, layout);
                     }
                 }
                 // Block until the controller raises its interrupt (a report completed).
@@ -3017,12 +3082,12 @@ fn configure_and_read_keyboard(
                 // controller will not raise another interrupt while EHB is set.
                 write_erdp(io, layout, image.event_ring.dequeue_iova());
                 for _ in 0..HID_EVENTS_PER_WAKE {
-                    let Some((_cc, _, trb_iova)) = poll_transfer_event_limited(
+                    let Some((_cc, _, trb_iova)) = poll_transfer_event_slots(
                         io,
                         layout,
                         &mut *image,
                         evt,
-                        slot_id,
+                        &slots[..slot_count],
                         IRQ_EVENT_DRAIN_LIMIT,
                     ) else {
                         break;
@@ -3039,7 +3104,8 @@ fn configure_and_read_keyboard(
                             // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
                             // pointer pipeline already consumes. Idle reports repeat at the
                             // polling interval, so drop them rather than waking Sora for nothing.
-                            if let Some((motion, _edges)) = mouse_decoder
+                            if let Some((motion, _edges)) = lane
+                                .mouse_decoder
                                 .decode(&report[..lane.hid.max_packet_size.min(8) as usize], None)
                             {
                                 let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
@@ -3048,7 +3114,7 @@ fn configure_and_read_keyboard(
                                     let _ = channel_write(Handle(mouse), wire.as_ptr(), wire.len());
                                 }
                             }
-                        } else if let Ok(events) = decoder.decode(report) {
+                        } else if let Ok(events) = lane.decoder.decode(report) {
                             let keyboard = KEYBOARD_CHANNEL.load(Ordering::Relaxed);
                             for event in events.as_slice() {
                                 if event.state == kumo_hid::KeyState::Pressed {
@@ -3079,6 +3145,26 @@ fn configure_and_read_keyboard(
 
     // A resident HID device without an interrupt cannot be served safely at this priority.
     log(b"drv-xhci: hid found but no irq granted; not serving\n");
+}
+
+/// Bring up every device's lanes and hand them to one resident loop that never returns.
+fn run_hid_devices(
+    devices: &mut [Option<KeyboardHandoff>; MAX_HID_DEVICES],
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
+    evt: &DmaTrbs,
+) {
+    let mut lanes: [Option<HidLane>; MAX_HID_LANES] = [None, None, None, None];
+    let mut count = 0usize;
+    for device in devices.iter_mut().flatten() {
+        device.bring_up(io, layout, image, cmd, evt, &mut lanes, &mut count);
+    }
+    if count == 0 {
+        return log(b"drv-xhci: no hid lanes; not serving\n");
+    }
+    run_hid_lanes(io, layout, image, evt, &mut lanes);
 }
 
 /// Issue a no-data control transfer over EP0 (Setup + IN Status), for SET_CONFIGURATION and
@@ -3738,10 +3824,11 @@ fn configure_and_read_hub(
 
     // U2/J541: reach through the hub to every stable port, in ascending order and one at a time:
     // only one device may answer at address 0 while its port resets. Each gets its own slot, page
-    // and pass budget (the attach wait above slept rather than held the CPU). A boot keyboard's
-    // report loop never returns, so it runs only after every one-shot device (storage) has had its
-    // turn. — TIMBERDOODLE
-    let mut keyboard = None;
+    // and pass budget (the attach wait above slept rather than held the CPU). The boot HID
+    // devices' shared report loop never returns, so they run only after every one-shot device
+    // (storage) has had its turn. — TIMBERDOODLE
+    let mut devices: [Option<KeyboardHandoff>; MAX_HID_DEVICES] = [None, None];
+    let mut device_count = 0usize;
     for down_port in stable.iter() {
         let found = enumerate_hub_downstream(
             io,
@@ -3760,20 +3847,21 @@ fn configure_and_read_hub(
             Deadline::after(HUB_PASS_BUDGET_NS),
         );
         if let Some(handoff) = found {
-            if keyboard.is_none() {
-                keyboard = Some(handoff);
+            if device_count < MAX_HID_DEVICES {
+                devices[device_count] = Some(handoff);
+                device_count += 1;
             } else {
-                log(b"drv-xhci: hub dev second hid device left alone\n");
+                log(b"drv-xhci: hub dev third hid device left alone\n");
             }
         }
     }
-    if let Some(handoff) = keyboard {
-        handoff.run(io, layout, image, cmd, evt);
+    if device_count > 0 {
+        run_hid_devices(&mut devices, io, layout, image, cmd, evt);
     }
 }
 
-/// A hub-downstream boot HID device, addressed and described. Its report loop never returns, so
-/// it waits here until every other downstream device has been enumerated (J541).
+/// A hub-downstream boot HID device, addressed and described. The shared report loop never
+/// returns, so the handoffs wait here until every downstream device has had its turn (J541).
 #[derive(Clone, Copy)]
 struct KeyboardHandoff {
     slot_id: u8,
@@ -3787,13 +3875,15 @@ struct KeyboardHandoff {
 }
 
 impl KeyboardHandoff {
-    fn run(
-        mut self,
+    fn bring_up(
+        &mut self,
         io: &mut Mmio,
         layout: RegisterLayout,
         image: &mut NoOpCommandImage,
         cmd: &mut DmaTrbs,
         evt: &DmaTrbs,
+        lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+        count: &mut usize,
     ) {
         // SAFETY: the device's page stays mapped for the driver's lifetime.
         let ep0_seg = &mut unsafe {
@@ -3802,7 +3892,7 @@ impl KeyboardHandoff {
                 EP0_RING_TRBS,
             )
         };
-        configure_and_read_keyboard(
+        bring_up_hid_device(
             io,
             layout,
             image,
@@ -3817,6 +3907,8 @@ impl KeyboardHandoff {
             self.slot_words,
             self.config_value,
             self.plan,
+            lanes,
+            count,
         );
     }
 }
@@ -4542,10 +4634,26 @@ fn poll_transfer_event_limited(
     slot_id: u8,
     limit: u32,
 ) -> Option<(u8, u32, u64)> {
+    poll_transfer_event_slots(io, layout, image, evt, &[slot_id], limit)
+}
+
+/// [`poll_transfer_event_limited`] over a set of slots: the resident HID loop serves lanes on
+/// more than one device slot, so a completion for any of those slots is its to reclaim. An event
+/// for another slot is stashed for that slot's own poll, exactly as the single-slot path did.
+fn poll_transfer_event_slots(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    slots: &[u8],
+    limit: u32,
+) -> Option<(u8, u32, u64)> {
     let stashing = STASH_ENABLED.load(Ordering::Relaxed);
     if stashing {
-        if let Some(event) = event_stash().take(slot_id) {
-            return Some((event.completion_code, event.remaining, event.trb_iova));
+        for slot in slots {
+            if let Some(event) = event_stash().take(*slot) {
+                return Some((event.completion_code, event.remaining, event.trb_iova));
+            }
         }
     }
     for spin in 0..limit {
@@ -4573,10 +4681,10 @@ fn poll_transfer_event_limited(
                 ..
             }) = event
             {
-                if event_slot == slot_id {
+                if slots.contains(&event_slot) {
                     return Some((completion_code, remaining, trb_iova));
                 }
-                // J545: another device's completion, popped while this slot waited. In the
+                // J545: another device's completion, popped while a HID slot waited. In the
                 // resident loop that is the keyboard's report during a block read: keep it for
                 // the keyboard's own poll rather than drop it and stall typing. — TIMBERDOODLE
                 if stashing {
