@@ -1,9 +1,9 @@
 #![no_std]
-//j655
-//j656
 //j657
 //j658
 //j667
+//j668
+//j670
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -437,6 +437,22 @@ pub fn band_view_at(band: &Band, x: u32, y: u32) -> Option<usize> {
     None
 }
 
+/// A runtime titles toggle on the same control lane: the server draws its own band labels
+/// through the glyph atlas, F2c's first visible text consumer. — TIMBERDOODLE
+pub const TITLES_TAG: u8 = b'T';
+
+pub fn encode_titles(on: bool) -> [u8; 2] {
+    [TITLES_TAG, on as u8]
+}
+
+pub fn parse_titles(bytes: &[u8]) -> Option<bool> {
+    if bytes.len() == 2 && bytes[0] == TITLES_TAG && bytes[1] <= 1 {
+        Some(bytes[1] == 1)
+    } else {
+        None
+    }
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -817,5 +833,17 @@ mod tests {
         assert_eq!(band_view_at(&band, lower.x + 2, lower.y + 2), Some(0));
         assert_eq!(band_view_at(&band, lower.x - 4, lower.y - 4), None);
         assert_eq!(band_view_at(&band, 0, 0), None);
+    }
+
+    #[test]
+    fn titles_records_round_trip_and_reject_bad_frames() {
+        assert_eq!(encode_titles(true), [TITLES_TAG, 1]);
+        assert_eq!(encode_titles(false), [TITLES_TAG, 0]);
+        assert_eq!(parse_titles(&[TITLES_TAG, 1]), Some(true));
+        assert_eq!(parse_titles(&[TITLES_TAG, 0]), Some(false));
+        assert_eq!(parse_titles(&[TITLES_TAG, 2]), None);
+        assert_eq!(parse_titles(&[TITLES_TAG]), None);
+        assert_eq!(parse_titles(&[b'X', 0]), None);
+        assert_eq!(parse_titles(&[TITLES_TAG, 0, 0]), None);
     }
 }

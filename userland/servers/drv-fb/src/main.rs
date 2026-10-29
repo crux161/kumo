@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j657
-//j658
 //j660
 //j662
 //j667
+//j668
+//j670
 
 mod clock_probe;
 mod display_probe;
@@ -518,6 +518,38 @@ extern "C" fn main(
     // chrome. A focus change repaints only the old and new chrome frames. — TIMBERDOODLE
     let mut focused: Option<usize> = None;
 
+    // F2c: server-drawn band labels through the glyph atlas, toggled by a `T` record and
+    // redrawn once per wake beneath the cursor overlay. — TIMBERDOODLE
+    let mut titles = false;
+    let draw_labels =
+        |on: bool, fb: u64, stride: usize, order: PixelOrder, width: u32, height: u32| {
+            if !on {
+                return;
+            }
+            drv_fb::blit_ascii(
+                b"VIEW 0",
+                width,
+                height,
+                stride,
+                order,
+                8,
+                8,
+                0x00ff_ffff,
+                |at, color| unsafe { (fb as *mut u32).add(at).write_volatile(color) },
+            );
+            drv_fb::blit_ascii(
+                b"VIEW 1",
+                width,
+                height,
+                stride,
+                order,
+                8,
+                32,
+                0x00ff_ffff,
+                |at, color| unsafe { (fb as *mut u32).add(at).write_volatile(color) },
+            );
+        };
+
     // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
     // view with a fresh presentation channel and surface. — TIMBERDOODLE
     let control_koid = handle_koid(bootstrap);
@@ -588,6 +620,16 @@ extern "C" fn main(
         // and modeset repaints write under it, so it is redrawn once per wake before the next
         // wait; a pointer move repairs its old and new rectangles from the scene first.
         // — TIMBERDOODLE
+        // F2c: the band labels are an overlay like the cursor; a band recompose can erase
+        // them, so both redraw once per wake, the labels beneath the sprite. — TIMBERDOODLE
+        draw_labels(
+            titles,
+            fb_va,
+            stride,
+            pixel_order,
+            width as u32,
+            height as u32,
+        );
         if let Some(cursor) = cursor {
             drv_fb::draw_cursor(
                 width as u32,
@@ -773,6 +815,77 @@ extern "C" fn main(
                                 }
                             }
                         }
+                    }
+                }
+                continue;
+            }
+            if n == 2 && rx[0] == kumo_graphics::TITLES_TAG {
+                if channel.0 != 0 {
+                    let _ = kumo_rt::handle_close(channel);
+                }
+                if let Some(on) = kumo_graphics::parse_titles(&rx[..n]) {
+                    if titles != on {
+                        titles = on;
+                        // Repair the label rectangles from the band, then redraw if turning on.
+                        if let Some(band) = layout.as_ref() {
+                            let mut content = [None; kumo_graphics::VIEW_COUNT];
+                            let mut bases = [0u64; kumo_graphics::VIEW_COUNT];
+                            for (other, entry) in view_content.iter().enumerate() {
+                                if let Some((base, description)) = entry {
+                                    bases[other] = *base;
+                                    content[other] = Some(*description);
+                                }
+                            }
+                            for rect in [
+                                kumo_graphics::Damage {
+                                    x: 8,
+                                    y: 8,
+                                    width: 48,
+                                    height: 16,
+                                },
+                                kumo_graphics::Damage {
+                                    x: 8,
+                                    y: 32,
+                                    width: 48,
+                                    height: 16,
+                                },
+                            ] {
+                                if let Some(rect) =
+                                    drv_fb::clip_damage(rect, width as u32, height as u32)
+                                {
+                                    drv_fb::repaint_band_rect(
+                                        band,
+                                        stride,
+                                        rect,
+                                        &content,
+                                        pixel_order,
+                                        focused,
+                                        |layer, at| unsafe {
+                                            (bases[layer] as *const u32).add(at).read_volatile()
+                                        },
+                                        |at, color| unsafe {
+                                            (fb_va as *mut u32).add(at).write_volatile(color)
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        draw_labels(
+                            titles,
+                            fb_va,
+                            stride,
+                            pixel_order,
+                            width as u32,
+                            height as u32,
+                        );
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            if titles {
+                                b"drv-fb: titles on\n" as &[u8]
+                            } else {
+                                b"drv-fb: titles off\n"
+                            },
+                        );
                     }
                 }
                 continue;

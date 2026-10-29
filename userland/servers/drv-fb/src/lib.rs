@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j639
-//j655
 //j656
 //j662
 //j667
+//j668
+//j670
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -929,6 +929,45 @@ pub fn chrome_damage(view: &kumo_graphics::View, band_height: u32) -> kumo_graph
         y,
         width: right.saturating_sub(x),
         height: bottom.saturating_sub(y),
+    }
+}
+
+/// Draw one line of ASCII text at `(x, y)` through the console's glyph atlas: each cell is
+/// `GLYPH_W` wide and `GLYPH_H` tall, and a set coverage bit writes `color`. This is the seam
+/// a scalable face can replace later; today the atlas is the in-tree PSF coverage. The
+/// framebuffer is non-cacheable, so no cache maintenance is needed. — TIMBERDOODLE
+pub fn blit_ascii<W: FnMut(usize, u32)>(
+    text: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    order: PixelOrder,
+    x: u32,
+    y: u32,
+    color: u32,
+    mut write: W,
+) {
+    let color = order.pixel((color >> 16) as u8, (color >> 8) as u8, color as u8);
+    for (index, byte) in text.iter().enumerate() {
+        let glyph = font::glyph(*byte as u32);
+        let cell_x = x.saturating_add((index * GLYPH_W) as u32);
+        for (row, bits) in glyph.rows.iter().enumerate() {
+            let py = y.saturating_add(row as u32);
+            if py >= height {
+                break;
+            }
+            let columns = glyph.columns * GLYPH_W;
+            for column in 0..columns {
+                if bits & (0x8000 >> column) == 0 {
+                    continue;
+                }
+                let px = cell_x.saturating_add(column as u32);
+                if px >= width {
+                    break;
+                }
+                write(py as usize * stride + px as usize, color);
+            }
+        }
     }
 }
 
@@ -2049,6 +2088,37 @@ mod tests {
         };
         assert_eq!(chrome_damage(&tall, 90).height, 90);
         assert_eq!(chrome_damage(&tall, 90).x, 0);
+    }
+
+    #[test]
+    fn blit_ascii_writes_the_glyph_coverage_and_clips() {
+        let mut glass = [0u32; 16 * 40];
+        blit_ascii(
+            b"V0",
+            40,
+            16,
+            40,
+            PixelOrder::Rgb,
+            0,
+            0,
+            0x00ff_ffff,
+            |at, color| glass[at] = color,
+        );
+        let white = PixelOrder::Rgb.pixel(0xff, 0xff, 0xff);
+        let lit = glass.iter().filter(|pixel| **pixel == white).count();
+        assert!(lit > 8, "only {lit} glyph pixels");
+        // A width of four clips the first cell and the whole second cell.
+        blit_ascii(
+            b"V0",
+            4,
+            16,
+            40,
+            PixelOrder::Rgb,
+            0,
+            0,
+            0x00ff_ffff,
+            |at, _| assert!(at % 40 < 4, "wrote outside the width"),
+        );
     }
 
     #[test]

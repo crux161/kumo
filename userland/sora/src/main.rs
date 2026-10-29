@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j659
 //j663
 //j667
 //j668
 //j669
+//j670
 
 extern crate alloc;
 
@@ -863,6 +863,36 @@ fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
         return;
     }
     notice(&[b"sora: keys view ", &[b'0' + view as u8], b"\n"]);
+}
+
+/// Toggle the server's own band labels (F2c's first visible glyph-atlas consumer): the record
+/// rides the retained drv-fb bootstrap lane. `gfx-titles on|off`. — TIMBERDOODLE
+fn gfx_titles(cmd: &kumoza::Command) {
+    let on = match cmd.args.first().map(|arg| arg.as_str()) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            usage(b"usage: gfx-titles on|off\n");
+            return;
+        }
+    };
+    let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+    if control.0 == 0 {
+        log(b"gfx-titles: no display server\n");
+        fail_status(1);
+        return;
+    }
+    let record = kumo_graphics::encode_titles(on);
+    if channel_write(control, record.as_ptr(), record.len()) != 0 {
+        log(b"gfx-titles: control write failed\n");
+        fail_status(1);
+        return;
+    }
+    notice(&[if on {
+        b"sora: titles on\n" as &[u8]
+    } else {
+        b"sora: titles off\n"
+    }]);
 }
 
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
@@ -4648,6 +4678,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-keys" {
         gfx_keys(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gfx-titles" {
+        gfx_titles(cmd);
         return true;
     }
     if cmd.name == "gfx-damage" {
