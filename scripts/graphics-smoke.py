@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j670
 #j672
 #j674
 #j675
 #j676
+#j677
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -19,13 +19,15 @@ from pathlib import Path
 import re
 import shutil
 import select
+import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, titles=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -68,6 +70,13 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # fallback for view 0: one mode, both branches, each presenter killed
                 # mid-grant and each view regranted to a reference client.
                 data = b"dmesg -n 6\ngfx-client\ngfx-recover\ngfx-recover\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if acceptance:
+                # The F2 acceptance clause: two concurrent client processes paint both
+                # views, one input consumer per view listens, and the harness types the
+                # focus cycle over the serial socket. The console level stays at 6: the
+                # consumers' key records are INFO, and the standard trailing `dmesg -n 5`
+                # would suppress every one of them during the host-typed phase.
+                data = b"dmesg -n 6\ngfx-clients\ngfx-keys\ngfx-keys\necho graphics-smoke-after-present\n"
             if titles:
                 # The server draws its own band labels through the glyph atlas; gfx-demo still
                 # paints both views so the proven two-view band model applies unchanged.
@@ -205,7 +214,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, titles=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -226,6 +235,10 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     elif recover:
         # The leading client paints view 0; the first recover run's restarted client
         # repaints view 1; the second run's restarted client repaints view 0.
+        images = [demo_pixel, demo_pixel]
+    elif acceptance:
+        # Two concurrent client processes paint both views; focus cycles back to none, so
+        # the chrome layer matches the default two-view model.
         images = [demo_pixel, demo_pixel]
     elif regrant or async_regrant:
         images = [bitmap_reference(None), demo_pixel]
@@ -323,6 +336,7 @@ def main():
     parser.add_argument("--regrant", action="store_true", help="prove a released view accepts a fresh client and surface")
     parser.add_argument("--async-regrant", action="store_true", help="prove ASYNC client exits release views for a later regrant")
     parser.add_argument("--recover", action="store_true", help="prove a killed presenter leaves a recoverable view that takes a fresh client")
+    parser.add_argument("--acceptance", action="store_true", help="prove the F2 acceptance clause: two clients, keyboard focus switching between their consumers")
     parser.add_argument("--titles", action="store_true", help="prove server-drawn band labels through the glyph atlas")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
@@ -343,7 +357,9 @@ def main():
         parser.error("--async-regrant is a separate proof")
     if args.recover and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant):
         parser.error("--recover is a separate proof")
-    if args.titles and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover):
+    if args.acceptance and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover):
+        parser.error("--acceptance is a separate proof")
+    if args.titles and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance):
         parser.error("--titles is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
@@ -360,25 +376,59 @@ def main():
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
                      args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant,
-                     args.recover, args.titles)
+                     args.recover, args.acceptance, args.titles)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
+    serial_sock = work / "serial.sock"
+    transcript_buf = bytearray()
+    serial_conn = None
     with (work / "qemu.log").open("wb") as log:
         process = subprocess.Popen([
             "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a72",
             "-m", "512", "-display", "none", "-device", "ramfb", "-monitor", "none",
-            "-serial", f"file:{serial}", "-qmp", "stdio",
+            "-serial",
+            (f"unix:{serial_sock},server=on,wait=off" if args.acceptance else f"file:{serial}"),
+            "-qmp", "stdio",
             "-drive", f"if=pflash,format=raw,file={args.firmware_code},readonly=on",
             "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",
             "-drive", f"file=fat:rw:{work / 'esp'},format=raw,if=virtio",
             "-net", "none",
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
+        if args.acceptance:
+            # The acceptance gate types keys from the host, so the serial line is a unix
+            # socket; a reader thread keeps the transcript live and mirrors it to the log.
+            serial_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            for _ in range(200):
+                try:
+                    serial_conn.connect(str(serial_sock))
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(0.05)
+            else:
+                raise RuntimeError("serial socket never appeared")
+
+            def serial_pump(conn, buf):
+                with open(serial, "ab") as sink:
+                    while True:
+                        try:
+                            chunk = conn.recv(65536)
+                        except OSError:
+                            return
+                        if not chunk:
+                            return
+                        buf.extend(chunk)
+                        sink.write(chunk)
+                        sink.flush()
+
+            threading.Thread(target=serial_pump, args=(serial_conn, transcript_buf), daemon=True).start()
         try:
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError((work / "qemu.log").read_text())
-                transcript = serial.read_bytes() if serial.exists() else b""
+                transcript = bytes(transcript_buf) if args.acceptance else (
+                    serial.read_bytes() if serial.exists() else b""
+                )
                 if args.with_dtb and b"TOWER: CPU EXCEPTION" in transcript:
                     raise RuntimeError(f"kernel fault during DTB syscall smoke; inspect {serial}")
                 ready = b"INDRA login:" in transcript and (
@@ -398,11 +448,36 @@ def main():
                     ) >= 2 and b"bmp-view: bitmap copied; buffer released (software GOP)" in transcript
                 if args.titles:
                     ready = ready and b"drv-fb: titles on" in transcript
+                if args.acceptance:
+                    ready = (ready
+                             and b"sora: keys view 0" in transcript
+                             and b"sora: keys view 1" in transcript
+                             and transcript.count(b"gfx-keys: online") >= 2
+                             and transcript.count(
+                                 b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
+                             ) >= 2)
                 if ready:
                     break
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"boot timed out; inspect {serial}")
+            if args.acceptance:
+                # Drive the keyboard over the serial socket: Ctrl-] cycles focus
+                # none to 0 to 1 to none twice, and only the focused view's consumer
+                # ever sees a key.
+                for data in (b"\x1d", b"b", b"\x1d", b"c", b"\x1d",
+                             b"\x1d", b"e", b"\x1d", b"\x1d"):
+                    serial_conn.sendall(data)
+                    time.sleep(0.25)
+                deadline_keys = time.monotonic() + 15
+                while time.monotonic() < deadline_keys:
+                    if (bytes(transcript_buf).count(b"sora: focus none") >= 2
+                            and b"gfx-keys: view 0 key 0x65" in bytes(transcript_buf)):
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(f"keyboard acceptance sequence did not complete; inspect {serial}")
+                transcript = bytes(transcript_buf)
             client = b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
             if args.bitmap_path:
                 for marker in [b"bmp-view: not found", b"bmp-view: permission denied", b"usage: bmp-view [path]",
@@ -465,6 +540,25 @@ def main():
                 assert transcript.rindex(b"kill: process") < transcript.rindex(client), (
                     f"the restarted presenter ran before the kill; inspect {serial}")
                 assert b"drv-fb: view regrant refused" not in transcript
+            elif args.acceptance:
+                # The F2 acceptance clause: two distinct client processes painted both
+                # views and keyboard input switched focus cleanly between their consumers.
+                assert transcript.count(client) == 2, f"missing two client presents; inspect {serial}"
+                assert transcript.count(b"gfx-keys: online") >= 2, f"missing consumers; inspect {serial}"
+                assert transcript.count(b"sora: keys view 0") == 1
+                assert transcript.count(b"sora: keys view 1") == 1
+                position = -1
+                for record in (b"sora: focus view 0", b"sora: focus view 1", b"sora: focus none",
+                               b"sora: focus view 0", b"sora: focus view 1", b"sora: focus none"):
+                    found = transcript.find(record, position + 1)
+                    assert found > position, f"focus chain out of order at {record!r}; inspect {serial}"
+                    position = found
+                assert transcript.count(b"gfx-keys: view 0 key 0x62") == 1
+                assert transcript.count(b"gfx-keys: view 1 key 0x63") == 1
+                assert transcript.count(b"gfx-keys: view 0 key 0x65") == 1
+                assert b"gfx-keys: view 1 key 0x65" not in transcript
+                assert transcript.count(b"gfx-keys: view") == 3, f"consumers saw stray keys; inspect {serial}"
+                assert b"key 0x1d" not in transcript, f"the focus key reached a consumer; inspect {serial}"
             elif args.regrant:
                 bmp = b"bmp-view: bitmap copied; buffer released (software GOP)"
                 assert transcript.count(client) == 2, f"missing two client presents; inspect {serial}"
@@ -526,7 +620,8 @@ def main():
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
                          args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage,
-                         args.regrant, args.async_regrant, args.recover, args.titles)
+                         args.regrant, args.async_regrant, args.recover, args.acceptance,
+                         args.titles)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
@@ -541,10 +636,14 @@ def main():
                 print("Async-regrant UEFI smoke green: both ASYNC client exits released their views for a fresh client")
             if args.recover:
                 print("Recover UEFI smoke green: a killed presenter released its view and a fresh client painted it")
+            if args.acceptance:
+                print("Acceptance UEFI smoke green: two client processes, keyboard focus switched cleanly between their consumers")
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
+            if serial_conn is not None:
+                serial_conn.close()
             process.terminate()
             try:
                 process.wait(timeout=5)

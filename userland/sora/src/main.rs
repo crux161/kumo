@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j668
 //j669
 //j670
 //j675
 //j676
+//j677
 
 extern crate alloc;
 
@@ -842,8 +842,10 @@ fn wait_for_released() -> Option<usize> {
 }
 
 /// Admit one input consumer for a grantable view (F2b focus routing): Sora keeps the server
-/// end of the input channel and transfers the client end in `x0`. While that view holds focus,
-/// keyboard bytes go to the consumer; a view without one keeps the shell. — TIMBERDOODLE
+/// end of the input channel, transfers the client end in `x0`, and names the view as the
+/// channel's first record so every consumed key is attributable (J677's acceptance gate).
+/// While that view holds focus, keyboard bytes go to the consumer; a view without one keeps
+/// the shell. — TIMBERDOODLE
 fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
     if !cmd.args.is_empty() {
         usage(b"usage: gfx-keys\n");
@@ -882,6 +884,12 @@ fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
         fail_status(1);
         return;
     }
+    // The view index rides the channel, not a register: ProcessRun's plain argument slot
+    // silently stages any value that collides with a live handle in Sora's table (J677 saw
+    // `view 2` arrive for a passed 1), so the first channel record is the safe carrier.
+    // — TIMBERDOODLE
+    let index = [view as u8];
+    let _ = channel_write(Handle(server as u32), index.as_ptr(), index.len());
     notice(&[b"sora: keys view ", &[b'0' + view as u8], b"\n"]);
 }
 
