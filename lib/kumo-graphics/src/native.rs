@@ -1,6 +1,7 @@
 //j636
 //j638
 //j639
+//j683
 
 //! J0's bounded serial cooperative native-image leases. One READ VMO accompanies an exact
 //! request, after the producer observes GPU completion and the driver's output clean.
@@ -149,6 +150,63 @@ impl Reply {
     }
     pub fn releases(self, image: Image) -> bool {
         self.retired && self.sequence == image.sequence && self.gpu_point == image.gpu_point
+    }
+}
+
+/// G8c-b2's frame-retired wait: the presenter registers a point (a presentation sequence)
+/// on the native channel before publishing its image, so the arm precedes the load. A wake
+/// byte arrives when that point's consumed load is proven. — TIMBERDOODLE
+pub const WAIT_LEN: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetireWait {
+    pub point: u64,
+}
+impl RetireWait {
+    pub fn encode(self) -> [u8; WAIT_LEN] {
+        let mut out = [0; WAIT_LEN];
+        out[..4].copy_from_slice(b"KNW1");
+        out[4..12].copy_from_slice(&self.point.to_le_bytes());
+        out
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != WAIT_LEN || &bytes[..4] != b"KNW1" || bytes[12..].iter().any(|b| *b != 0)
+        {
+            return None;
+        }
+        let point = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        (point != 0).then_some(Self { point })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitReply {
+    pub point: u64,
+    /// True when a wake-channel read end accompanies this reply; false means the point was
+    /// already retired when the wait was read.
+    pub armed: bool,
+}
+impl WaitReply {
+    pub fn encode(self) -> [u8; WAIT_LEN] {
+        let mut out = [0; WAIT_LEN];
+        out[..4].copy_from_slice(b"KNW2");
+        out[4..12].copy_from_slice(&self.point.to_le_bytes());
+        out[12] = u8::from(self.armed);
+        out
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != WAIT_LEN
+            || &bytes[..4] != b"KNW2"
+            || bytes[13..].iter().any(|b| *b != 0)
+            || bytes[12] > 1
+        {
+            return None;
+        }
+        let point = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        (point != 0).then_some(Self {
+            point,
+            armed: bytes[12] == 1,
+        })
     }
 }
 
@@ -437,5 +495,38 @@ mod tests {
             0
         });
         assert_eq!(words, 32768);
+    }
+
+    #[test]
+    fn retire_wait_and_reply_round_trip_and_reject_malformed_frames() {
+        for point in 1..=u64::from(PRESENTATIONS) {
+            let wait = RetireWait { point };
+            let wire = wait.encode();
+            assert_eq!(&wire[..4], b"KNW1");
+            assert_eq!(RetireWait::decode(&wire), Some(wait));
+            for len in 0..WAIT_LEN {
+                assert_eq!(RetireWait::decode(&wire[..len]), None);
+            }
+            let mut dirty = wire;
+            dirty[12] = 1;
+            assert_eq!(RetireWait::decode(&dirty), None);
+        }
+        assert_eq!(RetireWait::decode(&RetireWait { point: 0 }.encode()), None);
+
+        let armed = WaitReply {
+            point: 2,
+            armed: true,
+        };
+        let wire = armed.encode();
+        assert_eq!(&wire[..4], b"KNW2");
+        assert_eq!(WaitReply::decode(&wire), Some(armed));
+        let done = WaitReply {
+            point: 2,
+            armed: false,
+        };
+        assert_eq!(WaitReply::decode(&done.encode()), Some(done));
+        let mut bad = wire;
+        bad[12] = 2;
+        assert_eq!(WaitReply::decode(&bad), None);
     }
 }

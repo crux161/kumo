@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j645
 //j646
 //j647
 //j652
 //j682
+//j683
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -230,6 +230,17 @@ fn present_image(
         kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER,
     ))
     .ok_or(())?;
+    // G8c-b2: register the frame-retired wait for this sequence before publishing the
+    // image, so the arm precedes the consumed load. The pair gate: the GPU point
+    // (submit_wait) and this frame-retired wake both precede any reuse. — TIMBERDOODLE
+    let wait = kumo_graphics::native::RetireWait {
+        point: u64::from(image.sequence),
+    };
+    let wait_frame = wait.encode();
+    if kumo_rt::channel_write(channel, wait_frame.as_ptr(), wait_frame.len()) != 0 {
+        let _ = kumo_rt::handle_close(grant);
+        return Err(Failure::Failed);
+    }
     let bytes = image.encode();
     if kumo_rt::channel_write_with_handle(channel, bytes.as_ptr(), bytes.len(), grant) != 0 {
         let _ = kumo_rt::handle_close(grant);
@@ -238,26 +249,79 @@ fn present_image(
     log(format_args!("gpu-client: J0c sequence{} point{} leased READ-only; GPU/CPU writes blocked until matching retirement\n",image.sequence,image.gpu_point));
     let port = handle(kumo_rt::port_create()).ok_or(())?;
     let timer = handle(kumo_rt::timer_create(120_000_000_000)).ok_or(())?;
-    if kumo_rt::port_bind(port, channel) != 0
-        || kumo_rt::port_bind(port, timer) != 0
-        || kumo_rt::port_wait(port) != kumo_rt::handle_koid(channel)
-    {
+    if kumo_rt::port_bind(port, channel) != 0 || kumo_rt::port_bind(port, timer) != 0 {
         return Err(Failure::Failed);
     }
-    let mut bytes = [0; kumo_graphics::native::REPLY_LEN + 1];
-    let (n, extra) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
+    let channel_koid = kumo_rt::handle_koid(channel);
+    let mut bytes = [0; kumo_graphics::native::REQUEST_LEN + 1];
+    let mut wake: Option<Handle> = None;
+    let mut armed = false;
+    let mut woken = false;
+    let mut reply: Option<kumo_graphics::native::Reply> = None;
+    // Both timeline signals arrive on this port: the wait reply and the retirement reply
+    // on the native channel, the frame-retired wake byte on its own channel. Reuse is held
+    // until the retirement reply AND the wake are both observed (the pair gate).
+    loop {
+        let source = kumo_rt::port_wait(port);
+        if source == channel_koid {
+            let (n, extra) =
+                kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
+            let extra = handle(extra);
+            if let Some(wait_reply) = bytes
+                .get(..n)
+                .and_then(kumo_graphics::native::WaitReply::decode)
+            {
+                if let Some(extra) = extra {
+                    if wake.is_some() || kumo_rt::port_bind(port, extra) != 0 {
+                        let _ = kumo_rt::handle_close(extra);
+                        return Err(Failure::Failed);
+                    }
+                    wake = Some(extra);
+                }
+                if wait_reply.armed != wake.is_some() {
+                    return Err(Failure::Failed);
+                }
+                armed = wait_reply.armed;
+            } else if let Some(image_reply) = bytes
+                .get(..n)
+                .and_then(kumo_graphics::native::Reply::decode)
+            {
+                if extra.is_some() {
+                    return Err(Failure::Failed);
+                }
+                reply = Some(image_reply);
+                if !armed {
+                    break;
+                }
+                if woken {
+                    break;
+                }
+            } else {
+                return Err(Failure::Failed);
+            }
+        } else if let Some(wake_handle) = wake.filter(|w| kumo_rt::handle_koid(*w) == source) {
+            let mut byte = [0u8; 1];
+            let n = kumo_rt::channel_read(wake_handle, byte.as_mut_ptr(), byte.len());
+            woken = n == 1 && byte[0] == 1;
+            if woken && reply.is_some() {
+                break;
+            }
+        } else {
+            return Err(Failure::Failed);
+        }
+    }
     let _ = kumo_rt::port_unbind(port, channel);
+    if let Some(wake_handle) = wake {
+        let _ = kumo_rt::port_unbind(port, wake_handle);
+        let _ = kumo_rt::handle_close(wake_handle);
+    }
     let _ = kumo_rt::port_unbind(port, timer);
     let _ = kumo_rt::handle_close(timer);
     let _ = kumo_rt::handle_close(port);
-    if extra != 0 {
-        let _ = kumo_rt::handle_close(Handle(extra as u32));
+    if armed && !woken {
         return Err(Failure::Failed);
     }
-    let reply = bytes
-        .get(..n)
-        .and_then(kumo_graphics::native::Reply::decode)
-        .ok_or(())?;
+    let reply = reply.ok_or(())?;
     if reply.is_cancelled() {
         return Err(Failure::Cancelled);
     }

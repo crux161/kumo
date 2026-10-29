@@ -1,8 +1,8 @@
-//j634
 //j635
 //j636
 //j638
 //j639
+//j683
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -247,6 +247,10 @@ struct VopResource(Handle);
 /// The channel outlives every phase move. Drop may cancel only while no native
 /// image is possibly reachable; an uncertain publication closes without a receipt.
 /// No cancellation is sent after successful completion. — KESTREL
+/// Bounded frame-retired waits armed on the native channel; the presentations are bounded
+/// the same way, and one outstanding wait per present is the client's shape. — TIMBERDOODLE
+pub const MAX_NATIVE_WAITS: usize = 4;
+
 struct NativeChannel {
     handle: Handle,
     cancel_safe: bool,
@@ -352,6 +356,10 @@ pub struct Pending {
     native_channel: NativeChannel,
     native_frame: Option<NativeFrame>,
     native_source: u64,
+    /// The highest presentation sequence whose consumed-load retirement is proven.
+    native_retired: u64,
+    /// Armed frame-retired waits: (point, wake write end). — TIMBERDOODLE
+    native_waits: [Option<(u64, Handle)>; MAX_NATIVE_WAITS],
     native_lease: kumo_graphics::native::Lease,
     native_cpu: u64,
 }
@@ -568,6 +576,8 @@ fn begin(
         },
         native_frame: None,
         native_source: 0,
+        native_retired: 0,
+        native_waits: [None; MAX_NATIVE_WAITS],
         native_lease: kumo_graphics::native::Lease::default(),
         native_cpu: 0,
     })
@@ -755,6 +765,11 @@ pub fn advance(mut pending: Pending) -> Option<Pending> {
                 "display: J0a image wait timed out; console retained\n"
             ));
             let _ = port_unbind(pending.port, pending.vblank.native);
+            for slot in &mut pending.native_waits {
+                if let Some((_, handle)) = slot.take() {
+                    close(handle);
+                }
+            }
             None
         }
         Phase::NativeHold => native_retire(pending, &mut device),
@@ -1852,7 +1867,85 @@ fn native_present(mut pending: Pending) -> Option<Pending> {
     let _ = port_unbind(pending.port, channel);
     let mut bytes = [0; REQUEST_LEN + 1];
     let (n, raw) = kumo_rt::channel_read_with_handle(channel, bytes.as_mut_ptr(), bytes.len());
-    let Some(vmo) = syscall_handle(raw) else {
+    let grant = syscall_handle(raw);
+    // G8c-b2: a frame-retired wait registers on the same channel and precedes its image
+    // frame by construction, so the arm is read first. A wait for the next point arms a
+    // wake pair; a wait for an already-proven point is answered unarmed (done). Any other
+    // point, or an arm failure, refuses the frame and ends the bounded presentation.
+    // — TIMBERDOODLE
+    if let Some(wait) = bytes
+        .get(..n)
+        .and_then(kumo_graphics::native::RetireWait::decode)
+    {
+        if let Some(handle) = grant {
+            close(handle);
+            return None;
+        }
+        if wait.point <= pending.native_retired {
+            let reply = kumo_graphics::native::WaitReply {
+                point: wait.point,
+                armed: false,
+            };
+            let frame = reply.encode();
+            if kumo_rt::channel_write_with_handle(channel, frame.as_ptr(), frame.len(), Handle(0))
+                != 0
+            {
+                return None;
+            }
+            log(format_args!(
+                "display: retire wait already retired point {}\n",
+                wait.point
+            ));
+            // Rebind the channel watch before re-entering the wait: this function unbinds
+            // it on entry, and the queued image frame must be able to wake the port
+            // (native_start's arm-before-release rule; J683's first metal run timed out
+            // here). — TIMBERDOODLE
+            if port_bind(pending.port, channel) != 0 {
+                return None;
+            }
+            return next(pending, Phase::NativeWait, 10_000);
+        }
+        if wait.point != pending.native_retired + 1
+            || wait.point > u64::from(kumo_graphics::native::PRESENTATIONS)
+        {
+            return None;
+        }
+        let Some(free) = pending.native_waits.iter().position(|slot| slot.is_none()) else {
+            return None;
+        };
+        let (read_raw, write_raw) = kumo_rt::channel_create_pair();
+        let (Some(read), Some(write)) = (syscall_handle(read_raw), syscall_handle(write_raw))
+        else {
+            if let Some(read) = syscall_handle(read_raw) {
+                close(read);
+            }
+            if let Some(write) = syscall_handle(write_raw) {
+                close(write);
+            }
+            return None;
+        };
+        pending.native_waits[free] = Some((wait.point, write));
+        let reply = kumo_graphics::native::WaitReply {
+            point: wait.point,
+            armed: true,
+        };
+        let frame = reply.encode();
+        if kumo_rt::channel_write_with_handle(channel, frame.as_ptr(), frame.len(), read) != 0 {
+            close(read);
+            return None;
+        }
+        log(format_args!(
+            "display: retire wait armed point {}\n",
+            wait.point
+        ));
+        // Same rule for the armed path: the watch must exist before the queued image
+        // frame can wake the port. — TIMBERDOODLE
+        if port_bind(pending.port, channel) != 0 {
+            return None;
+        }
+        return next(pending, Phase::NativeWait, 10_000);
+    }
+    let Some(vmo) = grant else {
         return None;
     };
     let image = bytes.get(..n).and_then(Image::decode);
@@ -1984,6 +2077,24 @@ fn native_retire(mut pending: Pending, device: &mut Device) -> Option<Pending> {
             let _ = port_unbind(pending.port, channel);
         }
         return None;
+    }
+    // G8c-b2: the consumed load is proven for this sequence, so every armed wait at or
+    // below it is satisfied. The byte is the frame-retired wake; the reply above is the
+    // same fact on the cancellation channel. — TIMBERDOODLE
+    pending.native_retired = u64::from(reply.sequence);
+    for slot in &mut pending.native_waits {
+        let due = match slot {
+            Some((point, _)) => *point <= pending.native_retired,
+            None => false,
+        };
+        if due {
+            if let Some((point, handle)) = slot.take() {
+                let byte = [1u8];
+                let _ = kumo_rt::channel_write(handle, byte.as_ptr(), 1);
+                close(handle);
+                log(format_args!("display: retire wait woken point {}\n", point));
+            }
+        }
     }
     if complete {
         pending.native_channel.finished = true;
