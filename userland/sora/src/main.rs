@@ -1,18 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j675
-//j676
-//j677
-//j684
-//j686
-//j690
-//j691
-//j692
 //j693
 //j694
 //j697
 //j698
+//j701
 
 extern crate alloc;
 
@@ -1187,9 +1180,10 @@ fn log_row_hash(row: &[u8]) -> u64 {
 /// One console-view refresh: read the view's stream tail (the kernel log ring for view 0,
 /// Sora's own userland console stream for view 1), render changed rows over the retained
 /// surface, present a bounding damage set, and decode the reply. `quiet` keeps the mirror's
-/// idle and unavailable ticks silent; one-shot runs announce them. Returns false when the
-/// view is unavailable, and the caller decides whether that is fatal. — TIMBERDOODLE
-fn console_refresh(view: usize, quiet: bool) -> bool {
+/// idle and unavailable ticks silent; one-shot runs announce them. Returns the pass outcome:
+/// DEAD when the view is unavailable (the caller decides whether that is fatal), RETIRED when
+/// its present consumed a frame start, ALIVE otherwise. — TIMBERDOODLE
+fn console_refresh(view: usize, quiet: bool) -> sora::RefreshOutcome {
     use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
     const LOG_VA: u64 = 0x3800_0000;
     let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
@@ -1201,7 +1195,7 @@ fn console_refresh(view: usize, quiet: bool) -> bool {
         if !quiet {
             log(b"gfx-log: no graphics view held\n");
         }
-        return false;
+        return sora::RefreshOutcome::DEAD;
     }
     let map = vmar_map(
         Handle(0),
@@ -1214,7 +1208,7 @@ fn console_refresh(view: usize, quiet: bool) -> bool {
     if map != 0 {
         GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
         log(b"gfx-log: surface map failed\n");
-        return false;
+        return sora::RefreshOutcome::DEAD;
     }
     let result = (|| -> Option<(Status, Option<([u64; LOG_ROWS], (usize, usize))>)> {
         if !child_parked(process_wait()) {
@@ -1383,7 +1377,7 @@ fn console_refresh(view: usize, quiet: bool) -> bool {
                 term(&[b'0' + view as u8]);
                 term(b" unchanged; no present\n");
             }
-            true
+            sora::RefreshOutcome::ALIVE
         }
         Some((status, Some((hashes, (first, last)))))
             if matches!(status, Status::Copied | Status::Retired) =>
@@ -1403,35 +1397,42 @@ fn console_refresh(view: usize, quiet: bool) -> bool {
             term(b"; rows ");
             term(&[b'0' + first as u8, b'-', b'0' + last as u8]);
             term(b" damaged\n");
-            true
+            if status == Status::Retired {
+                sora::RefreshOutcome::RETIRED
+            } else {
+                sora::RefreshOutcome::ALIVE
+            }
         }
         Some(_) => {
             let _ = handle_close(channel);
             log(b"gfx-log: view rejected; view disabled\n");
-            false
+            sora::RefreshOutcome::DEAD
         }
         None => {
             let _ = handle_close(channel);
             log(b"gfx-log: view failed; view disabled\n");
-            false
+            sora::RefreshOutcome::DEAD
         }
     }
 }
 
-/// Refresh every console view once; true when at least one view answered. The mirror
-/// disables only when every view is gone. — TIMBERDOODLE
-fn refresh_all(quiet: bool) -> bool {
-    let mut alive = false;
+/// Refresh every console view once; the pass stays alive when at least one view answered,
+/// and names a retirement when any present retired. The mirror disables only when every
+/// view is gone. — TIMBERDOODLE
+fn refresh_all(quiet: bool) -> sora::RefreshOutcome {
+    let mut outcome = sora::RefreshOutcome::DEAD;
     for view in 0..kumo_graphics::VIEW_COUNT {
-        alive |= console_refresh(view, quiet);
+        let view_outcome = console_refresh(view, quiet);
+        outcome.alive |= view_outcome.alive;
+        outcome.retired |= view_outcome.retired;
     }
-    alive
+    outcome
 }
 
 fn gfx_log(cmd: &kumoza::Command) {
     match cmd.args.first().map(|arg| arg.as_str()) {
         None => {
-            if !refresh_all(false) {
+            if !refresh_all(false).alive {
                 fail_status(1);
             }
         }
@@ -1800,12 +1801,10 @@ fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
     Some((timer, Handle(koid as u32)))
 }
 
-/// The live log mirror's cadence: often enough to feel current, rare enough that a gated
-/// present's two-frame wait never crowds the serve loop. — TIMBERDOODLE
-const LOG_MIRROR_NS: u64 = 250_000_000;
-
-fn arm_log_mirror(port: Handle) -> Option<(Handle, Handle)> {
-    let raw = timer_create(LOG_MIRROR_NS);
+/// Arm the next mirror wake on `port` with the pass's cadence: a retired present chains
+/// through the gate's own frame wait, and the idle poll covers quiet tails. — TIMBERDOODLE
+fn arm_log_mirror(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
+    let raw = timer_create(delay_ns);
     if raw == u64::MAX {
         return None;
     }
@@ -4833,7 +4832,7 @@ extern "C" fn sora_main(
         loop {
             // A typed `gfx-log on` lands mid-loop; arm the mirror cadence on the next pass.
             if LOG_MIRROR.load(Ordering::Relaxed) && log_mirror_timer.is_none() {
-                log_mirror_timer = arm_log_mirror(port);
+                log_mirror_timer = arm_log_mirror(port, sora::LOG_MIRROR_IDLE_NS);
                 if log_mirror_timer.is_none() {
                     log(b"gfx-log: mirror timer unavailable\n");
                     LOG_MIRROR.store(false, Ordering::Relaxed);
@@ -4862,12 +4861,18 @@ extern "C" fn sora_main(
                 };
                 let _ = port_unbind(port, timer);
                 let _ = handle_close(timer);
-                if LOG_MIRROR.load(Ordering::Relaxed) && !refresh_all(true) {
-                    LOG_MIRROR.store(false, Ordering::Relaxed);
-                    log(b"gfx-log: mirror disabled; view unavailable\n");
-                }
                 if LOG_MIRROR.load(Ordering::Relaxed) {
-                    log_mirror_timer = arm_log_mirror(port);
+                    // A retired present names the frame this pass reached; the next pass is
+                    // paced by the gate's frame wait, not by a fixed timer cadence.
+                    // — TIMBERDOODLE
+                    let outcome = refresh_all(true);
+                    if outcome.alive {
+                        log_mirror_timer =
+                            arm_log_mirror(port, sora::log_mirror_delay(outcome.retired));
+                    } else {
+                        LOG_MIRROR.store(false, Ordering::Relaxed);
+                        log(b"gfx-log: mirror disabled; view unavailable\n");
+                    }
                 }
                 continue;
             }

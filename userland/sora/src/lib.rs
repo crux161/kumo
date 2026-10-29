@@ -1,12 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j559
-//j562
 //j563
 //j564
 //j568
 //j687
+//j701
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -197,6 +196,55 @@ impl RestartBackoff {
         let delay = self.next_delay_ns;
         self.next_delay_ns = self.next_delay_ns.saturating_mul(2).min(self.max_delay_ns);
         delay
+    }
+}
+
+/// One live-mirror pass's outcome across the console views: whether any view stayed live,
+/// and whether any present answered Retired (the gate consumed a frame start after its
+/// copy). — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RefreshOutcome {
+    /// At least one view refreshed or was current.
+    pub alive: bool,
+    /// At least one present retired on the scanout.
+    pub retired: bool,
+}
+
+impl RefreshOutcome {
+    /// No view answered.
+    pub const DEAD: Self = Self {
+        alive: false,
+        retired: false,
+    };
+    /// At least one view answered, with no retirement proof.
+    pub const ALIVE: Self = Self {
+        alive: true,
+        retired: false,
+    };
+    /// At least one present retired on the scanout.
+    pub const RETIRED: Self = Self {
+        alive: true,
+        retired: true,
+    };
+}
+
+/// The live log mirror's idle poll cadence: with no retirement to pace it, the mirror
+/// re-reads the stream tails this often. — TIMBERDOODLE
+pub const LOG_MIRROR_IDLE_NS: u64 = 250_000_000;
+
+/// The live log mirror's chained cadence after a present answered Retired: the gate's
+/// post-copy frame-start wait is the pacing, so the mirror re-enters its loop immediately
+/// and the next present begins by waiting for the next frame. No artificial delay.
+/// — TIMBERDOODLE
+pub const LOG_MIRROR_CHAIN_NS: u64 = 1;
+
+/// The next mirror wake for a completed pass: chain on a retirement, poll when idle.
+/// — TIMBERDOODLE
+pub fn log_mirror_delay(retired: bool) -> u64 {
+    if retired {
+        LOG_MIRROR_CHAIN_NS
+    } else {
+        LOG_MIRROR_IDLE_NS
     }
 }
 
@@ -1018,6 +1066,16 @@ mod tests {
         let mut capped = RestartBackoff::new(u64::MAX, 7);
         assert_eq!(capped.next_delay_ns(), 7);
         assert_eq!(capped.next_delay_ns(), 7);
+    }
+
+    #[test]
+    fn the_log_mirror_chains_on_retirement_and_polls_when_idle() {
+        // A retired present consumed a frame start, so the gate itself paces the next pass;
+        // without one the mirror keeps its historical 250 ms tail poll. — TIMBERDOODLE
+        assert_eq!(log_mirror_delay(true), LOG_MIRROR_CHAIN_NS);
+        assert_eq!(log_mirror_delay(false), LOG_MIRROR_IDLE_NS);
+        assert_eq!(LOG_MIRROR_IDLE_NS, 250_000_000);
+        assert!(LOG_MIRROR_CHAIN_NS < LOG_MIRROR_IDLE_NS);
     }
 
     #[test]
