@@ -315,11 +315,15 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     assert poison == 0, f"clipped surface leaked {poison} poison pixels"
 
     # The text console below the band still renders glyphs (echo, boot log, login prompt).
-    text = sum(1 for y in range(BAND_H, height) for x in range(width) if at(x, y) == FG)
-    assert text > 100, f"console region has only {text} foreground pixels"
+    # DESIGN/024: antialiased edges are blends, so count every non-background console
+    # pixel and pin that full-coverage cores still render exactly the foreground.
+    text = sum(1 for y in range(BAND_H, height) for x in range(width) if at(x, y) != (0, 0, 0))
+    core = sum(1 for y in range(BAND_H, height) for x in range(width) if at(x, y) == FG)
+    assert text > 100, f"console region has only {text} text pixels"
+    assert core > 10, f"console region has only {core} full-coverage pixels"
     print(
         f"Graphics pixels green: two views at {rects} on {width}x{height}, "
-        f"chrome intact, clip poison absent, console text {text}px"
+        f"chrome intact, clip poison absent, console text {text}px ({core} core)"
     )
 
 

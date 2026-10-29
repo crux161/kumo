@@ -7,6 +7,7 @@
 //j674
 //j687
 //j688
+//j689
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -35,14 +36,6 @@ pub mod rk3588_relock;
 pub mod rk3588_scanout;
 pub mod rk3588_shared;
 pub mod rk3588_vblank;
-
-#[cfg(test)]
-/// The console's ASCII glyph rows as the tests read them, backed by the same glyph source
-/// the console draws (the vendored face, with the PSF fallback inside `font::glyph`).
-/// — TIMBERDOODLE
-fn glyph_rows(ch: u8) -> [u16; GLYPH_H] {
-    font::glyph(ch as u32).rows
-}
 
 /// Glyph cell dimensions, shared with the layout crate so the band, the winsize and the
 /// console pixels cannot drift apart.
@@ -151,7 +144,56 @@ unsafe fn blit_glyph(
     }
 }
 
-/// An 8x16 text grid over a 32-bpp linear framebuffer. Holds cursor/parser state; the
+/// Blend one face glyph's coverage into a console cell. Every pixel of the cell gets a
+/// colour computed only from `(foreground, background, coverage)` — never a read of the
+/// glass — so erase, scroll and repaint stay idempotent (DESIGN/024). The blend endpoints
+/// are exact: coverage 0 is the background and 255 the foreground.
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_face_cell(
+    (base, shadow): (*mut u32, *mut u32),
+    len_px: usize,
+    stride: usize,
+    position: (usize, usize),
+    coverage: &font::Coverage,
+    colors: (u32, u32),
+) {
+    let (x_px, y_px) = position;
+    let (fg, bg) = colors;
+    for (ry, row) in coverage.iter().enumerate() {
+        let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
+        for (rx, value) in row.iter().enumerate() {
+            let idx = row_start.wrapping_add(rx);
+            if idx < len_px {
+                let color = blend_coverage(bg, fg, *value);
+                unsafe {
+                    shadow.add(idx).write(color);
+                    base.add(idx).write_volatile(color);
+                }
+            }
+        }
+        // Clean both endpoints of the row, as the bit blitter does. — TIMBERDOODLE
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + GLYPH_W - 1;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// A `GLYPH_W` x `GLYPH_H` text grid over a 32-bpp linear framebuffer. Holds cursor/parser
+/// state; the
 /// pixels live in the caller's framebuffer mapping. Recoverable by construction — the
 /// console grid is derivable, never critical private RAM (`DESIGN/002`).
 pub struct Console {
@@ -406,25 +448,53 @@ impl Console {
                 }
             }
             _ => {
-                let glyph = font::glyph(scalar);
-                // A one-column framebuffer clips a wide glyph to its visible
-                // half instead of writing through stride padding. — KESTREL
-                let columns = glyph.columns.min(self.cols);
-                if self.col + columns > self.cols {
-                    self.newline();
+                let colors = (self.effective_foreground(), self.effective_background());
+                let coverage = if scalar < 0x80 {
+                    font::face_coverage(scalar as u8)
+                } else {
+                    None
+                };
+                match coverage {
+                    // PLAN/016 C1 / DESIGN/024: face glyphs blend per-pixel greyscale.
+                    Some(coverage) => {
+                        let columns = 1.min(self.cols);
+                        if self.col + columns > self.cols {
+                            self.newline();
+                        }
+                        unsafe {
+                            blit_face_cell(
+                                (self.base, self.shadow),
+                                self.len_px,
+                                self.stride,
+                                (self.col * GLYPH_W, self.row * GLYPH_H),
+                                &coverage,
+                                colors,
+                            );
+                        }
+                        self.col += columns;
+                    }
+                    None => {
+                        let glyph = font::glyph(scalar);
+                        // A one-column framebuffer clips a wide glyph to its visible
+                        // half instead of writing through stride padding. — KESTREL
+                        let columns = glyph.columns.min(self.cols);
+                        if self.col + columns > self.cols {
+                            self.newline();
+                        }
+                        unsafe {
+                            blit_glyph(
+                                (self.base, self.shadow),
+                                self.len_px,
+                                self.stride,
+                                (self.col * GLYPH_W, self.row * GLYPH_H),
+                                &glyph,
+                                columns * GLYPH_W,
+                                colors,
+                            );
+                        }
+                        self.col += columns;
+                    }
                 }
-                unsafe {
-                    blit_glyph(
-                        (self.base, self.shadow),
-                        self.len_px,
-                        self.stride,
-                        (self.col * GLYPH_W, self.row * GLYPH_H),
-                        &glyph,
-                        columns * GLYPH_W,
-                        (self.effective_foreground(), self.effective_background()),
-                    );
-                }
-                self.col += columns;
             }
         }
     }
@@ -1071,6 +1141,22 @@ pub fn blend_ink(background: u32, ink: u32, coverage: f32) -> u32 {
         let ink = (ink >> shift) & 0xff;
         let value = (background * (256 - coverage) + ink * coverage + 128) >> 8;
         out |= value.min(255) << shift;
+    }
+    out
+}
+
+/// Lerp between `background` and `ink` by 8-bit `coverage`, bytewise in the packed space.
+/// Endpoints are exact (0 gives the background, 255 the ink), which the console relies on
+/// for idempotent repaints (DESIGN/024). — TIMBERDOODLE
+pub fn blend_coverage(background: u32, ink: u32, coverage: u8) -> u32 {
+    let mut out = 0u32;
+    for shift in [0u32, 8, 16] {
+        let bg = ((background >> shift) & 0xff) as i32;
+        let fg = ((ink >> shift) & 0xff) as i32;
+        let delta = fg - bg;
+        let rounding = if delta >= 0 { 127 } else { -127 };
+        let value = bg + (delta * i32::from(coverage) + rounding) / 255;
+        out |= (value.clamp(0, 255) as u32) << shift;
     }
     out
 }
@@ -2498,7 +2584,9 @@ mod tests {
             .iter()
             .all(|pixel| *pixel == 0xdead_beef));
         assert_eq!(glass[WIDTH * HEIGHT], 0xdead_beef);
-        assert!(glass[BAND * WIDTH..].contains(&FG));
+        // DESIGN/024: antialiased text need not contain a full-coverage pixel; any
+        // non-background console pixel proves the text reached the glass. — TIMBERDOODLE
+        assert!(glass[BAND * WIDTH..].iter().any(|&pixel| pixel != BG));
     }
 
     /// Assert that glyph-cell `(cx, cy)` holds exactly the bitmap for `ch`.
@@ -2515,15 +2603,12 @@ mod tests {
         foreground: u32,
         background: u32,
     ) {
-        let rows = glyph_rows(ch);
+        // DESIGN/024: the console blends the same coverage the face rasterizes.
+        let coverage = font::face_coverage(ch).expect("the vendored face parses");
         for ry in 0..GLYPH_H {
             for rx in 0..GLYPH_W {
                 let got = buf[(cy * GLYPH_H + ry) * stride + (cx * GLYPH_W + rx)];
-                let want = if (rows[ry] >> (15 - rx)) & 1 != 0 {
-                    foreground
-                } else {
-                    background
-                };
+                let want = blend_coverage(background, foreground, coverage[ry][rx]);
                 assert_eq!(
                     got, want,
                     "pixel mismatch for {:?} at cell ({cx},{cy}) sub ({rx},{ry})",
@@ -2666,6 +2751,67 @@ mod tests {
         assert_cell(&buf, b'A', 2, 0);
     }
 
+    /// DESIGN/024: blend endpoints are exact, so erase and repaint can rely on them.
+    #[test]
+    fn coverage_blend_endpoints_are_exact() {
+        for (bg, fg) in [
+            (BG, FG),
+            (0x0012_3456, 0x00ab_cdef),
+            (0x00ff_ffff, 0x0000_0000),
+        ] {
+            assert_eq!(blend_coverage(bg, fg, 0), bg);
+            assert_eq!(blend_coverage(bg, fg, 255), fg);
+        }
+    }
+
+    /// DESIGN/024: face edges land strictly between the two cell colours.
+    #[test]
+    fn face_edges_blend_between_the_cell_colours() {
+        let coverage = font::face_coverage(b'A').expect("the vendored face parses");
+        let mut edge = None;
+        for (y, row) in coverage.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                if value != 0 && value != 255 {
+                    edge = Some((x, y, value));
+                }
+            }
+        }
+        let (x, y, value) = edge.expect("A carries an antialiased edge");
+        let got = blend_coverage(BG, FG, value);
+        assert_ne!(got, BG, "edge pixel collapsed to background at ({x},{y})");
+        assert_ne!(got, FG, "edge pixel collapsed to foreground at ({x},{y})");
+    }
+
+    /// DESIGN/024: a cell repainted through different glyphs returns byte-identical.
+    #[test]
+    fn cell_repaint_is_byte_identical_through_the_blend() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+        con.write(b"A");
+        let first = buf;
+        con.write(b"\rB");
+        con.write(b"\rA");
+        assert!(buf == first);
+    }
+
+    /// DESIGN/024: reverse video swaps the blend colours, keeping the same coverage.
+    #[test]
+    fn reverse_video_blends_against_swapped_colours() {
+        let mut normal = fresh();
+        let mut flipped = fresh();
+        let mut plain = unsafe { Console::new(normal.as_mut_ptr(), W, H, STRIDE) };
+        let mut reversed = unsafe { Console::new(flipped.as_mut_ptr(), W, H, STRIDE) };
+        plain.write(b"R");
+        reversed.write(b"\x1b[7mR");
+        let coverage = font::face_coverage(b'R').expect("the vendored face parses");
+        for (y, row) in coverage.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                assert_eq!(normal[y * STRIDE + x], blend_coverage(BG, FG, value));
+                assert_eq!(flipped[y * STRIDE + x], blend_coverage(FG, BG, value));
+            }
+        }
+    }
+
     #[test]
     fn new_clears_to_background() {
         let mut buf = fresh();
@@ -2771,12 +2917,11 @@ mod tests {
         for (row, line) in out.iter_mut().enumerate() {
             for (col, cell) in line.iter_mut().enumerate() {
                 let letter = b'A' + (row * 5 + col) as u8;
-                let rows = glyph_rows(letter);
+                let coverage = font::face_coverage(letter).expect("the vendored face parses");
                 let holds = (0..GLYPH_H).all(|ry| {
                     (0..GLYPH_W).all(|rx| {
-                        let on = (rows[ry] >> (15 - rx)) & 1 != 0;
                         buf[(row * GLYPH_H + ry) * ED_W + col * GLYPH_W + rx]
-                            == if on { FG } else { BG }
+                            == blend_coverage(BG, FG, coverage[ry][rx])
                     })
                 });
                 let blank = (0..GLYPH_H).all(|ry| {

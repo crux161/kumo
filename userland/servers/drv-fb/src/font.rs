@@ -1,6 +1,7 @@
 //j552
 //j673
 //j687
+//j689
 
 //! Fixed console bitmaps: ASCII and box drawing in one GLYPH_W x GLYPH_H cell; CJK in a
 //! 16x16 bitmap within a double-width cell.
@@ -127,17 +128,21 @@ fn box_glyph(scalar: u32) -> Option<Glyph> {
     Some(Glyph { columns: 1, rows })
 }
 
-/// ASCII glyphs now come from the vendored face at a scale whose advance is one cell (8 px),
-/// thresholded into the same 8x16 mask the PSF source produced, so the console's geometry,
-/// scroll, winsize and CJK path are untouched. Falls back to the PSF bitmap when the face
-/// cannot be parsed. — TIMBERDOODLE
-fn face_ascii(ch: u8) -> Option<Glyph> {
+/// Per-pixel 8-bit ink coverage of one face glyph inside a console cell: entry `[y][x]`
+/// is the fraction of pixel `(x, y)` the outline covers, 0 (none) to 255 (full).
+/// — TIMBERDOODLE
+pub(super) type Coverage = [[u8; GLYPH_W]; GLYPH_H];
+
+/// Rasterize the vendored face's coverage for one byte at the cell's scale. Non-printable
+/// bytes keep the PSF source's tofu rule ('?'); a glyph with no outline is blank.
+/// — TIMBERDOODLE
+pub(super) fn face_coverage(ch: u8) -> Option<Coverage> {
     use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
     let font = FontRef::try_from_slice(super::FACE_TTF).ok()?;
-    // Maple Mono's advance is 0.6 em, so one 8-px cell puts the scale at 8 / 0.6 pixels.
+    // Maple Mono's advance is 0.6 em, so one cell of GLYPH_W pixels puts the scale at
+    // GLYPH_W / 0.6 pixels. — TIMBERDOODLE
     let scale = PxScale::from(GLYPH_W as f32 / 0.6);
     let scaled = font.as_scaled(scale);
-    // Keep the PSF source's tofu rule: a non-printable byte renders as '?'.
     let printable = if (0x20..=0x7e).contains(&ch) {
         ch
     } else {
@@ -145,13 +150,12 @@ fn face_ascii(ch: u8) -> Option<Glyph> {
     };
     let glyph_id = font.glyph_id(printable as char);
     let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(0.0, scaled.ascent()));
-    let outlined = font.outline_glyph(glyph)?;
+    let mut coverage = [[0u8; GLYPH_W]; GLYPH_H];
+    let Some(outlined) = font.outline_glyph(glyph) else {
+        return Some(coverage);
+    };
     let bounds = outlined.px_bounds();
-    let mut rows = [0u16; GLYPH_H];
-    outlined.draw(|gx, gy, coverage| {
-        if coverage < 0.5 {
-            return;
-        }
+    outlined.draw(|gx, gy, value| {
         let px = bounds.min.x + gx as f32;
         let py = bounds.min.y + gy as f32;
         if px < 0.0 || py < 0.0 {
@@ -161,8 +165,25 @@ fn face_ascii(ch: u8) -> Option<Glyph> {
         if px >= GLYPH_W || py >= GLYPH_H {
             return;
         }
-        rows[py] |= 0x8000 >> px;
+        // core's f32 has no round(); +0.5 then truncate rounds the non-negative coverages.
+        coverage[py][px] = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     });
+    Some(coverage)
+}
+
+/// ASCII glyphs from the vendored face, thresholded into the bit mask the PSF source
+/// produced, so the fallback path and the bit tests keep the face's exact geometry.
+/// — TIMBERDOODLE
+fn face_ascii(ch: u8) -> Option<Glyph> {
+    let coverage = face_coverage(ch)?;
+    let mut rows = [0u16; GLYPH_H];
+    for (y, row) in rows.iter_mut().enumerate() {
+        for (x, value) in coverage[y].iter().enumerate() {
+            if *value >= 128 {
+                *row |= 0x8000 >> x;
+            }
+        }
+    }
     Some(Glyph { columns: 1, rows })
 }
 
