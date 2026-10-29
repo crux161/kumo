@@ -131,7 +131,7 @@ fn box_glyph(scalar: u32) -> Option<Glyph> {
 /// Per-pixel 8-bit ink coverage of one face glyph inside a console cell: entry `[y][x]`
 /// is the fraction of pixel `(x, y)` the outline covers, 0 (none) to 255 (full).
 /// — TIMBERDOODLE
-pub(super) type Coverage = [[u8; GLYPH_W]; GLYPH_H];
+pub type Coverage = [[u8; GLYPH_W]; GLYPH_H];
 
 /// Rasterize the vendored face's coverage for one byte at the cell's scale. Non-printable
 /// bytes keep the PSF source's tofu rule ('?'); a glyph with no outline is blank.

@@ -2,6 +2,8 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 //j674
 //j675
 //j684
@@ -11,6 +13,7 @@
 //j690
 //j695
 //j696
+//j700
 
 mod clock_probe;
 mod display_probe;
@@ -467,6 +470,24 @@ extern "C" fn main(
             pixel_order,
         )
     };
+    // PLAN/016 C4 / DESIGN/024: one shared coverage atlas, heaped once at startup and leaked
+    // for the process lifetime — the 16 KiB user stack rules out any stack-resident atlas.
+    // — TIMBERDOODLE
+    let atlas: &'static [drv_fb::Coverage] = {
+        let mut atlas = alloc::vec![
+            [[0u8; GLYPH_W]; GLYPH_H];
+            drv_fb::ATLAS_GLYPHS
+        ];
+        if drv_fb::fill_atlas(&mut atlas) {
+            alloc::vec::Vec::leak(atlas)
+        } else {
+            log_err(b"drv-fb: console atlas unavailable; per-draw rasterization\n");
+            &[]
+        }
+    };
+    if !atlas.is_empty() {
+        con = con.atlas_attached(atlas);
+    }
     // PLAN/016 C3 S2 / DESIGN/025: the console region is a region-class surface; validate its
     // extent against the ratified 8 MiB bound before the console claims it.
     let region_surface = kumo_graphics::Surface {

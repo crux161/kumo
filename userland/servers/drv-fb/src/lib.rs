@@ -10,6 +10,7 @@
 //j689
 //j692
 //j695
+//j700
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -27,6 +28,7 @@
 
 pub mod dtb_topology;
 mod font;
+pub use font::Coverage;
 pub mod probe_va;
 pub mod rk3588;
 pub mod rk3588_clock;
@@ -230,6 +232,9 @@ pub struct Console {
     /// Cells touched since the last [`Console::take_damage`]: `(col0, row0, col1, row1)`
     /// half-open and clamped to the grid. — TIMBERDOODLE
     dirty: Option<(usize, usize, usize, usize)>,
+    /// PLAN/016 C4: the process-wide coverage atlas; glyphs in it skip per-draw
+    /// rasterization. Storage lives with the caller, never this struct. — TIMBERDOODLE
+    atlas: Option<&'static [Coverage]>,
 }
 
 impl Console {
@@ -340,6 +345,7 @@ impl Console {
             cursor_visible: false,
             cursor_drawn: false,
             dirty: None,
+            atlas: None,
         };
         if clear {
             con.clear();
@@ -497,8 +503,17 @@ impl Console {
             }
             _ => {
                 let colors = (self.effective_foreground(), self.effective_background());
+                // PLAN/016 C4: the shared atlas answers first; per-draw rasterization is
+                // the fallback and the only path for scalars outside it. — TIMBERDOODLE
                 let coverage = if scalar < 0x80 {
-                    font::face_coverage(scalar as u8)
+                    let key = if (0x20..=0x7e).contains(&(scalar as u8)) {
+                        scalar as u8
+                    } else {
+                        b'?'
+                    };
+                    self.atlas
+                        .and_then(|atlas| atlas.get((key - 0x20) as usize).copied())
+                        .or_else(|| font::face_coverage(scalar as u8))
                 } else {
                     None
                 };
@@ -943,6 +958,13 @@ impl Console {
         })
     }
 
+    /// PLAN/016 C4: attach the process-wide coverage atlas so glyphs in it skip per-draw
+    /// rasterization. The atlas outlives the console by construction. — TIMBERDOODLE
+    pub fn atlas_attached(mut self, atlas: &'static [Coverage]) -> Console {
+        self.atlas = Some(atlas);
+        self
+    }
+
     fn scroll(&mut self) {
         self.mark(0, 0, self.cols, self.rows);
         let shift = GLYPH_H * self.stride;
@@ -1144,6 +1166,24 @@ pub fn blit_ascii<W: FnMut(usize, u32)>(
 /// The vendored face: Maple Mono NF CN by subframe7536, subset to ASCII under the SIL Open
 /// Font License 1.1 (the license text ships beside the asset). — TIMBERDOODLE
 const FACE_TTF: &[u8] = include_bytes!("../assets/maple-ascii.ttf");
+
+/// PLAN/016 C4: the shared coverage atlas spans the printable ASCII range.
+pub const ATLAS_GLYPHS: usize = 95;
+
+/// PLAN/016 C4: fill the shared coverage atlas from the vendored face; false when the face
+/// cannot be parsed, which leaves every console on per-draw rasterization. — TIMBERDOODLE
+pub fn fill_atlas(atlas: &mut [Coverage]) -> bool {
+    if atlas.len() < ATLAS_GLYPHS {
+        return false;
+    }
+    for (index, ch) in (0x20u8..=0x7e).enumerate() {
+        let Some(coverage) = font::face_coverage(ch) else {
+            return false;
+        };
+        atlas[index] = coverage;
+    }
+    true
+}
 
 /// Whether the console's ASCII glyphs are being drawn from the vendored face.
 pub fn font_face_ascii_ready() -> bool {
@@ -1672,6 +1712,8 @@ pub unsafe fn clean_pixels(base: *mut u32, start: usize, len: usize) {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     // A small in-memory framebuffer: three cells wide by two cells tall.
@@ -2852,6 +2894,37 @@ mod tests {
         assert!(buf[GLYPH_H * STRIDE..]
             .iter()
             .all(|&pixel| pixel == 0x1234_5678));
+    }
+
+    #[test]
+    fn the_shared_atlas_matches_per_draw_rasterization() {
+        let mut atlas = [[[0u8; GLYPH_W]; GLYPH_H]; ATLAS_GLYPHS];
+        assert!(fill_atlas(&mut atlas));
+        for (index, ch) in (0x20u8..=0x7e).enumerate() {
+            assert_eq!(
+                atlas[index],
+                font::face_coverage(ch).expect("the vendored face parses"),
+                "atlas entry for {:?}",
+                ch as char
+            );
+        }
+    }
+
+    #[test]
+    fn an_atlas_console_renders_identically_to_a_per_draw_console() {
+        let mut atlas = [[[0u8; GLYPH_W]; GLYPH_H]; ATLAS_GLYPHS];
+        assert!(fill_atlas(&mut atlas));
+        let shared_atlas: &'static [Coverage] = std::boxed::Box::leak(std::boxed::Box::new(atlas));
+        let mut direct = fresh();
+        let mut attached = fresh();
+        let mut plain = unsafe { Console::new(direct.as_mut_ptr(), W, H, STRIDE) };
+        let mut shared = unsafe { Console::new(attached.as_mut_ptr(), W, H, STRIDE) }
+            .atlas_attached(shared_atlas);
+        for text in [b"Aa0!".as_slice(), b"~? zz".as_slice()] {
+            plain.write(text);
+            shared.write(text);
+        }
+        assert!(direct == attached);
     }
 
     #[test]
