@@ -10,10 +10,11 @@
 //j691
 //j692
 //j693
+//j694
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
@@ -87,19 +88,39 @@ const LOG_ROWS: usize = 6;
 const LOG_COLS: usize = 25;
 const _: () = assert!(kumo_graphics::DEMO.width as usize / drv_fb::GLYPH_W == LOG_COLS);
 const _: () = assert!(kumo_graphics::DEMO.height as usize >= LOG_ROWS * drv_fb::GLYPH_H);
-static LOG_ROW_HASH: [AtomicU64; LOG_ROWS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
+/// C3 slice-4: per-view console row hashes; each console view owns its own state.
+static LOG_ROW_HASH: [[AtomicU64; LOG_ROWS]; kumo_graphics::VIEW_COUNT] = [
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
 ];
-/// Koid of the surface those hashes describe; a regranted view starts from a blank VMO.
-static LOG_VMO_KOID: AtomicU64 = AtomicU64::new(0);
-/// C3 slice-3: while set, the serve loop refreshes the log view on a cadence so the
-/// surface follows the log without anyone typing `gfx-log`.
+/// Koid of each view's surface; a regranted view starts from a blank VMO.
+static LOG_VMO_KOID: [AtomicU64; kumo_graphics::VIEW_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0)];
+/// C3 slice-3: while set, the serve loop refreshes the console views on a cadence so the
+/// surfaces follow their streams without anyone typing `gfx-log`.
 static LOG_MIRROR: AtomicBool = AtomicBool::new(false);
+/// C3 slice-4: Sora's own console stream, a single-writer byte ring feeding the userland
+/// console view. `debug_write` is the funnel every Sora console byte passes through.
+static USER_RING: [AtomicU8; 1024] = [const { AtomicU8::new(0) }; 1024];
+static USER_RING_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Which stream each console view shows: view 0 the kernel log ring, view 1 Sora's own
+/// userland console stream. — TIMBERDOODLE
+const CONSOLE_SOURCES: [u8; kumo_graphics::VIEW_COUNT] = [0, 1];
+const CONSOLE_KERNEL_RING: u8 = 0;
 
 /// Bounded reply reads for the supervisor's demo presents. Sora's channel read parks once
 /// per call and returns an empty read on any unrelated wake, and the production vblank gate
@@ -1153,22 +1174,23 @@ fn log_row_hash(row: &[u8]) -> u64 {
     hash
 }
 
-/// One log-view refresh: read the ring's tail, render changed rows over the retained
-/// surface, present a bounding damage set, and decode the reply. `quiet_unchanged` keeps
-/// the mirror's idle ticks silent; one-shot runs announce the no-change skip. Returns false
-/// when the view is unavailable, and the caller decides whether that is fatal.
-/// — TIMBERDOODLE
-fn log_refresh(quiet_unchanged: bool) -> bool {
+/// One console-view refresh: read the view's stream tail (the kernel log ring for view 0,
+/// Sora's own userland console stream for view 1), render changed rows over the retained
+/// surface, present a bounding damage set, and decode the reply. `quiet` keeps the mirror's
+/// idle and unavailable ticks silent; one-shot runs announce them. Returns false when the
+/// view is unavailable, and the caller decides whether that is fatal. — TIMBERDOODLE
+fn console_refresh(view: usize, quiet: bool) -> bool {
     use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
-    const LOG_VIEW: usize = 0;
     const LOG_VA: u64 = 0x3800_0000;
-    let channel = Handle(GRAPHICS_CHANNEL[LOG_VIEW].swap(0, Ordering::Relaxed));
-    let vmo = Handle(GRAPHICS_VMO[LOG_VIEW].load(Ordering::Relaxed));
+    let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
+    let vmo = Handle(GRAPHICS_VMO[view].load(Ordering::Relaxed));
     if channel.0 == 0 || vmo.0 == 0 {
         if channel.0 != 0 {
-            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+            GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
         }
-        log(b"gfx-log: no graphics view held\n");
+        if !quiet {
+            log(b"gfx-log: no graphics view held\n");
+        }
         return false;
     }
     let map = vmar_map(
@@ -1180,7 +1202,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
         (VmarFlags::READ | VmarFlags::WRITE).0,
     );
     if map != 0 {
-        GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+        GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
         log(b"gfx-log: surface map failed\n");
         return false;
     }
@@ -1189,22 +1211,34 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
             log(b"gfx-log: pre-present pump failed\n");
             return None;
         }
-        // The ring's last bytes: a bounded overwrite tail over the older lines.
-        let resource = Handle(ROOT_RESOURCE.load(Ordering::Relaxed) as u32);
+        // Fetch the view's stream tail; `seen` counts bytes ever, `tail` keeps the last
+        // window in overwrite order (the shared linearize below restores line order).
         let mut tail = [0u8; 1024];
-        let mut seen = 0usize;
-        let mut chunk = [0u8; 1024];
-        let mut offset = 0u64;
-        for _ in 0..64 {
-            let (n, next) = kumo_rt::log_read(resource, offset, &mut chunk);
-            if n == u64::MAX || n == 0 {
-                break;
+        let seen;
+        if CONSOLE_SOURCES[view] == CONSOLE_KERNEL_RING {
+            let resource = Handle(ROOT_RESOURCE.load(Ordering::Relaxed) as u32);
+            let mut chunk = [0u8; 1024];
+            let mut offset = 0u64;
+            let mut total = 0usize;
+            for _ in 0..64 {
+                let (n, next) = kumo_rt::log_read(resource, offset, &mut chunk);
+                if n == u64::MAX || n == 0 {
+                    break;
+                }
+                for &byte in &chunk[..n as usize] {
+                    tail[total % tail.len()] = byte;
+                    total += 1;
+                }
+                offset = next;
             }
-            for &byte in &chunk[..n as usize] {
-                tail[seen % tail.len()] = byte;
-                seen += 1;
+            seen = total;
+        } else {
+            let seq = USER_RING_SEQ.load(Ordering::Relaxed) as usize;
+            let len = seq.min(tail.len());
+            for (offset, index) in (seq - len..seq).enumerate() {
+                tail[offset] = USER_RING[index % tail.len()].load(Ordering::Relaxed);
             }
-            offset = next;
+            seen = seq;
         }
         // Linearize the tail once: the overwrite ring may have wrapped.
         let start = seen.saturating_sub(tail.len());
@@ -1214,10 +1248,12 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
             linear[offset] = tail[index % tail.len()];
         }
         // Split into lines and keep the last LOG_ROWS, each padded to the row width.
-        // Present-traffic records are dropped: the display server writes two for every
-        // present, so a view that shows them can never converge on its own tail.
-        // — TIMBERDOODLE
+        // Present-traffic records and the view's own records are dropped: the display
+        // server writes two lines for every present, so a view that shows them can never
+        // converge on its own tail, and failure-path `gfx-log:` records ride the userland
+        // stream too. — TIMBERDOODLE
         const PRESENT_RECORD: &[u8] = b"display: present ";
+        const SELF_RECORD: &[u8] = b"gfx-log: ";
         let mut lines = [[b' '; LOG_COLS]; LOG_ROWS];
         let mut row = 0usize;
         let mut cursor = 0usize;
@@ -1227,7 +1263,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
                 .position(|&byte| byte == b'\n')
                 .map_or(len, |rel| cursor + rel);
             let line = &linear[cursor..end];
-            // Ring lines carry a `[ timestamp] ` stamp; match the record after it.
+            // Ring lines carry a `[ timestamp] ` stamp; match the records after it.
             let text = match line.iter().position(|&byte| byte == b']') {
                 Some(close) if line.first() == Some(&b'[') => {
                     let rest = &line[close + 1..];
@@ -1239,7 +1275,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
                 }
                 _ => line,
             };
-            if !text.starts_with(PRESENT_RECORD) {
+            if !text.starts_with(PRESENT_RECORD) && !text.starts_with(SELF_RECORD) {
                 let mut col = 0usize;
                 for &byte in line {
                     // A plain text surface: printable ASCII inside the row width.
@@ -1258,9 +1294,9 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
         }
         // A regranted view starts from a blank VMO; never trust the old row hashes there.
         let vmo_koid = handle_koid(vmo);
-        let fresh_surface = LOG_VMO_KOID.swap(vmo_koid, Ordering::Relaxed) != vmo_koid;
+        let fresh_surface = LOG_VMO_KOID[view].swap(vmo_koid, Ordering::Relaxed) != vmo_koid;
         if fresh_surface {
-            for slot in &LOG_ROW_HASH {
+            for slot in &LOG_ROW_HASH[view] {
                 slot.store(0, Ordering::Relaxed);
             }
         }
@@ -1268,7 +1304,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
         let mut changed: Option<(usize, usize)> = None;
         for (index, line) in lines.iter().enumerate() {
             hashes[index] = log_row_hash(line);
-            if LOG_ROW_HASH[index].load(Ordering::Relaxed) != hashes[index] {
+            if LOG_ROW_HASH[view][index].load(Ordering::Relaxed) != hashes[index] {
                 changed = Some(match changed {
                     Some((first, _)) => (first, index),
                     None => (index, index),
@@ -1288,7 +1324,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
             )
         };
         for index in first..=last {
-            if LOG_ROW_HASH[index].load(Ordering::Relaxed) == hashes[index] {
+            if LOG_ROW_HASH[view][index].load(Ordering::Relaxed) == hashes[index] {
                 continue;
             }
             console.write(&[0x1b, b'[']);
@@ -1309,7 +1345,7 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
             };
             DamageSet::single(damage).unwrap_or(DamageSet::FULL)
         };
-        let sequence = GRAPHICS_SEQUENCE[LOG_VIEW].fetch_add(1, Ordering::Relaxed);
+        let sequence = GRAPHICS_SEQUENCE[view].fetch_add(1, Ordering::Relaxed);
         let frame = Present {
             sequence,
             surface: DEMO,
@@ -1330,20 +1366,24 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
     match result {
         Some((Status::Copied | Status::Retired, None)) => {
             // A valid reply with no changed rows: the retained surface is current.
-            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
-            if !quiet_unchanged {
-                term(b"gfx-log: view 0 unchanged; no present\n");
+            GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
+            if !quiet {
+                term(b"gfx-log: view ");
+                term(&[b'0' + view as u8]);
+                term(b" unchanged; no present\n");
             }
             true
         }
         Some((status, Some((hashes, (first, last)))))
             if matches!(status, Status::Copied | Status::Retired) =>
         {
-            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
-            for (slot, hash) in LOG_ROW_HASH.iter().zip(hashes.iter()) {
+            GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
+            for (slot, hash) in LOG_ROW_HASH[view].iter().zip(hashes.iter()) {
                 slot.store(*hash, Ordering::Relaxed);
             }
-            term(b"gfx-log: view 0 ");
+            term(b"gfx-log: view ");
+            term(&[b'0' + view as u8]);
+            term(b" ");
             term(if status == Status::Retired {
                 b"retired" as &[u8]
             } else {
@@ -1356,28 +1396,38 @@ fn log_refresh(quiet_unchanged: bool) -> bool {
         }
         Some(_) => {
             let _ = handle_close(channel);
-            log(b"gfx-log: view 0 rejected; view disabled\n");
+            log(b"gfx-log: view rejected; view disabled\n");
             false
         }
         None => {
             let _ = handle_close(channel);
-            log(b"gfx-log: view 0 failed; view disabled\n");
+            log(b"gfx-log: view failed; view disabled\n");
             false
         }
     }
 }
 
+/// Refresh every console view once; true when at least one view answered. The mirror
+/// disables only when every view is gone. — TIMBERDOODLE
+fn refresh_all(quiet: bool) -> bool {
+    let mut alive = false;
+    for view in 0..kumo_graphics::VIEW_COUNT {
+        alive |= console_refresh(view, quiet);
+    }
+    alive
+}
+
 fn gfx_log(cmd: &kumoza::Command) {
     match cmd.args.first().map(|arg| arg.as_str()) {
         None => {
-            if !log_refresh(false) {
+            if !refresh_all(false) {
                 fail_status(1);
             }
         }
         Some("on") => {
             LOG_MIRROR.store(true, Ordering::Relaxed);
             term(b"gfx-log: mirror on\n");
-            let _ = log_refresh(false);
+            let _ = refresh_all(false);
         }
         Some("off") => {
             LOG_MIRROR.store(false, Ordering::Relaxed);
@@ -1667,10 +1717,17 @@ static SERVING: AtomicBool = AtomicBool::new(false);
 
 /// Sora's console write: the kernel log while booting, the terminal once serving.
 fn debug_write(ptr: *const u8, len: usize) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // C3 slice-4: every Sora console byte also feeds the userland console view's ring.
+    let mut seq = USER_RING_SEQ.load(Ordering::Relaxed);
+    for &byte in bytes {
+        USER_RING[(seq as usize) % USER_RING.len()].store(byte, Ordering::Relaxed);
+        seq = seq.wrapping_add(1);
+    }
+    USER_RING_SEQ.store(seq, Ordering::Relaxed);
     if SERVING.load(Ordering::Relaxed) {
         kumo_rt::debug_write(ptr, len)
     } else {
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
         kumo_rt::log_write(kumo_abi::sys::log_level::INFO, bytes)
     }
 }
@@ -4767,7 +4824,7 @@ extern "C" fn sora_main(
                 };
                 let _ = port_unbind(port, timer);
                 let _ = handle_close(timer);
-                if LOG_MIRROR.load(Ordering::Relaxed) && !log_refresh(true) {
+                if LOG_MIRROR.load(Ordering::Relaxed) && !refresh_all(true) {
                     LOG_MIRROR.store(false, Ordering::Relaxed);
                     log(b"gfx-log: mirror disabled; view unavailable\n");
                 }

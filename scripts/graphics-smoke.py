@@ -275,23 +275,28 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
                 continue
             if titles and in_label(x, y):
                 continue
-            if log and in_rects(x, y, [(rects[0][0], rects[0][1], VIEW_W, VIEW_H)]):
+            if log and in_rects(
+                x,
+                y,
+                [(rx, ry, VIEW_W, VIEW_H) for rx, ry in rects],
+            ):
                 continue
             want = compose_expected(x, y, rects, images)
             assert at(x, y) == want, f"band pixel {(x, y)} is {at(x, y)}, want {want}"
     if log:
-        # C3 slice-1: view 0's client rect holds the presented log text. The server's title
-        # strip overlays its top rows and is asserted with the other strips.
-        vx, vy = rects[0]
-        ink = 0
-        for y in range(vy + 16, vy + VIEW_H):
-            for x in range(vx, vx + VIEW_W):
-                pixel = at(x, y)
-                assert pixel != POISON, f"log surface leaked poison at {(x, y)}"
-                if pixel != (0, 0, 0):
-                    ink += 1
-        assert ink > 200, f"log view shows only {ink} text pixels"
-        print("Log band: presented surface holds rendered log text")
+        # C3 slices 1-4: each view's client rect holds its presented console text (view 0
+        # the kernel log, view 1 the userland stream). The server's title strip overlays
+        # the top rows and is asserted with the other strips.
+        for index, (vx, vy) in enumerate(rects):
+            ink = 0
+            for y in range(vy + 16, vy + VIEW_H):
+                for x in range(vx, vx + VIEW_W):
+                    pixel = at(x, y)
+                    assert pixel != POISON, f"console view {index} leaked poison at {(x, y)}"
+                    if pixel != (0, 0, 0):
+                        ink += 1
+            assert ink > 200, f"console view {index} shows only {ink} text pixels"
+        print("Console band: both views hold presented console text")
 
     if titles:
         for index, (lx, ly, lw, lh) in enumerate(LABEL_RECTS):
@@ -629,6 +634,9 @@ def main():
                 assert b"graphics-smoke-after-present" in transcript
                 # C3 slice-3: the mirror keeps the view live after the serve loop starts.
                 assert b"gfx-log: mirror on" in transcript, f"missing mirror record; inspect {serial}"
+                assert b"gfx-log: view 1 " in transcript, (
+                    f"missing userland-console view record; inspect {serial}"
+                )
                 assert transcript.rfind(b"gfx-log: view 0") > transcript.rfind(
                     b"sora: entering serve loop"
                 ), f"mirror never refreshed after the serve loop started; inspect {serial}"
@@ -690,7 +698,7 @@ def main():
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             if args.log:
-                print("Log UEFI smoke green: the kernel log presented as a client surface, only changed rows damaged, and kept live by the mirror")
+                print("Log UEFI smoke green: per-view console surfaces (kernel log, userland stream), only changed rows damaged, kept live by the mirror")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:
