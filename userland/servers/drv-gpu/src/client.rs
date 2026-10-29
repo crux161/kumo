@@ -1,8 +1,8 @@
-//j647
 //j650
 //j651
 //j652
 //j681
+//j682
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. The resident driver retains every DMA
@@ -249,6 +249,10 @@ impl Hardware<'_> {
             .find(|slot| slot.is_none())
             .expect("free slot checked above");
         *free = Some((point, write));
+        log(
+            log_level::NOTICE,
+            format_args!("drv-gpu: fence wait armed point {}\n", point),
+        );
         Some(read)
     }
 
@@ -262,10 +266,14 @@ impl Hardware<'_> {
                 None => false,
             };
             if satisfied {
-                if let Some((_, handle)) = slot.take() {
+                if let Some((point, handle)) = slot.take() {
                     let byte = [1u8];
                     let _ = kumo_rt::channel_write(handle, byte.as_ptr(), 1);
                     let _ = kumo_rt::handle_close(handle);
+                    log(
+                        log_level::NOTICE,
+                        format_args!("drv-gpu: fence wait woken point {}\n", point),
+                    );
                 }
             }
         }

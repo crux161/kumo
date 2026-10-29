@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j644
 //j645
 //j646
 //j647
 //j652
+//j682
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -17,8 +17,8 @@ use gpu_client::{
 };
 use kumo_abi::{Handle, VmarFlags};
 use kumo_gpu::{
-    client::{Client, Error as ClientError, Transport, TransportError},
-    Status as GpuStatus, Submission, SyncState, REPLY_LEN, REQUEST_LEN, VA_END, VA_START,
+    client::{Client, Error as ClientError, FenceStatus, Transport, TransportError},
+    Status as GpuStatus, Submission, REPLY_LEN, REQUEST_LEN, VA_END, VA_START,
 };
 
 use kumo_mali::{
@@ -134,25 +134,66 @@ fn submit_wait(
         }
     }
     barrier();
-    client.submit(Submission {
+    // G8c-b: the first real fence consumer. The wait is registered on the gpu-done
+    // timeline and this thread parks on its own wake channel until the driver's completion
+    // path signals it; a Port timer bounds the wait so a dead producer cannot wedge the
+    // client (DESIGN/023, ratified). SyncRead remains the library's fallback path.
+    // — TIMBERDOODLE
+    let fence = client.submit_fence(Submission {
         group,
         stream_va: VA_START,
         stream_bytes: (stream.len() * 8) as u32,
         signal_point: point,
     })?;
-    for _ in 0..1000 {
-        match client.sync_read(group, point)? {
-            SyncState::Complete { gpu_status: 0 } => {
+    match client.fence_wait(fence)? {
+        FenceStatus::Done { gpu_status: 0 } => {
+            barrier();
+            Ok(())
+        }
+        FenceStatus::Done { .. } => Err(Failure::Failed),
+        FenceStatus::Armed(wake) => {
+            if wait_wake(wake) {
                 barrier();
-                return Ok(());
+                Ok(())
+            } else {
+                Err(Failure::Failed)
             }
-            SyncState::Pending => {
-                let _ = kumo_rt::sleep_ns(1_000_000);
-            }
-            _ => return Err(Failure::Failed),
         }
     }
-    Err(Failure::Failed)
+}
+
+/// Park on an armed fence wake channel with a 5 s upper bound, driven by the Port/timer
+/// wake the ratification chose. A closed channel without its byte is a failure, not a
+/// wake: the driver closes armed ends it could not complete at teardown. The wake handle
+/// is consumed either way. — TIMBERDOODLE
+fn wait_wake(wake: Handle) -> bool {
+    let Some(port) = handle(kumo_rt::port_create()) else {
+        let _ = kumo_rt::handle_close(wake);
+        return false;
+    };
+    let Some(timer) = handle(kumo_rt::timer_create(5_000_000_000)) else {
+        let _ = kumo_rt::handle_close(wake);
+        let _ = kumo_rt::handle_close(port);
+        return false;
+    };
+    let wake_koid = kumo_rt::handle_koid(wake);
+    let bound = kumo_rt::handle_koid(timer);
+    let bound_ok = bound != u64::MAX
+        && wake_koid != u64::MAX
+        && kumo_rt::port_bind(port, wake) == 0
+        && kumo_rt::port_bind(port, timer) == 0;
+    let mut woke = false;
+    if bound_ok && kumo_rt::port_wait(port) == wake_koid {
+        let mut byte = [0u8; 1];
+        let n = kumo_rt::channel_read(wake, byte.as_mut_ptr(), byte.len());
+        woke = n == 1 && byte[0] == 1;
+    }
+    let _ = kumo_rt::port_unbind(port, wake);
+    let _ = kumo_rt::port_unbind(port, timer);
+    let _ = kumo_rt::handle_close(timer);
+    let _ = kumo_rt::handle_close(wake);
+    let _ = kumo_rt::handle_close(port);
+    woke
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
