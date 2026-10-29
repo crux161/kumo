@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j657
-//j658
 //j659
 //j663
 //j667
+//j668
+//j669
 
 extern crate alloc;
 
@@ -97,6 +97,11 @@ static GRAPHICS_ASYNC: [AtomicBool; kumo_graphics::VIEW_COUNT] =
 /// reports the view released, so a second wait can bind it again and the kernel replays the
 /// retained exit. — TIMBERDOODLE
 static GRAPHICS_ASYNC_PROCESS: [AtomicU32; kumo_graphics::VIEW_COUNT] =
+    [AtomicU32::new(0), AtomicU32::new(0)];
+/// The server end of each view's input channel (F2b focus routing), or 0. Created when a
+/// `gfx-keys` consumer is admitted and retired when the consumer's channel closes.
+/// — TIMBERDOODLE
+static GRAPHICS_INPUT: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 
 /// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
@@ -655,19 +660,16 @@ fn refresh_released() {
 /// — TIMBERDOODLE
 const FOCUS_KEY: u8 = 0x1d;
 
-/// The next view with a held grant after `current`, wrapping; `None` when no view is held.
+/// The next view with a held grant after `current`. The cycle walks forward only and passes
+/// through none after the last grantable view, so the shell regains the keyboard.
+/// — TIMBERDOODLE
 fn next_focus(current: Option<usize>) -> Option<usize> {
     let start = match current {
-        Some(view) => (view + 1) % kumo_graphics::VIEW_COUNT,
+        Some(view) => view + 1,
         None => 0,
     };
-    for step in 0..kumo_graphics::VIEW_COUNT {
-        let view = (start + step) % kumo_graphics::VIEW_COUNT;
-        if GRAPHICS_GRANTABLE[view].load(Ordering::Relaxed) {
-            return Some(view);
-        }
-    }
-    None
+    (start..kumo_graphics::VIEW_COUNT)
+        .find(|view| GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed))
 }
 
 /// Tell drv-fb which view owns the keyboard and record the change. — TIMBERDOODLE
@@ -817,6 +819,50 @@ fn wait_for_released() -> Option<usize> {
         GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed)
             && GRAPHICS_RELEASED[*view].load(Ordering::Relaxed)
     })
+}
+
+/// Admit one input consumer for a grantable view (F2b focus routing): Sora keeps the server
+/// end of the input channel and transfers the client end in `x0`. While that view holds focus,
+/// keyboard bytes go to the consumer; a view without one keeps the shell. — TIMBERDOODLE
+fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-keys\n");
+        return;
+    }
+    let view = (0..kumo_graphics::VIEW_COUNT).find(|view| {
+        GRAPHICS_GRANTABLE[*view].load(Ordering::Relaxed)
+            && GRAPHICS_INPUT[*view].load(Ordering::Relaxed) == 0
+    });
+    let Some(view) = view else {
+        log(b"gfx-keys: no view free for an input consumer\n");
+        fail_status(1);
+        return;
+    };
+    let (server, client) = channel_create_pair();
+    if server == u64::MAX || client == u64::MAX {
+        log(b"gfx-keys: channel unavailable\n");
+        fail_status(1);
+        return;
+    }
+    GRAPHICS_INPUT[view].store(server as u32, Ordering::Relaxed);
+    let flags = ProcessRunFlags::TRANSFER_ARG.bits();
+    let ran = run_elf_threads(
+        initrd,
+        kumo_abi::initrd::GFX_KEYS_PATH.as_bytes(),
+        client,
+        0,
+        flags,
+        b"gfx-keys",
+        0,
+        None,
+    );
+    if !ran {
+        GRAPHICS_INPUT[view].store(0, Ordering::Relaxed);
+        let _ = handle_close(Handle(server as u32));
+        fail_status(1);
+        return;
+    }
+    notice(&[b"sora: keys view ", &[b'0' + view as u8], b"\n"]);
 }
 
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
@@ -4413,6 +4459,36 @@ extern "C" fn sora_main(
                             break;
                         }
                     }
+                } else if n > 0
+                    && focus_view
+                        .is_some_and(|view| GRAPHICS_INPUT[view].load(Ordering::Relaxed) != 0)
+                {
+                    // F2b focus routing: the focused view's input consumer owns the keyboard.
+                    // A write that finds the consumer gone retires the channel and hands the
+                    // keyboard back to the shell. Ctrl-] still cycles. — TIMBERDOODLE
+                    let view = focus_view.expect("focused view");
+                    let consumer = Handle(GRAPHICS_INPUT[view].load(Ordering::Relaxed));
+                    let mut delivered = true;
+                    for i in 0..n {
+                        if serve_buf[i] == FOCUS_KEY {
+                            let next = next_focus(focus_view);
+                            if next != focus_view {
+                                focus_view = next;
+                                announce_focus(next);
+                            }
+                            continue;
+                        }
+                        if channel_write(consumer, serve_buf[i..i + 1].as_ptr(), 1) != 0 {
+                            delivered = false;
+                            break;
+                        }
+                    }
+                    if !delivered {
+                        GRAPHICS_INPUT[view].store(0, Ordering::Relaxed);
+                        let _ = handle_close(consumer);
+                        focus_view = None;
+                        announce_focus(None);
+                    }
                 } else if n > 0 && interactive_ttyd.is_some() {
                     let tty = interactive_ttyd.unwrap().instance;
                     let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
@@ -4568,6 +4644,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-clients" {
         graphics_clients(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gfx-keys" {
+        gfx_keys(cmd, initrd);
         return true;
     }
     if cmd.name == "gfx-damage" {

@@ -851,6 +851,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
             let gfx_client = build_graphics_client_image(&workspace_root()?, "gfx-client")?;
+            let gfx_keys = build_graphics_client_image(&workspace_root()?, "gfx-keys")?;
             let bmp_view = build_graphics_client_image(&workspace_root()?, "bmp-view")?;
             let gpu_client = build_gpu_client_image(&workspace_root()?)?;
             let ls = build_ls_image(&workspace_root()?)?;
@@ -880,6 +881,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
                 (GFX_CLIENT_PATH, gfx_client.as_slice()),
+                (kumo_abi::initrd::GFX_KEYS_PATH, gfx_keys.as_slice()),
                 (BMP_VIEW_PATH, bmp_view.as_slice()),
                 (
                     "share/images/sample.bmp",

@@ -1,8 +1,8 @@
-#j594
 #j595
 #j596
 #j598
 #j648
+#j669
 [workspace]
 members = [
     "boot/niji-loader",
@@ -36,6 +36,7 @@ members = [
     "userland/wc",
     "userland/hello",
     "userland/gfx-client",
+    "userland/gfx-keys",
     "userland/gpu-client",
     "userland/ls",
     "userland/lua-repl",

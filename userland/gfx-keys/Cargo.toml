@@ -1,0 +1,19 @@
+#j669
+
+[package]
+name = "gfx-keys"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "gfx-keys"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

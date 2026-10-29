@@ -1,8 +1,8 @@
-//j569
 //j572
 //j578
 //j595
 //j648
+//j669
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -47,6 +47,9 @@ pub const BMP_VIEW_PATH: &str = "bin/bmp-view";
 /// A separate-process presentation client (F1b): Sora transfers one presentation channel and
 /// one surface VMO in `x0`/`x1`; the client writes the diagnostic image, presents, and exits.
 pub const GFX_CLIENT_PATH: &str = "bin/gfx-client";
+/// An input consumer for the focused view (F2b focus routing): receives one input channel in
+/// `x0`, logs each byte it receives, and exits when the channel closes.
+pub const GFX_KEYS_PATH: &str = "bin/gfx-keys";
 /// G6b's cooperative GPU session proof program; receives only its GPU channel in x0.
 pub const GPU_CLIENT_PATH: &str = "bin/gpu-client";
 /// `ls` as a real program: receives a read-only initrd VMO handle in `x0` and prints
