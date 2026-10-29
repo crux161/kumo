@@ -6,6 +6,7 @@
 //j673
 //j674
 //j687
+//j688
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -48,10 +49,10 @@ fn glyph_rows(ch: u8) -> [u16; GLYPH_H] {
 pub const GLYPH_W: usize = kumo_graphics::CONSOLE_CELL_W as usize;
 pub const GLYPH_H: usize = kumo_graphics::CONSOLE_CELL_H as usize;
 
-/// Phosphor green on black. Green is the middle byte, so this single constant is the
-/// same pixel under both RGB888x and BGR888x — the renderer never needs to know the
-/// framebuffer's channel order (identical reasoning to the Stage-A console).
-pub const FG: u32 = 0x0000_ff00;
+/// PLAN/016 C0: crisp off-white on black. R, G and B are equal, so this single constant
+/// is the same pixel under both RGB888x and BGR888x — the renderer never needs to know
+/// the framebuffer's channel order (identical reasoning to the Stage-A console).
+pub const FG: u32 = 0x00ee_eeee;
 pub const BG: u32 = 0x0000_0000;
 
 /// Byte order of the three color channels in one little-endian framebuffer pixel.

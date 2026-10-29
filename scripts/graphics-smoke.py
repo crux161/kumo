@@ -133,7 +133,7 @@ VIEW_BG = (0, 0, 0)
 CHROME_COLOR = (0x5A, 0x8F, 0xC8)
 VIEW_SOLID = (0x00, 0xA0, 0xFF)
 POISON = (0xFF, 0x00, 0xFF)
-FG = (0, 0xFF, 0)
+FG = (0xEE, 0xEE, 0xEE)  # PLAN/016 C0 off-white
 # F2c titles mode: the server-drawn band labels (two six-character rows scaled to the
 # console cell, 10x20) and their ink colour. The boxes bound the real ink; exact pixels
 # outside them are still asserted.

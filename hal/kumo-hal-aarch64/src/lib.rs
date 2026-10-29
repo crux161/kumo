@@ -6,6 +6,7 @@
 //j635
 //j640
 //j660
+//j688
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -688,9 +689,9 @@ fn dw8250_putc(byte: u8) {
 const FONT: &[u8] = include_bytes!("../font8x16.psf");
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
-// Jet Alone-style phosphor green on black. Green is the middle byte, so 0x0000_ff00 is
-// the same pixel in RGB888x and BGR888x — format-agnostic like white was.
-const FG: u32 = 0x0000_ff00; // phosphor green
+// PLAN/016 C0: crisp off-white on black. R, G and B are equal, so 0x00ee_eeee is the
+// same pixel in RGB888x and BGR888x — format-agnostic, like the green it replaced.
+const FG: u32 = 0x00ee_eeee; // off-white
 const BG: u32 = 0x0000_0000; // black
 
 static FB_PRESENT: AtomicBool = AtomicBool::new(false);
@@ -885,7 +886,7 @@ fn draw_qr_code(qr: &qrcodegen::QrCode) {
                 false
             };
             // Black modules on a white quiet zone — what decoders expect, and it reads cleanly
-            // over the phosphor-green console without inversion.
+            // over the off-white console without inversion.
             let color = if is_dark { 0x0000_0000 } else { 0x00ff_ffff };
             let py = layout.y_offset + y;
             let px = layout.x_offset + x;
@@ -1309,7 +1310,7 @@ pub fn set_framebuffer(base: u64, len_bytes: u64, width: u32, height: u32, strid
     FB_ROW.store(0, ORD);
     FB_KERNEL_OWNER.store(true, ORD);
 
-    // Clear to the black phosphor backdrop, then flush to RAM so it shows on real
+    // Clear to the black backdrop, then flush to RAM so it shows on real
     // hardware where the framebuffer may be write-back cached (see `fb_clean_line`).
     let ptr = base as *mut u32;
     let mut i = 0;
