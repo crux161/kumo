@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j663
 //j667
 //j668
 //j669
 //j670
+//j675
 
 extern crate alloc;
 
@@ -629,6 +629,26 @@ fn query_released() -> Option<u8> {
     kumo_graphics::parse_release_reply(reply.get(..n)?)
 }
 
+/// Ask drv-fb which views hold a recorded frame, so a supervisor can observe that a
+/// presenter has come up before acting on the grant. — TIMBERDOODLE
+fn query_presented() -> Option<u8> {
+    let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+    if control.0 == 0 {
+        return None;
+    }
+    if channel_write(
+        control,
+        kumo_graphics::PRESENTED_QUERY.as_ptr(),
+        kumo_graphics::PRESENTED_QUERY.len(),
+    ) != 0
+    {
+        return None;
+    }
+    let mut reply = [0u8; 8];
+    let n = channel_read(control, reply.as_mut_ptr(), reply.len()) as usize;
+    kumo_graphics::parse_presented_reply(reply.get(..n)?)
+}
+
 /// Fold drv-fb's release mask into Sora's released views, logging each newly observed one.
 fn refresh_released() {
     let Some(mask) = query_released() else {
@@ -863,6 +883,150 @@ fn gfx_keys(cmd: &kumoza::Command, initrd: Handle) {
         return;
     }
     notice(&[b"sora: keys view ", &[b'0' + view as u8], b"\n"]);
+}
+
+/// Admit a presenter, kill it mid-grant, and recover the view for a fresh presenter (F2c
+/// slice-6). The hold client presents one full frame and parks; once drv-fb records that
+/// frame, Sora kills the child, waits for the release record, regrants the view and runs the
+/// reference client to prove presentation survives a presenter's death. — TIMBERDOODLE
+fn gfx_recover(cmd: &kumoza::Command, initrd: Handle) {
+    use kumo_graphics::VIEW_COUNT;
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-recover\n");
+        return;
+    }
+    let mut selected = None;
+    for view in 0..VIEW_COUNT {
+        let channel = Handle(GRAPHICS_CHANNEL[view].swap(0, Ordering::Relaxed));
+        if channel.0 == 0 {
+            continue;
+        }
+        let vmo = Handle(GRAPHICS_VMO[view].swap(0, Ordering::Relaxed));
+        selected = Some((view, channel, vmo));
+        break;
+    }
+    let Some((view, channel, vmo)) = selected else {
+        log(b"gfx-recover: no graphics view available\n");
+        fail_status(1);
+        return;
+    };
+    if vmo.0 == 0 {
+        let _ = handle_close(channel);
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+        log(b"gfx-recover: no surface available\n");
+        fail_status(1);
+        return;
+    }
+    notice(&[
+        b"sora: gfx-recover: hold admitted for view ",
+        &[b'0' + view as u8],
+        b"\n",
+    ]);
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let mut kept = None;
+    let ran = run_elf_threads(
+        initrd,
+        kumo_abi::initrd::GFX_HOLD_PATH.as_bytes(),
+        channel.0 as u64,
+        vmo.0 as u64,
+        flags,
+        b"gfx-hold",
+        0,
+        Some(&mut kept),
+    );
+    let Some(child) = kept.filter(|_| ran) else {
+        // An admitted child owns the handles; only an admission failure leaves them here.
+        if handle_koid(channel) != u64::MAX {
+            let _ = handle_close(channel);
+            let _ = handle_close(vmo);
+        }
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+        log(b"gfx-recover: hold admission failed\n");
+        fail_status(1);
+        return;
+    };
+    // Wait (bounded) until drv-fb records the presenter's first frame: recovery of a live
+    // grant is only meaningful once the child has actually presented.
+    let mut presented = false;
+    for _ in 0..4000 {
+        if query_presented().is_some_and(|mask| mask & (1u8 << view) != 0) {
+            presented = true;
+            break;
+        }
+        let _ = process_wait();
+    }
+    if !presented {
+        log(b"gfx-recover: presenter never presented\n");
+        let _ = process_kill(child);
+        let _ = handle_close(child);
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+        fail_status(1);
+        return;
+    }
+    notice(&[
+        b"sora: view ",
+        &[b'0' + view as u8],
+        b" presented before the kill\n",
+    ]);
+    // Kill the presenter mid-grant: the view must release through the normal lane-close
+    // path, exactly as a crashed presenter would. — TIMBERDOODLE
+    let _ = process_kill(child);
+    let _ = handle_close(child);
+    let mut released = false;
+    for _ in 0..4000 {
+        let _ = process_wait();
+        if query_released().is_some_and(|mask| mask & (1u8 << view) != 0) {
+            released = true;
+            break;
+        }
+    }
+    if !released {
+        log(b"gfx-recover: killed presenter never released the view\n");
+        fail_status(1);
+        return;
+    }
+    notice(&[
+        b"sora: view ",
+        &[b'0' + view as u8],
+        b" recovered after the kill\n",
+    ]);
+    GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+    // Restart the presenter on a fresh grant: the recovery half of the proof.
+    let Some((channel, vmo)) = regrant_view(view) else {
+        log(b"gfx-recover: regrant failed\n");
+        fail_status(1);
+        return;
+    };
+    GRAPHICS_RELEASED[view].store(false, Ordering::Relaxed);
+    let flags = (ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2).bits();
+    let ran = run_elf_threads(
+        initrd,
+        GFX_CLIENT_PATH.as_bytes(),
+        channel.0 as u64,
+        vmo.0 as u64,
+        flags,
+        b"gfx-client",
+        0,
+        None,
+    );
+    if !ran {
+        if handle_koid(channel) != u64::MAX {
+            let _ = handle_close(channel);
+            let _ = handle_close(vmo);
+        }
+        GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+        log(b"gfx-recover: restarted presenter failed\n");
+        fail_status(1);
+        return;
+    }
+    GRAPHICS_RELEASED[view].store(true, Ordering::Relaxed);
+    notice(&[
+        b"sora: gfx-recover: view ",
+        &[b'0' + view as u8],
+        b" recovered and regranted\n",
+    ]);
 }
 
 /// Toggle the server's own band labels (F2c's first visible glyph-atlas consumer): the record
@@ -4678,6 +4842,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-keys" {
         gfx_keys(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gfx-recover" {
+        gfx_recover(cmd, initrd);
         return true;
     }
     if cmd.name == "gfx-titles" {

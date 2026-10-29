@@ -1,9 +1,9 @@
 #![no_std]
-//j658
 //j667
 //j668
 //j670
 //j674
+//j675
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -369,6 +369,25 @@ pub fn release_reply(mask: u8) -> [u8; 2] {
 
 pub fn parse_release_reply(bytes: &[u8]) -> Option<u8> {
     if bytes.len() == 2 && bytes[0] == RELEASE_REPLY_TAG {
+        Some(bytes[1])
+    } else {
+        None
+    }
+}
+
+/// A presented-state query on the same control lane: Sora asks drv-fb which views hold a
+/// recorded frame, so a supervisor can tell a presenter has come up before acting on it.
+/// The reply carries one bit per view; bit N means view N has an accepted frame. — TIMBERDOODLE
+pub const PRESENTED_QUERY_TAG: u8 = b'W';
+pub const PRESENTED_REPLY_TAG: u8 = b'V';
+pub const PRESENTED_QUERY: [u8; 1] = [PRESENTED_QUERY_TAG];
+
+pub fn presented_reply(mask: u8) -> [u8; 2] {
+    [PRESENTED_REPLY_TAG, mask]
+}
+
+pub fn parse_presented_reply(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() == 2 && bytes[0] == PRESENTED_REPLY_TAG {
         Some(bytes[1])
     } else {
         None
@@ -801,6 +820,17 @@ mod tests {
         assert_eq!(parse_release_reply(&[b'S']), None);
         assert_eq!(parse_release_reply(&[b'X', 0]), None);
         assert_eq!(parse_release_reply(&[b'S', 0, 0]), None);
+    }
+
+    #[test]
+    fn presented_query_and_reply_are_exact() {
+        assert_eq!(PRESENTED_QUERY, [b'W']);
+        assert_eq!(presented_reply(0b10), [b'V', 0b10]);
+        assert_eq!(parse_presented_reply(&presented_reply(0)), Some(0));
+        assert_eq!(parse_presented_reply(&presented_reply(0xff)), Some(0xff));
+        assert_eq!(parse_presented_reply(&[b'V']), None);
+        assert_eq!(parse_presented_reply(&[b'X', 0]), None);
+        assert_eq!(parse_presented_reply(&[b'V', 0, 0]), None);
     }
 
     #[test]

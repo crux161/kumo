@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j659
 #j660
 #j670
 #j672
 #j674
+#j675
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -25,7 +25,7 @@ import tempfile
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, titles=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, titles=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -62,6 +62,10 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # Both views are leased to ASYNC clients; bmp-view must wait for both
                 # releases and regrant view 0.
                 data = b"dmesg -n 6\ngfx-clients\nbmp-view\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if recover:
+                # One presenter presents and is killed mid-grant; the supervisor must see
+                # the release and regrant the view to the reference client.
+                data = b"dmesg -n 6\ngfx-recover\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if titles:
                 # The server draws its own band labels through the glyph atlas; gfx-demo still
                 # paints both views so the proven two-view band model applies unchanged.
@@ -199,7 +203,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, titles=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, titles=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -217,6 +221,9 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     # the same model proves the overlap and z-order, not only the two wells.
     if damage:
         images = [damage_demo_pixel, None]
+    elif recover:
+        # Only view 0 is painted, by the restarted client; view 1 stays a bare well.
+        images = [demo_pixel, None]
     elif regrant or async_regrant:
         images = [bitmap_reference(None), demo_pixel]
     elif bitmap:
@@ -312,6 +319,7 @@ def main():
     parser.add_argument("--zorder", action="store_true", help="prove server z-order: the lower client presents after the upper view")
     parser.add_argument("--regrant", action="store_true", help="prove a released view accepts a fresh client and surface")
     parser.add_argument("--async-regrant", action="store_true", help="prove ASYNC client exits release views for a later regrant")
+    parser.add_argument("--recover", action="store_true", help="prove a killed presenter leaves a recoverable view that takes a fresh client")
     parser.add_argument("--titles", action="store_true", help="prove server-drawn band labels through the glyph atlas")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
@@ -330,7 +338,9 @@ def main():
         parser.error("--regrant is a separate proof")
     if args.async_regrant and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant):
         parser.error("--async-regrant is a separate proof")
-    if args.titles and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant):
+    if args.recover and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant):
+        parser.error("--recover is a separate proof")
+    if args.titles and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover):
         parser.error("--titles is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
@@ -347,7 +357,7 @@ def main():
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
                      args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant,
-                     args.titles)
+                     args.recover, args.titles)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     with (work / "qemu.log").open("wb") as log:
@@ -426,6 +436,21 @@ def main():
                 assert transcript.count(client) == 1, f"missing lower client present; inspect {serial}"
                 assert transcript.index(demo1) < transcript.index(client), f"lower client did not present last; inspect {serial}"
                 assert b"gfx-demo: one or more views failed" not in transcript
+            elif args.recover:
+                assert transcript.count(b"gfx-hold: holding after present") == 1, f"missing hold record; inspect {serial}"
+                assert b"kill: process" in transcript, f"missing kill report; inspect {serial}"
+                assert transcript.index(b"gfx-hold: holding after present") < transcript.index(b"kill: process"), (
+                    f"the presenter was killed before it presented; inspect {serial}")
+                assert b"drv-fb: presentation client closed" in transcript, f"missing lane close; inspect {serial}"
+                assert b"drv-fb: view 0 recovered" in transcript, f"missing recovery record; inspect {serial}"
+                assert b"sora: view 0 presented before the kill" in transcript
+                assert b"sora: view 0 recovered after the kill" in transcript
+                assert transcript.count(client) == 1, f"missing restarted presenter; inspect {serial}"
+                assert transcript.index(b"kill: process") < transcript.index(client), (
+                    f"the restarted presenter ran before the kill; inspect {serial}")
+                assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
+                assert b"sora: gfx-recover: view 0 recovered and regranted" in transcript
+                assert b"drv-fb: view regrant refused" not in transcript
             elif args.regrant:
                 bmp = b"bmp-view: bitmap copied; buffer released (software GOP)"
                 assert transcript.count(client) == 2, f"missing two client presents; inspect {serial}"
@@ -487,7 +512,7 @@ def main():
             command("screendump", {"filename": str(work / "screen.ppm")})
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
                          args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage,
-                         args.regrant, args.async_regrant, args.titles)
+                         args.regrant, args.async_regrant, args.recover, args.titles)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
@@ -500,6 +525,8 @@ def main():
                 print("Regrant UEFI smoke green: a released view accepted a fresh client and surface")
             if args.async_regrant:
                 print("Async-regrant UEFI smoke green: both ASYNC client exits released their views for a fresh client")
+            if args.recover:
+                print("Recover UEFI smoke green: a killed presenter released its view and a fresh client painted it")
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")

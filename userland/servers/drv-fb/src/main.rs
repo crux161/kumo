@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j670
 //j671
 //j672
 //j673
 //j674
+//j675
 
 mod clock_probe;
 mod display_probe;
@@ -783,6 +783,20 @@ extern "C" fn main(
                 let _ = kumo_rt::channel_write(bootstrap, reply.as_ptr(), reply.len());
                 continue;
             }
+            if n == 1 && rx[0] == kumo_graphics::PRESENTED_QUERY_TAG {
+                if channel.0 != 0 {
+                    let _ = kumo_rt::handle_close(channel);
+                }
+                let mut mask = 0u8;
+                for (index, entry) in view_content.iter().enumerate() {
+                    if entry.is_some() {
+                        mask |= 1u8 << index;
+                    }
+                }
+                let reply = kumo_graphics::presented_reply(mask);
+                let _ = kumo_rt::channel_write(bootstrap, reply.as_ptr(), reply.len());
+                continue;
+            }
             if n == kumo_graphics::POINTER_RECORD_LEN && rx[0] == kumo_graphics::POINTER_TAG {
                 if channel.0 != 0 {
                     let _ = kumo_rt::handle_close(channel);
@@ -1121,6 +1135,16 @@ extern "C" fn main(
                 lanes[index] = None;
                 view_released[index] = true;
                 log_info(b"drv-fb: presentation client closed\n");
+                // F2c slice-6: a presenter that dies after its first frame leaves a recorded,
+                // recoverable view. The frame stays retained (F2a-3); the record names the
+                // view so the supervisor's recovery is observable per view. — TIMBERDOODLE
+                if view_content[index].is_some() {
+                    let mut line = Line::new();
+                    line.push(b"drv-fb: view ");
+                    line.push_decimal(index);
+                    line.push(b" recovered\n");
+                    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+                }
                 continue;
             }
             if extra_handle != 0 {

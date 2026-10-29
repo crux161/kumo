@@ -1,8 +1,8 @@
-//j572
 //j578
 //j595
 //j648
 //j669
+//j675
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -50,6 +50,10 @@ pub const GFX_CLIENT_PATH: &str = "bin/gfx-client";
 /// An input consumer for the focused view (F2b focus routing): receives one input channel in
 /// `x0`, logs each byte it receives, and exits when the channel closes.
 pub const GFX_KEYS_PATH: &str = "bin/gfx-keys";
+/// A long-lived presentation client for the presenter-recovery proof: receives one
+/// presentation channel in `x0` and one surface VMO in `x1`, presents once, and parks until
+/// the supervisor kills it. — TIMBERDOODLE
+pub const GFX_HOLD_PATH: &str = "bin/gfx-hold";
 /// G6b's cooperative GPU session proof program; receives only its GPU channel in x0.
 pub const GPU_CLIENT_PATH: &str = "bin/gpu-client";
 /// `ls` as a real program: receives a read-only initrd VMO handle in `x0` and prints
