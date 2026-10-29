@@ -5,6 +5,7 @@
 //j675
 //j684
 //j687
+//j696
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -14,6 +15,10 @@
 pub mod native;
 
 pub const SURFACE_BYTES: usize = 256 * 1024;
+/// PLAN/016 C3 S2 / DESIGN/025: the region-surface class bound for full-width server-owned
+/// regions (the text console below the band). Ratified at 8 MiB with the view class
+/// unchanged, so every existing client and smoke model is untouched. — TIMBERDOODLE
+pub const REGION_SURFACE_BYTES: usize = 8 * 1024 * 1024;
 /// `KGP2` frame: magic, sequence, surface (four words), damage count, four 16-byte rects.
 pub const REQUEST_LEN: usize = 92;
 pub const REPLY_LEN: usize = 12;
@@ -151,6 +156,31 @@ impl Surface {
 
     pub fn fits(self, backing_bytes: usize) -> bool {
         self.byte_len().is_some_and(|bytes| bytes <= backing_bytes)
+    }
+
+    /// The region-surface class: the same validation and extent rules as a view-class
+    /// surface, bounded at [`REGION_SURFACE_BYTES`] instead of [`SURFACE_BYTES`].
+    /// — TIMBERDOODLE
+    pub fn byte_len_region(self) -> Option<usize> {
+        if self.width == 0
+            || self.height == 0
+            || self.stride < self.width
+            || self.format != XRGB8888
+        {
+            return None;
+        }
+        let bytes = u64::from(self.stride)
+            .checked_mul(u64::from(self.height))?
+            .checked_mul(4)?;
+        usize::try_from(bytes)
+            .ok()
+            .filter(|bytes| *bytes <= REGION_SURFACE_BYTES)
+    }
+
+    /// Whether a region-class surface fits `backing_bytes` under the region bound.
+    pub fn fits_region(self, backing_bytes: usize) -> bool {
+        self.byte_len_region()
+            .is_some_and(|bytes| bytes <= backing_bytes)
     }
 }
 
@@ -667,6 +697,30 @@ mod tests {
         .encode();
         reply[8] = 99;
         assert_eq!(Reply::decode(&reply), None);
+    }
+
+    #[test]
+    fn region_surfaces_take_the_region_class_not_the_view_class() {
+        let console = Surface {
+            width: 1600,
+            height: 740,
+            stride: 1600,
+            format: XRGB8888,
+        };
+        assert!(
+            console.byte_len().is_none(),
+            "view class must not take a 4.7 MiB region"
+        );
+        assert_eq!(console.byte_len_region(), Some(1600 * 740 * 4));
+        assert!(console.fits_region(REGION_SURFACE_BYTES));
+        let oversized = Surface {
+            width: 4096,
+            height: 1080,
+            stride: 4096,
+            format: XRGB8888,
+        };
+        assert!(oversized.byte_len_region().is_none());
+        assert!(DEMO.fits(REGION_SURFACE_BYTES));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //j687
 //j690
 //j695
+//j696
 
 mod clock_probe;
 mod display_probe;
@@ -52,9 +53,9 @@ fn flush_console(
     region_y: u32,
     width: u32,
     height: u32,
-) {
+) -> bool {
     let Some(damage) = con.take_damage() else {
-        return;
+        return false;
     };
     let rect = kumo_graphics::Damage {
         x: damage.x,
@@ -63,7 +64,7 @@ fn flush_console(
         height: damage.height,
     };
     let Some(rect) = drv_fb::clip_damage(rect, width, height) else {
-        return;
+        return false;
     };
     drv_fb::copy_shadow_rect(
         stride,
@@ -75,6 +76,7 @@ fn flush_console(
     unsafe {
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
+    true
 }
 
 /// One log line built without `core::fmt` (J559).
@@ -465,6 +467,24 @@ extern "C" fn main(
             pixel_order,
         )
     };
+    // PLAN/016 C3 S2 / DESIGN/025: the console region is a region-class surface; validate its
+    // extent against the ratified 8 MiB bound before the console claims it.
+    let region_surface = kumo_graphics::Surface {
+        width: region.width,
+        height: region.height,
+        stride: stride as u32,
+        format: kumo_graphics::XRGB8888,
+    };
+    match region_surface.byte_len_region() {
+        Some(bytes) => {
+            let mut line = Line::new();
+            line.push(b"display: console region surface ");
+            line.push_decimal(bytes);
+            line.push(b" bytes (region class)\n");
+            let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+        }
+        None => log_err(b"display: console region exceeds the region-surface class\n"),
+    }
     // Paint the band: background, server-drawn chrome, and empty view wells. Client pixels
     // reach the glass only through present_view, and only inside a view rectangle.
     if let Some(band) = &layout {
@@ -620,6 +640,7 @@ extern "C" fn main(
         }
     }
     let mut gate: Option<Gate> = None;
+    let mut console_retired_once = false;
 
     let mut cursor: Option<Cursor> = None;
     let mut pointer_records: u32 = 0;
@@ -783,7 +804,7 @@ extern "C" fn main(
             line.push_decimal((deferred_max_ns / 1000) as usize);
             line.push(b"\n");
             let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
-            flush_console(
+            if flush_console(
                 &mut con,
                 shadow,
                 fb_va,
@@ -791,7 +812,21 @@ extern "C" fn main(
                 region.y,
                 width as u32,
                 height as u32,
-            );
+            ) {
+                // PLAN/016 C3 S2 / DESIGN/025: the console's own present asks the vblank gate
+                // for a consumed frame start, exactly as client presents do.
+                // Never narrate a present through the log it would appear in: only the
+                // one-time retirement NOTICE is recorded, or the console feeds itself.
+                // — TIMBERDOODLE
+                let retired = gate.is_some_and(Gate::frame_started);
+                if retired && !console_retired_once {
+                    console_retired_once = true;
+                    let _ = kumo_rt::log_write(
+                        kumo_abi::sys::log_level::NOTICE,
+                        b"display: console present retired (region surface)\n",
+                    );
+                }
+            }
         }
         was_deferred = deferred;
         // F2c: per-window title bars are the fourth overlay: a chrome strip across the top of
@@ -1313,7 +1348,7 @@ extern "C" fn main(
                     deferred_max_ns =
                         deferred_max_ns.max(kumo_rt::clock_get().saturating_sub(started));
                 } else {
-                    flush_console(
+                    if flush_console(
                         &mut con,
                         shadow,
                         fb_va,
@@ -1321,7 +1356,16 @@ extern "C" fn main(
                         region.y,
                         width as u32,
                         height as u32,
-                    );
+                    ) {
+                        let retired = gate.is_some_and(Gate::frame_started);
+                        if retired && !console_retired_once {
+                            console_retired_once = true;
+                            let _ = kumo_rt::log_write(
+                                kumo_abi::sys::log_level::NOTICE,
+                                b"display: console present retired (region surface)\n",
+                            );
+                        }
+                    }
                 }
             }
         } else if let Some(index) = lanes
