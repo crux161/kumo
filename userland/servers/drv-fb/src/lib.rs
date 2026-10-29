@@ -9,6 +9,7 @@
 //j688
 //j689
 //j692
+//j695
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -226,6 +227,9 @@ pub struct Console {
     csi_bytes: u8,
     cursor_visible: bool,
     cursor_drawn: bool,
+    /// Cells touched since the last [`Console::take_damage`]: `(col0, row0, col1, row1)`
+    /// half-open and clamped to the grid. — TIMBERDOODLE
+    dirty: Option<(usize, usize, usize, usize)>,
 }
 
 impl Console {
@@ -335,6 +339,7 @@ impl Console {
             csi_bytes: 0,
             cursor_visible: false,
             cursor_drawn: false,
+            dirty: None,
         };
         if clear {
             con.clear();
@@ -514,6 +519,7 @@ impl Console {
                                 colors,
                             );
                         }
+                        self.mark(self.col, self.row, self.col + columns, self.row + 1);
                         self.col += columns;
                     }
                     None => {
@@ -535,6 +541,7 @@ impl Console {
                                 colors,
                             );
                         }
+                        self.mark(self.col, self.row, self.col + columns, self.row + 1);
                         self.col += columns;
                     }
                 }
@@ -808,6 +815,7 @@ impl Console {
     }
 
     fn draw_cursor(&mut self) {
+        self.mark(self.col, self.row, self.col + 1, self.row + 1);
         if !self.cursor_drawn && self.col < self.cols && self.row < self.rows {
             self.invert_cursor_cell();
             self.cursor_drawn = true;
@@ -891,14 +899,52 @@ impl Console {
     ///
     /// # Safety
     /// `index` must be below `len_px`.
-    unsafe fn put(&self, index: usize, color: u32) {
+    unsafe fn put(&mut self, index: usize, color: u32) {
+        // PLAN/016 C3 S1 / DESIGN/025: every pixel write marks its cell so the server can
+        // present the console as batched damage instead of per-glyph glass writes.
+        // — TIMBERDOODLE
+        if self.stride != 0 {
+            let x = index % self.stride;
+            let y = index / self.stride;
+            self.mark(x / GLYPH_W, y / GLYPH_H, x / GLYPH_W + 1, y / GLYPH_H + 1);
+        }
         unsafe {
             self.shadow.add(index).write(color);
-            self.base.add(index).write_volatile(color);
+            if !core::ptr::eq(self.base, self.shadow) {
+                self.base.add(index).write_volatile(color);
+            }
         }
     }
 
+    /// Record that cells `[col0, col1) x [row0, row1)` were touched, clamped to the grid.
+    fn mark(&mut self, col0: usize, row0: usize, col1: usize, row1: usize) {
+        let col0 = col0.min(self.cols);
+        let row0 = row0.min(self.rows);
+        let col1 = col1.min(self.cols);
+        let row1 = row1.min(self.rows);
+        if col0 >= col1 || row0 >= row1 {
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            Some((c0, r0, c1, r1)) => (c0.min(col0), r0.min(row0), c1.max(col1), r1.max(row1)),
+            None => (col0, row0, col1, row1),
+        });
+    }
+
+    /// Take the pixel rectangle touched since the last call, in console-local coordinates.
+    /// The console's caller presents exactly this rectangle to the glass. — TIMBERDOODLE
+    pub fn take_damage(&mut self) -> Option<kumo_graphics::Damage> {
+        let (col0, row0, col1, row1) = self.dirty.take()?;
+        Some(kumo_graphics::Damage {
+            x: (col0 * GLYPH_W) as u32,
+            y: (row0 * GLYPH_H) as u32,
+            width: ((col1 - col0) * GLYPH_W) as u32,
+            height: ((row1 - row0) * GLYPH_H) as u32,
+        })
+    }
+
     fn scroll(&mut self) {
+        self.mark(0, 0, self.cols, self.rows);
         let shift = GLYPH_H * self.stride;
         let visible = (self.rows * GLYPH_H * self.stride).min(self.len_px);
         let kept = visible.saturating_sub(shift);
@@ -2806,6 +2852,46 @@ mod tests {
         assert!(buf[GLYPH_H * STRIDE..]
             .iter()
             .all(|&pixel| pixel == 0x1234_5678));
+    }
+
+    #[test]
+    fn dirty_cells_track_writes_wide_glyphs_scrolls_and_clears() {
+        let mut buf = fresh();
+        let mut con = unsafe { Console::new(buf.as_mut_ptr(), W, H, STRIDE) };
+        // The constructor's clear is the first damage; discard it.
+        let _ = con.take_damage();
+        con.write(b"A");
+        assert_eq!(
+            con.take_damage(),
+            Some(kumo_graphics::Damage {
+                x: 0,
+                y: 0,
+                width: GLYPH_W as u32,
+                height: GLYPH_H as u32,
+            })
+        );
+        assert_eq!(con.take_damage(), None);
+        // A wide glyph at column 1 spans two cells.
+        con.write("あ".as_bytes());
+        assert_eq!(
+            con.take_damage(),
+            Some(kumo_graphics::Damage {
+                x: GLYPH_W as u32,
+                y: 0,
+                width: 2 * GLYPH_W as u32,
+                height: GLYPH_H as u32,
+            })
+        );
+        // A scroll touches the whole grid.
+        con.write(b"\r\n\r\nX");
+        let scrolled = con.take_damage().expect("scroll damages the whole grid");
+        assert_eq!((scrolled.x, scrolled.y), (0, 0));
+        assert_eq!((scrolled.width, scrolled.height), (W as u32, H as u32));
+        // So does a clear.
+        con.clear();
+        let full = con.take_damage().expect("clear damages the whole grid");
+        assert_eq!((full.x, full.y), (0, 0));
+        assert_eq!((full.width, full.height), (W as u32, H as u32));
     }
 
     #[test]

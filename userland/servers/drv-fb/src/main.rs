@@ -9,6 +9,7 @@
 //j686
 //j687
 //j690
+//j695
 
 mod clock_probe;
 mod display_probe;
@@ -38,6 +39,43 @@ fn log_err(message: &[u8]) {
 }
 
 kumo_rt::entry!(main);
+
+/// PLAN/016 C3 S1 / DESIGN/025: present the console's accumulated damage to the glass in one
+/// shadow-to-glass copy. The console renders into the shadow only now; this is its only
+/// console paint, and the loop top's overlays repaint above it on the next pass.
+/// — TIMBERDOODLE
+fn flush_console(
+    con: &mut Console,
+    shadow: *mut u32,
+    fb_va: u64,
+    stride: usize,
+    region_y: u32,
+    width: u32,
+    height: u32,
+) {
+    let Some(damage) = con.take_damage() else {
+        return;
+    };
+    let rect = kumo_graphics::Damage {
+        x: damage.x,
+        y: damage.y + region_y,
+        width: damage.width,
+        height: damage.height,
+    };
+    let Some(rect) = drv_fb::clip_damage(rect, width, height) else {
+        return;
+    };
+    drv_fb::copy_shadow_rect(
+        stride,
+        |at| unsafe { shadow.add(at).read_volatile() },
+        rect,
+        |at, pixel| unsafe { (fb_va as *mut u32).add(at).write_volatile(pixel) },
+    );
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
 
 /// One log line built without `core::fmt` (J559).
 struct Line {
@@ -413,10 +451,13 @@ extern "C" fn main(
     let layout = kumo_graphics::band(width as u32, height as u32);
     let region = kumo_graphics::console_region(width as u32, height as u32);
     let console_px = region.y as usize * stride;
-    // Build the text console below the band (clears only that region).
+    // Build the text console below the band (clears only that region). PLAN/016 C3 S1 /
+    // DESIGN/025: the console renders into the cached shadow only; the serving loop presents
+    // its batched damage to the glass, retiring the per-glyph volatile glass write.
+    // — TIMBERDOODLE
     let mut con = unsafe {
         Console::new_shadowed(
-            (fb_va as *mut u32).add(console_px),
+            shadow.add(console_px),
             shadow.add(console_px),
             region.width as usize,
             region.height as usize,
@@ -726,7 +767,10 @@ extern "C" fn main(
     let (mut deferred_bytes, mut deferred_max_ns) = (0u64, 0u64);
     loop {
         let measuring = r1.as_ref().is_some_and(|p| p.measuring_vblank());
-        let deferred = con.defer_output(measuring);
+        // S1: deferral is the loop withholding its glass present while the console keeps
+        // rendering into the shadow; the console's damage accumulates until the flush.
+        // — TIMBERDOODLE
+        let deferred = measuring;
         if deferred && !was_deferred {
             deferred_bytes = 0;
             deferred_max_ns = 0;
@@ -739,6 +783,15 @@ extern "C" fn main(
             line.push_decimal((deferred_max_ns / 1000) as usize);
             line.push(b"\n");
             let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+            flush_console(
+                &mut con,
+                shadow,
+                fb_va,
+                stride,
+                region.y,
+                width as u32,
+                height as u32,
+            );
         }
         was_deferred = deferred;
         // F2c: per-window title bars are the fourth overlay: a chrome strip across the top of
@@ -1259,6 +1312,16 @@ extern "C" fn main(
                     deferred_bytes += n as u64;
                     deferred_max_ns =
                         deferred_max_ns.max(kumo_rt::clock_get().saturating_sub(started));
+                } else {
+                    flush_console(
+                        &mut con,
+                        shadow,
+                        fb_va,
+                        stride,
+                        region.y,
+                        width as u32,
+                        height as u32,
+                    );
                 }
             }
         } else if let Some(index) = lanes
