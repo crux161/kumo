@@ -9,6 +9,7 @@
 //j690
 //j691
 //j692
+//j693
 
 extern crate alloc;
 
@@ -96,6 +97,9 @@ static LOG_ROW_HASH: [AtomicU64; LOG_ROWS] = [
 ];
 /// Koid of the surface those hashes describe; a regranted view starts from a blank VMO.
 static LOG_VMO_KOID: AtomicU64 = AtomicU64::new(0);
+/// C3 slice-3: while set, the serve loop refreshes the log view on a cadence so the
+/// surface follows the log without anyone typing `gfx-log`.
+static LOG_MIRROR: AtomicBool = AtomicBool::new(false);
 
 /// Bounded reply reads for the supervisor's demo presents. Sora's channel read parks once
 /// per call and returns an empty read on any unrelated wake, and the production vblank gate
@@ -1149,12 +1153,13 @@ fn log_row_hash(row: &[u8]) -> u64 {
     hash
 }
 
-fn gfx_log(cmd: &kumoza::Command) {
+/// One log-view refresh: read the ring's tail, render changed rows over the retained
+/// surface, present a bounding damage set, and decode the reply. `quiet_unchanged` keeps
+/// the mirror's idle ticks silent; one-shot runs announce the no-change skip. Returns false
+/// when the view is unavailable, and the caller decides whether that is fatal.
+/// — TIMBERDOODLE
+fn log_refresh(quiet_unchanged: bool) -> bool {
     use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
-    if !cmd.args.is_empty() {
-        usage(b"usage: gfx-log\n");
-        return;
-    }
     const LOG_VIEW: usize = 0;
     const LOG_VA: u64 = 0x3800_0000;
     let channel = Handle(GRAPHICS_CHANNEL[LOG_VIEW].swap(0, Ordering::Relaxed));
@@ -1164,8 +1169,7 @@ fn gfx_log(cmd: &kumoza::Command) {
             GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
         }
         log(b"gfx-log: no graphics view held\n");
-        fail_status(1);
-        return;
+        return false;
     }
     let map = vmar_map(
         Handle(0),
@@ -1178,8 +1182,7 @@ fn gfx_log(cmd: &kumoza::Command) {
     if map != 0 {
         GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
         log(b"gfx-log: surface map failed\n");
-        fail_status(1);
-        return;
+        return false;
     }
     let result = (|| -> Option<(Status, Option<([u64; LOG_ROWS], (usize, usize))>)> {
         if !child_parked(process_wait()) {
@@ -1328,7 +1331,10 @@ fn gfx_log(cmd: &kumoza::Command) {
         Some((Status::Copied | Status::Retired, None)) => {
             // A valid reply with no changed rows: the retained surface is current.
             GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
-            term(b"gfx-log: view 0 unchanged; no present\n");
+            if !quiet_unchanged {
+                term(b"gfx-log: view 0 unchanged; no present\n");
+            }
+            true
         }
         Some((status, Some((hashes, (first, last)))))
             if matches!(status, Status::Copied | Status::Retired) =>
@@ -1346,17 +1352,38 @@ fn gfx_log(cmd: &kumoza::Command) {
             term(b"; rows ");
             term(&[b'0' + first as u8, b'-', b'0' + last as u8]);
             term(b" damaged\n");
+            true
         }
         Some(_) => {
             let _ = handle_close(channel);
             log(b"gfx-log: view 0 rejected; view disabled\n");
-            fail_status(1);
+            false
         }
         None => {
             let _ = handle_close(channel);
             log(b"gfx-log: view 0 failed; view disabled\n");
-            fail_status(1);
+            false
         }
+    }
+}
+
+fn gfx_log(cmd: &kumoza::Command) {
+    match cmd.args.first().map(|arg| arg.as_str()) {
+        None => {
+            if !log_refresh(false) {
+                fail_status(1);
+            }
+        }
+        Some("on") => {
+            LOG_MIRROR.store(true, Ordering::Relaxed);
+            term(b"gfx-log: mirror on\n");
+            let _ = log_refresh(false);
+        }
+        Some("off") => {
+            LOG_MIRROR.store(false, Ordering::Relaxed);
+            term(b"gfx-log: mirror off\n");
+        }
+        _ => usage(b"usage: gfx-log [on|off]\n"),
     }
 }
 
@@ -1666,6 +1693,24 @@ const BOOT_SETTLE_NS: u64 = 3_000_000_000;
 /// Arm the first-prompt timer on `port`; `None` when no timer could be bound.
 fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
     let raw = timer_create(BOOT_SETTLE_NS);
+    if raw == u64::MAX {
+        return None;
+    }
+    let timer = Handle(raw as u32);
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return None;
+    }
+    Some((timer, Handle(koid as u32)))
+}
+
+/// The live log mirror's cadence: often enough to feel current, rare enough that a gated
+/// present's two-frame wait never crowds the serve loop. — TIMBERDOODLE
+const LOG_MIRROR_NS: u64 = 250_000_000;
+
+fn arm_log_mirror(port: Handle) -> Option<(Handle, Handle)> {
+    let raw = timer_create(LOG_MIRROR_NS);
     if raw == u64::MAX {
         return None;
     }
@@ -4670,6 +4715,7 @@ extern "C" fn sora_main(
             sora::RestartBackoff::new(TTYD_INITIAL_BACKOFF_NS, TTYD_MAX_BACKOFF_NS);
         let mut pending_ttyd_restart: Option<(sora::ServerRecipe<'static>, Handle)> = None;
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
+        let mut log_mirror_timer: Option<(Handle, Handle)> = None;
 
         log(b"sora: entering serve loop\n");
         SERVING.store(true, Ordering::Relaxed);
@@ -4690,6 +4736,14 @@ extern "C" fn sora_main(
         // `channel_read`: an empty HID channel would park Sora inside the syscall's SoraState
         // borrow, leaving the boot floor alive but unable to forward any ordinary console input.
         loop {
+            // A typed `gfx-log on` lands mid-loop; arm the mirror cadence on the next pass.
+            if LOG_MIRROR.load(Ordering::Relaxed) && log_mirror_timer.is_none() {
+                log_mirror_timer = arm_log_mirror(port);
+                if log_mirror_timer.is_none() {
+                    log(b"gfx-log: mirror timer unavailable\n");
+                    LOG_MIRROR.store(false, Ordering::Relaxed);
+                }
+            }
             let source = Handle(port_wait(port) as u32);
             if display_koid == Some(source) {
                 if let Some(b) = display_broker.as_ref() {
@@ -4705,6 +4759,21 @@ extern "C" fn sora_main(
             }
             if first_prompt.map(|(_, koid)| koid) == Some(source) {
                 settle_first_prompt(&mut first_prompt, port, &cwd, b"timeout");
+                continue;
+            }
+            if log_mirror_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = log_mirror_timer.take() else {
+                    continue;
+                };
+                let _ = port_unbind(port, timer);
+                let _ = handle_close(timer);
+                if LOG_MIRROR.load(Ordering::Relaxed) && !log_refresh(true) {
+                    LOG_MIRROR.store(false, Ordering::Relaxed);
+                    log(b"gfx-log: mirror disabled; view unavailable\n");
+                }
+                if LOG_MIRROR.load(Ordering::Relaxed) {
+                    log_mirror_timer = arm_log_mirror(port);
+                }
                 continue;
             }
             if login_pause_koid() == Some(source) {

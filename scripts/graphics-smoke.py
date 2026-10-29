@@ -82,10 +82,11 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # paints both views so the proven two-view band model applies unchanged.
                 data = b"dmesg -n 6\ngfx-titles on\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if log:
-                # C3 slices 1-2: the log's tail presented as view 0's surface, then two more
-                # runs — one after new log lines (partial row damage) and one with an
-                # unchanged tail (no present at all).
-                data = b"dmesg -n 6\ngfx-log\nrun hello\ngfx-log\ngfx-log\necho graphics-smoke-after-present\ndmesg -n 5\n"
+                # C3 slices 1-3: the log's tail presented as view 0's surface, two more runs
+                # (partial row damage, then an unchanged no-present tail), and the live
+                # mirror left on so the serve loop keeps refreshing the view through the
+                # rest of boot.
+                data = b"dmesg -n 6\ngfx-log\nrun hello\ngfx-log\ngfx-log\ngfx-log on\nrun args alpha beta\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -626,6 +627,11 @@ def main():
                 )
                 assert b"gfx-log: no graphics view held" not in transcript
                 assert b"graphics-smoke-after-present" in transcript
+                # C3 slice-3: the mirror keeps the view live after the serve loop starts.
+                assert b"gfx-log: mirror on" in transcript, f"missing mirror record; inspect {serial}"
+                assert transcript.rfind(b"gfx-log: view 0") > transcript.rfind(
+                    b"sora: entering serve loop"
+                ), f"mirror never refreshed after the serve loop started; inspect {serial}"
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -684,7 +690,7 @@ def main():
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             if args.log:
-                print("Log UEFI smoke green: the kernel log presented as a client surface, only changed rows damaged")
+                print("Log UEFI smoke green: the kernel log presented as a client surface, only changed rows damaged, and kept live by the mirror")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:
