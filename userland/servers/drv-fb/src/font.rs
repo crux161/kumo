@@ -1,8 +1,9 @@
 //j552
+//j673
 
 //! Fixed console bitmaps: ASCII 8x16, CJK 16x16, and single-cell box drawing.
 
-use super::GLYPH_H;
+use super::{GLYPH_H, GLYPH_W};
 
 const ASCII_FONT: &[u8] = include_bytes!("../font8x16.psf");
 // Share the existing offline-generated data, not the HAL implementation. This
@@ -117,9 +118,53 @@ fn box_glyph(scalar: u32) -> Option<Glyph> {
     Some(Glyph::narrow(&rows))
 }
 
+/// ASCII glyphs now come from the vendored face at a scale whose advance is one cell (8 px),
+/// thresholded into the same 8x16 mask the PSF source produced, so the console's geometry,
+/// scroll, winsize and CJK path are untouched. Falls back to the PSF bitmap when the face
+/// cannot be parsed. — TIMBERDOODLE
+fn face_ascii(ch: u8) -> Option<Glyph> {
+    use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
+    let font = FontRef::try_from_slice(super::FACE_TTF).ok()?;
+    // Maple Mono's advance is 0.6 em, so one 8-px cell puts the scale at 8 / 0.6 pixels.
+    let scale = PxScale::from(GLYPH_W as f32 / 0.6);
+    let scaled = font.as_scaled(scale);
+    // Keep the PSF source's tofu rule: a non-printable byte renders as '?'.
+    let printable = if (0x20..=0x7e).contains(&ch) {
+        ch
+    } else {
+        b'?'
+    };
+    let glyph_id = font.glyph_id(printable as char);
+    let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(0.0, scaled.ascent()));
+    let outlined = font.outline_glyph(glyph)?;
+    let bounds = outlined.px_bounds();
+    let mut rows = [0u16; GLYPH_H];
+    outlined.draw(|gx, gy, coverage| {
+        if coverage < 0.5 {
+            return;
+        }
+        let px = bounds.min.x + gx as f32;
+        let py = bounds.min.y + gy as f32;
+        if px < 0.0 || py < 0.0 {
+            return;
+        }
+        let (px, py) = (px as usize, py as usize);
+        if px >= GLYPH_W || py >= GLYPH_H {
+            return;
+        }
+        rows[py] |= 0x8000 >> px;
+    });
+    Some(Glyph { columns: 1, rows })
+}
+
+/// Whether the console's ASCII source is the vendored face rather than the PSF bitmap.
+pub(super) fn face_ascii_ready() -> bool {
+    ab_glyph::FontRef::try_from_slice(super::FACE_TTF).is_ok()
+}
+
 pub(super) fn glyph(scalar: u32) -> Glyph {
     if scalar < 0x80 {
-        return Glyph::narrow(ascii_rows(scalar as u8));
+        return face_ascii(scalar as u8).unwrap_or_else(|| Glyph::narrow(ascii_rows(scalar as u8)));
     }
     if let Some(glyph) = box_glyph(scalar) {
         return glyph;
@@ -150,6 +195,19 @@ mod tests {
         assert!(cjk_rows(0x1f642).is_none());
         assert_eq!(glyph(0x1f642).columns, 2);
         assert!(glyph(0x1f642).rows.iter().any(|&bits| bits != 0));
+    }
+
+    #[test]
+    fn ascii_glyphs_come_from_the_face_within_one_cell() {
+        assert!(face_ascii_ready());
+        let glyph = glyph(b'A' as u32);
+        assert_eq!(glyph.columns, 1);
+        assert!(glyph.rows.iter().any(|&bits| bits != 0), "no ink in A");
+        // Every set bit is inside the eight columns of one cell.
+        assert!(glyph.rows.iter().all(|&bits| bits & 0x00ff == 0));
+        // The face's outline differs from the PSF bitmap in at least one row.
+        let psf = Glyph::narrow(ascii_rows(b'A'));
+        assert!(glyph.rows.iter().zip(psf.rows.iter()).any(|(a, b)| a != b));
     }
 
     #[test]

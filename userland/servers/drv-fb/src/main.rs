@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j667
 //j668
 //j670
 //j671
 //j672
+//j673
 
 mod clock_probe;
 mod display_probe;
@@ -452,6 +452,12 @@ extern "C" fn main(
     let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
     log_info(b"drv-fb: initialized\n");
     log_info(b"drv-fb: console ready\n");
+    if drv_fb::font_face_ascii_ready() {
+        let _ = kumo_rt::log_write(
+            kumo_abi::sys::log_level::NOTICE,
+            b"drv-fb: console face maple-mono 13.3px\n",
+        );
+    }
 
     // Map each view's read-only surface after the fixed framebuffer and shadow mappings, so
     // the kernel's placement cannot be overwritten by them. Mapping failure disables only

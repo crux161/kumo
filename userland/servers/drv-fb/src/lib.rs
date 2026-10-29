@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j667
 //j668
 //j670
 //j671
 //j672
+//j673
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -34,7 +34,12 @@ pub mod rk3588_shared;
 pub mod rk3588_vblank;
 
 #[cfg(test)]
-use font::ascii_rows as glyph_rows;
+/// The console's ASCII glyph rows in the low-byte form the layout tests read, backed by the
+/// same glyph source the console draws (the vendored face, with the PSF fallback inside
+/// `font::glyph`). — TIMBERDOODLE
+fn glyph_rows(ch: u8) -> [u16; GLYPH_H] {
+    core::array::from_fn(|y| font::glyph(ch as u32).rows[y] >> 8)
+}
 
 /// Glyph cell dimensions of the embedded PSF2 font.
 pub const GLYPH_W: usize = 8;
@@ -974,6 +979,11 @@ pub fn blit_ascii<W: FnMut(usize, u32)>(
 /// The vendored face: Maple Mono NF CN by subframe7536, subset to ASCII under the SIL Open
 /// Font License 1.1 (the license text ships beside the asset). — TIMBERDOODLE
 const FACE_TTF: &[u8] = include_bytes!("../assets/maple-ascii.ttf");
+
+/// Whether the console's ASCII glyphs are being drawn from the vendored face.
+pub fn font_face_ascii_ready() -> bool {
+    font::face_ascii_ready()
+}
 
 /// Draw one line of ASCII at `(x, y)` rasterized from the vendored face at `GLYPH_H` pixels.
 /// Coverage of at least one half writes `color`, so the result is pure ink on the background
