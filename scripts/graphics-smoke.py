@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j658
 #j659
 #j660
 #j670
 #j672
+#j674
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -225,11 +225,20 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
         images = [demo_pixel, demo_pixel]
     else:
         images = [demo_pixel, lambda x, y: VIEW_SOLID]
+    # F2c: the server draws a title bar across the top of each view; the band model excludes
+    # those strips and their contents are asserted separately below.
+    title_rects = [(vx, vy, VIEW_W, 16) for vx, vy in rects]
+
+    def in_rects(x, y, rects_):
+        return any(rx <= x < rx + rw and ry <= y < ry + rh for rx, ry, rw, rh in rects_)
+
     def in_label(x, y):
-        return any(lx <= x < lx + lw and ly <= y < ly + lh for lx, ly, lw, lh in LABEL_RECTS)
+        return in_rects(x, y, LABEL_RECTS)
 
     for y in range(BAND_H):
         for x in range(width):
+            if in_rects(x, y, title_rects):
+                continue
             if titles and in_label(x, y):
                 continue
             want = compose_expected(x, y, rects, images)
@@ -256,6 +265,25 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
                     )
             assert inked > 8, f"label {index} has only {inked} glyph pixels"
         print("Titles band: server-drawn anti-aliased glyph labels present")
+    for index, (bx, by, bw, bh) in enumerate(title_rects):
+        inked = 0
+        for y in range(by, by + bh):
+            for x in range(bx, bx + bw):
+                pixel = at(x, y)
+                if pixel == CHROME_COLOR:
+                    continue
+                inked += 1
+                fractions = []
+                for channel, floor in zip(pixel, CHROME_COLOR):
+                    assert floor <= channel <= 255, (
+                        f"title bar {index} pixel {(x, y)} leaves the chrome envelope"
+                    )
+                    fractions.append((channel - floor) / (255 - floor))
+                assert max(fractions) - min(fractions) <= 0.08, (
+                    f"title bar {index} pixel {(x, y)} is not white blended over chrome"
+                )
+        assert inked > 8, f"title bar {index} has only {inked} title pixels"
+    print("Title bars: per-view chrome strips with blended titles present")
 
     # The clipped surface's out-of-view poison must never reach the glass.
     poison = sum(1 for y in range(height) for x in range(width) if at(x, y) == POISON)

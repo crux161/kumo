@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j668
 //j670
 //j671
 //j672
 //j673
+//j674
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -1033,6 +1033,26 @@ pub fn blit_face<W: FnMut(usize, u32)>(
         caret += scaled.h_advance(glyph_id);
     }
     true
+}
+
+/// Fill a framebuffer rectangle with one colour, clipped to the framebuffer. `write` receives
+/// absolute indices; the framebuffer is non-cacheable, so no cache maintenance is needed.
+pub fn fill_rect<W: FnMut(usize, u32)>(
+    width: u32,
+    height: u32,
+    stride: usize,
+    rect: kumo_graphics::Damage,
+    color: u32,
+    mut write: W,
+) {
+    let Some(rect) = clip_damage(rect, width, height) else {
+        return;
+    };
+    for y in rect.y..rect.y + rect.height {
+        for x in rect.x..rect.x + rect.width {
+            write(y as usize * stride + x as usize, color);
+        }
+    }
 }
 
 /// Blend `ink` over `background` at `coverage` (0..=1) bytewise in the order's packed space:
@@ -2331,6 +2351,28 @@ mod tests {
             }
         }
         assert!(partial > 8, "only {partial} partially covered pixels");
+    }
+
+    #[test]
+    fn fill_rect_paints_and_clips_at_the_framebuffer() {
+        let mut glass = [0u32; 8 * 8];
+        fill_rect(
+            8,
+            8,
+            8,
+            kumo_graphics::Damage {
+                x: 6,
+                y: 6,
+                width: 4,
+                height: 4,
+            },
+            0x0012_3456,
+            |at, color| glass[at] = color,
+        );
+        assert_eq!(glass[6 * 8 + 6], 0x0012_3456);
+        assert_eq!(glass[7 * 8 + 7], 0x0012_3456);
+        assert_eq!(glass[5 * 8 + 6], 0);
+        assert_eq!(glass[6 * 8 + 5], 0);
     }
 
     #[test]

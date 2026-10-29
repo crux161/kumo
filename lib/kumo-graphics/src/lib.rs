@@ -1,9 +1,9 @@
 #![no_std]
-//j657
 //j658
 //j667
 //j668
 //j670
+//j674
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -44,6 +44,9 @@ pub const BAND_BG: u32 = 0x0016_1b22;
 pub const VIEW_CHROME_COLOR: u32 = 0x005a_8fc8;
 /// Chrome colour of the focused view; the server paints it so the keyboard owner is visible.
 pub const VIEW_CHROME_FOCUS: u32 = 0x00f0_b040;
+/// Height of the server-drawn title bar at the top of each view. The bar belongs to the
+/// server's chrome and overlays the top rows of the client surface for now. — TIMBERDOODLE
+pub const TITLE_HEIGHT: u32 = 16;
 pub const VIEW_SOLID: u32 = 0x0000_a0ff;
 pub const CLIP_POISON: u32 = 0x00ff_00ff;
 
@@ -453,6 +456,17 @@ pub fn parse_titles(bytes: &[u8]) -> Option<bool> {
     }
 }
 
+/// The band rectangle of one view's title bar: the full width of the view, `TITLE_HEIGHT`
+/// tall from its top edge. — TIMBERDOODLE
+pub fn title_rect(view: &View) -> Damage {
+    Damage {
+        x: view.x,
+        y: view.y,
+        width: view.width,
+        height: TITLE_HEIGHT,
+    }
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -845,5 +859,21 @@ mod tests {
         assert_eq!(parse_titles(&[TITLES_TAG]), None);
         assert_eq!(parse_titles(&[b'X', 0]), None);
         assert_eq!(parse_titles(&[TITLES_TAG, 0, 0]), None);
+    }
+
+    #[test]
+    fn title_rects_sit_inside_their_views() {
+        let Some(band) = band(800, 600) else {
+            return;
+        };
+        for view in &band.views {
+            let rect = title_rect(view);
+            assert_eq!(rect.x, view.x);
+            assert_eq!(rect.y, view.y);
+            assert_eq!(rect.width, view.width);
+            assert_eq!(rect.height, TITLE_HEIGHT);
+            assert!(rect.height < view.height);
+        }
+        assert!(TITLE_HEIGHT < VIEW_HEIGHT);
     }
 }

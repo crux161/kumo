@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j668
 //j670
 //j671
 //j672
 //j673
+//j674
 
 mod clock_probe;
 mod display_probe;
@@ -458,6 +458,7 @@ extern "C" fn main(
             b"drv-fb: console face maple-mono 13.3px\n",
         );
     }
+    let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, b"drv-fb: title bars on\n");
 
     // Map each view's read-only surface after the fixed framebuffer and shadow mappings, so
     // the kernel's placement cannot be overwritten by them. Mapping failure disables only
@@ -654,6 +655,43 @@ extern "C" fn main(
             let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
         }
         was_deferred = deferred;
+        // F2c: per-window title bars are the fourth overlay: a chrome strip across the top of
+        // each view with the view's title blended over it, redrawn each wake beneath the labels
+        // and the sprite. — TIMBERDOODLE
+        if let Some(band) = layout.as_ref() {
+            for (index, view) in band.views.iter().enumerate() {
+                let color = if focused == Some(index) {
+                    kumo_graphics::VIEW_CHROME_FOCUS
+                } else {
+                    kumo_graphics::VIEW_CHROME_COLOR
+                };
+                let write = |at: usize, pixel: u32| unsafe {
+                    (fb_va as *mut u32).add(at).write_volatile(pixel)
+                };
+                drv_fb::fill_rect(
+                    width as u32,
+                    height as u32,
+                    stride,
+                    kumo_graphics::title_rect(view),
+                    pixel_order.pixel((color >> 16) as u8, (color >> 8) as u8, color as u8),
+                    write,
+                );
+                let read = |at: usize| unsafe { (fb_va as *const u32).add(at).read_volatile() };
+                let title: &[u8] = if index == 0 { b"VIEW 0" } else { b"VIEW 1" };
+                drv_fb::blit_face_alpha(
+                    title,
+                    width as u32,
+                    height as u32,
+                    stride,
+                    pixel_order,
+                    view.x + 4,
+                    view.y,
+                    0x00ff_ffff,
+                    read,
+                    write,
+                );
+            }
+        }
         // F2b slice-1: the sprite is a pure overlay over the scene. Console output, presents
         // and modeset repaints write under it, so it is redrawn once per wake before the next
         // wait; a pointer move repairs its old and new rectangles from the scene first.
