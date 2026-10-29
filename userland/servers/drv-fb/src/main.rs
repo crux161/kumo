@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j673
 //j674
 //j675
 //j684
 //j685
+//j686
 
 mod clock_probe;
 mod display_probe;
@@ -529,11 +529,32 @@ extern "C" fn main(
         irq: Handle,
         source: u64,
         port: Handle,
+        /// The resource handle the hardware acknowledge goes through; owned by the gate.
+        vop: Handle,
     }
     impl Gate {
-        /// Wait at most two 60 Hz periods for one frame start and acknowledge it. A timer
-        /// miss or binding failure answers false, which keeps the reply honest.
+        /// Answer true only when one frame start is delivered AFTER this call begins.
+        /// First drain any latched pre-copy frame-start state, acknowledging each drained
+        /// event on both sides, then wait at most two 60 Hz periods for a fresh one.
+        /// — TIMBERDOODLE
         fn frame_started(self) -> bool {
+            loop {
+                let Some(timer) = syscall_handle(timer_create(1)) else {
+                    return false;
+                };
+                if port_bind(self.port, timer) != 0 {
+                    let _ = handle_close(timer);
+                    return false;
+                }
+                let source = port_wait(self.port);
+                let _ = kumo_rt::port_unbind(self.port, timer);
+                let _ = handle_close(timer);
+                if source != self.source {
+                    break;
+                }
+                modeset::gate_ack(self.vop);
+                let _ = interrupt_complete(self.irq);
+            }
             let Some(timer) = syscall_handle(timer_create(33_000_000)) else {
                 return false;
             };
@@ -543,6 +564,7 @@ extern "C" fn main(
             }
             let started = port_wait(self.port) == self.source;
             if started {
+                modeset::gate_ack(self.vop);
                 let _ = interrupt_complete(self.irq);
             }
             let _ = kumo_rt::port_unbind(self.port, timer);
@@ -844,11 +866,16 @@ extern "C" fn main(
                         let _ = handle_close(gate_vop);
                     } else if let Some(port) = syscall_handle(port_create()) {
                         if port_bind(port, irq) == 0 {
+                            // The diagnostic disabled the frame-start source on its way
+                            // out; the gate re-arms it as the line's owner. — TIMBERDOODLE
+                            modeset::gate_enable(gate_vop);
                             gate = Some(Gate {
                                 irq,
                                 source: handle_koid(irq),
                                 port,
+                                vop: gate_vop,
                             });
+                            gate_vop = Handle(0);
                             let _ = kumo_rt::log_write(
                                 kumo_abi::sys::log_level::NOTICE,
                                 b"display: present gate armed, answering Retired on frame starts\n",
@@ -1258,6 +1285,12 @@ extern "C" fn main(
             if extra_handle != 0 {
                 let _ = kumo_rt::handle_close(Handle(extra_handle as u32));
             }
+            // The first gated demo's present sat unread for minutes; intake is timestamped
+            // so the wait and the reply can be told apart. — TIMBERDOODLE
+            let _ = kumo_rt::log_write(
+                kumo_abi::sys::log_level::NOTICE,
+                b"display: present received\n",
+            );
             let request = rx.get(..n).and_then(Present::decode);
             let reply = match (request, &layout) {
                 (Some(request), Some(band)) if extra_handle == 0 && lane.surface != 0 => {
@@ -1322,6 +1355,16 @@ extern "C" fn main(
                             status = Status::Retired;
                         }
                     }
+                    // The demo's first gated run failed blind; every reply now names what
+                    // it carried. — TIMBERDOODLE
+                    let _ = kumo_rt::log_write(
+                        kumo_abi::sys::log_level::NOTICE,
+                        if status == Status::Retired {
+                            b"display: present reply retired\n" as &[u8]
+                        } else {
+                            b"display: present reply copied\n"
+                        },
+                    );
                     Reply {
                         sequence: request.sequence,
                         status,

@@ -1,8 +1,8 @@
-//j636
 //j638
 //j639
 //j683
 //j685
+//j686
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -792,6 +792,21 @@ fn close(handle: Handle) {
 }
 
 /// D1b: arm the VOP interrupt with VP2's frame start as its only source and count frames.
+/// Enable VP2 frame-start delivery for the serving-loop gate. The diagnostic disables the
+/// source on every terminal path; re-arming it is the same checked write D1b proved, done
+/// by the gate owner after the diagnostic released the line. — TIMBERDOODLE
+pub fn gate_enable(vop: Handle) {
+    let mut device = Device(vop);
+    vblank::enable(&mut device);
+}
+
+/// Hardware-acknowledge the VOP frame-start status for the serving-loop gate, before the
+/// interrupt itself is completed. — TIMBERDOODLE
+pub fn gate_ack(vop: Handle) {
+    let mut device = Device(vop);
+    let _ = vblank::acknowledge(&mut device);
+}
+
 fn open_vop_irq(pending: &Pending, device: &mut Device, label: &str) -> Option<(Handle, u64)> {
     let intid = rk3588::VOP_INTID;
     if pending.vblank.live_irq != intid || !pending.vblank.mmu_view {

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j670
 //j675
 //j676
 //j677
 //j684
+//j686
 
 extern crate alloc;
 
@@ -76,6 +76,13 @@ static GRAPHICS_VMO: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 static GRAPHICS_SEQUENCE: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(1), AtomicU32::new(1)];
+
+/// Bounded reply reads for the supervisor's demo presents. Sora's channel read parks once
+/// per call and returns an empty read on any unrelated wake, and the production vblank gate
+/// may hold a reply for two frame periods while it proves the frame start — so one attempt
+/// can honestly miss. Each attempt survives exactly one unrelated wake; the reply logs land
+/// with the reply itself, so the next wake after them carries it. — KINGFISHER
+const REPLY_READ_ATTEMPTS: usize = 4;
 
 /// Sora's write end of drv-fb's bootstrap channel, retained after startup so a released view
 /// can be regranted with a fresh presentation channel. — TIMBERDOODLE
@@ -263,6 +270,7 @@ fn graphics_demo(cmd: &kumoza::Command) {
         let result = (|| {
             // Let drv-fb drain the command echo before enqueueing the present request.
             if !child_parked(process_wait()) {
+                log(b"gfx-demo: pre-present pump failed\n");
                 return None;
             }
             let mut row = [0u8; 320 * 4];
@@ -289,12 +297,35 @@ fn graphics_demo(cmd: &kumoza::Command) {
             if channel_write(channel, frame.as_ptr(), frame.len()) != 0
                 || !child_parked(process_wait())
             {
+                log(b"gfx-demo: present queue failed\n");
                 return None;
             }
             let mut reply = [0u8; REPLY_LEN + 1];
-            let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
-            let reply = Reply::decode(reply.get(..len)?)?;
-            (reply.sequence == sequence).then_some(reply.status)
+            // The gate may hold the reply behind its bounded frame-start wait; a single
+            // read can be released empty by an unrelated wake first. — KINGFISHER
+            let mut len = 0;
+            for _ in 0..REPLY_READ_ATTEMPTS {
+                len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+                if len != 0 {
+                    break;
+                }
+            }
+            let decoded = reply.get(..len).and_then(Reply::decode);
+            let Some(reply) = decoded else {
+                log(if len == 0 {
+                    b"gfx-demo: reply missing\n" as &[u8]
+                } else if len < REPLY_LEN {
+                    b"gfx-demo: reply short\n"
+                } else {
+                    b"gfx-demo: reply undecodable\n"
+                });
+                return None;
+            };
+            if reply.sequence != sequence {
+                log(b"gfx-demo: reply sequence mismatch\n");
+                return None;
+            }
+            Some(reply.status)
         })();
         match result {
             Some(status) => {
