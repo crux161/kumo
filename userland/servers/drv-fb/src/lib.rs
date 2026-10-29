@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j611
 //j639
 //j655
 //j656
 //j662
+//j667
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -841,6 +841,127 @@ pub fn paint_band<F: FnMut(usize, u32)>(
     }
 }
 
+/// Software cursor geometry: a 12x19 arrow whose hot spot is its top-left pixel.
+pub const CURSOR_WIDTH: u32 = 12;
+pub const CURSOR_HEIGHT: u32 = 19;
+
+/// Mask rows: `.` transparent, `1` white body, `2` black outline.
+const CURSOR_ROWS: [&[u8; CURSOR_WIDTH as usize]; CURSOR_HEIGHT as usize] = [
+    b"2...........",
+    b"22..........",
+    b"212.........",
+    b"2112........",
+    b"21112.......",
+    b"211112......",
+    b"2111112.....",
+    b"21111112....",
+    b"211111112...",
+    b"2111111112..",
+    b"21111111112.",
+    b"211111111122",
+    b"21111112211.",
+    b"2111221122..",
+    b"2122.211....",
+    b"22...211....",
+    b"2.....22....",
+    b"............",
+    b"............",
+];
+
+/// The framebuffer rectangle one cursor sprite covers at `(x, y)`.
+pub fn cursor_damage(x: u32, y: u32) -> kumo_graphics::Damage {
+    kumo_graphics::Damage {
+        x,
+        y,
+        width: CURSOR_WIDTH,
+        height: CURSOR_HEIGHT,
+    }
+}
+
+/// The smallest rectangle containing both, unclipped.
+pub fn union_damage(a: kumo_graphics::Damage, b: kumo_graphics::Damage) -> kumo_graphics::Damage {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
+    kumo_graphics::Damage {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+/// Clip a rectangle to a `width`x`height` framebuffer; `None` when nothing remains.
+pub fn clip_damage(
+    rect: kumo_graphics::Damage,
+    width: u32,
+    height: u32,
+) -> Option<kumo_graphics::Damage> {
+    let x0 = rect.x.min(width);
+    let y0 = rect.y.min(height);
+    let x1 = rect.x.saturating_add(rect.width).min(width);
+    let y1 = rect.y.saturating_add(rect.height).min(height);
+    (x1 > x0 && y1 > y0).then_some(kumo_graphics::Damage {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+/// Copy one framebuffer rectangle of the console image from its shadow to the glass. The shadow
+/// is the authoritative console picture; the glass lags it only while console output is
+/// deferred for vblank measurement.
+pub fn copy_shadow_rect<S: Fn(usize) -> u32, W: FnMut(usize, u32)>(
+    stride: usize,
+    read: S,
+    rect: kumo_graphics::Damage,
+    mut write: W,
+) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            let at = y as usize * stride + x as usize;
+            write(at, read(at));
+        }
+    }
+}
+
+/// Draw the software cursor at `(x, y)`, clipped to the framebuffer. `write` receives absolute
+/// framebuffer indices; the framebuffer is non-cacheable, so no cache maintenance is needed.
+pub fn draw_cursor<W: FnMut(usize, u32)>(
+    width: u32,
+    height: u32,
+    stride: usize,
+    order: PixelOrder,
+    x: u32,
+    y: u32,
+    mut write: W,
+) {
+    let white = order.pixel(0xff, 0xff, 0xff);
+    let black = order.pixel(0, 0, 0);
+    for (row, pixels) in CURSOR_ROWS.iter().enumerate() {
+        let py = y.saturating_add(row as u32);
+        if py >= height {
+            break;
+        }
+        for (col, mask) in pixels.iter().enumerate() {
+            let px = x.saturating_add(col as u32);
+            if px >= width {
+                break;
+            }
+            let color = match *mask {
+                b'1' => white,
+                b'2' => black,
+                _ => continue,
+            };
+            write(py as usize * stride + px as usize, color);
+        }
+    }
+}
+
 /// Present one client surface into its server-owned view. The server copies only the
 /// intersection of the surface and the view: `read_pixel` is never called outside the view,
 /// and `write_pixel` never touches chrome or the other view. A surface larger than its view
@@ -961,11 +1082,6 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
     } else {
         damage.rects()
     };
-    let rgb = |pixel: u32| order.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
-    let band_bg = rgb(kumo_graphics::BAND_BG);
-    let chrome = rgb(kumo_graphics::VIEW_CHROME_COLOR);
-    let well = rgb(kumo_graphics::VIEW_BG);
-    let border = kumo_graphics::VIEW_CHROME;
     for rect in targets {
         let Some(rect) = rect.clipped_to(surface) else {
             continue;
@@ -976,46 +1092,85 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
             for x in rect.x..x1 {
                 let sx = view.x + x;
                 let sy = view.y + y;
-                let mut color = band_bg;
-                for &layer in &band.order {
-                    let other = &band.views[layer];
-                    if sx < other.x.saturating_sub(border)
-                        || sy < other.y.saturating_sub(border)
-                        || sx >= other.x.saturating_add(other.width).saturating_add(border)
-                        || sy >= other.y.saturating_add(other.height).saturating_add(border)
-                    {
-                        continue;
-                    }
-                    if sx < other.x
-                        || sx >= other.x.saturating_add(other.width)
-                        || sy < other.y
-                        || sy >= other.y.saturating_add(other.height)
-                    {
-                        color = chrome;
-                        continue;
-                    }
-                    match content[layer] {
-                        Some(description) => {
-                            let lx = sx - other.x;
-                            let ly = sy - other.y;
-                            if lx < description.width && ly < description.height {
-                                let pixel = read(
-                                    layer,
-                                    ly as usize * description.stride as usize + lx as usize,
-                                );
-                                color = rgb(pixel);
-                            } else {
-                                color = well;
-                            }
-                        }
-                        None => color = well,
-                    }
-                }
+                let color = compose_band_pixel(band, order, content, &mut read, sx, sy);
                 write(sy as usize * stride + sx as usize, color);
             }
         }
     }
     Ok(())
+}
+
+/// One band pixel composed from every layer in back-to-front order: chrome, retained client
+/// content, or a well. Shared by [`compose_present`] and [`repaint_band_rect`].
+fn compose_band_pixel<R: FnMut(usize, usize) -> u32>(
+    band: &kumo_graphics::Band,
+    order: PixelOrder,
+    content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
+    read: &mut R,
+    sx: u32,
+    sy: u32,
+) -> u32 {
+    let rgb = |pixel: u32| order.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
+    let band_bg = rgb(kumo_graphics::BAND_BG);
+    let chrome = rgb(kumo_graphics::VIEW_CHROME_COLOR);
+    let well = rgb(kumo_graphics::VIEW_BG);
+    let border = kumo_graphics::VIEW_CHROME;
+    let mut color = band_bg;
+    for &layer in &band.order {
+        let other = &band.views[layer];
+        if sx < other.x.saturating_sub(border)
+            || sy < other.y.saturating_sub(border)
+            || sx >= other.x.saturating_add(other.width).saturating_add(border)
+            || sy >= other.y.saturating_add(other.height).saturating_add(border)
+        {
+            continue;
+        }
+        if sx < other.x
+            || sx >= other.x.saturating_add(other.width)
+            || sy < other.y
+            || sy >= other.y.saturating_add(other.height)
+        {
+            color = chrome;
+            continue;
+        }
+        match content[layer] {
+            Some(description) => {
+                let lx = sx - other.x;
+                let ly = sy - other.y;
+                if lx < description.width && ly < description.height {
+                    let pixel = read(
+                        layer,
+                        ly as usize * description.stride as usize + lx as usize,
+                    );
+                    color = rgb(pixel);
+                } else {
+                    color = well;
+                }
+            }
+            None => color = well,
+        }
+    }
+    color
+}
+
+/// Recompose one arbitrary band rectangle across its layers. Unlike [`compose_present`] this is
+/// not tied to a presenting view's surface or damage: it is how the server repairs the scene
+/// under a moved cursor. The rectangle must already be clipped to the band.
+pub fn repaint_band_rect<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
+    band: &kumo_graphics::Band,
+    stride: usize,
+    rect: kumo_graphics::Damage,
+    content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
+    order: PixelOrder,
+    mut read: R,
+    mut write: W,
+) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        for x in rect.x..rect.x.saturating_add(rect.width) {
+            let color = compose_band_pixel(band, order, content, &mut read, x, y);
+            write(y as usize * stride + x as usize, color);
+        }
+    }
 }
 
 /// Emit the framebuffer cache spans a Present wrote, so the server cleans only the accepted
@@ -1622,6 +1777,148 @@ mod tests {
         });
         assert_eq!(count, 4);
         assert!(spans[..count].iter().all(|&(_, len)| len == 8));
+    }
+
+    #[test]
+    fn cursor_rectangles_union_and_clip_at_the_framebuffer() {
+        let a = cursor_damage(10, 20);
+        assert_eq!((a.width, a.height), (CURSOR_WIDTH, CURSOR_HEIGHT));
+        let b = cursor_damage(4, 30);
+        let union = union_damage(a, b);
+        assert_eq!(
+            union,
+            kumo_graphics::Damage {
+                x: 4,
+                y: 20,
+                width: 6 + CURSOR_WIDTH,
+                height: 10 + CURSOR_HEIGHT,
+            }
+        );
+        assert_eq!(clip_damage(union, 800, 600), Some(union));
+        let edge = clip_damage(cursor_damage(796, 4), 800, 600);
+        assert_eq!(
+            edge,
+            Some(kumo_graphics::Damage {
+                x: 796,
+                y: 4,
+                width: 4,
+                height: CURSOR_HEIGHT,
+            })
+        );
+        assert_eq!(clip_damage(cursor_damage(800, 0), 800, 600), None);
+    }
+
+    #[test]
+    fn draw_cursor_paints_the_mask_and_clips_at_the_edge() {
+        const WIDTH: usize = 16;
+        const HEIGHT: usize = 24;
+        let mut glass = [0xdead_beef; WIDTH * HEIGHT];
+        draw_cursor(14, 23, WIDTH, PixelOrder::Rgb, 12, 20, |at, color| {
+            glass[at] = color
+        });
+        let white = PixelOrder::Rgb.pixel(0xff, 0xff, 0xff);
+        let black = PixelOrder::Rgb.pixel(0, 0, 0);
+        // Hot spot is the black outline; the body below it is white; transparent stays put.
+        assert_eq!(glass[20 * WIDTH + 12], black);
+        assert_eq!(glass[21 * WIDTH + 12], black);
+        assert_eq!(glass[22 * WIDTH + 13], white);
+        assert_eq!(glass[20 * WIDTH + 14], 0xdead_beef);
+        // The sprite is clipped at the right and bottom edges: no writes outside the array.
+        assert_eq!(glass[23 * WIDTH + 15], 0xdead_beef);
+    }
+
+    #[test]
+    fn copy_shadow_rect_copies_only_the_rectangle() {
+        const STRIDE: usize = 8;
+        let shadow: [u32; 48] = core::array::from_fn(|index| index as u32);
+        let mut glass = [0u32; 48];
+        let rect = kumo_graphics::Damage {
+            x: 2,
+            y: 1,
+            width: 3,
+            height: 2,
+        };
+        copy_shadow_rect(STRIDE, |at| shadow[at], rect, |at, pixel| glass[at] = pixel);
+        assert_eq!(glass[1 * STRIDE + 2], 1 * STRIDE as u32 + 2);
+        assert_eq!(glass[2 * STRIDE + 4], 2 * STRIDE as u32 + 4);
+        assert_eq!(glass[0], 0);
+        assert_eq!(glass[1 * STRIDE + 5], 0);
+        assert_eq!(glass[3 * STRIDE + 2], 0);
+    }
+
+    #[test]
+    fn repaint_band_rect_recomposes_background_chrome_and_content() {
+        let Some(band) = kumo_graphics::band(800, 600) else {
+            return;
+        };
+        const STRIDE: usize = 800;
+        let view = band.views[0];
+        let chrome = PixelOrder::Rgb.pixel(0x5a, 0x8f, 0xc8);
+        let surface = kumo_graphics::DEMO;
+        let content = {
+            let mut content = [None; kumo_graphics::VIEW_COUNT];
+            content[0] = Some(surface);
+            content
+        };
+        let mut pixels = [0u32; 16 * 16];
+        let rect = kumo_graphics::Damage {
+            x: view.x,
+            y: view.y,
+            width: 16,
+            height: 16,
+        };
+        repaint_band_rect(
+            &band,
+            STRIDE,
+            rect,
+            &content,
+            PixelOrder::Rgb,
+            |_layer, at| {
+                let lx = at % surface.stride as usize;
+                let ly = at / surface.stride as usize;
+                kumo_graphics::demo_pixel(lx as u32, ly as u32)
+            },
+            |at, color| {
+                pixels[(at / STRIDE - view.y as usize) * 16 + at % STRIDE - view.x as usize] = color
+            },
+        );
+        assert!(pixels.iter().all(|pixel| *pixel != 0));
+        // The band background outside every view survives a rectangle over it.
+        let outside = kumo_graphics::Damage {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut background = [0u32; 16];
+        repaint_band_rect(
+            &band,
+            STRIDE,
+            outside,
+            &content,
+            PixelOrder::Rgb,
+            |_, _| 0,
+            |at, color| background[(at / STRIDE) * 4 + at % STRIDE] = color,
+        );
+        let band_bg = PixelOrder::Rgb.pixel(0x16, 0x1b, 0x22);
+        assert!(background.iter().all(|pixel| *pixel == band_bg));
+        // One pixel of the view's chrome frame is the chrome colour, not background.
+        let mut chrome_pixel = 0u32;
+        repaint_band_rect(
+            &band,
+            STRIDE,
+            kumo_graphics::Damage {
+                x: view.x - 1,
+                y: view.y,
+                width: 1,
+                height: 1,
+            },
+            &content,
+            PixelOrder::Rgb,
+            |_, _| 0,
+            |_, color| chrome_pixel = color,
+        );
+        assert_eq!(chrome_pixel, chrome);
     }
 
     #[test]

@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j656
 //j657
 //j658
 //j660
 //j662
+//j667
 
 mod clock_probe;
 mod display_probe;
@@ -16,7 +16,7 @@ mod modeset;
 mod phy_relock;
 mod shared_probe;
 
-use drv_fb::{clean_pixels, paint_band, present_view, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
+use drv_fb::{clean_pixels, paint_band, Console, PixelOrder, BG, GLYPH_H, GLYPH_W};
 use kumo_abi::{BootInfo, FramebufferFormat, Handle, Rights, VmarFlags};
 use kumo_graphics::{Present, Reply, Status, SURFACE_BYTES};
 use kumo_rt::{
@@ -501,6 +501,20 @@ extern "C" fn main(
     // True when a client closed the lane and left the view available to a regrant. — TIMBERDOODLE
     let mut view_released = [false; kumo_graphics::VIEW_COUNT];
 
+    // F2b slice-1: the software cursor. drv-fb owns the sprite; a `P` record on the control
+    // lane only says where. The sprite is drawn last, and a move repairs the scene beneath it
+    // from the console shadow and the retained band layers, so no saved-background buffer
+    // exists to go stale. — TIMBERDOODLE
+    #[derive(Clone, Copy)]
+    struct Cursor {
+        x: u32,
+        y: u32,
+        #[allow(dead_code)]
+        buttons: u8,
+    }
+    let mut cursor: Option<Cursor> = None;
+    let mut pointer_records: u32 = 0;
+
     // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
     // view with a fresh presentation channel and surface. — TIMBERDOODLE
     let control_koid = handle_koid(bootstrap);
@@ -567,6 +581,21 @@ extern "C" fn main(
             let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
         }
         was_deferred = deferred;
+        // F2b slice-1: the sprite is a pure overlay over the scene. Console output, presents
+        // and modeset repaints write under it, so it is redrawn once per wake before the next
+        // wait; a pointer move repairs its old and new rectangles from the scene first.
+        // — TIMBERDOODLE
+        if let Some(cursor) = cursor {
+            drv_fb::draw_cursor(
+                width as u32,
+                height as u32,
+                stride,
+                pixel_order,
+                cursor.x,
+                cursor.y,
+                |at, color| unsafe { (fb_va as *mut u32).add(at).write_volatile(color) },
+            );
+        }
         let source = Handle(port_wait(port) as u32);
         if r1.as_ref().is_some_and(|pending| pending.owns(source)) {
             r1 = r1.take().and_then(|pending| modeset::wake(pending, source));
@@ -587,6 +616,107 @@ extern "C" fn main(
                 }
                 let reply = kumo_graphics::release_reply(mask);
                 let _ = kumo_rt::channel_write(bootstrap, reply.as_ptr(), reply.len());
+                continue;
+            }
+            if n == kumo_graphics::POINTER_RECORD_LEN && rx[0] == kumo_graphics::POINTER_TAG {
+                if channel.0 != 0 {
+                    let _ = kumo_rt::handle_close(channel);
+                }
+                if let Some((x, y, buttons)) = kumo_graphics::parse_pointer(&rx[..n]) {
+                    let previous = cursor;
+                    let placed = Cursor {
+                        x: x as u32,
+                        y: y as u32,
+                        buttons,
+                    };
+                    cursor = Some(placed);
+                    pointer_records = pointer_records.saturating_add(1);
+                    if pointer_records == 1 {
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            b"drv-fb: pointer ready\n",
+                        );
+                    }
+                    if pointer_records <= 8 {
+                        let mut line = Line::new();
+                        line.push(b"drv-fb: pointer x=");
+                        line.push_decimal(x as usize);
+                        line.push(b" y=");
+                        line.push_decimal(y as usize);
+                        line.push(b" buttons=");
+                        line.push_decimal(buttons as usize);
+                        line.push(b"\n");
+                        log_info(line.bytes());
+                    }
+                    let new_rect = drv_fb::cursor_damage(placed.x, placed.y);
+                    let damage = match previous {
+                        Some(old) => {
+                            drv_fb::union_damage(drv_fb::cursor_damage(old.x, old.y), new_rect)
+                        }
+                        None => new_rect,
+                    };
+                    if let Some(rect) = drv_fb::clip_damage(damage, width as u32, height as u32) {
+                        let console_top = layout.as_ref().map_or(0, |band| band.height);
+                        let bottom = rect.y.saturating_add(rect.height);
+                        if bottom > console_top {
+                            let top = rect.y.max(console_top);
+                            drv_fb::copy_shadow_rect(
+                                stride,
+                                |at| unsafe { shadow.add(at).read_volatile() },
+                                kumo_graphics::Damage {
+                                    x: rect.x,
+                                    y: top,
+                                    width: rect.width,
+                                    height: bottom - top,
+                                },
+                                |at, pixel| unsafe {
+                                    (fb_va as *mut u32).add(at).write_volatile(pixel)
+                                },
+                            );
+                        }
+                        if let Some(band) = layout.as_ref() {
+                            if rect.y < band.height {
+                                let mut content = [None; kumo_graphics::VIEW_COUNT];
+                                let mut bases = [0u64; kumo_graphics::VIEW_COUNT];
+                                for (other, entry) in view_content.iter().enumerate() {
+                                    if let Some((base, description)) = entry {
+                                        bases[other] = *base;
+                                        content[other] = Some(*description);
+                                    }
+                                }
+                                drv_fb::repaint_band_rect(
+                                    band,
+                                    stride,
+                                    kumo_graphics::Damage {
+                                        x: rect.x,
+                                        y: rect.y,
+                                        width: rect.width,
+                                        height: band.height.min(bottom) - rect.y,
+                                    },
+                                    &content,
+                                    pixel_order,
+                                    |layer, at| unsafe {
+                                        (bases[layer] as *const u32).add(at).read_volatile()
+                                    },
+                                    |at, color| unsafe {
+                                        (fb_va as *mut u32).add(at).write_volatile(color)
+                                    },
+                                );
+                            }
+                        }
+                        drv_fb::draw_cursor(
+                            width as u32,
+                            height as u32,
+                            stride,
+                            pixel_order,
+                            placed.x,
+                            placed.y,
+                            |at, color| unsafe {
+                                (fb_va as *mut u32).add(at).write_volatile(color)
+                            },
+                        );
+                    }
+                }
                 continue;
             }
             let _ = kumo_rt::log_write(

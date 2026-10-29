@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j655
 //j657
 //j658
 //j659
 //j663
+//j667
 
 extern crate alloc;
 
@@ -4283,6 +4283,18 @@ extern "C" fn sora_main(
                         if let Some(report) = drv_i2c_hid::decode_mouse_event(&serve_buf[..n]) {
                             mouse_events_seen = mouse_events_seen.saturating_add(1);
                             pointer_state.apply_boot_mouse(report);
+                            // F2b slice-1: forward the clamped position to drv-fb, which owns
+                            // the cursor sprite over the composed scene. — TIMBERDOODLE
+                            let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+                            if control.0 != 0 {
+                                let position = pointer_state.position();
+                                let record = kumo_graphics::encode_pointer(
+                                    position.x as u16,
+                                    position.y as u16,
+                                    pointer_state.buttons(),
+                                );
+                                let _ = channel_write(control, record.as_ptr(), record.len());
+                            }
                             // One NOTICE record proves the physical pointer path on metal
                             // without needing dmesg's INFO level. — TIMBERDOODLE
                             if mouse_events_seen == 1 {

@@ -1,9 +1,9 @@
 #![no_std]
-//j636
 //j655
 //j656
 //j657
 //j658
+//j667
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -370,6 +370,29 @@ pub fn parse_release_reply(bytes: &[u8]) -> Option<u8> {
     }
 }
 
+/// A runtime pointer record on the same control lane: Sora forwards the mouse position its
+/// `PointerState` already clamped to the framebuffer. Coordinates are absolute framebuffer
+/// pixels; drv-fb owns the sprite and never learns which device moved. — TIMBERDOODLE
+pub const POINTER_TAG: u8 = b'P';
+pub const POINTER_RECORD_LEN: usize = 6;
+
+pub fn encode_pointer(x: u16, y: u16, buttons: u8) -> [u8; POINTER_RECORD_LEN] {
+    let x = x.to_le_bytes();
+    let y = y.to_le_bytes();
+    [POINTER_TAG, x[0], x[1], y[0], y[1], buttons]
+}
+
+pub fn parse_pointer(bytes: &[u8]) -> Option<(u16, u16, u8)> {
+    if bytes.len() != POINTER_RECORD_LEN || bytes[0] != POINTER_TAG {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([bytes[1], bytes[2]]),
+        u16::from_le_bytes([bytes[3], bytes[4]]),
+        bytes[5],
+    ))
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -704,5 +727,17 @@ mod tests {
         assert_eq!(parse_release_reply(&[b'S']), None);
         assert_eq!(parse_release_reply(&[b'X', 0]), None);
         assert_eq!(parse_release_reply(&[b'S', 0, 0]), None);
+    }
+
+    #[test]
+    fn pointer_records_round_trip_and_reject_bad_frames() {
+        let record = encode_pointer(0, 0, 0);
+        assert_eq!(record[0], POINTER_TAG);
+        assert_eq!(parse_pointer(&record), Some((0, 0, 0)));
+        let record = encode_pointer(u16::MAX, 1234, 0b0000_0111);
+        assert_eq!(parse_pointer(&record), Some((u16::MAX, 1234, 0x07)));
+        assert_eq!(parse_pointer(&record[..5]), None);
+        assert_eq!(parse_pointer(&[POINTER_TAG; POINTER_RECORD_LEN + 1]), None);
+        assert_eq!(parse_pointer(&[b'X', 0, 0, 0, 0, 0]), None);
     }
 }
