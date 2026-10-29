@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j545
 //j548
 //j549
 //j550
 //j559
+//j664
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -1169,7 +1169,10 @@ fn enumerate_root_device(
     if role == RootRole::SuperSpeedSide {
         return log(b"drv-xhci: ss side device is neither hub nor storage; left alone\n");
     }
-    match kumo_hid::find_hid_boot_keyboard(&config[..read_len as usize]) {
+    let config_bytes = &config[..read_len as usize];
+    let hid = kumo_hid::find_hid_boot_keyboard(config_bytes)
+        .or_else(|| kumo_hid::find_hid_boot_mouse(config_bytes));
+    match hid {
         Some(hid) => {
             log(b"drv-xhci: hid if=");
             log_hex(hid.interface_number as u64);
@@ -2564,9 +2567,10 @@ fn log_ascii(bytes: &[u8]) {
     log(&safe[..length]);
 }
 
-/// Slice D2: bring a boot keyboard online — SET_CONFIGURATION, Configure Endpoint for its
-/// interrupt-IN endpoint, SET_PROTOCOL(boot) — then arm the interrupt ring and log the raw HID
-/// reports as keys are pressed. Bounded so it logs a burst and exits rather than pinning the CPU.
+/// Bring one boot HID interface online, keyboard or mouse: SET_CONFIGURATION, Configure Endpoint
+/// for its interrupt-IN endpoint, SET_PROTOCOL(boot), then arm the interrupt ring and forward its
+/// reports. The keyboard loop is resident; a mouse forwards the 3-byte wire to Sora's pointer
+/// pipeline. Bounded only when the controller has no IRQ.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_read_keyboard(
     io: &mut Mmio,
@@ -3531,7 +3535,7 @@ fn configure_and_read_hub(
             if keyboard.is_none() {
                 keyboard = Some(handoff);
             } else {
-                log(b"drv-xhci: hub dev second keyboard left alone\n");
+                log(b"drv-xhci: hub dev second hid device left alone\n");
             }
         }
     }
@@ -3540,8 +3544,8 @@ fn configure_and_read_hub(
     }
 }
 
-/// A boot keyboard behind a hub, addressed and described. Its report loop never returns, so it
-/// waits here until every other downstream device has been enumerated (J541).
+/// One boot HID interface behind a hub, addressed and described. Its report loop never returns,
+/// so it waits here until every other downstream device has been enumerated (J541).
 #[derive(Clone, Copy)]
 struct KeyboardHandoff {
     slot_id: u8,
@@ -3727,7 +3731,9 @@ fn enumerate_hub_downstream(
         Err(_) => log(b"drv-xhci: malformed storage interface\n"),
         Ok(None) => {}
     }
-    let Some(hid) = kumo_hid::find_hid_boot_keyboard(config.bytes()) else {
+    let hid = kumo_hid::find_hid_boot_keyboard(config.bytes())
+        .or_else(|| kumo_hid::find_hid_boot_mouse(config.bytes()));
+    let Some(hid) = hid else {
         return skipped(b"drv-xhci: dev no hid boot iface\n");
     };
     log(b"drv-xhci: dev hid if=");
@@ -3737,8 +3743,8 @@ fn enumerate_hub_downstream(
     log(b" ep=");
     log_hex(hid.in_endpoint_address as u64);
     log(b"\n");
-    if !hid.is_keyboard() {
-        return skipped(b"drv-xhci: hub dev not a boot keyboard\n");
+    if !(hid.is_keyboard() || hid.is_mouse()) {
+        return skipped(b"drv-xhci: hub dev not a boot hid interface\n");
     }
     Some(KeyboardHandoff {
         slot_id: dev_slot,
