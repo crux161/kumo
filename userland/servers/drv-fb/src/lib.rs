@@ -912,6 +912,26 @@ pub fn clip_damage(
     })
 }
 
+/// The band rectangle a view's chrome frame covers: the view expanded by the chrome border,
+/// clipped to the band's height. The caller clips the x extent and the framebuffer.
+pub fn chrome_damage(view: &kumo_graphics::View, band_height: u32) -> kumo_graphics::Damage {
+    let border = kumo_graphics::VIEW_CHROME;
+    let x = view.x.saturating_sub(border);
+    let y = view.y.saturating_sub(border);
+    let right = view.x.saturating_add(view.width).saturating_add(border);
+    let bottom = view
+        .y
+        .saturating_add(view.height)
+        .saturating_add(border)
+        .min(band_height);
+    kumo_graphics::Damage {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
 /// Copy one framebuffer rectangle of the console image from its shadow to the glass. The shadow
 /// is the authoritative console picture; the glass lags it only while console output is
 /// deferred for vblank measurement.
@@ -1050,8 +1070,10 @@ pub fn present_damage<R: FnMut(usize) -> u32, W: FnMut(usize, u32)>(
 /// retained surface is supplied and covers the pixel), or its well. The presenting view's
 /// content is supplied by the caller even on its first full present. Pixels outside the
 /// region are not touched, so a lower view's present cannot erase an upper view outside its
-/// own region and a closed client's retained content stays composed. — TIMBERDOODLE
-pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
+/// own region and a closed client's retained content stays composed. The focused view's chrome
+/// uses [`kumo_graphics::VIEW_CHROME_FOCUS`]. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+pub fn compose_present_focused<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
     band: &kumo_graphics::Band,
     stride: usize,
     presenting: usize,
@@ -1060,6 +1082,7 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
     backing_bytes: usize,
     content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
     order: PixelOrder,
+    focus: Option<usize>,
     mut read: R,
     mut write: W,
 ) -> Result<(), kumo_graphics::Status> {
@@ -1092,7 +1115,7 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
             for x in rect.x..x1 {
                 let sx = view.x + x;
                 let sy = view.y + y;
-                let color = compose_band_pixel(band, order, content, &mut read, sx, sy);
+                let color = compose_band_pixel(band, order, focus, content, &mut read, sx, sy);
                 write(sy as usize * stride + sx as usize, color);
             }
         }
@@ -1105,6 +1128,7 @@ pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
 fn compose_band_pixel<R: FnMut(usize, usize) -> u32>(
     band: &kumo_graphics::Band,
     order: PixelOrder,
+    focus: Option<usize>,
     content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
     read: &mut R,
     sx: u32,
@@ -1113,6 +1137,7 @@ fn compose_band_pixel<R: FnMut(usize, usize) -> u32>(
     let rgb = |pixel: u32| order.pixel((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
     let band_bg = rgb(kumo_graphics::BAND_BG);
     let chrome = rgb(kumo_graphics::VIEW_CHROME_COLOR);
+    let focused_chrome = rgb(kumo_graphics::VIEW_CHROME_FOCUS);
     let well = rgb(kumo_graphics::VIEW_BG);
     let border = kumo_graphics::VIEW_CHROME;
     let mut color = band_bg;
@@ -1130,7 +1155,11 @@ fn compose_band_pixel<R: FnMut(usize, usize) -> u32>(
             || sy < other.y
             || sy >= other.y.saturating_add(other.height)
         {
-            color = chrome;
+            color = if focus == Some(layer) {
+                focused_chrome
+            } else {
+                chrome
+            };
             continue;
         }
         match content[layer] {
@@ -1162,15 +1191,46 @@ pub fn repaint_band_rect<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
     rect: kumo_graphics::Damage,
     content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
     order: PixelOrder,
+    focus: Option<usize>,
     mut read: R,
     mut write: W,
 ) {
     for y in rect.y..rect.y.saturating_add(rect.height) {
         for x in rect.x..rect.x.saturating_add(rect.width) {
-            let color = compose_band_pixel(band, order, content, &mut read, x, y);
+            let color = compose_band_pixel(band, order, focus, content, &mut read, x, y);
             write(y as usize * stride + x as usize, color);
         }
     }
+}
+
+/// [`compose_present_focused`] with no focused view; the clients and smokes that predate focus
+/// keep their exact pixel model. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+pub fn compose_present<W: FnMut(usize, u32), R: FnMut(usize, usize) -> u32>(
+    band: &kumo_graphics::Band,
+    stride: usize,
+    presenting: usize,
+    damage: kumo_graphics::DamageSet,
+    surface: kumo_graphics::Surface,
+    backing_bytes: usize,
+    content: &[Option<kumo_graphics::Surface>; kumo_graphics::VIEW_COUNT],
+    order: PixelOrder,
+    read: R,
+    write: W,
+) -> Result<(), kumo_graphics::Status> {
+    compose_present_focused(
+        band,
+        stride,
+        presenting,
+        damage,
+        surface,
+        backing_bytes,
+        content,
+        order,
+        None,
+        read,
+        write,
+    )
 }
 
 /// Emit the framebuffer cache spans a Present wrote, so the server cleans only the accepted
@@ -1873,6 +1933,7 @@ mod tests {
             rect,
             &content,
             PixelOrder::Rgb,
+            None,
             |_layer, at| {
                 let lx = at % surface.stride as usize;
                 let ly = at / surface.stride as usize;
@@ -1897,6 +1958,7 @@ mod tests {
             outside,
             &content,
             PixelOrder::Rgb,
+            None,
             |_, _| 0,
             |at, color| background[(at / STRIDE) * 4 + at % STRIDE] = color,
         );
@@ -1915,10 +1977,78 @@ mod tests {
             },
             &content,
             PixelOrder::Rgb,
+            None,
             |_, _| 0,
             |_, color| chrome_pixel = color,
         );
         assert_eq!(chrome_pixel, chrome);
+    }
+
+    #[test]
+    fn repaint_band_rect_highlights_the_focused_views_chrome() {
+        let Some(band) = kumo_graphics::band(800, 600) else {
+            return;
+        };
+        const STRIDE: usize = 800;
+        let content = [None; kumo_graphics::VIEW_COUNT];
+        let view = band.views[0];
+        let chrome = kumo_graphics::Damage {
+            x: view.x - 1,
+            y: view.y,
+            width: 1,
+            height: 1,
+        };
+        let mut highlighted = 0u32;
+        repaint_band_rect(
+            &band,
+            STRIDE,
+            chrome,
+            &content,
+            PixelOrder::Rgb,
+            Some(0),
+            |_, _| 0,
+            |_, color| highlighted = color,
+        );
+        assert_eq!(highlighted, PixelOrder::Rgb.pixel(0xf0, 0xb0, 0x40));
+        let mut normal = 0u32;
+        repaint_band_rect(
+            &band,
+            STRIDE,
+            chrome,
+            &content,
+            PixelOrder::Rgb,
+            None,
+            |_, _| 0,
+            |_, color| normal = color,
+        );
+        assert_eq!(normal, PixelOrder::Rgb.pixel(0x5a, 0x8f, 0xc8));
+    }
+
+    #[test]
+    fn chrome_damage_expands_by_the_border_and_clamps_to_the_band() {
+        let view = kumo_graphics::View {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
+        assert_eq!(
+            chrome_damage(&view, 90),
+            kumo_graphics::Damage {
+                x: 8,
+                y: 18,
+                width: 104,
+                height: 54,
+            }
+        );
+        let tall = kumo_graphics::View {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 200,
+        };
+        assert_eq!(chrome_damage(&tall, 90).height, 90);
+        assert_eq!(chrome_damage(&tall, 90).x, 0);
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub const MIN_CONSOLE_ROWS: u32 = 8;
 pub const VIEW_BG: u32 = 0x0000_0000;
 pub const BAND_BG: u32 = 0x0016_1b22;
 pub const VIEW_CHROME_COLOR: u32 = 0x005a_8fc8;
+/// Chrome colour of the focused view; the server paints it so the keyboard owner is visible.
+pub const VIEW_CHROME_FOCUS: u32 = 0x00f0_b040;
 pub const VIEW_SOLID: u32 = 0x0000_a0ff;
 pub const CLIP_POISON: u32 = 0x00ff_00ff;
 
@@ -393,6 +395,48 @@ pub fn parse_pointer(bytes: &[u8]) -> Option<(u16, u16, u8)> {
     ))
 }
 
+/// A runtime focus record on the same control lane: Sora names the view that owns the keyboard,
+/// or clears focus. drv-fb paints that view's chrome in [`VIEW_CHROME_FOCUS`]. — TIMBERDOODLE
+pub const FOCUS_TAG: u8 = b'K';
+/// The focus record's "no view focused" view byte.
+pub const FOCUS_NONE: u8 = u8::MAX;
+
+pub fn focus_record(view: Option<usize>) -> Option<[u8; 2]> {
+    match view {
+        Some(view) if view >= VIEW_COUNT => None,
+        Some(view) => Some([FOCUS_TAG, view as u8]),
+        None => Some([FOCUS_TAG, FOCUS_NONE]),
+    }
+}
+
+pub fn parse_focus(bytes: &[u8]) -> Option<Option<usize>> {
+    if bytes.len() != 2 || bytes[0] != FOCUS_TAG {
+        return None;
+    }
+    match bytes[1] {
+        FOCUS_NONE => Some(None),
+        view if (view as usize) < VIEW_COUNT => Some(Some(view as usize)),
+        _ => None,
+    }
+}
+
+/// The topmost view whose client content contains `(x, y)`, in the band's z-order. Clicks on
+/// chrome or between views select nothing, so focus changes only by aiming at content.
+/// — TIMBERDOODLE
+pub fn band_view_at(band: &Band, x: u32, y: u32) -> Option<usize> {
+    for &layer in band.order.iter().rev() {
+        let view = &band.views[layer];
+        if x >= view.x
+            && y >= view.y
+            && x < view.x.saturating_add(view.width)
+            && y < view.y.saturating_add(view.height)
+        {
+            return Some(layer);
+        }
+    }
+    None
+}
+
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -739,5 +783,39 @@ mod tests {
         assert_eq!(parse_pointer(&record[..5]), None);
         assert_eq!(parse_pointer(&[POINTER_TAG; POINTER_RECORD_LEN + 1]), None);
         assert_eq!(parse_pointer(&[b'X', 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn focus_records_round_trip_and_reject_bad_frames() {
+        for view in 0..VIEW_COUNT {
+            let record = focus_record(Some(view)).unwrap();
+            assert_eq!(record[0], FOCUS_TAG);
+            assert_eq!(parse_focus(&record), Some(Some(view)));
+        }
+        let none = focus_record(None).unwrap();
+        assert_eq!(none, [FOCUS_TAG, FOCUS_NONE]);
+        assert_eq!(parse_focus(&none), Some(None));
+        assert_eq!(focus_record(Some(VIEW_COUNT)), None);
+        assert_eq!(parse_focus(&[FOCUS_TAG]), None);
+        assert_eq!(parse_focus(&[FOCUS_TAG, VIEW_COUNT as u8]), None);
+        assert_eq!(parse_focus(&[b'X', 0]), None);
+        assert_eq!(parse_focus(&[FOCUS_TAG, 0, 0]), None);
+    }
+
+    #[test]
+    fn band_view_at_returns_the_topmost_content_view() {
+        let Some(band) = band(800, 600) else {
+            return;
+        };
+        let lower = band.views[0];
+        let upper = band.views[1];
+        // The overlap belongs to the upper view; each view's own corner belongs to it.
+        let overlap_x = upper.x + 2;
+        let overlap_y = upper.y + 2;
+        assert!(overlap_x < lower.x + lower.width);
+        assert_eq!(band_view_at(&band, overlap_x, overlap_y), Some(1));
+        assert_eq!(band_view_at(&band, lower.x + 2, lower.y + 2), Some(0));
+        assert_eq!(band_view_at(&band, lower.x - 4, lower.y - 4), None);
+        assert_eq!(band_view_at(&band, 0, 0), None);
     }
 }

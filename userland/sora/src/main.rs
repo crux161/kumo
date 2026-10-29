@@ -650,6 +650,40 @@ fn refresh_released() {
     }
 }
 
+/// F2b focus: Ctrl-] cycles the keyboard owner among Sora-held views without reaching the
+/// shell. A Kilo session keeps the key; a full-screen program owns the keyboard.
+/// — TIMBERDOODLE
+const FOCUS_KEY: u8 = 0x1d;
+
+/// The next view with a held grant after `current`, wrapping; `None` when no view is held.
+fn next_focus(current: Option<usize>) -> Option<usize> {
+    let start = match current {
+        Some(view) => (view + 1) % kumo_graphics::VIEW_COUNT,
+        None => 0,
+    };
+    for step in 0..kumo_graphics::VIEW_COUNT {
+        let view = (start + step) % kumo_graphics::VIEW_COUNT;
+        if GRAPHICS_GRANTABLE[view].load(Ordering::Relaxed) {
+            return Some(view);
+        }
+    }
+    None
+}
+
+/// Tell drv-fb which view owns the keyboard and record the change. — TIMBERDOODLE
+fn announce_focus(view: Option<usize>) {
+    let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
+    if control.0 != 0 {
+        if let Some(record) = kumo_graphics::focus_record(view) {
+            let _ = channel_write(control, record.as_ptr(), record.len());
+        }
+    }
+    match view {
+        Some(view) => notice(&[b"sora: focus view ", &[b'0' + view as u8], b"\n"]),
+        None => notice(&[b"sora: focus none\n"]),
+    }
+}
+
 /// How long Sora waits for one ASYNC client to exit before giving up on its view. The old
 /// pump bound was 64 scheduler calls; a wall-clock bound does not depend on scheduler speed.
 const ASYNC_CLIENT_WAIT_NS: u64 = 5_000_000_000;
@@ -2644,6 +2678,10 @@ extern "C" fn sora_main(
     let mut hid_keyboard_input: Option<Handle> = None;
     let mut mouse_input: Option<Handle> = None;
     let mut pointer_state = sora::PointerState::default();
+    // F2b focus: the framebuffer extent for click hit-testing, and the view Sora last named
+    // as the keyboard owner. Focus changes are announced to drv-fb on the retained lane.
+    let mut fb_extent: (u32, u32) = (0, 0);
+    let mut focus_view: Option<usize> = None;
     let mut display_broker: Option<DisplayBroker> = None;
 
     // J159: BootInfo VMO handle arrives in x8 (beyond the C-ABI first-8). `_start` captured it
@@ -3121,6 +3159,7 @@ extern "C" fn sora_main(
                 log_fb_geometry(&fb);
                 if fb.is_plausible() {
                     pointer_state = sora::PointerState::new(fb.width, fb.height);
+                    fb_extent = (fb.width, fb.height);
                 }
                 // Refuse to mint an MMIO Resource over implausibly-shaped geometry: a corrupt
                 // snapshot read must fail here as a clear diagnostic, not reach the kernel's
@@ -4282,7 +4321,11 @@ extern "C" fn sora_main(
                     if n == drv_i2c_hid::MOUSE_EVENT_BYTES {
                         if let Some(report) = drv_i2c_hid::decode_mouse_event(&serve_buf[..n]) {
                             mouse_events_seen = mouse_events_seen.saturating_add(1);
+                            // F2b focus: a left-button press focuses the view under the
+                            // pointer, so detect the edge before the new state is applied.
+                            let was_left = pointer_state.buttons() & 1 != 0;
                             pointer_state.apply_boot_mouse(report);
+                            let left_pressed = !was_left && pointer_state.buttons() & 1 != 0;
                             // F2b slice-1: forward the clamped position to drv-fb, which owns
                             // the cursor sprite over the composed scene. — TIMBERDOODLE
                             let control = Handle(DRV_FB_BOOTSTRAP.load(Ordering::Relaxed));
@@ -4294,6 +4337,21 @@ extern "C" fn sora_main(
                                     pointer_state.buttons(),
                                 );
                                 let _ = channel_write(control, record.as_ptr(), record.len());
+                            }
+                            if left_pressed {
+                                let position = pointer_state.position();
+                                let target = kumo_graphics::band(fb_extent.0, fb_extent.1)
+                                    .and_then(|band| {
+                                        kumo_graphics::band_view_at(&band, position.x, position.y)
+                                    });
+                                if let Some(view) = target {
+                                    if GRAPHICS_GRANTABLE[view].load(Ordering::Relaxed)
+                                        && focus_view != Some(view)
+                                    {
+                                        focus_view = Some(view);
+                                        announce_focus(focus_view);
+                                    }
+                                }
                             }
                             // One NOTICE record proves the physical pointer path on metal
                             // without needing dmesg's INFO level. — TIMBERDOODLE
@@ -4359,6 +4417,17 @@ extern "C" fn sora_main(
                     let tty = interactive_ttyd.unwrap().instance;
                     let mut tty_reply = [0u8; ttyd::REPLY_BUF_BYTES];
                     for i in 0..n {
+                        if serve_buf[i] == FOCUS_KEY {
+                            // A cycle that lands on the same view (for example when only one
+                            // view is grantable) changes nothing and announces nothing.
+                            // — TIMBERDOODLE
+                            let next = next_focus(focus_view);
+                            if next != focus_view {
+                                focus_view = next;
+                                announce_focus(next);
+                            }
+                            continue;
+                        }
                         dispatch_ttyd_key(
                             tty.client,
                             serve_buf[i],

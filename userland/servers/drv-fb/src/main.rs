@@ -514,6 +514,9 @@ extern "C" fn main(
     }
     let mut cursor: Option<Cursor> = None;
     let mut pointer_records: u32 = 0;
+    // F2b focus: the view Sora last named as the keyboard owner, painted with highlighted
+    // chrome. A focus change repaints only the old and new chrome frames. — TIMBERDOODLE
+    let mut focused: Option<usize> = None;
 
     // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
     // view with a fresh presentation channel and surface. — TIMBERDOODLE
@@ -695,6 +698,7 @@ extern "C" fn main(
                                     },
                                     &content,
                                     pixel_order,
+                                    focused,
                                     |layer, at| unsafe {
                                         (bases[layer] as *const u32).add(at).read_volatile()
                                     },
@@ -715,6 +719,60 @@ extern "C" fn main(
                                 (fb_va as *mut u32).add(at).write_volatile(color)
                             },
                         );
+                    }
+                }
+                continue;
+            }
+            if n == 2 && rx[0] == kumo_graphics::FOCUS_TAG {
+                if channel.0 != 0 {
+                    let _ = kumo_rt::handle_close(channel);
+                }
+                if let Some(next) = kumo_graphics::parse_focus(&rx[..n]) {
+                    if focused != next {
+                        let previous = focused;
+                        focused = next;
+                        let mut line = Line::new();
+                        line.push(b"drv-fb: focus ");
+                        match next {
+                            Some(view) => {
+                                line.push(b"view ");
+                                line.push_decimal(view);
+                            }
+                            None => line.push(b"none"),
+                        }
+                        line.push(b"\n");
+                        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, line.bytes());
+                        if let Some(band) = layout.as_ref() {
+                            let mut content = [None; kumo_graphics::VIEW_COUNT];
+                            let mut bases = [0u64; kumo_graphics::VIEW_COUNT];
+                            for (other, entry) in view_content.iter().enumerate() {
+                                if let Some((base, description)) = entry {
+                                    bases[other] = *base;
+                                    content[other] = Some(*description);
+                                }
+                            }
+                            for view in [previous, next].into_iter().flatten() {
+                                let chrome = drv_fb::chrome_damage(&band.views[view], band.height);
+                                if let Some(rect) =
+                                    drv_fb::clip_damage(chrome, width as u32, height as u32)
+                                {
+                                    drv_fb::repaint_band_rect(
+                                        band,
+                                        stride,
+                                        rect,
+                                        &content,
+                                        pixel_order,
+                                        focused,
+                                        |layer, at| unsafe {
+                                            (bases[layer] as *const u32).add(at).read_volatile()
+                                        },
+                                        |at, color| unsafe {
+                                            (fb_va as *mut u32).add(at).write_volatile(color)
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -848,7 +906,7 @@ extern "C" fn main(
                         // The presenting view's new surface applies before it is stored.
                         bases[index] = lane.surface;
                         content[index] = Some(request.surface);
-                        drv_fb::compose_present(
+                        drv_fb::compose_present_focused(
                             band,
                             stride,
                             index,
@@ -857,6 +915,7 @@ extern "C" fn main(
                             SURFACE_BYTES,
                             &content,
                             pixel_order,
+                            focused,
                             |layer, at| unsafe {
                                 // SAFETY: every Some(description) in `content` came from an
                                 // accepted present backed by this retained mapping.
