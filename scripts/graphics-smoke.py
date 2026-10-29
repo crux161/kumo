@@ -82,8 +82,10 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # paints both views so the proven two-view band model applies unchanged.
                 data = b"dmesg -n 6\ngfx-titles on\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if log:
-                # C3 slice-1: the kernel log's tail presented as view 0's client surface.
-                data = b"dmesg -n 6\ngfx-log\necho graphics-smoke-after-present\ndmesg -n 5\n"
+                # C3 slices 1-2: the log's tail presented as view 0's surface, then two more
+                # runs — one after new log lines (partial row damage) and one with an
+                # unchanged tail (no present at all).
+                data = b"dmesg -n 6\ngfx-log\nrun hello\ngfx-log\ngfx-log\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -618,6 +620,10 @@ def main():
                 assert b"gfx-log: view 0 retired" in transcript or b"gfx-log: view 0 copied" in transcript, (
                     f"missing log-view reply; inspect {serial}"
                 )
+                assert b"; rows " in transcript, f"missing damaged-row record; inspect {serial}"
+                assert b"gfx-log: view 0 unchanged; no present" in transcript, (
+                    f"missing unchanged-tail record; inspect {serial}"
+                )
                 assert b"gfx-log: no graphics view held" not in transcript
                 assert b"graphics-smoke-after-present" in transcript
             else:
@@ -678,7 +684,7 @@ def main():
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             if args.log:
-                print("Log UEFI smoke green: the kernel log presented as a client surface through the presentation path")
+                print("Log UEFI smoke green: the kernel log presented as a client surface, only changed rows damaged")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:

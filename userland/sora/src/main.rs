@@ -8,6 +8,7 @@
 //j686
 //j690
 //j691
+//j692
 
 extern crate alloc;
 
@@ -78,6 +79,23 @@ static GRAPHICS_VMO: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 static GRAPHICS_SEQUENCE: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(1), AtomicU32::new(1)];
+
+/// C3 slice-2: the six row hashes of the last presented log view; zero means "never
+/// presented". The incremental view rewrites and damages only rows whose hash moved.
+const LOG_ROWS: usize = 6;
+const LOG_COLS: usize = 25;
+const _: () = assert!(kumo_graphics::DEMO.width as usize / drv_fb::GLYPH_W == LOG_COLS);
+const _: () = assert!(kumo_graphics::DEMO.height as usize >= LOG_ROWS * drv_fb::GLYPH_H);
+static LOG_ROW_HASH: [AtomicU64; LOG_ROWS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// Koid of the surface those hashes describe; a regranted view starts from a blank VMO.
+static LOG_VMO_KOID: AtomicU64 = AtomicU64::new(0);
 
 /// Bounded reply reads for the supervisor's demo presents. Sora's channel read parks once
 /// per call and returns an empty read on any unrelated wake, and the production vblank gate
@@ -1116,12 +1134,21 @@ fn gfx_titles(cmd: &kumoza::Command) {
     }]);
 }
 
-/// C3 slice-1 (PLAN/016 C3): present the kernel log as a client surface. Sora reads the log
-/// ring's tail, renders it into view 0's granted surface with the console's own renderer, and
-/// presents it through the standard KGP2 path, so the log is a surface with damage and a
-/// retirement reply instead of bytes the display server paints itself. Full-surface damage for
-/// this first slice; bounding-box damage and a live boot-time mirror are the follow-ups.
+/// C3 slices 1-2 (PLAN/016 C3): present the kernel log as a client surface, rewriting and
+/// damaging only the rows that changed. Sora reads the log ring's tail, keeps the last six
+/// padded rows, compares their hashes against the last presented rows, renders changed rows
+/// with the console's own coverage renderer over the retained surface, and presents a
+/// bounding damage set of just those rows. An unchanged tail skips the present entirely.
 /// — TIMBERDOODLE
+fn log_row_hash(row: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in row {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn gfx_log(cmd: &kumoza::Command) {
     use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
     if !cmd.args.is_empty() {
@@ -1154,7 +1181,7 @@ fn gfx_log(cmd: &kumoza::Command) {
         fail_status(1);
         return;
     }
-    let result = (|| {
+    let result = (|| -> Option<(Status, Option<([u64; LOG_ROWS], (usize, usize))>)> {
         if !child_parked(process_wait()) {
             log(b"gfx-log: pre-present pump failed\n");
             return None;
@@ -1176,30 +1203,114 @@ fn gfx_log(cmd: &kumoza::Command) {
             }
             offset = next;
         }
-        let mut text = [0u8; 1024];
-        let mut text_len = 0usize;
-        for index in seen.saturating_sub(tail.len())..seen {
-            let byte = tail[index % tail.len()];
-            // A plain text surface: printable ASCII and newlines only.
-            if byte == b'\n' || (0x20..=0x7e).contains(&byte) {
-                text[text_len] = byte;
-                text_len += 1;
+        // Linearize the tail once: the overwrite ring may have wrapped.
+        let start = seen.saturating_sub(tail.len());
+        let mut linear = [0u8; 1024];
+        let len = seen - start;
+        for (offset, index) in (start..seen).enumerate() {
+            linear[offset] = tail[index % tail.len()];
+        }
+        // Split into lines and keep the last LOG_ROWS, each padded to the row width.
+        // Present-traffic records are dropped: the display server writes two for every
+        // present, so a view that shows them can never converge on its own tail.
+        // — TIMBERDOODLE
+        const PRESENT_RECORD: &[u8] = b"display: present ";
+        let mut lines = [[b' '; LOG_COLS]; LOG_ROWS];
+        let mut row = 0usize;
+        let mut cursor = 0usize;
+        while cursor < len {
+            let end = linear[cursor..len]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(len, |rel| cursor + rel);
+            let line = &linear[cursor..end];
+            // Ring lines carry a `[ timestamp] ` stamp; match the record after it.
+            let text = match line.iter().position(|&byte| byte == b']') {
+                Some(close) if line.first() == Some(&b'[') => {
+                    let rest = &line[close + 1..];
+                    let skip = rest
+                        .iter()
+                        .position(|&byte| byte != b' ')
+                        .unwrap_or(rest.len());
+                    &rest[skip..]
+                }
+                _ => line,
+            };
+            if !text.starts_with(PRESENT_RECORD) {
+                let mut col = 0usize;
+                for &byte in line {
+                    // A plain text surface: printable ASCII inside the row width.
+                    if (0x20..=0x7e).contains(&byte) && col < LOG_COLS {
+                        lines[row][col] = byte;
+                        col += 1;
+                    }
+                }
+                row += 1;
+                if row == LOG_ROWS {
+                    lines.rotate_left(1);
+                    row -= 1;
+                }
+            }
+            cursor = end + 1;
+        }
+        // A regranted view starts from a blank VMO; never trust the old row hashes there.
+        let vmo_koid = handle_koid(vmo);
+        let fresh_surface = LOG_VMO_KOID.swap(vmo_koid, Ordering::Relaxed) != vmo_koid;
+        if fresh_surface {
+            for slot in &LOG_ROW_HASH {
+                slot.store(0, Ordering::Relaxed);
             }
         }
+        let mut hashes = [0u64; LOG_ROWS];
+        let mut changed: Option<(usize, usize)> = None;
+        for (index, line) in lines.iter().enumerate() {
+            hashes[index] = log_row_hash(line);
+            if LOG_ROW_HASH[index].load(Ordering::Relaxed) != hashes[index] {
+                changed = Some(match changed {
+                    Some((first, _)) => (first, index),
+                    None => (index, index),
+                });
+            }
+        }
+        let Some((first, last)) = changed else {
+            return Some((Status::Copied, None));
+        };
+        // Repaint only the changed rows over the retained picture.
         let mut console = unsafe {
-            drv_fb::Console::new(
+            drv_fb::Console::new_preserving(
                 LOG_VA as *mut u32,
                 DEMO.width as usize,
                 DEMO.height as usize,
                 DEMO.stride as usize,
             )
         };
-        console.write(&text[..text_len]);
+        for index in first..=last {
+            if LOG_ROW_HASH[index].load(Ordering::Relaxed) == hashes[index] {
+                continue;
+            }
+            console.write(&[0x1b, b'[']);
+            console.write(&[b'0' + (index as u8 + 1)]);
+            console.write(b";1H");
+            console.write(&lines[index]);
+        }
+        // A pristine lane refuses a partial first present: the server must see every pixel
+        // declared once. The first frame on a fresh surface claims the whole of it.
+        let damage = if fresh_surface {
+            DamageSet::FULL
+        } else {
+            let damage = kumo_graphics::Damage {
+                x: 0,
+                y: (first * drv_fb::GLYPH_H) as u32,
+                width: DEMO.width,
+                height: ((last - first + 1) * drv_fb::GLYPH_H) as u32,
+            };
+            DamageSet::single(damage).unwrap_or(DamageSet::FULL)
+        };
         let sequence = GRAPHICS_SEQUENCE[LOG_VIEW].fetch_add(1, Ordering::Relaxed);
         let frame = Present {
             sequence,
             surface: DEMO,
-            damage: DamageSet::FULL,
+            damage,
         }
         .encode();
         if channel_write(channel, frame.as_ptr(), frame.len()) != 0 || !child_parked(process_wait())
@@ -1210,22 +1321,36 @@ fn gfx_log(cmd: &kumoza::Command) {
         let mut reply = [0u8; REPLY_LEN + 1];
         let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
         let reply = Reply::decode(reply.get(..len)?)?;
-        (reply.sequence == sequence).then_some(reply.status)
+        (reply.sequence == sequence).then_some((reply.status, Some((hashes, (first, last)))))
     })();
     let _ = kumo_rt::vmar_unmap(LOG_VA, kumo_graphics::SURFACE_BYTES as u64);
     match result {
-        Some(status) => {
-            // A valid reply releases the surface for Sora's next use, as gfx-demo does.
+        Some((Status::Copied | Status::Retired, None)) => {
+            // A valid reply with no changed rows: the retained surface is current.
             GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
-            log(b"gfx-log: view 0 ");
-            if status == Status::Retired {
-                log(b"retired; log surface reached the scanout\n");
-            } else if status == Status::Copied {
-                log(b"copied; log surface released (software GOP)\n");
-            } else {
-                log(b"rejected\n");
-                fail_status(1);
+            term(b"gfx-log: view 0 unchanged; no present\n");
+        }
+        Some((status, Some((hashes, (first, last)))))
+            if matches!(status, Status::Copied | Status::Retired) =>
+        {
+            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+            for (slot, hash) in LOG_ROW_HASH.iter().zip(hashes.iter()) {
+                slot.store(*hash, Ordering::Relaxed);
             }
+            term(b"gfx-log: view 0 ");
+            term(if status == Status::Retired {
+                b"retired" as &[u8]
+            } else {
+                b"copied"
+            });
+            term(b"; rows ");
+            term(&[b'0' + first as u8, b'-', b'0' + last as u8]);
+            term(b" damaged\n");
+        }
+        Some(_) => {
+            let _ = handle_close(channel);
+            log(b"gfx-log: view 0 rejected; view disabled\n");
+            fail_status(1);
         }
         None => {
             let _ = handle_close(channel);
@@ -1497,6 +1622,13 @@ core::arch::global_asm!(
 
 fn log(msg: &[u8]) {
     debug_write(msg.as_ptr(), msg.len());
+}
+
+/// The log view's own records: terminal output, not kernel-log entries. The view reads the
+/// same ring it would otherwise narrate into, so its bookkeeping must not feed itself.
+/// — TIMBERDOODLE
+fn term(msg: &[u8]) {
+    let _ = kumo_rt::debug_write(msg.as_ptr(), msg.len());
 }
 
 /// Set when the serve loop is about to draw its first prompt (J559). Until then everything Sora

@@ -8,6 +8,7 @@
 //j687
 //j688
 //j689
+//j692
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -268,6 +269,46 @@ impl Console {
         stride: usize,
         pixel_order: PixelOrder,
     ) -> Console {
+        unsafe {
+            Self::new_shadowed_inner(base, shadow, width_px, height_px, stride, pixel_order, true)
+        }
+    }
+
+    /// Build a console over an existing picture without clearing it. The incremental log
+    /// view rewrites only the rows that changed, so its surface must survive construction.
+    /// — TIMBERDOODLE
+    ///
+    /// # Safety
+    /// `base` must point at a writable framebuffer of at least `stride * height_px`
+    /// `u32` pixels and outlive the `Console`.
+    pub unsafe fn new_preserving(
+        base: *mut u32,
+        width_px: usize,
+        height_px: usize,
+        stride: usize,
+    ) -> Console {
+        unsafe {
+            Self::new_shadowed_inner(
+                base,
+                base,
+                width_px,
+                height_px,
+                stride,
+                PixelOrder::Bgr,
+                false,
+            )
+        }
+    }
+
+    unsafe fn new_shadowed_inner(
+        base: *mut u32,
+        shadow: *mut u32,
+        width_px: usize,
+        height_px: usize,
+        stride: usize,
+        pixel_order: PixelOrder,
+        clear: bool,
+    ) -> Console {
         let stride = if stride == 0 { width_px } else { stride };
         let mut con = Console {
             base,
@@ -295,7 +336,9 @@ impl Console {
             cursor_visible: false,
             cursor_drawn: false,
         };
-        con.clear();
+        if clear {
+            con.clear();
+        }
         con
     }
 
@@ -2752,6 +2795,19 @@ mod tests {
     }
 
     /// DESIGN/024: blend endpoints are exact, so erase and repaint can rely on them.
+    #[test]
+    fn a_preserving_console_leaves_the_picture_and_draws_over_it() {
+        let mut buf = [0x1234_5678u32; W * H];
+        let mut con = unsafe { Console::new_preserving(buf.as_mut_ptr(), W, H, STRIDE) };
+        assert!(buf.iter().all(|&pixel| pixel == 0x1234_5678));
+        con.write(b"A");
+        assert_cell(&buf, b'A', 0, 0);
+        // Only the written cell row is repainted; the rest keeps its picture.
+        assert!(buf[GLYPH_H * STRIDE..]
+            .iter()
+            .all(|&pixel| pixel == 0x1234_5678));
+    }
+
     #[test]
     fn coverage_blend_endpoints_are_exact() {
         for (bg, fg) in [
