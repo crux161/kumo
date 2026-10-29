@@ -7,6 +7,7 @@
 //j684
 //j686
 //j690
+//j691
 
 extern crate alloc;
 
@@ -1113,6 +1114,125 @@ fn gfx_titles(cmd: &kumoza::Command) {
     } else {
         b"sora: titles off\n"
     }]);
+}
+
+/// C3 slice-1 (PLAN/016 C3): present the kernel log as a client surface. Sora reads the log
+/// ring's tail, renders it into view 0's granted surface with the console's own renderer, and
+/// presents it through the standard KGP2 path, so the log is a surface with damage and a
+/// retirement reply instead of bytes the display server paints itself. Full-surface damage for
+/// this first slice; bounding-box damage and a live boot-time mirror are the follow-ups.
+/// — TIMBERDOODLE
+fn gfx_log(cmd: &kumoza::Command) {
+    use kumo_graphics::{DamageSet, Present, Reply, Status, DEMO, REPLY_LEN};
+    if !cmd.args.is_empty() {
+        usage(b"usage: gfx-log\n");
+        return;
+    }
+    const LOG_VIEW: usize = 0;
+    const LOG_VA: u64 = 0x3800_0000;
+    let channel = Handle(GRAPHICS_CHANNEL[LOG_VIEW].swap(0, Ordering::Relaxed));
+    let vmo = Handle(GRAPHICS_VMO[LOG_VIEW].load(Ordering::Relaxed));
+    if channel.0 == 0 || vmo.0 == 0 {
+        if channel.0 != 0 {
+            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+        }
+        log(b"gfx-log: no graphics view held\n");
+        fail_status(1);
+        return;
+    }
+    let map = vmar_map(
+        Handle(0),
+        vmo,
+        0,
+        LOG_VA,
+        kumo_graphics::SURFACE_BYTES as u64,
+        (VmarFlags::READ | VmarFlags::WRITE).0,
+    );
+    if map != 0 {
+        GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+        log(b"gfx-log: surface map failed\n");
+        fail_status(1);
+        return;
+    }
+    let result = (|| {
+        if !child_parked(process_wait()) {
+            log(b"gfx-log: pre-present pump failed\n");
+            return None;
+        }
+        // The ring's last bytes: a bounded overwrite tail over the older lines.
+        let resource = Handle(ROOT_RESOURCE.load(Ordering::Relaxed) as u32);
+        let mut tail = [0u8; 1024];
+        let mut seen = 0usize;
+        let mut chunk = [0u8; 1024];
+        let mut offset = 0u64;
+        for _ in 0..64 {
+            let (n, next) = kumo_rt::log_read(resource, offset, &mut chunk);
+            if n == u64::MAX || n == 0 {
+                break;
+            }
+            for &byte in &chunk[..n as usize] {
+                tail[seen % tail.len()] = byte;
+                seen += 1;
+            }
+            offset = next;
+        }
+        let mut text = [0u8; 1024];
+        let mut text_len = 0usize;
+        for index in seen.saturating_sub(tail.len())..seen {
+            let byte = tail[index % tail.len()];
+            // A plain text surface: printable ASCII and newlines only.
+            if byte == b'\n' || (0x20..=0x7e).contains(&byte) {
+                text[text_len] = byte;
+                text_len += 1;
+            }
+        }
+        let mut console = unsafe {
+            drv_fb::Console::new(
+                LOG_VA as *mut u32,
+                DEMO.width as usize,
+                DEMO.height as usize,
+                DEMO.stride as usize,
+            )
+        };
+        console.write(&text[..text_len]);
+        let sequence = GRAPHICS_SEQUENCE[LOG_VIEW].fetch_add(1, Ordering::Relaxed);
+        let frame = Present {
+            sequence,
+            surface: DEMO,
+            damage: DamageSet::FULL,
+        }
+        .encode();
+        if channel_write(channel, frame.as_ptr(), frame.len()) != 0 || !child_parked(process_wait())
+        {
+            log(b"gfx-log: present queue failed\n");
+            return None;
+        }
+        let mut reply = [0u8; REPLY_LEN + 1];
+        let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+        let reply = Reply::decode(reply.get(..len)?)?;
+        (reply.sequence == sequence).then_some(reply.status)
+    })();
+    let _ = kumo_rt::vmar_unmap(LOG_VA, kumo_graphics::SURFACE_BYTES as u64);
+    match result {
+        Some(status) => {
+            // A valid reply releases the surface for Sora's next use, as gfx-demo does.
+            GRAPHICS_CHANNEL[LOG_VIEW].store(channel.0, Ordering::Relaxed);
+            log(b"gfx-log: view 0 ");
+            if status == Status::Retired {
+                log(b"retired; log surface reached the scanout\n");
+            } else if status == Status::Copied {
+                log(b"copied; log surface released (software GOP)\n");
+            } else {
+                log(b"rejected\n");
+                fail_status(1);
+            }
+        }
+        None => {
+            let _ = handle_close(channel);
+            log(b"gfx-log: view 0 failed; view disabled\n");
+            fail_status(1);
+        }
+    }
 }
 
 fn graphics_client(cmd: &kumoza::Command, initrd: Handle, cwd: &WorkingDirectory) {
@@ -4906,6 +5026,10 @@ fn eval_command(
     }
     if cmd.name == "gfx-titles" {
         gfx_titles(cmd);
+        return true;
+    }
+    if cmd.name == "gfx-log" {
+        gfx_log(cmd);
         return true;
     }
     if cmd.name == "gfx-damage" {

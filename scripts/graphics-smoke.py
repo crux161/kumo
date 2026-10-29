@@ -27,7 +27,7 @@ import threading
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -81,6 +81,9 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # The server draws its own band labels through the glyph atlas; gfx-demo still
                 # paints both views so the proven two-view band model applies unchanged.
                 data = b"dmesg -n 6\ngfx-titles on\ngfx-demo\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if log:
+                # C3 slice-1: the kernel log's tail presented as view 0's client surface.
+                data = b"dmesg -n 6\ngfx-log\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -216,7 +219,7 @@ def bitmap_reference(source=None, scratch=False):
     return pixel
 
 
-def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False):
+def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_clients=False, damage=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False):
     data = path.read_bytes()
     header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\n", data)
     assert header, "unexpected QEMU screenshot format"
@@ -248,6 +251,9 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
         images = [bitmap_reference(bitmap_file, scratch), lambda x, y: VIEW_SOLID]
     elif two_clients:
         images = [demo_pixel, demo_pixel]
+    elif log:
+        # The log surface fills view 0 (asserted separately); view 1 stays an empty well.
+        images = [None, None]
     else:
         images = [demo_pixel, lambda x, y: VIEW_SOLID]
     # F2c: the server draws a title bar across the top of each view; the band model excludes
@@ -266,8 +272,24 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
                 continue
             if titles and in_label(x, y):
                 continue
+            if log and in_rects(x, y, [(rects[0][0], rects[0][1], VIEW_W, VIEW_H)]):
+                continue
             want = compose_expected(x, y, rects, images)
             assert at(x, y) == want, f"band pixel {(x, y)} is {at(x, y)}, want {want}"
+    if log:
+        # C3 slice-1: view 0's client rect holds the presented log text. The server's title
+        # strip overlays its top rows and is asserted with the other strips.
+        vx, vy = rects[0]
+        ink = 0
+        for y in range(vy + 16, vy + VIEW_H):
+            for x in range(vx, vx + VIEW_W):
+                pixel = at(x, y)
+                assert pixel != POISON, f"log surface leaked poison at {(x, y)}"
+                if pixel != (0, 0, 0):
+                    ink += 1
+        assert ink > 200, f"log view shows only {ink} text pixels"
+        print("Log band: presented surface holds rendered log text")
+
     if titles:
         for index, (lx, ly, lw, lh) in enumerate(LABEL_RECTS):
             inked = 0
@@ -344,6 +366,7 @@ def main():
     parser.add_argument("--recover", action="store_true", help="prove a killed presenter leaves a recoverable view that takes a fresh client")
     parser.add_argument("--acceptance", action="store_true", help="prove the F2 acceptance clause: two clients, keyboard focus switching between their consumers")
     parser.add_argument("--titles", action="store_true", help="prove server-drawn band labels through the glyph atlas")
+    parser.add_argument("--log", action="store_true", help="prove the kernel log presented as a client surface through the damage path")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -367,6 +390,8 @@ def main():
         parser.error("--acceptance is a separate proof")
     if args.titles and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance):
         parser.error("--titles is a separate proof")
+    if args.log and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance or args.titles):
+        parser.error("--log is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -382,7 +407,7 @@ def main():
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
                      args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant,
-                     args.recover, args.acceptance, args.titles)
+                     args.recover, args.acceptance, args.titles, args.log)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     serial_sock = work / "serial.sock"
@@ -589,6 +614,12 @@ def main():
                 assert transcript.count(demo) == 1, f"missing view 1 reply; inspect {serial}"
                 assert b"gfx-demo: one or more views failed" not in transcript
                 assert b"drv-fb: titles on" in transcript
+            elif args.log:
+                assert b"gfx-log: view 0 retired" in transcript or b"gfx-log: view 0 copied" in transcript, (
+                    f"missing log-view reply; inspect {serial}"
+                )
+                assert b"gfx-log: no graphics view held" not in transcript
+                assert b"graphics-smoke-after-present" in transcript
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -627,7 +658,7 @@ def main():
             check_pixels(work / "screen.ppm", args.bitmap, args.bitmap_file,
                          args.bitmap_path == "/tmp/INPUT.BMP", args.two_clients, args.damage,
                          args.regrant, args.async_regrant, args.recover, args.acceptance,
-                         args.titles)
+                         args.titles, args.log)
             if args.bitmap:
                 print("Bitmap UEFI smoke green: all 32768 pixels match the BMP, letterboxing, chrome, console, login")
             if args.two_clients:
@@ -646,6 +677,8 @@ def main():
                 print("Acceptance UEFI smoke green: two client processes, keyboard focus switched cleanly between their consumers")
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
+            if args.log:
+                print("Log UEFI smoke green: the kernel log presented as a client surface through the presentation path")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:
