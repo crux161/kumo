@@ -1,15 +1,17 @@
-//j612
 //j632
 //j634
 //j635
 //j636
+//j678
 
 //! D1a/D1c: owned scanout, alternating buffers and consumed-load retirement.
 //!
 //! Recovery class: soft-state. The buffer's address is a device address, backed by an
 //! explicitly prepared READ mapping in the kernel-owned DeviceCtx. CPU painting uses an
 //! uncached mapping of the actual VMO, so DMA sees completed writes after a barrier.
-//! The historical trusted bypass diagnostic used physical addresses in this field.
+//! The trusted bypass diagnostic of J612 used physical addresses in this field and is
+//! historical: since DESIGN/022's ratification (D1d) every address written here is a device
+//! address backed by a prepared READ mapping in the kernel-owned domain. — TIMBERDOODLE
 //! A flip rewrites ESMART2 region0's `MST_YRGB` and requests the consumed VP2 load.
 //! — KESTREL
 //!
