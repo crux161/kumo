@@ -698,7 +698,7 @@ def main():
             if args.titles:
                 print("Titles UEFI smoke green: server-drawn glyph labels in the band, exact pixels outside them")
             if args.log:
-                print("Log UEFI smoke green: per-view console surfaces (kernel log, userland stream), only changed rows damaged, kept live by the mirror")
+                print("Log UEFI smoke green: per-view console surfaces (kernel log, shell stream), only changed rows damaged, kept live by the mirror")
             print("Graphics UEFI smoke green: separate client + supervisor views, clipping, chrome, reuse, console text, login")
         finally:
             if serial_conn is not None:

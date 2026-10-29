@@ -11,6 +11,7 @@
 //j692
 //j693
 //j694
+//j697
 
 extern crate alloc;
 
@@ -113,13 +114,14 @@ static LOG_VMO_KOID: [AtomicU64; kumo_graphics::VIEW_COUNT] =
 /// C3 slice-3: while set, the serve loop refreshes the console views on a cadence so the
 /// surfaces follow their streams without anyone typing `gfx-log`.
 static LOG_MIRROR: AtomicBool = AtomicBool::new(false);
-/// C3 slice-4: Sora's own console stream, a single-writer byte ring feeding the userland
-/// console view. `debug_write` is the funnel every Sora console byte passes through.
-static USER_RING: [AtomicU8; 1024] = [const { AtomicU8::new(0) }; 1024];
-static USER_RING_SEQ: AtomicU32 = AtomicU32::new(0);
-/// Which stream each console view shows: view 0 the kernel log ring, view 1 Sora's own
-/// userland console stream. — TIMBERDOODLE
-const CONSOLE_SOURCES: [u8; kumo_graphics::VIEW_COUNT] = [0, 1];
+/// C3 S3-a: the interactive terminal's stream, a single-writer byte ring feeding the
+/// terminal view. Only shell output enters it — prompts, ttyd echo and command output via
+/// `shell_write`; Sora's own notices never do. — TIMBERDOODLE
+static SHELL_RING: [AtomicU8; 1024] = [const { AtomicU8::new(0) }; 1024];
+static SHELL_RING_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Which stream each console view shows: view 0 the kernel log ring, view 1 the interactive
+/// terminal's shell stream. — TIMBERDOODLE
+const CONSOLE_SOURCES: [u8; kumo_graphics::VIEW_COUNT] = [0, 2];
 const CONSOLE_KERNEL_RING: u8 = 0;
 
 /// Bounded reply reads for the supervisor's demo presents. Sora's channel read parks once
@@ -1233,10 +1235,11 @@ fn console_refresh(view: usize, quiet: bool) -> bool {
             }
             seen = total;
         } else {
-            let seq = USER_RING_SEQ.load(Ordering::Relaxed) as usize;
+            // The interactive terminal's shell stream (not Sora's notices).
+            let seq = SHELL_RING_SEQ.load(Ordering::Relaxed) as usize;
             let len = seq.min(tail.len());
             for (offset, index) in (seq - len..seq).enumerate() {
-                tail[offset] = USER_RING[index % tail.len()].load(Ordering::Relaxed);
+                tail[offset] = SHELL_RING[index % tail.len()].load(Ordering::Relaxed);
             }
             seen = seq;
         }
@@ -1718,18 +1721,29 @@ static SERVING: AtomicBool = AtomicBool::new(false);
 /// Sora's console write: the kernel log while booting, the terminal once serving.
 fn debug_write(ptr: *const u8, len: usize) -> u64 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    // C3 slice-4: every Sora console byte also feeds the userland console view's ring.
-    let mut seq = USER_RING_SEQ.load(Ordering::Relaxed);
-    for &byte in bytes {
-        USER_RING[(seq as usize) % USER_RING.len()].store(byte, Ordering::Relaxed);
-        seq = seq.wrapping_add(1);
-    }
-    USER_RING_SEQ.store(seq, Ordering::Relaxed);
     if SERVING.load(Ordering::Relaxed) {
         kumo_rt::debug_write(ptr, len)
     } else {
         kumo_rt::log_write(kumo_abi::sys::log_level::INFO, bytes)
     }
+}
+
+/// C3 S3-a: write shell output — prompts, ttyd echo and command output — to the console and
+/// to the terminal view's ring. Sora's own records (`log`/`notice`/`diag`) stay out of the
+/// terminal by construction. — TIMBERDOODLE
+fn shell_write(ptr: *const u8, len: usize) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let mut seq = SHELL_RING_SEQ.load(Ordering::Relaxed);
+    for &byte in bytes {
+        SHELL_RING[(seq as usize) % SHELL_RING.len()].store(byte, Ordering::Relaxed);
+        seq = seq.wrapping_add(1);
+    }
+    SHELL_RING_SEQ.store(seq, Ordering::Relaxed);
+    debug_write(ptr, len)
+}
+
+fn shell_output(message: &[u8]) {
+    let _ = shell_write(message.as_ptr(), message.len());
 }
 
 /// A boot milestone: one short line the console's default level shows, written in one call so
@@ -1843,7 +1857,7 @@ fn write_shell_prompt(cwd: &WorkingDirectory) {
     .render();
     // Rendered whole and written back to back, so a driver line cannot split it except at a
     // 256-byte DebugWrite boundary.
-    let _ = sora::relay_console_output(&prompt, |chunk| debug_write(chunk.as_ptr(), chunk.len()));
+    let _ = sora::relay_console_output(&prompt, |chunk| shell_write(chunk.as_ptr(), chunk.len()));
 }
 
 /// Log a `u64` as `0x…` hex on the live serial. `no_std` Sora has no formatter, so a
@@ -5863,10 +5877,10 @@ fn read_hostname(initrd: Handle) {
 fn write_login_prompt() {
     match LOGIN.get().stage() {
         sora::LoginStage::Name => {
-            log(HOSTNAME.get().as_str().as_bytes());
-            log(b" login: ");
+            shell_output(HOSTNAME.get().as_str().as_bytes());
+            shell_output(b" login: ");
         }
-        sora::LoginStage::Password => log(b"Password: "),
+        sora::LoginStage::Password => shell_output(b"Password: "),
         sora::LoginStage::Paused => {}
     }
 }
@@ -6203,7 +6217,7 @@ fn dmesg(cmd: &kumoza::Command) {
                     return;
                 }
                 if !sora::relay_console_output(&buf[..n as usize], |chunk| {
-                    debug_write(chunk.as_ptr(), chunk.len())
+                    shell_write(chunk.as_ptr(), chunk.len())
                 }) {
                     return;
                 }
@@ -6810,7 +6824,7 @@ fn pump_to_console(read_end: Handle) {
             break;
         }
         if !sora::relay_console_output(&buf[..n as usize], |chunk| {
-            debug_write(chunk.as_ptr(), chunk.len())
+            shell_write(chunk.as_ptr(), chunk.len())
         }) {
             break;
         }
@@ -6853,7 +6867,7 @@ fn lua_relay_reply(stdout: Handle) -> bool {
         end_lua_session();
         return false;
     }
-    debug_write(buf.as_ptr(), n as usize);
+    shell_write(buf.as_ptr(), n as usize);
     true
 }
 
@@ -6982,7 +6996,7 @@ fn kilo_relay_paint(stdout: Handle) -> bool {
         return false;
     }
     if sora::relay_console_output(&buf[..n as usize], |chunk| {
-        debug_write(chunk.as_ptr(), chunk.len())
+        shell_write(chunk.as_ptr(), chunk.len())
     }) {
         // A complete repaint is editor progress, not a lifetime key budget.
         // Lua output must not reset this editor's liveness counter. — KESTREL
@@ -7803,7 +7817,7 @@ fn dispatch_ttyd_key(
         return false;
     }
     if !parsed.echo.is_empty() {
-        debug_write(parsed.echo.as_ptr(), parsed.echo.len());
+        shell_write(parsed.echo.as_ptr(), parsed.echo.len());
     }
     let Some(line) = parsed.line else {
         return true;
