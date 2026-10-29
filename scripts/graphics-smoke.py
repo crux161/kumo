@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j657
 #j658
 #j659
 #j660
 #j670
+#j672
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -236,18 +236,26 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
             assert at(x, y) == want, f"band pixel {(x, y)} is {at(x, y)}, want {want}"
     if titles:
         for index, (lx, ly, lw, lh) in enumerate(LABEL_RECTS):
-            white = sum(
-                1 for y in range(ly, ly + lh) for x in range(lx, lx + lw) if at(x, y) == WHITE
-            )
-            stray = sum(
-                1
-                for y in range(ly, ly + lh)
-                for x in range(lx, lx + lw)
-                if at(x, y) not in (WHITE, BAND_BG)
-            )
-            assert white > 8, f"label {index} has only {white} glyph pixels"
-            assert stray == 0, f"label {index} has {stray} pixels that are neither white nor band"
-        print("Titles band: server-drawn glyph labels present")
+            inked = 0
+            for y in range(ly, ly + lh):
+                for x in range(lx, lx + lw):
+                    pixel = at(x, y)
+                    if pixel == BAND_BG:
+                        continue
+                    inked += 1
+                    # Alpha blending: each channel must lie between the band background and
+                    # white, and the per-channel fractions must agree within rounding.
+                    fractions = []
+                    for channel, floor in zip(pixel, BAND_BG):
+                        assert floor <= channel <= 255, (
+                            f"label {index} pixel {(x, y)} leaves the blend envelope"
+                        )
+                        fractions.append((channel - floor) / (255 - floor))
+                    assert max(fractions) - min(fractions) <= 0.08, (
+                        f"label {index} pixel {(x, y)} is not a blend of band and white"
+                    )
+            assert inked > 8, f"label {index} has only {inked} glyph pixels"
+        print("Titles band: server-drawn anti-aliased glyph labels present")
 
     # The clipped surface's out-of-view poison must never reach the glass.
     poison = sum(1 for y in range(height) for x in range(width) if at(x, y) == POISON)

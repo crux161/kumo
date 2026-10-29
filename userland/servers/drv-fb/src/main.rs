@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j662
 //j667
 //j668
 //j670
 //j671
+//j672
 
 mod clock_probe;
 mod display_probe;
@@ -518,8 +518,9 @@ extern "C" fn main(
     // chrome. A focus change repaints only the old and new chrome frames. — TIMBERDOODLE
     let mut focused: Option<usize> = None;
 
-    // F2c: server-drawn band labels, rasterized from the vendored face, toggled by a `T`
-    // record and redrawn once per wake beneath the cursor overlay. — TIMBERDOODLE
+    // F2c: server-drawn band labels, rasterized from the vendored face and alpha-blended into
+    // the band, toggled by a `T` record and redrawn once per wake beneath the cursor overlay.
+    // — TIMBERDOODLE
     let mut titles = false;
     let mut face_logged = false;
     let draw_labels =
@@ -527,10 +528,11 @@ extern "C" fn main(
             if !on {
                 return;
             }
+            let read = |at: usize| unsafe { (fb as *const u32).add(at).read_volatile() };
             let write = |at: usize, color: u32| unsafe {
                 (fb as *mut u32).add(at).write_volatile(color);
             };
-            if !drv_fb::blit_face(
+            if !drv_fb::blit_face_alpha(
                 b"VIEW 0",
                 width,
                 height,
@@ -539,6 +541,7 @@ extern "C" fn main(
                 8,
                 8,
                 0x00ff_ffff,
+                read,
                 write,
             ) {
                 drv_fb::blit_ascii(
@@ -553,7 +556,7 @@ extern "C" fn main(
                     write,
                 );
             }
-            if !drv_fb::blit_face(
+            if !drv_fb::blit_face_alpha(
                 b"VIEW 1",
                 width,
                 height,
@@ -562,6 +565,7 @@ extern "C" fn main(
                 8,
                 32,
                 0x00ff_ffff,
+                read,
                 write,
             ) {
                 drv_fb::blit_ascii(
@@ -648,8 +652,52 @@ extern "C" fn main(
         // and modeset repaints write under it, so it is redrawn once per wake before the next
         // wait; a pointer move repairs its old and new rectangles from the scene first.
         // — TIMBERDOODLE
-        // F2c: the band labels are an overlay like the cursor; a band recompose can erase
-        // them, so both redraw once per wake, the labels beneath the sprite. — TIMBERDOODLE
+        // F2c: the band labels are an overlay like the cursor, and blending is not
+        // idempotent, so each wake repaints their rectangles from the band before blending
+        // them again, beneath the sprite. — TIMBERDOODLE
+        if titles {
+            if let Some(band) = layout.as_ref() {
+                let mut content = [None; kumo_graphics::VIEW_COUNT];
+                let mut bases = [0u64; kumo_graphics::VIEW_COUNT];
+                for (other, entry) in view_content.iter().enumerate() {
+                    if let Some((base, description)) = entry {
+                        bases[other] = *base;
+                        content[other] = Some(*description);
+                    }
+                }
+                for rect in [
+                    kumo_graphics::Damage {
+                        x: 8,
+                        y: 8,
+                        width: 48,
+                        height: 16,
+                    },
+                    kumo_graphics::Damage {
+                        x: 8,
+                        y: 32,
+                        width: 48,
+                        height: 16,
+                    },
+                ] {
+                    if let Some(rect) = drv_fb::clip_damage(rect, width as u32, height as u32) {
+                        drv_fb::repaint_band_rect(
+                            band,
+                            stride,
+                            rect,
+                            &content,
+                            pixel_order,
+                            focused,
+                            |layer, at| unsafe {
+                                (bases[layer] as *const u32).add(at).read_volatile()
+                            },
+                            |at, color| unsafe {
+                                (fb_va as *mut u32).add(at).write_volatile(color)
+                            },
+                        );
+                    }
+                }
+            }
+        }
         draw_labels(
             titles,
             fb_va,

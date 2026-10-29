@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j662
 //j667
 //j668
 //j670
 //j671
+//j672
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -1018,6 +1018,73 @@ pub fn blit_face<W: FnMut(usize, u32)>(
                     return;
                 }
                 write(py as usize * stride + px as usize, color);
+            });
+        }
+        caret += scaled.h_advance(glyph_id);
+    }
+    true
+}
+
+/// Blend `ink` over `background` at `coverage` (0..=1) bytewise in the order's packed space:
+/// both pixels share the packing, so each of the three colour bytes lerps independently.
+pub fn blend_ink(background: u32, ink: u32, coverage: f32) -> u32 {
+    let coverage = (coverage.clamp(0.0, 1.0) * 256.0) as u32;
+    let mut out = 0u32;
+    for shift in [0u32, 8, 16] {
+        let background = (background >> shift) & 0xff;
+        let ink = (ink >> shift) & 0xff;
+        let value = (background * (256 - coverage) + ink * coverage + 128) >> 8;
+        out |= value.min(255) << shift;
+    }
+    out
+}
+
+/// Draw one line of ASCII at `(x, y)` rasterized from the vendored face, alpha-blending each
+/// covered pixel against the pixel already on the glass. `read` supplies the background for
+/// that pixel; the framebuffer is non-cacheable, so no cache maintenance is needed. Returns
+/// false when the face cannot be parsed. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+pub fn blit_face_alpha<R: Fn(usize) -> u32, W: FnMut(usize, u32)>(
+    text: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    order: PixelOrder,
+    x: u32,
+    y: u32,
+    color: u32,
+    read: R,
+    mut write: W,
+) -> bool {
+    use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
+    let Ok(font) = FontRef::try_from_slice(FACE_TTF) else {
+        return false;
+    };
+    let scale = PxScale::from(GLYPH_H as f32);
+    let scaled = font.as_scaled(scale);
+    let color = order.pixel((color >> 16) as u8, (color >> 8) as u8, color as u8);
+    let mut caret = x as f32;
+    for byte in text {
+        let glyph_id = font.glyph_id(*byte as char);
+        let glyph = glyph_id
+            .with_scale_and_position(scale, ab_glyph::point(caret, y as f32 + scaled.ascent()));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                if coverage == 0.0 {
+                    return;
+                }
+                let px = bounds.min.x + gx as f32;
+                let py = bounds.min.y + gy as f32;
+                if px < 0.0 || py < 0.0 {
+                    return;
+                }
+                let (px, py) = (px as u32, py as u32);
+                if px >= width || py >= height {
+                    return;
+                }
+                let at = py as usize * stride + px as usize;
+                write(at, blend_ink(read(at), color, coverage));
             });
         }
         caret += scaled.h_advance(glyph_id);
@@ -2204,6 +2271,56 @@ mod tests {
             0x00ff_ffff,
             |at, _| assert!(at % 64 < 4, "wrote outside the width"),
         ));
+    }
+
+    #[test]
+    fn blend_ink_lerps_each_colour_byte_between_background_and_ink() {
+        let background = PixelOrder::Rgb.pixel(0x16, 0x1b, 0x22);
+        let white = PixelOrder::Rgb.pixel(0xff, 0xff, 0xff);
+        assert_eq!(blend_ink(background, white, 0.0), background);
+        assert_eq!(blend_ink(background, white, 1.0), white);
+        let half = blend_ink(background, white, 0.5);
+        let red = (half >> 16) & 0xff;
+        let green = (half >> 8) & 0xff;
+        let blue = half & 0xff;
+        assert!((0x16..=0xff).contains(&red) && red > 0x16 && red < 0xff);
+        assert!((0x1b..=0xff).contains(&green) && green > 0x1b && green < 0xff);
+        assert!((0x22..=0xff).contains(&blue) && blue > 0x22 && blue < 0xff);
+    }
+
+    #[test]
+    fn blit_face_alpha_blends_against_the_glass_and_never_darkens() {
+        let background = PixelOrder::Rgb.pixel(0x16, 0x1b, 0x22);
+        let mut glass = [background; 20 * 64];
+        let snapshot = glass;
+        assert!(blit_face_alpha(
+            b"V",
+            64,
+            20,
+            64,
+            PixelOrder::Rgb,
+            0,
+            0,
+            0x00ff_ffff,
+            |at| snapshot[at],
+            |at, color| glass[at] = color,
+        ));
+        let white = PixelOrder::Rgb.pixel(0xff, 0xff, 0xff);
+        let mut partial = 0;
+        for pixel in glass {
+            if pixel == background {
+                continue;
+            }
+            for shift in [0u32, 8, 16] {
+                let channel = (pixel >> shift) & 0xff;
+                let floor = (background >> shift) & 0xff;
+                assert!(channel >= floor, "blend darkened a channel");
+            }
+            if pixel != white {
+                partial += 1;
+            }
+        }
+        assert!(partial > 8, "only {partial} partially covered pixels");
     }
 
     #[test]
