@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j660
 #j670
 #j672
 #j674
 #j675
+#j676
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -63,9 +63,11 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # releases and regrant view 0.
                 data = b"dmesg -n 6\ngfx-clients\nbmp-view\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if recover:
-                # One presenter presents and is killed mid-grant; the supervisor must see
-                # the release and regrant the view to the reference client.
-                data = b"dmesg -n 6\ngfx-recover\necho graphics-smoke-after-present\ndmesg -n 5\n"
+                # The leading client consumes view 0's pristine grant, so the first recover
+                # run takes view 1's pristine grant and the second takes the released-view
+                # fallback for view 0: one mode, both branches, each presenter killed
+                # mid-grant and each view regranted to a reference client.
+                data = b"dmesg -n 6\ngfx-client\ngfx-recover\ngfx-recover\necho graphics-smoke-after-present\ndmesg -n 5\n"
             if titles:
                 # The server draws its own band labels through the glyph atlas; gfx-demo still
                 # paints both views so the proven two-view band model applies unchanged.
@@ -222,8 +224,9 @@ def check_pixels(path, bitmap=False, bitmap_file=None, scratch=False, two_client
     if damage:
         images = [damage_demo_pixel, None]
     elif recover:
-        # Only view 0 is painted, by the restarted client; view 1 stays a bare well.
-        images = [demo_pixel, None]
+        # The leading client paints view 0; the first recover run's restarted client
+        # repaints view 1; the second run's restarted client repaints view 0.
+        images = [demo_pixel, demo_pixel]
     elif regrant or async_regrant:
         images = [bitmap_reference(None), demo_pixel]
     elif bitmap:
@@ -437,19 +440,30 @@ def main():
                 assert transcript.index(demo1) < transcript.index(client), f"lower client did not present last; inspect {serial}"
                 assert b"gfx-demo: one or more views failed" not in transcript
             elif args.recover:
-                assert transcript.count(b"gfx-hold: holding after present") == 1, f"missing hold record; inspect {serial}"
-                assert b"kill: process" in transcript, f"missing kill report; inspect {serial}"
-                assert transcript.index(b"gfx-hold: holding after present") < transcript.index(b"kill: process"), (
+                # A reference client consumes view 0 first, so the first recover run takes
+                # view 1's pristine grant and the second takes the released-view fallback
+                # for view 0: one mode, both branches. Counts follow the chain exactly:
+                # the leading client presents; each run holds, is killed, closes a lane
+                # with content, regrants, and a restarted client presents and closes.
+                hold = b"gfx-hold: holding after present"
+                assert transcript.count(hold) == 2, f"missing hold records; inspect {serial}"
+                assert transcript.count(b"kill: process") == 2, f"missing kill reports; inspect {serial}"
+                assert transcript.count(b"drv-fb: presentation client closed") == 5, f"missing lane closes; inspect {serial}"
+                assert transcript.count(b"drv-fb: view 0 recovered") == 3, f"missing view 0 recovery records; inspect {serial}"
+                assert transcript.count(b"drv-fb: view 1 recovered") == 2, f"missing view 1 recovery records; inspect {serial}"
+                assert transcript.count(b"sora: view 0 presented before the kill") == 1
+                assert transcript.count(b"sora: view 1 presented before the kill") == 1
+                assert transcript.count(b"sora: view 0 recovered after the kill") == 1
+                assert transcript.count(b"sora: view 1 recovered after the kill") == 1
+                assert transcript.count(client) == 3, f"missing client presents; inspect {serial}"
+                assert transcript.count(b"drv-fb: view 0 regranted") == 2, f"missing view 0 regrants; inspect {serial}"
+                assert transcript.count(b"drv-fb: view 1 regranted") == 1, f"missing view 1 regrant; inspect {serial}"
+                assert transcript.count(b"sora: gfx-recover: view 0 recovered and regranted") == 1
+                assert transcript.count(b"sora: gfx-recover: view 1 recovered and regranted") == 1
+                assert transcript.index(hold) < transcript.index(b"kill: process"), (
                     f"the presenter was killed before it presented; inspect {serial}")
-                assert b"drv-fb: presentation client closed" in transcript, f"missing lane close; inspect {serial}"
-                assert b"drv-fb: view 0 recovered" in transcript, f"missing recovery record; inspect {serial}"
-                assert b"sora: view 0 presented before the kill" in transcript
-                assert b"sora: view 0 recovered after the kill" in transcript
-                assert transcript.count(client) == 1, f"missing restarted presenter; inspect {serial}"
-                assert transcript.index(b"kill: process") < transcript.index(client), (
+                assert transcript.rindex(b"kill: process") < transcript.rindex(client), (
                     f"the restarted presenter ran before the kill; inspect {serial}")
-                assert b"drv-fb: view 0 regranted" in transcript, f"missing regrant record; inspect {serial}"
-                assert b"sora: gfx-recover: view 0 recovered and regranted" in transcript
                 assert b"drv-fb: view regrant refused" not in transcript
             elif args.regrant:
                 bmp = b"bmp-view: bitmap copied; buffer released (software GOP)"

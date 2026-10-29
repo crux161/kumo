@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j667
 //j668
 //j669
 //j670
 //j675
+//j676
 
 extern crate alloc;
 
@@ -904,6 +904,18 @@ fn gfx_recover(cmd: &kumoza::Command, initrd: Handle) {
         let vmo = Handle(GRAPHICS_VMO[view].swap(0, Ordering::Relaxed));
         selected = Some((view, channel, vmo));
         break;
+    }
+    // The metal case: an earlier presenter consumed the bootstrap grant and exited, so the
+    // view is released rather than pristine. Recover it the same way a first client would be
+    // regranted, instead of refusing. — TIMBERDOODLE
+    if selected.is_none() {
+        if let Some(view) = wait_for_released() {
+            if let Some((channel, vmo)) = regrant_view(view) {
+                GRAPHICS_RELEASED[view].store(false, Ordering::Relaxed);
+                GRAPHICS_ASYNC[view].store(false, Ordering::Relaxed);
+                selected = Some((view, channel, vmo));
+            }
+        }
     }
     let Some((view, channel, vmo)) = selected else {
         log(b"gfx-recover: no graphics view available\n");
