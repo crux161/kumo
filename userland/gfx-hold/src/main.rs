@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j675
+//j684
 
 //! A long-lived presentation client for the presenter-recovery proof (F2c slice-6): Sora
 //! transfers one presentation channel in `x0` and its surface VMO in `x1`, the same handoff
@@ -60,7 +61,10 @@ extern "C" fn main(
     let mut reply = [0u8; REPLY_LEN + 1];
     let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
     match reply.get(..len).and_then(Reply::decode) {
-        Some(reply) if reply.sequence == sequence && reply.status == Status::Copied => {
+        Some(reply)
+            if reply.sequence == sequence
+                && matches!(reply.status, Status::Retired | Status::Copied) =>
+        {
             log(b"gfx-hold: holding after present\n");
         }
         _ => {

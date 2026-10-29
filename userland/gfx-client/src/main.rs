@@ -2,6 +2,7 @@
 #![no_main]
 //j569
 //j655
+//j684
 
 //! A separate-process presentation client (F1b): Sora transfers one presentation channel in
 //! `x0` and its surface VMO in `x1`. The client writes the diagnostic image, presents, waits
@@ -58,8 +59,17 @@ extern "C" fn main(
     let mut reply = [0u8; REPLY_LEN + 1];
     let len = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
     match reply.get(..len).and_then(Reply::decode) {
-        Some(reply) if reply.sequence == sequence && reply.status == Status::Copied => {
-            log(b"gfx-client: 256x128 surface copied; buffer released (software GOP)\n");
+        Some(reply)
+            if reply.sequence == sequence
+                && matches!(reply.status, Status::Retired | Status::Copied) =>
+        {
+            // The status names exactly what the server proved: retirement on the glass, or
+            // the honest copy fallback. The log line mirrors it. — TIMBERDOODLE
+            if reply.status == Status::Retired {
+                log(b"gfx-client: 256x128 surface retired; frame proven on the scanout\n");
+            } else {
+                log(b"gfx-client: 256x128 surface copied; buffer released (software GOP)\n");
+            }
             process_exit(0)
         }
         _ => {

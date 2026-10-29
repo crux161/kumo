@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j671
 //j672
 //j673
 //j674
 //j675
+//j684
 
 mod clock_probe;
 mod display_probe;
@@ -1205,6 +1205,9 @@ extern "C" fn main(
                             |start, len| unsafe { clean_pixels(fb_va as *mut u32, start, len) },
                         );
                     }
+                    // Until the production vblank gate exists (G8c-c2), the software path
+                    // can only prove the copy, so it answers the honest fallback status.
+                    // — TIMBERDOODLE
                     Reply {
                         sequence: request.sequence,
                         status: result.err().unwrap_or(Status::Copied),

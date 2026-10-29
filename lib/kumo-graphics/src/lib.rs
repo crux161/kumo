@@ -1,9 +1,9 @@
 #![no_std]
-//j667
 //j668
 //j670
 //j674
 //j675
+//j684
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -301,12 +301,18 @@ impl Present {
     }
 }
 
+/// The outcome of one present. `Retired` is the strongest claim: the server proved the
+/// frame reached the scanout and was consumed by it at least once. `Copied` is the honest
+/// fallback for a server with no scanout-timing authority (software GOP / ramfb): the
+/// pixels are in the scanout buffer, but retirement is unproven. Clients accept both.
+/// — TIMBERDOODLE
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Status {
-    Copied = 0,
+    Retired = 0,
     BadRequest = 1,
     BadSurface = 2,
+    Copied = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,9 +337,10 @@ impl Reply {
         Some(Self {
             sequence: word(bytes, 4),
             status: match word(bytes, 8) {
-                0 => Status::Copied,
+                0 => Status::Retired,
                 1 => Status::BadRequest,
                 2 => Status::BadSurface,
+                3 => Status::Copied,
                 _ => return None,
             },
         })
@@ -620,13 +627,36 @@ mod tests {
         let mut invalid = wire;
         invalid[3] = b'3';
         assert_eq!(Present::decode(&invalid), None);
-        for status in [Status::Copied, Status::BadRequest, Status::BadSurface] {
+        for status in [
+            Status::Retired,
+            Status::Copied,
+            Status::BadRequest,
+            Status::BadSurface,
+        ] {
             let reply = Reply {
                 sequence: 17,
                 status,
             };
             assert_eq!(Reply::decode(&reply.encode()), Some(reply));
         }
+        // The success value keeps its wire position; the copy fallback is a new value, so
+        // an old decoder refuses it rather than mistaking it for retirement.
+        assert_eq!(
+            Reply {
+                sequence: 17,
+                status: Status::Retired,
+            }
+            .encode()[8],
+            0
+        );
+        assert_eq!(
+            Reply {
+                sequence: 17,
+                status: Status::Copied,
+            }
+            .encode()[8],
+            3
+        );
         let mut reply = Reply {
             sequence: 17,
             status: Status::Copied,

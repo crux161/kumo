@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
-//j649
 //j655
 //j661
+//j684
 
 //! Sora transfers a finite bootstrap channel (x0) and a writable surface VMO (x1).
 //! Bootstrap grants one presenter and, optionally, the selected file as a read-only VMO.
@@ -96,8 +96,15 @@ extern "C" fn main(
     let mut bytes = [0u8; REPLY_LEN + 1];
     let len = channel_read(channel, bytes.as_mut_ptr(), bytes.len()) as usize;
     match bytes.get(..len).and_then(Reply::decode) {
-        Some(reply) if reply.sequence == sequence && reply.status == Status::Copied => {
-            let message = b"bmp-view: bitmap copied; buffer released (software GOP)\n";
+        Some(reply)
+            if reply.sequence == sequence
+                && matches!(reply.status, Status::Retired | Status::Copied) =>
+        {
+            let message: &[u8] = if reply.status == Status::Retired {
+                b"bmp-view: bitmap retired; frame proven on the scanout\n"
+            } else {
+                b"bmp-view: bitmap copied; buffer released (software GOP)\n"
+            };
             let _ = log_write(kumo_abi::sys::log_level::INFO, message);
             process_exit(0)
         }

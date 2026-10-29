@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j669
 //j670
 //j675
 //j676
 //j677
+//j684
 
 extern crate alloc;
 
@@ -300,11 +300,15 @@ fn graphics_demo(cmd: &kumoza::Command) {
             Some(status) => {
                 // A valid reply releases this surface even when its view rejected it.
                 GRAPHICS_CHANNEL[view].store(channel.0, Ordering::Relaxed);
-                if status == Status::Copied {
+                if matches!(status, Status::Retired | Status::Copied) {
                     copied[view] = true;
                     log(b"gfx-demo: view ");
                     log(&[b'0' + view as u8]);
-                    log(b" copied; buffer released (software GOP)\n");
+                    if status == Status::Retired {
+                        log(b" retired; frame proven on the scanout\n");
+                    } else {
+                        log(b" copied; buffer released (software GOP)\n");
+                    }
                 } else {
                     failed = true;
                 }
