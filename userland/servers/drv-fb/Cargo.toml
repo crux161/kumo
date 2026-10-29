@@ -1,5 +1,6 @@
 #j567
 #j598
+#j671
 
 [package]
 name = "drv-fb"
@@ -15,6 +16,10 @@ doctest = false
 [dependencies]
 kumo-graphics = { path = "../../../lib/kumo-graphics" }
 kumo-fdt = { path = "../../../lib/kumo-fdt" }
+# F2c: the pure-Rust rasterizer behind the glyph atlas (PLAN/015 §3.2). Vendored under
+# vendor/cargo; no_std plus its `libm` feature, which also selects core_maths through
+# ttf-parser's no-std-float path, so the same build serves host tests and the aarch64 image.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
 
 [[bin]]
 name = "drv-fb"

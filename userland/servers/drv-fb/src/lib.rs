@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j656
 //j662
 //j667
 //j668
 //j670
+//j671
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy 8x16 cells; CJK occupies 16x16.
@@ -969,6 +969,60 @@ pub fn blit_ascii<W: FnMut(usize, u32)>(
             }
         }
     }
+}
+
+/// The vendored face: Maple Mono NF CN by subframe7536, subset to ASCII under the SIL Open
+/// Font License 1.1 (the license text ships beside the asset). — TIMBERDOODLE
+const FACE_TTF: &[u8] = include_bytes!("../assets/maple-ascii.ttf");
+
+/// Draw one line of ASCII at `(x, y)` rasterized from the vendored face at `GLYPH_H` pixels.
+/// Coverage of at least one half writes `color`, so the result is pure ink on the background
+/// and callers keep their exact pixel rules. Returns false when the face cannot be parsed.
+/// The framebuffer is non-cacheable, so no cache maintenance is needed. — TIMBERDOODLE
+pub fn blit_face<W: FnMut(usize, u32)>(
+    text: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    order: PixelOrder,
+    x: u32,
+    y: u32,
+    color: u32,
+    mut write: W,
+) -> bool {
+    use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
+    let Ok(font) = FontRef::try_from_slice(FACE_TTF) else {
+        return false;
+    };
+    let scale = PxScale::from(GLYPH_H as f32);
+    let scaled = font.as_scaled(scale);
+    let color = order.pixel((color >> 16) as u8, (color >> 8) as u8, color as u8);
+    let mut caret = x as f32;
+    for byte in text {
+        let glyph_id = font.glyph_id(*byte as char);
+        let glyph = glyph_id
+            .with_scale_and_position(scale, ab_glyph::point(caret, y as f32 + scaled.ascent()));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                if coverage < 0.5 {
+                    return;
+                }
+                let px = bounds.min.x + gx as f32;
+                let py = bounds.min.y + gy as f32;
+                if px < 0.0 || py < 0.0 {
+                    return;
+                }
+                let (px, py) = (px as u32, py as u32);
+                if px >= width || py >= height {
+                    return;
+                }
+                write(py as usize * stride + px as usize, color);
+            });
+        }
+        caret += scaled.h_advance(glyph_id);
+    }
+    true
 }
 
 /// Copy one framebuffer rectangle of the console image from its shadow to the glass. The shadow
@@ -2119,6 +2173,37 @@ mod tests {
             0x00ff_ffff,
             |at, _| assert!(at % 40 < 4, "wrote outside the width"),
         );
+    }
+
+    #[test]
+    fn blit_face_rasterizes_the_vendored_face_and_clips() {
+        let mut glass = [0u32; 20 * 64];
+        assert!(blit_face(
+            b"V",
+            64,
+            20,
+            64,
+            PixelOrder::Rgb,
+            0,
+            0,
+            0x00ff_ffff,
+            |at, color| glass[at] = color
+        ));
+        let white = PixelOrder::Rgb.pixel(0xff, 0xff, 0xff);
+        let ink = glass.iter().filter(|pixel| **pixel == white).count();
+        assert!(ink > 8, "only {ink} face pixels");
+        // A narrow framebuffer clips the outline instead of writing outside it.
+        assert!(blit_face(
+            b"V",
+            4,
+            20,
+            64,
+            PixelOrder::Rgb,
+            0,
+            0,
+            0x00ff_ffff,
+            |at, _| assert!(at % 64 < 4, "wrote outside the width"),
+        ));
     }
 
     #[test]

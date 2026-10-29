@@ -2,11 +2,11 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j660
 //j662
 //j667
 //j668
 //j670
+//j671
 
 mod clock_probe;
 mod display_probe;
@@ -518,15 +518,19 @@ extern "C" fn main(
     // chrome. A focus change repaints only the old and new chrome frames. — TIMBERDOODLE
     let mut focused: Option<usize> = None;
 
-    // F2c: server-drawn band labels through the glyph atlas, toggled by a `T` record and
-    // redrawn once per wake beneath the cursor overlay. — TIMBERDOODLE
+    // F2c: server-drawn band labels, rasterized from the vendored face, toggled by a `T`
+    // record and redrawn once per wake beneath the cursor overlay. — TIMBERDOODLE
     let mut titles = false;
+    let mut face_logged = false;
     let draw_labels =
         |on: bool, fb: u64, stride: usize, order: PixelOrder, width: u32, height: u32| {
             if !on {
                 return;
             }
-            drv_fb::blit_ascii(
+            let write = |at: usize, color: u32| unsafe {
+                (fb as *mut u32).add(at).write_volatile(color);
+            };
+            if !drv_fb::blit_face(
                 b"VIEW 0",
                 width,
                 height,
@@ -535,9 +539,21 @@ extern "C" fn main(
                 8,
                 8,
                 0x00ff_ffff,
-                |at, color| unsafe { (fb as *mut u32).add(at).write_volatile(color) },
-            );
-            drv_fb::blit_ascii(
+                write,
+            ) {
+                drv_fb::blit_ascii(
+                    b"VIEW 0",
+                    width,
+                    height,
+                    stride,
+                    order,
+                    8,
+                    8,
+                    0x00ff_ffff,
+                    write,
+                );
+            }
+            if !drv_fb::blit_face(
                 b"VIEW 1",
                 width,
                 height,
@@ -546,8 +562,20 @@ extern "C" fn main(
                 8,
                 32,
                 0x00ff_ffff,
-                |at, color| unsafe { (fb as *mut u32).add(at).write_volatile(color) },
-            );
+                write,
+            ) {
+                drv_fb::blit_ascii(
+                    b"VIEW 1",
+                    width,
+                    height,
+                    stride,
+                    order,
+                    8,
+                    32,
+                    0x00ff_ffff,
+                    write,
+                );
+            }
         };
 
     // Sora retains this bootstrap channel's peer; a runtime `R` record on it regrants one
@@ -878,6 +906,13 @@ extern "C" fn main(
                             width as u32,
                             height as u32,
                         );
+                        if titles && !face_logged {
+                            face_logged = true;
+                            let _ = kumo_rt::log_write(
+                                kumo_abi::sys::log_level::NOTICE,
+                                b"drv-fb: face maple-mono 16px\n",
+                            );
+                        }
                         let _ = kumo_rt::log_write(
                             kumo_abi::sys::log_level::NOTICE,
                             if titles {
