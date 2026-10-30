@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j664
 //j665
 //j666
 //j690
 //j703
+//j704
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -203,6 +203,9 @@ const DOWNSTREAM_PAGES: u32 = 32;
 const HUB_FEATURE_PORT_ENABLE: u8 = 1;
 const HUB_FEATURE_PORT_RESET: u8 = 4;
 const HUB_FEATURE_C_PORT_RESET: u8 = 20;
+/// SuperSpeed hub change features a port reset latches beyond C_PORT_RESET (USB 3.2 hub class).
+const HUB_FEATURE_C_PORT_LINK_STATE: u8 = 28;
+const HUB_FEATURE_C_BH_PORT_RESET: u8 = 29;
 const HUB_PORT_STATUS_ENABLE: u16 = 1 << 1;
 const HUB_PORT_STATUS_LOW_SPEED: u16 = 1 << 9;
 const HUB_PORT_STATUS_HIGH_SPEED: u16 = 1 << 10;
@@ -3689,9 +3692,7 @@ fn configure_and_read_hub(
     log(b" power-good ms=");
     log_hex(hub.power_good_delay_ns() / 1_000_000);
     log(b"\n");
-    // Everything below is one bounded pass: a driver child cannot be preempted, so the hub work
-    // must promise an upper bound on how long it holds the CPU away from a live keyboard driver.
-    let pass = Deadline::after(HUB_PASS_BUDGET_NS);
+    // A driver child cannot be preempted, so every phase below runs under a wall-clock budget.
 
     // A SuperSpeed hub routes by the Route String, indexed by its own tier: SET_HUB_DEPTH (USB 3.2
     // §10.16.2.9) tells it which nibble is its own. A hub on a root port is depth 0.
@@ -3740,9 +3741,12 @@ fn configure_and_read_hub(
     }
 
     // --- Power every downstream port (SET_FEATURE PORT_POWER, feature 8) ---
+    // The power phase gets its own budget: the depth and endpoint setup above already consumed
+    // part of the pass, and a four-port hub needs one control transfer per port. — TIMBERDOODLE
+    let power_pass = Deadline::after(HUB_POWER_BUDGET_NS);
     let mut port = 1u8;
     while port <= nbr_ports {
-        if pass.expired() {
+        if power_pass.expired() {
             return log(b"drv-xhci: hub pass budget spent (power)\n");
         }
         let set_power = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
@@ -3786,7 +3790,7 @@ fn configure_and_read_hub(
                     // and strands a sibling controller's masked keyboard interrupt.
                     let mut got = None;
                     for _ in 0..HUB_STATUS_WAIT_ROUNDS {
-                        if pass.expired() {
+                        if power_pass.expired() {
                             break;
                         }
                         if let Some(result) = poll_transfer_event_limited(
@@ -3884,15 +3888,13 @@ fn configure_and_read_hub(
     log(b"drv-xhci: hub scan done\n");
 
     if speed_raw >= 4 {
-        // A device behind a SuperSpeed hub needs a SuperSpeed slot context (Route String, no
-        // Transaction Translator) and SS port-status decoding that `enumerate_hub_downstream` does
-        // not have yet. Name what is there; enumerating it is the next slice. — TIMBERDOODLE
+        // A SuperSpeed downstream device uses a SuperSpeed slot context, a Route String, no
+        // Transaction Translator, and the hub type as its speed. — TIMBERDOODLE
         for down_port in stable.iter() {
             log(b"drv-xhci: ss hub dev port=");
             log_hex(down_port as u64);
-            log(b" (downstream enumeration pending)\n");
+            log(b"\n");
         }
-        return;
     }
 
     // U2/J541: reach through the hub to every stable port, in ascending order and one at a time:
@@ -4249,7 +4251,11 @@ fn reset_and_address_downstream(
         let reply: [u8; 2] = hub_data_buf.read(0);
         let status = u16::from_le_bytes(reply);
         if status & HUB_PORT_STATUS_ENABLE != 0 {
-            down_speed = if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
+            // A SuperSpeed hub's downstream device is SuperSpeed by construction; Linux derives
+            // the device speed from the hub type, not the port-status speed bits. — TIMBERDOODLE
+            down_speed = if hub_speed_raw >= 4 {
+                4
+            } else if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
                 2
             } else if status & HUB_PORT_STATUS_HIGH_SPEED != 0 {
                 3
@@ -4269,27 +4275,31 @@ fn reset_and_address_downstream(
     log_hex(down_speed as u64);
     log(b"\n");
 
-    // Acknowledge the reset-complete change bit so the hub stops reporting it.
-    let clear_change = [
-        0x23,
-        0x01,
-        HUB_FEATURE_C_PORT_RESET,
-        0x00,
-        down_port,
-        0x00,
-        0x00,
-        0x00,
-    ];
-    let _ = control_no_data(
-        io,
-        layout,
-        image,
-        evt,
-        hub_ep0_ring,
-        &mut *hub_ep0_seg,
-        hub_slot_id,
-        clear_change,
-    );
+    // Acknowledge the reset-complete change bits so the hub stops reporting them. A SuperSpeed
+    // hub latches C_BH_PORT_RESET and C_PORT_LINK_STATE in addition to C_PORT_RESET; Linux
+    // clears all three after an SS port reset. — TIMBERDOODLE
+    let clear_features: &[u8] = if hub_speed_raw >= 4 {
+        &[
+            HUB_FEATURE_C_PORT_RESET,
+            HUB_FEATURE_C_BH_PORT_RESET,
+            HUB_FEATURE_C_PORT_LINK_STATE,
+        ]
+    } else {
+        &[HUB_FEATURE_C_PORT_RESET]
+    };
+    for feature in clear_features {
+        let clear_change = [0x23, 0x01, *feature, 0x00, down_port, 0x00, 0x00, 0x00];
+        let _ = control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            hub_ep0_ring,
+            &mut *hub_ep0_seg,
+            hub_slot_id,
+            clear_change,
+        );
+    }
 
     // --- A private DMA page for this device's contexts, EP0 ring and buffers ---
     let (dev_va, dev_phys) = map_downstream_page()?;
@@ -4428,6 +4438,11 @@ const YIELD_INTERVAL: u32 = 512;
 /// non-preemptible driver may hold the machine — and lets the pass abort cleanly instead of
 /// stranding a sibling controller's keyboard.
 const HUB_PASS_BUDGET_NS: u64 = 400_000_000; // 400 ms
+
+/// Wall-clock budget for one hub's downstream power phase. A four-port hub needs one hub-class
+/// control transfer per port, which does not fit in the enumeration pass; the SuperSpeed hub
+/// expired inside it on metal. — TIMBERDOODLE
+const HUB_POWER_BUDGET_NS: u64 = 2_000_000_000;
 
 /// A monotonic wall-clock budget for one bounded pass of work.
 #[derive(Clone, Copy)]
