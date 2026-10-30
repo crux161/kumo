@@ -13,6 +13,7 @@
 //j494
 //j534
 //j556
+//j724
 
 use core::cell::UnsafeCell;
 
@@ -1077,6 +1078,13 @@ fn wake_child_waiting_on(target: WaitTarget) {
 /// EL0 GPR/FP state on the current thread's kernel stack; this avoids the J287/J288
 /// broad IRQ-preemption corruption while still giving timer-backed `PortWait` a
 /// deterministic resume point. — KESTREL
+//j724
+/// The deferred user-wake decision: a pending wake is due exactly when the scheduler is
+/// live, not done, and Sora is still blocked. Pure so the host tests pin it. — TIMBERDOODLE
+fn deferred_user_wake_due(done: bool, pending: bool, user_blocked: bool) -> bool {
+    !done && pending && user_blocked
+}
+
 pub fn reschedule_if_pending_after_svc() {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -1087,7 +1095,28 @@ pub fn reschedule_if_pending_after_svc() {
     let p = sched_ptr();
     let switch = unsafe {
         let s = &mut *p;
-        if s.done || !s.safe_reschedule_pending {
+        if s.done {
+            return;
+        }
+        //j724
+        // Pay a deferred user wake at this SVC boundary. `wake_user_after_irq_signal` can
+        // only record `user_wake_pending` when the IRQ interrupted a child, and the flag was
+        // previously pumped only by `pump_idle_floor` — which needs the idle floor to be
+        // current, and sustained churn keeps a child runnable at every scheduling point, so a
+        // parked Sora's wake starved for seconds (J723's metal verdict). This is the SVC-side
+        // payer the doctrine always described: make her ready here and let the ordinary
+        // reschedule machinery switch at this safe boundary. — TIMBERDOODLE
+        if deferred_user_wake_due(
+            false,
+            s.user_wake_pending,
+            matches!(s.user_thread.state(), ThreadState::Blocked),
+        ) {
+            s.user_wake_pending = false;
+            s.user_thread.ready();
+            s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+            s.safe_reschedule_pending = true;
+        }
+        if !s.safe_reschedule_pending {
             return;
         }
         let decision = s.dispatcher.reschedule_current();
@@ -1348,6 +1377,15 @@ fn dispatch_context(
 #[cfg(test)]
 mod tests {
     use super::{wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget};
+
+    //j724
+    #[test]
+    fn deferred_user_wake_is_due_only_for_a_blocked_live_scheduler() {
+        assert!(super::deferred_user_wake_due(false, true, true));
+        assert!(!super::deferred_user_wake_due(false, true, false));
+        assert!(!super::deferred_user_wake_due(false, false, true));
+        assert!(!super::deferred_user_wake_due(true, true, true));
+    }
 
     #[test]
     fn target_of_reports_where_a_thread_is_parked() {
