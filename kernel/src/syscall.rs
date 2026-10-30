@@ -2970,14 +2970,20 @@ impl SyscallEngine {
                 let status = match process.handles_mut().remove(handle) {
                     Ok(entry) => {
                         if entry.kind == ObjectKind::Channel {
-                            if let Ok(Some(peer_koid)) = self.ipc.close_by_koid(entry.koid) {
-                                self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                                // J547: a child parked in `ChannelRead` on the surviving end
-                                // waits on its endpoint, not a port. Wake it as a write would, so
-                                // its retried read sees `PeerClosed` instead of sleeping forever.
-                                // — TIMBERDOODLE
-                                #[cfg(target_os = "none")]
-                                crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                            //j717
+                            // A close now reaps the dead endpoint's inbox and any channel
+                            // endpoints its dropped transfers carried, so every returned peer
+                            // koid is signalled and woken, not just the direct one. — TIMBERDOODLE
+                            if let Ok(peer_koids) = self.ipc.close_by_koid(entry.koid) {
+                                for peer_koid in peer_koids {
+                                    self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                                    // J547: a child parked in `ChannelRead` on the surviving end
+                                    // waits on its endpoint, not a port. Wake it as a write
+                                    // would, so its retried read sees `PeerClosed` instead of
+                                    // sleeping forever. — TIMBERDOODLE
+                                    #[cfg(target_os = "none")]
+                                    crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                                }
                             }
                         }
                         if entry.kind == ObjectKind::Timer {

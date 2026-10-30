@@ -396,16 +396,44 @@ impl IpcRegistry {
         Err(IpcError::BadHandle)
     }
 
-    pub fn close_by_koid(&mut self, koid: KoId) -> Result<Option<KoId>, IpcError> {
+    //j717
+    /// Close the endpoint named by `koid` and reap what it still holds: its own inbox —
+    /// messages no reader will ever drain — and, through every dropped transfer that carries
+    /// a channel endpoint, that endpoint too, cascading until the carried chain ends. A
+    /// dropped capability is closed the way a closed handle would be, so the carried
+    /// endpoint's peer observes `PEER_CLOSED` instead of waiting on something that no
+    /// longer exists. Returns every peer koid that must be signalled/woken for a closure:
+    /// the direct peer and any cascaded peers. Other transfers simply drop, releasing their
+    /// references so the J708 reuse pass sees the object unqueued. — TIMBERDOODLE
+    pub fn close_by_koid(&mut self, koid: KoId) -> Result<Vec<KoId>, IpcError> {
         let end = self.channel_end_for(koid)?;
-        let channel = self.channel_mut_by_koid(koid)?;
-        channel.close(end);
-        let peer_end = peer(end);
-        if channel.endpoint(peer_end).open {
-            Ok(Some(channel.object(peer_end).koid()))
-        } else {
-            Ok(None)
+        let mut signals = Vec::new();
+        let mut carried = Vec::new();
+        {
+            let channel = self.channel_mut_by_koid(koid)?;
+            channel.close(end);
+            if channel.endpoint(peer(end)).open {
+                signals.push(channel.object(peer(end)).koid());
+            }
+            collect_carried_transfers(channel.endpoint_mut(end), &mut carried);
         }
+        while let Some(carried_koid) = carried.pop() {
+            let Ok(carried_end) = self.channel_end_for(carried_koid) else {
+                continue;
+            };
+            let Ok(channel) = self.channel_mut_by_koid(carried_koid) else {
+                continue;
+            };
+            if !channel.endpoint(carried_end).open {
+                continue;
+            }
+            channel.close(carried_end);
+            if channel.endpoint(peer(carried_end)).open {
+                signals.push(channel.object(peer(carried_end)).koid());
+            }
+            collect_carried_transfers(channel.endpoint_mut(carried_end), &mut carried);
+        }
+        Ok(signals)
     }
 }
 
@@ -520,6 +548,19 @@ fn peer(end: ChannelEnd) -> ChannelEnd {
     }
 }
 
+//j717
+/// Drain one endpoint's inbox — its owner just closed it, so no reader remains — and collect
+/// the koids of channel endpoints carried by the dropped messages. — TIMBERDOODLE
+fn collect_carried_transfers(endpoint: &mut EndpointState, carried: &mut Vec<KoId>) {
+    for message in endpoint.inbox.drain(..) {
+        for entry in message.transfers {
+            if entry.kind == ObjectKind::Channel {
+                carried.push(entry.koid);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortPacket {
     pub source: KoId,
@@ -603,6 +644,62 @@ pub fn smoke() -> Result<IpcReport, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //j717
+    #[test]
+    fn close_reaps_the_dead_endpoint_inbox_and_closes_carried_channel_ends() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        // Pair A is the capability a message will carry; pair B carries the message.
+        let (a_left, a_right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let a_left_koid = sender.handles().get(a_left).unwrap().koid;
+        let a_right_koid = sender.handles().get(a_right).unwrap().koid;
+        let (b_left, b_right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let b_left_koid = sender.handles().get(b_left).unwrap().koid;
+        let b_right_koid = sender.handles().get(b_right).unwrap().koid;
+        ipc.channel_write(
+            &mut sender,
+            b_left,
+            Message::new(1, b"carried end", &[a_left]).unwrap(),
+        )
+        .unwrap();
+        assert!(ipc.koid_queued(a_left_koid));
+        let signals = ipc.close_by_koid(b_right_koid).unwrap();
+        // Two peers must learn: the direct one (B's surviving end) and the carried
+        // endpoint's peer, which died with the message. — TIMBERDOODLE
+        assert_eq!(signals.len(), 2);
+        assert!(signals.contains(&b_left_koid));
+        assert!(signals.contains(&a_right_koid));
+        assert!(ipc
+            .channel_signals_by_koid(a_right_koid)
+            .unwrap()
+            .contains(Signals::PEER_CLOSED));
+        assert!(!ipc.koid_queued(a_left_koid));
+    }
+
+    //j717
+    #[test]
+    fn close_reaps_queued_transfers_so_they_hold_no_reference() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let right_koid = sender.handles().get(right).unwrap().koid;
+        let (handle, refs) = context(&mut objects, &mut sender);
+        let koid = sender.handles().get(handle).unwrap().koid;
+        ipc.channel_write(
+            &mut sender,
+            left,
+            Message::new(1, b"ctx", &[handle]).unwrap(),
+        )
+        .unwrap();
+        assert!(ipc.koid_queued(koid));
+        assert!(refs.is_referenced());
+        ipc.close_by_koid(right_koid).unwrap();
+        assert!(!ipc.koid_queued(koid));
+        assert!(!refs.is_referenced());
+    }
 
     fn context(
         objects: &mut ObjectManager,
