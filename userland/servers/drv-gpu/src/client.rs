@@ -5,9 +5,12 @@
 //j682
 //j707
 //j709
+//j714
 
-//! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
-//! grant or automatic restart exists in this lane. G8a gives the session an on-demand buffer
+//! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
+//! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
+//! contained close that proved quiescence lets the driver read the next one — a poisoned
+//! close retains everything and never serves again. G8a gives the session an on-demand buffer
 //! table: BufferDestroy unbinds every VA range the session still holds for one allocation,
 //! flushes AS1, and only then releases that allocation's CPU mapping and driver VMO handle.
 //! A confirmed soft reset releases whatever the channel still owned; a failed reset retains
@@ -533,6 +536,16 @@ fn contain(hw: &mut Hardware<'_>, session: &mut Session) -> Containment {
     Containment::run(soft_reset(hw.device), session, hw)
 }
 
+//j714
+/// Serve exactly one granted session channel and return its [`Containment`] (DESIGN/024).
+///
+/// The channel is the session: when it closes, or a write to it fails, service has stopped
+/// accepting and the contained close below runs before this function returns. Every
+/// transport handle the session held — the reply grant, the waiter channels, this channel —
+/// is closed on both the released and the poisoned path; only the metadata and DMA a poison
+/// retains stay behind. The caller decides what happens next: a release licenses the next
+/// `g`, and a poison parks with everything retained. Parking here would hide that decision
+/// inside a function whose whole contract is one session. — TIMBERDOODLE
 pub(super) fn serve(
     channel: Handle,
     device: &mut Device,
@@ -553,7 +566,7 @@ pub(super) fn serve(
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
     thread_features: u32,
-) -> ! {
+) -> Containment {
     let mut hw = Hardware {
         device,
         shader_present,
@@ -583,6 +596,10 @@ pub(super) fn serve(
         log_level::NOTICE,
         format_args!("drv-gpu: client session ready\n"),
     );
+    //j714
+    // One granted channel is one session: this loop reads only the channel it was handed and
+    // ends when that channel does. A fresh session is a fresh `serve` over a fresh `g`, never
+    // a second loop over a spent channel. — TIMBERDOODLE
     loop {
         let mut bytes = [0u8; REQUEST_LEN + 1];
         let (len, raw_handle) =
@@ -648,6 +665,9 @@ pub(super) fn serve(
     // first; only a confirmed reset licenses releasing anything. The record states exactly
     // what was released, and a failed reset yields retained=yes with the session poisoned.
     // — TIMBERDOODLE
+    //j714
+    // This record is also the return value: the release proof travels to the caller, which
+    // asks it the one question left — whether another grant may be served. — TIMBERDOODLE
     let containment = contain(&mut hw, &mut session);
     log(log_level::NOTICE, format_args!("{}\n", containment));
     if let Err(error) = containment.reset {
@@ -656,6 +676,7 @@ pub(super) fn serve(
             format_args!("drv-gpu: containment reset cause: {:?}\n", error),
         );
     }
+    //j714
     // Transport state is not DMA: the grant and waiter channels close on both paths, so no
     // client can be handed a view into a session this driver will never serve again. The
     // buffers themselves were released only if containment proved the GPU stopped.
@@ -670,5 +691,9 @@ pub(super) fn serve(
         }
     }
     let _ = kumo_rt::handle_close(channel);
-    park()
+    //j714
+    // Return, don't park: the caller owns the long-lived loop (DESIGN/024). A released
+    // containment lets it read the next `g`; a poisoned one closes the handoff and parks
+    // with everything retained. — TIMBERDOODLE
+    containment
 }

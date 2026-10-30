@@ -10,6 +10,7 @@
 //j711
 //j711
 //j713
+//j714
 
 extern crate alloc;
 
@@ -163,65 +164,137 @@ static GRAPHICS_ASYNC_PROCESS: [AtomicU32; kumo_graphics::VIEW_COUNT] =
 static GRAPHICS_INPUT: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 
-/// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
-/// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
-/// `drv_gpu::GPU_VIEW` has been handed over; otherwise it is closed so drv-gpu stops waiting.
+/// G5b/G8d-b: the sending end of drv-gpu's bootstrap channel. On a board with the GPU's
+/// power unit it is the driver's long-lived session handoff (DESIGN/024): the firmware
+/// grant and the first session's `g` ride it at launch, the boot view's `v`/`s` — or a
+/// bare `v` carrying no view — follow once drv-fb's grants exist, and every later
+/// session's `g` reuses the same pair. Sora never closes it on a GPU board; on any other
+/// board it was closed at spawn, so this slot stays zero and nothing waits on it.
+/// — TIMBERDOODLE
 static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
-/// One cooperative G6b lease per boot. It is transferred once and never re-granted after
-/// client/driver failure; a new boot resets the device before any fresh grant. — TIMBERDOODLE
+//j714 The retained session handoff once the boot view's records have been queued: the
+/// serve loop's reachable copy of the drv-gpu pair, so a regrant can offer `g` without the
+/// pair ever being closed. Zero on a non-GPU board and after a driver end that closed.
+static GPU_SESSION_HANDOFF: AtomicU32 = AtomicU32::new(0);
+/// The first session's client end of the GPU wire channel, staged by drv-gpu's launcher and
+/// transferred once by the boot launch. Later sessions mint their own pair in the regrant
+/// path, so this slot stays zero after the boot transfer. — TIMBERDOODLE
 static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
 //j711
-/// The sending end of the GPU client's lane bootstrap pair, held from pair creation until
-/// the lane is named after launch. `N` + the native producer keeps today's J0c lane; `V` +
-/// view channel, `S` + view surface and then `N` hand view `GPU_VIEW` to the churn lane,
-/// which still runs the J0c native diagnostic first (j713). The client reads this pair as
-/// its second transferred argument. — TIMBERDOODLE
+/// The sending end of one launch's lane bootstrap pair. Every launch mints a fresh pair —
+/// the boot one and each G8d-b regrant — and names its lane before dropping the sender:
+/// `N` + the native producer on a normal image, or `V` + view channel, `S` + view surface
+/// and then `N` on a churn image. The boot churn lane still runs the J0c native diagnostic
+/// first (j713); a regranted churn lane has no native producer, so its `N` carries handle
+/// zero and the client resumes the churn timeline without native frames (DESIGN/024). The
+/// client reads this pair as its second transferred argument. — TIMBERDOODLE
 static GPU_LANE_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 
-fn launch_gpu_client(initrd: Handle) {
+/// Boot launch: take the one session wire channel and native producer drv-gpu's launcher
+/// staged, and run the cooperative client through the shared lane path. The retained child
+/// process handle (the gfx-hold `kept` precedent) goes back to the caller so the serve loop
+/// can supervise it; `None` when this board has no GPU lane to run.
+fn launch_gpu_client(initrd: Handle) -> Option<Handle> {
     let channel = GPU_CLIENT_CHANNEL.swap(0, Ordering::Relaxed);
     if channel == 0 {
-        return;
+        return None;
     }
     let native = GPU_NATIVE_CHANNEL.swap(0, Ordering::Relaxed);
-    //j711
-    // Both lanes need one bootstrap pair: the session channel still rides x0, and the lane
-    // selector rides this pair's other end after launch. The child end is transferred as x1;
-    // Sora keeps the sending end until it has named the lane. — TIMBERDOODLE
+    launch_gpu_client_session(
+        initrd,
+        u64::from(channel),
+        u64::from(native),
+        if GPU_CHURN_VIEW {
+            LaneGrant::SoraChurn
+        } else {
+            LaneGrant::Normal
+        },
+    )
+}
+
+/// Which lane a launch names, and where its view grant comes from.
+#[derive(Clone, Copy)]
+enum LaneGrant {
+    /// A normal image: `N` plus the native producer (handle zero when there is none).
+    Normal,
+    /// The boot launch on a churn image: swap view `GPU_VIEW`'s grant out of the statics.
+    SoraChurn,
+    /// A regrant on a churn image: the grant drv-fb issued for this session, or zeros when
+    /// no view released in time (the client then fails honestly).
+    Regranted(Handle, Handle),
+}
+
+/// Where a churn view grant no client consumed goes next.
+#[derive(Clone, Copy)]
+enum GrantReturn {
+    /// A boot grant: back into the statics, so a shell client can still use the view.
+    ToSora,
+    /// A regrant: close it and let drv-fb report the release afresh for the next attempt.
+    Released,
+}
+
+//j714 One launch of the cooperative GPU client through the lane path — shared by the boot
+/// launch and every supervised regrant, so both speak the same protocol. It mints the
+/// one-shot lane pair, transfers the session channel in x0 and the pair's child end in x1
+/// (ASYNC|TRANSFER_ARG|TRANSFER_ARG2), then names the lane before dropping the lane sender:
+/// `N` + native producer on a normal image, `V` + view channel, `S` + view surface and then
+/// `N` on a churn image (DESIGN/024). `session` is the client end of the session wire
+/// channel; its server end has already been offered to drv-gpu as `g`.
+fn launch_gpu_client_session(
+    initrd: Handle,
+    session: u64,
+    native: u64,
+    lane_grant: LaneGrant,
+) -> Option<Handle> {
+    let valid = |raw: u64| raw != 0 && raw != u64::MAX;
+    // Both lanes need one bootstrap pair: the session channel rides x0, and the lane
+    // selector rides this pair's other end. The child end is transferred as x1; Sora keeps
+    // the sending end until it has named the lane. — TIMBERDOODLE
     let (sender, lane_child) = channel_create_pair();
-    if ![sender, lane_child]
-        .into_iter()
-        .all(|raw| raw != 0 && raw != u64::MAX)
-    {
-        let _ = handle_close(Handle(channel));
-        if native != 0 {
-            let _ = handle_close(Handle(native));
+    if !valid(sender) || !valid(lane_child) {
+        if valid(session) {
+            let _ = handle_close(Handle(session as u32));
+        }
+        if valid(native) {
+            let _ = handle_close(Handle(native as u32));
+        }
+        if let LaneGrant::Regranted(channel, vmo) = lane_grant {
+            return_gpu_view_grant(channel, vmo, GrantReturn::Released);
         }
         log(b"gpu-client: lane bootstrap unavailable; session retired\n");
-        return;
+        return None;
     }
-    // On the churn lane view `GPU_VIEW`'s grant leaves the regrant statics before launch and
-    // returns to them if the launch never reaches the send, so a shell client can still use
-    // the view afterwards. — TIMBERDOODLE
-    let view_grant = GPU_CHURN_VIEW.then(|| {
-        let view_channel = Handle(GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
-        let view_vmo = Handle(GRAPHICS_VMO[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
-        GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
-        (view_channel, view_vmo)
-    });
+    // On the churn lane view `GPU_VIEW`'s boot grant leaves the regrant statics only after
+    // the pair exists, and returns to them if the launch never reaches the send, so a shell
+    // client can still use the view afterwards. — TIMBERDOODLE
+    let (view_grant, homing) = match lane_grant {
+        LaneGrant::Normal => (None, GrantReturn::ToSora),
+        LaneGrant::SoraChurn => {
+            let view_channel =
+                Handle(GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+            let view_vmo = Handle(GRAPHICS_VMO[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+            (Some((view_channel, view_vmo)), GrantReturn::ToSora)
+        }
+        LaneGrant::Regranted(channel, vmo) => (Some((channel, vmo)), GrantReturn::Released),
+    };
     GPU_LANE_BOOTSTRAP.store(sender as u32, Ordering::Relaxed);
     let flags =
         (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
             .bits();
-    if run_elf(
+    let mut kept = None;
+    let ran = run_elf_threads(
         initrd,
         kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
-        u64::from(channel),
+        session,
         lane_child,
         flags,
         b"gpu-client",
-    ) {
+        0,
+        Some(&mut kept),
+    );
+    if ran {
         let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
         match view_grant {
             Some((view_channel, view_vmo)) => {
@@ -231,23 +304,33 @@ fn launch_gpu_client(initrd: Handle) {
                     let _ = channel_write_with_handle(sender, b"S".as_ptr(), 1, Handle(0));
                     log(b"gpu-client: churn lane has no view grant\n");
                 } else if channel_write_with_handle(sender, b"V".as_ptr(), 1, view_channel) != 0 {
-                    // A refused send leaves the handle in Sora's table.
-                    GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(view_channel.0, Ordering::Relaxed);
-                    GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
-                    GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
-                    log(b"gpu-client: churn lane view channel refused; view restored\n");
+                    // A refused send leaves the handles in Sora's table.
+                    match homing {
+                        GrantReturn::ToSora => {
+                            GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW]
+                                .store(view_channel.0, Ordering::Relaxed);
+                            GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
+                            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                            log(b"gpu-client: churn lane view channel refused; view restored\n");
+                        }
+                        GrantReturn::Released => {
+                            return_gpu_view_grant(view_channel, view_vmo, GrantReturn::Released);
+                            log(b"gpu-client: churn lane view channel refused; grant closed\n");
+                        }
+                    }
                 } else if channel_write_with_handle(sender, b"S".as_ptr(), 1, view_vmo) != 0 {
                     // The channel already moved; without its surface the view cannot be
                     // painted, so the client closes it and drv-fb reports the release.
                     let _ = handle_close(view_vmo);
                     log(b"gpu-client: churn lane view surface refused\n");
                 }
-                // j713: the churn lane also runs the J0c native diagnostic first, so the
-                // native producer travels after the view pair. — TIMBERDOODLE
+                // j713: the boot churn lane also runs the J0c native diagnostic first, so
+                // the native producer travels after the view pair. A regranted lane has no
+                // producer and sends handle zero, which the client accepts (DESIGN/024).
                 if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
                     && native != 0
                 {
-                    let _ = handle_close(Handle(native));
+                    let _ = handle_close(Handle(native as u32));
                 }
                 let _ = handle_close(sender);
             }
@@ -255,34 +338,112 @@ fn launch_gpu_client(initrd: Handle) {
                 if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
                     && native != 0
                 {
-                    let _ = handle_close(Handle(native));
+                    let _ = handle_close(Handle(native as u32));
                 }
                 let _ = handle_close(sender);
             }
         }
         log(b"gpu-client: session handed to a separate process\n");
+        kept
     } else {
         let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
         let _ = handle_close(sender);
         let _ = handle_close(Handle(lane_child as u32));
-        let _ = handle_close(Handle(channel));
+        let _ = handle_close(Handle(session as u32));
         if native != 0 {
-            let _ = handle_close(Handle(native));
+            let _ = handle_close(Handle(native as u32));
         }
         if let Some((view_channel, view_vmo)) = view_grant {
             if view_channel.0 != 0 || view_vmo.0 != 0 {
-                GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(view_channel.0, Ordering::Relaxed);
-                GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
-                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                return_gpu_view_grant(view_channel, view_vmo, homing);
             }
         }
         log(b"gpu-client: launch failed; session retired\n");
+        None
     }
 }
 
+/// Return a churn view grant no client consumed: a boot grant goes back to the statics (a
+/// shell client may still use it), while a regrant is closed so drv-fb reports the release
+/// afresh and the next attempt waits on real evidence, not a cached flag.
+fn return_gpu_view_grant(channel: Handle, vmo: Handle, homing: GrantReturn) {
+    match homing {
+        GrantReturn::ToSora => {
+            GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(channel.0, Ordering::Relaxed);
+            GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(vmo.0, Ordering::Relaxed);
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        }
+        GrantReturn::Released => {
+            if channel.0 != 0 {
+                let _ = handle_close(channel);
+            }
+            if vmo.0 != 0 {
+                let _ = handle_close(vmo);
+            }
+            // Still grantable: the release query re-confirms drv-fb's side before regrant.
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+//j714 One supervised regrant: a fresh session channel whose server end rides the retained
+/// drv-gpu handoff as `g` (DESIGN/024's once-per-session record), then the shared lane path.
+/// On a churn image the client also needs view `GPU_VIEW` back: the shell gfx-recover
+/// machinery (`wait_for_released` + `regrant_view`) is reused for exactly that view, and an
+/// unreleased view becomes the lane's honest zero grant rather than a fabricated one.
+fn regrant_gpu_session(initrd: Handle) -> Option<Handle> {
+    let handoff = Handle(GPU_SESSION_HANDOFF.load(Ordering::Relaxed));
+    if handoff.0 == 0 {
+        log(b"gpu-client: no session handoff; session regrant unavailable\n");
+        return None;
+    }
+    let valid = |raw: u64| raw != 0 && raw != u64::MAX;
+    let (client, server) = channel_create_pair();
+    if !valid(client) || !valid(server) {
+        for raw in [client, server] {
+            if valid(raw) {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+        log(b"gpu-client: session pair unavailable; regrant refused\n");
+        return None;
+    }
+    if channel_write_with_handle(handoff, b"g".as_ptr(), 1, Handle(server as u32)) != 0 {
+        // Refused: the driver's receiver is gone, and neither end moved.
+        let _ = handle_close(Handle(server as u32));
+        let _ = handle_close(Handle(client as u32));
+        log(b"gpu-client: session regrant refused; grant closed\n");
+        return None;
+    }
+    let lane_grant = if GPU_CHURN_VIEW {
+        // The old lease died with session one, so the view is eligible for the release
+        // query again; only `GPU_VIEW` can carry this lane.
+        GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        let grant = wait_for_released()
+            .filter(|view| *view == drv_gpu::GPU_VIEW)
+            .and_then(regrant_view);
+        match grant {
+            Some((view_channel, view_vmo)) => {
+                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+                GRAPHICS_RELEASED[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+                LaneGrant::Regranted(view_channel, view_vmo)
+            }
+            None => {
+                log(b"gpu-client: view regrant unavailable; sending an honest absence\n");
+                LaneGrant::Regranted(Handle(0), Handle(0))
+            }
+        }
+    } else {
+        LaneGrant::Normal
+    };
+    launch_gpu_client_session(initrd, client, 0, lane_grant)
+}
+
 /// Hand one view's grant (its presentation channel and writable surface) to drv-gpu, which
-/// paints and presents it. Returns false, leaving the grant with Sora, when no GPU driver is
-/// waiting or the first send fails; a refused send leaves the handle in Sora's table.
+/// paints and presents it, then keep the bootstrap pair as the retained session handoff —
+/// the same pair carries every later session's `g` (DESIGN/024). Returns false, leaving the
+/// grant with Sora, when no GPU driver is waiting or the first send fails; a refused send
+/// leaves the handle in Sora's table.
 /// — TIMBERDOODLE
 fn hand_view_to_gpu(view: usize, channel: Handle, vmo: Handle) -> bool {
     let sender = Handle(GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed));
@@ -305,17 +466,32 @@ fn hand_view_to_gpu(view: usize, channel: Handle, vmo: Handle) -> bool {
         log(&[b'0' + view as u8]);
         log(b" handed to the GPU driver\n");
     }
-    let _ = handle_close(sender);
+    //j714 The pair outlives the boot view grant: it is the driver's session handoff now,
+    // so the next session's `g` has somewhere to go (DESIGN/024).
+    GPU_SESSION_HANDOFF.store(sender.0, Ordering::Relaxed);
     true
 }
 
-/// Close drv-gpu's bootstrap sender when no view went to it (no framebuffer, no band), so its
-/// read ends with PeerClosed instead of waiting for the rest of the boot.
+/// Retire the pre-grant bootstrap slot once the boot view has had its chance. On a GPU
+/// board the sender is not closed — it becomes the retained session handoff — and a board
+/// that handed no view to drv-gpu (a churn image keeps `GPU_VIEW`, and a framebuffer-less
+/// board has none) records the absence honestly with a bare `v` whose handle is zero, so
+/// the driver's first-session view read ends instead of waiting on a pair Sora will never
+/// close (DESIGN/024). Non-GPU boards never stored a sender here, so nothing changes.
 fn release_gpu_bootstrap() {
     let sender = GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed);
-    if sender != 0 {
-        let _ = handle_close(Handle(sender));
+    if sender == 0 {
+        return;
     }
+    let handoff = Handle(sender);
+    if channel_write_with_handle(handoff, b"v".as_ptr(), 1, Handle(0)) != 0 {
+        // The driver closed its end; nothing can serve sessions over this pair.
+        let _ = handle_close(handoff);
+        log(b"drv-gpu: boot view absence refused; handoff closed\n");
+        return;
+    }
+    GPU_SESSION_HANDOFF.store(sender, Ordering::Relaxed);
+    log(b"drv-gpu: boot view absence recorded for the first session\n");
 }
 
 /// Queue each view's surface grant on its own graphics channel before handing the server
@@ -1874,6 +2050,22 @@ const BOOT_SETTLE_NS: u64 = 3_000_000_000;
 /// Arm the first-prompt timer on `port`; `None` when no timer could be bound.
 fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
     let raw = timer_create(BOOT_SETTLE_NS);
+    if raw == u64::MAX {
+        return None;
+    }
+    let timer = Handle(raw as u32);
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return None;
+    }
+    Some((timer, Handle(koid as u32)))
+}
+
+/// Arm one delayed GPU session-regrant attempt on the serve port, the same one-shot timer
+/// shape the ttyd restart and first-prompt paths use. — TIMBERDOODLE
+fn arm_gpu_restart(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
+    let raw = timer_create(delay_ns);
     if raw == u64::MAX {
         return None;
     }
@@ -4830,7 +5022,7 @@ extern "C" fn sora_main(
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
     release_gpu_bootstrap();
-    launch_gpu_client(initrd);
+    let mut gpu_client_process = launch_gpu_client(initrd);
     log(b"sora: serve setup\n");
     let port_h = port_create();
     let console_koid = handle_koid(console);
@@ -4952,6 +5144,30 @@ extern "C" fn sora_main(
         let mut pending_ttyd_restart: Option<(sora::ServerRecipe<'static>, Handle)> = None;
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
         let mut log_mirror_timer: Option<(Handle, Handle)> = None;
+
+        // G8d-b: gpu-client supervision. The retained child is bound exactly like a
+        // supervised server, and on the churn image each termination schedules a session
+        // regrant inside the DESIGN/002 give-up budget.
+        const GPU_MAX_RESTARTS: u32 = 3;
+        const GPU_INITIAL_BACKOFF_NS: u64 = 50_000_000;
+        const GPU_MAX_BACKOFF_NS: u64 = 200_000_000;
+        let mut gpu_restart_budget = sora::RestartBudget::new(GPU_MAX_RESTARTS);
+        let mut gpu_restart_backoff =
+            sora::RestartBackoff::new(GPU_INITIAL_BACKOFF_NS, GPU_MAX_BACKOFF_NS);
+        let mut gpu_restart_timer: Option<(Handle, Handle)> = None;
+        let mut gpu_client_process = gpu_client_process.take();
+        let mut gpu_client_koid = None;
+        if let Some(process) = gpu_client_process {
+            let koid = handle_koid(process);
+            if koid != u64::MAX && port_bind(port, process) == 0 {
+                gpu_client_koid = Some(Handle(koid as u32));
+                log(b"gpu-client: supervision armed\n");
+            } else {
+                let _ = handle_close(process);
+                gpu_client_process = None;
+                log(b"gpu-client: supervision bind failed\n");
+            }
+        }
 
         log(b"sora: entering serve loop\n");
         SERVING.store(true, Ordering::Relaxed);
@@ -5116,6 +5332,77 @@ extern "C" fn sora_main(
                     log(b"ttyd: restart budget exhausted\n");
                 } else {
                     log(b"ttyd: terminated\n");
+                }
+                continue;
+            }
+            //j714 gpu-client supervision. A termination is the session's end; on the churn
+            // image one regrant attempt is armed per give-up budget unit, paced by the same
+            // capped backoff the supervised servers use.
+            if gpu_restart_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = gpu_restart_timer.take() else {
+                    continue;
+                };
+                let _ = port_unbind(port, timer);
+                let _ = handle_close(timer);
+                if !gpu_restart_budget.try_consume() {
+                    log(b"gpu-client: restart budget exhausted; giving up\n");
+                    continue;
+                }
+                match regrant_gpu_session(initrd) {
+                    Some(process) => {
+                        let koid = handle_koid(process);
+                        if koid != u64::MAX && port_bind(port, process) == 0 {
+                            gpu_client_process = Some(process);
+                            gpu_client_koid = Some(Handle(koid as u32));
+                            log(b"gpu-client: session regranted\n");
+                        } else {
+                            let _ = handle_close(process);
+                            log(b"gpu-client: regrant supervision bind failed\n");
+                        }
+                    }
+                    None => {
+                        if gpu_restart_budget.exhausted() {
+                            log(b"gpu-client: restart budget exhausted; giving up\n");
+                        } else {
+                            let delay_ns = gpu_restart_backoff.next_delay_ns();
+                            match arm_gpu_restart(port, delay_ns) {
+                                Some(timer) => {
+                                    gpu_restart_timer = Some(timer);
+                                    log(b"gpu-client: session regrant delayed\n");
+                                }
+                                None => {
+                                    log(b"gpu-client: restart timer unavailable; giving up\n");
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if Some(source) == gpu_client_koid {
+                gpu_client_koid = None;
+                if let Some(process) = gpu_client_process.take() {
+                    // Teardown reclaims only bindings keyed on the dead process's own
+                    // handles: drop Sora's watch before closing it (the ttyd pattern).
+                    let _ = port_unbind(port, process);
+                    let _ = handle_close(process);
+                }
+                if !GPU_CHURN_VIEW {
+                    log(b"gpu-client: client exited; restart gated off on this image\n");
+                    continue;
+                }
+                // The view's lease died with the client; make it eligible for the release
+                // query so the regrant can ask drv-fb for it again (churn lane only).
+                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                if GPU_SESSION_HANDOFF.load(Ordering::Relaxed) == 0 {
+                    log(b"gpu-client: no session handoff; supervision stops\n");
+                    continue;
+                }
+                log(b"gpu-client: client exited; session regrant scheduled\n");
+                let delay_ns = gpu_restart_backoff.next_delay_ns();
+                match arm_gpu_restart(port, delay_ns) {
+                    Some(timer) => gpu_restart_timer = Some(timer),
+                    None => log(b"gpu-client: restart timer unavailable; giving up\n"),
                 }
                 continue;
             }

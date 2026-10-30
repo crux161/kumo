@@ -8,6 +8,7 @@
 //j711
 //j712
 //j713
+//j714
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -70,6 +71,9 @@ fn handle(raw: u64) -> Option<Handle> {
 /// The lane Sora named on the bootstrap pair. `Native` is the J0c diagnostic channel (the
 /// handle is 0 when the image has no presenter); `Churn` is view `GPU_VIEW`'s production
 /// channel and surface, handed to this one cooperative client for the G8 loop.
+//j714 A `Churn` lane's native producer may be handle zero: a session regranted after a
+/// supervised exit runs no J0c diagnostic (DESIGN/024), and only the boot session's three
+/// native presentations set drv-fb's diagnostic-completed flag.
 #[derive(Clone, Copy)]
 enum Lane {
     Native(Handle),
@@ -141,10 +145,19 @@ fn select_lane(bootstrap: Handle) -> Result<Lane, ()> {
                 let _ = kumo_rt::handle_close(surface);
                 return fail("churn lane native tag missing");
             }
-            let Some(presentation) = handle(raw) else {
-                let _ = kumo_rt::handle_close(channel);
-                let _ = kumo_rt::handle_close(surface);
-                return fail("churn lane carries no native producer");
+            //j714 Handle zero is the honest no-producer churn lane (DESIGN/024): a
+            // regranted session carries none. Only a malformed nonzero value fails.
+            let presentation = if raw == 0 {
+                Handle(0)
+            } else {
+                match handle(raw) {
+                    Some(presentation) => presentation,
+                    None => {
+                        let _ = kumo_rt::handle_close(channel);
+                        let _ = kumo_rt::handle_close(surface);
+                        return fail("churn lane carried an invalid native producer");
+                    }
+                }
             };
             Ok(Lane::Churn {
                 channel,
@@ -299,6 +312,10 @@ fn wait_wake(wake: Handle) -> bool {
 //j711
 /// The counted acceptance run: 100 frames, each a fresh 160 KiB buffer at [`CHURN_VA`].
 const CHURN_FRAMES: u32 = 100;
+//j714 The restarted churn lane ran no native frames, so its timeline resumes past the
+/// bring-up paint at point 3: DESIGN/024 §4 names point 4 without the J0c three and point 7
+/// with them (the session timeline requires exactly the next point). — TIMBERDOODLE
+const CHURN_FIRST_POINT_NO_NATIVE: u64 = 4;
 /// The view-class surface drv-gpu presents its G5b paint through, replicated exactly:
 /// 256x128 linear XRGB8888 with stride 256 (`PAINT_SURFACE` in
 /// userland/servers/drv-gpu/src/lib.rs). drv-fb refuses a mismatched surface, so a drift
@@ -983,19 +1000,25 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
             surface,
             presentation,
         } => {
-            // j713: the J0c native diagnostic runs first; its third retirement sets drv-fb's
-            // diagnostic-completed flag, so the vblank gate arms before the churn readiness
-            // probe. Points: 3 = bring-up paint, 4..=6 = native frames. — TIMBERDOODLE
-            native_frames(
-                &mut client,
-                cpu,
-                vmo,
-                group,
-                presentation,
-                &triangle,
-                &compute,
-            )?;
-            let first_point = 4 + u64::from(kumo_graphics::native::PRESENTATIONS);
+            // j713: the boot session's J0c native diagnostic runs first; its third retirement
+            // sets drv-fb's diagnostic-completed flag, so the vblank gate arms before the
+            // churn readiness probe. Points: 3 = bring-up paint, 4..=6 = native frames.
+            // — TIMBERDOODLE
+            //j714 A regranted session has no producer: it runs no native frames at all (not
+            // the no-presenter single-frame path) and starts its churn timeline at point 5.
+            let mut first_point = CHURN_FIRST_POINT_NO_NATIVE;
+            if presentation.0 != 0 {
+                native_frames(
+                    &mut client,
+                    cpu,
+                    vmo,
+                    group,
+                    presentation,
+                    &triangle,
+                    &compute,
+                )?;
+                first_point = 4 + u64::from(kumo_graphics::native::PRESENTATIONS);
+            }
             churn_run(
                 &mut client,
                 cpu,
@@ -1136,7 +1159,10 @@ extern "C" fn main(channel: u64, bootstrap: u64) -> ! {
         } => {
             let _ = kumo_rt::handle_close(view);
             let _ = kumo_rt::handle_close(surface);
-            let _ = kumo_rt::handle_close(presentation);
+            //j714 A no-producer churn lane carries handle zero; never close it.
+            if presentation.0 != 0 {
+                let _ = kumo_rt::handle_close(presentation);
+            }
         }
     }
     let failed = match result {

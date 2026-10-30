@@ -6,12 +6,14 @@
 //j655
 //j690
 //j707
+//j714
 
 extern crate alloc;
 
 mod client;
 
 use core::fmt::{self, Write};
+use drv_gpu::contain::{Containment, SessionNext};
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
     cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
@@ -637,7 +639,23 @@ fn report_stream_stall(
 /// G3b: after the reset, read the vendored firmware out of the initrd, map its sections into
 /// address space 0 with their own flags, boot the MCU, and validate the global interface the
 /// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
-fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_present: u64) -> u8 {
+//j714
+/// One session of DESIGN/024's long-lived handoff. The first act is the blocking read of the
+/// next `g` record, so no GPU state moves until Sora grants a session; the soft-reset ladder
+/// behind that read is the fresh clean start every grant requires, and the tables, arena and
+/// firmware staging are allocated per call so a new session never borrows the last one's DMA
+/// (reclaim is G8d-c's). `first_session` gates the `v`/`s` view records and the G5b paint
+/// into them: the view is the boot-time proof, so only the first session reads or paints it.
+/// A setup failure returns the exit code it returned before G8d-b; a session that reached
+/// service returns the `Containment` its close produced, and only a confirmed release lets
+/// the caller read another `g`. — TIMBERDOODLE
+fn run_mali(
+    device: &mut Device,
+    initrd: Handle,
+    bootstrap: Handle,
+    shader_present: u64,
+    first_session: bool,
+) -> Result<Containment, u8> {
     let mut tag = [0u8; 1];
     let (len, raw) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
     let Some(client_channel) =
@@ -647,7 +665,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: no client session grant\n"),
         );
-        return 1;
+        return Err(1);
     };
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
@@ -663,7 +681,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: soft reset failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     }
 
@@ -683,7 +701,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 mmu.va_bits
             ),
         );
-        return 1;
+        return Err(1);
     }
     if mmu.as_present & 1 == 0 {
         log(
@@ -693,7 +711,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 mmu.as_present
             ),
         );
-        return 1;
+        return Err(1);
     }
 
     match power_l2(device) {
@@ -709,7 +727,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: L2 power-on failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     }
 
@@ -721,7 +739,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: initrd table unreadable\n"),
         );
-        return 1;
+        return Err(1);
     };
     let entry = match find_entry(&table[..table_bytes], MALI_FIRMWARE_PATH) {
         Ok(Some(entry)) => entry,
@@ -730,14 +748,14 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: firmware image missing from the initrd\n"),
             );
-            return 1;
+            return Err(1);
         }
         Err(_) => {
             log(
                 log_level::ERR,
                 format_args!("drv-gpu: initrd entry table invalid\n"),
             );
-            return 1;
+            return Err(1);
         }
     };
     if entry.len as usize > FIRMWARE_MAX {
@@ -745,7 +763,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: firmware image larger than the staging buffer\n"),
         );
-        return 1;
+        return Err(1);
     }
     // SAFETY: one driver process, and the staging buffer is only used during this boot.
     let buffer = unsafe {
@@ -759,7 +777,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: firmware image unreadable\n"),
         );
-        return 1;
+        return Err(1);
     }
     let firmware = match Firmware::parse(&buffer[..entry.len as usize]) {
         Ok(firmware) => firmware,
@@ -768,7 +786,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: firmware parse failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     };
     let build = firmware
@@ -792,7 +810,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: table arena allocation failed\n"),
         );
-        return 1;
+        return Err(1);
     };
     zero_mapping(&arena_mapping, TABLE_ARENA_LEN);
     let mut table_memory = TableDma {
@@ -803,11 +821,11 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: table arena rejected\n"),
         );
-        return 1;
+        return Err(1);
     };
     let Some(transtab) = arena.alloc_table(&mut table_memory) else {
         log(log_level::ERR, format_args!("drv-gpu: no L0 table\n"));
-        return 1;
+        return Err(1);
     };
 
     let mut loaded: [Option<Loaded>; MAX_SECTIONS] = [None; MAX_SECTIONS];
@@ -819,7 +837,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 format_args!("drv-gpu: more firmware sections than the loader holds\n"),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
         let Some(mapping) = map_contiguous(section.len) else {
             log(
@@ -830,7 +848,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 ),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         };
         zero_mapping(&mapping, section.len);
         copy_mapping(&mapping, section.data);
@@ -852,7 +870,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 ),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
         loaded[count] = Some(Loaded {
             va: section.va,
@@ -868,7 +886,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             format_args!("drv-gpu: no loadable firmware sections\n"),
         );
         let _ = soft_reset(device);
-        return 1;
+        return Err(1);
     }
     dsb();
     log(
@@ -885,7 +903,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: AS0 enable failed: {:?}\n", error),
         );
-        return 1;
+        return Err(1);
     }
     log(
         log_level::NOTICE,
@@ -921,7 +939,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 );
             }
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
     }
 
@@ -935,7 +953,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             format_args!("drv-gpu: no shared firmware section was loaded\n"),
         );
         let _ = soft_reset(device);
-        return 1;
+        return Err(1);
     };
     let mut control = [0u32; 8];
     for (index, word) in control.iter_mut().enumerate() {
@@ -998,7 +1016,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: global interface init failed: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
             // G4b: the first command-stream group. Its control blocks live in the shared
@@ -1027,7 +1045,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: CSG/CS blocks outside the shared section\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             if !(8..=32).contains(&csg.stream_num) {
                 log(
@@ -1038,7 +1056,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     ),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             log(
                 log_level::INFO,
@@ -1070,7 +1088,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: queue interface pages allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
             zero_mapping(&io_pages, 2 * PAGE_SIZE);
             if let Err(error) = map_range(
@@ -1087,7 +1105,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: queue interface pages map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
 
             let suspend_len = (u64::from(csg.suspend_size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -1100,7 +1118,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: suspend buffer allocation failed\n"),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
                 zero_mapping(&mapping, suspend_len);
                 if let Err(error) = map_range(
@@ -1117,7 +1135,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: suspend buffer map failed: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 suspend_va = MCU_SUSPEND_VA;
                 suspend_window = McuWindow {
@@ -1134,7 +1152,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS0 page-table flush failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
 
             let Some(work) = map_contiguous(WORK_LEN) else {
@@ -1143,13 +1161,13 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: group work buffer allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
             zero_mapping(&work, WORK_LEN);
             let Some(as1_l0) = arena.alloc_table(&mut table_memory) else {
                 log(log_level::ERR, format_args!("drv-gpu: no table for AS1\n"));
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
             if let Err(error) = map_range(
                 &mut table_memory,
@@ -1165,7 +1183,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 work map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             // G5a's offscreen target: one 256x128 XRGB8888 view, poisoned so a pixel the GPU
             // never wrote shows up as a mismatch.
@@ -1175,7 +1193,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: paint target allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
             for offset in (0..PAINT_BYTES).step_by(4) {
                 // SAFETY: a word inside the paint target's Normal-NC DMA mapping.
@@ -1195,7 +1213,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 paint target map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             // Separate GPU permissions: the binary is cached read-only executable; descriptor
             // and push data are uncached read-only no-execute. CPU uploads use Normal-NC, and
@@ -1208,7 +1226,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: kernel data refused: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             };
             for (gpu_va, bytes, executable) in [
@@ -1221,7 +1239,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: kernel allocation failed at 0x{:x}\n", gpu_va),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
                 zero_mapping(&mapping, PAGE_SIZE);
                 copy_mapping(&mapping, bytes);
@@ -1246,7 +1264,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         ),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
             log(log_level::NOTICE, format_args!(
@@ -1262,7 +1280,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 enable failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             log(
                 log_level::INFO,
@@ -1451,7 +1469,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         );
                     }
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
 
@@ -1524,7 +1542,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     );
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 device.delay_us(100);
             }
@@ -1587,7 +1605,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                                 format_args!("drv-gpu: compute stream refused: {:?}\n", error),
                             );
                             let _ = soft_reset(device);
-                            return 1;
+                            return Err(1);
                         }
                     };
                     words[..stream.len()].copy_from_slice(&stream);
@@ -1623,7 +1641,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                             ),
                         );
                         let _ = soft_reset(device);
-                        return 1;
+                        return Err(1);
                     }
                 };
                 let (insert, extract) = {
@@ -1642,7 +1660,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         ),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
                 // G4d: wait for the job on the JOB interrupt (INTID 124) instead of polling. The
                 // first wait is armed before the doorbell rings (inside `await_job_irq`), so a
@@ -1710,7 +1728,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                                 ),
                             );
                             let _ = soft_reset(device);
-                            return 1;
+                            return Err(1);
                         }
                     };
                     if submit {
@@ -1801,7 +1819,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 if outcome != JobWait::Interrupt {
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 if seqno != job || status != 0 || (!painting && landed != value) {
                     log(
@@ -1813,7 +1831,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     );
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 if painting {
                     // G5c-2: the shader wrote the surface through a GPU-uncached mapping and cleaned
@@ -1848,7 +1866,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         );
                         report_stream_stall(&mut *device, input, output, windows, csg, cs);
                         let _ = soft_reset(device);
-                        return 1;
+                        return Err(1);
                     }
                 }
             }
@@ -1860,9 +1878,17 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 ),
             );
             // G5b: only a pixel-exact paint reaches here, so the view never shows a bad image.
-            present_paint(bootstrap, paint.va);
+            //j714
+            // The `v`/`s` records are consumed once, by the first session: the view is the
+            // boot-time proof of G5b, not a per-session service. A later session neither
+            // reads records Sora will not send again nor paints a view it never received;
+            // the paint job above already re-proved this session's compute path offscreen.
+            // — TIMBERDOODLE
+            if first_session {
+                present_paint(bootstrap, paint.va);
+            }
 
-            client::serve(
+            Ok(client::serve(
                 client_channel,
                 device,
                 &mut table_memory,
@@ -1882,7 +1908,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 thread_max_threads,
                 thread_max_workgroup_size,
                 thread_features,
-            )
+            ))
         }
         Err(error) => {
             log(
@@ -1890,7 +1916,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 format_args!("drv-gpu: global interface invalid: {:?}\n", error),
             );
             let _ = soft_reset(device);
-            1
+            Err(1)
         }
     }
 }
@@ -1922,7 +1948,11 @@ fn present_paint(bootstrap: Handle, paint_va: u64) {
         );
         return;
     };
-    let _ = kumo_rt::handle_close(bootstrap);
+    //j714
+    // The handoff receiver stays open: DESIGN/024 makes the bootstrap pair the long-lived
+    // session lane, and the first session's job ended with the view grant, not the handoff.
+    // Closing it here would turn Sora's next `g` into PeerClosed and end the driver at one
+    // session. — TIMBERDOODLE
     for (offset, _, _) in surface_chunks() {
         let mut bytes = [0u8; SURFACE_CHUNK_BYTES];
         for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
@@ -2000,6 +2030,8 @@ fn park() -> ! {
 extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
     // G5b: x1 is a bootstrap channel. Its first message carries the initrd handle the firmware
     // is read from (x1 itself until J590); the view arrives later on the same channel.
+    // G8d-b: the same pair is the long-lived session handoff — every later `g` is a fresh
+    // session's server end, and this receiver stays open across sessions. — TIMBERDOODLE
     let bootstrap = Handle(bootstrap as u32);
     let mut tag = [0u8; 1];
     let (len, initrd) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
@@ -2038,7 +2070,47 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
                     identity.shader_present
                 ),
             );
-            run_mali(&mut device, initrd, bootstrap, identity.shader_present)
+            //j714
+            // DESIGN/024's session loop: the bootstrap pair is the long-lived handoff, so
+            // every `g` record is one session's server end and `run_mali` blocks on it
+            // before touching the GPU. Only a containment that proved quiescence licenses
+            // another turn, and the reset that opens the next turn is run_mali's own ladder;
+            // a poison closes the handoff receiver — no handle is left for a grant this
+            // driver will never serve — and parks with everything retained. Sora's
+            // RestartBudget owns the attempt count; the driver keeps accepting while it can
+            // serve honestly. — TIMBERDOODLE
+            let mut first_session = true;
+            let mut session_number = 0u32;
+            loop {
+                session_number += 1;
+                log(
+                    log_level::NOTICE,
+                    format_args!("drv-gpu: serving session {}\n", session_number),
+                );
+                match run_mali(
+                    &mut device,
+                    initrd,
+                    bootstrap,
+                    identity.shader_present,
+                    first_session,
+                ) {
+                    Ok(containment) => match containment.next() {
+                        SessionNext::Regrant => first_session = false,
+                        SessionNext::Park => {
+                            //j714
+                            // Retain everything and refuse every further grant. Closing this
+                            // receiver stops Sora's next `g` at the send; a grant already
+                            // queued in the kernel mailbox keeps its handle until that queue
+                            // is dropped, which this driver cannot reach without reading it,
+                            // so the containment record is the honest account of what was
+                            // kept. — TIMBERDOODLE
+                            let _ = kumo_rt::handle_close(bootstrap);
+                            park()
+                        }
+                    },
+                    Err(code) => break code,
+                }
+            }
         }
         Err(ProbeError::PowerUp(status)) if status == Errno::NotSupported.status() => {
             log(

@@ -1,5 +1,6 @@
 //j710
 //j709
+//j714
 
 //! G8d-a: the contained-close contract. A session that leaves service is closed in exactly
 //! one of two states, and the two are never mixed.
@@ -14,9 +15,11 @@
 //! parks and never regrants. A later observer can prove the leak; it can never be repaired
 //! by guessing that the GPU stopped.
 //!
-//! This module owns the ordering and the record. It does not reset anything (the caller
-//! passes the result), does not close channels (transport state outlives neither path and
-//! belongs to the caller), and does not reclaim kernel VMOs (G8d-b). — TIMBERDOODLE
+//! This module owns the ordering and the record, and the one question the long-lived driver
+//! loop asks of that record (G8d-b): only a *released* containment licenses another session.
+//! It does not reset anything (the caller passes the result), does not close channels
+//! (transport state outlives neither path and belongs to the caller), and does not reclaim
+//! kernel VMOs (G8d-c). — TIMBERDOODLE
 
 use core::fmt;
 
@@ -34,6 +37,19 @@ pub enum ContainmentState {
     Released,
     /// The reset failed; everything was retained and the session may never be served again.
     Poisoned,
+}
+
+//j714
+/// What the driver's session loop does after one served session closes (DESIGN/024). The
+/// decision is a pure function of the [`Containment`] record: `Regrant` needs a proven
+/// release, and anything less parks and keeps every byte. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionNext {
+    /// The reset was confirmed; read the next `g` and bring up a fresh session.
+    Regrant,
+    /// Quiescence was not proven; refuse every further grant and park with everything
+    /// retained.
+    Park,
 }
 
 /// The outcome of one contained close, including the exact counts it released.
@@ -82,6 +98,18 @@ impl Containment {
     /// True when nothing was released and this session may never serve again.
     pub fn retained(&self) -> bool {
         self.state == ContainmentState::Poisoned
+    }
+
+    //j714
+    /// The long-lived loop's one question (DESIGN/024): may the driver read another `g`?
+    /// Only a confirmed release answers yes; a poison retains everything, and the
+    /// unobservable `Quiescing` entry state has proven nothing, so it must never read as
+    /// permission either. — TIMBERDOODLE
+    pub fn next(&self) -> SessionNext {
+        match self.state {
+            ContainmentState::Released => SessionNext::Regrant,
+            ContainmentState::Poisoned | ContainmentState::Quiescing => SessionNext::Park,
+        }
     }
 }
 
@@ -301,5 +329,39 @@ mod tests {
             std::format!("{}", containment),
             "drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no"
         );
+    }
+
+    //j714
+    #[test]
+    fn a_released_containment_licenses_the_next_grant() {
+        let (mut session, mut backend) = (Session::default(), Fake::default());
+        let containment = Containment::run(Ok(ResetPath::Interrupt), &mut session, &mut backend);
+        assert_eq!(containment.next(), SessionNext::Regrant);
+    }
+
+    //j714
+    #[test]
+    fn a_poisoned_containment_refuses_every_further_grant() {
+        let (mut session, mut backend) = (Session::default(), Fake::default());
+        let containment = Containment::run(
+            Err(ResetError::Timeout { rawstat: 0 }),
+            &mut session,
+            &mut backend,
+        );
+        assert_eq!(containment.next(), SessionNext::Park);
+    }
+
+    //j714
+    #[test]
+    fn a_containment_that_never_ran_cannot_license_a_regrant() {
+        // Quiescing is not an observable result of `run`; it names the entry state so the
+        // vocabulary is complete, and the decision must treat it as the non-proof it is.
+        // — TIMBERDOODLE
+        let containment = Containment {
+            state: ContainmentState::Quiescing,
+            reset: Ok(ResetPath::Interrupt),
+            release: SessionRelease::NONE,
+        };
+        assert_eq!(containment.next(), SessionNext::Park);
     }
 }
