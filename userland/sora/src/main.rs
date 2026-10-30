@@ -12,6 +12,7 @@
 //j713
 //j714
 //j715
+//j720
 
 extern crate alloc;
 
@@ -2098,6 +2099,49 @@ fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
 
 /// Arm one delayed GPU session-regrant attempt on the serve port, the same one-shot timer
 /// shape the ttyd restart and first-prompt paths use. — TIMBERDOODLE
+//j720
+/// Arm the next clock-watch sample with the same one-shot timer shape as the other serve
+/// timers. — TIMBERDOODLE
+fn arm_clock_watch(port: Handle) -> Option<(Handle, Handle)> {
+    if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    arm_gpu_restart(port, GPU_CLOCK_WATCH_PERIOD_NS)
+}
+
+//j720
+/// Read and log one GPU clock sample from the read-only CRU mapping: the source/divider
+/// decode plus the raw select, gate and GPLL words, so a moving clock is visible in the
+/// same log as the JOB completion times. — TIMBERDOODLE
+fn log_gpu_clock_sample() {
+    if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let read = |offset: u64| unsafe { ((GPU_CLOCK_CRU_VA + offset) as *const u32).read_volatile() };
+    let clksel158 = read(GPU_CLOCK_O_CLKSEL158);
+    let clock = sora::decode_gpu_clock(clksel158, read(GPU_CLOCK_O_CLKSEL161));
+    log(b"clk-gpu: clksel158=");
+    log_hex(u64::from(clksel158));
+    log(b" gate66=");
+    log_hex(u64::from(read(GPU_CLOCK_O_GATE66)));
+    log(b" gate67=");
+    log_hex(u64::from(read(GPU_CLOCK_O_GATE67)));
+    log(b" gpll0=");
+    log_hex(u64::from(read(GPU_CLOCK_O_GPLL0)));
+    log(b" src=");
+    log(clock.parent_name().as_bytes());
+    log(b" div=");
+    log_hex(u64::from(clock.divider));
+    match clock.rate_mhz(GPU_CLOCK_GPLL_MHZ) {
+        Some(mhz) => {
+            log(b" rate=");
+            log_hex(u64::from(mhz));
+            log(b"MHz\n");
+        }
+        None => log(b" rate=unknown\n"),
+    }
+}
+
 fn arm_gpu_restart(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
     let raw = timer_create(delay_ns);
     if raw == u64::MAX {
@@ -3656,6 +3700,27 @@ const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
 /// images keep drv-gpu's G5b boot paint and the J0c diagnostic unchanged. — TIMBERDOODLE
 const GPU_CHURN_VIEW: bool = false;
 
+//j720
+/// The GPU clock watch: a read-only CRU mapping minted from the root Resource and sampled
+/// on the serve port every ten seconds while the churn lane is on. Its purpose is to
+/// explain the elapsed-time JOB slowdown with evidence: if a CRU word moves, the clock or a
+/// gate moved with it; if every word holds, the drift is elsewhere. Offsets are
+/// `CRU_CLKSEL_CON158/161`, `GATE_CON66/67` and `GPLL_CON0` from
+/// hal/kumo-hal-aarch64/src/mali.rs and power_unit.rs; the span is drv-fb's read-only
+/// clock-probe window. — TIMBERDOODLE
+const CLOCK_CRU_BASE: u64 = drv_fb::rk3588_clock::CRU_BASE;
+const CLOCK_CRU_LEN: u64 = drv_fb::rk3588_clock::CRU_LEN;
+const GPU_CLOCK_WATCH_PERIOD_NS: u64 = 10_000_000_000;
+const GPU_CLOCK_CRU_VA: u64 = 0x3502_0000;
+const GPU_CLOCK_O_CLKSEL158: u64 = 0x578;
+const GPU_CLOCK_O_CLKSEL161: u64 = 0x584;
+const GPU_CLOCK_O_GATE66: u64 = 0x908;
+const GPU_CLOCK_O_GATE67: u64 = 0x90c;
+const GPU_CLOCK_O_GPLL0: u64 = 0x1c0;
+/// DESIGN/020: GPLL is 1188 MHz, so GPLL/6 is the ratified 198 MHz boot rate.
+const GPU_CLOCK_GPLL_MHZ: u32 = 1188;
+static GPU_CLOCK_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
 #[cfg(target_arch = "aarch64")]
@@ -5055,6 +5120,27 @@ extern "C" fn sora_main(
     // either console or block has data. Source koid matching dispatches to
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
+    //j720
+    // Mint one read-only CRU window from the root Resource, exactly as the display probe's
+    // PMU lane does, and let the serve-loop sampler read the GPU clock words from it.
+    // — TIMBERDOODLE
+    if GPU_CHURN_VIEW {
+        let raw = kumo_rt::resource_mint_mmio(res, CLOCK_CRU_BASE, CLOCK_CRU_LEN);
+        if let Some(vmo) = syscall_handle(raw) {
+            if vmar_map(
+                Handle(0),
+                vmo,
+                0,
+                GPU_CLOCK_CRU_VA,
+                CLOCK_CRU_LEN,
+                VmarFlags::READ.0,
+            ) == 0
+            {
+                GPU_CLOCK_WATCH_ACTIVE.store(true, Ordering::Relaxed);
+            }
+            let _ = handle_close(vmo);
+        }
+    }
     release_gpu_bootstrap();
     let mut gpu_client_process = launch_gpu_client(initrd);
     log(b"sora: serve setup\n");
@@ -5189,6 +5275,8 @@ extern "C" fn sora_main(
         let mut gpu_restart_backoff =
             sora::RestartBackoff::new(GPU_INITIAL_BACKOFF_NS, GPU_MAX_BACKOFF_NS);
         let mut gpu_restart_timer: Option<(Handle, Handle)> = None;
+        //j720
+        let mut clock_watch_timer: Option<(Handle, Handle)> = None;
         let mut gpu_client_process = gpu_client_process.take();
         let mut gpu_client_koid = None;
         if let Some(process) = gpu_client_process {
@@ -5204,6 +5292,8 @@ extern "C" fn sora_main(
         }
 
         log(b"sora: entering serve loop\n");
+        //j720
+        clock_watch_timer = arm_clock_watch(port);
         SERVING.store(true, Ordering::Relaxed);
         // First light of the interactive shell: render the prompt once so the settled framebuffer
         // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
@@ -5410,6 +5500,22 @@ extern "C" fn sora_main(
                             }
                         }
                     }
+                }
+                continue;
+            }
+            //j720
+            // One clock sample per period, chained on the serve port like the log mirror.
+            // — TIMBERDOODLE
+            if clock_watch_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = clock_watch_timer.take() else {
+                    continue;
+                };
+                let _ = port_unbind(port, timer);
+                let _ = handle_close(timer);
+                log_gpu_clock_sample();
+                match arm_clock_watch(port) {
+                    Some(timer) => clock_watch_timer = Some(timer),
+                    None => log(b"clk-gpu: watch disarmed\n"),
                 }
                 continue;
             }

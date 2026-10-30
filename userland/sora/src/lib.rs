@@ -6,6 +6,7 @@
 //j568
 //j687
 //j701
+//j720
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -1329,5 +1330,75 @@ mod tests {
         ] {
             assert!(shell_may_read(path));
         }
+    }
+}
+
+//j720
+/// Decode the GPU clock source and divider from `CRU_CLKSEL_CON158` and `CON161`, mirroring
+/// `hal/kumo-hal-aarch64/src/mali.rs`'s `MaliG610ClockStatus` decoder exactly. The kernel
+/// HAL is not a userland dependency, so this small mirror is deliberate; keep the two in
+/// step. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuClock {
+    pub parent: u8,
+    pub divider: u32,
+    pub pvtpll: bool,
+    pub osc: bool,
+}
+
+pub fn decode_gpu_clock(clksel158: u32, clksel161: u32) -> GpuClock {
+    GpuClock {
+        parent: ((clksel158 >> 5) & 0b111) as u8,
+        divider: (clksel158 & 0x1f) + 1,
+        pvtpll: clksel158 & (1 << 14) != 0,
+        osc: clksel161 & (1 << 2) != 0,
+    }
+}
+
+impl GpuClock {
+    pub fn parent_name(&self) -> &'static str {
+        match self.parent {
+            0 => "gpll",
+            1 => "cpll",
+            2 => "aupll",
+            3 => "npll",
+            4 => "spll",
+            _ => "reserved",
+        }
+    }
+
+    /// The effective rate when the parent is the 1188 MHz GPLL (DESIGN/020); any other
+    /// parent or PVTPLL is reported as unknown rather than guessed. — TIMBERDOODLE
+    pub fn rate_mhz(&self, gpll_mhz: u32) -> Option<u32> {
+        if !self.pvtpll && self.parent == 0 {
+            Some(gpll_mhz / self.divider)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod gpu_clock_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_gpll_six_as_the_ratified_boot_rate() {
+        // DESIGN/020: GPLL/6 = 198 MHz; CLKSEL_CON158 holds parent [7:5] and divider [4:0].
+        let clock = decode_gpu_clock(5, 0);
+        assert_eq!(clock.parent_name(), "gpll");
+        assert_eq!(clock.divider, 6);
+        assert_eq!(clock.rate_mhz(1188), Some(198));
+        assert!(!clock.pvtpll);
+    }
+
+    #[test]
+    fn pvtpll_and_foreign_parents_never_guess_a_rate() {
+        let pvtpll = decode_gpu_clock(1 << 14, 1 << 2);
+        assert!(pvtpll.pvtpll && pvtpll.osc);
+        assert_eq!(pvtpll.rate_mhz(1188), None);
+        let spll = decode_gpu_clock(4 << 5, 0);
+        assert_eq!(spll.parent_name(), "spll");
+        assert_eq!(spll.rate_mhz(1188), None);
     }
 }
