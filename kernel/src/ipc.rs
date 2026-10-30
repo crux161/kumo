@@ -1,6 +1,7 @@
 //j399
 //j409
 //j618
+//j708
 
 use alloc::vec::Vec;
 
@@ -324,6 +325,20 @@ impl IpcRegistry {
             }
         }
         Err(IpcError::NotChannel)
+    }
+
+    /// True when any queued message still owns a transferred handle for `koid`. A queued
+    /// capability is not in any process table until the receiver reads it, so a VMO release
+    /// must consult the mailboxes as well as every process. — TIMBERDOODLE
+    pub fn koid_queued(&self, koid: KoId) -> bool {
+        self.channels.iter().any(|channel| {
+            [&channel.left, &channel.right].iter().any(|endpoint| {
+                endpoint
+                    .inbox
+                    .iter()
+                    .any(|message| message.transfers.iter().any(|entry| entry.koid == koid))
+            })
+        })
     }
 
     pub fn peer_koid_for(&self, koid: KoId) -> Result<KoId, IpcError> {

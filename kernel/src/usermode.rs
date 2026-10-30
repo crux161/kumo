@@ -1,4 +1,5 @@
 //j632
+//j708
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -1213,6 +1214,7 @@ fn teardown_process_and_signal(koid: KoId) {
         // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
         sora.engine.retire_device_contexts();
         sora.engine.retire_interrupts();
+        sora.engine.retire_vmos(None);
         if primary {
             sora.process.signal(kumo_abi::Signals::TERMINATED);
         } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {

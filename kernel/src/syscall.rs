@@ -1,8 +1,8 @@
-//j633
 //j634
 //j635
 //j659
 //j660
+//j708
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -690,6 +690,25 @@ fn alloc_contiguous(
     }
 }
 
+/// Zero and clean a reclaimed DMA run before handing it to a driver. Host tests never call
+/// this path because a physical address is meaningless there. — TIMBERDOODLE
+fn zero_reclaimed_run(phys: u64, len: u64) {
+    #[cfg(target_os = "none")]
+    {
+        let saved = kumo_hal::active::read_user_aspace_root();
+        unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+        // SAFETY: the run came from the DMA allocator and the kernel identity tree, which is
+        // active here, maps it Normal-WB.
+        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, len as usize) };
+        kumo_hal::active::clean_dcache_to_poc(phys as usize, len as usize);
+        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (phys, len);
+    }
+}
+
 fn ensure_anonymous_frame(
     entry: &VmoEntry,
     page_index: usize,
@@ -965,6 +984,10 @@ pub struct SyscallEngine {
     // Registry clones and device pins own the same immutable VMO identity and the same
     // demand-page cache. Copying the cache could allocate divergent backing. — KESTREL
     vmos: Vec<Rc<VmoEntry>>,
+    /// Contiguous DMA runs returned by a retired VMO, ready for a later
+    /// `VmoCreateContiguous`. Shared across engine clones so two engines can never hand out
+    /// the same frames. — TIMBERDOODLE
+    free_dma_runs: Rc<RefCell<Vec<kumo_abi::Range>>>,
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
@@ -1015,6 +1038,7 @@ impl SyscallEngine {
             objects: ObjectManager::new(),
             ipc: IpcRegistry::new(),
             vmos: Vec::new(),
+            free_dma_runs: Rc::new(RefCell::new(Vec::new())),
             processes: Vec::new(),
             threads: Vec::new(),
             boot_info: None,
@@ -2470,6 +2494,80 @@ impl SyscallEngine {
         Ok(())
     }
 
+    /// Reclaim a dead DMA VMO's contiguous run for a later `VmoCreateContiguous`. Every
+    /// reference must be gone: no handle in any process or the caller, no CPU mapping, no
+    /// queued IPC transfer, and no pin or device mapping (`strong_count == 1`). Anonymous,
+    /// physical and MMIO VMOs keep their existing lifecycles. — TIMBERDOODLE
+    pub(crate) fn retire_vmos(&mut self, caller: Option<&Process>) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.vmos.len() {
+            let (koid, run) = {
+                let entry = &self.vmos[index];
+                let run = match entry.vmo.backing() {
+                    crate::mm::VmoBacking::Dma { phys_base } => {
+                        Some(kumo_abi::Range::new(phys_base, entry.vmo.len()))
+                    }
+                    _ => None,
+                };
+                (entry.koid, run)
+            };
+            let referenced = |process: &Process| {
+                process
+                    .handles()
+                    .holds(koid, ObjectKind::Vmo, Rights::empty())
+                    || process.mappings().iter().any(|(_, mapped)| *mapped == koid)
+            };
+            let freeable = run.is_some()
+                && Rc::strong_count(&self.vmos[index]) == 1
+                && !self.processes.iter().any(|process| referenced(process))
+                && !caller.is_some_and(|process| referenced(process))
+                && !self.ipc.koid_queued(koid);
+            if !freeable {
+                index += 1;
+                continue;
+            }
+            // Record the run before dropping the entry; if the free list cannot grow, keep
+            // the VMO rather than lose the only record of its frames. — TIMBERDOODLE
+            if self.free_dma_runs.borrow_mut().try_reserve(1).is_err() {
+                index += 1;
+                continue;
+            }
+            let entry = self.vmos.remove(index);
+            if let crate::mm::VmoBacking::Dma { phys_base } = entry.vmo.backing() {
+                self.free_dma_runs
+                    .borrow_mut()
+                    .push(kumo_abi::Range::new(phys_base, entry.vmo.len()));
+            }
+            removed += 1;
+        }
+        removed
+    }
+
+    /// Take a freed run for a new DMA VMO, splitting it when it is larger. A run that
+    /// overlaps a current exclusion is skipped, never handed out. — TIMBERDOODLE
+    fn take_free_dma_run(&mut self, count: u64, excluded: &[kumo_abi::Range]) -> Option<u64> {
+        let bytes = count.checked_mul(crate::mm::PAGE_SIZE)?;
+        if bytes == 0 {
+            return None;
+        }
+        let mut runs = self.free_dma_runs.borrow_mut();
+        let index = runs.iter().position(|run| {
+            run.len >= bytes
+                && !excluded
+                    .iter()
+                    .any(|ex| ranges_overlap(run.start, bytes, ex.start, ex.len))
+        })?;
+        let start = runs[index].start;
+        if runs[index].len == bytes {
+            runs.remove(index);
+        } else {
+            runs[index].start += bytes;
+            runs[index].len -= bytes;
+        }
+        Some(start)
+    }
+
     /// Look up a VMO by koid. Returns `None` if not found.
     pub fn vmo_by_koid(&self, koid: KoId) -> Option<Vmo> {
         self.vmos.iter().find_map(|entry| {
@@ -2862,6 +2960,7 @@ impl SyscallEngine {
         // discarded by IPC before returning to userspace. — KESTREL
         self.retire_device_contexts();
         self.retire_interrupts();
+        self.retire_vmos(Some(process));
         result
     }
 
@@ -3959,9 +4058,15 @@ impl SyscallEngine {
                 let excluded = self.table_pages.dma_exclusions();
                 #[cfg(not(feature = "arch_aarch64"))]
                 let excluded = Vec::new();
-                let phys = match alloc_contiguous(&boot, count, &excluded) {
-                    Ok(phys) => phys,
-                    Err(e) => return KernelCallResult::Status(e.status()),
+                let phys = match self.take_free_dma_run(count, &excluded) {
+                    Some(phys) => {
+                        zero_reclaimed_run(phys, len);
+                        phys
+                    }
+                    None => match alloc_contiguous(&boot, count, &excluded) {
+                        Ok(phys) => phys,
+                        Err(e) => return KernelCallResult::Status(e.status()),
+                    },
                 };
                 let vmo = match crate::mm::Vmo::from_dma_range(phys, len) {
                     Ok(vmo) => vmo,
@@ -5161,6 +5266,148 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    mod vmo_reclaim {
+        use super::*;
+        use crate::mm::{Mapping, Vmo, PAGE_SIZE};
+        use kumo_abi::Range;
+
+        fn adopt_dma_vmo(
+            engine: &mut SyscallEngine,
+            process: &mut Process,
+            phys: u64,
+        ) -> (Handle, KoId) {
+            let object = engine.objects.create(ObjectKind::Vmo);
+            let koid = object.koid();
+            engine.vmos.push(Rc::new(VmoEntry {
+                koid,
+                vmo: Vmo::from_dma_range(phys, 2 * PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            }));
+            let handle = process
+                .handles_mut()
+                .insert(
+                    object,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+                )
+                .unwrap();
+            (handle, koid)
+        }
+
+        fn close(engine: &mut SyscallEngine, process: &mut Process, handle: Handle) {
+            assert_eq!(
+                engine.dispatch(process, KernelCall::HandleClose { handle }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+
+        #[test]
+        fn a_dead_dma_vmo_returns_its_run_and_the_run_is_reusable() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+            assert_eq!(
+                engine.free_dma_runs.borrow().as_slice(),
+                &[Range::new(0x4000_0000, 2 * PAGE_SIZE)]
+            );
+            assert_eq!(engine.take_free_dma_run(2, &[]), Some(0x4000_0000));
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+
+        #[test]
+        fn a_live_handle_or_mapping_keeps_the_run() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            let duplicate = process
+                .handles_mut()
+                .duplicate(handle, Rights::READ)
+                .unwrap();
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            close(&mut engine, &mut process, duplicate);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_2000);
+            process.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ,
+                },
+                koid,
+            );
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            process.remove_mapping_exact(0x2000_0000, PAGE_SIZE);
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        #[test]
+        fn a_queued_transfer_keeps_the_run_until_the_receiver_closes() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            let (sender, receiver) = engine
+                .ipc
+                .channel_create(&mut engine.objects, &mut process)
+                .unwrap();
+            let binding = [handle];
+            let message = kumo_ipc::Message::new(0, &[], &binding).unwrap();
+            engine
+                .ipc
+                .channel_write(&mut process, sender, message)
+                .unwrap();
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            let received = engine.ipc.channel_read(&mut process, receiver).unwrap();
+            let installed = received.handles()[0];
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.handles_mut().close(installed).unwrap();
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        #[test]
+        fn anonymous_vmos_keep_their_lifecycle() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let object = engine.objects.create(ObjectKind::Vmo);
+            let koid = object.koid();
+            engine.vmos.push(Rc::new(VmoEntry {
+                koid,
+                vmo: Vmo::new(PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            }));
+            let handle = process.handles_mut().insert(object, Rights::READ).unwrap();
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+        }
+
+        #[test]
+        fn a_reclaimed_run_skips_exclusions_and_splits_when_larger() {
+            let mut engine = SyscallEngine::new();
+            engine
+                .free_dma_runs
+                .borrow_mut()
+                .push(Range::new(0x4000_0000, 3 * PAGE_SIZE));
+            assert_eq!(
+                engine.take_free_dma_run(1, &[Range::new(0x4000_0000, PAGE_SIZE)]),
+                None
+            );
+            assert_eq!(engine.take_free_dma_run(1, &[]), Some(0x4000_0000));
+            assert_eq!(
+                engine.free_dma_runs.borrow().as_slice(),
+                &[Range::new(0x4000_1000, 2 * PAGE_SIZE)]
+            );
+            assert_eq!(engine.take_free_dma_run(2, &[]), Some(0x4000_1000));
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+    }
 
     mod context_retirement {
         use super::*;
