@@ -1,6 +1,7 @@
 //j426
 //j430
 //j481
+//j703
 
 use crate::{XhciProbeConfig, XHCI_NO_STREAM_ID};
 
@@ -20,7 +21,7 @@ pub const X13S_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0xd000;
 pub const X13S_USB0_XHCI_STREAM_ID: u32 = 0x820;
 pub const RK3588_USB0_XHCI_MMIO_BASE: u64 = 0xfc00_0000;
 pub const RK3588_USB0_XHCI_MMIO_LEN: u64 = 0x40_0000;
-pub const RK3588_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0x8000;
+pub const RK3588_USB0_XHCI_REGISTER_MMIO_LEN: u64 = 0xD000;
 pub const RK3588_USB0_XHCI_IRQ: u32 = 252;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,7 +245,9 @@ fn rk3588_xhci_topology(node: &Node) -> Option<XhciControllerTopology> {
     Some(XhciControllerTopology {
         mmio_base,
         mmio_length,
-        // RK3588 TRM Part 2 chapter 13 limits xHCI registers to 0x0000..0x7fff.
+        // The xHCI block is 0x0000..0x7fff, but the DWC3 globals sit at 0xC100..0xC6FF and
+        // host-mode init needs them (PLAN_VI §2.5). Grant one page-aligned window over both.
+        // — TIMBERDOODLE
         // USB3OTG_0 has no DT `iommus` binding; this first-light probe performs no DMA.
         // — KESTREL 2026-07-24
         register_length: RK3588_USB0_XHCI_REGISTER_MMIO_LEN,

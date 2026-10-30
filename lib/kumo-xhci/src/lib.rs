@@ -1,11 +1,9 @@
 #![no_std]
-//j521
-//j529
-//j533
 //j539
 //j540
 //j541
 //j545
+//j703
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -16,6 +14,7 @@
 mod context;
 mod controller;
 mod dma;
+mod dwc3;
 mod fdt;
 mod hub;
 mod noop;
@@ -31,6 +30,7 @@ pub use context::{
 };
 pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
 pub use dma::{DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource};
+pub use dwc3::{HostInit, RegisterUpdate};
 pub use fdt::{
     discover_primary_xhci, discover_rk3588_usb0_xhci, discover_x13s_usb0_xhci, GicInterrupt,
     XhciControllerTopology, RK3588_USB0_XHCI_IRQ, RK3588_USB0_XHCI_MMIO_BASE,
@@ -45,8 +45,15 @@ pub use hub::{
 pub use noop::{
     prepare_noop_command_image, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas,
 };
-pub use probe::{XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN};
-pub use registers::{portsc_offset, CapabilityRegisters, PortStatus, RootPortScan};
+pub use probe::{
+    XhciProbeConfig, FLAG_DWC3, QUIRK_DIS_DEL_PHY_POWER_CHG, QUIRK_DIS_ENBLSLPM,
+    QUIRK_DIS_RXDET_INP3, QUIRK_DIS_TX_IPGAP_LINECHECK, QUIRK_DIS_U1_ENTRY, QUIRK_DIS_U2_ENTRY,
+    QUIRK_DIS_U2_FREECLK_EXISTS, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+};
+pub use registers::{
+    port_power_value, port_reset_value, port_state_to_neutral, port_warm_reset_value,
+    portsc_offset, CapabilityRegisters, PortStatus, RootPortScan,
+};
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
 };

@@ -1,12 +1,27 @@
 //j426
 //j529
 //j538
+//j703
 
 use crate::{ContextSize, Error};
 
 const MIN_CAPLENGTH: u8 = 0x20;
 const PORT_REGISTER_SET_OFFSET: usize = 0x400;
 const PORT_REGISTER_STRIDE: usize = 0x10;
+
+// PORTSC bits the root-port helpers need (xHCI 5.4.8). — TIMBERDOODLE
+const PORTSC_CONNECT: u32 = 1 << 0;
+const PORTSC_PED: u32 = 1 << 1;
+const PORTSC_RESET: u32 = 1 << 4;
+const PORTSC_PLS_MASK: u32 = 0xf << 5;
+const PORTSC_POWER: u32 = 1 << 9;
+const PORTSC_WRC: u32 = 1 << 19;
+const PORTSC_CAS: u32 = 1 << 24;
+const PORTSC_WR: u32 = 1 << 31;
+/// Read-only status bits a neutral write saves (Linux `XHCI_PORT_RO`).
+const PORTSC_RO: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30);
+/// Read/write bits where writing the read value leaves the bit unchanged (`XHCI_PORT_RWS`).
+const PORTSC_RWS: u32 = (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
 
 /// xHCI capability registers needed before touching controller state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +91,29 @@ pub fn portsc_offset(caplength: u8, port_index: u8) -> Option<usize> {
         .checked_add((port_index as usize).checked_mul(PORT_REGISTER_STRIDE)?)
 }
 
+/// The read-back state that can be written to PORTSC without changing the port (Linux
+/// `xhci_port_state_to_neutral`). PED and every RW1C change bit are zeroed and the reserved bits
+/// are cleared, so a reset or power write cannot disable a port or clear a change latch.
+/// — TIMBERDOODLE
+pub const fn port_state_to_neutral(raw: u32) -> u32 {
+    (raw & PORTSC_RO) | (raw & PORTSC_RWS)
+}
+
+/// A neutral PORTSC value that initiates a port reset (bit 4). — TIMBERDOODLE
+pub const fn port_reset_value(raw: u32) -> u32 {
+    port_state_to_neutral(raw) | PORTSC_RESET
+}
+
+/// A neutral PORTSC value that initiates a warm reset (bit 31). — TIMBERDOODLE
+pub const fn port_warm_reset_value(raw: u32) -> u32 {
+    port_state_to_neutral(raw) | PORTSC_WR
+}
+
+/// A neutral PORTSC value that powers the port (bit 9). — TIMBERDOODLE
+pub const fn port_power_value(raw: u32) -> u32 {
+    port_state_to_neutral(raw) | PORTSC_POWER
+}
+
 /// Parsed PORTSC fields used by first-light logging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortStatus {
@@ -92,15 +130,15 @@ impl PortStatus {
     }
 
     pub const fn connected(self) -> bool {
-        self.raw & 1 != 0
+        self.raw & PORTSC_CONNECT != 0
     }
 
     pub const fn enabled(self) -> bool {
-        self.raw & (1 << 1) != 0
+        self.raw & PORTSC_PED != 0
     }
 
     pub const fn link_state(self) -> u8 {
-        ((self.raw >> 5) & 0xf) as u8
+        ((self.raw & PORTSC_PLS_MASK) >> 5) as u8
     }
 
     pub const fn speed(self) -> u8 {
@@ -115,6 +153,21 @@ impl PortStatus {
     /// enumerates on, even when it is plugged into a blue USB3 connector.
     pub const fn usb2_ready(self) -> bool {
         self.connected() && self.enabled() && matches!(self.speed(), 1..=3)
+    }
+
+    /// A port reset is in progress.
+    pub const fn reset_in_progress(self) -> bool {
+        self.raw & PORTSC_RESET != 0
+    }
+
+    /// A warm reset completed since the last change-bit clear.
+    pub const fn warm_reset_done(self) -> bool {
+        self.raw & PORTSC_WRC != 0
+    }
+
+    /// The link wants a warm reset: SS.Inactive, Compliance, or a latched warm-reset change.
+    pub const fn warm_reset_required(self) -> bool {
+        self.raw & PORTSC_CAS != 0 || matches!(self.link_state(), 6 | 10)
     }
 }
 
@@ -215,6 +268,44 @@ mod tests {
         assert!(port.powered());
         assert_eq!(port.link_state(), 3);
         assert_eq!(port.speed(), 4);
+    }
+
+    #[test]
+    fn neutral_writes_never_disable_or_clear_a_port() {
+        // 0xe03 = CCS|PED|PP|U0 at High Speed; 0x1203 is the same at SuperSpeed with CSC latched.
+        for raw in [0xe03u32, 0x1203, 0x2a0] {
+            let neutral = port_state_to_neutral(raw);
+            assert_eq!(neutral & (1 << 1), 0, "PED must be zero in a neutral write");
+            assert_eq!(neutral & (1 << 17), 0, "change bits must be zero");
+            assert_eq!(neutral & (0xf << 28), 0, "reserved bits must be zero");
+            assert_eq!(neutral & (1 << 24), 0);
+            assert_eq!(neutral & 1, raw & 1);
+            assert_eq!(neutral & (0xf << 5), raw & (0xf << 5));
+            assert_eq!(neutral & (1 << 9), raw & (1 << 9));
+        }
+    }
+
+    #[test]
+    fn reset_power_and_warm_reset_values_add_only_their_strobe() {
+        let raw = 0xe03;
+        assert_ne!(port_reset_value(raw) & (1 << 4), 0);
+        assert_ne!(port_power_value(raw) & (1 << 9), 0);
+        assert_ne!(port_warm_reset_value(raw) & (1 << 31), 0);
+        assert_eq!(port_power_value(raw) & (1 << 4), 0);
+        assert_eq!(port_warm_reset_value(raw) & (1 << 4), 0);
+    }
+
+    #[test]
+    fn warm_reset_is_required_for_inactive_compliance_and_cas() {
+        let inactive = PortStatus::new(1 | (1 << 9) | (6 << 5));
+        let compliance = PortStatus::new(1 | (1 << 9) | (10 << 5));
+        let cas = PortStatus::new(1 | (1 << 24));
+        let polling = PortStatus::new(1 | (1 << 9) | (7 << 5));
+        assert!(inactive.warm_reset_required());
+        assert!(compliance.warm_reset_required());
+        assert!(cas.warm_reset_required());
+        assert!(!polling.warm_reset_required());
+        assert!(PortStatus::new(1 | (1 << 19)).warm_reset_done());
     }
 
     // PORTSC values as read on the Orange Pi 5 Plus front panel on 2026-07-28: the

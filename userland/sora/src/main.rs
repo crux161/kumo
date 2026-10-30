@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j693
 //j694
 //j697
 //j698
 //j701
+//j703
 
 extern crate alloc;
 
@@ -2028,16 +2028,35 @@ fn xhci_usb0_probe_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<kumo_xhci:
 /// RK3588 has three xHCI controllers. usb0 @ 0xfc000000 is the USB-C role-switch port; usb1 and
 /// host2 front the USB-A ports where a keyboard is likely attached. A USB-A device is invisible to
 /// a driver bound only to usb0, so spawn a drv-xhci per controller and let each enumerate its own.
-/// The register window is 0x8000; enumeration polls, so a placeholder IRQ is fine for usb1/host2.
+/// The register window covers the xHCI block and the DWC3 globals at +0xC100..0xC6FF, so host
+/// mode and PHY policy can be programmed; enumeration polls, and every controller now has its
+/// real GIC line. — TIMBERDOODLE
 const RK3588_USB1_XHCI_MMIO_BASE: u64 = 0xfc40_0000;
 const RK3588_HOST2_XHCI_MMIO_BASE: u64 = 0xfcd0_0000;
-const RK3588_XHCI_REGISTER_MMIO_LEN: u64 = 0x8000;
+const RK3588_XHCI_REGISTER_MMIO_LEN: u64 = 0xD000;
 /// GIC INTIDs for the other two xHCI controllers. `rk3588-base.dtsi`/`rk3588-extra.dtsi` list
 /// usb_host0/1/2 as GIC_SPI 220/221/222, and an SPI's INTID is its number + 32 (usb0's 220 → 252
 /// matches the DTB-derived config). Without a real IRQ a driver has to busy-poll for reports, and
 /// at driver priority that starves the whole system — every controller gets its line.
 const RK3588_USB1_XHCI_IRQ: u32 = 253;
 const RK3588_HOST2_XHCI_IRQ: u32 = 254;
+
+/// The live opi5 DTB's snps quirks, per controller. Host-mode init must honor them; the
+/// u1/u2-entry pair is carried for the record even though mainline host ignores it.
+/// — TIMBERDOODLE
+const RK3588_USB0_DWC3_FLAGS: u32 = kumo_xhci::FLAG_DWC3
+    | kumo_xhci::QUIRK_DIS_ENBLSLPM
+    | kumo_xhci::QUIRK_DIS_U1_ENTRY
+    | kumo_xhci::QUIRK_DIS_U2_ENTRY
+    | kumo_xhci::QUIRK_DIS_U2_FREECLK_EXISTS
+    | kumo_xhci::QUIRK_DIS_DEL_PHY_POWER_CHG
+    | kumo_xhci::QUIRK_DIS_TX_IPGAP_LINECHECK;
+const RK3588_USB1_DWC3_FLAGS: u32 = kumo_xhci::FLAG_DWC3
+    | kumo_xhci::QUIRK_DIS_ENBLSLPM
+    | kumo_xhci::QUIRK_DIS_U2_FREECLK_EXISTS
+    | kumo_xhci::QUIRK_DIS_DEL_PHY_POWER_CHG
+    | kumo_xhci::QUIRK_DIS_TX_IPGAP_LINECHECK;
+const RK3588_HOST2_DWC3_FLAGS: u32 = RK3588_USB1_DWC3_FLAGS | kumo_xhci::QUIRK_DIS_RXDET_INP3;
 
 /// U5: bootstrap tag preceding the keyboard-channel writer handed to a drv-xhci instance.
 const XHCI_KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
@@ -2146,7 +2165,7 @@ fn launch_xhci_first_light(
         Some(config) => spawn_xhci(
             initrd,
             root_resource,
-            config,
+            config.with_flags(RK3588_USB0_DWC3_FLAGS),
             writer_for(have_channel),
             mouse_for(have_mouse),
             storage_for(0),
@@ -2161,7 +2180,8 @@ fn launch_xhci_first_light(
             RK3588_XHCI_REGISTER_MMIO_LEN,
             RK3588_USB1_XHCI_IRQ,
             kumo_xhci::XHCI_NO_STREAM_ID,
-        ),
+        )
+        .with_flags(RK3588_USB1_DWC3_FLAGS),
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(1),
@@ -2174,7 +2194,8 @@ fn launch_xhci_first_light(
             RK3588_XHCI_REGISTER_MMIO_LEN,
             RK3588_HOST2_XHCI_IRQ,
             kumo_xhci::XHCI_NO_STREAM_ID,
-        ),
+        )
+        .with_flags(RK3588_HOST2_DWC3_FLAGS),
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(2),
