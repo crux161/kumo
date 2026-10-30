@@ -1,3 +1,4 @@
+//j710
 //j650
 //j651
 //j652
@@ -12,8 +13,8 @@
 
 use crate::{
     Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
-    DeviceTopology, Fence, Reply, Request, Response, Status, Submission, SyncState, REPLY_LEN,
-    REQUEST_LEN,
+    DeviceTopology, Fence, Reply, Request, Response, Status, Submission, SyncState, Unbind,
+    REPLY_LEN, REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +145,16 @@ impl<T: Transport> Client<T> {
     }
     pub fn bind(&mut self, binding: Binding) -> Result<(), Error> {
         self.call(Command::VmBind(binding))?;
+        Ok(())
+    }
+    /// Remove exactly this session's live mappings in `range`. The range must tile whole
+    /// bindings; the server refuses an unknown, foreign or partial range without changing
+    /// anything, so a recoverable error is safe to retry with a corrected range. Live
+    /// unbind is allowed after GroupCreate. — TIMBERDOODLE
+    pub fn unbind(&mut self, range: Unbind) -> Result<(), Error> {
+        let (Response::VmUnbound(_), None) = self.call(Command::VmUnbind(range))? else {
+            unreachable!()
+        };
         Ok(())
     }
     /// Release one allocation this session owns. The server first unbinds every mapping it
@@ -286,6 +297,7 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,
+        (Command::VmUnbind(range), Response::VmUnbound(received)) => range == received,
         (
             Command::BufferCreate { bytes },
             Response::BufferCreated {

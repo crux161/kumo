@@ -1,3 +1,4 @@
+//j710
 //j650
 //j651
 //j652
@@ -83,6 +84,15 @@ pub trait Backend {
     fn create_vm(&mut self) -> Result<(), Status>;
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), Status>;
     fn bind(&mut self, binding: Binding) -> Result<(), Status>;
+    /// Remove every GPU VA mapping in `bindings` — exactly this session's live bindings for
+    /// one contiguous range, in ascending VA order and never empty. Allowed while the group
+    /// exists; the backend must order same-address-space work before it touches the tables.
+    /// It clears the page-table entries and invalidates the packed region only; no CSG, JS,
+    /// MCU, doorbell or reset operation belongs here. All-or-nothing: a recoverable status
+    /// leaves every mapping intact and retryable, while a partial unmap or uncertain
+    /// invalidation must answer `DeviceLost` so the session retires without assuming the GPU
+    /// stopped. — TIMBERDOODLE
+    fn unbind(&mut self, bindings: &[Binding]) -> Result<(), Status>;
     /// Unbind every GPU VA mapping in `bindings` — exactly this session's live bindings that
     /// name `id` — and release the allocation's backing. This is all-or-nothing: a recoverable
     /// status leaves every mapping and the backing intact and retryable, while any partial
@@ -301,11 +311,10 @@ impl Session {
                 Ok(Response::BufferCreated { buffer: id, bytes })
             }
             Command::BufferDestroy { buffer } => {
-                // G8a keeps the frozen-binding model: destroying unbinds VA ranges, which is
-                // only safe while no group exists to reference them. Lifting this needs live
-                // MMU invalidation and queue quiescence — G8b: the opcode-15 VmUnbind slice, not
-                // implemented in this tree. RESEARCH/017 closed Addendum 4 at the driver level,
-                // but the live-mutation code path and its metal two-group proof remain G8b. — TIMBERDOODLE
+                // Destroy's implicit unbind batch stays refused once the group exists. G8b
+                // landed live mapping changes as explicit VmBind/VmUnbind, which state their
+                // exact ranges; this implicit batch keeps its own follow-up rather than
+                // widening a proven path in the same slice. — TIMBERDOODLE
                 if !self.vm || self.group {
                     return Err(Status::BadState);
                 }
@@ -337,7 +346,10 @@ impl Session {
                 Ok(Response::BufferDestroyed { buffer })
             }
             Command::VmBind(binding) => {
-                if !self.vm || self.group {
+                // Live binds are allowed after GroupCreate (G8b): the backend fences
+                // same-address-space work and invalidates the affected page-table region, so
+                // no queue is stopped for this mutation. RESEARCH/017. — TIMBERDOODLE
+                if !self.vm {
                     return Err(Status::BadState);
                 }
                 if binding.vm != 1 {
@@ -366,6 +378,68 @@ impl Session {
                 backend.bind(binding)?;
                 self.bindings[index] = Some(binding);
                 Ok(Response::VmBound)
+            }
+            Command::VmUnbind(range) => {
+                // G8b's live counterpart. The range is validated against the live table
+                // before any backend call: it must cover whole bindings with no hole, no
+                // overhang and no foreign VM. The table changes only after the backend
+                // confirms the clear and invalidation, so a recoverable refusal is
+                // retryable and a DeviceLost answer retires without a half-updated table.
+                // — TIMBERDOODLE
+                if !self.vm {
+                    return Err(Status::BadState);
+                }
+                if range.vm != 1 {
+                    return Err(Status::NotFound);
+                }
+                if !range.valid_shape() {
+                    return Err(Status::BadRequest);
+                }
+                // valid_shape proved this addition cannot overflow and stays in the window.
+                let end = range.va + range.bytes;
+                let mut batch = [EMPTY_BINDING; MAX_BINDINGS];
+                let mut count = 0;
+                for binding in self.bindings.iter().flatten().copied() {
+                    if binding.va >= end || range.va >= binding.va + binding.bytes {
+                        continue;
+                    }
+                    // An intersecting binding must be wholly inside the request: a range
+                    // that splits one leaves an undefined half-mapping, so refuse it.
+                    if binding.va < range.va || binding.va + binding.bytes > end {
+                        return Err(Status::BadRequest);
+                    }
+                    batch[count] = binding;
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err(Status::NotFound);
+                }
+                // Sort by VA (at most MAX_BINDINGS entries) and require an exact tiling:
+                // every byte of the request belongs to exactly one live binding.
+                for i in 1..count {
+                    let mut j = i;
+                    while j > 0 && batch[j - 1].va > batch[j].va {
+                        batch.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+                let mut cursor = range.va;
+                for binding in &batch[..count] {
+                    if binding.va != cursor {
+                        return Err(Status::BadRequest);
+                    }
+                    cursor += binding.bytes;
+                }
+                if cursor != end {
+                    return Err(Status::BadRequest);
+                }
+                backend.unbind(&batch[..count])?;
+                for slot in &mut self.bindings {
+                    if slot.is_some_and(|binding| binding.va >= range.va && binding.va < end) {
+                        *slot = None;
+                    }
+                }
+                Ok(Response::VmUnbound(range))
             }
             Command::GroupCreate { vm } => {
                 if !self.vm || self.group {
@@ -458,7 +532,7 @@ impl Session {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::{BindFlags, SyncState, MAX_BUFFER_BYTES, PAGE_BYTES, VA_START};
+    use crate::{BindFlags, SyncState, Unbind, MAX_BUFFER_BYTES, PAGE_BYTES, VA_START};
     use std::vec::Vec;
 
     #[derive(Default)]
@@ -468,6 +542,10 @@ mod tests {
         /// session derived — recorded before the injected failure so a test can distinguish
         /// "never called" from "called and refused". — TIMBERDOODLE
         destroyed: Vec<(u32, Vec<Binding>)>,
+        /// Every unbind batch the backend was asked to perform, recorded before the injected
+        /// failure so a test can distinguish "never called" from "called and refused".
+        /// — TIMBERDOODLE
+        unbound: Vec<Vec<Binding>>,
         fail: Option<Status>,
         submit_error: Option<SubmitError>,
         topology: Option<u64>,
@@ -540,6 +618,12 @@ mod tests {
         fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), Status> {
             self.destroyed.push((id, bindings.to_vec()));
             self.record(Command::BufferDestroy { buffer: id })
+        }
+        fn unbind(&mut self, bindings: &[Binding]) -> Result<(), Status> {
+            self.unbound.push(bindings.to_vec());
+            let va = bindings.first().map_or(0, |binding| binding.va);
+            let bytes = bindings.iter().map(|binding| binding.bytes).sum();
+            self.record(Command::VmUnbind(Unbind { vm: 1, va, bytes }))
         }
         fn create_group(&mut self) -> Result<(), Status> {
             self.record(Command::GroupCreate { vm: 1 })
@@ -951,7 +1035,7 @@ mod tests {
         }
     }
     #[test]
-    fn invalid_ids_overlap_frozen_binds_and_replay_never_reach_backend() {
+    fn invalid_ids_overlap_and_replay_never_reach_backend() {
         let (mut s, mut b) = (Session::default(), Fake::default());
         send(&mut s, &mut b, Command::VmCreate).unwrap();
         send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
@@ -975,9 +1059,11 @@ mod tests {
         assert_eq!(b.calls.len(), calls);
         send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
         let calls = b.calls.len();
+        // G8b lifts the frozen-binding rule: this bind is legal after the group exists, so
+        // the occupied VA is an overlap refusal rather than a state refusal. — TIMBERDOODLE
         assert_eq!(
             send(&mut s, &mut b, Command::VmBind(binding())),
-            Err(Status::BadState)
+            Err(Status::BadRequest)
         );
         assert_eq!(
             send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
@@ -1008,6 +1094,190 @@ mod tests {
         );
         assert_eq!(b.calls.len(), calls);
     }
+
+    #[test]
+    fn live_bind_and_unbind_work_after_the_group_exists() {
+        let (mut s, mut b) = ready();
+        let range = Unbind {
+            vm: 1,
+            va: VA_START,
+            bytes: PAGE_BYTES,
+        };
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Ok(Response::VmUnbound(range))
+        );
+        assert_eq!(b.unbound.len(), 1);
+        assert_eq!(b.unbound[0], std::vec![binding()]);
+        assert!(s.bindings.iter().all(Option::is_none));
+        // The VA is free and the group still exists: live rebind is legal.
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmBind(binding())),
+            Ok(Response::VmBound)
+        );
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        // A submission still validates against the live mapping.
+        assert_eq!(
+            send(&mut s, &mut b, job(1)),
+            Ok(Response::Submitted { point: 1 })
+        );
+    }
+
+    #[test]
+    fn vm_unbind_requires_a_live_vm_and_the_sessions_own_vm_id() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        let range = Unbind {
+            vm: 1,
+            va: VA_START,
+            bytes: PAGE_BYTES,
+        };
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Err(Status::BadState)
+        );
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        let calls = b.calls.len();
+        // Any other nonzero VM is foreign: NotFound, and never a backend call.
+        for vm in [2, 3, u32::MAX] {
+            assert_eq!(
+                send(&mut s, &mut b, Command::VmUnbind(Unbind { vm, ..range })),
+                Err(Status::NotFound)
+            );
+        }
+        assert_eq!(b.calls.len(), calls);
+        assert!(b.unbound.is_empty());
+    }
+
+    #[test]
+    fn vm_unbind_refuses_unknown_partial_hole_and_foreign_ranges_without_mutation() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: 2 * PAGE_BYTES,
+            },
+        )
+        .unwrap();
+        send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
+        let wide = Binding {
+            buffer: 2,
+            va: VA_START + 2 * PAGE_BYTES,
+            bytes: 2 * PAGE_BYTES,
+            ..binding()
+        };
+        send(&mut s, &mut b, Command::VmBind(wide)).unwrap();
+        let calls = b.calls.len();
+        let range = |va, bytes| Unbind { vm: 1, va, bytes };
+        // Unknown: no live binding intersects the range.
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::VmUnbind(range(VA_START + 8 * PAGE_BYTES, PAGE_BYTES))
+            ),
+            Err(Status::NotFound)
+        );
+        // Partial: the request names one page of a two-page live binding.
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::VmUnbind(range(VA_START + 2 * PAGE_BYTES, PAGE_BYTES))
+            ),
+            Err(Status::BadRequest)
+        );
+        // Hole: the range covers the first binding plus the unmapped page between them.
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::VmUnbind(range(VA_START, 2 * PAGE_BYTES))
+            ),
+            Err(Status::BadRequest)
+        );
+        // Overhang past the last live binding is also a hole in the tiling.
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::VmUnbind(range(VA_START, 5 * PAGE_BYTES))
+            ),
+            Err(Status::BadRequest)
+        );
+        assert_eq!(b.calls.len(), calls);
+        assert!(b.unbound.is_empty());
+        assert_eq!(s.bindings.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn vm_unbind_accepts_adjacent_bindings_tiled_by_one_request() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        let first = binding();
+        let second = Binding {
+            buffer: 2,
+            va: VA_START + PAGE_BYTES,
+            ..binding()
+        };
+        send(&mut s, &mut b, Command::VmBind(first)).unwrap();
+        send(&mut s, &mut b, Command::VmBind(second)).unwrap();
+        send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
+        let range = Unbind {
+            vm: 1,
+            va: VA_START,
+            bytes: 2 * PAGE_BYTES,
+        };
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Ok(Response::VmUnbound(range))
+        );
+        assert_eq!(b.unbound, std::vec![std::vec![first, second]]);
+        assert!(s.bindings.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn vm_unbind_failure_keeps_the_table_retryable_or_retires_on_uncertainty() {
+        let (mut s, mut b) = ready();
+        let range = Unbind {
+            vm: 1,
+            va: VA_START,
+            bytes: PAGE_BYTES,
+        };
+        b.fail = Some(Status::BadRequest);
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Err(Status::BadRequest)
+        );
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert!(!s.retired);
+        // The recoverable refusal committed nothing, so the same request retries.
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Ok(Response::VmUnbound(range))
+        );
+        assert!(s.bindings.iter().all(Option::is_none));
+        send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
+        b.fail = Some(Status::DeviceLost);
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmUnbind(range)),
+            Err(Status::DeviceLost)
+        );
+        assert!(s.retired);
+        // The table still names the binding: only a proven reset may close the session.
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        let calls = b.calls.len();
+        assert_eq!(
+            send(&mut s, &mut b, Command::GetInfo),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(b.calls.len(), calls);
+    }
+
     #[test]
     fn failures_do_not_commit_allocations_or_bindings_and_enforce_budget() {
         let (mut s, mut b) = (Session::default(), Fake::default());
@@ -1431,6 +1701,9 @@ mod tests {
                 Err(Status::NotSupported)
             }
             fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn unbind(&mut self, _: &[Binding]) -> Result<(), Status> {
                 Err(Status::NotSupported)
             }
             fn create_group(&mut self) -> Result<(), Status> {

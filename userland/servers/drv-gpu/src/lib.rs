@@ -1,3 +1,4 @@
+//j710
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 //j594
@@ -109,6 +110,9 @@ const AS_COMMAND_FLUSH_MEM: u32 = 5;
 /// panthor locks the whole 64-bit range before a space's UPDATE: region width 63, base 0
 /// (RESEARCH/009 §7.6's packing with start 0 and size 2^64).
 const AS_LOCKADDR_WHOLE: u64 = 63;
+/// panthor's `AS_LOCK_REGION_MIN_SIZE`: a live page-table flush never locks less than 32 KiB
+/// (panthor_mmu.c `lock_region`). — TIMBERDOODLE
+const AS_LOCK_REGION_MIN: u64 = 1 << 15;
 /// RESEARCH/009 §7.3: panthor's non-coherent `mair_to_memattr` byte table for RK3588.
 pub const AS_MEMATTR_NON_COHERENT: u64 = 0x4C4C_4C4C_8C4C_8F4C;
 const AS_TRANSCFG_ADRMODE_AARCH64_4K: u64 = 6;
@@ -402,6 +406,9 @@ pub enum AsError {
     Busy { status: u32 },
     /// The hardware has no such address space (eight exist; RESEARCH/009 §7.1).
     Space { space: u32 },
+    /// A range cannot be packed into `AS_LOCKADDR`: zero length or `va + bytes` overflow.
+    /// — TIMBERDOODLE
+    Range { va: u64, bytes: u64 },
 }
 
 /// RESEARCH/009 §7.4: AArch64 4 KiB stage-1 walks, write-back and read-allocate, with the
@@ -510,6 +517,35 @@ pub fn disable_as0(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
     disable_as(io, 0)
 }
 
+/// Pack a live-flush range exactly as panthor's `lock_region` does: the smallest naturally
+/// aligned power-of-two block containing `va..va + bytes`, encoded as `log2(size) - 1` in bits
+/// [5:0] with the block base in bits [63:6]. The 32 KiB floor and the log2-minus-one encoding
+/// are panthor's, not an approximation. The MMU ignores the low base bits, which is why the
+/// encoded block may cover unmapped VAs around the request. A zero-length or overflowing range
+/// has no encoding. — TIMBERDOODLE
+pub fn lockaddr_for_range(va: u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 {
+        return None;
+    }
+    let end = va.checked_add(bytes)?;
+    // Linux `fls64`: zero for zero, otherwise one plus the highest set bit's index.
+    let fls = 64 - (va ^ (end - 1)).leading_zeros();
+    let width = fls.max(AS_LOCK_REGION_MIN.ilog2()) - 1;
+    let base = va & (u64::MAX << width);
+    Some(base | u64::from(width))
+}
+
+/// The shared LOCK/FLUSH_PT/UNLOCK tail: `lockaddr` is already encoded and the caller has a
+/// live `window`. If LOCK succeeds and a later command fails, the region stays locked and the
+/// caller's DeviceLost reset containment owns the cleanup. — TIMBERDOODLE
+fn flush_pt(io: &mut (impl MmioIo + ClockIo), window: u32, lockaddr: u64) -> Result<(), AsError> {
+    let address = window + as_offset(AS_LOCKADDR);
+    write64(io, address, address + 4, lockaddr);
+    as_command(io, window, AS_COMMAND_LOCK)?;
+    as_command(io, window, AS_COMMAND_FLUSH_PT)?;
+    as_command(io, window, AS_COMMAND_UNLOCK)
+}
+
 /// Flush a live space's page-table caches: lock the whole range, `FLUSH_PT`, unlock
 /// (RESEARCH/009 §7.6; panthor runs this after every live mapping change). KUMO maps the queue
 /// pages and the suspend buffer into AS0 after it is enabled, so those edits need it. — TIMBERDOODLE
@@ -517,11 +553,28 @@ pub fn flush_page_tables(io: &mut (impl MmioIo + ClockIo), space: u32) -> Result
     let Some(window) = as_window(space) else {
         return Err(AsError::Space { space });
     };
-    let lockaddr = window + as_offset(AS_LOCKADDR);
-    write64(io, lockaddr, lockaddr + 4, AS_LOCKADDR_WHOLE);
-    as_command(io, window, AS_COMMAND_LOCK)?;
-    as_command(io, window, AS_COMMAND_FLUSH_PT)?;
-    as_command(io, window, AS_COMMAND_UNLOCK)
+    flush_pt(io, window, AS_LOCKADDR_WHOLE)
+}
+
+/// Invalidate a live space's page-table caches over `va..va + bytes` only, the way panthor's
+/// `panthor_vm_flush_range` does: pack `AS_LOCKADDR` for that range, then LOCK/FLUSH_PT/UNLOCK
+/// under the same 10 µs/100 ms `AS_ACTIVE` discipline as every other AS command. This narrows a
+/// live mapping change to the affected block instead of locking the whole space; it neither
+/// touches translation config nor stops a queue, group or the MCU (RESEARCH/017). Whole-space
+/// enable/disable keep their own FLUSH_MEM sequence. — TIMBERDOODLE
+pub fn flush_range(
+    io: &mut (impl MmioIo + ClockIo),
+    space: u32,
+    va: u64,
+    bytes: u64,
+) -> Result<(), AsError> {
+    let Some(window) = as_window(space) else {
+        return Err(AsError::Space { space });
+    };
+    let Some(lockaddr) = lockaddr_for_range(va, bytes) else {
+        return Err(AsError::Range { va, bytes });
+    };
+    flush_pt(io, window, lockaddr)
 }
 
 /// Clear a latched address-space-0 fault and keep the MMU line masked.
@@ -2999,6 +3052,81 @@ mod tests {
             flush_page_tables(&mut io, 8),
             Err(AsError::Space { space: 8 })
         );
+    }
+
+    #[test]
+    fn lockaddr_packing_matches_panthors_naturally_aligned_block() {
+        const BASE: u64 = 0x2000_0000;
+        // The 32 KiB floor: a one-page request locks a 32 KiB block, encoded width 14.
+        assert_eq!(lockaddr_for_range(BASE, 0x1000), Some(BASE | 14));
+        assert_eq!(lockaddr_for_range(BASE + 0x1000, 0x1000), Some(BASE | 14));
+        assert_eq!(lockaddr_for_range(0x1000, 0x1000), Some(14));
+        // A request crossing a 64 KiB boundary grows to a 64 KiB block (width 15).
+        assert_eq!(lockaddr_for_range(BASE, 0x1_0000), Some(BASE | 15));
+        // The base rounds down to the block: the low `width` bits of the VA are ignored.
+        assert_eq!(lockaddr_for_range(BASE + 0x4000, 0x8000), Some(BASE | 15));
+        // Whole space: start 0 and size ~0 give width 63, the enable/disable encoding.
+        assert_eq!(lockaddr_for_range(0, u64::MAX), Some(AS_LOCKADDR_WHOLE));
+        // Zero-length and overflowing ranges have no encoding.
+        assert_eq!(lockaddr_for_range(BASE, 0), None);
+        assert_eq!(lockaddr_for_range(u64::MAX - 0xFFF, 0x1000), None);
+        // Every encoding keeps exactly the low `width` bits clear, as panthor's
+        // `GENMASK_ULL(63, region_width)` does, and its block contains the request.
+        for offset in (0..0x1_0000).step_by(0x1000) {
+            let encoded = lockaddr_for_range(BASE + offset, 0x1000).unwrap();
+            let width = (encoded & 0x3f) as u32;
+            let base = encoded & !0x3f;
+            let size = 1u64 << (width + 1);
+            assert_eq!(base & ((1u64 << width) - 1), 0, "encoded base bits");
+            assert!(base <= BASE + offset, "block starts before the request");
+            assert!(
+                BASE + offset + 0x1000 <= base + size,
+                "block ends after the request"
+            );
+        }
+    }
+
+    #[test]
+    fn flush_range_locks_only_the_packed_block_for_a_live_space() {
+        const BASE: u64 = 0x2000_0000;
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(flush_range(&mut io, 1, BASE + 0x1000, 0x1000), Ok(()));
+        let encoded = BASE | 14;
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x2450, encoded as u32),
+                (0x2454, (encoded >> 32) as u32),
+                (0x2458, AS_COMMAND_LOCK),
+                (0x2458, AS_COMMAND_FLUSH_PT),
+                (0x2458, AS_COMMAND_UNLOCK),
+            ]
+        );
+        // Each AS command waits for AS_ACTIVE to clear before and after it.
+        assert_eq!(io.read_log, std::vec![0x2468; 6]);
+    }
+
+    #[test]
+    fn flush_range_refuses_a_bad_space_or_an_unpackable_range_without_writing() {
+        const BASE: u64 = 0x2000_0000;
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(
+            flush_range(&mut io, 8, BASE, 0x1000),
+            Err(AsError::Space { space: 8 })
+        );
+        assert_eq!(
+            flush_range(&mut io, 1, BASE, 0),
+            Err(AsError::Range { va: BASE, bytes: 0 })
+        );
+        assert_eq!(
+            flush_range(&mut io, 1, u64::MAX, 2),
+            Err(AsError::Range {
+                va: u64::MAX,
+                bytes: 2
+            })
+        );
+        assert!(io.writes.is_empty());
+        assert!(io.read_log.is_empty());
     }
 
     #[test]

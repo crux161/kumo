@@ -1,3 +1,4 @@
+//j710
 #![no_std]
 #![no_main]
 //j709
@@ -73,6 +74,9 @@ impl Backend for FakeBackend {
         Ok(())
     }
     fn bind(&mut self, _binding: Binding) -> Result<(), Status> {
+        Ok(())
+    }
+    fn unbind(&mut self, _bindings: &[Binding]) -> Result<(), Status> {
         Ok(())
     }
     fn destroy_buffer(&mut self, _id: u32, _bindings: &[Binding]) -> Result<(), Status> {

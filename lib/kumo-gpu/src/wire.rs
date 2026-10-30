@@ -1,3 +1,4 @@
+//j710
 //j650
 //j651
 //j652
@@ -11,7 +12,7 @@
 
 use crate::{
     valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState,
+    DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState, Unbind,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -38,6 +39,12 @@ pub enum Command {
         buffer: u32,
     },
     VmBind(Binding),
+    /// Remove exactly the live mappings covering one contiguous range. Allowed after
+    /// GroupCreate: the driver orders same-address-space work and invalidates only the packed
+    /// page-table region, without stopping any queue. The reply is `VmUnbound` echoing the
+    /// range; an unknown, foreign or partially covered range is refused without mutation.
+    /// — TIMBERDOODLE
+    VmUnbind(Unbind),
     /// One normal-priority queue with a driver-owned 4 KiB ring and core masks.
     GroupCreate {
         vm: u32,
@@ -88,6 +95,7 @@ impl Request {
                     u64::from(b.flags.0),
                 ],
             ),
+            Command::VmUnbind(u) => (15, [u64::from(u.vm), u.va, u.bytes, 0, 0, 0]),
             Command::GroupCreate { vm } => (4, [u64::from(vm), 0, 0, 0, 0, 0]),
             Command::Submit(s) => (
                 5,
@@ -148,6 +156,17 @@ impl Request {
                 b.validate(crate::MAX_BUFFER_BYTES).ok()?;
                 Command::VmBind(b)
             }
+            15 if a[0] != 0 => {
+                let u = Unbind {
+                    vm: a[0] as u32,
+                    va: a[1],
+                    bytes: a[2],
+                };
+                if !u.valid_shape() {
+                    return None;
+                }
+                Command::VmUnbind(u)
+            }
             4 if a[0] != 0 => Command::GroupCreate { vm: a[0] as u32 },
             5 => {
                 let s = Submission {
@@ -204,6 +223,10 @@ pub enum Response {
         buffer: u32,
     },
     VmBound,
+    /// The named range is gone: every live binding it covered was unbound after the driver
+    /// cleared and invalidated exactly that mapping. The range crosses verbatim as the echo a
+    /// client correlates against its request; no handle accompanies it. — TIMBERDOODLE
+    VmUnbound(Unbind),
     GroupCreated {
         group: u32,
     },
@@ -283,6 +306,7 @@ impl Reply {
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::BufferDestroyed { buffer }) => (14, [u64::from(buffer), 0, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
+            Ok(Response::VmUnbound(u)) => (15, [u64::from(u.vm), u.va, u.bytes, 0]),
             Ok(Response::GroupCreated { group }) => (4, [u64::from(group), 0, 0, 0]),
             Ok(Response::Submitted { point }) => (5, [point, 0, 0, 0]),
             Ok(Response::Sync { point, state }) => match state {
@@ -363,6 +387,17 @@ impl Reply {
                     buffer: a[0] as u32,
                 },
                 3 => Response::VmBound,
+                15 if a[0] != 0 => {
+                    let u = Unbind {
+                        vm: a[0] as u32,
+                        va: a[1],
+                        bytes: a[2],
+                    };
+                    if !u.valid_shape() {
+                        return None;
+                    }
+                    Response::VmUnbound(u)
+                }
                 4 if a[0] != 0 => Response::GroupCreated { group: a[0] as u32 },
                 5 if a[0] != 0 => Response::Submitted { point: a[0] },
                 6 if a[0] != 0 => Response::Sync {

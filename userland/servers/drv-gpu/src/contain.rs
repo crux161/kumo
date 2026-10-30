@@ -1,3 +1,4 @@
+//j710
 //j709
 
 //! G8d-a: the contained-close contract. A session that leaves service is closed in exactly
@@ -133,6 +134,9 @@ mod tests {
             Ok(())
         }
         fn bind(&mut self, _: Binding) -> Result<(), Status> {
+            Ok(())
+        }
+        fn unbind(&mut self, _: &[Binding]) -> Result<(), Status> {
             Ok(())
         }
         fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {

@@ -1,3 +1,4 @@
+//j710
 //j651
 //j652
 //j681
@@ -13,12 +14,15 @@
 //! every byte, because the resident driver cannot prove the GPU stopped. G8d-a makes that
 //! tail a state machine (`drv_gpu::contain`): stop accepting, quiesce, close the session with
 //! exact counts, then retire the driver's mappings — or poison and retain everything.
+//! G8b adds live VmUnbind: clear exactly the session's page-table entries, then invalidate
+//! only their packed MMU region. The serve loop is synchronous, so same-AS work is already
+//! finished when the request is dispatched; no queue, MCU or reset operation is involved.
 
 use alloc::vec::Vec;
 
 use super::*;
 use drv_gpu::contain::Containment;
-use drv_gpu::{client_job_wrapper, protocol, JobSlot, JOB_WRAPPER_WORDS};
+use drv_gpu::{client_job_wrapper, flush_range, protocol, JobSlot, JOB_WRAPPER_WORDS};
 use protocol::{
     session::{Backend, Session, SubmitError, MAX_WAITS},
     Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, SyncState,
@@ -207,6 +211,64 @@ impl Backend for Hardware<'_> {
         }
         dsb();
         flush_page_tables(self.device, GROUP_AS).map_err(|_| GpuStatus::DeviceLost)?;
+        Ok(())
+    }
+
+    fn unbind(&mut self, bindings: &[Binding]) -> Result<(), GpuStatus> {
+        // Fence invariant: the serve loop dispatches one request at a time and finishes the
+        // pending job before it reads the next frame, so no same-AS work is in flight when
+        // this runs. If that loop ever overlaps submission with request handling, this
+        // method must wait for the group's queue to drain first. RESEARCH/017's live path is
+        // the MMU's own packed-region invalidation; no CSG, JS, MCU, doorbell or reset
+        // operation is added here. — TIMBERDOODLE
+        if bindings.is_empty() {
+            return Err(GpuStatus::BadRequest);
+        }
+        let mut ranges: Vec<UnmapRange> = Vec::new();
+        // NoMemory is recoverable: nothing was cleared, so the session keeps the bindings.
+        if ranges.try_reserve(bindings.len()).is_err() {
+            return Err(GpuStatus::NoMemory);
+        }
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for binding in bindings {
+            let binding_end = binding
+                .va
+                .checked_add(binding.bytes)
+                .ok_or(GpuStatus::BadRequest)?;
+            start = start.min(binding.va);
+            end = end.max(binding_end);
+            ranges.push(UnmapRange {
+                va: binding.va,
+                len: binding.bytes,
+            });
+        }
+        // The library preflights every page before its first store, so a refusal changes no
+        // page. A live flush failure could leave cleared mappings the GPU still caches:
+        // that is DeviceLost, and `serve`'s reset containment owns the cleanup.
+        if let Err(error) = unmap_ranges(self.tables, self.root, &ranges) {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unbind failed: {:?}\n", error),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        dsb();
+        flush_range(self.device, GROUP_AS, start, end - start).map_err(|error| {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unbind flush failed: {:?}\n", error),
+            );
+            GpuStatus::DeviceLost
+        })?;
+        log(
+            log_level::INFO,
+            format_args!(
+                "drv-gpu: client unbound {} mapping(s) over {} bytes\n",
+                bindings.len(),
+                end - start
+            ),
+        );
         Ok(())
     }
 

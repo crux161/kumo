@@ -1,3 +1,4 @@
+//j710
 #![no_std]
 //j650
 //j651
@@ -13,12 +14,14 @@
 //! BufferCreate allocates DMA backing in the driver on demand, bounded by a total live-memory
 //! budget rather than a fixed object count, and returns a shared VMO handle with the reply.
 //! BufferDestroy releases one allocation: the session first unbinds every GPU VA mapping that
-//! names it, then the backend releases the backing. While the frozen-binding model holds, a
-//! destroy is refused once the group exists; lifting that is the G8b opcode-15 VmUnbind
-//! slice, not implemented here.
+//! names it, then the backend releases the backing. Destroy's implicit unbind batch is still
+//! refused once the group exists; live mapping changes use VmBind and VmUnbind instead. Those
+//! are allowed after GroupCreate: the driver orders same-address-space work, then invalidates
+//! just the packed page-table region (RESEARCH/017) without stopping any queue.
 //! Requests carry no handles or physical addresses. The transport must enforce those
 //! handle counts, resolve IDs in this session, retain backing until the GPU is quiescent and
-//! reject overlapping binds. Bind before GroupCreate; mappings remain fixed until close.
+//! reject overlapping binds. Unbind names an exact tiling of live bindings and never exposes
+//! backing the GPU may still reach.
 //! This library validates frames and arithmetic, not kernel rights or the server object table.
 //! Clients stop writing bound buffers before Submit and reuse them after completion. This
 //! cooperative first lane does not claim isolation from hostile command streams.
@@ -190,6 +193,29 @@ impl Binding {
         self.vm == other.vm
             && self.va < other.va.saturating_add(other.bytes)
             && other.va < self.va.saturating_add(self.bytes)
+    }
+}
+
+/// A live-unbind request: remove this session's mappings covering exactly `va..va + bytes` on
+/// `vm`. The range must tile whole live bindings with no partial, missing or foreign coverage;
+/// page alignment and the same `0x2000_0000..0x2100_0000` window as VmBind apply. Unlike a
+/// binding, one request may name several adjacent bindings. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Unbind {
+    pub vm: u32,
+    pub va: u64,
+    pub bytes: u64,
+}
+
+impl Unbind {
+    /// The same window and alignment rules as a binding, plus a nonempty range. Ownership and
+    /// exact tiling are the session's checks, not this arithmetic helper's. — TIMBERDOODLE
+    pub fn valid_shape(self) -> bool {
+        self.vm != 0
+            && self.bytes > 0
+            && self.va % PAGE_BYTES == 0
+            && self.bytes % PAGE_BYTES == 0
+            && in_window(self.va, self.bytes)
     }
 }
 

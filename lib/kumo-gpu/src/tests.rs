@@ -1,3 +1,4 @@
+//j710
 //j650
 //j651
 //j652
@@ -16,6 +17,14 @@ fn binding() -> Binding {
         offset: 0,
         bytes: PAGE_BYTES,
         flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+    }
+}
+
+fn unbind() -> Unbind {
+    Unbind {
+        vm: 1,
+        va: VA_START,
+        bytes: PAGE_BYTES,
     }
 }
 
@@ -42,6 +51,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
+        Command::VmUnbind(unbind()),
         Command::GroupCreate { vm: 1 },
         Command::Submit(submission()),
         Command::SyncRead { group: 3, point: 1 },
@@ -129,6 +139,7 @@ fn request_decoder_rejects_reserved_bytes_unknown_ops_versions_and_truncation() 
         Command::GroupCreate { vm: 1 },
         Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
+        Command::VmUnbind(unbind()),
         Command::Submit(submission()),
     ] {
         let mut wire = Request { id: 1, command }.encode();
@@ -189,6 +200,51 @@ fn buffer_destroy_frames_use_opcode_14_and_reject_zero_reserved_or_truncated_ids
 }
 
 #[test]
+fn vm_unbind_frames_use_opcode_15_and_reject_zero_reserved_truncated_or_unaligned_ranges() {
+    let request = Request {
+        id: 4,
+        command: Command::VmUnbind(unbind()),
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &15u32.to_le_bytes());
+    let expected: std::vec::Vec<u8> = [1u64, VA_START, PAGE_BYTES, 0, 0, 0]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    assert_eq!(&bytes[16..], expected);
+    assert_eq!(Request::decode(&bytes), Some(request));
+    for at in 40..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 VM ID must not narrow silently.
+    assert_eq!(Request::decode(&truncated), None);
+
+    let reply = Reply {
+        id: 4,
+        result: Ok(Response::VmUnbound(unbind())),
+    };
+    let bytes = reply.encode();
+    assert_eq!(&bytes[12..16], &15u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &1u64.to_le_bytes());
+    assert_eq!(&bytes[24..32], &VA_START.to_le_bytes());
+    assert_eq!(&bytes[32..40], &PAGE_BYTES.to_le_bytes());
+    assert_eq!(&bytes[40..], &[0u8; 8]);
+    assert_eq!(Reply::decode(&bytes), Some(reply));
+    assert_eq!(reply.result.unwrap().handle_count(), 0);
+    for at in 40..REPLY_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 VM ID must not narrow silently.
+    assert_eq!(Reply::decode(&truncated), None);
+}
+
+#[test]
 fn malformed_semantic_requests_never_decode() {
     let b = binding();
     let s = submission();
@@ -211,6 +267,27 @@ fn malformed_semantic_requests_never_decode() {
         }),
         Command::VmBind(Binding { vm: 0, ..b }),
         Command::VmBind(Binding { va: VA_END, ..b }),
+        Command::VmUnbind(Unbind { vm: 0, ..unbind() }),
+        Command::VmUnbind(Unbind {
+            bytes: 0,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            va: VA_START + 1,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            bytes: PAGE_BYTES + 1,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            va: VA_END,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            bytes: (VA_END - VA_START) + PAGE_BYTES,
+            ..unbind()
+        }),
         Command::VmBind(Binding {
             offset: u64::MAX - 4095,
             ..b
@@ -253,6 +330,7 @@ fn replies_distinguish_acceptance_pending_success_and_gpu_error() {
         },
         Response::BufferDestroyed { buffer: 2 },
         Response::VmBound,
+        Response::VmUnbound(unbind()),
         Response::GroupCreated { group: 3 },
         Response::Submitted { point: 1 },
         Response::Sync {
