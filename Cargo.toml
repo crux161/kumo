@@ -1,0 +1,16 @@
+[package]
+name = "nopng"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "A minimal PNG encoder/decoder with no dependencies and no_std"
+homepage = "https://github.com/sile/nopng"
+repository = "https://github.com/sile/nopng"
+readme = "README.md"
+categories = ["multimedia::images", "encoding", "no-std"]
+
+[dependencies]
+
+[dev-dependencies]
+noprop = "0.2.1"
