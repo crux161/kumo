@@ -6,6 +6,7 @@
 //j682
 //j683
 //j711
+//j712
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -456,15 +457,26 @@ fn present_counted(channel: Handle, sequence: u32) -> Result<PresentStatus, &'st
 }
 
 //j711
+/// The churn lane starts during Sora's boot, while drv-fb is still measuring D1b's vblank
+/// cadence; a tight probe loop perturbs that measurement (metal 2026-10-30: median 61.120 Hz
+/// against mode 60.000, so the diagnostic correctly refused to complete and the gate stayed
+/// unarmed). Wait out the quiet window first, then present once per second so the probe is at
+/// most a rounding error in any frame count. A run that never sees `Retired` aborts named
+/// when the bound expires. — TIMBERDOODLE
+const CHURN_READY_QUIET_NS: u64 = 20_000_000_000;
+const CHURN_READY_PACE_NS: u64 = 1_000_000_000;
+const CHURN_READY_BOUND_NS: u64 = 180_000_000_000;
+
 /// The vblank gate arms only after drv-fb's start-up display diagnostic completes, so the
-/// first replies may honestly be `Copied`. Present the first frame with fresh sequences
-/// until the first `Retired`, under one 30 s bound; a run that never sees one aborts named.
-/// — TIMBERDOODLE
+/// first replies may honestly be `Copied`; present the first frame with fresh sequences
+/// until the first `Retired`. — TIMBERDOODLE
 fn churn_readiness(channel: Handle, sequence: &mut u32, probes: &mut u32) -> Result<(), Failure> {
-    let (port, timer, channel_koid, timer_koid) = match open_reply_port(channel, 30_000_000_000) {
-        Ok(parts) => parts,
-        Err(cause) => return Err(churn_abort(0, None, cause)),
-    };
+    let _ = kumo_rt::sleep_ns(CHURN_READY_QUIET_NS);
+    let (port, timer, channel_koid, timer_koid) =
+        match open_reply_port(channel, CHURN_READY_BOUND_NS) {
+            Ok(parts) => parts,
+            Err(cause) => return Err(churn_abort(0, None, cause)),
+        };
     let result = loop {
         *sequence = (*sequence).wrapping_add(1);
         *probes = (*probes).saturating_add(1);
@@ -479,7 +491,10 @@ fn churn_readiness(channel: Handle, sequence: &mut u32, probes: &mut u32) -> Res
         }
         match await_present_reply(channel, port, channel_koid, timer_koid, *sequence) {
             Ok(PresentStatus::Retired) => break Ok(()),
-            Ok(PresentStatus::Copied) => continue,
+            Ok(PresentStatus::Copied) => {
+                let _ = kumo_rt::sleep_ns(CHURN_READY_PACE_NS);
+                continue;
+            }
             Ok(status) => break Err(churn_abort(0, Some(status), "readiness reply")),
             Err(cause) => break Err(churn_abort(0, None, cause)),
         }
