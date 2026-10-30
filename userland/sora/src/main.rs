@@ -11,6 +11,7 @@
 //j711
 //j713
 //j714
+//j715
 
 extern crate alloc;
 
@@ -391,6 +392,13 @@ fn return_gpu_view_grant(channel: Handle, vmo: Handle, homing: GrantReturn) {
 /// On a churn image the client also needs view `GPU_VIEW` back: the shell gfx-recover
 /// machinery (`wait_for_released` + `regrant_view`) is reused for exactly that view, and an
 /// unreleased view becomes the lane's honest zero grant rather than a fabricated one.
+//j715
+/// Bounded release observation for a churn regrant: twenty control-lane queries paced at
+/// 100 ms (2 s) cover the multi-second observation delay seen on metal without letting a
+/// wedged control lane hold the serve loop indefinitely. — TIMBERDOODLE
+const GPU_REGRANT_OBSERVE_ROUNDS: u32 = 20;
+const GPU_REGRANT_OBSERVE_PACE_NS: u64 = 100_000_000;
+
 fn regrant_gpu_session(initrd: Handle) -> Option<Handle> {
     let handoff = Handle(GPU_SESSION_HANDOFF.load(Ordering::Relaxed));
     if handoff.0 == 0 {
@@ -416,12 +424,38 @@ fn regrant_gpu_session(initrd: Handle) -> Option<Handle> {
         return None;
     }
     let lane_grant = if GPU_CHURN_VIEW {
-        // The old lease died with session one, so the view is eligible for the release
-        // query again; only `GPU_VIEW` can carry this lane.
+        // j715: observe the release with a bounded poll of the control lane. The first metal
+        // regrant queried 34 ms after drv-fb recorded `view 1 recovered` and still saw no
+        // release bit, while a later attempt observed it only after ~1.8 s, so the shell's
+        // wait helpers are replaced here by direct queries the caller can time, and the mask
+        // is logged to make a miss diagnosable. This runs on the serve loop, hence bounded
+        // rounds and pacing rather than an unbounded wait. — TIMBERDOODLE
         GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
-        let grant = wait_for_released()
-            .filter(|view| *view == drv_gpu::GPU_VIEW)
-            .and_then(regrant_view);
+        let mut last_mask = None;
+        let mut observed = false;
+        for _round in 0..GPU_REGRANT_OBSERVE_ROUNDS {
+            last_mask = query_released();
+            if last_mask.is_some_and(|mask| mask & (1u8 << drv_gpu::GPU_VIEW) != 0) {
+                observed = true;
+                break;
+            }
+            let _ = kumo_rt::sleep_ns(GPU_REGRANT_OBSERVE_PACE_NS);
+        }
+        log(b"gpu-client: release observation mask=");
+        match last_mask {
+            Some(mask) => log_hex(u64::from(mask)),
+            None => log(b"none"),
+        }
+        if observed {
+            log(b" observed=yes\n");
+        } else {
+            log(b" observed=no\n");
+        }
+        let grant = if observed {
+            regrant_view(drv_gpu::GPU_VIEW)
+        } else {
+            None
+        };
         match grant {
             Some((view_channel, view_vmo)) => {
                 GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
