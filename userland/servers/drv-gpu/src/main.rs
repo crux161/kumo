@@ -7,11 +7,13 @@
 //j690
 //j707
 //j714
+//j716
 
 extern crate alloc;
 
 mod client;
 
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use drv_gpu::contain::{Containment, SessionNext};
 use drv_gpu::{
@@ -655,6 +657,10 @@ fn run_mali(
     bootstrap: Handle,
     shader_present: u64,
     first_session: bool,
+    //j716
+    // Every contiguous-DMA mapping this bring-up creates is recorded here so the caller can
+    // release the session's DMA in full after a confirmed release (G8d-c). — TIMBERDOODLE
+    dma: &mut Vec<Mapping>,
 ) -> Result<Containment, u8> {
     let mut tag = [0u8; 1];
     let (len, raw) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
@@ -812,6 +818,7 @@ fn run_mali(
         );
         return Err(1);
     };
+    dma.push(arena_mapping);
     zero_mapping(&arena_mapping, TABLE_ARENA_LEN);
     let mut table_memory = TableDma {
         arena: arena_mapping,
@@ -850,6 +857,7 @@ fn run_mali(
             let _ = soft_reset(device);
             return Err(1);
         };
+        dma.push(mapping);
         zero_mapping(&mapping, section.len);
         copy_mapping(&mapping, section.data);
         let attrs = section.flags.page_attrs();
@@ -1090,6 +1098,7 @@ fn run_mali(
                 let _ = soft_reset(device);
                 return Err(1);
             };
+            dma.push(io_pages);
             zero_mapping(&io_pages, 2 * PAGE_SIZE);
             if let Err(error) = map_range(
                 &mut table_memory,
@@ -1120,6 +1129,7 @@ fn run_mali(
                     let _ = soft_reset(device);
                     return Err(1);
                 };
+                dma.push(mapping);
                 zero_mapping(&mapping, suspend_len);
                 if let Err(error) = map_range(
                     &mut table_memory,
@@ -1163,6 +1173,7 @@ fn run_mali(
                 let _ = soft_reset(device);
                 return Err(1);
             };
+            dma.push(work);
             zero_mapping(&work, WORK_LEN);
             let Some(as1_l0) = arena.alloc_table(&mut table_memory) else {
                 log(log_level::ERR, format_args!("drv-gpu: no table for AS1\n"));
@@ -1195,6 +1206,7 @@ fn run_mali(
                 let _ = soft_reset(device);
                 return Err(1);
             };
+            dma.push(paint);
             for offset in (0..PAINT_BYTES).step_by(4) {
                 // SAFETY: a word inside the paint target's Normal-NC DMA mapping.
                 unsafe { ((paint.va + offset) as *mut u32).write_volatile(PAINT_POISON) };
@@ -1241,6 +1253,7 @@ fn run_mali(
                     let _ = soft_reset(device);
                     return Err(1);
                 };
+                dma.push(mapping);
                 zero_mapping(&mapping, PAGE_SIZE);
                 copy_mapping(&mapping, bytes);
                 if let Err(error) = map_range(
@@ -2081,6 +2094,10 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
             // serve honestly. — TIMBERDOODLE
             let mut first_session = true;
             let mut session_number = 0u32;
+            //j716
+            // One session's bring-up DMA, cleared by release after every confirmed close.
+            // — TIMBERDOODLE
+            let mut session_dma: Vec<Mapping> = Vec::new();
             loop {
                 session_number += 1;
                 log(
@@ -2093,9 +2110,32 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
                     bootstrap,
                     identity.shader_present,
                     first_session,
+                    &mut session_dma,
                 ) {
                     Ok(containment) => match containment.next() {
-                        SessionNext::Regrant => first_session = false,
+                        //j716
+                        // G8d-c: a confirmed release licenses reclaiming the session's
+                        // bring-up DMA as well as its wire session. Each mapping is a
+                        // contiguous-DMA VMO, so unmapping and closing it returns the frames
+                        // to the kernel's free list once no reference remains (J708's retire
+                        // pass is the mechanism); the next session's bring-up allocates from
+                        // the same pool. Poison retains everything instead. — TIMBERDOODLE
+                        SessionNext::Regrant => {
+                            let count = session_dma.len();
+                            let mut bytes = 0u64;
+                            for mapping in session_dma.drain(..) {
+                                bytes += mapping.len;
+                                release_mapping(mapping);
+                            }
+                            log(
+                                log_level::NOTICE,
+                                format_args!(
+                                    "drv-gpu: session {} bring-up released mappings={} bytes={}\n",
+                                    session_number, count, bytes
+                                ),
+                            );
+                            first_session = false;
+                        }
                         SessionNext::Park => {
                             //j714
                             // Retain everything and refuse every further grant. Closing this
