@@ -16,7 +16,6 @@
 //j629
 //j630
 //j660
-//j717
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1187,15 +1186,10 @@ fn teardown_process_and_signal(koid: KoId) {
         for entry in handles {
             match entry.kind {
                 kumo_abi::ObjectKind::Channel => {
-                    //j717
-                    // Every peer the close reaped — direct or carried — is recorded so the
-                    // teardown wakes them once the Sora borrow ends. — TIMBERDOODLE
-                    if let Ok(peer_koids) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
-                        for peer_koid in peer_koids {
-                            sora.engine
-                                .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                            closed_peers.push(peer_koid);
-                        }
+                    if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
+                        sora.engine
+                            .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                        closed_peers.push(peer_koid);
                     }
                 }
                 // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
