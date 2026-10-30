@@ -4,6 +4,7 @@
 //j660
 //j708
 //j719
+//j725
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -1511,6 +1512,19 @@ impl SyscallEngine {
             }
             i += 1;
         }
+    }
+
+    //j725
+    /// The lateness the pending sweep would report: the oldest expired-but-unfired timer's
+    /// deadline age at `now_ns`. Read-only, so the IRQ path can record it before the sweep
+    /// marks timers fired, and host tests can pin it. — TIMBERDOODLE
+    pub fn timer_sweep_late(&self, now_ns: u64) -> u64 {
+        self.timers
+            .iter()
+            .filter(|timer| !timer.fired && timer.deadline_ns <= now_ns)
+            .map(|timer| now_ns.saturating_sub(timer.deadline_ns))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Expire every one-shot timer whose monotonic deadline has arrived.
@@ -9396,6 +9410,21 @@ mod tests {
             engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
             KernelCallResult::Handle(Handle(1))
         );
+    }
+
+    //j725
+    #[test]
+    fn timer_sweep_late_reports_the_oldest_expired_deadline_age() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let _ = engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 100 });
+        let _ = engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 250 });
+        assert_eq!(engine.timer_sweep_late(99), 0);
+        assert_eq!(engine.timer_sweep_late(150), 50);
+        assert_eq!(engine.timer_sweep_late(260), 160);
+        // Firing the timers clears the lateness a later sample would report.
+        engine.signal_timers(260);
+        assert_eq!(engine.timer_sweep_late(260), 0);
     }
 
     #[test]

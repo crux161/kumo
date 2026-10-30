@@ -19,7 +19,17 @@
 //j719
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+//j725
+//j725
+// IRQ-path instrument: the sweep instrument from J723/J724 needed kernel-side numbers to see
+// whether the serve wake is late because the timer sweep itself runs late. Counts are cheap
+// relaxed atomics; the record prints every 1024 sweeps at NOTICE. — TIMBERDOODLE
+static IRQ_BUSY_SKIPS: AtomicU32 = AtomicU32::new(0);
+static TIMER_TICK_SKIPS: AtomicU32 = AtomicU32::new(0);
+static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
+static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -348,10 +358,36 @@ extern "C" fn signal_irq(irq: u32) {
         }
         let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
         sora.engine.signal_interrupt(irq);
+        //j725
+        // Record how late the sweep would be before it runs, then the running maxima/counts,
+        // and print one record every 1024 sweeps. — TIMBERDOODLE
+        let sweep_late = sora.engine.timer_sweep_late(now_ns);
         sora.engine.signal_timers(now_ns);
+        if sweep_late > SWEEP_MAX_LATE_NS.load(Ordering::Relaxed) {
+            SWEEP_MAX_LATE_NS.store(sweep_late, Ordering::Relaxed);
+        }
+        let sweeps = SWEEP_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if sweeps & 0x3ff == 0 {
+            crate::klog_at!(
+                kumo_abi::sys::log_level::NOTICE,
+                "sched: sweeps={} max-late={}ns busy-skips={} timer-skips={}\n",
+                sweeps,
+                SWEEP_MAX_LATE_NS.load(Ordering::Relaxed),
+                IRQ_BUSY_SKIPS.load(Ordering::Relaxed),
+                TIMER_TICK_SKIPS.load(Ordering::Relaxed)
+            );
+        }
         late
     });
     let Some(late) = delivered else {
+        //j725
+        // A busy SoraState borrow skips the whole signal path, timer sweep included. Count it,
+        // and count the timer PPI separately: those ticks are dropped rather than deferred.
+        // — TIMBERDOODLE
+        IRQ_BUSY_SKIPS.fetch_add(1, Ordering::Relaxed);
+        if irq < 32 {
+            TIMER_TICK_SKIPS.fetch_add(1, Ordering::Relaxed);
+        }
         // A full deferral set would lose this line rather than storm the machine; with
         // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
         if irq >= 32 {
