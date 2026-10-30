@@ -3,17 +3,21 @@
 //j681
 //j682
 //j707
+//j709
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
 //! grant or automatic restart exists in this lane. G8a gives the session an on-demand buffer
 //! table: BufferDestroy unbinds every VA range the session still holds for one allocation,
 //! flushes AS1, and only then releases that allocation's CPU mapping and driver VMO handle.
 //! A confirmed soft reset releases whatever the channel still owned; a failed reset retains
-//! every byte, because the resident driver cannot prove the GPU stopped.
+//! every byte, because the resident driver cannot prove the GPU stopped. G8d-a makes that
+//! tail a state machine (`drv_gpu::contain`): stop accepting, quiesce, close the session with
+//! exact counts, then retire the driver's mappings — or poison and retain everything.
 
 use alloc::vec::Vec;
 
 use super::*;
+use drv_gpu::contain::Containment;
 use drv_gpu::{client_job_wrapper, protocol, JobSlot, JOB_WRAPPER_WORDS};
 use protocol::{
     session::{Backend, Session, SubmitError, MAX_WAITS},
@@ -297,6 +301,18 @@ impl Backend for Hardware<'_> {
         });
         Ok(())
     }
+
+    /// Only called by [`Containment::run`], after a confirmed reset and after the session has
+    /// been closed. The reset stopped the MCU and every group, so no GPU state can still
+    /// reference these pages; release each CPU mapping and the driver's VMO handle. Nothing
+    /// here runs on the failed-reset path: unproven quiescence retains every byte.
+    /// — TIMBERDOODLE
+    fn retire(&mut self) {
+        for record in self.buffers.drain(..) {
+            release_mapping(record.mapping);
+        }
+        self.pending = None;
+    }
 }
 
 impl Hardware<'_> {
@@ -448,6 +464,13 @@ impl Hardware<'_> {
     }
 }
 
+/// G8d-a's driver-side close tail. Service has already stopped accepting requests; the only
+/// decision left is whether quiescence was proven. [`Containment::run`] owns the ordering and
+/// the record; this wrapper supplies the one real reset and the one real backend.
+fn contain(hw: &mut Hardware<'_>, session: &mut Session) -> Containment {
+    Containment::run(soft_reset(hw.device), session, hw)
+}
+
 pub(super) fn serve(
     channel: Handle,
     device: &mut Device,
@@ -559,28 +582,26 @@ pub(super) fn serve(
             Err(_) => break,
         }
     }
-    // A confirmed reset stopped the MCU and every group, so no GPU state can still reference
-    // the client's allocations; release each CPU mapping and driver VMO handle. A failed reset
-    // proves nothing, so every byte is retained and this driver parks, never regranting.
+    // G8d-a: the loop above was the only reader, so service has stopped accepting. Quiesce
+    // first; only a confirmed reset licenses releasing anything. The record states exactly
+    // what was released, and a failed reset yields retained=yes with the session poisoned.
     // — TIMBERDOODLE
-    match soft_reset(hw.device) {
-        Ok(_) => {
-            log(log_level::NOTICE, format_args!("drv-gpu: client session closed; GPU reset confirmed; releasing client backing\n"));
-            for record in hw.buffers.drain(..) {
-                release_mapping(record.mapping);
-            }
-        }
-        Err(error) => log(
+    let containment = contain(&mut hw, &mut session);
+    log(log_level::NOTICE, format_args!("{}\n", containment));
+    if let Err(error) = containment.reset {
+        log(
             log_level::ERR,
-            format_args!(
-                "drv-gpu: client reset failed: {:?}; all DMA backing retained, no regrant\n",
-                error
-            ),
-        ),
+            format_args!("drv-gpu: containment reset cause: {:?}\n", error),
+        );
     }
+    // Transport state is not DMA: the grant and waiter channels close on both paths, so no
+    // client can be handed a view into a session this driver will never serve again. The
+    // buffers themselves were released only if containment proved the GPU stopped.
     if let Some(handle) = hw.reply_grant.take() {
         let _ = kumo_rt::handle_close(handle);
     }
+    // The waiter channels close on both paths; a retained session keeps only its own metadata
+    // and DMA, never a peer that could still be woken by a driver that will not serve it.
     for slot in &mut hw.waiters {
         if let Some((_, handle)) = slot.take() {
             let _ = kumo_rt::handle_close(handle);

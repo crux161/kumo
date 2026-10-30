@@ -6,6 +6,7 @@
 //j698
 //j701
 //j703
+//j709
 
 extern crate alloc;
 
@@ -14,8 +15,9 @@ use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
-    GFX_CLIENT_PATH, GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GROUP_PATH, HOSTNAME_PATH,
+    IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH,
+    SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -3328,6 +3330,16 @@ const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
 /// `true` to run the demos when iterating on supervision.
 const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
 
+/// Gate for G8d-a's contained-close integration smoke: a fake GPU server and a fake client on
+/// QEMU. Default **off** — it launches two short-lived processes before the resident set. The
+/// same path is reachable on demand with the `gpu-contain` shell builtin, which is how
+/// `scripts/graphics-smoke.py --gpu-session-kill` drives it. It never touches the GPU, so it
+/// proves the contained-close ordering, not the real reset path on metal. — TIMBERDOODLE
+const RUN_GPU_CONTAINMENT_SMOKE: bool = false;
+/// Wall-clock budget for the fake client to arm the session, and then for the fake server to
+/// report after the kill. — TIMBERDOODLE
+const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
+
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
 #[cfg(target_arch = "aarch64")]
@@ -3614,6 +3626,17 @@ extern "C" fn sora_main(
             log(b"svc-health: crash contained\n");
         } else {
             log(b"svc-health: crash escaped\n");
+        }
+    }
+
+    // G8d-a: the contained-close integration smoke. Default off; it costs two short-lived
+    // processes and never touches the GPU. Enable it at boot or run `gpu-contain` from the
+    // shell/autoexec. — TIMBERDOODLE
+    if RUN_GPU_CONTAINMENT_SMOKE {
+        if run_gpu_session_kill_smoke(initrd) {
+            log(b"gpu-contain: ok\n");
+        } else {
+            log(b"gpu-contain: fail\n");
         }
     }
 
@@ -5345,6 +5368,17 @@ fn eval_command(
     }
     if cmd.name == "gfx-recover" {
         gfx_recover(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gpu-contain" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: gpu-contain\n");
+        } else if run_gpu_session_kill_smoke(initrd) {
+            log(b"gpu-contain: ok\n");
+        } else {
+            log(b"gpu-contain: fail\n");
+            fail_status(1);
+        }
         return true;
     }
     if cmd.name == "gfx-titles" {
@@ -7803,6 +7837,198 @@ fn run_crash_containment_smoke(initrd: Handle) -> bool {
     // The child faults immediately; the kernel contains it and reaps it. Reaching here at all
     // proves the kernel survived; `Ok` proves the crashed child was reaped (no resident left).
     all_residents_gone(process_wait())
+}
+
+/// Close a handle only while it is still this process's. A transferred handle's koid is
+/// `u64::MAX`; closing it would target an unrelated handle instead. — TIMBERDOODLE
+fn close_owned(handle: Handle) {
+    if handle_koid(handle) != u64::MAX {
+        let _ = handle_close(handle);
+    }
+}
+
+/// Stop a smoke child without assuming it is still alive. — TIMBERDOODLE
+fn stop_smoke_child(process: Option<Handle>) {
+    if let Some(process) = process {
+        let _ = process_kill(process);
+        let _ = process_wait();
+        let _ = handle_close(process);
+    }
+}
+
+/// G8d-a's contained-close integration proof, QEMU-only and off the boot path by default.
+///
+/// The fake client speaks the real `kumo-gpu` wire over a real channel and arms two buffers,
+/// two bindings and one fence wait; the fake server owns that session with a scripted backend.
+/// Sora waits for the server's ready signal, kills the client, and then requires one report
+/// carrying the exact records of both paths: a confirmed reset releases 2/2/1, and a refused
+/// reset releases nothing and retains its two claims. The fake server scripts the reset
+/// result — QEMU cannot power the GPU — so this proves ordering and accounting, not metal.
+/// — TIMBERDOODLE
+fn run_gpu_session_kill_smoke(initrd: Handle) -> bool {
+    let (request_client_raw, request_server_raw) = channel_create_pair();
+    let (Some(request_client), Some(request_server)) = (
+        syscall_handle(request_client_raw),
+        syscall_handle(request_server_raw),
+    ) else {
+        log(b"gpu-contain: request pair fail\n");
+        return false;
+    };
+    let (report_read_raw, report_write_raw) = channel_create_pair();
+    let (Some(report_read), Some(report_write)) = (
+        syscall_handle(report_read_raw),
+        syscall_handle(report_write_raw),
+    ) else {
+        close_owned(request_client);
+        close_owned(request_server);
+        log(b"gpu-contain: report pair fail\n");
+        return false;
+    };
+
+    let server_flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let mut server_proc = None;
+    if !run_elf_threads(
+        initrd,
+        GPU_CONTAIN_SERVER_PATH.as_bytes(),
+        request_server.0 as u64,
+        report_write.0 as u64,
+        server_flags,
+        b"gpu-contain-server",
+        0,
+        Some(&mut server_proc),
+    ) {
+        close_owned(request_client);
+        close_owned(request_server);
+        close_owned(report_read);
+        close_owned(report_write);
+        log(b"gpu-contain: server launch fail\n");
+        return false;
+    }
+    // Both arguments must be *moved*: Sora may keep no reference that would survive the
+    // client's kill and keep the server from seeing a peer close. — TIMBERDOODLE
+    if handle_koid(request_server) != u64::MAX || handle_koid(report_write) != u64::MAX {
+        close_owned(request_client);
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: server transfer fail\n");
+        return false;
+    }
+
+    let client_flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    let mut client_proc = None;
+    if !run_elf_threads(
+        initrd,
+        GPU_CONTAIN_CLIENT_PATH.as_bytes(),
+        request_client.0 as u64,
+        0,
+        client_flags,
+        b"gpu-contain-client",
+        0,
+        Some(&mut client_proc),
+    ) {
+        close_owned(request_client);
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: client launch fail\n");
+        return false;
+    }
+    if handle_koid(request_client) != u64::MAX {
+        close_owned(report_read);
+        stop_smoke_child(client_proc);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: client transfer fail\n");
+        return false;
+    }
+
+    let (Some(server), Some(client)) = (server_proc, client_proc) else {
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        stop_smoke_child(client_proc);
+        log(b"gpu-contain: process handle missing\n");
+        return false;
+    };
+
+    let Some(port) = syscall_handle(port_create()) else {
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: port fail\n");
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(GPU_CONTAIN_WAIT_NS)) else {
+        close_owned(port);
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: timer fail\n");
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    let report_koid = handle_koid(report_read);
+    if timer_koid == u64::MAX
+        || report_koid == u64::MAX
+        || port_bind(port, timer) != 0
+        || port_bind(port, report_read) != 0
+    {
+        close_owned(timer);
+        close_owned(port);
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: port bind fail\n");
+        return false;
+    }
+
+    let mut report = [0u8; 512];
+    let ready = port_wait(port) == report_koid && {
+        let len = channel_read(report_read, report.as_mut_ptr(), report.len()) as usize;
+        report.get(..len) == Some(b"ready\n".as_slice())
+    };
+    if !ready {
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        let _ = port_unbind(port, report_read);
+        let _ = port_unbind(port, timer);
+        close_owned(timer);
+        close_owned(port);
+        close_owned(report_read);
+        log(b"gpu-contain: client never armed\n");
+        return false;
+    }
+
+    // The client is parked with the session armed. Killing it closes the only remaining
+    // endpoint; the server acts only on that peer close. — TIMBERDOODLE
+    let _ = process_kill(client);
+    let _ = handle_close(client);
+    let mut report_len = 0usize;
+    if port_wait(port) == report_koid {
+        report_len = channel_read(report_read, report.as_mut_ptr(), report.len()) as usize;
+    }
+    if report_len > 0 {
+        log(&report[..report_len]);
+    }
+    const CONFIRMED: &str =
+        "drv-gpu: containment reset=ok buffers=2 bindings=2 waits=1 retained=no";
+    const REFUSED: &str =
+        "drv-gpu: containment reset=fail buffers=0 bindings=0 waits=0 retained=yes";
+    let text = core::str::from_utf8(&report[..report_len]).unwrap_or("");
+    let passed =
+        text.contains(CONFIRMED) && text.contains(REFUSED) && text.contains("gpu-contain: pass");
+    // Give the server its exit before dropping the process handle; the report is in hand.
+    for _ in 0..256 {
+        if all_residents_gone(process_wait()) {
+            break;
+        }
+    }
+    let _ = handle_close(server);
+    let _ = port_unbind(port, report_read);
+    let _ = port_unbind(port, timer);
+    close_owned(timer);
+    close_owned(port);
+    close_owned(report_read);
+    passed
 }
 
 /// Send one request to a resident server on `client`, pump the scheduler so that server

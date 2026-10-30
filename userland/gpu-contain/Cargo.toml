@@ -1,0 +1,29 @@
+#j709
+[package]
+name = "gpu-contain"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+drv-gpu = { path = "../servers/drv-gpu" }
+kumo-gpu = { path = "../../lib/kumo-gpu" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "gpu-contain-server"
+path = "src/bin/server.rs"
+test = false
+bench = false
+doctest = false
+
+[[bin]]
+name = "gpu-contain-client"
+path = "src/bin/client.rs"
+test = false
+bench = false
+doctest = false

@@ -3,6 +3,7 @@
 //j648
 //j649
 //j675
+//j709
 
 use std::env;
 use std::fmt;
@@ -19,11 +20,11 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, BMP_VIEW_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH,
-    DRV_I2C_HID_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH, HELLO_PATH,
-    INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
-    INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
-    TTYD_PATH, WC_PATH,
+    DRV_I2C_HID_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH,
+    GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
+    INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
+    KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, PERSONA_LINUX_HELLO_PATH,
+    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -855,6 +856,10 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let gfx_hold = build_graphics_client_image(&workspace_root()?, "gfx-hold")?;
             let bmp_view = build_graphics_client_image(&workspace_root()?, "bmp-view")?;
             let gpu_client = build_gpu_client_image(&workspace_root()?)?;
+            let gpu_contain_server =
+                build_gpu_contain_image(&workspace_root()?, "gpu-contain-server")?;
+            let gpu_contain_client =
+                build_gpu_contain_image(&workspace_root()?, "gpu-contain-client")?;
             let ls = build_ls_image(&workspace_root()?)?;
             let args = build_args_image(&workspace_root()?)?;
             let cat = build_cat_image(&workspace_root()?)?;
@@ -890,6 +895,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                     include_bytes!("../../userland/bmp-view/assets/sample.bmp"),
                 ),
                 (kumo_abi::initrd::GPU_CLIENT_PATH, gpu_client.as_slice()),
+                (GPU_CONTAIN_SERVER_PATH, gpu_contain_server.as_slice()),
+                (GPU_CONTAIN_CLIENT_PATH, gpu_contain_client.as_slice()),
                 (LS_PATH, ls.as_slice()),
                 (ARGS_PATH, args.as_slice()),
                 (CAT_PATH, cat.as_slice()),
@@ -1094,6 +1101,30 @@ fn build_gpu_client_image(root: &Path) -> Result<Vec<u8>, String> {
     let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as gpu-client ELF: {err}", path.display()))?;
+    Ok(bytes)
+}
+
+/// G8d-a's QEMU-only fake session pair, built from one package with two binaries.
+fn build_gpu_contain_image(root: &Path, program: &str) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "gpu-contain",
+            "--bin",
+            program,
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let path = root
+        .join("target/aarch64-unknown-none/release")
+        .join(program);
+    let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as {program} ELF: {err}", path.display()))?;
     Ok(bytes)
 }
 

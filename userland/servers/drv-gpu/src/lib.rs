@@ -5,6 +5,7 @@
 //j596
 //j655
 //j707
+//j709
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -19,11 +20,18 @@
 //! G5b presents it in one of drv-fb's views (DESIGN/019).
 //! G5c-1 carries the offline-compiled kernel (shaders/mali) and packs its descriptors exactly as
 //! Mesa does. G5c-2 maps it executable and dispatches it as the pixel producer.
+//!
+//! G8d-a gives the client channel a contained close: a confirmed soft reset closes the session
+//! and retires the driver's own claims, reporting exact released counts; an unconfirmed reset
+//! retains everything and poisons the session instead of freeing DMA it cannot prove idle.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
 /// Shared GPU channel contract and bounded session state.
 pub use kumo_gpu as protocol;
+
+/// G8d-a's contained-close state machine: reset first, release only on proof.
+pub mod contain;
 /// Shared Mali instructions, kernel, descriptors and CPU pixel reference.
 pub use kumo_mali::*;
 

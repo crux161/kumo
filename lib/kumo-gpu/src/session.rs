@@ -3,6 +3,7 @@
 //j652
 //j681
 //j707
+//j709
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -26,6 +27,31 @@ pub const MAX_WAITS: usize = 4;
 pub enum SubmitError {
     Unpublished(Status),
     DeviceLost,
+}
+
+/// Exact object counts a [`Session::close`] gave up. The caller reports these once, as the
+/// proof of what the containment path released rather than a claim that the hardware is idle;
+/// quiescence is the reset's job and is established before close is called. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionRelease {
+    pub buffers: u32,
+    pub bindings: u32,
+    pub waits: u32,
+    pub bytes: u64,
+}
+
+impl SessionRelease {
+    /// The answer to a second, idempotent close: nothing was left to release. — TIMBERDOODLE
+    pub const NONE: Self = Self {
+        buffers: 0,
+        bindings: 0,
+        waits: 0,
+        bytes: 0,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::NONE
+    }
 }
 
 pub trait Backend {
@@ -65,6 +91,14 @@ pub trait Backend {
     fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), Status>;
     fn create_group(&mut self) -> Result<(), Status>;
     fn submit(&mut self, submission: Submission) -> Result<(), SubmitError>;
+    /// Release every backend-side claim this session still holds — DMA registrations, MMU
+    /// mappings, queue references — **after** the caller has quiesced the device and the
+    /// session has been closed. The default is a deliberate no-op, not a silent success: a
+    /// backend that owns no tracked resource must not invent a release, and a backend that
+    /// cannot prove quiescence must keep its claims. The method returns nothing because a
+    /// failed or unknown release has no recoverable status here; the caller's reset result
+    /// already decided whether this path may run at all. — TIMBERDOODLE
+    fn retire(&mut self) {}
 }
 
 /// One live allocation in this session's own ID space. IDs are issued monotonically and never
@@ -91,6 +125,9 @@ pub struct Session {
     vm: bool,
     group: bool,
     retired: bool,
+    /// Set by [`Session::close`]. Separate from `retired`, which a backend DeviceLost may set
+    /// first: only an explicit close reports released counts, and only once. — TIMBERDOODLE
+    closed: bool,
     /// Live allocations, on demand: the budget — not a table size — bounds the session.
     /// — TIMBERDOODLE
     buffers: Vec<Allocation>,
@@ -119,6 +156,38 @@ impl Session {
             self.retired = true;
         }
         result
+    }
+
+    /// Contained close: make the session terminal and forget every object it tracks, returning
+    /// exact counts so the caller can report what this path released. Idempotent — a second
+    /// call answers [`SessionRelease::NONE`] and touches nothing.
+    ///
+    /// This releases *metadata only*. It neither resets the device nor frees DMA: the caller
+    /// must quiesce the GPU first, and then call [`Backend::retire`] to release the backing
+    /// this session can no longer name. If quiescence is not proven, the caller must not call
+    /// this at all — retain the metadata and the backing together and poison the session.
+    /// — TIMBERDOODLE
+    pub fn close(&mut self) -> SessionRelease {
+        if self.closed {
+            return SessionRelease::NONE;
+        }
+        self.closed = true;
+        self.retired = true;
+        let release = SessionRelease {
+            buffers: self.buffers.len() as u32,
+            bindings: self.bindings.iter().flatten().count() as u32,
+            waits: self.waits.iter().flatten().count() as u32,
+            bytes: self.total_buffer_bytes,
+        };
+        self.buffers.clear();
+        self.bindings = [None; MAX_BINDINGS];
+        self.waits = [None; MAX_WAITS];
+        self.total_buffer_bytes = 0;
+        // The VM and group are backend objects torn down by the reset, not tracked allocations;
+        // clearing the flags keeps the closed session from reading as still-created.
+        self.vm = false;
+        self.group = false;
+        release
     }
 
     pub fn complete(&mut self, point: u64, status: u32) -> Result<(), Status> {
@@ -407,6 +476,9 @@ mod tests {
         texture_features: Option<[u32; 4]>,
         core_features: Option<u32>,
         threads: Option<DeviceThreads>,
+        /// How many times the containment layer asked the backend to release its own claims.
+        /// A unit count, not a success flag: `retire` has nothing to answer. — TIMBERDOODLE
+        retire_calls: u32,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -475,6 +547,9 @@ mod tests {
         fn submit(&mut self, s: Submission) -> Result<(), SubmitError> {
             self.calls.push(Command::Submit(s));
             self.submit_error.take().map_or(Ok(()), Err)
+        }
+        fn retire(&mut self) {
+            self.retire_calls += 1;
         }
     }
     fn binding() -> Binding {
@@ -1261,5 +1336,112 @@ mod tests {
             Err(Status::DeviceLost)
         );
         assert_eq!(b.calls.len(), calls);
+    }
+    #[test]
+    fn close_is_idempotent_and_reports_exact_counts() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: 2 * PAGE_BYTES,
+            },
+        )
+        .unwrap();
+        for (buffer, va) in [(1, VA_START), (2, VA_START + PAGE_BYTES)] {
+            send(
+                &mut s,
+                &mut b,
+                Command::VmBind(Binding {
+                    buffer,
+                    va,
+                    ..binding()
+                }),
+            )
+            .unwrap();
+        }
+        send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
+        send(&mut s, &mut b, job(1)).unwrap();
+        send(&mut s, &mut b, Command::FenceWait { group: 1, point: 1 }).unwrap();
+        assert_eq!(s.waits.iter().flatten().count(), 1);
+
+        // Close answers with the metadata it dropped, exactly once. — TIMBERDOODLE
+        assert_eq!(
+            s.close(),
+            SessionRelease {
+                buffers: 2,
+                bindings: 2,
+                waits: 1,
+                bytes: 3 * PAGE_BYTES,
+            }
+        );
+        assert!(s.closed);
+        assert!(s.retired);
+        assert!(s.buffers.is_empty());
+        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.waits.iter().all(Option::is_none));
+        assert_eq!(s.total_buffer_bytes, 0);
+        assert!(!s.vm && !s.group);
+        // A second close is a no-op, not a second release. — TIMBERDOODLE
+        assert_eq!(s.close(), SessionRelease::NONE);
+        assert!(s.close().is_empty());
+        // The backend is untouched by close alone: retiring is the caller's separate step,
+        // ordered after a proven reset, so close can never smuggle in an unquiesced free.
+        assert_eq!(b.retire_calls, 0);
+    }
+
+    #[test]
+    fn dispatch_after_close_is_device_lost_and_never_reaches_the_backend() {
+        let (mut s, mut b) = ready();
+        assert!(!s.close().is_empty());
+        let calls = b.calls.len();
+        assert_eq!(
+            send(&mut s, &mut b, Command::GetInfo),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmCreate),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(b.calls.len(), calls);
+        assert_eq!(s.complete(1, 0), Err(Status::DeviceLost));
+    }
+
+    /// A backend may not report a release it did not perform: the default `retire` answers
+    /// nothing and leaves the backend's claims exactly as they were. — TIMBERDOODLE
+    #[test]
+    fn default_retire_never_invents_success() {
+        #[derive(Default)]
+        struct Passive {
+            claims: u32,
+        }
+        impl Backend for Passive {
+            fn info(&mut self) -> Result<DeviceInfo, Status> {
+                Err(Status::NotSupported)
+            }
+            fn create_vm(&mut self) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn create_buffer(&mut self, _: u32, _: u64) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn bind(&mut self, _: Binding) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn create_group(&mut self) -> Result<(), Status> {
+                Err(Status::NotSupported)
+            }
+            fn submit(&mut self, _: Submission) -> Result<(), SubmitError> {
+                Err(SubmitError::Unpublished(Status::NotSupported))
+            }
+        }
+        let mut passive = Passive { claims: 3 };
+        passive.retire();
+        assert_eq!(passive.claims, 3);
     }
 }
