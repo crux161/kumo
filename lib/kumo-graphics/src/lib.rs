@@ -1,16 +1,20 @@
 #![no_std]
-//j668
-//j670
-//j674
 //j675
 //j684
 //j687
 //j696
+//j705
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
 //! addresses or screen coordinates. Only one request may be outstanding. Stop writing before
-//! Present, and reuse the buffer only after its matching reply. A reply means copied, not vblank.
+//! Present, and reuse the buffer only after its matching reply.
+//!
+//! The reply carries two honest claims. `Retired` is the strongest: the presenter proved the
+//! frame reached the scanout and was consumed at least once, so reuse is safe and retirement is
+//! witnessed. `Copied` means the pixels are in the scanout buffer but retirement is unproven. It
+//! still permits reuse under the original contract, but it is not a vblank or tear-free claim.
+//! Clients accept both and must never read `Copied` as `Retired`. — TIMBERDOODLE
 
 pub mod native;
 
