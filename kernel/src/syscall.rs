@@ -3,6 +3,7 @@
 //j659
 //j660
 //j708
+//j719
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -2969,20 +2970,29 @@ impl SyscallEngine {
             KernelCall::HandleClose { handle } => {
                 let status = match process.handles_mut().remove(handle) {
                     Ok(entry) => {
-                        if entry.kind == ObjectKind::Channel {
-                            if let Ok(Some(peer_koid)) = self.ipc.close_by_koid(entry.koid) {
-                                self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                                // J547: a child parked in `ChannelRead` on the surviving end
-                                // waits on its endpoint, not a port. Wake it as a write would, so
-                                // its retried read sees `PeerClosed` instead of sleeping forever.
-                                // — TIMBERDOODLE
-                                #[cfg(target_os = "none")]
-                                crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                        let (kind, koid) = (entry.kind, entry.koid);
+                        //j719
+                        // The removed entry owns the handle's capability reference until it
+                        // drops; drop it first so the endpoint's observer reflects only the
+                        // handles that still exist when the registry judges the last owner.
+                        // — TIMBERDOODLE
+                        drop(entry);
+                        if kind == ObjectKind::Channel {
+                            if let Ok(peer_koids) = self.ipc.close_by_koid(koid) {
+                                for peer_koid in peer_koids {
+                                    self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                                    // J547: a child parked in `ChannelRead` on the surviving
+                                    // end waits on its endpoint, not a port. Wake it as a
+                                    // write would, so its retried read sees `PeerClosed`
+                                    // instead of sleeping forever. — TIMBERDOODLE
+                                    #[cfg(target_os = "none")]
+                                    crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                                }
                             }
                         }
-                        if entry.kind == ObjectKind::Timer {
-                            self.release_timer(entry.koid);
-                            self.release_port_bindings(entry.koid);
+                        if kind == ObjectKind::Timer {
+                            self.release_timer(koid);
+                            self.release_port_bindings(koid);
                         }
                         Errno::Ok.status()
                     }

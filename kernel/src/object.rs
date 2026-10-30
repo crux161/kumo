@@ -1,6 +1,7 @@
 //j618
 //j625
 //j632
+//j719
 
 use alloc::{
     rc::{Rc, Weak},
@@ -174,6 +175,22 @@ impl HandleTable {
         rights: Rights,
     ) -> Result<(Handle, HandleReferences), ObjectError> {
         if object.kind != ObjectKind::Interrupt {
+            return Err(ObjectError::WrongType);
+        }
+        self.insert_referenced(object, rights)
+    }
+
+    //j719
+    /// Insert a channel endpoint with its own reference lineage. Every duplicate,
+    /// transfer or staged grant clones this entry and shares the lineage, so the
+    /// endpoint's [`HandleReferences`] observer counts exactly the handles that still
+    /// own it — the fact a close-time mailbox reap must consult. — TIMBERDOODLE
+    pub(crate) fn insert_channel(
+        &mut self,
+        object: KernelObject,
+        rights: Rights,
+    ) -> Result<(Handle, HandleReferences), ObjectError> {
+        if object.kind != ObjectKind::Channel {
             return Err(ObjectError::WrongType);
         }
         self.insert_referenced(object, rights)

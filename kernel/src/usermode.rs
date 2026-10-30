@@ -16,6 +16,7 @@
 //j629
 //j630
 //j660
+//j719
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -1183,30 +1184,43 @@ fn teardown_process_and_signal(koid: KoId) {
             };
             proc.handles_mut().drain()
         };
+        //j719
+        // Two passes: every drained entry owns its capability reference until it drops, so
+        // the registry may only judge an endpoint's last owner after the whole table has
+        // been released. — TIMBERDOODLE
+        let mut drained = Vec::new();
         for entry in handles {
-            match entry.kind {
+            let kind = entry.kind;
+            let koid = entry.koid;
+            drop(entry);
+            drained.push((kind, koid));
+        }
+        for (kind, koid) in drained {
+            match kind {
                 kumo_abi::ObjectKind::Channel => {
-                    if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
-                        sora.engine
-                            .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                        closed_peers.push(peer_koid);
+                    if let Ok(peer_koids) = sora.engine.ipc_mut().close_by_koid(koid) {
+                        for peer_koid in peer_koids {
+                            sora.engine
+                                .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                            closed_peers.push(peer_koid);
+                        }
                     }
                 }
                 // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
                 // reclaim its Resource grants so a restarted instance
                 // re-binds cleanly instead of stacking orphaned entries in the engine.
                 kumo_abi::ObjectKind::Resource => {
-                    sora.engine.release_resource(entry.koid);
+                    sora.engine.release_resource(koid);
                 }
                 _ => {}
             }
             // Any object this process owned may have been a port or a watched object;
             // drop port bindings on either side so a dead watch never lingers.
             if !matches!(
-                entry.kind,
+                kind,
                 kumo_abi::ObjectKind::DeviceCtx | kumo_abi::ObjectKind::Interrupt
             ) {
-                sora.engine.release_port_bindings(entry.koid);
+                sora.engine.release_port_bindings(koid);
             }
         }
         // Drained entries have now dropped their capability owners. Retain uncertain
