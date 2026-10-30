@@ -7,6 +7,8 @@
 //j701
 //j703
 //j709
+//j711
+//j711
 
 extern crate alloc;
 
@@ -168,6 +170,12 @@ static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 /// client/driver failure; a new boot resets the device before any fresh grant. — TIMBERDOODLE
 static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
+//j711
+/// The sending end of the GPU client's lane bootstrap pair, held from pair creation until
+/// the lane is named after launch. `N` + the native producer keeps today's J0c lane; `V` +
+/// view channel then `S` + view surface hand view `GPU_VIEW` to the churn lane. The client
+/// reads this pair as its second transferred argument. — TIMBERDOODLE
+static GPU_LANE_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 
 fn launch_gpu_client(initrd: Handle) {
     let channel = GPU_CLIENT_CHANNEL.swap(0, Ordering::Relaxed);
@@ -175,23 +183,89 @@ fn launch_gpu_client(initrd: Handle) {
         return;
     }
     let native = GPU_NATIVE_CHANNEL.swap(0, Ordering::Relaxed);
-    let mut flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
-    if native != 0 {
-        flags |= ProcessRunFlags::TRANSFER_ARG2.bits();
+    //j711
+    // Both lanes need one bootstrap pair: the session channel still rides x0, and the lane
+    // selector rides this pair's other end after launch. The child end is transferred as x1;
+    // Sora keeps the sending end until it has named the lane. — TIMBERDOODLE
+    let (sender, lane_child) = channel_create_pair();
+    if ![sender, lane_child]
+        .into_iter()
+        .all(|raw| raw != 0 && raw != u64::MAX)
+    {
+        let _ = handle_close(Handle(channel));
+        if native != 0 {
+            let _ = handle_close(Handle(native));
+        }
+        log(b"gpu-client: lane bootstrap unavailable; session retired\n");
+        return;
     }
+    // On the churn lane view `GPU_VIEW`'s grant leaves the regrant statics before launch and
+    // returns to them if the launch never reaches the send, so a shell client can still use
+    // the view afterwards. — TIMBERDOODLE
+    let view_grant = GPU_CHURN_VIEW.then(|| {
+        let view_channel = Handle(GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+        let view_vmo = Handle(GRAPHICS_VMO[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+        GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+        (view_channel, view_vmo)
+    });
+    GPU_LANE_BOOTSTRAP.store(sender as u32, Ordering::Relaxed);
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
     if run_elf(
         initrd,
         kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
         u64::from(channel),
-        u64::from(native),
+        lane_child,
         flags,
         b"gpu-client",
     ) {
+        let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
+        match view_grant {
+            Some((view_channel, view_vmo)) => {
+                if view_channel.0 == 0 || view_vmo.0 == 0 {
+                    // Honest absence: the client refuses a V lane without a usable grant.
+                    let _ = channel_write_with_handle(sender, b"V".as_ptr(), 1, Handle(0));
+                    let _ = channel_write_with_handle(sender, b"S".as_ptr(), 1, Handle(0));
+                    log(b"gpu-client: churn lane has no view grant\n");
+                } else if channel_write_with_handle(sender, b"V".as_ptr(), 1, view_channel) != 0 {
+                    // A refused send leaves the handle in Sora's table.
+                    GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(view_channel.0, Ordering::Relaxed);
+                    GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
+                    GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                    log(b"gpu-client: churn lane view channel refused; view restored\n");
+                } else if channel_write_with_handle(sender, b"S".as_ptr(), 1, view_vmo) != 0 {
+                    // The channel already moved; without its surface the view cannot be
+                    // painted, so the client closes it and drv-fb reports the release.
+                    let _ = handle_close(view_vmo);
+                    log(b"gpu-client: churn lane view surface refused\n");
+                }
+                let _ = handle_close(sender);
+            }
+            None => {
+                if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
+                    && native != 0
+                {
+                    let _ = handle_close(Handle(native));
+                }
+                let _ = handle_close(sender);
+            }
+        }
         log(b"gpu-client: session handed to a separate process\n");
     } else {
+        let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
+        let _ = handle_close(sender);
+        let _ = handle_close(Handle(lane_child as u32));
         let _ = handle_close(Handle(channel));
         if native != 0 {
             let _ = handle_close(Handle(native));
+        }
+        if let Some((view_channel, view_vmo)) = view_grant {
+            if view_channel.0 != 0 || view_vmo.0 != 0 {
+                GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(view_channel.0, Ordering::Relaxed);
+                GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
+                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+            }
         }
         log(b"gpu-client: launch failed; session retired\n");
     }
@@ -3340,6 +3414,13 @@ const RUN_GPU_CONTAINMENT_SMOKE: bool = false;
 /// report after the kill. — TIMBERDOODLE
 const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
 
+//j711
+/// G8 acceptance lane selector. Off by default: a loop image sets this true so the one
+/// cooperative GPU client receives view `GPU_VIEW`'s channel and surface over the lane
+/// bootstrap pair and runs the 100-frame churn loop on the production view path. Normal
+/// images keep drv-gpu's G5b boot paint and the J0c diagnostic unchanged. — TIMBERDOODLE
+const GPU_CHURN_VIEW: bool = false;
+
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
 #[cfg(target_arch = "aarch64")]
@@ -3934,9 +4015,12 @@ extern "C" fn sora_main(
                         // the one cooperative GPU client. No Resource reaches that client. — KESTREL
                         let mut native = Handle(0);
                         let mut producer = Handle(0);
+                        // The churn lane has no native presentation channel: drv-fb sees the
+                        // J record with Handle(0), exactly as when the GPU lane is absent.
                         if transferred
                             && display_broker.is_some()
                             && GPU_CLIENT_CHANNEL.load(Ordering::Relaxed) != 0
+                            && !GPU_CHURN_VIEW
                         {
                             let (a, b) = channel_create_pair();
                             if let (Some(a), Some(b)) = (syscall_handle(a), syscall_handle(b)) {
@@ -3998,7 +4082,12 @@ extern "C" fn sora_main(
                             log(b"drv-fb: run ok\n");
                             for (view, grant) in graphics.iter().enumerate() {
                                 if let Some((channel, vmo)) = grant {
+                                    //j711
+                                    // The churn lane keeps the view with Sora so the GPU
+                                    // client can receive it over the lane bootstrap after
+                                    // launch, instead of drv-gpu taking it now.
                                     if view == drv_gpu::GPU_VIEW
+                                        && !GPU_CHURN_VIEW
                                         && hand_view_to_gpu(view, *channel, *vmo)
                                     {
                                         continue;

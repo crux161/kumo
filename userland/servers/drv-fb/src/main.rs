@@ -14,6 +14,8 @@ extern crate alloc;
 //j695
 //j696
 //j700
+//j711
+//j711
 
 mod clock_probe;
 mod display_probe;
@@ -131,6 +133,10 @@ struct GraphicsLane {
     view: usize,
     /// A complete image has reached this view; a partial first present is refused. — TIMBERDOODLE
     full_seen: bool,
+    //j711
+    /// Presents received on this lane. The first three are narrated; a 100+ frame churn run
+    /// must not flood serial or disturb the console. — TIMBERDOODLE
+    presents: u32,
 }
 
 /// Log `label` then `v` in decimal and a newline. The bootstrap path offers no `core::fmt` and no
@@ -583,6 +589,8 @@ extern "C" fn main(
                 surface: view_surface[view],
                 view,
                 full_seen: false,
+                //j711
+                presents: 0,
             });
         } else {
             let _ = kumo_rt::handle_close(graphics[view]);
@@ -1322,6 +1330,8 @@ extern "C" fn main(
                             surface: new_surface,
                             view,
                             full_seen: false,
+                            //j711
+                            presents: 0,
                         });
                         view_surface[view] = new_surface;
                         view_released[view] = false;
@@ -1420,11 +1430,24 @@ extern "C" fn main(
                 let _ = kumo_rt::handle_close(Handle(extra_handle as u32));
             }
             // The first gated demo's present sat unread for minutes; intake is timestamped
-            // so the wait and the reply can be told apart. — TIMBERDOODLE
-            let _ = kumo_rt::log_write(
-                kumo_abi::sys::log_level::NOTICE,
-                b"display: present received\n",
-            );
+            // so the wait and the reply can be told apart. A churn client presents 100+
+            // frames, so only a lane's first three presents are narrated; the Reply still
+            // carries the status. — TIMBERDOODLE
+            //j711
+            let narrated = match lanes[index].as_mut() {
+                Some(entry) => {
+                    let seen = entry.presents;
+                    entry.presents = entry.presents.saturating_add(1);
+                    drv_fb::present_is_narrated(seen)
+                }
+                None => false,
+            };
+            if narrated {
+                let _ = kumo_rt::log_write(
+                    kumo_abi::sys::log_level::NOTICE,
+                    b"display: present received\n",
+                );
+            }
             let request = rx.get(..n).and_then(Present::decode);
             let reply = match (request, &layout) {
                 (Some(request), Some(band)) if extra_handle == 0 && lane.surface != 0 => {
@@ -1489,16 +1512,19 @@ extern "C" fn main(
                             status = Status::Retired;
                         }
                     }
-                    // The demo's first gated run failed blind; every reply now names what
-                    // it carried. — TIMBERDOODLE
-                    let _ = kumo_rt::log_write(
-                        kumo_abi::sys::log_level::NOTICE,
-                        if status == Status::Retired {
-                            b"display: present reply retired\n" as &[u8]
-                        } else {
-                            b"display: present reply copied\n"
-                        },
-                    );
+                    // The demo's first gated run failed blind; every narrated reply names
+                    // what it carried. Silence past the third present is deliberate: the
+                    // wire Reply still carries the same status. — TIMBERDOODLE
+                    if narrated {
+                        let _ = kumo_rt::log_write(
+                            kumo_abi::sys::log_level::NOTICE,
+                            if status == Status::Retired {
+                                b"display: present reply retired\n" as &[u8]
+                            } else {
+                                b"display: present reply copied\n"
+                            },
+                        );
+                    }
                     Reply {
                         sequence: request.sequence,
                         status,

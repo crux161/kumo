@@ -5,6 +5,7 @@
 //j681
 //j707
 //j709
+//j711
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -285,7 +286,10 @@ impl Session {
                 Ok(Response::VmCreated { vm: 1 })
             }
             Command::BufferCreate { bytes } => {
-                if !self.vm || self.group {
+                // Creation is legal once the group exists (j711): it allocates backing and
+                // binds nothing; a mapping still needs VmBind, which G8b allows post-group.
+                // — TIMBERDOODLE
+                if !self.vm {
                     return Err(Status::BadState);
                 }
                 if !valid_buffer_bytes(bytes) {
@@ -311,11 +315,11 @@ impl Session {
                 Ok(Response::BufferCreated { buffer: id, bytes })
             }
             Command::BufferDestroy { buffer } => {
-                // Destroy's implicit unbind batch stays refused once the group exists. G8b
-                // landed live mapping changes as explicit VmBind/VmUnbind, which state their
-                // exact ranges; this implicit batch keeps its own follow-up rather than
-                // widening a proven path in the same slice. — TIMBERDOODLE
-                if !self.vm || self.group {
+                // Destroy's implicit unbind batch is legal once the group exists (j711): the
+                // serve loop's synchronous ordering fences same-address-space work, the
+                // backend clears exactly this buffer's live mappings and flushes, and the
+                // metadata clears only after backend success. — TIMBERDOODLE
+                if !self.vm {
                     return Err(Status::BadState);
                 }
                 let position = self
@@ -1065,8 +1069,10 @@ mod tests {
             send(&mut s, &mut b, Command::VmBind(binding())),
             Err(Status::BadRequest)
         );
+        // Creation is legal after the group now (j711); an existing group is the refused
+        // state transition this test keeps guarding. — TIMBERDOODLE
         assert_eq!(
-            send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
+            send(&mut s, &mut b, Command::GroupCreate { vm: 1 }),
             Err(Status::BadState)
         );
         assert_eq!(
@@ -1279,6 +1285,55 @@ mod tests {
     }
 
     #[test]
+    fn post_group_create_bind_destroy_is_live_and_retryable() {
+        let (mut s, mut b) = ready();
+        // Allocation is legal with the group live (j711); the new buffer starts unbound.
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
+            Ok(Response::BufferCreated {
+                buffer: 2,
+                bytes: PAGE_BYTES
+            })
+        );
+        let second = Binding {
+            buffer: 2,
+            va: VA_START + 8 * PAGE_BYTES,
+            ..binding()
+        };
+        assert_eq!(
+            send(&mut s, &mut b, Command::VmBind(second)),
+            Ok(Response::VmBound)
+        );
+        // A recoverable refusal leaves the allocation and its mapping retryable.
+        b.fail = Some(Status::NoMemory);
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 2 }),
+            Err(Status::NoMemory)
+        );
+        assert!(s.buffers.iter().any(|allocation| allocation.id == 2));
+        assert!(s
+            .bindings
+            .iter()
+            .flatten()
+            .any(|binding| binding.buffer == 2));
+        b.fail = None;
+        // The implicit batch reaches the backend with exactly this buffer's live binding.
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 2 }),
+            Ok(Response::BufferDestroyed { buffer: 2 })
+        );
+        let (id, batch) = b.destroyed.last().cloned().expect("destroy recorded");
+        assert_eq!(id, 2);
+        assert_eq!(batch, std::vec![second]);
+        assert!(s
+            .bindings
+            .iter()
+            .flatten()
+            .all(|binding| binding.buffer != 2));
+        assert!(s.buffers.iter().all(|allocation| allocation.id != 2));
+    }
+
+    #[test]
     fn failures_do_not_commit_allocations_or_bindings_and_enforce_budget() {
         let (mut s, mut b) = (Session::default(), Fake::default());
         b.fail = Some(Status::NoMemory);
@@ -1478,20 +1533,27 @@ mod tests {
     }
 
     #[test]
-    fn buffer_destroy_is_refused_once_the_group_exists_under_the_frozen_model() {
+    fn buffer_destroy_is_live_once_the_group_exists() {
         let (mut s, mut b) = ready();
         let calls = b.calls.len();
-        // G8a cannot unmap a VA range a live group might reference; G8b owns that. The refusal
-        // is recoverable and the frozen session keeps working. — TIMBERDOODLE
+        // j711: a live group no longer freezes destruction. The backend receives the implicit
+        // unbind batch, the metadata retires, and the session keeps serving. — TIMBERDOODLE
         assert_eq!(
             send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
-            Err(Status::BadState)
+            Ok(Response::BufferDestroyed { buffer: 1 })
         );
-        assert_eq!(b.calls.len(), calls);
-        assert!(b.destroyed.is_empty());
-        assert_eq!(s.buffers.len(), 1);
-        assert_eq!(s.total_buffer_bytes, PAGE_BYTES);
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(b.calls.len(), calls + 1);
+        assert_eq!(b.destroyed.last().cloned(), Some((1, std::vec![binding()])));
+        assert!(s.buffers.is_empty());
+        assert_eq!(s.total_buffer_bytes, 0);
+        assert_eq!(s.bindings.iter().flatten().count(), 0);
+        // The group is still live: the next allocation, binding and submission proceed.
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        let rebound = Binding {
+            buffer: 2,
+            ..binding()
+        };
+        send(&mut s, &mut b, Command::VmBind(rebound)).unwrap();
         send(&mut s, &mut b, job(1)).unwrap();
     }
 

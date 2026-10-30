@@ -5,6 +5,7 @@
 //j652
 //j681
 //j707
+//j711
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -14,10 +15,10 @@
 //! BufferCreate allocates DMA backing in the driver on demand, bounded by a total live-memory
 //! budget rather than a fixed object count, and returns a shared VMO handle with the reply.
 //! BufferDestroy releases one allocation: the session first unbinds every GPU VA mapping that
-//! names it, then the backend releases the backing. Destroy's implicit unbind batch is still
-//! refused once the group exists; live mapping changes use VmBind and VmUnbind instead. Those
-//! are allowed after GroupCreate: the driver orders same-address-space work, then invalidates
-//! just the packed page-table region (RESEARCH/017) without stopping any queue.
+//! names it, then the backend releases the backing. Creation, destruction and their implicit
+//! unbind batches are legal after GroupCreate: the driver orders same-address-space work and
+//! flushes the space, while explicit VmBind and VmUnbind (opcode 15) narrow the invalidation
+//! to the packed page-table region (RESEARCH/017) without stopping any queue.
 //! Requests carry no handles or physical addresses. The transport must enforce those
 //! handle counts, resolve IDs in this session, retain backing until the GPU is quiescent and
 //! reject overlapping binds. Unbind names an exact tiling of live bindings and never exposes

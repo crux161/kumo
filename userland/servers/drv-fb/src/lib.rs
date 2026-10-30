@@ -5,6 +5,8 @@
 //j695
 //j700
 //j702
+//j711
+//j711
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
@@ -1760,6 +1762,14 @@ pub fn clean_present<F: FnMut(usize, usize)>(
             clean(start, len);
         }
     }
+}
+
+//j711
+/// G8c lane narration bound: a churn client presents 100+ frames per run, so the serial log
+/// and the console see only a lane's first three presents. The reply still carries the
+/// status, so silence loses no information. — TIMBERDOODLE
+pub fn present_is_narrated(presented: u32) -> bool {
+    presented < 3
 }
 
 /// Clean the cache lines covering `start..start + len` pixels, then DSB. No-op off target.
@@ -3592,5 +3602,35 @@ mod tests {
         assert_cell_colors(&buf, KILO_W, b'T', 1, 1, BG, FG);
         assert_cell_colors(&buf, KILO_W, b'o', 0, 2, FG, BG);
         assert_cell_colors(&buf, KILO_W, b'k', 1, 2, FG, BG);
+    }
+
+    //j711
+    #[test]
+    fn lane_narration_covers_exactly_the_first_three_presents() {
+        assert!(present_is_narrated(0));
+        assert!(present_is_narrated(1));
+        assert!(present_is_narrated(2));
+        assert!(!present_is_narrated(3));
+        assert!(!present_is_narrated(4));
+        assert!(!present_is_narrated(u32::MAX));
+    }
+
+    //j711
+    #[test]
+    fn every_existing_smoke_client_stays_fully_narrated() {
+        // gfx-client presents 3 native frames; bmp-view, gfx-demo and gfx-hold present 1;
+        // gfx-damage presents 2. The bound must not silence any of their records.
+        for presented in 0..3 {
+            assert!(present_is_narrated(presented));
+        }
+    }
+
+    //j711
+    #[test]
+    fn a_hundred_frame_churn_run_narrates_three_lines_per_lane() {
+        let narrated = (0..=100u32)
+            .filter(|presented| present_is_narrated(*presented))
+            .count();
+        assert_eq!(narrated, 3);
     }
 }

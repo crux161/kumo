@@ -3,6 +3,7 @@
 //j644
 //j681
 //j707
+//j711
 
 extern crate std;
 use super::*;
@@ -533,7 +534,7 @@ fn unbind_rejects_a_wrong_kind_or_mismatched_range_reply() {
 }
 
 #[test]
-fn destroy_buffer_releases_the_id_and_is_refused_after_the_group_exists() {
+fn destroy_buffer_releases_the_id_before_and_after_the_group_exists() {
     let mut client = Client::new(Loopback::default());
     let vm = client.create_vm().unwrap();
     let first = client.create_buffer(PAGE_BYTES).unwrap();
@@ -557,11 +558,13 @@ fn destroy_buffer_releases_the_id_and_is_refused_after_the_group_exists() {
         Err(Error::Server(Status::NotFound))
     );
     assert!(!client.is_lost());
-    // Under the frozen-binding model a destroy after GroupCreate is a recoverable refusal.
+    // Destroy is live once the group exists (j711): its implicit unbind batch is legal and a
+    // replayed ID still answers NotFound. — TIMBERDOODLE
     client.create_group(vm).unwrap();
+    client.destroy_buffer(&second).unwrap();
     assert_eq!(
         client.destroy_buffer(&second),
-        Err(Error::Server(Status::BadState))
+        Err(Error::Server(Status::NotFound))
     );
     assert!(!client.is_lost());
     assert!(client.transport.transport.closed.is_empty());
