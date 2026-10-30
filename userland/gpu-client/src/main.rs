@@ -7,6 +7,7 @@
 //j683
 //j711
 //j712
+//j713
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -72,7 +73,11 @@ fn handle(raw: u64) -> Option<Handle> {
 #[derive(Clone, Copy)]
 enum Lane {
     Native(Handle),
-    Churn { channel: Handle, surface: Handle },
+    Churn {
+        channel: Handle,
+        surface: Handle,
+        presentation: Handle,
+    },
 }
 
 //j711
@@ -123,7 +128,29 @@ fn select_lane(bootstrap: Handle) -> Result<Lane, ()> {
                 let _ = kumo_rt::handle_close(channel);
                 return fail("churn lane carried no view surface");
             };
-            Ok(Lane::Churn { channel, surface })
+            // j713: the churn lane also carries the native diagnostic producer; without it
+            // the display diagnostic cannot complete and the gate can never arm. — TIMBERDOODLE
+            let (len, raw) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
+            if len == 0 || (len as isize) < 0 {
+                let _ = kumo_rt::handle_close(channel);
+                let _ = kumo_rt::handle_close(surface);
+                return fail("churn lane closed before its native producer");
+            }
+            if len != 1 || tag[0] != b'N' {
+                let _ = kumo_rt::handle_close(channel);
+                let _ = kumo_rt::handle_close(surface);
+                return fail("churn lane native tag missing");
+            }
+            let Some(presentation) = handle(raw) else {
+                let _ = kumo_rt::handle_close(channel);
+                let _ = kumo_rt::handle_close(surface);
+                return fail("churn lane carries no native producer");
+            };
+            Ok(Lane::Churn {
+                channel,
+                surface,
+                presentation,
+            })
         }
         _ => fail("unknown lane tag"),
     }
@@ -516,6 +543,7 @@ fn churn_run(
     view: Handle,
     surface: Handle,
     compute: &[u64; 24],
+    first_point: u64,
 ) -> Result<(), Failure> {
     // The bring-up paint (point 3) is the first frame's content: copy it once, probe until
     // the gate answers Retired, then count 100 fresh frames.
@@ -534,7 +562,7 @@ fn churn_run(
     let mut retired = 0u32;
     let mut copied = 0u32;
     for frame in 1..=CHURN_FRAMES {
-        let point = 3 + u64::from(frame);
+        let point = first_point + u64::from(frame) - 1;
         let buffer = client
             .create_buffer(FRAME_BYTES)
             .map_err(|error| churn_api_fail(frame, "buffer create", error))?;
@@ -950,8 +978,34 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
             &triangle,
             &compute,
         )?,
-        Lane::Churn { channel, surface } => {
-            churn_run(&mut client, cpu, vm, group, channel, surface, &compute)?
+        Lane::Churn {
+            channel,
+            surface,
+            presentation,
+        } => {
+            // j713: the J0c native diagnostic runs first; its third retirement sets drv-fb's
+            // diagnostic-completed flag, so the vblank gate arms before the churn readiness
+            // probe. Points: 3 = bring-up paint, 4..=6 = native frames. — TIMBERDOODLE
+            native_frames(
+                &mut client,
+                cpu,
+                vmo,
+                group,
+                presentation,
+                &triangle,
+                &compute,
+            )?;
+            let first_point = 4 + u64::from(kumo_graphics::native::PRESENTATIONS);
+            churn_run(
+                &mut client,
+                cpu,
+                vm,
+                group,
+                channel,
+                surface,
+                &compute,
+                first_point,
+            )?
         }
     }
     let _ = kumo_rt::handle_close(vmo);
@@ -1078,9 +1132,11 @@ extern "C" fn main(channel: u64, bootstrap: u64) -> ! {
         Lane::Churn {
             channel: view,
             surface,
+            presentation,
         } => {
             let _ = kumo_rt::handle_close(view);
             let _ = kumo_rt::handle_close(surface);
+            let _ = kumo_rt::handle_close(presentation);
         }
     }
     let failed = match result {

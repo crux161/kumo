@@ -9,6 +9,7 @@
 //j709
 //j711
 //j711
+//j713
 
 extern crate alloc;
 
@@ -173,8 +174,9 @@ static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
 //j711
 /// The sending end of the GPU client's lane bootstrap pair, held from pair creation until
 /// the lane is named after launch. `N` + the native producer keeps today's J0c lane; `V` +
-/// view channel then `S` + view surface hand view `GPU_VIEW` to the churn lane. The client
-/// reads this pair as its second transferred argument. — TIMBERDOODLE
+/// view channel, `S` + view surface and then `N` hand view `GPU_VIEW` to the churn lane,
+/// which still runs the J0c native diagnostic first (j713). The client reads this pair as
+/// its second transferred argument. — TIMBERDOODLE
 static GPU_LANE_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 
 fn launch_gpu_client(initrd: Handle) {
@@ -239,6 +241,13 @@ fn launch_gpu_client(initrd: Handle) {
                     // painted, so the client closes it and drv-fb reports the release.
                     let _ = handle_close(view_vmo);
                     log(b"gpu-client: churn lane view surface refused\n");
+                }
+                // j713: the churn lane also runs the J0c native diagnostic first, so the
+                // native producer travels after the view pair. — TIMBERDOODLE
+                if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
+                    && native != 0
+                {
+                    let _ = handle_close(Handle(native));
                 }
                 let _ = handle_close(sender);
             }
@@ -4015,12 +4024,12 @@ extern "C" fn sora_main(
                         // the one cooperative GPU client. No Resource reaches that client. — KESTREL
                         let mut native = Handle(0);
                         let mut producer = Handle(0);
-                        // The churn lane has no native presentation channel: drv-fb sees the
-                        // J record with Handle(0), exactly as when the GPU lane is absent.
+                        // The churn lane keeps the pair too (j713): its J0c diagnostic is what
+                        // sets drv-fb's diagnostic-completed flag, so the vblank gate arms
+                        // before the churn loop's readiness probe. — TIMBERDOODLE
                         if transferred
                             && display_broker.is_some()
                             && GPU_CLIENT_CHANNEL.load(Ordering::Relaxed) != 0
-                            && !GPU_CHURN_VIEW
                         {
                             let (a, b) = channel_create_pair();
                             if let (Some(a), Some(b)) = (syscall_handle(a), syscall_handle(b)) {
