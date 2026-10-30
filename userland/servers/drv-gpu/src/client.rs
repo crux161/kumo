@@ -6,6 +6,7 @@
 //j707
 //j709
 //j714
+//j722
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -403,8 +404,13 @@ impl Hardware<'_> {
             .find(|slot| slot.is_none())
             .expect("free slot checked above");
         *free = Some((point, write));
+        //j722
+        // Per-frame lines belong at INFO: a churn run arms and wakes one fence per frame,
+        // and at NOTICE the flood is echoed into the console for every frame, which is
+        // exactly the load the lateness experiment measures. INFO keeps them visible on a
+        // KUMO_CONSOLE_LOGLEVEL=6 bring-up image and silent at the default. — TIMBERDOODLE
         log(
-            log_level::NOTICE,
+            log_level::INFO,
             format_args!("drv-gpu: fence wait armed point {}\n", point),
         );
         Some(read)
@@ -425,7 +431,7 @@ impl Hardware<'_> {
                     let _ = kumo_rt::channel_write(handle, byte.as_ptr(), 1);
                     let _ = kumo_rt::handle_close(handle);
                     log(
-                        log_level::NOTICE,
+                        log_level::INFO,
                         format_args!("drv-gpu: fence wait woken point {}\n", point),
                     );
                 }
@@ -516,8 +522,11 @@ impl Hardware<'_> {
             report_stream_stall(self.device, input, output, windows, csg, cs);
             return Err(GpuStatus::DeviceLost);
         }
+        //j722
+        // One line per frame belongs at INFO for the same reason as the fence lines above.
+        // — TIMBERDOODLE
         log(
-            log_level::NOTICE,
+            log_level::INFO,
             format_args!(
                 "drv-gpu: client point {} complete on JOB: hw_seqno={} status=0x0 ({} us)\n",
                 job.point,
