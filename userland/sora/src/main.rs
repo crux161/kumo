@@ -13,6 +13,7 @@
 //j714
 //j715
 //j720
+//j721
 
 extern crate alloc;
 
@@ -2106,6 +2107,11 @@ fn arm_clock_watch(port: Handle) -> Option<(Handle, Handle)> {
     if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
+    //j721
+    GPU_CLOCK_WATCH_DUE_NS.store(
+        kumo_rt::clock_get() + GPU_CLOCK_WATCH_PERIOD_NS,
+        Ordering::Relaxed,
+    );
     arm_gpu_restart(port, GPU_CLOCK_WATCH_PERIOD_NS)
 }
 
@@ -2136,10 +2142,19 @@ fn log_gpu_clock_sample() {
         Some(mhz) => {
             log(b" rate=");
             log_hex(u64::from(mhz));
-            log(b"MHz\n");
+            log(b"MHz");
         }
-        None => log(b" rate=unknown\n"),
+        None => log(b" rate=unknown"),
     }
+    //j721
+    // The serve-loop wake delay: monotonic now minus the due time recorded at arm. The
+    // churn boots showed the serial-visible interval growing to ~93 s; this records the
+    // same fact in-guest, one line per sample. — TIMBERDOODLE
+    let now = kumo_rt::clock_get();
+    let late = now.saturating_sub(GPU_CLOCK_WATCH_DUE_NS.load(Ordering::Relaxed));
+    log(b" late_ns=");
+    log_hex(late);
+    log(b"\n");
 }
 
 fn arm_gpu_restart(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
@@ -3700,6 +3715,13 @@ const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
 /// images keep drv-gpu's G5b boot paint and the J0c diagnostic unchanged. — TIMBERDOODLE
 const GPU_CHURN_VIEW: bool = false;
 
+//j721
+/// The clock-watch lane is independent of the churn lane so the same sampler can run as an
+/// idle control: with the watch on and churn off, its samples measure serve-loop timer
+/// lateness with no sustained GPU load. Committed off; acceptance builds flip either or
+/// both. — TIMBERDOODLE
+const GPU_CLOCK_WATCH: bool = false;
+
 //j720
 /// The GPU clock watch: a read-only CRU mapping minted from the root Resource and sampled
 /// on the serve port every ten seconds while the churn lane is on. Its purpose is to
@@ -3720,6 +3742,10 @@ const GPU_CLOCK_O_GPLL0: u64 = 0x1c0;
 /// DESIGN/020: GPLL is 1188 MHz, so GPLL/6 is the ratified 198 MHz boot rate.
 const GPU_CLOCK_GPLL_MHZ: u32 = 1188;
 static GPU_CLOCK_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+//j721
+/// Monotonic time the next sample is due, recorded when the timer is armed so the sample
+/// can report its own lateness in-guest. — TIMBERDOODLE
+static GPU_CLOCK_WATCH_DUE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
@@ -5124,7 +5150,7 @@ extern "C" fn sora_main(
     // Mint one read-only CRU window from the root Resource, exactly as the display probe's
     // PMU lane does, and let the serve-loop sampler read the GPU clock words from it.
     // — TIMBERDOODLE
-    if GPU_CHURN_VIEW {
+    if GPU_CLOCK_WATCH {
         let raw = kumo_rt::resource_mint_mmio(res, CLOCK_CRU_BASE, CLOCK_CRU_LEN);
         if let Some(vmo) = syscall_handle(raw) {
             if vmar_map(
