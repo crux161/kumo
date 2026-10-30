@@ -14,6 +14,7 @@
 //j715
 //j720
 //j721
+//j723
 
 extern crate alloc;
 
@@ -2151,9 +2152,16 @@ fn log_gpu_clock_sample() {
     // churn boots showed the serial-visible interval growing to ~93 s; this records the
     // same fact in-guest, one line per sample. — TIMBERDOODLE
     let now = kumo_rt::clock_get();
-    let late = now.saturating_sub(GPU_CLOCK_WATCH_DUE_NS.load(Ordering::Relaxed));
+    let due = GPU_CLOCK_WATCH_DUE_NS.load(Ordering::Relaxed);
+    let wake = GPU_CLOCK_WAKE_NS.load(Ordering::Relaxed);
+    //j723
+    // late_ns is due→now; wake_ns is due→the serve loop's last port wake. The difference
+    // is this sample's own logging cost, so a late timer and a slow log are separable.
+    // — TIMBERDOODLE
     log(b" late_ns=");
-    log_hex(late);
+    log_hex(now.saturating_sub(due));
+    log(b" wake_ns=");
+    log_hex(wake.saturating_sub(due));
     log(b"\n");
 }
 
@@ -3746,6 +3754,11 @@ static GPU_CLOCK_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Monotonic time the next sample is due, recorded when the timer is armed so the sample
 /// can report its own lateness in-guest. — TIMBERDOODLE
 static GPU_CLOCK_WATCH_DUE_NS: AtomicU64 = AtomicU64::new(0);
+//j723
+/// Monotonic time the serve loop's most recent port wake returned, so a sample can split
+/// its lateness into wake-side (timer delivery and scheduling) and log-side (sampling
+/// cost). — TIMBERDOODLE
+static GPU_CLOCK_WAKE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
@@ -5347,6 +5360,10 @@ extern "C" fn sora_main(
                 }
             }
             let source = Handle(port_wait(port) as u32);
+            //j723
+            // Capture the wake instant before any dispatch, so the clock sampler can tell a
+            // late wake from slow logging. — TIMBERDOODLE
+            GPU_CLOCK_WAKE_NS.store(kumo_rt::clock_get(), Ordering::Relaxed);
             if display_koid == Some(source) {
                 if let Some(b) = display_broker.as_ref() {
                     b.serve(initrd);
