@@ -1,6 +1,7 @@
 //j641
 //j644
 //j681
+//j707
 
 extern crate std;
 use super::*;
@@ -338,6 +339,9 @@ impl Backend for Model {
     fn bind(&mut self, _: Binding) -> Result<(), Status> {
         Ok(())
     }
+    fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
+        Ok(())
+    }
     fn create_group(&mut self) -> Result<(), Status> {
         Ok(())
     }
@@ -457,4 +461,39 @@ fn topology_rejects_wrong_kind_id_zero_and_grants_without_replay() {
     assert_eq!(client.topology(), Err(Error::Server(Status::NotSupported)));
     assert_eq!(client.info(), Ok(INFO));
     assert!(!client.is_lost());
+}
+
+#[test]
+fn destroy_buffer_releases_the_id_and_is_refused_after_the_group_exists() {
+    let mut client = Client::new(Loopback::default());
+    let vm = client.create_vm().unwrap();
+    let first = client.create_buffer(PAGE_BYTES).unwrap();
+    let second = client.create_buffer(PAGE_BYTES).unwrap();
+    assert_eq!((first.id, second.id), (1, 2));
+    let mapping = |buffer: u32| Binding {
+        vm,
+        buffer,
+        va: VA_START,
+        offset: 0,
+        bytes: PAGE_BYTES,
+        flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+    };
+    client.bind(mapping(first.id)).unwrap();
+    client.destroy_buffer(&first).unwrap();
+    // The session unbound the VA range with the buffer, so the next allocation may map it;
+    // the consumed ID answers NotFound and leaves the client live. — TIMBERDOODLE
+    client.bind(mapping(second.id)).unwrap();
+    assert_eq!(
+        client.destroy_buffer(&first),
+        Err(Error::Server(Status::NotFound))
+    );
+    assert!(!client.is_lost());
+    // Under the frozen-binding model a destroy after GroupCreate is a recoverable refusal.
+    client.create_group(vm).unwrap();
+    assert_eq!(
+        client.destroy_buffer(&second),
+        Err(Error::Server(Status::BadState))
+    );
+    assert!(!client.is_lost());
+    assert!(client.transport.transport.closed.is_empty());
 }

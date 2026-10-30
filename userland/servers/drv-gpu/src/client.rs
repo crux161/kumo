@@ -1,20 +1,33 @@
-//j650
 //j651
 //j652
 //j681
 //j682
+//j707
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
-//! grant or automatic restart exists in this lane. The resident driver retains every DMA
-//! mapping even after a reset failure, so losing the client cannot free live GPU backing.
+//! grant or automatic restart exists in this lane. G8a gives the session an on-demand buffer
+//! table: BufferDestroy unbinds every VA range the session still holds for one allocation,
+//! flushes AS1, and only then releases that allocation's CPU mapping and driver VMO handle.
+//! A confirmed soft reset releases whatever the channel still owned; a failed reset retains
+//! every byte, because the resident driver cannot prove the GPU stopped.
+
+use alloc::vec::Vec;
 
 use super::*;
 use drv_gpu::{client_job_wrapper, protocol, JobSlot, JOB_WRAPPER_WORDS};
 use protocol::{
-    session::{Backend, Session, SubmitError, MAX_BUFFERS, MAX_WAITS},
+    session::{Backend, Session, SubmitError, MAX_WAITS},
     Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, SyncState,
     REQUEST_LEN,
 };
+
+/// One live client allocation: the session's object ID and the driver's own DMA mapping.
+/// IDs are the session's, not array indices, so the table can grow, shrink and reorder.
+/// — TIMBERDOODLE
+struct BufferRecord {
+    id: u32,
+    mapping: Mapping,
+}
 
 struct Pending {
     point: u64,
@@ -43,7 +56,7 @@ struct Hardware<'a> {
     windows: [McuWindow; 3],
     csg: CsgControl,
     cs: CsControl,
-    buffers: [Option<Mapping>; MAX_BUFFERS],
+    buffers: Vec<BufferRecord>,
     reply_grant: Option<Handle>,
     pending: Option<Pending>,
     waiters: [Option<(u64, Handle)>; MAX_WAITS],
@@ -130,19 +143,28 @@ impl Backend for Hardware<'_> {
 
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), GpuStatus> {
         let mapping = map_contiguous(bytes).ok_or(GpuStatus::NoMemory)?;
-        self.buffers[id as usize - 1] = Some(mapping);
+        // Reserve before anything is committed: a table that cannot grow must fail before the
+        // driver owns a mapping the session cannot name. — TIMBERDOODLE
+        if self.buffers.try_reserve(1).is_err() {
+            release_mapping(mapping);
+            return Err(GpuStatus::NoMemory);
+        }
         zero_mapping(&mapping, bytes);
         dsb();
-        self.reply_grant = valid_handle(kumo_rt::handle_duplicate(
+        let Some(grant) = valid_handle(kumo_rt::handle_duplicate(
             mapping.handle,
             kumo_abi::Rights::READ
                 | kumo_abi::Rights::WRITE
                 | kumo_abi::Rights::DUPLICATE
                 | kumo_abi::Rights::TRANSFER,
-        ));
-        if self.reply_grant.is_none() {
+        )) else {
+            // Nothing crossed to the session yet, so this allocation is wholly the driver's
+            // and can be released without proving GPU quiescence. — TIMBERDOODLE
+            release_mapping(mapping);
             return Err(GpuStatus::DeviceLost);
-        }
+        };
+        self.buffers.push(BufferRecord { id, mapping });
+        self.reply_grant = Some(grant);
         log(
             log_level::INFO,
             format_args!("drv-gpu: client buffer {} shared, {} bytes\n", id, bytes),
@@ -151,7 +173,12 @@ impl Backend for Hardware<'_> {
     }
 
     fn bind(&mut self, b: Binding) -> Result<(), GpuStatus> {
-        let mapping = self.buffers[b.buffer as usize - 1].ok_or(GpuStatus::NotFound)?;
+        let record = self
+            .buffers
+            .iter()
+            .find(|record| record.id == b.buffer)
+            .ok_or(GpuStatus::NotFound)?;
+        let mapping = record.mapping;
         let attrs = PageAttrs {
             cached: !b.flags.contains(protocol::BindFlags::UNCACHED),
             readonly: b.flags.contains(protocol::BindFlags::READ_ONLY),
@@ -176,6 +203,52 @@ impl Backend for Hardware<'_> {
         }
         dsb();
         flush_page_tables(self.device, GROUP_AS).map_err(|_| GpuStatus::DeviceLost)?;
+        Ok(())
+    }
+
+    fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), GpuStatus> {
+        let index = self
+            .buffers
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or(GpuStatus::NotFound)?;
+        let mut ranges: Vec<UnmapRange> = Vec::new();
+        // NoMemory is recoverable: the session keeps the allocation and its bindings, and the
+        // caller may retry. — TIMBERDOODLE
+        if ranges.try_reserve(bindings.len()).is_err() {
+            return Err(GpuStatus::NoMemory);
+        }
+        ranges.extend(bindings.iter().map(|binding| UnmapRange {
+            va: binding.va,
+            len: binding.bytes,
+        }));
+        // The library preflights every page of every range before its first store, so a
+        // refusal there changes no page. A live flush failure, by contrast, could leave
+        // cleared mappings the GPU still caches: that is DeviceLost, and `serve`'s reset
+        // containment owns the cleanup. — TIMBERDOODLE
+        if let Err(error) = unmap_ranges(self.tables, self.root, &ranges) {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unmap failed: {:?}\n", error),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        if !ranges.is_empty() {
+            dsb();
+            flush_page_tables(self.device, GROUP_AS).map_err(|_| GpuStatus::DeviceLost)?;
+        }
+        // The GPU can no longer reach these pages: release the CPU mapping and the driver's
+        // VMO handle now. The client's granted duplicate is the client's own. — TIMBERDOODLE
+        let record = self.buffers.swap_remove(index);
+        release_mapping(record.mapping);
+        log(
+            log_level::INFO,
+            format_args!(
+                "drv-gpu: client buffer {} destroyed; {} binding(s) unbound\n",
+                id,
+                bindings.len()
+            ),
+        );
         Ok(())
     }
 
@@ -415,7 +488,7 @@ pub(super) fn serve(
         windows,
         csg,
         cs,
-        buffers: [None; MAX_BUFFERS],
+        buffers: Vec::new(),
         reply_grant: None,
         pending: None,
         waiters: [None; MAX_WAITS],
@@ -486,11 +559,24 @@ pub(super) fn serve(
             Err(_) => break,
         }
     }
-    // Even on failure, no DMA VMO is released: this driver parks resident after containment.
-    // Sora transfers one lease and never re-grants it in this boot. — TIMBERDOODLE
+    // A confirmed reset stopped the MCU and every group, so no GPU state can still reference
+    // the client's allocations; release each CPU mapping and driver VMO handle. A failed reset
+    // proves nothing, so every byte is retained and this driver parks, never regranting.
+    // — TIMBERDOODLE
     match soft_reset(hw.device) {
-        Ok(_) => log(log_level::NOTICE, format_args!("drv-gpu: client session closed; GPU reset confirmed; backing retained until reboot\n")),
-        Err(error) => log(log_level::ERR, format_args!("drv-gpu: client reset failed: {:?}; all DMA backing retained, no regrant\n", error)),
+        Ok(_) => {
+            log(log_level::NOTICE, format_args!("drv-gpu: client session closed; GPU reset confirmed; releasing client backing\n"));
+            for record in hw.buffers.drain(..) {
+                release_mapping(record.mapping);
+            }
+        }
+        Err(error) => log(
+            log_level::ERR,
+            format_args!(
+                "drv-gpu: client reset failed: {:?}; all DMA backing retained, no regrant\n",
+                error
+            ),
+        ),
     }
     if let Some(handle) = hw.reply_grant.take() {
         let _ = kumo_rt::handle_close(handle);

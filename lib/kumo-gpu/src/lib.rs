@@ -1,17 +1,22 @@
 #![no_std]
-//j647
 //j650
 //j651
 //j652
 //j681
+//j707
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
 //! local to that channel and become invalid when it closes. Reconnect and recreate after a
 //! driver restart; never replay a Submit whose outcome is unknown.
 //!
-//! BufferCreate allocates DMA backing in the driver and returns a shared VMO handle with the
-//! reply. Requests carry no handles or physical addresses. The transport must enforce those
+//! BufferCreate allocates DMA backing in the driver on demand, bounded by a total live-memory
+//! budget rather than a fixed object count, and returns a shared VMO handle with the reply.
+//! BufferDestroy releases one allocation: the session first unbinds every GPU VA mapping that
+//! names it, then the backend releases the backing. While the frozen-binding model holds, a
+//! destroy is refused once the group exists; lifting that is the G8b opcode-15 VmUnbind
+//! slice, not implemented here.
+//! Requests carry no handles or physical addresses. The transport must enforce those
 //! handle counts, resolve IDs in this session, retain backing until the GPU is quiescent and
 //! reject overlapping binds. Bind before GroupCreate; mappings remain fixed until close.
 //! This library validates frames and arithmetic, not kernel rights or the server object table.
@@ -19,6 +24,8 @@
 //! cooperative first lane does not claim isolation from hostile command streams.
 //!
 //! G6b serves this contract from drv-gpu for one brokered client per boot.
+
+extern crate alloc;
 
 pub mod c;
 pub mod client;
@@ -30,7 +37,15 @@ pub const PAGE_BYTES: u64 = 4096;
 /// First lane: a 16 MiB client window, separate from G5's resident work buffers.
 pub const VA_START: u64 = 0x2000_0000;
 pub const VA_END: u64 = 0x2100_0000;
+/// The largest single allocation. A buffer's GPU binding must fit wholly inside this length.
 pub const MAX_BUFFER_BYTES: u64 = 2 * 1024 * 1024;
+/// Live DMA bytes one channel may hold at once. G8a removes the fixed four-entry table: a
+/// BufferCreate succeeds while the *budget* has room, so the count of live buffers is a
+/// consequence of their sizes (at most `MAX_TOTAL_BUFFER_BYTES / PAGE_BYTES` of 4 KiB
+/// buffers) rather than a separate policy limit. Destroy returns a buffer's bytes to the
+/// budget. Physical-frame reclamation is the kernel's; this is the protocol's accounting.
+/// — TIMBERDOODLE
+pub const MAX_TOTAL_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_STREAM_BYTES: u32 = 64 * 1024;
 pub const RING_BYTES: u32 = 4096;
 

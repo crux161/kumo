@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j593
 //j594
 //j595
 //j596
 //j655
+//j707
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1207,6 +1207,10 @@ pub enum TableError {
     Range { va: u64, len: u64 },
     /// An entry that must be a table is a block descriptor.
     Collision { level: u32 },
+    /// The page was never mapped through this root, so there is nothing to unbind.
+    Unmapped { va: u64 },
+    /// The leaf exists but is not the 4 KiB page descriptor this binding model creates.
+    Mismatch { va: u64 },
 }
 
 /// The attributes a leaf page is mapped with (RESEARCH/009 §7.2; panthor's map flags).
@@ -1295,6 +1299,83 @@ pub fn map_range(
             page_descriptor(pa + offset, attrs.cached, attrs.readonly, !attrs.executable),
         );
         offset += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+/// One VA range a destroy must unbind. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnmapRange {
+    pub va: u64,
+    pub len: u64,
+}
+
+/// Walk to the level-3 entry for `va` without allocating. A zero or non-table intermediate
+/// descriptor proves no page was mapped through this root. — TIMBERDOODLE
+fn leaf_entry(memory: &mut impl TableMemory, transtab: u64, va: u64) -> Result<u64, TableError> {
+    let mut table = transtab;
+    for level in 0..(PAGE_TABLE_LEVELS - 1) {
+        let value = memory.read64(table + table_index(va, level) as u64 * 8);
+        if value == 0 {
+            return Err(TableError::Unmapped { va });
+        }
+        if value & TABLE_DESCRIPTOR_TYPE != TABLE_DESCRIPTOR_TYPE {
+            return Err(TableError::Mismatch { va });
+        }
+        table = value & PHYSICAL_ADDRESS_MASK;
+    }
+    Ok(table + table_index(va, PAGE_TABLE_LEVELS - 1) as u64 * 8)
+}
+
+/// Unbind every 4 KiB page named by `ranges`, all-or-nothing: the preflight pass proves every
+/// page is a live page mapping before the clear pass writes a single zero. A partial unmap
+/// would leave the caller unable to say which backing is still reachable, so a mismatch or an
+/// already-unmapped page refuses the whole batch and changes nothing. Tables are never freed,
+/// so the model cannot reclaim them; the caller flushes the address space once afterwards.
+/// — TIMBERDOODLE
+pub fn unmap_ranges(
+    memory: &mut impl TableMemory,
+    transtab: u64,
+    ranges: &[UnmapRange],
+) -> Result<(), TableError> {
+    for range in ranges {
+        let end = range.va.checked_add(range.len);
+        if range.len == 0
+            || range.va % PAGE_SIZE != 0
+            || range.len % PAGE_SIZE != 0
+            || end.is_none_or(|end| end > (1u64 << 48))
+        {
+            return Err(TableError::Range {
+                va: range.va,
+                len: range.len,
+            });
+        }
+    }
+    for range in ranges {
+        let mut offset = 0u64;
+        while offset < range.len {
+            let va = range.va + offset;
+            let entry = leaf_entry(memory, transtab, va)?;
+            let value = memory.read64(entry);
+            if value == 0 {
+                return Err(TableError::Unmapped { va });
+            }
+            if value & TABLE_DESCRIPTOR_TYPE != TABLE_DESCRIPTOR_TYPE {
+                return Err(TableError::Mismatch { va });
+            }
+            offset += PAGE_SIZE;
+        }
+    }
+    for range in ranges {
+        let mut offset = 0u64;
+        while offset < range.len {
+            let va = range.va + offset;
+            // The preflight just proved this walk succeeds; clearing never allocates, so no
+            // descriptor it relies on can have changed.
+            let entry = leaf_entry(memory, transtab, va)?;
+            memory.write64(entry, 0);
+            offset += PAGE_SIZE;
+        }
     }
     Ok(())
 }
@@ -3772,6 +3853,195 @@ mod g3b_tests {
             map_range(&mut memory, &mut arena, l0, 0x1000, 0x2000, 0x1000, attrs()),
             Err(TableError::Collision { level: 0 })
         );
+    }
+
+    #[test]
+    fn unmap_ranges_clears_every_named_page_and_leaves_neighbours() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x3000,
+            attrs(),
+        )
+        .unwrap();
+        let page = |memory: &FakeMemory, index: u64| memory.get(0x10_3000 + index * 8);
+        assert_ne!(page(&memory, 0), 0);
+        assert_ne!(page(&memory, 2), 0);
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[UnmapRange {
+                    va: 0x0400_1000,
+                    len: 0x1000
+                }]
+            ),
+            Ok(())
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 1), 0);
+        assert_ne!(page(&memory, 2), 0);
+        // A multi-range batch clears exactly its pages, and the level tables stay linked: a
+        // re-map at the same VA reuses them. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_2000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Ok(())
+        );
+        assert_eq!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 2), 0);
+        assert_eq!(memory.get(0x10_2000 + 0x20 * 8), 0x10_3003);
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0060_0000,
+            0x1000,
+            attrs(),
+        )
+        .unwrap();
+        assert_eq!(page(&memory, 0), 0x0060_0f47);
+        // An unmapped page is Unmapped, not a silent no-op success.
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[UnmapRange {
+                    va: 0x0400_1000,
+                    len: 0x1000
+                }]
+            ),
+            Err(TableError::Unmapped { va: 0x0400_1000 })
+        );
+    }
+
+    #[test]
+    fn unmap_ranges_preflights_every_page_before_clearing_any() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x2000,
+            attrs(),
+        )
+        .unwrap();
+        let page = |memory: &FakeMemory, index: u64| memory.get(0x10_3000 + index * 8);
+        // The batch names two live pages and one never-mapped page: nothing is cleared, so
+        // the caller still owns every mapping it had. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_9000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_1000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Unmapped { va: 0x0400_9000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_ne!(page(&memory, 1), 0);
+        // A leaf that is not a valid page descriptor is a mismatch, and again the whole batch
+        // is refused before any store. — TIMBERDOODLE
+        memory.write64(0x10_3000 + 8, 0x0030_0001);
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_1000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Mismatch { va: 0x0400_1000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 1), 0x0030_0001);
+        // A VA whose intermediate table was never allocated is Unmapped too; the live range
+        // listed before it stays mapped because the preflight ran first. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0500_0000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Unmapped { va: 0x0500_0000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+    }
+
+    #[test]
+    fn unmap_ranges_refuses_bad_ranges_without_touching_the_table() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x1000,
+            attrs(),
+        )
+        .unwrap();
+        for (va, len) in [
+            (0x0400_0000, 0),
+            (0x0400_0001, 0x1000),
+            (0x0400_1000, 0x800),
+            (1u64 << 48, 0x1000),
+            (u64::MAX - 0xfff, 0x1000),
+        ] {
+            assert_eq!(
+                unmap_ranges(&mut memory, l0, &[UnmapRange { va, len }]),
+                Err(TableError::Range { va, len }),
+                "{va:#x} {len:#x}"
+            );
+        }
+        assert_ne!(memory.get(0x10_3000), 0);
     }
 
     const ARM: u32 = 1;

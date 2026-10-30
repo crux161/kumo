@@ -1,8 +1,8 @@
-//j647
 //j650
 //j651
 //j652
 //j681
+//j707
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -146,6 +146,18 @@ impl<T: Transport> Client<T> {
         self.call(Command::VmBind(binding))?;
         Ok(())
     }
+    /// Release one allocation this session owns. The server first unbinds every mapping it
+    /// still holds for the buffer, then releases the backing; the granted handle stays the
+    /// caller's to close. IDs are never reused, so a second destroy of the same buffer is a
+    /// server `NotFound` rather than a fresh object. — TIMBERDOODLE
+    pub fn destroy_buffer(&mut self, buffer: &Buffer<T::Handle>) -> Result<(), Error> {
+        let (Response::BufferDestroyed { .. }, None) =
+            self.call(Command::BufferDestroy { buffer: buffer.id })?
+        else {
+            unreachable!()
+        };
+        Ok(())
+    }
     pub fn create_group(&mut self, vm: u32) -> Result<u32, Error> {
         let (Response::GroupCreated { group }, _) = self.call(Command::GroupCreate { vm })? else {
             unreachable!()
@@ -280,6 +292,9 @@ fn matches_response(command: Command, response: Response) -> bool {
                 bytes: received, ..
             },
         ) => bytes == received,
+        (Command::BufferDestroy { buffer }, Response::BufferDestroyed { buffer: received }) => {
+            buffer == received
+        }
         (Command::Submit(job), Response::Submitted { point }) => job.signal_point == point,
         (
             Command::SyncRead { point, .. },

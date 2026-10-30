@@ -1,8 +1,8 @@
-//j647
 //j650
 //j651
 //j652
 //j681
+//j707
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -29,6 +29,13 @@ pub enum Command {
     VmCreate,
     BufferCreate {
         bytes: u64,
+    },
+    /// Release one allocation this session owns. While the binding model is frozen (G8a,
+    /// before GroupCreate), the server first unbinds every GPU VA mapping that names it.
+    /// The reply is `BufferDestroyed`; a never-issued, foreign, or already-destroyed ID is
+    /// `NotFound`. — TIMBERDOODLE
+    BufferDestroy {
+        buffer: u32,
     },
     VmBind(Binding),
     /// One normal-priority queue with a driver-owned 4 KiB ring and core masks.
@@ -69,6 +76,7 @@ impl Request {
             Command::GetThreadProperties => (13, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
+            Command::BufferDestroy { buffer } => (14, [u64::from(buffer), 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
                 3,
                 [
@@ -122,6 +130,11 @@ impl Request {
             13 => Command::GetThreadProperties,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
+            // Zero is never a buffer ID. The canonical re-encode below also refuses an ID
+            // whose high bits would be lost by the u32 conversion and any reserved slot.
+            14 if a[0] != 0 => Command::BufferDestroy {
+                buffer: a[0] as u32,
+            },
             3 => {
                 let b = Binding {
                     vm: a[0] as u32,
@@ -183,6 +196,12 @@ pub enum Response {
     BufferCreated {
         buffer: u32,
         bytes: u64,
+    },
+    /// The named allocation is gone: its live bindings were unbound and its backing released.
+    /// The reply carries no handle; the caller's own granted handle is the caller's to close.
+    /// — TIMBERDOODLE
+    BufferDestroyed {
+        buffer: u32,
     },
     VmBound,
     GroupCreated {
@@ -262,6 +281,7 @@ impl Reply {
             ),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
+            Ok(Response::BufferDestroyed { buffer }) => (14, [u64::from(buffer), 0, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
             Ok(Response::GroupCreated { group }) => (4, [u64::from(group), 0, 0, 0]),
             Ok(Response::Submitted { point }) => (5, [point, 0, 0, 0]),
@@ -336,6 +356,11 @@ impl Reply {
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {
                     buffer: a[0] as u32,
                     bytes: a[1],
+                },
+                // Same zero/truncation rules as the request: canonical re-encoding rejects a
+                // zero ID, lost high bits, and any nonzero reserved slot. — TIMBERDOODLE
+                14 if a[0] != 0 => Response::BufferDestroyed {
+                    buffer: a[0] as u32,
                 },
                 3 => Response::VmBound,
                 4 if a[0] != 0 => Response::GroupCreated { group: a[0] as u32 },

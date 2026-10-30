@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j650
-//j651
 //j652
 //j653
 //j655
 //j690
+//j707
+
+extern crate alloc;
 
 mod client;
 
@@ -19,15 +20,15 @@ use drv_gpu::{
     paint_reference_checksum, power_l2, probe, program_group, program_queue, publish_insert,
     queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
     read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
-    surface_chunks, wake_stream, write_job_words, ClockIo, Completion, CompletionIo, CsControl,
-    CsFeatures, CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall,
-    JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath,
-    SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE,
-    BOOTSTRAP_VIEW_CHANNEL, BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE,
-    CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS,
-    GPU_VIEW, JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
-    KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
-    PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
+    surface_chunks, unmap_ranges, wake_stream, write_job_words, ClockIo, Completion, CompletionIo,
+    CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface,
+    GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface,
+    ResetPath, SectionFlags, TableArena, TableMemory, UnmapRange, APERTURE_BASE, APERTURE_LEN,
+    BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL, BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START,
+    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ,
+    GLB_PING_TIMEOUT_NS, GPU_VIEW, JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA,
+    KUMO_PAINT_V10, KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX,
+    PAINT_SURFACE, PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -135,12 +136,13 @@ struct Device {
 /// writes through `va` with volatile stores only (the J539/J540 noalias lesson).
 #[derive(Clone, Copy)]
 struct Mapping {
-    /// Kept open for the life of the process: the handle is what keeps the VMO (and the
-    /// firmware's memory) alive; nothing reads it after the mapping is made.
-    #[allow(dead_code)]
+    /// Kept open for the life of the allocation: the handle is what keeps the VMO (and the
+    /// firmware's memory) alive; it is closed only by [`release_mapping`].
     handle: Handle,
     va: u64,
     phys: u64,
+    /// The exact VMO length, so release can remove precisely this mapping. — TIMBERDOODLE
+    len: u64,
 }
 
 fn map_contiguous(len: u64) -> Option<Mapping> {
@@ -155,7 +157,21 @@ fn map_contiguous(len: u64) -> Option<Mapping> {
         let _ = kumo_rt::handle_close(handle);
         return None;
     }
-    Some(Mapping { handle, va, phys })
+    Some(Mapping {
+        handle,
+        va,
+        phys,
+        len,
+    })
+}
+
+/// Release the driver's side of one DMA allocation: remove the CPU mapping first, then close
+/// the VMO handle. The client's granted duplicate is the client's own and is unaffected; the
+/// caller must already have proved the GPU cannot reach `phys` (a cleared binding plus
+/// `FLUSH_PT`, or a confirmed soft reset). — TIMBERDOODLE
+fn release_mapping(mapping: Mapping) {
+    let _ = kumo_rt::vmar_unmap(mapping.va, mapping.len);
+    let _ = kumo_rt::handle_close(mapping.handle);
 }
 
 fn zero_mapping(mapping: &Mapping, len: u64) {

@@ -1,8 +1,8 @@
-//j647
 //j650
 //j651
 //j652
 //j681
+//j707
 
 extern crate std;
 
@@ -40,6 +40,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetThreadProperties,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
+        Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
         Command::GroupCreate { vm: 1 },
         Command::Submit(submission()),
@@ -126,6 +127,7 @@ fn request_decoder_rejects_reserved_bytes_unknown_ops_versions_and_truncation() 
     }
     for command in [
         Command::GroupCreate { vm: 1 },
+        Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
         Command::Submit(submission()),
     ] {
@@ -143,6 +145,50 @@ fn request_decoder_rejects_reserved_bytes_unknown_ops_versions_and_truncation() 
 }
 
 #[test]
+fn buffer_destroy_frames_use_opcode_14_and_reject_zero_reserved_or_truncated_ids() {
+    let request = Request {
+        id: 2,
+        command: Command::BufferDestroy {
+            buffer: 0x1234_5678,
+        },
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &14u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &0x1234_5678u64.to_le_bytes());
+    assert_eq!(&bytes[24..], &[0u8; 40]);
+    assert_eq!(Request::decode(&bytes), Some(request));
+    for at in 24..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 object ID must not narrow silently.
+    assert_eq!(Request::decode(&truncated), None);
+
+    let reply = Reply {
+        id: 2,
+        result: Ok(Response::BufferDestroyed {
+            buffer: 0x1234_5678,
+        }),
+    };
+    let bytes = reply.encode();
+    assert_eq!(&bytes[12..16], &14u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &0x1234_5678u64.to_le_bytes());
+    assert_eq!(&bytes[24..], &[0u8; 24]);
+    assert_eq!(Reply::decode(&bytes), Some(reply));
+    assert_eq!(reply.result.unwrap().handle_count(), 0);
+    for at in 24..REPLY_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1;
+    assert_eq!(Reply::decode(&truncated), None);
+}
+
+#[test]
 fn malformed_semantic_requests_never_decode() {
     let b = binding();
     let s = submission();
@@ -154,6 +200,7 @@ fn malformed_semantic_requests_never_decode() {
         Command::BufferCreate {
             bytes: MAX_BUFFER_BYTES + PAGE_BYTES,
         },
+        Command::BufferDestroy { buffer: 0 },
         Command::VmBind(Binding {
             flags: BindFlags(8),
             ..b
@@ -204,6 +251,7 @@ fn replies_distinguish_acceptance_pending_success_and_gpu_error() {
             buffer: 2,
             bytes: PAGE_BYTES,
         },
+        Response::BufferDestroyed { buffer: 2 },
         Response::VmBound,
         Response::GroupCreated { group: 3 },
         Response::Submitted { point: 1 },
@@ -289,6 +337,12 @@ fn reply_decoder_rejects_noncanonical_or_truncated_frames() {
                 buffer: 1,
                 bytes: 1,
             }),
+        },
+        // A destroy reply's ID is an object ID, not an extension slot: zero never crosses,
+        // and a nonzero reserved slot or a lost high bit is a malformed frame.
+        Reply {
+            id: 1,
+            result: Ok(Response::BufferDestroyed { buffer: 0 }),
         },
     ] {
         assert_eq!(Reply::decode(&reply.encode()), None);

@@ -1,19 +1,20 @@
-//j647
 //j650
 //j651
 //j652
 //j681
+//j707
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
 
+use alloc::vec::Vec;
+
 use crate::{
     valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
     DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission,
-    SyncState, Timeline, MAX_BUFFER_BYTES,
+    SyncState, Timeline, MAX_TOTAL_BUFFER_BYTES,
 };
 
-pub const MAX_BUFFERS: usize = 4;
 pub const MAX_BINDINGS: usize = 8;
 /// Bounded armed-fence points per session. Completed points are pruned before the bound is
 /// enforced, so the table holds only waits that are still pending. — TIMBERDOODLE
@@ -56,9 +57,33 @@ pub trait Backend {
     fn create_vm(&mut self) -> Result<(), Status>;
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), Status>;
     fn bind(&mut self, binding: Binding) -> Result<(), Status>;
+    /// Unbind every GPU VA mapping in `bindings` — exactly this session's live bindings that
+    /// name `id` — and release the allocation's backing. This is all-or-nothing: a recoverable
+    /// status leaves every mapping and the backing intact and retryable, while any partial
+    /// unmap or uncertain release must answer `DeviceLost` so the session retires without
+    /// freeing DMA the GPU might still reach. — TIMBERDOODLE
+    fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), Status>;
     fn create_group(&mut self) -> Result<(), Status>;
     fn submit(&mut self, submission: Submission) -> Result<(), SubmitError>;
 }
+
+/// One live allocation in this session's own ID space. IDs are issued monotonically and never
+/// reused, so a stale destroy can never name a later allocation. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Allocation {
+    id: u32,
+    bytes: u64,
+}
+
+/// Placeholder used only to build the fixed-size unbind batch; never sent. — TIMBERDOODLE
+const EMPTY_BINDING: Binding = Binding {
+    vm: 0,
+    buffer: 0,
+    va: 0,
+    offset: 0,
+    bytes: 0,
+    flags: crate::BindFlags(0),
+};
 
 #[derive(Default)]
 pub struct Session {
@@ -66,7 +91,14 @@ pub struct Session {
     vm: bool,
     group: bool,
     retired: bool,
-    buffers: [u64; MAX_BUFFERS],
+    /// Live allocations, on demand: the budget — not a table size — bounds the session.
+    /// — TIMBERDOODLE
+    buffers: Vec<Allocation>,
+    /// Bytes charged against [`MAX_TOTAL_BUFFER_BYTES`] by the live allocations above.
+    total_buffer_bytes: u64,
+    /// The last buffer ID issued; zero means none. Never decreases and is never reused.
+    /// — TIMBERDOODLE
+    next_buffer: u32,
     bindings: [Option<Binding>; MAX_BINDINGS],
     timeline: Timeline,
     waits: [Option<u64>; MAX_WAITS],
@@ -180,19 +212,60 @@ impl Session {
                 if !valid_buffer_bytes(bytes) {
                     return Err(Status::BadRequest);
                 }
-                let index = self
+                // Budget, not table size, bounds the session: the live byte total is the
+                // policy, and the number of buffers follows from their sizes. — TIMBERDOODLE
+                let total = self
+                    .total_buffer_bytes
+                    .checked_add(bytes)
+                    .filter(|total| *total <= MAX_TOTAL_BUFFER_BYTES)
+                    .ok_or(Status::NoMemory)?;
+                let id = self.next_buffer.checked_add(1).ok_or(Status::NoMemory)?;
+                // Reserve before the backend allocates. A failed reservation must reach no
+                // backend call, or the session would own DMA it cannot name. — TIMBERDOODLE
+                self.buffers.try_reserve(1).map_err(|_| Status::NoMemory)?;
+                backend.create_buffer(id, bytes)?;
+                // IDs issue only after success, so a failed create burns no ID and a stale
+                // destroy can never name this or a later allocation. — TIMBERDOODLE
+                self.buffers.push(Allocation { id, bytes });
+                self.total_buffer_bytes = total;
+                self.next_buffer = id;
+                Ok(Response::BufferCreated { buffer: id, bytes })
+            }
+            Command::BufferDestroy { buffer } => {
+                // G8a keeps the frozen-binding model: destroying unbinds VA ranges, which is
+                // only safe while no group exists to reference them. Lifting this needs live
+                // MMU invalidation and queue quiescence — G8b: the opcode-15 VmUnbind slice, not
+                // implemented in this tree. RESEARCH/017 closed Addendum 4 at the driver level,
+                // but the live-mutation code path and its metal two-group proof remain G8b. — TIMBERDOODLE
+                if !self.vm || self.group {
+                    return Err(Status::BadState);
+                }
+                let position = self
                     .buffers
                     .iter()
-                    .position(|len| *len == 0)
-                    .ok_or(Status::NoMemory)?;
-                let used: u64 = self.buffers.iter().sum();
-                if used + bytes > MAX_BUFFER_BYTES {
-                    return Err(Status::NoMemory);
+                    .position(|allocation| allocation.id == buffer)
+                    .ok_or(Status::NotFound)?;
+                let mut batch = [EMPTY_BINDING; MAX_BINDINGS];
+                let mut count = 0;
+                for binding in self.bindings.iter().flatten() {
+                    if binding.buffer == buffer {
+                        batch[count] = *binding;
+                        count += 1;
+                    }
                 }
-                let id = index as u32 + 1;
-                backend.create_buffer(id, bytes)?;
-                self.buffers[index] = bytes;
-                Ok(Response::BufferCreated { buffer: id, bytes })
+                // All-or-nothing: a recoverable failure leaves every mapping and the backing
+                // intact and retryable; a partial unmap or uncertain release must answer
+                // DeviceLost, which retires this session before any metadata commits.
+                // — TIMBERDOODLE
+                backend.destroy_buffer(buffer, &batch[..count])?;
+                for slot in &mut self.bindings {
+                    if slot.is_some_and(|binding| binding.buffer == buffer) {
+                        *slot = None;
+                    }
+                }
+                let allocation = self.buffers.remove(position);
+                self.total_buffer_bytes -= allocation.bytes;
+                Ok(Response::BufferDestroyed { buffer })
             }
             Command::VmBind(binding) => {
                 if !self.vm || self.group {
@@ -201,13 +274,13 @@ impl Session {
                 if binding.vm != 1 {
                     return Err(Status::NotFound);
                 }
-                let bytes = binding
-                    .buffer
-                    .checked_sub(1)
-                    .and_then(|i| self.buffers.get(i as usize))
-                    .filter(|bytes| **bytes != 0)
+                let bytes = self
+                    .buffers
+                    .iter()
+                    .find(|allocation| allocation.id == binding.buffer)
+                    .map(|allocation| allocation.bytes)
                     .ok_or(Status::NotFound)?;
-                binding.validate(*bytes)?;
+                binding.validate(bytes)?;
                 if self
                     .bindings
                     .iter()
@@ -316,12 +389,16 @@ impl Session {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::{BindFlags, SyncState, PAGE_BYTES, VA_START};
+    use crate::{BindFlags, SyncState, MAX_BUFFER_BYTES, PAGE_BYTES, VA_START};
     use std::vec::Vec;
 
     #[derive(Default)]
     struct Fake {
         calls: Vec<Command>,
+        /// Every destroy the backend was asked to perform, with the exact binding batch the
+        /// session derived — recorded before the injected failure so a test can distinguish
+        /// "never called" from "called and refused". — TIMBERDOODLE
+        destroyed: Vec<(u32, Vec<Binding>)>,
         fail: Option<Status>,
         submit_error: Option<SubmitError>,
         topology: Option<u64>,
@@ -387,6 +464,10 @@ mod tests {
         }
         fn bind(&mut self, b: Binding) -> Result<(), Status> {
             self.record(Command::VmBind(b))
+        }
+        fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), Status> {
+            self.destroyed.push((id, bindings.to_vec()));
+            self.record(Command::BufferDestroy { buffer: id })
         }
         fn create_group(&mut self) -> Result<(), Status> {
             self.record(Command::GroupCreate { vm: 1 })
@@ -510,7 +591,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GetTopology),
             Ok(topology)
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
         backend.topology = Some(0);
         assert_eq!(
@@ -555,7 +636,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GetMmuFeatures),
             Ok(mmu)
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
         backend.mmu_features = Some(0);
         assert_eq!(
@@ -601,7 +682,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GetCoreFeatures),
             Ok(core)
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
         // The board's measured word is exactly zero: variant byte 0 is the pinned table's
         // G610 entry, so zero is a valid attestation, not a failed read, and the session
@@ -654,7 +735,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
             Ok(Response::GroupCreated { group: 1 })
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
     }
 
@@ -698,7 +779,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
             Ok(Response::GroupCreated { group: 1 })
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
     }
 
@@ -748,7 +829,7 @@ mod tests {
             send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
             Ok(Response::GroupCreated { group: 1 })
         );
-        assert!(session.buffers.iter().all(|bytes| *bytes == 0));
+        assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));
     }
 
@@ -866,23 +947,30 @@ mod tests {
             send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
             Err(Status::NoMemory)
         );
-        assert_eq!(
-            send(
-                &mut s,
-                &mut b,
-                Command::BufferCreate {
+        // The failed create reached the backend but committed nothing, so the ID it would
+        // have received is still issued to the next successful allocation. — TIMBERDOODLE
+        let budget_cap = (MAX_TOTAL_BUFFER_BYTES / MAX_BUFFER_BYTES) as u32;
+        for expected in 1..=budget_cap {
+            assert_eq!(
+                send(
+                    &mut s,
+                    &mut b,
+                    Command::BufferCreate {
+                        bytes: MAX_BUFFER_BYTES
+                    }
+                ),
+                Ok(Response::BufferCreated {
+                    buffer: expected,
                     bytes: MAX_BUFFER_BYTES
-                }
-            ),
-            Ok(Response::BufferCreated {
-                buffer: 1,
-                bytes: MAX_BUFFER_BYTES
-            })
-        );
+                })
+            );
+        }
+        let calls = b.calls.len();
         assert_eq!(
             send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
             Err(Status::NoMemory)
         );
+        assert_eq!(b.calls.len(), calls);
         b.fail = Some(Status::NoMemory);
         assert_eq!(
             send(&mut s, &mut b, Command::VmBind(binding())),
@@ -894,7 +982,7 @@ mod tests {
         );
     }
     #[test]
-    fn object_quotas_and_partial_map_failure_bound_the_session() {
+    fn budget_and_binding_quotas_and_partial_map_failure_bound_the_session() {
         let (mut s, mut b) = (Session::default(), Fake::default());
         assert_eq!(
             send(&mut s, &mut b, Command::GroupCreate { vm: 1 }),
@@ -902,8 +990,16 @@ mod tests {
         );
         assert!(b.calls.is_empty());
         send(&mut s, &mut b, Command::VmCreate).unwrap();
-        for _ in 0..MAX_BUFFERS {
-            send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        let budget_cap = (MAX_TOTAL_BUFFER_BYTES / MAX_BUFFER_BYTES) as u32;
+        for _ in 0..budget_cap {
+            send(
+                &mut s,
+                &mut b,
+                Command::BufferCreate {
+                    bytes: MAX_BUFFER_BYTES,
+                },
+            )
+            .unwrap();
         }
         let calls = b.calls.len();
         assert_eq!(
@@ -970,5 +1066,200 @@ mod tests {
             send(&mut s, &mut b, Command::SyncRead { group: 1, point: 2 }),
             Err(Status::DeviceLost)
         );
+    }
+
+    #[test]
+    fn buffer_create_is_on_demand_and_destroy_returns_budget() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        // The fixed four-entry table is gone: eight small allocations all succeed, each with
+        // its own monotonically issued ID. — TIMBERDOODLE
+        for expected in 1..=8 {
+            assert_eq!(
+                send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
+                Ok(Response::BufferCreated {
+                    buffer: expected,
+                    bytes: PAGE_BYTES
+                })
+            );
+        }
+        assert_eq!(s.buffers.len(), 8);
+        assert_eq!(s.total_buffer_bytes, 8 * PAGE_BYTES);
+        // Destroy returns its bytes to the budget and never reissues its ID.
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 3 }),
+            Ok(Response::BufferDestroyed { buffer: 3 })
+        );
+        assert_eq!(s.total_buffer_bytes, 7 * PAGE_BYTES);
+        assert!(!s.buffers.iter().any(|allocation| allocation.id == 3));
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }),
+            Ok(Response::BufferCreated {
+                buffer: 9,
+                bytes: PAGE_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn buffer_destroy_rejects_unknown_foreign_and_double_ids_without_backend_calls() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        // No VM yet: the object does not exist and the refusal must not reach the backend.
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::BadState)
+        );
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        let calls = b.calls.len();
+        // An ID never issued in this session — a foreign or stale ID — is NotFound.
+        for buffer in [2, u32::MAX] {
+            assert_eq!(
+                send(&mut s, &mut b, Command::BufferDestroy { buffer }),
+                Err(Status::NotFound)
+            );
+        }
+        assert_eq!(b.calls.len(), calls);
+        assert!(b.destroyed.is_empty());
+        send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }).unwrap();
+        let calls = b.calls.len();
+        // The double destroy is NotFound too: the ID was consumed by the first success.
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::NotFound)
+        );
+        assert_eq!(b.calls.len(), calls);
+        assert_eq!(b.destroyed.len(), 1);
+    }
+
+    #[test]
+    fn buffer_destroy_is_refused_once_the_group_exists_under_the_frozen_model() {
+        let (mut s, mut b) = ready();
+        let calls = b.calls.len();
+        // G8a cannot unmap a VA range a live group might reference; G8b owns that. The refusal
+        // is recoverable and the frozen session keeps working. — TIMBERDOODLE
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::BadState)
+        );
+        assert_eq!(b.calls.len(), calls);
+        assert!(b.destroyed.is_empty());
+        assert_eq!(s.buffers.len(), 1);
+        assert_eq!(s.total_buffer_bytes, PAGE_BYTES);
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        send(&mut s, &mut b, job(1)).unwrap();
+    }
+
+    #[test]
+    fn buffer_destroy_unbinds_every_mapping_before_releasing_the_allocation() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: 2 * PAGE_BYTES,
+            },
+        )
+        .unwrap();
+        // Two disjoint mappings of the one buffer, plus one mapping of a second buffer that
+        // must survive the destroy. — TIMBERDOODLE
+        for (va, offset) in [(VA_START, 0), (VA_START + 4 * PAGE_BYTES, PAGE_BYTES)] {
+            send(
+                &mut s,
+                &mut b,
+                Command::VmBind(Binding {
+                    va,
+                    offset,
+                    bytes: PAGE_BYTES,
+                    ..binding()
+                }),
+            )
+            .unwrap();
+        }
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::VmBind(Binding {
+                buffer: 2,
+                va: VA_START + 8 * PAGE_BYTES,
+                ..binding()
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Ok(Response::BufferDestroyed { buffer: 1 })
+        );
+        // The backend saw exactly the two live mappings that name buffer 1 — never another
+        // buffer's binding, never the whole table. — TIMBERDOODLE
+        assert_eq!(b.destroyed.len(), 1);
+        let (id, unbound) = &b.destroyed[0];
+        assert_eq!(*id, 1);
+        assert_eq!(unbound.len(), 2);
+        assert!(unbound.iter().all(|binding| binding.buffer == 1));
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert!(s
+            .bindings
+            .iter()
+            .flatten()
+            .all(|binding| binding.buffer == 2));
+        assert!(!s.buffers.iter().any(|allocation| allocation.id == 1));
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::VmBind(Binding {
+                    va: VA_START + 16 * PAGE_BYTES,
+                    ..binding()
+                })
+            ),
+            Err(Status::NotFound)
+        );
+    }
+
+    #[test]
+    fn buffer_destroy_failure_keeps_the_allocation_retryable_or_retires_on_uncertainty() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
+        // A recoverable refusal changed nothing: the mapping is still live and a retry works.
+        b.fail = Some(Status::NoMemory);
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::NoMemory)
+        );
+        assert_eq!(s.buffers.len(), 1);
+        assert_eq!(s.total_buffer_bytes, PAGE_BYTES);
+        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Ok(Response::BufferDestroyed { buffer: 1 })
+        );
+        assert!(s.buffers.is_empty());
+        assert_eq!(s.total_buffer_bytes, 0);
+        assert!(s.bindings.iter().all(Option::is_none));
+
+        // Uncertainty — a partial unmap or a failed live flush — retires the session before
+        // any metadata commits, so a later destroy can never double-free the backing.
+        // — TIMBERDOODLE
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        b.fail = Some(Status::DeviceLost);
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(s.buffers.len(), 1);
+        assert_eq!(s.total_buffer_bytes, PAGE_BYTES);
+        let calls = b.calls.len();
+        assert_eq!(
+            send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(b.calls.len(), calls);
     }
 }
