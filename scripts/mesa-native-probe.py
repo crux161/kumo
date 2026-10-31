@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j647
 #j650
 #j651
 #j652
 #j653
+#j738
 """Compile/link the native Mesa property boundary; optionally run a modeled-service UEFI proof.
 
 No download, image installation or hardware reset. See toolchain/mesa/README.md.
@@ -142,8 +142,11 @@ def main():
     math = (sysroot / "include/math.h").read_text()
     for name in ("isfinite", "isinf", "isnan", "isnormal"):
         declaration = f"int {name}(double x);"
-        assert math.count(declaration) == 1, f"recheck math-header workaround: {name}"
-        math = math.replace(declaration, f"int ({name})(double x);")
+        if declaration in math:
+            assert math.count(declaration) == 1, f"recheck math-header workaround: {name}"
+            math = math.replace(declaration, f"int ({name})(double x);")
+        else:
+            assert f"#define {name}(x)" in math, f"missing classification macro: {name}"
     (compat / "math.h").write_text(math)
 
     cc = shutil.which("clang")

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j736
+#j738
 """Build G7l's C++ runtime and optionally prove it in a disposable full UEFI image."""
 import argparse
 from pathlib import Path
@@ -13,7 +14,7 @@ OUT = ROOT / "build/mesa-drivers/result/cxx"
 GREEN = b"G7l C++ runtime green: static init, virtual dispatch, vector, sort, guarded statics, mutex, hash, TLS, exit"
 
 
-def stage_image(source, destination, elf):
+def stage_image(source, destination, elf, commands=b"dmesg -n 6\nrelibc g7l\necho G7l-after-launch\n"):
     assert not destination.exists(), f"refusing to replace existing image copy: {destination}"
     shutil.copytree(source, destination)
     path = destination / "EFI/KUMO/initrd.img"
@@ -28,7 +29,7 @@ def stage_image(source, destination, elf):
         offset, size = struct.unpack_from("<QQ", original, entry + 64)
         data = original[offset:offset + size]
         if name == b"etc/autoexec":
-            data = b"dmesg -n 6\nrelibc g7l\necho G7l-after-launch\n"
+            data = commands
             found.add(name)
         elif name == b"bin/relibc-smoke":
             data = elf.read_bytes()
@@ -39,10 +40,11 @@ def stage_image(source, destination, elf):
     path.write_bytes(out)
 
 
-def boot(image, timeout):
-    work = OUT / f"qemu-{time.time_ns()}"
+def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", green=GREEN, tag="G7l"):
+    work = elf.parent / f"qemu-{time.time_ns()}"
     work.mkdir(parents=True)
-    stage_image(image, work / "esp", OUT / "cxx-smoke")
+    commands = f"dmesg -n 6\nrelibc {tag.lower()}\necho {tag}-after-launch\n".encode()
+    stage_image(image, work / "esp", elf, commands)
     dtb = work / "esp/EFI/KUMO/dtb/qcom/sc8280xp-lenovo-thinkpad-x13s.dtb"
     dtb.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["qemu-system-aarch64", "-machine", f"virt,gic-version=3,dumpdtb={dtb}",
@@ -51,7 +53,7 @@ def boot(image, timeout):
     firmware = Path("/opt/homebrew/share/qemu")
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
     serial = work / "serial.log"
-    print(f"G7l UEFI proof artifacts: {work}", flush=True)
+    print(f"{tag} UEFI proof artifacts: {work}", flush=True)
     with (work / "qemu.log").open("wb") as log:
         process = subprocess.Popen([
             "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a72",
@@ -66,15 +68,15 @@ def boot(image, timeout):
             while time.monotonic() < deadline:
                 assert process.poll() is None, f"QEMU exited; inspect {work}"
                 transcript = serial.read_bytes() if serial.exists() else b""
-                if b"G7l C++ runtime FAILED" in transcript:
-                    raise RuntimeError(f"C++ proof failed; inspect {serial}")
-                if all(marker in transcript for marker in (GREEN, b"G7l-after-launch", b"INDRA login:")):
+                if (label + " FAILED").encode() in transcript:
+                    raise RuntimeError(f"{tag} proof failed; inspect {serial}")
+                if all(marker in transcript for marker in (green, (tag + "-after-launch").encode(), b"INDRA login:")):
                     break
                 time.sleep(0.1)
             else:
-                raise RuntimeError(f"C++ proof timed out; inspect {serial}")
-            before, proof = transcript.split(b"G7l C++ runtime begin", 1)
-            assert proof.count(GREEN) == 1 and b"TOWER" not in proof and b"FAILED" not in proof
+                raise RuntimeError(f"{tag} proof timed out; inspect {serial}")
+            before, proof = transcript.split((label + " begin").encode(), 1)
+            assert proof.count(green) == 1 and b"TOWER" not in proof and b"FAILED" not in proof
             # Standing QEMU board-UART exception, restricted to pre-proof faults.
             # It is the same allowance as thread-tls-smoke.py. — SAKER
             faults = before.split(b"TOWER (reversed): MICROSERVICE CONTAINED")[1:]
@@ -82,7 +84,7 @@ def boot(image, timeout):
             for fault in faults:
                 assert b"cause=FAULT" in fault and b"FAR=0x0000000011000000" in fault
                 assert b"synchronous external abort on read" in fault
-            print(GREEN.decode(), flush=True)
+            print(green.decode(), flush=True)
         finally:
             process.terminate()
             try:

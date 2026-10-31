@@ -1,9 +1,26 @@
-<!-- j506 -->
 <!-- j507 -->
 <!-- j508 -->
 <!-- j509 -->
 <!-- j736 -->
+<!-- j738 -->
 # KUMO relibc overlay
+
+G7m enables relibc's pinned openlibm implementation (`math_libm`) and adds
+`open_memstream` for Mesa's compiler diagnostics. The memory writer uses C-owned
+storage, publishes its buffer on flush/close, preserves seeks and zero-filled
+holes, and returns ownership to the caller for `free`. It creates no descriptor;
+`fileno` refuses with `EBADF`. The SDK installs the pinned openlibm headers and
+generates math constants/classification declarations usable from both C and C++.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/mesa-libc-smoke.py --run
+```
+
+The QEMU proof covers growth, overwrite, seek, holes, empty streams, close/free,
+invalid operations and the 26 measured math exports. The C++ regression also
+passes; the remaining Mesa link gaps are DRM/synchronization and build IDs.
+Implementation and acceptance decisions — SAKER, 2026-10-31 (J738).
 
 G7l's C++ acceptance adds a nonzero initialized TLS variable. It exposed a
 static-startup bug: `STATIC_TCB_MASTER.offset` used the segment's rounded size,

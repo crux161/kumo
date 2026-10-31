@@ -1,5 +1,6 @@
 #!/bin/sh
 #j511
+#j738
 # Build KUMO's C sysroot: relibc's installed headers plus its static archive.
 #
 # relibc generates most of its headers from Rust with cbindgen. That tool's whole
@@ -63,8 +64,8 @@ mkdir -p "$SYSROOT/include" "$SYSROOT/lib"
 cp "$archive" "$SYSROOT/lib/libc.a"
 cp -R "$STAGE/include/." "$SYSROOT/include/"
 # relibc links openlibm for the math surface; its headers ship beside it.
-cp "$STAGE/openlibm/include"/*.h "$SYSROOT/include/" 2>/dev/null || true
-cp "$STAGE/openlibm/src"/*.h "$SYSROOT/include/" 2>/dev/null || true
+cp "$ROOT/vendor/relibc/openlibm/include"/*.h "$SYSROOT/include/" 2>/dev/null || true
+cp "$ROOT/vendor/relibc/openlibm/src"/*.h "$SYSROOT/include/" 2>/dev/null || true
 
 generated=0
 failed=0

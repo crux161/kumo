@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j735
+#j738
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -58,12 +59,18 @@ def stage():
     math = (include / "math.h").read_text()
     for name in ("isfinite", "isinf", "isnan", "isnormal"):
         old = f"int {name}(double x);"
-        assert math.count(old) == 1, f"recheck math header repair: {name}"
-        math = math.replace(old, f"#ifndef __cplusplus\nint ({name})(double x);\n#endif")
-    assert math.count("#define\tNAN\t\t(__nan.__uf)") == 1
-    math = math.replace("#define\tNAN\t\t(__nan.__uf)", '#define NAN __builtin_nanf("")')
-    assert "#define HUGE_VAL " not in math
-    (include / "math.h").write_text("#define HUGE_VAL __builtin_huge_val()\n" + math)
+        if old in math:
+            assert math.count(old) == 1, f"recheck math header repair: {name}"
+            math = math.replace(old, f"#ifndef __cplusplus\nint ({name})(double x);\n#endif")
+        else:
+            assert f"#define {name}(x)" in math, f"missing classification macro: {name}"
+    if "#define\tNAN\t\t(__nan.__uf)" in math:
+        math = math.replace("#define\tNAN\t\t(__nan.__uf)", '#define NAN __builtin_nanf("")')
+    else:
+        assert '#define NAN __builtin_nanf("")' in math, "recheck NAN header"
+    if "#define HUGE_VAL " not in math:
+        math = "#define HUGE_VAL __builtin_huge_val()\n" + math
+    (include / "math.h").write_text(math)
     for directory in ("include", "src"):
         for header in (ROOT / "vendor/relibc/openlibm" / directory).glob("*.h"):
             shutil.copyfile(header, include / header.name)
