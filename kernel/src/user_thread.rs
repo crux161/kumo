@@ -41,6 +41,17 @@ static USER_WAKE_KEPT_CHILD: AtomicU32 = AtomicU32::new(0);
 static USER_RESUME_MAX_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "none")]
 static USER_RESUME_OVER_1S: AtomicU32 = AtomicU32::new(0);
+//j729
+#[cfg(target_os = "none")]
+static SORA_AWAY_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_MAX_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_RESUMES: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static SORA_PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
@@ -1363,6 +1374,9 @@ fn dispatch_context(
     match decision {
         Decision::Switch { from, to } => {
             s.switches = s.switches.saturating_add(1);
+            //j729
+            #[cfg(target_os = "none")]
+            let user_was_running = matches!(s.user_thread.state(), ThreadState::Running);
             let prev = if let Some(from_id) = from {
                 if from_id == s.user_thread.koid() {
                     if matches!(s.user_thread.state(), ThreadState::Running) {
@@ -1409,6 +1423,37 @@ fn dispatch_context(
                 set_active_aspace_root(s.kernel_ttbr0);
                 &s.boot_ctx as *const ThreadContext
             };
+            //j729
+            #[cfg(target_os = "none")]
+            {
+                let user_koid = s.user_thread.koid();
+                if from == Some(user_koid) && to != user_koid {
+                    if user_was_running {
+                        SORA_AWAY_AT.store(kumo_hal::active::monotonic_nanos(), Ordering::Relaxed);
+                        SORA_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if to == user_koid {
+                    let away_at = SORA_AWAY_AT.swap(0, Ordering::Relaxed);
+                    if away_at != 0 {
+                        let delta = kumo_hal::active::monotonic_nanos().saturating_sub(away_at);
+                        SORA_AWAY_TOTAL_NS.fetch_add(delta, Ordering::Relaxed);
+                        SORA_AWAY_MAX_NS.fetch_max(delta, Ordering::Relaxed);
+                        let n = SORA_AWAY_RESUMES
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1);
+                        if n & 0x1f == 0 {
+                            crate::klog_at!(
+                                kumo_abi::sys::log_level::NOTICE,
+                                "sched: user-away resumes={} preempts={} max={}ms total={}ms\n",
+                                n,
+                                SORA_PREEMPT_COUNT.load(Ordering::Relaxed),
+                                SORA_AWAY_MAX_NS.load(Ordering::Relaxed) / 1_000_000,
+                                SORA_AWAY_TOTAL_NS.load(Ordering::Relaxed) / 1_000_000
+                            );
+                        }
+                    }
+                }
+            }
             //j726
             #[cfg(target_os = "none")]
             if to == s.user_thread.koid() {
