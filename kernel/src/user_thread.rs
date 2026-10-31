@@ -23,6 +23,24 @@ use kumo_hal::active::{switch_context, ThreadContext, TowerContext, TowerThreadR
 use crate::mm::PAGE_SIZE;
 use crate::object::ObjectManager;
 use crate::sched::{ClassId, Decision, Dispatcher, Priority};
+
+//j726 — ready-to-run lateness. The J724 SVC payer readies a blocked Sora, but the
+//strict-priority dispatcher keeps the current child (Priority 63 outranks her 64), so the
+//wake completes only at a moment when no child is runnable. These counters time that gap:
+//when she was made ready, whether the dispatcher kept the child, and how late she resumed.
+// — TIMBERDOODLE
+#[cfg(target_os = "none")]
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "none")]
+static USER_READY_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static USER_WAKE_READIES: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static USER_WAKE_KEPT_CHILD: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static USER_RESUME_MAX_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static USER_RESUME_OVER_1S: AtomicU32 = AtomicU32::new(0);
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
@@ -1115,12 +1133,35 @@ pub fn reschedule_if_pending_after_svc() {
             s.user_thread.ready();
             s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
             s.safe_reschedule_pending = true;
+            //j726
+            #[cfg(target_os = "none")]
+            {
+                USER_READY_AT.store(kumo_hal::active::monotonic_nanos(), Ordering::Relaxed);
+                let readies = USER_WAKE_READIES
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                if readies & 0x3f == 0 {
+                    crate::klog_at!(
+                        kumo_abi::sys::log_level::NOTICE,
+                        "sched: user-wake readies={} kept-child={} ready-to-run-max={}ms over1s={}\n",
+                        readies,
+                        USER_WAKE_KEPT_CHILD.load(Ordering::Relaxed),
+                        USER_RESUME_MAX_NS.load(Ordering::Relaxed) / 1_000_000,
+                        USER_RESUME_OVER_1S.load(Ordering::Relaxed)
+                    );
+                }
+            }
         }
         if !s.safe_reschedule_pending {
             return;
         }
         let decision = s.dispatcher.reschedule_current();
         let switch = dispatch_context(s, decision);
+        //j726
+        #[cfg(target_os = "none")]
+        if switch.is_none() && s.user_thread.state() == ThreadState::Ready {
+            USER_WAKE_KEPT_CHILD.fetch_add(1, Ordering::Relaxed);
+        }
         if switch.is_some() || s.dispatcher.runnable_count() == 0 {
             s.safe_reschedule_pending = false;
         }
@@ -1368,6 +1409,26 @@ fn dispatch_context(
                 set_active_aspace_root(s.kernel_ttbr0);
                 &s.boot_ctx as *const ThreadContext
             };
+            //j726
+            #[cfg(target_os = "none")]
+            if to == s.user_thread.koid() {
+                let ready_at = USER_READY_AT.swap(0, Ordering::Relaxed);
+                if ready_at != 0 {
+                    let delta = kumo_hal::active::monotonic_nanos().saturating_sub(ready_at);
+                    USER_RESUME_MAX_NS.fetch_max(delta, Ordering::Relaxed);
+                    if delta >= 1_000_000_000 {
+                        let over = USER_RESUME_OVER_1S.fetch_add(1, Ordering::Relaxed);
+                        if over & 0x3 == 0 {
+                            crate::klog_at!(
+                                kumo_abi::sys::log_level::NOTICE,
+                                "sched: user resumed ready-to-run={}ms late (over1s={})\n",
+                                delta / 1_000_000,
+                                over + 1
+                            );
+                        }
+                    }
+                }
+            }
             Some((prev, next))
         }
         Decision::Idle | Decision::Continue(_) => None,
