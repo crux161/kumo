@@ -2113,6 +2113,8 @@ fn arm_clock_watch(port: Handle) -> Option<(Handle, Handle)> {
         kumo_rt::clock_get() + GPU_CLOCK_WATCH_PERIOD_NS,
         Ordering::Relaxed,
     );
+    //j728
+    GPU_CLOCK_POPS_AT_ARM.store(GPU_CLOCK_POPS.load(Ordering::Relaxed), Ordering::Relaxed);
     arm_gpu_restart(port, GPU_CLOCK_WATCH_PERIOD_NS)
 }
 
@@ -2120,21 +2122,29 @@ fn arm_clock_watch(port: Handle) -> Option<(Handle, Handle)> {
 /// Read and log one GPU clock sample from the read-only CRU mapping: the source/divider
 /// decode plus the raw select, gate and GPLL words, so a moving clock is visible in the
 /// same log as the JOB completion times. — TIMBERDOODLE
-fn log_gpu_clock_sample() {
+fn log_gpu_clock_sample(pops: u64, prep_ns: u64) {
     if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    //j728
+    let log_start = kumo_rt::clock_get();
     let read = |offset: u64| unsafe { ((GPU_CLOCK_CRU_VA + offset) as *const u32).read_volatile() };
+    let r0 = kumo_rt::clock_get();
     let clksel158 = read(GPU_CLOCK_O_CLKSEL158);
-    let clock = sora::decode_gpu_clock(clksel158, read(GPU_CLOCK_O_CLKSEL161));
+    let clksel161 = read(GPU_CLOCK_O_CLKSEL161);
+    let gate66 = read(GPU_CLOCK_O_GATE66);
+    let gate67 = read(GPU_CLOCK_O_GATE67);
+    let gpll0 = read(GPU_CLOCK_O_GPLL0);
+    let r1 = kumo_rt::clock_get();
+    let clock = sora::decode_gpu_clock(clksel158, clksel161);
     log(b"clk-gpu: clksel158=");
     log_hex(u64::from(clksel158));
     log(b" gate66=");
-    log_hex(u64::from(read(GPU_CLOCK_O_GATE66)));
+    log_hex(u64::from(gate66));
     log(b" gate67=");
-    log_hex(u64::from(read(GPU_CLOCK_O_GATE67)));
+    log_hex(u64::from(gate67));
     log(b" gpll0=");
-    log_hex(u64::from(read(GPU_CLOCK_O_GPLL0)));
+    log_hex(u64::from(gpll0));
     log(b" src=");
     log(clock.parent_name().as_bytes());
     log(b" div=");
@@ -2147,17 +2157,21 @@ fn log_gpu_clock_sample() {
         }
         None => log(b" rate=unknown"),
     }
-    //j721
-    // The serve-loop wake delay: monotonic now minus the due time recorded at arm. The
-    // churn boots showed the serial-visible interval growing to ~93 s; this records the
-    // same fact in-guest, one line per sample. — TIMBERDOODLE
+    //j728
+    // Decompose the sample's own cycle: pops on the serve port since the arm, the
+    // unbind/close prep, the CRU register reads, and the logging so far, so a late
+    // sample names its hop. — TIMBERDOODLE
     let now = kumo_rt::clock_get();
     let due = GPU_CLOCK_WATCH_DUE_NS.load(Ordering::Relaxed);
     let wake = GPU_CLOCK_WAKE_NS.load(Ordering::Relaxed);
-    //j723
-    // late_ns is due→now; wake_ns is due→the serve loop's last port wake. The difference
-    // is this sample's own logging cost, so a late timer and a slow log are separable.
-    // — TIMBERDOODLE
+    log(b" pops=");
+    log_hex(pops);
+    log(b" prep_ns=");
+    log_hex(prep_ns);
+    log(b" read_ns=");
+    log_hex(r1.saturating_sub(r0));
+    log(b" log_ns=");
+    log_hex(now.saturating_sub(log_start));
     log(b" late_ns=");
     log_hex(now.saturating_sub(due));
     log(b" wake_ns=");
@@ -3759,6 +3773,9 @@ static GPU_CLOCK_WATCH_DUE_NS: AtomicU64 = AtomicU64::new(0);
 /// its lateness into wake-side (timer delivery and scheduling) and log-side (sampling
 /// cost). — TIMBERDOODLE
 static GPU_CLOCK_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+//j728
+static GPU_CLOCK_POPS: AtomicU64 = AtomicU64::new(0);
+static GPU_CLOCK_POPS_AT_ARM: AtomicU64 = AtomicU64::new(0);
 
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
@@ -5364,6 +5381,8 @@ extern "C" fn sora_main(
             // Capture the wake instant before any dispatch, so the clock sampler can tell a
             // late wake from slow logging. — TIMBERDOODLE
             GPU_CLOCK_WAKE_NS.store(kumo_rt::clock_get(), Ordering::Relaxed);
+            //j728
+            GPU_CLOCK_POPS.fetch_add(1, Ordering::Relaxed);
             if display_koid == Some(source) {
                 if let Some(b) = display_broker.as_ref() {
                     b.serve(initrd);
@@ -5553,9 +5572,15 @@ extern "C" fn sora_main(
                 let Some((timer, _)) = clock_watch_timer.take() else {
                     continue;
                 };
+                //j728
+                let pops = GPU_CLOCK_POPS
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(GPU_CLOCK_POPS_AT_ARM.load(Ordering::Relaxed));
+                let t0 = kumo_rt::clock_get();
                 let _ = port_unbind(port, timer);
                 let _ = handle_close(timer);
-                log_gpu_clock_sample();
+                let t1 = kumo_rt::clock_get();
+                log_gpu_clock_sample(pops, t1.saturating_sub(t0));
                 match arm_clock_watch(port) {
                     Some(timer) => clock_watch_timer = Some(timer),
                     None => log(b"clk-gpu: watch disarmed\n"),
