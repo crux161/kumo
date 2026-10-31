@@ -1,5 +1,6 @@
 # The measured KUMO C++ runtime — G7l
 <!-- j736 -->
+<!-- j737 -->
 
 Build the G7k tool cache and driver graph first, keeping the offline container:
 
@@ -50,5 +51,5 @@ copies at the variant-I segment start. The unchanged zero-filled TLS smoke had
 not exercised that case. Gallium's initialized TLS dispatch pointer needs the
 same correction. The other relibc platform paths retain their previous offset.
 
-G7l's QEMU acceptance passes. Metal acceptance is still required before the
-gate is closed. Runtime and build decisions — SAKER, 2026-10-31.
+G7l passes both full UEFI QEMU and Orange Pi 5 Plus metal acceptance (J737).
+The same smoke returned through its static destructor and reached login over PXE. Runtime and build decisions — SAKER, 2026-10-31.
