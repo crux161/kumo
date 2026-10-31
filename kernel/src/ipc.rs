@@ -1,8 +1,8 @@
-//j399
 //j409
 //j618
 //j708
 //j719
+//j731
 
 use alloc::vec::Vec;
 
@@ -395,6 +395,17 @@ impl IpcRegistry {
             }
         }
         Err(IpcError::NotChannel)
+    }
+
+    //j731
+    /// Registry sizes for the J731 census. No path removes a port, so `port_count` is every
+    /// port created since boot. — TIMBERDOODLE
+    pub fn port_count(&self) -> usize {
+        self.ports.len()
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
     }
 
     fn port_mut_by_koid(&mut self, koid: KoId) -> Result<&mut Port, IpcError> {

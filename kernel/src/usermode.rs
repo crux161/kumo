@@ -11,12 +11,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j627
-//j628
 //j629
 //j630
 //j660
 //j719
+//j731
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -30,6 +29,56 @@ static IRQ_BUSY_SKIPS: AtomicU32 = AtomicU32::new(0);
 static TIMER_TICK_SKIPS: AtomicU32 = AtomicU32::new(0);
 static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
 static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
+
+//j731
+// Engine census: the length of every list a dispatched syscall or an interrupt walks, and the
+// window maxima of dispatch's four parts, printed at most every 10 s as Sora enters `PortWait`.
+// Her sample line is complete by then, so the record cannot land inside it (J729's
+// interleave). — TIMBERDOODLE
+#[cfg(target_os = "none")]
+static CENSUS_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+fn log_engine_census_if_due() {
+    let now = kumo_hal::active::monotonic_nanos();
+    let last = CENSUS_AT_NS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 10_000_000_000 {
+        return;
+    }
+    CENSUS_AT_NS.store(now, Ordering::Relaxed);
+    let (c, sora_live, sora_slots) = with_sora(|sora| {
+        let table = sora.process.handles();
+        (
+            sora.engine.census(Some(&sora.process)),
+            table.live_count(),
+            table.slot_count(),
+        )
+    });
+    let ([call, ctx, irq, vmo], calls) = crate::syscall::take_dispatch_maxima();
+    crate::klog_at!(
+        kumo_abi::sys::log_level::NOTICE,
+        "census: ports={} chans={} binds={} timers={} irqs={} vmos={}/{}dma ctxs={} dvmaps={} procs={} handles={}/{} sora={}/{} | n={} max-us call={} ctx={} irq={} vmo={}\n",
+        c.ports,
+        c.channels,
+        c.port_bindings,
+        c.timers,
+        c.interrupts,
+        c.vmos,
+        c.dma_vmos,
+        c.device_ctxs,
+        c.device_vmar_mappings,
+        c.processes,
+        c.handles,
+        c.handle_slots,
+        sora_live,
+        sora_slots,
+        calls,
+        call / 1_000,
+        ctx / 1_000,
+        irq / 1_000,
+        vmo / 1_000
+    );
+}
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -2108,6 +2157,9 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 return;
             }
         }
+        //j731
+        #[cfg(target_os = "none")]
+        log_engine_census_if_due();
         r[0] = wait_sora_port_without_borrow(port);
         crate::user_thread::reschedule_if_pending_after_svc();
         return;

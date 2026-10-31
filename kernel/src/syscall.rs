@@ -1,13 +1,12 @@
-//j634
-//j635
-//j659
 //j660
 //j708
 //j719
 //j725
+//j731
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
@@ -975,6 +974,54 @@ pub(crate) fn kernel_device_frame_allowed(base: u64, len: u64) -> bool {
         let _ = (base, len);
         true
     }
+}
+
+//j731
+/// The length of every engine list a dispatched syscall or an interrupt walks, for the J731
+/// census. `handle_slots` counts allocated handle slots, closed ones included (handle values are
+/// never reused); `handles` counts the live ones. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineCensus {
+    pub ports: usize,
+    pub channels: usize,
+    pub port_bindings: usize,
+    pub timers: usize,
+    pub interrupts: usize,
+    pub vmos: usize,
+    pub dma_vmos: usize,
+    pub device_ctxs: usize,
+    pub device_vmar_mappings: usize,
+    pub processes: usize,
+    pub handles: usize,
+    pub handle_slots: usize,
+}
+
+/// Window maxima of one `dispatch`'s four parts (the call, then the device-context, interrupt
+/// and VMO retire passes) and the window's call count; the census record takes and clears them.
+/// The host build stamps zero, so these stay zero there. — TIMBERDOODLE
+static DISPATCH_PART_MAX_NS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn dispatch_stamp() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        kumo_hal::active::monotonic_nanos()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
+
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn take_dispatch_maxima() -> ([u64; 4], u64) {
+    let max = core::array::from_fn(|part| DISPATCH_PART_MAX_NS[part].swap(0, Ordering::Relaxed));
+    (max, DISPATCH_CALLS.swap(0, Ordering::Relaxed))
 }
 
 #[derive(Clone, Debug)]
@@ -2970,13 +3017,58 @@ impl SyscallEngine {
     }
 
     pub fn dispatch(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
+        //j731
+        let mut stamps = [dispatch_stamp(); 5];
         let result = self.dispatch_inner(process, call);
+        stamps[1] = dispatch_stamp();
         // The inner call has dropped its removed entries. This also catches grants
         // discarded by IPC before returning to userspace. — KESTREL
         self.retire_device_contexts();
+        stamps[2] = dispatch_stamp();
         self.retire_interrupts();
+        stamps[3] = dispatch_stamp();
         self.retire_vmos(Some(process));
+        stamps[4] = dispatch_stamp();
+        for (part, max) in DISPATCH_PART_MAX_NS.iter().enumerate() {
+            max.fetch_max(
+                stamps[part + 1].saturating_sub(stamps[part]),
+                Ordering::Relaxed,
+            );
+        }
+        DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
         result
+    }
+
+    //j731
+    /// Count every engine list a dispatched syscall or an interrupt walks. `caller` adds a
+    /// process the engine does not own (Sora's) to the handle totals. — TIMBERDOODLE
+    pub fn census(&self, caller: Option<&Process>) -> EngineCensus {
+        let (handles, handle_slots) = self
+            .processes
+            .iter()
+            .chain(caller)
+            .map(Process::handles)
+            .fold((0, 0), |(live, slots), table| {
+                (live + table.live_count(), slots + table.slot_count())
+            });
+        EngineCensus {
+            ports: self.ipc.port_count(),
+            channels: self.ipc.channel_count(),
+            port_bindings: self.devices.port_bindings.len(),
+            timers: self.timers.len(),
+            interrupts: self.interrupts.len(),
+            vmos: self.vmos.len(),
+            dma_vmos: self
+                .vmos
+                .iter()
+                .filter(|entry| matches!(entry.vmo.backing(), crate::mm::VmoBacking::Dma { .. }))
+                .count(),
+            device_ctxs: self.devices.device_ctxs.len(),
+            device_vmar_mappings: self.devices.device_vmar_mappings.len(),
+            processes: self.processes.len(),
+            handles,
+            handle_slots,
+        }
     }
 
     fn dispatch_inner(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
@@ -5290,6 +5382,51 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    //j731
+    #[test]
+    fn the_census_counts_each_list_a_dispatch_walks() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let base = engine.census(Some(&process));
+        let KernelCallResult::Handle(port) = engine.dispatch(&mut process, KernelCall::PortCreate)
+        else {
+            panic!("expected a port handle");
+        };
+        let KernelCallResult::Handle(timer) =
+            engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 100 })
+        else {
+            panic!("expected a timer handle");
+        };
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: timer,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let bound = engine.census(Some(&process));
+        assert_eq!(bound.ports, base.ports + 1);
+        assert_eq!(bound.timers, base.timers + 1);
+        assert_eq!(bound.port_bindings, base.port_bindings + 1);
+        assert_eq!(bound.handles, base.handles + 2);
+        assert_eq!(bound.handle_slots, base.handle_slots + 2);
+        // Closing the timer releases its list entry and its binding; the caller's slot stays
+        // allocated, which is what `handle_slots` exists to show. — TIMBERDOODLE
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::HandleClose { handle: timer }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let closed = engine.census(Some(&process));
+        assert_eq!(closed.timers, base.timers);
+        assert_eq!(closed.port_bindings, base.port_bindings);
+        assert_eq!(closed.handles, base.handles + 1);
+        assert_eq!(closed.handle_slots, base.handle_slots + 2);
+        assert_eq!(engine.census(None).handle_slots, 0);
+    }
 
     mod vmo_reclaim {
         use super::*;

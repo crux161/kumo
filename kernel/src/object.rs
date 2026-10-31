@@ -2,6 +2,7 @@
 //j625
 //j632
 //j719
+//j731
 
 use alloc::{
     rc::{Rc, Weak},
@@ -260,6 +261,14 @@ impl HandleTable {
 
     pub fn live_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    //j731
+    /// Every slot this table has allocated, closed ones included: handle values are never
+    /// reused, so [`holds`](Self::holds) and [`live_count`](Self::live_count) walk this many
+    /// entries. The J731 census reports it beside the live count. — TIMBERDOODLE
+    pub fn slot_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn drain(&mut self) -> Vec<OwnedHandleEntry> {
