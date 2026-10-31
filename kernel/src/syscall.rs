@@ -1,8 +1,8 @@
-//j660
 //j708
 //j719
 //j725
 //j731
+//j732
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -2913,6 +2913,47 @@ impl SyscallEngine {
             .map_err(|_| Errno::InvalidArgs)
     }
 
+    //j732
+    /// Clear and forget every CPU mapping a dead child still records, so the VMOs it mapped can
+    /// retire. Teardown drains a process's handles, but a surviving mapping record is a
+    /// reference `retire_vmos` must honour, and the dead `Process` stays in `processes` (J731:
+    /// a finished gpu-client kept every frame buffer it had mapped). Each record goes the way
+    /// `VmarUnmap` takes one, live leaves first. A record whose clear fails is kept, so its VMO
+    /// stays referenced rather than its frames reaching the free list while a leaf still names
+    /// them. Returns (released, kept). — TIMBERDOODLE
+    pub(crate) fn release_process_mappings(&mut self, koid: KoId) -> (usize, usize) {
+        let Some(index) = self.processes.iter().position(|p| p.koid() == koid) else {
+            return (0, 0);
+        };
+        let ttbr0 = self.processes[index].ttbr0;
+        #[cfg(target_os = "none")]
+        let saved = ttbr0.map(|_| {
+            let saved = kumo_hal::active::read_user_aspace_root();
+            // SAFETY: the kernel identity map is always live; the saved root is restored below.
+            unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+            saved
+        });
+        let (mut released, mut kept) = (0, 0);
+        let mut at = self.processes[index].mappings().len();
+        while at > 0 {
+            at -= 1;
+            let mapping = self.processes[index].mappings()[at].0;
+            let cleared = ttbr0.is_none_or(|root| self.clear_from_live_tree(root, mapping).is_ok());
+            if cleared {
+                self.processes[index].remove_mapping_exact(mapping.virt, mapping.len);
+                released += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        #[cfg(target_os = "none")]
+        if let Some(saved) = saved {
+            // SAFETY: restores the root that was live on entry.
+            unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+        }
+        (released, kept)
+    }
+
     /// Look up a process by koid. Returns `None` if not found.
     pub fn process_by_koid(&self, koid: KoId) -> Option<&Process> {
         self.processes.iter().find(|p| p.koid() == koid)
@@ -5414,8 +5455,8 @@ mod tests {
         assert_eq!(bound.port_bindings, base.port_bindings + 1);
         assert_eq!(bound.handles, base.handles + 2);
         assert_eq!(bound.handle_slots, base.handle_slots + 2);
-        // Closing the timer releases its list entry and its binding; the caller's slot stays
-        // allocated, which is what `handle_slots` exists to show. — TIMBERDOODLE
+        // Closing the timer releases its list entry and its binding, and since J732 its
+        // handle entry too, so the scanned slots fall with the live count. — TIMBERDOODLE
         assert_eq!(
             engine.dispatch(&mut process, KernelCall::HandleClose { handle: timer }),
             KernelCallResult::Status(Errno::Ok.status())
@@ -5424,7 +5465,7 @@ mod tests {
         assert_eq!(closed.timers, base.timers);
         assert_eq!(closed.port_bindings, base.port_bindings);
         assert_eq!(closed.handles, base.handles + 1);
-        assert_eq!(closed.handle_slots, base.handle_slots + 2);
+        assert_eq!(closed.handle_slots, base.handle_slots + 1);
         assert_eq!(engine.census(None).handle_slots, 0);
     }
 
@@ -5506,6 +5547,34 @@ mod tests {
             process.remove_mapping_exact(0x2000_0000, PAGE_SIZE);
             assert_eq!(engine.retire_vmos(Some(&process)), 1);
             assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        //j732
+        #[test]
+        fn a_dead_childs_mapping_is_released_and_its_run_retires() {
+            let mut engine = SyscallEngine::new();
+            let mut child = test_process(&mut engine);
+            let (_, koid) = adopt_dma_vmo(&mut engine, &mut child, 0x4000_0000);
+            child.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ,
+                },
+                koid,
+            );
+            let child_koid = child.koid();
+            engine.processes.push(child);
+            let index = engine.processes.len() - 1;
+            // Teardown drains the handles; the mapping record alone still holds the run.
+            drop(engine.processes[index].handles_mut().drain());
+            assert_eq!(engine.retire_vmos(None), 0);
+            assert_eq!(engine.release_process_mappings(child_koid), (1, 0));
+            assert!(engine.processes[index].mappings().is_empty());
+            assert_eq!(engine.retire_vmos(None), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+            assert_eq!(engine.release_process_mappings(KoId(u64::MAX)), (0, 0));
         }
 
         #[test]

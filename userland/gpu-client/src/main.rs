@@ -1,14 +1,10 @@
 #![no_std]
 #![no_main]
-//j646
-//j647
-//j652
-//j682
-//j683
 //j711
 //j712
 //j713
 //j714
+//j732
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -625,6 +621,7 @@ fn churn_run(
             sample_mismatch(churn_cpu)
         };
         if let Some((x, y, got, want)) = first {
+            let _ = kumo_rt::vmar_unmap(churn_cpu, buffer.bytes);
             let _ = kumo_rt::handle_close(buffer.handle);
             log_at(
                 kumo_abi::sys::log_level::ERR,
@@ -666,6 +663,14 @@ fn churn_run(
                     bytes: FRAME_BYTES,
                 })
                 .map_err(|error| churn_api_fail(frame, "churn unbind", error))?;
+        }
+        //j732
+        // Drop the CPU view before the buffer goes: a surviving mapping is a reference the
+        // kernel must honour, and J731's census caught every frame's 160 KiB buffer kept alive
+        // by exactly this map. — TIMBERDOODLE
+        if kumo_rt::vmar_unmap(churn_cpu, buffer.bytes) != 0 {
+            let _ = kumo_rt::handle_close(buffer.handle);
+            return Err(churn_abort(frame, None, "churn buffer unmap failed"));
         }
         client
             .destroy_buffer(&buffer)

@@ -11,11 +11,11 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j629
 //j630
 //j660
 //j719
 //j731
+//j732
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1311,6 +1311,22 @@ fn teardown_process_and_signal(koid: KoId) {
         // Drained entries have now dropped their capability owners. Retain uncertain
         // contexts and retire final IRQ owners before publishing termination; surviving
         // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
+        //j732
+        // A dead child's mapping records are references too: release them before the VMO pass
+        // so the buffers it mapped can retire (J731). Sora's own teardown keeps hers.
+        // — TIMBERDOODLE
+        if !primary {
+            let (released, kept) = sora.engine.release_process_mappings(koid);
+            if kept != 0 {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "teardown: process {} kept {} of {} mappings (clear refused)\n",
+                    koid.0,
+                    kept,
+                    released + kept
+                );
+            }
+        }
         sora.engine.retire_device_contexts();
         sora.engine.retire_interrupts();
         sora.engine.retire_vmos(None);
