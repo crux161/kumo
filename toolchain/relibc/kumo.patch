@@ -479,10 +479,26 @@ index 50a40fe..587f23b 100644
  mod sys;
  
 diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
-index 0bf42bf..2051e7f 100644
 --- a/src/ld_so/mod.rs
 +++ b/src/ld_so/mod.rs
-@@ -128,7 +128,7 @@ fn static_init(
+@@ -110,7 +110,15 @@
+             unsafe {
+                 STATIC_TCB_MASTER.ptr = p_vaddr as *const u8;
+                 STATIC_TCB_MASTER.image_size = p_filesz;
+-                STATIC_TCB_MASTER.offset = valign;
++                // Variant-I static TLS starts at offset zero on KUMO AArch64.
++                // The old end-relative offset silently misplaced nonzero initializers.
++                // Keep the other platforms unchanged. — SAKER, J736
++                STATIC_TCB_MASTER.offset = if cfg!(all(target_os = "kumo", target_arch = "aarch64"))
++                {
++                    0
++                } else {
++                    valign
++                };
+ 
+                 let tcb = Tcb::new(vsize).expect("failed to allocate TCB");
+                 tcb.masters_ptr = ptr::addr_of_mut!(STATIC_TCB_MASTER);
+@@ -128,7 +136,7 @@
      }
  }
  
