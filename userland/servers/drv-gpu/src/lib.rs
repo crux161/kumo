@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j655
 //j707
 //j709
 //j710
 //j733
+//j734
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1386,6 +1386,24 @@ fn leaf_entry(memory: &mut impl TableMemory, transtab: u64, va: u64) -> Result<u
     Ok(table + table_index(va, PAGE_TABLE_LEVELS - 1) as u64 * 8)
 }
 
+//j734
+/// True when no page of `va..va + len` is mapped through `transtab`: each walk either finds no
+/// table on the way or a zero leaf. `map_range` overwrites leaves silently, so a caller placing
+/// new pages beside the firmware's own sections proves the span free first. A block descriptor
+/// counts as mapped. — TIMBERDOODLE
+pub fn range_unmapped(memory: &mut impl TableMemory, transtab: u64, va: u64, len: u64) -> bool {
+    let mut offset = 0u64;
+    while offset < len {
+        match leaf_entry(memory, transtab, va + offset) {
+            Err(TableError::Unmapped { .. }) => {}
+            Ok(entry) if memory.read64(entry) == 0 => {}
+            _ => return false,
+        }
+        offset += PAGE_SIZE;
+    }
+    true
+}
+
 /// Unbind every 4 KiB page named by `ranges`, all-or-nothing: the preflight pass proves every
 /// page is a live page mapping before the clear pass writes a single zero. A partial unmap
 /// would leave the caller unable to say which backing is still reachable, so a mismatch or an
@@ -2019,6 +2037,44 @@ pub fn start_group(
     loop {
         let ack = io.read32(csg_output_va);
         if ack & mask == req & mask {
+            return Ok(ack);
+        }
+        if io.now_ns() >= deadline {
+            return Err(GroupError::AckTimeout { req, ack });
+        }
+        io.delay_us(10);
+    }
+}
+
+//j734
+/// CSG `STATE` value that retires a slot (§9.5; panthor's `CSG_STATE_TERMINATE`).
+pub const CSG_STATE_TERMINATE: u32 = 0;
+
+/// Retire a group the way [`start_group`] starts one: set its STATE to terminate, toggle its GLB
+/// doorbell-request bit, ring doorbell 0, and require the CSG acknowledge to show the terminate
+/// state. No endpoint toggle: panthor queues only the state change for a termination. A second
+/// group raised for a proof leaves the slot as it found it. — TIMBERDOODLE
+pub fn stop_group(
+    io: &mut (impl FirmwareMemory + GlbIo + ClockIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+    slot: u32,
+    timeout_ns: u64,
+) -> Result<u32, GroupError> {
+    let req = (io.read32(csg_input_va) & !CSG_STATE_MASK) | CSG_STATE_TERMINATE;
+    io.write32(csg_input_va, req);
+    let bit = 1u32 << slot;
+    let doorbell_req = io.read_input(GLB_DOORBELL_REQ);
+    let doorbell_ack = io.read_output(GLB_DOORBELL_REQ);
+    io.write_input(
+        GLB_DOORBELL_REQ,
+        (doorbell_req & !bit) | (!doorbell_ack & bit),
+    );
+    io.ring_doorbell();
+    let deadline = io.now_ns().saturating_add(timeout_ns);
+    loop {
+        let ack = io.read32(csg_output_va);
+        if ack & CSG_STATE_MASK == CSG_STATE_TERMINATE {
             return Ok(ack);
         }
         if io.now_ns() >= deadline {
@@ -4028,6 +4084,39 @@ mod g3b_tests {
         );
     }
 
+    //j734
+    #[test]
+    fn range_unmapped_sees_a_live_leaf_a_cleared_leaf_and_a_missing_table() {
+        let (mut memory, mut arena, l0) = arena();
+        // Nothing mapped: no tables on the walk.
+        assert!(range_unmapped(&mut memory, l0, 0x0411_0000, 0x9000));
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0410_0000,
+            0x0020_0000,
+            0x2000,
+            attrs(),
+        )
+        .unwrap();
+        // Same 2 MiB table, untouched pages: a zero leaf.
+        assert!(range_unmapped(&mut memory, l0, 0x0411_0000, 0x9000));
+        // Any live page in the span refuses it, even the last one.
+        assert!(!range_unmapped(&mut memory, l0, 0x0410_0000, 0x1000));
+        assert!(!range_unmapped(&mut memory, l0, 0x040F_F000, 0x3000));
+        unmap_ranges(
+            &mut memory,
+            l0,
+            &[UnmapRange {
+                va: 0x0410_0000,
+                len: 0x2000,
+            }],
+        )
+        .unwrap();
+        assert!(range_unmapped(&mut memory, l0, 0x0410_0000, 0x2000));
+    }
+
     #[test]
     fn unmap_ranges_clears_every_named_page_and_leaves_neighbours() {
         let (mut memory, mut arena, l0) = arena();
@@ -4930,6 +5019,45 @@ mod g4b_tests {
             })
         );
         assert_eq!(io.get(0x6500), 0x01);
+    }
+
+    //j734
+    #[test]
+    fn stop_group_clears_only_the_state_toggles_its_own_slot_and_waits() {
+        let mut io = FakeFirmware::new();
+        // A started group with its endpoint bit set; slot 1's GLB bit starts acknowledged.
+        io.set(
+            0x6500,
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE,
+        );
+        io.glb_output.insert(GLB_DOORBELL_REQ, 0b10);
+        io.glb_input.insert(GLB_DOORBELL_REQ, 0b10);
+        io.script_reads(0x6700, &[CSG_STATE_START, CSG_ENDPOINT_CONFIG]);
+        assert_eq!(
+            stop_group(&mut io, 0x6500, 0x6700, 1, 100_000_000),
+            Ok(CSG_ENDPOINT_CONFIG)
+        );
+        // The state is cleared; the endpoint and event bits are left as the host wrote them.
+        assert_eq!(io.get(0x6500), CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE);
+        // Only slot 1's bit moves, to the opposite of its ack.
+        assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&0b00));
+        assert_eq!(io.doorbells, 1);
+        assert_eq!(io.delays, 1);
+    }
+
+    #[test]
+    fn stop_group_times_out_while_the_ack_still_shows_start() {
+        let mut io = FakeFirmware::new();
+        io.set(0x6500, CSG_STATE_START);
+        io.set(0x6700, CSG_STATE_START);
+        assert_eq!(
+            stop_group(&mut io, 0x6500, 0x6700, 1, 100_000_000),
+            Err(GroupError::AckTimeout {
+                req: 0,
+                ack: CSG_STATE_START
+            })
+        );
+        assert_eq!(io.delays, 10_000);
     }
 
     #[test]

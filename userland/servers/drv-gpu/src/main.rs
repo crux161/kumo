@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j690
 //j707
 //j714
 //j716
 //j733
+//j734
 
 extern crate alloc;
 
@@ -14,6 +14,7 @@ mod client;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use drv_gpu::contain::{Containment, SessionNext};
+//j734
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
     cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, flush_range,
@@ -33,6 +34,7 @@ use drv_gpu::{
     KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
     PAINT_WIDTH, SPIN_STREAM_WORDS, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
+use drv_gpu::{csg_pending_events, disable_as, range_unmapped, stop_group};
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
 };
@@ -47,7 +49,10 @@ const MMIO_VA: u64 = 0x1100_0000;
 const FIRMWARE_MAX: usize = 320 * 1024;
 /// Seven loadable sections need L0, L1, L2 and one L3 per 2 MiB region the image touches: nine
 /// tables for the vendored image, with room to spare.
-const TABLE_ARENA_LEN: u64 = 16 * PAGE_SIZE;
+//j734
+/// J734's second group adds AS2's four tables (L0-L3) to the nine for the image, AS1's and the
+/// client's; eight more pages keep the old headroom.
+const TABLE_ARENA_LEN: u64 = 24 * PAGE_SIZE;
 const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.
@@ -108,6 +113,28 @@ const _: () = assert!(SPIN_STREAM_VA + (SPIN_STREAM_WORDS as u64) * 8 <= PAINT_S
 const _: () = assert!(SPIN_MARKER_VA + 4 <= AS1_STREAMS_VA);
 const _: () = assert!(AS1_SCRATCH_VA >= AS1_PAINT_VA + PAINT_BYTES);
 const _: () = assert!(AS1_SCRATCH_VA % 0x8000 == 0 && AS1_SCRATCH_VA < AS1_WORK_VA + 0x20_0000);
+//j734
+/// J734: a second group on CSG slot 1 in its own address space (AS2), raised only for the
+/// cross-group half of the G8b gate and retired before the wrapped jobs. Its queue pages and
+/// suspend buffer sit in AS0 just past group A's, inside the same 2 MiB table; its ring,
+/// streams, target and sync object use AS1's layout at the same VAs in AS2, so nothing it
+/// touches is reachable through AS1.
+const B_SLOT: u32 = 1;
+const B_AS: u32 = 2;
+const B_IO_PAGES_VA: u64 = 0x0411_0000;
+const B_SUSPEND_VA: u64 = B_IO_PAGES_VA + 2 * PAGE_SIZE;
+const _: () = assert!(shared_region_contains(B_IO_PAGES_VA));
+const _: () = assert!(shared_region_contains(B_SUSPEND_VA));
+const _: () = assert!(B_IO_PAGES_VA >> 21 == MCU_IO_PAGES_VA >> 21);
+/// Twice job 4's spin: B must outlast the AS1 edit and group A's whole store.
+const B_SPIN_ITERATIONS: u32 = 1 << 19;
+const B_STARTED: u32 = 0x5717_00B1;
+const B_VALUE: u32 = 0xC0DE_00B1;
+/// Group A's direct store while B spins: a target line past job 4's marker.
+const A_CONCURRENT_VA: u64 = AS1_TARGET_VA + (SPIN_JOB + 2) * CS_LINE_BYTES;
+const A_CONCURRENT_VALUE: u32 = 0xC0DE_00A1;
+const _: () = assert!(A_CONCURRENT_VA + 4 <= AS1_STREAMS_VA);
+const GROUP_STOP_TIMEOUT_NS: u64 = 100_000_000;
 const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
@@ -1616,6 +1643,45 @@ fn run_mali(
                 );
             }
 
+            //j734
+            // The cross-group half of the G8b gate, before the wrapped jobs so group B is gone
+            // by the time anything waits on a JOB interrupt. — TIMBERDOODLE
+            let proof = prove_two_groups(
+                device,
+                dma,
+                &mut table_memory,
+                &mut arena,
+                TwoGroupSetup {
+                    as0_root: transtab,
+                    as1_root: as1_l0,
+                    va_bits: mmu.va_bits,
+                    as_present: mmu.as_present,
+                    shared: windows[0],
+                    input,
+                    output,
+                    group_stride: glb.group_stride,
+                    group,
+                    a_csg: csg,
+                    a_iface: queue_iface,
+                    a_work: work,
+                    a_windows: windows,
+                    scratch_pa: paint.phys,
+                    attrs: noexec_uncached,
+                },
+            );
+            match proof {
+                Ok(report) => report.log(),
+                Err(cause) => {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: two-group proof failed: {}\n", cause),
+                    );
+                    report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                    let _ = soft_reset(device);
+                    return Err(1);
+                }
+            }
+
             // G4c: two jobs through RESEARCH/009 §10.6's wrapper, the way panthor submits every
             // job. Each wrapper flushes, CALLs its own store stream, waits for every scoreboard
             // and adds 1 to the queue's sync object; a job is done when the seqno reaches its
@@ -2126,6 +2192,427 @@ fn update_under_spin(
         fault,
         error,
     }
+}
+
+//j734
+/// What [`prove_two_groups`] needs from group A's bring-up.
+struct TwoGroupSetup {
+    as0_root: u64,
+    as1_root: u64,
+    va_bits: u32,
+    as_present: u32,
+    shared: McuWindow,
+    input: u64,
+    output: u64,
+    group_stride: u32,
+    group: GroupConfig,
+    a_csg: CsgControl,
+    a_iface: QueueIface,
+    a_work: Mapping,
+    a_windows: [McuWindow; 3],
+    scratch_pa: u64,
+    attrs: PageAttrs,
+}
+
+/// What the two-group proof saw; every field is a measurement the record prints.
+struct TwoGroupReport {
+    b_started_us: u64,
+    edit_us: u64,
+    flush_ids: [u32; 3],
+    a_store_us: u64,
+    b_running_after_edit: bool,
+    b_done_first_us: Option<u64>,
+    b_in_flight: bool,
+    b_us: u64,
+    b_status: u32,
+    stop_ack: u32,
+}
+
+impl TwoGroupReport {
+    fn log(&self) {
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG{}/AS{} spinning after {} us; AS1 edit {} us under it (flush ids 0x{:x} 0x{:x} 0x{:x}); CSG{} running after the edit={}\n",
+                B_SLOT,
+                B_AS,
+                self.b_started_us,
+                self.edit_us,
+                self.flush_ids[0],
+                self.flush_ids[1],
+                self.flush_ids[2],
+                B_SLOT,
+                self.b_running_after_edit
+            ),
+        );
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG0 store landed in {} us; CSG{} finished first={:?} us\n",
+                self.a_store_us, B_SLOT, self.b_done_first_us
+            ),
+        );
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG{} still in flight after both={}; finished status=0x{:x} value=0x{:08x} in {} us; no AS1/AS2 fault; CSG{} stopped (ack=0x{:08x}), AS{} off\n",
+                B_SLOT, self.b_in_flight, self.b_status, B_VALUE, self.b_us, B_SLOT, self.stop_ack, B_AS
+            ),
+        );
+    }
+}
+
+/// RESEARCH/017 §3.3.8's two-group proof. Raise group B on CSG1 in its own address space, start
+/// it spinning, and while it provably runs: edit AS1 live (J733's map/flush/unmap/flush) and
+/// let group A on CSG0 run a store. B must still be running afterwards and must then finish
+/// clean, with neither space faulted. B is acknowledged, terminated and its space disabled
+/// before returning, so the session goes on with exactly the one group it had. Errors name the
+/// step; the caller contains them with the usual stall report and soft reset. — TIMBERDOODLE
+fn prove_two_groups(
+    device: &mut Device,
+    dma: &mut Vec<Mapping>,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    setup: TwoGroupSetup,
+) -> Result<TwoGroupReport, &'static str> {
+    if setup.as_present & (1 << B_AS) == 0 {
+        return Err("no AS2 on this GPU");
+    }
+    let mut shared_memory = SharedMemory {
+        mcu: setup.shared.mcu,
+        cpu: setup.shared.cpu,
+        len: setup.shared.len,
+    };
+    let csg_mcu = setup.shared.mcu
+        + u64::from(CSG_CONTROL_BASE)
+        + u64::from(setup.group_stride) * u64::from(B_SLOT);
+    let csg = read_csg_control(&mut shared_memory, csg_mcu);
+    let cs = read_cs_control(
+        &mut shared_memory,
+        csg_mcu + u64::from(CSG_STREAM_CONTROL_OFFSET),
+    );
+    let inside = |va: u64| va >= setup.shared.mcu && va < setup.shared.mcu + setup.shared.len;
+    if !inside(csg.input_va)
+        || !inside(csg.output_va)
+        || !inside(cs.input_va)
+        || !inside(cs.output_va)
+    {
+        return Err("CSG1/CS blocks outside the shared section");
+    }
+    let suspend_len = (u64::from(csg.suspend_size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if MCU_SUSPEND_VA + suspend_len > B_IO_PAGES_VA {
+        return Err("group A's suspend buffer reaches group B's pages");
+    }
+    // `map_range` overwrites silently: prove B's MCU pages free of every firmware section first.
+    if !range_unmapped(
+        tables,
+        setup.as0_root,
+        B_IO_PAGES_VA,
+        2 * PAGE_SIZE + suspend_len,
+    ) {
+        return Err("group B's AS0 pages are already mapped");
+    }
+    let io_pages = map_contiguous(2 * PAGE_SIZE).ok_or("group B interface pages")?;
+    dma.push(io_pages);
+    zero_mapping(&io_pages, 2 * PAGE_SIZE);
+    map_range(
+        tables,
+        arena,
+        setup.as0_root,
+        B_IO_PAGES_VA,
+        io_pages.phys,
+        2 * PAGE_SIZE,
+        setup.attrs,
+    )
+    .map_err(|_| "group B interface pages map")?;
+    let mut suspend_window = McuWindow::default();
+    if suspend_len > 0 {
+        let suspend = map_contiguous(suspend_len).ok_or("group B suspend buffer")?;
+        dma.push(suspend);
+        zero_mapping(&suspend, suspend_len);
+        map_range(
+            tables,
+            arena,
+            setup.as0_root,
+            B_SUSPEND_VA,
+            suspend.phys,
+            suspend_len,
+            setup.attrs,
+        )
+        .map_err(|_| "group B suspend buffer map")?;
+        suspend_window = McuWindow {
+            mcu: B_SUSPEND_VA,
+            cpu: suspend.va,
+            len: suspend_len,
+        };
+    }
+    flush_page_tables(device, 0).map_err(|_| "AS0 flush for group B")?;
+
+    let as2_l0 = arena.alloc_table(tables).ok_or("no table for AS2")?;
+    let work = map_contiguous(WORK_LEN).ok_or("group B work buffer")?;
+    dma.push(work);
+    zero_mapping(&work, WORK_LEN);
+    map_range(
+        tables,
+        arena,
+        as2_l0,
+        AS1_WORK_VA,
+        work.phys,
+        WORK_LEN,
+        setup.attrs,
+    )
+    .map_err(|_| "AS2 work map")?;
+    dsb();
+    enable_as(device, B_AS, as2_l0, setup.va_bits).map_err(|_| "AS2 enable")?;
+
+    let b_windows = [
+        setup.shared,
+        McuWindow {
+            mcu: B_IO_PAGES_VA,
+            cpu: io_pages.va,
+            len: 2 * PAGE_SIZE,
+        },
+        suspend_window,
+    ];
+    let b_iface = QueueIface::at(B_IO_PAGES_VA);
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        program_queue(
+            &mut glb_io,
+            cs.input_va,
+            QueueConfig {
+                ring_va: AS1_WORK_VA,
+                ring_size: RING_SIZE,
+                ring_input_va: b_iface.input_va,
+                ring_output_va: b_iface.output_va,
+                doorbell: B_SLOT + 1,
+                priority: 0,
+            },
+        );
+        program_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            GroupConfig {
+                address_space: B_AS,
+                suspend_va: if suspend_len > 0 { B_SUSPEND_VA } else { 0 },
+                ..setup.group
+            },
+        );
+        start_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            B_SLOT,
+            GROUP_START_TIMEOUT_NS,
+        )
+        .map_err(|_| "group B start")?;
+    }
+
+    // B's spin under the §10.6 wrapper, so its sync object reports a status.
+    let cpu = |va: u64| work.va + (va - AS1_WORK_VA);
+    let b_target = AS1_TARGET_VA + SPIN_JOB * CS_LINE_BYTES;
+    let stream = spin_store_stream(
+        SPIN_MARKER_VA,
+        B_STARTED,
+        b_target,
+        B_VALUE,
+        B_SPIN_ITERATIONS,
+    )
+    .ok_or("group B spin stream")?;
+    for (index, word) in stream.iter().enumerate() {
+        // SAFETY: the streams page of B's Normal-NC work buffer; the const assert keeps the
+        // spin stream below the paint stream's offset.
+        unsafe { ((cpu(SPIN_STREAM_VA) + index as u64 * 8) as *mut u64).write_volatile(*word) };
+    }
+    dsb();
+    let wrapper = job_wrapper(
+        CsFeatures::decode(cs.features),
+        JobCall {
+            latest_flush: latest_flush_id(device),
+            stream_va: SPIN_STREAM_VA,
+            stream_len: (stream.len() * 8) as u32,
+            sync_va: AS1_SYNC_VA,
+        },
+    )
+    .map_err(|_| "group B wrapper")?;
+    let slot = job_slot(0, 0, RING_SIZE).ok_or("group B ring")?;
+    write_job_words(0, slot, &wrapper, RING_SIZE, |offset, word| {
+        // SAFETY: `offset` is below RING_SIZE, inside the ring page of B's work buffer.
+        unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
+    });
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        publish_insert(&mut glb_io, b_iface, slot.end);
+    }
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        wake_stream(&mut glb_io, csg.input_va, csg.output_va, B_SLOT, 0);
+    }
+    let rung = device.now_ns();
+    device.write32(csf_doorbell(B_SLOT + 1), 1);
+    // SAFETY: one aligned word of B's Normal-NC work buffer.
+    let read32 = |va: u64| unsafe { (cpu(va) as *const u32).read_volatile() };
+    let deadline = rung.saturating_add(SPIN_START_TIMEOUT_NS);
+    while read32(SPIN_MARKER_VA) != B_STARTED {
+        if device.now_ns() >= deadline {
+            return Err("group B never reached its spin");
+        }
+        device.delay_us(10);
+    }
+    let b_started_us = (device.now_ns() - rung) / 1_000;
+
+    // Under B's spin: G8b's live edit on group A's space, then a store by group A itself.
+    let mut flush_ids = [latest_flush_id(device), 0, 0];
+    let edit_begin = device.now_ns();
+    edit_scratch(
+        device,
+        tables,
+        arena,
+        setup.as1_root,
+        setup.scratch_pa,
+        setup.attrs,
+        &mut flush_ids,
+    )?;
+    let edit_us = (device.now_ns() - edit_begin) / 1_000;
+    // SAFETY: B's sync object, 8-byte aligned in its Normal-NC sync page.
+    let b_seqno = || unsafe { (cpu(AS1_SYNC_VA) as *const u64).read_volatile() };
+    // The claim itself: the queue in the other group and space is still running after the edit.
+    let b_running_after_edit = read32(b_target) == 0 && b_seqno() == 0;
+    let a_cpu = |va: u64| setup.a_work.va + (va - AS1_WORK_VA);
+    let a_stream = store_stream(A_CONCURRENT_VA, A_CONCURRENT_VALUE);
+    let a_insert = {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        queue_insert(&mut glb_io, setup.a_iface)
+    };
+    // The prefetcher reads whole 64-byte lines and already holds the first stream's line, NOPs
+    // past its end included: a stream written mid-line runs its first words as those stale NOPs
+    // (J586's rule, which `job_slot` keeps). J734's second run placed this store at 0x30, lost its
+    // address and value, and re-stored the first stream's word instead. Start on a fresh line.
+    let a_start = (a_insert + CS_LINE_BYTES - 1) & !(CS_LINE_BYTES - 1);
+    let mut position = a_insert & !7;
+    while position < a_start {
+        // SAFETY: inside the ring page of A's Normal-NC work buffer; A's queue is drained.
+        unsafe {
+            ((setup.a_work.va + ring_offset(position, RING_SIZE) as u64) as *mut u64)
+                .write_volatile(0)
+        };
+        position += 8;
+    }
+    for (index, word) in a_stream.iter().enumerate() {
+        let offset = ring_offset(a_start + index as u64 * 8, RING_SIZE);
+        // SAFETY: as above.
+        unsafe { ((setup.a_work.va + offset as u64) as *mut u64).write_volatile(*word) };
+    }
+    dsb();
+    // Clear the first stream's leftover IDLE and stream events first, as every wrapped job does
+    // before its doorbell.
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        ack_group_events(&mut glb_io, setup.a_csg.input_va, setup.a_csg.output_va);
+    }
+    let a_rung = device.now_ns();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        publish_insert(
+            &mut glb_io,
+            setup.a_iface,
+            a_start + (a_stream.len() * 8) as u64,
+        );
+    }
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        wake_stream(
+            &mut glb_io,
+            setup.a_csg.input_va,
+            setup.a_csg.output_va,
+            GROUP_SLOT,
+            0,
+        );
+    }
+    device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+    // Whether A runs beside B or only after it is a finding, not the claim: wait out B's whole
+    // budget and note which finished first. Only a store that never lands is an error.
+    let deadline = a_rung.saturating_add(SPIN_TIMEOUT_NS);
+    let mut b_done_first_us = None;
+    // SAFETY: A's Normal-NC target page, one aligned word.
+    while unsafe { (a_cpu(A_CONCURRENT_VA) as *const u32).read_volatile() } != A_CONCURRENT_VALUE {
+        if b_done_first_us.is_none() && b_seqno() >= 1 {
+            b_done_first_us = Some((device.now_ns() - a_rung) / 1_000);
+        }
+        if device.now_ns() >= deadline {
+            let mut glb_io =
+                SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+            let (insert, extract) = (
+                queue_insert(&mut glb_io, setup.a_iface),
+                queue_extract(&mut glb_io, setup.a_iface),
+            );
+            let state = glb_io.read32(setup.a_csg.output_va + 0x18);
+            let pending =
+                csg_pending_events(&mut glb_io, setup.a_csg.input_va, setup.a_csg.output_va);
+            let rawstat = mmu_rawstat(glb_io.device);
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: group A store stuck: insert=0x{:x} extract=0x{:x} csg0 state=0x{:08x} pending=0x{:08x} mmu rawstat=0x{:08x}; B done first={:?} us\n",
+                    insert, extract, state, pending, rawstat, b_done_first_us
+                ),
+            );
+            return Err("group A's store never landed");
+        }
+        device.delay_us(10);
+    }
+    let a_store_us = (device.now_ns() - a_rung) / 1_000;
+    let b_in_flight = read32(b_target) == 0 && b_seqno() == 0;
+
+    let deadline = rung.saturating_add(SPIN_TIMEOUT_NS);
+    while b_seqno() < 1 {
+        if device.now_ns() >= deadline {
+            return Err("group B never finished its spin");
+        }
+        device.delay_us(100);
+    }
+    let b_us = (device.now_ns() - rung) / 1_000;
+    let b_status = read32(AS1_SYNC_VA + SYNC_STATUS_OFFSET);
+    if mmu_rawstat(device) & ((1 << GROUP_AS) | (1 << B_AS)) != 0 {
+        return Err("an AS1 or AS2 fault is latched");
+    }
+    if b_status != 0 || read32(b_target) != B_VALUE {
+        return Err("group B finished wrong");
+    }
+
+    // Leave the slot as it was found: no pending event, terminated, its space off.
+    let stop_ack = {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        ack_group_events(&mut glb_io, csg.input_va, csg.output_va);
+        let ack = stop_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            B_SLOT,
+            GROUP_STOP_TIMEOUT_NS,
+        )
+        .map_err(|_| "group B stop")?;
+        ack_group_events(&mut glb_io, csg.input_va, csg.output_va);
+        ack
+    };
+    clear_job_irqs(device, job_irq_csg(B_SLOT));
+    disable_as(device, B_AS).map_err(|_| "AS2 disable")?;
+    Ok(TwoGroupReport {
+        b_started_us,
+        edit_us,
+        flush_ids,
+        a_store_us,
+        b_running_after_edit,
+        b_done_first_us,
+        b_in_flight,
+        b_us,
+        b_status,
+        stop_ack,
+    })
 }
 
 /// The edit itself: map, invalidate the packed region, unmap, invalidate again, sampling
