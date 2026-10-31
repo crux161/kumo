@@ -1,9 +1,78 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j647 -->
 <!-- j650 -->
 <!-- j651 -->
 <!-- j652 -->
 <!-- j653 -->
+<!-- j735 -->
+
+## G7k: both complete driver graphs cross-build
+
+`scripts/mesa-drivers.py` builds Gallium panfrost, the Mesa state tracker/GLSL
+compiler/GLES2 dispatch, and panvk together for `aarch64-unknown-none`, with
+`host_machine.system = 'kumo'`. This is a separate compile/link inventory; the
+native property probe below keeps its original scope. No target probe ELF is
+executed, and no kernel, runtime, image or served payload changes in G7k.
+
+```sh
+scripts/relibc-headers.sh
+# Network is allowed only while preparing the pinned tool cache and original tarball:
+python3 scripts/mesa-drivers.py --prepare
+# Subsequent clean builds use the cache, with Docker networking disabled:
+python3 scripts/mesa-drivers.py
+```
+
+Preparation extends the existing shader builder with clang/lld/libc++ headers
+22.1.8-3 from the same signed Debian snapshot (20261024T000000Z), builds the
+native `vtn_bindgen2`, then snapshots that tool cache. The source tarball's full
+SHA256 is checked before every extraction. The actual build runs in a separate
+`--network=none` container with a read-only repository mount and Meson
+`--wrap-mode=nodownload`. Python/Mako, native compiler tools and every package
+version are recorded. `--keep` leaves this offline container running for the
+following slices; remove `kumo-mesa-drivers-g7k` before starting another clean run.
+No Linux library or Linux host-header directory is passed to the target compiler.
+The Debian clang driver uses `aarch64-none-elf` only for configure-test links so
+that it selects LLD directly; every target translation unit uses
+`aarch64-unknown-none`. C++ uses `-fno-exceptions -fno-rtti` and libc++ headers
+configured for relibc's pthread declarations, without localization or parallel
+algorithms. The Linux-built libc++ binary is never linked.
+
+The checked [driver inventory](DRIVER-INVENTORY.md) records the measured result:
+53 required GL gaps, 44 required Vulkan gaps, and the requesting archive/object.
+`build/mesa-drivers/result/` contains all static archives, diagnostic ELFs,
+linker errors/maps/extraction traces, per-object sizes, the exhaustive
+`inventory.json` and `optional-undefined.tsv`, and input/tool/archive hashes.
+There is one optional GL TLS wrapper and 6,292 optional Vulkan dispatch symbols;
+each is verified against a weak reference in an extracted object. They are
+accounted separately from required failures. Every symbol must be classified or
+the recipe fails. The plan's glapi root has the pinned source's actual name,
+`_mesa_glapi_get_dispatch`.
+
+`kumo-build.patch` is applied to the pristine source, independently of the older
+`native-header.patch`. It admits generic POSIX utilities on KUMO, uses relibc's
+existing C11 threads instead of Mesa's duplicate fallback, exposes build-ID
+declarations without providing bodies, retains the DRM modifier metadata that
+panvk requires, supplies libdrm declarations only, and creates static GLES/panvk
+targets. All upstream GPU architecture variants are compiled and linked where
+their driver tables reference them, including v10. The legacy JM Linux kernel
+backend `panfrost_kmod.c` alone is excluded for KUMO because its performance
+session needs eventfd/timerfd; the Panthor backend, both real drivers, their
+compilers, and their CSF operations remain in the inventory. Optional standalone
+compiler scaffolds, test libraries, video implementations and alternative lite
+Vulkan runtimes are outside the driver link graphs.
+
+The recipe repairs only its private header copies: classification declarations
+are protected from macro expansion and libc++ overload conflicts, missing
+`HUGE_VAL`/`NAN` definitions use compiler constants, openlibm fenv headers are
+installed from the pinned relibc submodule, and a compile-only header declares
+`open_memstream` while importing the existing `alloca`/strings declarations.
+No missing function is stubbed successfully. `open_memstream`, math exports,
+the measured C++ runtime, DRM/sync seams and static build IDs remain explicit
+follow-up work. Link success against an existing libc export is not proof that
+the operation succeeds at runtime. G7l/G7m must establish that separately.
+
+G7k build and inventory decisions — SAKER, 2026-10-31.
+
+The original scaffold documentation follows.
 
 This is a compile/link scaffold, not a usable Mesa device or a rendering driver.
 The probe compiles the actual pinned `pan_kmod.h` and `pan_props.c` for

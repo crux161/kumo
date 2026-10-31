@@ -1,0 +1,24 @@
+#j735
+# Mesa driver inventory; paths are inside the isolated recipe container.
+[binaries]
+c = 'clang-22'
+cpp = 'clang++-22'
+ar = 'llvm-ar-22'
+strip = 'llvm-strip-22'
+
+[host_machine]
+system = 'kumo'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+
+[built-in options]
+b_staticpic = false
+b_pie = false
+c_args = ['--target=aarch64-unknown-none', '--sysroot=/work/kumo-mesa/sysroot', '-isystem', '/work/kumo-mesa/sysroot/include', '-D__kumo__', '-include', '/work/kumo-mesa/inventory-compat.h', '-ffreestanding', '-fno-pic', '-fno-pie', '-fno-stack-protector', '-ffunction-sections', '-fdata-sections']
+cpp_args = ['--target=aarch64-unknown-none', '--sysroot=/work/kumo-mesa/sysroot', '-nostdinc++', '-isystem', '/work/kumo-mesa/libcxx', '-isystem', '/work/kumo-mesa/sysroot/include', '-D__kumo__', '-include', '/work/kumo-mesa/inventory-compat.h', '-ffreestanding', '-fno-pic', '-fno-pie', '-fno-stack-protector', '-ffunction-sections', '-fdata-sections', '-fno-exceptions', '-fno-rtti']
+c_link_args = ['--target=aarch64-none-elf', '-fuse-ld=lld', '-nostdlib', '-L/work/kumo-mesa/sysroot/lib', '-Wl,-e,main', '-Wl,--gc-sections', '-lc']
+cpp_link_args = ['--target=aarch64-none-elf', '-fuse-ld=lld', '-nostdlib', '-L/work/kumo-mesa/sysroot/lib', '-Wl,-e,main', '-Wl,--gc-sections', '-lc']
