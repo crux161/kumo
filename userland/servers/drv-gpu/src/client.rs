@@ -1,12 +1,8 @@
-//j710
-//j651
-//j652
-//j681
-//j682
-//j707
 //j709
+//j710
 //j714
 //j722
+//j733
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -327,7 +323,7 @@ impl Backend for Hardware<'_> {
             log_level::NOTICE,
             format_args!(
                 "drv-gpu: client group 1 leases CSG0 queue0, hardware seqno base={}\n",
-                PAINT_JOB
+                BRINGUP_JOBS
             ),
         );
         Ok(())
@@ -337,7 +333,7 @@ impl Backend for Hardware<'_> {
         if self.pending.is_some() {
             return Err(SubmitError::Unpublished(GpuStatus::Busy));
         }
-        let seqno = PAINT_JOB
+        let seqno = BRINGUP_JOBS
             .checked_add(job.signal_point)
             .ok_or(SubmitError::Unpublished(GpuStatus::BadRequest))?;
         dsb();

@@ -1,12 +1,10 @@
-//j710
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j594
-//j595
-//j596
 //j655
 //j707
 //j709
+//j710
+//j733
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -2192,6 +2190,45 @@ pub fn store_stream(target: u64, value: u32) -> [u64; 6] {
         flush_cache2(0, 3),
         wait_slot(1),
     ]
+}
+
+//j733
+/// Words in [`spin_store_stream`].
+pub const SPIN_STREAM_WORDS: usize = 14;
+
+/// J733's in-flight stream: store `started` at `marker`, spin `iterations` times on the
+/// command-stream processor, then store `value` at `target`, each store cleaned to memory the way
+/// [`store_stream`] cleans its one. Between the two words the CPU can see the queue running, the
+/// window a live AS1 update must land in to show it stops nothing (RESEARCH/017 §3.3.8). r0-r3
+/// are `store_stream`'s; r4 counts. None for zero iterations, which the decrement-first loop
+/// would turn into 2^32. — TIMBERDOODLE
+pub fn spin_store_stream(
+    marker: u64,
+    started: u32,
+    target: u64,
+    value: u32,
+    iterations: u32,
+) -> Option<[u64; SPIN_STREAM_WORDS]> {
+    if iterations == 0 {
+        return None;
+    }
+    Some([
+        move48(0, marker),
+        move32(2, started),
+        sync_set32(0, 0, 2),
+        move32(3, 0),
+        flush_cache2(0, 3),
+        wait_slot(1),
+        move32(4, iterations),
+        // The loop: decrement r4 and branch back to the decrement while it is non-zero.
+        add_imm32(4, 4, -1),
+        branch(CS_COND_NEQUAL, 4, -2),
+        move48(0, target),
+        move32(2, value),
+        sync_set32(0, 0, 2),
+        flush_cache2(0, 3),
+        wait_slot(1),
+    ])
 }
 
 /// SYNC_SET32: store a register to an address pair with system scope; signal on completion
@@ -5426,6 +5463,28 @@ mod g5a_tests {
         fn pixel(&self, x: u32, y: u32) -> u32 {
             self.read32(TARGET + u64::from(y * PAINT_WIDTH + x) * 4)
         }
+    }
+
+    //j733
+    #[test]
+    fn the_spin_stream_loops_on_its_own_decrement_between_two_cleaned_stores() {
+        assert_eq!(spin_store_stream(0x1000, 1, 0x2000, 2, 0), None);
+        let words = spin_store_stream(0x1000, 0x5717, 0x2000, 0xC0DE_0004, 7).unwrap();
+        // Mesa's convention: a branch at index b with offset o continues at b + 1 + o.
+        let branch_at = words.iter().position(|word| *word >> 56 == 22).unwrap();
+        let target = branch_at as i64 + 1 - 2;
+        assert_eq!(words[branch_at], branch(CS_COND_NEQUAL, 4, -2));
+        assert_eq!(words[target as usize], add_imm32(4, 4, -1));
+        assert_eq!(words[target as usize - 1], move32(4, 7));
+        // The started store is cleaned and waited on before the loop, the value store after it.
+        let started = &words[..6];
+        let finished = &words[branch_at + 1..];
+        assert_eq!(started[0], move48(0, 0x1000));
+        assert_eq!(started[2], sync_set32(0, 0, 2));
+        assert_eq!(started[4..], [flush_cache2(0, 3), wait_slot(1)]);
+        assert_eq!(finished[0], move48(0, 0x2000));
+        assert_eq!(finished[1], move32(2, 0xC0DE_0004));
+        assert_eq!(finished[3..], [flush_cache2(0, 3), wait_slot(1)]);
     }
 
     #[test]

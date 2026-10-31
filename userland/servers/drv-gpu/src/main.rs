@@ -1,13 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j652
-//j653
-//j655
 //j690
 //j707
 //j714
 //j716
+//j733
 
 extern crate alloc;
 
@@ -18,21 +16,22 @@ use core::fmt::{self, Write};
 use drv_gpu::contain::{Containment, SessionNext};
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
-    cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
+    cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, flush_range,
     init_global_interface, job_irq_csg, job_slot, job_wrapper, kumo_paint_data, kumo_paint_stream,
     latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info, mmu_rawstat,
     paint_reference_checksum, power_l2, probe, program_group, program_queue, publish_insert,
     queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
-    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
-    surface_chunks, unmap_ranges, wake_stream, write_job_words, ClockIo, Completion, CompletionIo,
-    CsControl, CsFeatures, CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface,
-    GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface,
-    ResetPath, SectionFlags, TableArena, TableMemory, UnmapRange, APERTURE_BASE, APERTURE_LEN,
-    BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL, BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START,
-    CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ,
-    GLB_PING_TIMEOUT_NS, GPU_VIEW, JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA,
-    KUMO_PAINT_V10, KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX,
-    PAINT_SURFACE, PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
+    read_fault_as, ring_offset, shared_region_contains, soft_reset, spin_store_stream, start_group,
+    store_stream, surface_chunks, unmap_ranges, wake_stream, write_job_words, ClockIo, Completion,
+    CompletionIo, CsControl, CsFeatures, CsgControl, Fault, Firmware, FirmwareMemory, GlbIo,
+    GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, UnmapRange,
+    APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL,
+    BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, GPU_VIEW,
+    JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
+    KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
+    PAINT_WIDTH, SPIN_STREAM_WORDS, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
@@ -85,6 +84,30 @@ const AS1_PAINT_VA: u64 = AS1_WORK_VA + 0x10_0000;
 /// DESIGN/019's clip poison, never a value of the reference pattern.
 const PAINT_POISON: u32 = 0x00FF_00FF;
 const _: () = assert!(PAINT_STREAM_VA + (PAINT_STREAM_MAX as u64) * 8 <= AS1_SYNC_VA);
+//j733
+/// J733: job 4 spins on the command-stream processor while the driver edits AS1 live, so the edit
+/// lands under a queue that is provably running (RESEARCH/017 §3.3.8; U3's flush-ID question
+/// rides along). Its stream takes the streams page's third and fourth lines, its started marker
+/// the target line after its own. The scratch page it maps and unmaps sits in the work buffer's
+/// 2 MiB table, so no table is allocated, in a packed 32 KiB region nothing else uses.
+/// — TIMBERDOODLE
+const SPIN_JOB: u64 = PAINT_JOB + 1;
+/// The last bring-up job; a client's signal points count on from its seqno.
+const BRINGUP_JOBS: u64 = SPIN_JOB;
+const SPIN_STREAM_VA: u64 = AS1_STREAMS_VA + 2 * CS_LINE_BYTES;
+const SPIN_MARKER_VA: u64 = AS1_TARGET_VA + (SPIN_JOB + 1) * CS_LINE_BYTES;
+const SPIN_STARTED: u32 = 0x5717_0004;
+/// 2^18 decrements: ~170 ms at the ~660 ns per iteration metal measured at GPLL/6 (the first run's
+/// 2^22 took 2.76 s), a thousand times the edit's ~0.1 ms, far below the firmware's ~13 s progress
+/// timeout (2,560,000 x 1024 cycles at 198 MHz).
+const SPIN_ITERATIONS: u32 = 1 << 18;
+const SPIN_START_TIMEOUT_NS: u64 = 100_000_000;
+const SPIN_TIMEOUT_NS: u64 = 5_000_000_000;
+const AS1_SCRATCH_VA: u64 = AS1_WORK_VA + 0x18_0000;
+const _: () = assert!(SPIN_STREAM_VA + (SPIN_STREAM_WORDS as u64) * 8 <= PAINT_STREAM_VA);
+const _: () = assert!(SPIN_MARKER_VA + 4 <= AS1_STREAMS_VA);
+const _: () = assert!(AS1_SCRATCH_VA >= AS1_PAINT_VA + PAINT_BYTES);
+const _: () = assert!(AS1_SCRATCH_VA % 0x8000 == 0 && AS1_SCRATCH_VA < AS1_WORK_VA + 0x20_0000);
 const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
@@ -1602,10 +1625,14 @@ fn run_mali(
             let iface = QueueIface::at(MCU_IO_PAGES_VA);
             let sync = work.va + (AS1_SYNC_VA - AS1_WORK_VA);
             let mut seqno = 0;
-            let mut flush_ids = [0u32; PAINT_JOB as usize];
-            for job in 1..=PAINT_JOB {
-                // Jobs 1 and 2 store one value each; job 3 runs the compute kernel.
+            let mut flush_ids = [0u32; BRINGUP_JOBS as usize];
+            //j733
+            let mut live_update = None;
+            for job in 1..=BRINGUP_JOBS {
+                // Jobs 1 and 2 store one value each; job 3 runs the compute kernel; job 4 spins
+                // while AS1 is edited under it.
                 let painting = job == PAINT_JOB;
+                let spinning = job == SPIN_JOB;
                 let target_va = AS1_TARGET_VA + job * CS_LINE_BYTES;
                 let value = WRAPPED_VALUE_BASE | job as u32;
                 let mut words = [0u64; PAINT_STREAM_MAX];
@@ -1623,6 +1650,23 @@ fn run_mali(
                     };
                     words[..stream.len()].copy_from_slice(&stream);
                     (PAINT_STREAM_VA, stream.len())
+                } else if spinning {
+                    let Some(stream) = spin_store_stream(
+                        SPIN_MARKER_VA,
+                        SPIN_STARTED,
+                        target_va,
+                        value,
+                        SPIN_ITERATIONS,
+                    ) else {
+                        log(
+                            log_level::ERR,
+                            format_args!("drv-gpu: spin stream refused\n"),
+                        );
+                        let _ = soft_reset(device);
+                        return Err(1);
+                    };
+                    words[..stream.len()].copy_from_slice(&stream);
+                    (SPIN_STREAM_VA, stream.len())
                 } else {
                     let stream = store_stream(target_va, value);
                     words[..stream.len()].copy_from_slice(&stream);
@@ -1703,7 +1747,11 @@ fn run_mali(
                 }
                 clear_job_irqs(device, csg_bit | JOB_IRQ_GLOBAL_IF);
                 let started = device.now_ns();
-                let deadline = started.saturating_add(WORK_TIMEOUT_NS);
+                let deadline = started.saturating_add(if spinning {
+                    SPIN_TIMEOUT_NS
+                } else {
+                    WORK_TIMEOUT_NS
+                });
                 let mut waits = 0u32;
                 let mut fired = 0u32;
                 let (mut rawstat, mut stat, mut events, mut glb_events) = (0u32, 0u32, 0u32, 0u32);
@@ -1730,6 +1778,17 @@ fn run_mali(
                             wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
                         }
                         device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+                        if spinning {
+                            live_update = Some(update_under_spin(
+                                device,
+                                &mut table_memory,
+                                &mut arena,
+                                as1_l0,
+                                paint.phys,
+                                work,
+                                noexec_uncached,
+                            ));
+                        }
                     }) {
                         Ok(irq) => irq,
                         Err(status) => {
@@ -1829,6 +1888,15 @@ fn run_mali(
                         job, events, glb_events, irq_req, irq_ack, cs_req, cs_ack, rawstat, stat
                     ),
                 );
+                //j733
+                // Reported before the outcome check, so a stalled spin still says what the edit saw.
+                if let Some(update) = live_update.take() {
+                    if !update.report(elapsed_us) {
+                        report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                        let _ = soft_reset(device);
+                        return Err(1);
+                    }
+                }
                 if outcome != JobWait::Interrupt {
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
@@ -1886,8 +1954,8 @@ fn run_mali(
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}; flush ids 0x{:x} 0x{:x} 0x{:x}\n",
-                    PAINT_JOB, seqno, flush_ids[0], flush_ids[1], flush_ids[2]
+                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}; flush ids 0x{:x} 0x{:x} 0x{:x} 0x{:x}\n",
+                    BRINGUP_JOBS, seqno, flush_ids[0], flush_ids[1], flush_ids[2], flush_ids[3]
                 ),
             );
             // G5b: only a pixel-exact paint reaches here, so the view never shows a bad image.
@@ -1932,6 +2000,165 @@ fn run_mali(
             Err(1)
         }
     }
+}
+
+//j733
+/// What job 4's live AS1 edit saw. `in_flight` is the proof's precondition: the started marker
+/// landed before the edit, and neither the job's value nor its seqno had landed after it.
+/// — TIMBERDOODLE
+struct LiveUpdate {
+    started: bool,
+    wait_us: u64,
+    edit_us: u64,
+    in_flight: bool,
+    seqno: u64,
+    /// LATEST_FLUSH_ID before the edit, after the first FLUSH_PT, and after the second (U3).
+    flush_ids: [u32; 3],
+    fault: Option<Fault>,
+    error: Option<&'static str>,
+}
+
+impl LiveUpdate {
+    /// Log the record once the job has finished; false when the edit failed or faulted the space,
+    /// which the caller contains like any failed job. A job that finished before the edit makes
+    /// the proof void, not the session wrong.
+    fn report(&self, job_us: u64) -> bool {
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: job {} ran under a live AS1 edit: started={} after {} us; map+flush and unmap+flush of 0x{:x} took {} us; in flight after={} (seqno={}); job {} us; flush ids 0x{:x} 0x{:x} 0x{:x}; fault={:?}\n",
+                SPIN_JOB,
+                self.started,
+                self.wait_us,
+                AS1_SCRATCH_VA,
+                self.edit_us,
+                self.in_flight,
+                self.seqno,
+                job_us,
+                self.flush_ids[0],
+                self.flush_ids[1],
+                self.flush_ids[2],
+                self.fault
+            ),
+        );
+        if let Some(error) = self.error {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: live AS1 edit failed: {}\n", error),
+            );
+            return false;
+        }
+        if self.fault.is_some() {
+            return false;
+        }
+        if !self.in_flight {
+            log(
+                log_level::WARNING,
+                format_args!(
+                    "drv-gpu: live AS1 edit proof void: job {} was not observed running across it\n",
+                    SPIN_JOB
+                ),
+            );
+        }
+        true
+    }
+}
+
+/// Wait for job 4's started marker, then map a scratch page into live AS1, invalidate only its
+/// packed region, unmap it, and invalidate again: G8b's VmBind/VmUnbind sequence (RESEARCH/017
+/// §3.3.1), issued while the queue runs. No CSG, CS, MCU or doorbell register is touched.
+fn update_under_spin(
+    device: &mut Device,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    root: u64,
+    scratch_pa: u64,
+    work: Mapping,
+    attrs: PageAttrs,
+) -> LiveUpdate {
+    let cpu = |va: u64| work.va + (va - AS1_WORK_VA);
+    let begin = device.now_ns();
+    let deadline = begin.saturating_add(SPIN_START_TIMEOUT_NS);
+    let started = loop {
+        // SAFETY: the marker word on its own line of AS1's Normal-NC target page.
+        let seen = unsafe { (cpu(SPIN_MARKER_VA) as *const u32).read_volatile() } == SPIN_STARTED;
+        if seen || device.now_ns() >= deadline {
+            break seen;
+        }
+        device.delay_us(10);
+    };
+    let wait_us = (device.now_ns() - begin) / 1_000;
+    let mut flush_ids = [latest_flush_id(device), 0, 0];
+    let edit_begin = device.now_ns();
+    let error = edit_scratch(
+        device,
+        tables,
+        arena,
+        root,
+        scratch_pa,
+        attrs,
+        &mut flush_ids,
+    )
+    .err();
+    let edit_us = (device.now_ns() - edit_begin) / 1_000;
+    // The fault registers read back zero when nothing faulted; only AS1's rawstat bit says one is
+    // latched, as the boot-time AS1 report already checks. J733's first metal run took the zero
+    // decode for a fault and failed a clean job.
+    let fault = if mmu_rawstat(device) & (1u32 << GROUP_AS) != 0 {
+        read_fault_as(device, GROUP_AS)
+    } else {
+        None
+    };
+    // SAFETY: job 4's target word and the queue's sync object, both in AS1's Normal-NC pages.
+    let (landed, seqno) = unsafe {
+        (
+            (cpu(AS1_TARGET_VA + SPIN_JOB * CS_LINE_BYTES) as *const u32).read_volatile(),
+            (cpu(AS1_SYNC_VA) as *const u64).read_volatile(),
+        )
+    };
+    LiveUpdate {
+        started,
+        wait_us,
+        edit_us,
+        in_flight: started && landed == 0 && seqno < SPIN_JOB,
+        seqno,
+        flush_ids,
+        fault,
+        error,
+    }
+}
+
+/// The edit itself: map, invalidate the packed region, unmap, invalidate again, sampling
+/// LATEST_FLUSH_ID after each invalidation into `flush_ids[1..]`.
+fn edit_scratch(
+    device: &mut Device,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    root: u64,
+    scratch_pa: u64,
+    attrs: PageAttrs,
+    flush_ids: &mut [u32; 3],
+) -> Result<(), &'static str> {
+    map_range(
+        tables,
+        arena,
+        root,
+        AS1_SCRATCH_VA,
+        scratch_pa,
+        PAGE_SIZE,
+        attrs,
+    )
+    .map_err(|_| "scratch map")?;
+    flush_range(device, GROUP_AS, AS1_SCRATCH_VA, PAGE_SIZE).map_err(|_| "flush after map")?;
+    flush_ids[1] = latest_flush_id(device);
+    let scratch = [UnmapRange {
+        va: AS1_SCRATCH_VA,
+        len: PAGE_SIZE,
+    }];
+    unmap_ranges(tables, root, &scratch).map_err(|_| "scratch unmap")?;
+    flush_range(device, GROUP_AS, AS1_SCRATCH_VA, PAGE_SIZE).map_err(|_| "flush after unmap")?;
+    flush_ids[2] = latest_flush_id(device);
+    Ok(())
 }
 
 /// G5b: take view [`GPU_VIEW`] from the bootstrap channel, copy the painted target into its
