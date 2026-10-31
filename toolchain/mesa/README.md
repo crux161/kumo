@@ -1,9 +1,48 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j650 -->
 <!-- j651 -->
 <!-- j652 -->
 <!-- j653 -->
 <!-- j735 -->
+<!-- j740 -->
+
+## G7m: OS closure and Mesa utilities
+
+After G7k preparation and G7l, keep the offline driver container running:
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/mesa-util-smoke.py --run
+```
+
+The closure recipe synchronizes the actual SDK, rebuilds affected Mesa archives
+and the measured C++ runtime, then links both complete probe graphs without
+ignoring undefined symbols. It retains only the previously inventoried optional
+weak dispatch/TLS references. Both links have zero required gaps.
+
+`drm-refusal.c` exposes the measured libdrm signatures only under `__kumo__`.
+Every device, ioctl, BO/FD, syncobj and sync-file operation refuses with ENOTSUP;
+outputs remain untouched. No integer FD becomes a capability. Null cleanup is
+harmless; attempting to free a live foreign DRM object aborts. These entry points
+keep retained DRM code explicit until native seams replace their callers.
+
+`static-build-id.c` reads the linker's actual GNU note from mapped program
+headers in a static ET_EXEC image. Its utility target preserves that note in a
+read-only PT_LOAD and PT_NOTE and uses LLD's SHA1 build ID. The runtime ID must
+match llvm-readelf byte for byte; foreign addresses have no ID. The relibc
+overlay also corrects Elf64_Word/Sword to their 32-bit ELF widths, with compile-time
+size and offset checks at the consumer.
+
+The QEMU proof executes Mesa's ralloc ownership/destructors, collision-heavy
+hash insertion/growth/removal, stable sparse storage across distant indices,
+dynarray growth, simple mutex/once/once-data, and C++ TLS sort callback. It also
+checks every refusal, the actual Mesa DRM factory, and relibc's existing dlopen
+refusal/error reset. It creates no thread and makes no concurrency claim.
+Build manifests, both probe links/maps/extraction traces, note bytes and UEFI
+proof logs live in `build/mesa-drivers/result/closure/`.
+
+G7m is closed by the passing OS/util proof (J740). Runtime GLSL/SPIR-V compiler
+acceptance (G7n), native device/memory/sync/heaps (G7o–G7q), and Gallium rendering
+remain later gates. Closure decisions — SAKER, 2026-10-31.
 
 ## G7k: both complete driver graphs cross-build
 

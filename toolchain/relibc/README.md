@@ -1,9 +1,14 @@
-<!-- j507 -->
 <!-- j508 -->
 <!-- j509 -->
 <!-- j736 -->
 <!-- j738 -->
+<!-- j740 -->
 # KUMO relibc overlay
+
+G7m's static build-ID proof exposed upstream ELF typedefs with the wrong width:
+`Elf64_Word` and `Elf64_Sword` were 64 bits. The overlay makes them 32 bits;
+`Xword`/`Sxword` remain 64 bits. The consumer pins ELF64 header/program/note sizes
+and validates the running note against llvm-readelf (J740). — SAKER, 2026-10-31
 
 G7m enables relibc's pinned openlibm implementation (`math_libm`) and adds
 `open_memstream` for Mesa's compiler diagnostics. The memory writer uses C-owned

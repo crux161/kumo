@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j736
 #j738
+#j740
 """Build G7l's C++ runtime and optionally prove it in a disposable full UEFI image."""
 import argparse
 from pathlib import Path
@@ -85,6 +86,7 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
                 assert b"cause=FAULT" in fault and b"FAR=0x0000000011000000" in fault
                 assert b"synchronous external abort on read" in fault
             print(green.decode(), flush=True)
+            return transcript
         finally:
             process.terminate()
             try:
