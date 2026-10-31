@@ -1,14 +1,48 @@
-//j647
 //j650
 //j651
 //j652
 //j653
+//j739
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
 #![no_std]
 
-use core::cell::Cell;
+extern crate alloc;
+
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    cell::Cell,
+    ffi::c_void,
+};
+
+struct LibcAllocator;
+extern "C" {
+    fn posix_memalign(out: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+    fn free(pointer: *mut c_void);
+}
+// Session now owns dynamic bookkeeping. Keep its storage in the same real
+// relibc allocation domain as the C probe, including over-aligned layouts. — SAKER
+unsafe impl GlobalAlloc for LibcAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut pointer = core::ptr::null_mut();
+        if posix_memalign(
+            &mut pointer,
+            layout.align().max(core::mem::size_of::<usize>()),
+            layout.size(),
+        ) != 0
+        {
+            return core::ptr::null_mut();
+        }
+        pointer.cast()
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, _: Layout) {
+        free(pointer.cast());
+    }
+}
+#[global_allocator]
+static ALLOCATOR: LibcAllocator = LibcAllocator;
 use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
@@ -212,6 +246,12 @@ impl Backend for Hardware {
     fn bind(&mut self, _: Binding) -> Result<(), Status> {
         Err(Status::NotSupported)
     }
+    fn unbind(&mut self, _: &[Binding]) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
+    fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
     fn create_group(&mut self) -> Result<(), Status> {
         Err(Status::NotSupported)
     }
@@ -284,6 +324,21 @@ fn transport<'a>(
 
 #[no_mangle]
 pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
+    unsafe {
+        let layout = Layout::from_size_align(33, 4096).unwrap();
+        let pointer = alloc::alloc::alloc(layout);
+        if pointer.is_null() || (pointer as usize) % layout.align() != 0 {
+            return 1000;
+        }
+        pointer.write_bytes(0x5a, layout.size());
+        let valid = core::slice::from_raw_parts(pointer, layout.size())
+            .iter()
+            .all(|b| *b == 0x5a);
+        alloc::alloc::dealloc(pointer, layout);
+        if !valid {
+            return 1001;
+        }
+    }
     let sends = Cell::new(0);
     let closed = Cell::new(0);
     let mut client = Client::new(transport(&sends, &closed, true, false));
