@@ -8,12 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j425
-//j493
 //j494
 //j534
 //j556
 //j724
+//j730
 
 use core::cell::UnsafeCell;
 
@@ -72,8 +71,19 @@ const CHILD_PRIORITY: Priority = Priority(63);
 /// enumeration fan-out + the svc-health/M10 transients with headroom.
 const MAX_RESIDENT_CHILDREN: usize = 12;
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
-/// Same priority as the blocking child — more urgent than Sora (64).
+/// Same priority as the blocking child — more urgent than Sora's boot admit (64), less
+/// urgent than every later wake of hers (`USER_WAKE_PRIORITY`, J730).
 const CHILD_ASYNC_PRIORITY: Priority = Priority(63);
+//j730
+/// The priority a woken user thread is admitted at, on every wake path: the SVC-tail payer,
+/// the idle-floor pump, and the direct wake. At her boot 64 Sora lost every dispatcher
+/// comparison to a runnable child (63), so under sustained child load her serve loop ran
+/// only when no child could (J726: >100k kept-child decisions; J729: 224 preemptions in
+/// three minutes). The dispatcher keeps a running thread's priority across preemption, so
+/// after her first wake she stays at 62 and children run when she parks. Metal (J730): the
+/// clock samples stayed under 100 ms late through three churn sessions, where J721-J729 saw
+/// seconds. — TIMBERDOODLE
+const USER_WAKE_PRIORITY: Priority = Priority(62);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserSchedError {
@@ -592,8 +602,8 @@ pub fn run_prepared_child(
 }
 
 /// P10-g: spawn a child asynchronously using the proven resident-child slot.
-/// The child is admitted at CHILD_ASYNC_PRIORITY (63, more urgent than Sora at 64)
-/// but does NOT preempt immediately. Returns immediately.
+/// The child is admitted at CHILD_ASYNC_PRIORITY (63, more urgent than Sora's boot 64,
+/// less urgent than her woken 62) but does NOT preempt immediately. Returns immediately.
 pub fn spawn_child_async(
     objects: &mut ObjectManager,
     proc_koid: KoId,
@@ -1142,7 +1152,7 @@ pub fn reschedule_if_pending_after_svc() {
         ) {
             s.user_wake_pending = false;
             s.user_thread.ready();
-            s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+            s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
             s.safe_reschedule_pending = true;
             //j726
             #[cfg(target_os = "none")]
@@ -1277,7 +1287,7 @@ pub fn pump_idle_floor() {
             s.user_wake_pending = false;
             if matches!(s.user_thread.state(), ThreadState::Blocked) {
                 s.user_thread.ready();
-                s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+                s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
             }
         }
         if !s.safe_reschedule_pending && s.dispatcher.runnable_count() == 0 {
@@ -1307,7 +1317,7 @@ pub fn wake_user() {
             return;
         }
         s.user_thread.ready();
-        s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+        s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
         let decision = s.dispatcher.reschedule_current();
         dispatch_context(s, decision)
     };
