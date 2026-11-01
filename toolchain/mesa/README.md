@@ -1,9 +1,46 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j743 -->
 <!-- j744 -->
 <!-- j745 -->
 <!-- j746 -->
 <!-- j747 -->
+<!-- j749 -->
+
+## G7p-a: native sync payloads on G8c fences
+
+`kumo_gpu::sync::SyncObjects` borrows one native Client and owns session-local binary and
+timeline sync metadata. It publishes every output of a Submit only after its acknowledgement;
+validation and fallible allocation happen before publication. A refused submit preserves the
+old payloads. Transport/protocol uncertainty and GPU failure latch the existing Client's loss,
+so neither work nor signals are replayed.
+
+- Binary objects can start signaled, be CPU-signaled, reset and replaced. Their wait value is 0.
+- Timeline values are u64, monotonic and sparse; a wait for 0 is satisfied. Pending logical
+  points map to accepted G8c queue fences. All GPU signals in a store use the same group, so a
+  later completed queue point covers the earlier ones. Observed completion prunes old rows.
+- `wait_pending` answers availability of a submitted signal, separately from completion.
+  An unsubmitted value has no snapshot; no fake wake is manufactured for a future producer.
+- A captured `Snapshot` survives binary reset, replacement and object destruction. Gallium can
+  use it instead of an exported sync file. Opaque object IDs and snapshots include a never-reused
+  store generation; a foreign or stale object cannot alias a new one.
+- `arm` uses G8c FenceWait, returning Done or one owned wake-channel read end. The caller must
+  bound its Port wait with a timer and close the wake on every path. After any wake, re-arm and
+  require Done/status 0; a wake, timeout or peer close alone cannot complete a payload. There is
+  no SyncRead loop.
+- Bounds are 64 live objects and 256 unobserved timeline points per object. CPU timeline signal
+  conservatively returns Busy while GPU points remain unobserved; it cannot bypass GPU work.
+
+```sh
+cargo test -p kumo-gpu
+python3 scripts/mesa-sync-smoke.py --run
+```
+
+The QEMU proof runs the real codec, Session and native client over a modeled GPU producer,
+with real kernel VMO, wake-channel, Port and timer objects. It checks accepted versus completed
+signals, snapshots, rejected-submit rollback, bounded timeout/abandonment and terminal loss.
+It does not execute GPU work. Submit dependencies, blocking/wait-many policy, native C callback
+exposure, group fatal/timeout reporting and real-driver integration remain G7p/GL1/VK2. The
+C ABI stays 12; no DRM FD, sync-file operation or new wire opcode is introduced.
+— MILVUS, 2026-11-01
 
 ## G7o-f: the device, BOs and VM on metal
 
