@@ -1,11 +1,8 @@
 //j710
-//j650
-//j651
-//j652
-//j681
 //j707
 //j709
 //j711
+//j742
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -13,9 +10,9 @@
 use alloc::vec::Vec;
 
 use crate::{
-    valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response, Status, Submission,
-    SyncState, Timeline, MAX_TOTAL_BUFFER_BYTES,
+    valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response,
+    Status, Submission, SyncState, Timeline, MAX_TOTAL_BUFFER_BYTES,
 };
 
 pub const MAX_BINDINGS: usize = 8;
@@ -80,6 +77,11 @@ pub trait Backend {
     }
     /// Optional read-only extension. An unimplemented backend must not invent thread properties.
     fn thread_properties(&mut self) -> Result<DeviceThreads, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Optional read-only extension. An unimplemented backend must not invent memory-system
+    /// words or a coherency protocol it never programmed.
+    fn memory_properties(&mut self) -> Result<DeviceMemory, Status> {
         Err(Status::NotSupported)
     }
     fn create_vm(&mut self) -> Result<(), Status>;
@@ -276,6 +278,13 @@ impl Session {
                 // backend's own NotSupported crosses as the recoverable NotSupported error,
                 // exactly as the tiler and texture arms do. — TIMBERDOODLE
                 Ok(Response::Threads(backend.thread_properties()?))
+            }
+            Command::GetMemoryProperties => {
+                // Required in the query sense, like core features, and crossed verbatim with no
+                // zero guard: COHERENCY_FEATURES reads zero on the Orange Pi and protocol 0 is
+                // ACE-Lite, so a zero word is data here, and deciding what any word implies is
+                // the consumer's job. — TIMBERDOODLE
+                Ok(Response::Memory(backend.memory_properties()?))
             }
             Command::VmCreate => {
                 if self.vm {
@@ -558,6 +567,7 @@ mod tests {
         texture_features: Option<[u32; 4]>,
         core_features: Option<u32>,
         threads: Option<DeviceThreads>,
+        memory: Option<DeviceMemory>,
         /// How many times the containment layer asked the backend to release its own claims.
         /// A unit count, not a success flag: `retire` has nothing to answer. — TIMBERDOODLE
         retire_calls: u32,
@@ -602,6 +612,10 @@ mod tests {
         fn thread_properties(&mut self) -> Result<DeviceThreads, Status> {
             self.record(Command::GetThreadProperties)?;
             self.threads.ok_or(Status::NotSupported)
+        }
+        fn memory_properties(&mut self) -> Result<DeviceMemory, Status> {
+            self.record(Command::GetMemoryProperties)?;
+            self.memory.ok_or(Status::NotSupported)
         }
         fn info(&mut self) -> Result<DeviceInfo, Status> {
             self.record(Command::GetInfo)?;
@@ -991,6 +1005,58 @@ mod tests {
         assert_eq!(
             send(&mut session, &mut backend, Command::GroupCreate { vm: 1 }),
             Ok(Response::GroupCreated { group: 1 })
+        );
+        assert!(session.buffers.is_empty());
+        assert!(session.bindings.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn memory_properties_cross_verbatim_and_an_unimplemented_backend_invents_nothing() {
+        let mut session = Session::default();
+        let mut backend = Fake::default();
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetMemoryProperties),
+            Err(Status::NotSupported)
+        );
+        // The Orange Pi's measured words (J653): 0x0712_0306, 0x301, coherency features zero,
+        // and the "none" protocol (31) drv-gpu writes before L2 power-up. — TIMBERDOODLE
+        let board = DeviceMemory {
+            l2_features: 0x0712_0306,
+            mem_features: 0x301,
+            coherency_features: 0,
+            coherency_protocol: 31,
+        };
+        backend.memory = Some(board);
+        assert_eq!(
+            send(&mut session, &mut backend, Command::GetMemoryProperties),
+            Ok(Response::Memory(board))
+        );
+        // Every word zero, protocol 0 (ACE-Lite) included, still crosses unchanged; and full
+        // 32-bit words are not narrowed. — TIMBERDOODLE
+        for memory in [
+            DeviceMemory {
+                l2_features: 0,
+                mem_features: 0,
+                coherency_features: 0,
+                coherency_protocol: 0,
+            },
+            DeviceMemory {
+                l2_features: u32::MAX,
+                mem_features: u32::MAX,
+                coherency_features: u32::MAX,
+                coherency_protocol: u32::MAX,
+            },
+        ] {
+            backend.memory = Some(memory);
+            assert_eq!(
+                send(&mut session, &mut backend, Command::GetMemoryProperties),
+                Ok(Response::Memory(memory))
+            );
+        }
+        // A read-only query leaves the session live and consumes no object. — TIMBERDOODLE
+        assert_eq!(
+            send(&mut session, &mut backend, Command::VmCreate),
+            Ok(Response::VmCreated { vm: 1 })
         );
         assert!(session.buffers.is_empty());
         assert!(session.bindings.iter().all(Option::is_none));

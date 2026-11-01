@@ -1,9 +1,8 @@
 //j710
-//j650
-//j651
 //j652
 //j681
 //j707
+//j742
 
 extern crate std;
 
@@ -47,6 +46,7 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetTextureFeatures,
         Command::GetCoreFeatures,
         Command::GetThreadProperties,
+        Command::GetMemoryProperties,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
         Command::BufferDestroy { buffer: 1 },
@@ -955,4 +955,82 @@ fn thread_properties_cross_three_raw_words_accept_all_zero_and_reject_truncation
     .encode();
     reserved[40..48].copy_from_slice(&1u64.to_le_bytes());
     assert_eq!(Reply::decode(&reserved), None);
+}
+
+#[test]
+fn memory_properties_cross_four_raw_words_verbatim_and_reject_truncation() {
+    let request = Request {
+        id: 17,
+        command: Command::GetMemoryProperties,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &17u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    // Required words with no absence meaning, so zero crosses like any other value. The rows
+    // are the Orange Pi's measured words (J653) with the "none" protocol drv-gpu programs,
+    // all zero (protocol 0 is ACE-Lite), and both ends of u32 in every slot. — TIMBERDOODLE
+    for memory in [
+        DeviceMemory {
+            l2_features: 0x0712_0306,
+            mem_features: 0x301,
+            coherency_features: 0,
+            coherency_protocol: 31,
+        },
+        DeviceMemory {
+            l2_features: 0,
+            mem_features: 0,
+            coherency_features: 0,
+            coherency_protocol: 0,
+        },
+        DeviceMemory {
+            l2_features: u32::MAX,
+            mem_features: 1,
+            coherency_features: u32::MAX,
+            coherency_protocol: 1,
+        },
+    ] {
+        let response = Response::Memory(memory);
+        let reply = Reply {
+            id: 17,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &17u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(memory.l2_features).to_le_bytes());
+        assert_eq!(
+            &bytes[24..32],
+            &u64::from(memory.mem_features).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[32..40],
+            &u64::from(memory.coherency_features).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[40..48],
+            &u64::from(memory.coherency_protocol).to_le_bytes()
+        );
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+    }
+    // A word wider than 32 bits would narrow silently, so the canonical re-encode check must
+    // refuse each of the four slots separately. — TIMBERDOODLE
+    for slot in 0..4 {
+        let mut widened = Reply {
+            id: 17,
+            result: Ok(Response::Memory(DeviceMemory {
+                l2_features: 0x0712_0306,
+                mem_features: 0x301,
+                coherency_features: 0,
+                coherency_protocol: 31,
+            })),
+        }
+        .encode();
+        let at = 16 + slot * 8;
+        widened[at..at + 8].copy_from_slice(&(0x1_0000_0000u64 + 0x1234).to_le_bytes());
+        assert_eq!(Reply::decode(&widened), None);
+    }
 }

@@ -1,9 +1,34 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j652 -->
 <!-- j653 -->
 <!-- j735 -->
 <!-- j740 -->
 <!-- j741 -->
+<!-- j742 -->
+
+## G7o-a: the property set is complete
+
+GetMemoryProperties (opcode 17) attests `L2_FEATURES` (+0x004), `MEM_FEATURES` (+0x010),
+`COHERENCY_FEATURES` (+0x300) and the `GPU_COHERENCY_PROTOCOL` value drv-gpu programs before L2
+power-up (31, "none"). All four words are required and cross verbatim. drv-gpu already read
+and logged the three registers at bring-up (J653); it now serves them.
+
+`kumo_kmod.c` builds one complete `pan_kmod_dev_props`, which G7o-d's device will publish
+unchanged:
+- `l2_features` and `mem_features` are attested; upstream's `pan_query_l2_slices` and
+  `pan_query_bus_width` derive 4 slices and a 128-bit bus from the board's words;
+- `is_io_coherent` is upstream's `protocol != none`, so false on the Orange Pi;
+- `pgsize_bitmap` is the protocol's 4 KiB page granule, carried from `kumo_gpu::PAGE_BYTES`
+  and the only leaf size drv-gpu writes;
+- KUMO's stated policy, which the later BO and VM slices must honor: MEDIUM priority only
+  (GroupCreate carries none); Panthor's base BO flags EXECUTABLE, NO_MMAP and GPU_UNCACHED,
+  with no WB_MMAP because CPU mappings are non-cacheable; no VM op flags (no sparse); no
+  timestamps.
+
+The missing mask therefore reaches zero for a device whose optional groups are present.
+Only bits 1, 3 and 4 can remain, for an absent or unusable tiler, texture or thread group.
+`kumo_mesa_probe` still returns INCOMPLETE and publishes no device: BO, VM and group operations
+are not real yet. The live gpu-client logs the memory group on every boot, decoded as upstream
+does. — TIMBERDOODLE, 2026-10-31
 
 ## G7n: the compiler runs on KUMO
 
@@ -221,16 +246,16 @@ separately from hardware evidence.
 ## Native seam and runtime closure
 
 `lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
-80-byte result (private C ABI version9; older versions are refused). The C-owned report the
-bridge fills is 168 bytes, its last field `has_afbc` carrying upstream's AFBC constant rather
-than a hardware attestation. `with_api` lends an **existing** typed client for synchronous serial
-queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures, GetTilerFeatures,
-GetTextureFeatures, GetCoreFeatures then GetThreadProperties, preserving the same client and
-consuming seven request IDs on success. The
-result is published only after all seven succeed; a failed later query leaves no partial
+104-byte result (private C ABI version10; older versions are refused). The C-owned report the
+bridge fills is 240 bytes; `has_afbc` carries upstream's AFBC constant rather than a hardware
+attestation, and G7o-a's block follows it. `with_api` lends an **existing** typed client for
+synchronous serial queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures,
+GetTilerFeatures, GetTextureFeatures, GetCoreFeatures, GetThreadProperties then
+GetMemoryProperties, preserving the same client and consuming eight request IDs on success.
+The result is published only after all eight succeed; a failed later query leaves no partial
 identity. NotSupported from an optional query is the one status that does not abort it;
-core features are required, so any failure of that sixth query aborts the whole report, and
-any thread-query failure other than NotSupported aborts it too. The thread group is optional:
+core features and memory properties are required, so any failure of either aborts the whole
+report, and any thread-query failure other than NotSupported aborts it too. The thread group is optional:
 NotSupported leaves its three words zero and missing-property bit 4 set. The opaque context may not be retained, raced, reentered or unwound. It carries
 no FD, OS handle, Rust layout or new authority. The Rust owner keeps endpoint and grant
 cleanup responsibility. G7a's request ID, correlation and loss rules remain authoritative.
@@ -246,10 +271,11 @@ No Linux preprocessor identity or DRM emulation is used.
 Compilation uses real relibc pthread declarations because Mesa's embedded lock structures
 require them (`HAVE_PTHREAD`). This does **not** initialize a Mesa lock or prove pthread
 execution. `HAVE_ENDIAN_H` and `HAVE_STRUCT_TIMESPEC` describe actual installed headers.
-The scaffold C object refers to exactly seven upstream functions: `pan_query_core_count`,
+The scaffold C object refers to exactly nine upstream functions: `pan_query_core_count`,
 `pan_query_core_id_range`, `pan_query_tiler_features`, `pan_query_compressed_formats`,
-`pan_query_afrc`, `pan_query_afbc` and, since G7g, `pan_get_model`. All seven must appear
-defined in the final
+`pan_query_afrc`, `pan_query_afbc`, since G7g `pan_get_model`, and since G7o-a
+`pan_query_l2_slices` and `pan_query_bus_width` (both in the already-linked `pan_props.c`).
+All nine must appear defined in the final
 native ELF, which has no unresolved symbols. G7h deliberately adds none: the thread
 derivations are upstream's expressions applied to the attested words, and the optional
 `pan_query_thread_tls_alloc` helper is not called, because the report already records its
@@ -339,14 +365,14 @@ absent. The scaffold never initializes
 |---|---|
 | 0 | gpu_variant |
 | 1 | ~~tiler_features~~ supplied by G7e; shader_present by G7c — cleared only when a shape is derived |
-| 2 | mem_features, l2_features (mmu_features supplied by G7d) |
+| 2 | ~~mem_features, l2_features~~ supplied by G7o-a over GetMemoryProperties (mmu_features supplied by G7d); required, so the bit clears on every published report |
 | 3 | ~~texture_features[4]~~ supplied by G7i — all four words read in one powered block; bit clears only when the query succeeded |
 | 4 | ~~max_threads_per_core, max_tasks_per_core, max_threads_per_wg, num_registers_per_core, max_tls_instance_per_core~~ supplied by G7h; cleared only when all four upstream-asserted derivations are nonzero |
 | 5 | ~~afbc_features~~ supplied by G7j as upstream's constant, consumed through `pan_query_afbc`; there is no hardware register |
-| 6 | gpu_can_query_timestamp, timestamp_device_coherent, timestamp_frequency, timestamp_cycles_to_ns_factor |
-| 7 | allowed_group_priorities_mask |
-| 8 | supported_bo_flags, supported_vm_op_flags |
-| 9 | is_io_coherent, pgsize_bitmap |
+| 6 | ~~gpu_can_query_timestamp, timestamp_device_coherent, timestamp_frequency, timestamp_cycles_to_ns_factor~~ G7o-a policy: no timestamps (the protocol has no timestamp query), all zero |
+| 7 | ~~allowed_group_priorities_mask~~ G7o-a policy: MEDIUM only, because GroupCreate carries no priority |
+| 8 | ~~supported_bo_flags, supported_vm_op_flags~~ G7o-a policy: EXECUTABLE, NO_MMAP, GPU_UNCACHED; no VM op flags |
+| 9 | ~~is_io_coherent, pgsize_bitmap~~ G7o-a: upstream's `protocol != none` from the programmed protocol (false), and the protocol's 4 KiB granule |
 
 This inventories the structure, not a promise that the first renderer needs every field
 or that optional timestamp/performance features must be enabled. G7c selects Panfrost device discovery as the first consumer: its `pan_device.c`

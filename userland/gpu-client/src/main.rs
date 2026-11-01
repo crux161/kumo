@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j711
 //j712
 //j713
 //j714
 //j732
+//j742
 
 //! One cooperative session granted by Sora in x0, with no Resource, MMIO or firmware handle.
 //! Recovery class: soft-state. On any error exit and let drv-gpu contain the session.
@@ -888,6 +888,21 @@ fn run(channel: Handle, lane: Lane) -> Result<(), Failure> {
         )),
         Err(_) => return Err(Failure::Failed),
     }
+    // G7o-a: required, so any failure fails the session. Decoded exactly as upstream's
+    // pan_query_l2_slices (MEM_FEATURES[11:8] + 1) and pan_query_bus_width
+    // (1 << L2_FEATURES[27:24]); coherent means the programmed protocol is not "none" (31),
+    // upstream's is_io_coherent. — TIMBERDOODLE
+    let memory = client.memory()?;
+    log(format_args!(
+        "gpu-client: G7o-a attested memory: L2_FEATURES=0x{:08x} MEM_FEATURES=0x{:08x}, slices={}, bus={} bits, coherency features=0x{:08x} protocol={} (io coherent={})\n",
+        memory.l2_features,
+        memory.mem_features,
+        ((memory.mem_features >> 8) & 0xf) + 1,
+        1u32 << ((memory.l2_features >> 24) & 0xf),
+        memory.coherency_features,
+        memory.coherency_protocol,
+        memory.coherency_protocol != 31
+    ));
     let features = CsFeatures::decode(info.cs_features);
     let compute = compute_stream(features).map_err(|_| ())?;
     let triangle = triangle_stream(features).map_err(|_| ())?;

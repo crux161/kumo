@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j707
 //j709
 //j710
 //j733
 //j734
+//j742
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -63,8 +63,9 @@ const L2_PWRTRANS_HI: u32 = 0x224;
 const GPU_COHERENCY_FEATURES: u32 = 0x300;
 const GPU_COHERENCY_PROTOCOL: u32 = 0x304;
 /// RESEARCH/009 §1.2 and §6.4: RK3588 is not `dma-coherent`, so the GPU speaks no coherency
-/// protocol. The write must precede L2 power-up.
-const GPU_COHERENCY_NONE: u32 = 31;
+/// protocol. The write must precede L2 power-up. Public since G7o-a: the client server
+/// reports this programmed value, and upstream derives `is_io_coherent` from it.
+pub const GPU_COHERENCY_NONE: u32 = 31;
 
 // RESEARCH/009 §4.2, §4.4 and §4.5: the GPU_CONTROL interrupt and command words.
 const GPU_INT_RAWSTAT: u32 = 0x020;

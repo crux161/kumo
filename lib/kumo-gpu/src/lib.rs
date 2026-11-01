@@ -1,11 +1,9 @@
 //j710
 #![no_std]
-//j650
-//j651
-//j652
 //j681
 //j707
 //j711
+//j742
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -120,6 +118,22 @@ pub struct DeviceThreads {
     pub max_threads: u32,
     pub max_workgroup_size: u32,
     pub thread_features: u32,
+}
+
+/// The memory-system words, crossed undecoded like their siblings: `L2_FEATURES` (GPU_CONTROL
+/// +0x004), `MEM_FEATURES` (+0x010) and `COHERENCY_FEATURES` (+0x300), plus the
+/// `GPU_COHERENCY_PROTOCOL` value the driver itself programmed before L2 power-up (31 is
+/// "none"). Upstream derives the L2 slice count from `MEM_FEATURES[11:8]` and the bus width
+/// from `L2_FEATURES[31:24]`, and sets `is_io_coherent` from the protocol the kernel selected,
+/// which is what `coherency_protocol` is here. The raw `COHERENCY_FEATURES` word is the
+/// hardware's half of that decision and no consumer decodes it. Required: every word is read
+/// unconditionally at bring-up. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceMemory {
+    pub l2_features: u32,
+    pub mem_features: u32,
+    pub coherency_features: u32,
+    pub coherency_protocol: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

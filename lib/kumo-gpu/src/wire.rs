@@ -1,9 +1,9 @@
 //j710
-//j650
 //j651
 //j652
 //j681
 //j707
+//j742
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -11,8 +11,9 @@
 //! requires a fresh session. The server must reject duplicate/stale IDs before any mutation.
 
 use crate::{
-    valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState, Unbind,
+    valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState,
+    Unbind,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -27,6 +28,9 @@ pub enum Command {
     GetTextureFeatures,
     GetCoreFeatures,
     GetThreadProperties,
+    /// The memory-system words and the coherency protocol the driver programmed (G7o-a).
+    /// Appended after the discovery opcodes, so earlier sessions are unchanged. — TIMBERDOODLE
+    GetMemoryProperties,
     VmCreate,
     BufferCreate {
         bytes: u64,
@@ -81,6 +85,7 @@ impl Request {
             Command::GetTextureFeatures => (11, [0; 6]),
             Command::GetCoreFeatures => (12, [0; 6]),
             Command::GetThreadProperties => (13, [0; 6]),
+            Command::GetMemoryProperties => (17, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
             Command::BufferDestroy { buffer } => (14, [u64::from(buffer), 0, 0, 0, 0, 0]),
@@ -136,6 +141,7 @@ impl Request {
             11 => Command::GetTextureFeatures,
             12 => Command::GetCoreFeatures,
             13 => Command::GetThreadProperties,
+            17 => Command::GetMemoryProperties,
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             // Zero is never a buffer ID. The canonical re-encode below also refuses an ID
@@ -207,6 +213,11 @@ pub enum Response {
     /// Three raw thread-property words in slots 0..2; slot 3 is zero. No word is
     /// special-cased here: all three may legitimately be zero when the group is absent. — TIMBERDOODLE
     Threads(DeviceThreads),
+    /// Four raw words in slots 0..3: `L2_FEATURES`, `MEM_FEATURES`, `COHERENCY_FEATURES` and
+    /// the programmed coherency protocol. All four slots are used, so there is no reserved
+    /// slot to check; the re-encode check still refuses a word truncated to 32 bits.
+    /// — TIMBERDOODLE
+    Memory(DeviceMemory),
     VmCreated {
         vm: u32,
     },
@@ -302,6 +313,15 @@ impl Reply {
                     0,
                 ],
             ),
+            Ok(Response::Memory(memory)) => (
+                17,
+                [
+                    u64::from(memory.l2_features),
+                    u64::from(memory.mem_features),
+                    u64::from(memory.coherency_features),
+                    u64::from(memory.coherency_protocol),
+                ],
+            ),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
             Ok(Response::BufferDestroyed { buffer }) => (14, [u64::from(buffer), 0, 0, 0]),
@@ -375,6 +395,14 @@ impl Reply {
                     max_threads: a[0] as u32,
                     max_workgroup_size: a[1] as u32,
                     thread_features: a[2] as u32,
+                }),
+                // Required words with no absence meaning: zero crosses verbatim, and the
+                // consumer, not this codec, decides what a zero word implies. — TIMBERDOODLE
+                17 => Response::Memory(DeviceMemory {
+                    l2_features: a[0] as u32,
+                    mem_features: a[1] as u32,
+                    coherency_features: a[2] as u32,
+                    coherency_protocol: a[3] as u32,
                 }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {

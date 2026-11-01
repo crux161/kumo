@@ -1,8 +1,8 @@
-//j647
 //j650
 //j651
 //j652
 //j653
+//j742
 
 //! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
 //! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
@@ -12,7 +12,7 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -61,6 +61,18 @@ pub struct Info {
     pub texture_features_1: u32,
     pub texture_features_2: u32,
     pub texture_features_3: u32,
+    /// Version10's memory-system words (G7o-a), raw: `L2_FEATURES`, `MEM_FEATURES` and
+    /// `COHERENCY_FEATURES`, then the `GPU_COHERENCY_PROTOCOL` value the driver programmed
+    /// (31 is "none"). The query is required, and every word crosses verbatim, zero included.
+    /// Upstream derives slices, bus width and `is_io_coherent` from these. — TIMBERDOODLE
+    pub l2_features: u32,
+    pub mem_features: u32,
+    pub coherency_features: u32,
+    pub coherency_protocol: u32,
+    /// This protocol's VM page granule, which is also the only leaf size drv-gpu writes. Service
+    /// policy like the window above, not a hardware report; C turns it into `pgsize_bitmap`.
+    /// — TIMBERDOODLE
+    pub page_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +139,10 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             },
             Err(error) => return Err(error),
         };
+        // Memory properties are required, so any failure — NotSupported included — aborts the
+        // whole query, like core features. Asked last, so every earlier failure path keeps
+        // its request count. — TIMBERDOODLE
+        let memory = client.memory()?;
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -144,6 +160,11 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             texture_features_1: texture_features[1],
             texture_features_2: texture_features[2],
             texture_features_3: texture_features[3],
+            l2_features: memory.l2_features,
+            mem_features: memory.mem_features,
+            coherency_features: memory.coherency_features,
+            coherency_protocol: memory.coherency_protocol,
+            page_bytes: crate::PAGE_BYTES,
         })
     })();
     match result {
@@ -159,7 +180,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 80);
+const _: () = assert!(size_of::<Info>() == 104);
 // Pin both tail offsets. `tiler_features` exactly fills the padding that followed
 // `mmu_features`, so version4's Info is the same *size* as version3's and a size check alone
 // cannot distinguish them — only the version field and these offsets can. Version7 appended
@@ -179,14 +200,21 @@ const _: () = assert!(core::mem::offset_of!(Info, thread_features) == 64);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_1) == 68);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_2) == 72);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_3) == 76);
+// Version10 appends four u32 memory words at 80..96, then the u64 page granule at its natural
+// 96, so the structure ends at 104 with no padding anywhere. — TIMBERDOODLE
+const _: () = assert!(core::mem::offset_of!(Info, l2_features) == 80);
+const _: () = assert!(core::mem::offset_of!(Info, mem_features) == 84);
+const _: () = assert!(core::mem::offset_of!(Info, coherency_features) == 88);
+const _: () = assert!(core::mem::offset_of!(Info, coherency_protocol) == 92);
+const _: () = assert!(core::mem::offset_of!(Info, page_bytes) == 96);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-        DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response, Status, REPLY_LEN,
-        REQUEST_LEN,
+        client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
+        DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response,
+        Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -202,6 +230,7 @@ mod tests {
         core_failure: bool,
         threads_unsupported: bool,
         threads_failure: bool,
+        memory_unsupported: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -269,6 +298,18 @@ mod tests {
                         thread_features: 0x0310_0005,
                     }))
                 }
+            } else if self.command == Some(Command::GetMemoryProperties) {
+                if self.memory_unsupported {
+                    Err(Status::NotSupported)
+                } else {
+                    // The Orange Pi's measured words (J653) and the "none" protocol. — TIMBERDOODLE
+                    Ok(Response::Memory(DeviceMemory {
+                        l2_features: 0x0712_0306,
+                        mem_features: 0x301,
+                        coherency_features: 0,
+                        coherency_protocol: 31,
+                    }))
+                }
             } else {
                 Ok(Response::Info(DeviceInfo {
                     gpu_id: 0xa8670005,
@@ -328,8 +369,58 @@ mod tests {
                 assert_eq!(out.thread_max_threads, 1024);
                 assert_eq!(out.thread_max_workgroup_size, 512);
                 assert_eq!(out.thread_features, 0x0310_0005);
+                assert_eq!(
+                    (
+                        out.l2_features,
+                        out.mem_features,
+                        out.coherency_features,
+                        out.coherency_protocol
+                    ),
+                    (0x0712_0306, 0x301, 0, 31)
+                );
+                assert_eq!(out.page_bytes, crate::PAGE_BYTES);
             }
         });
+        assert!(client.info().is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_memory_query_is_required_and_publishes_nothing() {
+        let mut client = Client::new(Wire {
+            memory_unsupported: true,
+            ..Wire::default()
+        });
+        with_api(&mut client, |api| {
+            let mut out = Info {
+                gpu_id: 99,
+                thread_features: 99,
+                l2_features: 99,
+                coherency_protocol: 99,
+                page_bytes: 99,
+                ..Info::default()
+            };
+            let query = api.query.unwrap();
+            // All seven earlier queries succeed. Unlike tiler, texture or threads, NotSupported
+            // here is not an absence: the words are required, so the whole report is withheld.
+            // — TIMBERDOODLE
+            assert_eq!(
+                unsafe { query(api.context, &mut out) },
+                SERVER_ERROR + Status::NotSupported as u32
+            );
+            assert_eq!(
+                (
+                    out.gpu_id,
+                    out.thread_features,
+                    out.l2_features,
+                    out.coherency_protocol,
+                    out.page_bytes
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!((out.va_start, out.va_end), (0, 0));
+        });
+        // A refused query is recoverable: the client stays live. — TIMBERDOODLE
+        assert!(!client.is_lost());
         assert!(client.info().is_ok());
     }
 

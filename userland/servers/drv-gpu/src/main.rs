@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j707
 //j714
 //j716
 //j733
 //j734
+//j742
 
 extern crate alloc;
 
@@ -2055,6 +2055,15 @@ fn run_mali(
                 thread_max_threads,
                 thread_max_workgroup_size,
                 thread_features,
+                // G7o-a: the same words logged above, plus the protocol this driver wrote
+                // before L2 power-up. Served raw; upstream derives slices, bus width and
+                // coherency from them. — TIMBERDOODLE
+                drv_gpu::protocol::DeviceMemory {
+                    l2_features,
+                    mem_features,
+                    coherency_features,
+                    coherency_protocol: drv_gpu::GPU_COHERENCY_NONE,
+                },
             ))
         }
         Err(error) => {

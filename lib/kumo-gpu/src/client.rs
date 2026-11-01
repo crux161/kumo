@@ -1,9 +1,9 @@
 //j710
-//j650
 //j651
 //j652
 //j681
 //j707
+//j742
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -12,9 +12,9 @@
 //! reset, DMA reclamation, a GPU fence or a Mesa/DRM implementation. — KESTREL
 
 use crate::{
-    Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
-    DeviceTopology, Fence, Reply, Request, Response, Status, Submission, SyncState, Unbind,
-    REPLY_LEN, REQUEST_LEN,
+    Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu, DeviceTexture,
+    DeviceThreads, DeviceTiler, DeviceTopology, Fence, Reply, Request, Response, Status,
+    Submission, SyncState, Unbind, REPLY_LEN, REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +124,12 @@ impl<T: Transport> Client<T> {
             unreachable!()
         };
         Ok(threads)
+    }
+    pub fn memory(&mut self) -> Result<DeviceMemory, Error> {
+        let (Response::Memory(memory), _) = self.call(Command::GetMemoryProperties)? else {
+            unreachable!()
+        };
+        Ok(memory)
     }
     pub fn create_vm(&mut self) -> Result<u32, Error> {
         let (Response::VmCreated { vm }, _) = self.call(Command::VmCreate)? else {
@@ -294,6 +300,7 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::GetTextureFeatures, Response::Texture(_))
         | (Command::GetCoreFeatures, Response::Core(_))
         | (Command::GetThreadProperties, Response::Threads(_))
+        | (Command::GetMemoryProperties, Response::Memory(_))
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,

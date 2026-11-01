@@ -1,8 +1,8 @@
-//j709
 //j710
 //j714
 //j722
 //j733
+//j742
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -55,6 +55,7 @@ struct Hardware<'a> {
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
     thread_features: u32,
+    memory: protocol::DeviceMemory,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -140,6 +141,12 @@ impl Backend for Hardware<'_> {
             max_workgroup_size: self.thread_max_workgroup_size,
             thread_features: self.thread_features,
         })
+    }
+    fn memory_properties(&mut self) -> Result<protocol::DeviceMemory, GpuStatus> {
+        // Required and verbatim: the three words bring-up read in its powered block and the
+        // coherency protocol this driver programmed. COHERENCY_FEATURES reads zero on the
+        // Orange Pi, which is data, not absence. Nothing is derived here. — TIMBERDOODLE
+        Ok(self.memory)
     }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
         log(
@@ -571,6 +578,7 @@ pub(super) fn serve(
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
     thread_features: u32,
+    memory: protocol::DeviceMemory,
 ) -> Containment {
     let mut hw = Hardware {
         device,
@@ -582,6 +590,7 @@ pub(super) fn serve(
         thread_max_threads,
         thread_max_workgroup_size,
         thread_features,
+        memory,
         tables,
         arena,
         root,
