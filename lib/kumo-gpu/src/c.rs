@@ -1,24 +1,28 @@
-//j650
 //j651
 //j652
 //j653
 //j742
+//j744
 
-//! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
-//! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
+//! Borrowed C query/BO boundary for the pinned Mesa backend. Kernel handles and BO ownership
+//! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
 
 use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
 pub const TRANSPORT: u32 = 3;
 pub const PROTOCOL: u32 = 4;
 pub const DEVICE_LOST: u32 = 5;
+pub const NO_MEMORY: u32 = 6;
+pub const MAP_FAILED: u32 = 7;
+pub const UNMAP_FAILED: u32 = 8;
+pub const UNKNOWN_BUFFER: u32 = 9;
 pub const SERVER_ERROR: u32 = 16;
 
 #[derive(Clone, Copy, Default)]
@@ -82,6 +86,11 @@ pub struct Api {
     pub bytes: u32,
     pub context: *mut c_void,
     pub query: Option<unsafe extern "C" fn(*mut c_void, *mut Info) -> u32>,
+    pub buffer_create:
+        Option<unsafe extern "C" fn(*mut c_void, u64, u32, *mut crate::bo::Info) -> u32>,
+    pub buffer_destroy: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub buffer_map: Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> u32>,
+    pub buffer_unmap: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
 }
 
 /// The C consumer may call query synchronously during `f` only. It must not retain any
@@ -93,8 +102,125 @@ pub fn with_api<T: Transport, R>(client: &mut Client<T>, f: impl FnOnce(&Api) ->
         bytes: size_of::<Api>() as u32,
         context: (client as *mut Client<T>).cast(),
         query: Some(query::<T>),
+        buffer_create: None,
+        buffer_destroy: None,
+        buffer_map: None,
+        buffer_unmap: None,
     })
 }
+
+/// Query and BO callbacks borrow the same session and Rust-owned handles. No API, BO or
+/// mapped pointer may outlive f, and calls must be serial and non-reentrant. — KESTREL
+pub fn with_buffer_api<T: Transport, M: crate::bo::Mapper<T::Handle>, R>(
+    buffers: &mut crate::bo::Buffers<'_, T, M>,
+    f: impl FnOnce(&Api) -> R,
+) -> R {
+    f(&Api {
+        version: VERSION,
+        bytes: size_of::<Api>() as u32,
+        context: (buffers as *mut crate::bo::Buffers<'_, T, M>).cast(),
+        query: Some(buffer_query::<T, M>),
+        buffer_create: Some(buffer_create::<T, M>),
+        buffer_destroy: Some(buffer_destroy::<T, M>),
+        buffer_map: Some(buffer_map::<T, M>),
+        buffer_unmap: Some(buffer_unmap::<T, M>),
+    })
+}
+
+fn bo_error(error: crate::bo::Error) -> u32 {
+    use crate::bo::Error as E;
+    match error {
+        E::Client(error) => client_error(error),
+        E::InvalidRequest => INVALID_REQUEST,
+        E::NotFound => UNKNOWN_BUFFER,
+        E::NoMemory => NO_MEMORY,
+        E::Map(crate::bo::MapError::NoMemory) => NO_MEMORY,
+        E::Map(_) => MAP_FAILED,
+        E::Unmap(_) => UNMAP_FAILED,
+    }
+}
+fn client_error(error: Error) -> u32 {
+    match error {
+        Error::InvalidRequest => INVALID_REQUEST,
+        Error::Transport(_) => TRANSPORT,
+        Error::Protocol => PROTOCOL,
+        Error::DeviceLost | Error::RequestIdsExhausted => DEVICE_LOST,
+        Error::Server(status) => SERVER_ERROR + status as u32,
+    }
+}
+unsafe extern "C" fn buffer_query<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    out: *mut Info,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    unsafe { query::<T>((buffers.client as *mut Client<T>).cast(), out) }
+}
+unsafe extern "C" fn buffer_create<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    bytes: u64,
+    flags: u32,
+    out: *mut crate::bo::Info,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(crate::bo::Info::default()) };
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    match buffers.create(bytes, flags) {
+        Ok(info) => {
+            unsafe { out.write(info) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn buffer_destroy<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    buffers.destroy(id).map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn buffer_map<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+    out: *mut *mut c_void,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    match buffers.map(id) {
+        Ok(address) => {
+            unsafe { out.write(address.as_ptr().cast()) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn buffer_unmap<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    buffers.unmap(id).map_or_else(bo_error, |()| OK)
+}
+const _: () = assert!(size_of::<Api>() == 56);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_create) == 24);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_destroy) == 32);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_map) == 40);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_unmap) == 48);
+const _: () = assert!(size_of::<crate::bo::Info>() == 16);
 
 unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -> u32 {
     if context.is_null() || out.is_null() {
@@ -172,11 +298,7 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             unsafe { out.write(info) };
             OK
         }
-        Err(Error::InvalidRequest) => INVALID_REQUEST,
-        Err(Error::Transport(_)) => TRANSPORT,
-        Err(Error::Protocol) => PROTOCOL,
-        Err(Error::DeviceLost | Error::RequestIdsExhausted) => DEVICE_LOST,
-        Err(Error::Server(status)) => SERVER_ERROR + status as u32,
+        Err(error) => client_error(error),
     }
 }
 

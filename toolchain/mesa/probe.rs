@@ -1,8 +1,8 @@
-//j651
 //j652
 //j653
 //j739
 //j742
+//j744
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -112,7 +112,7 @@ const _: () = assert!(core::mem::offset_of!(Report, l2_slices) == 192);
 const _: () = assert!(core::mem::offset_of!(Report, pgsize_bitmap) == 200);
 const _: () = assert!(core::mem::offset_of!(Report, is_io_coherent) == 208);
 const _: () = assert!(core::mem::offset_of!(Report, timestamp_frequency) == 232);
-const _: () = assert!(core::mem::size_of::<Api>() == 24);
+const _: () = assert!(core::mem::size_of::<Api>() == 56);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
     cs_features: 0x7085f,
@@ -396,7 +396,10 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         // old caller's allocation. The extra sentinel words are guard storage, and they
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
-        let old_api = Api { version: 9, ..*api };
+        let old_api = Api {
+            version: 10,
+            ..*api
+        };
         let mut guarded = [0xfeedbeefcafebabeu64; 32];
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
             || guarded != [0xfeedbeefcafebabeu64; 32]
@@ -406,7 +409,10 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 9, ..*api },
+            Api {
+                version: 10,
+                ..*api
+            },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -916,7 +922,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     // "AFBC is no longer optional") and consumes it through the real pan_query_afbc, so the
     // modeled service must report has_afbc 1 and clear missing bit 5 while every earlier
     // property and every other mask bit stay unchanged. The request chain and the full
-    // success mask are pinned here; version 9 is refused before any I/O and version 10 is the
+    // success mask are pinned here; version 10 is refused before any I/O and version 11 is the
     // one accepted. pan_query_afbc's false branch needs pan_arch(gpu_id) < 5, which the pinned
     // Mali-G610 identity cannot produce; it is unreachable here, documented rather than
     // simulated with a fabricated device. — TIMBERDOODLE
@@ -924,11 +930,14 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let wire = transport(&sends, &closed, false, false);
     let mut client = Client::new(wire);
     let ok = with_api(&mut client, |api| {
-        if api.version != 10 {
+        if api.version != 11 {
             return false;
         }
         let mut guarded = [0xfeedbeefcafebabeu64; 32];
-        let old_api = Api { version: 9, ..*api };
+        let old_api = Api {
+            version: 10,
+            ..*api
+        };
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
             || guarded != [0xfeedbeefcafebabeu64; 32]
             || sends.get() != 0
@@ -1095,16 +1104,19 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
     }
 
-    // Check 19's version guard: version 9 is refused before any I/O, and this report's own
-    // version 10 is the one that is queried. — TIMBERDOODLE
+    // The extended callback ABI refuses version 10 before I/O and accepts version 11.
+    // Property report layout is unchanged. — KESTREL
     sends.set(0);
     let mut client = Client::new(transport(&sends, &closed, false, false));
     let ok = with_api(&mut client, |api| {
         let mut report = Report::default();
-        let old = Api { version: 9, ..*api };
+        let old = Api {
+            version: 10,
+            ..*api
+        };
         (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
             && sends.get() == 0
-            && api.version == 10
+            && api.version == 11
             && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
             && sends.get() == QUERIES
     });

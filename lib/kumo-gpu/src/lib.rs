@@ -1,9 +1,9 @@
 #![no_std]
-//j681
 //j707
 //j711
 //j742
 //j743
+//j744
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+pub mod bo;
 pub mod c;
 pub mod client;
 pub mod session;

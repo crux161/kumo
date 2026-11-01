@@ -1,9 +1,56 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j735 -->
 <!-- j740 -->
 <!-- j741 -->
 <!-- j742 -->
 <!-- j743 -->
+<!-- j744 -->
+
+## G7o-c: native BO allocation, destruction and CPU mapping
+
+The borrowed callback ABI is version **11** (56-byte API); its existing 104-byte
+property result and 240-byte report retain their layouts. Four optional callbacks
+create, destroy, map and unmap BOs. `with_api` stays query-only;
+`with_buffer_api` supplies all four over a Rust `bo::Buffers` store. Kernel VMO
+handles remain in Rust. C sees a session-local ID, flags, rounded size and a scoped
+CPU pointer. Query and BO callbacks use the same client and request sequence.
+
+`kumo_kmod.h` embeds the pinned Mesa `pan_kmod_bo` in caller-owned native storage.
+Its allocation/free/mmap/munmap helpers use the callback table directly. The
+owner token rejects a foreign context before I/O. This BO is unpublished:
+`base.dev` and `exclusive_vm` remain null, and generic Mesa device helpers require
+G7o-d. A service VM must already exist before BO allocation. — KESTREL, 2026-10-31
+
+- Only EXECUTABLE, NO_MMAP and GPU_UNCACHED are accepted, in any combination.
+  Zero, overflowing and over-limit sizes refuse before I/O; other sizes round up
+  to the 4 KiB page granule.
+- CPU mapping is lazy and covers the complete BO with RW Normal-NC data pages.
+  Repeated mmap returns the existing pointer; munmap is idempotent and remapping
+  preserves the VMO contents. NO_MMAP refuses before mapping. The native helper
+  accepts the drivers' `PROT_READ | PROT_WRITE`, `MAP_SHARED`, null-address call;
+  other protections, private/fixed requests and CPU execution refuse explicitly.
+- GPU bind policy is READ_ONLY for EXECUTABLE, NO_EXECUTE otherwise, plus UNCACHED
+  for GPU_UNCACHED. Actual VM binding and both drivers' W^X acceptance remain d/e.
+- Free first confirms BufferDestroy, which orders GPU work and unbinds in the
+  service, then unmaps the CPU alias and closes the local VMO grant. Recoverable
+  failures keep the BO retryable. If unmap fails after the destroy acknowledgement,
+  retry finishes local cleanup without issuing a second destroy.
+- Scope abandonment marks the client lost, releases local mappings/grants, and
+  sends no destroy replay. The caller must close the endpoint and reconnect;
+  drv-gpu retains its backing until contained reset proves quiescence. A failed
+  CPU unmap retains the kernel mapping's pin. — KESTREL, 2026-10-31
+
+```sh
+python3 scripts/mesa-bo-smoke.py --run
+```
+
+The runner verifies the pinned header/source and existing property-link closure,
+then links the real C BO helpers into a native Rust test executable. The service
+is modeled through the real wire codec and Session; allocation and mapping use
+real kernel paged VMOs and `native.rs`'s kernel adapter. It checks all eight flag
+combinations, every page's first/last words across unmap/remap, a 4 MiB + 1-byte
+request, stale/foreign rejection, exact request/handle/map counts and zero live
+bytes at close. It publishes no device and claims no GPU hardware execution.
+— KESTREL, 2026-10-31
 
 ## G7o-b: service memory for real driver allocations
 
@@ -58,8 +105,8 @@ unchanged:
 
 The missing mask therefore reaches zero for a device whose optional groups are present.
 Only bits 1, 3 and 4 can remain, for an absent or unusable tiler, texture or thread group.
-`kumo_mesa_probe` still returns INCOMPLETE and publishes no device: BO, VM and group operations
-are not real yet. The live gpu-client logs the memory group on every boot, decoded as upstream
+`kumo_mesa_probe` still returns INCOMPLETE and publishes no device: Device, VM and group operations
+are not published yet. The live gpu-client logs the memory group on every boot, decoded as upstream
 does. — TIMBERDOODLE, 2026-10-31
 
 ## G7n: the compiler runs on KUMO
@@ -278,7 +325,7 @@ separately from hardware evidence.
 ## Native seam and runtime closure
 
 `lib/kumo-gpu/src/c.rs` and `kumo_gpu.h` share a versioned callback descriptor and a
-104-byte result (private C ABI version10; older versions are refused). The C-owned report the
+104-byte result (private C ABI version11; older versions are refused). The C-owned report the
 bridge fills is 240 bytes; `has_afbc` carries upstream's AFBC constant rather than a hardware
 attestation, and G7o-a's block follows it. `with_api` lends an **existing** typed client for
 synchronous serial queries. Each callback performs GetInfo, GetTopology, GetMmuFeatures,

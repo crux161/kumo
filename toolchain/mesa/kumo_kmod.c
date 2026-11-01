@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: MIT */
-/*j650*/
 /*j651*/
 /*j652*/
 /*j653*/
 /*j742*/
-#include "kumo_gpu.h"
+/*j744*/
+#include "kumo_kmod.h"
 #include "kmod/pan_kmod.h"
 #include "model/pan_model.h"
+#include <sys/mman.h>
 
 /* This table is deliberately unregistered and incomplete. A DRM fd is never
  * reinterpreted as a capability. No pan_kmod_dev is published until native
@@ -93,8 +94,8 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
 
     /* Once a partial input for single helpers, this is now the complete property set (G7o-a):
      * every field is an attested word, upstream's derivation of one, or KUMO's stated policy
-     * above. It is still never published as a device, because the BO, VM and group
-     * operations are not real yet; the missing mask below records what is still unusable.
+     * above. It is still never published as a device, because native device, VM and group
+     * operations are not published yet; the missing mask below records what is still unusable.
      * — KESTREL, SAKER, TIMBERDOODLE */
     const struct pan_kmod_dev_props props = {
         .shader_present = out->info.shader_present,
@@ -253,4 +254,85 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)
         __builtin_trap();
     return KUMO_MESA_INCOMPLETE;
+}
+
+/* These operations are used before device publication through an explicit native API.
+ * G7o-d will attach them to a real device/VM; this slice publishes no pan_kmod_dev.
+ * The embedded BO is the actual pinned Mesa type, never an emulated definition. — KESTREL */
+_Static_assert(PAN_KMOD_BO_FLAG_EXECUTABLE == KUMO_GPU_BO_EXECUTABLE, "executable flag");
+_Static_assert(PAN_KMOD_BO_FLAG_NO_MMAP == KUMO_GPU_BO_NO_MMAP, "no-mmap flag");
+_Static_assert(PAN_KMOD_BO_FLAG_GPU_UNCACHED == KUMO_GPU_BO_GPU_UNCACHED, "uncached flag");
+
+static bool
+buffer_api_valid(const struct kumo_gpu_api *api)
+{
+    return api && api->version == KUMO_GPU_API_VERSION && api->bytes == sizeof(*api) &&
+           api->context && api->buffer_create && api->buffer_destroy &&
+           api->buffer_map && api->buffer_unmap;
+}
+
+static bool
+buffer_owned(const struct kumo_gpu_api *api, const struct kumo_mesa_bo *bo)
+{
+    return buffer_api_valid(api) && bo && bo->owner == api->context && bo->base.handle;
+}
+
+uint32_t
+kumo_mesa_bo_alloc(const struct kumo_gpu_api *api, uint64_t size, uint32_t flags,
+                    struct kumo_mesa_bo *out)
+{
+    if (!buffer_api_valid(api) || !out)
+        return KUMO_GPU_BAD_ARGUMENT;
+    if (flags & ~KUMO_GPU_BO_FLAGS)
+        return KUMO_GPU_INVALID_REQUEST;
+    struct kumo_gpu_buffer_info info = {0};
+    uint32_t status = api->buffer_create(api->context, size, flags, &info);
+    if (status)
+        return status;
+    *out = (struct kumo_mesa_bo){
+        .base = {.refcnt = 1, .size = info.bytes, .handle = info.id, .flags = info.flags},
+        .owner = api->context,
+    };
+    return KUMO_GPU_OK;
+}
+
+uint32_t
+kumo_mesa_bo_free(const struct kumo_gpu_api *api, struct kumo_mesa_bo *bo)
+{
+    if (!buffer_owned(api, bo))
+        return KUMO_GPU_BAD_ARGUMENT;
+    uint32_t status = api->buffer_destroy(api->context, bo->base.handle);
+    if (!status)
+        *bo = (struct kumo_mesa_bo){0};
+    return status;
+}
+
+uint32_t
+kumo_mesa_bo_mmap(const struct kumo_gpu_api *api, const struct kumo_mesa_bo *bo,
+                   int prot, int flags, void *host_addr, void **out)
+{
+    if (!buffer_owned(api, bo) || !out)
+        return KUMO_GPU_BAD_ARGUMENT;
+    *out = NULL;
+    /* The native mapper implements exactly the drivers' full-BO RW shared mapping.
+     * Unsupported protections or fixed/private mappings must not be silently widened.
+     * GPU executable permission does not make this CPU mapping executable. — KESTREL */
+    if (prot != (PROT_READ | PROT_WRITE) || flags != MAP_SHARED || host_addr || (bo->base.flags & PAN_KMOD_BO_FLAG_NO_MMAP))
+        return KUMO_GPU_INVALID_REQUEST;
+    return api->buffer_map(api->context, bo->base.handle, out);
+}
+
+uint32_t
+kumo_mesa_bo_munmap(const struct kumo_gpu_api *api, const struct kumo_mesa_bo *bo)
+{
+    if (!buffer_owned(api, bo))
+        return KUMO_GPU_BAD_ARGUMENT;
+    return api->buffer_unmap(api->context, bo->base.handle);
+}
+
+uint32_t
+kumo_mesa_bo_bind_flags(const struct kumo_mesa_bo *bo)
+{
+    return ((bo->base.flags & PAN_KMOD_BO_FLAG_EXECUTABLE) ? 1u : 2u) |
+           ((bo->base.flags & PAN_KMOD_BO_FLAG_GPU_UNCACHED) ? 4u : 0u);
 }

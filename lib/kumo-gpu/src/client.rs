@@ -1,9 +1,8 @@
-//j710
-//j651
 //j652
 //j681
 //j707
 //j742
+//j744
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -222,6 +221,16 @@ impl<T: Transport> Client<T> {
             (Response::WaitArmed { .. }, Some(handle)) => Ok(FenceStatus::Armed(handle)),
             _ => Err(self.fail(Error::Protocol)),
         }
+    }
+
+    /// Release a received VMO grant owned by the caller. This does not destroy the service
+    /// allocation or prove GPU completion. — KESTREL
+    pub fn close_buffer_handle(&mut self, handle: T::Handle) {
+        self.transport.close_handle(handle);
+    }
+
+    pub(crate) fn abandon(&mut self) {
+        self.lost = true;
     }
 
     fn fail(&mut self, error: Error) -> Error {

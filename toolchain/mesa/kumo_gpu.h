@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j650*/
 /*j651*/
 /*j652*/
 /*j653*/
 /*j742*/
+/*j744*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -11,16 +11,22 @@
 #include <stdint.h>
 
 /* Private versioned C boundary, mirrored by kumo_gpu::c. The opaque context is a
- * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
- * synchronously within with_api only; do not retain, reenter, race or unwind it.
- * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 10u
+ * borrowed Rust Client or BO store, never an FD or kernel handle. It may be called serially,
+ * synchronously within the borrowed API callback only; do not retain, reenter, race or unwind it.
+ * BO callbacks are optional for query-only with_api; with_buffer_api supplies all four.
+ * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
+ * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
+#define KUMO_GPU_API_VERSION 11u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
 #define KUMO_GPU_TRANSPORT 3u
 #define KUMO_GPU_PROTOCOL 4u
 #define KUMO_GPU_DEVICE_LOST 5u
+#define KUMO_GPU_NO_MEMORY 6u
+#define KUMO_GPU_MAP_FAILED 7u
+#define KUMO_GPU_UNMAP_FAILED 8u
+#define KUMO_GPU_UNKNOWN_BUFFER 9u
 #define KUMO_GPU_SERVER_ERROR 16u /* plus kumo_gpu::Status */
 
 struct kumo_gpu_info {
@@ -63,11 +69,27 @@ struct kumo_gpu_info {
 /* GPU_COHERENCY_PROTOCOL's "no coherency" encoding, also Panthor's
  * DRM_PANTHOR_GPU_COHERENCY_NONE. Upstream's is_io_coherent is `protocol != NONE`. */
 #define KUMO_GPU_COHERENCY_NONE 31u
+/* BOs expose session-local IDs, never VMO handles or physical addresses. — KESTREL */
+#define KUMO_GPU_BO_EXECUTABLE 1u
+#define KUMO_GPU_BO_NO_MMAP (1u << 2)
+#define KUMO_GPU_BO_GPU_UNCACHED (1u << 5)
+#define KUMO_GPU_BO_FLAGS (KUMO_GPU_BO_EXECUTABLE | KUMO_GPU_BO_NO_MMAP | KUMO_GPU_BO_GPU_UNCACHED)
+struct kumo_gpu_buffer_info {
+    uint32_t id;
+    uint32_t flags;
+    uint64_t bytes;
+};
+
 struct kumo_gpu_api {
     uint32_t version;
     uint32_t bytes;
     void *context;
     uint32_t (*query)(void *context, struct kumo_gpu_info *out);
+    uint32_t (*buffer_create)(void *context, uint64_t bytes, uint32_t flags,
+                              struct kumo_gpu_buffer_info *out);
+    uint32_t (*buffer_destroy)(void *context, uint32_t id);
+    uint32_t (*buffer_map)(void *context, uint32_t id, void **out);
+    uint32_t (*buffer_unmap)(void *context, uint32_t id);
 };
 
 #define KUMO_MESA_INCOMPLETE 1u
@@ -190,8 +212,14 @@ _Static_assert(offsetof(struct kumo_mesa_report, l2_slices) == 192, "report memo
 _Static_assert(offsetof(struct kumo_mesa_report, pgsize_bitmap) == 200, "report page offset");
 _Static_assert(offsetof(struct kumo_mesa_report, is_io_coherent) == 208, "report policy offset");
 _Static_assert(offsetof(struct kumo_mesa_report, timestamp_frequency) == 232, "report policy offset");
+_Static_assert(sizeof(struct kumo_gpu_buffer_info) == 16, "buffer layout");
+_Static_assert(offsetof(struct kumo_gpu_buffer_info, bytes) == 8, "buffer alignment");
 #if UINTPTR_MAX == UINT64_MAX
-_Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
+_Static_assert(sizeof(struct kumo_gpu_api) == 56, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_create) == 24, "create callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_destroy) == 32, "destroy callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_map) == 40, "map callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_unmap) == 48, "unmap callback");
 #endif
 #endif
