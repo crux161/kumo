@@ -1,9 +1,57 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j740 -->
 <!-- j741 -->
 <!-- j742 -->
 <!-- j743 -->
 <!-- j744 -->
+<!-- j745 -->
+
+## G7o-d: native device and immediate VM operations
+
+The callback ABI is **12**, with a **112-byte API**; Info remains 104 bytes and the
+property report remains 240 bytes. Seven new callbacks open/close the device,
+create/destroy a logical VM, bind/unbind, and report known device loss. The
+query-only and BO-only APIs leave those callbacks null. `with_device_api` owns one
+session for its scope: all C objects/pointers must die inside it, calls are serial
+and non-reentrant, and normal scope return always closes the endpoint once.
+
+`pan_kmod_kumo_dev_create` explicitly selects `kumo` using this capability API,
+without a DRM name, FD, ioctl or fabricated DRM version. It publishes the shared
+complete property set unchanged, after validating every required/optional group
+and opening the one service VM. The actual pinned Mesa initialization, allocators,
+refcounts, handle table and cleanup helpers manage the device, BOs and VM. The
+FD-based factory refuses. Generic `pan_kmod_bo_mmap` routes fd=-1 native BOs to
+the callback, and unsupported sparse/async operations refuse before upstream
+sparse emulation can allocate a dummy BO. — KESTREL, 2026-10-31
+
+One live logical VM may lease an aligned subrange of the service window
+`0x20000000..0x30000000`. This slice accepts manual VA allocation (VM flags zero)
+and immediate map/unmap only. Automatic VA and activity tracking, requested by
+Gallium, require later G7p/GL1 work; this device is not yet a Gallium/panvk render
+context. Logical VM IDs never repeat during the session. Exclusive BOs retain
+that generation after VM destruction, so pointer reuse cannot reassign them.
+Map rows enforce owner, range, offset and BO extent; Rust derives executable
+READ_ONLY versus data NO_EXECUTE policy from immutable BO flags. Unmap requires
+exact coverage by whole live bindings, with no holes. — KESTREL, 2026-10-31
+
+Successful operations commit metadata only after the service acknowledges them.
+A batch that fails after a successful prefix closes the session and exposes a
+faulty VM. BO/VM void destructors do the same on failure. Device destruction
+invalidates all children, drops local aliases/grants, and closes the owned endpoint;
+drv-gpu retains DMA backing until reset establishes quiescence. No destroy replay,
+fake wait completion, sync object, group, submission or hardware execution is added.
+
+```sh
+python3 scripts/mesa-device-smoke.py --run
+```
+
+The proof uses the real generic Mesa lifecycle and a modeled GPU service through
+the actual codec/Session, backed by real kernel VMOs and NC mappings. Eight cases
+cover complete/incomplete/failed properties, C allocation failure, refcounts,
+map/unmap/remap, offset binds, VM subranges/recreation, exclusive generations,
+unsupported modes, partial bind failure, BO/VM destructor failure and destruction
+with live children. It also checks real native-channel send/receive/idempotent
+close. Both complete GL/VK link graphs include the backend; GPU metal acceptance
+remains G7o-f. — KESTREL, 2026-10-31
 
 ## G7o-c: native BO allocation, destruction and CPU mapping
 

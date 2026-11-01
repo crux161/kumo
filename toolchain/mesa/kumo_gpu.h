@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j651*/
 /*j652*/
 /*j653*/
 /*j742*/
 /*j744*/
+/*j745*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -14,9 +14,12 @@
  * borrowed Rust Client or BO store, never an FD or kernel handle. It may be called serially,
  * synchronously within the borrowed API callback only; do not retain, reenter, race or unwind it.
  * BO callbacks are optional for query-only with_api; with_buffer_api supplies all four.
+ * with_device_api supplies native lifecycle/bind callbacks and closes its owned session
+ * on normal scope return. The device owns one manual-VA logical VM at a time; status
+ * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
-#define KUMO_GPU_API_VERSION 11u
+#define KUMO_GPU_API_VERSION 12u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -80,6 +83,14 @@ struct kumo_gpu_buffer_info {
     uint64_t bytes;
 };
 
+struct kumo_gpu_vm_binding {
+    uint32_t vm;
+    uint32_t buffer;
+    uint64_t va;
+    uint64_t offset;
+    uint64_t bytes;
+};
+
 struct kumo_gpu_api {
     uint32_t version;
     uint32_t bytes;
@@ -90,6 +101,13 @@ struct kumo_gpu_api {
     uint32_t (*buffer_destroy)(void *context, uint32_t id);
     uint32_t (*buffer_map)(void *context, uint32_t id, void **out);
     uint32_t (*buffer_unmap)(void *context, uint32_t id);
+    uint32_t (*device_open)(void *context);
+    uint32_t (*device_close)(void *context);
+    uint32_t (*vm_create)(void *context, uint64_t start, uint64_t bytes, uint32_t *out);
+    uint32_t (*vm_destroy)(void *context, uint32_t vm);
+    uint32_t (*vm_bind)(void *context, const struct kumo_gpu_vm_binding *binding);
+    uint32_t (*vm_unbind)(void *context, uint32_t vm, uint64_t va, uint64_t bytes);
+    uint32_t (*device_status)(void *context);
 };
 
 #define KUMO_MESA_INCOMPLETE 1u
@@ -214,12 +232,15 @@ _Static_assert(offsetof(struct kumo_mesa_report, is_io_coherent) == 208, "report
 _Static_assert(offsetof(struct kumo_mesa_report, timestamp_frequency) == 232, "report policy offset");
 _Static_assert(sizeof(struct kumo_gpu_buffer_info) == 16, "buffer layout");
 _Static_assert(offsetof(struct kumo_gpu_buffer_info, bytes) == 8, "buffer alignment");
+_Static_assert(sizeof(struct kumo_gpu_vm_binding) == 32, "VM binding layout");
 #if UINTPTR_MAX == UINT64_MAX
-_Static_assert(sizeof(struct kumo_gpu_api) == 56, "64-bit callback layout");
+_Static_assert(sizeof(struct kumo_gpu_api) == 112, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_create) == 24, "create callback");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_destroy) == 32, "destroy callback");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_map) == 40, "map callback");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_unmap) == 48, "unmap callback");
+_Static_assert(offsetof(struct kumo_gpu_api, device_open) == 56, "device callback");
+_Static_assert(offsetof(struct kumo_gpu_api, device_status) == 104, "device state callback");
 #endif
 #endif

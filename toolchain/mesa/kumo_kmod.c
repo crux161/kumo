@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j651*/
 /*j652*/
 /*j653*/
 /*j742*/
 /*j744*/
+/*j745*/
 #include "kumo_kmod.h"
 #include "kmod/pan_kmod.h"
 #include "model/pan_model.h"
@@ -62,7 +62,8 @@ _Static_assert(sizeof(((struct pan_kmod_dev_props *)0)->timestamp_frequency) == 
 #define KUMO_SUPPORTED_VM_OP_FLAGS 0u
 
 uint32_t
-kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
+kumo_mesa_query_properties(const struct kumo_gpu_api *api, struct kumo_mesa_report *out,
+                 struct pan_kmod_dev_props *complete)
 {
     if (!out)
         return KUMO_MESA_BAD_ABI;
@@ -253,12 +254,19 @@ kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
      * refusal callback is type-checked by Mesa and exercised by this probe. — KESTREL */
     if (native_scaffold.dev_create(-1, 0, NULL, NULL) != NULL)
         __builtin_trap();
+    if (complete) *complete = props;
     return KUMO_MESA_INCOMPLETE;
 }
 
-/* These operations are used before device publication through an explicit native API.
- * G7o-d will attach them to a real device/VM; this slice publishes no pan_kmod_dev.
- * The embedded BO is the actual pinned Mesa type, never an emulated definition. — KESTREL */
+uint32_t
+kumo_mesa_probe(const struct kumo_gpu_api *api, struct kumo_mesa_report *out)
+{
+    return kumo_mesa_query_properties(api, out, NULL);
+}
+
+/* These BO-only helpers leave device initialization to native-device.c, which also
+ * uses them for the published backend. The embedded BO is the actual pinned Mesa
+ * type, never an emulated definition. — KESTREL */
 _Static_assert(PAN_KMOD_BO_FLAG_EXECUTABLE == KUMO_GPU_BO_EXECUTABLE, "executable flag");
 _Static_assert(PAN_KMOD_BO_FLAG_NO_MMAP == KUMO_GPU_BO_NO_MMAP, "no-mmap flag");
 _Static_assert(PAN_KMOD_BO_FLAG_GPU_UNCACHED == KUMO_GPU_BO_GPU_UNCACHED, "uncached flag");

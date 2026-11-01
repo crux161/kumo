@@ -1,8 +1,8 @@
-//j652
 //j681
 //j707
 //j742
 //j744
+//j745
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -33,6 +33,12 @@ pub trait Transport {
         bytes: &mut [u8; REPLY_LEN + 1],
     ) -> Result<(usize, Option<Self::Handle>), TransportError>;
     fn close_handle(&mut self, handle: Self::Handle);
+}
+
+/// A native device owns its brokered endpoint. Close is a contained session loss, not a
+/// promise that DMA has already stopped; drv-gpu performs reset before release. — KESTREL
+pub trait SessionTransport: Transport {
+    fn close_session(&mut self);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +72,7 @@ pub struct Client<T: Transport> {
     transport: T,
     id: u32,
     lost: bool,
+    closed: bool,
 }
 
 impl<T: Transport> Client<T> {
@@ -76,6 +83,7 @@ impl<T: Transport> Client<T> {
             transport,
             id: 0,
             lost: false,
+            closed: false,
         }
     }
     pub fn is_lost(&self) -> bool {
@@ -296,6 +304,16 @@ impl<T: Transport> Client<T> {
                 }
                 Ok((response, handle))
             }
+        }
+    }
+}
+
+impl<T: SessionTransport> Client<T> {
+    pub fn close_session(&mut self) {
+        self.lost = true;
+        if !self.closed {
+            self.closed = true;
+            self.transport.close_session();
         }
     }
 }

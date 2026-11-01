@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 #j740
+#j745
 """Close both measured Mesa links and build the real KUMO utility acceptance."""
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -39,13 +41,19 @@ def compile_flags():
     kmod = next(c for c in commands if c["file"].endswith("/pan_kmod.c"))
     includes = [arg for arg in shlex.split(kmod["command"]) if arg.startswith("-I")]
     return [*flags, *includes, "-I", str(MESA / "mesa-26.2.5/src"), "-I", str(BUILD / "src"),
-            "-I", str(MESA / "drm"), "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+            "-I", str(MESA / "drm"), "-I", str(TOOL), "-I", str(MESA / "mesa-26.2.5/src/panfrost"), "-I", str(MESA / "mesa-26.2.5/src/panfrost/lib"), "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
             "-Wno-missing-field-initializers"]
 
 
 def main():
     OUT.mkdir(exist_ok=True)
     measured = json.loads(Path("/output/inventory.json").read_text())
+    header = MESA / "mesa-26.2.5/src/panfrost/lib/kmod/pan_kmod.h"
+    if "return pan_kmod_kumo_bo_mmap" not in header.read_text():
+        assert hashlib.sha256(header.read_bytes()).hexdigest() == "55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4"
+        run(["patch", "--batch", "--fuzz=0", "-p1", "-d", MESA / "mesa-26.2.5", "-i", TOOL / "native-device-header.patch"])
+    assert hashlib.sha256(header.read_bytes()).hexdigest() == "5080af914d916bb48c4c7351f25334703fb5575f393e82500f82d4ef34b7f979"
+
     # Install the current SDK without rewriting unchanged headers, so Ninja's
     # dependency graph rebuilds exactly the affected target objects. — SAKER
     for source in (ROOT / "target/kumo-sysroot").rglob("*"):
@@ -57,11 +65,21 @@ def main():
     names = sorted({name.removeprefix("build/") for driver in measured.values()
                     for name in driver["archive_bytes"] if name != "sysroot/lib/libc.a"})
     (OUT / "rebuild.log").write_text(run(["ninja", "-j8", *names]))
+    # Header routes change the real link graph. Re-measure it before the C++
+    # closure check so new native dependencies retain object provenance. — KESTREL
+    spec = importlib.util.spec_from_file_location("drivers", TOOL / "build-drivers.py")
+    drivers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(drivers)
+    targets = run(["ninja", "-t", "targets", "all"])
+    archives = sorted(BUILD / line.split(":", 1)[0] for line in targets.splitlines()
+                      if re.search(r"\.a: STATIC_LINKER(?:_RSP)?$", line)
+                      and not any(part in "/" + line for part in drivers.EXCLUDE))
+    measured = drivers.inventory(archives)
     (OUT / "cxx.log").write_text(run(["python3", ROOT / "toolchain/cxx/build.py"]))
     flags = compile_flags()
     objects = []
     depfiles = []
-    for name in ("drm-refusal", "static-build-id", "util-smoke"):
+    for name in ("drm-refusal", "static-build-id", "util-smoke", "kumo_kmod", "native-device"):
         obj = OUT / f"{name}.o"
         dep = OUT / f"{name}.d"
         run(["clang-22", *flags, "-MD", "-MF", dep, "-c", TOOL / f"{name}.c", "-o", obj])
@@ -74,7 +92,7 @@ def main():
         archives = [MESA / name for name in measured[driver]["archive_bytes"] if name != "sysroot/lib/libc.a"]
         elf = OUT / f"link-{driver}.elf"
         run([*link, "-e", "main", f"-Map={elf}.map", f"--why-extract={elf}.extract", "-o", elf,
-             MESA / f"link-{driver}.o", *objects[:2], "--start-group", runtime, *archives, libc, "--end-group"])
+             MESA / f"link-{driver}.o", *objects[:2], *objects[3:], "--start-group", runtime, *archives, libc, "--end-group"])
         undefined = run(["llvm-nm-22", "-P", "--undefined-only", elf])
         (OUT / f"link-{driver}.undefined").write_text(undefined)
         optional = {symbol for symbol, entry in measured[driver]["undefined"].items() if not entry["required"]}
@@ -105,7 +123,7 @@ def main():
     inputs = {libc, runtime, ROOT / "toolchain/relibc/smoke/link.ld", Path("/output/inventory.json"),
               BUILD / "compile_commands.json", TOOL / "kumo-build.patch"}
     inputs.update(TOOL / f"{name}.c" for name in ("drm-refusal", "static-build-id", "util-smoke"))
-    inputs.add(TOOL / "build-closure.py")
+    inputs.update(TOOL / name for name in ["build-closure.py", "native-device-header.patch", "kumo_gpu.h", "kumo_kmod.h", "native-device.c", "kumo_kmod.c"])
     for dep in depfiles:
         for path in dep.read_text().replace("\\\n", " ").split(":", 1)[1].split():
             assert not path.startswith("/usr/include/"), "Linux target-header contamination"

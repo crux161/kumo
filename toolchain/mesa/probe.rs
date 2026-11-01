@@ -1,8 +1,8 @@
-//j652
 //j653
 //j739
 //j742
 //j744
+//j745
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -112,7 +112,7 @@ const _: () = assert!(core::mem::offset_of!(Report, l2_slices) == 192);
 const _: () = assert!(core::mem::offset_of!(Report, pgsize_bitmap) == 200);
 const _: () = assert!(core::mem::offset_of!(Report, is_io_coherent) == 208);
 const _: () = assert!(core::mem::offset_of!(Report, timestamp_frequency) == 232);
-const _: () = assert!(core::mem::size_of::<Api>() == 56);
+const _: () = assert!(core::mem::size_of::<Api>() == 112);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
     cs_features: 0x7085f,
@@ -397,7 +397,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
         let old_api = Api {
-            version: 10,
+            version: 11,
             ..*api
         };
         let mut guarded = [0xfeedbeefcafebabeu64; 32];
@@ -410,7 +410,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
             Api {
-                version: 10,
+                version: 11,
                 ..*api
             },
             Api {
@@ -930,12 +930,12 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let wire = transport(&sends, &closed, false, false);
     let mut client = Client::new(wire);
     let ok = with_api(&mut client, |api| {
-        if api.version != 11 {
+        if api.version != 12 {
             return false;
         }
         let mut guarded = [0xfeedbeefcafebabeu64; 32];
         let old_api = Api {
-            version: 10,
+            version: 11,
             ..*api
         };
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
@@ -1111,12 +1111,12 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let ok = with_api(&mut client, |api| {
         let mut report = Report::default();
         let old = Api {
-            version: 10,
+            version: 11,
             ..*api
         };
         (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
             && sends.get() == 0
-            && api.version == 11
+            && api.version == 12
             && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
             && sends.get() == QUERIES
     });

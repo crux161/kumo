@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j735
 #j738
+#j745
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -52,6 +53,7 @@ def stage():
         archive.extractall(WORK, filter="data")
     mesa = WORK / "mesa-26.2.5"
     run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "kumo-build.patch"], "patch.log")
+    run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "native-device-header.patch"], "native-header.log")
     shutil.copytree(ROOT / "target/kumo-sysroot", WORK / "sysroot")
     include = WORK / "sysroot/include"
     # Private header repairs; the installed sysroot remains unchanged. All actual
@@ -108,6 +110,8 @@ def category(symbol):
         return "Panthor ioctl user"
     if symbol.startswith("drm"):
         return "DRM / libdrm"
+    if symbol == "pan_kmod_kumo_bo_mmap":
+        return "other: native capability backend"
     if symbol in BUILD_ID:
         return "other: static build ID"
     raise AssertionError(f"unclassified required symbol: {symbol}")

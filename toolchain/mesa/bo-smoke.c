@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*j744*/
+/*j745*/
 #include "kumo_kmod.h"
 #include <sys/mman.h>
 
@@ -53,7 +54,7 @@ kumo_mesa_bo_proof(const struct kumo_gpu_api *api)
     };
     struct kumo_mesa_bo bo = {.base.handle = 0xfeed};
     struct kumo_gpu_api old = *api;
-    old.version = 10;
+    old.version = 11;
     CHECK(kumo_mesa_bo_alloc(&old, 1, 0, &bo) == KUMO_GPU_BAD_ARGUMENT && bo.base.handle == 0xfeed, 1);
     old = *api;
     old.buffer_destroy = NULL;

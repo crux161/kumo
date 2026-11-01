@@ -1,12 +1,13 @@
 //j744
+//j745
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use crate::client::{Buffer, Client, Error as ClientError, Transport};
-use crate::{BindFlags, MAX_BUFFER_BYTES, PAGE_BYTES};
+use crate::client::{Buffer, Client, Error as ClientError, SessionTransport, Transport};
+use crate::{BindFlags, Binding, Unbind, MAX_BUFFER_BYTES, PAGE_BYTES, VA_END, VA_START};
 
 // These are the pinned pan_kmod flags, checked against Mesa by the C bridge. — KESTREL
 pub const EXECUTABLE: u32 = 1;
@@ -61,15 +62,36 @@ struct Record<H> {
     destroyed: bool,
 }
 
-/// The caller creates the service VM before allocating BOs (device/VM ownership is G7o-d).
-/// All C BOs and pointers are scoped to a with_buffer_api call. Explicit free is the normal
-/// path. Abandonment invalidates the client and drops only local claims: the caller must
-/// close the endpoint and reconnect, and drv-gpu still resets before freeing its DMA.
-/// — KESTREL
+#[derive(Clone, Copy)]
+struct Vm {
+    id: u32,
+    start: u64,
+    end: u64,
+}
+
+/// Logical VM identity and one map request; physical backing stays in the Rust BO table.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VmBinding {
+    pub vm: u32,
+    pub buffer: u32,
+    pub va: u64,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// Rust owns BO grants and CPU aliases for the borrowed callback scope. The BO-only API
+/// requires an existing service VM; with_device_api opens one and always closes its owned
+/// session on normal return. Native logical VMs lease that single service address space.
+/// Abandonment drops only local claims; drv-gpu resets before freeing its DMA. — KESTREL
 pub struct Buffers<'a, T: Transport, M: Mapper<T::Handle>> {
     pub(crate) client: &'a mut Client<T>,
     mapper: &'a mut M,
     records: Vec<Record<T::Handle>>,
+    device_open: bool,
+    vm: Option<Vm>,
+    next_vm: u32,
+    bindings: Vec<Binding>,
 }
 
 impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
@@ -78,6 +100,10 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             client,
             mapper,
             records: Vec::new(),
+            device_open: false,
+            vm: None,
+            next_vm: 0,
+            bindings: Vec::new(),
         }
     }
 
@@ -154,11 +180,24 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
         if !record.destroyed {
             self.client.destroy_buffer(&record.buffer)?;
             record.destroyed = true;
+            self.bindings.retain(|binding| binding.buffer != id);
         }
         self.unmap(id)?;
         let record = self.records.swap_remove(index);
         self.client.close_buffer_handle(record.buffer.handle);
         Ok(())
+    }
+
+    fn release_local(&mut self) {
+        for record in self.records.drain(..) {
+            if let Some(address) = record.address {
+                let _ = self.mapper.unmap(address, record.buffer.bytes);
+            }
+            self.client.close_buffer_handle(record.buffer.handle);
+        }
+        self.bindings.clear();
+        self.vm = None;
+        self.device_open = false;
     }
 
     pub fn live_count(&self) -> usize {
@@ -168,17 +207,139 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
 
 impl<T: Transport, M: Mapper<T::Handle>> Drop for Buffers<'_, T, M> {
     fn drop(&mut self) {
-        if !self.records.is_empty() {
+        if !self.records.is_empty() || self.device_open {
             self.client.abandon();
         }
         // No destroy replay on abandonment. A driver-held VMO keeps GPU backing alive;
         // a failed CPU unmap keeps the kernel mapping's own pin. — KESTREL
-        for record in self.records.drain(..) {
-            if let Some(address) = record.address {
-                let _ = self.mapper.unmap(address, record.buffer.bytes);
-            }
-            self.client.close_buffer_handle(record.buffer.handle);
+        self.release_local();
+    }
+}
+
+impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
+    pub fn open_device(&mut self) -> Result<(), Error> {
+        if self.client.is_lost() {
+            return Err(ClientError::DeviceLost.into());
         }
+        if self.device_open || !self.records.is_empty() {
+            return Err(Error::InvalidRequest);
+        }
+        // Create the one service VM before publishing a native device. Mesa's logical VMs
+        // lease this AS; destroying/recreating one does not send a second VmCreate. — KESTREL
+        if self.client.create_vm()? != 1 {
+            self.client.abandon();
+            return Err(ClientError::Protocol.into());
+        }
+        self.device_open = true;
+        Ok(())
+    }
+    pub fn close_device(&mut self) {
+        // Release only local claims, then close the endpoint so the driver contains DMA.
+        // Endpoint close is idempotent, even after protocol/device loss. — KESTREL
+        self.release_local();
+        self.client.close_session();
+    }
+    pub fn device_ready(&self) -> bool {
+        self.device_open && !self.client.is_lost()
+    }
+    pub fn create_native_vm(&mut self, start: u64, bytes: u64) -> Result<u32, Error> {
+        if !self.device_ready() {
+            return Err(ClientError::DeviceLost.into());
+        }
+        let end = start.checked_add(bytes).ok_or(Error::InvalidRequest)?;
+        if self.vm.is_some()
+            || bytes == 0
+            || start % PAGE_BYTES != 0
+            || bytes % PAGE_BYTES != 0
+            || start < VA_START
+            || end > VA_END
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let id = self.next_vm.checked_add(1).ok_or(Error::NoMemory)?;
+        self.next_vm = id;
+        self.vm = Some(Vm { id, start, end });
+        Ok(id)
+    }
+    fn native_vm(&self, id: u32) -> Result<Vm, Error> {
+        if !self.device_ready() {
+            return Err(ClientError::DeviceLost.into());
+        }
+        self.vm.filter(|vm| vm.id == id).ok_or(Error::NotFound)
+    }
+    pub fn bind_native(&mut self, request: VmBinding) -> Result<(), Error> {
+        let vm = self.native_vm(request.vm)?;
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.buffer.id == request.buffer && !record.destroyed)
+            .ok_or(Error::NotFound)?;
+        let binding = Binding {
+            vm: 1,
+            buffer: request.buffer,
+            va: request.va,
+            offset: request.offset,
+            bytes: request.bytes,
+            flags: bind_flags(record.flags),
+        };
+        binding
+            .validate(record.buffer.bytes)
+            .map_err(|_| Error::InvalidRequest)?;
+        if binding.va < vm.start
+            || binding.va + binding.bytes > vm.end
+            || self.bindings.iter().any(|other| binding.overlaps(*other))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        if self.bindings.len() == crate::session::MAX_BINDINGS {
+            return Err(Error::NoMemory);
+        }
+        self.bindings.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        self.client.bind(binding)?;
+        self.bindings.push(binding);
+        Ok(())
+    }
+    pub fn unbind_native(&mut self, id: u32, va: u64, bytes: u64) -> Result<(), Error> {
+        let vm = self.native_vm(id)?;
+        let range = Unbind { vm: 1, va, bytes };
+        if !range.valid_shape() || va < vm.start || va + bytes > vm.end {
+            return Err(Error::InvalidRequest);
+        }
+        let end = va + bytes;
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.va < end && va < b.va + b.bytes && (b.va < va || b.va + b.bytes > end))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let mut cursor = va;
+        while cursor < end {
+            let binding = self
+                .bindings
+                .iter()
+                .find(|b| b.va == cursor)
+                .ok_or(Error::NotFound)?;
+            cursor += binding.bytes;
+        }
+        self.client.unbind(range)?;
+        self.bindings.retain(|b| b.va < va || b.va >= end);
+        Ok(())
+    }
+    pub fn destroy_native_vm(&mut self, id: u32) -> Result<(), Error> {
+        self.native_vm(id)?;
+        // A retry resumes at the first remaining binding; successful invalidations are
+        // never replayed. The C void destructor makes any failure terminal. — KESTREL
+        while let Some(binding) = self.bindings.last().copied() {
+            self.client.unbind(Unbind {
+                vm: 1,
+                va: binding.va,
+                bytes: binding.bytes,
+            })?;
+            self.bindings.pop();
+        }
+        self.vm = None;
+        Ok(())
     }
 }
 

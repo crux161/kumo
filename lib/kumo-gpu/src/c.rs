@@ -1,10 +1,10 @@
-//j651
 //j652
 //j653
 //j742
 //j744
+//j745
 
-//! Borrowed C query/BO boundary for the pinned Mesa backend. Kernel handles and BO ownership
+//! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
 //! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
 
 use core::{ffi::c_void, mem::size_of};
@@ -12,7 +12,7 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -91,6 +91,13 @@ pub struct Api {
     pub buffer_destroy: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
     pub buffer_map: Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> u32>,
     pub buffer_unmap: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub device_open: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub device_close: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub vm_create: Option<unsafe extern "C" fn(*mut c_void, u64, u64, *mut u32) -> u32>,
+    pub vm_destroy: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub vm_bind: Option<unsafe extern "C" fn(*mut c_void, *const crate::bo::VmBinding) -> u32>,
+    pub vm_unbind: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u64) -> u32>,
+    pub device_status: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
 }
 
 /// The C consumer may call query synchronously during `f` only. It must not retain any
@@ -106,6 +113,13 @@ pub fn with_api<T: Transport, R>(client: &mut Client<T>, f: impl FnOnce(&Api) ->
         buffer_destroy: None,
         buffer_map: None,
         buffer_unmap: None,
+        device_open: None,
+        device_close: None,
+        vm_create: None,
+        vm_destroy: None,
+        vm_bind: None,
+        vm_unbind: None,
+        device_status: None,
     })
 }
 
@@ -124,7 +138,140 @@ pub fn with_buffer_api<T: Transport, M: crate::bo::Mapper<T::Handle>, R>(
         buffer_destroy: Some(buffer_destroy::<T, M>),
         buffer_map: Some(buffer_map::<T, M>),
         buffer_unmap: Some(buffer_unmap::<T, M>),
+        device_open: None,
+        device_close: None,
+        vm_create: None,
+        vm_destroy: None,
+        vm_bind: None,
+        vm_unbind: None,
+        device_status: None,
     })
+}
+
+/// Own one native session for the callback scope. Close the endpoint on return as well as
+/// explicit device destruction; all Mesa objects and pointers must die inside f. — KESTREL
+pub fn with_device_api<T: crate::client::SessionTransport, M: crate::bo::Mapper<T::Handle>, R>(
+    buffers: &mut crate::bo::Buffers<'_, T, M>,
+    f: impl FnOnce(&Api) -> R,
+) -> R {
+    let mut api = with_buffer_api(buffers, |api| *api);
+    api.device_open = Some(device_open::<T, M>);
+    api.device_close = Some(device_close::<T, M>);
+    api.vm_create = Some(vm_create::<T, M>);
+    api.vm_destroy = Some(vm_destroy::<T, M>);
+    api.vm_bind = Some(vm_bind::<T, M>);
+    api.vm_unbind = Some(vm_unbind::<T, M>);
+    api.device_status = Some(device_status::<T, M>);
+    let result = f(&api);
+    buffers.close_device();
+    result
+}
+unsafe extern "C" fn device_open<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .open_device()
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn device_close<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }.close_device();
+    OK
+}
+unsafe extern "C" fn device_status<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    if unsafe { &*context.cast::<crate::bo::Buffers<'_, T, M>>() }.device_ready() {
+        OK
+    } else {
+        DEVICE_LOST
+    }
+}
+unsafe extern "C" fn vm_create<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    start: u64,
+    bytes: u64,
+    out: *mut u32,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(0) };
+    match unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .create_native_vm(start, bytes)
+    {
+        Ok(id) => {
+            unsafe { out.write(id) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn vm_destroy<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .destroy_native_vm(id)
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn vm_bind<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    request: *const crate::bo::VmBinding,
+) -> u32 {
+    if context.is_null() || request.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .bind_native(unsafe { *request })
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn vm_unbind<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    id: u32,
+    va: u64,
+    bytes: u64,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .unbind_native(id, va, bytes)
+        .map_or_else(bo_error, |()| OK)
 }
 
 fn bo_error(error: crate::bo::Error) -> u32 {
@@ -215,11 +362,14 @@ unsafe extern "C" fn buffer_unmap<T: Transport, M: crate::bo::Mapper<T::Handle>>
     let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
     buffers.unmap(id).map_or_else(bo_error, |()| OK)
 }
-const _: () = assert!(size_of::<Api>() == 56);
+const _: () = assert!(size_of::<Api>() == 112);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_create) == 24);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_destroy) == 32);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_map) == 40);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_unmap) == 48);
+const _: () = assert!(core::mem::offset_of!(Api, device_open) == 56);
+const _: () = assert!(core::mem::offset_of!(Api, device_status) == 104);
+const _: () = assert!(size_of::<crate::bo::VmBinding>() == 32);
 const _: () = assert!(size_of::<crate::bo::Info>() == 16);
 
 unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -> u32 {

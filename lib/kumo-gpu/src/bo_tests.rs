@@ -1,4 +1,5 @@
 //j744
+//j745
 use super::*;
 use crate::{
     c, client::TransportError, Command, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
@@ -13,7 +14,9 @@ struct State {
     maps: u32,
     unmaps: u32,
     next: u32,
+    sessions_closed: u32,
     fail: Option<Status>,
+    fail_after: usize,
     map_fail: bool,
     unmap_fail: bool,
 }
@@ -27,7 +30,13 @@ impl Transport for Wire {
         let request = Request::decode(bytes).unwrap();
         let mut state = self.state.borrow_mut();
         state.calls.push(request.command);
-        let result = if let Some(error) = state.fail.take() {
+        let failure = if state.fail.is_some() && state.fail_after > 0 {
+            state.fail_after -= 1;
+            None
+        } else {
+            state.fail.take()
+        };
+        let result = if let Some(error) = failure {
             Err(error)
         } else {
             Ok(match request.command {
@@ -39,6 +48,9 @@ impl Transport for Wire {
                     }
                 }
                 Command::BufferDestroy { buffer } => Response::BufferDestroyed { buffer },
+                Command::VmCreate => Response::VmCreated { vm: 1 },
+                Command::VmBind(_) => Response::VmBound,
+                Command::VmUnbind(range) => Response::VmUnbound(range),
                 _ => panic!("unexpected request"),
             })
         };
@@ -62,6 +74,11 @@ impl Transport for Wire {
     }
     fn close_handle(&mut self, handle: u32) {
         self.state.borrow_mut().closed.push(handle);
+    }
+}
+impl crate::client::SessionTransport for Wire {
+    fn close_session(&mut self) {
+        self.state.borrow_mut().sessions_closed += 1;
     }
 }
 struct Memory(Rc<RefCell<State>>);
@@ -272,4 +289,195 @@ fn c_callbacks_clear_outputs_refuse_null_and_keep_ids_private() {
         );
         assert_eq!(query.gpu_id, 0);
     });
+}
+
+#[test]
+fn native_vm_lifetimes_use_one_service_vm_and_fresh_logical_ids() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    buffers.open_device().unwrap();
+    assert_eq!(buffers.open_device(), Err(Error::InvalidRequest));
+    let bo = buffers
+        .create(2 * PAGE_BYTES, EXECUTABLE | GPU_UNCACHED)
+        .unwrap();
+    let vm = buffers.create_native_vm(VA_START, 8 * PAGE_BYTES).unwrap();
+    let request = VmBinding {
+        vm,
+        buffer: bo.id,
+        va: VA_START,
+        offset: PAGE_BYTES,
+        bytes: PAGE_BYTES,
+    };
+    buffers.bind_native(request).unwrap();
+    let Command::VmBind(binding) = *state.borrow().calls.last().unwrap() else {
+        panic!()
+    };
+    assert_eq!(binding.vm, 1);
+    assert_eq!(
+        binding.flags,
+        BindFlags(BindFlags::READ_ONLY | BindFlags::UNCACHED)
+    );
+    let calls = state.borrow().calls.len();
+    assert_eq!(buffers.bind_native(request), Err(Error::InvalidRequest));
+    assert_eq!(
+        buffers.bind_native(VmBinding {
+            offset: 2 * PAGE_BYTES,
+            ..request
+        }),
+        Err(Error::InvalidRequest)
+    );
+    assert_eq!(
+        buffers.bind_native(VmBinding {
+            vm: vm + 1,
+            ..request
+        }),
+        Err(Error::NotFound)
+    );
+    assert_eq!(state.borrow().calls.len(), calls);
+    buffers.destroy_native_vm(vm).unwrap();
+    let next = buffers.create_native_vm(VA_START, 8 * PAGE_BYTES).unwrap();
+    assert!(next > vm);
+    assert_eq!(buffers.bind_native(request), Err(Error::NotFound));
+    buffers
+        .bind_native(VmBinding {
+            vm: next,
+            ..request
+        })
+        .unwrap();
+    buffers.destroy(bo.id).unwrap(); // implicit unbind removes local native binding metadata
+    let calls = state.borrow().calls.len();
+    buffers.destroy_native_vm(next).unwrap();
+    assert_eq!(state.borrow().calls.len(), calls);
+    assert_eq!(
+        state
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| **c == Command::VmCreate)
+            .count(),
+        1
+    );
+    buffers.close_device();
+    buffers.close_device();
+    assert_eq!(state.borrow().sessions_closed, 1);
+    assert!(!buffers.device_ready());
+}
+
+#[test]
+fn native_unbind_requires_exact_coverage_and_preserves_metadata_on_refusal() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    buffers.open_device().unwrap();
+    let bo = buffers.create(4 * PAGE_BYTES, 0).unwrap();
+    let vm = buffers
+        .create_native_vm(VA_START + PAGE_BYTES, 8 * PAGE_BYTES)
+        .unwrap();
+    for i in [1, 2] {
+        buffers
+            .bind_native(VmBinding {
+                vm,
+                buffer: bo.id,
+                va: VA_START + i * PAGE_BYTES,
+                offset: 0,
+                bytes: PAGE_BYTES,
+            })
+            .unwrap();
+    }
+    let calls = state.borrow().calls.len();
+    for (va, bytes) in [
+        (VA_START, PAGE_BYTES),
+        (VA_START + 2 * PAGE_BYTES, 2 * PAGE_BYTES),
+        (VA_START + PAGE_BYTES + 1, PAGE_BYTES),
+        (u64::MAX, PAGE_BYTES),
+    ] {
+        assert!(buffers.unbind_native(vm, va, bytes).is_err());
+    }
+    assert_eq!(state.borrow().calls.len(), calls);
+    state.borrow_mut().fail = Some(crate::Status::NoMemory);
+    assert!(buffers
+        .unbind_native(vm, VA_START + PAGE_BYTES, 2 * PAGE_BYTES)
+        .is_err());
+    buffers
+        .unbind_native(vm, VA_START + PAGE_BYTES, 2 * PAGE_BYTES)
+        .unwrap();
+    assert!(buffers.bindings.is_empty());
+    buffers.destroy(bo.id).unwrap();
+    buffers.destroy_native_vm(vm).unwrap();
+    buffers.close_device();
+}
+
+#[test]
+fn native_scope_closes_on_abandonment_and_failure_without_replaying_work() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| unsafe {
+        assert_eq!(api.device_open.unwrap()(api.context), c::OK);
+        let mut vm = 999;
+        assert_eq!(
+            api.vm_create.unwrap()(api.context, VA_START, PAGE_BYTES, &mut vm),
+            c::OK
+        );
+        assert_ne!(vm, 0);
+        let mut info = Info::default();
+        assert_eq!(
+            api.buffer_create.unwrap()(api.context, PAGE_BYTES, 0, &mut info),
+            c::OK
+        );
+        let mut pointer = core::ptr::null_mut();
+        assert_eq!(
+            api.buffer_map.unwrap()(api.context, info.id, &mut pointer),
+            c::OK
+        );
+        // Leave children live: scope exit owns local teardown and endpoint close.
+    });
+    assert_eq!(state.borrow().sessions_closed, 1);
+    assert_eq!(state.borrow().closed, [101]);
+    assert_eq!(state.borrow().unmaps, 1);
+    assert!(!state
+        .borrow()
+        .calls
+        .iter()
+        .any(|c| matches!(c, Command::BufferDestroy { .. })));
+    assert_eq!(
+        buffers.open_device(),
+        Err(Error::Client(ClientError::DeviceLost))
+    );
+}
+
+#[test]
+fn native_vm_destroy_failure_is_retryable_without_reissuing_successful_unbinds() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    buffers.open_device().unwrap();
+    let bo = buffers.create(PAGE_BYTES, 0).unwrap();
+    let vm = buffers.create_native_vm(VA_START, 2 * PAGE_BYTES).unwrap();
+    for va in [VA_START, VA_START + PAGE_BYTES] {
+        buffers
+            .bind_native(VmBinding {
+                vm,
+                buffer: bo.id,
+                va,
+                offset: 0,
+                bytes: PAGE_BYTES,
+            })
+            .unwrap();
+    }
+    state.borrow_mut().fail = Some(crate::Status::NoMemory);
+    state.borrow_mut().fail_after = 1;
+    assert!(buffers.destroy_native_vm(vm).is_err());
+    assert_eq!(buffers.bindings.len(), 1);
+    buffers.destroy_native_vm(vm).unwrap();
+    assert!(buffers.bindings.is_empty());
+    let unbound: Vec<u64> = state
+        .borrow()
+        .calls
+        .iter()
+        .filter_map(|command| match command {
+            Command::VmUnbind(range) => Some(range.va),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unbound, [VA_START + PAGE_BYTES, VA_START, VA_START]);
+    buffers.destroy(bo.id).unwrap();
+    buffers.close_device();
 }
