@@ -1,9 +1,9 @@
-//j710
 #![no_std]
 //j681
 //j707
 //j711
 //j742
+//j743
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -36,18 +36,18 @@ pub mod wire;
 pub use wire::{Command, Reply, Request, Response, REPLY_LEN, REQUEST_LEN};
 
 pub const PAGE_BYTES: u64 = 4096;
-/// First lane: a 16 MiB client window, separate from G5's resident work buffers.
+/// A 256 MiB client window, separate from G5's resident work buffers.
 pub const VA_START: u64 = 0x2000_0000;
-pub const VA_END: u64 = 0x2100_0000;
+pub const VA_END: u64 = 0x3000_0000;
 /// The largest single allocation. A buffer's GPU binding must fit wholly inside this length.
-pub const MAX_BUFFER_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 /// Live DMA bytes one channel may hold at once. G8a removes the fixed four-entry table: a
 /// BufferCreate succeeds while the *budget* has room, so the count of live buffers is a
 /// consequence of their sizes (at most `MAX_TOTAL_BUFFER_BYTES / PAGE_BYTES` of 4 KiB
 /// buffers) rather than a separate policy limit. Destroy returns a buffer's bytes to the
 /// budget. Physical-frame reclamation is the kernel's; this is the protocol's accounting.
 /// — TIMBERDOODLE
-pub const MAX_TOTAL_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_TOTAL_BUFFER_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_STREAM_BYTES: u32 = 64 * 1024;
 pub const RING_BYTES: u32 = 4096;
 
@@ -213,7 +213,7 @@ impl Binding {
 
 /// A live-unbind request: remove this session's mappings covering exactly `va..va + bytes` on
 /// `vm`. The range must tile whole live bindings with no partial, missing or foreign coverage;
-/// page alignment and the same `0x2000_0000..0x2100_0000` window as VmBind apply. Unlike a
+/// page alignment and the same `0x2000_0000..0x3000_0000` window as VmBind apply. Unlike a
 /// binding, one request may name several adjacent bindings. — TIMBERDOODLE
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Unbind {

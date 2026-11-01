@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j709
 //j710
 //j733
 //j734
 //j742
+//j743
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1359,6 +1359,43 @@ pub fn map_range(
             page_descriptor(pa + offset, attrs.cached, attrs.readonly, !attrs.executable),
         );
         offset += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+/// Map independent physical pages into one GPU VA range. Validate the complete list before
+/// writing any leaf. Table exhaustion after publication is terminal, as for map_range.
+/// — KESTREL
+pub fn map_pages(
+    memory: &mut impl TableMemory,
+    arena: &mut TableArena,
+    transtab: u64,
+    va: u64,
+    pages: &[u64],
+    attrs: PageAttrs,
+) -> Result<(), TableError> {
+    let len = (pages.len() as u64)
+        .checked_mul(PAGE_SIZE)
+        .ok_or(TableError::Range { va, len: 0 })?;
+    if pages.is_empty()
+        || va % PAGE_SIZE != 0
+        || va.checked_add(len).is_none_or(|end| end > (1 << 48))
+        || pages
+            .iter()
+            .any(|pa| pa % PAGE_SIZE != 0 || *pa & !PHYSICAL_ADDRESS_MASK != 0)
+    {
+        return Err(TableError::Range { va, len });
+    }
+    for (index, pa) in pages.iter().enumerate() {
+        map_range(
+            memory,
+            arena,
+            transtab,
+            va + index as u64 * PAGE_SIZE,
+            *pa,
+            PAGE_SIZE,
+            attrs,
+        )?;
     }
     Ok(())
 }
@@ -3968,6 +4005,69 @@ mod g3b_tests {
             cached: true,
             readonly: false,
             executable: true,
+        }
+    }
+
+    #[test]
+    fn scattered_pages_cross_tables_preserve_offsets_and_unmap_exactly() {
+        let (mut memory, mut arena, root) = arena();
+        let va = protocol::VA_START + 0x1ff000;
+        let pages = [0x8010_0000, 0x9000_3000, 0x8200_7000];
+        let attributes = PageAttrs {
+            cached: false,
+            readonly: true,
+            executable: true,
+        };
+        map_pages(&mut memory, &mut arena, root, va, &pages, attributes).unwrap();
+        for (n, page) in pages.iter().enumerate() {
+            let leaf = leaf_entry(&mut memory, root, va + n as u64 * PAGE_SIZE).unwrap();
+            assert_eq!(memory.get(leaf), page_descriptor(*page, false, true, false));
+        }
+        unmap_ranges(
+            &mut memory,
+            root,
+            &[UnmapRange {
+                va: va + PAGE_SIZE,
+                len: PAGE_SIZE,
+            }],
+        )
+        .unwrap();
+        assert!(range_unmapped(&mut memory, root, va + PAGE_SIZE, PAGE_SIZE));
+        assert!(!range_unmapped(&mut memory, root, va, PAGE_SIZE));
+        assert!(!range_unmapped(
+            &mut memory,
+            root,
+            va + 2 * PAGE_SIZE,
+            PAGE_SIZE
+        ));
+        let before = memory.words.clone();
+        assert!(map_pages(
+            &mut memory,
+            &mut arena,
+            root,
+            va,
+            &[pages[0], 1],
+            attributes
+        )
+        .is_err());
+        assert_eq!(memory.words, before);
+    }
+
+    #[test]
+    fn client_table_arena_covers_the_whole_raised_window() {
+        let mut memory = FakeMemory::new();
+        let mut arena = TableArena::new(
+            ARENA,
+            (24 + (protocol::VA_END - protocol::VA_START) / (2 * 1024 * 1024)) * PAGE_SIZE,
+        )
+        .unwrap();
+        // Reserve the resident allowance, leaving the client's root/parent headroom intact.
+        for _ in 0..20 {
+            arena.alloc_table(&mut memory).unwrap();
+        }
+        let root = arena.alloc_table(&mut memory).unwrap();
+        for va in (protocol::VA_START..protocol::VA_END).step_by(2 * 1024 * 1024) {
+            map_pages(&mut memory, &mut arena, root, va, &[0x8000_0000], attrs()).unwrap();
         }
     }
 

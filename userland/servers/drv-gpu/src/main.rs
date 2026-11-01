@@ -1,8 +1,6 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j714
-//j716
 //j733
 //j734
 //j742
@@ -15,6 +13,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use drv_gpu::contain::{Containment, SessionNext};
 //j734
+//j743
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
     cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, flush_range,
@@ -52,7 +51,10 @@ const FIRMWARE_MAX: usize = 320 * 1024;
 //j734
 /// J734's second group adds AS2's four tables (L0-L3) to the nine for the image, AS1's and the
 /// client's; eight more pages keep the old headroom.
-const TABLE_ARENA_LEN: u64 = 24 * PAGE_SIZE;
+// The client window needs one L3 per 2 MiB, even after churn visits every region.
+// Add these to the resident firmware/two-group allowance. — KESTREL
+const TABLE_ARENA_LEN: u64 =
+    (24 + (kumo_gpu::VA_END - kumo_gpu::VA_START) / (2 * 1024 * 1024)) * PAGE_SIZE;
 const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.

@@ -1,8 +1,8 @@
-//j614
 //j629
 //j630
 //j632
 //j660
+//j743
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +98,11 @@ pub enum Syscall {
     DeviceRegisterWrite = 53,
     /// Activate a prepared kernel-owned DeviceCtx; MAP right required.
     DeviceCtxActivate = 54,
+    /// Allocate page-scattered, zeroed DMA RAM: (size, physical_pages, page_count).
+    /// The output must hold exactly one u64 per rounded-up 4 KiB page. Returns a shared
+    /// VMO handle or u64::MAX. Physical addresses are returned only at creation, as with
+    /// VmoCreateContiguous; no client buffer ID or wire request reveals them. — KESTREL
+    VmoCreatePaged = 55,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -358,6 +363,7 @@ mod tests {
     fn contiguous_dma_vmo_occupies_the_next_syscall_slot() {
         assert_eq!(Syscall::DeviceCtxInfo as usize, 44);
         assert_eq!(Syscall::VmoCreateContiguous as usize, 45);
+        assert_eq!(Syscall::VmoCreatePaged as usize, 55);
         // D1: the futex pair had been reserved numbers with no implementation since the ABI was
         // laid out; pinning them here keeps the now-live syscalls where userland expects them.
         assert_eq!(Syscall::FutexWait as usize, 28);

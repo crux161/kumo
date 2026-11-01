@@ -1,5 +1,8 @@
-//j632
-//j708
+//j660
+//j719
+//j731
+//j732
+//j743
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -10,12 +13,6 @@
 //!
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
-
-//j630
-//j660
-//j719
-//j731
-//j732
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1672,6 +1669,33 @@ fn dispatch_object_syscall(
     } else if num == Syscall::VmoCreate as u64 {
         let size = r[0];
         match engine.dispatch(target, KernelCall::VmoCreate { size }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreatePaged as u64 {
+        let size = r[0];
+        let ptr = r[1];
+        let count = r[2];
+        let valid = crate::mm::align_up(size)
+            .is_some_and(|len| len != 0 && len / crate::mm::PAGE_SIZE == count)
+            && ptr % 8 == 0
+            && count
+                .checked_mul(8)
+                .is_some_and(|len| target.user_range_is_writable(ptr, len));
+        if !valid {
+            r[0] = u64::MAX;
+            return true;
+        }
+        // Require mapped writable output, including the installed stack. The backend writes
+        // only after allocation and handle publication succeed. — KESTREL
+        match engine.dispatch(
+            target,
+            KernelCall::VmoCreatePaged {
+                size,
+                pages: ptr as *mut u64,
+                count: count as usize,
+            },
+        ) {
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
         }

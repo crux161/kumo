@@ -6,6 +6,7 @@ use kumo_hal::PageFlags;
 //j469
 //j616
 //j620
+//j743
 
 pub mod heap;
 
@@ -146,6 +147,45 @@ pub unsafe fn alloc_contiguous_frames_excluding(
             return Some(start);
         }
     }
+}
+
+/// Fill a preallocated DMA page list in one allocator walk. A short return owns the prefix:
+/// the caller must reclaim it on failure. No contiguous physical run is required. — KESTREL
+///
+/// # Safety
+/// Same boot ranges and active identity-map requirements as contiguous DMA allocation.
+pub unsafe fn alloc_dma_pages_excluding(
+    boot: &BootInfo,
+    pages: &mut [Option<u64>],
+    excluded: &[Range],
+) -> usize {
+    let plan = unsafe { KernelMemoryPlan::from_boot_info(boot) };
+    let mut frames = plan.frame_allocator().excluding(excluded);
+    let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
+    #[cfg(feature = "arch_aarch64")]
+    let framebuffer = boot_framebuffer_range(boot);
+    let mut filled = 0;
+    while filled < pages.len() {
+        let Some(range) = frames.next_frame() else {
+            break;
+        };
+        let frame = range.start;
+        if frame < watermark
+            || !crate::syscall::kernel_device_frame_allowed(frame & !(BLOCK_2M - 1), BLOCK_2M)
+        {
+            continue;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        if !normal_identity_block(plan.regions(), framebuffer, frame & !(BLOCK_2M - 1)) {
+            continue;
+        }
+        FRAME_WATERMARK.store(frame.saturating_add(PAGE_SIZE), Ordering::Relaxed);
+        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
+        kumo_hal::active::clean_dcache_to_poc(frame as usize, PAGE_SIZE as usize);
+        pages[filled] = Some(frame);
+        filled += 1;
+    }
+    filled
 }
 
 /// What kernel paging brought up.
@@ -381,6 +421,8 @@ pub enum VmoBacking {
     /// gets coherency-free DMA without cache maintenance; the frames are cleaned to PoC at
     /// allocation so the NC alias and the device see the zeroed contents, not stale WB lines.
     Dma { phys_base: u64 },
+    /// Eagerly allocated, zeroed and cleaned DMA pages stored in the VMO entry.
+    DmaPaged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,6 +479,12 @@ impl Vmo {
             len: align_up(len).ok_or(MemoryError::InvalidRange)?,
             backing: VmoBacking::Dma { phys_base },
         })
+    }
+
+    pub fn new_dma_paged(len: u64) -> Result<Self, MemoryError> {
+        let mut vmo = Self::new(len)?;
+        vmo.backing = VmoBacking::DmaPaged;
+        Ok(vmo)
     }
 
     pub const fn len(self) -> u64 {

@@ -1,8 +1,8 @@
-//j710
 //j707
 //j709
 //j711
 //j742
+//j743
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -15,7 +15,7 @@ use crate::{
     Status, Submission, SyncState, Timeline, MAX_TOTAL_BUFFER_BYTES,
 };
 
-pub const MAX_BINDINGS: usize = 8;
+pub const MAX_BINDINGS: usize = 256;
 /// Bounded armed-fence points per session. Completed points are pruned before the bound is
 /// enforced, so the table holds only waits that are still pending. — TIMBERDOODLE
 pub const MAX_WAITS: usize = 4;
@@ -122,16 +122,6 @@ struct Allocation {
     bytes: u64,
 }
 
-/// Placeholder used only to build the fixed-size unbind batch; never sent. — TIMBERDOODLE
-const EMPTY_BINDING: Binding = Binding {
-    vm: 0,
-    buffer: 0,
-    va: 0,
-    offset: 0,
-    bytes: 0,
-    flags: crate::BindFlags(0),
-};
-
 #[derive(Default)]
 pub struct Session {
     ids: RequestIds,
@@ -149,7 +139,7 @@ pub struct Session {
     /// The last buffer ID issued; zero means none. Never decreases and is never reused.
     /// — TIMBERDOODLE
     next_buffer: u32,
-    bindings: [Option<Binding>; MAX_BINDINGS],
+    bindings: Vec<Binding>,
     timeline: Timeline,
     waits: [Option<u64>; MAX_WAITS],
 }
@@ -188,12 +178,12 @@ impl Session {
         self.retired = true;
         let release = SessionRelease {
             buffers: self.buffers.len() as u32,
-            bindings: self.bindings.iter().flatten().count() as u32,
+            bindings: self.bindings.len() as u32,
             waits: self.waits.iter().flatten().count() as u32,
             bytes: self.total_buffer_bytes,
         };
         self.buffers.clear();
-        self.bindings = [None; MAX_BINDINGS];
+        self.bindings.clear();
         self.waits = [None; MAX_WAITS];
         self.total_buffer_bytes = 0;
         // The VM and group are backend objects torn down by the reset, not tracked allocations;
@@ -336,24 +326,21 @@ impl Session {
                     .iter()
                     .position(|allocation| allocation.id == buffer)
                     .ok_or(Status::NotFound)?;
-                let mut batch = [EMPTY_BINDING; MAX_BINDINGS];
-                let mut count = 0;
-                for binding in self.bindings.iter().flatten() {
+                let mut batch = Vec::new();
+                batch
+                    .try_reserve(self.bindings.len())
+                    .map_err(|_| Status::NoMemory)?;
+                for binding in self.bindings.iter() {
                     if binding.buffer == buffer {
-                        batch[count] = *binding;
-                        count += 1;
+                        batch.push(*binding);
                     }
                 }
                 // All-or-nothing: a recoverable failure leaves every mapping and the backing
                 // intact and retryable; a partial unmap or uncertain release must answer
                 // DeviceLost, which retires this session before any metadata commits.
                 // — TIMBERDOODLE
-                backend.destroy_buffer(buffer, &batch[..count])?;
-                for slot in &mut self.bindings {
-                    if slot.is_some_and(|binding| binding.buffer == buffer) {
-                        *slot = None;
-                    }
-                }
+                backend.destroy_buffer(buffer, &batch)?;
+                self.bindings.retain(|binding| binding.buffer != buffer);
                 let allocation = self.buffers.remove(position);
                 self.total_buffer_bytes -= allocation.bytes;
                 Ok(Response::BufferDestroyed { buffer })
@@ -375,21 +362,15 @@ impl Session {
                     .map(|allocation| allocation.bytes)
                     .ok_or(Status::NotFound)?;
                 binding.validate(bytes)?;
-                if self
-                    .bindings
-                    .iter()
-                    .flatten()
-                    .any(|other| binding.overlaps(*other))
-                {
+                if self.bindings.iter().any(|other| binding.overlaps(*other)) {
                     return Err(Status::BadRequest);
                 }
-                let index = self
-                    .bindings
-                    .iter()
-                    .position(Option::is_none)
-                    .ok_or(Status::NoMemory)?;
+                if self.bindings.len() == MAX_BINDINGS {
+                    return Err(Status::NoMemory);
+                }
+                self.bindings.try_reserve(1).map_err(|_| Status::NoMemory)?;
                 backend.bind(binding)?;
-                self.bindings[index] = Some(binding);
+                self.bindings.push(binding);
                 Ok(Response::VmBound)
             }
             Command::VmUnbind(range) => {
@@ -410,9 +391,11 @@ impl Session {
                 }
                 // valid_shape proved this addition cannot overflow and stays in the window.
                 let end = range.va + range.bytes;
-                let mut batch = [EMPTY_BINDING; MAX_BINDINGS];
-                let mut count = 0;
-                for binding in self.bindings.iter().flatten().copied() {
+                let mut batch = Vec::new();
+                batch
+                    .try_reserve(self.bindings.len())
+                    .map_err(|_| Status::NoMemory)?;
+                for binding in self.bindings.iter().copied() {
                     if binding.va >= end || range.va >= binding.va + binding.bytes {
                         continue;
                     }
@@ -421,15 +404,14 @@ impl Session {
                     if binding.va < range.va || binding.va + binding.bytes > end {
                         return Err(Status::BadRequest);
                     }
-                    batch[count] = binding;
-                    count += 1;
+                    batch.push(binding);
                 }
-                if count == 0 {
+                if batch.is_empty() {
                     return Err(Status::NotFound);
                 }
                 // Sort by VA (at most MAX_BINDINGS entries) and require an exact tiling:
                 // every byte of the request belongs to exactly one live binding.
-                for i in 1..count {
+                for i in 1..batch.len() {
                     let mut j = i;
                     while j > 0 && batch[j - 1].va > batch[j].va {
                         batch.swap(j - 1, j);
@@ -437,7 +419,7 @@ impl Session {
                     }
                 }
                 let mut cursor = range.va;
-                for binding in &batch[..count] {
+                for binding in &batch {
                     if binding.va != cursor {
                         return Err(Status::BadRequest);
                     }
@@ -446,12 +428,9 @@ impl Session {
                 if cursor != end {
                     return Err(Status::BadRequest);
                 }
-                backend.unbind(&batch[..count])?;
-                for slot in &mut self.bindings {
-                    if slot.is_some_and(|binding| binding.va >= range.va && binding.va < end) {
-                        *slot = None;
-                    }
-                }
+                backend.unbind(&batch)?;
+                self.bindings
+                    .retain(|binding| binding.va < range.va || binding.va >= end);
                 Ok(Response::VmUnbound(range))
             }
             Command::GroupCreate { vm } => {
@@ -475,7 +454,6 @@ impl Session {
                 if !self
                     .bindings
                     .iter()
-                    .flatten()
                     .any(|b| job.validate_for(1, *b).is_ok())
                 {
                     return Err(Status::BadRequest);
@@ -769,7 +747,7 @@ mod tests {
             Ok(topology)
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
         backend.topology = Some(0);
         assert_eq!(
             send(&mut session, &mut backend, Command::GetTopology),
@@ -814,7 +792,7 @@ mod tests {
             Ok(mmu)
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
         backend.mmu_features = Some(0);
         assert_eq!(
             send(&mut session, &mut backend, Command::GetMmuFeatures),
@@ -860,7 +838,7 @@ mod tests {
             Ok(core)
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
         // The board's measured word is exactly zero: variant byte 0 is the pinned table's
         // G610 entry, so zero is a valid attestation, not a failed read, and the session
         // stays live. — TIMBERDOODLE
@@ -913,7 +891,7 @@ mod tests {
             Ok(Response::GroupCreated { group: 1 })
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
     }
 
     #[test]
@@ -957,7 +935,7 @@ mod tests {
             Ok(Response::GroupCreated { group: 1 })
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
     }
 
     #[test]
@@ -1007,7 +985,7 @@ mod tests {
             Ok(Response::GroupCreated { group: 1 })
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
     }
 
     #[test]
@@ -1059,7 +1037,7 @@ mod tests {
             Ok(Response::VmCreated { vm: 1 })
         );
         assert!(session.buffers.is_empty());
-        assert!(session.bindings.iter().all(Option::is_none));
+        assert!(session.bindings.is_empty());
     }
 
     #[test]
@@ -1181,13 +1159,13 @@ mod tests {
         );
         assert_eq!(b.unbound.len(), 1);
         assert_eq!(b.unbound[0], std::vec![binding()]);
-        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.bindings.is_empty());
         // The VA is free and the group still exists: live rebind is legal.
         assert_eq!(
             send(&mut s, &mut b, Command::VmBind(binding())),
             Ok(Response::VmBound)
         );
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(s.bindings.len(), 1);
         // A submission still validates against the live mapping.
         assert_eq!(
             send(&mut s, &mut b, job(1)),
@@ -1281,7 +1259,7 @@ mod tests {
         );
         assert_eq!(b.calls.len(), calls);
         assert!(b.unbound.is_empty());
-        assert_eq!(s.bindings.iter().flatten().count(), 2);
+        assert_eq!(s.bindings.len(), 2);
     }
 
     #[test]
@@ -1309,7 +1287,7 @@ mod tests {
             Ok(Response::VmUnbound(range))
         );
         assert_eq!(b.unbound, std::vec![std::vec![first, second]]);
-        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.bindings.is_empty());
     }
 
     #[test]
@@ -1325,14 +1303,14 @@ mod tests {
             send(&mut s, &mut b, Command::VmUnbind(range)),
             Err(Status::BadRequest)
         );
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(s.bindings.len(), 1);
         assert!(!s.retired);
         // The recoverable refusal committed nothing, so the same request retries.
         assert_eq!(
             send(&mut s, &mut b, Command::VmUnbind(range)),
             Ok(Response::VmUnbound(range))
         );
-        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.bindings.is_empty());
         send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
         b.fail = Some(Status::DeviceLost);
         assert_eq!(
@@ -1341,7 +1319,7 @@ mod tests {
         );
         assert!(s.retired);
         // The table still names the binding: only a proven reset may close the session.
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(s.bindings.len(), 1);
         let calls = b.calls.len();
         assert_eq!(
             send(&mut s, &mut b, Command::GetInfo),
@@ -1363,7 +1341,7 @@ mod tests {
         );
         let second = Binding {
             buffer: 2,
-            va: VA_START + 8 * PAGE_BYTES,
+            va: VA_START + MAX_BINDINGS as u64 * PAGE_BYTES,
             ..binding()
         };
         assert_eq!(
@@ -1377,11 +1355,7 @@ mod tests {
             Err(Status::NoMemory)
         );
         assert!(s.buffers.iter().any(|allocation| allocation.id == 2));
-        assert!(s
-            .bindings
-            .iter()
-            .flatten()
-            .any(|binding| binding.buffer == 2));
+        assert!(s.bindings.iter().any(|binding| binding.buffer == 2));
         b.fail = None;
         // The implicit batch reaches the backend with exactly this buffer's live binding.
         assert_eq!(
@@ -1391,11 +1365,7 @@ mod tests {
         let (id, batch) = b.destroyed.last().cloned().expect("destroy recorded");
         assert_eq!(id, 2);
         assert_eq!(batch, std::vec![second]);
-        assert!(s
-            .bindings
-            .iter()
-            .flatten()
-            .all(|binding| binding.buffer != 2));
+        assert!(s.bindings.iter().all(|binding| binding.buffer != 2));
         assert!(s.buffers.iter().all(|allocation| allocation.id != 2));
     }
 
@@ -1448,6 +1418,62 @@ mod tests {
         );
     }
     #[test]
+    fn raised_budget_and_binding_batches_destroy_reclaim_and_keep_ids_monotonic() {
+        assert_eq!(MAX_BUFFER_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_TOTAL_BUFFER_BYTES, 128 * 1024 * 1024);
+        assert_eq!(MAX_BINDINGS, 256);
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: MAX_BUFFER_BYTES,
+            },
+        )
+        .unwrap();
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: MAX_BUFFER_BYTES,
+            },
+        )
+        .unwrap();
+        for i in 0..MAX_BINDINGS {
+            send(
+                &mut s,
+                &mut b,
+                Command::VmBind(Binding {
+                    va: VA_START + i as u64 * PAGE_BYTES,
+                    offset: i as u64 * PAGE_BYTES,
+                    ..binding()
+                }),
+            )
+            .unwrap();
+        }
+        send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
+        send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }).unwrap();
+        assert_eq!(b.destroyed[0].1.len(), MAX_BINDINGS);
+        assert!(s.bindings.is_empty());
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::BufferCreate {
+                    bytes: MAX_BUFFER_BYTES
+                }
+            ),
+            Ok(Response::BufferCreated {
+                buffer: 3,
+                bytes: MAX_BUFFER_BYTES
+            })
+        );
+        assert_eq!(s.close().bytes, MAX_TOTAL_BUFFER_BYTES);
+        assert!(core::mem::size_of::<Session>() < 1024);
+    }
+
+    #[test]
     fn budget_and_binding_quotas_and_partial_map_failure_bound_the_session() {
         let (mut s, mut b) = (Session::default(), Fake::default());
         assert_eq!(
@@ -1490,7 +1516,7 @@ mod tests {
                 &mut s,
                 &mut b,
                 Command::VmBind(Binding {
-                    va: VA_START + 8 * PAGE_BYTES,
+                    va: VA_START + MAX_BINDINGS as u64 * PAGE_BYTES,
                     ..binding()
                 })
             ),
@@ -1612,7 +1638,7 @@ mod tests {
         assert_eq!(b.destroyed.last().cloned(), Some((1, std::vec![binding()])));
         assert!(s.buffers.is_empty());
         assert_eq!(s.total_buffer_bytes, 0);
-        assert_eq!(s.bindings.iter().flatten().count(), 0);
+        assert_eq!(s.bindings.len(), 0);
         // The group is still live: the next allocation, binding and submission proceed.
         send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
         let rebound = Binding {
@@ -1656,7 +1682,7 @@ mod tests {
             &mut b,
             Command::VmBind(Binding {
                 buffer: 2,
-                va: VA_START + 8 * PAGE_BYTES,
+                va: VA_START + MAX_BINDINGS as u64 * PAGE_BYTES,
                 ..binding()
             }),
         )
@@ -1672,12 +1698,8 @@ mod tests {
         assert_eq!(*id, 1);
         assert_eq!(unbound.len(), 2);
         assert!(unbound.iter().all(|binding| binding.buffer == 1));
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
-        assert!(s
-            .bindings
-            .iter()
-            .flatten()
-            .all(|binding| binding.buffer == 2));
+        assert_eq!(s.bindings.len(), 1);
+        assert!(s.bindings.iter().all(|binding| binding.buffer == 2));
         assert!(!s.buffers.iter().any(|allocation| allocation.id == 1));
         assert_eq!(
             send(
@@ -1706,14 +1728,14 @@ mod tests {
         );
         assert_eq!(s.buffers.len(), 1);
         assert_eq!(s.total_buffer_bytes, PAGE_BYTES);
-        assert_eq!(s.bindings.iter().flatten().count(), 1);
+        assert_eq!(s.bindings.len(), 1);
         assert_eq!(
             send(&mut s, &mut b, Command::BufferDestroy { buffer: 1 }),
             Ok(Response::BufferDestroyed { buffer: 1 })
         );
         assert!(s.buffers.is_empty());
         assert_eq!(s.total_buffer_bytes, 0);
-        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.bindings.is_empty());
 
         // Uncertainty — a partial unmap or a failed live flush — retires the session before
         // any metadata commits, so a later destroy can never double-free the backing.
@@ -1778,7 +1800,7 @@ mod tests {
         assert!(s.closed);
         assert!(s.retired);
         assert!(s.buffers.is_empty());
-        assert!(s.bindings.iter().all(Option::is_none));
+        assert!(s.bindings.is_empty());
         assert!(s.waits.iter().all(Option::is_none));
         assert_eq!(s.total_buffer_bytes, 0);
         assert!(!s.vm && !s.group);

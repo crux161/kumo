@@ -1,8 +1,8 @@
-//j710
 //j714
 //j722
 //j733
 //j742
+//j743
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -34,7 +34,19 @@ use protocol::{
 /// — TIMBERDOODLE
 struct BufferRecord {
     id: u32,
-    mapping: Mapping,
+    handle: Handle,
+    va: u64,
+    bytes: u64,
+    pages: Vec<u64>,
+}
+
+impl BufferRecord {
+    /// Only before GPU publication, after checked unbind/flush, or after confirmed reset.
+    /// — KESTREL
+    fn release(self) {
+        let _ = kumo_rt::vmar_unmap(self.va, self.bytes);
+        let _ = kumo_rt::handle_close(self.handle);
+    }
 }
 
 struct Pending {
@@ -157,28 +169,46 @@ impl Backend for Hardware<'_> {
     }
 
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), GpuStatus> {
-        let mapping = map_contiguous(bytes).ok_or(GpuStatus::NoMemory)?;
-        // Reserve before anything is committed: a table that cannot grow must fail before the
-        // driver owns a mapping the session cannot name. — TIMBERDOODLE
-        if self.buffers.try_reserve(1).is_err() {
-            release_mapping(mapping);
+        self.buffers
+            .try_reserve(1)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        let mut pages = Vec::new();
+        let count = (bytes / PAGE_SIZE) as usize;
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        pages.resize(count, 0);
+        let handle = valid_handle(kumo_rt::vmo_create_paged(bytes, &mut pages))
+            .ok_or(GpuStatus::NoMemory)?;
+        let (status, va) = kumo_rt::vmar_map_anywhere(
+            handle,
+            bytes,
+            (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+        );
+        if status != 0 {
+            let _ = kumo_rt::handle_close(handle);
             return Err(GpuStatus::NoMemory);
         }
-        zero_mapping(&mapping, bytes);
-        dsb();
+        let record = BufferRecord {
+            id,
+            handle,
+            va,
+            bytes,
+            pages,
+        };
         let Some(grant) = valid_handle(kumo_rt::handle_duplicate(
-            mapping.handle,
+            handle,
             kumo_abi::Rights::READ
                 | kumo_abi::Rights::WRITE
                 | kumo_abi::Rights::DUPLICATE
                 | kumo_abi::Rights::TRANSFER,
         )) else {
-            // Nothing crossed to the session yet, so this allocation is wholly the driver's
-            // and can be released without proving GPU quiescence. — TIMBERDOODLE
-            release_mapping(mapping);
+            record.release();
             return Err(GpuStatus::DeviceLost);
         };
-        self.buffers.push(BufferRecord { id, mapping });
+        // The kernel already zeroed and cleaned every page before creating this NC alias.
+        // — KESTREL
+        self.buffers.push(record);
         self.reply_grant = Some(grant);
         log(
             log_level::INFO,
@@ -193,7 +223,9 @@ impl Backend for Hardware<'_> {
             .iter()
             .find(|record| record.id == b.buffer)
             .ok_or(GpuStatus::NotFound)?;
-        let mapping = record.mapping;
+        let first = (b.offset / PAGE_SIZE) as usize;
+        let end = first + (b.bytes / PAGE_SIZE) as usize;
+        let pages = record.pages.get(first..end).ok_or(GpuStatus::BadRequest)?;
         let attrs = PageAttrs {
             cached: !b.flags.contains(protocol::BindFlags::UNCACHED),
             readonly: b.flags.contains(protocol::BindFlags::READ_ONLY),
@@ -201,15 +233,9 @@ impl Backend for Hardware<'_> {
         };
         // A partial table update or failed live flush retires this session; its ranges are
         // never reused. Reset containment runs before any handle is closed. — TIMBERDOODLE
-        if let Err(error) = map_range(
-            self.tables,
-            self.arena,
-            self.root,
-            b.va,
-            mapping.phys + b.offset,
-            b.bytes,
-            attrs,
-        ) {
+        if let Err(error) =
+            drv_gpu::map_pages(self.tables, self.arena, self.root, b.va, pages, attrs)
+        {
             log(
                 log_level::ERR,
                 format_args!("drv-gpu: client map failed: {:?}\n", error),
@@ -313,7 +339,7 @@ impl Backend for Hardware<'_> {
         // The GPU can no longer reach these pages: release the CPU mapping and the driver's
         // VMO handle now. The client's granted duplicate is the client's own. — TIMBERDOODLE
         let record = self.buffers.swap_remove(index);
-        release_mapping(record.mapping);
+        record.release();
         log(
             log_level::INFO,
             format_args!(
@@ -378,7 +404,7 @@ impl Backend for Hardware<'_> {
     /// — TIMBERDOODLE
     fn retire(&mut self) {
         for record in self.buffers.drain(..) {
-            release_mapping(record.mapping);
+            record.release();
         }
         self.pending = None;
     }

@@ -1,8 +1,8 @@
-//j609
 //j614
 //j629
 //j632
 //j660
+//j743
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -562,6 +562,24 @@ pub fn vmo_create(size: u64) -> u64 {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub fn vmo_create(_size: u64) -> u64 {
+    u64::MAX
+}
+
+/// Create one shareable DMA VMO backed by independent pages. `pages` must have exactly
+/// one entry per rounded-up 4 KiB page; it receives physical addresses only on success.
+#[cfg(target_arch = "aarch64")]
+pub fn vmo_create_paged(size: u64, pages: &mut [u64]) -> u64 {
+    syscall(
+        Syscall::VmoCreatePaged,
+        size,
+        pages.as_mut_ptr() as u64,
+        pages.len() as u64,
+        0,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmo_create_paged(_size: u64, _pages: &mut [u64]) -> u64 {
     u64::MAX
 }
 

@@ -1,8 +1,8 @@
-//j708
 //j719
 //j725
 //j731
 //j732
+//j743
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -147,6 +147,11 @@ pub enum KernelCall<'a> {
     },
     VmoCreateContiguous {
         size: u64,
+    },
+    VmoCreatePaged {
+        size: u64,
+        pages: *mut u64,
+        count: usize,
     },
     IoMmuFromResource {
         resource: Handle,
@@ -599,7 +604,7 @@ impl VmoPin {
                 }
                 Some(phys_base)
             }
-            VmoBacking::Anonymous => None,
+            VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => None,
             VmoBacking::Mmio { phys_base } => {
                 if !framebuffer.is_some_and(|proof| proof.allows(entry.vmo, offset, len)) {
                     return Err(Errno::NotSupported);
@@ -715,6 +720,15 @@ fn ensure_anonymous_frame(
     page_index: usize,
     boot: &BootInfo,
 ) -> Result<u64, Errno> {
+    if entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged {
+        return entry
+            .frames
+            .borrow()
+            .get(page_index)
+            .copied()
+            .flatten()
+            .ok_or(Errno::BadState);
+    }
     ensure_vmo_frame(entry, page_index, || alloc_anonymous_frame(boot))
 }
 
@@ -830,7 +844,7 @@ impl DeviceState {
                             return false;
                         }
                     }
-                    VmoBacking::Anonymous => {
+                    VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
                         let Ok(frames) = map.backing.frames.try_borrow() else {
                             return false;
                         };
@@ -1379,6 +1393,33 @@ impl SyscallEngine {
         use crate::mm::VmoBacking;
         let base = match vmo.backing() {
             VmoBacking::Anonymous => return true,
+            VmoBacking::DmaPaged => {
+                let Some(entry) = authorized else { return true };
+                let Some(end) = offset.checked_add(len).filter(|end| *end <= vmo.len()) else {
+                    return false;
+                };
+                if len == 0 {
+                    return true;
+                }
+                let frames = entry.frames.borrow();
+                return (offset / crate::mm::PAGE_SIZE..=(end - 1) / crate::mm::PAGE_SIZE).all(
+                    |i| {
+                        frames
+                            .get(i as usize)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|page| {
+                                let (start, bytes) = if coarse {
+                                    (page & !((1 << 21) - 1), 1 << 21)
+                                } else {
+                                    (page, crate::mm::PAGE_SIZE)
+                                };
+                                self.devices.ram_allowed(start, bytes, authorized)
+                                    && self.device_owner.ram_allowed(start, bytes, authorized)
+                            })
+                    },
+                );
+            }
             VmoBacking::PhysicalRam { phys_base }
             | VmoBacking::Mmio { phys_base }
             | VmoBacking::Dma { phys_base } => phys_base,
@@ -2556,7 +2597,7 @@ impl SyscallEngine {
         Ok(())
     }
 
-    /// Reclaim a dead DMA VMO's contiguous run for a later `VmoCreateContiguous`. Every
+    /// Reclaim a dead DMA VMO's run or individual pages for later DMA allocation. Every
     /// reference must be gone: no handle in any process or the caller, no CPU mapping, no
     /// queued IPC transfer, and no pin or device mapping (`strong_count == 1`). Anonymous,
     /// physical and MMIO VMOs keep their existing lifecycles. — TIMBERDOODLE
@@ -2580,7 +2621,8 @@ impl SyscallEngine {
                     .holds(koid, ObjectKind::Vmo, Rights::empty())
                     || process.mappings().iter().any(|(_, mapped)| *mapped == koid)
             };
-            let freeable = run.is_some()
+            let paged = self.vmos[index].vmo.backing() == crate::mm::VmoBacking::DmaPaged;
+            let freeable = (run.is_some() || paged)
                 && Rc::strong_count(&self.vmos[index]) == 1
                 && !self.processes.iter().any(|process| referenced(process))
                 && !caller.is_some_and(|process| referenced(process))
@@ -2591,7 +2633,12 @@ impl SyscallEngine {
             }
             // Record the run before dropping the entry; if the free list cannot grow, keep
             // the VMO rather than lose the only record of its frames. — TIMBERDOODLE
-            if self.free_dma_runs.borrow_mut().try_reserve(1).is_err() {
+            let needed = if paged {
+                self.vmos[index].frames.borrow().len()
+            } else {
+                1
+            };
+            if self.free_dma_runs.borrow_mut().try_reserve(needed).is_err() {
                 index += 1;
                 continue;
             }
@@ -2601,9 +2648,26 @@ impl SyscallEngine {
                     .borrow_mut()
                     .push(kumo_abi::Range::new(phys_base, entry.vmo.len()));
             }
+            if paged {
+                self.return_dma_pages(&entry.frames.borrow());
+            }
             removed += 1;
         }
         removed
+    }
+
+    // Capacity must be reserved by the caller before releasing ownership. Coalesce adjacent
+    // pages so reusing a large BO does not turn the free list into a quadratic page queue.
+    // — KESTREL
+    fn return_dma_pages(&mut self, pages: &[Option<u64>]) {
+        let mut runs = self.free_dma_runs.borrow_mut();
+        for page in pages.iter().flatten() {
+            if let Some(last) = runs.last_mut().filter(|run| run.start + run.len == *page) {
+                last.len += crate::mm::PAGE_SIZE;
+            } else {
+                runs.push(kumo_abi::Range::new(*page, crate::mm::PAGE_SIZE));
+            }
+        }
     }
 
     /// Take a freed run for a new DMA VMO, splitting it when it is larger. A run that
@@ -2615,10 +2679,22 @@ impl SyscallEngine {
         }
         let mut runs = self.free_dma_runs.borrow_mut();
         let index = runs.iter().position(|run| {
+            const MASK: u64 = (1 << 21) - 1;
+            let Some(end) = run
+                .start
+                .checked_add(bytes)
+                .and_then(|end| end.checked_add(MASK))
+            else {
+                return false;
+            };
+            let base = run.start & !MASK;
+            let span = (end & !MASK) - base;
             run.len >= bytes
-                && !excluded
-                    .iter()
-                    .any(|ex| ranges_overlap(run.start, bytes, ex.start, ex.len))
+                && !excluded.iter().any(|ex| ranges_overlap(run.start, bytes, ex.start, ex.len))
+                // Reclaimed RAM must pass the same retained-domain check as fresh RAM,
+                // before zeroing an uncached CPU alias's complete block reach. — KESTREL
+                && self.devices.ram_allowed(base, span, None)
+                && self.device_owner.ram_allowed(base, span, None)
         })?;
         let start = runs[index].start;
         if runs[index].len == bytes {
@@ -2628,6 +2704,91 @@ impl SyscallEngine {
             runs[index].len -= bytes;
         }
         Some(start)
+    }
+
+    /// Keep every allocated page owned through failure and publication. Reclaimed pages are
+    /// zeroed and cleaned before reuse; fresh pages use one allocator walk. — KESTREL
+    fn create_paged_vmo(
+        &mut self,
+        process: &mut Process,
+        size: u64,
+        output: &mut [u64],
+    ) -> Result<Handle, Errno> {
+        let vmo = Vmo::new_dma_paged(size).map_err(|_| Errno::InvalidArgs)?;
+        let count = usize::try_from(vmo.frame_count()).map_err(|_| Errno::InvalidArgs)?;
+        if output.len() != count {
+            return Err(Errno::InvalidArgs);
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(count)
+            .map_err(|_| Errno::NoMemory)?;
+        frames.resize(count, None);
+        // Capacity for the complete rollback is secured before removing a single free page.
+        self.free_dma_runs
+            .borrow_mut()
+            .try_reserve(count)
+            .map_err(|_| Errno::NoMemory)?;
+        #[cfg(feature = "arch_aarch64")]
+        let excluded = self.table_pages.dma_exclusions();
+        #[cfg(not(feature = "arch_aarch64"))]
+        let excluded = Vec::new();
+        let mut have = 0;
+        while have < count {
+            let Some(page) = self.take_free_dma_run(1, &excluded) else {
+                break;
+            };
+            zero_reclaimed_run(page, crate::mm::PAGE_SIZE);
+            frames[have] = Some(page);
+            have += 1;
+        }
+        if have < count {
+            if let Some(boot) = self.boot_info {
+                #[cfg(target_os = "none")]
+                let saved = kumo_hal::active::read_user_aspace_root();
+                #[cfg(target_os = "none")]
+                unsafe {
+                    kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0())
+                };
+                // SAFETY: the validated boot ranges are mapped by the active identity tree.
+                have += unsafe {
+                    crate::mm::alloc_dma_pages_excluding(&boot, &mut frames[have..], &excluded)
+                };
+                #[cfg(target_os = "none")]
+                unsafe {
+                    kumo_hal::active::set_user_aspace_root(saved)
+                };
+            }
+        }
+        let result = if have == count {
+            self.root_vmo_create(
+                process,
+                vmo,
+                Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(errno_from_object)
+        } else {
+            Err(Errno::NoMemory)
+        };
+        match result {
+            Ok(handle) => {
+                let koid = process
+                    .handles()
+                    .get(handle)
+                    .map_err(errno_from_object)?
+                    .koid;
+                let entry = self.vmo_entry_by_koid(koid).ok_or(Errno::Internal)?;
+                for (dest, page) in output.iter_mut().zip(&frames) {
+                    *dest = page.expect("complete DMA page list");
+                }
+                entry.frames.replace(frames);
+                Ok(handle)
+            }
+            Err(error) => {
+                self.return_dma_pages(&frames);
+                Err(error)
+            }
+        }
     }
 
     /// Look up a VMO by koid. Returns `None` if not found.
@@ -2661,7 +2822,7 @@ impl SyscallEngine {
             | crate::mm::VmoBacking::Dma { phys_base } => {
                 phys_base.checked_add(vmo_offset).ok_or(Errno::InvalidArgs)
             }
-            crate::mm::VmoBacking::Anonymous => {
+            crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
                 let Some(boot) = self.boot_info else {
                     return Err(Errno::Internal);
                 };
@@ -2814,7 +2975,7 @@ impl SyscallEngine {
                 };
                 needs_frame_alloc = false;
             }
-            crate::mm::VmoBacking::Dma { .. } => {
+            crate::mm::VmoBacking::Dma { .. } | crate::mm::VmoBacking::DmaPaged => {
                 // DMA RAM is Normal memory, never Device, and never executable. Uncached
                 // (Normal-NC) is the coherency-free default a driver asks for; a cacheable
                 // request stays Normal-WB for the future coherent-DMA path.
@@ -2826,7 +2987,7 @@ impl SyscallEngine {
                 } else {
                     kumo_hal::active::user_page_desc(false, writable)
                 };
-                needs_frame_alloc = false;
+                needs_frame_alloc = vmo_entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged;
             }
             crate::mm::VmoBacking::Anonymous => {
                 if device || uncached {
@@ -2845,7 +3006,7 @@ impl SyscallEngine {
             crate::mm::VmoBacking::PhysicalRam { phys_base }
             | crate::mm::VmoBacking::Mmio { phys_base }
             | crate::mm::VmoBacking::Dma { phys_base } => phys_base,
-            crate::mm::VmoBacking::Anonymous => 0,
+            crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => 0,
         };
 
         let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot_ref) };
@@ -3102,7 +3263,12 @@ impl SyscallEngine {
             dma_vmos: self
                 .vmos
                 .iter()
-                .filter(|entry| matches!(entry.vmo.backing(), crate::mm::VmoBacking::Dma { .. }))
+                .filter(|entry| {
+                    matches!(
+                        entry.vmo.backing(),
+                        crate::mm::VmoBacking::Dma { .. } | crate::mm::VmoBacking::DmaPaged
+                    )
+                })
                 .count(),
             device_ctxs: self.devices.device_ctxs.len(),
             device_vmar_mappings: self.devices.device_vmar_mappings.len(),
@@ -3251,7 +3417,8 @@ impl SyscallEngine {
                                         kumo_hal::active::read_phys(phys_base + offset, dest_slice);
                                         Errno::Ok.status()
                                     }
-                                    crate::mm::VmoBacking::Anonymous => {
+                                    crate::mm::VmoBacking::Anonymous
+                                    | crate::mm::VmoBacking::DmaPaged => {
                                         let mut copied = 0usize;
                                         while copied < len {
                                             let pos = offset + copied as u64;
@@ -3322,7 +3489,8 @@ impl SyscallEngine {
                                     }
                                     Errno::Ok.status()
                                 }
-                                crate::mm::VmoBacking::Anonymous => {
+                                crate::mm::VmoBacking::Anonymous
+                                | crate::mm::VmoBacking::DmaPaged => {
                                     let Some(boot) = self.boot_info else {
                                         return KernelCallResult::Status(Errno::Internal.status());
                                     };
@@ -3754,8 +3922,13 @@ impl SyscallEngine {
                                 executable: false,
                             });
                         }
-                        crate::mm::VmoBacking::Anonymous => {
-                            if device || uncached {
+                        crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
+                            if device
+                                || (uncached
+                                    && vmo_entry.vmo.backing() == crate::mm::VmoBacking::Anonymous)
+                                || (executable
+                                    && vmo_entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged)
+                            {
                                 return KernelCallResult::Status(Errno::InvalidArgs.status());
                             }
                             if mapping.len % crate::mm::PAGE_SIZE != 0 {
@@ -3783,7 +3956,7 @@ impl SyscallEngine {
                                     len: crate::mm::PAGE_SIZE,
                                     writable,
                                     device: false,
-                                    uncached: false,
+                                    uncached,
                                     executable,
                                 });
                                 page += 1;
@@ -4202,6 +4375,23 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
+            KernelCall::VmoCreatePaged { size, pages, count } => {
+                if pages.is_null()
+                    || pages as usize % 8 != 0
+                    || count > isize::MAX as usize / 8
+                    || crate::mm::align_up(size)
+                        .is_none_or(|len| len == 0 || len / crate::mm::PAGE_SIZE != count as u64)
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                // The syscall boundary validated the issuer's output range, as for VmoRead.
+                // — KESTREL
+                let output = unsafe { core::slice::from_raw_parts_mut(pages, count) };
+                match self.create_paged_vmo(process, size, output) {
+                    Ok(handle) => KernelCallResult::Handle(handle),
+                    Err(error) => KernelCallResult::Status(error.status()),
+                }
+            }
             KernelCall::VmoCreateContiguous { size } => {
                 let Some(boot) = self.boot_info else {
                     return KernelCallResult::Status(Errno::Internal.status());
@@ -5406,7 +5596,7 @@ fn physical_vmo_write_allowed(vmo: &Vmo, offset: u64, len: u64) -> bool {
         | crate::mm::VmoBacking::Dma { phys_base } => phys_base
             .checked_add(offset)
             .is_some_and(|base| !kumo_hal::active::device_mmio_read_only(base, len)),
-        crate::mm::VmoBacking::Anonymous => true,
+        crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => true,
     }
 }
 
@@ -5600,6 +5790,77 @@ mod tests {
             process.handles_mut().close(installed).unwrap();
             assert_eq!(engine.retire_vmos(Some(&process)), 1);
             assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        #[test]
+        fn paged_dma_uses_fragmented_runs_and_keeps_shared_identity_until_final_release() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let physical = [0x4000_0000, 0x4080_0000, 0x4010_0000];
+            engine
+                .free_dma_runs
+                .borrow_mut()
+                .extend(physical.iter().map(|p| Range::new(*p, PAGE_SIZE)));
+            let mut output = [0; 3];
+            let handle = engine
+                .create_paged_vmo(&mut process, 3 * PAGE_SIZE, &mut output)
+                .unwrap();
+            assert_eq!(output, physical);
+            let koid = process.handles().get(handle).unwrap().koid;
+            let entry = engine.vmos.iter().find(|e| e.koid == koid).unwrap().clone();
+            assert_eq!(entry.vmo.backing(), crate::mm::VmoBacking::DmaPaged);
+            assert_eq!(*entry.frames.borrow(), physical.map(Some));
+            let duplicate = process
+                .handles_mut()
+                .duplicate(handle, Rights::READ)
+                .unwrap();
+            close(&mut engine, &mut process, handle);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: 3 * PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ | kumo_hal::PageFlags::UNCACHED,
+                },
+                koid,
+            );
+            close(&mut engine, &mut process, duplicate);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.remove_mapping_exact(0x2000_0000, 3 * PAGE_SIZE);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0); // retained device-style Rc pin
+            drop(entry);
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            for page in physical {
+                assert_eq!(engine.take_free_dma_run(1, &[]), Some(page));
+            }
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+
+        #[test]
+        fn paged_dma_failure_returns_the_entire_prefix_without_publishing_output_or_handles() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let run = Range::new(0x4000_0000, 2 * PAGE_SIZE);
+            engine.free_dma_runs.borrow_mut().push(run);
+            let before = engine.census(Some(&process));
+            let mut output = [0xdead; 3];
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, 3 * PAGE_SIZE, &mut output),
+                Err(Errno::NoMemory)
+            );
+            assert_eq!(output, [0xdead; 3]);
+            assert_eq!(engine.census(Some(&process)), before);
+            assert_eq!(engine.free_dma_runs.borrow().as_slice(), &[run]);
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, PAGE_SIZE, &mut output),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, 0, &mut []),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(engine.free_dma_runs.borrow().as_slice(), &[run]);
         }
 
         #[test]

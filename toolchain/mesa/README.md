@@ -1,9 +1,41 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j653 -->
 <!-- j735 -->
 <!-- j740 -->
 <!-- j741 -->
 <!-- j742 -->
+<!-- j743 -->
+
+## G7o-b: service memory for real driver allocations
+
+The native channel now allows 64 MiB per BO, 128 MiB live per session, 256 bindings,
+and a 256 MiB GPU VA window (`0x20000000..0x30000000`). These are bounded bring-up
+limits, not a promise that every arbitrary GL/Vulkan workload fits. Mesa 26.2.5's
+v10 drivers use 64 KiB command rings and geometry storage, 16/64 KiB descriptor and
+shader slabs, and 2 MiB tiler chunks; images and buffers can exceed the former
+2 MiB cap. The 128 MiB legacy tiler BO in both sources is gated to PAN_ARCH <= 9,
+and is not part of the G610/v10 requirement. — KESTREL, 2026-10-31
+
+BufferCreate now uses `VmoCreatePaged` (syscall 55): independent zeroed/cleaned DMA
+pages, one shareable VMO, and one contiguous Normal-NC CPU mapping. The physical
+page list is returned to the allocating driver only; the GPU channel still returns
+an ID, size and VMO grant. VmBind resolves offsets in that list and writes individual
+GPU leaves. The driver reserves enough table pages to visit the entire VA window;
+binding metadata and temporary unbind batches live on the heap. Reset-before-release,
+checked unbind/flush, live-byte accounting and monotonic IDs keep their existing contract.
+A failed allocation returns its entire prefix to the DMA free list. Duplicates, CPU
+mappings, queued transfers and retained kernel references prevent reclamation.
+
+```sh
+python3 scripts/gpu-memory-smoke.py --run
+```
+
+This builds a small native Rust probe and copies the QEMU image into a disposable
+ESP. It forces physical holes with live guard VMOs, allocates 64 MiB, checks both
+ends of every page through two shared NC aliases, closes one owner while retaining
+the other, and requires the same pages back zeroed after final release. Host tests
+cover the GPU table walk, offsets, table capacity, the budget and binding quotas,
+and failure/close accounting. GPU hardware acceptance remains G7o-f; Mesa's BO and
+VM backend operations remain G7o-c/d. — KESTREL, 2026-10-31
 
 ## G7o-a: the property set is complete
 
