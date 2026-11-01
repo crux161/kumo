@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*j745*/
+/*j746*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -65,8 +66,13 @@ pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api, const struct pan_kmod_a
         report.missing_properties || !report.model_resolved || props.is_io_coherent ||
         props.pgsize_bitmap != PAN_PGSIZE_4K || !report.info.va_start ||
         report.info.va_start >= report.info.va_end ||
-        report.info.va_start % PAN_PGSIZE_4K || report.info.va_end % PAN_PGSIZE_4K)
+        report.info.va_start % PAN_PGSIZE_4K || report.info.va_end % PAN_PGSIZE_4K ||
+        report.info.va_start >> 32 != (report.info.va_end - 1) >> 32)
         return NULL;
+    /* Gallium (v10, unchecked) and panvk (asserted) store a blend shader's PC as 32 bits, so
+     * all executable BOs must share one 4 GiB region. The window is the drivers' whole user
+     * VA range; one crossing a 4 GiB boundary could split their code, so it is refused, not
+     * published. An auto-VA backend must keep this invariant (G7o-e). — TIMBERDOODLE */
     if (!allocator) allocator = &default_allocator;
     struct kumo_device *dev = allocator->zalloc(allocator, sizeof(*dev), false);
     if (!dev) return NULL;

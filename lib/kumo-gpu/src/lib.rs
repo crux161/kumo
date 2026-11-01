@@ -1,9 +1,9 @@
 #![no_std]
-//j707
 //j711
 //j742
 //j743
 //j744
+//j746
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -40,6 +40,10 @@ pub const PAGE_BYTES: u64 = 4096;
 /// A 256 MiB client window, separate from G5's resident work buffers.
 pub const VA_START: u64 = 0x2000_0000;
 pub const VA_END: u64 = 0x3000_0000;
+// Valhall's blend descriptor keeps only the low 32 bits of a blend shader's PC, so every
+// executable binding a client makes must share one 4 GiB region (G7o-e). Panthor's auto-VA
+// enforces it with a split heap; here the whole window is one region. — TIMBERDOODLE
+const _: () = assert!(VA_START >> 32 == (VA_END - 1) >> 32);
 /// The largest single allocation. A buffer's GPU binding must fit wholly inside this length.
 pub const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 /// Live DMA bytes one channel may hold at once. G8a removes the fixed four-entry table: a

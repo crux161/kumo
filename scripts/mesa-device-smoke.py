@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j745
+#j746
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "toolchain/mesa"
 OUT = ROOT / "build/proofs/g7o-d"
 GREEN = b"G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close"
+WX_GREEN = b"G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window"
 
 
 def run(command, **kwargs):
@@ -87,8 +89,11 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         spec = importlib.util.spec_from_file_location("uefi_smoke", ROOT / "scripts/cxx-smoke.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.boot(ROOT / "build/images/qemu-virt-aarch64", 120, elf=elf,
-                    label="G7o-d native device", green=GREEN, tag="G7o-d")
+        transcript = module.boot(ROOT / "build/images/qemu-virt-aarch64", 120, elf=elf,
+                                 label="G7o-d native device", green=GREEN, tag="G7o-d")
+        proof = transcript.split(b"G7o-d native device begin", 1)[1]
+        assert proof.count(WX_GREEN) == 1 and proof.index(WX_GREEN) < proof.index(GREEN)
+        print(WX_GREEN.decode(), flush=True)
 
 
 if __name__ == "__main__":

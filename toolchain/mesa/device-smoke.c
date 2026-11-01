@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*j745*/
+/*j746*/
 #include "kumo_kmod.h"
 #include <stdio.h>
 #include <sys/mman.h>
@@ -8,6 +9,59 @@
 static void *fail_alloc(const struct pan_kmod_allocator *a, size_t size, bool transient)
 { (void)a; (void)size; (void)transient; return NULL; }
 static void unused_free(const struct pan_kmod_allocator *a, void *p) { (void)a; (void)p; }
+static uint32_t (*real_query)(void *context, struct kumo_gpu_info *out);
+static uint32_t straddling_query(void *context, struct kumo_gpu_info *out)
+{
+    uint32_t status = real_query(context, out);
+    out->va_end = UINT64_C(0x100001000); // one page past the first 4 GiB boundary
+    return status;
+}
+
+/* G7o-e: the executable BO requests both drivers make (toolchain/mesa/WX-INVENTORY.md),
+ * through the real device. Buffer 1 is the caller's data BO; the Rust service asserts
+ * READ_ONLY for buffers 2 and 3 and NO_EXECUTE for 1. — TIMBERDOODLE */
+static unsigned driver_shapes(struct pan_kmod_dev *dev, struct pan_kmod_vm *vm,
+                              struct pan_kmod_bo *data, struct pan_kmod_va_range range)
+{
+    /* panvk asks EXECUTABLE | WB_MMAP and panvk_device_adjust_bo_flags drops WB_MMAP the
+     * device does not offer. Unmasked, the request fails closed before any wire I/O. */
+    uint32_t panvk_flags = PAN_KMOD_BO_FLAG_EXECUTABLE | PAN_KMOD_BO_FLAG_WB_MMAP;
+    CHECK(!(dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_WB_MMAP), 40);
+    CHECK(!pan_kmod_bo_alloc(dev, vm, 16 * 1024, panvk_flags), 41);
+    if (!(dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_WB_MMAP))
+        panvk_flags &= ~PAN_KMOD_BO_FLAG_WB_MMAP;
+    /* Gallium's shader pools: 4 KiB slabs of PAN_BO_EXECUTE alone, not shareable and so
+     * exclusive to the context VM. panvk's executable pool: 16 KiB slabs on the device VM. */
+    struct pan_kmod_bo *gallium = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
+    struct pan_kmod_bo *panvk = pan_kmod_bo_alloc(dev, vm, 16 * 1024, panvk_flags);
+    CHECK(gallium && panvk && gallium->exclusive_vm == vm && panvk->exclusive_vm == vm &&
+          panvk->flags == PAN_KMOD_BO_FLAG_EXECUTABLE, 42);
+    struct pan_kmod_bo *code[2] = {gallium, panvk};
+    for (uint32_t i = 0; i < 2; ++i) {
+        /* Both drivers write their binaries through exactly this map; never PROT_EXEC. */
+        CHECK(pan_kmod_bo_mmap(code[i], PROT_READ | PROT_WRITE | PROT_EXEC, MAP_SHARED, NULL) == MAP_FAILED, 43);
+        volatile uint32_t *cpu = pan_kmod_bo_mmap(code[i], PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+        CHECK(cpu != MAP_FAILED, 44);
+        for (uint32_t w = 0; w < code[i]->size / 4; ++w) cpu[w] = 0x7e000000u ^ (w * 0x9e37u + i);
+        CHECK(!pan_kmod_kumo_bo_munmap(code[i]), 45);
+        cpu = pan_kmod_bo_mmap(code[i], PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+        CHECK(cpu != MAP_FAILED, 46);
+        for (uint32_t w = 0; w < code[i]->size / 4; ++w) CHECK(cpu[w] == (0x7e000000u ^ (w * 0x9e37u + i)), 47);
+    }
+    /* Code at both ends of the window, which is one 4 GiB region by the factory's check. */
+    struct pan_kmod_vm_op ops[3] = {
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {range.start, data->size}, .map = {data, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {range.start + 0x100000, gallium->size}, .map = {gallium, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {range.start + range.size - panvk->size, panvk->size},
+         .map = {panvk, 0}},
+    };
+    CHECK(ops[1].va.start >> 32 == (ops[2].va.start + ops[2].va.size - 1) >> 32, 48);
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 3) == 0, 49);
+    pan_kmod_bo_put(panvk); pan_kmod_bo_put(gallium); pan_kmod_bo_put(data);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
 
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
@@ -16,6 +70,8 @@ unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 1);
     bad = *api; bad.vm_bind = NULL;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 2);
+    bad = *api; real_query = api->query; bad.query = straddling_query;
+    CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 39);
     if (mode == 6) {
         const struct pan_kmod_allocator allocator = {.zalloc = fail_alloc, .free = unused_free};
         CHECK(!pan_kmod_kumo_dev_create(api, &allocator), 3);
@@ -47,6 +103,7 @@ unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
     CHECK(vm && vm->dev == dev && vm->handle == 1 && vm->pgsize_bitmap == 4096, 17);
     CHECK(!pan_kmod_vm_create(dev, 0, range.start, range.size), 18);
     CHECK(pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_USABLE, 19);
+    if (mode == 8) return driver_shapes(dev, vm, bo, range);
     struct pan_kmod_bo *exec = pan_kmod_bo_alloc(dev, vm, 2 * 4096,
         PAN_KMOD_BO_FLAG_EXECUTABLE | PAN_KMOD_BO_FLAG_GPU_UNCACHED);
     CHECK(exec && exec->exclusive_vm == vm, 20);
@@ -107,6 +164,7 @@ int main(void)
     puts("G7o-d native device begin: modeled GPU service, real Mesa lifecycle and VMOs");
     unsigned failed = kumo_mesa_device_proof();
     if (failed) { printf("G7o-d native device FAILED at case %u\n", failed); return 1; }
+    puts("G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window");
     puts("G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close");
     return 0;
 }

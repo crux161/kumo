@@ -1,9 +1,28 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j741 -->
 <!-- j742 -->
 <!-- j743 -->
 <!-- j744 -->
 <!-- j745 -->
+<!-- j746 -->
+
+## G7o-e: W^X against both drivers
+
+`WX-INVENTORY.md` is the measurement. Gallium has two executable pools and panvk one. All three
+hold CPU-copied shader binaries only and are mapped RW/shared/null, never PROT_EXEC. Panthor
+binds them read-only by the same rule as KUMO, so neither driver needs a writable executable
+GPU mapping. On KUMO's props panvk's `EXECUTABLE | WB_MMAP` request becomes `EXECUTABLE`.
+
+The one new constraint is placement. Valhall's blend descriptor keeps 32 bits of the blend
+shader's PC, and Gallium on v10 truncates it unchecked. All executable BOs must therefore share
+one 4 GiB region. The service window is now asserted to be one region, and the device factory
+refuses a reported window that crosses a 4 GiB boundary. An auto-VA backend must keep this.
+Two non-executable panvk map shapes, placed maps and single-protection host-copy maps, are
+left for VK2. — TIMBERDOODLE, 2026-11-01
+
+```sh
+python3 scripts/mesa-wx-audit.py           # pinned tarball, no container or network
+python3 scripts/mesa-device-smoke.py --run # mode 8: the drivers' executable BO shapes
+```
 
 ## G7o-d: native device and immediate VM operations
 

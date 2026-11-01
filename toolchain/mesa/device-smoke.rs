@@ -1,4 +1,5 @@
 //j745
+//j746
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -175,14 +176,15 @@ impl Backend for Hardware {
         if self.mode == 2 && self.bind_calls == 2 {
             return Err(Status::NoMemory);
         }
-        assert_eq!(
-            binding.flags,
-            if binding.buffer == 2 {
-                BindFlags(BindFlags::READ_ONLY | BindFlags::UNCACHED)
-            } else {
-                BindFlags(BindFlags::NO_EXECUTE)
-            }
-        );
+        // Mode 8 binds the drivers' executable pools (buffers 2 and 3, cached) beside a
+        // data BO; it is the G7o-e W^X shape. — TIMBERDOODLE
+        let flags = match (self.mode, binding.buffer) {
+            (8, 2 | 3) => BindFlags::READ_ONLY,
+            (8, _) => BindFlags::NO_EXECUTE,
+            (_, 2) => BindFlags::READ_ONLY | BindFlags::UNCACHED,
+            _ => BindFlags::NO_EXECUTE,
+        };
+        assert_eq!(binding.flags, BindFlags(flags));
         self.binds.push(binding);
         Ok(())
     }
@@ -355,7 +357,7 @@ fn endpoint_proof() {
 #[no_mangle]
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
-    for mode in 0..8 {
+    for mode in 0..9 {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
             session: Session::default(),
@@ -408,6 +410,11 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         if mode == 2 {
             assert_eq!(server.release.buffers, 2);
             assert_eq!(server.release.bindings, 1);
+        }
+        if mode == 8 {
+            // The unmasked EXECUTABLE | WB_MMAP request never reached the wire.
+            assert_eq!(created, 3);
+            assert_eq!(server.hardware.bind_calls, 3);
         }
         if matches!(mode, 4 | 7) {
             assert_eq!(server.release.buffers, 2);
