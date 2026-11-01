@@ -1,9 +1,52 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j651 -->
 <!-- j652 -->
 <!-- j653 -->
 <!-- j735 -->
 <!-- j740 -->
+<!-- j741 -->
+
+## G7n: the compiler runs on KUMO
+
+After G7m, keep the offline driver container running:
+
+```sh
+python3 scripts/mesa-compiler-smoke.py --run
+```
+
+`build-compiler.py` builds one harness twice from the same Mesa build: for KUMO
+on relibc, and natively for Linux as the reference. It runs three compiles, all
+for v10 (GPU_ID `0xa8670005`):
+
+- **SPIR-V → NIR → Valhall.** Mesa's own `panfrost_compile`
+  (`src/panfrost/clc/pan_compile.c`, compiled unchanged) on the shader recipe's
+  `kumo_paint` SPIR-V. On Linux its two outputs must equal the recipe's own
+  `panfrost_compile` byte for byte.
+- **GLSL ES 3.10 → NIR → Valhall**, twice. Mesa's standalone GLSL front end and
+  linker run first. The state tracker's compute lowering follows, then Gallium
+  panfrost's compute compile in `panfrost_shader_compile`'s order.
+  `g7n/paint.comp` is the kumo_paint pattern in GLSL. `g7n/math.comp` adds
+  shared memory, barriers, a reduction, and a constant expression folded with
+  the build's libm (openlibm on KUMO, glibc on Linux).
+
+KUMO must print every Linux line exactly: size, BLAKE3 of the output, work
+registers, TLS, WLS and sysvals.
+
+`pan_compile.c` reads and writes files. KUMO's root volume is read-only and
+relibc's `mmap` is anonymous-only. So its file calls are renamed in the object
+(`llvm-objcopy --redefine-sym`) to an in-memory layer in `compiler-smoke.c`.
+glibc's headers spell them `open64`/`fopen64`/`lseek64`/`mmap64`, so both
+spellings are renamed.
+
+The GLSL compiler outran the 16 KiB main stack every KUMO program had. The
+harness asks for 2 MiB through `PT_GNU_STACK`, and Sora now honours its
+`p_memsz` (16 KiB floor, 8 MiB ceiling, refused above). With an explicit
+`PHDRS` block lld emits the header but leaves the size zero, so the build
+writes the field after linking and checks it with llvm-readelf.
+
+CPU only: no GPU device is opened and no compiled binary runs. QEMU and Orange
+Pi 5 Plus metal both printed the Linux reference byte for byte (J741). Outputs,
+the Linux transcript and the manifest live in
+`build/mesa-drivers/result/compiler/`. — TIMBERDOODLE, 2026-10-31
 
 ## G7m: OS closure and Mesa utilities
 

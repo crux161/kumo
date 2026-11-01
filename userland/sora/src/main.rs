@@ -1,20 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j694
-//j697
-//j698
-//j701
-//j703
-//j709
-//j711
-//j711
-//j713
-//j714
 //j715
 //j720
 //j721
 //j723
+//j741
 
 extern crate alloc;
 
@@ -8038,6 +8029,7 @@ fn run_elf_threads(
     let mut segments = [empty; MAX_SEGMENTS];
     let mut segment_count = 0usize;
     let mut vmo_len = 0u64;
+    let mut stack_request = 0u64;
 
     for index in 0..elf.phnum as usize {
         let ph_off = elf_off + elf.phoff + (index as u64) * (elf.phentsize as u64);
@@ -8055,6 +8047,9 @@ fn run_elf_threads(
                 return false;
             }
         };
+        if ph.kind == linux_elf::PT_GNU_STACK {
+            stack_request = ph.mem_size;
+        }
         if ph.kind != linux_elf::PT_LOAD {
             continue;
         }
@@ -8082,6 +8077,20 @@ fn run_elf_threads(
         log(b": no load\n");
         return false;
     }
+    //j741
+    // Thread zero's stack is what the image's PT_GNU_STACK p_memsz asks for (the field
+    // `-z stack-size=` sets), never less than the 16 KiB every program has had, and refused
+    // rather than clamped above MAX_MAIN_STACK. Mesa's GLSL compiler outran 16 KiB on its first KUMO run (G7n). An image
+    // that asks for nothing keeps exactly the old layout. — TIMBERDOODLE
+    const MAX_MAIN_STACK: u64 = 8 * 1024 * 1024;
+    let main_stack = match align_up(stack_request) {
+        Some(size) if size <= MAX_MAIN_STACK => size.max(0x4000),
+        _ => {
+            log(name);
+            log(b": stack request too large\n");
+            return false;
+        }
+    };
     let vmo_len = match align_up(vmo_len) {
         Some(len) if len > 0 => len,
         _ => {
@@ -8166,9 +8175,8 @@ fn run_elf_threads(
         // — CORVUS / KESTREL 2026-07-26
         const STACK_TOP: u64 = 0x1001_0000;
         const STACK_STRIDE: u64 = 0x1_0000;
-        const STACK_SIZE: u64 = 0x4000;
         let arena_top = STACK_TOP + u64::from(extra_threads) * STACK_STRIDE;
-        let arena_size = arena_top - (STACK_TOP - STACK_SIZE);
+        let arena_size = arena_top - (STACK_TOP - main_stack);
         if address_space_create(child_as, arena_top, arena_size) == u64::MAX {
             log(name);
             log(b": as fail\n");

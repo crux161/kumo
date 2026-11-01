@@ -1,0 +1,29 @@
+#version 310 es
+// j741
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// G7n's first GLSL ES input: kumo_paint.cl's 256x128 XRGB8888 pattern written as a GLSL ES 3.10
+// compute shader, so the same picture reaches Valhall through Mesa's GLSL front end instead of
+// mesa_clc. Red, green, blue and white 64-pixel bars on the top half; below them blue follows x
+// and green follows twice the row. SSBO only: no uniforms, samplers or images, so the state
+// tracker's uniform lowering has nothing to do. — TIMBERDOODLE 2026-10-31
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) writeonly buffer Target {
+   uint px[];
+} target;
+
+uint kumo_pixel(uint x, uint y)
+{
+   if (y < 64u)
+      return x < 64u ? 0x00FF0000u : x < 128u ? 0x0000FF00u : x < 192u ? 0x000000FFu : 0x00FFFFFFu;
+   return (((y - 64u) * 2u) << 8) | x;
+}
+
+void main()
+{
+   uint x = gl_GlobalInvocationID.x;
+   uint y = gl_GlobalInvocationID.y;
+   target.px[y * 256u + x] = kumo_pixel(x, y);
+}
