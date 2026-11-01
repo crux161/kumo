@@ -1,5 +1,6 @@
 # G7o-e — W^X against both Mesa drivers
 <!-- j746 -->
+<!-- j747 -->
 
 Measured against the pinned Mesa 26.2.5 tarball (sha256 `794b3d17…a0a5`), v10/CSF paths of
 Gallium panfrost and panvk. `python3 scripts/mesa-wx-audit.py` re-reads the tarball in place
@@ -104,8 +105,19 @@ window.
 - Permissions only. Cache maintenance for recycled code is not measured here. A freed BO's
   VA, or its pages after the J743 free list returns them zeroed, can carry new code. GPU-side
   invalidation at that reuse belongs to drv-gpu's unbind and to the submit path (G7p/GL1).
-- GPU behaviour on metal. Execution from a READ_ONLY executable binding is already
-  metal-proven: G6c's client compute dispatch (J596, DESIGN/021) ran its 256-byte binary from
-  a read-only, executable, cached binding at `0x2000_2000` on the Orange Pi, with zero
-  mismatches. Proposed for G7o-f: a GPU store aimed at an executable binding faults, and a
-  shader still executes from the same binding.
+- Shader execution through a Mesa-made binding. Execution from a READ_ONLY executable
+  binding is metal-proven by G6c's client compute dispatch (J596, DESIGN/021), which ran its
+  256-byte binary from a read-only, executable, cached binding at `0x2000_2000` on the Orange
+  Pi with zero mismatches. G7o-f did not repeat it through the bridge.
+
+## On metal (J747)
+
+G7o-f's live client bound a 4 KiB EXECUTABLE BO through `pan_kmod_vm_bind`, then aimed a CS
+store at it. The Orange Pi's MMU refused it:
+`AS1 fault at VA=0x0000000020100080: PERMISSION_FAULT Write`.
+
+- drv-gpu retired the job after its 1 s work timeout.
+- It contained the close: `reset=ok buffers=5 bindings=5 waits=0 retained=no`.
+- The executable bytes were unchanged through the CPU map.
+
+The rule holds in hardware, not only in the bind flags.

@@ -1,9 +1,44 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j742 -->
 <!-- j743 -->
 <!-- j744 -->
 <!-- j745 -->
 <!-- j746 -->
+<!-- j747 -->
+
+## G7o-f: the device, BOs and VM on metal
+
+`device-metal.c`/`.rs` run as the Orange Pi's GPU client, staged in place of `bin/gpu-client`,
+over the live drv-gpu session. Sora passes that session in x0, which relibc would consume, so
+`device-metal-crt0.S` keeps x0/x1 and starts relibc on an empty, closed startup channel. Lines
+go to the kernel log, because a Sora-launched client has no stdio.
+
+What one boot proves on hardware:
+- the published props equal J742's attestation;
+- five Mesa BOs exist, the 64 MiB one among them, and every page is filled, remapped and
+  verified through real DMA pages;
+- five binds go through `pan_kmod_vm_bind`;
+- GPU `SYNC_SET32` stores through Mesa bindings land in the data BO and on 17 pages across
+  the 64 MiB;
+- a live unbind and rebind work;
+- a store aimed at an executable binding faults (`PERMISSION_FAULT Write`). drv-gpu then
+  contains the close with `reset=ok`, and the executable bytes are unchanged.
+
+`Buffers::native_client` reaches the session's group, submit and sync operations, which the
+bridge does not model until G7p.
+
+Two facts for later slices:
+- **`SYNC_SET32` writes a 32-bit sync object, `{value, status}`**: the value at the target
+  and status 0 in the next word. It is not a bare 32-bit store.
+- **KUMO's Submit reads its stream from a read-only binding, and through the bridge only
+  EXECUTABLE BOs bind read-only.** Gallium and panvk keep command streams in writable,
+  non-executable pools, so GL1 must settle that rule.
+
+— TIMBERDOODLE, 2026-11-01
+
+```sh
+python3 scripts/mesa-device-metal.py --stage build/proofs/g7o-f/opi  # never serves it
+python3 scripts/mesa-device-metal.py --check <tio log>                 # judges the log's last boot
+```
 
 ## G7o-e: W^X against both drivers
 

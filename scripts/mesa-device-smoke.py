@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j745
 #j746
+#j747
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -21,11 +22,10 @@ def run(command, **kwargs):
     return subprocess.run(list(map(str, command)), cwd=ROOT, check=True, **kwargs)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", action="store_true")
-    args = parser.parse_args()
-    OUT.mkdir(parents=True, exist_ok=True)
+def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S"):
+    """Build one static proof ELF from `cases`.c and `cases`.rs over the real bridge. The
+    G7o-f metal client reuses it with its own cases, startup file and output. — TIMBERDOODLE"""
+    out.mkdir(parents=True, exist_ok=True)
     # This verifies the source/header pins, prepares native headers, builds the same C
     # bridge and checks its measured dependency closure; no download. — KESTREL
     run(["python3", ROOT / "scripts/mesa-native-probe.py"])
@@ -42,17 +42,17 @@ def main():
     for include in ["include", "src", "src/panfrost", "src/panfrost/lib", "src/panfrost/model"]:
         flags.extend(["-isystem", mesa / include])
     flags.extend(["-isystem", native / "generated"])
-    for name in ["native-device", "device-smoke"]:
-        run([cc, *flags, "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", OUT / f"{name}.o"])
+    for name in ["native-device", cases]:
+        run([cc, *flags, "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", out / f"{name}.o"])
     run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none",
          "-p", "kumo-rt", "-p", "kumo-gpu", "-p", "kumo-abi"])
     deps = ROOT / "target/aarch64-unknown-none/release"
-    elf = OUT / "device-smoke"
+    elf = out / cases
     run(["rustc", "--edition=2021", "--crate-type=staticlib", "--target=aarch64-unknown-none",
          "-C", "panic=abort", "-C", "opt-level=2", "--extern", f"kumo_gpu={deps / 'libkumo_gpu.rlib'}",
          "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}", "-L", f"dependency={deps / 'deps'}",
-         TOOL / "device-smoke.rs", "-o", OUT / "libdevice.a"])
-    run([cc, "--target=aarch64-unknown-none", "-c", ROOT / "toolchain/relibc/smoke/crt0.S", "-o", OUT / "crt0.o"])
+         TOOL / f"{cases}.rs", "-o", out / "libdevice.a"])
+    run([cc, "--target=aarch64-unknown-none", "-c", crt0, "-o", out / "crt0.o"])
     mode = subprocess.check_output(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", "kumo-mesa-drivers-g7k"], text=True).strip()
     assert mode == "none", "native device build container must remain offline"
     # Mesa's exported archives are thin. Materialize their real cached members, rather
@@ -70,20 +70,28 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
 """
     run(["docker", "exec", "kumo-mesa-drivers-g7k", "python3", "-c", materialize])
     for name in ['kmod', 'util', 'c11']:
-        run(["docker", "cp", f"kumo-mesa-drivers-g7k:/output/device-deps/{name}.a", OUT / f"{name}.a"])
+        run(["docker", "cp", f"kumo-mesa-drivers-g7k:/output/device-deps/{name}.a", out / f"{name}.a"])
     command = ["ld.lld", "-static", "--gc-sections", "-z", "noexecstack", "-T", ROOT / "toolchain/relibc/smoke/link.ld",
-               "-o", elf, OUT / "crt0.o", OUT / "device-smoke.o", OUT / "native-device.o", native / "kumo_kmod.o",
-               native / "pan_props.o", native / "pan_model.o", "--start-group", OUT / "libdevice.a",
-               OUT / "kmod.a", OUT / "util.a", OUT / "c11.a", sysroot / "lib/libc.a", "--end-group"]
+               "-o", elf, out / "crt0.o", out / f"{cases}.o", out / "native-device.o", native / "kumo_kmod.o",
+               native / "pan_props.o", native / "pan_model.o", "--start-group", out / "libdevice.a",
+               out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a", "--end-group"]
     run(command)
     undefined = run([nm, "--undefined-only", elf], capture_output=True, text=True).stdout
     assert not undefined.strip(), "Device proof ELF has unresolved symbols"
-    run(["rustfmt", "--edition", "2021", "--check", TOOL / "device-smoke.rs", TOOL / "native.rs"])
-    paths = [elf, Path(__file__), TOOL / "device-smoke.c", TOOL / "device-smoke.rs", TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
+    run(["rustfmt", "--edition", "2021", "--check", TOOL / f"{cases}.rs", TOOL / "native.rs"])
+    paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{cases}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
-             ROOT / "lib/kumo-gpu/src/client.rs", native / "manifest.json", OUT / "kmod.a", OUT / "util.a", OUT / "c11.a", sysroot / "lib/libc.a"]
-    (OUT / "manifest.json").write_text(json.dumps({"input_sha256": {
+             ROOT / "lib/kumo-gpu/src/client.rs", native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
+    (out / "manifest.json").write_text(json.dumps({"input_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}}, indent=2) + "\n")
+    return elf
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", action="store_true")
+    args = parser.parse_args()
+    elf = build()
     print(f"G7o-d native device compile/link green: {elf}", flush=True)
     if args.run:
         spec = importlib.util.spec_from_file_location("uefi_smoke", ROOT / "scripts/cxx-smoke.py")

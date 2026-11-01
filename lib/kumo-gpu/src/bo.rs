@@ -1,5 +1,6 @@
 //j744
 //j745
+//j747
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
@@ -202,6 +203,13 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
 
     pub fn live_count(&self) -> usize {
         self.records.len()
+    }
+
+    /// The borrowed session, for native operations this store does not model yet: groups,
+    /// submission and sync (G7p). Buffer, VM and binding requests must still go through the
+    /// store, which owns their bookkeeping. — TIMBERDOODLE
+    pub fn native_client(&mut self) -> &mut Client<T> {
+        self.client
     }
 }
 
