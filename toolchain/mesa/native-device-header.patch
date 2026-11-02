@@ -1,4 +1,5 @@
 #j745
+#j765
 # Native BO mmap route and explicit VM-operation refusal. — KESTREL
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
@@ -13,10 +14,13 @@
 +   if (bo->dev->fd < 0)
 +      return pan_kmod_kumo_bo_mmap(bo, prot, flags, host_addr);
 +#endif
-@@ -999,0 +1009,6 @@
+@@ -999,0 +1009,9 @@
 +#ifdef __kumo__
 +   /* Native VM operations do not emulate sparse or asynchronous requests. — KESTREL */
-+   if (mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE || (op_count && !ops)) return -1;
++   /* GL1-d: a deferred request waits for the VM's last point, then applies immediately
++    * (the backend requires TRACK_ACTIVITY). — TIMBERDOODLE */
++   if ((mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE &&
++        mode != PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT) || (op_count && !ops)) return -1;
 +   for (uint32_t i = 0; i < op_count; ++i)
 +      if (ops[i].flags) return -1;
 +#endif

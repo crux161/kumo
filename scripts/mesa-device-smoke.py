@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j757
 #j759
 #j760
 #j761
 #j762
+#j765
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -26,6 +26,11 @@ HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusa
 CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
 CONTEXT_SYNC_GREEN = b"GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released"
 CONTEXT_INIT_GREEN = b"GL1-c destroy: the screen and device are gone; the session-owned group was not reused"
+BATCH_LINES = [b"GL1-d poll: a zero-timeout fence_finish found the batch still pending, and returned its wake",
+               b"GL1-d fence: fence_finish completed natively, by ARM, WAIT and ARM again",
+               b"GL1-d readback: 0 of 4096 pixels differ from 0xdeadbeef (the modeled service runs no GPU)",
+               b"GL1-d destroy: fence, texture, context and screen are gone; every BO left through a deferred unmap",
+               b"GL1-d model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=2 wakes=3"]
 
 
 def run(command, **kwargs):
@@ -149,7 +154,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     if gl:
         gl_inputs = gl_dependencies(out)
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", *(["gl-context"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-context"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -182,7 +187,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen and context proofs (modes 17-19)")
+                        help="also link Gallium and run its screen, context and batch proofs (modes 17-20)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -210,6 +215,14 @@ def main():
             print(SCREEN_GREEN.decode(), flush=True)
             print(CONTEXT_SYNC_GREEN.decode(), flush=True)
             print("GL1-c3 context green: Gallium initialization, native ARM/wake/completion, one group per session, heap and context cleanup; modeled service", flush=True)
+            # GL1-d: each mode-20 line once, in order, ahead of the final green. — TIMBERDOODLE
+            at = 0
+            for line in BATCH_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            print("GL1-d batch green: a clear flushed as one native submission, a held poll timed out with its wake returned, "
+                  "the fence completed by ARM/WAIT/ARM, bo_wait and deferred unmaps answered from completion; modeled service", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

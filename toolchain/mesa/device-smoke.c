@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j757*/
 /*j759*/
 /*j760*/
 /*j761*/
 /*j762*/
+/*j765*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -309,6 +309,17 @@ static unsigned auto_va_cases(const struct kumo_gpu_api *api)
         .va = {PAN_KMOD_VM_MAP_AUTO_VA, code->size}, .map = {code, 0}};
     CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &again, 1) == 0 &&
           again.va.start == ops[1].va.start, 197);
+    /* GL1-d: with no submission behind it, Gallium's deferred unmap waits for nothing and frees
+     * the range for the next map. A BO starts with no activity, and a point no submission
+     * reached is refused. — TIMBERDOODLE */
+    struct pan_kmod_vm_op deferred = {.type = PAN_KMOD_VM_OP_TYPE_UNMAP, .va = {again.va.start, code->size}};
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT, &deferred, 1) == 0, 204);
+    struct pan_kmod_vm_op third = {.type = PAN_KMOD_VM_OP_TYPE_MAP,
+        .va = {PAN_KMOD_VM_MAP_AUTO_VA, code->size}, .map = {code, 0}};
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &third, 1) == 0 &&
+          third.va.start == again.va.start, 205);
+    CHECK(pan_kmod_bo_wait(code, INT64_MAX, false) && pan_kmod_kumo_vm_wait(vm, 0, 0) == 1, 206);
+    CHECK(pan_kmod_kumo_bo_attach_sync_point(code, 1, true) < 0, 207);
     unsigned maps = 0;
     for (;;) {
         struct pan_kmod_vm_op fill = {.type = PAN_KMOD_VM_OP_TYPE_MAP,
@@ -332,6 +343,9 @@ static unsigned auto_va_cases(const struct kumo_gpu_api *api)
 #ifdef KUMO_GL_SCREEN
 /* GL1-b: mode 17 runs Gallium's screen, and exists only in the build that links Gallium. */
 extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+/* GL1-d: mode 20 runs a clear, a fence and a readback against the modeled producer. */
+extern unsigned kumo_gl_batch_cases(const struct kumo_gpu_api *api, void (*say)(const char *),
+                                    unsigned (*control)(unsigned));
 extern unsigned kumo_gl_context_sync_cases(const struct kumo_gpu_api *api);
 extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 static void say_line(const char *line) { puts(line); fflush(stdout); }
@@ -339,7 +353,7 @@ static void say_line(const char *line) { puts(line); fflush(stdout); }
 unsigned kumo_mesa_device_modes(void)
 {
 #ifdef KUMO_GL_SCREEN
-    return 20;
+    return 21;
 #else
     return 17;
 #endif
@@ -348,6 +362,7 @@ unsigned kumo_mesa_device_modes(void)
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
 #ifdef KUMO_GL_SCREEN
+    if (mode == 20) return kumo_gl_batch_cases(api, say_line, kumo_mesa_native_control);
     if (mode == 19) return kumo_gl_context_init_cases(api, say_line);
     if (mode == 18) return kumo_gl_context_sync_cases(api);
     if (mode == 17) return kumo_gl_screen_cases(api, say_line);

@@ -1,8 +1,8 @@
-//j752
 //j757
 //j759
 //j761
 //j762
+//j765
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -357,6 +357,8 @@ struct Server {
     status_grants_closed: u32,
     peer_dead: bool,
     denied_sends: u32,
+    /// GL1-d: while set, an armed wait does not complete the last point. — TIMBERDOODLE
+    hold: bool,
 }
 struct Wire {
     server: Rc<RefCell<Server>>,
@@ -457,8 +459,8 @@ impl Transport for Wire {
             id: request.id,
             result,
         });
-        let complete =
-            server.hardware.mode == 19 && matches!(result, Ok(Response::WaitArmed { .. }));
+        let complete = (server.hardware.mode == 19 || server.hardware.mode == 20 && !server.hold)
+            && matches!(result, Ok(Response::WaitArmed { .. }));
         drop(server);
         if complete {
             // The modeled producer completes only after ARM established a real wake channel.
@@ -554,6 +556,10 @@ pub extern "C" fn kumo_mesa_native_control(action: u32) -> u32 {
                 Vec::new()
             }
             11 => return u32::from(server.denied_sends != 1),
+            12 | 13 => {
+                server.hold = action == 12;
+                return 0;
+            }
             _ => return 1,
         }
     };
@@ -795,6 +801,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             status_grants_closed: 0,
             peer_dead: false,
             denied_sends: 0,
+            hold: false,
         }));
         let mut client = Client::new(Wire {
             server: server.clone(),
@@ -916,6 +923,8 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             // Six maps crossed (three, the hole refilled, two fills); the caller-chosen and the
             // window-full maps never did. Every address is page-aligned inside the window, and the
             // only explicit unbind is the code page's. — TIMBERDOODLE
+            // GL1-d adds a deferred unbind of the refilled page and a seventh map that reuses it.
+            // — TIMBERDOODLE
             let vas: alloc::vec::Vec<u64> = server
                 .calls
                 .iter()
@@ -924,13 +933,53 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(vas.len(), 6);
-            assert_eq!(server.hardware.bind_calls, 6);
-            assert_eq!(server.hardware.unbind_calls, 1);
+            assert_eq!(vas.len(), 7);
+            assert_eq!(vas[3], vas[1]);
+            assert_eq!(vas[4], vas[1]);
+            assert_eq!(server.hardware.bind_calls, 7);
+            assert_eq!(server.hardware.unbind_calls, 2);
             assert!(vas
                 .iter()
                 .all(|va| va % PAGE_BYTES == 0
                     && (kumo_gpu::VA_START..kumo_gpu::VA_END).contains(va)));
+        }
+        if matches!(mode, 17 | 19 | 20) {
+            // GL1-d: Gallium frees every BO with a deferred unmap that now crosses, so each
+            // binding it made is explicitly unbound before its buffer goes. — TIMBERDOODLE
+            let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            let binds = count(|c| matches!(c, Command::VmBind(_)));
+            assert!(binds > 0);
+            assert_eq!(count(|c| matches!(c, Command::VmUnbind(_))), binds);
+        }
+        if mode == 20 {
+            // The init job took point 1 and the clear's batch point 2. The held poll armed a
+            // wake and gave it back, the infinite wait armed another, and the read map's bo_wait
+            // and every deferred unmap were answered from observed completion. — TIMBERDOODLE
+            let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            unsafe {
+                printf(
+                    b"GL1-d model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu submits=%u wakes=%u\n\0"
+                        .as_ptr(),
+                    server.release.buffers,
+                    server.release.bindings,
+                    server.release.waits,
+                    server.release.heaps,
+                    server.release.bytes,
+                    count(|c| matches!(c, Command::Submit(_))) as u32,
+                    server.wake_reads.len() as u32,
+                );
+            }
+            assert_eq!(server.release.buffers, 0);
+            assert_eq!(server.release.bindings, 0);
+            assert_eq!(server.release.heaps, 0);
+            assert_eq!(server.release.bytes, 0);
+            assert_eq!(count(|c| matches!(c, Command::GroupCreate { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapCreate(_))), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapDestroy { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::Submit(_))), 2);
+            assert_eq!(count(|c| matches!(c, Command::SyncRead { .. })), 0);
+            assert_eq!(server.last_point, 2);
+            assert_eq!(server.wake_reads.len(), 3);
         }
         if mode == 15 {
             // Every refused shape stayed local; three heaps crossed and all three were destroyed,

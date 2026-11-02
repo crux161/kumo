@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j745
 #j759
 #j760
 #j761
 #j762
+#j765
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -117,7 +117,10 @@ def category(symbol):
     # Native capability backend entry points, supplied by build-closure.py. — KESTREL
     if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap", "pan_kmod_kumo_cs_reg_count",
                   "pan_kmod_kumo_sync_create", "pan_kmod_kumo_sync_destroy", "pan_kmod_kumo_dev_lost",
-                  "pan_kmod_kumo_native", "pan_kmod_kumo_heap_create", "pan_kmod_kumo_heap_destroy"):
+                  "pan_kmod_kumo_native", "pan_kmod_kumo_heap_create", "pan_kmod_kumo_heap_destroy",
+                  "pan_kmod_kumo_vm_sync_lock", "pan_kmod_kumo_vm_sync_unlock",
+                  "pan_kmod_kumo_bo_attach_sync_point", "pan_kmod_kumo_sync_snapshot",
+                  "pan_kmod_kumo_snapshot_wait", "pan_kmod_kumo_vm_wait"):
         return "other: native capability backend"
     if symbol in BUILD_ID:
         return "other: static build ID"

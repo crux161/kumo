@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j757*/
 /*j759*/
 /*j760*/
 /*j761*/
 /*j762*/
+/*j765*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -13,11 +13,14 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include "pan_props.h"
+#include "util/os_time.h"
 #include "util/vma.h"
 
 /* GL1-b: an AUTO_VA VM hands out addresses from one heap over its whole range. The window
  * is one 4 GiB region, so G7o-e's executable rule holds for any address it picks. — TIMBERDOODLE */
-struct kumo_vm { struct pan_kmod_vm base; uint64_t start, end; struct util_vma_heap heap; };
+struct kumo_vm { struct pan_kmod_vm base; uint64_t start, end; struct util_vma_heap heap;
+                 /* GL1-d: the native timeline (0 until first use) and its last point. */
+                 uint64_t timeline, point; };
 #define KUMO_VM_FLAGS (PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY)
 
 struct kumo_device {
@@ -149,6 +152,119 @@ uint32_t pan_kmod_kumo_heap_destroy(struct pan_kmod_dev *base, uint32_t heap, ui
     if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
     return status;
 }
+static uint32_t native_op(struct pan_kmod_dev *base, uint32_t operation, uint64_t id, uint64_t value,
+                          struct kumo_gpu_native_reply *out)
+{
+    const struct kumo_gpu_native_request request = {.operation = operation, .id = id, .value = value};
+    return pan_kmod_kumo_native(base, &request, out);
+}
+static struct kumo_vm *tracked_vm(struct pan_kmod_vm *vm)
+{
+    struct kumo_device *dev = device(vm ? vm->dev : NULL);
+    return dev && dev->vm == vm && (vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY) ? (struct kumo_vm *)vm : NULL;
+}
+/* GL1-d: the timeline is created at the first submission, so a screen that never submits
+ * (and GL1-c2's observed context refusals) holds no extra native object. — TIMBERDOODLE */
+uint64_t pan_kmod_kumo_vm_sync_lock(struct pan_kmod_vm *vm, uint64_t *timeline)
+{
+    struct kumo_vm *kvm = tracked_vm(vm);
+    *timeline = 0;
+    if (!kvm) return 0;
+    if (!kvm->timeline) {
+        struct kumo_gpu_native_reply out;
+        if (native_op(vm->dev, KUMO_NATIVE_CREATE_TIMELINE, 0, 0, &out) != KUMO_GPU_OK || !out.id) {
+            poison(device(vm->dev));
+            return 0;
+        }
+        kvm->timeline = out.id;
+    }
+    *timeline = kvm->timeline;
+    return kvm->point;
+}
+void pan_kmod_kumo_vm_sync_unlock(struct pan_kmod_vm *vm, uint64_t point)
+{
+    struct kumo_vm *kvm = tracked_vm(vm);
+    if (kvm && point > kvm->point) kvm->point = point;
+}
+int pan_kmod_kumo_bo_attach_sync_point(struct pan_kmod_bo *base, uint64_t point, bool written)
+{
+    struct kumo_device *dev = device(base ? base->dev : NULL);
+    if (!dev || !point || !dev->vm || point > ((struct kumo_vm *)dev->vm)->point) return -1;
+    struct kumo_mesa_bo *bo = (struct kumo_mesa_bo *)base;
+    bo->read_point = MAX2(bo->read_point, point);
+    if (written) bo->write_point = MAX2(bo->write_point, point);
+    return 0;
+}
+int pan_kmod_kumo_sync_snapshot(struct pan_kmod_dev *base, uint64_t sync, uint64_t value,
+                                uint64_t *snapshot)
+{
+    *snapshot = 0;
+    struct kumo_gpu_native_reply out;
+    if (native_op(base, KUMO_NATIVE_SNAPSHOT, sync, value, &out) != KUMO_GPU_OK) {
+        struct kumo_device *dev = device(base);
+        if (dev) poison(dev);
+        return -1;
+    }
+    if (out.state != KUMO_NATIVE_AVAILABLE || !out.id) return -1;
+    *snapshot = out.id;
+    return 0;
+}
+int pan_kmod_kumo_snapshot_wait(struct pan_kmod_dev *base, uint64_t snapshot, int64_t timeout_ns)
+{
+    struct kumo_device *dev = device(base);
+    if (!dev) return -1;
+    const int64_t start = os_time_get_nano();
+    const int64_t deadline = timeout_ns < 0 || timeout_ns > INT64_MAX - start ? INT64_MAX
+                                                                                : start + timeout_ns;
+    for (unsigned closed = 0; snapshot;) {
+        struct kumo_gpu_native_reply out;
+        if (native_op(base, KUMO_NATIVE_ARM, snapshot, 0, &out) != KUMO_GPU_OK) break;
+        if (out.state == KUMO_NATIVE_COMPLETE) return 1;
+        if (out.state != KUMO_NATIVE_AVAILABLE || !out.id) break;
+        const uint64_t wake = out.id;
+        const int64_t left = deadline == INT64_MAX ? INT64_MAX : deadline - os_time_get_nano();
+        if (left <= 0) {
+            /* Pending at the deadline: give the wake back and report the timeout. */
+            if (native_op(base, KUMO_NATIVE_DROP, wake, 0, &out) != KUMO_GPU_OK) break;
+            return 0;
+        }
+        const uint64_t bound = MIN2((uint64_t)left, KUMO_NATIVE_MAX_TIMEOUT_NS);
+        if (native_op(base, KUMO_NATIVE_WAIT, wake, bound, &out) != KUMO_GPU_OK) break;
+        /* Two peer closes in a row with no completion between them is a broken producer. */
+        if (out.state == KUMO_NATIVE_CLOSED) {
+            if (++closed > 1) break;
+        } else if (out.state == KUMO_NATIVE_WOKEN || out.state == KUMO_NATIVE_TIMED_OUT) {
+            closed = 0;
+        } else {
+            break;
+        }
+    }
+    /* A failed fence, a refused wait or an unknown snapshot: no completion can be claimed
+     * and no BO can be read, so the device is lost before the caller continues. */
+    poison(dev);
+    return -1;
+}
+int pan_kmod_kumo_vm_wait(struct pan_kmod_vm *vm, uint64_t point, int64_t timeout_ns)
+{
+    struct kumo_vm *kvm = tracked_vm(vm);
+    if (!kvm) return -1;
+    if (!point) return 1;
+    /* Points are attached only after their submission, so one with nothing behind it is a
+     * broken record rather than work still to come. */
+    uint64_t snapshot;
+    if (!kvm->timeline || point > kvm->point ||
+        pan_kmod_kumo_sync_snapshot(vm->dev, kvm->timeline, point, &snapshot)) {
+        poison(device(vm->dev));
+        return -1;
+    }
+    const int result = pan_kmod_kumo_snapshot_wait(vm->dev, snapshot, timeout_ns);
+    struct kumo_gpu_native_reply out;
+    if (native_op(vm->dev, KUMO_NATIVE_DROP, snapshot, 0, &out) != KUMO_GPU_OK) {
+        poison(device(vm->dev));
+        return -1;
+    }
+    return result;
+}
 struct pan_kmod_dev *
 pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api, const struct pan_kmod_allocator *allocator)
 {
@@ -252,10 +368,17 @@ static struct pan_kmod_bo *refuse_import(struct pan_kmod_dev *dev, uint32_t hand
     return NULL;
 }
 static off_t no_mmap_offset(struct pan_kmod_bo *bo) { (void)bo; return -1; }
-static bool no_wait(struct pan_kmod_bo *bo, int64_t timeout, bool read_only)
+/* GL1-d: Panthor's rule over the BO's points: a reader waits for the last write, a writer for
+ * every access. A BO with no point was never in a submission that attached one; a native
+ * caller outside Gallium's batches (G7p's proofs) owns its own completion. On a lost device
+ * nothing completes, because the BO's CPU aliases are already gone. — TIMBERDOODLE */
+static bool wait_bo(struct pan_kmod_bo *base, int64_t timeout, bool read_only)
 {
-    (void)bo; (void)timeout; (void)read_only;
-    return false; /* G7p provides synchronization; no completion is invented. — KESTREL */
+    const struct kumo_mesa_bo *bo = (const struct kumo_mesa_bo *)base;
+    const uint64_t point = read_only ? bo->write_point : MAX2(bo->write_point, bo->read_point);
+    if (!point) return true;
+    struct kumo_device *dev = device(base->dev);
+    return dev && dev->vm && pan_kmod_kumo_vm_wait(dev->vm, point, timeout) == 1;
 }
 static int flush_nc(struct pan_kmod_dev *base)
 {
@@ -283,9 +406,10 @@ static struct pan_kmod_vm *create_vm(struct pan_kmod_dev *base, uint32_t flags,
                                     uint64_t start, uint64_t bytes)
 {
     struct kumo_device *dev = device(base);
-    /* Gallium asks for AUTO_VA | TRACK_ACTIVITY. General BO activity tracking remains GL1-d;
-     * GL1-c's initialization explicitly waits for its native completion before releasing BOs.
-     * bo_wait still makes no independent completion claim. — KESTREL */
+    /* Gallium asks for AUTO_VA | TRACK_ACTIVITY. GL1-c's initialization explicitly waits for
+     * its native completion before releasing BOs. — KESTREL */
+    /* GL1-d tracks activity: the timeline, each BO's points, bo_wait and deferred unmaps.
+     * — TIMBERDOODLE */
     if (!ready(dev) || dev->vm || (flags & ~KUMO_VM_FLAGS) || !bytes || start % PAN_PGSIZE_4K || bytes % PAN_PGSIZE_4K ||
         start < dev->range.start || start > UINT64_MAX - bytes ||
         start + bytes > dev->range.start + dev->range.size) return NULL;
@@ -309,6 +433,7 @@ static void destroy_vm(struct pan_kmod_vm *vm)
 {
     struct kumo_device *dev = device(vm->dev);
     if (!dev || dev->vm != vm) return;
+    pan_kmod_kumo_sync_destroy(vm->dev, ((struct kumo_vm *)vm)->timeline);
     if (dev->api.vm_destroy(dev->api.context, vm->handle) != KUMO_GPU_OK) poison(dev);
     for (struct kumo_mesa_bo *bo = dev->bos; bo; bo = bo->next)
         if (bo->base.exclusive_vm == vm) bo->base.exclusive_vm = NULL;
@@ -327,7 +452,9 @@ static int bind_vm(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
                    struct pan_kmod_vm_op *ops, uint32_t count)
 {
     struct kumo_device *dev = device(vm->dev);
-    if (!ready(dev) || dev->vm != vm || mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE || (count && !ops)) return -1;
+    const bool deferred = mode == PAN_KMOD_VM_OP_MODE_DEFER_TO_NEXT_IDLE_POINT;
+    if (!ready(dev) || dev->vm != vm || (mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE && !deferred) ||
+        (deferred && !(vm->flags & PAN_KMOD_VM_FLAG_TRACK_ACTIVITY)) || (count && !ops)) return -1;
     struct kumo_vm *kvm = (struct kumo_vm *)vm;
     const bool auto_va = vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
     /* Validate every row's shape and owner before the first request. If a later runtime
@@ -352,6 +479,12 @@ static int bind_vm(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
                 op->va.size > bo->base.size - (uint64_t)op->map.bo_offset) return -1;
         } else if (op->type != PAN_KMOD_VM_OP_TYPE_UNMAP) return -1;
     }
+    /* GL1-d: panfrost_bo_free unmaps with DEFER_TO_NEXT_IDLE_POINT. Panthor queues the
+     * operation behind the VM's last point in the kernel; KUMO waits for that point here and
+     * then applies it immediately, so nothing the GPU may still use is unmapped. Until GL1-d
+     * this mode was refused and Gallium ignored the error, so every freed BO kept its auto-VA
+     * range and only the server's buffer destroy dropped the binding. — TIMBERDOODLE */
+    if (deferred && pan_kmod_kumo_vm_wait(vm, kvm->point, INT64_MAX) != 1) return -1;
     /* Every address is chosen before the first request, so a full window refuses the whole
      * batch with nothing sent. */
     for (uint32_t i = 0; auto_va && i < count; ++i) {
@@ -406,7 +539,7 @@ static void no_perf_dump(struct pan_kmod_perf_session *s, struct mali_perf_dump_
 const struct pan_kmod_ops kumo_kmod_ops = {
     .dev_create = refuse_fd, .dev_destroy = destroy_device, .dev_query_user_va_range = user_range,
     .bo_alloc = allocate_bo, .bo_free = free_bo, .bo_import = refuse_import,
-    .bo_get_mmap_offset = no_mmap_offset, .flush_bo_map_syncs = flush_nc, .bo_wait = no_wait,
+    .bo_get_mmap_offset = no_mmap_offset, .flush_bo_map_syncs = flush_nc, .bo_wait = wait_bo,
     .vm_create = create_vm, .vm_destroy = destroy_vm, .vm_bind = bind_vm, .vm_query_state = vm_state,
     .query_timestamp = no_timestamp, .perf_create = no_perf, .perf_enable = no_perf_enable,
     .perf_disable = no_perf_disable, .perf_dump = no_perf_dump, .perf_destroy = no_perf_op,

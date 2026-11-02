@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j754*/
 /*j757*/
 /*j758*/
 /*j759*/
 /*j762*/
+/*j765*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -15,6 +15,8 @@
  * G7q-c's C bridge (pan_kmod_kumo_heap_create/destroy), 5 is GL1's no-execute command streams
  * (J758), 6 is GL1-b's Gallium screen (gl-screen.c, linked with Gallium). A failed group ends its
  * session, and Sora regrants only on the churn image, so each failure needs its own boot.
+ * — TIMBERDOODLE */
+/* 7 is GL1-c's Gallium context (KESTREL) and 8 GL1-d's clear, fence and readback (gl-batch.c).
  * — TIMBERDOODLE */
 #include "kumo_kmod.h"
 #include <stdarg.h>
@@ -37,6 +39,10 @@ extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)
 #endif
 #if KUMO_METAL_PROOF == 7
 extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+#endif
+#if KUMO_METAL_PROOF == 8
+extern unsigned kumo_gl_batch_cases(const struct kumo_gpu_api *api, void (*say)(const char *),
+                                    unsigned (*control)(unsigned));
 #endif
 extern uint32_t kumo_metal_run(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                const uint64_t *words, uint32_t count);
@@ -688,6 +694,9 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #if KUMO_METAL_PROOF == 7
     return kumo_gl_context_init_cases(api, kumo_metal_log);
 #endif
+#if KUMO_METAL_PROOF == 8
+    return kumo_gl_batch_cases(api, kumo_metal_log, NULL);
+#endif
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -723,8 +732,12 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "GL1-c metal context begin: live drv-gpu session, Gallium's CSF initialization through the native bridge"
 #define FAILED_LINE "GL1-c metal context FAILED at case %u"
 #define GREEN_LINE "GL1-c metal context green: Gallium's native initialization completed, a second context was refused, and the heap, context and screen were destroyed"
+#elif KUMO_METAL_PROOF == 8
+#define BEGIN_LINE "GL1-d metal batch begin: live drv-gpu session, Gallium's clear, flush, fence and readback over the native bridge"
+#define FAILED_LINE "GL1-d metal batch FAILED at case %u"
+#define GREEN_LINE "GL1-d metal batch green: Mali cleared the render target through Gallium, the native fence completed, the CPU read the clear color back, and everything was destroyed"
 #else
-#error "KUMO_METAL_PROOF must be 0 to 6"
+#error "KUMO_METAL_PROOF must be 0 to 8"
 #endif
 
 extern unsigned kumo_metal_proof(void);

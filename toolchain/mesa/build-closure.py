@@ -2,6 +2,7 @@
 #j740
 #j745
 #j762
+#j765
 """Close both measured Mesa links and build the real KUMO utility acceptance."""
 import hashlib
 import importlib.util
@@ -53,7 +54,7 @@ def main():
     if "return pan_kmod_kumo_bo_mmap" not in header.read_text():
         assert hashlib.sha256(header.read_bytes()).hexdigest() == "55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4"
         run(["patch", "--batch", "--fuzz=0", "-p1", "-d", MESA / "mesa-26.2.5", "-i", TOOL / "native-device-header.patch"])
-    assert hashlib.sha256(header.read_bytes()).hexdigest() == "5080af914d916bb48c4c7351f25334703fb5575f393e82500f82d4ef34b7f979"
+    assert hashlib.sha256(header.read_bytes()).hexdigest() == "584111ae3e5ef8a1659f34b44ce41bd681dffbc80d950bd7ec4d413cdd9fe945"
     for name in ("kumo_gpu.h", "kumo_kmod.h"):
         source = TOOL / name
         dest = MESA / "mesa-26.2.5/src/gallium/drivers/panfrost" / name

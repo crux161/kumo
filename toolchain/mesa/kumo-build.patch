@@ -1,8 +1,8 @@
-#j735
 #j759
 #j760
 #j761
 #j762
+#j765
 --- a/include/drm-uapi/drm.h
 +++ b/include/drm-uapi/drm.h
 @@ -45,7 +45,7 @@
@@ -855,3 +855,420 @@
 
     struct {
        uint32_t handle;
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -21,6 +21,51 @@
+
+ #ifdef __kumo__
+ #include "kumo_kmod.h"
++
++static int csf_native_call(struct panfrost_device *dev, uint32_t op, uint64_t id,
++                           uint64_t value, struct kumo_gpu_native_reply *reply);
++
++/* GL1-d: every submission on the context's one group takes the VM timeline's next point,
++ * which is the group's own next point (D2). One PREPARE signals that point and the context
++ * binary, which is what drmSyncobjTransfer did. No wait is sent: every fence in a session
++ * belongs to this group's one queue, which runs its jobs in order, each ending with all of
++ * its work done, as drm_sched skips dependencies on its own queue. The point is published
++ * only once Submit was accepted; anything uncertain closes the native device. The caller
++ * owns the returned snapshot. — TIMBERDOODLE */
++static int
++csf_native_submit(struct panfrost_context *ctx, uint64_t va, uint32_t bytes,
++                  uint64_t *point, uint64_t *snapshot)
++{
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   uint64_t timeline;
++   const uint64_t next = pan_kmod_kumo_vm_sync_lock(dev->kmod.vm, &timeline) + 1;
++   const struct kumo_gpu_native_point signals[] = {
++      {timeline, next},
++      {ctx->native_syncobj, 0},
++   };
++   const struct kumo_gpu_native_request prepare = {
++      .operation = KUMO_NATIVE_PREPARE, .id = ctx->csf.native_group,
++      .job = {pan_kmod_vm_handle(dev->kmod.vm), bytes, va, next},
++      .signals = signals, .signal_count = 2,
++   };
++   struct kumo_gpu_native_reply reply;
++   if (!timeline ||
++       pan_kmod_kumo_native(dev->kmod.dev, &prepare, &reply) != KUMO_GPU_OK || !reply.id)
++      goto failed;
++   const uint64_t job = reply.id;
++   if (csf_native_call(dev, KUMO_NATIVE_STEP, job, 0, &reply) ||
++       reply.state != KUMO_NATIVE_SUBMITTED || !reply.id)
++      goto failed;
++   *snapshot = reply.id;
++   *point = next;
++   pan_kmod_kumo_vm_sync_unlock(dev->kmod.vm, next);
++   if (csf_native_call(dev, KUMO_NATIVE_DROP, job, 0, &reply))
++      goto failed;
++   return 0;
++failed:
++   pan_kmod_kumo_dev_lost(dev->kmod.dev);
++   return -1;
++}
+ #endif
+
+ static struct cs_builder_conf
+@@ -518,6 +563,7 @@
+    return 0;
+ }
+
++#ifndef __kumo__
+ static void
+ csf_prepare_qsubmit(struct panfrost_context *ctx,
+                     struct drm_panthor_queue_submit *submit, uint8_t queue,
+@@ -564,6 +610,7 @@
+
+    return 0;
+ }
++#endif
+
+ static int
+ csf_emit_batch_end(struct panfrost_batch *batch)
+@@ -616,6 +663,7 @@
+    return 0;
+ }
+
++#ifndef __kumo__
+ static int
+ csf_submit_collect_wait_ops(struct panfrost_batch *batch,
+                             struct util_dynarray *syncops,
+@@ -703,6 +751,19 @@
+    }
+
+    return 0;
++}
++#endif
++
++static int
++csf_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t vm_sync_handle,
++                         uint64_t point, bool written)
++{
++#ifdef __kumo__
++   /* GL1-d: every KUMO BO is private to the one VM, whose timeline is implied. — TIMBERDOODLE */
++   return pan_kmod_kumo_bo_attach_sync_point(bo, point, written);
++#else
++   return panthor_kmod_bo_attach_sync_point(bo, vm_sync_handle, point, written);
++#endif
+ }
+
+ static int
+@@ -721,8 +782,8 @@
+     */
+    util_dynarray_foreach(&batch->pool.bos, struct panfrost_bo *, bo) {
+       (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+-      ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+-                                              vm_sync_signal_point, true);
++      ret = csf_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
++                                     vm_sync_signal_point, true);
+       if (ret)
+          return ret;
+    }
+@@ -730,8 +791,8 @@
+    util_dynarray_foreach(&batch->csf.cs_chunk_pool.bos, struct panfrost_bo *,
+                          bo) {
+       (*bo)->gpu_access |= PAN_BO_ACCESS_RW;
+-      ret = panthor_kmod_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
+-                                              vm_sync_signal_point, true);
++      ret = csf_bo_attach_sync_point((*bo)->kmod_bo, vm_sync_handle,
++                                     vm_sync_signal_point, true);
+       if (ret)
+          return ret;
+    }
+@@ -747,16 +808,21 @@
+       struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+
+       bo->gpu_access |= flags & (PAN_BO_ACCESS_RW);
+-      ret = panthor_kmod_bo_attach_sync_point(bo->kmod_bo, vm_sync_handle,
+-                                              vm_sync_signal_point,
+-                                              flags & PAN_BO_ACCESS_WRITE);
++      ret = csf_bo_attach_sync_point(bo->kmod_bo, vm_sync_handle,
++                                     vm_sync_signal_point,
++                                     flags & PAN_BO_ACCESS_WRITE);
+       if (ret)
+          return ret;
+    }
+
+    /* And finally transfer the VM sync point to the context syncobj. */
++#ifdef __kumo__
++   /* The submission's PREPARE already signaled the context binary. — TIMBERDOODLE */
++   return 0;
++#else
+    return drmSyncobjTransfer(panfrost_device_fd(dev), ctx->syncobj, 0,
+                              vm_sync_handle, vm_sync_signal_point, 0);
++#endif
+ }
+
+ static void
+@@ -791,14 +857,30 @@
+ csf_sync_ctx_state(struct panfrost_context *ctx)
+ {
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
++#ifndef __kumo__
+    struct drm_panthor_group_get_state state = {
+       .group_handle = ctx->csf.group_handle,
+    };
+    int ret;
++#endif
+
+    if (!ctx->csf.is_init)
+       return PIPE_NO_RESET;
+
++#ifdef __kumo__
++   /* GL1-d: native GROUP_STATE. KUMO reports no innocence, so a fatal fault or a timeout is
++    * a guilty reset, as with Panthor before 1.3; UNKNOWN or a failed read is an unknown one.
++    * A non-usable report has already closed the session. — TIMBERDOODLE */
++   struct kumo_gpu_native_reply reply;
++   enum pipe_reset_status native_status = PIPE_GUILTY_CONTEXT_RESET;
++   if (csf_native_call(dev, KUMO_NATIVE_GROUP_STATE, ctx->csf.native_group, 0, &reply) ||
++       reply.value == KUMO_GROUP_UNKNOWN)
++      native_status = PIPE_UNKNOWN_CONTEXT_RESET;
++   else if (reply.value == KUMO_GROUP_USABLE)
++      native_status = PIPE_NO_RESET;
++   update_reset_status(ctx, native_status);
++   return native_status;
++#else
+    ret = pan_kmod_ioctl(panfrost_device_fd(dev),
+                         DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &state);
+    if (ret) {
+@@ -834,6 +916,7 @@
+    update_reset_status(ctx, reset_status);
+
+    return reset_status;
++#endif
+ }
+
+ static void
+@@ -845,8 +928,13 @@
+        reset_status != PIPE_INNOCENT_CONTEXT_RESET)
+       return;
+
++#ifdef __kumo__
++   /* A session has one group (GL1-c), so a reset context is not re-created. — TIMBERDOODLE */
++   mesa_loge("Group became unusable; KUMO keeps one group per session, so no re-initialization");
++#else
+    mesa_loge("Group became unusable, re-initializing context");
+    panfrost_context_reinit(ctx);
++#endif
+ }
+
+ static void
+@@ -865,9 +953,14 @@
+
+    /* Wait so we can get errors reported back */
+    if (wait) {
++#ifdef __kumo__
+       ASSERTED int ret =
++         pan_kmod_kumo_vm_wait(dev->kmod.vm, vm_sync_signal_point, INT64_MAX) == 1 ? 0 : -1;
++#else
++      ASSERTED int ret =
+          drmSyncobjTimelineWait(panfrost_device_fd(dev), &vm_sync_handle,
+                                 &vm_sync_signal_point, 1, INT64_MAX, 0, NULL);
++#endif
+       assert(ret >= 0);
+
+       struct pan_csf_tiler_oom_ctx *tiler_oom_ctx =
+@@ -920,6 +1013,29 @@
+    uint32_t cs_size = cs_root_chunk_size(batch->csf.cs.builder);
+    struct panfrost_context *ctx = batch->ctx;
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
++#ifdef __kumo__
++   /* GL1-d: see csf_native_submit. The context binary holds this job's fence, so the
++    * submission's own snapshot is dropped. A no-op context submits nothing and takes no
++    * point. — TIMBERDOODLE */
++   if (ctx->is_noop)
++      return 0;
++   uint64_t point, snapshot;
++   ret = csf_native_submit(ctx, cs_start, cs_size, &point, &snapshot);
++   if (ret) {
++      csf_check_ctx_state_and_reinit(ctx);
++      return ret;
++   }
++   pan_kmod_kumo_sync_destroy(dev->kmod.dev, snapshot);
++   const struct drm_panthor_queue_submit qsubmit = {
++      .stream_addr = cs_start,
++      .stream_size = cs_size,
++   };
++   const struct drm_panthor_group_submit gsubmit = {
++      .queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &qsubmit),
++   };
++   csf_submit_wait_and_dump(batch, &gsubmit, 0, point);
++   return csf_attach_sync_points(batch, 0, point);
++#else
+    uint32_t vm_sync_handle = panthor_kmod_vm_sync_handle(dev->kmod.vm);
+    struct util_dynarray syncops;
+
+@@ -963,6 +1079,7 @@
+ out_free_syncops:
+    util_dynarray_fini(&syncops);
+    return ret;
++#endif
+ }
+
+ static uint64_t
+@@ -1845,30 +1962,16 @@
+    return -1;
+ }
+
++/* GL1-d: the init job is the group's first submission, so it takes point 1 of the VM
++ * timeline through csf_native_submit, ahead of every batch. — TIMBERDOODLE */
+ static int
+ csf_native_submit_init(struct panfrost_context *ctx, uint64_t va, uint32_t bytes)
+ {
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+-   const struct kumo_gpu_native_point signal = {ctx->native_syncobj, 0};
+-   const struct kumo_gpu_native_request prepare = {
+-      .operation = KUMO_NATIVE_PREPARE, .id = ctx->csf.native_group,
+-      .job = {pan_kmod_vm_handle(dev->kmod.vm), bytes, va, 1},
+-      .signals = &signal, .signal_count = 1,
+-   };
+-   struct kumo_gpu_native_reply reply;
+-   if (pan_kmod_kumo_native(dev->kmod.dev, &prepare, &reply) != KUMO_GPU_OK || !reply.id)
+-      goto failed;
+-   uint64_t job = reply.id;
+-   if (csf_native_call(dev, KUMO_NATIVE_STEP, job, 0, &reply) ||
+-       reply.state != KUMO_NATIVE_SUBMITTED || !reply.id)
+-      goto failed;
+-   uint64_t snapshot = reply.id;
+-   if (csf_native_call(dev, KUMO_NATIVE_DROP, job, 0, &reply))
+-      goto failed;
++   uint64_t point, snapshot;
++   if (csf_native_submit(ctx, va, bytes, &point, &snapshot))
++      return -1;
+    return csf_native_wait_snapshot(dev, snapshot);
+-failed:
+-   pan_kmod_kumo_dev_lost(dev->kmod.dev);
+-   return -1;
+ }
+
+ static void
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -1078,6 +1078,12 @@
+    int fd = -1;
+    assert(!value);
+
++#ifdef __kumo__
++   /* GL1-d: every fence this process can hold comes from its one context's one queue (D2),
++    * which already runs in order, so a server-side wait has nothing to add. — TIMBERDOODLE */
++   (void)dev; (void)ctx; (void)ret; (void)fd; (void)f;
++   return;
++#endif
+    ret = drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
+    assert(!ret);
+
+--- a/src/gallium/drivers/panfrost/pan_fence.c
++++ b/src/gallium/drivers/panfrost/pan_fence.c
+@@ -15,6 +15,13 @@
+ #include "util/os_time.h"
+ #include "util/u_inlines.h"
+
++#ifdef __kumo__
++/* GL1-d: a fence is a native snapshot of the context binary, the payload G7p captures in
++ * place of exporting a sync file, waited by ARM, bounded WAITs and ARM again. Sync files
++ * stay refused: KUMO has no EGL and no cross-process fences (the GL1 cut). — TIMBERDOODLE */
++#include "kumo_kmod.h"
++#endif
++
+ void
+ panfrost_fence_reference(struct pipe_screen *pscreen,
+                          struct pipe_fence_handle **ptr,
+@@ -24,7 +31,11 @@
+    struct pipe_fence_handle *old = *ptr;
+
+    if (pipe_reference(&old->reference, &fence->reference)) {
++#ifdef __kumo__
++      pan_kmod_kumo_sync_destroy(dev->kmod.dev, old->native_snapshot);
++#else
+       drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
++#endif
+       free(old);
+    }
+
+@@ -41,6 +52,14 @@
+    if (fence->signaled)
+       return true;
+
++#ifdef __kumo__
++   (void)ret;
++   const int64_t relative = timeout > INT64_MAX ? INT64_MAX : (int64_t)timeout;
++   fence->signaled =
++      pan_kmod_kumo_snapshot_wait(dev->kmod.dev, fence->native_snapshot, relative) == 1;
++   return fence->signaled;
++#endif
++
+    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+    if (abs_timeout == OS_TIMEOUT_INFINITE)
+       abs_timeout = INT64_MAX;
+@@ -58,6 +77,10 @@
+    struct panfrost_device *dev = pan_device(screen);
+    int fd = -1;
+
++#ifdef __kumo__
++   (void)dev; (void)f;
++   return fd;
++#endif
+    drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
+    return fd;
+ }
+@@ -69,6 +92,10 @@
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+    int ret;
+
++#ifdef __kumo__
++   (void)dev; (void)ret; (void)fd; (void)type;
++   return NULL;
++#endif
+    struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+    if (!f)
+       return NULL;
+@@ -111,6 +138,21 @@
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+    int fd = -1, ret;
+
++#ifdef __kumo__
++   (void)fd; (void)ret;
++   uint64_t snapshot;
++   if (pan_kmod_kumo_sync_snapshot(dev->kmod.dev, ctx->native_syncobj, 0, &snapshot))
++      return NULL;
++   struct pipe_fence_handle *native = calloc(1, sizeof(*native));
++   if (!native) {
++      pan_kmod_kumo_sync_destroy(dev->kmod.dev, snapshot);
++      return NULL;
++   }
++   pipe_reference_init(&native->reference, 1);
++   native->native_snapshot = snapshot;
++   return native;
++#endif
++
+    /* Snapshot the last rendering out fence. We'd rather have another
+     * syncobj instead of a sync file, but this is all we get.
+     * (HandleToFD/FDToHandle just gives you another syncobj ID for the
+--- a/src/gallium/drivers/panfrost/pan_fence.h
++++ b/src/gallium/drivers/panfrost/pan_fence.h
+@@ -13,6 +13,10 @@
+    struct pipe_reference reference;
+    uint32_t syncobj;
+    bool signaled;
++#ifdef __kumo__
++   /* GL1-d: the context binary's native snapshot, owned until the fence dies. */
++   uint64_t native_snapshot;
++#endif
+ };
+
+ void panfrost_fence_reference(struct pipe_screen *pscreen,
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -895,7 +895,12 @@
+    caps->supported_prim_modes =
+    caps->supported_prim_modes_with_restart = modes;
+
++#ifdef __kumo__
++   /* GL1-d: fences are native snapshots; sync files stay refused. — TIMBERDOODLE */
++   caps->native_fence_fd = false;
++#else
+    caps->native_fence_fd = true;
++#endif
+
+    caps->context_priority_mask = from_kmod_group_allow_priority_flags(
+       dev->kmod.dev->props.allowed_group_priorities_mask);

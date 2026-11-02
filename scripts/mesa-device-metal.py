@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j754
 #j757
 #j758
 #j759
 #j762
+#j765
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
@@ -132,6 +132,21 @@ PROOFS = {
         green=("GL1-c metal context green: Gallium's native initialization completed, a second context was refused, "
                "and the heap, context and screen were destroyed"),
         after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point 1 failed"]),
+    # GL1-d (J765): a clear through Gallium's batch, its native fence and the CPU readback. On
+    # metal the poll may find the batch complete or pending; both lines start alike. — TIMBERDOODLE
+    "gl1-d": dict(
+        define=8, out="gl1-d-metal", gl=True, begin="GL1-d metal batch begin",
+        lines=["GL1-d target: a linear 64x64 RGBA8 render target, filled from the CPU with 0xdeadbeef",
+               "GL1-d batch: pipe->clear flushed as one native submission; the fence snapshots the context binary",
+               "GL1-d poll: a zero-timeout fence_finish found the batch",
+               "GL1-d fence: fence_finish completed natively, ",
+               "GL1-d readback: 0 of 4096 pixels differ from 0xff996633 (the GPU's clear color)",
+               "GL1-d state: native GROUP_STATE reports the group usable, so no reset",
+               "GL1-d destroy: fence, texture, context and screen are gone; every BO left through a deferred unmap"],
+        green=("GL1-d metal batch green: Mali cleared the render target through Gallium, the native fence completed, "
+               "the CPU read the clear color back, and everything was destroyed"),
+        after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point 1 failed",
+                                       "drv-gpu: client point 2 failed"]),
 }
 
 

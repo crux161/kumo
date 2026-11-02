@@ -1,9 +1,44 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j759 -->
 <!-- j760 -->
 <!-- j761 -->
 <!-- j762 -->
 <!-- j763 -->
+<!-- j765 -->
+
+## GL1-d: batches, activity tracking and fences
+
+Gallium's batches now submit through the native device (J765). Each submission takes the VM
+timeline's next point, which is also the group's next point, because a session has one group
+(D2). One PREPARE signals that point and the context binary, which is what
+`drmSyncobjTransfer` did. No wait goes into the PREPARE: every fence in a session is on that
+one group's queue, which runs in order. Only an accepted Submit publishes the point. Batch
+end attaches it to every BO the batch touched, as Panthor's per-BO sync points do. The kumo
+backend's `bo_wait` is real now: a reader waits for the last write, a writer for every
+access, by SNAPSHOT, ARM, bounded WAITs and ARM again (`pan_kmod_kumo_snapshot_wait`). A
+fence is a native snapshot of the context binary. `fence_finish` waits on it the same way,
+the sync-file paths stay refused, and `native_fence_fd` is now false. `csf_sync_ctx_state`
+reads native GROUP_STATE, and a reset context is not re-created. The init job takes point 1
+through the same path.
+
+Freed BOs used to leak their GPU addresses. `panfrost_bo_free` unmaps with
+`DEFER_TO_NEXT_IDLE_POINT`, which the bridge refused until now. Gallium ignored the error, so
+every freed BO kept its auto-VA range, and only the server's buffer destroy dropped the
+binding. A TRACK_ACTIVITY VM now waits for its last point and then unmaps.
+
+`mesa-device-smoke.py --gl-screen --run` adds mode 20 (21 modes in all). It clears a linear
+64x64 RGBA8 target, flushes with a fence, polls the fence while the modeled producer holds
+completion (the poll times out and gives its wake back), waits, reads back and checks group
+state. Exactly two Submits cross, at points 1 and 2, with three wakes. In modes 17, 19 and 20,
+every binding Gallium makes is explicitly unbound before its buffer is destroyed. Mode 16
+adds a deferred unmap whose range the next map reuses. Metal proof 8 (`--proof gl1-d`) runs
+the same cases on Mali, where every pixel must read back as the clear color. — TIMBERDOODLE,
+2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl1-d --stage <dir>
+python3 scripts/mesa-device-metal.py --proof gl1-d --check <tio log>
+```
 
 ## GL1-c4: context initialization and cleanup on Mali
 
