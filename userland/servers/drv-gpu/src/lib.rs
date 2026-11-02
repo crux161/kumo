@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j734
 //j742
 //j743
 //j752
 //j754
+//j755
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -2233,6 +2233,72 @@ pub fn wake_stream(
         (glb_req & !slot_bit) | (!glb_ack & slot_bit),
     );
     io.ring_doorbell();
+}
+
+//j755
+/// RESEARCH/009 §9.6: CS_REQ/CS_ACK bit 26. The stream's tiler ran out of heap.
+pub const CS_TILER_OOM: u32 = 1 << 26;
+
+/// What the firmware reports with a TILER_OOM (RESEARCH/009 §9.6, CS output +0xC0..+0xD0):
+/// the heap context that ran out, and its render-pass counters (§11.7). — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TilerOom {
+    pub heap_address: u64,
+    pub vt_start: u32,
+    pub vt_end: u32,
+    pub frag_end: u32,
+}
+
+impl TilerOom {
+    /// Render passes whose geometry has started and whose fragments have not finished.
+    pub const fn in_flight(self) -> u32 {
+        self.vt_start.wrapping_sub(self.frag_end)
+    }
+}
+
+/// The stream's raised, unanswered TILER_OOM, if one is pending: `(req ^ ack)` under bit 26.
+pub fn tiler_oom(
+    mem: &mut impl FirmwareMemory,
+    cs_input_va: u64,
+    cs_output_va: u64,
+) -> Option<TilerOom> {
+    let pending = (mem.read32(cs_input_va) ^ mem.read32(cs_output_va)) & CS_TILER_OOM != 0;
+    pending.then(|| TilerOom {
+        heap_address: read_mcu64(mem, cs_output_va + 0xD0),
+        vt_start: mem.read32(cs_output_va + 0xC0),
+        vt_end: mem.read32(cs_output_va + 0xC4),
+        frag_end: mem.read32(cs_output_va + 0xCC),
+    })
+}
+
+/// Panthor's growth rule (`panthor_heap_grow`): no new chunk while more render passes are in
+/// flight than the heap's target, or once it holds `max_chunks`. Refusing is not an error. The
+/// firmware then waits for fragment work to free chunks, or runs the stream's tiler-OOM
+/// exception handler (incremental rendering). — TIMBERDOODLE
+pub const fn heap_may_grow(
+    oom: TilerOom,
+    chunks: u32,
+    max_chunks: u32,
+    target_in_flight: u32,
+) -> bool {
+    oom.in_flight() <= target_in_flight && chunks < max_chunks
+}
+
+/// §11.7 steps 2-3 on the stream's side: hand the firmware `chunk`, an encoded link
+/// ([`heap_chunk_link`]) or 0 for none, as both heap_start and heap_end, as Panthor does, then
+/// acknowledge the event by copying its ACK bit into REQ. The caller orders these writes with a
+/// barrier, then wakes the stream ([`wake_stream`]). — TIMBERDOODLE
+pub fn answer_tiler_oom(
+    mem: &mut impl FirmwareMemory,
+    cs_input_va: u64,
+    cs_output_va: u64,
+    chunk: u64,
+) {
+    write_mcu64(mem, cs_input_va + 0x20, chunk);
+    write_mcu64(mem, cs_input_va + 0x28, chunk);
+    let req = mem.read32(cs_input_va);
+    let ack = mem.read32(cs_output_va);
+    mem.write32(cs_input_va, (req & !CS_TILER_OOM) | (ack & CS_TILER_OOM));
 }
 
 /// RESEARCH/009 §9.7: the firmware's consumption pointer from the queue's output page.
@@ -5417,6 +5483,83 @@ mod g4b_tests {
             io.get(0x6500),
             CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_IDLE
         );
+    }
+
+    //j755
+    const CS_IN: u64 = 0x0410_0000;
+    const CS_OUT: u64 = 0x0410_1000;
+
+    fn raise_oom(fw: &mut FakeFirmware, heap: u64, vt_start: u32, vt_end: u32, frag_end: u32) {
+        fw.set(CS_IN, CS_STATE_START);
+        fw.set(CS_OUT, CS_STATE_START | CS_TILER_OOM);
+        fw.set(CS_OUT + 0xD0, heap as u32);
+        fw.set(CS_OUT + 0xD4, (heap >> 32) as u32);
+        fw.set(CS_OUT + 0xC0, vt_start);
+        fw.set(CS_OUT + 0xC4, vt_end);
+        fw.set(CS_OUT + 0xCC, frag_end);
+    }
+
+    #[test]
+    fn a_tiler_oom_is_read_only_while_req_and_ack_differ() {
+        let mut fw = FakeFirmware::new();
+        fw.set(CS_IN, CS_STATE_START);
+        fw.set(CS_OUT, CS_STATE_START);
+        assert_eq!(tiler_oom(&mut fw, CS_IN, CS_OUT), None);
+        raise_oom(&mut fw, 0x3000_0000, 7, 9, 5);
+        let oom = tiler_oom(&mut fw, CS_IN, CS_OUT).unwrap();
+        assert_eq!(
+            oom,
+            TilerOom {
+                heap_address: 0x3000_0000,
+                vt_start: 7,
+                vt_end: 9,
+                frag_end: 5
+            }
+        );
+        assert_eq!(oom.in_flight(), 2);
+        // Counters wrap; in flight is a difference, not an ordering.
+        let wrapped = TilerOom {
+            vt_start: 1,
+            frag_end: u32::MAX,
+            ..oom
+        };
+        assert_eq!(wrapped.in_flight(), 2);
+    }
+
+    #[test]
+    fn heaps_grow_only_under_their_target_and_their_maximum() {
+        let oom = TilerOom {
+            heap_address: 0x3000_0000,
+            vt_start: 4,
+            vt_end: 4,
+            frag_end: 1,
+        };
+        assert!(heap_may_grow(oom, 5, 64, 65535));
+        assert!(heap_may_grow(oom, 5, 64, 3)); // exactly at the target is allowed
+        assert!(!heap_may_grow(oom, 5, 64, 2));
+        assert!(!heap_may_grow(oom, 64, 64, 65535));
+    }
+
+    #[test]
+    fn answering_hands_over_the_chunk_and_acks_only_the_oom_bit() {
+        let mut fw = FakeFirmware::new();
+        raise_oom(&mut fw, 0x3000_0000, 1, 1, 0);
+        // Another pending event in the same words must stay pending.
+        fw.set(CS_OUT, CS_STATE_START | CS_TILER_OOM | (1 << 31));
+        let link = heap_chunk_link(0x3006_1000, 128 * 1024);
+        answer_tiler_oom(&mut fw, CS_IN, CS_OUT, link);
+        assert_eq!(fw.get(CS_IN + 0x20), link as u32);
+        assert_eq!(fw.get(CS_IN + 0x24), (link >> 32) as u32);
+        assert_eq!(fw.get(CS_IN + 0x28), link as u32);
+        assert_eq!(fw.get(CS_IN + 0x2C), (link >> 32) as u32);
+        assert_eq!(fw.get(CS_IN), CS_STATE_START | CS_TILER_OOM);
+        assert_eq!(tiler_oom(&mut fw, CS_IN, CS_OUT), None);
+        // A refusal hands over nothing and still acknowledges.
+        let mut fw = FakeFirmware::new();
+        raise_oom(&mut fw, 0x3000_0000, 1, 1, 0);
+        answer_tiler_oom(&mut fw, CS_IN, CS_OUT, 0);
+        assert_eq!((fw.get(CS_IN + 0x20), fw.get(CS_IN + 0x28)), (0, 0));
+        assert_eq!(tiler_oom(&mut fw, CS_IN, CS_OUT), None);
     }
 }
 

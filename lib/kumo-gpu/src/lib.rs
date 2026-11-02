@@ -1,9 +1,9 @@
 #![no_std]
-//j746
 //j749
 //j751
 //j752
 //j754
+//j755
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -30,7 +30,8 @@
 //! G7q-a adds tiler heaps: HeapCreate (opcode 19) has the driver allocate a context page and
 //! the initial chunks, link them and map them no-execute in its own heap window, charging the
 //! shared budget; HeapDestroy (20) unmaps and releases them. Clients get two addresses back
-//! and never map heap memory.
+//! and never map heap memory. G7q-b lets the driver grow a heap on tiler OOM, charging each
+//! chunk through `Session::charge_heap` first.
 
 extern crate alloc;
 

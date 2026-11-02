@@ -1,8 +1,8 @@
-//j733
 //j742
 //j743
 //j752
 //j754
+//j755
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -112,9 +112,13 @@ impl HeapPiece {
     }
 }
 
-/// One live heap: its context page first, then its chunks in list order from the head.
+/// One live heap: its context page first, then its initial chunks in list order from the head,
+/// then any chunks grown on tiler OOM (G7q-b), which belong to no list. — TIMBERDOODLE
 struct HeapMemory {
     id: u32,
+    chunk_bytes: u64,
+    max_chunks: u32,
+    target_in_flight: u32,
     pieces: Vec<HeapPiece>,
 }
 
@@ -240,13 +244,25 @@ impl Backend for Hardware<'_> {
                     format_args!("drv-gpu: client heap {} map failed: {:?}\n", id, error),
                 );
                 // Some tables may name these pages now: keep them for retire, after reset.
-                self.heaps.push(HeapMemory { id, pieces });
+                self.heaps.push(HeapMemory {
+                    id,
+                    chunk_bytes,
+                    max_chunks: spec.max_chunks,
+                    target_in_flight: spec.target_in_flight,
+                    pieces,
+                });
                 return Err(GpuStatus::DeviceLost);
             }
         }
         dsb();
         if flush_page_tables(self.device, GROUP_AS).is_err() {
-            self.heaps.push(HeapMemory { id, pieces });
+            self.heaps.push(HeapMemory {
+                id,
+                chunk_bytes,
+                max_chunks: spec.max_chunks,
+                target_in_flight: spec.target_in_flight,
+                pieces,
+            });
             return Err(GpuStatus::DeviceLost);
         }
         log(
@@ -256,7 +272,13 @@ impl Backend for Hardware<'_> {
                 id, base, count, chunk_bytes, head, spec.max_chunks, spec.target_in_flight
             ),
         );
-        self.heaps.push(HeapMemory { id, pieces });
+        self.heaps.push(HeapMemory {
+            id,
+            chunk_bytes,
+            max_chunks: spec.max_chunks,
+            target_in_flight: spec.target_in_flight,
+            pieces,
+        });
         Ok(protocol::HeapPlacement {
             context_va: base,
             first_chunk_va: head,
@@ -719,7 +741,109 @@ impl Hardware<'_> {
         }
     }
 
-    fn finish_pending(&mut self) -> Result<Option<u64>, GpuStatus> {
+    //j755
+    /// G7q-b: grow the heap whose context the firmware named by one chunk, when Panthor's rule,
+    /// the heap's maximum and the shared budget all allow it. `Ok(0)` is a refusal, which the
+    /// firmware handles by waiting for fragment work or running the stream's OOM handler. Only
+    /// a partial map or a failed live flush is DeviceLost. A grown chunk's header stays the
+    /// kernel's zeroes: Panthor links only initial chunks, and hands the firmware this one
+    /// directly. — TIMBERDOODLE
+    fn grow_heap(
+        &mut self,
+        oom: drv_gpu::TilerOom,
+        session: &mut Session,
+    ) -> Result<u64, GpuStatus> {
+        let Some(index) = self.heaps.iter().position(|heap| {
+            heap.pieces.first().map(|piece| piece.gpu_va) == Some(oom.heap_address)
+        }) else {
+            log(
+                log_level::WARNING,
+                format_args!(
+                    "drv-gpu: tiler OOM names no heap (context 0x{:x}); answered with no chunk\n",
+                    oom.heap_address
+                ),
+            );
+            return Ok(0);
+        };
+        let heap = &self.heaps[index];
+        let (id, chunk_bytes) = (heap.id, heap.chunk_bytes);
+        let chunks = (heap.pieces.len() - 1) as u32;
+        if !drv_gpu::heap_may_grow(oom, chunks, heap.max_chunks, heap.target_in_flight)
+            || session.charge_heap(id, chunk_bytes).is_err()
+        {
+            log(
+                log_level::INFO,
+                format_args!(
+                    "drv-gpu: client heap {} not grown at {} chunks (in flight {})\n",
+                    id,
+                    chunks,
+                    oom.in_flight()
+                ),
+            );
+            return Ok(0);
+        }
+        let mut live: Vec<(u64, u64)> = Vec::new();
+        let total = self.heaps.iter().map(|heap| heap.pieces.len()).sum();
+        let placed =
+            live.try_reserve(total).is_ok() && self.heaps[index].pieces.try_reserve(1).is_ok();
+        if placed {
+            for piece in self.heaps.iter().flat_map(|heap| heap.pieces.iter()) {
+                live.push((piece.gpu_va, piece.bytes));
+            }
+        }
+        let piece = placed
+            .then(|| {
+                drv_gpu::first_fit(
+                    &live,
+                    protocol::HEAP_VA_START,
+                    protocol::HEAP_VA_END,
+                    chunk_bytes,
+                )
+            })
+            .flatten()
+            .and_then(|va| HeapPiece::allocate(va, chunk_bytes).ok());
+        let Some(piece) = piece else {
+            session.refund_heap(id, chunk_bytes);
+            return Ok(0);
+        };
+        let va = piece.gpu_va;
+        let attrs = PageAttrs {
+            cached: true,
+            readonly: false,
+            executable: false,
+        };
+        let mapped =
+            drv_gpu::map_pages(self.tables, self.arena, self.root, va, &piece.pages, attrs);
+        // From here the pages may be named by a table: they stay with the heap for retire.
+        self.heaps[index].pieces.push(piece);
+        if let Err(error) = mapped {
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: client heap {} growth map failed: {:?}\n",
+                    id, error
+                ),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        dsb();
+        // The stream is running: invalidate only the packed region, as J733's live edit did.
+        flush_range(self.device, GROUP_AS, va, chunk_bytes).map_err(|_| GpuStatus::DeviceLost)?;
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: client heap {} grew to {} chunks: 0x{:x} (in flight {}, pending {})\n",
+                id,
+                chunks + 1,
+                va,
+                oom.in_flight(),
+                oom.vt_end.wrapping_sub(oom.frag_end)
+            ),
+        );
+        Ok(drv_gpu::heap_chunk_link(va, chunk_bytes))
+    }
+
+    fn finish_pending(&mut self, session: &mut Session) -> Result<Option<u64>, GpuStatus> {
         let Some(job) = self.pending.take() else {
             return Ok(None);
         };
@@ -779,6 +903,26 @@ impl Hardware<'_> {
             {
                 let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
                 ack_group_events(&mut io, csg.input_va, csg.output_va);
+            }
+            //j755
+            // G7q-b: a stream whose tiler ran out of heap waits for an answer. Serve it, then
+            // keep waiting under the same deadline. — TIMBERDOODLE
+            let oom = {
+                let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
+                drv_gpu::tiler_oom(&mut io, cs.input_va, cs.output_va)
+            };
+            if let Some(oom) = oom {
+                let chunk = self.grow_heap(oom, session)?;
+                {
+                    let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
+                    drv_gpu::answer_tiler_oom(&mut io, cs.input_va, cs.output_va, chunk);
+                }
+                dsb();
+                {
+                    let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
+                    wake_stream(&mut io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+                }
+                continue;
             }
             // SAFETY: aligned words of the driver's retained Normal-NC queue sync page.
             let seqno = unsafe { (sync as *const u64).read_volatile() };
@@ -964,7 +1108,7 @@ pub(super) fn serve(
         if retired {
             break;
         }
-        match hw.finish_pending() {
+        match hw.finish_pending(&mut session) {
             Ok(Some(point)) => {
                 if session.complete(point, 0).is_err() {
                     break;

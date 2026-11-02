@@ -1,9 +1,26 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j750 -->
 <!-- j751 -->
 <!-- j752 -->
 <!-- j753 -->
 <!-- j754 -->
+<!-- j755 -->
+
+## G7q-b: tiler OOM served by growing the heap
+
+drv-gpu now answers `CS_TILER_OOM`, Panthor's `group_process_tiler_oom` and
+`panthor_heap_grow`, inside a job's wait. It reads the heap context the firmware named and the
+render-pass counters. It grows that heap by one chunk unless more passes are in flight than
+`target_in_flight` or the heap already has `max_chunks`. The chunk is charged to the shared
+session budget first, and the charge is refunded if allocation fails. drv-gpu maps the chunk
+live and invalidates only its packed region. It hands the firmware the chunk's encoded link as
+both heap_start and heap_end (0 for a refusal), acknowledges bit 26 alone, and wakes the stream.
+A refusal is not an error: the firmware then waits for fragment work or runs the stream's
+tiler-OOM handler. Only a partial map or a failed live flush loses the session.
+
+This is host-proven only. No KUMO workload tiles yet, so nothing raises the event. A metal
+boot with the new wait loop (the G7q-a proof, `build/proofs/g7q-b/`) completed every job and
+logged no OOM line. Growth on hardware is G7q-d's, under the first tiling job.
+— TIMBERDOODLE, 2026-11-01
 
 ## G7q-a: tiler heap memory on metal
 

@@ -1,8 +1,8 @@
-//j711
 //j742
 //j743
 //j752
 //j754
+//j755
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -143,6 +143,22 @@ struct Allocation {
     bytes: u64,
 }
 
+//j755
+/// One heap's charge: what creation took, and what tiler-OOM growth added since (G7q-b).
+/// Refunds come only out of growth. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeapCharge {
+    id: u32,
+    initial: u64,
+    grown: u64,
+}
+
+impl HeapCharge {
+    const fn bytes(self) -> u64 {
+        self.initial + self.grown
+    }
+}
+
 #[derive(Default)]
 pub struct Session {
     ids: RequestIds,
@@ -165,7 +181,7 @@ pub struct Session {
     waits: [Option<u64>; MAX_WAITS],
     /// Live tiler heaps and the bytes each charges, in their own monotonic ID space.
     /// — TIMBERDOODLE
-    heaps: Vec<Allocation>,
+    heaps: Vec<HeapCharge>,
     next_heap: u32,
 }
 
@@ -221,6 +237,43 @@ impl Session {
         self.vm = false;
         self.group = false;
         release
+    }
+
+    //j755
+    /// G7q-b: charge one chunk the backend wants to add to `heap` while it serves a tiler OOM,
+    /// outside any request. The budget is the same one buffers draw on. A refusal is NoMemory,
+    /// and the backend then answers the firmware with no chunk. — TIMBERDOODLE
+    pub fn charge_heap(&mut self, heap: u32, bytes: u64) -> Result<(), Status> {
+        if self.retired {
+            return Err(Status::DeviceLost);
+        }
+        let allocation = self
+            .heaps
+            .iter_mut()
+            .find(|allocation| allocation.id == heap)
+            .ok_or(Status::NotFound)?;
+        let total = self
+            .total_buffer_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_TOTAL_BUFFER_BYTES)
+            .ok_or(Status::NoMemory)?;
+        allocation.grown += bytes;
+        self.total_buffer_bytes = total;
+        Ok(())
+    }
+
+    /// Return a charge the backend could not use because its allocation failed before anything
+    /// was mapped. It never returns more than the heap's growth beyond its creation charge.
+    pub fn refund_heap(&mut self, heap: u32, bytes: u64) {
+        if let Some(allocation) = self
+            .heaps
+            .iter_mut()
+            .find(|allocation| allocation.id == heap)
+        {
+            let bytes = bytes.min(allocation.grown);
+            allocation.grown -= bytes;
+            self.total_buffer_bytes -= bytes;
+        }
     }
 
     pub fn complete(&mut self, point: u64, status: u32) -> Result<(), Status> {
@@ -585,7 +638,11 @@ impl Session {
                 if !placement.valid() {
                     return Err(Status::DeviceLost);
                 }
-                self.heaps.push(Allocation { id, bytes });
+                self.heaps.push(HeapCharge {
+                    id,
+                    initial: bytes,
+                    grown: 0,
+                });
                 self.total_buffer_bytes = total;
                 self.next_heap = id;
                 Ok(Response::HeapCreated {
@@ -603,11 +660,11 @@ impl Session {
                     .position(|allocation| allocation.id == heap)
                     .ok_or(Status::NotFound)?;
                 backend.destroy_heap(heap)?;
-                let allocation = self.heaps.swap_remove(position);
-                self.total_buffer_bytes -= allocation.bytes;
+                let charge = self.heaps.swap_remove(position);
+                self.total_buffer_bytes -= charge.bytes();
                 Ok(Response::HeapDestroyed {
                     heap,
-                    bytes: allocation.bytes,
+                    bytes: charge.bytes(),
                 })
             }
         }
@@ -2204,5 +2261,41 @@ mod tests {
         assert_eq!(release.buffers, 1);
         assert_eq!(release.bytes, PAGE_BYTES + 2 * 256 * 1024 + PAGE_BYTES);
         assert_eq!(s.close(), SessionRelease::NONE);
+    }
+
+    //j755
+    #[test]
+    fn tiler_oom_growth_is_charged_to_the_heap_and_refunded_on_failure() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        b.heaps = true;
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        let chunk = 2 * 1024 * 1024u64;
+        send(&mut s, &mut b, heap(chunk as u32, 1, 64)).unwrap();
+        let created = PAGE_BYTES + chunk;
+        assert_eq!(s.charge_heap(9, chunk), Err(Status::NotFound));
+        s.charge_heap(1, chunk).unwrap();
+        assert_eq!(s.total_buffer_bytes, created + chunk);
+        // Refunds never take back the creation charge.
+        s.refund_heap(1, 10 * chunk);
+        assert_eq!(s.total_buffer_bytes, created);
+        // Growth stops at the shared budget, not at max_chunks alone.
+        let mut grown = 0;
+        while s.charge_heap(1, chunk).is_ok() {
+            grown += 1;
+        }
+        assert_eq!(s.total_buffer_bytes + chunk > MAX_TOTAL_BUFFER_BYTES, true);
+        assert!(grown < 64);
+        // Destroy returns everything the heap held, growth included.
+        let held = s.total_buffer_bytes;
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapDestroy { heap: 1 }),
+            Ok(Response::HeapDestroyed {
+                heap: 1,
+                bytes: held
+            })
+        );
+        assert_eq!(s.total_buffer_bytes, 0);
+        s.close();
+        assert_eq!(s.charge_heap(1, chunk), Err(Status::DeviceLost));
     }
 }
