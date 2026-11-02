@@ -1,4 +1,5 @@
 //j747
+//j753
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -95,6 +96,12 @@ pub extern "C" fn kumo_metal_start(main: Main) -> ! {
     let (closed, empty) = native::call(Syscall::ChannelCreate, [0; 6]);
     native::call(Syscall::HandleClose, [closed, 0, 0, 0, 0, 0]);
     unsafe { __relibc_kumo_start(empty, main) }
+}
+
+/// Monotonic nanoseconds, so the G7p-e timeout proof can time its wait. — TIMBERDOODLE
+#[no_mangle]
+pub extern "C" fn kumo_metal_now_ns() -> u64 {
+    native::call(Syscall::ClockGet, [0; 6]).0
 }
 
 #[no_mangle]

@@ -1,9 +1,56 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j747 -->
 <!-- j749 -->
 <!-- j750 -->
 <!-- j751 -->
 <!-- j752 -->
+<!-- j753 -->
+
+## G7p-e: native sync and group state on metal
+
+G7o-f's vehicle (`device-metal.c`/`.rs`, staged as `bin/gpu-client`) now builds one of three
+proofs, picked by `KUMO_METAL_PROOF`: 0 is G7o-f, 1 is G7p-e ending in a fatal fault, 2 is
+G7p-e ending in a timeout. A failed group ends its session, and Sora regrants only on the churn
+image, so each failure state needs its own boot. Every G7p-e boot first runs the same cases
+through `pan_kmod_kumo_native` against real Mali completions:
+- binary and timeline syncs, a group whose READ-only status page reads USABLE, and a CPU
+  binary signal and reset;
+- job A (point 1) signals a binary and timeline 42, which is then wait-pending;
+- job B (point 2) waits on both of A's signals before anything has observed A, so its STEP
+  asks drv-gpu about point 1, finds it done on the GPU, and submits. A CPU signal of
+  timeline 200 is refused Busy behind B's unobserved point;
+- ARM completes both points, both `{value, status 0}` stores land, and timeline 200 is
+  accepted afterwards.
+
+Job C (point 3) then fails on purpose. drv-gpu accepts it, fails it at its 1 s deadline,
+publishes the group status, contains with `reset=ok` and closes the session. ARM sees the
+close, the VM is faulty, and GROUP_STATE reports the right fact before and after the loss:
+- **fatal:** a store into the executable binding faults (`PERMISSION_FAULT Write`), so the
+  MMU evidence makes the stall FATAL;
+- **timeout:** a `SYNC_WAIT32` on a word nobody writes stalls with no fault evidence, so it is
+  TIMED_OUT.
+
+drv-gpu runs each job to completion or deadline before reading the next request. So no fence
+a request asks about is still running, and WAIT's Port/timer wake path stays proven in QEMU
+only. The proof lines are NOTICE, and J748's default console shows WARNING and worse, so
+`--stage` rebuilds the image with `KUMO_CONSOLE_LOGLEVEL=5` before copying it.
+
+Facts for later slices:
+- **A known loss unmaps every CPU alias of the session's BOs** (J751's shared-owner close).
+  The first fatal boot read a BO after the loss and took an EL0 translation fault. A Mesa
+  robustness path (GL5, VK6) must not touch a mapping after loss, or the bridge must keep
+  aliases until unmap.
+- drv-gpu's stall report printed CS status words of zero in both failures. RESEARCH/009
+  §9.5 lists a CSG_REQ STATUS_UPDATE toggle that drv-gpu never requests; that is the likely
+  cause, and it is not yet verified.
+
+— TIMBERDOODLE, 2026-11-01
+
+```sh
+python3 scripts/mesa-device-metal.py --proof g7p-e-fatal --stage build/proofs/g7p-e-fatal/image
+python3 scripts/mesa-device-metal.py --proof g7p-e-fatal --check <tio log>
+python3 scripts/mesa-device-metal.py --proof g7p-e-timeout --stage build/proofs/g7p-e-timeout/image
+python3 scripts/mesa-device-metal.py --proof g7p-e-timeout --check <tio log>
+```
 
 ## G7p-d: group facts survive command-channel loss
 
@@ -232,6 +279,8 @@ Two facts for later slices:
 python3 scripts/mesa-device-metal.py --stage build/proofs/g7o-f/opi  # never serves it
 python3 scripts/mesa-device-metal.py --check <tio log>                 # judges the log's last boot
 ```
+
+Since J753, `--stage` builds the image with `KUMO_CONSOLE_LOGLEVEL=5` (see G7p-e).
 
 ## G7o-e: W^X against both drivers
 

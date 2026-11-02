@@ -1,21 +1,31 @@
 /* SPDX-License-Identifier: MIT */
 /*j747*/
+/*j753*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
  * executable binding, which must fault and end the session (G7o-e's W^X rule on hardware).
  * — TIMBERDOODLE */
+/* G7p-e: the same vehicle runs MILVUS's native sync and group state (J749-J752) on Mali.
+ * KUMO_METAL_PROOF picks the proof at build time: 0 is G7o-f, 1 is G7p-e ending in a fatal
+ * fault, 2 is G7p-e ending in a timeout. A failed group ends its session, and Sora regrants
+ * only on the churn image, so each failure needs its own boot. — TIMBERDOODLE */
 #include "kumo_kmod.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <sys/mman.h>
 
-/* device-metal.rs: one kernel-log line (a Sora-launched client has no stdio), and one CS
- * store through the session's native group. */
+#ifndef KUMO_METAL_PROOF
+#define KUMO_METAL_PROOF 0
+#endif
+
+/* device-metal.rs: one kernel-log line (a Sora-launched client has no stdio), one CS store
+ * through the session's own group (G7o-f only), and the monotonic clock. */
 extern void kumo_metal_log(const char *line);
 extern uint32_t kumo_metal_store(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                  uint64_t target, uint32_t value);
+extern uint64_t kumo_metal_now_ns(void);
 
 static void say(const char *format, ...)
 {
@@ -77,7 +87,7 @@ static void diagnose(const char *name, struct pan_kmod_bo *bo, volatile uint32_t
         (unsigned long long)broken_first[3]);
 }
 
-unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
+static unsigned device_cases(const struct kumo_gpu_api *api)
 {
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
     CHECK(dev, 1);
@@ -204,15 +214,261 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
     return 0;
 }
 
+/* G7p-e. drv-gpu serves one job at a time: it replies to a Submit, runs the job to completion
+ * or to its 1 s deadline, and only then reads the next request. Every fence a later request
+ * asks about is therefore already settled by the hardware. Dependency steps, ARM and
+ * wait-pending run against real completions here. A wake that has to wait for a completion
+ * cannot happen on this lane, so WAIT's Port/timer path stays proven in QEMU only.
+ * — TIMBERDOODLE */
+static uint32_t native_op(struct pan_kmod_dev *dev, uint32_t op, uint64_t id, uint64_t value,
+                          struct kumo_gpu_native_reply *out)
+{
+    const struct kumo_gpu_native_request request = {.operation = op, .id = id, .value = value};
+    *out = (struct kumo_gpu_native_reply){UINT64_MAX, UINT32_MAX, UINT32_MAX, UINT64_MAX};
+    return pan_kmod_kumo_native(dev, &request, out);
+}
+static uint32_t native_prepare(struct pan_kmod_dev *dev, uint32_t vm, uint64_t group,
+                               uint64_t stream_va, uint32_t stream_bytes, uint64_t point,
+                               const struct kumo_gpu_native_point *waits, uint32_t wait_count,
+                               const struct kumo_gpu_native_point *signals, uint32_t signal_count,
+                               struct kumo_gpu_native_reply *out)
+{
+    const struct kumo_gpu_native_request request = {
+        .operation = KUMO_NATIVE_PREPARE, .id = group,
+        .job = {vm, stream_bytes, stream_va, point},
+        .waits = waits, .signals = signals, .wait_count = wait_count, .signal_count = signal_count,
+    };
+    *out = (struct kumo_gpu_native_reply){UINT64_MAX, UINT32_MAX, UINT32_MAX, UINT64_MAX};
+    return pan_kmod_kumo_native(dev, &request, out);
+}
+
+/* Mali v10 CS words (Mesa genxml/v10.xml), the encodings J747's store already uses. */
+#define CS_MOVE48(reg, value) ((UINT64_C(1) << 56) | ((uint64_t)(reg) << 48) | ((value) & UINT64_C(0xffffffffffff)))
+#define CS_MOVE32(reg, value) ((UINT64_C(2) << 56) | ((uint64_t)(reg) << 48) | (uint32_t)(value))
+#define CS_WAIT_SLOT0 ((UINT64_C(3) << 56) | (UINT64_C(1) << 16))
+#define CS_SYNC_SET32(address, data) \
+    ((UINT64_C(38) << 56) | ((uint64_t)(address) << 40) | ((uint64_t)(data) << 32))
+/* Continue once the 32-bit word at the address pair is GREATER than the data register. */
+#define CS_SYNC_WAIT32_GREATER(address, data) \
+    ((UINT64_C(39) << 56) | ((uint64_t)(address) << 40) | ((uint64_t)(data) << 32) | (UINT64_C(1) << 28))
+
+/* A store job on its own 64-byte stream line. SYNC_SET32 writes the 8-byte sync object
+ * {value, status 0} (J747). Returns the stream's length in bytes. */
+static uint32_t store_stream(volatile uint64_t *line, uint64_t target, uint32_t value)
+{
+    line[0] = CS_MOVE48(0, target);
+    line[1] = CS_MOVE32(2, value);
+    line[2] = CS_SYNC_SET32(0, 2);
+    line[3] = CS_WAIT_SLOT0;
+    return 32;
+}
+
+/* A job that never finishes and never faults: it waits for `gate` to exceed 0x7fffffff. The
+ * CPU wrote 0 there, and 0 is not greater whether the CS compares signed or unsigned. The
+ * store after the wait would run only if the wait let go; drv-gpu's CS-status line shows where
+ * the stream stopped. */
+static uint32_t stall_stream(volatile uint64_t *line, uint64_t gate, uint64_t target, uint32_t value)
+{
+    line[0] = CS_MOVE48(0, gate);
+    line[1] = CS_MOVE32(2, 0x7fffffffu);
+    line[2] = CS_SYNC_WAIT32_GREATER(0, 2);
+    line[3] = CS_MOVE48(4, target);
+    line[4] = CS_MOVE32(6, value);
+    line[5] = CS_SYNC_SET32(4, 6);
+    line[6] = CS_WAIT_SLOT0;
+    return 56;
+}
+
+#define SENTINEL 0xa5a5a5a5u
+#define VALUE_A 0x7f0e0001u
+#define VALUE_B 0x7f0e0002u
+#define VALUE_C 0x7f0e00ffu
+#define BUSY (KUMO_GPU_SERVER_ERROR + 4u) /* kumo_gpu::Status::Busy */
+
+static unsigned sync_cases(const struct kumo_gpu_api *api, bool timeout)
+{
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    CHECK(dev && api->version == 14 && api->bytes == 120, 1);
+    say("G7p-e device: gpu_id=0x%llx, native C ABI %u with a %u-byte table",
+        (unsigned long long)dev->props.gpu_id, api->version, api->bytes);
+    struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
+    struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, range.start, range.size);
+    CHECK(vm && pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_USABLE, 2);
+
+    /* A stream BO (read-only, as Submit requires), an executable BO the fatal job writes to,
+     * and a data BO. */
+    struct pan_kmod_bo *stream = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
+    struct pan_kmod_bo *code = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
+    struct pan_kmod_bo *data = pan_kmod_bo_alloc(dev, vm, 4096, 0);
+    CHECK(stream && code && data, 3);
+    volatile uint32_t *code_cpu, *data_cpu;
+    unsigned failed;
+    if ((failed = fill_and_verify(code, 1, &code_cpu))) return 10 + failed;
+    if ((failed = fill_and_verify(data, 3, &data_cpu))) return 15 + failed;
+    volatile uint64_t *stream_cpu = pan_kmod_bo_mmap(stream, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    CHECK(stream_cpu != MAP_FAILED && stream_cpu[0] == 0, 4);
+    const uint64_t data_va = range.start, code_va = range.start + MIB, stream_va = range.start + 2 * MIB;
+    struct pan_kmod_vm_op ops[3] = {
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {data_va, data->size}, .map = {data, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {code_va, code->size}, .map = {code, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {stream_va, stream->size}, .map = {stream, 0}},
+    };
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 3) == 0, 5);
+
+    /* All three streams are written before the GPU runs any of them. A line the GPU might
+     * prefetch while an earlier job runs then already holds its final words (J734). */
+    data_cpu[5] = SENTINEL;
+    data_cpu[9] = SENTINEL;
+    data_cpu[16] = 0;
+    data_cpu[20] = SENTINEL;
+    data_cpu[21] = SENTINEL;
+    code_cpu[32] = PATTERN(1, 32);
+    const uint32_t a_bytes = store_stream(stream_cpu, data_va + 16, VALUE_A);
+    const uint32_t b_bytes = store_stream(stream_cpu + 8, data_va + 32, VALUE_B);
+    const uint32_t c_bytes = timeout ? stall_stream(stream_cpu + 16, data_va + 64, data_va + 80, VALUE_C)
+                                     : store_stream(stream_cpu + 16, code_va + 128, VALUE_C);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    struct kumo_gpu_native_reply out;
+    CHECK(native_op(dev, KUMO_NATIVE_CREATE_BINARY, 0, 0, &out) == KUMO_GPU_OK, 20);
+    const uint64_t input = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_CREATE_BINARY, 0, 0, &out) == KUMO_GPU_OK, 21);
+    const uint64_t output = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_CREATE_BINARY, 0, 0, &out) == KUMO_GPU_OK, 22);
+    const uint64_t cpu = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_CREATE_TIMELINE, 0, 0, &out) == KUMO_GPU_OK, 23);
+    const uint64_t timeline = out.id;
+    /* The first GroupWatch on hardware: drv-gpu's READ-only status page must decode. */
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_CREATE, 0, vm->handle, &out) == KUMO_GPU_OK &&
+          out.value == KUMO_GROUP_USABLE, 24);
+    const uint64_t group = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK &&
+          out.value == KUMO_GROUP_USABLE && out.gpu_status == 0, 25);
+    CHECK(native_op(dev, KUMO_NATIVE_SIGNAL, cpu, 0, &out) == KUMO_GPU_OK, 26);
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, cpu, 0, &out) == KUMO_GPU_OK && out.value == 1, 27);
+    CHECK(native_op(dev, KUMO_NATIVE_RESET, cpu, 0, &out) == KUMO_GPU_OK, 28);
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, cpu, 0, &out) == KUMO_GPU_OK && out.value == 0, 29);
+    say("G7p-e group: native group on VM %u, drv-gpu's status page reads USABLE; a CPU binary signals and resets",
+        vm->handle);
+
+    /* A, point 1: signals the binary `input` and timeline 42. */
+    const struct kumo_gpu_native_point a_signals[] = {{input, 0}, {timeline, 42}};
+    CHECK(native_prepare(dev, vm->handle, group, stream_va, a_bytes, 1, NULL, 0, a_signals, 2, &out) == KUMO_GPU_OK, 30);
+    const uint64_t a = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_STEP, a, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_SUBMITTED, 31);
+    const uint64_t a_done = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, timeline, 42, &out) == KUMO_GPU_OK && out.value == 1, 32);
+    say("G7p-e A: point 1 submitted natively, signalling a binary and timeline 42; 42 is wait-pending");
+
+    /* B, point 2: waits on both of A's signals. Nothing has observed A yet, so B captures
+     * A's fence, and its step must ask drv-gpu about point 1 before it may submit. */
+    const struct kumo_gpu_native_point b_waits[] = {{input, 0}, {timeline, 42}};
+    const struct kumo_gpu_native_point b_signals[] = {{output, 0}, {timeline, 100}};
+    CHECK(native_prepare(dev, vm->handle, group, stream_va + 64, b_bytes, 2, b_waits, 2, b_signals, 2, &out) == KUMO_GPU_OK, 33);
+    const uint64_t b = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_STEP, b, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_SUBMITTED, 34);
+    const uint64_t b_done = out.id;
+    /* A CPU signal must not overtake B's unobserved GPU point on the same timeline. */
+    CHECK(native_op(dev, KUMO_NATIVE_SIGNAL, timeline, 200, &out) == BUSY, 35);
+    say("G7p-e B: point 2 captured A's unobserved fence, its step found point 1 done on the GPU and submitted; CPU timeline 200 refused busy");
+
+    CHECK(native_op(dev, KUMO_NATIVE_ARM, a_done, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_COMPLETE, 36);
+    CHECK(native_op(dev, KUMO_NATIVE_ARM, b_done, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_COMPLETE, 37);
+    if (data_cpu[4] != VALUE_A || data_cpu[5] != 0 || data_cpu[8] != VALUE_B || data_cpu[9] != 0 ||
+        data_cpu[0] != PATTERN(3, 0)) {
+        say("G7p-e diag: data words 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x", data_cpu[4], data_cpu[5],
+            data_cpu[8], data_cpu[9], data_cpu[0]);
+        return 38;
+    }
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, output, 0, &out) == KUMO_GPU_OK && out.value == 1, 39);
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, timeline, 100, &out) == KUMO_GPU_OK && out.value == 1, 40);
+    CHECK(native_op(dev, KUMO_NATIVE_SIGNAL, timeline, 200, &out) == KUMO_GPU_OK, 41);
+    CHECK(native_op(dev, KUMO_NATIVE_PENDING, timeline, 200, &out) == KUMO_GPU_OK && out.value == 1, 42);
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == KUMO_GROUP_USABLE, 43);
+    say("G7p-e ARM: points 1 and 2 complete on the GPU's fences, both {value, status 0} landed; timeline 200 accepted after; group USABLE");
+
+    /* C, point 3: built to fail. drv-gpu accepts it, then fails it after its reply, publishes
+     * the group's status and closes the session. ARM's request is never answered; it sees the
+     * close. */
+    if (timeout)
+        say("G7p-e timeout: point 3 waits on a word nobody writes; expecting TIMED_OUT at drv-gpu's 1 s deadline");
+    else
+        say("G7p-e fatal: point 3 stores into the executable binding 0x%llx; expecting FATAL",
+            (unsigned long long)(code_va + 128));
+    const struct kumo_gpu_native_point c_signals[] = {{timeline, 300}};
+    CHECK(native_prepare(dev, vm->handle, group, stream_va + 128, c_bytes, 3, NULL, 0, c_signals, 1, &out) == KUMO_GPU_OK, 44);
+    const uint64_t c = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_STEP, c, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_SUBMITTED, 45);
+    const uint64_t c_done = out.id;
+    const uint64_t begin = kumo_metal_now_ns();
+    const uint32_t lost = native_op(dev, KUMO_NATIVE_ARM, c_done, 0, &out);
+    const uint64_t waited_ms = (kumo_metal_now_ns() - begin) / 1000000;
+    CHECK(lost == KUMO_GPU_TRANSPORT || lost == KUMO_GPU_DEVICE_LOST, 46);
+    CHECK(pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_FAULTY, 47);
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK, 48);
+    const uint64_t expected = timeout ? KUMO_GROUP_TIMED_OUT : KUMO_GROUP_FATAL;
+    const uint64_t state = out.value;
+    const uint32_t gpu_status = out.gpu_status;
+    if (state != expected) {
+        say("G7p-e diag: group state %llu gpu_status 0x%x after ARM returned %u in %llu ms",
+            (unsigned long long)state, gpu_status, lost, (unsigned long long)waited_ms);
+        return 49;
+    }
+    /* Asked again after the loss, the cached fact must not change. */
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK &&
+          out.value == state && out.gpu_status == gpu_status, 50);
+    /* No BO is read past this point. A known loss closes the shared owner, and that unmaps
+     * every local CPU alias (J751); J753's first boot read code_cpu here and took an EL0
+     * translation fault. The driver's fault and CS-status lines are the evidence of what the
+     * GPU did. */
+    if (timeout) {
+        CHECK(waited_ms >= 900, 51);
+        say("G7p-e timeout: ARM saw the session close (%u) after %llu ms; GROUP_STATE TIMED_OUT gpu_status=0x%x, the same after loss; VM faulty",
+            lost, (unsigned long long)waited_ms, gpu_status);
+    } else {
+        say("G7p-e fatal: ARM saw the session close (%u) after %llu ms; GROUP_STATE FATAL gpu_status=0x%x, the same after loss; VM faulty",
+            lost, (unsigned long long)waited_ms, gpu_status);
+    }
+
+    pan_kmod_bo_put(data);
+    pan_kmod_bo_put(code);
+    pan_kmod_bo_put(stream);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
+#undef SENTINEL
+
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
+{
+    return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
+}
+
+#if KUMO_METAL_PROOF == 0
+#define BEGIN_LINE "G7o-f metal device begin: live drv-gpu session, real Mesa lifecycle, DMA pages and page tables"
+#define FAILED_LINE "G7o-f metal device FAILED at case %u"
+#define GREEN_LINE "G7o-f metal device green: live props, Mesa BOs and VM, GPU stores through Mesa bindings, live rebind, W^X store faulted and contained"
+#elif KUMO_METAL_PROOF == 1
+#define BEGIN_LINE "G7p-e metal sync begin (fatal): live drv-gpu session, native C sync and group state on Mali"
+#define FAILED_LINE "G7p-e metal sync FAILED at case %u"
+#define GREEN_LINE "G7p-e metal sync green (fatal): native binary and timeline syncs, a dependency checked against the GPU, ARM completions, wait-pending and FATAL group state on Mali"
+#elif KUMO_METAL_PROOF == 2
+#define BEGIN_LINE "G7p-e metal sync begin (timeout): live drv-gpu session, native C sync and group state on Mali"
+#define FAILED_LINE "G7p-e metal sync FAILED at case %u"
+#define GREEN_LINE "G7p-e metal sync green (timeout): native binary and timeline syncs, a dependency checked against the GPU, ARM completions, wait-pending and TIMED_OUT group state on Mali"
+#else
+#error "KUMO_METAL_PROOF must be 0, 1 or 2"
+#endif
+
 extern unsigned kumo_metal_proof(void);
 int main(void)
 {
-    kumo_metal_log("G7o-f metal device begin: live drv-gpu session, real Mesa lifecycle, DMA pages and page tables");
+    kumo_metal_log(BEGIN_LINE);
     unsigned failed = kumo_metal_proof();
     if (failed) {
-        say("G7o-f metal device FAILED at case %u", failed);
+        say(FAILED_LINE, failed);
         return 1;
     }
-    kumo_metal_log("G7o-f metal device green: live props, Mesa BOs and VM, GPU stores through Mesa bindings, live rebind, W^X store faulted and contained");
+    kumo_metal_log(GREEN_LINE);
     return 0;
 }

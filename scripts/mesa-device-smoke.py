@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j745
 #j746
 #j747
 #j751
 #j752
+#j753
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -26,9 +26,11 @@ def run(command, **kwargs):
     return subprocess.run(list(map(str, command)), cwd=ROOT, check=True, **kwargs)
 
 
-def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S"):
+def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=()):
     """Build one static proof ELF from `cases`.c and `cases`.rs over the real bridge. The
-    G7o-f metal client reuses it with its own cases, startup file and output. — TIMBERDOODLE"""
+    G7o-f metal client reuses it with its own cases, startup file and output. — TIMBERDOODLE
+    `defines` go to the cases file only, never the shared bridge: G7p-e selects its proof
+    with one. — TIMBERDOODLE"""
     out.mkdir(parents=True, exist_ok=True)
     # This verifies the source/header pins, prepares native headers, builds the same C
     # bridge and checks its measured dependency closure; no download. — KESTREL
@@ -47,7 +49,8 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
         flags.extend(["-isystem", mesa / include])
     flags.extend(["-isystem", native / "generated"])
     for name in ["native-device", cases]:
-        run([cc, *flags, "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", out / f"{name}.o"])
+        run([cc, *flags, *(defines if name == cases else ()), "-Wno-unused-parameter", "-c",
+             TOOL / f"{name}.c", "-o", out / f"{name}.o"])
     run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none",
          "-p", "kumo-rt", "-p", "kumo-gpu", "-p", "kumo-abi"])
     if cases == "device-smoke":
@@ -90,7 +93,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
              native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
-    (out / "manifest.json").write_text(json.dumps({"input_sha256": {
+    (out / "manifest.json").write_text(json.dumps({"defines": list(defines), "input_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}}, indent=2) + "\n")
     return elf
 
