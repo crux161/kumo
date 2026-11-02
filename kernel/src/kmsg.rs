@@ -1,4 +1,5 @@
 //j559
+//j748
 
 //! The kernel log (J559): one ring of timestamped lines that `dmesg` reads, fed by the kernel's
 //! `klog!` and by userland `LogWrite`, with a console level deciding which lines also reach the
@@ -31,14 +32,14 @@ const LINE_BYTES: usize = 240;
 pub const KERNEL_SOURCE: u64 = 0;
 const FREE: u64 = u64::MAX;
 
-/// The console level a build starts with: NOTICE and more urgent reach the screen. Building with
+/// The console level a build starts with: WARNING and more urgent reach the screen. Building with
 /// `KUMO_CONSOLE_LOGLEVEL=7` puts back the full output every boot printed before J559.
 pub const DEFAULT_CONSOLE_LEVEL: u8 = match option_env!("KUMO_CONSOLE_LOGLEVEL") {
     Some(level) => match level.as_bytes() {
         [digit @ b'0'..=b'7'] => *digit - b'0',
-        _ => NOTICE,
+        _ => WARNING,
     },
-    None => NOTICE,
+    None => WARNING,
 };
 
 static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(DEFAULT_CONSOLE_LEVEL);
@@ -491,9 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_notice_unless_the_build_asks() {
+    fn the_default_is_warning_unless_the_build_asks() {
         if option_env!("KUMO_CONSOLE_LOGLEVEL").is_none() {
-            assert_eq!(DEFAULT_CONSOLE_LEVEL, NOTICE);
+            assert_eq!(DEFAULT_CONSOLE_LEVEL, WARNING);
         }
         assert_eq!(WARNING, 4);
     }

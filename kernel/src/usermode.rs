@@ -1,8 +1,8 @@
-//j660
 //j719
 //j731
 //j732
 //j743
+//j748
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -28,15 +28,17 @@ static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
 static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
 
 //j731
-// Engine census: the length of every list a dispatched syscall or an interrupt walks, and the
-// window maxima of dispatch's four parts, printed at most every 10 s as Sora enters `PortWait`.
-// Her sample line is complete by then, so the record cannot land inside it (J729's
-// interleave). — TIMBERDOODLE
+// Engine census is opt-in through `dmesg -n debug`; lower the level to stop it. Once enabled,
+// print list lengths and dispatch window maxima at most every 10 s as Sora enters `PortWait`.
+// Ordinary login and shell input must not start periodic diagnostics. — TIMBERDOODLE
 #[cfg(target_os = "none")]
 static CENSUS_AT_NS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "none")]
 fn log_engine_census_if_due() {
+    if !crate::kmsg::visible(crate::kmsg::DEBUG) {
+        return;
+    }
     let now = kumo_hal::active::monotonic_nanos();
     let last = CENSUS_AT_NS.load(Ordering::Relaxed);
     if last != 0 && now.saturating_sub(last) < 10_000_000_000 {

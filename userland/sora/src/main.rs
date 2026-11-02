@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j715
 //j720
 //j721
 //j723
 //j741
+//j748
 
 extern crate alloc;
 
@@ -856,11 +856,12 @@ fn bitmap_volume_file(fs: Handle, path: &[u8]) -> Result<(Handle, u64), &'static
             if channel_write(fs, request.as_ptr(), request.len()) != 0 {
                 return Err(b"bmp-view: filesystem unavailable\n");
             }
-            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-            if n == 0 || n > reply.len() as u64 {
+            let n = read_channel_ready(fs, &mut reply)
+                .ok_or(b"bmp-view: filesystem read failed\n".as_slice())?;
+            if n == 0 {
                 return Err(b"bmp-view: filesystem read failed\n");
             }
-            Ok(n as usize)
+            Ok(n)
         };
         let n = kumo_vfs::Request::open(path)
             .encode_into(&mut request)
@@ -882,11 +883,11 @@ fn bitmap_volume_file(fs: Handle, path: &[u8]) -> Result<(Handle, u64), &'static
             if channel_write(fs, request.as_ptr(), n) != 0 {
                 return None;
             }
-            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-            if n == 0 || n > reply.len() as u64 {
+            let n = read_channel_ready(fs, &mut reply)?;
+            if n == 0 {
                 return None;
             }
-            let data = kumo_vfs::read_payload(&reply[..n as usize]).ok()?;
+            let data = kumo_vfs::read_payload(&reply[..n]).ok()?;
             if data.len() > bytes.len() {
                 return None;
             }
@@ -5587,7 +5588,7 @@ extern "C" fn sora_main(
                     let _ = handle_close(process);
                 }
                 if !GPU_CHURN_VIEW {
-                    log(b"gpu-client: client exited; restart gated off on this image\n");
+                    diag(b"gpu-client: client exited; restart gated off on this image\n");
                     continue;
                 }
                 // The view's lease died with the client; make it eligible for the release
@@ -6809,7 +6810,7 @@ fn copy_from_initrd(initrd: Handle, base: u64, len: u64, dst: Handle, offset: u6
     true
 }
 
-/// One request to `identityd` and its reply, pumped the way `ttyd_request_reply` is.
+/// One request to `identityd` and its reply, pumped through the resident child.
 fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Option<usize> {
     let client = Handle(IDENTITYD.load(Ordering::Relaxed));
     if client.0 == 0 {
@@ -6991,11 +6992,11 @@ fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), Directo
         if channel_write(fs, request.as_ptr(), len) != 0 {
             return Err(DirectoryError::Unavailable);
         }
-        let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-        if n == 0 || n > reply.len() as u64 {
+        let n = read_channel_ready(fs, &mut reply).ok_or(DirectoryError::Unavailable)?;
+        if n == 0 {
             return Err(DirectoryError::Unavailable);
         }
-        match kumo_vfs::parse_dir_reply(&reply[..n as usize]) {
+        match kumo_vfs::parse_dir_reply(&reply[..n]) {
             Ok(_) => Ok(()),
             Err(kumo_vfs::VfsError::Status(kumo_vfs::VFS_NOT_FOUND)) => {
                 Err(DirectoryError::NotFound)
@@ -7492,13 +7493,14 @@ fn reclaim_startup_handles(bootstrap: Handle, count: Option<usize>) {
 fn pump_to_console(read_end: Handle) {
     let mut buf = [0u8; kumo_ipc::MAX_INLINE_BYTES];
     loop {
-        let n = channel_read(read_end, buf.as_mut_ptr(), buf.len());
-        if n == 0 || n == u64::MAX {
+        let Some(n) = read_channel_ready(read_end, &mut buf) else {
+            break;
+        };
+        if n == 0 {
             break;
         }
-        if !sora::relay_console_output(&buf[..n as usize], |chunk| {
-            shell_write(chunk.as_ptr(), chunk.len())
-        }) {
+        if !sora::relay_console_output(&buf[..n], |chunk| shell_write(chunk.as_ptr(), chunk.len()))
+        {
             break;
         }
     }
@@ -8975,17 +8977,58 @@ fn run_persona_posix_tty_read_smoke(initrd: Handle) -> bool {
     child_parked(status) || all_residents_gone(status)
 }
 
+// Sora serializes synchronous replies and output reads. Reuse one port: the engine does not
+// yet reap closed ports, so a port per read would grow the registry. — TIMBERDOODLE
+static REPLY_PORT: AtomicU32 = AtomicU32::new(0);
+
+fn reply_port() -> Option<Handle> {
+    let mut port = Handle(REPLY_PORT.load(Ordering::Relaxed));
+    if port.0 == 0 {
+        port = syscall_handle(port_create())?;
+        REPLY_PORT.store(port.0, Ordering::Relaxed);
+    }
+    Some(port)
+}
+
+/// A synchronous read cannot treat an unrelated supervisor wake as EOF. Binding replays
+/// READABLE/PEER_CLOSED, including a reply or output queued before the bind. — TIMBERDOODLE
+fn read_channel_ready(channel: Handle, reply: &mut [u8]) -> Option<usize> {
+    let port = reply_port()?;
+    if port_bind(port, channel) != 0 {
+        return None;
+    }
+    let result = if port_wait(port) == handle_koid(channel) {
+        let n = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+        (n <= reply.len()).then_some(n)
+    } else {
+        None
+    };
+    let _ = port_unbind(port, channel);
+    result
+}
+
 fn ttyd_request_reply(client: Handle, request: TtyRequest, reply: &mut [u8]) -> Option<usize> {
     let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
     let req_len = request.encode_into(&mut req)?;
-    if channel_write(client, req.as_ptr(), req_len) != 0 {
+    let port = reply_port()?;
+    if port_bind(port, client) != 0 {
         return None;
     }
-    if !child_parked(process_wait()) {
-        return None;
-    }
-    let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
-    Some(n)
+    // ChannelRead may return empty after an unrelated wake of the supervisor. Advancing
+    // the next request then consumes the previous reply; a login mode/history ACK can
+    // hide the initial empty read and leave every later key's echo one request behind.
+    // PortWait retries unrelated wakes, and binding before sending also covers a fast
+    // reply. Read only after this exchange's channel has a packet. — TIMBERDOODLE
+    let result = if channel_write(client, req.as_ptr(), req_len) == 0
+        && port_wait(port) == handle_koid(client)
+    {
+        let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+        (n > 0 && n <= reply.len()).then_some(n)
+    } else {
+        None
+    };
+    let _ = port_unbind(port, client);
+    result
 }
 
 fn child_parked(status: u64) -> bool {
