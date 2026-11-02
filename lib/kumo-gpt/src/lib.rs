@@ -2,6 +2,7 @@
 //j524
 //j542
 //j543
+//j767
 
 //! Allocation-free validation and discovery for GUID Partition Tables.
 //!
@@ -526,6 +527,23 @@ impl PartitionTable<'_> {
     }
 }
 
+/// J767: whether logical block zero is itself a FAT32 volume boot sector: a "superfloppy" with
+/// no partition table. Windows formats removable media this way, and so does the Loupedeck CT's
+/// built-in drive. Its boot code runs through the MBR record area, so [`MbrPartitionTable::parse`]
+/// reports [`MbrError::BadBootIndicator`] for it. The test is the one an MBR can't pass: the
+/// 0x55AA signature, an x86 jump (`EB xx 90` or `E9 xx xx`), and FAT32's type string at 0x52. The
+/// volume then spans the medium, and its own BPB still has to prove itself, as a partition's does.
+pub fn superfloppy_fat32(
+    logical_block: &[u8],
+    logical_block_size: usize,
+    media_block_count: u64,
+) -> bool {
+    validate_media(logical_block, logical_block_size, media_block_count).is_ok()
+        && logical_block[510..512] == [0x55, 0xaa]
+        && matches!(logical_block[..3], [0xeb, _, 0x90] | [0xe9, _, _])
+        && &logical_block[0x52..0x5a] == b"FAT32   "
+}
+
 fn validate_media(
     logical_block: &[u8],
     logical_block_size: usize,
@@ -902,6 +920,54 @@ mod tests {
             MbrPartitionTable::parse(&vbr, 512, STICK_BLOCKS),
             Err(MbrError::BadBootIndicator)
         );
+    }
+
+    /// The Loupedeck CT's LBA0 (CRUX's dmesg, J767): `EB 58 90`, OEM `MSDOS5.0`, 512-byte
+    /// sectors, 8 per cluster, 0x0ed8 reserved, then FAT32's type string and boot code.
+    fn ct_boot_sector() -> Vec<u8> {
+        let mut vbr = vec![0x90; 512];
+        vbr[..16].copy_from_slice(&[
+            0xeb, 0x58, 0x90, b'M', b'S', b'D', b'O', b'S', b'5', b'.', b'0', 0x00, 0x02, 0x08,
+            0xd8, 0x0e,
+        ]);
+        vbr[0x52..0x5a].copy_from_slice(b"FAT32   ");
+        vbr[510] = 0x55;
+        vbr[511] = 0xaa;
+        vbr
+    }
+
+    #[test]
+    fn a_whole_disk_fat32_volume_is_a_superfloppy() {
+        let vbr = ct_boot_sector();
+        assert_eq!(
+            MbrPartitionTable::parse(&vbr, 512, STICK_BLOCKS),
+            Err(MbrError::BadBootIndicator)
+        );
+        assert!(superfloppy_fat32(&vbr, 512, STICK_BLOCKS));
+        let mut near_jump = vbr.clone();
+        near_jump[..3].copy_from_slice(&[0xe9, 0x00, 0x01]);
+        assert!(superfloppy_fat32(&near_jump, 512, STICK_BLOCKS));
+    }
+
+    #[test]
+    fn only_a_fat32_boot_sector_is_a_superfloppy() {
+        let mbr = classic_mbr(&[(0, 0x80, MBR_TYPE_FAT32_LBA, 2048, 4096)]);
+        assert!(!superfloppy_fat32(&mbr, 512, STICK_BLOCKS));
+        let mut fat16 = ct_boot_sector();
+        fat16[0x52..0x5a].fill(0x90);
+        fat16[0x36..0x3e].copy_from_slice(b"FAT16   ");
+        assert!(!superfloppy_fat32(&fat16, 512, STICK_BLOCKS));
+        let mut no_jump = ct_boot_sector();
+        no_jump[0] = 0x00;
+        assert!(!superfloppy_fat32(&no_jump, 512, STICK_BLOCKS));
+        let mut unsigned = ct_boot_sector();
+        unsigned[511] = 0x00;
+        assert!(!superfloppy_fat32(&unsigned, 512, STICK_BLOCKS));
+        assert!(!superfloppy_fat32(
+            &ct_boot_sector()[..511],
+            512,
+            STICK_BLOCKS
+        ));
     }
 
     #[test]

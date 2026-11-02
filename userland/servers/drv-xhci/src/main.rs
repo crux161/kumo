@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j665
 //j666
 //j690
 //j703
 //j704
+//j767
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -19,8 +19,8 @@ use kumo_fatfs::{
     BlockReader, Bpb, FatError, FatVolume, PartitionFitError, PartitionReader, SECTOR_SIZE,
 };
 use kumo_gpt::{
-    validate_protective_mbr, GptError, GptHeader, Guid, MbrError, MbrPartition, MbrPartitionTable,
-    Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
+    superfloppy_fat32, validate_protective_mbr, GptError, GptHeader, Guid, MbrError, MbrPartition,
+    MbrPartitionTable, Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid,
@@ -1662,10 +1662,17 @@ fn configure_and_probe_storage(
             // J541. Its FAT32 record is judged the same way as a GPT's ESP. — TIMBERDOODLE
             Err(GptError::BadProtectiveMbr) => {
                 log_storage_phase(b"gpt-mbr", b"classic");
-                let Some(partition) = find_mbr_fat32(lba0, logical_block_size, media_blocks) else {
-                    return;
-                };
-                (b"mbr", partition.first_lba, partition.block_count)
+                match find_mbr_fat32(lba0, logical_block_size, media_blocks) {
+                    Some(partition) => (b"mbr", partition.first_lba, partition.block_count),
+                    // J767: no partition table at all. LBA0 is the volume's own boot sector (a
+                    // superfloppy, as the Loupedeck CT ships), so the volume is the whole medium.
+                    // The FAT32 probe below still judges its BPB. — TIMBERDOODLE
+                    None if superfloppy_fat32(lba0, logical_block_size, media_blocks) => {
+                        log_storage_phase(b"superfloppy", b"fat32");
+                        (b"whole", 0, media_blocks)
+                    }
+                    None => return,
+                }
             }
             Err(error) => return log_gpt_error(b"mbr", error),
         };
