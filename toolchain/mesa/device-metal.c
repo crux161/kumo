@@ -3,6 +3,7 @@
 /*j753*/
 /*j754*/
 /*j757*/
+/*j758*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -11,7 +12,8 @@
 /* G7p-e: the same vehicle runs MILVUS's native sync and group state (J749-J752) on Mali.
  * KUMO_METAL_PROOF picks the proof at build time: 0 is G7o-f, 1 is G7p-e ending in a fatal
  * fault, 2 is G7p-e ending in a timeout, 3 is G7q-a's tiler heap, 4 is the same heap through
- * G7q-c's C bridge (pan_kmod_kumo_heap_create/destroy). A failed group ends its
+ * G7q-c's C bridge (pan_kmod_kumo_heap_create/destroy), 5 is GL1's no-execute command streams
+ * (J758). A failed group ends its
  * session, and Sora regrants only on the churn image, so each failure needs its own boot.
  * — TIMBERDOODLE */
 #include "kumo_kmod.h"
@@ -115,8 +117,8 @@ static unsigned device_cases(const struct kumo_gpu_api *api)
     CHECK(vm && pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_USABLE, 4);
 
     /* Gallium's shader slab, panvk's shader slab (its WB_MMAP masked away), a CS stream BO
-     * (EXECUTABLE is Mesa's only read-only binding, and KUMO's Submit reads its stream from
-     * one), a data BO and the 64 MiB cap. */
+     * (EXECUTABLE is Mesa's only read-only binding; until J758 KUMO's Submit read its stream
+     * only from one), a data BO and the 64 MiB cap. */
     struct pan_kmod_bo *gallium = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
     struct pan_kmod_bo *panvk = pan_kmod_bo_alloc(dev, vm, 16 * 1024, PAN_KMOD_BO_FLAG_EXECUTABLE);
     struct pan_kmod_bo *stream = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
@@ -448,6 +450,89 @@ static unsigned sync_cases(const struct kumo_gpu_api *api, bool timeout)
 }
 #undef SENTINEL
 
+/* GL1's first rule (J758, CRUX 2026-11-02): Submit takes a stream from a writable no-execute
+ * binding, where Gallium's and panvk's command-stream pools keep them. Three jobs through the
+ * native bridge. The first runs from a cached NX BO. The second rewrites that same 64-byte line
+ * and runs again; Gallium recycles CS chunks, and J747 only ever used fresh lines, so this asks
+ * whether a stale copy of the old line survives anywhere between jobs. The third runs from a
+ * GPU-uncached NX BO. A stream crossing its binding's end is still refused. — TIMBERDOODLE */
+#define NX_SENTINEL 0xa5a5a5a5u
+static unsigned nx_stream_cases(const struct kumo_gpu_api *api)
+{
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    CHECK(dev, 1);
+    struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
+    struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, range.start, range.size);
+    CHECK(vm, 2);
+    struct pan_kmod_bo *cached = pan_kmod_bo_alloc(dev, vm, 4096, 0);
+    struct pan_kmod_bo *uncached = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_GPU_UNCACHED);
+    struct pan_kmod_bo *data = pan_kmod_bo_alloc(dev, vm, 4096, 0);
+    CHECK(cached && uncached && data, 3);
+    volatile uint64_t *cached_cpu = pan_kmod_bo_mmap(cached, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    volatile uint64_t *uncached_cpu = pan_kmod_bo_mmap(uncached, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    volatile uint32_t *data_cpu = pan_kmod_bo_mmap(data, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    CHECK(cached_cpu != MAP_FAILED && uncached_cpu != MAP_FAILED && data_cpu != MAP_FAILED, 4);
+    const uint64_t data_va = range.start, cached_va = range.start + MIB, uncached_va = range.start + 2 * MIB;
+    struct pan_kmod_vm_op ops[3] = {
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {data_va, data->size}, .map = {data, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {cached_va, cached->size}, .map = {cached, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {uncached_va, uncached->size}, .map = {uncached, 0}},
+    };
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 3) == 0, 5);
+
+    struct kumo_gpu_native_reply out;
+    CHECK(native_op(dev, KUMO_NATIVE_CREATE_TIMELINE, 0, 0, &out) == KUMO_GPU_OK, 10);
+    const uint64_t timeline = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_CREATE, 0, vm->handle, &out) == KUMO_GPU_OK &&
+          out.value == KUMO_GROUP_USABLE, 11);
+    const uint64_t group = out.id;
+    say("GL1-a streams: two writable no-execute BOs (GPU-cached at 0x%llx, uncached at 0x%llx) hold the command streams",
+        (unsigned long long)cached_va, (unsigned long long)uncached_va);
+
+    /* One job: the store stream at `stream_cpu`/`stream_va`, timeline point `point * 10`. */
+    const uint64_t streams_va[3] = {cached_va, cached_va, uncached_va};
+    volatile uint64_t *streams_cpu[3] = {cached_cpu, cached_cpu, uncached_cpu};
+    const uint32_t values[3] = {0x7f1a0001u, 0x7f1a0002u, 0x7f1a0003u};
+    for (unsigned job = 0; job < 3; ++job) {
+        const unsigned word = 4 + 4 * job;
+        data_cpu[word + 1] = NX_SENTINEL;
+        const uint32_t bytes = store_stream(streams_cpu[job], data_va + 4 * word, values[job]);
+        __asm__ volatile("dsb sy" ::: "memory");
+        const struct kumo_gpu_native_point signals[] = {{timeline, 10 * (job + 1)}};
+        CHECK(native_prepare(dev, vm->handle, group, streams_va[job], bytes, job + 1, NULL, 0, signals, 1, &out) ==
+              KUMO_GPU_OK, 20 + job);
+        const uint64_t intent = out.id;
+        CHECK(native_op(dev, KUMO_NATIVE_STEP, intent, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_SUBMITTED,
+              23 + job);
+        CHECK(native_op(dev, KUMO_NATIVE_ARM, out.id, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_COMPLETE,
+              26 + job);
+        if (data_cpu[word] != values[job] || data_cpu[word + 1] != 0) {
+            say("GL1-a diag: job %u read back 0x%08x 0x%08x (want 0x%08x 0); earlier words 0x%08x 0x%08x",
+                job + 1, data_cpu[word], data_cpu[word + 1], values[job], data_cpu[4], data_cpu[8]);
+            return 30 + job;
+        }
+    }
+    CHECK(data_cpu[4] == values[0] && data_cpu[8] == values[1], 33);
+    say("GL1-a cached: a stream in the cached NX BO ran and {0x%08x, status 0} landed", values[0]);
+    say("GL1-a rewrite: the same line rewritten ran its new words; {0x%08x, status 0} landed, the first store intact",
+        values[1]);
+    say("GL1-a uncached: a stream in the uncached NX BO ran and {0x%08x, status 0} landed", values[2]);
+
+    /* Still one binding per stream: crossing the cached BO's end is refused locally. */
+    const struct kumo_gpu_native_point late[] = {{timeline, 40}};
+    CHECK(native_prepare(dev, vm->handle, group, cached_va + 4096 - 64, 128, 4, NULL, 0, late, 1, &out) ==
+          KUMO_GPU_INVALID_REQUEST, 40);
+    say("GL1-a refusal: a stream crossing its binding's end was refused");
+
+    pan_kmod_bo_put(data);
+    pan_kmod_bo_put(uncached);
+    pan_kmod_bo_put(cached);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
+#undef NX_SENTINEL
+
 /* G7q-a. The heap's memory is the driver's and the client cannot map it, so the GPU reads it:
  * each job loads one chunk header and stores it into the data BO, and the next job follows the
  * link the GPU reported. The walk is therefore the chain as the GPU sees it, not the layout
@@ -589,6 +674,8 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
     if (KUMO_METAL_PROOF == 3 || KUMO_METAL_PROOF == 4)
         return heap_cases(api, KUMO_METAL_PROOF == 4);
+    if (KUMO_METAL_PROOF == 5)
+        return nx_stream_cases(api);
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -612,8 +699,12 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "G7q-c metal heap begin: live drv-gpu session, a tiler heap through the C bridge the GPU walks"
 #define FAILED_LINE "G7q-c metal heap FAILED at case %u"
 #define GREEN_LINE "G7q-c metal heap green: pan_kmod_kumo_heap_create placed and linked the chunks the GPU walked, and pan_kmod_kumo_heap_destroy unmapped them"
+#elif KUMO_METAL_PROOF == 5
+#define BEGIN_LINE "GL1-a metal streams begin: live drv-gpu session, command streams in writable no-execute BOs"
+#define FAILED_LINE "GL1-a metal streams FAILED at case %u"
+#define GREEN_LINE "GL1-a metal streams green: Submit ran streams from cached and uncached writable no-execute bindings, a rewritten line ran its new words, and a straddling stream was refused"
 #else
-#error "KUMO_METAL_PROOF must be 0, 1, 2, 3 or 4"
+#error "KUMO_METAL_PROOF must be 0 to 5"
 #endif
 
 extern unsigned kumo_metal_proof(void);

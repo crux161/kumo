@@ -1,8 +1,8 @@
-//j681
 //j707
 //j742
 //j752
 //j754
+//j758
 
 extern crate std;
 
@@ -520,17 +520,37 @@ fn bindings_check_both_extents_overflow_flags_and_overlap() {
     );
 }
 
+//j758
 #[test]
-fn submit_must_fit_read_only_binding_in_the_groups_vm() {
+fn submit_must_fit_one_binding_in_the_groups_vm() {
     let b = binding();
     let s = submission();
     assert_eq!(s.validate_for(1, b), Ok(()));
     assert_eq!(s.validate_for(2, b), Err(Status::BadRequest));
+    // J758: a writable no-execute binding holds a stream too (Gallium's and panvk's CS pools),
+    // cached or not.
+    for flags in [
+        BindFlags::NO_EXECUTE,
+        BindFlags::NO_EXECUTE | BindFlags::UNCACHED,
+        BindFlags::READ_ONLY | BindFlags::NO_EXECUTE,
+    ] {
+        assert_eq!(
+            s.validate_for(
+                1,
+                Binding {
+                    flags: BindFlags(flags),
+                    ..b
+                }
+            ),
+            Ok(())
+        );
+    }
+    // W^X still holds: a writable executable binding is not a valid binding at all.
     assert_eq!(
         s.validate_for(
             1,
             Binding {
-                flags: BindFlags(BindFlags::NO_EXECUTE),
+                flags: BindFlags(0),
                 ..b
             }
         ),

@@ -3,10 +3,11 @@
 #j753
 #j754
 #j757
+#j758
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
-  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a or g7q-c: the cases the client runs.
+  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a, g7q-c or gl1-a: the cases the client runs.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -100,6 +101,18 @@ PROOFS = {
                 "drv-gpu: AS1 fault at VA=0x0000000030041000: TRANSLATION_FAULT",
                 "drv-gpu: containment reset=ok"],
         absent=[]),
+    # GL1-a (J758): command streams from writable no-execute bindings, Gallium's and panvk's
+    # CS pools, cached and uncached, with one line reused. — TIMBERDOODLE
+    "gl1-a": dict(
+        define=5, out="gl1-a", begin="GL1-a metal streams begin",
+        lines=["GL1-a streams: two writable no-execute BOs (GPU-cached at 0x20100000, uncached at 0x20200000)",
+               "GL1-a cached: a stream in the cached NX BO ran and {0x7f1a0001, status 0} landed",
+               "GL1-a rewrite: the same line rewritten ran its new words; {0x7f1a0002, status 0} landed",
+               "GL1-a uncached: a stream in the uncached NX BO ran and {0x7f1a0003, status 0} landed",
+               "GL1-a refusal: a stream crossing its binding's end was refused"],
+        green=("GL1-a metal streams green: Submit ran streams from cached and uncached writable no-execute "
+               "bindings, a rewritten line ran its new words, and a straddling stream was refused"),
+        after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
 }
 
 
@@ -162,15 +175,15 @@ def check(log, proof):
         assert len(hits) == 1, f"{expected!r} appears {len(hits)} times"
         assert hits[0] >= position, f"{expected!r} is out of order"
         position = hits[0]
-    if proof["after"]:
-        first = next(i for i, line in enumerate(window) if proof["after"] in line)
-        last = next(i for i, line in enumerate(window) if proof["green"] in line)
-        failure = window[first:last]
-        for expected in proof["driver"]:
-            hits = [line for line in failure if expected in line]
-            assert len(hits) == 1, f"{expected!r} appears {len(hits)} times in the failure window"
-        for unwanted in proof["absent"]:
-            assert not any(unwanted in line for line in failure), f"{unwanted!r} in the failure window"
+    # Without a failure window, `absent` covers the whole proof: GL1-a must fault nowhere.
+    last = next(i for i, line in enumerate(window) if proof["green"] in line)
+    first = next(i for i, line in enumerate(window) if proof["after"] in line) if proof["after"] else 0
+    failure = window[first:last]
+    for expected in proof["driver"]:
+        hits = [line for line in failure if expected in line]
+        assert len(hits) == 1, f"{expected!r} appears {len(hits)} times in the failure window"
+    for unwanted in proof["absent"]:
+        assert not any(unwanted in line for line in failure), f"{unwanted!r} in the failure window"
     for bad in ("TOWER", "FAILED", "ABEND"):
         assert not any(bad in line for line in live), f"{bad} in the boot"
     for line in window:

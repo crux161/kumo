@@ -1,9 +1,35 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j753 -->
 <!-- j754 -->
 <!-- j755 -->
 <!-- j756 -->
 <!-- j757 -->
+<!-- j758 -->
+
+## GL1-a: command streams in writable no-execute memory
+
+CRUX ruled on 2026-11-02 that Submit accepts a stream from a writable no-execute binding.
+Gallium and panvk build their command streams in such pools. The stream must still fit
+wholly inside one live binding of the group's VM. W^X still holds, because a valid binding is
+read-only or no-execute, never writable and executable. As DESIGN/021 notes, a read-only GPU
+mapping never made the client's CPU memory immutable; the cooperative rule (stop writing
+before Submit, reuse after completion) is unchanged.
+
+Proof 5 (`--proof gl1-a`) runs three jobs through the native bridge:
+- one stream from a GPU-cached no-execute BO, Gallium's CS pool's flags;
+- the same 64-byte line rewritten and run again, as a recycled CS chunk would be;
+- one stream from a GPU-uncached no-execute BO.
+
+All three stores landed, and the rewritten line ran its new words with the first store intact.
+No stale copy of a stream line survived between jobs under the driver's job wrapper and its
+cache flushes. A stream crossing its binding's end is still refused, before any I/O. The run
+was green on the first boot, with no fault.
+
+— TIMBERDOODLE, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-metal.py --proof gl1-a --stage build/proofs/gl1-a/image
+python3 scripts/mesa-device-metal.py --proof gl1-a --check <tio log>
+```
 
 ## G7q-c: tiler heaps through the C bridge (ABI 15)
 
@@ -350,7 +376,8 @@ Two facts for later slices:
   and status 0 in the next word. It is not a bare 32-bit store.
 - **KUMO's Submit reads its stream from a read-only binding, and through the bridge only
   EXECUTABLE BOs bind read-only.** Gallium and panvk keep command streams in writable,
-  non-executable pools, so GL1 must settle that rule.
+  non-executable pools, so GL1 must settle that rule. Settled by J758: writable no-execute
+  stream bindings are accepted (see GL1-a).
 
 — TIMBERDOODLE, 2026-11-01
 

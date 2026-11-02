@@ -1,9 +1,9 @@
 #![no_std]
-//j749
 //j751
 //j752
 //j754
 //j755
+//j758
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -334,8 +334,15 @@ impl Submission {
     }
 
     /// The server supplies the group's VM and a previously validated binding from this same
-    /// session. The entire stream must fit one read-only binding. The driver samples its own
+    /// session. The entire stream must fit one binding of that VM. The driver samples its own
     /// latest flush ID and owns the ring, wrapper and sync object. — TIMBERDOODLE
+    //j758
+    /// Since J758 (CRUX, 2026-11-02) the binding may be writable, as Gallium's and panvk's
+    /// command-stream pools are. The CS front end reads a stream as data, and every valid
+    /// binding is read-only or no-execute (W^X), so a stream is never in memory that is both
+    /// writable and executable. A read-only GPU mapping never made the shared CPU VMO immutable
+    /// anyway (DESIGN/021): clients stop writing before Submit and reuse after completion.
+    /// — TIMBERDOODLE
     pub fn validate_for(self, group_vm: u32, binding: Binding) -> Result<(), Status> {
         binding.validate(MAX_BUFFER_BYTES)?;
         let stream_end = self
@@ -348,7 +355,6 @@ impl Submission {
             .ok_or(Status::BadRequest)?;
         if !self.valid_shape()
             || binding.vm != group_vm
-            || !binding.flags.contains(BindFlags::READ_ONLY)
             || self.stream_va < binding.va
             || stream_end > binding_end
         {
