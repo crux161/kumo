@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j563
 //j564
 //j568
 //j687
 //j701
+//j766
 //j720
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
@@ -295,8 +295,9 @@ impl kumo_rt::Server for Sora {
     }
 }
 
-/// Longest `/media/<name>` component: an 11-byte FAT label, or a 9-byte `XXXX-XXXX` serial.
-pub const MEDIA_NAME_MAX: usize = 11;
+/// Longest `/media/<name>` component. A volume's own name is at most an 11-byte FAT label or a
+/// 9-byte `XXXX-XXXX` serial; a name given to `mount` may use the rest (J766).
+pub const MEDIA_NAME_MAX: usize = 32;
 
 /// The directory a removable volume mounts under in `/media` (DESIGN/012 §2.1, J545): its label
 /// with the padding trimmed, else its serial written `XXXX-XXXX` the way Linux shows a FAT
@@ -339,8 +340,58 @@ impl MediaName {
         name
     }
 
+    /// A name given to `mount` (J766): 1 to [`MEDIA_NAME_MAX`] bytes of ASCII letters, digits,
+    /// `-`, `_` and `.`, not starting with `.`. A name outside that is refused rather than
+    /// rewritten, because the user chose it.
+    pub fn chosen(name: &[u8]) -> Option<MediaName> {
+        let plain = name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        if name.is_empty() || name.len() > MEDIA_NAME_MAX || !plain || name[0] == b'.' {
+            return None;
+        }
+        let mut chosen = MediaName {
+            bytes: [0; MEDIA_NAME_MAX],
+            len: name.len(),
+        };
+        chosen.bytes[..name.len()].copy_from_slice(name);
+        Some(chosen)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
+    }
+}
+
+/// `mount`'s mount point (J766): a canonical absolute path naming one `/media/<name>` directory,
+/// the only place KUMO mounts a volume. Deeper paths, `/media` itself and other trees are refused.
+pub fn mount_point(path: &[u8]) -> Option<MediaName> {
+    match media_route(path) {
+        MediaRoute::Volume { name, path: b"/" } => MediaName::chosen(name),
+        _ => None,
+    }
+}
+
+/// Storage controllers whose driver can offer a volume: usb0, usb1 and host2 (J545).
+pub const STORAGE_DEVICES: usize = 3;
+
+/// The shell's name for the volume the storage driver on controller `index` offers (J766):
+/// `/dev/disk<index>s1`. Each driver serves the one FAT32 volume it found on its stick, so the
+/// slice is always 1. KUMO has no `/dev` tree; the name exists for `mount` and `umount`.
+pub fn disk_path(index: usize) -> [u8; 12] {
+    assert!(index < STORAGE_DEVICES);
+    let mut path = *b"/dev/disk0s1";
+    path[9] = b'0' + index as u8;
+    path
+}
+
+/// The controller index a `/dev/disk<N>s1` name refers to.
+pub fn parse_disk(path: &[u8]) -> Option<usize> {
+    match path.strip_prefix(b"/dev/disk")? {
+        [digit @ b'0'..=b'9', b's', b'1'] if usize::from(digit - b'0') < STORAGE_DEVICES => {
+            Some(usize::from(digit - b'0'))
+        }
+        _ => None,
     }
 }
 
@@ -1121,6 +1172,60 @@ mod tests {
             MediaName::new(Some(*b"\xc9T\xc9        "), 0).as_bytes(),
             b"_T_"
         );
+    }
+
+    #[test]
+    fn mount_takes_a_plain_name_as_given() {
+        assert_eq!(MediaName::chosen(b"CT").unwrap().as_bytes(), b"CT");
+        let longest = [b'a'; MEDIA_NAME_MAX];
+        assert_eq!(MediaName::chosen(&longest).unwrap().as_bytes(), longest);
+        assert_eq!(MediaName::chosen(&[b'a'; MEDIA_NAME_MAX + 1]), None);
+        for refused in [
+            b"".as_slice(),
+            b".hidden",
+            b"..",
+            b"MY DISK",
+            b"a/b",
+            b"\xc9T",
+        ] {
+            assert_eq!(MediaName::chosen(refused), None, "{refused:?}");
+        }
+        // A volume's own name always fits beside a chosen one.
+        assert!(MediaName::new(Some(*b"KUMO_DATA.1"), 0).as_bytes().len() <= MEDIA_NAME_MAX);
+    }
+
+    #[test]
+    fn a_mount_point_is_one_media_directory() {
+        assert_eq!(mount_point(b"/media/CT").unwrap().as_bytes(), b"CT");
+        for refused in [
+            b"/media".as_slice(),
+            b"/media/",
+            b"/media/CT/sub",
+            b"/tmp/CT",
+            b"/mediaCT",
+            b"/media/.CT",
+        ] {
+            assert_eq!(mount_point(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn disks_are_named_by_their_controller() {
+        assert_eq!(&disk_path(0), b"/dev/disk0s1");
+        assert_eq!(&disk_path(2), b"/dev/disk2s1");
+        for index in 0..STORAGE_DEVICES {
+            assert_eq!(parse_disk(&disk_path(index)), Some(index));
+        }
+        for refused in [
+            b"/dev/disk3s1".as_slice(),
+            b"/dev/disk0s2",
+            b"/dev/disk0",
+            b"disk0s1",
+            b"/dev/disk10s1",
+            b"/dev/sda1",
+        ] {
+            assert_eq!(parse_disk(refused), None, "{refused:?}");
+        }
     }
 
     #[test]

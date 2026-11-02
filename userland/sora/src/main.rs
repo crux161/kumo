@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j720
 //j721
 //j723
 //j741
 //j748
+//j766
 
 extern crate alloc;
 
@@ -2463,6 +2463,46 @@ struct Media {
     ready: drv_blk::MediaReady,
     /// The offering driver's control channel: where a new client's block channel goes.
     control: Handle,
+    /// Its storage controller, the `N` of `/dev/disk<N>s1` (J766).
+    device: usize,
+}
+
+/// J766: the volume each storage controller's driver offers, mounted or not. `mount` mounts one
+/// at a time at `/media/<name>`, because the shell's routes serve one volume.
+#[derive(Clone, Copy)]
+struct Device {
+    ready: drv_blk::MediaReady,
+    control: Handle,
+}
+
+static DEVICES: Shared<[Option<Device>; sora::STORAGE_DEVICES]> =
+    Shared(core::cell::UnsafeCell::new([None; sora::STORAGE_DEVICES]));
+
+fn set_device(index: usize, device: Option<Device>) {
+    let mut devices = DEVICES.get();
+    devices[index] = device;
+    DEVICES.set(devices);
+}
+
+/// Mount the offered volume of controller `index` as `/media/<name>`, and say so.
+fn mount_device(index: usize, device: Device, name: sora::MediaName) {
+    set_media(Some(Media {
+        name,
+        ready: device.ready,
+        control: device.control,
+        device: index,
+    }));
+    notice(&[
+        b"media: ",
+        &sora::disk_path(index),
+        b" mounted on /media/",
+        name.as_bytes(),
+        if device.ready.read_only {
+            b" (fat32, read-only)\n" as &[u8]
+        } else {
+            b" (fat32)\n"
+        },
+    ]);
 }
 
 struct MediaCell(core::cell::UnsafeCell<Option<Media>>);
@@ -6028,6 +6068,14 @@ fn eval_command(
         }
         return true;
     }
+    if cmd.name == "mount" {
+        mount_command(cmd, cwd);
+        return true;
+    }
+    if cmd.name == "umount" {
+        umount_command(cmd, cwd);
+        return true;
+    }
     if cmd.name == "cd" {
         if cmd.args.len() > 1 {
             usage(b"usage: cd [path]\n");
@@ -6361,6 +6409,7 @@ fn media_offered(
     if n == 0 || n == u64::MAX {
         let _ = port_unbind(port, control);
         koids[index] = None;
+        set_device(index, None);
         if media().is_some_and(|media| media.control == control) {
             set_media(None);
             log(b"media: driver gone; volume removed\n");
@@ -6372,11 +6421,20 @@ fn media_offered(
         return false;
     };
     let name = sora::MediaName::new(ready.label, ready.serial);
-    set_media(Some(Media {
-        name,
-        ready,
-        control,
-    }));
+    let device = Device { ready, control };
+    set_device(index, Some(device));
+    // J766: a volume mounts by itself only when `/media` is free or already holds it; a second
+    // stick waits for `mount`.
+    if media().is_some_and(|media| media.device != index) {
+        notice(&[
+            b"media: ",
+            &sora::disk_path(index),
+            b" ready; another volume is mounted, so `mount ",
+            &sora::disk_path(index),
+            b"` waits for `umount`\n",
+        ]);
+        return false;
+    }
     diag(b"media: /media/");
     diag(name.as_bytes());
     diag(b" usb fat32 blocks=");
@@ -6388,15 +6446,7 @@ fn media_offered(
     } else {
         b"\n"
     });
-    notice(&[
-        b"media: /media/",
-        name.as_bytes(),
-        if ready.read_only {
-            b" mounted (fat32, read-only)\n" as &[u8]
-        } else {
-            b" mounted (fat32)\n"
-        },
-    ]);
+    mount_device(index, device, name);
     // J545's end-to-end check: mount the volume once through a block-backed `fatfs`, then let
     // that instance go. Its mount crosses every new hop (Sora's connect, the driver's resident
     // loop, the block protocol), and its exit returns the driver's client slot. — TIMBERDOODLE
@@ -6927,6 +6977,154 @@ fn dmesg(cmd: &kumoza::Command) {
         },
         _ => usage(b"usage: dmesg [-n level]\n"),
     }
+}
+
+/// Log `parts` as one line, then fail with `status` when it is not 0.
+fn log_line(parts: &[&[u8]], status: u8) {
+    for part in parts {
+        log(part);
+    }
+    if status != 0 {
+        fail_status(status);
+    }
+}
+
+/// `mount [/dev/diskNs1 [/media/NAME]]` (J766). FAT32 is KUMO's only filesystem, so there is no
+/// `-t`. With no operand it lists every offered volume: the mounted one as Linux prints it, the
+/// others as waiting. A device mounts at the given `/media/<name>`, or without one at the name it
+/// takes by itself: its label, else its serial. Failures exit 32, as Linux's `mount` does.
+fn mount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
+    let mounted = media();
+    let Some(operand) = cmd.args.first() else {
+        for (index, device) in DEVICES.get().iter().enumerate() {
+            let Some(device) = device else { continue };
+            let path = sora::disk_path(index);
+            match mounted.filter(|media| media.device == index) {
+                Some(media) => log_line(
+                    &[
+                        &path,
+                        b" on /media/",
+                        media.name.as_bytes(),
+                        b" type fat32 (",
+                        if device.ready.read_only { b"ro" } else { b"rw" },
+                        b")\n",
+                    ],
+                    0,
+                ),
+                None => log_line(&[&path, b" type fat32 (not mounted)\n"], 0),
+            }
+        }
+        return;
+    };
+    if cmd.args.len() > 2 {
+        usage(b"usage: mount [/dev/diskNs1 [/media/NAME]]\n");
+        return;
+    }
+    let operand = operand.as_bytes();
+    let Some(index) = sora::parse_disk(operand) else {
+        log_line(
+            &[
+                b"mount: ",
+                operand,
+                b": not a device; KUMO names them /dev/diskNs1\n",
+            ],
+            32,
+        );
+        return;
+    };
+    let Some(device) = DEVICES.get()[index] else {
+        log_line(&[b"mount: ", operand, b": no such device\n"], 32);
+        return;
+    };
+    let name = match cmd.args.get(1) {
+        None => sora::MediaName::new(device.ready.label, device.ready.serial),
+        Some(point) => {
+            let resolved = match cwd.resolve(point) {
+                Ok(resolved) => resolved,
+                Err(error) => return log_directory_error(b"mount", error),
+            };
+            let Some(name) = sora::mount_point(resolved.as_bytes()) else {
+                log_line(
+                    &[
+                        b"mount: ",
+                        resolved.as_bytes(),
+                        b": the mount point must be /media/NAME, NAME being letters, digits, - _ or .\n",
+                    ],
+                    32,
+                );
+                return;
+            };
+            name
+        }
+    };
+    match mounted {
+        Some(media) if media.device == index => log_line(
+            &[
+                b"mount: ",
+                operand,
+                b": already mounted on /media/",
+                media.name.as_bytes(),
+                b"\n",
+            ],
+            32,
+        ),
+        Some(media) => log_line(
+            &[
+                b"mount: /media/",
+                media.name.as_bytes(),
+                b" is mounted; KUMO mounts one volume at a time, so umount it first\n",
+            ],
+            32,
+        ),
+        None => mount_device(index, device, name),
+    }
+}
+
+/// `umount /media/NAME` or `umount /dev/diskNs1` (J766). The volume leaves `/media`; its device
+/// stays offered, so `mount` can bring it back. The shell's working directory inside it makes
+/// the mount busy, as Linux reports a busy target.
+fn umount_command(cmd: &kumoza::Command, cwd: &WorkingDirectory) {
+    let [operand] = cmd.args.as_slice() else {
+        usage(b"usage: umount /media/NAME | /dev/diskNs1\n");
+        return;
+    };
+    let Some(media) = media() else {
+        log_line(&[b"umount: ", operand.as_bytes(), b": not mounted\n"], 32);
+        return;
+    };
+    let target = match sora::parse_disk(operand.as_bytes()) {
+        Some(index) => index == media.device,
+        None => match cwd.resolve(operand) {
+            Ok(resolved) => sora::mount_point(resolved.as_bytes())
+                .is_some_and(|name| name.as_bytes() == media.name.as_bytes()),
+            Err(error) => return log_directory_error(b"umount", error),
+        },
+    };
+    if !target {
+        log_line(&[b"umount: ", operand.as_bytes(), b": not mounted\n"], 32);
+        return;
+    }
+    let busy = matches!(sora::media_route(cwd.path().as_bytes()),
+        sora::MediaRoute::Volume { name, .. } if name == media.name.as_bytes());
+    if busy {
+        log_line(
+            &[
+                b"umount: /media/",
+                media.name.as_bytes(),
+                b": target is busy\n",
+            ],
+            32,
+        );
+        return;
+    }
+    set_media(None);
+    notice(&[
+        b"media: ",
+        &sora::disk_path(media.device),
+        b" unmounted from /media/",
+        media.name.as_bytes(),
+        b"\n",
+    ]);
 }
 
 fn log_directory_error(command: &[u8], error: DirectoryError) {
