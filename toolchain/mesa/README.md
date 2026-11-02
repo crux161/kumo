@@ -1,9 +1,40 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j752 -->
 <!-- j753 -->
 <!-- j754 -->
 <!-- j755 -->
 <!-- j756 -->
+<!-- j757 -->
+
+## G7q-c: tiler heaps through the C bridge (ABI 15)
+
+ABI 15 appends `heap_create` and `heap_destroy` to the API table, which grows from 120 to 136
+bytes, and the factory refuses a device that lacks either. The published device exposes them
+as `pan_kmod_kumo_heap_create(dev, request, info)` and `pan_kmod_kumo_heap_destroy(dev, heap,
+bytes)`, the shape of TILER_HEAP_CREATE and _DESTROY, for GL1's `pan_csf.c` seam and VK2's
+queue seam. `struct kumo_gpu_heap_request` names the logical VM, the chunk size, the initial
+and maximum chunk counts, `target_in_flight`, and an MBZ flags word. `struct kumo_gpu_heap_info`
+returns the heap ID, the context VA and the first chunk's VA.
+
+Heaps go through the same BO/session owner as everything else. The owner checks Panthor's
+rules, an unknown logical VM, and the eight-heap cap locally, so a refusal sends nothing.
+Every heap crosses on the server VM. A heap belongs to its logical VM: destroying that VM
+destroys its heaps first, as Panthor's VM teardown takes its heap pool, and the next logical
+VM starts with none. An unknown heap is `KUMO_GPU_UNKNOWN_OBJECT`, and known loss poisons the
+device here too. Failures leave a zeroed `info`.
+
+Proofs:
+- QEMU mode 15 of `mesa-device-smoke.py --heaps --run`: the factory's refusals, Panthor's
+  shapes refused with no I/O, exact bytes on destroy, and VM teardown destroying heaps.
+- Metal proof 4 (`--proof g7q-c`): G7q-a's GPU chain walk on a heap made and destroyed
+  through the bridge. It was green on the first boot.
+
+— TIMBERDOODLE, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --heaps --run
+python3 scripts/mesa-device-metal.py --proof g7q-c --stage build/proofs/g7q-c-metal/image
+python3 scripts/mesa-device-metal.py --proof g7q-c --check <tio log>
+```
 
 ## G7q-b: tiler OOM served by growing the heap
 

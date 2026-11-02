@@ -1,8 +1,8 @@
-//j739
 //j742
 //j744
 //j745
 //j751
+//j757
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -112,7 +112,7 @@ const _: () = assert!(core::mem::offset_of!(Report, l2_slices) == 192);
 const _: () = assert!(core::mem::offset_of!(Report, pgsize_bitmap) == 200);
 const _: () = assert!(core::mem::offset_of!(Report, is_io_coherent) == 208);
 const _: () = assert!(core::mem::offset_of!(Report, timestamp_frequency) == 232);
-const _: () = assert!(core::mem::size_of::<Api>() == 120);
+const _: () = assert!(core::mem::size_of::<Api>() == 136);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
     cs_features: 0x7085f,

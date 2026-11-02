@@ -2,6 +2,7 @@
 /*j747*/
 /*j753*/
 /*j754*/
+/*j757*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -9,7 +10,8 @@
  * — TIMBERDOODLE */
 /* G7p-e: the same vehicle runs MILVUS's native sync and group state (J749-J752) on Mali.
  * KUMO_METAL_PROOF picks the proof at build time: 0 is G7o-f, 1 is G7p-e ending in a fatal
- * fault, 2 is G7p-e ending in a timeout, 3 is G7q-a's tiler heap. A failed group ends its
+ * fault, 2 is G7p-e ending in a timeout, 3 is G7q-a's tiler heap, 4 is the same heap through
+ * G7q-c's C bridge (pan_kmod_kumo_heap_create/destroy). A failed group ends its
  * session, and Sora regrants only on the churn image, so each failure needs its own boot.
  * — TIMBERDOODLE */
 #include "kumo_kmod.h"
@@ -295,7 +297,7 @@ static uint32_t stall_stream(volatile uint64_t *line, uint64_t gate, uint64_t ta
 static unsigned sync_cases(const struct kumo_gpu_api *api, bool timeout)
 {
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
-    CHECK(dev && api->version == 14 && api->bytes == 120, 1);
+    CHECK(dev && api->version == 15 && api->bytes == 136, 1);
     say("G7p-e device: gpu_id=0x%llx, native C ABI %u with a %u-byte table",
         (unsigned long long)dev->props.gpu_id, api->version, api->bytes);
     struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
@@ -476,8 +478,11 @@ static uint32_t copy_job(void *context, volatile uint64_t *stream_cpu, uint64_t 
     return kumo_metal_run(context, stream_cpu, stream_va, job, sizeof job / sizeof job[0]);
 }
 
-static unsigned heap_cases(const struct kumo_gpu_api *api)
+/* Proof 3 creates and destroys the heap on the session's Client; proof 4 goes through the
+ * published device's ABI 15 entry points, as GL1's pan_csf.c seam will. — TIMBERDOODLE */
+static unsigned heap_cases(const struct kumo_gpu_api *api, bool bridge)
 {
+    const char *tag = bridge ? "G7q-c" : "G7q-a";
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
     CHECK(dev, 1);
     struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
@@ -497,11 +502,18 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
     CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 2) == 0, 5);
 
     uint64_t heap[3] = {0};
-    CHECK(kumo_metal_heap_create(api->context, HEAP_CHUNK, HEAP_CHUNKS, HEAP_CHUNKS + 1, heap) == 0, 10);
+    if (bridge) {
+        const struct kumo_gpu_heap_request request = {vm->handle, HEAP_CHUNK, HEAP_CHUNKS, HEAP_CHUNKS + 1, 65535, 0};
+        struct kumo_gpu_heap_info info;
+        CHECK(pan_kmod_kumo_heap_create(dev, &request, &info) == KUMO_GPU_OK && info.reserved == 0, 10);
+        heap[0] = info.heap, heap[1] = info.context_va, heap[2] = info.first_chunk_va;
+    } else {
+        CHECK(kumo_metal_heap_create(api->context, HEAP_CHUNK, HEAP_CHUNKS, HEAP_CHUNKS + 1, heap) == 0, 10);
+    }
     const uint64_t context_va = heap[1], head = heap[2];
     CHECK(context_va >= KUMO_HEAP_VA_START && head < KUMO_HEAP_VA_END && context_va % 4096 == 0 &&
           head % 4096 == 0 && head != context_va, 11);
-    say("G7q-a heap: %u chunks of %u bytes, context 0x%llx, head 0x%llx",
+    say("%s heap: %u chunks of %u bytes, context 0x%llx, head 0x%llx", tag,
         HEAP_CHUNKS, HEAP_CHUNK, (unsigned long long)context_va, (unsigned long long)head);
 
     /* Walk from the head: every link the GPU reads must carry the chunk size in pages and
@@ -522,7 +534,7 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
             break;
         if ((word & 0xfff) != HEAP_CHUNK / 4096 || (word & ~UINT64_C(0xfff)) < KUMO_HEAP_VA_START ||
             (word & ~UINT64_C(0xfff)) >= KUMO_HEAP_VA_END) {
-            say("G7q-a diag: link %u at 0x%llx read 0x%llx", links, (unsigned long long)va,
+            say("%s diag: link %u at 0x%llx read 0x%llx", tag, links, (unsigned long long)va,
                 (unsigned long long)word);
             return 21;
         }
@@ -535,8 +547,8 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
         for (unsigned j = i + 1; j < links; ++j)
             CHECK(seen[i] + HEAP_CHUNK <= seen[j] || seen[j] + HEAP_CHUNK <= seen[i], 24);
     }
-    say("G7q-a walk: the GPU followed %u links from the head through 0x%llx and 0x%llx; each carried the chunk size, the last was 0",
-        links, (unsigned long long)seen[1], (unsigned long long)seen[2]);
+    say("%s walk: the GPU followed %u links from the head through 0x%llx and 0x%llx; each carried the chunk size, the last was 0",
+        tag, links, (unsigned long long)seen[1], (unsigned long long)seen[2]);
 
     /* The context is the GPU's and starts zeroed. */
     for (unsigned i = 8; i < 12; ++i)
@@ -546,19 +558,25 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
     ++line;
     CHECK(status == 0, 40 + status);
     CHECK(data_cpu[8] == 0 && data_cpu[9] == 0 && data_cpu[10] == 0 && data_cpu[11] == 0, 41);
-    say("G7q-a context: the GPU read its 32 bytes at 0x%llx, all zero", (unsigned long long)context_va);
+    say("%s context: the GPU read its 32 bytes at 0x%llx, all zero", tag, (unsigned long long)context_va);
 
     uint64_t bytes = 0;
-    CHECK(kumo_metal_heap_destroy(api->context, (uint32_t)heap[0], &bytes) == 0, 50);
+    if (bridge) {
+        CHECK(pan_kmod_kumo_heap_destroy(dev, (uint32_t)heap[0], &bytes) == KUMO_GPU_OK, 50);
+        uint64_t again = 1;
+        CHECK(pan_kmod_kumo_heap_destroy(dev, (uint32_t)heap[0], &again) == KUMO_GPU_UNKNOWN_OBJECT && again == 0, 54);
+    } else {
+        CHECK(kumo_metal_heap_destroy(api->context, (uint32_t)heap[0], &bytes) == 0, 50);
+    }
     CHECK(bytes == 4096 + HEAP_CHUNKS * HEAP_CHUNK, 51);
-    say("G7q-a destroy: %llu bytes returned; a load from the old head 0x%llx must now fault",
+    say("%s destroy: %llu bytes returned; a load from the old head 0x%llx must now fault", tag,
         (unsigned long long)bytes, (unsigned long long)head);
     /* No BO is read after this: the fault ends the session and unmaps its aliases. */
     const uint32_t lost = copy_job(api->context, stream_cpu + 8 * line, stream_va + 64 * line, head,
                                    data_va + 128, 2);
     CHECK(lost != 0, 52);
     CHECK(pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_FAULTY, 53);
-    say("G7q-a destroy: the load faulted (status %u) and the VM is faulty", lost);
+    say("%s destroy: the load faulted (status %u) and the VM is faulty", tag, lost);
 
     pan_kmod_bo_put(data);
     pan_kmod_bo_put(stream);
@@ -569,8 +587,8 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
 
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
-    if (KUMO_METAL_PROOF == 3)
-        return heap_cases(api);
+    if (KUMO_METAL_PROOF == 3 || KUMO_METAL_PROOF == 4)
+        return heap_cases(api, KUMO_METAL_PROOF == 4);
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -590,8 +608,12 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "G7q-a metal heap begin: live drv-gpu session, a tiler heap the GPU walks"
 #define FAILED_LINE "G7q-a metal heap FAILED at case %u"
 #define GREEN_LINE "G7q-a metal heap green: HeapCreate placed and linked the chunks the GPU walked, the context read zero, and HeapDestroy unmapped them"
+#elif KUMO_METAL_PROOF == 4
+#define BEGIN_LINE "G7q-c metal heap begin: live drv-gpu session, a tiler heap through the C bridge the GPU walks"
+#define FAILED_LINE "G7q-c metal heap FAILED at case %u"
+#define GREEN_LINE "G7q-c metal heap green: pan_kmod_kumo_heap_create placed and linked the chunks the GPU walked, and pan_kmod_kumo_heap_destroy unmapped them"
 #else
-#error "KUMO_METAL_PROOF must be 0, 1, 2 or 3"
+#error "KUMO_METAL_PROOF must be 0, 1, 2, 3 or 4"
 #endif
 
 extern unsigned kumo_metal_proof(void);

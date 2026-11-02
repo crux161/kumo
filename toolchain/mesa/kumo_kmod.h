@@ -2,6 +2,7 @@
 /*j744*/
 /*j745*/
 /*j751*/
+/*j757*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -40,6 +41,13 @@ int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
 uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *dev,
                               const struct kumo_gpu_native_request *request,
                               struct kumo_gpu_native_reply *out);
+/* G7q-c: TILER_HEAP_CREATE and _DESTROY for GL1's pan_csf.c and VK2's queue seams, through the
+ * same owner. request->vm is the logical VM's handle. Known loss poisons the device, as with
+ * every other native call. — TIMBERDOODLE */
+uint32_t pan_kmod_kumo_heap_create(struct pan_kmod_dev *dev,
+                                   const struct kumo_gpu_heap_request *request,
+                                   struct kumo_gpu_heap_info *out);
+uint32_t pan_kmod_kumo_heap_destroy(struct pan_kmod_dev *dev, uint32_t heap, uint64_t *bytes);
 extern const struct pan_kmod_ops kumo_kmod_ops;
 /* One property builder is shared by the report and native device publication. */
 uint32_t kumo_mesa_query_properties(const struct kumo_gpu_api *api, struct kumo_mesa_report *out,

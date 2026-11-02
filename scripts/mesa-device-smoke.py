@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j746
 #j747
 #j751
 #j752
 #j753
+#j757
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -18,8 +18,9 @@ TOOL = ROOT / "toolchain/mesa"
 OUT = ROOT / "build/proofs/g7o-d"
 GREEN = b"G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close"
 WX_GREEN = b"G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window"
-NATIVE_GREEN = b"G7p-c native C sync green: ABI 14, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
+NATIVE_GREEN = b"G7p-c native C sync green: ABI 15, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
 GROUP_GREEN = b"G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay"
+HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
 
 
 def run(command, **kwargs):
@@ -103,8 +104,11 @@ def main():
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--native-sync", action="store_true", help="select G7p-c's native C acceptance and proof directory")
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
+    parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     args = parser.parse_args()
-    elf = build(out=ROOT / "build/proofs/g7p-d" if args.group_state else ROOT / "build/proofs/g7p-c" if args.native_sync else OUT)
+    out = (ROOT / "build/proofs/g7q-c" if args.heaps else ROOT / "build/proofs/g7p-d" if args.group_state
+           else ROOT / "build/proofs/g7p-c" if args.native_sync else OUT)
+    elf = build(out=out)
     print(f"G7o-d native device compile/link green: {elf}", flush=True)
     if args.run:
         spec = importlib.util.spec_from_file_location("uefi_smoke", ROOT / "scripts/cxx-smoke.py")
@@ -116,6 +120,8 @@ def main():
         assert proof.count(WX_GREEN) == 1 and proof.index(WX_GREEN) < proof.index(GREEN)
         assert proof.count(NATIVE_GREEN) == 1 and proof.index(NATIVE_GREEN) < proof.index(GREEN)
         assert proof.count(GROUP_GREEN) == 1 and proof.index(GROUP_GREEN) < proof.index(GREEN)
+        assert proof.count(HEAP_GREEN) == 1 and proof.index(HEAP_GREEN) < proof.index(GREEN)
+        print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)
         print(NATIVE_GREEN.decode(), flush=True)
         print(WX_GREEN.decode(), flush=True)

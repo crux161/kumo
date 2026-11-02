@@ -2,6 +2,7 @@
 //j745
 //j751
 //j752
+//j757
 use super::*;
 use crate::{
     c, client::TransportError, Command, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
@@ -84,6 +85,23 @@ impl Transport for Wire {
                         Response::WaitArmed { point }
                     }
                 }
+                //j757
+                Command::HeapCreate(spec) => {
+                    assert_eq!(spec.vm, 1, "heaps always name the server VM");
+                    state.next += 1;
+                    let context_va = crate::HEAP_VA_START + u64::from(state.next) * 0x40_0000;
+                    Response::HeapCreated {
+                        heap: state.next,
+                        placement: crate::HeapPlacement {
+                            context_va,
+                            first_chunk_va: context_va + PAGE_BYTES,
+                        },
+                    }
+                }
+                Command::HeapDestroy { heap } => Response::HeapDestroyed {
+                    heap,
+                    bytes: 3 * PAGE_BYTES,
+                },
                 _ => panic!("unexpected request"),
             })
         };
@@ -634,8 +652,8 @@ fn native_callback_is_device_only_and_malformed_requests_clear_outputs_without_i
     let mut buffers = Buffers::new(&mut client, &mut mapper);
     c::with_buffer_api(&mut buffers, |api| assert!(api.native.is_none()));
     c::with_device_api(&mut buffers, |api| {
-        assert_eq!(api.version, 14);
-        assert_eq!(api.bytes, 120);
+        assert_eq!(api.version, 15);
+        assert_eq!(api.bytes, 136);
         let _vm = native_open(api);
         let before = state.borrow().calls.len();
         for request in [
@@ -999,4 +1017,159 @@ fn unreadable_watch_at_group_creation_closes_the_grant_and_latches_loss() {
         );
     });
     assert_eq!(state.borrow().closed, [700]);
+}
+
+//j757
+fn heap_request(vm: u32, chunk_bytes: u32, initial_chunks: u32, max_chunks: u32) -> c::HeapRequest {
+    c::HeapRequest {
+        vm,
+        chunk_bytes,
+        initial_chunks,
+        max_chunks,
+        target_in_flight: 65535,
+        flags: 0,
+    }
+}
+fn heap_create(api: &c::Api, request: c::HeapRequest) -> (u32, c::HeapInfo) {
+    let mut info = c::HeapInfo {
+        heap: u32::MAX,
+        reserved: u32::MAX,
+        context_va: u64::MAX,
+        first_chunk_va: u64::MAX,
+    };
+    let status = unsafe { api.heap_create.unwrap()(api.context, &request, &mut info) };
+    (status, info)
+}
+
+#[test]
+fn heap_callbacks_are_device_only_and_refuse_bad_shapes_without_io() {
+    let (state, mut client, mut mapper) = fixture();
+    c::with_api(&mut client, |api| {
+        assert!(api.heap_create.is_none() && api.heap_destroy.is_none())
+    });
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_buffer_api(&mut buffers, |api| assert!(api.heap_create.is_none()));
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        let before = state.borrow().calls.len();
+        let k128 = 128 * 1024;
+        for bad in [
+            c::HeapRequest {
+                flags: 1,
+                ..heap_request(vm, k128, 1, 1)
+            },
+            heap_request(vm, 64 * 1024, 1, 1),
+            heap_request(vm, k128 + 512, 1, 1),
+            heap_request(vm, k128, 0, 1),
+            heap_request(vm, k128, 2, 1),
+        ] {
+            let (status, info) = heap_create(api, bad);
+            assert_eq!(status, c::INVALID_REQUEST, "{bad:?}");
+            assert_eq!(info, c::HeapInfo::default());
+        }
+        // An unknown logical VM is refused locally too.
+        assert_eq!(
+            heap_create(api, heap_request(vm + 1, k128, 1, 1)).0,
+            c::UNKNOWN_BUFFER
+        );
+        let mut bytes = u64::MAX;
+        assert_eq!(
+            unsafe { api.heap_destroy.unwrap()(api.context, 7, &mut bytes) },
+            crate::c_sync::UNKNOWN_OBJECT
+        );
+        assert_eq!(bytes, 0);
+        assert_eq!(state.borrow().calls.len(), before);
+    });
+}
+
+#[test]
+fn heaps_cross_on_the_server_vm_cap_at_eight_and_return_their_bytes() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        let mut heaps = Vec::new();
+        for _ in 0..crate::MAX_HEAPS {
+            let (status, info) = heap_create(api, heap_request(vm, 2 * 1024 * 1024, 5, 64));
+            assert_eq!(status, c::OK);
+            assert!(crate::HeapPlacement {
+                context_va: info.context_va,
+                first_chunk_va: info.first_chunk_va
+            }
+            .valid());
+            assert_eq!(info.reserved, 0);
+            heaps.push(info.heap);
+        }
+        let before = state.borrow().calls.len();
+        assert_eq!(
+            heap_create(api, heap_request(vm, 128 * 1024, 1, 1)).0,
+            c::NO_MEMORY
+        );
+        assert_eq!(state.borrow().calls.len(), before);
+        let mut bytes = 0;
+        assert_eq!(
+            unsafe { api.heap_destroy.unwrap()(api.context, heaps[2], &mut bytes) },
+            c::OK
+        );
+        assert_eq!(bytes, 3 * PAGE_BYTES);
+        assert_eq!(
+            unsafe { api.heap_destroy.unwrap()(api.context, heaps[2], &mut bytes) },
+            crate::c_sync::UNKNOWN_OBJECT
+        );
+        assert_eq!(
+            heap_create(api, heap_request(vm, 128 * 1024, 1, 1)).0,
+            c::OK
+        );
+    });
+}
+
+#[test]
+fn destroying_the_logical_vm_destroys_its_heaps_first() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        let first = heap_create(api, heap_request(vm, 128 * 1024, 1, 2)).1.heap;
+        let second = heap_create(api, heap_request(vm, 128 * 1024, 1, 2)).1.heap;
+        let before = state.borrow().calls.len();
+        assert_eq!(unsafe { api.vm_destroy.unwrap()(api.context, vm) }, c::OK);
+        let calls = state.borrow().calls[before..].to_vec();
+        assert_eq!(
+            calls,
+            [
+                Command::HeapDestroy { heap: second },
+                Command::HeapDestroy { heap: first }
+            ]
+        );
+        // The new logical VM starts with no heaps.
+        let mut fresh = 0;
+        assert_eq!(
+            unsafe { api.vm_create.unwrap()(api.context, VA_START, VA_END - VA_START, &mut fresh) },
+            c::OK
+        );
+        let mut bytes = 0;
+        assert_eq!(
+            unsafe { api.heap_destroy.unwrap()(api.context, first, &mut bytes) },
+            crate::c_sync::UNKNOWN_OBJECT
+        );
+    });
+}
+
+#[test]
+fn a_lost_device_creates_no_heap() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        state.borrow_mut().fail = Some(Status::DeviceLost);
+        assert_ne!(
+            heap_create(api, heap_request(vm, 128 * 1024, 1, 1)).0,
+            c::OK
+        );
+        let before = state.borrow().calls.len();
+        let (status, info) = heap_create(api, heap_request(vm, 128 * 1024, 1, 1));
+        assert_eq!(status, c::DEVICE_LOST);
+        assert_eq!(info, c::HeapInfo::default());
+        assert_eq!(state.borrow().calls.len(), before);
+    });
 }

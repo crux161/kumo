@@ -2,6 +2,7 @@
 //j746
 //j751
 //j752
+//j757
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -85,8 +86,37 @@ struct Hardware {
     reject_submit: bool,
     status_vmo: Option<Handle>,
     report: kumo_gpu::GroupReport,
+    /// G7q-c: live modeled heaps. — TIMBERDOODLE
+    heaps: Vec<u32>,
 }
 impl Backend for Hardware {
+    //j757
+    fn create_heap(
+        &mut self,
+        id: u32,
+        spec: kumo_gpu::HeapSpec,
+    ) -> Result<kumo_gpu::HeapPlacement, Status> {
+        if self.mode != 15 {
+            return Err(Status::NotSupported);
+        }
+        self.heaps.push(id);
+        // The real driver's layout: the context page, then the chunks, the last one the head.
+        let context_va = kumo_gpu::HEAP_VA_START + u64::from(id) * 0x100_0000;
+        Ok(kumo_gpu::HeapPlacement {
+            context_va,
+            first_chunk_va: context_va
+                + PAGE_BYTES
+                + u64::from(spec.chunk_bytes) * u64::from(spec.initial_chunks - 1),
+        })
+    }
+    fn destroy_heap(&mut self, id: u32) -> Result<(), Status> {
+        let before = self.heaps.len();
+        self.heaps.retain(|heap| *heap != id);
+        if self.heaps.len() == before {
+            return Err(Status::NotFound);
+        }
+        Ok(())
+    }
     fn watch_group(&mut self) -> Result<kumo_gpu::GroupReport, Status> {
         if self.status_vmo.is_none() {
             self.status_vmo = Some(handle(
@@ -681,7 +711,7 @@ fn closed_status_cap_proof() {
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
     closed_status_cap_proof();
-    for mode in 0..15 {
+    for mode in 0..16 {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
             session: Session::default(),
@@ -694,6 +724,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 reject_submit: false,
                 status_vmo: None,
                 report: kumo_gpu::GroupReport::USABLE,
+                heaps: Vec::new(),
             },
             calls: Vec::new(),
             closed: 0,
@@ -746,7 +777,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         );
         assert!(server.hardware.status_vmo.is_none());
         assert!(server.wakes.is_empty());
-        if mode >= 9 {
+        if (9..15).contains(&mode) {
             assert!(!server
                 .calls
                 .iter()
@@ -787,6 +818,19 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         if matches!(mode, 4 | 7) {
             assert_eq!(server.release.buffers, 2);
             assert_eq!(server.release.bindings, 2);
+        }
+        if mode == 15 {
+            // Every refused shape stayed local; three heaps crossed and all three were destroyed,
+            // two of them by the logical VM's teardown.
+            let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            assert_eq!(count(|c| matches!(c, Command::HeapCreate(_))), 3);
+            assert_eq!(count(|c| matches!(c, Command::HeapDestroy { .. })), 3);
+            assert!(server
+                .calls
+                .iter()
+                .all(|c| !matches!(c, Command::HeapCreate(spec) if spec.vm != 1)));
+            assert!(server.hardware.heaps.is_empty());
+            assert_eq!(server.release.heaps, 0);
         }
     }
     0

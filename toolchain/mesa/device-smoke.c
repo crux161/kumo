@@ -3,7 +3,9 @@
 /*j746*/
 /*j751*/
 /*j752*/
+/*j757*/
 #include "kumo_kmod.h"
+#include <string.h>
 #include <stdio.h>
 #include <sys/mman.h>
 
@@ -91,14 +93,14 @@ static uint32_t native_prepare(struct pan_kmod_dev *dev, uint32_t vm, uint64_t g
 static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
     struct kumo_gpu_api bad = *api;
-    bad.version = 13;
+    bad.version = 14;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 100);
-    bad = *api; bad.bytes = 112;
+    bad = *api; bad.bytes = 128;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 101);
     bad = *api; bad.native = NULL;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 102);
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
-    CHECK(dev && api->version == 14 && api->bytes == 120, 103);
+    CHECK(dev && api->version == 15 && api->bytes == 136, 103);
     struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, UINT64_C(0x20000000), UINT64_C(0x10000000));
     CHECK(vm, 104);
     struct kumo_gpu_native_reply out;
@@ -214,8 +216,59 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
     return 0;
 }
 
+/* G7q-c: tiler heaps through the published device. — TIMBERDOODLE */
+static unsigned heap_cases(const struct kumo_gpu_api *api)
+{
+    struct kumo_gpu_api bad = *api;
+    bad.heap_create = NULL;
+    CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 170);
+    bad = *api; bad.heap_destroy = NULL;
+    CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 171);
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    CHECK(dev, 172);
+    struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, UINT64_C(0x20000000), UINT64_C(0x10000000));
+    CHECK(vm, 173);
+    const uint32_t mib2 = 2u * 1024 * 1024;
+    struct kumo_gpu_heap_request request = {vm->handle, mib2, 5, 64, 65535, 0};
+    struct kumo_gpu_heap_info info, empty = {0};
+    CHECK(pan_kmod_kumo_heap_create(dev, &request, &info) == KUMO_GPU_OK && info.heap == 1 &&
+          info.reserved == 0 && info.context_va >= UINT64_C(0x30000000) &&
+          info.first_chunk_va == info.context_va + 4096 + 4u * (uint64_t)mib2, 174);
+    const uint32_t first = info.heap;
+    /* Panthor's refusals never reach the wire, and leave a zeroed answer. */
+    struct kumo_gpu_heap_request refused[] = {
+        {vm->handle, mib2, 5, 64, 65535, 1},
+        {vm->handle, 64u * 1024, 1, 1, 1, 0},
+        {vm->handle, mib2, 0, 64, 1, 0},
+        {vm->handle, mib2, 5, 4, 1, 0},
+        {vm->handle + 1, mib2, 1, 1, 1, 0},
+    };
+    for (unsigned i = 0; i < sizeof refused / sizeof refused[0]; ++i) {
+        CHECK(pan_kmod_kumo_heap_create(dev, &refused[i], &info) != KUMO_GPU_OK, 175);
+        CHECK(!memcmp(&info, &empty, sizeof info), 176);
+    }
+    uint64_t bytes = 1;
+    CHECK(pan_kmod_kumo_heap_destroy(dev, 99, &bytes) == KUMO_GPU_UNKNOWN_OBJECT && bytes == 0, 177);
+    request.chunk_bytes = 128u * 1024; request.initial_chunks = 1; request.max_chunks = 2;
+    CHECK(pan_kmod_kumo_heap_create(dev, &request, &info) == KUMO_GPU_OK && info.heap == 2, 178);
+    CHECK(pan_kmod_kumo_heap_destroy(dev, first, &bytes) == KUMO_GPU_OK &&
+          bytes == 4096 + 5u * (uint64_t)mib2, 179);
+    CHECK(pan_kmod_kumo_heap_destroy(dev, first, &bytes) == KUMO_GPU_UNKNOWN_OBJECT, 180);
+    /* The logical VM's teardown destroys heap 2; the next VM starts with none. */
+    pan_kmod_vm_destroy(vm);
+    vm = pan_kmod_vm_create(dev, 0, UINT64_C(0x20000000), UINT64_C(0x10000000));
+    CHECK(vm && vm->handle == 2, 181);
+    CHECK(pan_kmod_kumo_heap_destroy(dev, 2, &bytes) == KUMO_GPU_UNKNOWN_OBJECT, 182);
+    request.vm = vm->handle;
+    CHECK(pan_kmod_kumo_heap_create(dev, &request, &info) == KUMO_GPU_OK && info.heap == 3, 183);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
+
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
+    if (mode == 15) return heap_cases(api);
     if (mode >= 9) return native_sync_cases(api, mode);
     struct kumo_gpu_api bad = *api;
     bad.version = 11;
@@ -318,7 +371,8 @@ int main(void)
     unsigned failed = kumo_mesa_device_proof();
     if (failed) { printf("G7o-d native device FAILED at case %u\n", failed); return 1; }
     puts("G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay");
-    puts("G7p-c native C sync green: ABI 14, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
+    puts("G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back");
+    puts("G7p-c native C sync green: ABI 15, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
     puts("G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window");
     puts("G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close");
     return 0;

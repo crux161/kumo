@@ -1,8 +1,8 @@
-//j744
 //j745
 //j747
 //j751
 //j752
+//j757
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
@@ -122,6 +122,8 @@ pub struct Buffers<'a, T: Transport, M: Mapper<T::Handle>> {
     bindings: Vec<Binding>,
     pub(crate) native: Option<crate::c_sync::Context<T::Handle>>,
     pub(crate) group_report: Option<(u64, crate::GroupReport)>,
+    /// G7q-c: live tiler heaps, all owned by the current logical VM. — TIMBERDOODLE
+    heaps: Vec<u32>,
 }
 
 impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
@@ -136,6 +138,7 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             bindings: Vec::new(),
             native: None,
             group_report: None,
+            heaps: Vec::new(),
         }
     }
 
@@ -234,6 +237,8 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             self.client.close_buffer_handle(record.buffer.handle);
         }
         self.bindings.clear();
+        // The server releases a closed session's heaps with its reset; nothing to send.
+        self.heaps.clear();
         self.vm = None;
         self.device_open = false;
     }
@@ -405,6 +410,12 @@ impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
     }
     pub fn destroy_native_vm(&mut self, id: u32) -> Result<(), Error> {
         self.native_vm(id)?;
+        // A VM's heaps go first, as Panthor's VM teardown takes its heap pool. A retry
+        // resumes at the first heap still live. — TIMBERDOODLE
+        while let Some(heap) = self.heaps.last().copied() {
+            self.client.destroy_heap(heap)?;
+            self.heaps.pop();
+        }
         // A retry resumes at the first remaining binding; successful invalidations are
         // never replayed. The C void destructor makes any failure terminal. — KESTREL
         while let Some(binding) = self.bindings.last().copied() {
@@ -417,6 +428,55 @@ impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
         }
         self.vm = None;
         Ok(())
+    }
+}
+
+//j757
+impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
+    /// G7q-c: one tiler heap for logical VM `vm`, in TILER_HEAP_CREATE's shape. The server's VM
+    /// is always 1; the logical VM decides ownership, so destroying it destroys its heaps.
+    /// Shapes Panthor refuses, and an eighth live heap, fail here with no I/O. — TIMBERDOODLE
+    pub fn create_native_heap(
+        &mut self,
+        vm: u32,
+        chunk_bytes: u32,
+        initial_chunks: u32,
+        max_chunks: u32,
+        target_in_flight: u32,
+    ) -> Result<(u32, crate::HeapPlacement), Error> {
+        self.native_vm(vm)?;
+        let spec = crate::HeapSpec {
+            vm: 1,
+            chunk_bytes,
+            initial_chunks,
+            max_chunks,
+            target_in_flight,
+        };
+        if !spec.valid_shape() {
+            return Err(Error::InvalidRequest);
+        }
+        if self.heaps.len() >= crate::MAX_HEAPS {
+            return Err(Error::NoMemory);
+        }
+        self.heaps.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        let created = self.client.create_heap(spec)?;
+        self.heaps.push(created.0);
+        Ok(created)
+    }
+
+    /// Release one heap this owner created; returns the bytes the budget got back.
+    pub fn destroy_native_heap(&mut self, heap: u32) -> Result<u64, Error> {
+        if !self.device_ready() {
+            return Err(ClientError::DeviceLost.into());
+        }
+        let index = self
+            .heaps
+            .iter()
+            .position(|live| *live == heap)
+            .ok_or(Error::NotFound)?;
+        let bytes = self.client.destroy_heap(heap)?;
+        self.heaps.swap_remove(index);
+        Ok(bytes)
     }
 }
 

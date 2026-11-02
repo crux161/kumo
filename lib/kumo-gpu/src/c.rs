@@ -1,8 +1,8 @@
-//j742
 //j744
 //j745
 //j751
 //j752
+//j757
 
 //! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
 //! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
@@ -12,7 +12,7 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -105,7 +105,35 @@ pub struct Api {
             *mut crate::c_sync::Reply,
         ) -> u32,
     >,
+    /// ABI 15 (G7q-c): device-scope tiler heaps.
+    pub heap_create:
+        Option<unsafe extern "C" fn(*mut c_void, *const HeapRequest, *mut HeapInfo) -> u32>,
+    pub heap_destroy: Option<unsafe extern "C" fn(*mut c_void, u32, *mut u64) -> u32>,
 }
+
+//j757
+/// TILER_HEAP_CREATE's fields for the device's logical VM; `flags` must be zero. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct HeapRequest {
+    pub vm: u32,
+    pub chunk_bytes: u32,
+    pub initial_chunks: u32,
+    pub max_chunks: u32,
+    pub target_in_flight: u32,
+    pub flags: u32,
+}
+
+/// What TILER_HEAP_CREATE returns: the heap ID, its context VA and its first chunk's VA.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct HeapInfo {
+    pub heap: u32,
+    pub reserved: u32,
+    pub context_va: u64,
+    pub first_chunk_va: u64,
+}
+const _: () = assert!(size_of::<HeapRequest>() == 24 && size_of::<HeapInfo>() == 24);
 
 /// The C consumer may call query synchronously during `f` only. It must not retain any
 /// pointer, reenter the client, race another call or unwind across C. Calling the raw
@@ -128,6 +156,8 @@ pub fn with_api<T: Transport, R>(client: &mut Client<T>, f: impl FnOnce(&Api) ->
         vm_unbind: None,
         device_status: None,
         native: None,
+        heap_create: None,
+        heap_destroy: None,
     })
 }
 
@@ -154,6 +184,8 @@ pub fn with_buffer_api<T: Transport, M: crate::bo::Mapper<T::Handle>, R>(
         vm_unbind: None,
         device_status: None,
         native: None,
+        heap_create: None,
+        heap_destroy: None,
     })
 }
 
@@ -172,9 +204,73 @@ pub fn with_device_api<T: crate::client::SessionTransport, M: crate::bo::Mapper<
     api.vm_unbind = Some(vm_unbind::<T, M>);
     api.device_status = Some(device_status::<T, M>);
     api.native = Some(crate::c_sync::callback::<T, M>);
+    api.heap_create = Some(heap_create::<T, M>);
+    api.heap_destroy = Some(heap_destroy::<T, M>);
     let result = f(&api);
     buffers.close_device();
     result
+}
+//j757
+unsafe extern "C" fn heap_create<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    request: *const HeapRequest,
+    out: *mut HeapInfo,
+) -> u32 {
+    if context.is_null() || request.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    // Every failure leaves a zeroed answer, so C never reads a stale heap ID.
+    unsafe { out.write(HeapInfo::default()) };
+    let request = unsafe { *request };
+    if request.flags != 0 {
+        return INVALID_REQUEST;
+    }
+    match unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }.create_native_heap(
+        request.vm,
+        request.chunk_bytes,
+        request.initial_chunks,
+        request.max_chunks,
+        request.target_in_flight,
+    ) {
+        Ok((heap, placement)) => {
+            unsafe {
+                out.write(HeapInfo {
+                    heap,
+                    reserved: 0,
+                    context_va: placement.context_va,
+                    first_chunk_va: placement.first_chunk_va,
+                })
+            };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn heap_destroy<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    heap: u32,
+    bytes: *mut u64,
+) -> u32 {
+    if context.is_null() || bytes.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { bytes.write(0) };
+    match unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }.destroy_native_heap(heap)
+    {
+        Ok(released) => {
+            unsafe { bytes.write(released) };
+            OK
+        }
+        // A heap this owner never created, or already destroyed, is an unknown object.
+        Err(crate::bo::Error::NotFound) => crate::c_sync::UNKNOWN_OBJECT,
+        Err(error) => bo_error(error),
+    }
 }
 unsafe extern "C" fn device_open<
     T: crate::client::SessionTransport,
@@ -372,7 +468,7 @@ unsafe extern "C" fn buffer_unmap<T: Transport, M: crate::bo::Mapper<T::Handle>>
     let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
     buffers.unmap(id).map_or_else(bo_error, |()| OK)
 }
-const _: () = assert!(size_of::<Api>() == 120);
+const _: () = assert!(size_of::<Api>() == 136);
 const _: () = assert!(core::mem::offset_of!(Api, native) == 112);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_create) == 24);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_destroy) == 32);

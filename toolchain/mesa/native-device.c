@@ -3,6 +3,7 @@
 /*j746*/
 /*j751*/
 /*j752*/
+/*j757*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -56,7 +57,7 @@ static bool api_valid(const struct kumo_gpu_api *api)
            api->context && api->query && api->buffer_create && api->buffer_destroy &&
            api->buffer_map && api->buffer_unmap && api->device_open && api->device_close &&
            api->vm_create && api->vm_destroy && api->vm_bind && api->vm_unbind &&
-           api->device_status && api->native;
+           api->device_status && api->native && api->heap_create && api->heap_destroy;
 }
 uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *base,
                              const struct kumo_gpu_native_request *request,
@@ -73,6 +74,35 @@ uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *base,
     uint32_t status = dev->api.native(dev->api.context, request, out);
     /* Loss is terminal across BO, VM and sync callbacks. Closing retains the server's
      * reset-before-DMA-release obligation; C never fabricates quiescence. — MILVUS */
+    if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
+    return status;
+}
+uint32_t pan_kmod_kumo_heap_create(struct pan_kmod_dev *base,
+                                   const struct kumo_gpu_heap_request *request,
+                                   struct kumo_gpu_heap_info *out)
+{
+    if (!out) return KUMO_GPU_BAD_ARGUMENT;
+    *out = (struct kumo_gpu_heap_info){0};
+    if (!request) return KUMO_GPU_BAD_ARGUMENT;
+    struct kumo_device *dev = device(base);
+    if (!dev) return KUMO_GPU_INVALID_REQUEST;
+    if (!ready(dev)) {
+        poison(dev); return KUMO_GPU_DEVICE_LOST;
+    }
+    uint32_t status = dev->api.heap_create(dev->api.context, request, out);
+    if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
+    return status;
+}
+uint32_t pan_kmod_kumo_heap_destroy(struct pan_kmod_dev *base, uint32_t heap, uint64_t *bytes)
+{
+    if (!bytes) return KUMO_GPU_BAD_ARGUMENT;
+    *bytes = 0;
+    struct kumo_device *dev = device(base);
+    if (!dev) return KUMO_GPU_INVALID_REQUEST;
+    if (!ready(dev)) {
+        poison(dev); return KUMO_GPU_DEVICE_LOST;
+    }
+    uint32_t status = dev->api.heap_destroy(dev->api.context, heap, bytes);
     if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
     return status;
 }

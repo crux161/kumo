@@ -2,10 +2,11 @@
 #j747
 #j753
 #j754
+#j757
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
-  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout or g7q-a: the cases the client runs.
+  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a or g7q-c: the cases the client runs.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -80,6 +81,21 @@ PROOFS = {
                "context read zero, and HeapDestroy unmapped them"),
         # drv-gpu logs the destroy just before the client's line, so the window opens earlier.
         after="G7q-a context: the GPU read its 32 bytes",
+        driver=["drv-gpu: client heap 1 destroyed; 4 pieces unmapped",
+                "drv-gpu: AS1 fault at VA=0x0000000030041000: TRANSLATION_FAULT",
+                "drv-gpu: containment reset=ok"],
+        absent=[]),
+    # G7q-c (J757): the same walk with the heap created and destroyed through the C bridge.
+    "g7q-c": dict(
+        define=4, out="g7q-c-metal", begin="G7q-c metal heap begin",
+        lines=["G7q-c heap: 3 chunks of 131072 bytes, context 0x30000000, head 0x30041000",
+               "G7q-c walk: the GPU followed 3 links from the head through 0x30021000 and 0x30001000",
+               "G7q-c context: the GPU read its 32 bytes at 0x30000000, all zero",
+               "G7q-c destroy: 397312 bytes returned",
+               "G7q-c destroy: the load faulted"],
+        green=("G7q-c metal heap green: pan_kmod_kumo_heap_create placed and linked the chunks the GPU "
+               "walked, and pan_kmod_kumo_heap_destroy unmapped them"),
+        after="G7q-c context: the GPU read its 32 bytes",
         driver=["drv-gpu: client heap 1 destroyed; 4 pieces unmapped",
                 "drv-gpu: AS1 fault at VA=0x0000000030041000: TRANSLATION_FAULT",
                 "drv-gpu: containment reset=ok"],

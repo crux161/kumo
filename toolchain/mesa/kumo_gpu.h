@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j742*/
 /*j744*/
 /*j745*/
 /*j751*/
 /*j752*/
+/*j757*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -19,7 +19,7 @@
  * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
-#define KUMO_GPU_API_VERSION 14u
+#define KUMO_GPU_API_VERSION 15u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -145,6 +145,19 @@ struct kumo_gpu_native_reply {
     uint64_t value;
 };
 
+/* ABI 15 (G7q-c): one tiler heap per request, in DRM_PANTHOR_TILER_HEAP_CREATE's shape, for
+ * the device's logical VM. Panthor's rules apply: at least one initial chunk, max_chunks no
+ * fewer, and a page-aligned chunk size in [128 KiB, 8 MiB]. flags must be zero. The driver
+ * owns and maps the memory, so no handle or CPU pointer comes back. Destroying the logical VM
+ * destroys its heaps first. An unknown heap is KUMO_GPU_UNKNOWN_OBJECT. — TIMBERDOODLE */
+struct kumo_gpu_heap_request {
+    uint32_t vm, chunk_bytes, initial_chunks, max_chunks, target_in_flight, flags;
+};
+struct kumo_gpu_heap_info {
+    uint32_t heap, reserved;
+    uint64_t context_va, first_chunk_va;
+};
+
 struct kumo_gpu_api {
     uint32_t version;
     uint32_t bytes;
@@ -164,6 +177,9 @@ struct kumo_gpu_api {
     uint32_t (*device_status)(void *context);
     uint32_t (*native)(void *context, const struct kumo_gpu_native_request *request,
                        struct kumo_gpu_native_reply *out);
+    uint32_t (*heap_create)(void *context, const struct kumo_gpu_heap_request *request,
+                            struct kumo_gpu_heap_info *out);
+    uint32_t (*heap_destroy)(void *context, uint32_t heap, uint64_t *bytes);
 };
 
 #define KUMO_MESA_INCOMPLETE 1u
@@ -290,8 +306,13 @@ _Static_assert(sizeof(struct kumo_gpu_buffer_info) == 16, "buffer layout");
 _Static_assert(offsetof(struct kumo_gpu_buffer_info, bytes) == 8, "buffer alignment");
 _Static_assert(sizeof(struct kumo_gpu_vm_binding) == 32, "VM binding layout");
 #if UINTPTR_MAX == UINT64_MAX
-_Static_assert(sizeof(struct kumo_gpu_api) == 120, "64-bit callback layout");
+_Static_assert(sizeof(struct kumo_gpu_api) == 136, "64-bit callback layout");
 _Static_assert(offsetof(struct kumo_gpu_api, native) == 112, "native callback offset");
+_Static_assert(offsetof(struct kumo_gpu_api, heap_create) == 120, "heap create offset");
+_Static_assert(offsetof(struct kumo_gpu_api, heap_destroy) == 128, "heap destroy offset");
+_Static_assert(sizeof(struct kumo_gpu_heap_request) == 24, "heap request layout");
+_Static_assert(sizeof(struct kumo_gpu_heap_info) == 24, "heap info layout");
+_Static_assert(offsetof(struct kumo_gpu_heap_info, context_va) == 8, "heap info alignment");
 _Static_assert(sizeof(struct kumo_gpu_native_point) == 16, "native point layout");
 _Static_assert(sizeof(struct kumo_gpu_native_job) == 24, "native job layout");
 _Static_assert(sizeof(struct kumo_gpu_native_request) == 72, "native request layout");
