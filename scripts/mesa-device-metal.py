@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-#j758
 #j759
 #j762
 #j765
 #j768
-"""G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
-client, and check a serial log of its metal run.
+#j769
+"""Build live Mesa device and static GLES2 clients, stage them in the Orange Pi GPU slot,
+and check a serial log of the hardware run.
 
-  --proof NAME  select the native device, sync, heap, GL screen or GL context cases.
+  --proof NAME  select the native device, sync, heap, GL lifecycle or static GLES2 client.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -41,6 +41,15 @@ SLOT = b"bin/gpu-client"
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
 PROOFS = {
+    "gl1-f": dict(
+        cases="gl-client", runtime="device-metal", defines=["-DKUMO_GL_CLIENT_MAIN=1"],
+        out="gl1-f-metal", gl=True,
+        begin="GL1-f metal client begin",
+        lines=["GL1-f renderer: Mali-G610 MC4 (Panfrost)", "GL1-f version: OpenGL ES ",
+               "GL1-f finish: public glFinish returned with GL_NO_ERROR and the native device live",
+               "GL1-f destroy: context unbound, drawable and display destroyed"],
+        green="GL1-f metal client green: public GLES2 renderer names Mali-G610, glFinish completed, all frontend resources destroyed",
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point 1 failed"], after=None),
     "gl1-e": dict(
         define=9, out="gl1-e-metal", gl=True,
         begin="GL1-e metal frontend begin",
@@ -251,8 +260,10 @@ def main():
     spec = importlib.util.spec_from_file_location("device_smoke", ROOT / "scripts/mesa-device-smoke.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    elf = module.build("device-metal", ROOT / "build/proofs" / proof["out"], TOOL / "device-metal-crt0.S",
-                       defines=[f"-DKUMO_METAL_PROOF={proof['define']}"], gl=proof.get("gl", False))
+    defines = proof["defines"] if "defines" in proof else [f"-DKUMO_METAL_PROOF={proof['define']}"]
+    elf = module.build(proof.get("cases", "device-metal"), ROOT / "build/proofs" / proof["out"],
+                       TOOL / "device-metal-crt0.S", defines=defines, gl=proof.get("gl", False),
+                       runtime=proof.get("runtime"))
     print(f"{args.proof} metal client compile/link green: {elf} sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}")
     if args.stage:
         stage(args.stage, elf)

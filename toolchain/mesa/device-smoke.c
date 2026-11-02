@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j760*/
 /*j761*/
 /*j762*/
 /*j765*/
 /*j768*/
+/*j769*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -349,12 +349,13 @@ extern unsigned kumo_gl_batch_cases(const struct kumo_gpu_api *api, void (*say)(
 extern unsigned kumo_gl_context_sync_cases(const struct kumo_gpu_api *api);
 extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 extern unsigned kumo_gl_frontend_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+extern unsigned kumo_gl_client_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 static void say_line(const char *line) { puts(line); fflush(stdout); }
 #endif
 unsigned kumo_mesa_device_modes(void)
 {
 #ifdef KUMO_GL_SCREEN
-    return 22;
+    return 23;
 #else
     return 17;
 #endif
@@ -363,6 +364,7 @@ unsigned kumo_mesa_device_modes(void)
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
 #ifdef KUMO_GL_SCREEN
+    if (mode == 22) return kumo_gl_client_cases(api, say_line);
     if (mode == 21) return kumo_gl_frontend_cases(api, say_line);
     if (mode == 20) return kumo_gl_batch_cases(api, say_line, kumo_mesa_native_control);
     if (mode == 19) return kumo_gl_context_init_cases(api, say_line);

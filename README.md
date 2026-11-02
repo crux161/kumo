@@ -1,6 +1,7 @@
 <!-- j458 -->
 <!-- j764 -->
 <!-- j768 -->
+<!-- j769 -->
 
 <p align="center">
   <img src="resources/kumo_full-color.jpg" alt="KUMO cloud logo" width="180" />
@@ -43,12 +44,12 @@ development.
 | Applications | Native Rust programs, relibc-backed C utilities, the unmodified Kilo editor, a Lua REPL, and a bitmap viewer. C++ runtime and TLS proofs also run. |
 | Storage | Initrd files, writable FAT-backed scratch storage, and USB mass-storage/FAT32 access on Orange Pi. |
 | Display | Software framebuffer views in QEMU; native HDMI at 1600×900 on Orange Pi, owned scanout buffers, vblank flips, cursor/input routing, and view title bars. |
-| Mali-G610 | Native command submission and compute-to-display proofs on Orange Pi. Gallium clear/fence/readback and Mesa GLES2 context lifecycles are proven on the GPU. |
+| Mali-G610 | Native command submission and compute-to-display proofs on Orange Pi. Gallium clear/fence/readback and a static GLES2 client's renderer query and `glFinish` are proven on the GPU. |
 | x86_64 | QEMU userspace, private address spaces, interrupt delivery, preemption, and per-thread x87/SSE/AVX state preservation. |
 
-The Mesa work is progressing toward native OpenGL/GLES and Vulkan. KUMO's GL frontend can
-make a Mesa GLES2 context current with color/depth attachments. The next GL gate is a
-standalone static GLES2 client; rendering through public GL calls follows. A usable
+The Mesa work is progressing toward native OpenGL/GLES and Vulkan. A static GLES2 client
+now creates a context with color/depth attachments, queries the Mali renderer, and completes
+`glFinish` on hardware. The next GL gate is compute output and clear/readback through GL calls. A usable
 GL/Vulkan application stack is still ahead. See the [Mesa integration notes](toolchain/mesa/README.md)
 and [Mali compute kernels](shaders/mali/README.md).
 

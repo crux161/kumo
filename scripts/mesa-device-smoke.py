@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j760
 #j761
 #j762
 #j765
 #j768
+#j769
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -30,6 +30,10 @@ FRONTEND_LINES = [b"GL1-e drawable: owned 64x48 RGBA8 color and Z24/S8 depth/ste
                   b"GL1-e current: Mesa's GLES2 state-tracker context made current; glthread and threaded pipe off",
                   b"GL1-e front: validate supplied the attachments; native flush completed before the callback; callback refusal propagated",
                   b"GL1-e destroy: current context unbound, drawable and display released, session context recreation refused"]
+CLIENT_LINES = [b"GL1-f renderer: Mali-G610 MC4 (Panfrost)",
+                b"GL1-f version: OpenGL ES ",
+                b"GL1-f finish: public glFinish returned with GL_NO_ERROR and the native device live",
+                b"GL1-f destroy: context unbound, drawable and display destroyed"]
 BATCH_LINES = [b"GL1-d poll: a zero-timeout fence_finish found the batch still pending, and returned its wake",
                b"GL1-d fence: fence_finish completed natively, by ARM, WAIT and ARM again",
                b"GL1-d readback: 0 of 4096 pixels differ from 0xdeadbeef (the modeled service runs no GPU)",
@@ -113,13 +117,16 @@ subprocess.run(['clang-22', *flags, '-I', str(mesa / 'drm'), '-Wall', '-Wextra',
     return [deps / "kumo_gl.o", deps / "gl-frontend.o", deps / "drm-refusal.o", *archives, ROOT / "build/mesa-drivers/result/cxx/libkumo-cxx.a"]
 
 
-def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=(), gl=False):
-    """Build one static proof ELF from `cases`.c and `cases`.rs over the real bridge. The
-    G7o-f metal client reuses it with its own cases, startup file and output. — TIMBERDOODLE
+def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=(), gl=False, runtime=None):
+    """Build a static ELF from `cases`.c and a Rust runtime (default: `cases`.rs).
+    The GLES2 client reuses the metal session bootstrap with its own main. — KESTREL
     `defines` go to the cases file only, never the shared bridge: G7p-e selects its proof
     with one. — TIMBERDOODLE
     `gl` also links Gallium's panfrost driver, the frontend and lifecycle cases, the inventory's
     GL archives (G7k), drm-refusal (G7m) and the C++ runtime (G7l). — KESTREL"""
+    # The standalone GLES client shares the established GPU-slot bootstrap without
+    # copying its Rust session owner; existing proof targets keep their own runtime. — KESTREL
+    runtime = runtime or cases
     out.mkdir(parents=True, exist_ok=True)
     # This verifies the source/header pins, prepares native headers, builds the same C
     # bridge and checks its measured dependency closure; no download. — KESTREL
@@ -137,6 +144,12 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     for include in ["include", "src", "src/panfrost", "src/panfrost/lib", "src/panfrost/model"]:
         flags.extend(["-isystem", mesa / include])
     flags.extend(["-isystem", native / "generated"])
+    mode = subprocess.check_output(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", "kumo-mesa-drivers-g7k"], text=True).strip()
+    assert mode == "none", "native device build container must remain offline"
+    gl_inputs = gl_dependencies(out) if gl else []
+    if gl:
+        flags.extend(["-isystem", mesa / "src/gallium/include",
+                      "-isystem", out / "gl-deps/generated"])
     for name in ["native-device", cases]:
         run([cc, *flags, *(defines if name == cases else ()), "-Wno-unused-parameter", "-c",
              TOOL / f"{name}.c", "-o", out / f"{name}.o"])
@@ -149,10 +162,8 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     run(["rustc", "--edition=2021", "--crate-type=staticlib", "--target=aarch64-unknown-none",
          "-C", "panic=abort", "-C", "opt-level=2", "--extern", f"kumo_gpu={deps / 'libkumo_gpu.rlib'}",
          "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}", *(["--extern", f"drv_gpu={deps / 'libdrv_gpu.rlib'}"] if cases == "device-smoke" else []), "-L", f"dependency={deps / 'deps'}",
-         TOOL / f"{cases}.rs", "-o", out / "libdevice.a"])
+         TOOL / f"{runtime}.rs", "-o", out / "libdevice.a"])
     run([cc, "--target=aarch64-unknown-none", "-c", crt0, "-o", out / "crt0.o"])
-    mode = subprocess.check_output(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", "kumo-mesa-drivers-g7k"], text=True).strip()
-    assert mode == "none", "native device build container must remain offline"
     # Mesa's exported archives are thin. Materialize their real cached members, rather
     # than using dangling host paths or replacing the generic Mesa lifecycle. — KESTREL
     materialize = """from pathlib import Path
@@ -169,12 +180,10 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     run(["docker", "exec", "kumo-mesa-drivers-g7k", "python3", "-c", materialize])
     for name in ['kmod', 'util', 'c11']:
         run(["docker", "cp", f"kumo-mesa-drivers-g7k:/output/device-deps/{name}.a", out / f"{name}.a"])
-    gl_inputs = []
     gl_objects = []
     if gl:
-        gl_inputs = gl_dependencies(out)
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-context"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -197,8 +206,8 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     for line in undefined.splitlines():
         fields = line.split()
         assert len(fields) == 2 and fields[0] == "w" and fields[1] in optional, line
-    run(["rustfmt", "--edition", "2021", "--check", TOOL / f"{cases}.rs", TOOL / "native.rs"])
-    paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{cases}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
+    run(["rustfmt", "--edition", "2021", "--check", TOOL / f"{runtime}.rs", TOOL / "native.rs"])
+    paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{runtime}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
@@ -219,7 +228,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen, context, batch and frontend proofs (modes 17-21)")
+                        help="also link Gallium and run its screen, context, batch, frontend and GLES2 client proofs (modes 17-22)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -262,6 +271,13 @@ def main():
             assert at < proof.index(GREEN)
             assert b"GL1-e model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=1" in proof
             print("GL1-e frontend green: real Mesa GLES2 current context, color/depth validation, completed flush callback, lifecycle refusals and clean teardown; modeled service", flush=True)
+            at = 0
+            for line in CLIENT_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            assert b"GL1-f model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=1" in proof
+            print("GL1-f GLES2 client green: public renderer/version queries, glFinish, native device status and clean teardown; modeled service", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

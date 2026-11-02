@@ -1,9 +1,49 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j761 -->
 <!-- j762 -->
 <!-- j763 -->
 <!-- j765 -->
 <!-- j768 -->
+<!-- j769 -->
+
+## GL1-f: the static GLES2 client — GL1 complete
+
+[gl-client.c](gl-client.c) is a standalone static KUMO application with its own `main`.
+It opens Gallium's native screen, uses the KUMO frontend to create/bind a context and
+drawable, calls public GLES2 `glGetString`, `glGetError` and `glFinish`, then destroys the
+frontend resources. The C application uses `<GLES2/gl2.h>` and no private Mesa GL context
+or dispatch calls. It reuses the existing Rust GPU-slot bootstrap/session owner, keeping
+its native authority in the one granted session.
+
+`mesa-device-metal.py --proof gl1-f` builds `build/proofs/gl1-f-metal/gl-client`, an AArch64
+ET_EXEC with TLS and no interpreter or dynamic segment. The frontend, Mesa state tracker,
+glapi, panfrost and native bridge are statically linked. `--stage` builds the base Orange Pi
+image at console level 5, then packages the ELF in a separate candidate's `bin/gpu-client`
+slot. Serving or installing that candidate is a separate step. QEMU mode 22 runs the same
+application body against the modeled completion producer;
+all 23 device modes pass. No rendering job is submitted after Gallium's initialization.
+
+The standalone ELF passed on the Orange Pi (J769):
+
+```text
+GL1-f renderer: Mali-G610 MC4 (Panfrost)
+GL1-f version: OpenGL ES 3.1 Mesa 26.2.5
+GL1-f finish: public glFinish returned with GL_NO_ERROR and the native device live
+GL1-f destroy: context unbound, drawable and display destroyed
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+This is an entry-point/lifecycle proof; the reported version is not a conformance result.
+The loaded 26,552,495-byte initrd and its client matched the staged hashes. The original
+served tree and all 88 manifest entries were restored, and pxehost/tio stopped. Evidence:
+`build/proofs/gl1-f-metal/metal-tio.log`. **GL1 is closed. Next is GL2: runtime compute
+output into an SSBO, then GL clear/readback, each checked on Mali.** — KESTREL, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-metal.py --proof gl1-f
+python3 scripts/mesa-device-metal.py --proof gl1-f --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl1-f --check <tio-log>
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+```
 
 ## GL1-e: the KUMO GL frontend
 

@@ -1,8 +1,8 @@
-//j759
 //j761
 //j762
 //j765
 //j768
+//j769
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -459,7 +459,7 @@ impl Transport for Wire {
             id: request.id,
             result,
         });
-        let complete = (matches!(server.hardware.mode, 19 | 21)
+        let complete = (matches!(server.hardware.mode, 19 | 21 | 22)
             || server.hardware.mode == 20 && !server.hold)
             && matches!(result, Ok(Response::WaitArmed { .. }));
         drop(server);
@@ -944,7 +944,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 .all(|va| va % PAGE_BYTES == 0
                     && (kumo_gpu::VA_START..kumo_gpu::VA_END).contains(va)));
         }
-        if matches!(mode, 17 | 19 | 20 | 21) {
+        if matches!(mode, 17 | 19 | 20 | 21 | 22) {
             // GL1-d: Gallium frees every BO with a deferred unmap that now crosses, so each
             // binding it made is explicitly unbound before its buffer goes. — TIMBERDOODLE
             let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
@@ -952,13 +952,14 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             assert!(binds > 0);
             assert_eq!(count(|c| matches!(c, Command::VmUnbind(_))), binds);
         }
-        if mode == 21 {
+        if matches!(mode, 21 | 22) {
             // The frontend's GLES2 constructor submits the real init job. Merely making
             // current and flushing an untouched drawable adds no rendering job. — KESTREL
             let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            let label = if mode == 21 { b"GL1-e\0" } else { b"GL1-f\0" };
             unsafe {
-                printf(b"GL1-e model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu submits=%u\n\0".as_ptr(),
-                       server.release.buffers, server.release.bindings, server.release.waits,
+                printf(b"%s model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu submits=%u\n\0".as_ptr(),
+                       label.as_ptr(), server.release.buffers, server.release.bindings, server.release.waits,
                        server.release.heaps, server.release.bytes,
                        count(|c| matches!(c, Command::Submit(_))) as u32);
             }
