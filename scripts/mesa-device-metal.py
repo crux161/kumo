@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-#j747
 #j753
 #j754
 #j757
 #j758
+#j759
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
-  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a, g7q-c or gl1-a: the cases the client runs.
+  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a, g7q-c, gl1-a or gl1-b: the cases the client runs.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -113,6 +113,15 @@ PROOFS = {
         green=("GL1-a metal streams green: Submit ran streams from cached and uncached writable no-execute "
                "bindings, a rewritten line ran its new words, and a straddling stream was refused"),
         after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
+    # GL1-b (J759): Gallium's screen over the native device; the client links Gallium. — TIMBERDOODLE
+    "gl1-b": dict(
+        define=6, out="gl1-b-metal", gl=True, begin="GL1-b metal screen begin",
+        lines=["GL1-b screen: Mali-G610 MC4 (Panfrost) from Mesa, over KUMO's native device with no DRM fd",
+               "GL1-b caps: GLSL", "GL1-b resource: a 64x64 RGBA8 render-target texture created",
+               "GL1-b destroy: the texture and the screen are gone"],
+        green=("GL1-b metal screen green: Gallium's panfrost screen came up on Mali over the native device, "
+               "its caps read, a texture made, and everything destroyed"),
+        after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
 }
 
 
@@ -209,7 +218,7 @@ def main():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     elf = module.build("device-metal", ROOT / "build/proofs" / proof["out"], TOOL / "device-metal-crt0.S",
-                       defines=[f"-DKUMO_METAL_PROOF={proof['define']}"])
+                       defines=[f"-DKUMO_METAL_PROOF={proof['define']}"], gl=proof.get("gl", False))
     print(f"{args.proof} metal client compile/link green: {elf} sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}")
     if args.stage:
         stage(args.stage, elf)

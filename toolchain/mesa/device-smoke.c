@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j745*/
 /*j746*/
 /*j751*/
 /*j752*/
 /*j757*/
+/*j759*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -266,8 +266,79 @@ static unsigned heap_cases(const struct kumo_gpu_api *api)
     return 0;
 }
 
+/* GL1-b: the AUTO_VA VM Gallium creates. Addresses come from the lowest fit, a freed range is
+ * reused, a caller-chosen address is refused, and a full window refuses a map with its marker
+ * restored and nothing sent. The window (256 MiB) outgrows the 128 MiB budget, so it is filled
+ * by mapping one 64 MiB BO several times. — TIMBERDOODLE */
+static unsigned auto_va_cases(const struct kumo_gpu_api *api)
+{
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    CHECK(dev, 190);
+    struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
+    struct pan_kmod_vm *vm = pan_kmod_vm_create(
+        dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY, range.start, range.size);
+    CHECK(vm && vm->flags == (PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY), 191);
+    struct pan_kmod_bo *data = pan_kmod_bo_alloc(dev, vm, 3 * 4096, 0);
+    struct pan_kmod_bo *code = pan_kmod_bo_alloc(dev, vm, 4096, PAN_KMOD_BO_FLAG_EXECUTABLE);
+    struct pan_kmod_bo *big = pan_kmod_bo_alloc(dev, vm, UINT64_C(64) << 20, 0);
+    CHECK(data && code && big, 192);
+    struct pan_kmod_vm_op manual = {.type = PAN_KMOD_VM_OP_TYPE_MAP,
+        .va = {range.start, data->size}, .map = {data, 0}};
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &manual, 1) < 0, 193);
+    struct pan_kmod_vm_op ops[3] = {
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {PAN_KMOD_VM_MAP_AUTO_VA, data->size}, .map = {data, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {PAN_KMOD_VM_MAP_AUTO_VA, code->size}, .map = {code, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {PAN_KMOD_VM_MAP_AUTO_VA, big->size}, .map = {big, 0}},
+    };
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 3) == 0, 194);
+    CHECK(ops[0].va.start == range.start && ops[1].va.start == range.start + data->size &&
+          ops[2].va.start == ops[1].va.start + code->size, 195);
+    struct pan_kmod_vm_op unmap = {.type = PAN_KMOD_VM_OP_TYPE_UNMAP, .va = {ops[1].va.start, code->size}};
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &unmap, 1) == 0, 196);
+    struct pan_kmod_vm_op again = {.type = PAN_KMOD_VM_OP_TYPE_MAP,
+        .va = {PAN_KMOD_VM_MAP_AUTO_VA, code->size}, .map = {code, 0}};
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &again, 1) == 0 &&
+          again.va.start == ops[1].va.start, 197);
+    unsigned maps = 0;
+    for (;;) {
+        struct pan_kmod_vm_op fill = {.type = PAN_KMOD_VM_OP_TYPE_MAP,
+            .va = {PAN_KMOD_VM_MAP_AUTO_VA, big->size}, .map = {big, 0}};
+        if (pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &fill, 1)) {
+            CHECK(fill.va.start == PAN_KMOD_VM_MAP_AUTO_VA, 198);
+            break;
+        }
+        CHECK(fill.va.start >= range.start && fill.va.start + big->size <= range.start + range.size, 199);
+        CHECK(++maps < 8, 200);
+    }
+    CHECK(maps == 2 && pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_USABLE, 201);
+    pan_kmod_bo_put(big);
+    pan_kmod_bo_put(code);
+    pan_kmod_bo_put(data);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
+
+#ifdef KUMO_GL_SCREEN
+/* GL1-b: mode 17 runs Gallium's screen, and exists only in the build that links Gallium. */
+extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+static void say_line(const char *line) { puts(line); }
+#endif
+unsigned kumo_mesa_device_modes(void)
+{
+#ifdef KUMO_GL_SCREEN
+    return 18;
+#else
+    return 17;
+#endif
+}
+
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
+#ifdef KUMO_GL_SCREEN
+    if (mode == 17) return kumo_gl_screen_cases(api, say_line);
+#endif
+    if (mode == 16) return auto_va_cases(api);
     if (mode == 15) return heap_cases(api);
     if (mode >= 9) return native_sync_cases(api, mode);
     struct kumo_gpu_api bad = *api;
@@ -291,8 +362,10 @@ unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
     CHECK(!dev->ops->dev_create(17, 0, NULL, NULL), 7);
     struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
     CHECK(range.start == 0x20000000 && range.size == 0x10000000, 8);
-    CHECK(!pan_kmod_vm_create(dev, PAN_KMOD_VM_FLAG_AUTO_VA, range.start, range.size), 9);
-    CHECK(!pan_kmod_vm_create(dev, PAN_KMOD_VM_FLAG_TRACK_ACTIVITY, range.start, range.size), 10);
+    /* GL1-b accepts AUTO_VA and TRACK_ACTIVITY (mode 16); an unknown flag and a range outside
+     * the window are still refused. — TIMBERDOODLE */
+    CHECK(!pan_kmod_vm_create(dev, 1u << 5, range.start, range.size), 9);
+    CHECK(!pan_kmod_vm_create(dev, PAN_KMOD_VM_FLAG_AUTO_VA, range.start - 4096, range.size), 10);
     struct pan_kmod_bo *bo = pan_kmod_bo_alloc(dev, NULL, 4 * 4096, 0);
     CHECK(bo && bo->dev == dev && !bo->exclusive_vm && bo->size == 4 * 4096, 11);
     CHECK(pan_kmod_bo_get(bo) == bo && bo->refcnt == 2, 12);
@@ -371,6 +444,10 @@ int main(void)
     unsigned failed = kumo_mesa_device_proof();
     if (failed) { printf("G7o-d native device FAILED at case %u\n", failed); return 1; }
     puts("G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay");
+#ifdef KUMO_GL_SCREEN
+    puts("GL1-b screen green: Gallium's panfrost screen over the native device, its caps, a render-target texture, and a clean destroy");
+#endif
+    puts("GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fit addresses, a freed range reused, caller addresses refused, a full window refused with nothing sent");
     puts("G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back");
     puts("G7p-c native C sync green: ABI 15, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
     puts("G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window");

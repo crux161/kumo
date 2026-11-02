@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j745*/
 /*j746*/
 /*j751*/
 /*j752*/
 /*j757*/
+/*j759*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -12,8 +12,13 @@
 #pragma GCC diagnostic pop
 #include <stdlib.h>
 #include <sys/mman.h>
+#include "pan_props.h"
+#include "util/vma.h"
 
-struct kumo_vm { struct pan_kmod_vm base; uint64_t start, end; };
+/* GL1-b: an AUTO_VA VM hands out addresses from one heap over its whole range. The window
+ * is one 4 GiB region, so G7o-e's executable rule holds for any address it picks. — TIMBERDOODLE */
+struct kumo_vm { struct pan_kmod_vm base; uint64_t start, end; struct util_vma_heap heap; };
+#define KUMO_VM_FLAGS (PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY)
 
 struct kumo_device {
     struct pan_kmod_dev base;
@@ -239,7 +244,10 @@ static struct pan_kmod_vm *create_vm(struct pan_kmod_dev *base, uint32_t flags,
                                     uint64_t start, uint64_t bytes)
 {
     struct kumo_device *dev = device(base);
-    if (!ready(dev) || dev->vm || flags || !bytes || start % PAN_PGSIZE_4K || bytes % PAN_PGSIZE_4K ||
+    /* GL1-b: Gallium asks for AUTO_VA | TRACK_ACTIVITY. Activity tracking is accepted with nothing
+     * to track yet: no Gallium context submits until GL1-d, and Gallium skips the wait for a BO
+     * the GPU never touched. bo_wait stays honest (no_wait) meanwhile. — TIMBERDOODLE */
+    if (!ready(dev) || dev->vm || (flags & ~KUMO_VM_FLAGS) || !bytes || start % PAN_PGSIZE_4K || bytes % PAN_PGSIZE_4K ||
         start < dev->range.start || start > UINT64_MAX - bytes ||
         start + bytes > dev->range.start + dev->range.size) return NULL;
     struct kumo_vm *storage = pan_kmod_dev_alloc(base, sizeof(*storage));
@@ -251,6 +259,10 @@ static struct pan_kmod_vm *create_vm(struct pan_kmod_dev *base, uint32_t flags,
     }
     pan_kmod_vm_init(vm, base, id, flags);
     storage->start = start; storage->end = start + bytes;
+    if (flags & PAN_KMOD_VM_FLAG_AUTO_VA) {
+        util_vma_heap_init(&storage->heap, start, bytes);
+        storage->heap.alloc_high = false;
+    }
     dev->vm = vm;
     return vm;
 }
@@ -261,6 +273,8 @@ static void destroy_vm(struct pan_kmod_vm *vm)
     if (dev->api.vm_destroy(dev->api.context, vm->handle) != KUMO_GPU_OK) poison(dev);
     for (struct kumo_mesa_bo *bo = dev->bos; bo; bo = bo->next)
         if (bo->base.exclusive_vm == vm) bo->base.exclusive_vm = NULL;
+    if (vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA)
+        util_vma_heap_finish(&((struct kumo_vm *)vm)->heap);
     pan_kmod_vm_cleanup(vm);
     dev->vm = NULL;
     pan_kmod_dev_free(&dev->base, vm);
@@ -275,14 +289,21 @@ static int bind_vm(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
 {
     struct kumo_device *dev = device(vm->dev);
     if (!ready(dev) || dev->vm != vm || mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE || (count && !ops)) return -1;
+    struct kumo_vm *kvm = (struct kumo_vm *)vm;
+    const bool auto_va = vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA;
     /* Validate every row's shape and owner before the first request. If a later runtime
      * failure leaves a successful prefix, retire rather than pretend batch atomicity. — KESTREL */
     for (uint32_t i = 0; i < count; ++i) {
         struct pan_kmod_vm_op *op = &ops[i];
+        /* GL1-b: in an AUTO_VA VM every map asks for an address and gets one below; a caller
+         * that names its own is refused, as pan_kmod's contract requires. — TIMBERDOODLE */
+        const bool asks = op->type == PAN_KMOD_VM_OP_TYPE_MAP && op->va.start == PAN_KMOD_VM_MAP_AUTO_VA;
+        if (op->type == PAN_KMOD_VM_OP_TYPE_MAP && asks != auto_va) return -1;
         if (op->flags || op->signal.count || op->wait.count || !op->va.size ||
-            op->va.start % PAN_PGSIZE_4K || op->va.size % PAN_PGSIZE_4K ||
-            op->va.start < ((struct kumo_vm *)vm)->start || op->va.start > UINT64_MAX - op->va.size ||
-            op->va.start + op->va.size > ((struct kumo_vm *)vm)->end) return -1;
+            op->va.size % PAN_PGSIZE_4K) return -1;
+        if (!asks && (op->va.start % PAN_PGSIZE_4K ||
+            op->va.start < kvm->start || op->va.start > UINT64_MAX - op->va.size ||
+            op->va.start + op->va.size > kvm->end)) return -1;
         if (op->type == PAN_KMOD_VM_OP_TYPE_MAP) {
             struct kumo_mesa_bo *bo = (struct kumo_mesa_bo *)op->map.bo;
             if (!bo || bo->base.dev != &dev->base || bo->owner != dev->api.context ||
@@ -291,6 +312,23 @@ static int bind_vm(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
                 (uint64_t)op->map.bo_offset > bo->base.size ||
                 op->va.size > bo->base.size - (uint64_t)op->map.bo_offset) return -1;
         } else if (op->type != PAN_KMOD_VM_OP_TYPE_UNMAP) return -1;
+    }
+    /* Every address is chosen before the first request, so a full window refuses the whole
+     * batch with nothing sent. */
+    for (uint32_t i = 0; auto_va && i < count; ++i) {
+        struct pan_kmod_vm_op *op = &ops[i];
+        if (op->type != PAN_KMOD_VM_OP_TYPE_MAP) continue;
+        const uint64_t va = util_vma_heap_alloc(&kvm->heap, op->va.size,
+                                                pan_choose_gpu_va_alignment(vm, op->va.size));
+        if (!va) {
+            for (uint32_t j = 0; j < i; ++j) {
+                if (ops[j].type != PAN_KMOD_VM_OP_TYPE_MAP) continue;
+                util_vma_heap_free(&kvm->heap, ops[j].va.start, ops[j].va.size);
+                ops[j].va.start = PAN_KMOD_VM_MAP_AUTO_VA;
+            }
+            return -1;
+        }
+        op->va.start = va;
     }
     for (uint32_t i = 0; i < count; ++i) {
         struct pan_kmod_vm_op *op = &ops[i];
@@ -303,9 +341,18 @@ static int bind_vm(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
             status = dev->api.vm_unbind(dev->api.context, vm->handle, op->va.start, op->va.size);
         }
         if (status != KUMO_GPU_OK) {
+            /* Rows not yet bound give their addresses back; a bound prefix poisons below. */
+            for (uint32_t j = i; auto_va && j < count; ++j) {
+                if (ops[j].type != PAN_KMOD_VM_OP_TYPE_MAP) continue;
+                util_vma_heap_free(&kvm->heap, ops[j].va.start, ops[j].va.size);
+                ops[j].va.start = PAN_KMOD_VM_MAP_AUTO_VA;
+            }
             if (i || dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
             return -1;
         }
+        /* An unmapped range is free again for the next map. */
+        if (auto_va && op->type == PAN_KMOD_VM_OP_TYPE_UNMAP)
+            util_vma_heap_free(&kvm->heap, op->va.start, op->va.size);
     }
     return 0;
 }

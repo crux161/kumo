@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j747*/
 /*j753*/
 /*j754*/
 /*j757*/
 /*j758*/
+/*j759*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -13,7 +13,7 @@
  * KUMO_METAL_PROOF picks the proof at build time: 0 is G7o-f, 1 is G7p-e ending in a fatal
  * fault, 2 is G7p-e ending in a timeout, 3 is G7q-a's tiler heap, 4 is the same heap through
  * G7q-c's C bridge (pan_kmod_kumo_heap_create/destroy), 5 is GL1's no-execute command streams
- * (J758). A failed group ends its
+ * (J758), 6 is GL1-b's Gallium screen (gl-screen.c, linked with Gallium). A failed group ends its
  * session, and Sora regrants only on the churn image, so each failure needs its own boot.
  * — TIMBERDOODLE */
 #include "kumo_kmod.h"
@@ -32,6 +32,9 @@ extern void kumo_metal_log(const char *line);
 extern uint32_t kumo_metal_store(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                  uint64_t target, uint32_t value);
 extern uint64_t kumo_metal_now_ns(void);
+#if KUMO_METAL_PROOF == 6
+extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+#endif
 extern uint32_t kumo_metal_run(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                const uint64_t *words, uint32_t count);
 extern uint32_t kumo_metal_heap_create(void *context, uint32_t chunk_bytes, uint32_t initial_chunks,
@@ -676,6 +679,9 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
         return heap_cases(api, KUMO_METAL_PROOF == 4);
     if (KUMO_METAL_PROOF == 5)
         return nx_stream_cases(api);
+#if KUMO_METAL_PROOF == 6
+    return kumo_gl_screen_cases(api, kumo_metal_log);
+#endif
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -703,8 +709,12 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "GL1-a metal streams begin: live drv-gpu session, command streams in writable no-execute BOs"
 #define FAILED_LINE "GL1-a metal streams FAILED at case %u"
 #define GREEN_LINE "GL1-a metal streams green: Submit ran streams from cached and uncached writable no-execute bindings, a rewritten line ran its new words, and a straddling stream was refused"
+#elif KUMO_METAL_PROOF == 6
+#define BEGIN_LINE "GL1-b metal screen begin: live drv-gpu session, Gallium's panfrost screen over the native device"
+#define FAILED_LINE "GL1-b metal screen FAILED at case %u"
+#define GREEN_LINE "GL1-b metal screen green: Gallium's panfrost screen came up on Mali over the native device, its caps read, a texture made, and everything destroyed"
 #else
-#error "KUMO_METAL_PROOF must be 0 to 5"
+#error "KUMO_METAL_PROOF must be 0 to 6"
 #endif
 
 extern unsigned kumo_metal_proof(void);

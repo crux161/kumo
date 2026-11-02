@@ -1,9 +1,38 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j754 -->
 <!-- j755 -->
 <!-- j756 -->
 <!-- j757 -->
 <!-- j758 -->
+<!-- j759 -->
+
+## GL1-b: Gallium's screen over the native device
+
+`panfrost_create_screen_kumo(kmod)` (kumo-build.patch) opens Gallium's panfrost screen over a
+kmod device the client made with `pan_kmod_kumo_dev_create(api)`, with no DRM fd and no
+pipe-loader. It builds panfrost's driconf options itself and owns the device from then on.
+The kumo VM serves Gallium's `AUTO_VA | TRACK_ACTIVITY`: one lowest-fit address heap over the
+window, freed ranges reused, caller-chosen addresses refused, and a full window refused with
+nothing sent. Activity tracking waits for GL1-d's submissions, and Gallium skips the BO wait for
+anything the GPU never touched. Gallium's BO unmap now goes back through the bridge the map
+came from (`pan_kmod_kumo_bo_munmap`). relibc's `clock_gettime` gained the monotonic clocks:
+it had been an ENOSYS stub, and Gallium's BO cache aged its BOs by uninitialized stack.
+
+Proofs:
+- QEMU: `mesa-device-smoke.py --gl-screen --run`, mode 16 (auto-VA) and mode 17 (the screen),
+  linked with Gallium.
+- Metal: proof 6 (`--proof gl1-b`). It reported "Mali-G610 MC4 (Panfrost)", GLSL 140, a 16384
+  maximum 2D texture and compute, created and destroyed a 64x64 RGBA8 render target, and closed
+  with `containment reset=ok buffers=0 bindings=0`: every BO Gallium made was released.
+
+`build(gl=True)` links the inventory's GL archives on the host, rebuilding thin archives from
+their members and copying regular ones, plus drm-refusal, Gallium's generated format header and
+the C++ runtime. The metal client is 14.8 MB. — TIMBERDOODLE, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl1-b --stage build/proofs/gl1-b-metal/image
+python3 scripts/mesa-device-metal.py --proof gl1-b --check <tio log>
+```
 
 ## GL1-a: command streams in writable no-execute memory
 

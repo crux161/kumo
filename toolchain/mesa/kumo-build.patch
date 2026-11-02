@@ -196,3 +196,171 @@
     /* VK_EXT_drm_format_modifier
      *
      * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's
+--- a/src/gallium/drivers/panfrost/pan_device.c
++++ b/src/gallium/drivers/panfrost/pan_device.c
+@@ -31,13 +31,24 @@
+ int
+ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
+ {
+-   dev->memctx = memctx;
+-
+-   dev->kmod.dev = pan_kmod_dev_create(fd, PAN_KMOD_DEV_FLAG_OWNS_FD, NULL);
+-   if (!dev->kmod.dev) {
++   struct pan_kmod_dev *kmod =
++      pan_kmod_dev_create(fd, PAN_KMOD_DEV_FLAG_OWNS_FD, NULL);
++   if (!kmod) {
+       close(fd);
+       return -1;
+    }
++
++   return panfrost_open_kmod_device(memctx, kmod, dev);
++}
++
++/* KUMO (GL1-b): the same device over a kmod device that already exists, created without a
++ * DRM fd. It takes ownership: every failure path below destroys the kmod device. */
++int
++panfrost_open_kmod_device(void *memctx, struct pan_kmod_dev *kmod,
++                          struct panfrost_device *dev)
++{
++   dev->memctx = memctx;
++   dev->kmod.dev = kmod;
+
+    dev->arch = pan_arch(dev->kmod.dev->props.gpu_id);
+    dev->model = pan_get_model(dev->kmod.dev->props.gpu_id,
+--- a/src/gallium/drivers/panfrost/pan_device.h
++++ b/src/gallium/drivers/panfrost/pan_device.h
+@@ -199,6 +199,9 @@
+
+ int panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev);
+
++int panfrost_open_kmod_device(void *memctx, struct pan_kmod_dev *kmod,
++                              struct panfrost_device *dev);
++
+ void panfrost_close_device(struct panfrost_device *dev);
+
+ bool panfrost_supports_compressed_format(struct panfrost_device *dev,
+--- a/src/gallium/drivers/panfrost/pan_public.h
++++ b/src/gallium/drivers/panfrost/pan_public.h
+@@ -18,6 +18,14 @@
+ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
+                        struct renderonly *ro);
+
++#ifdef __kumo__
++struct pan_kmod_dev;
++
++/* KUMO (GL1-b): a screen over a kmod device made without a DRM fd, such as
++ * pan_kmod_kumo_dev_create's. It takes ownership of the device, failure included. */
++struct pipe_screen *panfrost_create_screen_kumo(struct pan_kmod_dev *kmod);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -1004,15 +1004,20 @@
+    return 0;
+ }
+
+-struct pipe_screen *
+-panfrost_create_screen(int fd, const struct pipe_screen_config *config,
+-                       struct renderonly *ro)
++/* KUMO (GL1-b): one body for both entries. With kmod, the device already exists and fd is
++ * unused; the screen owns kmod from here on, failure included. */
++static struct pipe_screen *
++create_screen(int fd, struct pan_kmod_dev *kmod,
++              const struct pipe_screen_config *config, struct renderonly *ro)
+ {
+    /* Create the screen */
+    struct panfrost_screen *screen = rzalloc(NULL, struct panfrost_screen);
+
+-   if (!screen)
++   if (!screen) {
++      if (kmod)
++         pan_kmod_dev_destroy(kmod);
+       return NULL;
++   }
+
+    struct panfrost_device *dev = pan_device(&screen->base);
+
+@@ -1029,7 +1034,8 @@
+
+    pan_trace_init();
+
+-   if (panfrost_open_device(screen, fd, dev)) {
++   if (kmod ? panfrost_open_kmod_device(screen, kmod, dev)
++            : panfrost_open_device(screen, fd, dev)) {
+       ralloc_free(screen);
+       return NULL;
+    }
+@@ -1184,3 +1190,36 @@
+
+    return &screen->base;
+ }
++
++struct pipe_screen *
++panfrost_create_screen(int fd, const struct pipe_screen_config *config,
++                       struct renderonly *ro)
++{
++   return create_screen(fd, NULL, config, ro);
++}
++
++#ifdef __kumo__
++#include "util/driconf.h"
++
++/* KUMO (GL1-b): there is no pipe-loader, so build panfrost's driconf options here, as the
++ * loader's drm helper does. The options are read only during creation. */
++static const driOptionDescription kumo_panfrost_driconf[] = {
++#include "driinfo_panfrost.h"
++};
++
++struct pipe_screen *
++panfrost_create_screen_kumo(struct pan_kmod_dev *kmod)
++{
++   driOptionCache info, options;
++   driParseOptionInfo(&info, kumo_panfrost_driconf,
++                      ARRAY_SIZE(kumo_panfrost_driconf));
++   const struct pipe_screen_config config = {
++      .options = &options,
++      .options_info = &info,
++   };
++   struct pipe_screen *screen = create_screen(-1, kmod, &config, NULL);
++   driDestroyOptionCache(&options);
++   driDestroyOptionInfo(&info);
++   return screen;
++}
++#endif
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -335,6 +335,11 @@
+    return 0;
+ }
+
++#ifdef __kumo__
++/* native-device.c, KUMO's kmod backend. */
++int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
++#endif
++
+ static void
+ panfrost_bo_munmap(struct panfrost_bo *bo)
+ {
+@@ -342,6 +347,19 @@
+
+    if (!bo->ptr.cpu)
+       return;
++
++#ifdef __kumo__
++   /* KUMO (GL1-b): pan_kmod_bo_mmap gave a device without a DRM fd its map from the native
++    * bridge, so the map goes back the same way. libc cannot unmap a mapping it never made. */
++   if (bo->kmod_bo->dev->fd < 0) {
++      if (pan_kmod_kumo_bo_munmap(bo->kmod_bo)) {
++         mesa_loge("native munmap failed");
++         abort();
++      }
++      bo->ptr.cpu = NULL;
++      return;
++   }
++#endif
+
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));

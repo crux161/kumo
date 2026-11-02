@@ -2,6 +2,7 @@
 #j735
 #j738
 #j745
+#j759
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -110,7 +111,8 @@ def category(symbol):
         return "Panthor ioctl user"
     if symbol.startswith("drm"):
         return "DRM / libdrm"
-    if symbol == "pan_kmod_kumo_bo_mmap":
+    # GL1-b (J759): Gallium's BO unmap goes back through the bridge the map came from.
+    if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap"):
         return "other: native capability backend"
     if symbol in BUILD_ID:
         return "other: static build ID"

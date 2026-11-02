@@ -1,8 +1,8 @@
-//j745
 //j746
 //j751
 //j752
 //j757
+//j759
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -28,6 +28,7 @@ extern "C" {
     fn posix_memalign(out: *mut *mut c_void, alignment: usize, size: usize) -> i32;
     fn free(p: *mut c_void);
     fn kumo_mesa_device_cases(api: *const Api, mode: u32) -> u32;
+    fn kumo_mesa_device_modes() -> u32;
 }
 unsafe impl GlobalAlloc for LibcAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -225,6 +226,8 @@ impl Backend for Hardware {
         // Mode 8 binds the drivers' executable pools (buffers 2 and 3, cached) beside a
         // data BO; it is the G7o-e W^X shape. — TIMBERDOODLE
         let flags = match (self.mode, binding.buffer) {
+            // Mode 16 maps data, code and a large BO wherever AUTO_VA put them. — TIMBERDOODLE
+            (16 | 17, _) => binding.flags.0,
             (9.., _) => BindFlags::READ_ONLY,
             (8, 2 | 3) => BindFlags::READ_ONLY,
             (8, _) => BindFlags::NO_EXECUTE,
@@ -711,7 +714,8 @@ fn closed_status_cap_proof() {
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
     closed_status_cap_proof();
-    for mode in 0..16 {
+    // 17 modes, or 18 when the build links Gallium for GL1-b's screen. — TIMBERDOODLE
+    for mode in 0..unsafe { kumo_mesa_device_modes() } {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
             session: Session::default(),
@@ -818,6 +822,26 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         if matches!(mode, 4 | 7) {
             assert_eq!(server.release.buffers, 2);
             assert_eq!(server.release.bindings, 2);
+        }
+        if mode == 16 {
+            // Six maps crossed (three, the hole refilled, two fills); the caller-chosen and the
+            // window-full maps never did. Every address is page-aligned inside the window, and the
+            // only explicit unbind is the code page's. — TIMBERDOODLE
+            let vas: alloc::vec::Vec<u64> = server
+                .calls
+                .iter()
+                .filter_map(|c| match c {
+                    Command::VmBind(b) => Some(b.va),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(vas.len(), 6);
+            assert_eq!(server.hardware.bind_calls, 6);
+            assert_eq!(server.hardware.unbind_calls, 1);
+            assert!(vas
+                .iter()
+                .all(|va| va % PAGE_BYTES == 0
+                    && (kumo_gpu::VA_START..kumo_gpu::VA_END).contains(va)));
         }
         if mode == 15 {
             // Every refused shape stayed local; three heaps crossed and all three were destroyed,

@@ -1,8 +1,8 @@
-//j512
 //j513
 //j514
 //j535
 //j557
+//j759
 // Generated from relibc's Pal traits at the revision pinned by KUMO. I-a1 made
 // startup-channel intake, fd 1/2 write, process exit, and retained anonymous maps live;
 // I-a2 lays KUMO's capabilities out as the SysV startup view relibc's own start path
@@ -53,6 +53,7 @@ const SYSCALL_VMO_CREATE: u64 = 12;
 const SYSCALL_VMO_READ: u64 = 13;
 const SYSCALL_VMAR_MAP: u64 = 15;
 const SYSCALL_PROCESS_EXIT: u64 = 21;
+const SYSCALL_CLOCK_GET: u64 = 26;
 const SYSCALL_FUTEX_WAIT: u64 = 28;
 const SYSCALL_FUTEX_WAKE: u64 = 29;
 
@@ -665,6 +666,18 @@ impl Sys {
     }
 }
 
+/// Whether `clk_id` is one of the clocks `ClockGet` answers: time since boot, never adjusted.
+fn monotonic_clock(clk_id: clockid_t) -> Result<()> {
+    use crate::header::{
+        errno::EINVAL,
+        time::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW},
+    };
+    match clk_id {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => Ok(()),
+        _ => Err(Errno(EINVAL)),
+    }
+}
+
 const fn unsupported() -> Errno {
     Errno(crate::header::errno::ENOSYS)
 }
@@ -682,12 +695,31 @@ impl Pal for Sys {
         Err(unsupported())
     }
 
+    //j759
+    /// The kernel's `ClockGet` counts nanoseconds since boot, which is exactly what the monotonic
+    /// clocks are. KUMO keeps no wall clock, so `CLOCK_REALTIME` and the CPU-time clocks are
+    /// refused rather than invented. Gallium's BO cache ages its BOs by `CLOCK_MONOTONIC`;
+    /// against the old stub it aged them by uninitialized stack and evicted a live BO (GL1-b).
+    /// — TIMBERDOODLE
     fn clock_getres(clk_id: clockid_t, tp: Option<Out<timespec>>) -> Result<()> {
-        Err(unsupported())
+        monotonic_clock(clk_id)?;
+        if let Some(mut tp) = tp {
+            tp.write(timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            });
+        }
+        Ok(())
     }
 
-    fn clock_gettime(clk_id: clockid_t, tp: Out<timespec>) -> Result<()> {
-        Err(unsupported())
+    fn clock_gettime(clk_id: clockid_t, mut tp: Out<timespec>) -> Result<()> {
+        monotonic_clock(clk_id)?;
+        let nanos = syscall4(SYSCALL_CLOCK_GET, 0, 0, 0, 0);
+        tp.write(timespec {
+            tv_sec: (nanos / 1_000_000_000) as time_t,
+            tv_nsec: (nanos % 1_000_000_000) as c_long,
+        });
+        Ok(())
     }
 
     unsafe fn clock_settime(clk_id: clockid_t, tp: *const timespec) -> Result<()> {
