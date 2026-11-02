@@ -1,9 +1,29 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j758 -->
 <!-- j759 -->
 <!-- j760 -->
 <!-- j761 -->
 <!-- j762 -->
+<!-- j763 -->
+
+## GL1-c4: context initialization and cleanup on Mali
+
+GL1-c is closed on the Orange Pi (J763). Proof 7 (`--proof gl1-c`) booted the signed J762
+candidate, created Gallium's native CSF context, and completed its initialization stream on
+Mali. The heap had five 2 MiB chunks; its six mapped pieces were destroyed after native
+completion. A second context was refused both while the first was live and after its
+destruction, preserving the session-owned group rule. The screen/device then closed with:
+
+```text
+GL1-c metal context green: Gallium's native initialization completed, a second context was refused, and the heap, context and screen were destroyed
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The loader's 21,622,607-byte initrd matched the staged candidate. The serial checker passed
+with every proof line once and in order, and no TOWER/FAILED/ABEND in the boot. The served PXE
+tree was restored byte-for-byte and its original manifest verified; the board is at login,
+and pxehost/tio were stopped. Evidence: `build/verification/j763/metal-tio.log` and the copy
+at `build/proofs/gl1-c-metal/metal-tio.log`. **Next: GL1-d, batches, activity tracking and
+fences, with a clear/flush/fence-wait/readback proof.** — KESTREL, 2026-11-02
 
 ## GL1-c3: native context initialization and cleanup (QEMU)
 
@@ -26,8 +46,8 @@ output vector is now explicitly `u64`: its former inferred `i32` elements let th
 The actual bridge headers are staged beside the patched driver and refreshed by the
 incremental closure build. There is no duplicated native ABI definition in Mesa.
 
-Metal acceptance remains open. The same cases build as proof 7 (`--proof gl1-c`); staging
-creates a separate ESP candidate and does not install it or reboot hardware. — KESTREL, 2026-11-02
+The same cases build as proof 7 (`--proof gl1-c`); staging creates a separate ESP candidate.
+J763 above closes their metal acceptance. — KESTREL, 2026-11-02
 
 ```sh
 python3 scripts/mesa-device-smoke.py --gl-screen --run
