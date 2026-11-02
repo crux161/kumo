@@ -1,8 +1,8 @@
-//j709
 //j711
 //j742
 //j743
 //j752
+//j754
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -11,8 +11,9 @@ use alloc::vec::Vec;
 
 use crate::{
     valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
-    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Request, RequestIds, Response,
-    Status, Submission, SyncState, Timeline, MAX_TOTAL_BUFFER_BYTES,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, HeapPlacement, HeapSpec, Request,
+    RequestIds, Response, Status, Submission, SyncState, Timeline, MAX_HEAPS,
+    MAX_TOTAL_BUFFER_BYTES,
 };
 
 pub const MAX_BINDINGS: usize = 256;
@@ -36,6 +37,8 @@ pub struct SessionRelease {
     pub buffers: u32,
     pub bindings: u32,
     pub waits: u32,
+    /// Tiler heaps (G7q-a). Their pages are in `bytes` too, since they share the budget.
+    pub heaps: u32,
     pub bytes: u64,
 }
 
@@ -45,6 +48,7 @@ impl SessionRelease {
         buffers: 0,
         bindings: 0,
         waits: 0,
+        heaps: 0,
         bytes: 0,
     };
 
@@ -109,6 +113,18 @@ pub trait Backend {
         Err(Status::NotSupported)
     }
     fn submit(&mut self, submission: Submission) -> Result<(), SubmitError>;
+    /// G7q-a: allocate one heap's context page and initial chunks, link the chunks head-first,
+    /// map everything no-execute in the heap window and flush. A recoverable status maps
+    /// nothing and keeps nothing; a partial map is `DeviceLost`, and the backend keeps what it
+    /// mapped for `retire`. Unsupported backends refuse. — TIMBERDOODLE
+    fn create_heap(&mut self, _id: u32, _spec: HeapSpec) -> Result<HeapPlacement, Status> {
+        Err(Status::NotSupported)
+    }
+    /// Unmap every page of heap `id`, flush, then release it. All-or-nothing, like
+    /// `destroy_buffer`. — TIMBERDOODLE
+    fn destroy_heap(&mut self, _id: u32) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
     /// Release every backend-side claim this session still holds — DMA registrations, MMU
     /// mappings, queue references — **after** the caller has quiesced the device and the
     /// session has been closed. The default is a deliberate no-op, not a silent success: a
@@ -147,6 +163,10 @@ pub struct Session {
     bindings: Vec<Binding>,
     timeline: Timeline,
     waits: [Option<u64>; MAX_WAITS],
+    /// Live tiler heaps and the bytes each charges, in their own monotonic ID space.
+    /// — TIMBERDOODLE
+    heaps: Vec<Allocation>,
+    next_heap: u32,
 }
 
 impl Session {
@@ -188,9 +208,11 @@ impl Session {
             buffers: self.buffers.len() as u32,
             bindings: self.bindings.len() as u32,
             waits: self.waits.iter().flatten().count() as u32,
+            heaps: self.heaps.len() as u32,
             bytes: self.total_buffer_bytes,
         };
         self.buffers.clear();
+        self.heaps.clear();
         self.bindings.clear();
         self.waits = [None; MAX_WAITS];
         self.total_buffer_bytes = 0;
@@ -536,6 +558,58 @@ impl Session {
                     }
                 }
             }
+            Command::HeapCreate(spec) => {
+                // A heap needs only the VM, as Panthor's does: Gallium creates it after the
+                // group, panvk per queue. — TIMBERDOODLE
+                if !self.vm {
+                    return Err(Status::BadState);
+                }
+                if spec.vm != 1 {
+                    return Err(Status::NotFound);
+                }
+                if self.heaps.len() >= MAX_HEAPS {
+                    return Err(Status::NoMemory);
+                }
+                // Heaps share the buffers' budget: tiler memory is DMA the session holds.
+                let bytes = spec.initial_bytes();
+                let total = self
+                    .total_buffer_bytes
+                    .checked_add(bytes)
+                    .filter(|total| *total <= MAX_TOTAL_BUFFER_BYTES)
+                    .ok_or(Status::NoMemory)?;
+                let id = self.next_heap.checked_add(1).ok_or(Status::NoMemory)?;
+                self.heaps.try_reserve(1).map_err(|_| Status::NoMemory)?;
+                let placement = backend.create_heap(id, spec)?;
+                // The backend has mapped memory by now, so a placement outside the window is
+                // not refusable: retire, and let containment release it. — TIMBERDOODLE
+                if !placement.valid() {
+                    return Err(Status::DeviceLost);
+                }
+                self.heaps.push(Allocation { id, bytes });
+                self.total_buffer_bytes = total;
+                self.next_heap = id;
+                Ok(Response::HeapCreated {
+                    heap: id,
+                    placement,
+                })
+            }
+            Command::HeapDestroy { heap } => {
+                if !self.vm {
+                    return Err(Status::BadState);
+                }
+                let position = self
+                    .heaps
+                    .iter()
+                    .position(|allocation| allocation.id == heap)
+                    .ok_or(Status::NotFound)?;
+                backend.destroy_heap(heap)?;
+                let allocation = self.heaps.swap_remove(position);
+                self.total_buffer_bytes -= allocation.bytes;
+                Ok(Response::HeapDestroyed {
+                    heap,
+                    bytes: allocation.bytes,
+                })
+            }
         }
     }
 }
@@ -571,6 +645,10 @@ mod tests {
         /// How many times the containment layer asked the backend to release its own claims.
         /// A unit count, not a success flag: `retire` has nothing to answer. — TIMBERDOODLE
         retire_calls: u32,
+        /// G7q-a: heaps are supported only when set; `bad_placement` answers one outside the
+        /// window. — TIMBERDOODLE
+        heaps: bool,
+        bad_placement: bool,
     }
     impl Fake {
         fn record(&mut self, command: Command) -> Result<(), Status> {
@@ -579,6 +657,24 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn create_heap(&mut self, id: u32, spec: HeapSpec) -> Result<HeapPlacement, Status> {
+            if !self.heaps {
+                return Err(Status::NotSupported);
+            }
+            self.record(Command::HeapCreate(spec))?;
+            let context_va = crate::HEAP_VA_START + u64::from(id) * 0x40_0000;
+            Ok(HeapPlacement {
+                context_va: if self.bad_placement {
+                    VA_START
+                } else {
+                    context_va
+                },
+                first_chunk_va: context_va + PAGE_BYTES,
+            })
+        }
+        fn destroy_heap(&mut self, heap: u32) -> Result<(), Status> {
+            self.record(Command::HeapDestroy { heap })
+        }
         fn watch_group(&mut self) -> Result<crate::GroupReport, Status> {
             self.record(Command::GroupWatch { group: 1 })?;
             self.group_report.ok_or(Status::NotSupported)
@@ -1820,6 +1916,7 @@ mod tests {
                 buffers: 2,
                 bindings: 2,
                 waits: 1,
+                heaps: 0,
                 bytes: 3 * PAGE_BYTES,
             }
         );
@@ -1933,5 +2030,179 @@ mod tests {
             Err(Status::DeviceLost)
         );
         assert_eq!(b.calls.len(), calls);
+    }
+
+    //j754
+    fn heap(chunk_bytes: u32, initial_chunks: u32, max_chunks: u32) -> Command {
+        Command::HeapCreate(HeapSpec {
+            vm: 1,
+            chunk_bytes,
+            initial_chunks,
+            max_chunks,
+            target_in_flight: 65535,
+        })
+    }
+
+    #[test]
+    fn heaps_need_a_vm_their_own_vm_and_a_backend_that_supports_them() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        assert_eq!(
+            send(&mut s, &mut b, heap(128 * 1024, 1, 1)),
+            Err(Status::BadState)
+        );
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        let mut spec = HeapSpec {
+            vm: 2,
+            chunk_bytes: 128 * 1024,
+            initial_chunks: 1,
+            max_chunks: 1,
+            target_in_flight: 1,
+        };
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapCreate(spec)),
+            Err(Status::NotFound)
+        );
+        spec.vm = 1;
+        // The default backend refuses, and the refusal charges and issues nothing.
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapCreate(spec)),
+            Err(Status::NotSupported)
+        );
+        assert_eq!(s.total_buffer_bytes, 0);
+        b.heaps = true;
+        assert!(matches!(
+            send(&mut s, &mut b, Command::HeapCreate(spec)),
+            Ok(Response::HeapCreated { heap: 1, .. })
+        ));
+        // Before any group, as Panthor allows.
+        assert!(!s.group);
+    }
+
+    #[test]
+    fn heaps_charge_the_shared_budget_and_return_it_on_destroy() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        b.heaps = true;
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        let two_mib = 2 * 1024 * 1024;
+        // Gallium's default: 2 MiB x 5, up to 64.
+        assert!(matches!(
+            send(&mut s, &mut b, heap(two_mib, 5, 64)),
+            Ok(Response::HeapCreated { heap: 1, .. })
+        ));
+        let charged = PAGE_BYTES + 5 * u64::from(two_mib);
+        assert_eq!(s.total_buffer_bytes, charged);
+        // Buffers and heaps draw on one budget: what is left is all a buffer may take.
+        let left = MAX_TOTAL_BUFFER_BYTES - charged;
+        assert!(left < MAX_BUFFER_BYTES * 2);
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: MAX_BUFFER_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::BufferCreate {
+                    bytes: MAX_BUFFER_BYTES
+                }
+            ),
+            Err(Status::NoMemory)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapDestroy { heap: 1 }),
+            Ok(Response::HeapDestroyed {
+                heap: 1,
+                bytes: charged
+            })
+        );
+        assert_eq!(s.total_buffer_bytes, MAX_BUFFER_BYTES);
+        send(
+            &mut s,
+            &mut b,
+            Command::BufferCreate {
+                bytes: MAX_BUFFER_BYTES,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn heap_ids_are_monotonic_never_reused_and_capped() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        b.heaps = true;
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        for id in 1..=MAX_HEAPS as u32 {
+            assert!(matches!(
+                send(&mut s, &mut b, heap(128 * 1024, 1, 4)),
+                Ok(Response::HeapCreated { heap, .. }) if heap == id
+            ));
+        }
+        assert_eq!(
+            send(&mut s, &mut b, heap(128 * 1024, 1, 4)),
+            Err(Status::NoMemory)
+        );
+        send(&mut s, &mut b, Command::HeapDestroy { heap: 3 }).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapDestroy { heap: 3 }),
+            Err(Status::NotFound)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapDestroy { heap: 99 }),
+            Err(Status::NotFound)
+        );
+        let next = MAX_HEAPS as u32 + 1;
+        assert!(matches!(
+            send(&mut s, &mut b, heap(128 * 1024, 1, 4)),
+            Ok(Response::HeapCreated { heap, .. }) if heap == next
+        ));
+    }
+
+    #[test]
+    fn a_refused_heap_charges_nothing_and_a_bad_placement_retires() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        b.heaps = true;
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        b.fail = Some(Status::NoMemory);
+        assert_eq!(
+            send(&mut s, &mut b, heap(128 * 1024, 2, 2)),
+            Err(Status::NoMemory)
+        );
+        assert_eq!(
+            (s.total_buffer_bytes, s.heaps.len(), s.next_heap),
+            (0, 0, 0)
+        );
+        // A placement outside the window means the backend mapped something it should not have:
+        // that cannot be refused, so the session retires.
+        b.bad_placement = true;
+        assert_eq!(
+            send(&mut s, &mut b, heap(128 * 1024, 2, 2)),
+            Err(Status::DeviceLost)
+        );
+        assert!(s.retired);
+        assert_eq!(s.heaps.len(), 0);
+    }
+
+    #[test]
+    fn a_failed_heap_destroy_keeps_the_heap_and_close_counts_heaps() {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        b.heaps = true;
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, heap(256 * 1024, 2, 8)).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        b.fail = Some(Status::NoMemory);
+        assert_eq!(
+            send(&mut s, &mut b, Command::HeapDestroy { heap: 1 }),
+            Err(Status::NoMemory)
+        );
+        assert_eq!(s.heaps.len(), 1);
+        let release = s.close();
+        assert_eq!(release.heaps, 1);
+        assert_eq!(release.buffers, 1);
+        assert_eq!(release.bytes, PAGE_BYTES + 2 * 256 * 1024 + PAGE_BYTES);
+        assert_eq!(s.close(), SessionRelease::NONE);
     }
 }

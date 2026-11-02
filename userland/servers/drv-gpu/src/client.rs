@@ -1,8 +1,8 @@
-//j722
 //j733
 //j742
 //j743
 //j752
+//j754
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -50,6 +50,82 @@ impl BufferRecord {
     }
 }
 
+//j754
+/// G7q-a: one piece of a tiler heap, the context page or one chunk, as its own VMO, so a chunk
+/// added on tiler OOM (G7q-b) is released the same way. No CPU alias outlives creation: the
+/// client never sees heap memory, and the driver writes only chunk headers. — TIMBERDOODLE
+struct HeapPiece {
+    handle: Handle,
+    gpu_va: u64,
+    bytes: u64,
+    pages: Vec<u64>,
+}
+
+impl HeapPiece {
+    /// Zeroed, cleaned pages from the kernel (as `create_buffer`'s are); nothing is mapped yet.
+    fn allocate(gpu_va: u64, bytes: u64) -> Result<Self, GpuStatus> {
+        let mut pages = Vec::new();
+        let count = (bytes / PAGE_SIZE) as usize;
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        pages.resize(count, 0);
+        let handle = valid_handle(kumo_rt::vmo_create_paged(bytes, &mut pages))
+            .ok_or(GpuStatus::NoMemory)?;
+        Ok(Self {
+            handle,
+            gpu_va,
+            bytes,
+            pages,
+        })
+    }
+
+    /// Write a chunk header's link word through a transient NC alias of its first page. The
+    /// rest of the 64-byte header stays the kernel's zeroes, as Panthor requires.
+    fn write_link(&self, link: u64) -> Result<(), GpuStatus> {
+        let (status, va) = kumo_rt::vmar_map_anywhere(
+            self.handle,
+            PAGE_SIZE,
+            (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+        );
+        if status != 0 {
+            return Err(GpuStatus::NoMemory);
+        }
+        // SAFETY: the first word of the page just mapped READ|WRITE at `va`.
+        unsafe { (va as *mut u64).write_volatile(link) };
+        dsb();
+        let _ = kumo_rt::vmar_unmap(va, PAGE_SIZE);
+        Ok(())
+    }
+
+    fn range(&self) -> UnmapRange {
+        UnmapRange {
+            va: self.gpu_va,
+            len: self.bytes,
+        }
+    }
+
+    /// Only before the piece is mapped, after a checked unmap and flush, or after a confirmed
+    /// reset.
+    fn release(self) {
+        let _ = kumo_rt::handle_close(self.handle);
+    }
+}
+
+/// One live heap: its context page first, then its chunks in list order from the head.
+struct HeapMemory {
+    id: u32,
+    pieces: Vec<HeapPiece>,
+}
+
+impl HeapMemory {
+    fn release(self) {
+        for piece in self.pieces {
+            piece.release();
+        }
+    }
+}
+
 struct Pending {
     point: u64,
     seqno: u64,
@@ -84,9 +160,144 @@ struct Hardware<'a> {
     waiters: [Option<(u64, Handle)>; MAX_WAITS],
     group_report: protocol::GroupReport,
     status_vmo: Option<Handle>,
+    heaps: Vec<HeapMemory>,
 }
 
 impl Backend for Hardware<'_> {
+    //j754
+    fn create_heap(
+        &mut self,
+        id: u32,
+        spec: protocol::HeapSpec,
+    ) -> Result<protocol::HeapPlacement, GpuStatus> {
+        let chunk_bytes = u64::from(spec.chunk_bytes);
+        let count = spec.initial_chunks as usize;
+        self.heaps.try_reserve(1).map_err(|_| GpuStatus::NoMemory)?;
+        let mut pieces: Vec<HeapPiece> = Vec::new();
+        pieces
+            .try_reserve_exact(count + 1)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        // One contiguous run: the context page, then the chunks. Growth (G7q-b) places single
+        // chunks in whatever gaps destroyed heaps left.
+        let mut live: Vec<(u64, u64)> = Vec::new();
+        live.try_reserve(self.heaps.iter().map(|heap| heap.pieces.len()).sum())
+            .map_err(|_| GpuStatus::NoMemory)?;
+        for piece in self.heaps.iter().flat_map(|heap| heap.pieces.iter()) {
+            live.push((piece.gpu_va, piece.bytes));
+        }
+        let run = protocol::HEAP_CONTEXT_BYTES + chunk_bytes * count as u64;
+        let base = drv_gpu::first_fit(&live, protocol::HEAP_VA_START, protocol::HEAP_VA_END, run)
+            .ok_or(GpuStatus::NoMemory)?;
+        // Allocate and link everything before any page table changes, so a refusal here maps
+        // nothing and keeps nothing.
+        let fail = |pieces: Vec<HeapPiece>, status| {
+            for piece in pieces {
+                piece.release();
+            }
+            Err(status)
+        };
+        match HeapPiece::allocate(base, protocol::HEAP_CONTEXT_BYTES) {
+            Ok(context) => pieces.push(context),
+            Err(status) => return fail(pieces, status),
+        }
+        // Panthor links each new initial chunk to the previous head and returns the last one
+        // allocated, so the chunk at the highest address is the head and the first one ends
+        // the list. — TIMBERDOODLE
+        let mut previous: Option<u64> = None;
+        for index in 0..count {
+            let va = base + protocol::HEAP_CONTEXT_BYTES + chunk_bytes * index as u64;
+            let chunk = match HeapPiece::allocate(va, chunk_bytes) {
+                Ok(chunk) => chunk,
+                Err(status) => return fail(pieces, status),
+            };
+            let link = previous.map_or(0, |next| drv_gpu::heap_chunk_link(next, chunk_bytes));
+            if let Err(status) = chunk.write_link(link) {
+                chunk.release();
+                return fail(pieces, status);
+            }
+            previous = Some(va);
+            pieces.push(chunk);
+        }
+        let head = previous.expect("at least one initial chunk");
+        // List order: context, then chunks from the head down. — TIMBERDOODLE
+        pieces[1..].reverse();
+        let attrs = PageAttrs {
+            cached: true,
+            readonly: false,
+            executable: false,
+        };
+        for piece in &pieces {
+            if let Err(error) = drv_gpu::map_pages(
+                self.tables,
+                self.arena,
+                self.root,
+                piece.gpu_va,
+                &piece.pages,
+                attrs,
+            ) {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: client heap {} map failed: {:?}\n", id, error),
+                );
+                // Some tables may name these pages now: keep them for retire, after reset.
+                self.heaps.push(HeapMemory { id, pieces });
+                return Err(GpuStatus::DeviceLost);
+            }
+        }
+        dsb();
+        if flush_page_tables(self.device, GROUP_AS).is_err() {
+            self.heaps.push(HeapMemory { id, pieces });
+            return Err(GpuStatus::DeviceLost);
+        }
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: client heap {} context 0x{:x} chunks {}x{} head 0x{:x} (max {}, in flight {})\n",
+                id, base, count, chunk_bytes, head, spec.max_chunks, spec.target_in_flight
+            ),
+        );
+        self.heaps.push(HeapMemory { id, pieces });
+        Ok(protocol::HeapPlacement {
+            context_va: base,
+            first_chunk_va: head,
+        })
+    }
+
+    fn destroy_heap(&mut self, id: u32) -> Result<(), GpuStatus> {
+        let index = self
+            .heaps
+            .iter()
+            .position(|heap| heap.id == id)
+            .ok_or(GpuStatus::NotFound)?;
+        let mut ranges: Vec<UnmapRange> = Vec::new();
+        ranges
+            .try_reserve(self.heaps[index].pieces.len())
+            .map_err(|_| GpuStatus::NoMemory)?;
+        ranges.extend(self.heaps[index].pieces.iter().map(HeapPiece::range));
+        // The same rule as destroy_buffer: a refusal changes no page, while a failed live
+        // flush may leave cached mappings, so it is DeviceLost and containment cleans up.
+        if let Err(error) = unmap_ranges(self.tables, self.root, &ranges) {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client heap {} unmap failed: {:?}\n", id, error),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        dsb();
+        flush_page_tables(self.device, GROUP_AS).map_err(|_| GpuStatus::DeviceLost)?;
+        let heap = self.heaps.swap_remove(index);
+        let pieces = heap.pieces.len();
+        heap.release();
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: client heap {} destroyed; {} pieces unmapped\n",
+                id, pieces
+            ),
+        );
+        Ok(())
+    }
+
     fn watch_group(&mut self) -> Result<protocol::GroupReport, GpuStatus> {
         if self.status_vmo.is_none() {
             let handle = valid_handle(kumo_rt::vmo_create(PAGE_SIZE)).ok_or(GpuStatus::NoMemory)?;
@@ -425,6 +636,9 @@ impl Backend for Hardware<'_> {
         for record in self.buffers.drain(..) {
             record.release();
         }
+        for heap in self.heaps.drain(..) {
+            heap.release();
+        }
         self.pending = None;
     }
 }
@@ -681,6 +895,7 @@ pub(super) fn serve(
         waiters: [None; MAX_WAITS],
         group_report: protocol::GroupReport::USABLE,
         status_vmo: None,
+        heaps: Vec::new(),
     };
     let mut session = Session::default();
     log(

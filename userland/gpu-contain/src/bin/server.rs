@@ -2,6 +2,7 @@
 #![no_std]
 #![no_main]
 //j709
+//j754
 
 //! QEMU-only fake server for G8d-a's contained-close smoke. It speaks enough of the real
 //! `kumo-gpu` wire to let a fake client arm two buffers, two bindings and one fence wait,
@@ -228,6 +229,7 @@ extern "C" fn main(request_raw: u64, report_raw: u64) -> ! {
                 buffers: 2,
                 bindings: 2,
                 waits: 1,
+                heaps: 0,
                 bytes: 3 * PAGE_BYTES,
             })
         && backend.retire_calls == 1

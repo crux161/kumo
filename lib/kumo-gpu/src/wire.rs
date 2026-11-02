@@ -1,8 +1,8 @@
-//j652
 //j681
 //j707
 //j742
 //j752
+//j754
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -11,8 +11,8 @@
 
 use crate::{
     valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
-    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, GroupReport, Status, Submission,
-    SyncState, Unbind,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, GroupReport, HeapPlacement,
+    HeapSpec, Status, Submission, SyncState, Unbind,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -70,6 +70,15 @@ pub enum Command {
         group: u32,
         point: u64,
     },
+    /// G7q-a: allocate, link and map one tiler heap in the driver's heap window. The reply is
+    /// `HeapCreated` with the context and first-chunk addresses; no handle crosses, because the
+    /// client never maps heap memory. — TIMBERDOODLE
+    HeapCreate(HeapSpec),
+    /// Unmap and release every page of one heap. The serve loop's ordering means no job is in
+    /// flight; a client must not destroy a heap a later job will still name. — TIMBERDOODLE
+    HeapDestroy {
+        heap: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +128,18 @@ impl Request {
             ),
             Command::SyncRead { group, point } => (6, [u64::from(group), point, 0, 0, 0, 0]),
             Command::FenceWait { group, point } => (16, [u64::from(group), point, 0, 0, 0, 0]),
+            Command::HeapCreate(h) => (
+                19,
+                [
+                    u64::from(h.vm),
+                    u64::from(h.chunk_bytes),
+                    u64::from(h.initial_chunks),
+                    u64::from(h.max_chunks),
+                    u64::from(h.target_in_flight),
+                    0,
+                ],
+            ),
+            Command::HeapDestroy { heap } => (20, [u64::from(heap), 0, 0, 0, 0, 0]),
         };
         let mut bytes = [0; REQUEST_LEN];
         bytes[..4].copy_from_slice(b"KGQ1");
@@ -199,6 +220,20 @@ impl Request {
                 group: a[0] as u32,
                 point: a[1],
             },
+            19 => {
+                let h = HeapSpec {
+                    vm: a[0] as u32,
+                    chunk_bytes: a[1] as u32,
+                    initial_chunks: a[2] as u32,
+                    max_chunks: a[3] as u32,
+                    target_in_flight: a[4] as u32,
+                };
+                if !h.valid_shape() {
+                    return None;
+                }
+                Command::HeapCreate(h)
+            }
+            20 if a[0] != 0 => Command::HeapDestroy { heap: a[0] as u32 },
             _ => return None,
         };
         let request = Self { id, command };
@@ -267,6 +302,15 @@ pub enum Response {
     /// driver writes one byte to it and closes its end when the point completes.
     WaitArmed {
         point: u64,
+    },
+    HeapCreated {
+        heap: u32,
+        placement: HeapPlacement,
+    },
+    /// The heap is unmapped and its pages released; `bytes` is what returned to the budget.
+    HeapDestroyed {
+        heap: u32,
+        bytes: u64,
     },
 }
 
@@ -355,6 +399,16 @@ impl Reply {
                 (16, [point, 0, u64::from(gpu_status), 0])
             }
             Ok(Response::WaitArmed { point }) => (16, [point, 1, 0, 0]),
+            Ok(Response::HeapCreated { heap, placement }) => (
+                19,
+                [
+                    u64::from(heap),
+                    placement.context_va,
+                    placement.first_chunk_va,
+                    0,
+                ],
+            ),
+            Ok(Response::HeapDestroyed { heap, bytes }) => (20, [u64::from(heap), bytes, 0, 0]),
         };
         bytes[12..16].copy_from_slice(&u32::to_le_bytes(op));
         put_args(&mut bytes[16..], &a);
@@ -466,6 +520,25 @@ impl Reply {
                 },
                 16 if a[0] != 0 && a[1] == 1 && a[2] == 0 && a[3] == 0 => {
                     Response::WaitArmed { point: a[0] }
+                }
+                19 if a[0] != 0 => {
+                    let placement = HeapPlacement {
+                        context_va: a[1],
+                        first_chunk_va: a[2],
+                    };
+                    if !placement.valid() {
+                        return None;
+                    }
+                    Response::HeapCreated {
+                        heap: a[0] as u32,
+                        placement,
+                    }
+                }
+                20 if a[0] != 0 && a[1] != 0 && a[1] % crate::PAGE_BYTES == 0 => {
+                    Response::HeapDestroyed {
+                        heap: a[0] as u32,
+                        bytes: a[1],
+                    }
                 }
                 _ => return None,
             })

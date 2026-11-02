@@ -1,9 +1,9 @@
 #![no_std]
-//j744
 //j746
 //j749
 //j751
 //j752
+//j754
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -26,6 +26,11 @@
 //! cooperative first lane does not claim isolation from hostile command streams.
 //!
 //! G6b serves this contract from drv-gpu for one brokered client per boot.
+//!
+//! G7q-a adds tiler heaps: HeapCreate (opcode 19) has the driver allocate a context page and
+//! the initial chunks, link them and map them no-execute in its own heap window, charging the
+//! shared budget; HeapDestroy (20) unmaps and releases them. Clients get two addresses back
+//! and never map heap memory.
 
 extern crate alloc;
 
@@ -59,6 +64,70 @@ pub const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_TOTAL_BUFFER_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_STREAM_BYTES: u32 = 64 * 1024;
 pub const RING_BYTES: u32 = 4096;
+
+//j754
+// G7q-a: tiler heaps live in a driver-owned window of the client's address space, outside the
+// manual-VA window, as Panthor keeps them in its kernel VA range. A client names a heap only by
+// ID and learns its two addresses from HeapCreated; no VmBind can reach this window. Heap memory
+// is data, never executable, so the 4 GiB rule above does not constrain it. — TIMBERDOODLE
+pub const HEAP_VA_START: u64 = 0x3000_0000;
+pub const HEAP_VA_END: u64 = 0x3800_0000;
+const _: () = assert!(VA_END <= HEAP_VA_START);
+const _: () = assert!(HEAP_VA_END - HEAP_VA_START >= MAX_TOTAL_BUFFER_BYTES);
+/// Panthor's bounds for one chunk (`drm_panthor_tiler_heap_create`: page-aligned, 128 KiB to
+/// 8 MiB). — TIMBERDOODLE
+pub const MIN_HEAP_CHUNK_BYTES: u32 = 128 * 1024;
+pub const MAX_HEAP_CHUNK_BYTES: u32 = 8 * 1024 * 1024;
+/// Live heaps per channel. Gallium makes one per context and panvk one per queue.
+pub const MAX_HEAPS: usize = 8;
+/// Each heap's 32-byte GPU-owned context gets a page of its own, charged with its chunks.
+pub const HEAP_CONTEXT_BYTES: u64 = PAGE_BYTES;
+
+/// One TILER_HEAP_CREATE, in Panthor's shape. `target_in_flight` is the render passes the
+/// firmware may keep in flight before it waits; KUMO records it for the OOM policy (G7q-b) and
+/// gives zero no special meaning. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapSpec {
+    pub vm: u32,
+    pub chunk_bytes: u32,
+    pub initial_chunks: u32,
+    pub max_chunks: u32,
+    pub target_in_flight: u32,
+}
+
+impl HeapSpec {
+    /// Panthor's rules: at least one initial chunk, `max_chunks` no fewer than that, and a
+    /// page-aligned chunk size in [128 KiB, 8 MiB]. The budget is the session's check.
+    pub fn valid_shape(self) -> bool {
+        self.vm != 0
+            && self.initial_chunks != 0
+            && self.max_chunks >= self.initial_chunks
+            && u64::from(self.chunk_bytes) % PAGE_BYTES == 0
+            && (MIN_HEAP_CHUNK_BYTES..=MAX_HEAP_CHUNK_BYTES).contains(&self.chunk_bytes)
+    }
+
+    /// What creation charges to the budget: the context page and every initial chunk.
+    pub fn initial_bytes(self) -> u64 {
+        HEAP_CONTEXT_BYTES + u64::from(self.initial_chunks) * u64::from(self.chunk_bytes)
+    }
+}
+
+/// Where the driver put a new heap: its context and the head of its chunk list. Both are
+/// page-aligned, distinct and inside the heap window. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapPlacement {
+    pub context_va: u64,
+    pub first_chunk_va: u64,
+}
+
+impl HeapPlacement {
+    pub fn valid(self) -> bool {
+        let inside = |va: u64| (HEAP_VA_START..HEAP_VA_END).contains(&va) && va % PAGE_BYTES == 0;
+        inside(self.context_va)
+            && inside(self.first_chunk_va)
+            && self.context_va != self.first_chunk_va
+    }
+}
 
 /// Read-only hardware identity and command-stream capabilities. No address, handle or
 /// firmware interface pointer crosses this query.

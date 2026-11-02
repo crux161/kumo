@@ -1,8 +1,8 @@
-//j652
 //j681
 //j707
 //j742
 //j752
+//j754
 
 extern crate std;
 
@@ -1123,4 +1123,157 @@ fn group_status_record_rejects_corruption_and_stale_health_after_close() {
     );
     assert_eq!(GroupReport::from_words(2, 7), None);
     assert_eq!(GroupReport::from_words(8, 0), None);
+}
+
+//j754
+#[test]
+fn heap_wire_is_exact_and_refuses_shapes_panthor_refuses() {
+    let spec = HeapSpec {
+        vm: 1,
+        chunk_bytes: 2 * 1024 * 1024,
+        initial_chunks: 5,
+        max_chunks: 64,
+        target_in_flight: 65535,
+    };
+    let request = Request {
+        id: 1,
+        command: Command::HeapCreate(spec),
+    };
+    let encoded = request.encode();
+    assert_eq!(&encoded[8..12], &19u32.to_le_bytes());
+    assert_eq!(Request::decode(&encoded), Some(request));
+    // Narrow fields lose no high bits, and the reserved slot stays zero.
+    for at in [12, 20, 28, 36, 44, 52, 56] {
+        let mut bad = encoded;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None, "byte {at}");
+    }
+    for refused in [
+        HeapSpec {
+            initial_chunks: 0,
+            ..spec
+        },
+        HeapSpec {
+            max_chunks: 4,
+            ..spec
+        },
+        HeapSpec {
+            chunk_bytes: 64 * 1024,
+            ..spec
+        },
+        HeapSpec {
+            chunk_bytes: 16 * 1024 * 1024,
+            ..spec
+        },
+        HeapSpec {
+            chunk_bytes: 128 * 1024 + 512,
+            ..spec
+        },
+        HeapSpec { vm: 0, ..spec },
+    ] {
+        let bytes = Request {
+            id: 1,
+            command: Command::HeapCreate(refused),
+        }
+        .encode();
+        assert_eq!(Request::decode(&bytes), None, "{refused:?}");
+    }
+    // Panthor's bounds are inclusive.
+    for edge in [MIN_HEAP_CHUNK_BYTES, MAX_HEAP_CHUNK_BYTES] {
+        assert!(HeapSpec {
+            chunk_bytes: edge,
+            ..spec
+        }
+        .valid_shape());
+    }
+    let destroy = Request {
+        id: 2,
+        command: Command::HeapDestroy { heap: 3 },
+    };
+    assert_eq!(Request::decode(&destroy.encode()), Some(destroy));
+    let zero = Request {
+        id: 2,
+        command: Command::HeapDestroy { heap: 0 },
+    };
+    assert_eq!(Request::decode(&zero.encode()), None);
+
+    let placement = HeapPlacement {
+        context_va: HEAP_VA_START,
+        first_chunk_va: HEAP_VA_START + 5 * 2 * 1024 * 1024 + PAGE_BYTES - 2 * 1024 * 1024,
+    };
+    let created = Reply {
+        id: 1,
+        result: Ok(Response::HeapCreated { heap: 1, placement }),
+    };
+    assert_eq!(
+        Response::HeapCreated { heap: 1, placement }.handle_count(),
+        0
+    );
+    let bytes = created.encode();
+    assert_eq!(Reply::decode(&bytes), Some(created));
+    for at in [20, 40] {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "byte {at}");
+    }
+    for wrong in [
+        HeapPlacement {
+            context_va: VA_START,
+            ..placement
+        },
+        HeapPlacement {
+            first_chunk_va: HEAP_VA_END,
+            ..placement
+        },
+        HeapPlacement {
+            context_va: HEAP_VA_START + 8,
+            ..placement
+        },
+        HeapPlacement {
+            first_chunk_va: placement.context_va,
+            ..placement
+        },
+    ] {
+        let bytes = Reply {
+            id: 1,
+            result: Ok(Response::HeapCreated {
+                heap: 1,
+                placement: wrong,
+            }),
+        }
+        .encode();
+        assert_eq!(Reply::decode(&bytes), None, "{wrong:?}");
+    }
+    let destroyed = Reply {
+        id: 2,
+        result: Ok(Response::HeapDestroyed {
+            heap: 3,
+            bytes: 3 * PAGE_BYTES,
+        }),
+    };
+    assert_eq!(Reply::decode(&destroyed.encode()), Some(destroyed));
+    for bytes in [0, PAGE_BYTES + 1] {
+        let bad = Reply {
+            id: 2,
+            result: Ok(Response::HeapDestroyed { heap: 3, bytes }),
+        }
+        .encode();
+        assert_eq!(Reply::decode(&bad), None);
+    }
+}
+
+#[test]
+fn the_heap_window_sits_outside_every_client_binding() {
+    assert!(VA_END <= HEAP_VA_START);
+    // No VmBind or Submit may name heap memory.
+    let mut b = binding();
+    b.va = HEAP_VA_START;
+    assert!(b.validate(MAX_BUFFER_BYTES).is_err());
+    let s = Submission {
+        group: 1,
+        stream_va: HEAP_VA_START,
+        stream_bytes: 64,
+        signal_point: 1,
+    };
+    assert!(!s.valid_shape());
 }

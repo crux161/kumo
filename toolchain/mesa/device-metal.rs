@@ -1,5 +1,6 @@
 //j747
 //j753
+//j754
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -125,8 +126,8 @@ type Store<'a> = Buffers<'a, native::Channel, native::Memory>;
 
 /// One CS SYNC_SET32 of `value` at GPU VA `target`, from a fresh 64-byte line of a Mesa BO
 /// whose binding is read-only (KUMO's Submit requires it). It writes a 32-bit sync object:
-/// `value`, then status 0 in the next word. The group is created on the service VM at first
-/// use; points run 1, 2, ... Returns 0 on completion with GPU status 0. — TIMBERDOODLE
+/// `value`, then status 0 in the next word. Returns 0 on completion with GPU status 0.
+/// — TIMBERDOODLE
 #[no_mangle]
 pub extern "C" fn kumo_metal_store(
     context: *mut c_void,
@@ -135,7 +136,37 @@ pub extern "C" fn kumo_metal_store(
     target: u64,
     value: u32,
 ) -> u32 {
-    if context.is_null() || stream_cpu.is_null() || stream_va % 64 != 0 {
+    let words = [
+        (1u64 << 56) | (target & 0x0000_ffff_ffff_ffff), // MOVE48 r0, target
+        (2u64 << 56) | (2u64 << 48) | u64::from(value),  // MOVE32 r2, value
+        (38u64 << 56) | (2u64 << 32),                    // SYNC_SET32 slot0, [r0], r2
+        (3u64 << 56) | (1u64 << 16),                     // WAIT slot0
+    ];
+    kumo_metal_run(
+        context,
+        stream_cpu,
+        stream_va,
+        words.as_ptr(),
+        words.len() as u32,
+    )
+}
+
+//j754
+/// Run `count` CS words (at most one 64-byte line) as one job on the session's own group,
+/// created on the service VM at first use; points run 1, 2, ... Returns 0 on completion with
+/// GPU status 0. G7q-a's heap walk shares it with the store above. — TIMBERDOODLE
+#[no_mangle]
+pub extern "C" fn kumo_metal_run(
+    context: *mut c_void,
+    stream_cpu: *mut u64,
+    stream_va: u64,
+    words: *const u64,
+    count: u32,
+) -> u32 {
+    if context.is_null() || stream_cpu.is_null() || words.is_null() || stream_va % 64 != 0 {
+        return 1;
+    }
+    if count == 0 || count > 8 {
         return 1;
     }
     // SAFETY: `context` is the Buffers store with_device_api lent the C cases; calls are
@@ -149,22 +180,17 @@ pub extern "C" fn kumo_metal_store(
         }
     }
     let group = GROUP.load(Ordering::Relaxed);
-    let words = [
-        (1u64 << 56) | (target & 0x0000_ffff_ffff_ffff), // MOVE48 r0, target
-        (2u64 << 56) | (2u64 << 48) | u64::from(value),  // MOVE32 r2, value
-        (38u64 << 56) | (2u64 << 32),                    // SYNC_SET32 slot0, [r0], r2
-        (3u64 << 56) | (1u64 << 16),                     // WAIT slot0
-    ];
-    for (i, word) in words.iter().enumerate() {
-        // SAFETY: four words inside the caller's mapped, line-aligned stream slot.
-        unsafe { stream_cpu.add(i).write_volatile(*word) };
+    for i in 0..count as usize {
+        // SAFETY: `count` caller words, copied into the caller's mapped, line-aligned stream
+        // slot.
+        unsafe { stream_cpu.add(i).write_volatile(*words.add(i)) };
     }
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
     let point = NEXT_POINT.fetch_add(1, Ordering::Relaxed);
     let submission = Submission {
         group,
         stream_va,
-        stream_bytes: (words.len() * 8) as u32,
+        stream_bytes: count * 8,
         signal_point: point,
     };
     if client.submit(submission).is_err() {
@@ -184,6 +210,62 @@ pub extern "C" fn kumo_metal_store(
         }
     }
     6
+}
+
+/// G7q-a: one tiler heap on the service VM. On success `out` holds the heap ID, the context VA
+/// and the first chunk's VA, and the result is 0. — TIMBERDOODLE
+#[no_mangle]
+pub extern "C" fn kumo_metal_heap_create(
+    context: *mut c_void,
+    chunk_bytes: u32,
+    initial_chunks: u32,
+    max_chunks: u32,
+    out: *mut u64,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return 1;
+    }
+    // SAFETY: as in kumo_metal_run.
+    let client: &mut Client<native::Channel> =
+        unsafe { &mut *context.cast::<Store<'_>>() }.native_client();
+    let spec = kumo_gpu::HeapSpec {
+        vm: 1,
+        chunk_bytes,
+        initial_chunks,
+        max_chunks,
+        target_in_flight: 65535,
+    };
+    match client.create_heap(spec) {
+        Ok((heap, placement)) => {
+            // SAFETY: the caller's three-word output array.
+            unsafe {
+                out.write(u64::from(heap));
+                out.add(1).write(placement.context_va);
+                out.add(2).write(placement.first_chunk_va);
+            }
+            0
+        }
+        Err(_) => 2,
+    }
+}
+
+/// Destroy heap `heap`; `bytes` receives what returned to the budget.
+#[no_mangle]
+pub extern "C" fn kumo_metal_heap_destroy(context: *mut c_void, heap: u32, bytes: *mut u64) -> u32 {
+    if context.is_null() || bytes.is_null() {
+        return 1;
+    }
+    // SAFETY: as in kumo_metal_run.
+    let client: &mut Client<native::Channel> =
+        unsafe { &mut *context.cast::<Store<'_>>() }.native_client();
+    match client.destroy_heap(heap) {
+        Ok(released) => {
+            // SAFETY: the caller's output word.
+            unsafe { bytes.write(released) };
+            0
+        }
+        Err(_) => 2,
+    }
 }
 
 #[no_mangle]

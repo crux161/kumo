@@ -4,6 +4,7 @@
 //j733
 //j734
 //j742
+//j754
 
 extern crate alloc;
 
@@ -53,8 +54,13 @@ const FIRMWARE_MAX: usize = 320 * 1024;
 /// client's; eight more pages keep the old headroom.
 // The client window needs one L3 per 2 MiB, even after churn visits every region.
 // Add these to the resident firmware/two-group allowance. — KESTREL
-const TABLE_ARENA_LEN: u64 =
-    (24 + (kumo_gpu::VA_END - kumo_gpu::VA_START) / (2 * 1024 * 1024)) * PAGE_SIZE;
+//j754
+// G7q-a: the heap window needs one L3 per 2 MiB too, so a full budget of heaps never runs the
+// arena dry mid-map. — TIMBERDOODLE
+const TABLE_ARENA_LEN: u64 = (24
+    + (kumo_gpu::VA_END - kumo_gpu::VA_START) / (2 * 1024 * 1024)
+    + (kumo_gpu::HEAP_VA_END - kumo_gpu::HEAP_VA_START) / (2 * 1024 * 1024))
+    * PAGE_SIZE;
 const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.

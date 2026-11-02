@@ -1,6 +1,7 @@
 //j710
 //j709
 //j714
+//j754
 
 //! G8d-a: the contained-close contract. A session that leaves service is closed in exactly
 //! one of two states, and the two are never mixed.
@@ -121,9 +122,15 @@ impl fmt::Display for Containment {
         let retained = if self.retained() { "yes" } else { "no" };
         write!(
             f,
-            "drv-gpu: containment reset={} buffers={} bindings={} waits={} retained={}",
-            reset, self.release.buffers, self.release.bindings, self.release.waits, retained
-        )
+            "drv-gpu: containment reset={} buffers={} bindings={} waits={}",
+            reset, self.release.buffers, self.release.bindings, self.release.waits
+        )?;
+        // G7q-a: a heap count appears only when there were heaps, so every heapless record
+        // keeps the exact bytes its boot-log assertions match. — TIMBERDOODLE
+        if self.release.heaps != 0 {
+            write!(f, " heaps={}", self.release.heaps)?;
+        }
+        write!(f, " retained={}", retained)
     }
 }
 
@@ -252,8 +259,25 @@ mod tests {
             buffers: 2,
             bindings: 2,
             waits: 1,
+            heaps: 0,
             bytes: 3 * PAGE_BYTES,
         }
+    }
+
+    #[test]
+    fn the_record_names_heaps_only_when_there_were_heaps() {
+        let mut h = Harness::populated();
+        let mut containment =
+            Containment::run(Ok(ResetPath::Interrupt), &mut h.session, &mut h.backend);
+        assert_eq!(
+            std::format!("{containment}"),
+            "drv-gpu: containment reset=ok buffers=2 bindings=2 waits=1 retained=no"
+        );
+        containment.release.heaps = 2;
+        assert_eq!(
+            std::format!("{containment}"),
+            "drv-gpu: containment reset=ok buffers=2 bindings=2 waits=1 heaps=2 retained=no"
+        );
     }
 
     #[test]

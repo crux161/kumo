@@ -1,9 +1,37 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j749 -->
 <!-- j750 -->
 <!-- j751 -->
 <!-- j752 -->
 <!-- j753 -->
+<!-- j754 -->
+
+## G7q-a: tiler heap memory on metal
+
+The channel has two new opcodes. HeapCreate (19) takes Panthor's TILER_HEAP_CREATE fields:
+a VM, a page-aligned chunk size in [128 KiB, 8 MiB], at least one initial chunk, a maximum no
+smaller than that, and `target_in_flight`. drv-gpu places a context page and the initial
+chunks in one run in its heap window, 0x3000_0000-0x3800_0000. That window is part of the
+client's address space but sits outside the client's manual-VA window, so no VmBind or
+Submit can name it. Each chunk header links the previous chunk, head-first as Panthor does.
+Everything is mapped no-execute and GPU-cached. The reply carries the context VA and the
+head chunk's VA, and no handle, since the client never maps heap memory. HeapDestroy (20)
+unmaps, flushes and releases the heap. Heaps share the 128 MiB session budget with buffers,
+and a session may hold 8.
+
+Proof 3 (`--proof g7q-a`) makes the GPU read the heap, because the client cannot. Each job
+LOAD_MULTIPLEs one chunk header and stores it in the data BO, and the next job follows the
+link the GPU reported. On metal the GPU walked 0x30041000 → 0x30021000 → 0x30001000 → 0. Each
+link carried the chunk size, and the context read 32 zero bytes. After HeapDestroy, a load
+from the old head took `TRANSLATION_FAULT Read` at exactly 0x30041000, and drv-gpu contained
+it with a reset.
+
+Tiler-OOM growth (G7q-b), the native C entry points (G7q-c) and growth under a real tiling
+job (G7q-d) are still to come. — TIMBERDOODLE, 2026-11-01
+
+```sh
+python3 scripts/mesa-device-metal.py --proof g7q-a --stage build/proofs/g7q-a/image
+python3 scripts/mesa-device-metal.py --proof g7q-a --check <tio log>
+```
 
 ## G7p-e: native sync and group state on metal
 

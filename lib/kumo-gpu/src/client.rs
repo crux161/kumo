@@ -1,8 +1,8 @@
-//j707
 //j742
 //j744
 //j745
 //j752
+//j754
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -200,6 +200,28 @@ impl<T: Transport> Client<T> {
             handle,
         })
     }
+    /// G7q-a: one tiler heap in the driver's heap window. Returns its ID and where its context
+    /// and first chunk live; the client never maps either. — TIMBERDOODLE
+    pub fn create_heap(
+        &mut self,
+        spec: crate::HeapSpec,
+    ) -> Result<(u32, crate::HeapPlacement), Error> {
+        let (Response::HeapCreated { heap, placement }, None) =
+            self.call(Command::HeapCreate(spec))?
+        else {
+            unreachable!()
+        };
+        Ok((heap, placement))
+    }
+    /// Release one heap. Returns the bytes given back to the budget. No later job may name it.
+    pub fn destroy_heap(&mut self, heap: u32) -> Result<u64, Error> {
+        let (Response::HeapDestroyed { bytes, .. }, None) =
+            self.call(Command::HeapDestroy { heap })?
+        else {
+            unreachable!()
+        };
+        Ok(bytes)
+    }
     /// Acceptance only. A successful return does not permit buffer reuse.
     pub fn submit(&mut self, submission: Submission) -> Result<(), Error> {
         self.call(Command::Submit(submission))?;
@@ -363,6 +385,10 @@ fn matches_response(command: Command, response: Response) -> bool {
         ) => bytes == received,
         (Command::BufferDestroy { buffer }, Response::BufferDestroyed { buffer: received }) => {
             buffer == received
+        }
+        (Command::HeapCreate(_), Response::HeapCreated { .. }) => true,
+        (Command::HeapDestroy { heap }, Response::HeapDestroyed { heap: received, .. }) => {
+            heap == received
         }
         (Command::Submit(job), Response::Submitted { point }) => job.signal_point == point,
         (

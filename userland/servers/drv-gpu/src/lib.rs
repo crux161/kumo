@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j733
 //j734
 //j742
 //j743
 //j752
+//j754
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1407,6 +1407,41 @@ pub struct UnmapRange {
     pub len: u64,
 }
 
+//j754
+/// G7q-a: a tiler-heap chunk header's first word (RESEARCH/009 §12.7, `panthor_heap.c`): the
+/// next chunk's page address, with the chunk size in 4 KiB units in the low 12 bits. Zero ends
+/// the list. — TIMBERDOODLE
+pub const fn heap_chunk_link(next_va: u64, chunk_bytes: u64) -> u64 {
+    (next_va & !0xFFF) | (chunk_bytes >> 12)
+}
+// The largest chunk Panthor allows, 8 MiB, is 2048 pages: it fits the 12-bit size field.
+const _: () = assert!((8 * 1024 * 1024u64 >> 12) <= 0xFFF);
+
+/// The lowest page-aligned start in `[start, end)` where `bytes` clears every live `(va, len)`
+/// range. `live` may be unsorted. Each overlap moves the candidate past the furthest-ending
+/// range it hits, so the search ends after at most `live.len() + 1` probes. — TIMBERDOODLE
+pub fn first_fit(live: &[(u64, u64)], start: u64, end: u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 || start % PAGE_SIZE != 0 {
+        return None;
+    }
+    let mut candidate = start;
+    loop {
+        let candidate_end = candidate.checked_add(bytes)?;
+        if candidate_end > end {
+            return None;
+        }
+        let past = live
+            .iter()
+            .filter(|(va, len)| *va < candidate_end && candidate < va.saturating_add(*len))
+            .map(|(va, len)| va.saturating_add(*len))
+            .max();
+        match past {
+            None => return Some(candidate),
+            Some(next) => candidate = next.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1),
+        }
+    }
+}
+
 /// Walk to the level-3 entry for `va` without allocating. A zero or non-table intermediate
 /// descriptor proves no page was mapped through this root. — TIMBERDOODLE
 fn leaf_entry(memory: &mut impl TableMemory, transtab: u64, va: u64) -> Result<u64, TableError> {
@@ -2748,6 +2783,39 @@ pub fn surface_chunks() -> impl Iterator<Item = (u64, u32, u32)> {
 mod tests {
     extern crate std;
     use super::*;
+
+    //j754
+    #[test]
+    fn heap_chunk_links_carry_the_next_page_and_the_size_in_pages() {
+        assert_eq!(
+            heap_chunk_link(0x3020_1000, 2 * 1024 * 1024),
+            0x3020_1000 | 0x200
+        );
+        assert_eq!(heap_chunk_link(0x3020_1fff, 128 * 1024), 0x3020_1000 | 0x20);
+        assert_eq!(
+            heap_chunk_link(0x3000_0000, 8 * 1024 * 1024),
+            0x3000_0000 | 0x800
+        );
+    }
+
+    #[test]
+    fn first_fit_takes_the_lowest_gap_and_refuses_what_cannot_fit() {
+        const W: u64 = 0x3000_0000;
+        assert_eq!(first_fit(&[], W, W + 0x10_0000, 0x1000), Some(W));
+        // Unsorted live ranges; the first gap big enough wins.
+        let live = [(W + 0x4000, 0x2000), (W, 0x1000), (W + 0x1000, 0x1000)];
+        assert_eq!(first_fit(&live, W, W + 0x10_0000, 0x2000), Some(W + 0x2000));
+        assert_eq!(first_fit(&live, W, W + 0x10_0000, 0x3000), Some(W + 0x6000));
+        // A range ending mid-page pushes the candidate to the next page.
+        assert_eq!(
+            first_fit(&[(W, 0x1800)], W, W + 0x10_0000, 0x1000),
+            Some(W + 0x2000)
+        );
+        // Exactly full, then one page too many.
+        assert_eq!(first_fit(&[], W, W + 0x4000, 0x4000), Some(W));
+        assert_eq!(first_fit(&[(W, 0x1000)], W, W + 0x4000, 0x4000), None);
+        assert_eq!(first_fit(&[], W, W + 0x4000, 0), None);
+    }
     use std::collections::{HashMap, VecDeque};
     use std::vec::Vec;
 
