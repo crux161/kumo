@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j742
 //j743
 //j752
 //j754
 //j755
+//j756
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -2173,6 +2173,51 @@ pub fn stop_group(
         }
         if io.now_ns() >= deadline {
             return Err(GroupError::AckTimeout { req, ack });
+        }
+        io.delay_us(10);
+    }
+}
+
+//j756
+/// RESEARCH/009 §9.5: CSG_REQ bit 5, a toggle. The firmware rewrites each stream's status words
+/// (CS output +0x40..+0x64) only when the host asks; without it they hold whatever the last
+/// update left. J753's stall reports read all zeros. — TIMBERDOODLE
+pub const CSG_STATUS_UPDATE: u32 = 1 << 5;
+
+/// Ask the firmware to refresh the group's stream status words, the way [`stop_group`] asks for
+/// a state change: toggle the request against the acknowledge, toggle the slot's GLB doorbell
+/// request bit, ring doorbell 0, then wait for the acknowledge to match. Panthor requests the
+/// same update before it reads a stream's blocked state. Returns whether the firmware
+/// acknowledged within `timeout_ns`; a group the firmware has stopped serving may not. A
+/// diagnostic, so it reports rather than fails. — TIMBERDOODLE
+pub fn refresh_csg_status(
+    io: &mut (impl FirmwareMemory + GlbIo + ClockIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+    slot: u32,
+    timeout_ns: u64,
+) -> bool {
+    let req = io.read32(csg_input_va);
+    let ack = io.read32(csg_output_va);
+    io.write32(
+        csg_input_va,
+        (req & !CSG_STATUS_UPDATE) | (!ack & CSG_STATUS_UPDATE),
+    );
+    let bit = 1u32 << slot;
+    let doorbell_req = io.read_input(GLB_DOORBELL_REQ);
+    let doorbell_ack = io.read_output(GLB_DOORBELL_REQ);
+    io.write_input(
+        GLB_DOORBELL_REQ,
+        (doorbell_req & !bit) | (!doorbell_ack & bit),
+    );
+    io.ring_doorbell();
+    let deadline = io.now_ns().saturating_add(timeout_ns);
+    loop {
+        if (io.read32(csg_input_va) ^ io.read32(csg_output_va)) & CSG_STATUS_UPDATE == 0 {
+            return true;
+        }
+        if io.now_ns() >= deadline {
+            return false;
         }
         io.delay_us(10);
     }
@@ -5560,6 +5605,50 @@ mod g4b_tests {
         answer_tiler_oom(&mut fw, CS_IN, CS_OUT, 0);
         assert_eq!((fw.get(CS_IN + 0x20), fw.get(CS_IN + 0x28)), (0, 0));
         assert_eq!(tiler_oom(&mut fw, CS_IN, CS_OUT), None);
+    }
+
+    //j756
+    const CSG_IN: u64 = 0x0410_4000;
+    const CSG_OUT: u64 = 0x0410_5000;
+
+    #[test]
+    fn a_status_update_toggles_against_the_ack_rings_and_waits_for_it() {
+        let mut fw = FakeFirmware::new();
+        fw.set(CSG_IN, CSG_STATE_START);
+        // The firmware acknowledges on the second read of the output word.
+        fw.script_reads(
+            CSG_OUT,
+            &[
+                CSG_STATE_START,
+                CSG_STATE_START,
+                CSG_STATE_START | CSG_STATUS_UPDATE,
+            ],
+        );
+        assert!(refresh_csg_status(&mut fw, CSG_IN, CSG_OUT, 0, 1_000_000));
+        assert_eq!(fw.get(CSG_IN), CSG_STATE_START | CSG_STATUS_UPDATE);
+        assert_eq!(fw.read_input(GLB_DOORBELL_REQ), 1);
+        assert_eq!(fw.doorbells, 1);
+        // The next request toggles back, whatever the level of the first.
+        let mut fw = FakeFirmware::new();
+        fw.set(CSG_IN, CSG_STATE_START | CSG_STATUS_UPDATE);
+        fw.script_reads(
+            CSG_OUT,
+            &[CSG_STATE_START | CSG_STATUS_UPDATE, CSG_STATE_START],
+        );
+        assert!(refresh_csg_status(&mut fw, CSG_IN, CSG_OUT, 1, 1_000_000));
+        assert_eq!(fw.get(CSG_IN), CSG_STATE_START);
+        assert_eq!(fw.read_input(GLB_DOORBELL_REQ), 2);
+    }
+
+    #[test]
+    fn an_unacknowledged_status_update_reports_false_at_the_deadline() {
+        let mut fw = FakeFirmware::new();
+        fw.set(CSG_IN, CSG_STATE_START);
+        fw.set(CSG_OUT, CSG_STATE_START);
+        assert!(!refresh_csg_status(&mut fw, CSG_IN, CSG_OUT, 0, 50_000));
+        assert!(fw.delays > 0);
+        // The STATE level was left as the host wrote it.
+        assert_eq!(fw.get(CSG_IN) & CSG_STATE_MASK, CSG_STATE_START);
     }
 }
 

@@ -1,9 +1,9 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j751 -->
 <!-- j752 -->
 <!-- j753 -->
 <!-- j754 -->
 <!-- j755 -->
+<!-- j756 -->
 
 ## G7q-b: tiler OOM served by growing the heap
 
@@ -84,9 +84,12 @@ Facts for later slices:
   The first fatal boot read a BO after the loss and took an EL0 translation fault. A Mesa
   robustness path (GL5, VK6) must not touch a mapping after loss, or the bridge must keep
   aliases until unmap.
-- drv-gpu's stall report printed CS status words of zero in both failures. RESEARCH/009
-  §9.5 lists a CSG_REQ STATUS_UPDATE toggle that drv-gpu never requests; that is the likely
-  cause, and it is not yet verified.
+- drv-gpu's stall report printed CS status words of zero in both failures, because it never
+  requested CSG_REQ STATUS_UPDATE (RESEARCH/009 §9.5). J756 requests it and tags the line
+  `(refreshed)` or `(stale)`. On metal the timeout's stall then read `cmd_ptr=0x20200090
+  blocked=3 wait=0x81000000 sync=0x7fffffff@0x20000040`: the SYNC_WAIT32 itself, waiting
+  GREATER on the gate word. With AS1 holding a permission fault, the firmware did not
+  acknowledge within 10 ms, so the fatal stall's words stay stale.
 
 — TIMBERDOODLE, 2026-11-01
 

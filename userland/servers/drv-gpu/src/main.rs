@@ -5,6 +5,7 @@
 //j734
 //j742
 //j754
+//j756
 
 extern crate alloc;
 
@@ -147,6 +148,9 @@ const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
 const WORK_TIMEOUT_NS: u64 = 1_000_000_000;
+//j756
+/// How long a stall report waits for the firmware to refresh the stream status words.
+const STATUS_UPDATE_TIMEOUT_NS: u64 = 10_000_000;
 /// After the stream lands, how long the firmware's extract may take to catch up (polled).
 const DRAIN_TIMEOUT_NS: u64 = 100_000_000;
 const FIRST_WORK_VALUE: u32 = 0x00C0_FFEE;
@@ -632,11 +636,22 @@ fn report_stream_stall(
 ) {
     {
         let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
+        //j756
+        // The status words are only as fresh as the last STATUS_UPDATE, so request one first and
+        // say whether the firmware answered. — TIMBERDOODLE
+        let fresh = drv_gpu::refresh_csg_status(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            GROUP_SLOT,
+            STATUS_UPDATE_TIMEOUT_NS,
+        );
         let status = read_cs_status(&mut glb_io, cs.output_va);
         log(
             log_level::NOTICE,
             format_args!(
-                "drv-gpu: CS status cmd_ptr=0x{:x} blocked={} wait=0x{:08x} sync=0x{:x}@0x{:x} fault=0x{:08x} fatal=0x{:08x}\n",
+                "drv-gpu: CS status ({}) cmd_ptr=0x{:x} blocked={} wait=0x{:08x} sync=0x{:x}@0x{:x} fault=0x{:08x} fatal=0x{:08x}\n",
+                if fresh { "refreshed" } else { "stale" },
                 status.cmd_ptr,
                 status.blocked_reason,
                 status.wait,
