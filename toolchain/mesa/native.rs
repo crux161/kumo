@@ -1,6 +1,7 @@
 //j744
 //j745
 //j751
+//j752
 //! Kernel handle/endpoint adapters for the native Mesa bridge. No FD or physical-address route.
 use core::ptr::NonNull;
 use kumo_abi::{sys::Syscall, Handle, VmarFlags};
@@ -20,6 +21,25 @@ pub(crate) fn call(number: Syscall, args: [u64; 6]) -> (u64, u64) {
 }
 pub struct Memory;
 impl Mapper<Handle> for Memory {
+    fn read(&mut self, handle: &Handle, bytes: &mut [u8]) -> Result<(), MapError> {
+        if call(
+            Syscall::VmoRead,
+            [
+                handle.0 as u64,
+                0,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+            ],
+        )
+        .0 == 0
+        {
+            Ok(())
+        } else {
+            Err(MapError::Failed)
+        }
+    }
     fn barrier(&mut self) {
         // Normal-NC CPU aliases still need store publication and completion ordering.
         // Cache cleaning remains the GPU producer's contract. — MILVUS

@@ -1,9 +1,9 @@
 #![no_std]
-//j743
 //j744
 //j746
 //j749
 //j751
+//j752
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -33,9 +33,11 @@ pub mod bo;
 pub mod c;
 pub mod c_sync;
 pub mod client;
+pub mod group;
 pub mod session;
 pub mod sync;
 pub mod wire;
+pub use group::{GroupReport, GroupState, GroupWatch};
 pub use wire::{Command, Reply, Request, Response, REPLY_LEN, REQUEST_LEN};
 
 pub const PAGE_BYTES: u64 = 4096;

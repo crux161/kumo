@@ -1,8 +1,8 @@
-//j681
 //j707
 //j742
 //j744
 //j745
+//j752
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -188,6 +188,18 @@ impl<T: Transport> Client<T> {
         };
         Ok(group)
     }
+    pub fn watch_group(&mut self, group: u32) -> Result<crate::GroupWatch<T::Handle>, Error> {
+        let (Response::GroupWatch { report, .. }, Some(handle)) =
+            self.call(Command::GroupWatch { group })?
+        else {
+            unreachable!()
+        };
+        Ok(crate::GroupWatch {
+            group,
+            report,
+            handle,
+        })
+    }
     /// Acceptance only. A successful return does not permit buffer reuse.
     pub fn submit(&mut self, submission: Submission) -> Result<(), Error> {
         self.call(Command::Submit(submission))?;
@@ -276,6 +288,11 @@ impl<T: Transport> Client<T> {
             .filter(|r| r.id == id);
         let valid = reply.is_some_and(|r| match r.result {
             Ok(response) => {
+                if matches!(response, Response::GroupWatch { report, .. }
+                            if report.state != crate::GroupState::Usable)
+                {
+                    self.lost = true;
+                }
                 matches_response(command, response)
                     && response.handle_count() == usize::from(handle.is_some())
             }
@@ -332,6 +349,12 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,
         (Command::VmUnbind(range), Response::VmUnbound(received)) => range == received,
+        (
+            Command::GroupWatch { group },
+            Response::GroupWatch {
+                group: received, ..
+            },
+        ) => group == received,
         (
             Command::BufferCreate { bytes },
             Response::BufferCreated {

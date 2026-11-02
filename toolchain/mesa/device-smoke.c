@@ -2,6 +2,7 @@
 /*j745*/
 /*j746*/
 /*j751*/
+/*j752*/
 #include "kumo_kmod.h"
 #include <stdio.h>
 #include <sys/mman.h>
@@ -90,14 +91,14 @@ static uint32_t native_prepare(struct pan_kmod_dev *dev, uint32_t vm, uint64_t g
 static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
     struct kumo_gpu_api bad = *api;
-    bad.version = 12;
+    bad.version = 13;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 100);
     bad = *api; bad.bytes = 112;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 101);
     bad = *api; bad.native = NULL;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 102);
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
-    CHECK(dev && api->version == 13 && api->bytes == 120, 103);
+    CHECK(dev && api->version == 14 && api->bytes == 120, 103);
     struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, UINT64_C(0x20000000), UINT64_C(0x10000000));
     CHECK(vm, 104);
     struct kumo_gpu_native_reply out;
@@ -123,6 +124,7 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
     CHECK(!pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &binding, 1), 111);
     CHECK(native_op(dev, KUMO_NATIVE_GROUP_CREATE, 0, vm->handle, &out) == KUMO_GPU_OK, 112);
     uint64_t group = out.id;
+    CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == KUMO_GROUP_USABLE, 161);
     CHECK(native_op(dev, KUMO_NATIVE_DROP, group, 0, &out) == KUMO_GPU_SERVER_ERROR + 7, 113);
     struct kumo_gpu_native_point first_signals[] = {{input, 0}, {timeline, 42}};
     struct kumo_gpu_native_point later_signals[] = {{output, 0}, {timeline, 100}};
@@ -134,6 +136,7 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
         CHECK(native_op(dev, KUMO_NATIVE_STEP, first, 0, &out) == KUMO_GPU_TRANSPORT && !out.id, 117);
         CHECK(pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_FAULTY, 118);
         CHECK(native_op(dev, KUMO_NATIVE_STEP, first, 0, &out) == KUMO_GPU_DEVICE_LOST, 119);
+        CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == KUMO_GROUP_UNKNOWN, 162);
         pan_kmod_dev_destroy(dev);
         return 0;
     }
@@ -146,6 +149,16 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
     CHECK(native_op(dev, KUMO_NATIVE_DROP, input, 0, &out) == KUMO_GPU_OK, 124);
     CHECK(native_op(dev, KUMO_NATIVE_STEP, second, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_AVAILABLE, 125);
     uint64_t wake = out.id;
+    if (mode >= 12) {
+        CHECK(!kumo_mesa_native_control(mode == 12 ? 8 : mode == 13 ? 9 : 10), 163);
+        CHECK(native_op(dev, KUMO_NATIVE_STEP, second, 0, &out) == KUMO_GPU_TRANSPORT, 164);
+        uint64_t expected = mode == 12 ? KUMO_GROUP_TIMED_OUT : mode == 13 ? KUMO_GROUP_FATAL : KUMO_GROUP_UNKNOWN;
+        CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == expected && !out.gpu_status, 165);
+        CHECK(!kumo_mesa_native_control(7) && !kumo_mesa_native_control(11), 166);
+        CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == expected, 167);
+        pan_kmod_dev_destroy(dev);
+        return 0;
+    }
     if (mode == 10) {
         CHECK(native_op(dev, KUMO_NATIVE_ARM, first_snapshot, 0, &out) == KUMO_GPU_OK && out.state == KUMO_NATIVE_AVAILABLE, 159);
         CHECK(!kumo_mesa_native_control(2), 126);
@@ -155,6 +168,7 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
         CHECK(pan_kmod_vm_query_state(vm) == PAN_KMOD_VM_FAULTY, 129);
         CHECK(native_op(dev, KUMO_NATIVE_STEP, second, 0, &out) == KUMO_GPU_DEVICE_LOST, 130);
         CHECK(!kumo_mesa_native_control(7), 160); /* known loss closed the shared owner now */
+        CHECK(native_op(dev, KUMO_NATIVE_GROUP_STATE, group, 0, &out) == KUMO_GPU_OK && out.value == KUMO_GROUP_FATAL && out.gpu_status == 0xbeef, 168);
         pan_kmod_dev_destroy(dev);
         return 0;
     }
@@ -303,7 +317,8 @@ int main(void)
     puts("G7p-c native C sync begin: actual Mesa device/BO/VM and shared callback owner");
     unsigned failed = kumo_mesa_device_proof();
     if (failed) { printf("G7o-d native device FAILED at case %u\n", failed); return 1; }
-    puts("G7p-c native C sync green: ABI 13, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
+    puts("G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay");
+    puts("G7p-c native C sync green: ABI 14, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
     puts("G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window");
     puts("G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close");
     return 0;

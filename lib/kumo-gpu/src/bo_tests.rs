@@ -1,6 +1,7 @@
 //j744
 //j745
 //j751
+//j752
 use super::*;
 use crate::{
     c, client::TransportError, Command, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
@@ -27,6 +28,8 @@ struct State {
     next_wake: u32,
     waits: Vec<(u32, u64)>,
     wait_outcome: Option<WaitOutcome>,
+    report: Option<crate::GroupReport>,
+    read_fail: bool,
 }
 struct Wire {
     state: Rc<RefCell<State>>,
@@ -61,6 +64,10 @@ impl Transport for Wire {
                 Command::VmBind(_) => Response::VmBound,
                 Command::VmUnbind(range) => Response::VmUnbound(range),
                 Command::GroupCreate { .. } => Response::GroupCreated { group: 1 },
+                Command::GroupWatch { group } => Response::GroupWatch {
+                    group,
+                    report: crate::GroupReport::USABLE,
+                },
                 Command::Submit(job) => {
                     state.submitted = job.signal_point;
                     Response::Submitted {
@@ -94,6 +101,7 @@ impl Transport for Wire {
         bytes[..REPLY_LEN].copy_from_slice(&reply.encode());
         let handle = match reply.result {
             Ok(Response::BufferCreated { buffer, .. }) => Some(buffer + 100),
+            Ok(Response::GroupWatch { .. }) => Some(700),
             Ok(Response::WaitArmed { .. }) => {
                 let mut state = self.state.borrow_mut();
                 state.next_wake += 1;
@@ -114,6 +122,23 @@ impl crate::client::SessionTransport for Wire {
 }
 struct Memory(Rc<RefCell<State>>);
 impl Mapper<u32> for Memory {
+    fn read(&mut self, handle: &u32, bytes: &mut [u8]) -> Result<(), MapError> {
+        assert_eq!(*handle, 700);
+        let state = self.0.borrow();
+        if state.read_fail {
+            return Err(MapError::Failed);
+        }
+        let report = state.report.unwrap_or(if state.gpu_status != 0 {
+            crate::GroupReport {
+                state: crate::GroupState::Fatal,
+                gpu_status: state.gpu_status,
+            }
+        } else {
+            crate::GroupReport::USABLE
+        });
+        bytes.copy_from_slice(&report.encode(1));
+        Ok(())
+    }
     fn wait(&mut self, handle: &u32, timeout_ns: u64) -> WaitOutcome {
         let mut state = self.0.borrow_mut();
         state.waits.push((*handle, timeout_ns));
@@ -609,7 +634,7 @@ fn native_callback_is_device_only_and_malformed_requests_clear_outputs_without_i
     let mut buffers = Buffers::new(&mut client, &mut mapper);
     c::with_buffer_api(&mut buffers, |api| assert!(api.native.is_none()));
     c::with_device_api(&mut buffers, |api| {
-        assert_eq!(api.version, 13);
+        assert_eq!(api.version, 14);
         assert_eq!(api.bytes, 120);
         let _vm = native_open(api);
         let before = state.borrow().calls.len();
@@ -866,4 +891,112 @@ fn native_table_quota_and_stale_ids_refuse_without_gpu_io() {
         );
         assert_eq!(state.borrow().calls, [Command::VmCreate]);
     });
+}
+
+#[test]
+fn group_state_keeps_positive_driver_facts_after_shared_owner_close() {
+    use crate::{c_sync as n, GroupReport, GroupState};
+    for report in [
+        GroupReport::TIMED_OUT,
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 0xbeef,
+        },
+    ] {
+        let (state, mut client, mut mapper) = fixture();
+        let mut buffers = Buffers::new(&mut client, &mut mapper);
+        c::with_device_api(&mut buffers, |api| {
+            let vm = native_open(api);
+            let group = native_group(api, vm);
+            assert_eq!(
+                native(api, native_request(n::GROUP_STATE, group, 0))
+                    .1
+                    .value,
+                GroupState::Usable as u64
+            );
+            state.borrow_mut().report = Some(report);
+            let before = state.borrow().calls.len();
+            let observed = native(api, native_request(n::GROUP_STATE, group, 0));
+            assert_eq!(observed.0, c::OK);
+            assert_eq!(observed.1.value, report.state as u64);
+            assert_eq!(observed.1.gpu_status, report.gpu_status);
+            assert_eq!(
+                unsafe { api.device_status.unwrap()(api.context) },
+                c::DEVICE_LOST
+            );
+            assert_eq!(unsafe { api.device_close.unwrap()(api.context) }, c::OK);
+            state.borrow_mut().read_fail = true;
+            let cached = native(api, native_request(n::GROUP_STATE, group, 0));
+            assert_eq!(cached, observed);
+            assert_eq!(
+                native(api, native_request(n::GROUP_STATE, group + 100000, 0)).0,
+                n::UNKNOWN_OBJECT
+            );
+            assert_eq!(state.borrow().calls.len(), before);
+        });
+        assert_eq!(
+            state.borrow().closed.iter().filter(|h| **h == 700).count(),
+            1
+        );
+        assert_eq!(state.borrow().sessions_closed, 1);
+    }
+}
+
+#[test]
+fn group_state_never_calls_a_closed_or_unreadable_group_usable() {
+    use crate::{c_sync as n, GroupState};
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        let group = native_group(api, vm);
+        state.borrow_mut().read_fail = true;
+        assert_eq!(
+            native(api, native_request(n::GROUP_STATE, group, 0))
+                .1
+                .value,
+            GroupState::Unknown as u64
+        );
+        assert_eq!(unsafe { api.device_close.unwrap()(api.context) }, c::OK);
+        assert_eq!(
+            native(api, native_request(n::GROUP_STATE, group, 0))
+                .1
+                .value,
+            GroupState::Unknown as u64
+        );
+    });
+    let (_, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        let group = native_group(api, vm);
+        assert_eq!(unsafe { api.device_close.unwrap()(api.context) }, c::OK);
+        assert_eq!(
+            native(api, native_request(n::GROUP_STATE, group, 0))
+                .1
+                .value,
+            GroupState::Unknown as u64
+        );
+    });
+}
+
+#[test]
+fn unreadable_watch_at_group_creation_closes_the_grant_and_latches_loss() {
+    use crate::c_sync as n;
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| {
+        let vm = native_open(api);
+        state.borrow_mut().read_fail = true;
+        assert_eq!(
+            native(api, native_request(n::GROUP_CREATE, 0, vm as u64)),
+            (c::PROTOCOL, n::Reply::default())
+        );
+        assert_eq!(state.borrow().closed, [700]);
+        assert_eq!(
+            unsafe { api.device_status.unwrap()(api.context) },
+            c::DEVICE_LOST
+        );
+    });
+    assert_eq!(state.borrow().closed, [700]);
 }

@@ -1,8 +1,8 @@
-//j707
 //j709
 //j711
 //j742
 //j743
+//j752
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -103,6 +103,11 @@ pub trait Backend {
     /// freeing DMA the GPU might still reach. — TIMBERDOODLE
     fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), Status>;
     fn create_group(&mut self) -> Result<(), Status>;
+    /// Prepare one READ-only CPU status VMO grant for the transport. Unsupported backends
+    /// must refuse; a zero-filled or invented status record is not usable. — MILVUS
+    fn watch_group(&mut self) -> Result<crate::GroupReport, Status> {
+        Err(Status::NotSupported)
+    }
     fn submit(&mut self, submission: Submission) -> Result<(), SubmitError>;
     /// Release every backend-side claim this session still holds — DMA registrations, MMU
     /// mappings, queue references — **after** the caller has quiesced the device and the
@@ -155,7 +160,10 @@ impl Session {
             return Err(Status::DeviceLost);
         }
         let result = self.execute(request.command, backend);
-        if result == Err(Status::DeviceLost) {
+        if result == Err(Status::DeviceLost)
+            || matches!(result,
+            Ok(Response::GroupWatch { report, .. }) if report.state != crate::GroupState::Usable)
+        {
             self.retired = true;
         }
         result
@@ -444,6 +452,19 @@ impl Session {
                 self.group = true;
                 Ok(Response::GroupCreated { group: 1 })
             }
+            Command::GroupWatch { group } => {
+                if !self.group {
+                    return Err(Status::BadState);
+                }
+                if group != 1 {
+                    return Err(Status::NotFound);
+                }
+                let report = backend.watch_group()?;
+                if !report.valid() {
+                    return Err(Status::DeviceLost);
+                }
+                Ok(Response::GroupWatch { group, report })
+            }
             Command::Submit(job) => {
                 if !self.group {
                     return Err(Status::BadState);
@@ -546,6 +567,7 @@ mod tests {
         core_features: Option<u32>,
         threads: Option<DeviceThreads>,
         memory: Option<DeviceMemory>,
+        group_report: Option<crate::GroupReport>,
         /// How many times the containment layer asked the backend to release its own claims.
         /// A unit count, not a success flag: `retire` has nothing to answer. — TIMBERDOODLE
         retire_calls: u32,
@@ -557,6 +579,10 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn watch_group(&mut self) -> Result<crate::GroupReport, Status> {
+            self.record(Command::GroupWatch { group: 1 })?;
+            self.group_report.ok_or(Status::NotSupported)
+        }
         fn topology(&mut self) -> Result<DeviceTopology, Status> {
             self.record(Command::GetTopology)?;
             self.topology
@@ -1866,5 +1892,46 @@ mod tests {
         let mut passive = Passive { claims: 3 };
         passive.retire();
         assert_eq!(passive.claims, 3);
+    }
+    #[test]
+    fn group_watch_requires_ownership_refuses_absence_and_terminal_snapshot_retires() {
+        let mut s = Session::default();
+        let mut b = Fake::default();
+        assert_eq!(
+            send(&mut s, &mut b, Command::GroupWatch { group: 1 }),
+            Err(Status::BadState)
+        );
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::GroupCreate { vm: 1 }).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, Command::GroupWatch { group: 2 }),
+            Err(Status::NotFound)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, Command::GroupWatch { group: 1 }),
+            Err(Status::NotSupported)
+        );
+        b.group_report = Some(crate::GroupReport::USABLE);
+        assert_eq!(
+            send(&mut s, &mut b, Command::GroupWatch { group: 1 }),
+            Ok(Response::GroupWatch {
+                group: 1,
+                report: crate::GroupReport::USABLE
+            })
+        );
+        b.group_report = Some(crate::GroupReport::TIMED_OUT);
+        assert_eq!(
+            send(&mut s, &mut b, Command::GroupWatch { group: 1 }),
+            Ok(Response::GroupWatch {
+                group: 1,
+                report: crate::GroupReport::TIMED_OUT
+            })
+        );
+        let calls = b.calls.len();
+        assert_eq!(
+            send(&mut s, &mut b, Command::GetInfo),
+            Err(Status::DeviceLost)
+        );
+        assert_eq!(b.calls.len(), calls);
     }
 }

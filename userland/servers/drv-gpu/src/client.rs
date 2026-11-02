@@ -1,8 +1,8 @@
-//j714
 //j722
 //j733
 //j742
 //j743
+//j752
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -19,6 +19,7 @@
 //! finished when the request is dispatched; no queue, MCU or reset operation is involved.
 
 use alloc::vec::Vec;
+use kumo_abi::Rights;
 
 use super::*;
 use drv_gpu::contain::Containment;
@@ -81,9 +82,27 @@ struct Hardware<'a> {
     reply_grant: Option<Handle>,
     pending: Option<Pending>,
     waiters: [Option<(u64, Handle)>; MAX_WAITS],
+    group_report: protocol::GroupReport,
+    status_vmo: Option<Handle>,
 }
 
 impl Backend for Hardware<'_> {
+    fn watch_group(&mut self) -> Result<protocol::GroupReport, GpuStatus> {
+        if self.status_vmo.is_none() {
+            let handle = valid_handle(kumo_rt::vmo_create(PAGE_SIZE)).ok_or(GpuStatus::NoMemory)?;
+            self.status_vmo = Some(handle);
+            if !self.write_group_report() {
+                return Err(GpuStatus::DeviceLost);
+            }
+        }
+        let grant = valid_handle(kumo_rt::handle_duplicate(
+            self.status_vmo.unwrap(),
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+        ))
+        .ok_or(GpuStatus::NoMemory)?;
+        self.reply_grant = Some(grant);
+        Ok(self.group_report)
+    }
     fn info(&mut self) -> Result<protocol::DeviceInfo, GpuStatus> {
         // GPU_ID at aperture +0, already checked by probe before this server starts.
         Ok(protocol::DeviceInfo {
@@ -411,6 +430,24 @@ impl Backend for Hardware<'_> {
 }
 
 impl Hardware<'_> {
+    fn write_group_report(&mut self) -> bool {
+        let Some(handle) = self.status_vmo else {
+            return true;
+        };
+        let bytes = self.group_report.encode(1);
+        kumo_rt::vmo_write(handle, 0, bytes.as_ptr(), bytes.len()) == 0
+    }
+    fn fail_group(&mut self, report: protocol::GroupReport) {
+        if self.group_report.state == protocol::GroupState::Usable {
+            self.group_report = report;
+            if !self.write_group_report() {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: failed to publish group status\n"),
+                );
+            }
+        }
+    }
     /// Arm a wait for `point`: create the wake-channel pair and hand the read end back for
     /// the reply. None means the pair could not be created or the bounded table is full; the
     /// caller reports NoMemory rather than an armed reply without its handle. — TIMBERDOODLE
@@ -541,6 +578,18 @@ impl Hardware<'_> {
         };
         let outcome = classify_job_wait(seqno >= job.seqno, last, fired);
         if outcome != JobWait::Interrupt || seqno != job.seqno || status != 0 {
+            let cs_status = {
+                let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
+                read_cs_status(&mut io, cs.output_va)
+            };
+            let mmu_fault = mmu_rawstat(self.device) & (1u32 << GROUP_AS) != 0;
+            self.fail_group(drv_gpu::classify_group_failure(
+                outcome,
+                status,
+                cs_status.fault,
+                cs_status.fatal,
+                mmu_fault,
+            ));
             log(
                 log_level::ERR,
                 format_args!(
@@ -630,6 +679,8 @@ pub(super) fn serve(
         reply_grant: None,
         pending: None,
         waiters: [None; MAX_WAITS],
+        group_report: protocol::GroupReport::USABLE,
+        status_vmo: None,
     };
     let mut session = Session::default();
     log(
@@ -658,7 +709,10 @@ pub(super) fn serve(
             }
             _ => (0, Err(GpuStatus::BadRequest)),
         };
-        let mut grant = if matches!(result, Ok(Response::BufferCreated { .. })) {
+        let mut grant = if matches!(
+            result,
+            Ok(Response::BufferCreated { .. } | Response::GroupWatch { .. })
+        ) {
             hw.reply_grant.take()
         } else {
             None
@@ -673,7 +727,12 @@ pub(super) fn serve(
                 None => result = Err(GpuStatus::NoMemory),
             }
         }
-        let retired = result == Err(GpuStatus::DeviceLost);
+        let retired = result == Err(GpuStatus::DeviceLost)
+            || matches!(result,
+            Ok(Response::GroupWatch { report, .. }) if report.state != protocol::GroupState::Usable);
+        if retired {
+            hw.fail_group(protocol::GroupReport::UNKNOWN);
+        }
         let frame = GpuReply { id, result }.encode();
         let sent = kumo_rt::channel_write_with_handle(
             channel,
@@ -698,7 +757,10 @@ pub(super) fn serve(
                 hw.drain_fence_waits(&session);
             }
             Ok(None) => (),
-            Err(_) => break,
+            Err(_) => {
+                hw.fail_group(protocol::GroupReport::UNKNOWN);
+                break;
+            }
         }
     }
     // G8d-a: the loop above was the only reader, so service has stopped accepting. Quiesce
@@ -708,6 +770,7 @@ pub(super) fn serve(
     //j714
     // This record is also the return value: the release proof travels to the caller, which
     // asks it the one question left — whether another grant may be served. — TIMBERDOODLE
+    hw.fail_group(protocol::GroupReport::UNKNOWN);
     let containment = contain(&mut hw, &mut session);
     log(log_level::NOTICE, format_args!("{}\n", containment));
     if let Err(error) = containment.reset {
@@ -721,6 +784,11 @@ pub(super) fn serve(
     // client can be handed a view into a session this driver will never serve again. The
     // buffers themselves were released only if containment proved the GPU stopped.
     if let Some(handle) = hw.reply_grant.take() {
+        let _ = kumo_rt::handle_close(handle);
+    }
+    // This VMO is CPU metadata and was never DMA-visible. It closes on either containment
+    // path; the client's READ-only grant independently retains the last record. — MILVUS
+    if let Some(handle) = hw.status_vmo.take() {
         let _ = kumo_rt::handle_close(handle);
     }
     // The waiter channels close on both paths; a retained session keeps only its own metadata

@@ -2,6 +2,7 @@
 /*j745*/
 /*j746*/
 /*j751*/
+/*j752*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -66,7 +67,9 @@ uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *base,
     if (!request) return KUMO_GPU_BAD_ARGUMENT;
     struct kumo_device *dev = device(base);
     if (!dev) return KUMO_GPU_INVALID_REQUEST;
-    if (!ready(dev)) { poison(dev); return KUMO_GPU_DEVICE_LOST; }
+    if (!ready(dev) && request->operation != KUMO_NATIVE_GROUP_STATE) {
+        poison(dev); return KUMO_GPU_DEVICE_LOST;
+    }
     uint32_t status = dev->api.native(dev->api.context, request, out);
     /* Loss is terminal across BO, VM and sync callbacks. Closing retains the server's
      * reset-before-DMA-release obligation; C never fabricates quiescence. — MILVUS */

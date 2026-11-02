@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j653*/
 /*j742*/
 /*j744*/
 /*j745*/
 /*j751*/
+/*j752*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -19,7 +19,7 @@
  * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
-#define KUMO_GPU_API_VERSION 13u
+#define KUMO_GPU_API_VERSION 14u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -110,6 +110,13 @@ struct kumo_gpu_vm_binding {
 #define KUMO_NATIVE_GROUP_CREATE 10u
 #define KUMO_NATIVE_PREPARE 11u
 #define KUMO_NATIVE_STEP 12u
+#define KUMO_NATIVE_GROUP_STATE 13u
+/* Mutually exclusive native values, not DRM bit flags. UNKNOWN asserts neither a GPU
+ * fault nor a timeout; no group-state result is a fence completion. — MILVUS */
+#define KUMO_GROUP_USABLE 0u
+#define KUMO_GROUP_FATAL 1u
+#define KUMO_GROUP_TIMED_OUT 2u
+#define KUMO_GROUP_UNKNOWN 3u
 #define KUMO_NATIVE_UNAVAILABLE 0u
 #define KUMO_NATIVE_AVAILABLE 1u
 #define KUMO_NATIVE_COMPLETE 2u

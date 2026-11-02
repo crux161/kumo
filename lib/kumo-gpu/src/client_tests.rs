@@ -1,10 +1,8 @@
-//j710
-//j641
 //j644
 //j681
 //j707
 //j711
-
+//j752
 extern crate std;
 use super::*;
 use crate::{
@@ -568,4 +566,57 @@ fn destroy_buffer_releases_the_id_before_and_after_the_group_exists() {
     );
     assert!(!client.is_lost());
     assert!(client.transport.transport.closed.is_empty());
+}
+
+#[test]
+fn group_watch_correlates_identity_and_owns_exactly_one_read_grant() {
+    let mut wire = Script::default();
+    wire.reply(
+        1,
+        Ok(Response::GroupWatch {
+            group: 1,
+            report: crate::GroupReport::USABLE,
+        }),
+        Some(77),
+    );
+    let mut client = Client::new(wire);
+    let watch = client.watch_group(1).unwrap();
+    assert_eq!(watch.group, 1);
+    assert_eq!(watch.report, crate::GroupReport::USABLE);
+    client.close_buffer_handle(watch.handle);
+    assert_eq!(client.transport.closed, [77]);
+    assert!(!client.is_lost());
+    for (group, handle) in [(2, Some(88)), (1, None)] {
+        let mut wire = Script::default();
+        wire.reply(
+            1,
+            Ok(Response::GroupWatch {
+                group,
+                report: crate::GroupReport::USABLE,
+            }),
+            handle,
+        );
+        let mut client = Client::new(wire);
+        assert!(matches!(client.watch_group(1), Err(Error::Protocol)));
+        assert!(client.is_lost());
+        if handle.is_some() {
+            assert_eq!(client.transport.closed, [88]);
+        }
+    }
+    let mut wire = Script::default();
+    wire.reply(
+        1,
+        Ok(Response::GroupWatch {
+            group: 1,
+            report: crate::GroupReport::TIMED_OUT,
+        }),
+        Some(99),
+    );
+    let mut client = Client::new(wire);
+    let watch = client.watch_group(1).unwrap();
+    assert!(client.is_lost());
+    assert_eq!(watch.report, crate::GroupReport::TIMED_OUT);
+    client.close_buffer_handle(watch.handle);
+    assert_eq!(client.watch_group(1).err(), Some(Error::DeviceLost));
+    assert_eq!(client.transport.sent.len(), 1);
 }

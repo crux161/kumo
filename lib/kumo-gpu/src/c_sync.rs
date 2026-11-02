@@ -1,5 +1,6 @@
 //j751
-//! Version-13 native C operations. One BO owner retains all sync metadata and wake handles.
+//j752
+//! Native C operations. One BO owner retains all sync metadata and wake/status handles.
 //! C receives opaque, never-reused IDs; no kernel handle or caller-supplied fence crosses.
 
 use alloc::vec::Vec;
@@ -29,6 +30,7 @@ pub const WAIT: u32 = 9;
 pub const GROUP_CREATE: u32 = 10;
 pub const PREPARE: u32 = 11;
 pub const STEP: u32 = 12;
+pub const GROUP_STATE: u32 = 13;
 
 pub const UNAVAILABLE: u32 = 0;
 pub const AVAILABLE: u32 = 1;
@@ -105,6 +107,8 @@ enum Object<H> {
     Group {
         vm: u32,
         group: u32,
+        watch: crate::GroupWatch<H>,
+        report: crate::GroupReport,
     },
     Job {
         vm: u32,
@@ -158,11 +162,30 @@ impl From<crate::client::Error> for Fault {
 impl<H> Context<H> {
     pub(crate) fn clear<T: Transport<Handle = H>>(&mut self, client: &mut Client<T>) {
         for record in self.objects.drain(..) {
-            if let Object::Wake(handle) = record.object {
-                client.close_buffer_handle(handle);
+            match record.object {
+                Object::Wake(handle) => client.close_buffer_handle(handle),
+                Object::Group { watch, .. } => client.close_buffer_handle(watch.handle),
+                _ => (),
             }
         }
         self.syncs = None;
+    }
+    pub(crate) fn capture_group<M: Mapper<H>>(
+        &mut self,
+        mapper: &mut M,
+    ) -> Option<(u64, crate::GroupReport)> {
+        for record in &mut self.objects {
+            if let Object::Group { watch, report, .. } = &mut record.object {
+                let mut bytes = [0; crate::group::REPORT_BYTES];
+                let read = mapper
+                    .read(&watch.handle, &mut bytes)
+                    .ok()
+                    .and_then(|()| crate::GroupReport::decode(&bytes, watch.group));
+                *report = retain_report(*report, read, false);
+                return Some((record.id, *report));
+            }
+        }
+        None
     }
     fn index(&self, id: u64) -> Result<usize, Fault> {
         self.objects
@@ -340,10 +363,75 @@ impl<H> Context<H> {
                     buffers.client.abandon();
                     return Err(crate::client::Error::Protocol.into());
                 }
-                Ok(self.insert(id, Object::Group { vm, group }, UNAVAILABLE))
+                let watch = match buffers.client.watch_group(group) {
+                    Ok(watch) => watch,
+                    Err(error) => {
+                        buffers.client.abandon();
+                        return Err(error.into());
+                    }
+                };
+                let mut bytes = [0; crate::group::REPORT_BYTES];
+                let report = buffers
+                    .read_native(&watch.handle, &mut bytes)
+                    .ok()
+                    .and_then(|()| crate::GroupReport::decode(&bytes, group));
+                let Some(report) = report else {
+                    buffers.client.close_buffer_handle(watch.handle);
+                    buffers.client.abandon();
+                    return Err(crate::client::Error::Protocol.into());
+                };
+                let report = retain_report(watch.report, Some(report), true);
+                if report.state != crate::GroupState::Usable {
+                    buffers.client.abandon();
+                }
+                let mut reply = self.insert(
+                    id,
+                    Object::Group {
+                        vm,
+                        group,
+                        watch,
+                        report,
+                    },
+                    UNAVAILABLE,
+                );
+                reply.value = report.state as u64;
+                Ok(reply)
+            }
+            GROUP_STATE => {
+                let report = if let Ok(index) = self.index(request.id) {
+                    let Object::Group {
+                        vm, watch, report, ..
+                    } = &mut self.objects[index].object
+                    else {
+                        return Err(Fault::Unknown);
+                    };
+                    let live = buffers.device_ready() && buffers.check_native_vm(*vm).is_ok();
+                    let mut bytes = [0; crate::group::REPORT_BYTES];
+                    let read = buffers
+                        .read_native(&watch.handle, &mut bytes)
+                        .ok()
+                        .and_then(|()| crate::GroupReport::decode(&bytes, watch.group));
+                    *report = retain_report(*report, read, live);
+                    *report
+                } else {
+                    buffers
+                        .group_report
+                        .filter(|(id, _)| *id == request.id)
+                        .map(|(_, report)| report)
+                        .ok_or(Fault::Unknown)?
+                };
+                if report.state != crate::GroupState::Usable {
+                    buffers.client.abandon();
+                }
+                Ok(Reply {
+                    state: AVAILABLE,
+                    value: report.state as u64,
+                    gpu_status: report.gpu_status,
+                    ..Reply::default()
+                })
             }
             PREPARE => {
-                let Object::Group { vm, group } = self.objects[self.index(request.id)?].object
+                let Object::Group { vm, group, .. } = self.objects[self.index(request.id)?].object
                 else {
                     return Err(Fault::Unknown);
                 };
@@ -404,6 +492,23 @@ impl<H> Context<H> {
     }
 }
 
+fn retain_report(
+    previous: crate::GroupReport,
+    read: Option<crate::GroupReport>,
+    live: bool,
+) -> crate::GroupReport {
+    // Positive driver facts survive subsequent close/read failure. Lack of evidence can
+    // never turn a stale usable record into a healthy closed group. — MILVUS
+    if matches!(
+        previous.state,
+        crate::GroupState::Fatal | crate::GroupState::TimedOut
+    ) {
+        previous
+    } else {
+        read.unwrap_or(crate::GroupReport::UNKNOWN).observed(live)
+    }
+}
+
 fn valid(request: &Request) -> bool {
     if request.flags != 0 {
         return false;
@@ -426,7 +531,7 @@ fn valid(request: &Request) -> bool {
         CREATE_BINARY => request.id == 0 && request.value <= 1,
         CREATE_TIMELINE => request.id == 0,
         GROUP_CREATE => request.id == 0 && request.value != 0 && request.value <= u32::MAX as u64,
-        DROP | RESET | ARM | STEP => request.id != 0 && request.value == 0,
+        DROP | RESET | ARM | STEP | GROUP_STATE => request.id != 0 && request.value == 0,
         SIGNAL | PENDING | SNAPSHOT => request.id != 0,
         WAIT => request.id != 0 && request.value != 0 && request.value <= MAX_TIMEOUT_NS,
         _ => false,
@@ -469,7 +574,7 @@ pub(crate) unsafe extern "C" fn callback<T: SessionTransport, M: Mapper<T::Handl
         return c::BAD_ARGUMENT;
     };
     let buffers = unsafe { &mut *context.cast::<Buffers<'_, T, M>>() };
-    if !buffers.device_ready() {
+    if !buffers.device_ready() && request.operation != GROUP_STATE {
         return c::DEVICE_LOST;
     }
     let mut native = buffers.native.take().unwrap_or_default();

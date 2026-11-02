@@ -2,6 +2,7 @@
 //j745
 //j747
 //j751
+//j752
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
@@ -39,6 +40,11 @@ pub enum WaitOutcome {
 pub trait Mapper<H> {
     fn map(&mut self, handle: &H, bytes: u64) -> Result<NonNull<u8>, MapError>;
     fn unmap(&mut self, address: NonNull<u8>, bytes: u64) -> Result<(), MapError>;
+    /// Read CPU metadata via the granted VMO's READ right. No writable mapping is needed.
+    /// A backend without this operation must refuse, never invent a status. — MILVUS
+    fn read(&mut self, _handle: &H, _bytes: &mut [u8]) -> Result<(), MapError> {
+        Err(MapError::Failed)
+    }
     /// Bound one wake-channel wait; do not close the borrowed handle or claim GPU
     /// completion. The shared owner closes it after every outcome. — MILVUS
     fn wait(&mut self, _wake: &H, _timeout_ns: u64) -> WaitOutcome {
@@ -115,6 +121,7 @@ pub struct Buffers<'a, T: Transport, M: Mapper<T::Handle>> {
     next_vm: u32,
     bindings: Vec<Binding>,
     pub(crate) native: Option<crate::c_sync::Context<T::Handle>>,
+    pub(crate) group_report: Option<(u64, crate::GroupReport)>,
 }
 
 impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
@@ -128,6 +135,7 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             next_vm: 0,
             bindings: Vec::new(),
             native: None,
+            group_report: None,
         }
     }
 
@@ -214,6 +222,9 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
 
     fn release_local(&mut self) {
         if let Some(mut native) = self.native.take() {
+            if let Some(report) = native.capture_group(self.mapper) {
+                self.group_report = Some(report);
+            }
             native.clear(self.client);
         }
         for record in self.records.drain(..) {
@@ -243,6 +254,13 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
     }
     pub(crate) fn barrier_native(&mut self) {
         self.mapper.barrier();
+    }
+    pub(crate) fn read_native(
+        &mut self,
+        handle: &T::Handle,
+        bytes: &mut [u8],
+    ) -> Result<(), MapError> {
+        self.mapper.read(handle, bytes)
     }
 }
 

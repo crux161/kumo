@@ -1,9 +1,8 @@
-//j710
-//j651
 //j652
 //j681
 //j707
 //j742
+//j752
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -12,8 +11,8 @@
 
 use crate::{
     valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
-    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState,
-    Unbind,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, GroupReport, Status, Submission,
+    SyncState, Unbind,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -52,6 +51,10 @@ pub enum Command {
     /// One normal-priority queue with a driver-owned 4 KiB ring and core masks.
     GroupCreate {
         vm: u32,
+    },
+    /// Obtain a READ-only CPU status VMO, which outlives terminal channel close. — MILVUS
+    GroupWatch {
+        group: u32,
     },
     Submit(Submission),
     /// Query is nonblocking; Pending never implies completion or permission to reuse backing.
@@ -102,6 +105,7 @@ impl Request {
             ),
             Command::VmUnbind(u) => (15, [u64::from(u.vm), u.va, u.bytes, 0, 0, 0]),
             Command::GroupCreate { vm } => (4, [u64::from(vm), 0, 0, 0, 0, 0]),
+            Command::GroupWatch { group } => (18, [u64::from(group), 0, 0, 0, 0, 0]),
             Command::Submit(s) => (
                 5,
                 [
@@ -142,6 +146,7 @@ impl Request {
             12 => Command::GetCoreFeatures,
             13 => Command::GetThreadProperties,
             17 => Command::GetMemoryProperties,
+            18 if a[0] != 0 => Command::GroupWatch { group: a[0] as u32 },
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
             // Zero is never a buffer ID. The canonical re-encode below also refuses an ID
@@ -241,6 +246,10 @@ pub enum Response {
     GroupCreated {
         group: u32,
     },
+    GroupWatch {
+        group: u32,
+        report: GroupReport,
+    },
     /// Accepted for execution, not completed. Poll SyncRead before reusing any backing.
     Submitted {
         point: u64,
@@ -264,7 +273,7 @@ pub enum Response {
 impl Response {
     pub const fn handle_count(self) -> usize {
         match self {
-            Self::BufferCreated { .. } | Self::WaitArmed { .. } => 1,
+            Self::BufferCreated { .. } | Self::WaitArmed { .. } | Self::GroupWatch { .. } => 1,
             _ => 0,
         }
     }
@@ -328,6 +337,15 @@ impl Reply {
             Ok(Response::VmBound) => (3, [0; 4]),
             Ok(Response::VmUnbound(u)) => (15, [u64::from(u.vm), u.va, u.bytes, 0]),
             Ok(Response::GroupCreated { group }) => (4, [u64::from(group), 0, 0, 0]),
+            Ok(Response::GroupWatch { group, report }) => (
+                18,
+                [
+                    u64::from(group),
+                    report.state as u64,
+                    u64::from(report.gpu_status),
+                    0,
+                ],
+            ),
             Ok(Response::Submitted { point }) => (5, [point, 0, 0, 0]),
             Ok(Response::Sync { point, state }) => match state {
                 SyncState::Pending => (6, [point, 0, 0, 0]),
@@ -427,6 +445,10 @@ impl Reply {
                     Response::VmUnbound(u)
                 }
                 4 if a[0] != 0 => Response::GroupCreated { group: a[0] as u32 },
+                18 if a[0] != 0 => Response::GroupWatch {
+                    group: a[0] as u32,
+                    report: GroupReport::from_words(a[1] as u32, a[2] as u32)?,
+                },
                 5 if a[0] != 0 => Response::Submitted { point: a[0] },
                 6 if a[0] != 0 => Response::Sync {
                     point: a[0],

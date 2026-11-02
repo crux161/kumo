@@ -3,6 +3,7 @@
 #j746
 #j747
 #j751
+#j752
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -17,7 +18,8 @@ TOOL = ROOT / "toolchain/mesa"
 OUT = ROOT / "build/proofs/g7o-d"
 GREEN = b"G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close"
 WX_GREEN = b"G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window"
-NATIVE_GREEN = b"G7p-c native C sync green: ABI 13, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
+NATIVE_GREEN = b"G7p-c native C sync green: ABI 14, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
+GROUP_GREEN = b"G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay"
 
 
 def run(command, **kwargs):
@@ -48,11 +50,13 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
         run([cc, *flags, "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", out / f"{name}.o"])
     run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none",
          "-p", "kumo-rt", "-p", "kumo-gpu", "-p", "kumo-abi"])
+    if cases == "device-smoke":
+        run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none", "-p", "drv-gpu", "--lib"])
     deps = ROOT / "target/aarch64-unknown-none/release"
     elf = out / cases
     run(["rustc", "--edition=2021", "--crate-type=staticlib", "--target=aarch64-unknown-none",
          "-C", "panic=abort", "-C", "opt-level=2", "--extern", f"kumo_gpu={deps / 'libkumo_gpu.rlib'}",
-         "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}", "-L", f"dependency={deps / 'deps'}",
+         "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}", *(["--extern", f"drv_gpu={deps / 'libdrv_gpu.rlib'}"] if cases == "device-smoke" else []), "-L", f"dependency={deps / 'deps'}",
          TOOL / f"{cases}.rs", "-o", out / "libdevice.a"])
     run([cc, "--target=aarch64-unknown-none", "-c", crt0, "-o", out / "crt0.o"])
     mode = subprocess.check_output(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", "kumo-mesa-drivers-g7k"], text=True).strip()
@@ -84,6 +88,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{cases}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
+             ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
              native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
     (out / "manifest.json").write_text(json.dumps({"input_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}}, indent=2) + "\n")
@@ -94,8 +99,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--native-sync", action="store_true", help="select G7p-c's native C acceptance and proof directory")
+    parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     args = parser.parse_args()
-    elf = build(out=ROOT / "build/proofs/g7p-c" if args.native_sync else OUT)
+    elf = build(out=ROOT / "build/proofs/g7p-d" if args.group_state else ROOT / "build/proofs/g7p-c" if args.native_sync else OUT)
     print(f"G7o-d native device compile/link green: {elf}", flush=True)
     if args.run:
         spec = importlib.util.spec_from_file_location("uefi_smoke", ROOT / "scripts/cxx-smoke.py")
@@ -106,6 +112,8 @@ def main():
         proof = transcript.split(b"G7o-d native device begin", 1)[1]
         assert proof.count(WX_GREEN) == 1 and proof.index(WX_GREEN) < proof.index(GREEN)
         assert proof.count(NATIVE_GREEN) == 1 and proof.index(NATIVE_GREEN) < proof.index(GREEN)
+        assert proof.count(GROUP_GREEN) == 1 and proof.index(GROUP_GREEN) < proof.index(GREEN)
+        print(GROUP_GREEN.decode(), flush=True)
         print(NATIVE_GREEN.decode(), flush=True)
         print(WX_GREEN.decode(), flush=True)
 

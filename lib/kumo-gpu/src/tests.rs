@@ -1,8 +1,8 @@
-//j710
 //j652
 //j681
 //j707
 //j742
+//j752
 
 extern crate std;
 
@@ -1033,4 +1033,94 @@ fn memory_properties_cross_four_raw_words_verbatim_and_reject_truncation() {
         widened[at..at + 8].copy_from_slice(&(0x1_0000_0000u64 + 0x1234).to_le_bytes());
         assert_eq!(Reply::decode(&widened), None);
     }
+}
+
+#[test]
+fn group_watch_wire_is_exact_and_requires_one_status_grant() {
+    let request = Request {
+        id: 1,
+        command: Command::GroupWatch { group: 1 },
+    };
+    let encoded = request.encode();
+    assert_eq!(&encoded[8..12], &18u32.to_le_bytes());
+    assert_eq!(Request::decode(&encoded), Some(request));
+    for at in [12, 20, 24, 32, 40, 48, 56] {
+        let mut bad = encoded;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    assert_eq!(Request::decode(&encoded[..63]), None);
+    for state in [
+        GroupState::Usable,
+        GroupState::Fatal,
+        GroupState::TimedOut,
+        GroupState::Unknown,
+    ] {
+        let report = GroupReport {
+            state,
+            gpu_status: if state == GroupState::Fatal {
+                0xbeef
+            } else {
+                0
+            },
+        };
+        let response = Response::GroupWatch { group: 1, report };
+        assert_eq!(response.handle_count(), 1);
+        let reply = Reply {
+            id: 1,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        for at in [20, 28, 36, 40] {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    let mut bad = Reply {
+        id: 1,
+        result: Ok(Response::GroupWatch {
+            group: 1,
+            report: GroupReport::USABLE,
+        }),
+    }
+    .encode();
+    bad[24] = 9;
+    assert_eq!(Reply::decode(&bad), None);
+    bad[24] = 0;
+    bad[32] = 1;
+    assert_eq!(Reply::decode(&bad), None);
+}
+
+#[test]
+fn group_status_record_rejects_corruption_and_stale_health_after_close() {
+    for report in [
+        GroupReport::USABLE,
+        GroupReport::UNKNOWN,
+        GroupReport::TIMED_OUT,
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 7,
+        },
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 0,
+        },
+    ] {
+        let bytes = report.encode(1);
+        assert_eq!(GroupReport::decode(&bytes, 1), Some(report));
+        assert_eq!(GroupReport::decode(&bytes, 2), None);
+        assert_eq!(GroupReport::decode(&bytes[..15], 1), None);
+        let mut bad = bytes;
+        bad[0] = 0;
+        assert_eq!(GroupReport::decode(&bad, 1), None);
+    }
+    assert_eq!(GroupReport::USABLE.observed(false), GroupReport::UNKNOWN);
+    assert_eq!(
+        GroupReport::TIMED_OUT.observed(false),
+        GroupReport::TIMED_OUT
+    );
+    assert_eq!(GroupReport::from_words(2, 7), None);
+    assert_eq!(GroupReport::from_words(8, 0), None);
 }

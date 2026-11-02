@@ -1,6 +1,7 @@
 //j745
 //j746
 //j751
+//j752
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -82,8 +83,19 @@ struct Hardware {
     bind_calls: u32,
     unbind_calls: u32,
     reject_submit: bool,
+    status_vmo: Option<Handle>,
+    report: kumo_gpu::GroupReport,
 }
 impl Backend for Hardware {
+    fn watch_group(&mut self) -> Result<kumo_gpu::GroupReport, Status> {
+        if self.status_vmo.is_none() {
+            self.status_vmo = Some(handle(
+                native::call(Syscall::VmoCreate, [PAGE_BYTES, 0, 0, 0, 0, 0]).0,
+            ));
+            self.publish_status(self.report);
+        }
+        Ok(self.report)
+    }
     fn info(&mut self) -> Result<DeviceInfo, Status> {
         Ok(DeviceInfo {
             gpu_id: 0xa8670005,
@@ -226,6 +238,30 @@ impl Backend for Hardware {
             close(vmo);
         }
         self.binds.clear();
+        if let Some(vmo) = self.status_vmo.take() {
+            close(vmo);
+        }
+    }
+}
+impl Hardware {
+    fn publish_status(&mut self, report: kumo_gpu::GroupReport) {
+        self.report = report;
+        let bytes = report.encode(1);
+        assert_eq!(
+            native::call(
+                Syscall::VmoWrite,
+                [
+                    self.status_vmo.unwrap().0 as u64,
+                    0,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0
+                ]
+            )
+            .0,
+            0
+        );
     }
 }
 struct Server {
@@ -241,6 +277,10 @@ struct Server {
     last_request: u32,
     last_point: u64,
     uncertain_submit: bool,
+    status_reads: Vec<Handle>,
+    status_grants_closed: u32,
+    peer_dead: bool,
+    denied_sends: u32,
 }
 struct Wire {
     server: Rc<RefCell<Server>>,
@@ -252,6 +292,10 @@ impl Transport for Wire {
     fn send(&mut self, bytes: &[u8; REQUEST_LEN]) -> Result<(), TransportError> {
         let request = Request::decode(bytes).unwrap();
         let mut server = self.server.borrow_mut();
+        if server.peer_dead {
+            server.denied_sends += 1;
+            return Err(TransportError::Closed);
+        }
         assert_eq!(server.closed, 0);
         assert_eq!(request.id, server.last_request + 1);
         server.last_request = request.id;
@@ -277,6 +321,49 @@ impl Transport for Wire {
                 )
                 .0,
             ));
+        }
+        if let Ok(Response::GroupWatch { .. }) = result {
+            let owner = hardware.status_vmo.unwrap();
+            let grant = handle(
+                native::call(
+                    Syscall::HandleDuplicate,
+                    [
+                        owner.0 as u64,
+                        (Rights::READ | Rights::DUPLICATE | Rights::TRANSFER).0 as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+                .0,
+            );
+            let bytes = [0x42u8];
+            assert_ne!(
+                native::call(
+                    Syscall::VmoWrite,
+                    [grant.0 as u64, 0, bytes.as_ptr() as u64, 1, 0, 0]
+                )
+                .0,
+                0
+            );
+            assert_ne!(
+                native::call(
+                    Syscall::VmarMap,
+                    [
+                        0,
+                        grant.0 as u64,
+                        0,
+                        0,
+                        PAGE_BYTES,
+                        (kumo_abi::VmarFlags::READ | kumo_abi::VmarFlags::WRITE).0
+                    ]
+                )
+                .0,
+                0
+            );
+            self.grant = Some(grant);
+            server.status_reads.push(grant);
         }
         if let Ok(Response::Submitted { point }) = result {
             server.last_point = point;
@@ -308,6 +395,8 @@ impl Transport for Wire {
         let mut server = self.server.borrow_mut();
         if server.wake_reads.contains(&vmo) {
             server.wakes_closed += 1;
+        } else if server.status_reads.contains(&vmo) {
+            server.status_grants_closed += 1;
         } else {
             server.grants_closed += 1;
         }
@@ -345,6 +434,12 @@ pub extern "C" fn kumo_mesa_native_control(action: u32) -> u32 {
                     .session
                     .complete(point, if action == 1 { 0 } else { 0xbeef })
                     .unwrap();
+                if action == 2 {
+                    server.hardware.publish_status(kumo_gpu::GroupReport {
+                        state: kumo_gpu::GroupState::Fatal,
+                        gpu_status: 0xbeef,
+                    });
+                }
                 core::mem::take(&mut server.wakes)
             }
             3 => {
@@ -358,6 +453,23 @@ pub extern "C" fn kumo_mesa_native_control(action: u32) -> u32 {
             5 => server.wakes.clone(),
             6 => core::mem::take(&mut server.wakes),
             7 => return u32::from(server.closed != 1),
+            8 | 9 => {
+                let report = drv_gpu::classify_group_failure(
+                    drv_gpu::JobWait::Stalled,
+                    0,
+                    0,
+                    0,
+                    action == 9,
+                );
+                server.hardware.publish_status(report);
+                server.peer_dead = true;
+                Vec::new()
+            }
+            10 => {
+                server.peer_dead = true;
+                Vec::new()
+            }
+            11 => return u32::from(server.denied_sends != 1),
             _ => return 1,
         }
     };
@@ -447,10 +559,129 @@ fn endpoint_proof() {
     );
     close(right);
 }
+
+fn closed_status_cap_proof() {
+    use kumo_gpu::{bo::Mapper, GroupReport, GroupState};
+    for published in [
+        GroupReport::TIMED_OUT,
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 0,
+        },
+        GroupReport::USABLE,
+    ] {
+        let owner = handle(native::call(Syscall::VmoCreate, [PAGE_BYTES, 0, 0, 0, 0, 0]).0);
+        let initial = GroupReport::USABLE.encode(1);
+        assert_eq!(
+            native::call(
+                Syscall::VmoWrite,
+                [
+                    owner.0 as u64,
+                    0,
+                    initial.as_ptr() as u64,
+                    initial.len() as u64,
+                    0,
+                    0
+                ]
+            )
+            .0,
+            0
+        );
+        let reader = handle(
+            native::call(
+                Syscall::HandleDuplicate,
+                [
+                    owner.0 as u64,
+                    (Rights::READ | Rights::TRANSFER).0 as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .0,
+        );
+        let (left, right) = native::call(Syscall::ChannelCreate, [0; 6]);
+        let right = handle(right);
+        let reply = Reply {
+            id: 1,
+            result: Ok(Response::GroupWatch {
+                group: 1,
+                report: GroupReport::USABLE,
+            }),
+        }
+        .encode();
+        assert_eq!(
+            native::call(
+                Syscall::ChannelWrite,
+                [
+                    right.0 as u64,
+                    reply.as_ptr() as u64,
+                    reply.len() as u64,
+                    reader.0 as u64,
+                    0,
+                    0
+                ]
+            )
+            .0,
+            0
+        );
+        let mut client = Client::new(native::Channel::new(handle(left)));
+        let watch = client.watch_group(1).unwrap();
+        let bytes = published.encode(1);
+        assert_eq!(
+            native::call(
+                Syscall::VmoWrite,
+                [
+                    owner.0 as u64,
+                    0,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0
+                ]
+            )
+            .0,
+            0
+        );
+        // Both the real command peer and the only writer close. The transferred READ
+        // grant alone retains the record, without writable authority. — MILVUS
+        close(right);
+        close(owner);
+        assert!(client.info().is_err());
+        assert!(client.is_lost());
+        assert_ne!(
+            native::call(
+                Syscall::VmoWrite,
+                [
+                    watch.handle.0 as u64,
+                    0,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0
+                ]
+            )
+            .0,
+            0
+        );
+        let mut read = [0; kumo_gpu::group::REPORT_BYTES];
+        native::Memory.read(&watch.handle, &mut read).unwrap();
+        assert_eq!(
+            GroupReport::decode(&read, 1)
+                .unwrap()
+                .observed(!client.is_lost()),
+            published.observed(false)
+        );
+        client.close_buffer_handle(watch.handle);
+        client.close_session();
+    }
+}
 #[no_mangle]
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
-    for mode in 0..12 {
+    closed_status_cap_proof();
+    for mode in 0..15 {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
             session: Session::default(),
@@ -461,6 +692,8 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 bind_calls: 0,
                 unbind_calls: 0,
                 reject_submit: false,
+                status_vmo: None,
+                report: kumo_gpu::GroupReport::USABLE,
             },
             calls: Vec::new(),
             closed: 0,
@@ -472,6 +705,10 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             last_request: 0,
             last_point: 0,
             uncertain_submit: false,
+            status_reads: Vec::new(),
+            status_grants_closed: 0,
+            peer_dead: false,
+            denied_sends: 0,
         }));
         let mut client = Client::new(Wire {
             server: server.clone(),
@@ -503,6 +740,11 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             .count();
         assert_eq!(server.grants_closed as usize, created);
         assert_eq!(server.wakes_closed as usize, server.wake_reads.len());
+        assert_eq!(
+            server.status_grants_closed as usize,
+            server.status_reads.len()
+        );
+        assert!(server.hardware.status_vmo.is_none());
         assert!(server.wakes.is_empty());
         if mode >= 9 {
             assert!(!server

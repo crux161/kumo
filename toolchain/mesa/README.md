@@ -1,15 +1,68 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j746 -->
 <!-- j747 -->
 <!-- j749 -->
 <!-- j750 -->
 <!-- j751 -->
+<!-- j752 -->
+
+## G7p-d: group facts survive command-channel loss
+
+ABI **14** retains the 120-byte API, 104-byte Info and 240-byte property report. Native
+operation `KUMO_NATIVE_GROUP_STATE` (13) takes the opaque group ID and returns a native enum
+in `reply.value` plus the observed `gpu_status`. It remains available after known loss and
+owner close, before the C device is destroyed. Other operations still refuse after loss.
+
+| Native group value | Meaning |
+|---|---|
+| USABLE (0) | Last producer report is usable, and this client/VM has no known loss |
+| FATAL (1) | GPU sync status, CS fault/fatal word or the group's MMU fault was observed |
+| TIMED_OUT (2) | Job deadline left seqno short, with no observed GPU/CS/MMU fault |
+| UNKNOWN (3) | Closed/unverified group, missing IRQ, late/mismatched seqno, transport or unreadable status |
+
+These values are mutually exclusive native enums, not Panthor bit flags or guilt attribution.
+A fault outranks a deadline: a permission fault which also stalls the queue reports FATAL,
+including when the raw sync status is zero. No group result is a fence completion or permission
+to reuse/free DMA. USABLE is a last-known snapshot, not an independent peer-liveness heartbeat;
+an observed transport/owner loss makes an old usable sample UNKNOWN.
+
+Wire opcode 18, `GroupWatch { group }`, requires the session's live group and returns its
+initial report plus one READ/DUPLICATE/TRANSFER status VMO grant. This is ordinary CPU metadata:
+no GPU mapping, device pin or MAP/WRITE grant. The driver initializes a fresh 4 KiB VMO per
+session and writes the 16-byte `KGS1, group, state, gpu_status` record with VmoWrite; readers
+use VmoRead. Strict decoding rejects unknown enums, wrong groups, truncated records, and
+nonzero GPU status outside FATAL. No new syscall or asynchronous reply format is introduced.
+
+The real driver's completion failure path samples CS/MMU fault evidence and publishes the
+terminal report before reset/containment and channel close. Other close paths publish UNKNOWN
+without erasing a positive fault/timeout. The CPU-only status owner closes on both reset
+outcomes; it never participates in DMA reclamation. A reader grant independently retains the
+last record after the writer and command endpoint disappear.
+
+The shared BO context acquires and validates this grant at native group creation, owns it
+until close, and caches positive reports before releasing it. GROUP_STATE performs no command
+RPC. It refuses foreign/stale/wrong-kind IDs, survives C-device poisoning, and never converts
+a known lost/unreadable group into USABLE. Failed subscription/initial validation closes the
+grant and contains the already-created session. Normal scope close retains UNKNOWN, not a
+fabricated fatal/timeout. The existing single-group and prepared-submit rules are unchanged.
+
+```sh
+python3 scripts/mesa-device-smoke.py --group-state --run
+```
+
+QEMU exercises real read-only VMO permissions and transfer, retains reports after closing a
+real command peer and the only writer, and tests fatal/timeout/unknown through the real C/Mesa
+device after a modeled command-transport loss. The model uses the production classification
+function. Status/wake/BO grants close exactly once; cached reads perform no replay or command
+I/O. Existing sync/device/W^X cases still run. The actual Mali failure sampling remains the
+next metal gate; no new hardware observation is claimed here.
+— MILVUS, 2026-11-01
 
 ## G7p-c: the native C boundary shares the BO/session owner
 
-The callback ABI is **13**, **120 bytes**. Info stays 104 bytes and the property report stays
-240 bytes. A single appended `native` callback exposes the operations below through
-`pan_kmod_kumo_native(dev, request, reply)`. The factory rejects ABI 12, truncated API tables
+J751 introduced callback ABI **13**, **120 bytes**; J752 advances it to 14 without a layout
+change. Info stays 104 bytes and the property report stays 240 bytes. A single appended
+`native` callback exposes the operations below through
+`pan_kmod_kumo_native(dev, request, reply)`. The current factory rejects ABI 13 and older, truncated API tables
 and a missing native callback. Query-only and BO-only APIs leave this callback null.
 
 The device's existing Rust `Buffers` context retains sync state, snapshots, prepared jobs and

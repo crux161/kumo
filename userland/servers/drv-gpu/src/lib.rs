@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j710
 //j733
 //j734
 //j742
 //j743
+//j752
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -1593,6 +1593,27 @@ pub const fn classify_job_wait(reached: bool, last: Completion, fired: u32) -> J
         (true, Completion::Fired, 1..) => JobWait::Interrupt,
         (true, _, 0) => JobWait::NoInterrupt,
         (true, _, _) => JobWait::LateSeqno,
+    }
+}
+
+/// A deadline is a timeout only without observed GPU/CS/MMU fault evidence. Missing IRQs,
+/// late seqnos and other unclassified failures never become invented GPU faults. — MILVUS
+pub const fn classify_group_failure(
+    outcome: JobWait,
+    gpu_status: u32,
+    cs_fault: u32,
+    cs_fatal: u32,
+    mmu_fault: bool,
+) -> protocol::GroupReport {
+    if gpu_status != 0 || cs_fault != 0 || cs_fatal != 0 || mmu_fault {
+        protocol::GroupReport {
+            state: protocol::GroupState::Fatal,
+            gpu_status,
+        }
+    } else if matches!(outcome, JobWait::Stalled) {
+        protocol::GroupReport::TIMED_OUT
+    } else {
+        protocol::GroupReport::UNKNOWN
     }
 }
 
@@ -6263,5 +6284,43 @@ mod g5c_tests {
         assert_eq!(on_disk.len() as u64, number(&m, "binary_bytes"));
         assert_eq!(on_disk.len() % 8, 0);
         assert_eq!(m["mesa"], "26.2.5-1");
+    }
+}
+
+#[cfg(test)]
+mod group_failure_tests {
+    use super::*;
+    #[test]
+    fn observed_faults_outrank_deadlines_and_unknown_irq_failures_stay_unknown() {
+        use protocol::{GroupReport, GroupState};
+        for outcome in [
+            JobWait::Interrupt,
+            JobWait::LateSeqno,
+            JobWait::NoInterrupt,
+            JobWait::Stalled,
+        ] {
+            for (gpu, fault, fatal, mmu) in [
+                (9, 0, 0, false),
+                (0, 7, 0, false),
+                (0, 0, 8, false),
+                (0, 0, 0, true),
+            ] {
+                assert_eq!(
+                    classify_group_failure(outcome, gpu, fault, fatal, mmu),
+                    GroupReport {
+                        state: GroupState::Fatal,
+                        gpu_status: gpu
+                    }
+                );
+            }
+            assert_eq!(
+                classify_group_failure(outcome, 0, 0, 0, false),
+                if outcome == JobWait::Stalled {
+                    GroupReport::TIMED_OUT
+                } else {
+                    GroupReport::UNKNOWN
+                }
+            );
+        }
     }
 }
