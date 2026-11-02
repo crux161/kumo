@@ -1,9 +1,49 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j760 -->
 <!-- j761 -->
 <!-- j762 -->
 <!-- j763 -->
 <!-- j765 -->
+<!-- j768 -->
+
+## GL1-e: the KUMO GL frontend
+
+[kumo_gl.h](kumo_gl.h) exposes a small C frontend over Gallium's native screen (J768).
+It creates a Mesa GLES2 state-tracker context with `st_api_create_context`, makes it current
+with `st_api_make_current`, and supplies a fixed-size drawable with owned RGBA8 color and
+Z24/S8 depth/stencil resources. The structure follows Mesa's Haiku `hgl` frontend. Glthread
+and the threaded pipe stay off; calls belong to one thread. GL1 admits one display, one
+context attempt per display/session, and one drawable at a time.
+
+`kumo_gl_display_create` takes ownership of the screen on success. Display destruction
+refuses while a context or drawable remains, and drawable destruction refuses while it is
+current. Context destruction unbinds it; a new context requires a fresh display/session.
+The drawable's validate callback returns resource references to Mesa. Its flush_front waits
+for native fence completion before invoking an optional caller presentation callback with
+the borrowed color resource. Callback refusal propagates to the caller. Offscreen operation
+needs no callback, and the frontend acquires no framebuffer or display authority.
+
+QEMU mode 21 checks Mesa's actual current GLES2 context and framebuffer attachment pointers,
+both thread modes off, invalid dimensions, duplicate-object and busy-destruction refusals,
+unbind/rebind, callback acceptance/refusal and teardown. All 22 device modes pass. The model
+sees exactly one Submit (Gallium's initialization), one group/heap, matching bind/unbind
+counts, and zero buffers/bindings/heaps/bytes at close. Its completed wait row is pruned by
+session close. State-tracker C++ queries pull the already inventoried optional weak TLS
+initializer; the link check permits only measured weak symbols and still rejects every
+strong unresolved symbol.
+
+Metal proof 9 (`--proof gl1-e`) ran the same cases on Mali. Mesa's context became current,
+the front flush completed, and the heap/context/display were destroyed with
+`containment reset=ok buffers=0 bindings=0 waits=0 retained=no`. The loader's 26,552,655-byte
+initrd matched the staged client. The served PXE tree and all 88 original manifest entries
+were restored; pxehost and tio are stopped. Evidence: `build/proofs/gl1-e-metal/metal-tio.log`.
+**Next: GL1-f, the static GLES2 application target and its public GL entry-point proof.**
+GL2 owns the first output through GL calls. — KESTREL, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl1-e --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl1-e --check <tio-log>
+```
 
 ## GL1-d: batches, activity tracking and fences
 

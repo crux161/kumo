@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j759
 #j760
 #j761
 #j762
 #j765
+#j768
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -26,6 +26,10 @@ HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusa
 CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
 CONTEXT_SYNC_GREEN = b"GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released"
 CONTEXT_INIT_GREEN = b"GL1-c destroy: the screen and device are gone; the session-owned group was not reused"
+FRONTEND_LINES = [b"GL1-e drawable: owned 64x48 RGBA8 color and Z24/S8 depth/stencil attachments",
+                  b"GL1-e current: Mesa's GLES2 state-tracker context made current; glthread and threaded pipe off",
+                  b"GL1-e front: validate supplied the attachments; native flush completed before the callback; callback refusal propagated",
+                  b"GL1-e destroy: current context unbound, drawable and display released, session context recreation refused"]
 BATCH_LINES = [b"GL1-d poll: a zero-timeout fence_finish found the batch still pending, and returned its wake",
                b"GL1-d fence: fence_finish completed natively, by ARM, WAIT and ARM again",
                b"GL1-d readback: 0 of 4096 pixels differ from 0xdeadbeef (the modeled service runs no GPU)",
@@ -64,6 +68,22 @@ for index, name in enumerate(json.loads(sys.argv[1])):
     members = subprocess.check_output(['llvm-ar-22', 't', archive], text=True).splitlines()
     subprocess.run(['llvm-ar-22', 'rcs', target, *[archive.parent / m for m in members]], check=True)
 commands = json.loads((build / 'compile_commands.json').read_text())
+entry = next(c for c in commands if c['file'].endswith('/st_manager.c'))
+frontend_flags, skip = [], False
+for arg in shlex.split(entry['command'])[1:]:
+    if skip:
+        skip = False
+    elif arg in ('-o', '-MF', '-MQ', '-MT'):
+        skip = True
+    elif arg not in ('-c', '-MD', '-MMD', entry['file']):
+        frontend_flags.append(arg)
+for source in ('kumo_gl', 'gl-frontend'):
+    subprocess.run(['clang-22', *frontend_flags, '-I', '/repo/toolchain/mesa',
+                    '-I', str(mesa / 'mesa-26.2.5/src/panfrost'),
+                    '-I', str(mesa / 'mesa-26.2.5/src/panfrost/lib'),
+                    '-I', str(mesa / 'mesa-26.2.5/src/panfrost/model'), '-Wall', '-Wextra',
+                    '-Werror', '-Wno-unused-parameter', '-c', f'/repo/toolchain/mesa/{source}.c',
+                    '-o', out / f'{source}.o'], check=True, cwd=build)
 entry = next(c for c in commands if c['file'].endswith('/ralloc.c'))
 flags, skip = [], False
 for arg in shlex.split(entry['command'])[1:]:
@@ -90,7 +110,7 @@ subprocess.run(['clang-22', *flags, '-I', str(mesa / 'drm'), '-Wall', '-Wextra',
     run(["docker", "cp", "kumo-mesa-drivers-g7k:/output/gl-deps", deps])
     archives = sorted(deps.glob("[0-9][0-9]-*.a"))
     assert len(archives) == len(names), "every GL archive must be materialized"
-    return [deps / "drm-refusal.o", *archives, ROOT / "build/mesa-drivers/result/cxx/libkumo-cxx.a"]
+    return [deps / "kumo_gl.o", deps / "gl-frontend.o", deps / "drm-refusal.o", *archives, ROOT / "build/mesa-drivers/result/cxx/libkumo-cxx.a"]
 
 
 def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=(), gl=False):
@@ -98,8 +118,8 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     G7o-f metal client reuses it with its own cases, startup file and output. — TIMBERDOODLE
     `defines` go to the cases file only, never the shared bridge: G7p-e selects its proof
     with one. — TIMBERDOODLE
-    `gl` also links Gallium's panfrost driver: gl-screen.c, the inventory's GL archives (G7k),
-    drm-refusal (G7m) and the C++ runtime (G7l). The ELF is then about 17 MB. — TIMBERDOODLE"""
+    `gl` also links Gallium's panfrost driver, the frontend and lifecycle cases, the inventory's
+    GL archives (G7k), drm-refusal (G7m) and the C++ runtime (G7l). — KESTREL"""
     out.mkdir(parents=True, exist_ok=True)
     # This verifies the source/header pins, prepares native headers, builds the same C
     # bridge and checks its measured dependency closure; no download. — KESTREL
@@ -167,7 +187,16 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
                out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a", "--end-group"]
     run(command)
     undefined = run([nm, "--undefined-only", elf], capture_output=True, text=True).stdout
-    assert not undefined.strip(), "Device proof ELF has unresolved symbols"
+    # State-tracker use pulls C++ shader/uniform queries. Their optional TLS
+    # initializer is already measured by G7k; the TLS variable itself is defined
+    # in Mesa's C glapi. Allow only measured weak symbols, never a strong gap. — KESTREL
+    optional = set()
+    if gl:
+        inventory = json.loads((ROOT / "build/mesa-drivers/result/inventory.json").read_text())
+        optional = {name for name, item in inventory["gl"]["undefined"].items() if not item["required"]}
+    for line in undefined.splitlines():
+        fields = line.split()
+        assert len(fields) == 2 and fields[0] == "w" and fields[1] in optional, line
     run(["rustfmt", "--edition", "2021", "--check", TOOL / f"{cases}.rs", TOOL / "native.rs"])
     paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{cases}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
@@ -175,6 +204,9 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
              native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
     paths.extend(TOOL / f"{obj.stem}.c" for obj in gl_objects)
+    if gl:
+        paths.extend([TOOL / "kumo_gl.c", TOOL / "kumo_gl.h", TOOL / "gl-frontend.c",
+                      *gl_inputs, ROOT / "build/mesa-drivers/result/inventory.json"])
     (out / "manifest.json").write_text(json.dumps({"defines": list(defines), "input_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}}, indent=2) + "\n")
     return elf
@@ -187,7 +219,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen, context and batch proofs (modes 17-20)")
+                        help="also link Gallium and run its screen, context, batch and frontend proofs (modes 17-21)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -223,6 +255,13 @@ def main():
             assert at < proof.index(GREEN)
             print("GL1-d batch green: a clear flushed as one native submission, a held poll timed out with its wake returned, "
                   "the fence completed by ARM/WAIT/ARM, bo_wait and deferred unmaps answered from completion; modeled service", flush=True)
+            at = 0
+            for line in FRONTEND_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            assert b"GL1-e model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=1" in proof
+            print("GL1-e frontend green: real Mesa GLES2 current context, color/depth validation, completed flush callback, lifecycle refusals and clean teardown; modeled service", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j757
 #j758
 #j759
 #j762
 #j765
+#j768
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
@@ -41,6 +41,15 @@ SLOT = b"bin/gpu-client"
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
 PROOFS = {
+    "gl1-e": dict(
+        define=9, out="gl1-e-metal", gl=True,
+        begin="GL1-e metal frontend begin",
+        lines=["GL1-e drawable: owned 64x48 RGBA8 color and Z24/S8 depth/stencil attachments",
+               "GL1-e current: Mesa's GLES2 state-tracker context made current; glthread and threaded pipe off",
+               "GL1-e front: validate supplied the attachments; native flush completed before the callback; callback refusal propagated",
+               "GL1-e destroy: current context unbound, drawable and display released, session context recreation refused"],
+        green="GL1-e metal frontend green: Mesa context made current on Mali, color/depth validated, front flush completed, context and display destroyed",
+        driver=[], absent=[], after=None),
     "g7o-f": dict(
         define=0, out="g7o-f", begin="G7o-f metal device begin",
         lines=["G7o-f device: gpu_id=", "G7o-f BOs: 5 live", "G7o-f VM: 5 immediate binds",

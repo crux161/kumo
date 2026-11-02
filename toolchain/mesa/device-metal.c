@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j757*/
 /*j758*/
 /*j759*/
 /*j762*/
 /*j765*/
+/*j768*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -18,6 +18,7 @@
  * — TIMBERDOODLE */
 /* 7 is GL1-c's Gallium context (KESTREL) and 8 GL1-d's clear, fence and readback (gl-batch.c).
  * — TIMBERDOODLE */
+/* 9 makes Mesa's GLES2 context current through the KUMO frontend (GL1-e). — KESTREL */
 #include "kumo_kmod.h"
 #include <stdarg.h>
 #include <stdbool.h>
@@ -43,6 +44,9 @@ extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void 
 #if KUMO_METAL_PROOF == 8
 extern unsigned kumo_gl_batch_cases(const struct kumo_gpu_api *api, void (*say)(const char *),
                                     unsigned (*control)(unsigned));
+#endif
+#if KUMO_METAL_PROOF == 9
+extern unsigned kumo_gl_frontend_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 #endif
 extern uint32_t kumo_metal_run(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                const uint64_t *words, uint32_t count);
@@ -697,6 +701,9 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #if KUMO_METAL_PROOF == 8
     return kumo_gl_batch_cases(api, kumo_metal_log, NULL);
 #endif
+#if KUMO_METAL_PROOF == 9
+    return kumo_gl_frontend_cases(api, kumo_metal_log);
+#endif
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -736,8 +743,12 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "GL1-d metal batch begin: live drv-gpu session, Gallium's clear, flush, fence and readback over the native bridge"
 #define FAILED_LINE "GL1-d metal batch FAILED at case %u"
 #define GREEN_LINE "GL1-d metal batch green: Mali cleared the render target through Gallium, the native fence completed, the CPU read the clear color back, and everything was destroyed"
+#elif KUMO_METAL_PROOF == 9
+#define BEGIN_LINE "GL1-e metal frontend begin: live drv-gpu session, Mesa GLES2 context and KUMO drawable"
+#define FAILED_LINE "GL1-e metal frontend FAILED at case %u"
+#define GREEN_LINE "GL1-e metal frontend green: Mesa context made current on Mali, color/depth validated, front flush completed, context and display destroyed"
 #else
-#error "KUMO_METAL_PROOF must be 0 to 8"
+#error "KUMO_METAL_PROOF must be 0 to 9"
 #endif
 
 extern unsigned kumo_metal_proof(void);
