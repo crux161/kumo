@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j753
 #j757
 #j759
 #j760
 #j761
+#j762
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -25,6 +25,7 @@ AUTO_VA_GREEN = b"GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fi
 HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
 CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
 CONTEXT_SYNC_GREEN = b"GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released"
+CONTEXT_INIT_GREEN = b"GL1-c destroy: the screen and device are gone; the session-owned group was not reused"
 
 
 def run(command, **kwargs):
@@ -148,7 +149,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     if gl:
         gl_inputs = gl_dependencies(out)
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", *(["gl-context"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", *(["gl-context"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -181,7 +182,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen (mode 17) and context sync ownership (mode 18)")
+                        help="also link Gallium and run its screen and context proofs (modes 17-19)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -205,8 +206,10 @@ def main():
         if args.gl_screen:
             assert proof.count(SCREEN_GREEN) == 1 and proof.index(SCREEN_GREEN) < proof.index(GREEN)
             assert proof.count(CONTEXT_SYNC_GREEN) == 1 and proof.index(CONTEXT_SYNC_GREEN) < proof.index(GREEN)
+            assert proof.count(CONTEXT_INIT_GREEN) == 1 and proof.index(CONTEXT_INIT_GREEN) < proof.index(GREEN)
             print(SCREEN_GREEN.decode(), flush=True)
             print(CONTEXT_SYNC_GREEN.decode(), flush=True)
+            print("GL1-c3 context green: Gallium initialization, native ARM/wake/completion, one group per session, heap and context cleanup; modeled service", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

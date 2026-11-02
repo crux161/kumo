@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j753*/
 /*j754*/
 /*j757*/
 /*j758*/
 /*j759*/
+/*j762*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -34,6 +34,9 @@ extern uint32_t kumo_metal_store(void *context, volatile uint64_t *stream_cpu, u
 extern uint64_t kumo_metal_now_ns(void);
 #if KUMO_METAL_PROOF == 6
 extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+#endif
+#if KUMO_METAL_PROOF == 7
+extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 #endif
 extern uint32_t kumo_metal_run(void *context, volatile uint64_t *stream_cpu, uint64_t stream_va,
                                const uint64_t *words, uint32_t count);
@@ -682,6 +685,9 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #if KUMO_METAL_PROOF == 6
     return kumo_gl_screen_cases(api, kumo_metal_log);
 #endif
+#if KUMO_METAL_PROOF == 7
+    return kumo_gl_context_init_cases(api, kumo_metal_log);
+#endif
     return KUMO_METAL_PROOF == 0 ? device_cases(api) : sync_cases(api, KUMO_METAL_PROOF == 2);
 }
 
@@ -713,6 +719,10 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "GL1-b metal screen begin: live drv-gpu session, Gallium's panfrost screen over the native device"
 #define FAILED_LINE "GL1-b metal screen FAILED at case %u"
 #define GREEN_LINE "GL1-b metal screen green: Gallium's panfrost screen came up on Mali over the native device, its caps read, a texture made, and everything destroyed"
+#elif KUMO_METAL_PROOF == 7
+#define BEGIN_LINE "GL1-c metal context begin: live drv-gpu session, Gallium's CSF initialization through the native bridge"
+#define FAILED_LINE "GL1-c metal context FAILED at case %u"
+#define GREEN_LINE "GL1-c metal context green: Gallium's native initialization completed, a second context was refused, and the heap, context and screen were destroyed"
 #else
 #error "KUMO_METAL_PROOF must be 0 to 6"
 #endif

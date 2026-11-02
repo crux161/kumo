@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j740
 #j745
+#j762
 """Close both measured Mesa links and build the real KUMO utility acceptance."""
 import hashlib
 import importlib.util
@@ -53,6 +54,11 @@ def main():
         assert hashlib.sha256(header.read_bytes()).hexdigest() == "55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4"
         run(["patch", "--batch", "--fuzz=0", "-p1", "-d", MESA / "mesa-26.2.5", "-i", TOOL / "native-device-header.patch"])
     assert hashlib.sha256(header.read_bytes()).hexdigest() == "5080af914d916bb48c4c7351f25334703fb5575f393e82500f82d4ef34b7f979"
+    for name in ("kumo_gpu.h", "kumo_kmod.h"):
+        source = TOOL / name
+        dest = MESA / "mesa-26.2.5/src/gallium/drivers/panfrost" / name
+        if not dest.exists() or source.read_bytes() != dest.read_bytes():
+            shutil.copyfile(source, dest)
 
     # Install the current SDK without rewriting unchanged headers, so Ninja's
     # dependency graph rebuilds exactly the affected target objects. — SAKER

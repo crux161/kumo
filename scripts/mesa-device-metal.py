@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-#j753
 #j754
 #j757
 #j758
 #j759
+#j762
 """G7o-f and G7p-e: build the live Mesa device client, stage it as an Orange Pi image's GPU
 client, and check a serial log of its metal run.
 
-  --proof NAME  g7o-f (the default), g7p-e-fatal, g7p-e-timeout, g7q-a, g7q-c, gl1-a or gl1-b: the cases the client runs.
+  --proof NAME  select the native device, sync, heap, GL screen or GL context cases.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -122,6 +122,16 @@ PROOFS = {
         green=("GL1-b metal screen green: Gallium's panfrost screen came up on Mali over the native device, "
                "its caps read, a texture made, and everything destroyed"),
         after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
+    "gl1-c": dict(
+        define=7, out="gl1-c-metal", gl=True, begin="GL1-c metal context begin",
+        lines=["GL1-c initialize: creating Gallium's native CSF context",
+               "GL1-c context: Gallium created its CSF context; the native initialization submission completed",
+               "GL1-c admission: a second context was refused while the first remained live",
+               "GL1-c cleanup: native completion observed, heap released, context destroyed",
+               "GL1-c destroy: the screen and device are gone; the session-owned group was not reused"],
+        green=("GL1-c metal context green: Gallium's native initialization completed, a second context was refused, "
+               "and the heap, context and screen were destroyed"),
+        after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point 1 failed"]),
 }
 
 

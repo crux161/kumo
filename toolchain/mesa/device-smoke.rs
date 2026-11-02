@@ -1,8 +1,8 @@
-//j751
 //j752
 //j757
 //j759
 //j761
+//j762
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -97,7 +97,7 @@ impl Backend for Hardware {
         id: u32,
         spec: kumo_gpu::HeapSpec,
     ) -> Result<kumo_gpu::HeapPlacement, Status> {
-        if self.mode != 15 {
+        if self.mode != 15 && self.mode < 19 {
             return Err(Status::NotSupported);
         }
         self.heaps.push(id);
@@ -183,7 +183,9 @@ impl Backend for Hardware {
         Ok(())
     }
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), Status> {
-        let mut pages = vec![0; (bytes / PAGE_BYTES) as usize];
+        // VmoCreatePaged writes u64 physical addresses. The raw pointer cast must not
+        // leave this buffer inferred as Vec<i32>. — KESTREL
+        let mut pages = vec![0u64; (bytes / PAGE_BYTES) as usize];
         let vmo = handle(
             native::call(
                 Syscall::VmoCreatePaged,
@@ -256,9 +258,50 @@ impl Backend for Hardware {
             Err(Status::NotSupported)
         }
     }
-    fn submit(&mut self, _: Submission) -> Result<(), SubmitError> {
+    fn submit(&mut self, job: Submission) -> Result<(), SubmitError> {
         if self.mode < 9 {
             return Err(SubmitError::Unpublished(Status::NotSupported));
+        }
+        if self.mode == 19 {
+            // Inspect Gallium's actual init BO, using Mesa 26.2.5 v10.xml's encodings.
+            // This checks the native heap address and a live handler binding; it models
+            // acceptance/completion rather than executing GPU instructions. — KESTREL
+            assert_eq!(job.stream_bytes, 40);
+            let binding = self.binds.iter().find(|b| b.va == job.stream_va).unwrap();
+            let vmo = self
+                .buffers
+                .iter()
+                .find(|b| b.0 == binding.buffer)
+                .unwrap()
+                .1;
+            let mut words = [0u64; 5];
+            assert_eq!(
+                native::call(
+                    Syscall::VmoRead,
+                    [
+                        vmo.0 as u64,
+                        binding.offset,
+                        words.as_mut_ptr() as u64,
+                        40,
+                        0,
+                        0
+                    ]
+                )
+                .0,
+                0
+            );
+            let context_va = kumo_gpu::HEAP_VA_START + u64::from(self.heaps[0]) * 0x100_0000;
+            assert_eq!(words[0], (1u64 << 56) | (72u64 << 48) | context_va);
+            assert_eq!(words[1], (48u64 << 56) | (72u64 << 40));
+            assert_eq!(words[2] >> 48, (1u64 << 8) | 86);
+            assert_eq!(words[3] >> 32, (2u64 << 24) | (88u64 << 16));
+            assert_eq!(words[4], (25u64 << 56) | (86u64 << 40) | (88u64 << 32) | 2);
+            let handler = words[2] & 0xffff_ffff_ffff;
+            let length = words[3] & 0xffff_ffff;
+            assert!(length > 0 && length % 8 == 0);
+            assert!(self.binds.iter().any(|b| b.va <= handler
+                && handler + length <= b.va + b.bytes
+                && b.flags.0 & BindFlags::NO_EXECUTE != 0));
         }
         if core::mem::take(&mut self.reject_submit) {
             Err(SubmitError::Unpublished(Status::NoMemory))
@@ -414,6 +457,14 @@ impl Transport for Wire {
             id: request.id,
             result,
         });
+        let complete =
+            server.hardware.mode == 19 && matches!(result, Ok(Response::WaitArmed { .. }));
+        drop(server);
+        if complete {
+            // The modeled producer completes only after ARM established a real wake channel.
+            // Drop the server borrow before the control path re-enters it. — KESTREL
+            assert_eq!(kumo_mesa_native_control(1), 0);
+        }
         Ok(())
     }
     fn receive(
@@ -788,6 +839,36 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 c,
                 Command::GroupCreate { .. } | Command::Submit(_) | Command::SyncRead { .. }
             )));
+        }
+        if mode == 19 {
+            unsafe {
+                printf(
+                    b"GL1-c model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu\n\0"
+                        .as_ptr(),
+                    server.release.buffers,
+                    server.release.bindings,
+                    server.release.waits,
+                    server.release.heaps,
+                    server.release.bytes,
+                );
+            }
+            assert_eq!(server.release.buffers, 0);
+            assert_eq!(server.release.bindings, 0);
+            assert_eq!(server.release.heaps, 0);
+            assert_eq!(server.release.bytes, 0);
+            // The completed wait's table row is pruned on the next wire ARM or close.
+            // Its endpoint is already consumed; the post-wake ARM used cached completion.
+            // — KESTREL
+            assert_eq!(server.release.waits, 1);
+            assert!(server.hardware.heaps.is_empty());
+            let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            assert_eq!(count(|c| matches!(c, Command::GroupCreate { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapCreate(_))), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapDestroy { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::Submit(_))), 1);
+            assert_eq!(count(|c| matches!(c, Command::SyncRead { .. })), 0);
+            assert_eq!(server.last_point, 1);
+            assert_eq!(server.wake_reads.len(), 1);
         }
         if (9..15).contains(&mode) {
             assert!(!server

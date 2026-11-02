@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j738
 #j745
 #j759
 #j760
 #j761
+#j762
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -56,6 +56,8 @@ def stage():
     mesa = WORK / "mesa-26.2.5"
     run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "kumo-build.patch"], "patch.log")
     run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "native-device-header.patch"], "native-header.log")
+    for name in ("kumo_gpu.h", "kumo_kmod.h"):
+        shutil.copyfile(TOOL / name, mesa / "src/gallium/drivers/panfrost" / name)
     shutil.copytree(ROOT / "target/kumo-sysroot", WORK / "sysroot")
     include = WORK / "sysroot/include"
     # Private header repairs; the installed sysroot remains unchanged. All actual
@@ -114,7 +116,8 @@ def category(symbol):
         return "DRM / libdrm"
     # Native capability backend entry points, supplied by build-closure.py. — KESTREL
     if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap", "pan_kmod_kumo_cs_reg_count",
-                  "pan_kmod_kumo_sync_create", "pan_kmod_kumo_sync_destroy"):
+                  "pan_kmod_kumo_sync_create", "pan_kmod_kumo_sync_destroy", "pan_kmod_kumo_dev_lost",
+                  "pan_kmod_kumo_native", "pan_kmod_kumo_heap_create", "pan_kmod_kumo_heap_destroy"):
         return "other: native capability backend"
     if symbol in BUILD_ID:
         return "other: static build ID"

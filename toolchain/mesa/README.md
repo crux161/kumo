@@ -1,9 +1,39 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j757 -->
 <!-- j758 -->
 <!-- j759 -->
 <!-- j760 -->
 <!-- j761 -->
+<!-- j762 -->
+
+## GL1-c3: native context initialization and cleanup (QEMU)
+
+Gallium's CSF initializer now creates the one native group, creates its tiler heap through
+ABI 15, and submits its own HEAP_SET / tiler-OOM-handler initialization stream through native
+PREPARE and STEP. The context keeps its full-width group ID. It waits through ARM, a bounded
+WAIT when pending, and another ARM: a wake alone is not completion. Cleanup snapshots the
+context's output binary, waits, and destroys the heap. The group remains session-owned; a
+second context, including after destruction of the first, is refused until a fresh session.
+Uncertain submission or completion closes the device before caller cleanup.
+
+`mesa-device-smoke.py --gl-screen --run` adds mode 19 (20 modes total). It inspects Gallium's
+actual five-word init stream and its live heap/handler addresses. The modeled producer
+completes only after a real ARM wake endpoint exists. Exactly one group, heap and Submit
+cross, the wake is consumed, and teardown leaves zero buffers/bindings/heaps/bytes. One
+completed wait-table row remains until close; it has no live endpoint. The raw VmoCreatePaged
+output vector is now explicitly `u64`: its former inferred `i32` elements let the kernel's
+64-bit address writes overwrite the proof process's heap.
+
+The actual bridge headers are staged beside the patched driver and refreshed by the
+incremental closure build. There is no duplicated native ABI definition in Mesa.
+
+Metal acceptance remains open. The same cases build as proof 7 (`--proof gl1-c`); staging
+creates a separate ESP candidate and does not install it or reboot hardware. — KESTREL, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl1-c --stage build/proofs/gl1-c-metal/image
+python3 scripts/mesa-device-metal.py --proof gl1-c --check <tio log>
+```
 
 ## GL1-c2: Gallium context binary sync ownership
 
@@ -17,13 +47,13 @@ No wire or native ABI change is needed.
 `mesa-device-smoke.py --gl-screen --run` adds mode 18, driving the real Gallium constructor.
 A test-only observer adds a high word to real native IDs and translates them back at the
 callback boundary, checks each binary's initial payload and that DROP removes its metadata,
-and injects first/second-create refusal. Two subsequent attempts reach the still-refusing
-GROUP_CREATE ioctl and release both binaries. After screen destruction the modeled service
+and injects first/second-create refusal. Two subsequent attempts inject native
+GROUP_CREATE refusal and release both binaries; any DRM ioctl now fails the proof. After screen destruction the modeled service
 has no buffer or binding left. Only this QEMU proof wraps `drmIoctl`, and it still delegates
 to the real refusal implementation; the metal screen client does not link the observer.
 
-The group/heap/init-stream and completion-wait paths remain GL1-c's next gate. This slice
-proves sync ownership and failure cleanup, with no successful context or GPU execution claim.
+GL1-c3 above adds the native group/heap/init-stream and completion-wait paths on QEMU.
+This earlier gate proves sync ownership and failure cleanup; metal context acceptance remains open.
 — KESTREL, 2026-11-02
 
 ## GL1-c1: native command-stream register counts

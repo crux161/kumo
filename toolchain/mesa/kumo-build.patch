@@ -2,6 +2,7 @@
 #j759
 #j760
 #j761
+#j762
 --- a/include/drm-uapi/drm.h
 +++ b/include/drm-uapi/drm.h
 @@ -45,7 +45,7 @@
@@ -546,3 +547,311 @@
 
     /* Set of 32 batches. When the set is full, the LRU entry (the batch
      * with the smallest seqnum) is flushed to free a slot.
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -20,8 +20,7 @@
+ #include "panfrost_tracepoints.h"
+
+ #ifdef __kumo__
+-/* Native metadata; never cast a KUMO device to Panthor's private layout. — KESTREL */
+-uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *dev);
++#include "kumo_kmod.h"
+ #endif
+
+ static struct cs_builder_conf
+@@ -1797,6 +1796,91 @@
+    }
+ }
+
++#ifdef __kumo__
++static int
++csf_native_call(struct panfrost_device *dev, uint32_t op, uint64_t id,
++                uint64_t value, struct kumo_gpu_native_reply *reply)
++{
++   const struct kumo_gpu_native_request request = {
++      .operation = op, .id = id, .value = value,
++   };
++   return pan_kmod_kumo_native(dev->kmod.dev, &request, reply) == KUMO_GPU_OK ? 0 : -1;
++}
++
++static int
++csf_native_wait_snapshot(struct panfrost_device *dev, uint64_t snapshot)
++{
++   struct kumo_gpu_native_reply reply;
++   /* One bounded wait, then observe the completed fence again. A wake is not itself
++    * completion. Any uncertainty closes the session before caller cleanup. — KESTREL */
++   for (unsigned attempt = 0; attempt < 2; ++attempt) {
++      if (csf_native_call(dev, KUMO_NATIVE_ARM, snapshot, 0, &reply))
++         break;
++      if (reply.state == KUMO_NATIVE_COMPLETE && !reply.gpu_status) {
++         if (!csf_native_call(dev, KUMO_NATIVE_DROP, snapshot, 0, &reply))
++            return 0;
++         break;
++      }
++      if (reply.state != KUMO_NATIVE_AVAILABLE || !reply.id)
++         break;
++      uint64_t wake = reply.id;
++      if (attempt || csf_native_call(dev, KUMO_NATIVE_WAIT, wake,
++                                    KUMO_NATIVE_MAX_TIMEOUT_NS, &reply) ||
++          reply.state != KUMO_NATIVE_WOKEN)
++         break;
++   }
++   pan_kmod_kumo_dev_lost(dev->kmod.dev);
++   return -1;
++}
++
++static int
++csf_native_wait_sync(struct panfrost_context *ctx)
++{
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   struct kumo_gpu_native_reply reply;
++   if (!csf_native_call(dev, KUMO_NATIVE_SNAPSHOT, ctx->native_syncobj, 0, &reply) &&
++       reply.state == KUMO_NATIVE_AVAILABLE && reply.id)
++      return csf_native_wait_snapshot(dev, reply.id);
++   pan_kmod_kumo_dev_lost(dev->kmod.dev);
++   return -1;
++}
++
++static int
++csf_native_submit_init(struct panfrost_context *ctx, uint64_t va, uint32_t bytes)
++{
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   const struct kumo_gpu_native_point signal = {ctx->native_syncobj, 0};
++   const struct kumo_gpu_native_request prepare = {
++      .operation = KUMO_NATIVE_PREPARE, .id = ctx->csf.native_group,
++      .job = {pan_kmod_vm_handle(dev->kmod.vm), bytes, va, 1},
++      .signals = &signal, .signal_count = 1,
++   };
++   struct kumo_gpu_native_reply reply;
++   if (pan_kmod_kumo_native(dev->kmod.dev, &prepare, &reply) != KUMO_GPU_OK || !reply.id)
++      goto failed;
++   uint64_t job = reply.id;
++   if (csf_native_call(dev, KUMO_NATIVE_STEP, job, 0, &reply) ||
++       reply.state != KUMO_NATIVE_SUBMITTED || !reply.id)
++      goto failed;
++   uint64_t snapshot = reply.id;
++   if (csf_native_call(dev, KUMO_NATIVE_DROP, job, 0, &reply))
++      goto failed;
++   return csf_native_wait_snapshot(dev, snapshot);
++failed:
++   pan_kmod_kumo_dev_lost(dev->kmod.dev);
++   return -1;
++}
++
++static void
++csf_native_release_heap(struct panfrost_context *ctx)
++{
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   uint64_t bytes;
++   if (pan_kmod_kumo_heap_destroy(dev->kmod.dev, ctx->csf.heap.handle, &bytes) != KUMO_GPU_OK)
++      pan_kmod_kumo_dev_lost(dev->kmod.dev);
++}
++#endif
++
+ #define POSITION_FIFO_SIZE (64 * 1024)
+
+ static enum drm_panthor_group_priority
+@@ -1833,6 +1917,22 @@
+
+    struct panfrost_screen *screen = pan_screen(ctx->base.screen);
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
++   int ret;
++#ifdef __kumo__
++   if (ctx->flags & (PIPE_CONTEXT_LOW_PRIORITY | PIPE_CONTEXT_HIGH_PRIORITY |
++                     PIPE_CONTEXT_REALTIME_PRIORITY))
++      return -1;
++   struct kumo_gpu_native_reply group_reply;
++   ret = csf_native_call(dev, KUMO_NATIVE_GROUP_CREATE, 0,
++                          pan_kmod_vm_handle(dev->kmod.vm), &group_reply);
++   if (ret)
++      goto err_group_create;
++   if (!group_reply.id || group_reply.value != KUMO_GROUP_USABLE) {
++      pan_kmod_kumo_dev_lost(dev->kmod.dev);
++      goto err_group_create;
++   }
++   ctx->csf.native_group = group_reply.id;
++#else
+    struct drm_panthor_queue_create qc[] = {{
+       .priority = 1,
+       .ringbuf_size = 64 * 1024,
+@@ -1850,8 +1950,7 @@
+       .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
+    };
+
+-   int ret =
+-      pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANTHOR_GROUP_CREATE,
++   ret = pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANTHOR_GROUP_CREATE,
+                      &gc);
+
+    if (ret)
+@@ -1862,6 +1961,7 @@
+    struct drm_panthor_group_destroy gd = {
+       .group_handle = ctx->csf.group_handle,
+    };
++#endif
+
+    /* Get tiler heap */
+    struct drm_panthor_tiler_heap_create thc = {
+@@ -1872,17 +1972,32 @@
+       .max_chunks = pan_screen(ctx->base.screen)->csf_tiler_heap.max_chunks,
+       .target_in_flight = 65535,
+    };
++#ifdef __kumo__
++   const struct kumo_gpu_heap_request heap_request = {
++      .vm = thc.vm_id, .chunk_bytes = thc.chunk_size,
++      .initial_chunks = thc.initial_chunk_count, .max_chunks = thc.max_chunks,
++      .target_in_flight = thc.target_in_flight,
++   };
++   struct kumo_gpu_heap_info heap_info;
++   ret = pan_kmod_kumo_heap_create(dev->kmod.dev, &heap_request, &heap_info) == KUMO_GPU_OK ? 0 : -1;
++   thc.handle = heap_info.heap;
++   thc.tiler_heap_ctx_gpu_va = heap_info.context_va;
++   thc.first_heap_chunk_gpu_va = heap_info.first_chunk_va;
++#else
+    ret = pan_kmod_ioctl(panfrost_device_fd(dev),
+                         DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc);
++#endif
+
+    if (ret)
+       goto err_tiler_heap;
+
+    ctx->csf.heap.handle = thc.handle;
+
++#ifndef __kumo__
+    struct drm_panthor_tiler_heap_destroy thd = {
+       .handle = ctx->csf.heap.handle,
+    };
++#endif
+
+    ctx->csf.heap.desc_bo =
+       panfrost_bo_create(dev, pan_size(TILER_HEAP), 0, "Tiler Heap");
+@@ -1933,6 +2048,7 @@
+    cs_set_exception_handler(&b, MALI_CS_EXCEPTION_TYPE_TILER_OOM,
+                             addr_reg, length_reg);
+
++#ifndef __kumo__
+    struct drm_panthor_queue_submit qsubmit;
+    struct drm_panthor_group_submit gsubmit;
+    struct drm_panthor_sync_op sync = {
+@@ -1940,6 +2056,7 @@
+          DRM_PANTHOR_SYNC_OP_SIGNAL | DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ,
+       .handle = ctx->syncobj,
+    };
++#endif
+
+    assert(cs_is_valid(&b));
+    cs_end(&b);
+@@ -1949,14 +2066,18 @@
+
+    cs_builder_fini(&b);
+
++#ifdef __kumo__
++   ret = csf_native_submit_init(ctx, cs_start, cs_size);
++#else
+    csf_prepare_qsubmit(ctx, &qsubmit, 0, cs_start, cs_size, &sync, 1);
+    csf_prepare_gsubmit(ctx, &gsubmit, &qsubmit, 1);
+    ret = csf_submit_gsubmit(ctx, &gsubmit);
+-
+-   if (dev->debug & PAN_DBG_TRACE) {
++#endif
++
++   if (!ret && (dev->debug & PAN_DBG_TRACE)) {
+       uint32_t regs[256] = {0};
+-      pandecode_interpret_cs(dev->decode_ctx, qsubmit.stream_addr,
+-                             qsubmit.stream_size, panfrost_device_gpu_id(dev),
++      pandecode_interpret_cs(dev->decode_ctx, cs_start,
++                             cs_size, panfrost_device_gpu_id(dev),
+                              regs);
+    }
+
+@@ -1964,9 +2085,11 @@
+       goto err_g_submit;
+
+    /* Wait before freeing the buffer. */
++#ifndef __kumo__
+    ret = drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
+                         NULL);
+    assert(!ret);
++#endif
+
+    panfrost_bo_unreference(cs_bo);
+
+@@ -1975,17 +2098,31 @@
+    ctx->csf.is_init = true;
+    return 0;
+ err_g_submit:
++#ifdef __kumo__
++   /* Successful handler construction owns these BOs even if init submission fails.
++    * A failed native submit closed the session before this release. — KESTREL */
++   panfrost_bo_unreference(ctx->csf.tiler_oom_handler.cs_bo);
++   panfrost_bo_unreference(ctx->csf.tiler_oom_handler.save_bo);
++#endif
+    panfrost_bo_unreference(cs_bo);
+ err_tiler_heap_cs_bo:
+    panfrost_bo_unreference(ctx->csf.tmp_geom_bo);
+ err_tiler_heap_tmp_geom_bo:
+    panfrost_bo_unreference(ctx->csf.heap.desc_bo);
+ err_tiler_heap_desc_bo:
++#ifdef __kumo__
++   csf_native_release_heap(ctx);
++#else
+    pan_kmod_ioctl(panfrost_device_fd(dev),
+                   DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
++#endif
+ err_tiler_heap:
++#ifndef __kumo__
+    pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANTHOR_GROUP_DESTROY,
+                   &gd);
++#endif
++   /* The native group is session-owned; another GROUP_CREATE is refused until a
++    * fresh device/session. No unsupported group DROP is fabricated. — KESTREL */
+ err_group_create:
+    return -1;
+ }
+@@ -1999,16 +2136,25 @@
+       return;
+
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
++#ifndef __kumo__
+    struct drm_panthor_tiler_heap_destroy thd = {
+       .handle = ctx->csf.heap.handle,
+    };
++#endif
+    ASSERTED int ret;
+
+    /* Make sure all jobs are done before destroying the heap. */
++#ifdef __kumo__
++   csf_native_wait_sync(ctx);
++#else
+    ret = drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
+                         NULL);
+    assert(!ret);
+-
++#endif
++
++#ifdef __kumo__
++   csf_native_release_heap(ctx);
++#else
+    ret = pan_kmod_ioctl(panfrost_device_fd(dev),
+                         DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+    assert(!ret);
+@@ -2021,6 +2167,7 @@
+       pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANTHOR_GROUP_DESTROY,
+                      &gd);
+    assert(!ret);
++#endif
+
+    panfrost_bo_unreference(ctx->csf.tmp_geom_bo);
+    panfrost_bo_unreference(ctx->csf.heap.desc_bo);
+--- a/src/gallium/drivers/panfrost/pan_csf.h
++++ b/src/gallium/drivers/panfrost/pan_csf.h
+@@ -93,6 +93,9 @@
+ struct panfrost_csf_context {
+    bool is_init;
+    uint32_t group_handle;
++#ifdef __kumo__
++   uint64_t native_group;
++#endif
+
+    struct {
+       uint32_t handle;

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j752*/
 /*j757*/
 /*j759*/
 /*j760*/
 /*j761*/
+/*j762*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -333,12 +333,13 @@ static unsigned auto_va_cases(const struct kumo_gpu_api *api)
 /* GL1-b: mode 17 runs Gallium's screen, and exists only in the build that links Gallium. */
 extern unsigned kumo_gl_screen_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
 extern unsigned kumo_gl_context_sync_cases(const struct kumo_gpu_api *api);
-static void say_line(const char *line) { puts(line); }
+extern unsigned kumo_gl_context_init_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+static void say_line(const char *line) { puts(line); fflush(stdout); }
 #endif
 unsigned kumo_mesa_device_modes(void)
 {
 #ifdef KUMO_GL_SCREEN
-    return 19;
+    return 20;
 #else
     return 17;
 #endif
@@ -347,6 +348,7 @@ unsigned kumo_mesa_device_modes(void)
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
 #ifdef KUMO_GL_SCREEN
+    if (mode == 19) return kumo_gl_context_init_cases(api, say_line);
     if (mode == 18) return kumo_gl_context_sync_cases(api);
     if (mode == 17) return kumo_gl_screen_cases(api, say_line);
 #endif

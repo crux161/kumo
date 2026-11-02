@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j745*/
 /*j751*/
 /*j757*/
 /*j760*/
 /*j761*/
+/*j762*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -43,6 +43,9 @@ uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *dev);
  * loses the device rather than claiming the sync was released. — KESTREL */
 int pan_kmod_kumo_sync_create(struct pan_kmod_dev *dev, bool signaled, uint64_t *id);
 void pan_kmod_kumo_sync_destroy(struct pan_kmod_dev *dev, uint64_t id);
+/* Terminal client failure closes the session before any uncertain GPU backing is freed.
+ * Only the server's confirmed reset can release that backing. — KESTREL */
+void pan_kmod_kumo_dev_lost(struct pan_kmod_dev *dev);
 void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
 int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
 /* The published device's original session/BO owner also owns all native sync metadata.

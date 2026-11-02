@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*j761*/
+/*j762*/
 /* GL1-c2: the actual Gallium context constructor owns native binary syncs, then stops at
- * the still-refusing group boundary. The test-only API observer gives real native IDs a
+ * an injected native group refusal. The test-only API observer gives real native IDs a
  * high word, translates them back at the callback boundary, and checks each released ID
  * is gone from Rust's metadata. This exercises Gallium's full-width storage and cleanup
  * without moving its private structs or changing the native ABI. — KESTREL */
@@ -20,17 +21,17 @@ int __wrap_drmIoctl(int fd, unsigned long request, void *arg);
 #define HIGH_ID (UINT64_C(1) << 32)
 static uint32_t (*real_native)(void *, const struct kumo_gpu_native_request *, struct kumo_gpu_native_reply *);
 static struct {
-    uint32_t creates, drops, fail_create, group_ioctls;
+    uint32_t creates, drops, fail_create, group_calls, drm_calls;
     bool faulty;
     struct { uint64_t original, exposed; } ids[2];
 } observed;
 
-/* Only the proof ELF wraps this symbol. The real refusing DRM entry point still runs;
- * a group ioctl must be the first remaining platform boundary. — KESTREL */
+/* Only the proof ELF wraps this symbol; no ioctl belongs in the native context path.
+ * Still delegate to the real refusal, never translate one into a native call. — KESTREL */
 int __wrap_drmIoctl(int fd, unsigned long request, void *arg)
 {
-    if (fd != -1 || request != DRM_IOCTL_PANTHOR_GROUP_CREATE) observed.faulty = true;
-    ++observed.group_ioctls;
+    observed.faulty = true;
+    ++observed.drm_calls;
     return __real_drmIoctl(fd, request, arg);
 }
 
@@ -50,6 +51,10 @@ static uint32_t observe_native(void *context, const struct kumo_gpu_native_reque
             observed.faulty = true;
             return KUMO_GPU_PROTOCOL;
         }
+    } else if (request->operation == KUMO_NATIVE_GROUP_CREATE) {
+        ++observed.group_calls;
+        *out = (struct kumo_gpu_native_reply){0};
+        return KUMO_GPU_NO_MEMORY;
     } else if (request->operation == KUMO_NATIVE_DROP) {
         for (; index < 2; ++index)
             if (observed.ids[index].exposed == request->id) break;
@@ -113,7 +118,7 @@ unsigned kumo_gl_context_sync_cases(const struct kumo_gpu_api *api)
         CHECK(observed.creates == (attempt == 0 ? 1 : 2), 20 + attempt);
         CHECK(observed.drops == (attempt == 0 ? 0 : attempt == 1 ? 1 : 2), 30 + attempt);
         CHECK(!observed.ids[0].exposed && !observed.ids[1].exposed, 40 + attempt);
-        CHECK(observed.group_ioctls == (attempt >= 2), 50 + attempt);
+        CHECK(observed.group_calls == (attempt >= 2) && !observed.drm_calls, 50 + attempt);
     }
     screen->destroy(screen);
     puts("GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released");

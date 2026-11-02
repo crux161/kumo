@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j752*/
 /*j757*/
 /*j759*/
 /*j760*/
 /*j761*/
+/*j762*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -49,6 +49,11 @@ static void poison(struct kumo_device *dev)
         dev->lost = true;
         dev->api.device_close(dev->api.context);
     }
+}
+void pan_kmod_kumo_dev_lost(struct pan_kmod_dev *base)
+{
+    struct kumo_device *dev = device(base);
+    if (dev) poison(dev);
 }
 static void *zalloc(const struct pan_kmod_allocator *allocator, size_t bytes, bool transient)
 {
@@ -278,9 +283,9 @@ static struct pan_kmod_vm *create_vm(struct pan_kmod_dev *base, uint32_t flags,
                                     uint64_t start, uint64_t bytes)
 {
     struct kumo_device *dev = device(base);
-    /* GL1-b: Gallium asks for AUTO_VA | TRACK_ACTIVITY. Activity tracking is accepted with nothing
-     * to track yet: no Gallium context submits until GL1-d, and Gallium skips the wait for a BO
-     * the GPU never touched. bo_wait stays honest (no_wait) meanwhile. — TIMBERDOODLE */
+    /* Gallium asks for AUTO_VA | TRACK_ACTIVITY. General BO activity tracking remains GL1-d;
+     * GL1-c's initialization explicitly waits for its native completion before releasing BOs.
+     * bo_wait still makes no independent completion claim. — KESTREL */
     if (!ready(dev) || dev->vm || (flags & ~KUMO_VM_FLAGS) || !bytes || start % PAN_PGSIZE_4K || bytes % PAN_PGSIZE_4K ||
         start < dev->range.start || start > UINT64_MAX - bytes ||
         start + bytes > dev->range.start + dev->range.size) return NULL;
