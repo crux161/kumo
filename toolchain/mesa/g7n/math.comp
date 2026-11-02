@@ -1,0 +1,39 @@
+#version 310 es
+// j741
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// G7n's second GLSL ES input, chosen to make the platforms disagree if they can. The constant
+// `k` is folded at compile time by Mesa's GLSL front end and NIR using the build host's libm
+// (KUMO: openlibm; Linux: glibc), so a last-bit difference in sin/exp/pow/log2/atan changes the
+// emitted immediate. The body adds shared memory, barriers in a uniform loop, a reduction,
+// integer division by constants and runtime transcendentals. SSBO only. — TIMBERDOODLE 2026-10-31
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Inputs {
+   float v[];
+} inputs;
+
+layout(std430, binding = 1) writeonly buffer Outputs {
+   float sums[];
+} outputs;
+
+shared float partial[64];
+
+const float k = sin(0.5) * exp(1.25) + pow(2.0, 0.3) + log2(10.0) + atan(1.0, 3.0);
+
+void main()
+{
+   uint i = gl_LocalInvocationIndex;
+   float v = inputs.v[gl_GlobalInvocationID.x];
+   uint bucket = (gl_GlobalInvocationID.x / 3u) % 7u;
+   partial[i] = v * k + sqrt(abs(v)) - floor(v * 0.25) + cos(v) + float(bucket);
+   barrier();
+   for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+      if (i < stride)
+         partial[i] += partial[i + stride];
+      barrier();
+   }
+   if (i == 0u)
+      outputs.sums[gl_WorkGroupID.x] = partial[0] / float(gl_WorkGroupSize.x);
+}

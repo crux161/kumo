@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j693
-//j694
-//j697
-//j698
-//j701
+//j720
+//j721
+//j723
+//j741
+//j748
 
 extern crate alloc;
 
@@ -14,8 +14,9 @@ use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
-    GFX_CLIENT_PATH, GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH,
-    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GROUP_PATH, HOSTNAME_PATH,
+    IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH,
+    SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -158,46 +159,319 @@ static GRAPHICS_ASYNC_PROCESS: [AtomicU32; kumo_graphics::VIEW_COUNT] =
 static GRAPHICS_INPUT: [AtomicU32; kumo_graphics::VIEW_COUNT] =
     [AtomicU32::new(0), AtomicU32::new(0)];
 
-/// G5b: the sending end of drv-gpu's bootstrap channel. It is held only on a board with the
-/// GPU's power unit, from drv-gpu's launch until drv-fb's views exist and view
-/// `drv_gpu::GPU_VIEW` has been handed over; otherwise it is closed so drv-gpu stops waiting.
+/// G5b/G8d-b: the sending end of drv-gpu's bootstrap channel. On a board with the GPU's
+/// power unit it is the driver's long-lived session handoff (DESIGN/024): the firmware
+/// grant and the first session's `g` ride it at launch, the boot view's `v`/`s` — or a
+/// bare `v` carrying no view — follow once drv-fb's grants exist, and every later
+/// session's `g` reuses the same pair. Sora never closes it on a GPU board; on any other
+/// board it was closed at spawn, so this slot stays zero and nothing waits on it.
+/// — TIMBERDOODLE
 static GPU_VIEW_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
-/// One cooperative G6b lease per boot. It is transferred once and never re-granted after
-/// client/driver failure; a new boot resets the device before any fresh grant. — TIMBERDOODLE
+//j714 The retained session handoff once the boot view's records have been queued: the
+/// serve loop's reachable copy of the drv-gpu pair, so a regrant can offer `g` without the
+/// pair ever being closed. Zero on a non-GPU board and after a driver end that closed.
+static GPU_SESSION_HANDOFF: AtomicU32 = AtomicU32::new(0);
+/// The first session's client end of the GPU wire channel, staged by drv-gpu's launcher and
+/// transferred once by the boot launch. Later sessions mint their own pair in the regrant
+/// path, so this slot stays zero after the boot transfer. — TIMBERDOODLE
 static GPU_CLIENT_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
+//j711
+/// The sending end of one launch's lane bootstrap pair. Every launch mints a fresh pair —
+/// the boot one and each G8d-b regrant — and names its lane before dropping the sender:
+/// `N` + the native producer on a normal image, or `V` + view channel, `S` + view surface
+/// and then `N` on a churn image. The boot churn lane still runs the J0c native diagnostic
+/// first (j713); a regranted churn lane has no native producer, so its `N` carries handle
+/// zero and the client resumes the churn timeline without native frames (DESIGN/024). The
+/// client reads this pair as its second transferred argument. — TIMBERDOODLE
+static GPU_LANE_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 
-fn launch_gpu_client(initrd: Handle) {
+/// Boot launch: take the one session wire channel and native producer drv-gpu's launcher
+/// staged, and run the cooperative client through the shared lane path. The retained child
+/// process handle (the gfx-hold `kept` precedent) goes back to the caller so the serve loop
+/// can supervise it; `None` when this board has no GPU lane to run.
+fn launch_gpu_client(initrd: Handle) -> Option<Handle> {
     let channel = GPU_CLIENT_CHANNEL.swap(0, Ordering::Relaxed);
     if channel == 0 {
-        return;
+        return None;
     }
     let native = GPU_NATIVE_CHANNEL.swap(0, Ordering::Relaxed);
-    let mut flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
-    if native != 0 {
-        flags |= ProcessRunFlags::TRANSFER_ARG2.bits();
-    }
-    if run_elf(
+    launch_gpu_client_session(
         initrd,
-        kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
         u64::from(channel),
         u64::from(native),
+        if GPU_CHURN_VIEW {
+            LaneGrant::SoraChurn
+        } else {
+            LaneGrant::Normal
+        },
+    )
+}
+
+/// Which lane a launch names, and where its view grant comes from.
+#[derive(Clone, Copy)]
+enum LaneGrant {
+    /// A normal image: `N` plus the native producer (handle zero when there is none).
+    Normal,
+    /// The boot launch on a churn image: swap view `GPU_VIEW`'s grant out of the statics.
+    SoraChurn,
+    /// A regrant on a churn image: the grant drv-fb issued for this session, or zeros when
+    /// no view released in time (the client then fails honestly).
+    Regranted(Handle, Handle),
+}
+
+/// Where a churn view grant no client consumed goes next.
+#[derive(Clone, Copy)]
+enum GrantReturn {
+    /// A boot grant: back into the statics, so a shell client can still use the view.
+    ToSora,
+    /// A regrant: close it and let drv-fb report the release afresh for the next attempt.
+    Released,
+}
+
+//j714 One launch of the cooperative GPU client through the lane path — shared by the boot
+/// launch and every supervised regrant, so both speak the same protocol. It mints the
+/// one-shot lane pair, transfers the session channel in x0 and the pair's child end in x1
+/// (ASYNC|TRANSFER_ARG|TRANSFER_ARG2), then names the lane before dropping the lane sender:
+/// `N` + native producer on a normal image, `V` + view channel, `S` + view surface and then
+/// `N` on a churn image (DESIGN/024). `session` is the client end of the session wire
+/// channel; its server end has already been offered to drv-gpu as `g`.
+fn launch_gpu_client_session(
+    initrd: Handle,
+    session: u64,
+    native: u64,
+    lane_grant: LaneGrant,
+) -> Option<Handle> {
+    let valid = |raw: u64| raw != 0 && raw != u64::MAX;
+    // Both lanes need one bootstrap pair: the session channel rides x0, and the lane
+    // selector rides this pair's other end. The child end is transferred as x1; Sora keeps
+    // the sending end until it has named the lane. — TIMBERDOODLE
+    let (sender, lane_child) = channel_create_pair();
+    if !valid(sender) || !valid(lane_child) {
+        if valid(session) {
+            let _ = handle_close(Handle(session as u32));
+        }
+        if valid(native) {
+            let _ = handle_close(Handle(native as u32));
+        }
+        if let LaneGrant::Regranted(channel, vmo) = lane_grant {
+            return_gpu_view_grant(channel, vmo, GrantReturn::Released);
+        }
+        log(b"gpu-client: lane bootstrap unavailable; session retired\n");
+        return None;
+    }
+    // On the churn lane view `GPU_VIEW`'s boot grant leaves the regrant statics only after
+    // the pair exists, and returns to them if the launch never reaches the send, so a shell
+    // client can still use the view afterwards. — TIMBERDOODLE
+    let (view_grant, homing) = match lane_grant {
+        LaneGrant::Normal => (None, GrantReturn::ToSora),
+        LaneGrant::SoraChurn => {
+            let view_channel =
+                Handle(GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+            let view_vmo = Handle(GRAPHICS_VMO[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+            (Some((view_channel, view_vmo)), GrantReturn::ToSora)
+        }
+        LaneGrant::Regranted(channel, vmo) => (Some((channel, vmo)), GrantReturn::Released),
+    };
+    GPU_LANE_BOOTSTRAP.store(sender as u32, Ordering::Relaxed);
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let mut kept = None;
+    let ran = run_elf_threads(
+        initrd,
+        kumo_abi::initrd::GPU_CLIENT_PATH.as_bytes(),
+        session,
+        lane_child,
         flags,
         b"gpu-client",
-    ) {
+        0,
+        Some(&mut kept),
+    );
+    if ran {
+        let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
+        match view_grant {
+            Some((view_channel, view_vmo)) => {
+                if view_channel.0 == 0 || view_vmo.0 == 0 {
+                    // Honest absence: the client refuses a V lane without a usable grant.
+                    let _ = channel_write_with_handle(sender, b"V".as_ptr(), 1, Handle(0));
+                    let _ = channel_write_with_handle(sender, b"S".as_ptr(), 1, Handle(0));
+                    log(b"gpu-client: churn lane has no view grant\n");
+                } else if channel_write_with_handle(sender, b"V".as_ptr(), 1, view_channel) != 0 {
+                    // A refused send leaves the handles in Sora's table.
+                    match homing {
+                        GrantReturn::ToSora => {
+                            GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW]
+                                .store(view_channel.0, Ordering::Relaxed);
+                            GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
+                            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                            log(b"gpu-client: churn lane view channel refused; view restored\n");
+                        }
+                        GrantReturn::Released => {
+                            return_gpu_view_grant(view_channel, view_vmo, GrantReturn::Released);
+                            log(b"gpu-client: churn lane view channel refused; grant closed\n");
+                        }
+                    }
+                } else if channel_write_with_handle(sender, b"S".as_ptr(), 1, view_vmo) != 0 {
+                    // The channel already moved; without its surface the view cannot be
+                    // painted, so the client closes it and drv-fb reports the release.
+                    let _ = handle_close(view_vmo);
+                    log(b"gpu-client: churn lane view surface refused\n");
+                }
+                // j713: the boot churn lane also runs the J0c native diagnostic first, so
+                // the native producer travels after the view pair. A regranted lane has no
+                // producer and sends handle zero, which the client accepts (DESIGN/024).
+                if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
+                    && native != 0
+                {
+                    let _ = handle_close(Handle(native as u32));
+                }
+                let _ = handle_close(sender);
+            }
+            None => {
+                if channel_write_with_handle(sender, b"N".as_ptr(), 1, Handle(native as u32)) != 0
+                    && native != 0
+                {
+                    let _ = handle_close(Handle(native as u32));
+                }
+                let _ = handle_close(sender);
+            }
+        }
         log(b"gpu-client: session handed to a separate process\n");
+        kept
     } else {
-        let _ = handle_close(Handle(channel));
+        let sender = Handle(GPU_LANE_BOOTSTRAP.swap(0, Ordering::Relaxed));
+        let _ = handle_close(sender);
+        let _ = handle_close(Handle(lane_child as u32));
+        let _ = handle_close(Handle(session as u32));
         if native != 0 {
-            let _ = handle_close(Handle(native));
+            let _ = handle_close(Handle(native as u32));
+        }
+        if let Some((view_channel, view_vmo)) = view_grant {
+            if view_channel.0 != 0 || view_vmo.0 != 0 {
+                return_gpu_view_grant(view_channel, view_vmo, homing);
+            }
         }
         log(b"gpu-client: launch failed; session retired\n");
+        None
     }
 }
 
+/// Return a churn view grant no client consumed: a boot grant goes back to the statics (a
+/// shell client may still use it), while a regrant is closed so drv-fb reports the release
+/// afresh and the next attempt waits on real evidence, not a cached flag.
+fn return_gpu_view_grant(channel: Handle, vmo: Handle, homing: GrantReturn) {
+    match homing {
+        GrantReturn::ToSora => {
+            GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].store(channel.0, Ordering::Relaxed);
+            GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(vmo.0, Ordering::Relaxed);
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        }
+        GrantReturn::Released => {
+            if channel.0 != 0 {
+                let _ = handle_close(channel);
+            }
+            if vmo.0 != 0 {
+                let _ = handle_close(vmo);
+            }
+            // Still grantable: the release query re-confirms drv-fb's side before regrant.
+            GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+//j714 One supervised regrant: a fresh session channel whose server end rides the retained
+/// drv-gpu handoff as `g` (DESIGN/024's once-per-session record), then the shared lane path.
+/// On a churn image the client also needs view `GPU_VIEW` back: the shell gfx-recover
+/// machinery (`wait_for_released` + `regrant_view`) is reused for exactly that view, and an
+/// unreleased view becomes the lane's honest zero grant rather than a fabricated one.
+//j715
+/// Bounded release observation for a churn regrant: twenty control-lane queries paced at
+/// 100 ms (2 s) cover the multi-second observation delay seen on metal without letting a
+/// wedged control lane hold the serve loop indefinitely. — TIMBERDOODLE
+const GPU_REGRANT_OBSERVE_ROUNDS: u32 = 20;
+const GPU_REGRANT_OBSERVE_PACE_NS: u64 = 100_000_000;
+
+fn regrant_gpu_session(initrd: Handle) -> Option<Handle> {
+    let handoff = Handle(GPU_SESSION_HANDOFF.load(Ordering::Relaxed));
+    if handoff.0 == 0 {
+        log(b"gpu-client: no session handoff; session regrant unavailable\n");
+        return None;
+    }
+    let valid = |raw: u64| raw != 0 && raw != u64::MAX;
+    let (client, server) = channel_create_pair();
+    if !valid(client) || !valid(server) {
+        for raw in [client, server] {
+            if valid(raw) {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+        log(b"gpu-client: session pair unavailable; regrant refused\n");
+        return None;
+    }
+    if channel_write_with_handle(handoff, b"g".as_ptr(), 1, Handle(server as u32)) != 0 {
+        // Refused: the driver's receiver is gone, and neither end moved.
+        let _ = handle_close(Handle(server as u32));
+        let _ = handle_close(Handle(client as u32));
+        log(b"gpu-client: session regrant refused; grant closed\n");
+        return None;
+    }
+    let lane_grant = if GPU_CHURN_VIEW {
+        // j715: observe the release with a bounded poll of the control lane. The first metal
+        // regrant queried 34 ms after drv-fb recorded `view 1 recovered` and still saw no
+        // release bit, while a later attempt observed it only after ~1.8 s, so the shell's
+        // wait helpers are replaced here by direct queries the caller can time, and the mask
+        // is logged to make a miss diagnosable. This runs on the serve loop, hence bounded
+        // rounds and pacing rather than an unbounded wait. — TIMBERDOODLE
+        GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+        let mut last_mask = None;
+        let mut observed = false;
+        for _round in 0..GPU_REGRANT_OBSERVE_ROUNDS {
+            last_mask = query_released();
+            if last_mask.is_some_and(|mask| mask & (1u8 << drv_gpu::GPU_VIEW) != 0) {
+                observed = true;
+                break;
+            }
+            let _ = kumo_rt::sleep_ns(GPU_REGRANT_OBSERVE_PACE_NS);
+        }
+        log(b"gpu-client: release observation mask=");
+        match last_mask {
+            Some(mask) => log_hex(u64::from(mask)),
+            None => log(b"none"),
+        }
+        if observed {
+            log(b" observed=yes\n");
+        } else {
+            log(b" observed=no\n");
+        }
+        let grant = if observed {
+            regrant_view(drv_gpu::GPU_VIEW)
+        } else {
+            None
+        };
+        match grant {
+            Some((view_channel, view_vmo)) => {
+                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+                GRAPHICS_RELEASED[drv_gpu::GPU_VIEW].store(false, Ordering::Relaxed);
+                LaneGrant::Regranted(view_channel, view_vmo)
+            }
+            None => {
+                log(b"gpu-client: view regrant unavailable; sending an honest absence\n");
+                LaneGrant::Regranted(Handle(0), Handle(0))
+            }
+        }
+    } else {
+        LaneGrant::Normal
+    };
+    launch_gpu_client_session(initrd, client, 0, lane_grant)
+}
+
 /// Hand one view's grant (its presentation channel and writable surface) to drv-gpu, which
-/// paints and presents it. Returns false, leaving the grant with Sora, when no GPU driver is
-/// waiting or the first send fails; a refused send leaves the handle in Sora's table.
+/// paints and presents it, then keep the bootstrap pair as the retained session handoff —
+/// the same pair carries every later session's `g` (DESIGN/024). Returns false, leaving the
+/// grant with Sora, when no GPU driver is waiting or the first send fails; a refused send
+/// leaves the handle in Sora's table.
 /// — TIMBERDOODLE
 fn hand_view_to_gpu(view: usize, channel: Handle, vmo: Handle) -> bool {
     let sender = Handle(GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed));
@@ -220,17 +494,32 @@ fn hand_view_to_gpu(view: usize, channel: Handle, vmo: Handle) -> bool {
         log(&[b'0' + view as u8]);
         log(b" handed to the GPU driver\n");
     }
-    let _ = handle_close(sender);
+    //j714 The pair outlives the boot view grant: it is the driver's session handoff now,
+    // so the next session's `g` has somewhere to go (DESIGN/024).
+    GPU_SESSION_HANDOFF.store(sender.0, Ordering::Relaxed);
     true
 }
 
-/// Close drv-gpu's bootstrap sender when no view went to it (no framebuffer, no band), so its
-/// read ends with PeerClosed instead of waiting for the rest of the boot.
+/// Retire the pre-grant bootstrap slot once the boot view has had its chance. On a GPU
+/// board the sender is not closed — it becomes the retained session handoff — and a board
+/// that handed no view to drv-gpu (a churn image keeps `GPU_VIEW`, and a framebuffer-less
+/// board has none) records the absence honestly with a bare `v` whose handle is zero, so
+/// the driver's first-session view read ends instead of waiting on a pair Sora will never
+/// close (DESIGN/024). Non-GPU boards never stored a sender here, so nothing changes.
 fn release_gpu_bootstrap() {
     let sender = GPU_VIEW_BOOTSTRAP.swap(0, Ordering::Relaxed);
-    if sender != 0 {
-        let _ = handle_close(Handle(sender));
+    if sender == 0 {
+        return;
     }
+    let handoff = Handle(sender);
+    if channel_write_with_handle(handoff, b"v".as_ptr(), 1, Handle(0)) != 0 {
+        // The driver closed its end; nothing can serve sessions over this pair.
+        let _ = handle_close(handoff);
+        log(b"drv-gpu: boot view absence refused; handoff closed\n");
+        return;
+    }
+    GPU_SESSION_HANDOFF.store(sender, Ordering::Relaxed);
+    log(b"drv-gpu: boot view absence recorded for the first session\n");
 }
 
 /// Queue each view's surface grant on its own graphics channel before handing the server
@@ -567,11 +856,12 @@ fn bitmap_volume_file(fs: Handle, path: &[u8]) -> Result<(Handle, u64), &'static
             if channel_write(fs, request.as_ptr(), request.len()) != 0 {
                 return Err(b"bmp-view: filesystem unavailable\n");
             }
-            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-            if n == 0 || n > reply.len() as u64 {
+            let n = read_channel_ready(fs, &mut reply)
+                .ok_or(b"bmp-view: filesystem read failed\n".as_slice())?;
+            if n == 0 {
                 return Err(b"bmp-view: filesystem read failed\n");
             }
-            Ok(n as usize)
+            Ok(n)
         };
         let n = kumo_vfs::Request::open(path)
             .encode_into(&mut request)
@@ -593,11 +883,11 @@ fn bitmap_volume_file(fs: Handle, path: &[u8]) -> Result<(Handle, u64), &'static
             if channel_write(fs, request.as_ptr(), n) != 0 {
                 return None;
             }
-            let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-            if n == 0 || n > reply.len() as u64 {
+            let n = read_channel_ready(fs, &mut reply)?;
+            if n == 0 {
                 return None;
             }
-            let data = kumo_vfs::read_payload(&reply[..n as usize]).ok()?;
+            let data = kumo_vfs::read_payload(&reply[..n]).ok()?;
             if data.len() > bytes.len() {
                 return None;
             }
@@ -1801,6 +2091,100 @@ fn arm_first_prompt(port: Handle) -> Option<(Handle, Handle)> {
     Some((timer, Handle(koid as u32)))
 }
 
+/// Arm one delayed GPU session-regrant attempt on the serve port, the same one-shot timer
+/// shape the ttyd restart and first-prompt paths use. — TIMBERDOODLE
+//j720
+/// Arm the next clock-watch sample with the same one-shot timer shape as the other serve
+/// timers. — TIMBERDOODLE
+fn arm_clock_watch(port: Handle) -> Option<(Handle, Handle)> {
+    if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    //j721
+    GPU_CLOCK_WATCH_DUE_NS.store(
+        kumo_rt::clock_get() + GPU_CLOCK_WATCH_PERIOD_NS,
+        Ordering::Relaxed,
+    );
+    //j728
+    GPU_CLOCK_POPS_AT_ARM.store(GPU_CLOCK_POPS.load(Ordering::Relaxed), Ordering::Relaxed);
+    arm_gpu_restart(port, GPU_CLOCK_WATCH_PERIOD_NS)
+}
+
+//j720
+/// Read and log one GPU clock sample from the read-only CRU mapping: the source/divider
+/// decode plus the raw select, gate and GPLL words, so a moving clock is visible in the
+/// same log as the JOB completion times. — TIMBERDOODLE
+fn log_gpu_clock_sample(pops: u64, prep_ns: u64) {
+    if !GPU_CLOCK_WATCH_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    //j728
+    let log_start = kumo_rt::clock_get();
+    let read = |offset: u64| unsafe { ((GPU_CLOCK_CRU_VA + offset) as *const u32).read_volatile() };
+    let r0 = kumo_rt::clock_get();
+    let clksel158 = read(GPU_CLOCK_O_CLKSEL158);
+    let clksel161 = read(GPU_CLOCK_O_CLKSEL161);
+    let gate66 = read(GPU_CLOCK_O_GATE66);
+    let gate67 = read(GPU_CLOCK_O_GATE67);
+    let gpll0 = read(GPU_CLOCK_O_GPLL0);
+    let r1 = kumo_rt::clock_get();
+    let clock = sora::decode_gpu_clock(clksel158, clksel161);
+    log(b"clk-gpu: clksel158=");
+    log_hex(u64::from(clksel158));
+    log(b" gate66=");
+    log_hex(u64::from(gate66));
+    log(b" gate67=");
+    log_hex(u64::from(gate67));
+    log(b" gpll0=");
+    log_hex(u64::from(gpll0));
+    log(b" src=");
+    log(clock.parent_name().as_bytes());
+    log(b" div=");
+    log_hex(u64::from(clock.divider));
+    match clock.rate_mhz(GPU_CLOCK_GPLL_MHZ) {
+        Some(mhz) => {
+            log(b" rate=");
+            log_hex(u64::from(mhz));
+            log(b"MHz");
+        }
+        None => log(b" rate=unknown"),
+    }
+    //j728
+    // Decompose the sample's own cycle: pops on the serve port since the arm, the
+    // unbind/close prep, the CRU register reads, and the logging so far, so a late
+    // sample names its hop. — TIMBERDOODLE
+    let now = kumo_rt::clock_get();
+    let due = GPU_CLOCK_WATCH_DUE_NS.load(Ordering::Relaxed);
+    let wake = GPU_CLOCK_WAKE_NS.load(Ordering::Relaxed);
+    log(b" pops=");
+    log_hex(pops);
+    log(b" prep_ns=");
+    log_hex(prep_ns);
+    log(b" read_ns=");
+    log_hex(r1.saturating_sub(r0));
+    log(b" log_ns=");
+    log_hex(now.saturating_sub(log_start));
+    log(b" late_ns=");
+    log_hex(now.saturating_sub(due));
+    log(b" wake_ns=");
+    log_hex(wake.saturating_sub(due));
+    log(b"\n");
+}
+
+fn arm_gpu_restart(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
+    let raw = timer_create(delay_ns);
+    if raw == u64::MAX {
+        return None;
+    }
+    let timer = Handle(raw as u32);
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return None;
+    }
+    Some((timer, Handle(koid as u32)))
+}
+
 /// Arm the next mirror wake on `port` with the pass's cadence: a retired present chains
 /// through the gate's own frame wait, and the idle poll covers quiet tails. — TIMBERDOODLE
 fn arm_log_mirror(port: Handle, delay_ns: u64) -> Option<(Handle, Handle)> {
@@ -2028,16 +2412,35 @@ fn xhci_usb0_probe_from_dtb(dtb_vmo: Handle, dtb_phys: u64) -> Option<kumo_xhci:
 /// RK3588 has three xHCI controllers. usb0 @ 0xfc000000 is the USB-C role-switch port; usb1 and
 /// host2 front the USB-A ports where a keyboard is likely attached. A USB-A device is invisible to
 /// a driver bound only to usb0, so spawn a drv-xhci per controller and let each enumerate its own.
-/// The register window is 0x8000; enumeration polls, so a placeholder IRQ is fine for usb1/host2.
+/// The register window covers the xHCI block and the DWC3 globals at +0xC100..0xC6FF, so host
+/// mode and PHY policy can be programmed; enumeration polls, and every controller now has its
+/// real GIC line. — TIMBERDOODLE
 const RK3588_USB1_XHCI_MMIO_BASE: u64 = 0xfc40_0000;
 const RK3588_HOST2_XHCI_MMIO_BASE: u64 = 0xfcd0_0000;
-const RK3588_XHCI_REGISTER_MMIO_LEN: u64 = 0x8000;
+const RK3588_XHCI_REGISTER_MMIO_LEN: u64 = 0xD000;
 /// GIC INTIDs for the other two xHCI controllers. `rk3588-base.dtsi`/`rk3588-extra.dtsi` list
 /// usb_host0/1/2 as GIC_SPI 220/221/222, and an SPI's INTID is its number + 32 (usb0's 220 → 252
 /// matches the DTB-derived config). Without a real IRQ a driver has to busy-poll for reports, and
 /// at driver priority that starves the whole system — every controller gets its line.
 const RK3588_USB1_XHCI_IRQ: u32 = 253;
 const RK3588_HOST2_XHCI_IRQ: u32 = 254;
+
+/// The live opi5 DTB's snps quirks, per controller. Host-mode init must honor them; the
+/// u1/u2-entry pair is carried for the record even though mainline host ignores it.
+/// — TIMBERDOODLE
+const RK3588_USB0_DWC3_FLAGS: u32 = kumo_xhci::FLAG_DWC3
+    | kumo_xhci::QUIRK_DIS_ENBLSLPM
+    | kumo_xhci::QUIRK_DIS_U1_ENTRY
+    | kumo_xhci::QUIRK_DIS_U2_ENTRY
+    | kumo_xhci::QUIRK_DIS_U2_FREECLK_EXISTS
+    | kumo_xhci::QUIRK_DIS_DEL_PHY_POWER_CHG
+    | kumo_xhci::QUIRK_DIS_TX_IPGAP_LINECHECK;
+const RK3588_USB1_DWC3_FLAGS: u32 = kumo_xhci::FLAG_DWC3
+    | kumo_xhci::QUIRK_DIS_ENBLSLPM
+    | kumo_xhci::QUIRK_DIS_U2_FREECLK_EXISTS
+    | kumo_xhci::QUIRK_DIS_DEL_PHY_POWER_CHG
+    | kumo_xhci::QUIRK_DIS_TX_IPGAP_LINECHECK;
+const RK3588_HOST2_DWC3_FLAGS: u32 = RK3588_USB1_DWC3_FLAGS | kumo_xhci::QUIRK_DIS_RXDET_INP3;
 
 /// U5: bootstrap tag preceding the keyboard-channel writer handed to a drv-xhci instance.
 const XHCI_KEYBOARD_BOOTSTRAP_TAG: u8 = b'k';
@@ -2146,7 +2549,7 @@ fn launch_xhci_first_light(
         Some(config) => spawn_xhci(
             initrd,
             root_resource,
-            config,
+            config.with_flags(RK3588_USB0_DWC3_FLAGS),
             writer_for(have_channel),
             mouse_for(have_mouse),
             storage_for(0),
@@ -2161,7 +2564,8 @@ fn launch_xhci_first_light(
             RK3588_XHCI_REGISTER_MMIO_LEN,
             RK3588_USB1_XHCI_IRQ,
             kumo_xhci::XHCI_NO_STREAM_ID,
-        ),
+        )
+        .with_flags(RK3588_USB1_DWC3_FLAGS),
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(1),
@@ -2174,7 +2578,8 @@ fn launch_xhci_first_light(
             RK3588_XHCI_REGISTER_MMIO_LEN,
             RK3588_HOST2_XHCI_IRQ,
             kumo_xhci::XHCI_NO_STREAM_ID,
-        ),
+        )
+        .with_flags(RK3588_HOST2_DWC3_FLAGS),
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(2),
@@ -3307,6 +3712,63 @@ const TIMER_IRQ: u32 = 27; // EL1 physical timer PPI
 /// `true` to run the demos when iterating on supervision.
 const RUN_LEGACY_SVC_HEALTH_BOOT_SMOKES: bool = false;
 
+/// Gate for G8d-a's contained-close integration smoke: a fake GPU server and a fake client on
+/// QEMU. Default **off** — it launches two short-lived processes before the resident set. The
+/// same path is reachable on demand with the `gpu-contain` shell builtin, which is how
+/// `scripts/graphics-smoke.py --gpu-session-kill` drives it. It never touches the GPU, so it
+/// proves the contained-close ordering, not the real reset path on metal. — TIMBERDOODLE
+const RUN_GPU_CONTAINMENT_SMOKE: bool = false;
+/// Wall-clock budget for the fake client to arm the session, and then for the fake server to
+/// report after the kill. — TIMBERDOODLE
+const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
+
+//j711
+/// G8 acceptance lane selector. Off by default: a loop image sets this true so the one
+/// cooperative GPU client receives view `GPU_VIEW`'s channel and surface over the lane
+/// bootstrap pair and runs the 100-frame churn loop on the production view path. Normal
+/// images keep drv-gpu's G5b boot paint and the J0c diagnostic unchanged. — TIMBERDOODLE
+const GPU_CHURN_VIEW: bool = false;
+
+//j721
+/// The clock-watch lane is independent of the churn lane so the same sampler can run as an
+/// idle control: with the watch on and churn off, its samples measure serve-loop timer
+/// lateness with no sustained GPU load. Committed off; acceptance builds flip either or
+/// both. — TIMBERDOODLE
+const GPU_CLOCK_WATCH: bool = false;
+
+//j720
+/// The GPU clock watch: a read-only CRU mapping minted from the root Resource and sampled
+/// on the serve port every ten seconds while the churn lane is on. Its purpose is to
+/// explain the elapsed-time JOB slowdown with evidence: if a CRU word moves, the clock or a
+/// gate moved with it; if every word holds, the drift is elsewhere. Offsets are
+/// `CRU_CLKSEL_CON158/161`, `GATE_CON66/67` and `GPLL_CON0` from
+/// hal/kumo-hal-aarch64/src/mali.rs and power_unit.rs; the span is drv-fb's read-only
+/// clock-probe window. — TIMBERDOODLE
+const CLOCK_CRU_BASE: u64 = drv_fb::rk3588_clock::CRU_BASE;
+const CLOCK_CRU_LEN: u64 = drv_fb::rk3588_clock::CRU_LEN;
+const GPU_CLOCK_WATCH_PERIOD_NS: u64 = 10_000_000_000;
+const GPU_CLOCK_CRU_VA: u64 = 0x3502_0000;
+const GPU_CLOCK_O_CLKSEL158: u64 = 0x578;
+const GPU_CLOCK_O_CLKSEL161: u64 = 0x584;
+const GPU_CLOCK_O_GATE66: u64 = 0x908;
+const GPU_CLOCK_O_GATE67: u64 = 0x90c;
+const GPU_CLOCK_O_GPLL0: u64 = 0x1c0;
+/// DESIGN/020: GPLL is 1188 MHz, so GPLL/6 is the ratified 198 MHz boot rate.
+const GPU_CLOCK_GPLL_MHZ: u32 = 1188;
+static GPU_CLOCK_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+//j721
+/// Monotonic time the next sample is due, recorded when the timer is armed so the sample
+/// can report its own lateness in-guest. — TIMBERDOODLE
+static GPU_CLOCK_WATCH_DUE_NS: AtomicU64 = AtomicU64::new(0);
+//j723
+/// Monotonic time the serve loop's most recent port wake returned, so a sample can split
+/// its lateness into wake-side (timer delivery and scheduling) and log-side (sampling
+/// cost). — TIMBERDOODLE
+static GPU_CLOCK_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+//j728
+static GPU_CLOCK_POPS: AtomicU64 = AtomicU64::new(0);
+static GPU_CLOCK_POPS_AT_ARM: AtomicU64 = AtomicU64::new(0);
+
 /// Keep full live vectors across the VMO factory syscall while its private-table guard
 /// runs. Use a successful anonymous creation; the smoke allocates no backing pages. — KESTREL
 #[cfg(target_arch = "aarch64")]
@@ -3593,6 +4055,17 @@ extern "C" fn sora_main(
             log(b"svc-health: crash contained\n");
         } else {
             log(b"svc-health: crash escaped\n");
+        }
+    }
+
+    // G8d-a: the contained-close integration smoke. Default off; it costs two short-lived
+    // processes and never touches the GPU. Enable it at boot or run `gpu-contain` from the
+    // shell/autoexec. — TIMBERDOODLE
+    if RUN_GPU_CONTAINMENT_SMOKE {
+        if run_gpu_session_kill_smoke(initrd) {
+            log(b"gpu-contain: ok\n");
+        } else {
+            log(b"gpu-contain: fail\n");
         }
     }
 
@@ -3890,6 +4363,9 @@ extern "C" fn sora_main(
                         // the one cooperative GPU client. No Resource reaches that client. — KESTREL
                         let mut native = Handle(0);
                         let mut producer = Handle(0);
+                        // The churn lane keeps the pair too (j713): its J0c diagnostic is what
+                        // sets drv-fb's diagnostic-completed flag, so the vblank gate arms
+                        // before the churn loop's readiness probe. — TIMBERDOODLE
                         if transferred
                             && display_broker.is_some()
                             && GPU_CLIENT_CHANNEL.load(Ordering::Relaxed) != 0
@@ -3954,7 +4430,12 @@ extern "C" fn sora_main(
                             log(b"drv-fb: run ok\n");
                             for (view, grant) in graphics.iter().enumerate() {
                                 if let Some((channel, vmo)) = grant {
+                                    //j711
+                                    // The churn lane keeps the view with Sora so the GPU
+                                    // client can receive it over the lane bootstrap after
+                                    // launch, instead of drv-gpu taking it now.
                                     if view == drv_gpu::GPU_VIEW
+                                        && !GPU_CHURN_VIEW
                                         && hand_view_to_gpu(view, *channel, *vmo)
                                     {
                                         continue;
@@ -4687,8 +5168,29 @@ extern "C" fn sora_main(
     // either console or block has data. Source koid matching dispatches to
     // the right handler. This replaces the per-channel-park loops and lifts
     // the 2-channel limit.
+    //j720
+    // Mint one read-only CRU window from the root Resource, exactly as the display probe's
+    // PMU lane does, and let the serve-loop sampler read the GPU clock words from it.
+    // — TIMBERDOODLE
+    if GPU_CLOCK_WATCH {
+        let raw = kumo_rt::resource_mint_mmio(res, CLOCK_CRU_BASE, CLOCK_CRU_LEN);
+        if let Some(vmo) = syscall_handle(raw) {
+            if vmar_map(
+                Handle(0),
+                vmo,
+                0,
+                GPU_CLOCK_CRU_VA,
+                CLOCK_CRU_LEN,
+                VmarFlags::READ.0,
+            ) == 0
+            {
+                GPU_CLOCK_WATCH_ACTIVE.store(true, Ordering::Relaxed);
+            }
+            let _ = handle_close(vmo);
+        }
+    }
     release_gpu_bootstrap();
-    launch_gpu_client(initrd);
+    let mut gpu_client_process = launch_gpu_client(initrd);
     log(b"sora: serve setup\n");
     let port_h = port_create();
     let console_koid = handle_koid(console);
@@ -4811,7 +5313,35 @@ extern "C" fn sora_main(
         let mut ttyd_restart_timer: Option<(Handle, Handle)> = None;
         let mut log_mirror_timer: Option<(Handle, Handle)> = None;
 
+        // G8d-b: gpu-client supervision. The retained child is bound exactly like a
+        // supervised server, and on the churn image each termination schedules a session
+        // regrant inside the DESIGN/002 give-up budget.
+        const GPU_MAX_RESTARTS: u32 = 3;
+        const GPU_INITIAL_BACKOFF_NS: u64 = 50_000_000;
+        const GPU_MAX_BACKOFF_NS: u64 = 200_000_000;
+        let mut gpu_restart_budget = sora::RestartBudget::new(GPU_MAX_RESTARTS);
+        let mut gpu_restart_backoff =
+            sora::RestartBackoff::new(GPU_INITIAL_BACKOFF_NS, GPU_MAX_BACKOFF_NS);
+        let mut gpu_restart_timer: Option<(Handle, Handle)> = None;
+        //j720
+        let mut clock_watch_timer: Option<(Handle, Handle)> = None;
+        let mut gpu_client_process = gpu_client_process.take();
+        let mut gpu_client_koid = None;
+        if let Some(process) = gpu_client_process {
+            let koid = handle_koid(process);
+            if koid != u64::MAX && port_bind(port, process) == 0 {
+                gpu_client_koid = Some(Handle(koid as u32));
+                log(b"gpu-client: supervision armed\n");
+            } else {
+                let _ = handle_close(process);
+                gpu_client_process = None;
+                log(b"gpu-client: supervision bind failed\n");
+            }
+        }
+
         log(b"sora: entering serve loop\n");
+        //j720
+        clock_watch_timer = arm_clock_watch(port);
         SERVING.store(true, Ordering::Relaxed);
         // First light of the interactive shell: render the prompt once so the settled framebuffer
         // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
@@ -4839,6 +5369,12 @@ extern "C" fn sora_main(
                 }
             }
             let source = Handle(port_wait(port) as u32);
+            //j723
+            // Capture the wake instant before any dispatch, so the clock sampler can tell a
+            // late wake from slow logging. — TIMBERDOODLE
+            GPU_CLOCK_WAKE_NS.store(kumo_rt::clock_get(), Ordering::Relaxed);
+            //j728
+            GPU_CLOCK_POPS.fetch_add(1, Ordering::Relaxed);
             if display_koid == Some(source) {
                 if let Some(b) = display_broker.as_ref() {
                     b.serve(initrd);
@@ -4974,6 +5510,99 @@ extern "C" fn sora_main(
                     log(b"ttyd: restart budget exhausted\n");
                 } else {
                     log(b"ttyd: terminated\n");
+                }
+                continue;
+            }
+            //j714 gpu-client supervision. A termination is the session's end; on the churn
+            // image one regrant attempt is armed per give-up budget unit, paced by the same
+            // capped backoff the supervised servers use.
+            if gpu_restart_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = gpu_restart_timer.take() else {
+                    continue;
+                };
+                let _ = port_unbind(port, timer);
+                let _ = handle_close(timer);
+                if !gpu_restart_budget.try_consume() {
+                    log(b"gpu-client: restart budget exhausted; giving up\n");
+                    continue;
+                }
+                match regrant_gpu_session(initrd) {
+                    Some(process) => {
+                        let koid = handle_koid(process);
+                        if koid != u64::MAX && port_bind(port, process) == 0 {
+                            gpu_client_process = Some(process);
+                            gpu_client_koid = Some(Handle(koid as u32));
+                            log(b"gpu-client: session regranted\n");
+                        } else {
+                            let _ = handle_close(process);
+                            log(b"gpu-client: regrant supervision bind failed\n");
+                        }
+                    }
+                    None => {
+                        if gpu_restart_budget.exhausted() {
+                            log(b"gpu-client: restart budget exhausted; giving up\n");
+                        } else {
+                            let delay_ns = gpu_restart_backoff.next_delay_ns();
+                            match arm_gpu_restart(port, delay_ns) {
+                                Some(timer) => {
+                                    gpu_restart_timer = Some(timer);
+                                    log(b"gpu-client: session regrant delayed\n");
+                                }
+                                None => {
+                                    log(b"gpu-client: restart timer unavailable; giving up\n");
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            //j720
+            // One clock sample per period, chained on the serve port like the log mirror.
+            // — TIMBERDOODLE
+            if clock_watch_timer.map(|(_, koid)| koid) == Some(source) {
+                let Some((timer, _)) = clock_watch_timer.take() else {
+                    continue;
+                };
+                //j728
+                let pops = GPU_CLOCK_POPS
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(GPU_CLOCK_POPS_AT_ARM.load(Ordering::Relaxed));
+                let t0 = kumo_rt::clock_get();
+                let _ = port_unbind(port, timer);
+                let _ = handle_close(timer);
+                let t1 = kumo_rt::clock_get();
+                log_gpu_clock_sample(pops, t1.saturating_sub(t0));
+                match arm_clock_watch(port) {
+                    Some(timer) => clock_watch_timer = Some(timer),
+                    None => log(b"clk-gpu: watch disarmed\n"),
+                }
+                continue;
+            }
+            if Some(source) == gpu_client_koid {
+                gpu_client_koid = None;
+                if let Some(process) = gpu_client_process.take() {
+                    // Teardown reclaims only bindings keyed on the dead process's own
+                    // handles: drop Sora's watch before closing it (the ttyd pattern).
+                    let _ = port_unbind(port, process);
+                    let _ = handle_close(process);
+                }
+                if !GPU_CHURN_VIEW {
+                    diag(b"gpu-client: client exited; restart gated off on this image\n");
+                    continue;
+                }
+                // The view's lease died with the client; make it eligible for the release
+                // query so the regrant can ask drv-fb for it again (churn lane only).
+                GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                if GPU_SESSION_HANDOFF.load(Ordering::Relaxed) == 0 {
+                    log(b"gpu-client: no session handoff; supervision stops\n");
+                    continue;
+                }
+                log(b"gpu-client: client exited; session regrant scheduled\n");
+                let delay_ns = gpu_restart_backoff.next_delay_ns();
+                match arm_gpu_restart(port, delay_ns) {
+                    Some(timer) => gpu_restart_timer = Some(timer),
+                    None => log(b"gpu-client: restart timer unavailable; giving up\n"),
                 }
                 continue;
             }
@@ -5324,6 +5953,17 @@ fn eval_command(
     }
     if cmd.name == "gfx-recover" {
         gfx_recover(cmd, initrd);
+        return true;
+    }
+    if cmd.name == "gpu-contain" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: gpu-contain\n");
+        } else if run_gpu_session_kill_smoke(initrd) {
+            log(b"gpu-contain: ok\n");
+        } else {
+            log(b"gpu-contain: fail\n");
+            fail_status(1);
+        }
         return true;
     }
     if cmd.name == "gfx-titles" {
@@ -6170,7 +6810,7 @@ fn copy_from_initrd(initrd: Handle, base: u64, len: u64, dst: Handle, offset: u6
     true
 }
 
-/// One request to `identityd` and its reply, pumped the way `ttyd_request_reply` is.
+/// One request to `identityd` and its reply, pumped through the resident child.
 fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Option<usize> {
     let client = Handle(IDENTITYD.load(Ordering::Relaxed));
     if client.0 == 0 {
@@ -6352,11 +6992,11 @@ fn check_volume_directory(fs: Option<Handle>, path: &[u8]) -> Result<(), Directo
         if channel_write(fs, request.as_ptr(), len) != 0 {
             return Err(DirectoryError::Unavailable);
         }
-        let n = channel_read(fs, reply.as_mut_ptr(), reply.len());
-        if n == 0 || n > reply.len() as u64 {
+        let n = read_channel_ready(fs, &mut reply).ok_or(DirectoryError::Unavailable)?;
+        if n == 0 {
             return Err(DirectoryError::Unavailable);
         }
-        match kumo_vfs::parse_dir_reply(&reply[..n as usize]) {
+        match kumo_vfs::parse_dir_reply(&reply[..n]) {
             Ok(_) => Ok(()),
             Err(kumo_vfs::VfsError::Status(kumo_vfs::VFS_NOT_FOUND)) => {
                 Err(DirectoryError::NotFound)
@@ -6853,13 +7493,14 @@ fn reclaim_startup_handles(bootstrap: Handle, count: Option<usize>) {
 fn pump_to_console(read_end: Handle) {
     let mut buf = [0u8; kumo_ipc::MAX_INLINE_BYTES];
     loop {
-        let n = channel_read(read_end, buf.as_mut_ptr(), buf.len());
-        if n == 0 || n == u64::MAX {
+        let Some(n) = read_channel_ready(read_end, &mut buf) else {
+            break;
+        };
+        if n == 0 {
             break;
         }
-        if !sora::relay_console_output(&buf[..n as usize], |chunk| {
-            shell_write(chunk.as_ptr(), chunk.len())
-        }) {
+        if !sora::relay_console_output(&buf[..n], |chunk| shell_write(chunk.as_ptr(), chunk.len()))
+        {
             break;
         }
     }
@@ -7390,6 +8031,7 @@ fn run_elf_threads(
     let mut segments = [empty; MAX_SEGMENTS];
     let mut segment_count = 0usize;
     let mut vmo_len = 0u64;
+    let mut stack_request = 0u64;
 
     for index in 0..elf.phnum as usize {
         let ph_off = elf_off + elf.phoff + (index as u64) * (elf.phentsize as u64);
@@ -7407,6 +8049,9 @@ fn run_elf_threads(
                 return false;
             }
         };
+        if ph.kind == linux_elf::PT_GNU_STACK {
+            stack_request = ph.mem_size;
+        }
         if ph.kind != linux_elf::PT_LOAD {
             continue;
         }
@@ -7434,6 +8079,20 @@ fn run_elf_threads(
         log(b": no load\n");
         return false;
     }
+    //j741
+    // Thread zero's stack is what the image's PT_GNU_STACK p_memsz asks for (the field
+    // `-z stack-size=` sets), never less than the 16 KiB every program has had, and refused
+    // rather than clamped above MAX_MAIN_STACK. Mesa's GLSL compiler outran 16 KiB on its first KUMO run (G7n). An image
+    // that asks for nothing keeps exactly the old layout. — TIMBERDOODLE
+    const MAX_MAIN_STACK: u64 = 8 * 1024 * 1024;
+    let main_stack = match align_up(stack_request) {
+        Some(size) if size <= MAX_MAIN_STACK => size.max(0x4000),
+        _ => {
+            log(name);
+            log(b": stack request too large\n");
+            return false;
+        }
+    };
     let vmo_len = match align_up(vmo_len) {
         Some(len) if len > 0 => len,
         _ => {
@@ -7518,9 +8177,8 @@ fn run_elf_threads(
         // — CORVUS / KESTREL 2026-07-26
         const STACK_TOP: u64 = 0x1001_0000;
         const STACK_STRIDE: u64 = 0x1_0000;
-        const STACK_SIZE: u64 = 0x4000;
         let arena_top = STACK_TOP + u64::from(extra_threads) * STACK_STRIDE;
-        let arena_size = arena_top - (STACK_TOP - STACK_SIZE);
+        let arena_size = arena_top - (STACK_TOP - main_stack);
         if address_space_create(child_as, arena_top, arena_size) == u64::MAX {
             log(name);
             log(b": as fail\n");
@@ -7782,6 +8440,198 @@ fn run_crash_containment_smoke(initrd: Handle) -> bool {
     // The child faults immediately; the kernel contains it and reaps it. Reaching here at all
     // proves the kernel survived; `Ok` proves the crashed child was reaped (no resident left).
     all_residents_gone(process_wait())
+}
+
+/// Close a handle only while it is still this process's. A transferred handle's koid is
+/// `u64::MAX`; closing it would target an unrelated handle instead. — TIMBERDOODLE
+fn close_owned(handle: Handle) {
+    if handle_koid(handle) != u64::MAX {
+        let _ = handle_close(handle);
+    }
+}
+
+/// Stop a smoke child without assuming it is still alive. — TIMBERDOODLE
+fn stop_smoke_child(process: Option<Handle>) {
+    if let Some(process) = process {
+        let _ = process_kill(process);
+        let _ = process_wait();
+        let _ = handle_close(process);
+    }
+}
+
+/// G8d-a's contained-close integration proof, QEMU-only and off the boot path by default.
+///
+/// The fake client speaks the real `kumo-gpu` wire over a real channel and arms two buffers,
+/// two bindings and one fence wait; the fake server owns that session with a scripted backend.
+/// Sora waits for the server's ready signal, kills the client, and then requires one report
+/// carrying the exact records of both paths: a confirmed reset releases 2/2/1, and a refused
+/// reset releases nothing and retains its two claims. The fake server scripts the reset
+/// result — QEMU cannot power the GPU — so this proves ordering and accounting, not metal.
+/// — TIMBERDOODLE
+fn run_gpu_session_kill_smoke(initrd: Handle) -> bool {
+    let (request_client_raw, request_server_raw) = channel_create_pair();
+    let (Some(request_client), Some(request_server)) = (
+        syscall_handle(request_client_raw),
+        syscall_handle(request_server_raw),
+    ) else {
+        log(b"gpu-contain: request pair fail\n");
+        return false;
+    };
+    let (report_read_raw, report_write_raw) = channel_create_pair();
+    let (Some(report_read), Some(report_write)) = (
+        syscall_handle(report_read_raw),
+        syscall_handle(report_write_raw),
+    ) else {
+        close_owned(request_client);
+        close_owned(request_server);
+        log(b"gpu-contain: report pair fail\n");
+        return false;
+    };
+
+    let server_flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let mut server_proc = None;
+    if !run_elf_threads(
+        initrd,
+        GPU_CONTAIN_SERVER_PATH.as_bytes(),
+        request_server.0 as u64,
+        report_write.0 as u64,
+        server_flags,
+        b"gpu-contain-server",
+        0,
+        Some(&mut server_proc),
+    ) {
+        close_owned(request_client);
+        close_owned(request_server);
+        close_owned(report_read);
+        close_owned(report_write);
+        log(b"gpu-contain: server launch fail\n");
+        return false;
+    }
+    // Both arguments must be *moved*: Sora may keep no reference that would survive the
+    // client's kill and keep the server from seeing a peer close. — TIMBERDOODLE
+    if handle_koid(request_server) != u64::MAX || handle_koid(report_write) != u64::MAX {
+        close_owned(request_client);
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: server transfer fail\n");
+        return false;
+    }
+
+    let client_flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG).bits();
+    let mut client_proc = None;
+    if !run_elf_threads(
+        initrd,
+        GPU_CONTAIN_CLIENT_PATH.as_bytes(),
+        request_client.0 as u64,
+        0,
+        client_flags,
+        b"gpu-contain-client",
+        0,
+        Some(&mut client_proc),
+    ) {
+        close_owned(request_client);
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: client launch fail\n");
+        return false;
+    }
+    if handle_koid(request_client) != u64::MAX {
+        close_owned(report_read);
+        stop_smoke_child(client_proc);
+        stop_smoke_child(server_proc);
+        log(b"gpu-contain: client transfer fail\n");
+        return false;
+    }
+
+    let (Some(server), Some(client)) = (server_proc, client_proc) else {
+        close_owned(report_read);
+        stop_smoke_child(server_proc);
+        stop_smoke_child(client_proc);
+        log(b"gpu-contain: process handle missing\n");
+        return false;
+    };
+
+    let Some(port) = syscall_handle(port_create()) else {
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: port fail\n");
+        return false;
+    };
+    let Some(timer) = syscall_handle(timer_create(GPU_CONTAIN_WAIT_NS)) else {
+        close_owned(port);
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: timer fail\n");
+        return false;
+    };
+    let timer_koid = handle_koid(timer);
+    let report_koid = handle_koid(report_read);
+    if timer_koid == u64::MAX
+        || report_koid == u64::MAX
+        || port_bind(port, timer) != 0
+        || port_bind(port, report_read) != 0
+    {
+        close_owned(timer);
+        close_owned(port);
+        close_owned(report_read);
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        log(b"gpu-contain: port bind fail\n");
+        return false;
+    }
+
+    let mut report = [0u8; 512];
+    let ready = port_wait(port) == report_koid && {
+        let len = channel_read(report_read, report.as_mut_ptr(), report.len()) as usize;
+        report.get(..len) == Some(b"ready\n".as_slice())
+    };
+    if !ready {
+        stop_smoke_child(Some(client));
+        stop_smoke_child(Some(server));
+        let _ = port_unbind(port, report_read);
+        let _ = port_unbind(port, timer);
+        close_owned(timer);
+        close_owned(port);
+        close_owned(report_read);
+        log(b"gpu-contain: client never armed\n");
+        return false;
+    }
+
+    // The client is parked with the session armed. Killing it closes the only remaining
+    // endpoint; the server acts only on that peer close. — TIMBERDOODLE
+    let _ = process_kill(client);
+    let _ = handle_close(client);
+    let mut report_len = 0usize;
+    if port_wait(port) == report_koid {
+        report_len = channel_read(report_read, report.as_mut_ptr(), report.len()) as usize;
+    }
+    if report_len > 0 {
+        log(&report[..report_len]);
+    }
+    const CONFIRMED: &str =
+        "drv-gpu: containment reset=ok buffers=2 bindings=2 waits=1 retained=no";
+    const REFUSED: &str =
+        "drv-gpu: containment reset=fail buffers=0 bindings=0 waits=0 retained=yes";
+    let text = core::str::from_utf8(&report[..report_len]).unwrap_or("");
+    let passed =
+        text.contains(CONFIRMED) && text.contains(REFUSED) && text.contains("gpu-contain: pass");
+    // Give the server its exit before dropping the process handle; the report is in hand.
+    for _ in 0..256 {
+        if all_residents_gone(process_wait()) {
+            break;
+        }
+    }
+    let _ = handle_close(server);
+    let _ = port_unbind(port, report_read);
+    let _ = port_unbind(port, timer);
+    close_owned(timer);
+    close_owned(port);
+    close_owned(report_read);
+    passed
 }
 
 /// Send one request to a resident server on `client`, pump the scheduler so that server
@@ -8127,17 +8977,58 @@ fn run_persona_posix_tty_read_smoke(initrd: Handle) -> bool {
     child_parked(status) || all_residents_gone(status)
 }
 
+// Sora serializes synchronous replies and output reads. Reuse one port: the engine does not
+// yet reap closed ports, so a port per read would grow the registry. — TIMBERDOODLE
+static REPLY_PORT: AtomicU32 = AtomicU32::new(0);
+
+fn reply_port() -> Option<Handle> {
+    let mut port = Handle(REPLY_PORT.load(Ordering::Relaxed));
+    if port.0 == 0 {
+        port = syscall_handle(port_create())?;
+        REPLY_PORT.store(port.0, Ordering::Relaxed);
+    }
+    Some(port)
+}
+
+/// A synchronous read cannot treat an unrelated supervisor wake as EOF. Binding replays
+/// READABLE/PEER_CLOSED, including a reply or output queued before the bind. — TIMBERDOODLE
+fn read_channel_ready(channel: Handle, reply: &mut [u8]) -> Option<usize> {
+    let port = reply_port()?;
+    if port_bind(port, channel) != 0 {
+        return None;
+    }
+    let result = if port_wait(port) == handle_koid(channel) {
+        let n = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+        (n <= reply.len()).then_some(n)
+    } else {
+        None
+    };
+    let _ = port_unbind(port, channel);
+    result
+}
+
 fn ttyd_request_reply(client: Handle, request: TtyRequest, reply: &mut [u8]) -> Option<usize> {
     let mut req = [0u8; ttyd::REQUEST_BUF_BYTES];
     let req_len = request.encode_into(&mut req)?;
-    if channel_write(client, req.as_ptr(), req_len) != 0 {
+    let port = reply_port()?;
+    if port_bind(port, client) != 0 {
         return None;
     }
-    if !child_parked(process_wait()) {
-        return None;
-    }
-    let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
-    Some(n)
+    // ChannelRead may return empty after an unrelated wake of the supervisor. Advancing
+    // the next request then consumes the previous reply; a login mode/history ACK can
+    // hide the initial empty read and leave every later key's echo one request behind.
+    // PortWait retries unrelated wakes, and binding before sending also covers a fast
+    // reply. Read only after this exchange's channel has a packet. — TIMBERDOODLE
+    let result = if channel_write(client, req.as_ptr(), req_len) == 0
+        && port_wait(port) == handle_koid(client)
+    {
+        let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+        (n > 0 && n <= reply.len()).then_some(n)
+    } else {
+        None
+    };
+    let _ = port_unbind(port, client);
+    result
 }
 
 fn child_parked(status: u64) -> bool {

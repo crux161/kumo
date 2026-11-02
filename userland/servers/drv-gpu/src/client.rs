@@ -1,20 +1,54 @@
-//j650
-//j651
-//j652
-//j681
-//j682
+//j722
+//j733
+//j742
+//j743
+//j752
 
-//! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. No second
-//! grant or automatic restart exists in this lane. The resident driver retains every DMA
-//! mapping even after a reset failure, so losing the client cannot free live GPU backing.
+//! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
+//! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
+//! contained close that proved quiescence lets the driver read the next one — a poisoned
+//! close retains everything and never serves again. G8a gives the session an on-demand buffer
+//! table: BufferDestroy unbinds every VA range the session still holds for one allocation,
+//! flushes AS1, and only then releases that allocation's CPU mapping and driver VMO handle.
+//! A confirmed soft reset releases whatever the channel still owned; a failed reset retains
+//! every byte, because the resident driver cannot prove the GPU stopped. G8d-a makes that
+//! tail a state machine (`drv_gpu::contain`): stop accepting, quiesce, close the session with
+//! exact counts, then retire the driver's mappings — or poison and retain everything.
+//! G8b adds live VmUnbind: clear exactly the session's page-table entries, then invalidate
+//! only their packed MMU region. The serve loop is synchronous, so same-AS work is already
+//! finished when the request is dispatched; no queue, MCU or reset operation is involved.
+
+use alloc::vec::Vec;
+use kumo_abi::Rights;
 
 use super::*;
-use drv_gpu::{client_job_wrapper, protocol, JobSlot, JOB_WRAPPER_WORDS};
+use drv_gpu::contain::Containment;
+use drv_gpu::{client_job_wrapper, flush_range, protocol, JobSlot, JOB_WRAPPER_WORDS};
 use protocol::{
-    session::{Backend, Session, SubmitError, MAX_BUFFERS, MAX_WAITS},
+    session::{Backend, Session, SubmitError, MAX_WAITS},
     Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, SyncState,
     REQUEST_LEN,
 };
+
+/// One live client allocation: the session's object ID and the driver's own DMA mapping.
+/// IDs are the session's, not array indices, so the table can grow, shrink and reorder.
+/// — TIMBERDOODLE
+struct BufferRecord {
+    id: u32,
+    handle: Handle,
+    va: u64,
+    bytes: u64,
+    pages: Vec<u64>,
+}
+
+impl BufferRecord {
+    /// Only before GPU publication, after checked unbind/flush, or after confirmed reset.
+    /// — KESTREL
+    fn release(self) {
+        let _ = kumo_rt::vmar_unmap(self.va, self.bytes);
+        let _ = kumo_rt::handle_close(self.handle);
+    }
+}
 
 struct Pending {
     point: u64,
@@ -34,6 +68,7 @@ struct Hardware<'a> {
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
     thread_features: u32,
+    memory: protocol::DeviceMemory,
     tables: &'a mut TableDma,
     arena: &'a mut TableArena,
     root: u64,
@@ -43,13 +78,31 @@ struct Hardware<'a> {
     windows: [McuWindow; 3],
     csg: CsgControl,
     cs: CsControl,
-    buffers: [Option<Mapping>; MAX_BUFFERS],
+    buffers: Vec<BufferRecord>,
     reply_grant: Option<Handle>,
     pending: Option<Pending>,
     waiters: [Option<(u64, Handle)>; MAX_WAITS],
+    group_report: protocol::GroupReport,
+    status_vmo: Option<Handle>,
 }
 
 impl Backend for Hardware<'_> {
+    fn watch_group(&mut self) -> Result<protocol::GroupReport, GpuStatus> {
+        if self.status_vmo.is_none() {
+            let handle = valid_handle(kumo_rt::vmo_create(PAGE_SIZE)).ok_or(GpuStatus::NoMemory)?;
+            self.status_vmo = Some(handle);
+            if !self.write_group_report() {
+                return Err(GpuStatus::DeviceLost);
+            }
+        }
+        let grant = valid_handle(kumo_rt::handle_duplicate(
+            self.status_vmo.unwrap(),
+            Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
+        ))
+        .ok_or(GpuStatus::NoMemory)?;
+        self.reply_grant = Some(grant);
+        Ok(self.group_report)
+    }
     fn info(&mut self) -> Result<protocol::DeviceInfo, GpuStatus> {
         // GPU_ID at aperture +0, already checked by probe before this server starts.
         Ok(protocol::DeviceInfo {
@@ -120,6 +173,12 @@ impl Backend for Hardware<'_> {
             thread_features: self.thread_features,
         })
     }
+    fn memory_properties(&mut self) -> Result<protocol::DeviceMemory, GpuStatus> {
+        // Required and verbatim: the three words bring-up read in its powered block and the
+        // coherency protocol this driver programmed. COHERENCY_FEATURES reads zero on the
+        // Orange Pi, which is data, not absence. Nothing is derived here. — TIMBERDOODLE
+        Ok(self.memory)
+    }
     fn create_vm(&mut self) -> Result<(), GpuStatus> {
         log(
             log_level::NOTICE,
@@ -129,20 +188,47 @@ impl Backend for Hardware<'_> {
     }
 
     fn create_buffer(&mut self, id: u32, bytes: u64) -> Result<(), GpuStatus> {
-        let mapping = map_contiguous(bytes).ok_or(GpuStatus::NoMemory)?;
-        self.buffers[id as usize - 1] = Some(mapping);
-        zero_mapping(&mapping, bytes);
-        dsb();
-        self.reply_grant = valid_handle(kumo_rt::handle_duplicate(
-            mapping.handle,
+        self.buffers
+            .try_reserve(1)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        let mut pages = Vec::new();
+        let count = (bytes / PAGE_SIZE) as usize;
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| GpuStatus::NoMemory)?;
+        pages.resize(count, 0);
+        let handle = valid_handle(kumo_rt::vmo_create_paged(bytes, &mut pages))
+            .ok_or(GpuStatus::NoMemory)?;
+        let (status, va) = kumo_rt::vmar_map_anywhere(
+            handle,
+            bytes,
+            (VmarFlags::READ | VmarFlags::WRITE | VmarFlags::UNCACHED).0,
+        );
+        if status != 0 {
+            let _ = kumo_rt::handle_close(handle);
+            return Err(GpuStatus::NoMemory);
+        }
+        let record = BufferRecord {
+            id,
+            handle,
+            va,
+            bytes,
+            pages,
+        };
+        let Some(grant) = valid_handle(kumo_rt::handle_duplicate(
+            handle,
             kumo_abi::Rights::READ
                 | kumo_abi::Rights::WRITE
                 | kumo_abi::Rights::DUPLICATE
                 | kumo_abi::Rights::TRANSFER,
-        ));
-        if self.reply_grant.is_none() {
+        )) else {
+            record.release();
             return Err(GpuStatus::DeviceLost);
-        }
+        };
+        // The kernel already zeroed and cleaned every page before creating this NC alias.
+        // — KESTREL
+        self.buffers.push(record);
+        self.reply_grant = Some(grant);
         log(
             log_level::INFO,
             format_args!("drv-gpu: client buffer {} shared, {} bytes\n", id, bytes),
@@ -151,7 +237,14 @@ impl Backend for Hardware<'_> {
     }
 
     fn bind(&mut self, b: Binding) -> Result<(), GpuStatus> {
-        let mapping = self.buffers[b.buffer as usize - 1].ok_or(GpuStatus::NotFound)?;
+        let record = self
+            .buffers
+            .iter()
+            .find(|record| record.id == b.buffer)
+            .ok_or(GpuStatus::NotFound)?;
+        let first = (b.offset / PAGE_SIZE) as usize;
+        let end = first + (b.bytes / PAGE_SIZE) as usize;
+        let pages = record.pages.get(first..end).ok_or(GpuStatus::BadRequest)?;
         let attrs = PageAttrs {
             cached: !b.flags.contains(protocol::BindFlags::UNCACHED),
             readonly: b.flags.contains(protocol::BindFlags::READ_ONLY),
@@ -159,15 +252,9 @@ impl Backend for Hardware<'_> {
         };
         // A partial table update or failed live flush retires this session; its ranges are
         // never reused. Reset containment runs before any handle is closed. — TIMBERDOODLE
-        if let Err(error) = map_range(
-            self.tables,
-            self.arena,
-            self.root,
-            b.va,
-            mapping.phys + b.offset,
-            b.bytes,
-            attrs,
-        ) {
+        if let Err(error) =
+            drv_gpu::map_pages(self.tables, self.arena, self.root, b.va, pages, attrs)
+        {
             log(
                 log_level::ERR,
                 format_args!("drv-gpu: client map failed: {:?}\n", error),
@@ -179,12 +266,116 @@ impl Backend for Hardware<'_> {
         Ok(())
     }
 
+    fn unbind(&mut self, bindings: &[Binding]) -> Result<(), GpuStatus> {
+        // Fence invariant: the serve loop dispatches one request at a time and finishes the
+        // pending job before it reads the next frame, so no same-AS work is in flight when
+        // this runs. If that loop ever overlaps submission with request handling, this
+        // method must wait for the group's queue to drain first. RESEARCH/017's live path is
+        // the MMU's own packed-region invalidation; no CSG, JS, MCU, doorbell or reset
+        // operation is added here. — TIMBERDOODLE
+        if bindings.is_empty() {
+            return Err(GpuStatus::BadRequest);
+        }
+        let mut ranges: Vec<UnmapRange> = Vec::new();
+        // NoMemory is recoverable: nothing was cleared, so the session keeps the bindings.
+        if ranges.try_reserve(bindings.len()).is_err() {
+            return Err(GpuStatus::NoMemory);
+        }
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for binding in bindings {
+            let binding_end = binding
+                .va
+                .checked_add(binding.bytes)
+                .ok_or(GpuStatus::BadRequest)?;
+            start = start.min(binding.va);
+            end = end.max(binding_end);
+            ranges.push(UnmapRange {
+                va: binding.va,
+                len: binding.bytes,
+            });
+        }
+        // The library preflights every page before its first store, so a refusal changes no
+        // page. A live flush failure could leave cleared mappings the GPU still caches:
+        // that is DeviceLost, and `serve`'s reset containment owns the cleanup.
+        if let Err(error) = unmap_ranges(self.tables, self.root, &ranges) {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unbind failed: {:?}\n", error),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        dsb();
+        flush_range(self.device, GROUP_AS, start, end - start).map_err(|error| {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unbind flush failed: {:?}\n", error),
+            );
+            GpuStatus::DeviceLost
+        })?;
+        log(
+            log_level::INFO,
+            format_args!(
+                "drv-gpu: client unbound {} mapping(s) over {} bytes\n",
+                bindings.len(),
+                end - start
+            ),
+        );
+        Ok(())
+    }
+
+    fn destroy_buffer(&mut self, id: u32, bindings: &[Binding]) -> Result<(), GpuStatus> {
+        let index = self
+            .buffers
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or(GpuStatus::NotFound)?;
+        let mut ranges: Vec<UnmapRange> = Vec::new();
+        // NoMemory is recoverable: the session keeps the allocation and its bindings, and the
+        // caller may retry. — TIMBERDOODLE
+        if ranges.try_reserve(bindings.len()).is_err() {
+            return Err(GpuStatus::NoMemory);
+        }
+        ranges.extend(bindings.iter().map(|binding| UnmapRange {
+            va: binding.va,
+            len: binding.bytes,
+        }));
+        // The library preflights every page of every range before its first store, so a
+        // refusal there changes no page. A live flush failure, by contrast, could leave
+        // cleared mappings the GPU still caches: that is DeviceLost, and `serve`'s reset
+        // containment owns the cleanup. — TIMBERDOODLE
+        if let Err(error) = unmap_ranges(self.tables, self.root, &ranges) {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: client unmap failed: {:?}\n", error),
+            );
+            return Err(GpuStatus::DeviceLost);
+        }
+        if !ranges.is_empty() {
+            dsb();
+            flush_page_tables(self.device, GROUP_AS).map_err(|_| GpuStatus::DeviceLost)?;
+        }
+        // The GPU can no longer reach these pages: release the CPU mapping and the driver's
+        // VMO handle now. The client's granted duplicate is the client's own. — TIMBERDOODLE
+        let record = self.buffers.swap_remove(index);
+        record.release();
+        log(
+            log_level::INFO,
+            format_args!(
+                "drv-gpu: client buffer {} destroyed; {} binding(s) unbound\n",
+                id,
+                bindings.len()
+            ),
+        );
+        Ok(())
+    }
+
     fn create_group(&mut self) -> Result<(), GpuStatus> {
         log(
             log_level::NOTICE,
             format_args!(
                 "drv-gpu: client group 1 leases CSG0 queue0, hardware seqno base={}\n",
-                PAINT_JOB
+                BRINGUP_JOBS
             ),
         );
         Ok(())
@@ -194,7 +385,7 @@ impl Backend for Hardware<'_> {
         if self.pending.is_some() {
             return Err(SubmitError::Unpublished(GpuStatus::Busy));
         }
-        let seqno = PAINT_JOB
+        let seqno = BRINGUP_JOBS
             .checked_add(job.signal_point)
             .ok_or(SubmitError::Unpublished(GpuStatus::BadRequest))?;
         dsb();
@@ -224,9 +415,39 @@ impl Backend for Hardware<'_> {
         });
         Ok(())
     }
+
+    /// Only called by [`Containment::run`], after a confirmed reset and after the session has
+    /// been closed. The reset stopped the MCU and every group, so no GPU state can still
+    /// reference these pages; release each CPU mapping and the driver's VMO handle. Nothing
+    /// here runs on the failed-reset path: unproven quiescence retains every byte.
+    /// — TIMBERDOODLE
+    fn retire(&mut self) {
+        for record in self.buffers.drain(..) {
+            record.release();
+        }
+        self.pending = None;
+    }
 }
 
 impl Hardware<'_> {
+    fn write_group_report(&mut self) -> bool {
+        let Some(handle) = self.status_vmo else {
+            return true;
+        };
+        let bytes = self.group_report.encode(1);
+        kumo_rt::vmo_write(handle, 0, bytes.as_ptr(), bytes.len()) == 0
+    }
+    fn fail_group(&mut self, report: protocol::GroupReport) {
+        if self.group_report.state == protocol::GroupState::Usable {
+            self.group_report = report;
+            if !self.write_group_report() {
+                log(
+                    log_level::ERR,
+                    format_args!("drv-gpu: failed to publish group status\n"),
+                );
+            }
+        }
+    }
     /// Arm a wait for `point`: create the wake-channel pair and hand the read end back for
     /// the reply. None means the pair could not be created or the bounded table is full; the
     /// caller reports NoMemory rather than an armed reply without its handle. — TIMBERDOODLE
@@ -249,8 +470,13 @@ impl Hardware<'_> {
             .find(|slot| slot.is_none())
             .expect("free slot checked above");
         *free = Some((point, write));
+        //j722
+        // Per-frame lines belong at INFO: a churn run arms and wakes one fence per frame,
+        // and at NOTICE the flood is echoed into the console for every frame, which is
+        // exactly the load the lateness experiment measures. INFO keeps them visible on a
+        // KUMO_CONSOLE_LOGLEVEL=6 bring-up image and silent at the default. — TIMBERDOODLE
         log(
-            log_level::NOTICE,
+            log_level::INFO,
             format_args!("drv-gpu: fence wait armed point {}\n", point),
         );
         Some(read)
@@ -271,7 +497,7 @@ impl Hardware<'_> {
                     let _ = kumo_rt::channel_write(handle, byte.as_ptr(), 1);
                     let _ = kumo_rt::handle_close(handle);
                     log(
-                        log_level::NOTICE,
+                        log_level::INFO,
                         format_args!("drv-gpu: fence wait woken point {}\n", point),
                     );
                 }
@@ -352,6 +578,18 @@ impl Hardware<'_> {
         };
         let outcome = classify_job_wait(seqno >= job.seqno, last, fired);
         if outcome != JobWait::Interrupt || seqno != job.seqno || status != 0 {
+            let cs_status = {
+                let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
+                read_cs_status(&mut io, cs.output_va)
+            };
+            let mmu_fault = mmu_rawstat(self.device) & (1u32 << GROUP_AS) != 0;
+            self.fail_group(drv_gpu::classify_group_failure(
+                outcome,
+                status,
+                cs_status.fault,
+                cs_status.fatal,
+                mmu_fault,
+            ));
             log(
                 log_level::ERR,
                 format_args!(
@@ -362,8 +600,11 @@ impl Hardware<'_> {
             report_stream_stall(self.device, input, output, windows, csg, cs);
             return Err(GpuStatus::DeviceLost);
         }
+        //j722
+        // One line per frame belongs at INFO for the same reason as the fence lines above.
+        // — TIMBERDOODLE
         log(
-            log_level::NOTICE,
+            log_level::INFO,
             format_args!(
                 "drv-gpu: client point {} complete on JOB: hw_seqno={} status=0x0 ({} us)\n",
                 job.point,
@@ -375,6 +616,23 @@ impl Hardware<'_> {
     }
 }
 
+/// G8d-a's driver-side close tail. Service has already stopped accepting requests; the only
+/// decision left is whether quiescence was proven. [`Containment::run`] owns the ordering and
+/// the record; this wrapper supplies the one real reset and the one real backend.
+fn contain(hw: &mut Hardware<'_>, session: &mut Session) -> Containment {
+    Containment::run(soft_reset(hw.device), session, hw)
+}
+
+//j714
+/// Serve exactly one granted session channel and return its [`Containment`] (DESIGN/024).
+///
+/// The channel is the session: when it closes, or a write to it fails, service has stopped
+/// accepting and the contained close below runs before this function returns. Every
+/// transport handle the session held — the reply grant, the waiter channels, this channel —
+/// is closed on both the released and the poisoned path; only the metadata and DMA a poison
+/// retains stay behind. The caller decides what happens next: a release licenses the next
+/// `g`, and a poison parks with everything retained. Parking here would hide that decision
+/// inside a function whose whole contract is one session. — TIMBERDOODLE
 pub(super) fn serve(
     channel: Handle,
     device: &mut Device,
@@ -395,7 +653,8 @@ pub(super) fn serve(
     thread_max_threads: u32,
     thread_max_workgroup_size: u32,
     thread_features: u32,
-) -> ! {
+    memory: protocol::DeviceMemory,
+) -> Containment {
     let mut hw = Hardware {
         device,
         shader_present,
@@ -406,6 +665,7 @@ pub(super) fn serve(
         thread_max_threads,
         thread_max_workgroup_size,
         thread_features,
+        memory,
         tables,
         arena,
         root,
@@ -415,16 +675,22 @@ pub(super) fn serve(
         windows,
         csg,
         cs,
-        buffers: [None; MAX_BUFFERS],
+        buffers: Vec::new(),
         reply_grant: None,
         pending: None,
         waiters: [None; MAX_WAITS],
+        group_report: protocol::GroupReport::USABLE,
+        status_vmo: None,
     };
     let mut session = Session::default();
     log(
         log_level::NOTICE,
         format_args!("drv-gpu: client session ready\n"),
     );
+    //j714
+    // One granted channel is one session: this loop reads only the channel it was handed and
+    // ends when that channel does. A fresh session is a fresh `serve` over a fresh `g`, never
+    // a second loop over a spent channel. — TIMBERDOODLE
     loop {
         let mut bytes = [0u8; REQUEST_LEN + 1];
         let (len, raw_handle) =
@@ -443,7 +709,10 @@ pub(super) fn serve(
             }
             _ => (0, Err(GpuStatus::BadRequest)),
         };
-        let mut grant = if matches!(result, Ok(Response::BufferCreated { .. })) {
+        let mut grant = if matches!(
+            result,
+            Ok(Response::BufferCreated { .. } | Response::GroupWatch { .. })
+        ) {
             hw.reply_grant.take()
         } else {
             None
@@ -458,7 +727,12 @@ pub(super) fn serve(
                 None => result = Err(GpuStatus::NoMemory),
             }
         }
-        let retired = result == Err(GpuStatus::DeviceLost);
+        let retired = result == Err(GpuStatus::DeviceLost)
+            || matches!(result,
+            Ok(Response::GroupWatch { report, .. }) if report.state != protocol::GroupState::Usable);
+        if retired {
+            hw.fail_group(protocol::GroupReport::UNKNOWN);
+        }
         let frame = GpuReply { id, result }.encode();
         let sent = kumo_rt::channel_write_with_handle(
             channel,
@@ -483,23 +757,51 @@ pub(super) fn serve(
                 hw.drain_fence_waits(&session);
             }
             Ok(None) => (),
-            Err(_) => break,
+            Err(_) => {
+                hw.fail_group(protocol::GroupReport::UNKNOWN);
+                break;
+            }
         }
     }
-    // Even on failure, no DMA VMO is released: this driver parks resident after containment.
-    // Sora transfers one lease and never re-grants it in this boot. — TIMBERDOODLE
-    match soft_reset(hw.device) {
-        Ok(_) => log(log_level::NOTICE, format_args!("drv-gpu: client session closed; GPU reset confirmed; backing retained until reboot\n")),
-        Err(error) => log(log_level::ERR, format_args!("drv-gpu: client reset failed: {:?}; all DMA backing retained, no regrant\n", error)),
+    // G8d-a: the loop above was the only reader, so service has stopped accepting. Quiesce
+    // first; only a confirmed reset licenses releasing anything. The record states exactly
+    // what was released, and a failed reset yields retained=yes with the session poisoned.
+    // — TIMBERDOODLE
+    //j714
+    // This record is also the return value: the release proof travels to the caller, which
+    // asks it the one question left — whether another grant may be served. — TIMBERDOODLE
+    hw.fail_group(protocol::GroupReport::UNKNOWN);
+    let containment = contain(&mut hw, &mut session);
+    log(log_level::NOTICE, format_args!("{}\n", containment));
+    if let Err(error) = containment.reset {
+        log(
+            log_level::ERR,
+            format_args!("drv-gpu: containment reset cause: {:?}\n", error),
+        );
     }
+    //j714
+    // Transport state is not DMA: the grant and waiter channels close on both paths, so no
+    // client can be handed a view into a session this driver will never serve again. The
+    // buffers themselves were released only if containment proved the GPU stopped.
     if let Some(handle) = hw.reply_grant.take() {
         let _ = kumo_rt::handle_close(handle);
     }
+    // This VMO is CPU metadata and was never DMA-visible. It closes on either containment
+    // path; the client's READ-only grant independently retains the last record. — MILVUS
+    if let Some(handle) = hw.status_vmo.take() {
+        let _ = kumo_rt::handle_close(handle);
+    }
+    // The waiter channels close on both paths; a retained session keeps only its own metadata
+    // and DMA, never a peer that could still be woken by a driver that will not serve it.
     for slot in &mut hw.waiters {
         if let Some((_, handle)) = slot.take() {
             let _ = kumo_rt::handle_close(handle);
         }
     }
     let _ = kumo_rt::handle_close(channel);
-    park()
+    //j714
+    // Return, don't park: the caller owns the long-lived loop (DESIGN/024). A released
+    // containment lets it read the next `g`; a poisoned one closes the handoff and parks
+    // with everything retained. — TIMBERDOODLE
+    containment
 }

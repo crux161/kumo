@@ -1,0 +1,22 @@
+#j745
+# Native BO mmap route and explicit VM-operation refusal. — KESTREL
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -748,0 +749,4 @@
++#ifdef __kumo__
++void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
++#endif
++
+@@ -752,0 +757,5 @@
++
++#ifdef __kumo__
++   if (bo->dev->fd < 0)
++      return pan_kmod_kumo_bo_mmap(bo, prot, flags, host_addr);
++#endif
+@@ -999,0 +1009,6 @@
++#ifdef __kumo__
++   /* Native VM operations do not emulate sparse or asynchronous requests. — KESTREL */
++   if (mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE || (op_count && !ops)) return -1;
++   for (uint32_t i = 0; i < op_count; ++i)
++      if (ops[i].flags) return -1;
++#endif

@@ -1,11 +1,12 @@
-//j633
-//j634
-//j635
-//j659
-//j660
+//j719
+//j725
+//j731
+//j732
+//j743
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
@@ -146,6 +147,11 @@ pub enum KernelCall<'a> {
     },
     VmoCreateContiguous {
         size: u64,
+    },
+    VmoCreatePaged {
+        size: u64,
+        pages: *mut u64,
+        count: usize,
     },
     IoMmuFromResource {
         resource: Handle,
@@ -598,7 +604,7 @@ impl VmoPin {
                 }
                 Some(phys_base)
             }
-            VmoBacking::Anonymous => None,
+            VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => None,
             VmoBacking::Mmio { phys_base } => {
                 if !framebuffer.is_some_and(|proof| proof.allows(entry.vmo, offset, len)) {
                     return Err(Errno::NotSupported);
@@ -690,11 +696,39 @@ fn alloc_contiguous(
     }
 }
 
+/// Zero and clean a reclaimed DMA run before handing it to a driver. Host tests never call
+/// this path because a physical address is meaningless there. — TIMBERDOODLE
+fn zero_reclaimed_run(phys: u64, len: u64) {
+    #[cfg(target_os = "none")]
+    {
+        let saved = kumo_hal::active::read_user_aspace_root();
+        unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+        // SAFETY: the run came from the DMA allocator and the kernel identity tree, which is
+        // active here, maps it Normal-WB.
+        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, len as usize) };
+        kumo_hal::active::clean_dcache_to_poc(phys as usize, len as usize);
+        unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (phys, len);
+    }
+}
+
 fn ensure_anonymous_frame(
     entry: &VmoEntry,
     page_index: usize,
     boot: &BootInfo,
 ) -> Result<u64, Errno> {
+    if entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged {
+        return entry
+            .frames
+            .borrow()
+            .get(page_index)
+            .copied()
+            .flatten()
+            .ok_or(Errno::BadState);
+    }
     ensure_vmo_frame(entry, page_index, || alloc_anonymous_frame(boot))
 }
 
@@ -810,7 +844,7 @@ impl DeviceState {
                             return false;
                         }
                     }
-                    VmoBacking::Anonymous => {
+                    VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
                         let Ok(frames) = map.backing.frames.try_borrow() else {
                             return false;
                         };
@@ -956,6 +990,54 @@ pub(crate) fn kernel_device_frame_allowed(base: u64, len: u64) -> bool {
     }
 }
 
+//j731
+/// The length of every engine list a dispatched syscall or an interrupt walks, for the J731
+/// census. `handle_slots` counts allocated handle slots, closed ones included (handle values are
+/// never reused); `handles` counts the live ones. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineCensus {
+    pub ports: usize,
+    pub channels: usize,
+    pub port_bindings: usize,
+    pub timers: usize,
+    pub interrupts: usize,
+    pub vmos: usize,
+    pub dma_vmos: usize,
+    pub device_ctxs: usize,
+    pub device_vmar_mappings: usize,
+    pub processes: usize,
+    pub handles: usize,
+    pub handle_slots: usize,
+}
+
+/// Window maxima of one `dispatch`'s four parts (the call, then the device-context, interrupt
+/// and VMO retire passes) and the window's call count; the census record takes and clears them.
+/// The host build stamps zero, so these stay zero there. — TIMBERDOODLE
+static DISPATCH_PART_MAX_NS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn dispatch_stamp() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        kumo_hal::active::monotonic_nanos()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
+
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn take_dispatch_maxima() -> ([u64; 4], u64) {
+    let max = core::array::from_fn(|part| DISPATCH_PART_MAX_NS[part].swap(0, Ordering::Relaxed));
+    (max, DISPATCH_CALLS.swap(0, Ordering::Relaxed))
+}
+
 #[derive(Clone, Debug)]
 pub struct SyscallEngine {
     devices: EngineDevices,
@@ -965,6 +1047,10 @@ pub struct SyscallEngine {
     // Registry clones and device pins own the same immutable VMO identity and the same
     // demand-page cache. Copying the cache could allocate divergent backing. — KESTREL
     vmos: Vec<Rc<VmoEntry>>,
+    /// Contiguous DMA runs returned by a retired VMO, ready for a later
+    /// `VmoCreateContiguous`. Shared across engine clones so two engines can never hand out
+    /// the same frames. — TIMBERDOODLE
+    free_dma_runs: Rc<RefCell<Vec<kumo_abi::Range>>>,
     processes: Vec<Process>,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
@@ -1015,6 +1101,7 @@ impl SyscallEngine {
             objects: ObjectManager::new(),
             ipc: IpcRegistry::new(),
             vmos: Vec::new(),
+            free_dma_runs: Rc::new(RefCell::new(Vec::new())),
             processes: Vec::new(),
             threads: Vec::new(),
             boot_info: None,
@@ -1306,6 +1393,33 @@ impl SyscallEngine {
         use crate::mm::VmoBacking;
         let base = match vmo.backing() {
             VmoBacking::Anonymous => return true,
+            VmoBacking::DmaPaged => {
+                let Some(entry) = authorized else { return true };
+                let Some(end) = offset.checked_add(len).filter(|end| *end <= vmo.len()) else {
+                    return false;
+                };
+                if len == 0 {
+                    return true;
+                }
+                let frames = entry.frames.borrow();
+                return (offset / crate::mm::PAGE_SIZE..=(end - 1) / crate::mm::PAGE_SIZE).all(
+                    |i| {
+                        frames
+                            .get(i as usize)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|page| {
+                                let (start, bytes) = if coarse {
+                                    (page & !((1 << 21) - 1), 1 << 21)
+                                } else {
+                                    (page, crate::mm::PAGE_SIZE)
+                                };
+                                self.devices.ram_allowed(start, bytes, authorized)
+                                    && self.device_owner.ram_allowed(start, bytes, authorized)
+                            })
+                    },
+                );
+            }
             VmoBacking::PhysicalRam { phys_base }
             | VmoBacking::Mmio { phys_base }
             | VmoBacking::Dma { phys_base } => phys_base,
@@ -1486,6 +1600,19 @@ impl SyscallEngine {
             }
             i += 1;
         }
+    }
+
+    //j725
+    /// The lateness the pending sweep would report: the oldest expired-but-unfired timer's
+    /// deadline age at `now_ns`. Read-only, so the IRQ path can record it before the sweep
+    /// marks timers fired, and host tests can pin it. — TIMBERDOODLE
+    pub fn timer_sweep_late(&self, now_ns: u64) -> u64 {
+        self.timers
+            .iter()
+            .filter(|timer| !timer.fired && timer.deadline_ns <= now_ns)
+            .map(|timer| now_ns.saturating_sub(timer.deadline_ns))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Expire every one-shot timer whose monotonic deadline has arrived.
@@ -2470,6 +2597,200 @@ impl SyscallEngine {
         Ok(())
     }
 
+    /// Reclaim a dead DMA VMO's run or individual pages for later DMA allocation. Every
+    /// reference must be gone: no handle in any process or the caller, no CPU mapping, no
+    /// queued IPC transfer, and no pin or device mapping (`strong_count == 1`). Anonymous,
+    /// physical and MMIO VMOs keep their existing lifecycles. — TIMBERDOODLE
+    pub(crate) fn retire_vmos(&mut self, caller: Option<&Process>) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.vmos.len() {
+            let (koid, run) = {
+                let entry = &self.vmos[index];
+                let run = match entry.vmo.backing() {
+                    crate::mm::VmoBacking::Dma { phys_base } => {
+                        Some(kumo_abi::Range::new(phys_base, entry.vmo.len()))
+                    }
+                    _ => None,
+                };
+                (entry.koid, run)
+            };
+            let referenced = |process: &Process| {
+                process
+                    .handles()
+                    .holds(koid, ObjectKind::Vmo, Rights::empty())
+                    || process.mappings().iter().any(|(_, mapped)| *mapped == koid)
+            };
+            let paged = self.vmos[index].vmo.backing() == crate::mm::VmoBacking::DmaPaged;
+            let freeable = (run.is_some() || paged)
+                && Rc::strong_count(&self.vmos[index]) == 1
+                && !self.processes.iter().any(|process| referenced(process))
+                && !caller.is_some_and(|process| referenced(process))
+                && !self.ipc.koid_queued(koid);
+            if !freeable {
+                index += 1;
+                continue;
+            }
+            // Record the run before dropping the entry; if the free list cannot grow, keep
+            // the VMO rather than lose the only record of its frames. — TIMBERDOODLE
+            let needed = if paged {
+                self.vmos[index].frames.borrow().len()
+            } else {
+                1
+            };
+            if self.free_dma_runs.borrow_mut().try_reserve(needed).is_err() {
+                index += 1;
+                continue;
+            }
+            let entry = self.vmos.remove(index);
+            if let crate::mm::VmoBacking::Dma { phys_base } = entry.vmo.backing() {
+                self.free_dma_runs
+                    .borrow_mut()
+                    .push(kumo_abi::Range::new(phys_base, entry.vmo.len()));
+            }
+            if paged {
+                self.return_dma_pages(&entry.frames.borrow());
+            }
+            removed += 1;
+        }
+        removed
+    }
+
+    // Capacity must be reserved by the caller before releasing ownership. Coalesce adjacent
+    // pages so reusing a large BO does not turn the free list into a quadratic page queue.
+    // — KESTREL
+    fn return_dma_pages(&mut self, pages: &[Option<u64>]) {
+        let mut runs = self.free_dma_runs.borrow_mut();
+        for page in pages.iter().flatten() {
+            if let Some(last) = runs.last_mut().filter(|run| run.start + run.len == *page) {
+                last.len += crate::mm::PAGE_SIZE;
+            } else {
+                runs.push(kumo_abi::Range::new(*page, crate::mm::PAGE_SIZE));
+            }
+        }
+    }
+
+    /// Take a freed run for a new DMA VMO, splitting it when it is larger. A run that
+    /// overlaps a current exclusion is skipped, never handed out. — TIMBERDOODLE
+    fn take_free_dma_run(&mut self, count: u64, excluded: &[kumo_abi::Range]) -> Option<u64> {
+        let bytes = count.checked_mul(crate::mm::PAGE_SIZE)?;
+        if bytes == 0 {
+            return None;
+        }
+        let mut runs = self.free_dma_runs.borrow_mut();
+        let index = runs.iter().position(|run| {
+            const MASK: u64 = (1 << 21) - 1;
+            let Some(end) = run
+                .start
+                .checked_add(bytes)
+                .and_then(|end| end.checked_add(MASK))
+            else {
+                return false;
+            };
+            let base = run.start & !MASK;
+            let span = (end & !MASK) - base;
+            run.len >= bytes
+                && !excluded.iter().any(|ex| ranges_overlap(run.start, bytes, ex.start, ex.len))
+                // Reclaimed RAM must pass the same retained-domain check as fresh RAM,
+                // before zeroing an uncached CPU alias's complete block reach. — KESTREL
+                && self.devices.ram_allowed(base, span, None)
+                && self.device_owner.ram_allowed(base, span, None)
+        })?;
+        let start = runs[index].start;
+        if runs[index].len == bytes {
+            runs.remove(index);
+        } else {
+            runs[index].start += bytes;
+            runs[index].len -= bytes;
+        }
+        Some(start)
+    }
+
+    /// Keep every allocated page owned through failure and publication. Reclaimed pages are
+    /// zeroed and cleaned before reuse; fresh pages use one allocator walk. — KESTREL
+    fn create_paged_vmo(
+        &mut self,
+        process: &mut Process,
+        size: u64,
+        output: &mut [u64],
+    ) -> Result<Handle, Errno> {
+        let vmo = Vmo::new_dma_paged(size).map_err(|_| Errno::InvalidArgs)?;
+        let count = usize::try_from(vmo.frame_count()).map_err(|_| Errno::InvalidArgs)?;
+        if output.len() != count {
+            return Err(Errno::InvalidArgs);
+        }
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(count)
+            .map_err(|_| Errno::NoMemory)?;
+        frames.resize(count, None);
+        // Capacity for the complete rollback is secured before removing a single free page.
+        self.free_dma_runs
+            .borrow_mut()
+            .try_reserve(count)
+            .map_err(|_| Errno::NoMemory)?;
+        #[cfg(feature = "arch_aarch64")]
+        let excluded = self.table_pages.dma_exclusions();
+        #[cfg(not(feature = "arch_aarch64"))]
+        let excluded = Vec::new();
+        let mut have = 0;
+        while have < count {
+            let Some(page) = self.take_free_dma_run(1, &excluded) else {
+                break;
+            };
+            zero_reclaimed_run(page, crate::mm::PAGE_SIZE);
+            frames[have] = Some(page);
+            have += 1;
+        }
+        if have < count {
+            if let Some(boot) = self.boot_info {
+                #[cfg(target_os = "none")]
+                let saved = kumo_hal::active::read_user_aspace_root();
+                #[cfg(target_os = "none")]
+                unsafe {
+                    kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0())
+                };
+                // SAFETY: the validated boot ranges are mapped by the active identity tree.
+                have += unsafe {
+                    crate::mm::alloc_dma_pages_excluding(&boot, &mut frames[have..], &excluded)
+                };
+                #[cfg(target_os = "none")]
+                unsafe {
+                    kumo_hal::active::set_user_aspace_root(saved)
+                };
+            }
+        }
+        let result = if have == count {
+            self.root_vmo_create(
+                process,
+                vmo,
+                Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(errno_from_object)
+        } else {
+            Err(Errno::NoMemory)
+        };
+        match result {
+            Ok(handle) => {
+                let koid = process
+                    .handles()
+                    .get(handle)
+                    .map_err(errno_from_object)?
+                    .koid;
+                let entry = self.vmo_entry_by_koid(koid).ok_or(Errno::Internal)?;
+                for (dest, page) in output.iter_mut().zip(&frames) {
+                    *dest = page.expect("complete DMA page list");
+                }
+                entry.frames.replace(frames);
+                Ok(handle)
+            }
+            Err(error) => {
+                self.return_dma_pages(&frames);
+                Err(error)
+            }
+        }
+    }
+
     /// Look up a VMO by koid. Returns `None` if not found.
     pub fn vmo_by_koid(&self, koid: KoId) -> Option<Vmo> {
         self.vmos.iter().find_map(|entry| {
@@ -2501,7 +2822,7 @@ impl SyscallEngine {
             | crate::mm::VmoBacking::Dma { phys_base } => {
                 phys_base.checked_add(vmo_offset).ok_or(Errno::InvalidArgs)
             }
-            crate::mm::VmoBacking::Anonymous => {
+            crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
                 let Some(boot) = self.boot_info else {
                     return Err(Errno::Internal);
                 };
@@ -2654,7 +2975,7 @@ impl SyscallEngine {
                 };
                 needs_frame_alloc = false;
             }
-            crate::mm::VmoBacking::Dma { .. } => {
+            crate::mm::VmoBacking::Dma { .. } | crate::mm::VmoBacking::DmaPaged => {
                 // DMA RAM is Normal memory, never Device, and never executable. Uncached
                 // (Normal-NC) is the coherency-free default a driver asks for; a cacheable
                 // request stays Normal-WB for the future coherent-DMA path.
@@ -2666,7 +2987,7 @@ impl SyscallEngine {
                 } else {
                     kumo_hal::active::user_page_desc(false, writable)
                 };
-                needs_frame_alloc = false;
+                needs_frame_alloc = vmo_entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged;
             }
             crate::mm::VmoBacking::Anonymous => {
                 if device || uncached {
@@ -2685,7 +3006,7 @@ impl SyscallEngine {
             crate::mm::VmoBacking::PhysicalRam { phys_base }
             | crate::mm::VmoBacking::Mmio { phys_base }
             | crate::mm::VmoBacking::Dma { phys_base } => phys_base,
-            crate::mm::VmoBacking::Anonymous => 0,
+            crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => 0,
         };
 
         let mut alloc = || unsafe { crate::mm::alloc_zeroed_frame(boot_ref) };
@@ -2751,6 +3072,47 @@ impl SyscallEngine {
         // root and the range was validated against the process's own mapping record.
         unsafe { kumo_hal::active::unmap_user_span(ttbr0, mapping.virt, mapping.len) }
             .map_err(|_| Errno::InvalidArgs)
+    }
+
+    //j732
+    /// Clear and forget every CPU mapping a dead child still records, so the VMOs it mapped can
+    /// retire. Teardown drains a process's handles, but a surviving mapping record is a
+    /// reference `retire_vmos` must honour, and the dead `Process` stays in `processes` (J731:
+    /// a finished gpu-client kept every frame buffer it had mapped). Each record goes the way
+    /// `VmarUnmap` takes one, live leaves first. A record whose clear fails is kept, so its VMO
+    /// stays referenced rather than its frames reaching the free list while a leaf still names
+    /// them. Returns (released, kept). — TIMBERDOODLE
+    pub(crate) fn release_process_mappings(&mut self, koid: KoId) -> (usize, usize) {
+        let Some(index) = self.processes.iter().position(|p| p.koid() == koid) else {
+            return (0, 0);
+        };
+        let ttbr0 = self.processes[index].ttbr0;
+        #[cfg(target_os = "none")]
+        let saved = ttbr0.map(|_| {
+            let saved = kumo_hal::active::read_user_aspace_root();
+            // SAFETY: the kernel identity map is always live; the saved root is restored below.
+            unsafe { kumo_hal::active::set_user_aspace_root(crate::user_thread::kernel_ttbr0()) };
+            saved
+        });
+        let (mut released, mut kept) = (0, 0);
+        let mut at = self.processes[index].mappings().len();
+        while at > 0 {
+            at -= 1;
+            let mapping = self.processes[index].mappings()[at].0;
+            let cleared = ttbr0.is_none_or(|root| self.clear_from_live_tree(root, mapping).is_ok());
+            if cleared {
+                self.processes[index].remove_mapping_exact(mapping.virt, mapping.len);
+                released += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        #[cfg(target_os = "none")]
+        if let Some(saved) = saved {
+            // SAFETY: restores the root that was live on entry.
+            unsafe { kumo_hal::active::set_user_aspace_root(saved) };
+        }
+        (released, kept)
     }
 
     /// Look up a process by koid. Returns `None` if not found.
@@ -2857,12 +3219,63 @@ impl SyscallEngine {
     }
 
     pub fn dispatch(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
+        //j731
+        let mut stamps = [dispatch_stamp(); 5];
         let result = self.dispatch_inner(process, call);
+        stamps[1] = dispatch_stamp();
         // The inner call has dropped its removed entries. This also catches grants
         // discarded by IPC before returning to userspace. — KESTREL
         self.retire_device_contexts();
+        stamps[2] = dispatch_stamp();
         self.retire_interrupts();
+        stamps[3] = dispatch_stamp();
+        self.retire_vmos(Some(process));
+        stamps[4] = dispatch_stamp();
+        for (part, max) in DISPATCH_PART_MAX_NS.iter().enumerate() {
+            max.fetch_max(
+                stamps[part + 1].saturating_sub(stamps[part]),
+                Ordering::Relaxed,
+            );
+        }
+        DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
         result
+    }
+
+    //j731
+    /// Count every engine list a dispatched syscall or an interrupt walks. `caller` adds a
+    /// process the engine does not own (Sora's) to the handle totals. — TIMBERDOODLE
+    pub fn census(&self, caller: Option<&Process>) -> EngineCensus {
+        let (handles, handle_slots) = self
+            .processes
+            .iter()
+            .chain(caller)
+            .map(Process::handles)
+            .fold((0, 0), |(live, slots), table| {
+                (live + table.live_count(), slots + table.slot_count())
+            });
+        EngineCensus {
+            ports: self.ipc.port_count(),
+            channels: self.ipc.channel_count(),
+            port_bindings: self.devices.port_bindings.len(),
+            timers: self.timers.len(),
+            interrupts: self.interrupts.len(),
+            vmos: self.vmos.len(),
+            dma_vmos: self
+                .vmos
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.vmo.backing(),
+                        crate::mm::VmoBacking::Dma { .. } | crate::mm::VmoBacking::DmaPaged
+                    )
+                })
+                .count(),
+            device_ctxs: self.devices.device_ctxs.len(),
+            device_vmar_mappings: self.devices.device_vmar_mappings.len(),
+            processes: self.processes.len(),
+            handles,
+            handle_slots,
+        }
     }
 
     fn dispatch_inner(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
@@ -2870,20 +3283,29 @@ impl SyscallEngine {
             KernelCall::HandleClose { handle } => {
                 let status = match process.handles_mut().remove(handle) {
                     Ok(entry) => {
-                        if entry.kind == ObjectKind::Channel {
-                            if let Ok(Some(peer_koid)) = self.ipc.close_by_koid(entry.koid) {
-                                self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                                // J547: a child parked in `ChannelRead` on the surviving end
-                                // waits on its endpoint, not a port. Wake it as a write would, so
-                                // its retried read sees `PeerClosed` instead of sleeping forever.
-                                // — TIMBERDOODLE
-                                #[cfg(target_os = "none")]
-                                crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                        let (kind, koid) = (entry.kind, entry.koid);
+                        //j719
+                        // The removed entry owns the handle's capability reference until it
+                        // drops; drop it first so the endpoint's observer reflects only the
+                        // handles that still exist when the registry judges the last owner.
+                        // — TIMBERDOODLE
+                        drop(entry);
+                        if kind == ObjectKind::Channel {
+                            if let Ok(peer_koids) = self.ipc.close_by_koid(koid) {
+                                for peer_koid in peer_koids {
+                                    self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                                    // J547: a child parked in `ChannelRead` on the surviving
+                                    // end waits on its endpoint, not a port. Wake it as a
+                                    // write would, so its retried read sees `PeerClosed`
+                                    // instead of sleeping forever. — TIMBERDOODLE
+                                    #[cfg(target_os = "none")]
+                                    crate::user_thread::wake_child_waiting_on_channel(peer_koid);
+                                }
                             }
                         }
-                        if entry.kind == ObjectKind::Timer {
-                            self.release_timer(entry.koid);
-                            self.release_port_bindings(entry.koid);
+                        if kind == ObjectKind::Timer {
+                            self.release_timer(koid);
+                            self.release_port_bindings(koid);
                         }
                         Errno::Ok.status()
                     }
@@ -2995,7 +3417,8 @@ impl SyscallEngine {
                                         kumo_hal::active::read_phys(phys_base + offset, dest_slice);
                                         Errno::Ok.status()
                                     }
-                                    crate::mm::VmoBacking::Anonymous => {
+                                    crate::mm::VmoBacking::Anonymous
+                                    | crate::mm::VmoBacking::DmaPaged => {
                                         let mut copied = 0usize;
                                         while copied < len {
                                             let pos = offset + copied as u64;
@@ -3066,7 +3489,8 @@ impl SyscallEngine {
                                     }
                                     Errno::Ok.status()
                                 }
-                                crate::mm::VmoBacking::Anonymous => {
+                                crate::mm::VmoBacking::Anonymous
+                                | crate::mm::VmoBacking::DmaPaged => {
                                     let Some(boot) = self.boot_info else {
                                         return KernelCallResult::Status(Errno::Internal.status());
                                     };
@@ -3498,8 +3922,13 @@ impl SyscallEngine {
                                 executable: false,
                             });
                         }
-                        crate::mm::VmoBacking::Anonymous => {
-                            if device || uncached {
+                        crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => {
+                            if device
+                                || (uncached
+                                    && vmo_entry.vmo.backing() == crate::mm::VmoBacking::Anonymous)
+                                || (executable
+                                    && vmo_entry.vmo.backing() == crate::mm::VmoBacking::DmaPaged)
+                            {
                                 return KernelCallResult::Status(Errno::InvalidArgs.status());
                             }
                             if mapping.len % crate::mm::PAGE_SIZE != 0 {
@@ -3527,7 +3956,7 @@ impl SyscallEngine {
                                     len: crate::mm::PAGE_SIZE,
                                     writable,
                                     device: false,
-                                    uncached: false,
+                                    uncached,
                                     executable,
                                 });
                                 page += 1;
@@ -3946,6 +4375,23 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
+            KernelCall::VmoCreatePaged { size, pages, count } => {
+                if pages.is_null()
+                    || pages as usize % 8 != 0
+                    || count > isize::MAX as usize / 8
+                    || crate::mm::align_up(size)
+                        .is_none_or(|len| len == 0 || len / crate::mm::PAGE_SIZE != count as u64)
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
+                // The syscall boundary validated the issuer's output range, as for VmoRead.
+                // — KESTREL
+                let output = unsafe { core::slice::from_raw_parts_mut(pages, count) };
+                match self.create_paged_vmo(process, size, output) {
+                    Ok(handle) => KernelCallResult::Handle(handle),
+                    Err(error) => KernelCallResult::Status(error.status()),
+                }
+            }
             KernelCall::VmoCreateContiguous { size } => {
                 let Some(boot) = self.boot_info else {
                     return KernelCallResult::Status(Errno::Internal.status());
@@ -3959,9 +4405,15 @@ impl SyscallEngine {
                 let excluded = self.table_pages.dma_exclusions();
                 #[cfg(not(feature = "arch_aarch64"))]
                 let excluded = Vec::new();
-                let phys = match alloc_contiguous(&boot, count, &excluded) {
-                    Ok(phys) => phys,
-                    Err(e) => return KernelCallResult::Status(e.status()),
+                let phys = match self.take_free_dma_run(count, &excluded) {
+                    Some(phys) => {
+                        zero_reclaimed_run(phys, len);
+                        phys
+                    }
+                    None => match alloc_contiguous(&boot, count, &excluded) {
+                        Ok(phys) => phys,
+                        Err(e) => return KernelCallResult::Status(e.status()),
+                    },
                 };
                 let vmo = match crate::mm::Vmo::from_dma_range(phys, len) {
                     Ok(vmo) => vmo,
@@ -5144,7 +5596,7 @@ fn physical_vmo_write_allowed(vmo: &Vmo, offset: u64, len: u64) -> bool {
         | crate::mm::VmoBacking::Dma { phys_base } => phys_base
             .checked_add(offset)
             .is_some_and(|base| !kumo_hal::active::device_mmio_read_only(base, len)),
-        crate::mm::VmoBacking::Anonymous => true,
+        crate::mm::VmoBacking::Anonymous | crate::mm::VmoBacking::DmaPaged => true,
     }
 }
 
@@ -5161,6 +5613,292 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    //j731
+    #[test]
+    fn the_census_counts_each_list_a_dispatch_walks() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let base = engine.census(Some(&process));
+        let KernelCallResult::Handle(port) = engine.dispatch(&mut process, KernelCall::PortCreate)
+        else {
+            panic!("expected a port handle");
+        };
+        let KernelCallResult::Handle(timer) =
+            engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 100 })
+        else {
+            panic!("expected a timer handle");
+        };
+        assert_eq!(
+            engine.dispatch(
+                &mut process,
+                KernelCall::PortBind {
+                    port,
+                    object: timer,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let bound = engine.census(Some(&process));
+        assert_eq!(bound.ports, base.ports + 1);
+        assert_eq!(bound.timers, base.timers + 1);
+        assert_eq!(bound.port_bindings, base.port_bindings + 1);
+        assert_eq!(bound.handles, base.handles + 2);
+        assert_eq!(bound.handle_slots, base.handle_slots + 2);
+        // Closing the timer releases its list entry and its binding, and since J732 its
+        // handle entry too, so the scanned slots fall with the live count. — TIMBERDOODLE
+        assert_eq!(
+            engine.dispatch(&mut process, KernelCall::HandleClose { handle: timer }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let closed = engine.census(Some(&process));
+        assert_eq!(closed.timers, base.timers);
+        assert_eq!(closed.port_bindings, base.port_bindings);
+        assert_eq!(closed.handles, base.handles + 1);
+        assert_eq!(closed.handle_slots, base.handle_slots + 1);
+        assert_eq!(engine.census(None).handle_slots, 0);
+    }
+
+    mod vmo_reclaim {
+        use super::*;
+        use crate::mm::{Mapping, Vmo, PAGE_SIZE};
+        use kumo_abi::Range;
+
+        fn adopt_dma_vmo(
+            engine: &mut SyscallEngine,
+            process: &mut Process,
+            phys: u64,
+        ) -> (Handle, KoId) {
+            let object = engine.objects.create(ObjectKind::Vmo);
+            let koid = object.koid();
+            engine.vmos.push(Rc::new(VmoEntry {
+                koid,
+                vmo: Vmo::from_dma_range(phys, 2 * PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            }));
+            let handle = process
+                .handles_mut()
+                .insert(
+                    object,
+                    Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+                )
+                .unwrap();
+            (handle, koid)
+        }
+
+        fn close(engine: &mut SyscallEngine, process: &mut Process, handle: Handle) {
+            assert_eq!(
+                engine.dispatch(process, KernelCall::HandleClose { handle }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+
+        #[test]
+        fn a_dead_dma_vmo_returns_its_run_and_the_run_is_reusable() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+            assert_eq!(
+                engine.free_dma_runs.borrow().as_slice(),
+                &[Range::new(0x4000_0000, 2 * PAGE_SIZE)]
+            );
+            assert_eq!(engine.take_free_dma_run(2, &[]), Some(0x4000_0000));
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+
+        #[test]
+        fn a_live_handle_or_mapping_keeps_the_run() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            let duplicate = process
+                .handles_mut()
+                .duplicate(handle, Rights::READ)
+                .unwrap();
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            close(&mut engine, &mut process, duplicate);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_2000);
+            process.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ,
+                },
+                koid,
+            );
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            process.remove_mapping_exact(0x2000_0000, PAGE_SIZE);
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        //j732
+        #[test]
+        fn a_dead_childs_mapping_is_released_and_its_run_retires() {
+            let mut engine = SyscallEngine::new();
+            let mut child = test_process(&mut engine);
+            let (_, koid) = adopt_dma_vmo(&mut engine, &mut child, 0x4000_0000);
+            child.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ,
+                },
+                koid,
+            );
+            let child_koid = child.koid();
+            engine.processes.push(child);
+            let index = engine.processes.len() - 1;
+            // Teardown drains the handles; the mapping record alone still holds the run.
+            drop(engine.processes[index].handles_mut().drain());
+            assert_eq!(engine.retire_vmos(None), 0);
+            assert_eq!(engine.release_process_mappings(child_koid), (1, 0));
+            assert!(engine.processes[index].mappings().is_empty());
+            assert_eq!(engine.retire_vmos(None), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+            assert_eq!(engine.release_process_mappings(KoId(u64::MAX)), (0, 0));
+        }
+
+        #[test]
+        fn a_queued_transfer_keeps_the_run_until_the_receiver_closes() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let (handle, koid) = adopt_dma_vmo(&mut engine, &mut process, 0x4000_0000);
+            let (sender, receiver) = engine
+                .ipc
+                .channel_create(&mut engine.objects, &mut process)
+                .unwrap();
+            let binding = [handle];
+            let message = kumo_ipc::Message::new(0, &[], &binding).unwrap();
+            engine
+                .ipc
+                .channel_write(&mut process, sender, message)
+                .unwrap();
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            let received = engine.ipc.channel_read(&mut process, receiver).unwrap();
+            let installed = received.handles()[0];
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.handles_mut().close(installed).unwrap();
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
+        }
+
+        #[test]
+        fn paged_dma_uses_fragmented_runs_and_keeps_shared_identity_until_final_release() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let physical = [0x4000_0000, 0x4080_0000, 0x4010_0000];
+            engine
+                .free_dma_runs
+                .borrow_mut()
+                .extend(physical.iter().map(|p| Range::new(*p, PAGE_SIZE)));
+            let mut output = [0; 3];
+            let handle = engine
+                .create_paged_vmo(&mut process, 3 * PAGE_SIZE, &mut output)
+                .unwrap();
+            assert_eq!(output, physical);
+            let koid = process.handles().get(handle).unwrap().koid;
+            let entry = engine.vmos.iter().find(|e| e.koid == koid).unwrap().clone();
+            assert_eq!(entry.vmo.backing(), crate::mm::VmoBacking::DmaPaged);
+            assert_eq!(*entry.frames.borrow(), physical.map(Some));
+            let duplicate = process
+                .handles_mut()
+                .duplicate(handle, Rights::READ)
+                .unwrap();
+            close(&mut engine, &mut process, handle);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.add_mapping(
+                Mapping {
+                    virt: 0x2000_0000,
+                    len: 3 * PAGE_SIZE,
+                    vmo_offset: 0,
+                    flags: kumo_hal::PageFlags::READ | kumo_hal::PageFlags::UNCACHED,
+                },
+                koid,
+            );
+            close(&mut engine, &mut process, duplicate);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
+            process.remove_mapping_exact(0x2000_0000, 3 * PAGE_SIZE);
+            assert_eq!(engine.retire_vmos(Some(&process)), 0); // retained device-style Rc pin
+            drop(entry);
+            assert_eq!(engine.retire_vmos(Some(&process)), 1);
+            for page in physical {
+                assert_eq!(engine.take_free_dma_run(1, &[]), Some(page));
+            }
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+
+        #[test]
+        fn paged_dma_failure_returns_the_entire_prefix_without_publishing_output_or_handles() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let run = Range::new(0x4000_0000, 2 * PAGE_SIZE);
+            engine.free_dma_runs.borrow_mut().push(run);
+            let before = engine.census(Some(&process));
+            let mut output = [0xdead; 3];
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, 3 * PAGE_SIZE, &mut output),
+                Err(Errno::NoMemory)
+            );
+            assert_eq!(output, [0xdead; 3]);
+            assert_eq!(engine.census(Some(&process)), before);
+            assert_eq!(engine.free_dma_runs.borrow().as_slice(), &[run]);
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, PAGE_SIZE, &mut output),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(
+                engine.create_paged_vmo(&mut process, 0, &mut []),
+                Err(Errno::InvalidArgs)
+            );
+            assert_eq!(engine.free_dma_runs.borrow().as_slice(), &[run]);
+        }
+
+        #[test]
+        fn anonymous_vmos_keep_their_lifecycle() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let object = engine.objects.create(ObjectKind::Vmo);
+            let koid = object.koid();
+            engine.vmos.push(Rc::new(VmoEntry {
+                koid,
+                vmo: Vmo::new(PAGE_SIZE).unwrap(),
+                frames: RefCell::new(Vec::new()),
+            }));
+            let handle = process.handles_mut().insert(object, Rights::READ).unwrap();
+            close(&mut engine, &mut process, handle);
+            assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+        }
+
+        #[test]
+        fn a_reclaimed_run_skips_exclusions_and_splits_when_larger() {
+            let mut engine = SyscallEngine::new();
+            engine
+                .free_dma_runs
+                .borrow_mut()
+                .push(Range::new(0x4000_0000, 3 * PAGE_SIZE));
+            assert_eq!(
+                engine.take_free_dma_run(1, &[Range::new(0x4000_0000, PAGE_SIZE)]),
+                None
+            );
+            assert_eq!(engine.take_free_dma_run(1, &[]), Some(0x4000_0000));
+            assert_eq!(
+                engine.free_dma_runs.borrow().as_slice(),
+                &[Range::new(0x4000_1000, 2 * PAGE_SIZE)]
+            );
+            assert_eq!(engine.take_free_dma_run(2, &[]), Some(0x4000_1000));
+            assert!(engine.free_dma_runs.borrow().is_empty());
+        }
+    }
 
     mod context_retirement {
         use super::*;
@@ -9139,6 +9877,21 @@ mod tests {
             engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
             KernelCallResult::Handle(Handle(1))
         );
+    }
+
+    //j725
+    #[test]
+    fn timer_sweep_late_reports_the_oldest_expired_deadline_age() {
+        let mut engine = SyscallEngine::new();
+        let mut process = test_process(&mut engine);
+        let _ = engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 100 });
+        let _ = engine.dispatch(&mut process, KernelCall::TimerCreate { deadline_ns: 250 });
+        assert_eq!(engine.timer_sweep_late(99), 0);
+        assert_eq!(engine.timer_sweep_late(150), 50);
+        assert_eq!(engine.timer_sweep_late(260), 160);
+        // Firing the timers clears the lateness a later sample would report.
+        engine.signal_timers(260);
+        assert_eq!(engine.timer_sweep_late(260), 0);
     }
 
     #[test]

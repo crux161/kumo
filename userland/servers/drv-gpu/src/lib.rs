@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j593
-//j594
-//j595
-//j596
-//j655
+//j733
+//j734
+//j742
+//j743
+//j752
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -19,11 +19,18 @@
 //! G5b presents it in one of drv-fb's views (DESIGN/019).
 //! G5c-1 carries the offline-compiled kernel (shaders/mali) and packs its descriptors exactly as
 //! Mesa does. G5c-2 maps it executable and dispatches it as the pixel producer.
+//!
+//! G8d-a gives the client channel a contained close: a confirmed soft reset closes the session
+//! and retires the driver's own claims, reporting exact released counts; an unconfirmed reset
+//! retains everything and poisons the session instead of freeing DMA it cannot prove idle.
 
 use kumo_abi::{DevicePowerStatus, Errno, Status};
 
 /// Shared GPU channel contract and bounded session state.
 pub use kumo_gpu as protocol;
+
+/// G8d-a's contained-close state machine: reset first, release only on proof.
+pub mod contain;
 /// Shared Mali instructions, kernel, descriptors and CPU pixel reference.
 pub use kumo_mali::*;
 
@@ -56,8 +63,9 @@ const L2_PWRTRANS_HI: u32 = 0x224;
 const GPU_COHERENCY_FEATURES: u32 = 0x300;
 const GPU_COHERENCY_PROTOCOL: u32 = 0x304;
 /// RESEARCH/009 §1.2 and §6.4: RK3588 is not `dma-coherent`, so the GPU speaks no coherency
-/// protocol. The write must precede L2 power-up.
-const GPU_COHERENCY_NONE: u32 = 31;
+/// protocol. The write must precede L2 power-up. Public since G7o-a: the client server
+/// reports this programmed value, and upstream derives `is_io_coherent` from it.
+pub const GPU_COHERENCY_NONE: u32 = 31;
 
 // RESEARCH/009 §4.2, §4.4 and §4.5: the GPU_CONTROL interrupt and command words.
 const GPU_INT_RAWSTAT: u32 = 0x020;
@@ -101,6 +109,9 @@ const AS_COMMAND_FLUSH_MEM: u32 = 5;
 /// panthor locks the whole 64-bit range before a space's UPDATE: region width 63, base 0
 /// (RESEARCH/009 §7.6's packing with start 0 and size 2^64).
 const AS_LOCKADDR_WHOLE: u64 = 63;
+/// panthor's `AS_LOCK_REGION_MIN_SIZE`: a live page-table flush never locks less than 32 KiB
+/// (panthor_mmu.c `lock_region`). — TIMBERDOODLE
+const AS_LOCK_REGION_MIN: u64 = 1 << 15;
 /// RESEARCH/009 §7.3: panthor's non-coherent `mair_to_memattr` byte table for RK3588.
 pub const AS_MEMATTR_NON_COHERENT: u64 = 0x4C4C_4C4C_8C4C_8F4C;
 const AS_TRANSCFG_ADRMODE_AARCH64_4K: u64 = 6;
@@ -394,6 +405,9 @@ pub enum AsError {
     Busy { status: u32 },
     /// The hardware has no such address space (eight exist; RESEARCH/009 §7.1).
     Space { space: u32 },
+    /// A range cannot be packed into `AS_LOCKADDR`: zero length or `va + bytes` overflow.
+    /// — TIMBERDOODLE
+    Range { va: u64, bytes: u64 },
 }
 
 /// RESEARCH/009 §7.4: AArch64 4 KiB stage-1 walks, write-back and read-allocate, with the
@@ -502,6 +516,35 @@ pub fn disable_as0(io: &mut (impl MmioIo + ClockIo)) -> Result<(), AsError> {
     disable_as(io, 0)
 }
 
+/// Pack a live-flush range exactly as panthor's `lock_region` does: the smallest naturally
+/// aligned power-of-two block containing `va..va + bytes`, encoded as `log2(size) - 1` in bits
+/// [5:0] with the block base in bits [63:6]. The 32 KiB floor and the log2-minus-one encoding
+/// are panthor's, not an approximation. The MMU ignores the low base bits, which is why the
+/// encoded block may cover unmapped VAs around the request. A zero-length or overflowing range
+/// has no encoding. — TIMBERDOODLE
+pub fn lockaddr_for_range(va: u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 {
+        return None;
+    }
+    let end = va.checked_add(bytes)?;
+    // Linux `fls64`: zero for zero, otherwise one plus the highest set bit's index.
+    let fls = 64 - (va ^ (end - 1)).leading_zeros();
+    let width = fls.max(AS_LOCK_REGION_MIN.ilog2()) - 1;
+    let base = va & (u64::MAX << width);
+    Some(base | u64::from(width))
+}
+
+/// The shared LOCK/FLUSH_PT/UNLOCK tail: `lockaddr` is already encoded and the caller has a
+/// live `window`. If LOCK succeeds and a later command fails, the region stays locked and the
+/// caller's DeviceLost reset containment owns the cleanup. — TIMBERDOODLE
+fn flush_pt(io: &mut (impl MmioIo + ClockIo), window: u32, lockaddr: u64) -> Result<(), AsError> {
+    let address = window + as_offset(AS_LOCKADDR);
+    write64(io, address, address + 4, lockaddr);
+    as_command(io, window, AS_COMMAND_LOCK)?;
+    as_command(io, window, AS_COMMAND_FLUSH_PT)?;
+    as_command(io, window, AS_COMMAND_UNLOCK)
+}
+
 /// Flush a live space's page-table caches: lock the whole range, `FLUSH_PT`, unlock
 /// (RESEARCH/009 §7.6; panthor runs this after every live mapping change). KUMO maps the queue
 /// pages and the suspend buffer into AS0 after it is enabled, so those edits need it. — TIMBERDOODLE
@@ -509,11 +552,28 @@ pub fn flush_page_tables(io: &mut (impl MmioIo + ClockIo), space: u32) -> Result
     let Some(window) = as_window(space) else {
         return Err(AsError::Space { space });
     };
-    let lockaddr = window + as_offset(AS_LOCKADDR);
-    write64(io, lockaddr, lockaddr + 4, AS_LOCKADDR_WHOLE);
-    as_command(io, window, AS_COMMAND_LOCK)?;
-    as_command(io, window, AS_COMMAND_FLUSH_PT)?;
-    as_command(io, window, AS_COMMAND_UNLOCK)
+    flush_pt(io, window, AS_LOCKADDR_WHOLE)
+}
+
+/// Invalidate a live space's page-table caches over `va..va + bytes` only, the way panthor's
+/// `panthor_vm_flush_range` does: pack `AS_LOCKADDR` for that range, then LOCK/FLUSH_PT/UNLOCK
+/// under the same 10 µs/100 ms `AS_ACTIVE` discipline as every other AS command. This narrows a
+/// live mapping change to the affected block instead of locking the whole space; it neither
+/// touches translation config nor stops a queue, group or the MCU (RESEARCH/017). Whole-space
+/// enable/disable keep their own FLUSH_MEM sequence. — TIMBERDOODLE
+pub fn flush_range(
+    io: &mut (impl MmioIo + ClockIo),
+    space: u32,
+    va: u64,
+    bytes: u64,
+) -> Result<(), AsError> {
+    let Some(window) = as_window(space) else {
+        return Err(AsError::Space { space });
+    };
+    let Some(lockaddr) = lockaddr_for_range(va, bytes) else {
+        return Err(AsError::Range { va, bytes });
+    };
+    flush_pt(io, window, lockaddr)
 }
 
 /// Clear a latched address-space-0 fault and keep the MMU line masked.
@@ -1207,6 +1267,10 @@ pub enum TableError {
     Range { va: u64, len: u64 },
     /// An entry that must be a table is a block descriptor.
     Collision { level: u32 },
+    /// The page was never mapped through this root, so there is nothing to unbind.
+    Unmapped { va: u64 },
+    /// The leaf exists but is not the 4 KiB page descriptor this binding model creates.
+    Mismatch { va: u64 },
 }
 
 /// The attributes a leaf page is mapped with (RESEARCH/009 §7.2; panthor's map flags).
@@ -1295,6 +1359,138 @@ pub fn map_range(
             page_descriptor(pa + offset, attrs.cached, attrs.readonly, !attrs.executable),
         );
         offset += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+/// Map independent physical pages into one GPU VA range. Validate the complete list before
+/// writing any leaf. Table exhaustion after publication is terminal, as for map_range.
+/// — KESTREL
+pub fn map_pages(
+    memory: &mut impl TableMemory,
+    arena: &mut TableArena,
+    transtab: u64,
+    va: u64,
+    pages: &[u64],
+    attrs: PageAttrs,
+) -> Result<(), TableError> {
+    let len = (pages.len() as u64)
+        .checked_mul(PAGE_SIZE)
+        .ok_or(TableError::Range { va, len: 0 })?;
+    if pages.is_empty()
+        || va % PAGE_SIZE != 0
+        || va.checked_add(len).is_none_or(|end| end > (1 << 48))
+        || pages
+            .iter()
+            .any(|pa| pa % PAGE_SIZE != 0 || *pa & !PHYSICAL_ADDRESS_MASK != 0)
+    {
+        return Err(TableError::Range { va, len });
+    }
+    for (index, pa) in pages.iter().enumerate() {
+        map_range(
+            memory,
+            arena,
+            transtab,
+            va + index as u64 * PAGE_SIZE,
+            *pa,
+            PAGE_SIZE,
+            attrs,
+        )?;
+    }
+    Ok(())
+}
+
+/// One VA range a destroy must unbind. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnmapRange {
+    pub va: u64,
+    pub len: u64,
+}
+
+/// Walk to the level-3 entry for `va` without allocating. A zero or non-table intermediate
+/// descriptor proves no page was mapped through this root. — TIMBERDOODLE
+fn leaf_entry(memory: &mut impl TableMemory, transtab: u64, va: u64) -> Result<u64, TableError> {
+    let mut table = transtab;
+    for level in 0..(PAGE_TABLE_LEVELS - 1) {
+        let value = memory.read64(table + table_index(va, level) as u64 * 8);
+        if value == 0 {
+            return Err(TableError::Unmapped { va });
+        }
+        if value & TABLE_DESCRIPTOR_TYPE != TABLE_DESCRIPTOR_TYPE {
+            return Err(TableError::Mismatch { va });
+        }
+        table = value & PHYSICAL_ADDRESS_MASK;
+    }
+    Ok(table + table_index(va, PAGE_TABLE_LEVELS - 1) as u64 * 8)
+}
+
+//j734
+/// True when no page of `va..va + len` is mapped through `transtab`: each walk either finds no
+/// table on the way or a zero leaf. `map_range` overwrites leaves silently, so a caller placing
+/// new pages beside the firmware's own sections proves the span free first. A block descriptor
+/// counts as mapped. — TIMBERDOODLE
+pub fn range_unmapped(memory: &mut impl TableMemory, transtab: u64, va: u64, len: u64) -> bool {
+    let mut offset = 0u64;
+    while offset < len {
+        match leaf_entry(memory, transtab, va + offset) {
+            Err(TableError::Unmapped { .. }) => {}
+            Ok(entry) if memory.read64(entry) == 0 => {}
+            _ => return false,
+        }
+        offset += PAGE_SIZE;
+    }
+    true
+}
+
+/// Unbind every 4 KiB page named by `ranges`, all-or-nothing: the preflight pass proves every
+/// page is a live page mapping before the clear pass writes a single zero. A partial unmap
+/// would leave the caller unable to say which backing is still reachable, so a mismatch or an
+/// already-unmapped page refuses the whole batch and changes nothing. Tables are never freed,
+/// so the model cannot reclaim them; the caller flushes the address space once afterwards.
+/// — TIMBERDOODLE
+pub fn unmap_ranges(
+    memory: &mut impl TableMemory,
+    transtab: u64,
+    ranges: &[UnmapRange],
+) -> Result<(), TableError> {
+    for range in ranges {
+        let end = range.va.checked_add(range.len);
+        if range.len == 0
+            || range.va % PAGE_SIZE != 0
+            || range.len % PAGE_SIZE != 0
+            || end.is_none_or(|end| end > (1u64 << 48))
+        {
+            return Err(TableError::Range {
+                va: range.va,
+                len: range.len,
+            });
+        }
+    }
+    for range in ranges {
+        let mut offset = 0u64;
+        while offset < range.len {
+            let va = range.va + offset;
+            let entry = leaf_entry(memory, transtab, va)?;
+            let value = memory.read64(entry);
+            if value == 0 {
+                return Err(TableError::Unmapped { va });
+            }
+            if value & TABLE_DESCRIPTOR_TYPE != TABLE_DESCRIPTOR_TYPE {
+                return Err(TableError::Mismatch { va });
+            }
+            offset += PAGE_SIZE;
+        }
+    }
+    for range in ranges {
+        let mut offset = 0u64;
+        while offset < range.len {
+            let va = range.va + offset;
+            // The preflight just proved this walk succeeds; clearing never allocates, so no
+            // descriptor it relies on can have changed.
+            let entry = leaf_entry(memory, transtab, va)?;
+            memory.write64(entry, 0);
+            offset += PAGE_SIZE;
+        }
     }
     Ok(())
 }
@@ -1397,6 +1593,27 @@ pub const fn classify_job_wait(reached: bool, last: Completion, fired: u32) -> J
         (true, Completion::Fired, 1..) => JobWait::Interrupt,
         (true, _, 0) => JobWait::NoInterrupt,
         (true, _, _) => JobWait::LateSeqno,
+    }
+}
+
+/// A deadline is a timeout only without observed GPU/CS/MMU fault evidence. Missing IRQs,
+/// late seqnos and other unclassified failures never become invented GPU faults. — MILVUS
+pub const fn classify_group_failure(
+    outcome: JobWait,
+    gpu_status: u32,
+    cs_fault: u32,
+    cs_fatal: u32,
+    mmu_fault: bool,
+) -> protocol::GroupReport {
+    if gpu_status != 0 || cs_fault != 0 || cs_fatal != 0 || mmu_fault {
+        protocol::GroupReport {
+            state: protocol::GroupState::Fatal,
+            gpu_status,
+        }
+    } else if matches!(outcome, JobWait::Stalled) {
+        protocol::GroupReport::TIMED_OUT
+    } else {
+        protocol::GroupReport::UNKNOWN
     }
 }
 
@@ -1888,6 +2105,44 @@ pub fn start_group(
     }
 }
 
+//j734
+/// CSG `STATE` value that retires a slot (§9.5; panthor's `CSG_STATE_TERMINATE`).
+pub const CSG_STATE_TERMINATE: u32 = 0;
+
+/// Retire a group the way [`start_group`] starts one: set its STATE to terminate, toggle its GLB
+/// doorbell-request bit, ring doorbell 0, and require the CSG acknowledge to show the terminate
+/// state. No endpoint toggle: panthor queues only the state change for a termination. A second
+/// group raised for a proof leaves the slot as it found it. — TIMBERDOODLE
+pub fn stop_group(
+    io: &mut (impl FirmwareMemory + GlbIo + ClockIo),
+    csg_input_va: u64,
+    csg_output_va: u64,
+    slot: u32,
+    timeout_ns: u64,
+) -> Result<u32, GroupError> {
+    let req = (io.read32(csg_input_va) & !CSG_STATE_MASK) | CSG_STATE_TERMINATE;
+    io.write32(csg_input_va, req);
+    let bit = 1u32 << slot;
+    let doorbell_req = io.read_input(GLB_DOORBELL_REQ);
+    let doorbell_ack = io.read_output(GLB_DOORBELL_REQ);
+    io.write_input(
+        GLB_DOORBELL_REQ,
+        (doorbell_req & !bit) | (!doorbell_ack & bit),
+    );
+    io.ring_doorbell();
+    let deadline = io.now_ns().saturating_add(timeout_ns);
+    loop {
+        let ack = io.read32(csg_output_va);
+        if ack & CSG_STATE_MASK == CSG_STATE_TERMINATE {
+            return Ok(ack);
+        }
+        if io.now_ns() >= deadline {
+            return Err(GroupError::AckTimeout { req, ack });
+        }
+        io.delay_us(10);
+    }
+}
+
 /// The queue's two interface pages (§9.7).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueIface {
@@ -2050,6 +2305,45 @@ pub fn store_stream(target: u64, value: u32) -> [u64; 6] {
         flush_cache2(0, 3),
         wait_slot(1),
     ]
+}
+
+//j733
+/// Words in [`spin_store_stream`].
+pub const SPIN_STREAM_WORDS: usize = 14;
+
+/// J733's in-flight stream: store `started` at `marker`, spin `iterations` times on the
+/// command-stream processor, then store `value` at `target`, each store cleaned to memory the way
+/// [`store_stream`] cleans its one. Between the two words the CPU can see the queue running, the
+/// window a live AS1 update must land in to show it stops nothing (RESEARCH/017 §3.3.8). r0-r3
+/// are `store_stream`'s; r4 counts. None for zero iterations, which the decrement-first loop
+/// would turn into 2^32. — TIMBERDOODLE
+pub fn spin_store_stream(
+    marker: u64,
+    started: u32,
+    target: u64,
+    value: u32,
+    iterations: u32,
+) -> Option<[u64; SPIN_STREAM_WORDS]> {
+    if iterations == 0 {
+        return None;
+    }
+    Some([
+        move48(0, marker),
+        move32(2, started),
+        sync_set32(0, 0, 2),
+        move32(3, 0),
+        flush_cache2(0, 3),
+        wait_slot(1),
+        move32(4, iterations),
+        // The loop: decrement r4 and branch back to the decrement while it is non-zero.
+        add_imm32(4, 4, -1),
+        branch(CS_COND_NEQUAL, 4, -2),
+        move48(0, target),
+        move32(2, value),
+        sync_set32(0, 0, 2),
+        flush_cache2(0, 3),
+        wait_slot(1),
+    ])
 }
 
 /// SYNC_SET32: store a register to an address pair with system scope; signal on completion
@@ -2913,6 +3207,81 @@ mod tests {
     }
 
     #[test]
+    fn lockaddr_packing_matches_panthors_naturally_aligned_block() {
+        const BASE: u64 = 0x2000_0000;
+        // The 32 KiB floor: a one-page request locks a 32 KiB block, encoded width 14.
+        assert_eq!(lockaddr_for_range(BASE, 0x1000), Some(BASE | 14));
+        assert_eq!(lockaddr_for_range(BASE + 0x1000, 0x1000), Some(BASE | 14));
+        assert_eq!(lockaddr_for_range(0x1000, 0x1000), Some(14));
+        // A request crossing a 64 KiB boundary grows to a 64 KiB block (width 15).
+        assert_eq!(lockaddr_for_range(BASE, 0x1_0000), Some(BASE | 15));
+        // The base rounds down to the block: the low `width` bits of the VA are ignored.
+        assert_eq!(lockaddr_for_range(BASE + 0x4000, 0x8000), Some(BASE | 15));
+        // Whole space: start 0 and size ~0 give width 63, the enable/disable encoding.
+        assert_eq!(lockaddr_for_range(0, u64::MAX), Some(AS_LOCKADDR_WHOLE));
+        // Zero-length and overflowing ranges have no encoding.
+        assert_eq!(lockaddr_for_range(BASE, 0), None);
+        assert_eq!(lockaddr_for_range(u64::MAX - 0xFFF, 0x1000), None);
+        // Every encoding keeps exactly the low `width` bits clear, as panthor's
+        // `GENMASK_ULL(63, region_width)` does, and its block contains the request.
+        for offset in (0..0x1_0000).step_by(0x1000) {
+            let encoded = lockaddr_for_range(BASE + offset, 0x1000).unwrap();
+            let width = (encoded & 0x3f) as u32;
+            let base = encoded & !0x3f;
+            let size = 1u64 << (width + 1);
+            assert_eq!(base & ((1u64 << width) - 1), 0, "encoded base bits");
+            assert!(base <= BASE + offset, "block starts before the request");
+            assert!(
+                BASE + offset + 0x1000 <= base + size,
+                "block ends after the request"
+            );
+        }
+    }
+
+    #[test]
+    fn flush_range_locks_only_the_packed_block_for_a_live_space() {
+        const BASE: u64 = 0x2000_0000;
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(flush_range(&mut io, 1, BASE + 0x1000, 0x1000), Ok(()));
+        let encoded = BASE | 14;
+        assert_eq!(
+            io.writes,
+            std::vec![
+                (0x2450, encoded as u32),
+                (0x2454, (encoded >> 32) as u32),
+                (0x2458, AS_COMMAND_LOCK),
+                (0x2458, AS_COMMAND_FLUSH_PT),
+                (0x2458, AS_COMMAND_UNLOCK),
+            ]
+        );
+        // Each AS command waits for AS_ACTIVE to clear before and after it.
+        assert_eq!(io.read_log, std::vec![0x2468; 6]);
+    }
+
+    #[test]
+    fn flush_range_refuses_a_bad_space_or_an_unpackable_range_without_writing() {
+        const BASE: u64 = 0x2000_0000;
+        let mut io = FakeGpu::new(Completion::Fired);
+        assert_eq!(
+            flush_range(&mut io, 8, BASE, 0x1000),
+            Err(AsError::Space { space: 8 })
+        );
+        assert_eq!(
+            flush_range(&mut io, 1, BASE, 0),
+            Err(AsError::Range { va: BASE, bytes: 0 })
+        );
+        assert_eq!(
+            flush_range(&mut io, 1, u64::MAX, 2),
+            Err(AsError::Range {
+                va: u64::MAX,
+                bytes: 2
+            })
+        );
+        assert!(io.writes.is_empty());
+        assert!(io.read_log.is_empty());
+    }
+
+    #[test]
     fn shared_region_bounds_match_research_009() {
         assert!(shared_region_contains(CSF_SHARED_REGION_START));
         assert!(shared_region_contains(CSF_SHARED_REGION_START + 0x10_0000));
@@ -3661,6 +4030,69 @@ mod g3b_tests {
     }
 
     #[test]
+    fn scattered_pages_cross_tables_preserve_offsets_and_unmap_exactly() {
+        let (mut memory, mut arena, root) = arena();
+        let va = protocol::VA_START + 0x1ff000;
+        let pages = [0x8010_0000, 0x9000_3000, 0x8200_7000];
+        let attributes = PageAttrs {
+            cached: false,
+            readonly: true,
+            executable: true,
+        };
+        map_pages(&mut memory, &mut arena, root, va, &pages, attributes).unwrap();
+        for (n, page) in pages.iter().enumerate() {
+            let leaf = leaf_entry(&mut memory, root, va + n as u64 * PAGE_SIZE).unwrap();
+            assert_eq!(memory.get(leaf), page_descriptor(*page, false, true, false));
+        }
+        unmap_ranges(
+            &mut memory,
+            root,
+            &[UnmapRange {
+                va: va + PAGE_SIZE,
+                len: PAGE_SIZE,
+            }],
+        )
+        .unwrap();
+        assert!(range_unmapped(&mut memory, root, va + PAGE_SIZE, PAGE_SIZE));
+        assert!(!range_unmapped(&mut memory, root, va, PAGE_SIZE));
+        assert!(!range_unmapped(
+            &mut memory,
+            root,
+            va + 2 * PAGE_SIZE,
+            PAGE_SIZE
+        ));
+        let before = memory.words.clone();
+        assert!(map_pages(
+            &mut memory,
+            &mut arena,
+            root,
+            va,
+            &[pages[0], 1],
+            attributes
+        )
+        .is_err());
+        assert_eq!(memory.words, before);
+    }
+
+    #[test]
+    fn client_table_arena_covers_the_whole_raised_window() {
+        let mut memory = FakeMemory::new();
+        let mut arena = TableArena::new(
+            ARENA,
+            (24 + (protocol::VA_END - protocol::VA_START) / (2 * 1024 * 1024)) * PAGE_SIZE,
+        )
+        .unwrap();
+        // Reserve the resident allowance, leaving the client's root/parent headroom intact.
+        for _ in 0..20 {
+            arena.alloc_table(&mut memory).unwrap();
+        }
+        let root = arena.alloc_table(&mut memory).unwrap();
+        for va in (protocol::VA_START..protocol::VA_END).step_by(2 * 1024 * 1024) {
+            map_pages(&mut memory, &mut arena, root, va, &[0x8000_0000], attrs()).unwrap();
+        }
+    }
+
+    #[test]
     fn map_range_links_levels_and_reuses_parent_tables() {
         let (mut memory, mut arena, l0) = arena();
         assert_eq!(l0, ARENA);
@@ -3772,6 +4204,228 @@ mod g3b_tests {
             map_range(&mut memory, &mut arena, l0, 0x1000, 0x2000, 0x1000, attrs()),
             Err(TableError::Collision { level: 0 })
         );
+    }
+
+    //j734
+    #[test]
+    fn range_unmapped_sees_a_live_leaf_a_cleared_leaf_and_a_missing_table() {
+        let (mut memory, mut arena, l0) = arena();
+        // Nothing mapped: no tables on the walk.
+        assert!(range_unmapped(&mut memory, l0, 0x0411_0000, 0x9000));
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0410_0000,
+            0x0020_0000,
+            0x2000,
+            attrs(),
+        )
+        .unwrap();
+        // Same 2 MiB table, untouched pages: a zero leaf.
+        assert!(range_unmapped(&mut memory, l0, 0x0411_0000, 0x9000));
+        // Any live page in the span refuses it, even the last one.
+        assert!(!range_unmapped(&mut memory, l0, 0x0410_0000, 0x1000));
+        assert!(!range_unmapped(&mut memory, l0, 0x040F_F000, 0x3000));
+        unmap_ranges(
+            &mut memory,
+            l0,
+            &[UnmapRange {
+                va: 0x0410_0000,
+                len: 0x2000,
+            }],
+        )
+        .unwrap();
+        assert!(range_unmapped(&mut memory, l0, 0x0410_0000, 0x2000));
+    }
+
+    #[test]
+    fn unmap_ranges_clears_every_named_page_and_leaves_neighbours() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x3000,
+            attrs(),
+        )
+        .unwrap();
+        let page = |memory: &FakeMemory, index: u64| memory.get(0x10_3000 + index * 8);
+        assert_ne!(page(&memory, 0), 0);
+        assert_ne!(page(&memory, 2), 0);
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[UnmapRange {
+                    va: 0x0400_1000,
+                    len: 0x1000
+                }]
+            ),
+            Ok(())
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 1), 0);
+        assert_ne!(page(&memory, 2), 0);
+        // A multi-range batch clears exactly its pages, and the level tables stay linked: a
+        // re-map at the same VA reuses them. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_2000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Ok(())
+        );
+        assert_eq!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 2), 0);
+        assert_eq!(memory.get(0x10_2000 + 0x20 * 8), 0x10_3003);
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0060_0000,
+            0x1000,
+            attrs(),
+        )
+        .unwrap();
+        assert_eq!(page(&memory, 0), 0x0060_0f47);
+        // An unmapped page is Unmapped, not a silent no-op success.
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[UnmapRange {
+                    va: 0x0400_1000,
+                    len: 0x1000
+                }]
+            ),
+            Err(TableError::Unmapped { va: 0x0400_1000 })
+        );
+    }
+
+    #[test]
+    fn unmap_ranges_preflights_every_page_before_clearing_any() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x2000,
+            attrs(),
+        )
+        .unwrap();
+        let page = |memory: &FakeMemory, index: u64| memory.get(0x10_3000 + index * 8);
+        // The batch names two live pages and one never-mapped page: nothing is cleared, so
+        // the caller still owns every mapping it had. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_9000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_1000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Unmapped { va: 0x0400_9000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_ne!(page(&memory, 1), 0);
+        // A leaf that is not a valid page descriptor is a mismatch, and again the whole batch
+        // is refused before any store. — TIMBERDOODLE
+        memory.write64(0x10_3000 + 8, 0x0030_0001);
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0400_1000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Mismatch { va: 0x0400_1000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+        assert_eq!(page(&memory, 1), 0x0030_0001);
+        // A VA whose intermediate table was never allocated is Unmapped too; the live range
+        // listed before it stays mapped because the preflight ran first. — TIMBERDOODLE
+        assert_eq!(
+            unmap_ranges(
+                &mut memory,
+                l0,
+                &[
+                    UnmapRange {
+                        va: 0x0400_0000,
+                        len: 0x1000,
+                    },
+                    UnmapRange {
+                        va: 0x0500_0000,
+                        len: 0x1000,
+                    },
+                ]
+            ),
+            Err(TableError::Unmapped { va: 0x0500_0000 })
+        );
+        assert_ne!(page(&memory, 0), 0);
+    }
+
+    #[test]
+    fn unmap_ranges_refuses_bad_ranges_without_touching_the_table() {
+        let (mut memory, mut arena, l0) = arena();
+        map_range(
+            &mut memory,
+            &mut arena,
+            l0,
+            0x0400_0000,
+            0x0020_0000,
+            0x1000,
+            attrs(),
+        )
+        .unwrap();
+        for (va, len) in [
+            (0x0400_0000, 0),
+            (0x0400_0001, 0x1000),
+            (0x0400_1000, 0x800),
+            (1u64 << 48, 0x1000),
+            (u64::MAX - 0xfff, 0x1000),
+        ] {
+            assert_eq!(
+                unmap_ranges(&mut memory, l0, &[UnmapRange { va, len }]),
+                Err(TableError::Range { va, len }),
+                "{va:#x} {len:#x}"
+            );
+        }
+        assert_ne!(memory.get(0x10_3000), 0);
     }
 
     const ARM: u32 = 1;
@@ -4489,6 +5143,45 @@ mod g4b_tests {
         assert_eq!(io.get(0x6500), 0x01);
     }
 
+    //j734
+    #[test]
+    fn stop_group_clears_only_the_state_toggles_its_own_slot_and_waits() {
+        let mut io = FakeFirmware::new();
+        // A started group with its endpoint bit set; slot 1's GLB bit starts acknowledged.
+        io.set(
+            0x6500,
+            CSG_STATE_START | CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE,
+        );
+        io.glb_output.insert(GLB_DOORBELL_REQ, 0b10);
+        io.glb_input.insert(GLB_DOORBELL_REQ, 0b10);
+        io.script_reads(0x6700, &[CSG_STATE_START, CSG_ENDPOINT_CONFIG]);
+        assert_eq!(
+            stop_group(&mut io, 0x6500, 0x6700, 1, 100_000_000),
+            Ok(CSG_ENDPOINT_CONFIG)
+        );
+        // The state is cleared; the endpoint and event bits are left as the host wrote them.
+        assert_eq!(io.get(0x6500), CSG_ENDPOINT_CONFIG | CSG_SYNC_UPDATE);
+        // Only slot 1's bit moves, to the opposite of its ack.
+        assert_eq!(io.glb_input.get(&GLB_DOORBELL_REQ), Some(&0b00));
+        assert_eq!(io.doorbells, 1);
+        assert_eq!(io.delays, 1);
+    }
+
+    #[test]
+    fn stop_group_times_out_while_the_ack_still_shows_start() {
+        let mut io = FakeFirmware::new();
+        io.set(0x6500, CSG_STATE_START);
+        io.set(0x6700, CSG_STATE_START);
+        assert_eq!(
+            stop_group(&mut io, 0x6500, 0x6700, 1, 100_000_000),
+            Err(GroupError::AckTimeout {
+                req: 0,
+                ack: CSG_STATE_START
+            })
+        );
+        assert_eq!(io.delays, 10_000);
+    }
+
     #[test]
     fn start_group_times_out_without_the_ack() {
         let mut io = FakeFirmware::new();
@@ -5020,6 +5713,28 @@ mod g5a_tests {
         fn pixel(&self, x: u32, y: u32) -> u32 {
             self.read32(TARGET + u64::from(y * PAINT_WIDTH + x) * 4)
         }
+    }
+
+    //j733
+    #[test]
+    fn the_spin_stream_loops_on_its_own_decrement_between_two_cleaned_stores() {
+        assert_eq!(spin_store_stream(0x1000, 1, 0x2000, 2, 0), None);
+        let words = spin_store_stream(0x1000, 0x5717, 0x2000, 0xC0DE_0004, 7).unwrap();
+        // Mesa's convention: a branch at index b with offset o continues at b + 1 + o.
+        let branch_at = words.iter().position(|word| *word >> 56 == 22).unwrap();
+        let target = branch_at as i64 + 1 - 2;
+        assert_eq!(words[branch_at], branch(CS_COND_NEQUAL, 4, -2));
+        assert_eq!(words[target as usize], add_imm32(4, 4, -1));
+        assert_eq!(words[target as usize - 1], move32(4, 7));
+        // The started store is cleaned and waited on before the loop, the value store after it.
+        let started = &words[..6];
+        let finished = &words[branch_at + 1..];
+        assert_eq!(started[0], move48(0, 0x1000));
+        assert_eq!(started[2], sync_set32(0, 0, 2));
+        assert_eq!(started[4..], [flush_cache2(0, 3), wait_slot(1)]);
+        assert_eq!(finished[0], move48(0, 0x2000));
+        assert_eq!(finished[1], move32(2, 0xC0DE_0004));
+        assert_eq!(finished[3..], [flush_cache2(0, 3), wait_slot(1)]);
     }
 
     #[test]
@@ -5569,5 +6284,43 @@ mod g5c_tests {
         assert_eq!(on_disk.len() as u64, number(&m, "binary_bytes"));
         assert_eq!(on_disk.len() % 8, 0);
         assert_eq!(m["mesa"], "26.2.5-1");
+    }
+}
+
+#[cfg(test)]
+mod group_failure_tests {
+    use super::*;
+    #[test]
+    fn observed_faults_outrank_deadlines_and_unknown_irq_failures_stay_unknown() {
+        use protocol::{GroupReport, GroupState};
+        for outcome in [
+            JobWait::Interrupt,
+            JobWait::LateSeqno,
+            JobWait::NoInterrupt,
+            JobWait::Stalled,
+        ] {
+            for (gpu, fault, fatal, mmu) in [
+                (9, 0, 0, false),
+                (0, 7, 0, false),
+                (0, 0, 8, false),
+                (0, 0, 0, true),
+            ] {
+                assert_eq!(
+                    classify_group_failure(outcome, gpu, fault, fatal, mmu),
+                    GroupReport {
+                        state: GroupState::Fatal,
+                        gpu_status: gpu
+                    }
+                );
+            }
+            assert_eq!(
+                classify_group_failure(outcome, 0, 0, 0, false),
+                if outcome == JobWait::Stalled {
+                    GroupReport::TIMED_OUT
+                } else {
+                    GroupReport::UNKNOWN
+                }
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@
 //j648
 //j669
 //j675
+//j709
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -56,6 +57,11 @@ pub const GFX_KEYS_PATH: &str = "bin/gfx-keys";
 pub const GFX_HOLD_PATH: &str = "bin/gfx-hold";
 /// G6b's cooperative GPU session proof program; receives only its GPU channel in x0.
 pub const GPU_CLIENT_PATH: &str = "bin/gpu-client";
+/// G8d-a's QEMU-only contained-close smoke pair. The server speaks the GPU wire to a fake
+/// backend and reports both containment records; the client arms a session and parks until
+/// Sora kills it. Neither touches the GPU or allocates DMA. — TIMBERDOODLE
+pub const GPU_CONTAIN_SERVER_PATH: &str = "bin/gpu-contain-server";
+pub const GPU_CONTAIN_CLIENT_PATH: &str = "bin/gpu-contain-client";
 /// `ls` as a real program: receives a read-only initrd VMO handle in `x0` and prints
 /// the entry list. The first program proven to *use* a passed capability (vs. the
 /// capability-less `hello`); launched by the shell's `ls` builtin, which narrows the

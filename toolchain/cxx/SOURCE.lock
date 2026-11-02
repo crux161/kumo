@@ -1,0 +1,56 @@
+{
+  "repository": "https://github.com/llvm/llvm-project",
+  "ref": "llvmorg-22.1.8",
+  "files": {
+    "libcxx/src/hash.cpp": {
+      "git_blob": "e1e6d2b4c2bdbaa297204a8d6dd138b47f147c36",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/hash.cpp",
+      "sha256": "1d5dd63a8ed59a79f945a8b3be6361819bd7ab0b6873a5d4c145ef2e19a58cdc"
+    },
+    "libcxx/src/mutex.cpp": {
+      "git_blob": "5b1e7da121fc45c7a60880f7a46325211cebf020",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/mutex.cpp",
+      "sha256": "e458015dc1dd19969bc811b2865b7c5d7ea36f4a345cd7b232bb8343299caef4"
+    },
+    "libcxx/src/mutex_destructor.cpp": {
+      "git_blob": "4c63ea0da74da6bfc585431e6507d2e72a1d08d9",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/mutex_destructor.cpp",
+      "sha256": "b3df9d6ce47baa0901227a8c1d6761c2979481c8843b5f375605d62c5c12f389"
+    },
+    "libcxx/src/include/atomic_support.h": {
+      "git_blob": "410f64b26711135b5f9aa7132041d4e05552d187",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/include/atomic_support.h",
+      "sha256": "c01d71b5a8fe48773f3670166030284b1050413e22f24bf21bb8c64637036f9e"
+    },
+    "libcxxabi/src/cxa_guard.cpp": {
+      "git_blob": "514fa962e3daa8364beced766a3bde5117f4be37",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxxabi/src/cxa_guard.cpp",
+      "sha256": "97dbc2a48acb2233301bd7c11717cda173b23c73e7da64eb1710332c3b19f54d"
+    },
+    "libcxxabi/src/cxa_guard_impl.h": {
+      "git_blob": "191a589176b1a306d634a7de366b1b67d117a8ca",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxxabi/src/cxa_guard_impl.h",
+      "sha256": "0c77f1e80dd8115e7fae1674e7c539b239b72b2b9552b79aaab68fd454d82f6d"
+    },
+    "libcxxabi/src/abort_message.h": {
+      "git_blob": "2c12c429569d342c5b06f3c387c56f385a426456",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxxabi/src/abort_message.h",
+      "sha256": "a5d95a89ae7013a171d3f7688f70f7b71e870ff85f2144c250782c399cff20de"
+    },
+    "libcxxabi/src/cxa_virtual.cpp": {
+      "git_blob": "8f4fdd0919f0e2243922e58e208ac1991d0af289",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxxabi/src/cxa_virtual.cpp",
+      "sha256": "0862e2a61238ea37d8aea2d5ebb21664df4217b3658f5a81c61813b6ed673949"
+    },
+    "libcxx/LICENSE.TXT": {
+      "git_blob": "e159d283443f92ac78b964d2bccebe8f95d5d445",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/LICENSE.TXT",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+    },
+    "libcxx/src/algorithm.cpp": {
+      "git_blob": "8157be6f7406e814369d0a45bafd9c4320277f46",
+      "url": "https://github.com/llvm/llvm-project/blob/llvmorg-22.1.8/libcxx/src/algorithm.cpp",
+      "sha256": "32d0eded6a24dcf1e5d4968e7a8e9902b459084bbe08d681dc14bf093ce53f9a"
+    }
+  }
+}

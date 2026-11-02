@@ -1,4 +1,8 @@
-//j632
+//j719
+//j731
+//j732
+//j743
+//j748
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -10,14 +14,70 @@
 //! Sora's ELF image is retained as a [`SoraRecipe`] so the kernel can relaunch it
 //! after a crash (`DESIGN/002`). Stage-A runs a bounded restart loop (3 attempts).
 
-//j627
-//j628
-//j629
-//j630
-//j660
-
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+//j725
+//j725
+// IRQ-path instrument: the sweep instrument from J723/J724 needed kernel-side numbers to see
+// whether the serve wake is late because the timer sweep itself runs late. Counts are cheap
+// relaxed atomics; the record prints every 1024 sweeps at NOTICE. — TIMBERDOODLE
+static IRQ_BUSY_SKIPS: AtomicU32 = AtomicU32::new(0);
+static TIMER_TICK_SKIPS: AtomicU32 = AtomicU32::new(0);
+static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
+static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
+
+//j731
+// Engine census is opt-in through `dmesg -n debug`; lower the level to stop it. Once enabled,
+// print list lengths and dispatch window maxima at most every 10 s as Sora enters `PortWait`.
+// Ordinary login and shell input must not start periodic diagnostics. — TIMBERDOODLE
+#[cfg(target_os = "none")]
+static CENSUS_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+fn log_engine_census_if_due() {
+    if !crate::kmsg::visible(crate::kmsg::DEBUG) {
+        return;
+    }
+    let now = kumo_hal::active::monotonic_nanos();
+    let last = CENSUS_AT_NS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 10_000_000_000 {
+        return;
+    }
+    CENSUS_AT_NS.store(now, Ordering::Relaxed);
+    let (c, sora_live, sora_slots) = with_sora(|sora| {
+        let table = sora.process.handles();
+        (
+            sora.engine.census(Some(&sora.process)),
+            table.live_count(),
+            table.slot_count(),
+        )
+    });
+    let ([call, ctx, irq, vmo], calls) = crate::syscall::take_dispatch_maxima();
+    crate::klog_at!(
+        kumo_abi::sys::log_level::NOTICE,
+        "census: ports={} chans={} binds={} timers={} irqs={} vmos={}/{}dma ctxs={} dvmaps={} procs={} handles={}/{} sora={}/{} | n={} max-us call={} ctx={} irq={} vmo={}\n",
+        c.ports,
+        c.channels,
+        c.port_bindings,
+        c.timers,
+        c.interrupts,
+        c.vmos,
+        c.dma_vmos,
+        c.device_ctxs,
+        c.device_vmar_mappings,
+        c.processes,
+        c.handles,
+        c.handle_slots,
+        sora_live,
+        sora_slots,
+        calls,
+        call / 1_000,
+        ctx / 1_000,
+        irq / 1_000,
+        vmo / 1_000
+    );
+}
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -346,10 +406,36 @@ extern "C" fn signal_irq(irq: u32) {
         }
         let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
         sora.engine.signal_interrupt(irq);
+        //j725
+        // Record how late the sweep would be before it runs, then the running maxima/counts,
+        // and print one record every 1024 sweeps. — TIMBERDOODLE
+        let sweep_late = sora.engine.timer_sweep_late(now_ns);
         sora.engine.signal_timers(now_ns);
+        if sweep_late > SWEEP_MAX_LATE_NS.load(Ordering::Relaxed) {
+            SWEEP_MAX_LATE_NS.store(sweep_late, Ordering::Relaxed);
+        }
+        let sweeps = SWEEP_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if sweeps & 0x3ff == 0 {
+            crate::klog_at!(
+                kumo_abi::sys::log_level::NOTICE,
+                "sched: sweeps={} max-late={}ns busy-skips={} timer-skips={}\n",
+                sweeps,
+                SWEEP_MAX_LATE_NS.load(Ordering::Relaxed),
+                IRQ_BUSY_SKIPS.load(Ordering::Relaxed),
+                TIMER_TICK_SKIPS.load(Ordering::Relaxed)
+            );
+        }
         late
     });
     let Some(late) = delivered else {
+        //j725
+        // A busy SoraState borrow skips the whole signal path, timer sweep included. Count it,
+        // and count the timer PPI separately: those ticks are dropped rather than deferred.
+        // — TIMBERDOODLE
+        IRQ_BUSY_SKIPS.fetch_add(1, Ordering::Relaxed);
+        if irq < 32 {
+            TIMER_TICK_SKIPS.fetch_add(1, Ordering::Relaxed);
+        }
         // A full deferral set would lose this line rather than storm the machine; with
         // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
         if irq >= 32 {
@@ -1182,37 +1268,67 @@ fn teardown_process_and_signal(koid: KoId) {
             };
             proc.handles_mut().drain()
         };
+        //j719
+        // Two passes: every drained entry owns its capability reference until it drops, so
+        // the registry may only judge an endpoint's last owner after the whole table has
+        // been released. — TIMBERDOODLE
+        let mut drained = Vec::new();
         for entry in handles {
-            match entry.kind {
+            let kind = entry.kind;
+            let koid = entry.koid;
+            drop(entry);
+            drained.push((kind, koid));
+        }
+        for (kind, koid) in drained {
+            match kind {
                 kumo_abi::ObjectKind::Channel => {
-                    if let Ok(Some(peer_koid)) = sora.engine.ipc_mut().close_by_koid(entry.koid) {
-                        sora.engine
-                            .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
-                        closed_peers.push(peer_koid);
+                    if let Ok(peer_koids) = sora.engine.ipc_mut().close_by_koid(koid) {
+                        for peer_koid in peer_koids {
+                            sora.engine
+                                .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
+                            closed_peers.push(peer_koid);
+                        }
                     }
                 }
                 // A dying driver's hardware authority is soft-state (DESIGN/002 §3):
                 // reclaim its Resource grants so a restarted instance
                 // re-binds cleanly instead of stacking orphaned entries in the engine.
                 kumo_abi::ObjectKind::Resource => {
-                    sora.engine.release_resource(entry.koid);
+                    sora.engine.release_resource(koid);
                 }
                 _ => {}
             }
             // Any object this process owned may have been a port or a watched object;
             // drop port bindings on either side so a dead watch never lingers.
             if !matches!(
-                entry.kind,
+                kind,
                 kumo_abi::ObjectKind::DeviceCtx | kumo_abi::ObjectKind::Interrupt
             ) {
-                sora.engine.release_port_bindings(entry.koid);
+                sora.engine.release_port_bindings(koid);
             }
         }
         // Drained entries have now dropped their capability owners. Retain uncertain
         // contexts and retire final IRQ owners before publishing termination; surviving
         // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
+        //j732
+        // A dead child's mapping records are references too: release them before the VMO pass
+        // so the buffers it mapped can retire (J731). Sora's own teardown keeps hers.
+        // — TIMBERDOODLE
+        if !primary {
+            let (released, kept) = sora.engine.release_process_mappings(koid);
+            if kept != 0 {
+                crate::klog_at!(
+                    kumo_abi::sys::log_level::NOTICE,
+                    "teardown: process {} kept {} of {} mappings (clear refused)\n",
+                    koid.0,
+                    kept,
+                    released + kept
+                );
+            }
+        }
         sora.engine.retire_device_contexts();
         sora.engine.retire_interrupts();
+        sora.engine.retire_vmos(None);
         if primary {
             sora.process.signal(kumo_abi::Signals::TERMINATED);
         } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {
@@ -1555,6 +1671,33 @@ fn dispatch_object_syscall(
     } else if num == Syscall::VmoCreate as u64 {
         let size = r[0];
         match engine.dispatch(target, KernelCall::VmoCreate { size }) {
+            KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
+            _ => r[0] = u64::MAX,
+        }
+    } else if num == Syscall::VmoCreatePaged as u64 {
+        let size = r[0];
+        let ptr = r[1];
+        let count = r[2];
+        let valid = crate::mm::align_up(size)
+            .is_some_and(|len| len != 0 && len / crate::mm::PAGE_SIZE == count)
+            && ptr % 8 == 0
+            && count
+                .checked_mul(8)
+                .is_some_and(|len| target.user_range_is_writable(ptr, len));
+        if !valid {
+            r[0] = u64::MAX;
+            return true;
+        }
+        // Require mapped writable output, including the installed stack. The backend writes
+        // only after allocation and handle publication succeed. — KESTREL
+        match engine.dispatch(
+            target,
+            KernelCall::VmoCreatePaged {
+                size,
+                pages: ptr as *mut u64,
+                count: count as usize,
+            },
+        ) {
             KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
             _ => r[0] = u64::MAX,
         }
@@ -2056,6 +2199,9 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 return;
             }
         }
+        //j731
+        #[cfg(target_os = "none")]
+        log_engine_census_if_due();
         r[0] = wait_sora_port_without_borrow(port);
         crate::user_thread::reschedule_if_pending_after_svc();
         return;

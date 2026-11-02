@@ -1,36 +1,62 @@
 #![no_std]
-//j647
-//j650
-//j651
-//j652
-//j681
+//j744
+//j746
+//j749
+//j751
+//j752
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
 //! local to that channel and become invalid when it closes. Reconnect and recreate after a
 //! driver restart; never replay a Submit whose outcome is unknown.
 //!
-//! BufferCreate allocates DMA backing in the driver and returns a shared VMO handle with the
-//! reply. Requests carry no handles or physical addresses. The transport must enforce those
+//! BufferCreate allocates DMA backing in the driver on demand, bounded by a total live-memory
+//! budget rather than a fixed object count, and returns a shared VMO handle with the reply.
+//! BufferDestroy releases one allocation: the session first unbinds every GPU VA mapping that
+//! names it, then the backend releases the backing. Creation, destruction and their implicit
+//! unbind batches are legal after GroupCreate: the driver orders same-address-space work and
+//! flushes the space, while explicit VmBind and VmUnbind (opcode 15) narrow the invalidation
+//! to the packed page-table region (RESEARCH/017) without stopping any queue.
+//! Requests carry no handles or physical addresses. The transport must enforce those
 //! handle counts, resolve IDs in this session, retain backing until the GPU is quiescent and
-//! reject overlapping binds. Bind before GroupCreate; mappings remain fixed until close.
+//! reject overlapping binds. Unbind names an exact tiling of live bindings and never exposes
+//! backing the GPU may still reach.
 //! This library validates frames and arithmetic, not kernel rights or the server object table.
 //! Clients stop writing bound buffers before Submit and reuse them after completion. This
 //! cooperative first lane does not claim isolation from hostile command streams.
 //!
 //! G6b serves this contract from drv-gpu for one brokered client per boot.
 
+extern crate alloc;
+
+pub mod bo;
 pub mod c;
+pub mod c_sync;
 pub mod client;
+pub mod group;
 pub mod session;
+pub mod sync;
 pub mod wire;
+pub use group::{GroupReport, GroupState, GroupWatch};
 pub use wire::{Command, Reply, Request, Response, REPLY_LEN, REQUEST_LEN};
 
 pub const PAGE_BYTES: u64 = 4096;
-/// First lane: a 16 MiB client window, separate from G5's resident work buffers.
+/// A 256 MiB client window, separate from G5's resident work buffers.
 pub const VA_START: u64 = 0x2000_0000;
-pub const VA_END: u64 = 0x2100_0000;
-pub const MAX_BUFFER_BYTES: u64 = 2 * 1024 * 1024;
+pub const VA_END: u64 = 0x3000_0000;
+// Valhall's blend descriptor keeps only the low 32 bits of a blend shader's PC, so every
+// executable binding a client makes must share one 4 GiB region (G7o-e). Panthor's auto-VA
+// enforces it with a split heap; here the whole window is one region. — TIMBERDOODLE
+const _: () = assert!(VA_START >> 32 == (VA_END - 1) >> 32);
+/// The largest single allocation. A buffer's GPU binding must fit wholly inside this length.
+pub const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+/// Live DMA bytes one channel may hold at once. G8a removes the fixed four-entry table: a
+/// BufferCreate succeeds while the *budget* has room, so the count of live buffers is a
+/// consequence of their sizes (at most `MAX_TOTAL_BUFFER_BYTES / PAGE_BYTES` of 4 KiB
+/// buffers) rather than a separate policy limit. Destroy returns a buffer's bytes to the
+/// budget. Physical-frame reclamation is the kernel's; this is the protocol's accounting.
+/// — TIMBERDOODLE
+pub const MAX_TOTAL_BUFFER_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_STREAM_BYTES: u32 = 64 * 1024;
 pub const RING_BYTES: u32 = 4096;
 
@@ -101,6 +127,22 @@ pub struct DeviceThreads {
     pub max_threads: u32,
     pub max_workgroup_size: u32,
     pub thread_features: u32,
+}
+
+/// The memory-system words, crossed undecoded like their siblings: `L2_FEATURES` (GPU_CONTROL
+/// +0x004), `MEM_FEATURES` (+0x010) and `COHERENCY_FEATURES` (+0x300), plus the
+/// `GPU_COHERENCY_PROTOCOL` value the driver itself programmed before L2 power-up (31 is
+/// "none"). Upstream derives the L2 slice count from `MEM_FEATURES[11:8]` and the bus width
+/// from `L2_FEATURES[31:24]`, and sets `is_io_coherent` from the protocol the kernel selected,
+/// which is what `coherency_protocol` is here. The raw `COHERENCY_FEATURES` word is the
+/// hardware's half of that decision and no consumer decodes it. Required: every word is read
+/// unconditionally at bring-up. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceMemory {
+    pub l2_features: u32,
+    pub mem_features: u32,
+    pub coherency_features: u32,
+    pub coherency_protocol: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +217,29 @@ impl Binding {
         self.vm == other.vm
             && self.va < other.va.saturating_add(other.bytes)
             && other.va < self.va.saturating_add(self.bytes)
+    }
+}
+
+/// A live-unbind request: remove this session's mappings covering exactly `va..va + bytes` on
+/// `vm`. The range must tile whole live bindings with no partial, missing or foreign coverage;
+/// page alignment and the same `0x2000_0000..0x3000_0000` window as VmBind apply. Unlike a
+/// binding, one request may name several adjacent bindings. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Unbind {
+    pub vm: u32,
+    pub va: u64,
+    pub bytes: u64,
+}
+
+impl Unbind {
+    /// The same window and alignment rules as a binding, plus a nonempty range. Ownership and
+    /// exact tiling are the session's checks, not this arithmetic helper's. — TIMBERDOODLE
+    pub fn valid_shape(self) -> bool {
+        self.vm != 0
+            && self.bytes > 0
+            && self.va % PAGE_BYTES == 0
+            && self.bytes % PAGE_BYTES == 0
+            && in_window(self.va, self.bytes)
     }
 }
 

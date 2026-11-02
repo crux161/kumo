@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j647*/
-/*j650*/
-/*j651*/
-/*j652*/
-/*j653*/
+/*j742*/
+/*j744*/
+/*j745*/
+/*j751*/
+/*j752*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -11,16 +11,28 @@
 #include <stdint.h>
 
 /* Private versioned C boundary, mirrored by kumo_gpu::c. The opaque context is a
- * borrowed Rust Client, never an FD or kernel handle. It may be called serially,
- * synchronously within with_api only; do not retain, reenter, race or unwind it.
- * No handle or object ownership crosses the query-only G7 boundary. — KESTREL */
-#define KUMO_GPU_API_VERSION 9u
+ * borrowed Rust Client or BO store, never an FD or kernel handle. It may be called serially,
+ * synchronously within the borrowed API callback only; do not retain, reenter, race or unwind it.
+ * BO callbacks are optional for query-only with_api; with_buffer_api supplies all four.
+ * with_device_api supplies native lifecycle/bind callbacks and closes its owned session
+ * on normal scope return. The device owns one manual-VA logical VM at a time; status
+ * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
+ * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
+ * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
+#define KUMO_GPU_API_VERSION 14u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
 #define KUMO_GPU_TRANSPORT 3u
 #define KUMO_GPU_PROTOCOL 4u
 #define KUMO_GPU_DEVICE_LOST 5u
+#define KUMO_GPU_NO_MEMORY 6u
+#define KUMO_GPU_MAP_FAILED 7u
+#define KUMO_GPU_UNMAP_FAILED 8u
+#define KUMO_GPU_UNKNOWN_BUFFER 9u
+#define KUMO_GPU_UNKNOWN_OBJECT 10u
+#define KUMO_GPU_UNSUBMITTED 11u
+#define KUMO_GPU_WAIT_FAILED 12u
 #define KUMO_GPU_SERVER_ERROR 16u /* plus kumo_gpu::Status */
 
 struct kumo_gpu_info {
@@ -48,12 +60,110 @@ struct kumo_gpu_info {
     uint32_t texture_features_1;
     uint32_t texture_features_2;
     uint32_t texture_features_3;
+    /* Version10 (G7o-a): the required memory-system words, verbatim, zero included —
+     * L2_FEATURES (+0x004), MEM_FEATURES (+0x010), COHERENCY_FEATURES (+0x300) — and the
+     * GPU_COHERENCY_PROTOCOL value drv-gpu programmed before L2 power-up. — TIMBERDOODLE */
+    uint32_t l2_features;
+    uint32_t mem_features;
+    uint32_t coherency_features;
+    uint32_t coherency_protocol;
+    /* The protocol's VM page granule and the only leaf size drv-gpu writes: service policy,
+     * like the window above. It becomes pgsize_bitmap. */
+    uint64_t page_bytes;
 };
+
+/* GPU_COHERENCY_PROTOCOL's "no coherency" encoding, also Panthor's
+ * DRM_PANTHOR_GPU_COHERENCY_NONE. Upstream's is_io_coherent is `protocol != NONE`. */
+#define KUMO_GPU_COHERENCY_NONE 31u
+/* BOs expose session-local IDs, never VMO handles or physical addresses. — KESTREL */
+#define KUMO_GPU_BO_EXECUTABLE 1u
+#define KUMO_GPU_BO_NO_MMAP (1u << 2)
+#define KUMO_GPU_BO_GPU_UNCACHED (1u << 5)
+#define KUMO_GPU_BO_FLAGS (KUMO_GPU_BO_EXECUTABLE | KUMO_GPU_BO_NO_MMAP | KUMO_GPU_BO_GPU_UNCACHED)
+struct kumo_gpu_buffer_info {
+    uint32_t id;
+    uint32_t flags;
+    uint64_t bytes;
+};
+
+struct kumo_gpu_vm_binding {
+    uint32_t vm;
+    uint32_t buffer;
+    uint64_t va;
+    uint64_t offset;
+    uint64_t bytes;
+};
+
+/* Native IDs are scoped metadata keys, never kernel handles. Snapshot/job/wake IDs are
+ * owned until DROP; WAIT consumes its wake ID on every outcome. No ID ever repeats across
+ * contexts. Requests, bounded arrays and output storage must be live, aligned and distinct.
+ * All calls are serial inside the original with_device_api scope. — MILVUS */
+#define KUMO_NATIVE_CREATE_BINARY 1u
+#define KUMO_NATIVE_CREATE_TIMELINE 2u
+#define KUMO_NATIVE_DROP 3u
+#define KUMO_NATIVE_RESET 4u
+#define KUMO_NATIVE_SIGNAL 5u
+#define KUMO_NATIVE_PENDING 6u
+#define KUMO_NATIVE_SNAPSHOT 7u
+#define KUMO_NATIVE_ARM 8u
+#define KUMO_NATIVE_WAIT 9u
+#define KUMO_NATIVE_GROUP_CREATE 10u
+#define KUMO_NATIVE_PREPARE 11u
+#define KUMO_NATIVE_STEP 12u
+#define KUMO_NATIVE_GROUP_STATE 13u
+/* Mutually exclusive native values, not DRM bit flags. UNKNOWN asserts neither a GPU
+ * fault nor a timeout; no group-state result is a fence completion. — MILVUS */
+#define KUMO_GROUP_USABLE 0u
+#define KUMO_GROUP_FATAL 1u
+#define KUMO_GROUP_TIMED_OUT 2u
+#define KUMO_GROUP_UNKNOWN 3u
+#define KUMO_NATIVE_UNAVAILABLE 0u
+#define KUMO_NATIVE_AVAILABLE 1u
+#define KUMO_NATIVE_COMPLETE 2u
+#define KUMO_NATIVE_SUBMITTED 3u
+#define KUMO_NATIVE_WOKEN 4u
+#define KUMO_NATIVE_TIMED_OUT 5u
+#define KUMO_NATIVE_CLOSED 6u
+#define KUMO_NATIVE_MAX_OBJECTS 256u
+#define KUMO_NATIVE_MAX_WAITS 64u
+#define KUMO_NATIVE_MAX_TIMEOUT_NS UINT64_C(5000000000)
+struct kumo_gpu_native_point { uint64_t id, value; };
+struct kumo_gpu_native_job {
+    uint32_t vm, stream_bytes;
+    uint64_t stream_va, signal_point;
+};
+struct kumo_gpu_native_request {
+    uint32_t operation, flags;
+    uint64_t id, value;
+    struct kumo_gpu_native_job job;
+    const struct kumo_gpu_native_point *waits, *signals;
+    uint32_t wait_count, signal_count;
+};
+struct kumo_gpu_native_reply {
+    uint64_t id;
+    uint32_t state, gpu_status;
+    uint64_t value;
+};
+
 struct kumo_gpu_api {
     uint32_t version;
     uint32_t bytes;
     void *context;
     uint32_t (*query)(void *context, struct kumo_gpu_info *out);
+    uint32_t (*buffer_create)(void *context, uint64_t bytes, uint32_t flags,
+                              struct kumo_gpu_buffer_info *out);
+    uint32_t (*buffer_destroy)(void *context, uint32_t id);
+    uint32_t (*buffer_map)(void *context, uint32_t id, void **out);
+    uint32_t (*buffer_unmap)(void *context, uint32_t id);
+    uint32_t (*device_open)(void *context);
+    uint32_t (*device_close)(void *context);
+    uint32_t (*vm_create)(void *context, uint64_t start, uint64_t bytes, uint32_t *out);
+    uint32_t (*vm_destroy)(void *context, uint32_t vm);
+    uint32_t (*vm_bind)(void *context, const struct kumo_gpu_vm_binding *binding);
+    uint32_t (*vm_unbind)(void *context, uint32_t vm, uint64_t va, uint64_t bytes);
+    uint32_t (*device_status)(void *context);
+    uint32_t (*native)(void *context, const struct kumo_gpu_native_request *request,
+                       struct kumo_gpu_native_reply *out);
 };
 
 #define KUMO_MESA_INCOMPLETE 1u
@@ -64,7 +174,10 @@ struct kumo_gpu_api {
 
 /* Complete pan_kmod_dev_props groups still unavailable over GetInfo. See README.
  * This mask records missing information; zero-filled properties are never a device.
- * Unsupported BO/VM/group/sync operations are listed separately. — KESTREL */
+ * Unsupported BO/VM/group/sync operations are listed separately. — KESTREL
+ * Since G7o-a bits 2 and 6-9 always clear on a published report: memory words are attested
+ * and the rest is stated KUMO policy. Only 1, 3 and 4 can remain, each for an absent or
+ * unusable optional group. — TIMBERDOODLE */
 #define KUMO_MESA_MISSING_VARIANT (UINT64_C(1) << 0)
 #define KUMO_MESA_MISSING_TOPOLOGY (UINT64_C(1) << 1)
 #define KUMO_MESA_MISSING_MEMORY (UINT64_C(1) << 2)
@@ -120,12 +233,27 @@ struct kumo_mesa_report {
      * block; it occupies the four bytes that were tail padding, so the report stays 168 bytes.
      * — TIMBERDOODLE */
     uint32_t has_afbc;
+    /* G7o-a. The first two are upstream's own derivations from the attested words,
+     * pan_query_l2_slices (MEM_FEATURES[11:8] + 1) and pan_query_bus_width
+     * (1 << L2_FEATURES[27:24]). The rest copy the completed pan_kmod_dev_props: pgsize_bitmap
+     * from page_bytes, is_io_coherent by upstream's expression, and KUMO's stated policy for
+     * priorities, BO/VM flags and timestamps. — TIMBERDOODLE */
+    uint32_t l2_slices;
+    uint32_t bus_width;
+    uint64_t pgsize_bitmap;
+    uint32_t is_io_coherent;
+    uint32_t allowed_group_priorities_mask;
+    uint32_t supported_bo_flags;
+    uint32_t supported_vm_op_flags;
+    uint32_t gpu_can_query_timestamp;
+    uint32_t timestamp_device_coherent;
+    uint64_t timestamp_frequency;
 };
 
 uint32_t kumo_mesa_probe(const struct kumo_gpu_api *api,
                          struct kumo_mesa_report *out);
 
-_Static_assert(sizeof(struct kumo_gpu_info) == 80, "query layout");
+_Static_assert(sizeof(struct kumo_gpu_info) == 104, "query layout");
 _Static_assert(offsetof(struct kumo_gpu_info, va_start) == 8, "query alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, mmu_features) == 40, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, tiler_features) == 44, "query tail alignment");
@@ -137,20 +265,45 @@ _Static_assert(offsetof(struct kumo_gpu_info, thread_features) == 64, "query thr
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_1) == 68, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_2) == 72, "query tail alignment");
 _Static_assert(offsetof(struct kumo_gpu_info, texture_features_3) == 76, "query tail alignment");
-/* Version8 appended the remaining texture words to the embedded info, so the private report
- * grew with it: 80-byte info, 168-byte report, thread block starting at 144. Version9 adds
- * has_afbc in the four bytes that were tail padding, so the size does not move again. Field
- * order is unchanged; only the trailing layout moves. — TIMBERDOODLE */
-_Static_assert(sizeof(struct kumo_mesa_report) == 168, "report layout");
-_Static_assert(offsetof(struct kumo_mesa_report, missing_properties) == 80, "report layout");
-_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 144, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 148, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 152, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 156, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 160, "report thread offset");
-_Static_assert(offsetof(struct kumo_mesa_report, has_afbc) == 164, "report tail alignment");
+_Static_assert(offsetof(struct kumo_gpu_info, l2_features) == 80, "query memory offset");
+_Static_assert(offsetof(struct kumo_gpu_info, mem_features) == 84, "query memory offset");
+_Static_assert(offsetof(struct kumo_gpu_info, coherency_features) == 88, "query memory offset");
+_Static_assert(offsetof(struct kumo_gpu_info, coherency_protocol) == 92, "query memory offset");
+_Static_assert(offsetof(struct kumo_gpu_info, page_bytes) == 96, "query page granule offset");
+/* Version10 grew the embedded info from 80 to 104 bytes, so every report field moved by 24:
+ * the thread block now starts at 168 and has_afbc sits at 188. The G7o-a block follows at
+ * 192 with both u64 fields naturally aligned, and the report ends at 240 with no padding.
+ * Field order is unchanged; only the trailing layout moves. — TIMBERDOODLE */
+_Static_assert(sizeof(struct kumo_mesa_report) == 240, "report layout");
+_Static_assert(offsetof(struct kumo_mesa_report, missing_properties) == 104, "report layout");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_core) == 168, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_threads_per_wg) == 172, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tasks_per_core) == 176, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, num_registers_per_core) == 180, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, max_tls_instance_per_core) == 184, "report thread offset");
+_Static_assert(offsetof(struct kumo_mesa_report, has_afbc) == 188, "report tail alignment");
+_Static_assert(offsetof(struct kumo_mesa_report, l2_slices) == 192, "report memory offset");
+_Static_assert(offsetof(struct kumo_mesa_report, pgsize_bitmap) == 200, "report page offset");
+_Static_assert(offsetof(struct kumo_mesa_report, is_io_coherent) == 208, "report policy offset");
+_Static_assert(offsetof(struct kumo_mesa_report, timestamp_frequency) == 232, "report policy offset");
+_Static_assert(sizeof(struct kumo_gpu_buffer_info) == 16, "buffer layout");
+_Static_assert(offsetof(struct kumo_gpu_buffer_info, bytes) == 8, "buffer alignment");
+_Static_assert(sizeof(struct kumo_gpu_vm_binding) == 32, "VM binding layout");
 #if UINTPTR_MAX == UINT64_MAX
-_Static_assert(sizeof(struct kumo_gpu_api) == 24, "64-bit callback layout");
+_Static_assert(sizeof(struct kumo_gpu_api) == 120, "64-bit callback layout");
+_Static_assert(offsetof(struct kumo_gpu_api, native) == 112, "native callback offset");
+_Static_assert(sizeof(struct kumo_gpu_native_point) == 16, "native point layout");
+_Static_assert(sizeof(struct kumo_gpu_native_job) == 24, "native job layout");
+_Static_assert(sizeof(struct kumo_gpu_native_request) == 72, "native request layout");
+_Static_assert(offsetof(struct kumo_gpu_native_request, waits) == 48, "native waits offset");
+_Static_assert(offsetof(struct kumo_gpu_native_request, wait_count) == 64, "native counts offset");
+_Static_assert(sizeof(struct kumo_gpu_native_reply) == 24, "native reply layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_create) == 24, "create callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_destroy) == 32, "destroy callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_map) == 40, "map callback");
+_Static_assert(offsetof(struct kumo_gpu_api, buffer_unmap) == 48, "unmap callback");
+_Static_assert(offsetof(struct kumo_gpu_api, device_open) == 56, "device callback");
+_Static_assert(offsetof(struct kumo_gpu_api, device_status) == 104, "device state callback");
 #endif
 #endif

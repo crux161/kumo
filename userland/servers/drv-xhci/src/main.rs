@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j550
-//j559
-//j664
 //j665
 //j666
 //j690
+//j703
+//j704
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -204,6 +203,9 @@ const DOWNSTREAM_PAGES: u32 = 32;
 const HUB_FEATURE_PORT_ENABLE: u8 = 1;
 const HUB_FEATURE_PORT_RESET: u8 = 4;
 const HUB_FEATURE_C_PORT_RESET: u8 = 20;
+/// SuperSpeed hub change features a port reset latches beyond C_PORT_RESET (USB 3.2 hub class).
+const HUB_FEATURE_C_PORT_LINK_STATE: u8 = 28;
+const HUB_FEATURE_C_BH_PORT_RESET: u8 = 29;
 const HUB_PORT_STATUS_ENABLE: u16 = 1 << 1;
 const HUB_PORT_STATUS_LOW_SPEED: u16 = 1 << 9;
 const HUB_PORT_STATUS_HIGH_SPEED: u16 = 1 << 10;
@@ -436,6 +438,13 @@ extern "C" fn main(
     // Slice B: drive KESTREL's host-proven no-op ladder on real silicon — reset the controller,
     // program the command/event rings + DCBAA in DMA memory, ring the doorbell, and read the
     // Command Completion Event back. The first time this ladder touches metal.
+    // A DWC3 core keeps host mode and PHY policy in its globals at +0xC100. The live DTB's
+    // quirks require settings the bootloader may not have applied; apply them before the xHCI
+    // reset ladder and log both sides for the next metal boot. — TIMBERDOODLE
+    if config.flags & kumo_xhci::FLAG_DWC3 != 0 {
+        apply_dwc3_host_init(config.flags);
+    }
+
     if let Some(layout) = layout {
         run_noop_ladder(layout, caps.caplength(), caps.max_ports());
         // Quiesce before exiting: we reset and started this controller, and leaving it running
@@ -459,6 +468,30 @@ fn quiesce_controller(layout: RegisterLayout) {
     let iman = io.read32(iman_offset(layout));
     io.write32(iman_offset(layout), iman & !(1 << 1));
     dsb();
+}
+
+/// Apply the DWC3 host-mode and PHY-policy writes, logging each register around the update.
+/// The globals are reachable because the register grant now spans +0xC100..+0xC6FF.
+/// — TIMBERDOODLE
+fn apply_dwc3_host_init(flags: u32) {
+    let plan = kumo_xhci::HostInit::for_flags(flags);
+    let mut io = Mmio;
+    for (name, update) in [
+        (b"gctl" as &[u8], plan.gctl),
+        (b"usb2" as &[u8], plan.usb2),
+        (b"usb3" as &[u8], plan.usb3),
+    ] {
+        let before = io.read32(update.offset);
+        io.write32(update.offset, (before & !update.clear) | update.set);
+        let after = io.read32(update.offset);
+        log_info(b"drv-xhci: dwc3 ");
+        log_info(name);
+        log_info(b" ");
+        log_hex(before as u64);
+        log_info(b" -> ");
+        log_hex(after as u64);
+        log_info(b"\n");
+    }
 }
 
 /// A dword MMIO port over the mapped controller register window for [`RegisterIo`].
@@ -609,6 +642,30 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
 
     let mut io = Mmio;
 
+    // Halt before HCRST (xHCI 4.20): clear Run/Stop and interrupts, then wait for USBSTS.HCH.
+    // Linux does exactly this in xhci_quiesce/xhci_halt; resetting a running controller left
+    // RK3588 root-port devices to time out. — TIMBERDOODLE
+    if layout.request_halt(&mut io).is_err() {
+        log(b"drv-xhci: halt write fail\n");
+        return;
+    }
+    let halt_deadline = Deadline::after(32_000_000);
+    loop {
+        dsb();
+        let halted = layout
+            .snapshot_status(&mut io)
+            .map(|status| status.halted())
+            .unwrap_or(false);
+        if halted {
+            break;
+        }
+        if halt_deadline.expired() {
+            log(b"drv-xhci: halt timeout\n");
+            return;
+        }
+        cooperative_yield();
+    }
+
     // Take ownership: request a host-controller reset, then wait for HCRST to self-clear and
     // CNR to drop (controller ready to accept ring programming).
     if layout.request_reset(&mut io).is_err() {
@@ -640,6 +697,24 @@ fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
     if layout.start(&mut io).is_err() {
         log(b"drv-xhci: start fail\n");
         return;
+    }
+    // xhci_start's other half: wait for HCH to clear, so the No-Op command is not issued to a
+    // controller that has not left halt. — TIMBERDOODLE
+    let start_deadline = Deadline::after(32_000_000);
+    loop {
+        dsb();
+        let running = layout
+            .snapshot_status(&mut io)
+            .map(|status| !status.halted())
+            .unwrap_or(false);
+        if running {
+            break;
+        }
+        if start_deadline.expired() {
+            log(b"drv-xhci: start timeout\n");
+            return;
+        }
+        cooperative_yield();
     }
 
     // The ring writes are Normal-NC; barrier so they are globally visible before the
@@ -3617,9 +3692,7 @@ fn configure_and_read_hub(
     log(b" power-good ms=");
     log_hex(hub.power_good_delay_ns() / 1_000_000);
     log(b"\n");
-    // Everything below is one bounded pass: a driver child cannot be preempted, so the hub work
-    // must promise an upper bound on how long it holds the CPU away from a live keyboard driver.
-    let pass = Deadline::after(HUB_PASS_BUDGET_NS);
+    // A driver child cannot be preempted, so every phase below runs under a wall-clock budget.
 
     // A SuperSpeed hub routes by the Route String, indexed by its own tier: SET_HUB_DEPTH (USB 3.2
     // §10.16.2.9) tells it which nibble is its own. A hub on a root port is depth 0.
@@ -3668,9 +3741,12 @@ fn configure_and_read_hub(
     }
 
     // --- Power every downstream port (SET_FEATURE PORT_POWER, feature 8) ---
+    // The power phase gets its own budget: the depth and endpoint setup above already consumed
+    // part of the pass, and a four-port hub needs one control transfer per port. — TIMBERDOODLE
+    let power_pass = Deadline::after(HUB_POWER_BUDGET_NS);
     let mut port = 1u8;
     while port <= nbr_ports {
-        if pass.expired() {
+        if power_pass.expired() {
             return log(b"drv-xhci: hub pass budget spent (power)\n");
         }
         let set_power = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00];
@@ -3714,7 +3790,7 @@ fn configure_and_read_hub(
                     // and strands a sibling controller's masked keyboard interrupt.
                     let mut got = None;
                     for _ in 0..HUB_STATUS_WAIT_ROUNDS {
-                        if pass.expired() {
+                        if power_pass.expired() {
                             break;
                         }
                         if let Some(result) = poll_transfer_event_limited(
@@ -3812,15 +3888,13 @@ fn configure_and_read_hub(
     log(b"drv-xhci: hub scan done\n");
 
     if speed_raw >= 4 {
-        // A device behind a SuperSpeed hub needs a SuperSpeed slot context (Route String, no
-        // Transaction Translator) and SS port-status decoding that `enumerate_hub_downstream` does
-        // not have yet. Name what is there; enumerating it is the next slice. — TIMBERDOODLE
+        // A SuperSpeed downstream device uses a SuperSpeed slot context, a Route String, no
+        // Transaction Translator, and the hub type as its speed. — TIMBERDOODLE
         for down_port in stable.iter() {
             log(b"drv-xhci: ss hub dev port=");
             log_hex(down_port as u64);
-            log(b" (downstream enumeration pending)\n");
+            log(b"\n");
         }
-        return;
     }
 
     // U2/J541: reach through the hub to every stable port, in ascending order and one at a time:
@@ -4177,7 +4251,11 @@ fn reset_and_address_downstream(
         let reply: [u8; 2] = hub_data_buf.read(0);
         let status = u16::from_le_bytes(reply);
         if status & HUB_PORT_STATUS_ENABLE != 0 {
-            down_speed = if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
+            // A SuperSpeed hub's downstream device is SuperSpeed by construction; Linux derives
+            // the device speed from the hub type, not the port-status speed bits. — TIMBERDOODLE
+            down_speed = if hub_speed_raw >= 4 {
+                4
+            } else if status & HUB_PORT_STATUS_LOW_SPEED != 0 {
                 2
             } else if status & HUB_PORT_STATUS_HIGH_SPEED != 0 {
                 3
@@ -4197,27 +4275,31 @@ fn reset_and_address_downstream(
     log_hex(down_speed as u64);
     log(b"\n");
 
-    // Acknowledge the reset-complete change bit so the hub stops reporting it.
-    let clear_change = [
-        0x23,
-        0x01,
-        HUB_FEATURE_C_PORT_RESET,
-        0x00,
-        down_port,
-        0x00,
-        0x00,
-        0x00,
-    ];
-    let _ = control_no_data(
-        io,
-        layout,
-        image,
-        evt,
-        hub_ep0_ring,
-        &mut *hub_ep0_seg,
-        hub_slot_id,
-        clear_change,
-    );
+    // Acknowledge the reset-complete change bits so the hub stops reporting them. A SuperSpeed
+    // hub latches C_BH_PORT_RESET and C_PORT_LINK_STATE in addition to C_PORT_RESET; Linux
+    // clears all three after an SS port reset. — TIMBERDOODLE
+    let clear_features: &[u8] = if hub_speed_raw >= 4 {
+        &[
+            HUB_FEATURE_C_PORT_RESET,
+            HUB_FEATURE_C_BH_PORT_RESET,
+            HUB_FEATURE_C_PORT_LINK_STATE,
+        ]
+    } else {
+        &[HUB_FEATURE_C_PORT_RESET]
+    };
+    for feature in clear_features {
+        let clear_change = [0x23, 0x01, *feature, 0x00, down_port, 0x00, 0x00, 0x00];
+        let _ = control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            hub_ep0_ring,
+            &mut *hub_ep0_seg,
+            hub_slot_id,
+            clear_change,
+        );
+    }
 
     // --- A private DMA page for this device's contexts, EP0 ring and buffers ---
     let (dev_va, dev_phys) = map_downstream_page()?;
@@ -4356,6 +4438,11 @@ const YIELD_INTERVAL: u32 = 512;
 /// non-preemptible driver may hold the machine — and lets the pass abort cleanly instead of
 /// stranding a sibling controller's keyboard.
 const HUB_PASS_BUDGET_NS: u64 = 400_000_000; // 400 ms
+
+/// Wall-clock budget for one hub's downstream power phase. A four-port hub needs one hub-class
+/// control transfer per port, which does not fit in the enumeration pass; the SuperSpeed hub
+/// expired inside it on metal. — TIMBERDOODLE
+const HUB_POWER_BUDGET_NS: u64 = 2_000_000_000;
 
 /// A monotonic wall-clock budget for one bounded pass of work.
 #[derive(Clone, Copy)]
@@ -4511,11 +4598,9 @@ fn ready_superspeed_port(caplength: u8, max_ports: u8, primary: u8) -> Option<(u
 /// Poll PORTSC after HCRST re-links the root ports until [`RootPortScan::choice`] picks one.
 /// Returns `(port_number, speed)` (port number is 1-based).
 fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
-    // PORTSC bits. PED (1) reads enabled; writing 1 disables, so mask it out of a modify-write.
-    // The change bits (17..=23, RW1C) must also be written 0 so a modify-write doesn't clear them.
-    const PORTSC_PED: u32 = 1 << 1;
-    const PORTSC_PR: u32 = 1 << 4;
-    const PORTSC_CHANGE_BITS: u32 = 0x7f << 17;
+    // A port reset must be issued through a neutral PORTSC value: PED is RW1CS and every change
+    // bit is RW1C, so a raw read-modify-write can disable the port or clear a change latch.
+    // — TIMBERDOODLE
     let mut reset_issued = [false; MAX_LOGGED_PORTS as usize];
     let mut fallback_ready = None;
     let deadline = Deadline::after(PORT_POLL_BUDGET_NS);
@@ -4532,13 +4617,11 @@ fn wait_for_device_port(caplength: u8, max_ports: u8) -> Option<(u8, u8)> {
                 let status = PortStatus::new(raw);
                 scan.observe(port + 1, status);
                 if status.connected() && !status.enabled() {
-                    // Connected but not enabled: a USB2 (Full/Low/High) device needs a software
-                    // Port Reset to reach Enabled; SuperSpeed ports auto-enable after link
-                    // training. Issue the reset once per port, then keep polling for PED.
+                    // Connected but not enabled: issue one neutral port reset per port, then
+                    // keep polling for PED. — TIMBERDOODLE
                     let index = port as usize;
                     if index < reset_issued.len() && !reset_issued[index] {
-                        let neutral = raw & !(PORTSC_PED | PORTSC_CHANGE_BITS);
-                        write32(offset, neutral | PORTSC_PR);
+                        write32(offset, kumo_xhci::port_reset_value(raw));
                         reset_issued[index] = true;
                     }
                 }

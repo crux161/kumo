@@ -1,8 +1,8 @@
-//j647
-//j650
-//j651
-//j652
-//j681
+//j707
+//j742
+//j744
+//j745
+//j752
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -11,9 +11,9 @@
 //! reset, DMA reclamation, a GPU fence or a Mesa/DRM implementation. — KESTREL
 
 use crate::{
-    Binding, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
-    DeviceTopology, Fence, Reply, Request, Response, Status, Submission, SyncState, REPLY_LEN,
-    REQUEST_LEN,
+    Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu, DeviceTexture,
+    DeviceThreads, DeviceTiler, DeviceTopology, Fence, Reply, Request, Response, Status,
+    Submission, SyncState, Unbind, REPLY_LEN, REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +33,12 @@ pub trait Transport {
         bytes: &mut [u8; REPLY_LEN + 1],
     ) -> Result<(usize, Option<Self::Handle>), TransportError>;
     fn close_handle(&mut self, handle: Self::Handle);
+}
+
+/// A native device owns its brokered endpoint. Close is a contained session loss, not a
+/// promise that DMA has already stopped; drv-gpu performs reset before release. — KESTREL
+pub trait SessionTransport: Transport {
+    fn close_session(&mut self);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +72,7 @@ pub struct Client<T: Transport> {
     transport: T,
     id: u32,
     lost: bool,
+    closed: bool,
 }
 
 impl<T: Transport> Client<T> {
@@ -76,6 +83,7 @@ impl<T: Transport> Client<T> {
             transport,
             id: 0,
             lost: false,
+            closed: false,
         }
     }
     pub fn is_lost(&self) -> bool {
@@ -124,6 +132,12 @@ impl<T: Transport> Client<T> {
         };
         Ok(threads)
     }
+    pub fn memory(&mut self) -> Result<DeviceMemory, Error> {
+        let (Response::Memory(memory), _) = self.call(Command::GetMemoryProperties)? else {
+            unreachable!()
+        };
+        Ok(memory)
+    }
     pub fn create_vm(&mut self) -> Result<u32, Error> {
         let (Response::VmCreated { vm }, _) = self.call(Command::VmCreate)? else {
             unreachable!()
@@ -146,11 +160,45 @@ impl<T: Transport> Client<T> {
         self.call(Command::VmBind(binding))?;
         Ok(())
     }
+    /// Remove exactly this session's live mappings in `range`. The range must tile whole
+    /// bindings; the server refuses an unknown, foreign or partial range without changing
+    /// anything, so a recoverable error is safe to retry with a corrected range. Live
+    /// unbind is allowed after GroupCreate. — TIMBERDOODLE
+    pub fn unbind(&mut self, range: Unbind) -> Result<(), Error> {
+        let (Response::VmUnbound(_), None) = self.call(Command::VmUnbind(range))? else {
+            unreachable!()
+        };
+        Ok(())
+    }
+    /// Release one allocation this session owns. The server first unbinds every mapping it
+    /// still holds for the buffer, then releases the backing; the granted handle stays the
+    /// caller's to close. IDs are never reused, so a second destroy of the same buffer is a
+    /// server `NotFound` rather than a fresh object. — TIMBERDOODLE
+    pub fn destroy_buffer(&mut self, buffer: &Buffer<T::Handle>) -> Result<(), Error> {
+        let (Response::BufferDestroyed { .. }, None) =
+            self.call(Command::BufferDestroy { buffer: buffer.id })?
+        else {
+            unreachable!()
+        };
+        Ok(())
+    }
     pub fn create_group(&mut self, vm: u32) -> Result<u32, Error> {
         let (Response::GroupCreated { group }, _) = self.call(Command::GroupCreate { vm })? else {
             unreachable!()
         };
         Ok(group)
+    }
+    pub fn watch_group(&mut self, group: u32) -> Result<crate::GroupWatch<T::Handle>, Error> {
+        let (Response::GroupWatch { report, .. }, Some(handle)) =
+            self.call(Command::GroupWatch { group })?
+        else {
+            unreachable!()
+        };
+        Ok(crate::GroupWatch {
+            group,
+            report,
+            handle,
+        })
     }
     /// Acceptance only. A successful return does not permit buffer reuse.
     pub fn submit(&mut self, submission: Submission) -> Result<(), Error> {
@@ -195,6 +243,16 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// Release a received VMO grant owned by the caller. This does not destroy the service
+    /// allocation or prove GPU completion. — KESTREL
+    pub fn close_buffer_handle(&mut self, handle: T::Handle) {
+        self.transport.close_handle(handle);
+    }
+
+    pub(crate) fn abandon(&mut self) {
+        self.lost = true;
+    }
+
     fn fail(&mut self, error: Error) -> Error {
         self.lost = true;
         error
@@ -230,6 +288,11 @@ impl<T: Transport> Client<T> {
             .filter(|r| r.id == id);
         let valid = reply.is_some_and(|r| match r.result {
             Ok(response) => {
+                if matches!(response, Response::GroupWatch { report, .. }
+                            if report.state != crate::GroupState::Usable)
+                {
+                    self.lost = true;
+                }
                 matches_response(command, response)
                     && response.handle_count() == usize::from(handle.is_some())
             }
@@ -262,6 +325,16 @@ impl<T: Transport> Client<T> {
     }
 }
 
+impl<T: SessionTransport> Client<T> {
+    pub fn close_session(&mut self) {
+        self.lost = true;
+        if !self.closed {
+            self.closed = true;
+            self.transport.close_session();
+        }
+    }
+}
+
 fn matches_response(command: Command, response: Response) -> bool {
     match (command, response) {
         (Command::GetInfo, Response::Info(_))
@@ -271,15 +344,26 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::GetTextureFeatures, Response::Texture(_))
         | (Command::GetCoreFeatures, Response::Core(_))
         | (Command::GetThreadProperties, Response::Threads(_))
+        | (Command::GetMemoryProperties, Response::Memory(_))
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
         | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,
+        (Command::VmUnbind(range), Response::VmUnbound(received)) => range == received,
+        (
+            Command::GroupWatch { group },
+            Response::GroupWatch {
+                group: received, ..
+            },
+        ) => group == received,
         (
             Command::BufferCreate { bytes },
             Response::BufferCreated {
                 bytes: received, ..
             },
         ) => bytes == received,
+        (Command::BufferDestroy { buffer }, Response::BufferDestroyed { buffer: received }) => {
+            buffer == received
+        }
         (Command::Submit(job), Response::Submitted { point }) => job.signal_point == point,
         (
             Command::SyncRead { point, .. },

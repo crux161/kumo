@@ -1,8 +1,8 @@
-//j647
-//j650
-//j651
 //j652
 //j681
+//j707
+//j742
+//j752
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -10,8 +10,9 @@
 //! requires a fresh session. The server must reject duplicate/stale IDs before any mutation.
 
 use crate::{
-    valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-    DeviceThreads, DeviceTiler, DeviceTopology, Status, Submission, SyncState,
+    valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, GroupReport, Status, Submission,
+    SyncState, Unbind,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -26,14 +27,34 @@ pub enum Command {
     GetTextureFeatures,
     GetCoreFeatures,
     GetThreadProperties,
+    /// The memory-system words and the coherency protocol the driver programmed (G7o-a).
+    /// Appended after the discovery opcodes, so earlier sessions are unchanged. — TIMBERDOODLE
+    GetMemoryProperties,
     VmCreate,
     BufferCreate {
         bytes: u64,
     },
+    /// Release one allocation this session owns. While the binding model is frozen (G8a,
+    /// before GroupCreate), the server first unbinds every GPU VA mapping that names it.
+    /// The reply is `BufferDestroyed`; a never-issued, foreign, or already-destroyed ID is
+    /// `NotFound`. — TIMBERDOODLE
+    BufferDestroy {
+        buffer: u32,
+    },
     VmBind(Binding),
+    /// Remove exactly the live mappings covering one contiguous range. Allowed after
+    /// GroupCreate: the driver orders same-address-space work and invalidates only the packed
+    /// page-table region, without stopping any queue. The reply is `VmUnbound` echoing the
+    /// range; an unknown, foreign or partially covered range is refused without mutation.
+    /// — TIMBERDOODLE
+    VmUnbind(Unbind),
     /// One normal-priority queue with a driver-owned 4 KiB ring and core masks.
     GroupCreate {
         vm: u32,
+    },
+    /// Obtain a READ-only CPU status VMO, which outlives terminal channel close. — MILVUS
+    GroupWatch {
+        group: u32,
     },
     Submit(Submission),
     /// Query is nonblocking; Pending never implies completion or permission to reuse backing.
@@ -67,8 +88,10 @@ impl Request {
             Command::GetTextureFeatures => (11, [0; 6]),
             Command::GetCoreFeatures => (12, [0; 6]),
             Command::GetThreadProperties => (13, [0; 6]),
+            Command::GetMemoryProperties => (17, [0; 6]),
             Command::VmCreate => (1, [0; 6]),
             Command::BufferCreate { bytes } => (2, [bytes, 0, 0, 0, 0, 0]),
+            Command::BufferDestroy { buffer } => (14, [u64::from(buffer), 0, 0, 0, 0, 0]),
             Command::VmBind(b) => (
                 3,
                 [
@@ -80,7 +103,9 @@ impl Request {
                     u64::from(b.flags.0),
                 ],
             ),
+            Command::VmUnbind(u) => (15, [u64::from(u.vm), u.va, u.bytes, 0, 0, 0]),
             Command::GroupCreate { vm } => (4, [u64::from(vm), 0, 0, 0, 0, 0]),
+            Command::GroupWatch { group } => (18, [u64::from(group), 0, 0, 0, 0, 0]),
             Command::Submit(s) => (
                 5,
                 [
@@ -120,8 +145,15 @@ impl Request {
             11 => Command::GetTextureFeatures,
             12 => Command::GetCoreFeatures,
             13 => Command::GetThreadProperties,
+            17 => Command::GetMemoryProperties,
+            18 if a[0] != 0 => Command::GroupWatch { group: a[0] as u32 },
             1 => Command::VmCreate,
             2 if valid_buffer_bytes(a[0]) => Command::BufferCreate { bytes: a[0] },
+            // Zero is never a buffer ID. The canonical re-encode below also refuses an ID
+            // whose high bits would be lost by the u32 conversion and any reserved slot.
+            14 if a[0] != 0 => Command::BufferDestroy {
+                buffer: a[0] as u32,
+            },
             3 => {
                 let b = Binding {
                     vm: a[0] as u32,
@@ -134,6 +166,17 @@ impl Request {
                 // Full buffer bounds and overlap checks happen after ID resolution.
                 b.validate(crate::MAX_BUFFER_BYTES).ok()?;
                 Command::VmBind(b)
+            }
+            15 if a[0] != 0 => {
+                let u = Unbind {
+                    vm: a[0] as u32,
+                    va: a[1],
+                    bytes: a[2],
+                };
+                if !u.valid_shape() {
+                    return None;
+                }
+                Command::VmUnbind(u)
             }
             4 if a[0] != 0 => Command::GroupCreate { vm: a[0] as u32 },
             5 => {
@@ -175,6 +218,11 @@ pub enum Response {
     /// Three raw thread-property words in slots 0..2; slot 3 is zero. No word is
     /// special-cased here: all three may legitimately be zero when the group is absent. — TIMBERDOODLE
     Threads(DeviceThreads),
+    /// Four raw words in slots 0..3: `L2_FEATURES`, `MEM_FEATURES`, `COHERENCY_FEATURES` and
+    /// the programmed coherency protocol. All four slots are used, so there is no reserved
+    /// slot to check; the re-encode check still refuses a word truncated to 32 bits.
+    /// — TIMBERDOODLE
+    Memory(DeviceMemory),
     VmCreated {
         vm: u32,
     },
@@ -184,9 +232,23 @@ pub enum Response {
         buffer: u32,
         bytes: u64,
     },
+    /// The named allocation is gone: its live bindings were unbound and its backing released.
+    /// The reply carries no handle; the caller's own granted handle is the caller's to close.
+    /// — TIMBERDOODLE
+    BufferDestroyed {
+        buffer: u32,
+    },
     VmBound,
+    /// The named range is gone: every live binding it covered was unbound after the driver
+    /// cleared and invalidated exactly that mapping. The range crosses verbatim as the echo a
+    /// client correlates against its request; no handle accompanies it. — TIMBERDOODLE
+    VmUnbound(Unbind),
     GroupCreated {
         group: u32,
+    },
+    GroupWatch {
+        group: u32,
+        report: GroupReport,
     },
     /// Accepted for execution, not completed. Poll SyncRead before reusing any backing.
     Submitted {
@@ -211,7 +273,7 @@ pub enum Response {
 impl Response {
     pub const fn handle_count(self) -> usize {
         match self {
-            Self::BufferCreated { .. } | Self::WaitArmed { .. } => 1,
+            Self::BufferCreated { .. } | Self::WaitArmed { .. } | Self::GroupWatch { .. } => 1,
             _ => 0,
         }
     }
@@ -260,10 +322,30 @@ impl Reply {
                     0,
                 ],
             ),
+            Ok(Response::Memory(memory)) => (
+                17,
+                [
+                    u64::from(memory.l2_features),
+                    u64::from(memory.mem_features),
+                    u64::from(memory.coherency_features),
+                    u64::from(memory.coherency_protocol),
+                ],
+            ),
             Ok(Response::VmCreated { vm }) => (1, [u64::from(vm), 0, 0, 0]),
             Ok(Response::BufferCreated { buffer, bytes }) => (2, [u64::from(buffer), bytes, 0, 0]),
+            Ok(Response::BufferDestroyed { buffer }) => (14, [u64::from(buffer), 0, 0, 0]),
             Ok(Response::VmBound) => (3, [0; 4]),
+            Ok(Response::VmUnbound(u)) => (15, [u64::from(u.vm), u.va, u.bytes, 0]),
             Ok(Response::GroupCreated { group }) => (4, [u64::from(group), 0, 0, 0]),
+            Ok(Response::GroupWatch { group, report }) => (
+                18,
+                [
+                    u64::from(group),
+                    report.state as u64,
+                    u64::from(report.gpu_status),
+                    0,
+                ],
+            ),
             Ok(Response::Submitted { point }) => (5, [point, 0, 0, 0]),
             Ok(Response::Sync { point, state }) => match state {
                 SyncState::Pending => (6, [point, 0, 0, 0]),
@@ -332,13 +414,41 @@ impl Reply {
                     max_workgroup_size: a[1] as u32,
                     thread_features: a[2] as u32,
                 }),
+                // Required words with no absence meaning: zero crosses verbatim, and the
+                // consumer, not this codec, decides what a zero word implies. — TIMBERDOODLE
+                17 => Response::Memory(DeviceMemory {
+                    l2_features: a[0] as u32,
+                    mem_features: a[1] as u32,
+                    coherency_features: a[2] as u32,
+                    coherency_protocol: a[3] as u32,
+                }),
                 1 if a[0] != 0 => Response::VmCreated { vm: a[0] as u32 },
                 2 if a[0] != 0 && valid_buffer_bytes(a[1]) => Response::BufferCreated {
                     buffer: a[0] as u32,
                     bytes: a[1],
                 },
+                // Same zero/truncation rules as the request: canonical re-encoding rejects a
+                // zero ID, lost high bits, and any nonzero reserved slot. — TIMBERDOODLE
+                14 if a[0] != 0 => Response::BufferDestroyed {
+                    buffer: a[0] as u32,
+                },
                 3 => Response::VmBound,
+                15 if a[0] != 0 => {
+                    let u = Unbind {
+                        vm: a[0] as u32,
+                        va: a[1],
+                        bytes: a[2],
+                    };
+                    if !u.valid_shape() {
+                        return None;
+                    }
+                    Response::VmUnbound(u)
+                }
                 4 if a[0] != 0 => Response::GroupCreated { group: a[0] as u32 },
+                18 if a[0] != 0 => Response::GroupWatch {
+                    group: a[0] as u32,
+                    report: GroupReport::from_words(a[1] as u32, a[2] as u32)?,
+                },
                 5 if a[0] != 0 => Response::Submitted { point: a[0] },
                 6 if a[0] != 0 => Response::Sync {
                     point: a[0],

@@ -1,6 +1,8 @@
-//j618
 //j625
 //j632
+//j719
+//j731
+//j732
 
 use alloc::{
     rc::{Rc, Weak},
@@ -132,7 +134,13 @@ impl StagedHandleGrant {
 
 #[derive(Clone, Debug)]
 pub struct HandleTable {
-    entries: Vec<Option<OwnedHandleEntry>>,
+    //j732
+    /// Live entries only, in ascending handle order. Handle values are issued monotonically and
+    /// never reused, so a push keeps the order and a lookup is a binary search; a close removes
+    /// its entry rather than leaving a tombstone, so every scan walks live handles only (J731:
+    /// tombstones grew ~20 per churn frame and `holds()` walked them on every dispatch).
+    /// — TIMBERDOODLE
+    entries: Vec<OwnedHandleEntry>,
     next_handle: u32,
     #[cfg(test)]
     insertion_limit: Option<usize>,
@@ -179,6 +187,22 @@ impl HandleTable {
         self.insert_referenced(object, rights)
     }
 
+    //j719
+    /// Insert a channel endpoint with its own reference lineage. Every duplicate,
+    /// transfer or staged grant clones this entry and shares the lineage, so the
+    /// endpoint's [`HandleReferences`] observer counts exactly the handles that still
+    /// own it — the fact a close-time mailbox reap must consult. — TIMBERDOODLE
+    pub(crate) fn insert_channel(
+        &mut self,
+        object: KernelObject,
+        rights: Rights,
+    ) -> Result<(Handle, HandleReferences), ObjectError> {
+        if object.kind != ObjectKind::Channel {
+            return Err(ObjectError::WrongType);
+        }
+        self.insert_referenced(object, rights)
+    }
+
     fn insert_referenced(
         &mut self,
         object: KernelObject,
@@ -191,11 +215,8 @@ impl HandleTable {
     }
 
     pub fn get(&self, handle: Handle) -> Result<HandleEntry, ObjectError> {
-        let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
-        self.entries
-            .get(index)
-            .and_then(|slot| slot.as_ref().map(|owner| owner.entry))
-            .ok_or(ObjectError::BadHandle)
+        let index = self.position(handle).ok_or(ObjectError::BadHandle)?;
+        Ok(self.entries[index].entry)
     }
 
     pub fn require(
@@ -229,30 +250,30 @@ impl HandleTable {
     }
 
     pub fn remove(&mut self, handle: Handle) -> Result<OwnedHandleEntry, ObjectError> {
-        let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
-        let slot = self.entries.get_mut(index).ok_or(ObjectError::BadHandle)?;
-        slot.take().ok_or(ObjectError::BadHandle)
+        let index = self.position(handle).ok_or(ObjectError::BadHandle)?;
+        Ok(self.entries.remove(index))
     }
 
     pub(crate) fn holds(&self, koid: KoId, kind: ObjectKind, rights: Rights) -> bool {
         self.entries
             .iter()
-            .flatten()
             .any(|e| e.koid == koid && e.kind == kind && e.rights.contains(rights))
     }
 
     pub fn live_count(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.is_some()).count()
+        self.entries.len()
+    }
+
+    //j731
+    /// The entries a scan of this table walks. J731 counted closed slots here; since J732 the
+    /// table keeps live entries only, so this equals [`live_count`](Self::live_count) and the
+    /// census shows the two together. — TIMBERDOODLE
+    pub fn slot_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn drain(&mut self) -> Vec<OwnedHandleEntry> {
-        let mut removed = Vec::new();
-        for slot in &mut self.entries {
-            if let Some(entry) = slot.take() {
-                removed.push(entry);
-            }
-        }
-        removed
+        core::mem::take(&mut self.entries)
     }
 
     pub fn insert_entry(&mut self, entry: OwnedHandleEntry) -> Result<Handle, ObjectError> {
@@ -260,17 +281,29 @@ impl HandleTable {
     }
 
     pub(crate) fn clone_entry(&self, handle: Handle) -> Result<OwnedHandleEntry, ObjectError> {
-        let index = handle_index(handle).ok_or(ObjectError::BadHandle)?;
+        let index = self.position(handle).ok_or(ObjectError::BadHandle)?;
+        Ok(self.entries[index].clone())
+    }
+
+    fn position(&self, handle: Handle) -> Option<usize> {
+        if handle == INVALID_HANDLE {
+            return None;
+        }
         self.entries
-            .get(index)
-            .and_then(Option::as_ref)
-            .cloned()
-            .ok_or(ObjectError::BadHandle)
+            .binary_search_by_key(&handle.0, |owner| owner.entry.handle.0)
+            .ok()
+    }
+
+    /// Handles issued so far. The table no longer holds closed entries, so the test insertion
+    /// limit counts issues, as it counted slots before J732. — TIMBERDOODLE
+    #[cfg(test)]
+    fn issued(&self) -> usize {
+        self.next_handle.wrapping_sub(1) as usize
     }
 
     #[cfg(test)]
     pub(crate) fn fail_insert_after(&mut self, successful: Option<usize>) {
-        self.insertion_limit = successful.map(|count| self.entries.len() + count);
+        self.insertion_limit = successful.map(|count| self.issued() + count);
     }
 
     /// Stage a copied or moved grant in `target` without changing this table.
@@ -320,7 +353,7 @@ impl HandleTable {
         self.reserve_insert()?;
         let handle = Handle(self.next_handle);
         self.next_handle = self.next_handle.checked_add(1).unwrap_or(0);
-        self.entries.push(Some(OwnedHandleEntry {
+        self.entries.push(OwnedHandleEntry {
             entry: HandleEntry {
                 handle,
                 koid,
@@ -328,7 +361,7 @@ impl HandleTable {
                 rights,
             },
             reference,
-        }));
+        });
         Ok(handle)
     }
 
@@ -341,7 +374,7 @@ impl HandleTable {
         #[cfg(test)]
         if self
             .insertion_limit
-            .is_some_and(|limit| self.entries.len() >= limit)
+            .is_some_and(|limit| self.issued() >= limit)
         {
             return Err(ObjectError::TableFull);
         }
@@ -359,17 +392,33 @@ impl Default for HandleTable {
     }
 }
 
-fn handle_index(handle: Handle) -> Option<usize> {
-    if handle == INVALID_HANDLE {
-        None
-    } else {
-        Some((handle.0 - 1) as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //j732
+    #[test]
+    fn a_closed_handle_leaves_no_entry_and_is_never_reissued() {
+        let mut table = HandleTable::new();
+        let vmo = |koid| KernelObject::new(KoId(koid), ObjectKind::Vmo);
+        let first = table.insert(vmo(1), Rights::READ).unwrap();
+        let second = table.insert(vmo(2), Rights::READ).unwrap();
+        let third = table.insert(vmo(3), Rights::READ).unwrap();
+        table.close(second).unwrap();
+        assert_eq!((table.live_count(), table.slot_count()), (2, 2));
+        assert_eq!(table.get(second), Err(ObjectError::BadHandle));
+        assert_eq!(table.close(second), Err(ObjectError::BadHandle));
+        assert_eq!(table.get(first).unwrap().koid, KoId(1));
+        assert_eq!(table.get(third).unwrap().koid, KoId(3));
+        assert!(!table.holds(KoId(2), ObjectKind::Vmo, Rights::empty()));
+        let fourth = table.insert(vmo(4), Rights::READ).unwrap();
+        assert!(fourth.0 > third.0);
+        assert_eq!(table.get(fourth).unwrap().koid, KoId(4));
+        assert_eq!(table.get(INVALID_HANDLE), Err(ObjectError::BadHandle));
+        assert_eq!(table.drain().len(), 3);
+        assert_eq!(table.slot_count(), 0);
+        assert_eq!(table.get(fourth), Err(ObjectError::BadHandle));
+    }
 
     fn context(table: &mut HandleTable) -> (Handle, HandleReferences) {
         table

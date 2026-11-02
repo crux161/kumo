@@ -1,6 +1,6 @@
 #j643
-# Hide DRM entry points in the native compile probe; no replacement stubs. — KESTREL
-# Zero context avoids patch-in-patch whitespace; exact pristine header hash is checked. — KESTREL
+#j745
+# Native capability entry points; exact pristine header hash is checked. — KESTREL
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
 @@ -24,0 +25 @@
@@ -23,6 +23,20 @@
 +
 @@ -748,0 +759 @@
 +#ifndef __kumo__
-@@ -771,0 +783,2 @@
+@@ -771,0 +783,9 @@
 +
++#else
++void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
++static inline void *
++pan_kmod_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr)
++{
++   return pan_kmod_kumo_bo_mmap(bo, prot, flags, host_addr);
++}
++#endif
+@@ -999,0 +1020,6 @@
++#ifdef __kumo__
++   /* Native VM operations do not emulate sparse or asynchronous requests. — KESTREL */
++   if (mode != PAN_KMOD_VM_OP_MODE_IMMEDIATE || (op_count && !ops)) return -1;
++   for (uint32_t i = 0; i < op_count; ++i)
++      if (ops[i].flags) return -1;
 +#endif

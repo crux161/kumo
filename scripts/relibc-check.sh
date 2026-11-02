@@ -3,6 +3,7 @@
 #j506
 #j507
 #j508
+#j738
 # Build KUMO's out-of-tree relibc platform and its I-a3 C smoke without touching the
 # pinned upstream checkout. Installed headers remain absent.
 set -eu
@@ -156,7 +157,7 @@ fi
     --target "$TARGET" \
     --manifest-path "$stage/Cargo.toml" \
     --no-default-features \
-    --features no_trace \
+    --features no_trace,math_libm \
     --lib
 
 printf 'KUMO relibc scaffold green: %s methods, target_os=kumo, source %s\n' \

@@ -1,9 +1,39 @@
-<!-- j505 -->
-<!-- j506 -->
-<!-- j507 -->
 <!-- j508 -->
 <!-- j509 -->
+<!-- j736 -->
+<!-- j738 -->
+<!-- j740 -->
 # KUMO relibc overlay
+
+G7m's static build-ID proof exposed upstream ELF typedefs with the wrong width:
+`Elf64_Word` and `Elf64_Sword` were 64 bits. The overlay makes them 32 bits;
+`Xword`/`Sxword` remain 64 bits. The consumer pins ELF64 header/program/note sizes
+and validates the running note against llvm-readelf (J740). — SAKER, 2026-10-31
+
+G7m enables relibc's pinned openlibm implementation (`math_libm`) and adds
+`open_memstream` for Mesa's compiler diagnostics. The memory writer uses C-owned
+storage, publishes its buffer on flush/close, preserves seeks and zero-filled
+holes, and returns ownership to the caller for `free`. It creates no descriptor;
+`fileno` refuses with `EBADF`. The SDK installs the pinned openlibm headers and
+generates math constants/classification declarations usable from both C and C++.
+
+```sh
+scripts/relibc-headers.sh
+python3 scripts/mesa-libc-smoke.py --run
+```
+
+The QEMU proof covers growth, overwrite, seek, holes, empty streams, close/free,
+invalid operations and the 26 measured math exports. The C++ regression also
+passes; the remaining Mesa link gaps are DRM/synchronization and build IDs.
+Implementation and acceptance decisions — SAKER, 2026-10-31 (J738).
+
+G7l's C++ acceptance adds a nonzero initialized TLS variable. It exposed a
+static-startup bug: `STATIC_TCB_MASTER.offset` used the segment's rounded size,
+so the initial `.tdata` bytes were copied past their variant-I location on KUMO
+AArch64. The KUMO overlay now uses offset zero for that path. The existing smoke
+checked zero-filled TLS and did not expose the misplaced initializer. The C++ proof exercises the repaired initializer; the scheduled thread/TLS
+regression also passes its TLS and C startup checks. Its later deferred-timer
+fault reproduces with the old libc and unchanged kernel (J736). — SAKER, 2026-10-31 (J736)
 
 KUMO keeps the audited upstream tree pristine at `vendor/relibc` and applies
 `kumo.patch` plus `overlay/` to an ephemeral source tree. This makes the

@@ -1,20 +1,54 @@
-//j647
-//j650
-//j651
-//j652
-//j653
+//j739
+//j742
+//j744
+//j745
+//j751
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
 #![no_std]
 
-use core::cell::Cell;
+extern crate alloc;
+
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    cell::Cell,
+    ffi::c_void,
+};
+
+struct LibcAllocator;
+extern "C" {
+    fn posix_memalign(out: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+    fn free(pointer: *mut c_void);
+}
+// Session now owns dynamic bookkeeping. Keep its storage in the same real
+// relibc allocation domain as the C probe, including over-aligned layouts. — SAKER
+unsafe impl GlobalAlloc for LibcAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut pointer = core::ptr::null_mut();
+        if posix_memalign(
+            &mut pointer,
+            layout.align().max(core::mem::size_of::<usize>()),
+            layout.size(),
+        ) != 0
+        {
+            return core::ptr::null_mut();
+        }
+        pointer.cast()
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, _: Layout) {
+        free(pointer.cast());
+    }
+}
+#[global_allocator]
+static ALLOCATOR: LibcAllocator = LibcAllocator;
 use kumo_gpu::{
     c::{with_api, Api, Info, DEVICE_LOST, PROTOCOL, SERVER_ERROR},
     client::{Client, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    Binding, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture, DeviceThreads, DeviceTiler,
-    DeviceTopology, Reply, Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
+    Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu, DeviceTexture, DeviceThreads,
+    DeviceTiler, DeviceTopology, Reply, Request, Status, Submission, REPLY_LEN, REQUEST_LEN,
 };
 
 #[cfg(target_os = "none")]
@@ -48,23 +82,37 @@ struct Report {
     num_registers_per_core: u32,
     max_tls_instance_per_core: u32,
     has_afbc: u32,
+    l2_slices: u32,
+    bus_width: u32,
+    pgsize_bitmap: u64,
+    is_io_coherent: u32,
+    allowed_group_priorities_mask: u32,
+    supported_bo_flags: u32,
+    supported_vm_op_flags: u32,
+    gpu_can_query_timestamp: u32,
+    timestamp_device_coherent: u32,
+    timestamp_frequency: u64,
 }
 extern "C" {
     fn kumo_mesa_probe(api: *const Api, out: *mut Report) -> u32;
 }
-const _: () = assert!(core::mem::size_of::<Report>() == 168);
-// The enlarged 80-byte Info shifts every report field, so the thread block starts at 144,
-// not at version6's 120. has_afbc fills the four bytes that were tail padding after it.
-// These pin the C mirror's offsets from the Rust side too. — TIMBERDOODLE
-const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 80);
-const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 140);
-const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 144);
-const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 148);
-const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 152);
-const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 156);
-const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 160);
-const _: () = assert!(core::mem::offset_of!(Report, has_afbc) == 164);
-const _: () = assert!(core::mem::size_of::<Api>() == 24);
+const _: () = assert!(core::mem::size_of::<Report>() == 240);
+// Version10's 104-byte Info shifts every report field by 24, so the thread block starts at
+// 168 and has_afbc sits at 188; the G7o-a block follows at 192. These pin the C mirror's
+// offsets from the Rust side too. — TIMBERDOODLE
+const _: () = assert!(core::mem::offset_of!(Report, missing_properties) == 104);
+const _: () = assert!(core::mem::offset_of!(Report, model_resolved) == 164);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_core) == 168);
+const _: () = assert!(core::mem::offset_of!(Report, max_threads_per_wg) == 172);
+const _: () = assert!(core::mem::offset_of!(Report, max_tasks_per_core) == 176);
+const _: () = assert!(core::mem::offset_of!(Report, num_registers_per_core) == 180);
+const _: () = assert!(core::mem::offset_of!(Report, max_tls_instance_per_core) == 184);
+const _: () = assert!(core::mem::offset_of!(Report, has_afbc) == 188);
+const _: () = assert!(core::mem::offset_of!(Report, l2_slices) == 192);
+const _: () = assert!(core::mem::offset_of!(Report, pgsize_bitmap) == 200);
+const _: () = assert!(core::mem::offset_of!(Report, is_io_coherent) == 208);
+const _: () = assert!(core::mem::offset_of!(Report, timestamp_frequency) == 232);
+const _: () = assert!(core::mem::size_of::<Api>() == 120);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
     cs_features: 0x7085f,
@@ -117,24 +165,41 @@ const THREAD_MAX_WORKGROUP_SIZE: u32 = 1024;
 const THREAD_FEATURES: u32 = 0x0310_0005;
 const MAX_TASKS_PER_CORE: u32 = THREAD_FEATURES >> 24;
 const REGISTERS_PER_CORE: u32 = THREAD_FEATURES & 0x3fffff;
+/// The Orange Pi's measured memory words (J653), with RESEARCH/009's [R] values: 64-byte lines,
+/// four slices and a 128-bit bus. COHERENCY_FEATURES reads zero and drv-gpu programs protocol
+/// 31, "none". — TIMBERDOODLE
+const L2_FEATURES: u32 = 0x0712_0306;
+const MEM_FEATURES: u32 = 0x301;
+const COHERENCY_FEATURES: u32 = 0;
+const COHERENCY_NONE: u32 = 31;
+const L2_SLICES: u32 = 4;
+const BUS_WIDTH: u32 = 128;
+/// KUMO's stated policy (G7o-a): Panthor's base BO flags EXECUTABLE (bit 0), NO_MMAP (bit 2)
+/// and GPU_UNCACHED (bit 5); MEDIUM (bit 1) the only group priority. — TIMBERDOODLE
+const BO_FLAGS: u32 = (1 << 0) | (1 << 2) | (1 << 5);
+const PRIORITY_MEDIUM: u32 = 1 << 1;
+/// Requests per probe: info, topology, MMU, tiler, texture, core, threads, then memory last.
+const QUERIES: u32 = 8;
 const MISSING_ALL: u64 = 1023;
-/// Core features are required, so bit 0 clears on every successful query, whether or not the
-/// derived variant lands in Mesa's model table. Bits 3 and 4 clear on the same successful
-/// query: G7i attests all four texture words together, and the modeled thread group satisfies
-/// upstream's nonzero assumption. Bit 5 clears because AFBC has no hardware register: the
-/// bridge supplies upstream's constant and pan_query_afbc returns true for the pinned G610.
-/// Bit 1 clears only when the tiler shape was derived. — TIMBERDOODLE
+/// Bits that clear on every published report. Core features (0) and memory words (2) are
+/// required queries; AFBC (5) is upstream's constant, true for the pinned G610; and timestamps,
+/// priorities, BO/VM flags and coherency/pages (6..9) are attested or stated policy since
+/// G7o-a. — TIMBERDOODLE
+const ALWAYS_SUPPLIED: u64 =
+    (1 << 0) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9);
+/// Bits 3 and 4 clear on a successful query too: G7i attests all four texture words together,
+/// and the modeled thread group satisfies upstream's nonzero assumption. Bit 1 clears only
+/// when the tiler shape was derived. With all three, the property set is complete. — TIMBERDOODLE
 const MISSING_WITH_VARIANT_AND_TILER_AND_THREADS: u64 =
-    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 4) & !(1 << 5);
+    MISSING_ALL & !ALWAYS_SUPPLIED & !(1 << 1) & !(1 << 3) & !(1 << 4);
 /// A tiler word that is absent or cannot be decoded leaves bit 1 set.
 const MISSING_WITH_VARIANT_AND_THREADS: u64 =
-    MISSING_ALL & !(1 << 0) & !(1 << 3) & !(1 << 4) & !(1 << 5);
+    MISSING_ALL & !ALWAYS_SUPPLIED & !(1 << 3) & !(1 << 4);
 /// A thread group whose derivations contradict upstream's nonzero assumption leaves bit 4 set.
-const MISSING_WITH_VARIANT_AND_TILER: u64 =
-    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 3) & !(1 << 5);
+const MISSING_WITH_VARIANT_AND_TILER: u64 = MISSING_ALL & !ALWAYS_SUPPLIED & !(1 << 1) & !(1 << 3);
 /// An absent texture group (element 0 zero) leaves bit 3 set.
-const MISSING_WITH_VARIANT_NO_TEXTURE: u64 =
-    MISSING_ALL & !(1 << 0) & !(1 << 1) & !(1 << 4) & !(1 << 5);
+const MISSING_WITH_VARIANT_NO_TEXTURE: u64 = MISSING_ALL & !ALWAYS_SUPPLIED & !(1 << 1) & !(1 << 4);
+const _: () = assert!(MISSING_WITH_VARIANT_AND_TILER_AND_THREADS == 0);
 
 struct Hardware {
     busy_once: bool,
@@ -146,6 +211,8 @@ struct Hardware {
     max_threads: u32,
     max_workgroup_size: u32,
     thread_features: u32,
+    memory: DeviceMemory,
+    memory_refused: bool,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -203,6 +270,14 @@ impl Backend for Hardware {
             thread_features: self.thread_features,
         })
     }
+    fn memory_properties(&mut self) -> Result<DeviceMemory, Status> {
+        // Mirrors the driver: the words are required and cross verbatim. A refusal here is
+        // modeled to prove C treats it as a failed report, not an absent group. — TIMBERDOODLE
+        if self.memory_refused {
+            return Err(Status::NotSupported);
+        }
+        Ok(self.memory)
+    }
     fn create_vm(&mut self) -> Result<(), Status> {
         Err(Status::NotSupported)
     }
@@ -210,6 +285,12 @@ impl Backend for Hardware {
         Err(Status::NotSupported)
     }
     fn bind(&mut self, _: Binding) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
+    fn unbind(&mut self, _: &[Binding]) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
+    fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
         Err(Status::NotSupported)
     }
     fn create_group(&mut self) -> Result<(), Status> {
@@ -274,6 +355,13 @@ fn transport<'a>(
             max_threads: THREAD_MAX_THREADS,
             max_workgroup_size: THREAD_MAX_WORKGROUP_SIZE,
             thread_features: THREAD_FEATURES,
+            memory: DeviceMemory {
+                l2_features: L2_FEATURES,
+                mem_features: MEM_FEATURES,
+                coherency_features: COHERENCY_FEATURES,
+                coherency_protocol: COHERENCY_NONE,
+            },
+            memory_refused: false,
         },
         reply: [0; REPLY_LEN],
         sends,
@@ -284,26 +372,47 @@ fn transport<'a>(
 
 #[no_mangle]
 pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
+    unsafe {
+        let layout = Layout::from_size_align(33, 4096).unwrap();
+        let pointer = alloc::alloc::alloc(layout);
+        if pointer.is_null() || (pointer as usize) % layout.align() != 0 {
+            return 1000;
+        }
+        pointer.write_bytes(0x5a, layout.size());
+        let valid = core::slice::from_raw_parts(pointer, layout.size())
+            .iter()
+            .all(|b| *b == 0x5a);
+        alloc::alloc::dealloc(pointer, layout);
+        if !valid {
+            return 1001;
+        }
+    }
     let sends = Cell::new(0);
     let closed = Cell::new(0);
     let mut client = Client::new(transport(&sends, &closed, true, false));
     let result = with_api(&mut client, |api| {
         let mut report = Report::default();
-        // A rejected old ABI must not write the larger version9 report into an
+        // A rejected old ABI must not write the larger version10 report into an
         // old caller's allocation. The extra sentinel words are guard storage, and they
         // span more than the current report so an overrun is observed rather than
         // allowed to smash the stack. — KESTREL, guard widened for v3 — SAKER
-        let old_api = Api { version: 8, ..*api };
-        let mut guarded = [0xfeedbeefcafebabeu64; 16];
+        let old_api = Api {
+            version: 11,
+            ..*api
+        };
+        let mut guarded = [0xfeedbeefcafebabeu64; 32];
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
-            || guarded != [0xfeedbeefcafebabeu64; 16]
+            || guarded != [0xfeedbeefcafebabeu64; 32]
             || sends.get() != 0
         {
             return 11;
         }
         // The C-side version/size/null checks must perform no query I/O. — KESTREL
         for bad in [
-            Api { version: 8, ..*api },
+            Api {
+                version: 11,
+                ..*api
+            },
             Api {
                 bytes: api.bytes - 1,
                 ..*api
@@ -334,7 +443,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         {
             return 3;
         }
-        for n in [8, 15] {
+        for n in [1 + QUERIES, 1 + 2 * QUERIES] {
             if unsafe { kumo_mesa_probe(api, &mut report) } != 1
                 || report.info.gpu_id != INFO.gpu_id
                 || report.info.cs_features != INFO.cs_features
@@ -367,6 +476,21 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 || report.max_tasks_per_core != MAX_TASKS_PER_CORE
                 || report.num_registers_per_core != REGISTERS_PER_CORE
                 || report.max_tls_instance_per_core != THREAD_MAX_THREADS
+                || report.info.l2_features != L2_FEATURES
+                || report.info.mem_features != MEM_FEATURES
+                || report.info.coherency_features != COHERENCY_FEATURES
+                || report.info.coherency_protocol != COHERENCY_NONE
+                || report.info.page_bytes != kumo_gpu::PAGE_BYTES
+                || report.l2_slices != L2_SLICES
+                || report.bus_width != BUS_WIDTH
+                || report.pgsize_bitmap != 0x1000
+                || report.is_io_coherent != 0
+                || report.allowed_group_priorities_mask != PRIORITY_MEDIUM
+                || report.supported_bo_flags != BO_FLAGS
+                || report.supported_vm_op_flags != 0
+                || report.gpu_can_query_timestamp != 0
+                || report.timestamp_device_coherent != 0
+                || report.timestamp_frequency != 0
                 || report.missing_properties != MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
                 || report.query_status != 0
                 || report.reserved != 0
@@ -380,7 +504,11 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     if result != 0 {
         return result;
     }
-    if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 16 || closed.get() != 0 {
+    if client.is_lost()
+        || client.info() != Ok(INFO)
+        || sends.get() != 2 + 2 * QUERIES
+        || closed.get() != 0
+    {
         return 5;
     }
 
@@ -401,7 +529,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.core_count == count
                 && report.core_id_range == range
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 7
+                && sends.get() == QUERIES
         });
         if !ok {
             return 9;
@@ -427,7 +555,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             let status = unsafe { kumo_mesa_probe(api, &mut report) };
-            if status != code || sends.get() != 7 {
+            if status != code || sends.get() != QUERIES {
                 return false;
             }
             if code == 1 {
@@ -493,7 +621,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.tiler_bin_size == bin
                 && report.tiler_max_levels == levels
                 && report.missing_properties == missing
-                && sends.get() == 7
+                && sends.get() == QUERIES
         });
         if !ok {
             return 14;
@@ -523,7 +651,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.model_resolved == 1
             && report.max_threads_per_core == THREAD_MAX_THREADS
             && report.max_threads_per_wg == THREAD_MAX_WORKGROUP_SIZE
-            && sends.get() == 7
+            && sends.get() == QUERIES
     });
     if !ok || client.is_lost() {
         return 15;
@@ -568,7 +696,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                     } else {
                         MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
                     }
-                && sends.get() == 7
+                && sends.get() == QUERIES
         });
         if !ok {
             return 16;
@@ -601,7 +729,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
                 && report.info.mmu_features == MMU_FEATURES
                 && report.va_range_size == MMU_VA_SIZE
-                && sends.get() == 7
+                && sends.get() == QUERIES
         });
         if !ok {
             return 17;
@@ -715,7 +843,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
                 && report.num_registers_per_core == registers
                 && report.max_tls_instance_per_core == tls
                 && report.missing_properties == missing
-                && sends.get() == 7
+                && sends.get() == QUERIES
         });
         if !ok || client.is_lost() {
             return 18;
@@ -754,7 +882,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.info.core_features == CORE_FEATURES
             && report.model_resolved == 1
             && report.core_count == 4
-            && sends.get() == 7
+            && sends.get() == QUERIES
     });
     if !ok || client.is_lost() {
         return 18;
@@ -783,7 +911,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.info.core_features == CORE_FEATURES
             && report.model_resolved == 1
             && report.va_range_size == MMU_VA_SIZE
-            && sends.get() == 7
+            && sends.get() == QUERIES
     });
     if !ok || client.is_lost() {
         return 18;
@@ -793,8 +921,8 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     // pinned bridge supplies upstream's constant (panthor_kmod.c: ".afbc_features = 0" because
     // "AFBC is no longer optional") and consumes it through the real pan_query_afbc, so the
     // modeled service must report has_afbc 1 and clear missing bit 5 while every earlier
-    // property and every other mask bit stay unchanged. The seven-request chain and the full
-    // success mask are pinned here; version 8 is refused before any I/O and version 9 is the
+    // property and every other mask bit stay unchanged. The request chain and the full
+    // success mask are pinned here; version 10 is refused before any I/O and version 11 is the
     // one accepted. pan_query_afbc's false branch needs pan_arch(gpu_id) < 5, which the pinned
     // Mali-G610 identity cannot produce; it is unreachable here, documented rather than
     // simulated with a fabricated device. — TIMBERDOODLE
@@ -802,13 +930,16 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let wire = transport(&sends, &closed, false, false);
     let mut client = Client::new(wire);
     let ok = with_api(&mut client, |api| {
-        if api.version != 9 {
+        if api.version != kumo_gpu::c::VERSION {
             return false;
         }
-        let mut guarded = [0xfeedbeefcafebabeu64; 16];
-        let old_api = Api { version: 8, ..*api };
+        let mut guarded = [0xfeedbeefcafebabeu64; 32];
+        let old_api = Api {
+            version: 11,
+            ..*api
+        };
         if unsafe { kumo_mesa_probe(&old_api, guarded.as_mut_ptr().cast()) } != 2
-            || guarded != [0xfeedbeefcafebabeu64; 16]
+            || guarded != [0xfeedbeefcafebabeu64; 32]
             || sends.get() != 0
         {
             return false;
@@ -839,7 +970,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
             && report.model_resolved == 1
             && report.query_status == 0
             && report.reserved == 0
-            && sends.get() == 7
+            && sends.get() == QUERIES
     });
     if !ok || client.is_lost() {
         return 20;
@@ -932,7 +1063,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         let ok = with_api(&mut client, |api| {
             let mut report = Report::default();
             let status = unsafe { kumo_mesa_probe(api, &mut report) };
-            if status != 1 || sends.get() != 7 {
+            if status != 1 || sends.get() != QUERIES {
                 return false;
             }
             let words = if attested { array } else { [0; 4] };
@@ -967,27 +1098,101 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         }
         // An absent texture group is recoverable exactly as an absent tiler word is: the client
         // stays live and one more query costs one more request ID. The merged chain consumes
-        // seven IDs per query (the thread query is last), so the follow-up query lands at eight.
-        if client.is_lost() || client.info() != Ok(INFO) || sends.get() != 8 {
+        // QUERIES IDs per query (the memory query is last), so the follow-up lands one after.
+        if client.is_lost() || client.info() != Ok(INFO) || sends.get() != QUERIES + 1 {
             return 19;
         }
     }
 
-    // Check 19's version guard: version 8 is refused before any I/O, and this report's own
-    // version 9 is the one that is queried. — TIMBERDOODLE
+    // The extended callback ABI refuses version 10 before I/O and accepts version 11.
+    // Property report layout is unchanged. — KESTREL
     sends.set(0);
     let mut client = Client::new(transport(&sends, &closed, false, false));
     let ok = with_api(&mut client, |api| {
         let mut report = Report::default();
-        let old = Api { version: 8, ..*api };
+        let old = Api {
+            version: 11,
+            ..*api
+        };
         (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
             && sends.get() == 0
-            && api.version == 9
+            && api.version == kumo_gpu::c::VERSION
             && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
-            && sends.get() == 7
+            && sends.get() == QUERIES
     });
     if !ok || client.is_lost() {
         return 19;
+    }
+
+    // Check 21 (G7o-a): the memory group. Upstream's own helpers derive slices and bus width
+    // from the attested words, so the rows pin the field extraction at the board's words, at
+    // zero, and with every bit set (bits above each field must be ignored). The protocol row
+    // proves is_io_coherent is upstream's `protocol != NONE` both ways, ACE-Lite being 0.
+    // Nothing else in the report moves, and the mask stays complete. — TIMBERDOODLE
+    for (l2, mem, protocol, slices, bus, coherent) in [
+        (
+            L2_FEATURES,
+            MEM_FEATURES,
+            COHERENCY_NONE,
+            L2_SLICES,
+            BUS_WIDTH,
+            0u32,
+        ),
+        (0u32, 0u32, COHERENCY_NONE, 1u32, 1u32, 0u32),
+        (u32::MAX, u32::MAX, COHERENCY_NONE, 16u32, 1u32 << 15, 0u32),
+        (L2_FEATURES, MEM_FEATURES, 0u32, L2_SLICES, BUS_WIDTH, 1u32),
+    ] {
+        sends.set(0);
+        let mut wire = transport(&sends, &closed, false, false);
+        wire.hardware.memory = DeviceMemory {
+            l2_features: l2,
+            mem_features: mem,
+            coherency_features: COHERENCY_FEATURES,
+            coherency_protocol: protocol,
+        };
+        let mut client = Client::new(wire);
+        let ok = with_api(&mut client, |api| {
+            let mut report = Report::default();
+            (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
+                && sends.get() == QUERIES
+                && report.info.l2_features == l2
+                && report.info.mem_features == mem
+                && report.info.coherency_protocol == protocol
+                && report.l2_slices == slices
+                && report.bus_width == bus
+                && report.is_io_coherent == coherent
+                && report.pgsize_bitmap == 0x1000
+                && report.supported_bo_flags == BO_FLAGS
+                && report.allowed_group_priorities_mask == PRIORITY_MEDIUM
+                && report.missing_properties == MISSING_WITH_VARIANT_AND_TILER_AND_THREADS
+                && report.info.gpu_id == INFO.gpu_id
+                && report.core_count == 4
+                && report.va_range_size == MMU_VA_SIZE
+        });
+        if !ok || client.is_lost() {
+            return 21;
+        }
+    }
+    // The memory words are required: a refusal is a failed report with nothing published,
+    // not an absent group. Unlike a zero attestation it does not retire the session. — TIMBERDOODLE
+    sends.set(0);
+    let mut wire = transport(&sends, &closed, false, false);
+    wire.hardware.memory_refused = true;
+    let mut client = Client::new(wire);
+    let ok = with_api(&mut client, |api| {
+        let mut report = Report::default();
+        (unsafe { kumo_mesa_probe(api, &mut report) }) == 3
+            && report.query_status == SERVER_ERROR + Status::NotSupported as u32
+            && report.info.gpu_id == 0
+            && report.info.l2_features == 0
+            && report.info.page_bytes == 0
+            && report.l2_slices == 0
+            && report.supported_bo_flags == 0
+            && report.missing_properties == 0
+            && sends.get() == QUERIES
+    });
+    if !ok || client.is_lost() || client.info() != Ok(INFO) {
+        return 21;
     }
     0
 }

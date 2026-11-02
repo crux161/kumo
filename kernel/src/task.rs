@@ -1,5 +1,6 @@
 //j659
 //j660
+//j743
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -138,6 +139,47 @@ impl Process {
             && !self
                 .user_stack
                 .is_some_and(|(stack_start, stack_len)| overlaps(stack_start, stack_len))
+    }
+
+    /// Cover a syscall output with actual writable mappings or the installed user stack,
+    /// rejecting holes and executable mappings even when they lie inside the VMAR. — KESTREL
+    pub fn user_range_is_writable(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0
+            || start < self.root_vmar.base()
+            || self
+                .root_vmar
+                .base()
+                .checked_add(self.root_vmar.len())
+                .is_none_or(|limit| end > limit)
+        {
+            return false;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let mapped_end = self
+                .mappings
+                .iter()
+                .filter(|(mapping, _)| {
+                    mapping.flags.contains(kumo_hal::PageFlags::WRITE)
+                        && !mapping.flags.contains(kumo_hal::PageFlags::EXECUTE)
+                        && !mapping.flags.contains(kumo_hal::PageFlags::DEVICE)
+                })
+                .map(|(mapping, _)| (mapping.virt, mapping.len))
+                .chain(self.user_stack)
+                .filter_map(|(base, bytes)| {
+                    base.checked_add(bytes)
+                        .filter(|limit| base <= cursor && cursor < *limit)
+                })
+                .max();
+            let Some(limit) = mapped_end else {
+                return false;
+            };
+            cursor = end.min(limit);
+        }
+        true
     }
 
     /// Find a free, page-aligned span of `len` bytes inside this process's root VMAR.
@@ -503,6 +545,45 @@ mod tests {
         let span = process.find_free_span(PAGE_SIZE, PAGE_SIZE).expect("span");
         assert_eq!(span, base + PAGE_SIZE * 12);
         assert!(process.user_range_is_free(span, PAGE_SIZE));
+    }
+
+    #[test]
+    fn syscall_output_requires_writable_coverage_including_stack_and_adjacent_mappings() {
+        let mut objects = ObjectManager::new();
+        let root = Job::root(&mut objects);
+        let mut process = Process::new(&mut objects, &root, test_vmar());
+        let base = test_vmar().base();
+        let p = PAGE_SIZE;
+        for (n, flags) in [
+            (1, PageFlags::WRITE),
+            (2, PageFlags::WRITE),
+            (4, PageFlags::READ),
+            (5, PageFlags::WRITE | PageFlags::EXECUTE),
+        ] {
+            process.add_mapping(
+                Mapping {
+                    virt: base + n * p,
+                    len: p,
+                    vmo_offset: 0,
+                    flags,
+                },
+                KoId(n),
+            );
+        }
+        process.set_user_stack(base + 8 * p, 2 * p);
+        assert!(process.user_range_is_writable(base + p, 2 * p));
+        assert!(process.user_range_is_writable(base + 8 * p, 2 * p));
+        for (start, len) in [
+            (base, p),
+            (base + 2 * p, 2 * p),
+            (base + 4 * p, p),
+            (base + 5 * p, p),
+            (base + 9 * p, 2 * p),
+            (u64::MAX - 1, 8),
+            (base + p, 0),
+        ] {
+            assert!(!process.user_range_is_writable(start, len));
+        }
     }
 
     #[test]

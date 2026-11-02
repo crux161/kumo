@@ -1,8 +1,8 @@
-//j622
 //j628
 //j629
 //j632
 //j633
+//j743
 
 //! Private RAM and pinned offline device mappings (DESIGN/022 D1d-b2a/b).
 //! A pool reserves its frames against VMO aliases for its lifetime and recycles them only
@@ -386,7 +386,7 @@ impl<A> TablePool<A> {
             VmoBacking::PhysicalRam { phys_base }
             | VmoBacking::Mmio { phys_base }
             | VmoBacking::Dma { phys_base } => phys_base,
-            VmoBacking::Anonymous => return Ok(None),
+            VmoBacking::Anonymous | VmoBacking::DmaPaged => return Ok(None),
         };
         let end = base
             .checked_add(vmo.len())

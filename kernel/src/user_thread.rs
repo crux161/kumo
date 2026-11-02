@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j425
-//j493
 //j494
 //j534
 //j556
+//j724
+//j730
 
 use core::cell::UnsafeCell;
 
@@ -22,6 +22,35 @@ use kumo_hal::active::{switch_context, ThreadContext, TowerContext, TowerThreadR
 use crate::mm::PAGE_SIZE;
 use crate::object::ObjectManager;
 use crate::sched::{ClassId, Decision, Dispatcher, Priority};
+
+//j726 — ready-to-run lateness. The J724 SVC payer readies a blocked Sora, but the
+//strict-priority dispatcher keeps the current child (Priority 63 outranks her 64), so the
+//wake completes only at a moment when no child is runnable. These counters time that gap:
+//when she was made ready, whether the dispatcher kept the child, and how late she resumed.
+// — TIMBERDOODLE
+#[cfg(target_os = "none")]
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "none")]
+static USER_READY_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static USER_WAKE_READIES: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static USER_WAKE_KEPT_CHILD: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static USER_RESUME_MAX_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static USER_RESUME_OVER_1S: AtomicU32 = AtomicU32::new(0);
+//j729
+#[cfg(target_os = "none")]
+static SORA_AWAY_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_MAX_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "none")]
+static SORA_AWAY_RESUMES: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "none")]
+static SORA_PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
 use crate::task::{Job, Process, Thread, ThreadState, DEFAULT_KERNEL_STACK_SIZE};
 
 const USER_PRIORITY: Priority = Priority(64);
@@ -42,8 +71,19 @@ const CHILD_PRIORITY: Priority = Priority(63);
 /// enumeration fan-out + the svc-health/M10 transients with headroom.
 const MAX_RESIDENT_CHILDREN: usize = 12;
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
-/// Same priority as the blocking child — more urgent than Sora (64).
+/// Same priority as the blocking child — more urgent than Sora's boot admit (64), less
+/// urgent than every later wake of hers (`USER_WAKE_PRIORITY`, J730).
 const CHILD_ASYNC_PRIORITY: Priority = Priority(63);
+//j730
+/// The priority a woken user thread is admitted at, on every wake path: the SVC-tail payer,
+/// the idle-floor pump, and the direct wake. At her boot 64 Sora lost every dispatcher
+/// comparison to a runnable child (63), so under sustained child load her serve loop ran
+/// only when no child could (J726: >100k kept-child decisions; J729: 224 preemptions in
+/// three minutes). The dispatcher keeps a running thread's priority across preemption, so
+/// after her first wake she stays at 62 and children run when she parks. Metal (J730): the
+/// clock samples stayed under 100 ms late through three churn sessions, where J721-J729 saw
+/// seconds. — TIMBERDOODLE
+const USER_WAKE_PRIORITY: Priority = Priority(62);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserSchedError {
@@ -562,8 +602,8 @@ pub fn run_prepared_child(
 }
 
 /// P10-g: spawn a child asynchronously using the proven resident-child slot.
-/// The child is admitted at CHILD_ASYNC_PRIORITY (63, more urgent than Sora at 64)
-/// but does NOT preempt immediately. Returns immediately.
+/// The child is admitted at CHILD_ASYNC_PRIORITY (63, more urgent than Sora's boot 64,
+/// less urgent than her woken 62) but does NOT preempt immediately. Returns immediately.
 pub fn spawn_child_async(
     objects: &mut ObjectManager,
     proc_koid: KoId,
@@ -1077,6 +1117,13 @@ fn wake_child_waiting_on(target: WaitTarget) {
 /// EL0 GPR/FP state on the current thread's kernel stack; this avoids the J287/J288
 /// broad IRQ-preemption corruption while still giving timer-backed `PortWait` a
 /// deterministic resume point. — KESTREL
+//j724
+/// The deferred user-wake decision: a pending wake is due exactly when the scheduler is
+/// live, not done, and Sora is still blocked. Pure so the host tests pin it. — TIMBERDOODLE
+fn deferred_user_wake_due(done: bool, pending: bool, user_blocked: bool) -> bool {
+    !done && pending && user_blocked
+}
+
 pub fn reschedule_if_pending_after_svc() {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
@@ -1087,11 +1134,55 @@ pub fn reschedule_if_pending_after_svc() {
     let p = sched_ptr();
     let switch = unsafe {
         let s = &mut *p;
-        if s.done || !s.safe_reschedule_pending {
+        if s.done {
+            return;
+        }
+        //j724
+        // Pay a deferred user wake at this SVC boundary. `wake_user_after_irq_signal` can
+        // only record `user_wake_pending` when the IRQ interrupted a child, and the flag was
+        // previously pumped only by `pump_idle_floor` — which needs the idle floor to be
+        // current, and sustained churn keeps a child runnable at every scheduling point, so a
+        // parked Sora's wake starved for seconds (J723's metal verdict). This is the SVC-side
+        // payer the doctrine always described: make her ready here and let the ordinary
+        // reschedule machinery switch at this safe boundary. — TIMBERDOODLE
+        if deferred_user_wake_due(
+            false,
+            s.user_wake_pending,
+            matches!(s.user_thread.state(), ThreadState::Blocked),
+        ) {
+            s.user_wake_pending = false;
+            s.user_thread.ready();
+            s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
+            s.safe_reschedule_pending = true;
+            //j726
+            #[cfg(target_os = "none")]
+            {
+                USER_READY_AT.store(kumo_hal::active::monotonic_nanos(), Ordering::Relaxed);
+                let readies = USER_WAKE_READIES
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                if readies & 0x3f == 0 {
+                    crate::klog_at!(
+                        kumo_abi::sys::log_level::NOTICE,
+                        "sched: user-wake readies={} kept-child={} ready-to-run-max={}ms over1s={}\n",
+                        readies,
+                        USER_WAKE_KEPT_CHILD.load(Ordering::Relaxed),
+                        USER_RESUME_MAX_NS.load(Ordering::Relaxed) / 1_000_000,
+                        USER_RESUME_OVER_1S.load(Ordering::Relaxed)
+                    );
+                }
+            }
+        }
+        if !s.safe_reschedule_pending {
             return;
         }
         let decision = s.dispatcher.reschedule_current();
         let switch = dispatch_context(s, decision);
+        //j726
+        #[cfg(target_os = "none")]
+        if switch.is_none() && s.user_thread.state() == ThreadState::Ready {
+            USER_WAKE_KEPT_CHILD.fetch_add(1, Ordering::Relaxed);
+        }
         if switch.is_some() || s.dispatcher.runnable_count() == 0 {
             s.safe_reschedule_pending = false;
         }
@@ -1196,7 +1287,7 @@ pub fn pump_idle_floor() {
             s.user_wake_pending = false;
             if matches!(s.user_thread.state(), ThreadState::Blocked) {
                 s.user_thread.ready();
-                s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+                s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
             }
         }
         if !s.safe_reschedule_pending && s.dispatcher.runnable_count() == 0 {
@@ -1226,7 +1317,7 @@ pub fn wake_user() {
             return;
         }
         s.user_thread.ready();
-        s.dispatcher.admit(s.user_thread.koid(), USER_PRIORITY);
+        s.dispatcher.admit(s.user_thread.koid(), USER_WAKE_PRIORITY);
         let decision = s.dispatcher.reschedule_current();
         dispatch_context(s, decision)
     };
@@ -1293,6 +1384,9 @@ fn dispatch_context(
     match decision {
         Decision::Switch { from, to } => {
             s.switches = s.switches.saturating_add(1);
+            //j729
+            #[cfg(target_os = "none")]
+            let user_was_running = matches!(s.user_thread.state(), ThreadState::Running);
             let prev = if let Some(from_id) = from {
                 if from_id == s.user_thread.koid() {
                     if matches!(s.user_thread.state(), ThreadState::Running) {
@@ -1339,6 +1433,57 @@ fn dispatch_context(
                 set_active_aspace_root(s.kernel_ttbr0);
                 &s.boot_ctx as *const ThreadContext
             };
+            //j729
+            #[cfg(target_os = "none")]
+            {
+                let user_koid = s.user_thread.koid();
+                if from == Some(user_koid) && to != user_koid {
+                    if user_was_running {
+                        SORA_AWAY_AT.store(kumo_hal::active::monotonic_nanos(), Ordering::Relaxed);
+                        SORA_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if to == user_koid {
+                    let away_at = SORA_AWAY_AT.swap(0, Ordering::Relaxed);
+                    if away_at != 0 {
+                        let delta = kumo_hal::active::monotonic_nanos().saturating_sub(away_at);
+                        SORA_AWAY_TOTAL_NS.fetch_add(delta, Ordering::Relaxed);
+                        SORA_AWAY_MAX_NS.fetch_max(delta, Ordering::Relaxed);
+                        let n = SORA_AWAY_RESUMES
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1);
+                        if n & 0x1f == 0 {
+                            crate::klog_at!(
+                                kumo_abi::sys::log_level::NOTICE,
+                                "sched: user-away resumes={} preempts={} max={}ms total={}ms\n",
+                                n,
+                                SORA_PREEMPT_COUNT.load(Ordering::Relaxed),
+                                SORA_AWAY_MAX_NS.load(Ordering::Relaxed) / 1_000_000,
+                                SORA_AWAY_TOTAL_NS.load(Ordering::Relaxed) / 1_000_000
+                            );
+                        }
+                    }
+                }
+            }
+            //j726
+            #[cfg(target_os = "none")]
+            if to == s.user_thread.koid() {
+                let ready_at = USER_READY_AT.swap(0, Ordering::Relaxed);
+                if ready_at != 0 {
+                    let delta = kumo_hal::active::monotonic_nanos().saturating_sub(ready_at);
+                    USER_RESUME_MAX_NS.fetch_max(delta, Ordering::Relaxed);
+                    if delta >= 1_000_000_000 {
+                        let over = USER_RESUME_OVER_1S.fetch_add(1, Ordering::Relaxed);
+                        if over & 0x3 == 0 {
+                            crate::klog_at!(
+                                kumo_abi::sys::log_level::NOTICE,
+                                "sched: user resumed ready-to-run={}ms late (over1s={})\n",
+                                delta / 1_000_000,
+                                over + 1
+                            );
+                        }
+                    }
+                }
+            }
             Some((prev, next))
         }
         Decision::Idle | Decision::Continue(_) => None,
@@ -1348,6 +1493,15 @@ fn dispatch_context(
 #[cfg(test)]
 mod tests {
     use super::{wait_target_needs_safe_reschedule, KoId, WaitQueue, WaitTarget};
+
+    //j724
+    #[test]
+    fn deferred_user_wake_is_due_only_for_a_blocked_live_scheduler() {
+        assert!(super::deferred_user_wake_due(false, true, true));
+        assert!(!super::deferred_user_wake_due(false, true, false));
+        assert!(!super::deferred_user_wake_due(false, false, true));
+        assert!(!super::deferred_user_wake_due(true, true, true));
+    }
 
     #[test]
     fn target_of_reports_where_a_thread_is_parked() {

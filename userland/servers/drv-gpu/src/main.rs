@@ -1,34 +1,39 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j650
-//j651
-//j652
-//j653
-//j655
-//j690
+//j733
+//j734
+//j742
+
+extern crate alloc;
 
 mod client;
 
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use drv_gpu::contain::{Containment, SessionNext};
+//j734
+//j743
 use drv_gpu::{
     ack_cs_irqs, ack_group_events, await_job_irq, check_paint, classify_job_wait, clear_job_irqs,
-    cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables,
+    cs_irq_req, csf_doorbell, enable_as, enable_as0, first_stream, flush_page_tables, flush_range,
     init_global_interface, job_irq_csg, job_slot, job_wrapper, kumo_paint_data, kumo_paint_stream,
     latched_fault, latest_flush_id, map_range, mcu_boot, mmu_info, mmu_rawstat,
     paint_reference_checksum, power_l2, probe, program_group, program_queue, publish_insert,
     queue_extract, queue_insert, quiet_mmu, read_cs_control, read_cs_status, read_csg_control,
-    read_fault_as, ring_offset, shared_region_contains, soft_reset, start_group, store_stream,
-    surface_chunks, wake_stream, write_job_words, ClockIo, Completion, CompletionIo, CsControl,
-    CsFeatures, CsgControl, Firmware, FirmwareMemory, GlbIo, GlobalInterface, GroupConfig, JobCall,
-    JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo, QueueConfig, QueueIface, ResetPath,
-    SectionFlags, TableArena, TableMemory, APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE,
-    BOOTSTRAP_VIEW_CHANNEL, BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE,
-    CSG_STREAM_CONTROL_OFFSET, CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS,
-    GPU_VIEW, JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
+    read_fault_as, ring_offset, shared_region_contains, soft_reset, spin_store_stream, start_group,
+    store_stream, surface_chunks, unmap_ranges, wake_stream, write_job_words, ClockIo, Completion,
+    CompletionIo, CsControl, CsFeatures, CsgControl, Fault, Firmware, FirmwareMemory, GlbIo,
+    GlobalInterface, GroupConfig, JobCall, JobWait, MmioIo, PageAttrs, ProbeError, ProbeIo,
+    QueueConfig, QueueIface, ResetPath, SectionFlags, TableArena, TableMemory, UnmapRange,
+    APERTURE_BASE, APERTURE_LEN, BOOTSTRAP_FIRMWARE, BOOTSTRAP_VIEW_CHANNEL,
+    BOOTSTRAP_VIEW_SURFACE, CSF_SHARED_REGION_START, CSG_CONTROL_BASE, CSG_STREAM_CONTROL_OFFSET,
+    CS_LINE_BYTES, GLB_DOORBELL, GLB_DOORBELL_REQ, GLB_PING_TIMEOUT_NS, GPU_VIEW,
+    JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
     KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
-    PAINT_WIDTH, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
+    PAINT_WIDTH, SPIN_STREAM_WORDS, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
 };
+use drv_gpu::{csg_pending_events, disable_as, range_unmapped, stop_group};
 use kumo_abi::initrd::{
     find_entry, INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_TABLE_MAX, MALI_FIRMWARE_PATH,
 };
@@ -43,7 +48,13 @@ const MMIO_VA: u64 = 0x1100_0000;
 const FIRMWARE_MAX: usize = 320 * 1024;
 /// Seven loadable sections need L0, L1, L2 and one L3 per 2 MiB region the image touches: nine
 /// tables for the vendored image, with room to spare.
-const TABLE_ARENA_LEN: u64 = 16 * PAGE_SIZE;
+//j734
+/// J734's second group adds AS2's four tables (L0-L3) to the nine for the image, AS1's and the
+/// client's; eight more pages keep the old headroom.
+// The client window needs one L3 per 2 MiB, even after churn visits every region.
+// Add these to the resident firmware/two-group allowance. — KESTREL
+const TABLE_ARENA_LEN: u64 =
+    (24 + (kumo_gpu::VA_END - kumo_gpu::VA_START) / (2 * 1024 * 1024)) * PAGE_SIZE;
 const MAX_SECTIONS: usize = 8;
 /// The RK3588 arch timer runs at 24 MHz (the boot report's GIC/TIMER line and RESEARCH/009 §9.3);
 /// the firmware's timers are expressed in 1024-tick units of it.
@@ -80,6 +91,52 @@ const AS1_PAINT_VA: u64 = AS1_WORK_VA + 0x10_0000;
 /// DESIGN/019's clip poison, never a value of the reference pattern.
 const PAINT_POISON: u32 = 0x00FF_00FF;
 const _: () = assert!(PAINT_STREAM_VA + (PAINT_STREAM_MAX as u64) * 8 <= AS1_SYNC_VA);
+//j733
+/// J733: job 4 spins on the command-stream processor while the driver edits AS1 live, so the edit
+/// lands under a queue that is provably running (RESEARCH/017 §3.3.8; U3's flush-ID question
+/// rides along). Its stream takes the streams page's third and fourth lines, its started marker
+/// the target line after its own. The scratch page it maps and unmaps sits in the work buffer's
+/// 2 MiB table, so no table is allocated, in a packed 32 KiB region nothing else uses.
+/// — TIMBERDOODLE
+const SPIN_JOB: u64 = PAINT_JOB + 1;
+/// The last bring-up job; a client's signal points count on from its seqno.
+const BRINGUP_JOBS: u64 = SPIN_JOB;
+const SPIN_STREAM_VA: u64 = AS1_STREAMS_VA + 2 * CS_LINE_BYTES;
+const SPIN_MARKER_VA: u64 = AS1_TARGET_VA + (SPIN_JOB + 1) * CS_LINE_BYTES;
+const SPIN_STARTED: u32 = 0x5717_0004;
+/// 2^18 decrements: ~170 ms at the ~660 ns per iteration metal measured at GPLL/6 (the first run's
+/// 2^22 took 2.76 s), a thousand times the edit's ~0.1 ms, far below the firmware's ~13 s progress
+/// timeout (2,560,000 x 1024 cycles at 198 MHz).
+const SPIN_ITERATIONS: u32 = 1 << 18;
+const SPIN_START_TIMEOUT_NS: u64 = 100_000_000;
+const SPIN_TIMEOUT_NS: u64 = 5_000_000_000;
+const AS1_SCRATCH_VA: u64 = AS1_WORK_VA + 0x18_0000;
+const _: () = assert!(SPIN_STREAM_VA + (SPIN_STREAM_WORDS as u64) * 8 <= PAINT_STREAM_VA);
+const _: () = assert!(SPIN_MARKER_VA + 4 <= AS1_STREAMS_VA);
+const _: () = assert!(AS1_SCRATCH_VA >= AS1_PAINT_VA + PAINT_BYTES);
+const _: () = assert!(AS1_SCRATCH_VA % 0x8000 == 0 && AS1_SCRATCH_VA < AS1_WORK_VA + 0x20_0000);
+//j734
+/// J734: a second group on CSG slot 1 in its own address space (AS2), raised only for the
+/// cross-group half of the G8b gate and retired before the wrapped jobs. Its queue pages and
+/// suspend buffer sit in AS0 just past group A's, inside the same 2 MiB table; its ring,
+/// streams, target and sync object use AS1's layout at the same VAs in AS2, so nothing it
+/// touches is reachable through AS1.
+const B_SLOT: u32 = 1;
+const B_AS: u32 = 2;
+const B_IO_PAGES_VA: u64 = 0x0411_0000;
+const B_SUSPEND_VA: u64 = B_IO_PAGES_VA + 2 * PAGE_SIZE;
+const _: () = assert!(shared_region_contains(B_IO_PAGES_VA));
+const _: () = assert!(shared_region_contains(B_SUSPEND_VA));
+const _: () = assert!(B_IO_PAGES_VA >> 21 == MCU_IO_PAGES_VA >> 21);
+/// Twice job 4's spin: B must outlast the AS1 edit and group A's whole store.
+const B_SPIN_ITERATIONS: u32 = 1 << 19;
+const B_STARTED: u32 = 0x5717_00B1;
+const B_VALUE: u32 = 0xC0DE_00B1;
+/// Group A's direct store while B spins: a target line past job 4's marker.
+const A_CONCURRENT_VA: u64 = AS1_TARGET_VA + (SPIN_JOB + 2) * CS_LINE_BYTES;
+const A_CONCURRENT_VALUE: u32 = 0xC0DE_00A1;
+const _: () = assert!(A_CONCURRENT_VA + 4 <= AS1_STREAMS_VA);
+const GROUP_STOP_TIMEOUT_NS: u64 = 100_000_000;
 const GROUP_SLOT: u32 = 0;
 const GROUP_AS: u32 = 1;
 const GROUP_START_TIMEOUT_NS: u64 = 100_000_000;
@@ -135,12 +192,13 @@ struct Device {
 /// writes through `va` with volatile stores only (the J539/J540 noalias lesson).
 #[derive(Clone, Copy)]
 struct Mapping {
-    /// Kept open for the life of the process: the handle is what keeps the VMO (and the
-    /// firmware's memory) alive; nothing reads it after the mapping is made.
-    #[allow(dead_code)]
+    /// Kept open for the life of the allocation: the handle is what keeps the VMO (and the
+    /// firmware's memory) alive; it is closed only by [`release_mapping`].
     handle: Handle,
     va: u64,
     phys: u64,
+    /// The exact VMO length, so release can remove precisely this mapping. — TIMBERDOODLE
+    len: u64,
 }
 
 fn map_contiguous(len: u64) -> Option<Mapping> {
@@ -155,7 +213,21 @@ fn map_contiguous(len: u64) -> Option<Mapping> {
         let _ = kumo_rt::handle_close(handle);
         return None;
     }
-    Some(Mapping { handle, va, phys })
+    Some(Mapping {
+        handle,
+        va,
+        phys,
+        len,
+    })
+}
+
+/// Release the driver's side of one DMA allocation: remove the CPU mapping first, then close
+/// the VMO handle. The client's granted duplicate is the client's own and is unaffected; the
+/// caller must already have proved the GPU cannot reach `phys` (a cleared binding plus
+/// `FLUSH_PT`, or a confirmed soft reset). — TIMBERDOODLE
+fn release_mapping(mapping: Mapping) {
+    let _ = kumo_rt::vmar_unmap(mapping.va, mapping.len);
+    let _ = kumo_rt::handle_close(mapping.handle);
 }
 
 fn zero_mapping(mapping: &Mapping, len: u64) {
@@ -621,7 +693,27 @@ fn report_stream_stall(
 /// G3b: after the reset, read the vendored firmware out of the initrd, map its sections into
 /// address space 0 with their own flags, boot the MCU, and validate the global interface the
 /// firmware publishes. The NOTICE lines are the ones a boot report relies on. — TIMBERDOODLE
-fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_present: u64) -> u8 {
+//j714
+/// One session of DESIGN/024's long-lived handoff. The first act is the blocking read of the
+/// next `g` record, so no GPU state moves until Sora grants a session; the soft-reset ladder
+/// behind that read is the fresh clean start every grant requires, and the tables, arena and
+/// firmware staging are allocated per call so a new session never borrows the last one's DMA
+/// (reclaim is G8d-c's). `first_session` gates the `v`/`s` view records and the G5b paint
+/// into them: the view is the boot-time proof, so only the first session reads or paints it.
+/// A setup failure returns the exit code it returned before G8d-b; a session that reached
+/// service returns the `Containment` its close produced, and only a confirmed release lets
+/// the caller read another `g`. — TIMBERDOODLE
+fn run_mali(
+    device: &mut Device,
+    initrd: Handle,
+    bootstrap: Handle,
+    shader_present: u64,
+    first_session: bool,
+    //j716
+    // Every contiguous-DMA mapping this bring-up creates is recorded here so the caller can
+    // release the session's DMA in full after a confirmed release (G8d-c). — TIMBERDOODLE
+    dma: &mut Vec<Mapping>,
+) -> Result<Containment, u8> {
     let mut tag = [0u8; 1];
     let (len, raw) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
     let Some(client_channel) =
@@ -631,7 +723,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: no client session grant\n"),
         );
-        return 1;
+        return Err(1);
     };
     match soft_reset(device) {
         Ok(ResetPath::Interrupt) => log(
@@ -647,7 +739,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: soft reset failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     }
 
@@ -667,7 +759,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 mmu.va_bits
             ),
         );
-        return 1;
+        return Err(1);
     }
     if mmu.as_present & 1 == 0 {
         log(
@@ -677,7 +769,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 mmu.as_present
             ),
         );
-        return 1;
+        return Err(1);
     }
 
     match power_l2(device) {
@@ -693,7 +785,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: L2 power-on failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     }
 
@@ -705,7 +797,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: initrd table unreadable\n"),
         );
-        return 1;
+        return Err(1);
     };
     let entry = match find_entry(&table[..table_bytes], MALI_FIRMWARE_PATH) {
         Ok(Some(entry)) => entry,
@@ -714,14 +806,14 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: firmware image missing from the initrd\n"),
             );
-            return 1;
+            return Err(1);
         }
         Err(_) => {
             log(
                 log_level::ERR,
                 format_args!("drv-gpu: initrd entry table invalid\n"),
             );
-            return 1;
+            return Err(1);
         }
     };
     if entry.len as usize > FIRMWARE_MAX {
@@ -729,7 +821,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: firmware image larger than the staging buffer\n"),
         );
-        return 1;
+        return Err(1);
     }
     // SAFETY: one driver process, and the staging buffer is only used during this boot.
     let buffer = unsafe {
@@ -743,7 +835,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: firmware image unreadable\n"),
         );
-        return 1;
+        return Err(1);
     }
     let firmware = match Firmware::parse(&buffer[..entry.len as usize]) {
         Ok(firmware) => firmware,
@@ -752,7 +844,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 log_level::ERR,
                 format_args!("drv-gpu: firmware parse failed: {:?}\n", error),
             );
-            return 1;
+            return Err(1);
         }
     };
     let build = firmware
@@ -776,8 +868,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: table arena allocation failed\n"),
         );
-        return 1;
+        return Err(1);
     };
+    dma.push(arena_mapping);
     zero_mapping(&arena_mapping, TABLE_ARENA_LEN);
     let mut table_memory = TableDma {
         arena: arena_mapping,
@@ -787,11 +880,11 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: table arena rejected\n"),
         );
-        return 1;
+        return Err(1);
     };
     let Some(transtab) = arena.alloc_table(&mut table_memory) else {
         log(log_level::ERR, format_args!("drv-gpu: no L0 table\n"));
-        return 1;
+        return Err(1);
     };
 
     let mut loaded: [Option<Loaded>; MAX_SECTIONS] = [None; MAX_SECTIONS];
@@ -803,7 +896,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 format_args!("drv-gpu: more firmware sections than the loader holds\n"),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
         let Some(mapping) = map_contiguous(section.len) else {
             log(
@@ -814,8 +907,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 ),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         };
+        dma.push(mapping);
         zero_mapping(&mapping, section.len);
         copy_mapping(&mapping, section.data);
         let attrs = section.flags.page_attrs();
@@ -836,7 +930,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 ),
             );
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
         loaded[count] = Some(Loaded {
             va: section.va,
@@ -852,7 +946,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             format_args!("drv-gpu: no loadable firmware sections\n"),
         );
         let _ = soft_reset(device);
-        return 1;
+        return Err(1);
     }
     dsb();
     log(
@@ -869,7 +963,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             log_level::ERR,
             format_args!("drv-gpu: AS0 enable failed: {:?}\n", error),
         );
-        return 1;
+        return Err(1);
     }
     log(
         log_level::NOTICE,
@@ -905,7 +999,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 );
             }
             let _ = soft_reset(device);
-            return 1;
+            return Err(1);
         }
     }
 
@@ -919,7 +1013,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             format_args!("drv-gpu: no shared firmware section was loaded\n"),
         );
         let _ = soft_reset(device);
-        return 1;
+        return Err(1);
     };
     let mut control = [0u32; 8];
     for (index, word) in control.iter_mut().enumerate() {
@@ -982,7 +1076,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: global interface init failed: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
             // G4b: the first command-stream group. Its control blocks live in the shared
@@ -1011,7 +1105,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: CSG/CS blocks outside the shared section\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             if !(8..=32).contains(&csg.stream_num) {
                 log(
@@ -1022,7 +1116,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     ),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             log(
                 log_level::INFO,
@@ -1054,8 +1148,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: queue interface pages allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
+            dma.push(io_pages);
             zero_mapping(&io_pages, 2 * PAGE_SIZE);
             if let Err(error) = map_range(
                 &mut table_memory,
@@ -1071,7 +1166,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: queue interface pages map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
 
             let suspend_len = (u64::from(csg.suspend_size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -1084,8 +1179,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: suspend buffer allocation failed\n"),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
+                dma.push(mapping);
                 zero_mapping(&mapping, suspend_len);
                 if let Err(error) = map_range(
                     &mut table_memory,
@@ -1101,7 +1197,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: suspend buffer map failed: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 suspend_va = MCU_SUSPEND_VA;
                 suspend_window = McuWindow {
@@ -1118,7 +1214,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS0 page-table flush failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
 
             let Some(work) = map_contiguous(WORK_LEN) else {
@@ -1127,13 +1223,14 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: group work buffer allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
+            dma.push(work);
             zero_mapping(&work, WORK_LEN);
             let Some(as1_l0) = arena.alloc_table(&mut table_memory) else {
                 log(log_level::ERR, format_args!("drv-gpu: no table for AS1\n"));
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
             if let Err(error) = map_range(
                 &mut table_memory,
@@ -1149,7 +1246,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 work map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             // G5a's offscreen target: one 256x128 XRGB8888 view, poisoned so a pixel the GPU
             // never wrote shows up as a mismatch.
@@ -1159,8 +1256,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: paint target allocation failed\n"),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             };
+            dma.push(paint);
             for offset in (0..PAINT_BYTES).step_by(4) {
                 // SAFETY: a word inside the paint target's Normal-NC DMA mapping.
                 unsafe { ((paint.va + offset) as *mut u32).write_volatile(PAINT_POISON) };
@@ -1179,7 +1277,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 paint target map failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             // Separate GPU permissions: the binary is cached read-only executable; descriptor
             // and push data are uncached read-only no-execute. CPU uploads use Normal-NC, and
@@ -1192,7 +1290,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: kernel data refused: {:?}\n", error),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             };
             for (gpu_va, bytes, executable) in [
@@ -1205,8 +1303,9 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         format_args!("drv-gpu: kernel allocation failed at 0x{:x}\n", gpu_va),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
+                dma.push(mapping);
                 zero_mapping(&mapping, PAGE_SIZE);
                 copy_mapping(&mapping, bytes);
                 if let Err(error) = map_range(
@@ -1230,7 +1329,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         ),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
             log(log_level::NOTICE, format_args!(
@@ -1246,7 +1345,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     format_args!("drv-gpu: AS1 enable failed: {:?}\n", error),
                 );
                 let _ = soft_reset(device);
-                return 1;
+                return Err(1);
             }
             log(
                 log_level::INFO,
@@ -1435,7 +1534,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         );
                     }
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
             }
 
@@ -1508,7 +1607,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     );
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 device.delay_us(100);
             }
@@ -1546,6 +1645,45 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 );
             }
 
+            //j734
+            // The cross-group half of the G8b gate, before the wrapped jobs so group B is gone
+            // by the time anything waits on a JOB interrupt. — TIMBERDOODLE
+            let proof = prove_two_groups(
+                device,
+                dma,
+                &mut table_memory,
+                &mut arena,
+                TwoGroupSetup {
+                    as0_root: transtab,
+                    as1_root: as1_l0,
+                    va_bits: mmu.va_bits,
+                    as_present: mmu.as_present,
+                    shared: windows[0],
+                    input,
+                    output,
+                    group_stride: glb.group_stride,
+                    group,
+                    a_csg: csg,
+                    a_iface: queue_iface,
+                    a_work: work,
+                    a_windows: windows,
+                    scratch_pa: paint.phys,
+                    attrs: noexec_uncached,
+                },
+            );
+            match proof {
+                Ok(report) => report.log(),
+                Err(cause) => {
+                    log(
+                        log_level::ERR,
+                        format_args!("drv-gpu: two-group proof failed: {}\n", cause),
+                    );
+                    report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                    let _ = soft_reset(device);
+                    return Err(1);
+                }
+            }
+
             // G4c: two jobs through RESEARCH/009 §10.6's wrapper, the way panthor submits every
             // job. Each wrapper flushes, CALLs its own store stream, waits for every scoreboard
             // and adds 1 to the queue's sync object; a job is done when the seqno reaches its
@@ -1555,10 +1693,14 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
             let iface = QueueIface::at(MCU_IO_PAGES_VA);
             let sync = work.va + (AS1_SYNC_VA - AS1_WORK_VA);
             let mut seqno = 0;
-            let mut flush_ids = [0u32; PAINT_JOB as usize];
-            for job in 1..=PAINT_JOB {
-                // Jobs 1 and 2 store one value each; job 3 runs the compute kernel.
+            let mut flush_ids = [0u32; BRINGUP_JOBS as usize];
+            //j733
+            let mut live_update = None;
+            for job in 1..=BRINGUP_JOBS {
+                // Jobs 1 and 2 store one value each; job 3 runs the compute kernel; job 4 spins
+                // while AS1 is edited under it.
                 let painting = job == PAINT_JOB;
+                let spinning = job == SPIN_JOB;
                 let target_va = AS1_TARGET_VA + job * CS_LINE_BYTES;
                 let value = WRAPPED_VALUE_BASE | job as u32;
                 let mut words = [0u64; PAINT_STREAM_MAX];
@@ -1571,11 +1713,28 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                                 format_args!("drv-gpu: compute stream refused: {:?}\n", error),
                             );
                             let _ = soft_reset(device);
-                            return 1;
+                            return Err(1);
                         }
                     };
                     words[..stream.len()].copy_from_slice(&stream);
                     (PAINT_STREAM_VA, stream.len())
+                } else if spinning {
+                    let Some(stream) = spin_store_stream(
+                        SPIN_MARKER_VA,
+                        SPIN_STARTED,
+                        target_va,
+                        value,
+                        SPIN_ITERATIONS,
+                    ) else {
+                        log(
+                            log_level::ERR,
+                            format_args!("drv-gpu: spin stream refused\n"),
+                        );
+                        let _ = soft_reset(device);
+                        return Err(1);
+                    };
+                    words[..stream.len()].copy_from_slice(&stream);
+                    (SPIN_STREAM_VA, stream.len())
                 } else {
                     let stream = store_stream(target_va, value);
                     words[..stream.len()].copy_from_slice(&stream);
@@ -1607,7 +1766,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                             ),
                         );
                         let _ = soft_reset(device);
-                        return 1;
+                        return Err(1);
                     }
                 };
                 let (insert, extract) = {
@@ -1626,7 +1785,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         ),
                     );
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 };
                 // G4d: wait for the job on the JOB interrupt (INTID 124) instead of polling. The
                 // first wait is armed before the doorbell rings (inside `await_job_irq`), so a
@@ -1656,7 +1815,11 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 }
                 clear_job_irqs(device, csg_bit | JOB_IRQ_GLOBAL_IF);
                 let started = device.now_ns();
-                let deadline = started.saturating_add(WORK_TIMEOUT_NS);
+                let deadline = started.saturating_add(if spinning {
+                    SPIN_TIMEOUT_NS
+                } else {
+                    WORK_TIMEOUT_NS
+                });
                 let mut waits = 0u32;
                 let mut fired = 0u32;
                 let (mut rawstat, mut stat, mut events, mut glb_events) = (0u32, 0u32, 0u32, 0u32);
@@ -1683,6 +1846,17 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                             wake_stream(&mut glb_io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
                         }
                         device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+                        if spinning {
+                            live_update = Some(update_under_spin(
+                                device,
+                                &mut table_memory,
+                                &mut arena,
+                                as1_l0,
+                                paint.phys,
+                                work,
+                                noexec_uncached,
+                            ));
+                        }
                     }) {
                         Ok(irq) => irq,
                         Err(status) => {
@@ -1694,7 +1868,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                                 ),
                             );
                             let _ = soft_reset(device);
-                            return 1;
+                            return Err(1);
                         }
                     };
                     if submit {
@@ -1782,10 +1956,19 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         job, events, glb_events, irq_req, irq_ack, cs_req, cs_ack, rawstat, stat
                     ),
                 );
+                //j733
+                // Reported before the outcome check, so a stalled spin still says what the edit saw.
+                if let Some(update) = live_update.take() {
+                    if !update.report(elapsed_us) {
+                        report_stream_stall(&mut *device, input, output, windows, csg, cs);
+                        let _ = soft_reset(device);
+                        return Err(1);
+                    }
+                }
                 if outcome != JobWait::Interrupt {
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 if seqno != job || status != 0 || (!painting && landed != value) {
                     log(
@@ -1797,7 +1980,7 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                     );
                     report_stream_stall(&mut *device, input, output, windows, csg, cs);
                     let _ = soft_reset(device);
-                    return 1;
+                    return Err(1);
                 }
                 if painting {
                     // G5c-2: the shader wrote the surface through a GPU-uncached mapping and cleaned
@@ -1832,21 +2015,29 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                         );
                         report_stream_stall(&mut *device, input, output, windows, csg, cs);
                         let _ = soft_reset(device);
-                        return 1;
+                        return Err(1);
                     }
                 }
             }
             log(
                 log_level::NOTICE,
                 format_args!(
-                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}; flush ids 0x{:x} 0x{:x} 0x{:x}\n",
-                    PAINT_JOB, seqno, flush_ids[0], flush_ids[1], flush_ids[2]
+                    "drv-gpu: {} wrapped jobs complete; queue sync object seqno={}; flush ids 0x{:x} 0x{:x} 0x{:x} 0x{:x}\n",
+                    BRINGUP_JOBS, seqno, flush_ids[0], flush_ids[1], flush_ids[2], flush_ids[3]
                 ),
             );
             // G5b: only a pixel-exact paint reaches here, so the view never shows a bad image.
-            present_paint(bootstrap, paint.va);
+            //j714
+            // The `v`/`s` records are consumed once, by the first session: the view is the
+            // boot-time proof of G5b, not a per-session service. A later session neither
+            // reads records Sora will not send again nor paints a view it never received;
+            // the paint job above already re-proved this session's compute path offscreen.
+            // — TIMBERDOODLE
+            if first_session {
+                present_paint(bootstrap, paint.va);
+            }
 
-            client::serve(
+            Ok(client::serve(
                 client_channel,
                 device,
                 &mut table_memory,
@@ -1866,7 +2057,16 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 thread_max_threads,
                 thread_max_workgroup_size,
                 thread_features,
-            )
+                // G7o-a: the same words logged above, plus the protocol this driver wrote
+                // before L2 power-up. Served raw; upstream derives slices, bus width and
+                // coherency from them. — TIMBERDOODLE
+                drv_gpu::protocol::DeviceMemory {
+                    l2_features,
+                    mem_features,
+                    coherency_features,
+                    coherency_protocol: drv_gpu::GPU_COHERENCY_NONE,
+                },
+            ))
         }
         Err(error) => {
             log(
@@ -1874,9 +2074,589 @@ fn run_mali(device: &mut Device, initrd: Handle, bootstrap: Handle, shader_prese
                 format_args!("drv-gpu: global interface invalid: {:?}\n", error),
             );
             let _ = soft_reset(device);
-            1
+            Err(1)
         }
     }
+}
+
+//j733
+/// What job 4's live AS1 edit saw. `in_flight` is the proof's precondition: the started marker
+/// landed before the edit, and neither the job's value nor its seqno had landed after it.
+/// — TIMBERDOODLE
+struct LiveUpdate {
+    started: bool,
+    wait_us: u64,
+    edit_us: u64,
+    in_flight: bool,
+    seqno: u64,
+    /// LATEST_FLUSH_ID before the edit, after the first FLUSH_PT, and after the second (U3).
+    flush_ids: [u32; 3],
+    fault: Option<Fault>,
+    error: Option<&'static str>,
+}
+
+impl LiveUpdate {
+    /// Log the record once the job has finished; false when the edit failed or faulted the space,
+    /// which the caller contains like any failed job. A job that finished before the edit makes
+    /// the proof void, not the session wrong.
+    fn report(&self, job_us: u64) -> bool {
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: job {} ran under a live AS1 edit: started={} after {} us; map+flush and unmap+flush of 0x{:x} took {} us; in flight after={} (seqno={}); job {} us; flush ids 0x{:x} 0x{:x} 0x{:x}; fault={:?}\n",
+                SPIN_JOB,
+                self.started,
+                self.wait_us,
+                AS1_SCRATCH_VA,
+                self.edit_us,
+                self.in_flight,
+                self.seqno,
+                job_us,
+                self.flush_ids[0],
+                self.flush_ids[1],
+                self.flush_ids[2],
+                self.fault
+            ),
+        );
+        if let Some(error) = self.error {
+            log(
+                log_level::ERR,
+                format_args!("drv-gpu: live AS1 edit failed: {}\n", error),
+            );
+            return false;
+        }
+        if self.fault.is_some() {
+            return false;
+        }
+        if !self.in_flight {
+            log(
+                log_level::WARNING,
+                format_args!(
+                    "drv-gpu: live AS1 edit proof void: job {} was not observed running across it\n",
+                    SPIN_JOB
+                ),
+            );
+        }
+        true
+    }
+}
+
+/// Wait for job 4's started marker, then map a scratch page into live AS1, invalidate only its
+/// packed region, unmap it, and invalidate again: G8b's VmBind/VmUnbind sequence (RESEARCH/017
+/// §3.3.1), issued while the queue runs. No CSG, CS, MCU or doorbell register is touched.
+fn update_under_spin(
+    device: &mut Device,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    root: u64,
+    scratch_pa: u64,
+    work: Mapping,
+    attrs: PageAttrs,
+) -> LiveUpdate {
+    let cpu = |va: u64| work.va + (va - AS1_WORK_VA);
+    let begin = device.now_ns();
+    let deadline = begin.saturating_add(SPIN_START_TIMEOUT_NS);
+    let started = loop {
+        // SAFETY: the marker word on its own line of AS1's Normal-NC target page.
+        let seen = unsafe { (cpu(SPIN_MARKER_VA) as *const u32).read_volatile() } == SPIN_STARTED;
+        if seen || device.now_ns() >= deadline {
+            break seen;
+        }
+        device.delay_us(10);
+    };
+    let wait_us = (device.now_ns() - begin) / 1_000;
+    let mut flush_ids = [latest_flush_id(device), 0, 0];
+    let edit_begin = device.now_ns();
+    let error = edit_scratch(
+        device,
+        tables,
+        arena,
+        root,
+        scratch_pa,
+        attrs,
+        &mut flush_ids,
+    )
+    .err();
+    let edit_us = (device.now_ns() - edit_begin) / 1_000;
+    // The fault registers read back zero when nothing faulted; only AS1's rawstat bit says one is
+    // latched, as the boot-time AS1 report already checks. J733's first metal run took the zero
+    // decode for a fault and failed a clean job.
+    let fault = if mmu_rawstat(device) & (1u32 << GROUP_AS) != 0 {
+        read_fault_as(device, GROUP_AS)
+    } else {
+        None
+    };
+    // SAFETY: job 4's target word and the queue's sync object, both in AS1's Normal-NC pages.
+    let (landed, seqno) = unsafe {
+        (
+            (cpu(AS1_TARGET_VA + SPIN_JOB * CS_LINE_BYTES) as *const u32).read_volatile(),
+            (cpu(AS1_SYNC_VA) as *const u64).read_volatile(),
+        )
+    };
+    LiveUpdate {
+        started,
+        wait_us,
+        edit_us,
+        in_flight: started && landed == 0 && seqno < SPIN_JOB,
+        seqno,
+        flush_ids,
+        fault,
+        error,
+    }
+}
+
+//j734
+/// What [`prove_two_groups`] needs from group A's bring-up.
+struct TwoGroupSetup {
+    as0_root: u64,
+    as1_root: u64,
+    va_bits: u32,
+    as_present: u32,
+    shared: McuWindow,
+    input: u64,
+    output: u64,
+    group_stride: u32,
+    group: GroupConfig,
+    a_csg: CsgControl,
+    a_iface: QueueIface,
+    a_work: Mapping,
+    a_windows: [McuWindow; 3],
+    scratch_pa: u64,
+    attrs: PageAttrs,
+}
+
+/// What the two-group proof saw; every field is a measurement the record prints.
+struct TwoGroupReport {
+    b_started_us: u64,
+    edit_us: u64,
+    flush_ids: [u32; 3],
+    a_store_us: u64,
+    b_running_after_edit: bool,
+    b_done_first_us: Option<u64>,
+    b_in_flight: bool,
+    b_us: u64,
+    b_status: u32,
+    stop_ack: u32,
+}
+
+impl TwoGroupReport {
+    fn log(&self) {
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG{}/AS{} spinning after {} us; AS1 edit {} us under it (flush ids 0x{:x} 0x{:x} 0x{:x}); CSG{} running after the edit={}\n",
+                B_SLOT,
+                B_AS,
+                self.b_started_us,
+                self.edit_us,
+                self.flush_ids[0],
+                self.flush_ids[1],
+                self.flush_ids[2],
+                B_SLOT,
+                self.b_running_after_edit
+            ),
+        );
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG0 store landed in {} us; CSG{} finished first={:?} us\n",
+                self.a_store_us, B_SLOT, self.b_done_first_us
+            ),
+        );
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: two groups: CSG{} still in flight after both={}; finished status=0x{:x} value=0x{:08x} in {} us; no AS1/AS2 fault; CSG{} stopped (ack=0x{:08x}), AS{} off\n",
+                B_SLOT, self.b_in_flight, self.b_status, B_VALUE, self.b_us, B_SLOT, self.stop_ack, B_AS
+            ),
+        );
+    }
+}
+
+/// RESEARCH/017 §3.3.8's two-group proof. Raise group B on CSG1 in its own address space, start
+/// it spinning, and while it provably runs: edit AS1 live (J733's map/flush/unmap/flush) and
+/// let group A on CSG0 run a store. B must still be running afterwards and must then finish
+/// clean, with neither space faulted. B is acknowledged, terminated and its space disabled
+/// before returning, so the session goes on with exactly the one group it had. Errors name the
+/// step; the caller contains them with the usual stall report and soft reset. — TIMBERDOODLE
+fn prove_two_groups(
+    device: &mut Device,
+    dma: &mut Vec<Mapping>,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    setup: TwoGroupSetup,
+) -> Result<TwoGroupReport, &'static str> {
+    if setup.as_present & (1 << B_AS) == 0 {
+        return Err("no AS2 on this GPU");
+    }
+    let mut shared_memory = SharedMemory {
+        mcu: setup.shared.mcu,
+        cpu: setup.shared.cpu,
+        len: setup.shared.len,
+    };
+    let csg_mcu = setup.shared.mcu
+        + u64::from(CSG_CONTROL_BASE)
+        + u64::from(setup.group_stride) * u64::from(B_SLOT);
+    let csg = read_csg_control(&mut shared_memory, csg_mcu);
+    let cs = read_cs_control(
+        &mut shared_memory,
+        csg_mcu + u64::from(CSG_STREAM_CONTROL_OFFSET),
+    );
+    let inside = |va: u64| va >= setup.shared.mcu && va < setup.shared.mcu + setup.shared.len;
+    if !inside(csg.input_va)
+        || !inside(csg.output_va)
+        || !inside(cs.input_va)
+        || !inside(cs.output_va)
+    {
+        return Err("CSG1/CS blocks outside the shared section");
+    }
+    let suspend_len = (u64::from(csg.suspend_size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if MCU_SUSPEND_VA + suspend_len > B_IO_PAGES_VA {
+        return Err("group A's suspend buffer reaches group B's pages");
+    }
+    // `map_range` overwrites silently: prove B's MCU pages free of every firmware section first.
+    if !range_unmapped(
+        tables,
+        setup.as0_root,
+        B_IO_PAGES_VA,
+        2 * PAGE_SIZE + suspend_len,
+    ) {
+        return Err("group B's AS0 pages are already mapped");
+    }
+    let io_pages = map_contiguous(2 * PAGE_SIZE).ok_or("group B interface pages")?;
+    dma.push(io_pages);
+    zero_mapping(&io_pages, 2 * PAGE_SIZE);
+    map_range(
+        tables,
+        arena,
+        setup.as0_root,
+        B_IO_PAGES_VA,
+        io_pages.phys,
+        2 * PAGE_SIZE,
+        setup.attrs,
+    )
+    .map_err(|_| "group B interface pages map")?;
+    let mut suspend_window = McuWindow::default();
+    if suspend_len > 0 {
+        let suspend = map_contiguous(suspend_len).ok_or("group B suspend buffer")?;
+        dma.push(suspend);
+        zero_mapping(&suspend, suspend_len);
+        map_range(
+            tables,
+            arena,
+            setup.as0_root,
+            B_SUSPEND_VA,
+            suspend.phys,
+            suspend_len,
+            setup.attrs,
+        )
+        .map_err(|_| "group B suspend buffer map")?;
+        suspend_window = McuWindow {
+            mcu: B_SUSPEND_VA,
+            cpu: suspend.va,
+            len: suspend_len,
+        };
+    }
+    flush_page_tables(device, 0).map_err(|_| "AS0 flush for group B")?;
+
+    let as2_l0 = arena.alloc_table(tables).ok_or("no table for AS2")?;
+    let work = map_contiguous(WORK_LEN).ok_or("group B work buffer")?;
+    dma.push(work);
+    zero_mapping(&work, WORK_LEN);
+    map_range(
+        tables,
+        arena,
+        as2_l0,
+        AS1_WORK_VA,
+        work.phys,
+        WORK_LEN,
+        setup.attrs,
+    )
+    .map_err(|_| "AS2 work map")?;
+    dsb();
+    enable_as(device, B_AS, as2_l0, setup.va_bits).map_err(|_| "AS2 enable")?;
+
+    let b_windows = [
+        setup.shared,
+        McuWindow {
+            mcu: B_IO_PAGES_VA,
+            cpu: io_pages.va,
+            len: 2 * PAGE_SIZE,
+        },
+        suspend_window,
+    ];
+    let b_iface = QueueIface::at(B_IO_PAGES_VA);
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        program_queue(
+            &mut glb_io,
+            cs.input_va,
+            QueueConfig {
+                ring_va: AS1_WORK_VA,
+                ring_size: RING_SIZE,
+                ring_input_va: b_iface.input_va,
+                ring_output_va: b_iface.output_va,
+                doorbell: B_SLOT + 1,
+                priority: 0,
+            },
+        );
+        program_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            GroupConfig {
+                address_space: B_AS,
+                suspend_va: if suspend_len > 0 { B_SUSPEND_VA } else { 0 },
+                ..setup.group
+            },
+        );
+        start_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            B_SLOT,
+            GROUP_START_TIMEOUT_NS,
+        )
+        .map_err(|_| "group B start")?;
+    }
+
+    // B's spin under the §10.6 wrapper, so its sync object reports a status.
+    let cpu = |va: u64| work.va + (va - AS1_WORK_VA);
+    let b_target = AS1_TARGET_VA + SPIN_JOB * CS_LINE_BYTES;
+    let stream = spin_store_stream(
+        SPIN_MARKER_VA,
+        B_STARTED,
+        b_target,
+        B_VALUE,
+        B_SPIN_ITERATIONS,
+    )
+    .ok_or("group B spin stream")?;
+    for (index, word) in stream.iter().enumerate() {
+        // SAFETY: the streams page of B's Normal-NC work buffer; the const assert keeps the
+        // spin stream below the paint stream's offset.
+        unsafe { ((cpu(SPIN_STREAM_VA) + index as u64 * 8) as *mut u64).write_volatile(*word) };
+    }
+    dsb();
+    let wrapper = job_wrapper(
+        CsFeatures::decode(cs.features),
+        JobCall {
+            latest_flush: latest_flush_id(device),
+            stream_va: SPIN_STREAM_VA,
+            stream_len: (stream.len() * 8) as u32,
+            sync_va: AS1_SYNC_VA,
+        },
+    )
+    .map_err(|_| "group B wrapper")?;
+    let slot = job_slot(0, 0, RING_SIZE).ok_or("group B ring")?;
+    write_job_words(0, slot, &wrapper, RING_SIZE, |offset, word| {
+        // SAFETY: `offset` is below RING_SIZE, inside the ring page of B's work buffer.
+        unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
+    });
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        publish_insert(&mut glb_io, b_iface, slot.end);
+    }
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        wake_stream(&mut glb_io, csg.input_va, csg.output_va, B_SLOT, 0);
+    }
+    let rung = device.now_ns();
+    device.write32(csf_doorbell(B_SLOT + 1), 1);
+    // SAFETY: one aligned word of B's Normal-NC work buffer.
+    let read32 = |va: u64| unsafe { (cpu(va) as *const u32).read_volatile() };
+    let deadline = rung.saturating_add(SPIN_START_TIMEOUT_NS);
+    while read32(SPIN_MARKER_VA) != B_STARTED {
+        if device.now_ns() >= deadline {
+            return Err("group B never reached its spin");
+        }
+        device.delay_us(10);
+    }
+    let b_started_us = (device.now_ns() - rung) / 1_000;
+
+    // Under B's spin: G8b's live edit on group A's space, then a store by group A itself.
+    let mut flush_ids = [latest_flush_id(device), 0, 0];
+    let edit_begin = device.now_ns();
+    edit_scratch(
+        device,
+        tables,
+        arena,
+        setup.as1_root,
+        setup.scratch_pa,
+        setup.attrs,
+        &mut flush_ids,
+    )?;
+    let edit_us = (device.now_ns() - edit_begin) / 1_000;
+    // SAFETY: B's sync object, 8-byte aligned in its Normal-NC sync page.
+    let b_seqno = || unsafe { (cpu(AS1_SYNC_VA) as *const u64).read_volatile() };
+    // The claim itself: the queue in the other group and space is still running after the edit.
+    let b_running_after_edit = read32(b_target) == 0 && b_seqno() == 0;
+    let a_cpu = |va: u64| setup.a_work.va + (va - AS1_WORK_VA);
+    let a_stream = store_stream(A_CONCURRENT_VA, A_CONCURRENT_VALUE);
+    let a_insert = {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        queue_insert(&mut glb_io, setup.a_iface)
+    };
+    // The prefetcher reads whole 64-byte lines and already holds the first stream's line, NOPs
+    // past its end included: a stream written mid-line runs its first words as those stale NOPs
+    // (J586's rule, which `job_slot` keeps). J734's second run placed this store at 0x30, lost its
+    // address and value, and re-stored the first stream's word instead. Start on a fresh line.
+    let a_start = (a_insert + CS_LINE_BYTES - 1) & !(CS_LINE_BYTES - 1);
+    let mut position = a_insert & !7;
+    while position < a_start {
+        // SAFETY: inside the ring page of A's Normal-NC work buffer; A's queue is drained.
+        unsafe {
+            ((setup.a_work.va + ring_offset(position, RING_SIZE) as u64) as *mut u64)
+                .write_volatile(0)
+        };
+        position += 8;
+    }
+    for (index, word) in a_stream.iter().enumerate() {
+        let offset = ring_offset(a_start + index as u64 * 8, RING_SIZE);
+        // SAFETY: as above.
+        unsafe { ((setup.a_work.va + offset as u64) as *mut u64).write_volatile(*word) };
+    }
+    dsb();
+    // Clear the first stream's leftover IDLE and stream events first, as every wrapped job does
+    // before its doorbell.
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        ack_group_events(&mut glb_io, setup.a_csg.input_va, setup.a_csg.output_va);
+    }
+    let a_rung = device.now_ns();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        publish_insert(
+            &mut glb_io,
+            setup.a_iface,
+            a_start + (a_stream.len() * 8) as u64,
+        );
+    }
+    dsb();
+    {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+        wake_stream(
+            &mut glb_io,
+            setup.a_csg.input_va,
+            setup.a_csg.output_va,
+            GROUP_SLOT,
+            0,
+        );
+    }
+    device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
+    // Whether A runs beside B or only after it is a finding, not the claim: wait out B's whole
+    // budget and note which finished first. Only a store that never lands is an error.
+    let deadline = a_rung.saturating_add(SPIN_TIMEOUT_NS);
+    let mut b_done_first_us = None;
+    // SAFETY: A's Normal-NC target page, one aligned word.
+    while unsafe { (a_cpu(A_CONCURRENT_VA) as *const u32).read_volatile() } != A_CONCURRENT_VALUE {
+        if b_done_first_us.is_none() && b_seqno() >= 1 {
+            b_done_first_us = Some((device.now_ns() - a_rung) / 1_000);
+        }
+        if device.now_ns() >= deadline {
+            let mut glb_io =
+                SharedGlb::new(&mut *device, setup.input, setup.output, setup.a_windows);
+            let (insert, extract) = (
+                queue_insert(&mut glb_io, setup.a_iface),
+                queue_extract(&mut glb_io, setup.a_iface),
+            );
+            let state = glb_io.read32(setup.a_csg.output_va + 0x18);
+            let pending =
+                csg_pending_events(&mut glb_io, setup.a_csg.input_va, setup.a_csg.output_va);
+            let rawstat = mmu_rawstat(glb_io.device);
+            log(
+                log_level::ERR,
+                format_args!(
+                    "drv-gpu: group A store stuck: insert=0x{:x} extract=0x{:x} csg0 state=0x{:08x} pending=0x{:08x} mmu rawstat=0x{:08x}; B done first={:?} us\n",
+                    insert, extract, state, pending, rawstat, b_done_first_us
+                ),
+            );
+            return Err("group A's store never landed");
+        }
+        device.delay_us(10);
+    }
+    let a_store_us = (device.now_ns() - a_rung) / 1_000;
+    let b_in_flight = read32(b_target) == 0 && b_seqno() == 0;
+
+    let deadline = rung.saturating_add(SPIN_TIMEOUT_NS);
+    while b_seqno() < 1 {
+        if device.now_ns() >= deadline {
+            return Err("group B never finished its spin");
+        }
+        device.delay_us(100);
+    }
+    let b_us = (device.now_ns() - rung) / 1_000;
+    let b_status = read32(AS1_SYNC_VA + SYNC_STATUS_OFFSET);
+    if mmu_rawstat(device) & ((1 << GROUP_AS) | (1 << B_AS)) != 0 {
+        return Err("an AS1 or AS2 fault is latched");
+    }
+    if b_status != 0 || read32(b_target) != B_VALUE {
+        return Err("group B finished wrong");
+    }
+
+    // Leave the slot as it was found: no pending event, terminated, its space off.
+    let stop_ack = {
+        let mut glb_io = SharedGlb::new(&mut *device, setup.input, setup.output, b_windows);
+        ack_group_events(&mut glb_io, csg.input_va, csg.output_va);
+        let ack = stop_group(
+            &mut glb_io,
+            csg.input_va,
+            csg.output_va,
+            B_SLOT,
+            GROUP_STOP_TIMEOUT_NS,
+        )
+        .map_err(|_| "group B stop")?;
+        ack_group_events(&mut glb_io, csg.input_va, csg.output_va);
+        ack
+    };
+    clear_job_irqs(device, job_irq_csg(B_SLOT));
+    disable_as(device, B_AS).map_err(|_| "AS2 disable")?;
+    Ok(TwoGroupReport {
+        b_started_us,
+        edit_us,
+        flush_ids,
+        a_store_us,
+        b_running_after_edit,
+        b_done_first_us,
+        b_in_flight,
+        b_us,
+        b_status,
+        stop_ack,
+    })
+}
+
+/// The edit itself: map, invalidate the packed region, unmap, invalidate again, sampling
+/// LATEST_FLUSH_ID after each invalidation into `flush_ids[1..]`.
+fn edit_scratch(
+    device: &mut Device,
+    tables: &mut TableDma,
+    arena: &mut TableArena,
+    root: u64,
+    scratch_pa: u64,
+    attrs: PageAttrs,
+    flush_ids: &mut [u32; 3],
+) -> Result<(), &'static str> {
+    map_range(
+        tables,
+        arena,
+        root,
+        AS1_SCRATCH_VA,
+        scratch_pa,
+        PAGE_SIZE,
+        attrs,
+    )
+    .map_err(|_| "scratch map")?;
+    flush_range(device, GROUP_AS, AS1_SCRATCH_VA, PAGE_SIZE).map_err(|_| "flush after map")?;
+    flush_ids[1] = latest_flush_id(device);
+    let scratch = [UnmapRange {
+        va: AS1_SCRATCH_VA,
+        len: PAGE_SIZE,
+    }];
+    unmap_ranges(tables, root, &scratch).map_err(|_| "scratch unmap")?;
+    flush_range(device, GROUP_AS, AS1_SCRATCH_VA, PAGE_SIZE).map_err(|_| "flush after unmap")?;
+    flush_ids[2] = latest_flush_id(device);
+    Ok(())
 }
 
 /// G5b: take view [`GPU_VIEW`] from the bootstrap channel, copy the painted target into its
@@ -1906,7 +2686,11 @@ fn present_paint(bootstrap: Handle, paint_va: u64) {
         );
         return;
     };
-    let _ = kumo_rt::handle_close(bootstrap);
+    //j714
+    // The handoff receiver stays open: DESIGN/024 makes the bootstrap pair the long-lived
+    // session lane, and the first session's job ended with the view grant, not the handoff.
+    // Closing it here would turn Sora's next `g` into PeerClosed and end the driver at one
+    // session. — TIMBERDOODLE
     for (offset, _, _) in surface_chunks() {
         let mut bytes = [0u8; SURFACE_CHUNK_BYTES];
         for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
@@ -1984,6 +2768,8 @@ fn park() -> ! {
 extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
     // G5b: x1 is a bootstrap channel. Its first message carries the initrd handle the firmware
     // is read from (x1 itself until J590); the view arrives later on the same channel.
+    // G8d-b: the same pair is the long-lived session handoff — every later `g` is a fresh
+    // session's server end, and this receiver stays open across sessions. — TIMBERDOODLE
     let bootstrap = Handle(bootstrap as u32);
     let mut tag = [0u8; 1];
     let (len, initrd) = kumo_rt::channel_read_with_handle(bootstrap, tag.as_mut_ptr(), 1);
@@ -2022,7 +2808,74 @@ extern "C" fn main(resource: u64, bootstrap: u64) -> ! {
                     identity.shader_present
                 ),
             );
-            run_mali(&mut device, initrd, bootstrap, identity.shader_present)
+            //j714
+            // DESIGN/024's session loop: the bootstrap pair is the long-lived handoff, so
+            // every `g` record is one session's server end and `run_mali` blocks on it
+            // before touching the GPU. Only a containment that proved quiescence licenses
+            // another turn, and the reset that opens the next turn is run_mali's own ladder;
+            // a poison closes the handoff receiver — no handle is left for a grant this
+            // driver will never serve — and parks with everything retained. Sora's
+            // RestartBudget owns the attempt count; the driver keeps accepting while it can
+            // serve honestly. — TIMBERDOODLE
+            let mut first_session = true;
+            let mut session_number = 0u32;
+            //j716
+            // One session's bring-up DMA, cleared by release after every confirmed close.
+            // — TIMBERDOODLE
+            let mut session_dma: Vec<Mapping> = Vec::new();
+            loop {
+                session_number += 1;
+                log(
+                    log_level::NOTICE,
+                    format_args!("drv-gpu: serving session {}\n", session_number),
+                );
+                match run_mali(
+                    &mut device,
+                    initrd,
+                    bootstrap,
+                    identity.shader_present,
+                    first_session,
+                    &mut session_dma,
+                ) {
+                    Ok(containment) => match containment.next() {
+                        //j716
+                        // G8d-c: a confirmed release licenses reclaiming the session's
+                        // bring-up DMA as well as its wire session. Each mapping is a
+                        // contiguous-DMA VMO, so unmapping and closing it returns the frames
+                        // to the kernel's free list once no reference remains (J708's retire
+                        // pass is the mechanism); the next session's bring-up allocates from
+                        // the same pool. Poison retains everything instead. — TIMBERDOODLE
+                        SessionNext::Regrant => {
+                            let count = session_dma.len();
+                            let mut bytes = 0u64;
+                            for mapping in session_dma.drain(..) {
+                                bytes += mapping.len;
+                                release_mapping(mapping);
+                            }
+                            log(
+                                log_level::NOTICE,
+                                format_args!(
+                                    "drv-gpu: session {} bring-up released mappings={} bytes={}\n",
+                                    session_number, count, bytes
+                                ),
+                            );
+                            first_session = false;
+                        }
+                        SessionNext::Park => {
+                            //j714
+                            // Retain everything and refuse every further grant. Closing this
+                            // receiver stops Sora's next `g` at the send; a grant already
+                            // queued in the kernel mailbox keeps its handle until that queue
+                            // is dropped, which this driver cannot reach without reading it,
+                            // so the containment record is the honest account of what was
+                            // kept. — TIMBERDOODLE
+                            let _ = kumo_rt::handle_close(bootstrap);
+                            park()
+                        }
+                    },
+                    Err(code) => break code,
+                }
+            }
         }
         Err(ProbeError::PowerUp(status)) if status == Errno::NotSupported.status() => {
             log(

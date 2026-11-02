@@ -479,10 +479,26 @@ index 50a40fe..587f23b 100644
  mod sys;
  
 diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
-index 0bf42bf..2051e7f 100644
 --- a/src/ld_so/mod.rs
 +++ b/src/ld_so/mod.rs
-@@ -128,7 +128,7 @@ fn static_init(
+@@ -110,7 +110,15 @@
+             unsafe {
+                 STATIC_TCB_MASTER.ptr = p_vaddr as *const u8;
+                 STATIC_TCB_MASTER.image_size = p_filesz;
+-                STATIC_TCB_MASTER.offset = valign;
++                // Variant-I static TLS starts at offset zero on KUMO AArch64.
++                // The old end-relative offset silently misplaced nonzero initializers.
++                // Keep the other platforms unchanged. — SAKER, J736
++                STATIC_TCB_MASTER.offset = if cfg!(all(target_os = "kumo", target_arch = "aarch64"))
++                {
++                    0
++                } else {
++                    valign
++                };
+ 
+                 let tcb = Tcb::new(vsize).expect("failed to allocate TCB");
+                 tcb.masters_ptr = ptr::addr_of_mut!(STATIC_TCB_MASTER);
+@@ -128,7 +136,7 @@
      }
  }
  
@@ -578,3 +594,132 @@ index 401910d..bd010b4 100644
  
      fn allocates_zeros(&self) -> bool {
          true
+diff --git a/src/header/stdio/mod.rs b/src/header/stdio/mod.rs
+--- a/src/header/stdio/mod.rs
++++ b/src/header/stdio/mod.rs
+@@ -51,6 +51,10 @@
+ 
+ mod ext;
+ mod helpers;
++#[cfg(target_os = "kumo")]
++mod kumo_memstream;
++#[cfg(target_os = "kumo")]
++pub use self::kumo_memstream::open_memstream;
+ pub mod printf;
+ pub mod reader;
+ pub mod scanf;
+@@ -99,6 +103,15 @@
+ 
+ pub trait Writer: Write + Pending {
+     fn purge(&mut self);
++    fn is_memstream(&self) -> bool {
++        false
++    }
++    fn memory_seek(&mut self, _offset: off_t, _whence: c_int) -> Option<io::Result<off_t>> {
++        None
++    }
++    fn memory_position(&self) -> Option<off_t> {
++        None
++    }
+ }
+ 
+ impl<W: crate::io::Write> Writer for BufWriter<W> {
+@@ -378,7 +391,8 @@
+ 
+     let mut r = stream.flush().is_err();
+     // TODO: better error handling
+-    let close = Sys::close(*stream.file).map(|()| 0).or_minus_one_errno() == -1;
++    let close = !stream.writer.is_memstream()
++        && Sys::close(*stream.file).map(|()| 0).or_minus_one_errno() == -1;
+     r = r || close;
+ 
+     if stream.flags & constants::F_PERM == 0 {
+@@ -549,6 +563,10 @@
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn fileno(stream: *mut FILE) -> c_int {
+     let stream = unsafe { (*stream).lock() };
++    if stream.writer.is_memstream() {
++        ERRNO.set(errno::EBADF);
++        return -1;
++    }
+     *stream.file
+ }
+ 
+@@ -766,7 +784,17 @@
+         return -1;
+     }
+ 
+-    let err = Sys::lseek(*stream.file, off, whence).or_minus_one_errno();
++    let err = if let Some(result) = stream.writer.memory_seek(off, whence) {
++        match result {
++            Ok(position) => position,
++            Err(error) => {
++                ERRNO.set(error.raw_os_error().unwrap_or(errno::EINVAL));
++                -1
++            }
++        }
++    } else {
++        Sys::lseek(*stream.file, off, whence).or_minus_one_errno()
++    };
+     if err < 0 {
+         return err as c_int;
+     }
+@@ -804,6 +832,9 @@
+ }
+ 
+ pub unsafe extern "C" fn ftell_locked(stream: &mut FILE) -> off_t {
++    if let Some(position) = stream.writer.memory_position() {
++        return position;
++    }
+     let pos = Sys::lseek(*stream.file, 0, SEEK_CUR).or_minus_one_errno();
+     if pos < 0 {
+         return -1;
+diff --git a/src/header/math/cbindgen.toml b/src/header/math/cbindgen.toml
+--- a/src/header/math/cbindgen.toml
++++ b/src/header/math/cbindgen.toml
+@@ -6,14 +6,16 @@
+ include_guard = "_RELIBC_MATH_H"
+ language = "C"
+ no_includes = true
++sys_includes = ["limits.h"]
+ cpp_compat = true
+ # constants from openlibm
+ after_includes = """
+ 
+-#define	HUGE_VALF	(float)HUGE_VAL
+-#define	HUGE_VALL	(long double)HUGE_VAL
+-#define	INFINITY	HUGE_VALF
+-#define	NAN		(__nan.__uf)
++#define HUGE_VAL __builtin_huge_val()
++#define HUGE_VALF __builtin_huge_valf()
++#define HUGE_VALL __builtin_huge_vall()
++#define INFINITY __builtin_inff()
++#define NAN __builtin_nanf("")
+ 
+ #define	FP_ILOGB0	(-INT_MAX)
+ #define	FP_ILOGBNAN	INT_MAX
+@@ -57,3 +59,8 @@
+ 
+ [enum]
+ prefix_with_name = true
++
++# Classification is supplied by the standard macros above; these Rust export
++# declarations conflict with those macros and libc++ overloads. — SAKER, J738
++[export]
++exclude = ["isfinite", "isinf", "isnan", "isnormal"]
+diff --git a/src/header/elf/mod.rs b/src/header/elf/mod.rs
+--- a/src/header/elf/mod.rs
++++ b/src/header/elf/mod.rs
+@@ -12,8 +12,10 @@
+ 
+ pub type Elf32_Word = uint32_t;
+ pub type Elf32_Sword = int32_t;
+-pub type Elf64_Word = uint64_t;
+-pub type Elf64_Sword = int64_t;
++// ELF64 Word is still 32 bits; Xword is the 64-bit type. Incorrect widths
++// shift every program/note-header field used by static build IDs. — SAKER, J740
++pub type Elf64_Word = uint32_t;
++pub type Elf64_Sword = int32_t;
+ 
+ pub type Elf32_Xword = uint64_t;
+ pub type Elf32_Sxword = int64_t;

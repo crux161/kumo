@@ -1,6 +1,8 @@
-//j399
 //j409
 //j618
+//j708
+//j719
+//j731
 
 use alloc::vec::Vec;
 
@@ -137,6 +139,11 @@ struct EndpointState {
     object: KernelObject,
     inbox: Vec<KernelMessage>,
     open: bool,
+    //j719
+    /// Counts the handles that still own this endpoint. A close may only reap the inbox
+    /// once this observer says no owner remains; the kernel-retained end of a root
+    /// channel has no observer and is never reaped. — TIMBERDOODLE
+    references: Option<crate::object::HandleReferences>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,11 +174,13 @@ impl IpcRegistry {
         objects: &mut ObjectManager,
         process: &mut Process,
     ) -> Result<(Handle, usize, ChannelEnd), IpcError> {
-        let channel = ChannelPair::new(objects);
-        let right = process.handles_mut().insert(
+        let mut channel = ChannelPair::new(objects);
+        //j719
+        let (right, right_references) = process.handles_mut().insert_channel(
             channel.object(ChannelEnd::Right),
             Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
+        channel.set_references(None, Some(right_references));
         let index = self.channels.len();
         self.channels.push(channel);
         Ok((right, index, ChannelEnd::Left))
@@ -182,15 +191,17 @@ impl IpcRegistry {
         objects: &mut ObjectManager,
         process: &mut Process,
     ) -> Result<(Handle, Handle), IpcError> {
-        let channel = ChannelPair::new(objects);
-        let left = process.handles_mut().insert(
+        let mut channel = ChannelPair::new(objects);
+        //j719
+        let (left, left_references) = process.handles_mut().insert_channel(
             channel.object(ChannelEnd::Left),
             Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
-        let right = process.handles_mut().insert(
+        let (right, right_references) = process.handles_mut().insert_channel(
             channel.object(ChannelEnd::Right),
             Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
+        channel.set_references(Some(left_references), Some(right_references));
         self.channels.push(channel);
         Ok((left, right))
     }
@@ -326,6 +337,20 @@ impl IpcRegistry {
         Err(IpcError::NotChannel)
     }
 
+    /// True when any queued message still owns a transferred handle for `koid`. A queued
+    /// capability is not in any process table until the receiver reads it, so a VMO release
+    /// must consult the mailboxes as well as every process. — TIMBERDOODLE
+    pub fn koid_queued(&self, koid: KoId) -> bool {
+        self.channels.iter().any(|channel| {
+            [&channel.left, &channel.right].iter().any(|endpoint| {
+                endpoint
+                    .inbox
+                    .iter()
+                    .any(|message| message.transfers.iter().any(|entry| entry.koid == koid))
+            })
+        })
+    }
+
     pub fn peer_koid_for(&self, koid: KoId) -> Result<KoId, IpcError> {
         for channel in &self.channels {
             if channel.object(ChannelEnd::Left).koid() == koid {
@@ -372,6 +397,17 @@ impl IpcRegistry {
         Err(IpcError::NotChannel)
     }
 
+    //j731
+    /// Registry sizes for the J731 census. No path removes a port, so `port_count` is every
+    /// port created since boot. — TIMBERDOODLE
+    pub fn port_count(&self) -> usize {
+        self.ports.len()
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
     fn port_mut_by_koid(&mut self, koid: KoId) -> Result<&mut Port, IpcError> {
         for port in &mut self.ports {
             if port.object().koid() == koid {
@@ -381,16 +417,46 @@ impl IpcRegistry {
         Err(IpcError::BadHandle)
     }
 
-    pub fn close_by_koid(&mut self, koid: KoId) -> Result<Option<KoId>, IpcError> {
+    //j719
+    /// Close the endpoint named by `koid` and, only when this close removed its last
+    /// owning handle, reap what it still holds: its inbox — messages no surviving owner
+    /// can ever read — and, through every dropped transfer that carries a channel
+    /// endpoint, that endpoint too when its own last owner is likewise gone. A dropped
+    /// capability is closed the way a closed handle would be, so the carried endpoint's
+    /// peer observes `PEER_CLOSED` instead of waiting on something that no longer exists.
+    /// Returns every peer koid that must be signalled/woken: the direct peer and any
+    /// cascaded peers. — TIMBERDOODLE
+    pub fn close_by_koid(&mut self, koid: KoId) -> Result<Vec<KoId>, IpcError> {
         let end = self.channel_end_for(koid)?;
-        let channel = self.channel_mut_by_koid(koid)?;
-        channel.close(end);
-        let peer_end = peer(end);
-        if channel.endpoint(peer_end).open {
-            Ok(Some(channel.object(peer_end).koid()))
-        } else {
-            Ok(None)
+        let mut signals = Vec::new();
+        let mut carried = Vec::new();
+        {
+            let channel = self.channel_mut_by_koid(koid)?;
+            channel.close(end);
+            if channel.endpoint(peer(end)).open {
+                signals.push(channel.object(peer(end)).koid());
+            }
+            if last_owner(channel.endpoint(end)) {
+                collect_carried_transfers(channel.endpoint_mut(end), &mut carried);
+            }
         }
+        while let Some(carried_koid) = carried.pop() {
+            let Ok(carried_end) = self.channel_end_for(carried_koid) else {
+                continue;
+            };
+            let Ok(channel) = self.channel_mut_by_koid(carried_koid) else {
+                continue;
+            };
+            if !channel.endpoint(carried_end).open || !last_owner(channel.endpoint(carried_end)) {
+                continue;
+            }
+            channel.close(carried_end);
+            if channel.endpoint(peer(carried_end)).open {
+                signals.push(channel.object(peer(carried_end)).koid());
+            }
+            collect_carried_transfers(channel.endpoint_mut(carried_end), &mut carried);
+        }
+        Ok(signals)
     }
 }
 
@@ -407,11 +473,13 @@ impl ChannelPair {
                 object: objects.create(ObjectKind::Channel),
                 inbox: Vec::new(),
                 open: true,
+                references: None,
             },
             right: EndpointState {
                 object: objects.create(ObjectKind::Channel),
                 inbox: Vec::new(),
                 open: true,
+                references: None,
             },
         }
     }
@@ -496,12 +564,48 @@ impl ChannelPair {
             ChannelEnd::Right => &mut self.right,
         }
     }
+
+    //j719
+    /// Attach the ownership observers minted when the endpoints' first handles were
+    /// inserted. — TIMBERDOODLE
+    fn set_references(
+        &mut self,
+        left: Option<crate::object::HandleReferences>,
+        right: Option<crate::object::HandleReferences>,
+    ) {
+        self.left.references = left;
+        self.right.references = right;
+    }
 }
 
 fn peer(end: ChannelEnd) -> ChannelEnd {
     match end {
         ChannelEnd::Left => ChannelEnd::Right,
         ChannelEnd::Right => ChannelEnd::Left,
+    }
+}
+
+//j719
+/// True when no handle — table entry, staged grant or queued transfer — still owns this
+/// endpoint. An endpoint without an observer (a root channel's kernel-retained end) can
+/// never prove that, so it is never reaped. — TIMBERDOODLE
+fn last_owner(endpoint: &EndpointState) -> bool {
+    endpoint
+        .references
+        .as_ref()
+        .is_some_and(|references| !references.is_referenced())
+}
+
+//j719
+/// Drain one endpoint's inbox — no surviving owner can read it — and collect the koids of
+/// channel endpoints carried by the dropped messages. — TIMBERDOODLE
+fn collect_carried_transfers(endpoint: &mut EndpointState, carried: &mut Vec<KoId>) {
+    for message in endpoint.inbox.drain(..) {
+        for entry in message.transfers {
+            if entry.kind == ObjectKind::Channel {
+                carried.push(entry.koid);
+            }
+        }
     }
 }
 
@@ -588,6 +692,90 @@ pub fn smoke() -> Result<IpcReport, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //j719
+    #[test]
+    fn closing_one_duplicate_keeps_the_queued_config_for_the_survivor() {
+        let mut objects = ObjectManager::new();
+        let mut process = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut process).unwrap();
+        let survivor = process
+            .handles_mut()
+            .duplicate(right, Rights::READ | Rights::WRITE)
+            .unwrap();
+        let (context_handle, _refs) = context(&mut objects, &mut process);
+        ipc.channel_write(
+            &mut process,
+            left,
+            Message::new(1, b"config", &[context_handle]).unwrap(),
+        )
+        .unwrap();
+        // Closing one handle is not the end of the endpoint: the survivor still reads.
+        let right_koid = process.handles().get(right).unwrap().koid;
+        process.handles_mut().remove(right).unwrap();
+        let signals = ipc.close_by_koid(right_koid).unwrap();
+        assert_eq!(signals.len(), 1);
+        let received = ipc.channel_read(&mut process, survivor).unwrap();
+        assert_eq!(received.bytes(), b"config");
+        assert_eq!(received.handles().len(), 1);
+    }
+
+    //j719
+    #[test]
+    fn the_last_close_reaps_the_inbox_and_closes_carried_channel_ends() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (a_left, a_right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let a_left_koid = sender.handles().get(a_left).unwrap().koid;
+        let a_right_koid = sender.handles().get(a_right).unwrap().koid;
+        let (b_left, b_right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let b_left_koid = sender.handles().get(b_left).unwrap().koid;
+        let b_right_koid = sender.handles().get(b_right).unwrap().koid;
+        ipc.channel_write(
+            &mut sender,
+            b_left,
+            Message::new(1, b"carried end", &[a_left]).unwrap(),
+        )
+        .unwrap();
+        assert!(ipc.koid_queued(a_left_koid));
+        // The only handle to the receiving end goes; nothing else owns it.
+        sender.handles_mut().remove(b_right).unwrap();
+        let signals = ipc.close_by_koid(b_right_koid).unwrap();
+        assert_eq!(signals.len(), 2);
+        assert!(signals.contains(&b_left_koid));
+        assert!(signals.contains(&a_right_koid));
+        assert!(ipc
+            .channel_signals_by_koid(a_right_koid)
+            .unwrap()
+            .contains(Signals::PEER_CLOSED));
+        assert!(!ipc.koid_queued(a_left_koid));
+    }
+
+    //j719
+    #[test]
+    fn the_last_close_reaps_queued_transfers_and_releases_their_references() {
+        let mut objects = ObjectManager::new();
+        let mut sender = test_process(&mut objects);
+        let mut ipc = IpcRegistry::new();
+        let (left, right) = ipc.channel_create(&mut objects, &mut sender).unwrap();
+        let right_koid = sender.handles().get(right).unwrap().koid;
+        let (handle, refs) = context(&mut objects, &mut sender);
+        let koid = sender.handles().get(handle).unwrap().koid;
+        ipc.channel_write(
+            &mut sender,
+            left,
+            Message::new(1, b"ctx", &[handle]).unwrap(),
+        )
+        .unwrap();
+        assert!(ipc.koid_queued(koid));
+        assert!(refs.is_referenced());
+        sender.handles_mut().remove(right).unwrap();
+        ipc.close_by_koid(right_koid).unwrap();
+        assert!(!ipc.koid_queued(koid));
+        assert!(!refs.is_referenced());
+    }
 
     fn context(
         objects: &mut ObjectManager,

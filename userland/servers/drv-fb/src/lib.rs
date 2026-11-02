@@ -1,20 +1,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j670
-//j671
-//j672
-//j673
-//j674
-//j687
-//j688
 //j689
 //j692
 //j695
 //j700
+//j702
+//j711
+//j711
 
 //! `drv-fb` rendering core — a pure, host-tested UTF-8 console over a 32-bpp
 //! linear framebuffer. ASCII and box drawing occupy one cell (`GLYPH_W` x `GLYPH_H`);
-//! CJK occupies a 16x16 bitmap in a double-width cell.
+//! CJK occupies a 16x16 bitmap scaled through area coverage into a double-width cell.
 //!
 //! Per `PLAN §9` (server logic is arch-neutral and host-testable before it ever runs
 //! on metal) the load-bearing content lives here, not in the bin: a [`Console`] that
@@ -184,6 +180,75 @@ unsafe fn blit_face_cell(
             unsafe {
                 fb_clean_line(base.add(row_start) as usize);
                 let row_end = row_start + GLYPH_W - 1;
+                if row_end < len_px {
+                    fb_clean_line(base.add(row_end) as usize);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+}
+
+/// The area coverage of one wide-cell pixel: the 16x16 bitmap source scales into the
+/// 2*GLYPH_W x GLYPH_H double cell at 5:4, so each output pixel is the exact integer area
+/// overlap of its 4x4 subpixel box with the inked source bits, rounded to 8 bits
+/// `(ink * 255 + 8) / 16` with exact 0 and 255 endpoints. — TIMBERDOODLE
+fn wide_pixel_coverage(rows: &[u16; GLYPH_H], x: usize, y: usize) -> u8 {
+    let (sx0, sx1) = (x * 4, x * 4 + 4);
+    let (sy0, sy1) = (y * 4, y * 4 + 4);
+    let mut ink = 0u32;
+    for source_x in sx0 / 5..=(sx1 - 1) / 5 {
+        let overlap_x = (5 * source_x + 5).min(sx1) - (5 * source_x).max(sx0);
+        for source_y in sy0 / 5..=(sy1 - 1) / 5 {
+            if rows[source_y] & (0x8000 >> source_x) != 0 {
+                let overlap_y = (5 * source_y + 5).min(sy1) - (5 * source_y).max(sy0);
+                ink += (overlap_x * overlap_y) as u32;
+            }
+        }
+    }
+    ((ink * 255 + 8) / 16) as u8
+}
+
+/// Blend one wide glyph's bitmap into a console double cell: the 16x16 source is
+/// area-resampled to the 2*GLYPH_W x GLYPH_H span (PLAN/016 C4-c), so CJK fills its cell
+/// and gains the face's greyscale edges while every pixel stays determined by
+/// `(foreground, background, coverage)` alone (DESIGN/024). — TIMBERDOODLE
+///
+/// # Safety
+/// `base` must point at `len_px` writable `u32` pixels.
+unsafe fn blit_wide_glyph(
+    (base, shadow): (*mut u32, *mut u32),
+    len_px: usize,
+    stride: usize,
+    position: (usize, usize),
+    rows: &[u16; GLYPH_H],
+    width: usize,
+    colors: (u32, u32),
+) {
+    let (x_px, y_px) = position;
+    let (fg, bg) = colors;
+    for ry in 0..GLYPH_H {
+        let py = y_px + ry;
+        let row_start = py.wrapping_mul(stride).wrapping_add(x_px);
+        for rx in 0..width {
+            let idx = row_start.wrapping_add(rx);
+            if idx < len_px {
+                let color = blend_coverage(bg, fg, wide_pixel_coverage(rows, rx, ry));
+                unsafe {
+                    shadow.add(idx).write(color);
+                    base.add(idx).write_volatile(color);
+                }
+            }
+        }
+        // Clean both endpoints of the row, as the narrow blitters do. — TIMBERDOODLE
+        #[cfg(target_os = "none")]
+        if row_start < len_px {
+            unsafe {
+                fb_clean_line(base.add(row_start) as usize);
+                let row_end = row_start + width - 1;
                 if row_end < len_px {
                     fb_clean_line(base.add(row_end) as usize);
                 }
@@ -546,15 +611,29 @@ impl Console {
                             self.newline();
                         }
                         unsafe {
-                            blit_glyph(
-                                (self.base, self.shadow),
-                                self.len_px,
-                                self.stride,
-                                (self.col * GLYPH_W, self.row * GLYPH_H),
-                                &glyph,
-                                columns * GLYPH_W,
-                                colors,
-                            );
+                            if glyph.columns == 2 {
+                                // PLAN/016 C4-c / DESIGN/024: wide bitmaps scale into
+                                // the double cell through area coverage. — TIMBERDOODLE
+                                blit_wide_glyph(
+                                    (self.base, self.shadow),
+                                    self.len_px,
+                                    self.stride,
+                                    (self.col * GLYPH_W, self.row * GLYPH_H),
+                                    &glyph.rows,
+                                    columns * GLYPH_W,
+                                    colors,
+                                );
+                            } else {
+                                blit_glyph(
+                                    (self.base, self.shadow),
+                                    self.len_px,
+                                    self.stride,
+                                    (self.col * GLYPH_W, self.row * GLYPH_H),
+                                    &glyph,
+                                    columns * GLYPH_W,
+                                    colors,
+                                );
+                            }
                         }
                         self.mark(self.col, self.row, self.col + columns, self.row + 1);
                         self.col += columns;
@@ -1685,6 +1764,14 @@ pub fn clean_present<F: FnMut(usize, usize)>(
     }
 }
 
+//j711
+/// G8c lane narration bound: a churn client presents 100+ frames per run, so the serial log
+/// and the console see only a lane's first three presents. The reply still carries the
+/// status, so silence loses no information. — TIMBERDOODLE
+pub fn present_is_narrated(presented: u32) -> bool {
+    presented < 3
+}
+
 /// Clean the cache lines covering `start..start + len` pixels, then DSB. No-op off target.
 ///
 /// # Safety
@@ -2750,12 +2837,62 @@ mod tests {
     }
 
     fn assert_wide_cell(buf: &[u32], stride: usize, rows: &[u16; GLYPH_H], cx: usize, cy: usize) {
-        for (y, &bits) in rows.iter().enumerate() {
-            for x in 0..16 {
-                let want = if bits & (1 << (15 - x)) != 0 { FG } else { BG };
-                assert_eq!(buf[(cy * GLYPH_H + y) * stride + cx * GLYPH_W + x], want);
+        // PLAN/016 C4-c: the bitmap scales into the whole double cell through area
+        // coverage, so the oracle is the coverage blend, not the source bit. The scaler
+        // itself is pinned by hand-computed weights in its own test. — TIMBERDOODLE
+        for y in 0..GLYPH_H {
+            for x in 0..2 * GLYPH_W {
+                let want = blend_coverage(BG, FG, wide_pixel_coverage(rows, x, y));
+                assert_eq!(
+                    buf[(cy * GLYPH_H + y) * stride + cx * GLYPH_W + x],
+                    want,
+                    "pixel mismatch at cell ({cx},{cy}) sub ({x},{y})"
+                );
             }
         }
+    }
+
+    #[test]
+    fn wide_bitmap_coverage_weights_are_exact_five_to_four() {
+        // Source pixel (0,0) spans subpixels [0,5) on both axes and output pixel (0,0)
+        // spans [0,4): its 4x4 overlap is fully inked (255). (1,0) and (0,1) keep one
+        // subpixel of the column or row (4 of 16 => (4*255+8)/16 = 64), (1,1) keeps one
+        // subpixel (1 of 16 => 16), and pixels past the source edge see nothing.
+        // — TIMBERDOODLE
+        let mut corner = [0u16; GLYPH_H];
+        corner[0] = 0x8000;
+        assert_eq!(wide_pixel_coverage(&corner, 0, 0), 255);
+        assert_eq!(wide_pixel_coverage(&corner, 1, 0), 64);
+        assert_eq!(wide_pixel_coverage(&corner, 0, 1), 64);
+        assert_eq!(wide_pixel_coverage(&corner, 1, 1), 16);
+        assert_eq!(wide_pixel_coverage(&corner, 2, 0), 0);
+        assert_eq!(wide_pixel_coverage(&corner, 0, 2), 0);
+        // Blank and full sources hit the endpoints exactly.
+        let blank = [0u16; GLYPH_H];
+        assert!(
+            (0..GLYPH_H).all(|y| (0..2 * GLYPH_W).all(|x| wide_pixel_coverage(&blank, x, y) == 0))
+        );
+        let full = [0xffffu16; GLYPH_H];
+        assert!(
+            (0..GLYPH_H).all(|y| (0..2 * GLYPH_W).all(|x| wide_pixel_coverage(&full, x, y) == 255))
+        );
+        // Area is conserved: the rounded coverage mass tracks ink * 255 * 25/16.
+        let mut sample = [0u16; GLYPH_H];
+        sample[3] = 0x8321;
+        sample[9] = 0x0ff0;
+        let ink: u32 = sample.iter().map(|bits| bits.count_ones()).sum();
+        let total: u32 = (0..GLYPH_H)
+            .map(|y| {
+                (0..2 * GLYPH_W)
+                    .map(|x| u32::from(wide_pixel_coverage(&sample, x, y)))
+                    .sum::<u32>()
+            })
+            .sum();
+        let expected = ink * 255 * 25 / 16;
+        assert!(
+            total.abs_diff(expected) <= 200,
+            "coverage mass {total} vs {expected}"
+        );
     }
 
     #[test]
@@ -2771,8 +2908,11 @@ mod tests {
             0x0000, 0x0400, 0x0200, 0x02c0, 0x1f00, 0x0480, 0x0480, 0x07e0, 0x0d10, 0x1508, 0x2208,
             0x2608, 0x2a10, 0x1060, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
         ];
+        assert_eq!(font::glyph('あ' as u32).rows, HIRAGANA_A);
         assert_cell_colors(&buf, WIDTH, b'A', 0, 0, FG, BG);
         assert_wide_cell(&buf, WIDTH, &HIRAGANA_A, 1, 0);
+        // Output row 0 spans only source row 0, which is blank. — TIMBERDOODLE
+        assert!((GLYPH_W..3 * GLYPH_W).all(|x| buf[x] == BG));
         assert_cell_colors(&buf, WIDTH, b'B', 3, 0, FG, BG);
         assert_eq!(con.col, 4);
     }
@@ -3462,5 +3602,35 @@ mod tests {
         assert_cell_colors(&buf, KILO_W, b'T', 1, 1, BG, FG);
         assert_cell_colors(&buf, KILO_W, b'o', 0, 2, FG, BG);
         assert_cell_colors(&buf, KILO_W, b'k', 1, 2, FG, BG);
+    }
+
+    //j711
+    #[test]
+    fn lane_narration_covers_exactly_the_first_three_presents() {
+        assert!(present_is_narrated(0));
+        assert!(present_is_narrated(1));
+        assert!(present_is_narrated(2));
+        assert!(!present_is_narrated(3));
+        assert!(!present_is_narrated(4));
+        assert!(!present_is_narrated(u32::MAX));
+    }
+
+    //j711
+    #[test]
+    fn every_existing_smoke_client_stays_fully_narrated() {
+        // gfx-client presents 3 native frames; bmp-view, gfx-demo and gfx-hold present 1;
+        // gfx-damage presents 2. The bound must not silence any of their records.
+        for presented in 0..3 {
+            assert!(present_is_narrated(presented));
+        }
+    }
+
+    //j711
+    #[test]
+    fn a_hundred_frame_churn_run_narrates_three_lines_per_lane() {
+        let narrated = (0..=100u32)
+            .filter(|presented| present_is_narrated(*presented))
+            .count();
+        assert_eq!(narrated, 3);
     }
 }

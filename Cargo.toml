@@ -3,6 +3,7 @@
 #j648
 #j669
 #j675
+#j709
 [workspace]
 members = [
     "boot/niji-loader",
@@ -39,6 +40,7 @@ members = [
     "userland/gfx-hold",
     "userland/gfx-keys",
     "userland/gpu-client",
+    "userland/gpu-contain",
     "userland/ls",
     "userland/lua-repl",
     "userland/threads",

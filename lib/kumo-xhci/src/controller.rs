@@ -1,5 +1,6 @@
 //j429
 //j431
+//j703
 
 use crate::Error;
 
@@ -122,6 +123,16 @@ impl RegisterLayout {
             self.operational + OP_USBCMD,
             (command & !CMD_RUN) | CMD_RESET,
         );
+        Ok(())
+    }
+
+    /// Begin halting the controller: clear Run/Stop and Interrupt Enable before HCRST. The
+    /// caller polls USBSTS.HCH; xHCI 4.20 requires the halt to complete before Reset, and Linux
+    /// models exactly this in xhci_quiesce/xhci_halt. — TIMBERDOODLE
+    pub fn request_halt<IO: RegisterIo>(self, io: &mut IO) -> Result<(), Error> {
+        self.check32(self.operational + OP_USBCMD)?;
+        let command = io.read32(self.operational + OP_USBCMD);
+        io.write32(self.operational + OP_USBCMD, command & !(CMD_RUN | CMD_EIE));
         Ok(())
     }
 
@@ -454,6 +465,21 @@ mod tests {
             layout.ready_for_ring_programming(&mut bus),
             Err(Error::ControllerNotReady)
         );
+    }
+
+    #[test]
+    fn halt_clears_run_and_interrupts_before_reset() {
+        let layout = RegisterLayout::new(0x40, 0x1000, 0x800, 0x2000).unwrap();
+        let mut bus = ReplayBus {
+            usbcmd: CMD_RUN | CMD_EIE | 0x100,
+            ..ReplayBus::default()
+        };
+        layout.request_halt(&mut bus).unwrap();
+        assert_eq!(bus.write_at(0), (0x40, 0x100));
+        bus.usbsts = STS_HALT;
+        assert!(layout.snapshot_status(&mut bus).unwrap().halted());
+        layout.request_reset(&mut bus).unwrap();
+        assert_eq!(bus.write_at(1), (0x40, 0x102));
     }
 
     #[test]

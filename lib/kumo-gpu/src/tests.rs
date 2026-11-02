@@ -1,8 +1,8 @@
-//j647
-//j650
-//j651
 //j652
 //j681
+//j707
+//j742
+//j752
 
 extern crate std;
 
@@ -16,6 +16,14 @@ fn binding() -> Binding {
         offset: 0,
         bytes: PAGE_BYTES,
         flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+    }
+}
+
+fn unbind() -> Unbind {
+    Unbind {
+        vm: 1,
+        va: VA_START,
+        bytes: PAGE_BYTES,
     }
 }
 
@@ -38,9 +46,12 @@ fn all_requests_round_trip_and_have_a_fixed_versioned_frame() {
         Command::GetTextureFeatures,
         Command::GetCoreFeatures,
         Command::GetThreadProperties,
+        Command::GetMemoryProperties,
         Command::VmCreate,
         Command::BufferCreate { bytes: PAGE_BYTES },
+        Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
+        Command::VmUnbind(unbind()),
         Command::GroupCreate { vm: 1 },
         Command::Submit(submission()),
         Command::SyncRead { group: 3, point: 1 },
@@ -126,7 +137,9 @@ fn request_decoder_rejects_reserved_bytes_unknown_ops_versions_and_truncation() 
     }
     for command in [
         Command::GroupCreate { vm: 1 },
+        Command::BufferDestroy { buffer: 1 },
         Command::VmBind(binding()),
+        Command::VmUnbind(unbind()),
         Command::Submit(submission()),
     ] {
         let mut wire = Request { id: 1, command }.encode();
@@ -143,6 +156,95 @@ fn request_decoder_rejects_reserved_bytes_unknown_ops_versions_and_truncation() 
 }
 
 #[test]
+fn buffer_destroy_frames_use_opcode_14_and_reject_zero_reserved_or_truncated_ids() {
+    let request = Request {
+        id: 2,
+        command: Command::BufferDestroy {
+            buffer: 0x1234_5678,
+        },
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &14u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &0x1234_5678u64.to_le_bytes());
+    assert_eq!(&bytes[24..], &[0u8; 40]);
+    assert_eq!(Request::decode(&bytes), Some(request));
+    for at in 24..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 object ID must not narrow silently.
+    assert_eq!(Request::decode(&truncated), None);
+
+    let reply = Reply {
+        id: 2,
+        result: Ok(Response::BufferDestroyed {
+            buffer: 0x1234_5678,
+        }),
+    };
+    let bytes = reply.encode();
+    assert_eq!(&bytes[12..16], &14u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &0x1234_5678u64.to_le_bytes());
+    assert_eq!(&bytes[24..], &[0u8; 24]);
+    assert_eq!(Reply::decode(&bytes), Some(reply));
+    assert_eq!(reply.result.unwrap().handle_count(), 0);
+    for at in 24..REPLY_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1;
+    assert_eq!(Reply::decode(&truncated), None);
+}
+
+#[test]
+fn vm_unbind_frames_use_opcode_15_and_reject_zero_reserved_truncated_or_unaligned_ranges() {
+    let request = Request {
+        id: 4,
+        command: Command::VmUnbind(unbind()),
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &15u32.to_le_bytes());
+    let expected: std::vec::Vec<u8> = [1u64, VA_START, PAGE_BYTES, 0, 0, 0]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    assert_eq!(&bytes[16..], expected);
+    assert_eq!(Request::decode(&bytes), Some(request));
+    for at in 40..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 VM ID must not narrow silently.
+    assert_eq!(Request::decode(&truncated), None);
+
+    let reply = Reply {
+        id: 4,
+        result: Ok(Response::VmUnbound(unbind())),
+    };
+    let bytes = reply.encode();
+    assert_eq!(&bytes[12..16], &15u32.to_le_bytes());
+    assert_eq!(&bytes[16..24], &1u64.to_le_bytes());
+    assert_eq!(&bytes[24..32], &VA_START.to_le_bytes());
+    assert_eq!(&bytes[32..40], &PAGE_BYTES.to_le_bytes());
+    assert_eq!(&bytes[40..], &[0u8; 8]);
+    assert_eq!(Reply::decode(&bytes), Some(reply));
+    assert_eq!(reply.result.unwrap().handle_count(), 0);
+    for at in 40..REPLY_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Reply::decode(&bad), None, "reserved byte {at}");
+    }
+    let mut truncated = bytes;
+    truncated[20] = 1; // High bits of the u32 VM ID must not narrow silently.
+    assert_eq!(Reply::decode(&truncated), None);
+}
+
+#[test]
 fn malformed_semantic_requests_never_decode() {
     let b = binding();
     let s = submission();
@@ -154,6 +256,7 @@ fn malformed_semantic_requests_never_decode() {
         Command::BufferCreate {
             bytes: MAX_BUFFER_BYTES + PAGE_BYTES,
         },
+        Command::BufferDestroy { buffer: 0 },
         Command::VmBind(Binding {
             flags: BindFlags(8),
             ..b
@@ -164,6 +267,27 @@ fn malformed_semantic_requests_never_decode() {
         }),
         Command::VmBind(Binding { vm: 0, ..b }),
         Command::VmBind(Binding { va: VA_END, ..b }),
+        Command::VmUnbind(Unbind { vm: 0, ..unbind() }),
+        Command::VmUnbind(Unbind {
+            bytes: 0,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            va: VA_START + 1,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            bytes: PAGE_BYTES + 1,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            va: VA_END,
+            ..unbind()
+        }),
+        Command::VmUnbind(Unbind {
+            bytes: (VA_END - VA_START) + PAGE_BYTES,
+            ..unbind()
+        }),
         Command::VmBind(Binding {
             offset: u64::MAX - 4095,
             ..b
@@ -204,7 +328,9 @@ fn replies_distinguish_acceptance_pending_success_and_gpu_error() {
             buffer: 2,
             bytes: PAGE_BYTES,
         },
+        Response::BufferDestroyed { buffer: 2 },
         Response::VmBound,
+        Response::VmUnbound(unbind()),
         Response::GroupCreated { group: 3 },
         Response::Submitted { point: 1 },
         Response::Sync {
@@ -289,6 +415,12 @@ fn reply_decoder_rejects_noncanonical_or_truncated_frames() {
                 buffer: 1,
                 bytes: 1,
             }),
+        },
+        // A destroy reply's ID is an object ID, not an extension slot: zero never crosses,
+        // and a nonzero reserved slot or a lost high bit is a malformed frame.
+        Reply {
+            id: 1,
+            result: Ok(Response::BufferDestroyed { buffer: 0 }),
         },
     ] {
         assert_eq!(Reply::decode(&reply.encode()), None);
@@ -823,4 +955,172 @@ fn thread_properties_cross_three_raw_words_accept_all_zero_and_reject_truncation
     .encode();
     reserved[40..48].copy_from_slice(&1u64.to_le_bytes());
     assert_eq!(Reply::decode(&reserved), None);
+}
+
+#[test]
+fn memory_properties_cross_four_raw_words_verbatim_and_reject_truncation() {
+    let request = Request {
+        id: 17,
+        command: Command::GetMemoryProperties,
+    };
+    let bytes = request.encode();
+    assert_eq!(&bytes[8..12], &17u32.to_le_bytes());
+    for at in 12..REQUEST_LEN {
+        let mut bad = bytes;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    // Required words with no absence meaning, so zero crosses like any other value. The rows
+    // are the Orange Pi's measured words (J653) with the "none" protocol drv-gpu programs,
+    // all zero (protocol 0 is ACE-Lite), and both ends of u32 in every slot. — TIMBERDOODLE
+    for memory in [
+        DeviceMemory {
+            l2_features: 0x0712_0306,
+            mem_features: 0x301,
+            coherency_features: 0,
+            coherency_protocol: 31,
+        },
+        DeviceMemory {
+            l2_features: 0,
+            mem_features: 0,
+            coherency_features: 0,
+            coherency_protocol: 0,
+        },
+        DeviceMemory {
+            l2_features: u32::MAX,
+            mem_features: 1,
+            coherency_features: u32::MAX,
+            coherency_protocol: 1,
+        },
+    ] {
+        let response = Response::Memory(memory);
+        let reply = Reply {
+            id: 17,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(&bytes[12..16], &17u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &u64::from(memory.l2_features).to_le_bytes());
+        assert_eq!(
+            &bytes[24..32],
+            &u64::from(memory.mem_features).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[32..40],
+            &u64::from(memory.coherency_features).to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[40..48],
+            &u64::from(memory.coherency_protocol).to_le_bytes()
+        );
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        assert_eq!(response.handle_count(), 0);
+    }
+    // A word wider than 32 bits would narrow silently, so the canonical re-encode check must
+    // refuse each of the four slots separately. — TIMBERDOODLE
+    for slot in 0..4 {
+        let mut widened = Reply {
+            id: 17,
+            result: Ok(Response::Memory(DeviceMemory {
+                l2_features: 0x0712_0306,
+                mem_features: 0x301,
+                coherency_features: 0,
+                coherency_protocol: 31,
+            })),
+        }
+        .encode();
+        let at = 16 + slot * 8;
+        widened[at..at + 8].copy_from_slice(&(0x1_0000_0000u64 + 0x1234).to_le_bytes());
+        assert_eq!(Reply::decode(&widened), None);
+    }
+}
+
+#[test]
+fn group_watch_wire_is_exact_and_requires_one_status_grant() {
+    let request = Request {
+        id: 1,
+        command: Command::GroupWatch { group: 1 },
+    };
+    let encoded = request.encode();
+    assert_eq!(&encoded[8..12], &18u32.to_le_bytes());
+    assert_eq!(Request::decode(&encoded), Some(request));
+    for at in [12, 20, 24, 32, 40, 48, 56] {
+        let mut bad = encoded;
+        bad[at] = 1;
+        assert_eq!(Request::decode(&bad), None);
+    }
+    assert_eq!(Request::decode(&encoded[..63]), None);
+    for state in [
+        GroupState::Usable,
+        GroupState::Fatal,
+        GroupState::TimedOut,
+        GroupState::Unknown,
+    ] {
+        let report = GroupReport {
+            state,
+            gpu_status: if state == GroupState::Fatal {
+                0xbeef
+            } else {
+                0
+            },
+        };
+        let response = Response::GroupWatch { group: 1, report };
+        assert_eq!(response.handle_count(), 1);
+        let reply = Reply {
+            id: 1,
+            result: Ok(response),
+        };
+        let bytes = reply.encode();
+        assert_eq!(Reply::decode(&bytes), Some(reply));
+        for at in [20, 28, 36, 40] {
+            let mut bad = bytes;
+            bad[at] = 1;
+            assert_eq!(Reply::decode(&bad), None);
+        }
+    }
+    let mut bad = Reply {
+        id: 1,
+        result: Ok(Response::GroupWatch {
+            group: 1,
+            report: GroupReport::USABLE,
+        }),
+    }
+    .encode();
+    bad[24] = 9;
+    assert_eq!(Reply::decode(&bad), None);
+    bad[24] = 0;
+    bad[32] = 1;
+    assert_eq!(Reply::decode(&bad), None);
+}
+
+#[test]
+fn group_status_record_rejects_corruption_and_stale_health_after_close() {
+    for report in [
+        GroupReport::USABLE,
+        GroupReport::UNKNOWN,
+        GroupReport::TIMED_OUT,
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 7,
+        },
+        GroupReport {
+            state: GroupState::Fatal,
+            gpu_status: 0,
+        },
+    ] {
+        let bytes = report.encode(1);
+        assert_eq!(GroupReport::decode(&bytes, 1), Some(report));
+        assert_eq!(GroupReport::decode(&bytes, 2), None);
+        assert_eq!(GroupReport::decode(&bytes[..15], 1), None);
+        let mut bad = bytes;
+        bad[0] = 0;
+        assert_eq!(GroupReport::decode(&bad, 1), None);
+    }
+    assert_eq!(GroupReport::USABLE.observed(false), GroupReport::UNKNOWN);
+    assert_eq!(
+        GroupReport::TIMED_OUT.observed(false),
+        GroupReport::TIMED_OUT
+    );
+    assert_eq!(GroupReport::from_words(2, 7), None);
+    assert_eq!(GroupReport::from_words(8, 0), None);
 }

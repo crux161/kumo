@@ -1,12 +1,13 @@
-//j641
 //j644
 //j681
-
+//j707
+//j711
+//j752
 extern crate std;
 use super::*;
 use crate::{
     session::{Backend, Session, SubmitError},
-    BindFlags, DeviceTopology, PAGE_BYTES, VA_START,
+    BindFlags, DeviceTopology, Unbind, PAGE_BYTES, VA_START,
 };
 use std::{collections::VecDeque, vec::Vec};
 
@@ -338,6 +339,12 @@ impl Backend for Model {
     fn bind(&mut self, _: Binding) -> Result<(), Status> {
         Ok(())
     }
+    fn unbind(&mut self, _: &[Binding]) -> Result<(), Status> {
+        Ok(())
+    }
+    fn destroy_buffer(&mut self, _: u32, _: &[Binding]) -> Result<(), Status> {
+        Ok(())
+    }
     fn create_group(&mut self) -> Result<(), Status> {
         Ok(())
     }
@@ -457,4 +464,159 @@ fn topology_rejects_wrong_kind_id_zero_and_grants_without_replay() {
     assert_eq!(client.topology(), Err(Error::Server(Status::NotSupported)));
     assert_eq!(client.info(), Ok(INFO));
     assert!(!client.is_lost());
+}
+
+#[test]
+fn unbind_tiles_live_bindings_after_the_group_and_refuses_unknown_ranges() {
+    let mut client = Client::new(Loopback::default());
+    let vm = client.create_vm().unwrap();
+    let first = client.create_buffer(PAGE_BYTES).unwrap();
+    let second = client.create_buffer(PAGE_BYTES).unwrap();
+    let mapping = |buffer: u32, va: u64| Binding {
+        vm,
+        buffer,
+        va,
+        offset: 0,
+        bytes: PAGE_BYTES,
+        flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+    };
+    client.bind(mapping(first.id, VA_START)).unwrap();
+    client
+        .bind(mapping(second.id, VA_START + PAGE_BYTES))
+        .unwrap();
+    client.create_group(vm).unwrap();
+    // One request covers two adjacent live bindings after GroupCreate.
+    let range = Unbind {
+        vm,
+        va: VA_START,
+        bytes: 2 * PAGE_BYTES,
+    };
+    client.unbind(range).unwrap();
+    // The same range is now unknown; the refusal is recoverable and proves the session
+    // dropped both bindings without needing to read its private table. — TIMBERDOODLE
+    assert_eq!(client.unbind(range), Err(Error::Server(Status::NotFound)));
+    assert!(!client.is_lost());
+    // A live rebind at the freed VA proves the table was really cleared.
+    let rebound = mapping(first.id, VA_START);
+    client.bind(rebound).unwrap();
+    assert_eq!(
+        client.transport.transport.sent.last().unwrap().command,
+        Command::VmBind(rebound)
+    );
+    assert!(client.transport.transport.closed.is_empty());
+}
+
+#[test]
+fn unbind_rejects_a_wrong_kind_or_mismatched_range_reply() {
+    let range = Unbind {
+        vm: 1,
+        va: VA_START,
+        bytes: PAGE_BYTES,
+    };
+    let replies: [Result<Response, Status>; 2] = [
+        Ok(Response::VmBound),
+        Ok(Response::VmUnbound(Unbind {
+            va: VA_START + PAGE_BYTES,
+            ..range
+        })),
+    ];
+    for reply in replies {
+        let mut transport = Script::default();
+        transport.reply(1, reply, None);
+        let mut client = Client::new(transport);
+        assert_eq!(client.unbind(range), Err(Error::Protocol));
+        assert!(client.is_lost());
+        assert_eq!(client.unbind(range), Err(Error::DeviceLost));
+        assert_eq!(client.transport.sent.len(), 1);
+    }
+}
+
+#[test]
+fn destroy_buffer_releases_the_id_before_and_after_the_group_exists() {
+    let mut client = Client::new(Loopback::default());
+    let vm = client.create_vm().unwrap();
+    let first = client.create_buffer(PAGE_BYTES).unwrap();
+    let second = client.create_buffer(PAGE_BYTES).unwrap();
+    assert_eq!((first.id, second.id), (1, 2));
+    let mapping = |buffer: u32| Binding {
+        vm,
+        buffer,
+        va: VA_START,
+        offset: 0,
+        bytes: PAGE_BYTES,
+        flags: BindFlags(BindFlags::READ_ONLY | BindFlags::NO_EXECUTE),
+    };
+    client.bind(mapping(first.id)).unwrap();
+    client.destroy_buffer(&first).unwrap();
+    // The session unbound the VA range with the buffer, so the next allocation may map it;
+    // the consumed ID answers NotFound and leaves the client live. — TIMBERDOODLE
+    client.bind(mapping(second.id)).unwrap();
+    assert_eq!(
+        client.destroy_buffer(&first),
+        Err(Error::Server(Status::NotFound))
+    );
+    assert!(!client.is_lost());
+    // Destroy is live once the group exists (j711): its implicit unbind batch is legal and a
+    // replayed ID still answers NotFound. — TIMBERDOODLE
+    client.create_group(vm).unwrap();
+    client.destroy_buffer(&second).unwrap();
+    assert_eq!(
+        client.destroy_buffer(&second),
+        Err(Error::Server(Status::NotFound))
+    );
+    assert!(!client.is_lost());
+    assert!(client.transport.transport.closed.is_empty());
+}
+
+#[test]
+fn group_watch_correlates_identity_and_owns_exactly_one_read_grant() {
+    let mut wire = Script::default();
+    wire.reply(
+        1,
+        Ok(Response::GroupWatch {
+            group: 1,
+            report: crate::GroupReport::USABLE,
+        }),
+        Some(77),
+    );
+    let mut client = Client::new(wire);
+    let watch = client.watch_group(1).unwrap();
+    assert_eq!(watch.group, 1);
+    assert_eq!(watch.report, crate::GroupReport::USABLE);
+    client.close_buffer_handle(watch.handle);
+    assert_eq!(client.transport.closed, [77]);
+    assert!(!client.is_lost());
+    for (group, handle) in [(2, Some(88)), (1, None)] {
+        let mut wire = Script::default();
+        wire.reply(
+            1,
+            Ok(Response::GroupWatch {
+                group,
+                report: crate::GroupReport::USABLE,
+            }),
+            handle,
+        );
+        let mut client = Client::new(wire);
+        assert!(matches!(client.watch_group(1), Err(Error::Protocol)));
+        assert!(client.is_lost());
+        if handle.is_some() {
+            assert_eq!(client.transport.closed, [88]);
+        }
+    }
+    let mut wire = Script::default();
+    wire.reply(
+        1,
+        Ok(Response::GroupWatch {
+            group: 1,
+            report: crate::GroupReport::TIMED_OUT,
+        }),
+        Some(99),
+    );
+    let mut client = Client::new(wire);
+    let watch = client.watch_group(1).unwrap();
+    assert!(client.is_lost());
+    assert_eq!(watch.report, crate::GroupReport::TIMED_OUT);
+    client.close_buffer_handle(watch.handle);
+    assert_eq!(client.watch_group(1).err(), Some(Error::DeviceLost));
+    assert_eq!(client.transport.sent.len(), 1);
 }

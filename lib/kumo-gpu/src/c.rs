@@ -1,24 +1,28 @@
-//j647
-//j650
-//j651
-//j652
-//j653
+//j742
+//j744
+//j745
+//j751
+//j752
 
-//! Borrowed C query boundary for the pinned Mesa scaffold. No FD, handle, allocation or
-//! Rust layout crosses it. The caller keeps the same Client across calls. — KESTREL
+//! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
+//! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
 
 use core::{ffi::c_void, mem::size_of};
 
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 14;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
 pub const TRANSPORT: u32 = 3;
 pub const PROTOCOL: u32 = 4;
 pub const DEVICE_LOST: u32 = 5;
+pub const NO_MEMORY: u32 = 6;
+pub const MAP_FAILED: u32 = 7;
+pub const UNMAP_FAILED: u32 = 8;
+pub const UNKNOWN_BUFFER: u32 = 9;
 pub const SERVER_ERROR: u32 = 16;
 
 #[derive(Clone, Copy, Default)]
@@ -61,6 +65,18 @@ pub struct Info {
     pub texture_features_1: u32,
     pub texture_features_2: u32,
     pub texture_features_3: u32,
+    /// Version10's memory-system words (G7o-a), raw: `L2_FEATURES`, `MEM_FEATURES` and
+    /// `COHERENCY_FEATURES`, then the `GPU_COHERENCY_PROTOCOL` value the driver programmed
+    /// (31 is "none"). The query is required, and every word crosses verbatim, zero included.
+    /// Upstream derives slices, bus width and `is_io_coherent` from these. — TIMBERDOODLE
+    pub l2_features: u32,
+    pub mem_features: u32,
+    pub coherency_features: u32,
+    pub coherency_protocol: u32,
+    /// This protocol's VM page granule, which is also the only leaf size drv-gpu writes. Service
+    /// policy like the window above, not a hardware report; C turns it into `pgsize_bitmap`.
+    /// — TIMBERDOODLE
+    pub page_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +86,25 @@ pub struct Api {
     pub bytes: u32,
     pub context: *mut c_void,
     pub query: Option<unsafe extern "C" fn(*mut c_void, *mut Info) -> u32>,
+    pub buffer_create:
+        Option<unsafe extern "C" fn(*mut c_void, u64, u32, *mut crate::bo::Info) -> u32>,
+    pub buffer_destroy: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub buffer_map: Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> u32>,
+    pub buffer_unmap: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub device_open: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub device_close: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub vm_create: Option<unsafe extern "C" fn(*mut c_void, u64, u64, *mut u32) -> u32>,
+    pub vm_destroy: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    pub vm_bind: Option<unsafe extern "C" fn(*mut c_void, *const crate::bo::VmBinding) -> u32>,
+    pub vm_unbind: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u64) -> u32>,
+    pub device_status: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub native: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const crate::c_sync::Request,
+            *mut crate::c_sync::Reply,
+        ) -> u32,
+    >,
 }
 
 /// The C consumer may call query synchronously during `f` only. It must not retain any
@@ -81,8 +116,272 @@ pub fn with_api<T: Transport, R>(client: &mut Client<T>, f: impl FnOnce(&Api) ->
         bytes: size_of::<Api>() as u32,
         context: (client as *mut Client<T>).cast(),
         query: Some(query::<T>),
+        buffer_create: None,
+        buffer_destroy: None,
+        buffer_map: None,
+        buffer_unmap: None,
+        device_open: None,
+        device_close: None,
+        vm_create: None,
+        vm_destroy: None,
+        vm_bind: None,
+        vm_unbind: None,
+        device_status: None,
+        native: None,
     })
 }
+
+/// Query and BO callbacks borrow the same session and Rust-owned handles. No API, BO or
+/// mapped pointer may outlive f, and calls must be serial and non-reentrant. — KESTREL
+pub fn with_buffer_api<T: Transport, M: crate::bo::Mapper<T::Handle>, R>(
+    buffers: &mut crate::bo::Buffers<'_, T, M>,
+    f: impl FnOnce(&Api) -> R,
+) -> R {
+    f(&Api {
+        version: VERSION,
+        bytes: size_of::<Api>() as u32,
+        context: (buffers as *mut crate::bo::Buffers<'_, T, M>).cast(),
+        query: Some(buffer_query::<T, M>),
+        buffer_create: Some(buffer_create::<T, M>),
+        buffer_destroy: Some(buffer_destroy::<T, M>),
+        buffer_map: Some(buffer_map::<T, M>),
+        buffer_unmap: Some(buffer_unmap::<T, M>),
+        device_open: None,
+        device_close: None,
+        vm_create: None,
+        vm_destroy: None,
+        vm_bind: None,
+        vm_unbind: None,
+        device_status: None,
+        native: None,
+    })
+}
+
+/// Own one native session for the callback scope. Close the endpoint on return as well as
+/// explicit device destruction; all Mesa objects and pointers must die inside f. — KESTREL
+pub fn with_device_api<T: crate::client::SessionTransport, M: crate::bo::Mapper<T::Handle>, R>(
+    buffers: &mut crate::bo::Buffers<'_, T, M>,
+    f: impl FnOnce(&Api) -> R,
+) -> R {
+    let mut api = with_buffer_api(buffers, |api| *api);
+    api.device_open = Some(device_open::<T, M>);
+    api.device_close = Some(device_close::<T, M>);
+    api.vm_create = Some(vm_create::<T, M>);
+    api.vm_destroy = Some(vm_destroy::<T, M>);
+    api.vm_bind = Some(vm_bind::<T, M>);
+    api.vm_unbind = Some(vm_unbind::<T, M>);
+    api.device_status = Some(device_status::<T, M>);
+    api.native = Some(crate::c_sync::callback::<T, M>);
+    let result = f(&api);
+    buffers.close_device();
+    result
+}
+unsafe extern "C" fn device_open<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .open_device()
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn device_close<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }.close_device();
+    OK
+}
+unsafe extern "C" fn device_status<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    if unsafe { &*context.cast::<crate::bo::Buffers<'_, T, M>>() }.device_ready() {
+        OK
+    } else {
+        DEVICE_LOST
+    }
+}
+unsafe extern "C" fn vm_create<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    start: u64,
+    bytes: u64,
+    out: *mut u32,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(0) };
+    match unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .create_native_vm(start, bytes)
+    {
+        Ok(id) => {
+            unsafe { out.write(id) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn vm_destroy<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .destroy_native_vm(id)
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn vm_bind<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    request: *const crate::bo::VmBinding,
+) -> u32 {
+    if context.is_null() || request.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .bind_native(unsafe { *request })
+        .map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn vm_unbind<
+    T: crate::client::SessionTransport,
+    M: crate::bo::Mapper<T::Handle>,
+>(
+    context: *mut c_void,
+    id: u32,
+    va: u64,
+    bytes: u64,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() }
+        .unbind_native(id, va, bytes)
+        .map_or_else(bo_error, |()| OK)
+}
+
+pub(crate) fn bo_error(error: crate::bo::Error) -> u32 {
+    use crate::bo::Error as E;
+    match error {
+        E::Client(error) => client_error(error),
+        E::InvalidRequest => INVALID_REQUEST,
+        E::NotFound => UNKNOWN_BUFFER,
+        E::NoMemory => NO_MEMORY,
+        E::Map(crate::bo::MapError::NoMemory) => NO_MEMORY,
+        E::Map(_) => MAP_FAILED,
+        E::Unmap(_) => UNMAP_FAILED,
+    }
+}
+pub(crate) fn client_error(error: Error) -> u32 {
+    match error {
+        Error::InvalidRequest => INVALID_REQUEST,
+        Error::Transport(_) => TRANSPORT,
+        Error::Protocol => PROTOCOL,
+        Error::DeviceLost | Error::RequestIdsExhausted => DEVICE_LOST,
+        Error::Server(status) => SERVER_ERROR + status as u32,
+    }
+}
+unsafe extern "C" fn buffer_query<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    out: *mut Info,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    unsafe { query::<T>((buffers.client as *mut Client<T>).cast(), out) }
+}
+unsafe extern "C" fn buffer_create<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    bytes: u64,
+    flags: u32,
+    out: *mut crate::bo::Info,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(crate::bo::Info::default()) };
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    match buffers.create(bytes, flags) {
+        Ok(info) => {
+            unsafe { out.write(info) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn buffer_destroy<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    buffers.destroy(id).map_or_else(bo_error, |()| OK)
+}
+unsafe extern "C" fn buffer_map<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+    out: *mut *mut c_void,
+) -> u32 {
+    if context.is_null() || out.is_null() {
+        return BAD_ARGUMENT;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    match buffers.map(id) {
+        Ok(address) => {
+            unsafe { out.write(address.as_ptr().cast()) };
+            OK
+        }
+        Err(error) => bo_error(error),
+    }
+}
+unsafe extern "C" fn buffer_unmap<T: Transport, M: crate::bo::Mapper<T::Handle>>(
+    context: *mut c_void,
+    id: u32,
+) -> u32 {
+    if context.is_null() {
+        return BAD_ARGUMENT;
+    }
+    let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
+    buffers.unmap(id).map_or_else(bo_error, |()| OK)
+}
+const _: () = assert!(size_of::<Api>() == 120);
+const _: () = assert!(core::mem::offset_of!(Api, native) == 112);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_create) == 24);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_destroy) == 32);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_map) == 40);
+const _: () = assert!(core::mem::offset_of!(Api, buffer_unmap) == 48);
+const _: () = assert!(core::mem::offset_of!(Api, device_open) == 56);
+const _: () = assert!(core::mem::offset_of!(Api, device_status) == 104);
+const _: () = assert!(size_of::<crate::bo::VmBinding>() == 32);
+const _: () = assert!(size_of::<crate::bo::Info>() == 16);
 
 unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -> u32 {
     if context.is_null() || out.is_null() {
@@ -127,6 +426,10 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             },
             Err(error) => return Err(error),
         };
+        // Memory properties are required, so any failure — NotSupported included — aborts the
+        // whole query, like core features. Asked last, so every earlier failure path keeps
+        // its request count. — TIMBERDOODLE
+        let memory = client.memory()?;
         Ok(Info {
             gpu_id: info.gpu_id,
             cs_features: info.cs_features,
@@ -144,6 +447,11 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             texture_features_1: texture_features[1],
             texture_features_2: texture_features[2],
             texture_features_3: texture_features[3],
+            l2_features: memory.l2_features,
+            mem_features: memory.mem_features,
+            coherency_features: memory.coherency_features,
+            coherency_protocol: memory.coherency_protocol,
+            page_bytes: crate::PAGE_BYTES,
         })
     })();
     match result {
@@ -151,15 +459,11 @@ unsafe extern "C" fn query<T: Transport>(context: *mut c_void, out: *mut Info) -
             unsafe { out.write(info) };
             OK
         }
-        Err(Error::InvalidRequest) => INVALID_REQUEST,
-        Err(Error::Transport(_)) => TRANSPORT,
-        Err(Error::Protocol) => PROTOCOL,
-        Err(Error::DeviceLost | Error::RequestIdsExhausted) => DEVICE_LOST,
-        Err(Error::Server(status)) => SERVER_ERROR + status as u32,
+        Err(error) => client_error(error),
     }
 }
 
-const _: () = assert!(size_of::<Info>() == 80);
+const _: () = assert!(size_of::<Info>() == 104);
 // Pin both tail offsets. `tiler_features` exactly fills the padding that followed
 // `mmu_features`, so version4's Info is the same *size* as version3's and a size check alone
 // cannot distinguish them — only the version field and these offsets can. Version7 appended
@@ -179,14 +483,21 @@ const _: () = assert!(core::mem::offset_of!(Info, thread_features) == 64);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_1) == 68);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_2) == 72);
 const _: () = assert!(core::mem::offset_of!(Info, texture_features_3) == 76);
+// Version10 appends four u32 memory words at 80..96, then the u64 page granule at its natural
+// 96, so the structure ends at 104 with no padding anywhere. — TIMBERDOODLE
+const _: () = assert!(core::mem::offset_of!(Info, l2_features) == 80);
+const _: () = assert!(core::mem::offset_of!(Info, mem_features) == 84);
+const _: () = assert!(core::mem::offset_of!(Info, coherency_features) == 88);
+const _: () = assert!(core::mem::offset_of!(Info, coherency_protocol) == 92);
+const _: () = assert!(core::mem::offset_of!(Info, page_bytes) == 96);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMmu, DeviceTexture,
-        DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response, Status, REPLY_LEN,
-        REQUEST_LEN,
+        client::TransportError, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
+        DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response,
+        Status, REPLY_LEN, REQUEST_LEN,
     };
 
     #[derive(Default)]
@@ -202,6 +513,7 @@ mod tests {
         core_failure: bool,
         threads_unsupported: bool,
         threads_failure: bool,
+        memory_unsupported: bool,
         grant: bool,
     }
     impl Transport for Wire {
@@ -269,6 +581,18 @@ mod tests {
                         thread_features: 0x0310_0005,
                     }))
                 }
+            } else if self.command == Some(Command::GetMemoryProperties) {
+                if self.memory_unsupported {
+                    Err(Status::NotSupported)
+                } else {
+                    // The Orange Pi's measured words (J653) and the "none" protocol. — TIMBERDOODLE
+                    Ok(Response::Memory(DeviceMemory {
+                        l2_features: 0x0712_0306,
+                        mem_features: 0x301,
+                        coherency_features: 0,
+                        coherency_protocol: 31,
+                    }))
+                }
             } else {
                 Ok(Response::Info(DeviceInfo {
                     gpu_id: 0xa8670005,
@@ -328,8 +652,58 @@ mod tests {
                 assert_eq!(out.thread_max_threads, 1024);
                 assert_eq!(out.thread_max_workgroup_size, 512);
                 assert_eq!(out.thread_features, 0x0310_0005);
+                assert_eq!(
+                    (
+                        out.l2_features,
+                        out.mem_features,
+                        out.coherency_features,
+                        out.coherency_protocol
+                    ),
+                    (0x0712_0306, 0x301, 0, 31)
+                );
+                assert_eq!(out.page_bytes, crate::PAGE_BYTES);
             }
         });
+        assert!(client.info().is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_memory_query_is_required_and_publishes_nothing() {
+        let mut client = Client::new(Wire {
+            memory_unsupported: true,
+            ..Wire::default()
+        });
+        with_api(&mut client, |api| {
+            let mut out = Info {
+                gpu_id: 99,
+                thread_features: 99,
+                l2_features: 99,
+                coherency_protocol: 99,
+                page_bytes: 99,
+                ..Info::default()
+            };
+            let query = api.query.unwrap();
+            // All seven earlier queries succeed. Unlike tiler, texture or threads, NotSupported
+            // here is not an absence: the words are required, so the whole report is withheld.
+            // — TIMBERDOODLE
+            assert_eq!(
+                unsafe { query(api.context, &mut out) },
+                SERVER_ERROR + Status::NotSupported as u32
+            );
+            assert_eq!(
+                (
+                    out.gpu_id,
+                    out.thread_features,
+                    out.l2_features,
+                    out.coherency_protocol,
+                    out.page_bytes
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!((out.va_start, out.va_end), (0, 0));
+        });
+        // A refused query is recoverable: the client stays live. — TIMBERDOODLE
+        assert!(!client.is_lost());
         assert!(client.info().is_ok());
     }
 

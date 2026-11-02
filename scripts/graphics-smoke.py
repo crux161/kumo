@@ -4,6 +4,7 @@
 #j675
 #j676
 #j677
+#j709
 """Boot a disposable copy of the full UEFI image and verify F1a two-view pixels via QMP.
 
 No login credentials or changes to the built image are needed. By default only the copy's
@@ -27,7 +28,7 @@ import threading
 import time
 
 
-def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False, term=False):
+def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two_clients=False, damage=False, zorder=False, regrant=False, async_regrant=False, recover=False, acceptance=False, titles=False, log=False, term=False, gpu_session_kill=False):
     original = path.read_bytes()
     assert original[:8] == b"KUMORD01" and struct.unpack_from("<I", original, 8)[0] == 1
     count = struct.unpack_from("<I", original, 12)[0]
@@ -91,6 +92,11 @@ def replace_autoexec(path, bitmap=False, bitmap_path=None, bitmap_file=None, two
                 # C3 S3-b: the mirror keeps both views live and the terminal view owns the
                 # keyboard; the host focuses it and types at the login prompt.
                 data = b"dmesg -n 6\ngfx-log on\ngfx-term on\necho graphics-smoke-after-present\ndmesg -n 5\n"
+            if gpu_session_kill:
+                # G8d-a: the supervisor runs the contained-close smoke itself — a fake
+                # drv-gpu server, a fake client armed through the real wire, then a kill —
+                # and logs both containment records while the login prompt is still ahead.
+                data = b"dmesg -n 6\ngpu-contain\necho gpu-contain-after\ndmesg -n 5\n"
             if bitmap:
                 command = b"bmp-view"
                 if bitmap_path:
@@ -380,6 +386,7 @@ def main():
     parser.add_argument("--titles", action="store_true", help="prove server-drawn band labels through the glyph atlas")
     parser.add_argument("--log", action="store_true", help="prove the kernel log presented as a client surface through the damage path")
     parser.add_argument("--term", action="store_true", help="prove the terminal view owns the keyboard while focused")
+    parser.add_argument("--gpu-session-kill", action="store_true", help="prove G8d-a containment: kill a GPU session and require exact release/retain records")
     parser.add_argument("--bitmap-path", nargs="?", const="sample.bmp", help="exercise a target file path, relative to /share/images")
     parser.add_argument("--bitmap-file", type=Path, help="inject a host BMP at /share/images/input.bmp and verify it")
     args = parser.parse_args()
@@ -407,6 +414,8 @@ def main():
         parser.error("--log is a separate proof")
     if args.term and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance or args.titles or args.log):
         parser.error("--term is a separate proof")
+    if args.gpu_session_kill and (args.bitmap or args.two_clients or args.damage or args.zorder or args.regrant or args.async_regrant or args.recover or args.acceptance or args.titles or args.log or args.term):
+        parser.error("--gpu-session-kill is a separate proof")
     work = Path(tempfile.mkdtemp(prefix="kumo-gfx-"))
     print(f"Graphics smoke artifacts: {work}", flush=True)
     shutil.copytree(args.image, work / "esp")
@@ -422,7 +431,8 @@ def main():
         ], check=True, capture_output=True, timeout=15)
     replace_autoexec(work / "esp/EFI/KUMO/initrd.img", args.bitmap, args.bitmap_path, args.bitmap_file,
                      args.two_clients, args.damage, args.zorder, args.regrant, args.async_regrant,
-                     args.recover, args.acceptance, args.titles, args.log, args.term)
+                     args.recover, args.acceptance, args.titles, args.log, args.term,
+                     args.gpu_session_kill)
     shutil.copyfile(args.firmware_vars, work / "vars.fd")
     serial = work / "serial.log"
     serial_sock = work / "serial.sock"
@@ -481,9 +491,10 @@ def main():
                 )
                 if args.with_dtb and b"TOWER: CPU EXCEPTION" in transcript:
                     raise RuntimeError(f"kernel fault during DTB syscall smoke; inspect {serial}")
-                ready = b"INDRA login:" in transcript and (
-                    b"g-ok" if args.bitmap_path else b"graphics-smoke-after-present"
-                ) in transcript
+                marker = b"g-ok" if args.bitmap_path else b"graphics-smoke-after-present"
+                if args.gpu_session_kill:
+                    marker = b"gpu-contain-after"
+                ready = b"INDRA login:" in transcript and marker in transcript
                 if args.two_clients:
                     # The clients are admitted ASYNC after the marker; wait for both
                     # separate processes to present before the screenshot.
@@ -512,6 +523,9 @@ def main():
                              and transcript.count(
                                  b"gfx-client: 256x128 surface copied; buffer released (software GOP)"
                              ) >= 2)
+                if args.gpu_session_kill:
+                    # The builtin's own verdict and the server's records precede the echo.
+                    ready = ready and b"gpu-contain: ok" in transcript
                 if ready:
                     break
                 time.sleep(0.1)
@@ -685,6 +699,26 @@ def main():
                 assert transcript.rfind(b"gfx-log: view 0") > transcript.rfind(
                     b"sora: entering serve loop"
                 ), f"mirror never refreshed after the serve loop started; inspect {serial}"
+            elif args.gpu_session_kill:
+                # G8d-a: one kill, then the two scripted reset outcomes. A confirmed reset
+                # must release the session's exact metadata and the driver's claims; a
+                # refused reset must retain both and poison the session.
+                confirmed = b"drv-gpu: containment reset=ok buffers=2 bindings=2 waits=1 retained=no"
+                refused = b"drv-gpu: containment reset=fail buffers=0 bindings=0 waits=0 retained=yes"
+                # The fake server logs its records and also sends them as its report; Sora
+                # logs the report, so each exact record appears at least once.
+                assert confirmed in transcript, f"missing confirmed containment record; inspect {serial}"
+                assert refused in transcript, f"missing refused containment record; inspect {serial}"
+                assert b"gpu-contain: pass" in transcript, f"missing fake-server verdict; inspect {serial}"
+                assert b"gpu-contain: fail" not in transcript, f"the fake server reported a containment failure; inspect {serial}"
+                for failure in (b"request pair fail", b"report pair fail", b"server launch fail",
+                                b"server transfer fail", b"client launch fail", b"client transfer fail",
+                                b"process handle missing", b"port fail", b"timer fail",
+                                b"port bind fail", b"client never armed"):
+                    assert failure not in transcript, f"containment plumbing failed at {failure!r}; inspect {serial}"
+                assert (transcript.index(confirmed) < transcript.index(refused)
+                        < transcript.index(b"gpu-contain: pass")), (
+                    f"containment records are out of order; inspect {serial}")
             else:
                 assert transcript.count(client) == 1, f"missing client present; inspect {serial}"
                 demo = b"gfx-demo: view 1 copied; buffer released (software GOP)"
@@ -692,6 +726,11 @@ def main():
                 assert b"gfx-demo: one or more views failed" not in transcript
             assert b"gfx-client: presenter rejected surface" not in transcript
             assert b"surface reclaim failed" not in transcript
+            if args.gpu_session_kill:
+                # No pixels: this proof is the ordering and the counts on the wire and in
+                # the kernel log. The QEMU machine has no GPU at all.
+                print("GPU containment UEFI smoke green: a killed client stopped the server, a confirmed reset released exact counts, a refused reset retained everything")
+                return
             if args.with_dtb:
                 assert b" declared / " in transcript, f"staged DTB was not loaded; inspect {serial}"
                 marker = b"drv-gpu: DevicePowerUp NotSupported; aperture untouched"
