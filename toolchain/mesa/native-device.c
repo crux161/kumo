@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j746*/
 /*j751*/
 /*j752*/
 /*j757*/
 /*j759*/
+/*j760*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -24,6 +24,7 @@ struct kumo_device {
     struct pan_kmod_dev base;
     struct kumo_gpu_api api;
     struct pan_kmod_va_range range;
+    uint32_t cs_reg_count;
     struct kumo_mesa_bo *bos;
     struct pan_kmod_vm *vm;
     bool lost;
@@ -36,6 +37,11 @@ static struct kumo_device *device(const struct pan_kmod_dev *base)
 static bool ready(struct kumo_device *dev)
 {
     return dev && !dev->lost && dev->api.device_status(dev->api.context) == KUMO_GPU_OK;
+}
+uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *base)
+{
+    const struct kumo_device *dev = device(base);
+    return dev ? dev->cs_reg_count : 0;
 }
 static void poison(struct kumo_device *dev)
 {
@@ -138,6 +144,7 @@ pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api, const struct pan_kmod_a
     pan_kmod_dev_init(&dev->base, -1, PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL,
                       &driver, &kumo_kmod_ops, allocator);
     dev->base.props = props;
+    dev->cs_reg_count = (report.info.cs_features & 0xff) + 1;
     dev->api = *api;
     dev->range = (struct pan_kmod_va_range){report.info.va_start, report.info.va_end - report.info.va_start};
     if (api->device_open(api->context) != KUMO_GPU_OK) {

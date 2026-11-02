@@ -1,9 +1,23 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j755 -->
 <!-- j756 -->
 <!-- j757 -->
 <!-- j758 -->
 <!-- j759 -->
+<!-- j760 -->
+
+## GL1-c1: native command-stream register counts
+
+Gallium's context initializer, tiler-OOM handler and batch builder now take their register
+configuration through one helper in `kumo-build.patch`. On KUMO it uses
+`pan_kmod_kumo_cs_reg_count(dev)`: `CS_FEATURES[7:0] + 1`, cached from the native device's
+attested query, with the last four registers reserved for drv-gpu's Submit wrapper. The
+Panthor private-layout accessor remains in the non-KUMO branch. Firmware slot counts are
+not needed by these builders and are not invented.
+
+`mesa-device-smoke.py --gl-screen --run` also checks the modeled attested 96-register count,
+the 256-register decoding edge, repeated reads without another query, and null/foreign device
+refusal. This is GL1-c's first prerequisite: context creation, its init job and cleanup still
+need the native group/heap/sync/submission seam and a metal proof. — KESTREL, 2026-11-02
 
 ## GL1-b: Gallium's screen over the native device
 

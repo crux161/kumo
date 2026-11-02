@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j746*/
 /*j751*/
 /*j752*/
 /*j757*/
 /*j759*/
+/*j760*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +14,16 @@ static void *fail_alloc(const struct pan_kmod_allocator *a, size_t size, bool tr
 { (void)a; (void)size; (void)transient; return NULL; }
 static void unused_free(const struct pan_kmod_allocator *a, void *p) { (void)a; (void)p; }
 static uint32_t (*real_query)(void *context, struct kumo_gpu_info *out);
+static uint32_t csif_queries;
+static uint32_t csif_reg_field;
+static uint32_t csif_query(void *context, struct kumo_gpu_info *out)
+{
+    ++csif_queries;
+    uint32_t status = real_query(context, out);
+    if (status == KUMO_GPU_OK && csif_reg_field != UINT32_MAX)
+        out->cs_features = (out->cs_features & ~0xffu) | csif_reg_field;
+    return status;
+}
 static uint32_t straddling_query(void *context, struct kumo_gpu_info *out)
 {
     uint32_t status = real_query(context, out);
@@ -353,9 +363,23 @@ unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
         CHECK(!pan_kmod_kumo_dev_create(api, &allocator), 3);
         return 0;
     }
-    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    struct kumo_gpu_api queried = *api;
+    queried.query = csif_query;
+    csif_queries = 0;
+    csif_reg_field = mode == 0 ? 0xff : UINT32_MAX;
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(&queried, NULL);
     if (mode == 1 || mode == 5) { CHECK(!dev, 4); return 0; }
     CHECK(dev && dev->ops == &kumo_kmod_ops && dev->fd == -1 && !(dev->flags & PAN_KMOD_DEV_FLAG_OWNS_FD), 5);
+    /* The 0xff edge must stay 256, not truncate to a byte or copy the metal's 96. The
+     * accessor must use this device's original query, not fetch changing props. — KESTREL */
+    uint32_t cs_reg_count = mode == 0 ? 256 : 96;
+    csif_reg_field = 0;
+    CHECK(pan_kmod_kumo_cs_reg_count(dev) == cs_reg_count &&
+          pan_kmod_kumo_cs_reg_count(dev) == cs_reg_count && csif_queries == 1, 202);
+    const struct pan_kmod_dev foreign = {0};
+    CHECK(!pan_kmod_kumo_cs_reg_count(NULL) && !pan_kmod_kumo_cs_reg_count(&foreign), 203);
+    if (mode == 0)
+        puts("GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal");
     CHECK(dev->props.mem_features == 0x301 && dev->props.l2_features == 0x07120306 &&
           dev->props.pgsize_bitmap == 4096 && !dev->props.is_io_coherent &&
           dev->props.supported_bo_flags == KUMO_GPU_BO_FLAGS && !dev->props.supported_vm_op_flags, 6);

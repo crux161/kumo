@@ -3,6 +3,7 @@
 /*j745*/
 /*j751*/
 /*j757*/
+/*j760*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -34,6 +35,9 @@ uint32_t kumo_mesa_bo_bind_flags(const struct kumo_mesa_bo *bo);
  * with_device_api. A closed device/session is recreated only on a fresh grant. — KESTREL */
 struct pan_kmod_dev *pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api,
                                              const struct pan_kmod_allocator *allocator);
+/* CS_FEATURES[7:0] + 1, cached from the factory's attested query. A foreign device returns
+ * zero. The native Submit wrapper clobbers the last four registers. — KESTREL */
+uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *dev);
 void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
 int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
 /* The published device's original session/BO owner also owns all native sync metadata.

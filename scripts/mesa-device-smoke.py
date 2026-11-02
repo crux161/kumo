@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j751
 #j752
 #j753
 #j757
 #j759
+#j760
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -23,6 +23,7 @@ GROUP_GREEN = b"G7p-d group state green: READ-only status, fatal/timeout/unknown
 SCREEN_GREEN = b"GL1-b screen green: Gallium's panfrost screen over the native device, its caps, a render-target texture, and a clean destroy"
 AUTO_VA_GREEN = b"GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fit addresses, a freed range reused, caller addresses refused, a full window refused with nothing sent"
 HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
+CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
 
 
 def run(command, **kwargs):
@@ -184,6 +185,8 @@ def main():
         transcript = module.boot(ROOT / "build/images/qemu-virt-aarch64", 120, elf=elf,
                                  label="G7o-d native device", green=GREEN, tag="G7o-d")
         proof = transcript.split(b"G7o-d native device begin", 1)[1]
+        assert proof.count(CSIF_GREEN) == 1 and proof.index(CSIF_GREEN) < proof.index(GREEN)
+        print(CSIF_GREEN.decode(), flush=True)
         assert proof.count(WX_GREEN) == 1 and proof.index(WX_GREEN) < proof.index(GREEN)
         assert proof.count(NATIVE_GREEN) == 1 and proof.index(NATIVE_GREEN) < proof.index(GREEN)
         assert proof.count(GROUP_GREEN) == 1 and proof.index(GROUP_GREEN) < proof.index(GREEN)
