@@ -1,8 +1,8 @@
-//j652
 //j653
 //j742
 //j744
 //j745
+//j751
 
 //! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
 //! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
@@ -12,7 +12,7 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;
@@ -98,6 +98,13 @@ pub struct Api {
     pub vm_bind: Option<unsafe extern "C" fn(*mut c_void, *const crate::bo::VmBinding) -> u32>,
     pub vm_unbind: Option<unsafe extern "C" fn(*mut c_void, u32, u64, u64) -> u32>,
     pub device_status: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub native: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const crate::c_sync::Request,
+            *mut crate::c_sync::Reply,
+        ) -> u32,
+    >,
 }
 
 /// The C consumer may call query synchronously during `f` only. It must not retain any
@@ -120,6 +127,7 @@ pub fn with_api<T: Transport, R>(client: &mut Client<T>, f: impl FnOnce(&Api) ->
         vm_bind: None,
         vm_unbind: None,
         device_status: None,
+        native: None,
     })
 }
 
@@ -145,6 +153,7 @@ pub fn with_buffer_api<T: Transport, M: crate::bo::Mapper<T::Handle>, R>(
         vm_bind: None,
         vm_unbind: None,
         device_status: None,
+        native: None,
     })
 }
 
@@ -162,6 +171,7 @@ pub fn with_device_api<T: crate::client::SessionTransport, M: crate::bo::Mapper<
     api.vm_bind = Some(vm_bind::<T, M>);
     api.vm_unbind = Some(vm_unbind::<T, M>);
     api.device_status = Some(device_status::<T, M>);
+    api.native = Some(crate::c_sync::callback::<T, M>);
     let result = f(&api);
     buffers.close_device();
     result
@@ -274,7 +284,7 @@ unsafe extern "C" fn vm_unbind<
         .map_or_else(bo_error, |()| OK)
 }
 
-fn bo_error(error: crate::bo::Error) -> u32 {
+pub(crate) fn bo_error(error: crate::bo::Error) -> u32 {
     use crate::bo::Error as E;
     match error {
         E::Client(error) => client_error(error),
@@ -286,7 +296,7 @@ fn bo_error(error: crate::bo::Error) -> u32 {
         E::Unmap(_) => UNMAP_FAILED,
     }
 }
-fn client_error(error: Error) -> u32 {
+pub(crate) fn client_error(error: Error) -> u32 {
     match error {
         Error::InvalidRequest => INVALID_REQUEST,
         Error::Transport(_) => TRANSPORT,
@@ -362,7 +372,8 @@ unsafe extern "C" fn buffer_unmap<T: Transport, M: crate::bo::Mapper<T::Handle>>
     let buffers = unsafe { &mut *context.cast::<crate::bo::Buffers<'_, T, M>>() };
     buffers.unmap(id).map_or_else(bo_error, |()| OK)
 }
-const _: () = assert!(size_of::<Api>() == 112);
+const _: () = assert!(size_of::<Api>() == 120);
+const _: () = assert!(core::mem::offset_of!(Api, native) == 112);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_create) == 24);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_destroy) == 32);
 const _: () = assert!(core::mem::offset_of!(Api, buffer_map) == 40);

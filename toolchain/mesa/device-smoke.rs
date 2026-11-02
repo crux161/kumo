@@ -1,5 +1,6 @@
 //j745
 //j746
+//j751
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -46,6 +47,8 @@ unsafe impl GlobalAlloc for LibcAllocator {
 #[global_allocator]
 static ALLOCATOR: LibcAllocator = LibcAllocator;
 static CURRENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CONTROL: core::sync::atomic::AtomicPtr<RefCell<Server>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 extern "C" {
     fn printf(format: *const u8, ...) -> i32;
     fn abort() -> !;
@@ -78,6 +81,7 @@ struct Hardware {
     binds: Vec<Binding>,
     bind_calls: u32,
     unbind_calls: u32,
+    reject_submit: bool,
 }
 impl Backend for Hardware {
     fn info(&mut self) -> Result<DeviceInfo, Status> {
@@ -179,6 +183,7 @@ impl Backend for Hardware {
         // Mode 8 binds the drivers' executable pools (buffers 2 and 3, cached) beside a
         // data BO; it is the G7o-e W^X shape. — TIMBERDOODLE
         let flags = match (self.mode, binding.buffer) {
+            (9.., _) => BindFlags::READ_ONLY,
             (8, 2 | 3) => BindFlags::READ_ONLY,
             (8, _) => BindFlags::NO_EXECUTE,
             (_, 2) => BindFlags::READ_ONLY | BindFlags::UNCACHED,
@@ -200,10 +205,21 @@ impl Backend for Hardware {
         Ok(())
     }
     fn create_group(&mut self) -> Result<(), Status> {
-        Err(Status::NotSupported)
+        if self.mode >= 9 {
+            Ok(())
+        } else {
+            Err(Status::NotSupported)
+        }
     }
     fn submit(&mut self, _: Submission) -> Result<(), SubmitError> {
-        Err(SubmitError::Unpublished(Status::NotSupported))
+        if self.mode < 9 {
+            return Err(SubmitError::Unpublished(Status::NotSupported));
+        }
+        if core::mem::take(&mut self.reject_submit) {
+            Err(SubmitError::Unpublished(Status::NoMemory))
+        } else {
+            Ok(())
+        }
     }
     fn retire(&mut self) {
         for (_, vmo) in self.buffers.drain(..) {
@@ -219,6 +235,12 @@ struct Server {
     closed: u32,
     grants_closed: u32,
     release: SessionRelease,
+    wakes: Vec<Handle>,
+    wake_reads: Vec<Handle>,
+    wakes_closed: u32,
+    last_request: u32,
+    last_point: u64,
+    uncertain_submit: bool,
 }
 struct Wire {
     server: Rc<RefCell<Server>>,
@@ -231,6 +253,8 @@ impl Transport for Wire {
         let request = Request::decode(bytes).unwrap();
         let mut server = self.server.borrow_mut();
         assert_eq!(server.closed, 0);
+        assert_eq!(request.id, server.last_request + 1);
+        server.last_request = request.id;
         server.calls.push(request.command);
         let Server {
             session, hardware, ..
@@ -254,6 +278,18 @@ impl Transport for Wire {
                 .0,
             ));
         }
+        if let Ok(Response::Submitted { point }) = result {
+            server.last_point = point;
+            if core::mem::take(&mut server.uncertain_submit) {
+                return Err(TransportError::Failed);
+            }
+        }
+        if let Ok(Response::WaitArmed { .. }) = result {
+            let (read, write) = native::call(Syscall::ChannelCreate, [0; 6]);
+            self.grant = Some(handle(read));
+            server.wakes.push(handle(write));
+            server.wake_reads.push(handle(read));
+        }
         self.reply = Some(Reply {
             id: request.id,
             result,
@@ -269,7 +305,12 @@ impl Transport for Wire {
     }
     fn close_handle(&mut self, vmo: Handle) {
         close(vmo);
-        self.server.borrow_mut().grants_closed += 1;
+        let mut server = self.server.borrow_mut();
+        if server.wake_reads.contains(&vmo) {
+            server.wakes_closed += 1;
+        } else {
+            server.grants_closed += 1;
+        }
     }
 }
 impl SessionTransport for Wire {
@@ -281,7 +322,59 @@ impl SessionTransport for Wire {
         // never a claim that a client-side close proves real hardware quiescence. — KESTREL
         server.release = server.session.close();
         server.hardware.retire();
+        for write in server.wakes.drain(..) {
+            close(write);
+        }
     }
+}
+
+/// Only the C proof's modeled producer calls this between native API invocations.
+/// The Rc remains live for the mode; no callback reentry or GPU authority is added.
+/// — MILVUS
+#[no_mangle]
+pub extern "C" fn kumo_mesa_native_control(action: u32) -> u32 {
+    let pointer = CONTROL.load(core::sync::atomic::Ordering::Relaxed);
+    assert!(!pointer.is_null());
+    let state = unsafe { &*pointer };
+    let writes = {
+        let mut server = state.borrow_mut();
+        match action {
+            1 | 2 => {
+                let point = server.last_point;
+                server
+                    .session
+                    .complete(point, if action == 1 { 0 } else { 0xbeef })
+                    .unwrap();
+                core::mem::take(&mut server.wakes)
+            }
+            3 => {
+                server.hardware.reject_submit = true;
+                Vec::new()
+            }
+            4 => {
+                server.uncertain_submit = true;
+                Vec::new()
+            }
+            5 => server.wakes.clone(),
+            6 => core::mem::take(&mut server.wakes),
+            7 => return u32::from(server.closed != 1),
+            _ => return 1,
+        }
+    };
+    for write in writes {
+        if action == 1 || action == 5 {
+            // Abandoned read ends are expected; live waiters verify their own wake.
+            // — MILVUS
+            native::call(
+                Syscall::ChannelWrite,
+                [write.0 as u64, [1u8].as_ptr() as u64, 1, 0, 0, 0],
+            );
+        }
+        if action != 5 {
+            close(write);
+        }
+    }
+    0
 }
 fn endpoint_proof() {
     let (left, right) = native::call(Syscall::ChannelCreate, [0; 6]);
@@ -357,7 +450,7 @@ fn endpoint_proof() {
 #[no_mangle]
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
-    for mode in 0..9 {
+    for mode in 0..12 {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
             session: Session::default(),
@@ -367,11 +460,18 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 binds: Vec::new(),
                 bind_calls: 0,
                 unbind_calls: 0,
+                reject_submit: false,
             },
             calls: Vec::new(),
             closed: 0,
             grants_closed: 0,
             release: SessionRelease::NONE,
+            wakes: Vec::new(),
+            wake_reads: Vec::new(),
+            wakes_closed: 0,
+            last_request: 0,
+            last_point: 0,
+            uncertain_submit: false,
         }));
         let mut client = Client::new(Wire {
             server: server.clone(),
@@ -380,9 +480,14 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         });
         let mut memory = native::Memory;
         let mut buffers = Buffers::new(&mut client, &mut memory);
+        CONTROL.store(
+            Rc::as_ptr(&server).cast_mut(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let result = with_device_api(&mut buffers, |api| unsafe {
             kumo_mesa_device_cases(api, mode)
         });
+        CONTROL.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
         if result != 0 {
             return mode * 100 + result;
         }
@@ -397,6 +502,27 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             .filter(|c| matches!(c, Command::BufferCreate { .. }))
             .count();
         assert_eq!(server.grants_closed as usize, created);
+        assert_eq!(server.wakes_closed as usize, server.wake_reads.len());
+        assert!(server.wakes.is_empty());
+        if mode >= 9 {
+            assert!(!server
+                .calls
+                .iter()
+                .any(|c| matches!(c, Command::SyncRead { .. })));
+            let submitted = server
+                .calls
+                .iter()
+                .filter(|c| matches!(c, Command::Submit(_)))
+                .count();
+            assert_eq!(submitted, if mode == 9 { 3 } else { 1 });
+            if mode == 9 {
+                assert_eq!(server.release.buffers, 0);
+                assert_eq!(server.release.bindings, 0);
+            } else {
+                assert_eq!(server.release.buffers, 1);
+                assert_eq!(server.release.bindings, 1);
+            }
+        }
         let vm_creates = server
             .calls
             .iter()

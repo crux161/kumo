@@ -1,9 +1,10 @@
 //j744
 //j745
+//j751
 //! Kernel handle/endpoint adapters for the native Mesa bridge. No FD or physical-address route.
 use core::ptr::NonNull;
 use kumo_abi::{sys::Syscall, Handle, VmarFlags};
-use kumo_gpu::bo::{MapError, Mapper};
+use kumo_gpu::bo::{MapError, Mapper, WaitOutcome};
 
 // The same six-word syscall ABI as kumo-rt, without importing its allocator or startup.
 // This adapter can therefore run behind relibc's real C runtime too. — KESTREL
@@ -19,6 +20,11 @@ pub(crate) fn call(number: Syscall, args: [u64; 6]) -> (u64, u64) {
 }
 pub struct Memory;
 impl Mapper<Handle> for Memory {
+    fn barrier(&mut self) {
+        // Normal-NC CPU aliases still need store publication and completion ordering.
+        // Cache cleaning remains the GPU producer's contract. — MILVUS
+        unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    }
     fn map(&mut self, vmo: &Handle, bytes: u64) -> Result<NonNull<u8>, MapError> {
         let (status, va) = call(
             Syscall::VmarMap,
@@ -46,6 +52,54 @@ impl Mapper<Handle> for Memory {
             return Err(MapError::Failed);
         }
         Ok(())
+    }
+    fn wait(&mut self, wake: &Handle, timeout_ns: u64) -> WaitOutcome {
+        let (raw_port, _) = call(Syscall::PortCreate, [0; 6]);
+        if raw_port == 0 || raw_port > u32::MAX as u64 {
+            return WaitOutcome::Failed;
+        }
+        let (timer, _) = call(Syscall::TimerCreate, [timeout_ns, 0, 0, 0, 0, 0]);
+        if timer == 0 || timer > u32::MAX as u64 {
+            call(Syscall::HandleClose, [raw_port, 0, 0, 0, 0, 0]);
+            return WaitOutcome::Failed;
+        }
+        let wake_koid = call(Syscall::HandleKoid, [wake.0 as u64, 0, 0, 0, 0, 0]).0;
+        let timer_koid = call(Syscall::HandleKoid, [timer, 0, 0, 0, 0, 0]).0;
+        let bound = wake_koid != u64::MAX
+            && timer_koid != u64::MAX
+            && call(Syscall::PortBind, [raw_port, wake.0 as u64, 0, 0, 0, 0]).0 == 0
+            && call(Syscall::PortBind, [raw_port, timer, 0, 0, 0, 0]).0 == 0;
+        let result = if bound {
+            let source = call(Syscall::PortWait, [raw_port, 0, 0, 0, 0, 0]).0;
+            if source == wake_koid {
+                let mut byte = [0u8];
+                let (len, grant) = call(
+                    Syscall::ChannelRead,
+                    [wake.0 as u64, byte.as_mut_ptr() as u64, 1, 0, 0, 0],
+                );
+                // A malformed wake must not leak a transferred handle or imply completion.
+                // The owner closes the read end; FenceWait remains authoritative. — MILVUS
+                if grant != 0 && grant <= u32::MAX as u64 {
+                    call(Syscall::HandleClose, [grant, 0, 0, 0, 0, 0]);
+                }
+                if len == 1 && byte[0] == 1 && grant == 0 {
+                    WaitOutcome::Woken
+                } else {
+                    WaitOutcome::Closed
+                }
+            } else if source == timer_koid {
+                WaitOutcome::TimedOut
+            } else {
+                WaitOutcome::Failed
+            }
+        } else {
+            WaitOutcome::Failed
+        };
+        call(Syscall::PortUnbind, [raw_port, wake.0 as u64, 0, 0, 0, 0]);
+        call(Syscall::PortUnbind, [raw_port, timer, 0, 0, 0, 0]);
+        call(Syscall::HandleClose, [timer, 0, 0, 0, 0, 0]);
+        call(Syscall::HandleClose, [raw_port, 0, 0, 0, 0, 0]);
+        result
     }
 }
 /// Own one brokered GPU endpoint. Close requests containment; it never asserts GPU idle.

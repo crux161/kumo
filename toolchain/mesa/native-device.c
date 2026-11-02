@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*j745*/
 /*j746*/
+/*j751*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -53,7 +54,24 @@ static bool api_valid(const struct kumo_gpu_api *api)
     return api && api->version == KUMO_GPU_API_VERSION && api->bytes == sizeof(*api) &&
            api->context && api->query && api->buffer_create && api->buffer_destroy &&
            api->buffer_map && api->buffer_unmap && api->device_open && api->device_close &&
-           api->vm_create && api->vm_destroy && api->vm_bind && api->vm_unbind && api->device_status;
+           api->vm_create && api->vm_destroy && api->vm_bind && api->vm_unbind &&
+           api->device_status && api->native;
+}
+uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *base,
+                             const struct kumo_gpu_native_request *request,
+                             struct kumo_gpu_native_reply *out)
+{
+    if (!out) return KUMO_GPU_BAD_ARGUMENT;
+    *out = (struct kumo_gpu_native_reply){0};
+    if (!request) return KUMO_GPU_BAD_ARGUMENT;
+    struct kumo_device *dev = device(base);
+    if (!dev) return KUMO_GPU_INVALID_REQUEST;
+    if (!ready(dev)) { poison(dev); return KUMO_GPU_DEVICE_LOST; }
+    uint32_t status = dev->api.native(dev->api.context, request, out);
+    /* Loss is terminal across BO, VM and sync callbacks. Closing retains the server's
+     * reset-before-DMA-release obligation; C never fabricates quiescence. — MILVUS */
+    if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
+    return status;
 }
 struct pan_kmod_dev *
 pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api, const struct pan_kmod_allocator *allocator)

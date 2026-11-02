@@ -1,6 +1,7 @@
 //j744
 //j745
 //j747
+//j751
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
@@ -22,6 +23,15 @@ pub enum MapError {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitOutcome {
+    Woken,
+    TimedOut,
+    Closed,
+    Failed,
+    Unsupported,
+}
+
 /// The adapter owns successful mappings until an unmap succeeds. An unmap failure must
 /// retain the mapping/pin; closing a VMO handle cannot release still-mapped backing.
 /// Implementations must create RW Normal-NC mappings, never CPU executable mappings.
@@ -29,6 +39,17 @@ pub enum MapError {
 pub trait Mapper<H> {
     fn map(&mut self, handle: &H, bytes: u64) -> Result<NonNull<u8>, MapError>;
     fn unmap(&mut self, address: NonNull<u8>, bytes: u64) -> Result<(), MapError>;
+    /// Bound one wake-channel wait; do not close the borrowed handle or claim GPU
+    /// completion. The shared owner closes it after every outcome. — MILVUS
+    fn wait(&mut self, _wake: &H, _timeout_ns: u64) -> WaitOutcome {
+        WaitOutcome::Unsupported
+    }
+    /// Publish/observe shared memory around native operations. Device adapters must use
+    /// the barrier their mappings require; the default serves coherent host models.
+    /// — MILVUS
+    fn barrier(&mut self) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +114,7 @@ pub struct Buffers<'a, T: Transport, M: Mapper<T::Handle>> {
     vm: Option<Vm>,
     next_vm: u32,
     bindings: Vec<Binding>,
+    pub(crate) native: Option<crate::c_sync::Context<T::Handle>>,
 }
 
 impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
@@ -105,6 +127,7 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             vm: None,
             next_vm: 0,
             bindings: Vec::new(),
+            native: None,
         }
     }
 
@@ -190,6 +213,9 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
     }
 
     fn release_local(&mut self) {
+        if let Some(mut native) = self.native.take() {
+            native.clear(self.client);
+        }
         for record in self.records.drain(..) {
             if let Some(address) = record.address {
                 let _ = self.mapper.unmap(address, record.buffer.bytes);
@@ -205,11 +231,18 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
         self.records.len()
     }
 
-    /// The borrowed session, for native operations this store does not model yet: groups,
-    /// submission and sync (G7p). Buffer, VM and binding requests must still go through the
-    /// store, which owns their bookkeeping. — TIMBERDOODLE
+    /// Legacy direct access for J747's diagnostic. Do not interleave direct group/submit
+    /// operations with the native C bridge, or bypass the store's BO/VM bookkeeping.
+    /// The bridge owns those operations once in use. — MILVUS
     pub fn native_client(&mut self) -> &mut Client<T> {
         self.client
+    }
+
+    pub(crate) fn wait_native(&mut self, wake: &T::Handle, timeout_ns: u64) -> WaitOutcome {
+        self.mapper.wait(wake, timeout_ns)
+    }
+    pub(crate) fn barrier_native(&mut self) {
+        self.mapper.barrier();
     }
 }
 
@@ -274,6 +307,24 @@ impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
             return Err(ClientError::DeviceLost.into());
         }
         self.vm.filter(|vm| vm.id == id).ok_or(Error::NotFound)
+    }
+    pub(crate) fn check_native_vm(&self, id: u32) -> Result<(), Error> {
+        self.native_vm(id).map(|_| ())
+    }
+    pub(crate) fn check_native_submission(
+        &self,
+        vm: u32,
+        submission: crate::Submission,
+    ) -> Result<(), Error> {
+        self.native_vm(vm)?;
+        if submission.group != 1 || !submission.valid_shape() {
+            return Err(Error::InvalidRequest);
+        }
+        self.bindings
+            .iter()
+            .any(|binding| submission.validate_for(1, *binding).is_ok())
+            .then_some(())
+            .ok_or(Error::InvalidRequest)
     }
     pub fn bind_native(&mut self, request: VmBinding) -> Result<(), Error> {
         let vm = self.native_vm(request.vm)?;

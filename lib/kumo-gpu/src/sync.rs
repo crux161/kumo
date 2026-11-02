@@ -1,5 +1,6 @@
 //j749
 //j750
+//j751
 //! Session-local native sync objects, without DRM handles or sync files. Calls are serial.
 //! Pending means an accepted job owns a signal; only FenceWait Done proves completion.
 //! Captured dependencies gate publication; the caller owns bounded OS waits.
@@ -106,6 +107,12 @@ struct Record {
 /// work. At most 64 objects and 256 unobserved timeline points per object. — MILVUS
 pub struct SyncObjects<'a, T: Transport> {
     client: &'a mut Client<T>,
+    state: State,
+}
+
+// The BO/device owner retains this metadata between serial callback borrows. No second
+// Client, endpoint or request-ID sequence is created when lending the facade. — MILVUS
+pub(crate) struct State {
     owner: u64,
     next_id: u32,
     group: Option<u32>,
@@ -122,11 +129,28 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
         }
         Ok(Self {
             client,
-            owner,
-            next_id: 0,
-            group: None,
-            objects: Vec::new(),
+            state: State {
+                owner,
+                next_id: 0,
+                group: None,
+                objects: Vec::new(),
+            },
         })
+    }
+
+    pub(crate) fn with_state<R>(
+        client: &'a mut Client<T>,
+        state: &mut Option<State>,
+        f: impl FnOnce(&mut Self) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let mut facade = if let Some(state) = state.take() {
+            Self { client, state }
+        } else {
+            Self::new(client)?
+        };
+        let result = f(&mut facade);
+        *state = Some(facade.state);
+        result
     }
 
     fn ready(&self) -> Result<(), Error> {
@@ -139,10 +163,11 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
 
     fn index(&self, handle: SyncHandle) -> Result<usize, Error> {
         self.ready()?;
-        if handle.owner != self.owner {
+        if handle.owner != self.state.owner {
             return Err(Error::NotFound);
         }
-        self.objects
+        self.state
+            .objects
             .iter()
             .position(|record| record.id == handle.id)
             .ok_or(Error::NotFound)
@@ -150,15 +175,18 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
 
     fn create(&mut self, object: Object) -> Result<SyncHandle, Error> {
         self.ready()?;
-        if self.objects.len() == MAX_SYNCS {
+        if self.state.objects.len() == MAX_SYNCS {
             return Err(Error::NoMemory);
         }
-        let id = self.next_id.checked_add(1).ok_or(Error::NoMemory)?;
-        self.objects.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.objects.push(Record { id, object });
-        self.next_id = id;
+        let id = self.state.next_id.checked_add(1).ok_or(Error::NoMemory)?;
+        self.state
+            .objects
+            .try_reserve(1)
+            .map_err(|_| Error::NoMemory)?;
+        self.state.objects.push(Record { id, object });
+        self.state.next_id = id;
         Ok(SyncHandle {
-            owner: self.owner,
+            owner: self.state.owner,
             id,
         })
     }
@@ -176,13 +204,13 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
 
     pub fn destroy(&mut self, handle: SyncHandle) -> Result<(), Error> {
         let index = self.index(handle)?;
-        self.objects.swap_remove(index);
+        self.state.objects.swap_remove(index);
         Ok(())
     }
 
     pub fn reset(&mut self, handle: SyncHandle) -> Result<(), Error> {
         let index = self.index(handle)?;
-        let Object::Binary(payload) = &mut self.objects[index].object else {
+        let Object::Binary(payload) = &mut self.state.objects[index].object else {
             return Err(Error::InvalidRequest);
         };
         *payload = None;
@@ -191,7 +219,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
 
     pub fn signal(&mut self, point: Point) -> Result<(), Error> {
         let index = self.index(point.sync)?;
-        match &mut self.objects[index].object {
+        match &mut self.state.objects[index].object {
             Object::Binary(payload) if point.value == 0 => *payload = Some(Payload::Signaled),
             Object::Timeline { completed, pending } => {
                 // Do not let a CPU signal bypass unresolved GPU work. A later native queue
@@ -213,7 +241,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     /// after a producer publishes; this function neither blocks nor invents a wake channel.
     pub fn snapshot(&self, point: Point) -> Result<Option<Snapshot>, Error> {
         let index = self.index(point.sync)?;
-        let payload = match &self.objects[index].object {
+        let payload = match &self.state.objects[index].object {
             Object::Binary(payload) if point.value == 0 => *payload,
             Object::Timeline { completed, pending } => {
                 if point.value <= *completed {
@@ -228,7 +256,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
             _ => return Err(Error::InvalidRequest),
         };
         Ok(payload.map(|payload| Snapshot {
-            owner: self.owner,
+            owner: self.state.owner,
             payload,
         }))
     }
@@ -241,7 +269,10 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     fn reserve_signals(&mut self, submission: Submission, signals: &[Point]) -> Result<(), Error> {
         self.ready()?;
         if !submission.valid_shape()
-            || self.group.is_some_and(|group| group != submission.group)
+            || self
+                .state
+                .group
+                .is_some_and(|group| group != submission.group)
             || signals.len() > MAX_SYNCS
         {
             return Err(Error::InvalidRequest);
@@ -251,7 +282,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
             if signals[..n].iter().any(|other| other.sync == point.sync) {
                 return Err(Error::InvalidRequest);
             }
-            match &mut self.objects[index].object {
+            match &mut self.state.objects[index].object {
                 Object::Binary(_) if point.value == 0 => (),
                 Object::Timeline { completed, pending } => {
                     let last = pending.last().map_or(*completed, |(value, _)| *value);
@@ -302,7 +333,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
             .map_err(|_| Error::NoMemory)?;
         outputs.extend_from_slice(signals);
         Ok(PreparedSubmit {
-            owner: self.owner,
+            owner: self.state.owner,
             submission,
             waits: captured,
             signals: outputs,
@@ -320,7 +351,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
         prepared: &mut PreparedSubmit,
     ) -> Result<SubmitProgress<T::Handle>, Error> {
         self.ready()?;
-        if prepared.owner != self.owner {
+        if prepared.owner != self.state.owner {
             return Err(Error::NotFound);
         }
         if prepared.accepted {
@@ -350,18 +381,18 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     pub fn submit(&mut self, submission: Submission, signals: &[Point]) -> Result<Snapshot, Error> {
         self.reserve_signals(submission, signals)?;
         let fence = self.client.submit_fence(submission)?;
-        self.group = Some(fence.group);
+        self.state.group = Some(fence.group);
         for point in signals {
             // Every index was checked above; exclusive client access prevents reentry or
             // concurrent destruction between acceptance and metadata publication. — MILVUS
             let index = self.index(point.sync).expect("validated signal");
-            match &mut self.objects[index].object {
+            match &mut self.state.objects[index].object {
                 Object::Binary(payload) => *payload = Some(Payload::Fence(fence)),
                 Object::Timeline { pending, .. } => pending.push((point.value, fence)),
             }
         }
         Ok(Snapshot {
-            owner: self.owner,
+            owner: self.state.owner,
             payload: Payload::Fence(fence),
         })
     }
@@ -372,7 +403,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     /// No SyncRead polling, OS wait policy, or implicit retry lives here. — MILVUS
     pub fn arm(&mut self, snapshot: Snapshot) -> Result<FenceStatus<T::Handle>, Error> {
         self.ready()?;
-        if snapshot.owner != self.owner {
+        if snapshot.owner != self.state.owner {
             return Err(Error::NotFound);
         }
         let Payload::Fence(fence) = snapshot.payload else {
@@ -394,7 +425,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     }
 
     fn completed(&mut self, fence: Fence) {
-        for record in &mut self.objects {
+        for record in &mut self.state.objects {
             match &mut record.object {
                 Object::Binary(payload @ Some(Payload::Fence(_))) => {
                     if let Some(Payload::Fence(current)) = *payload {

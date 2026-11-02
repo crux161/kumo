@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*j744*/
 /*j745*/
+/*j751*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -34,6 +35,11 @@ struct pan_kmod_dev *pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api,
                                              const struct pan_kmod_allocator *allocator);
 void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
 int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
+/* The published device's original session/BO owner also owns all native sync metadata.
+ * No DRM dispatch, FD, second Client, or kernel handle is exposed. — MILVUS */
+uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *dev,
+                              const struct kumo_gpu_native_request *request,
+                              struct kumo_gpu_native_reply *out);
 extern const struct pan_kmod_ops kumo_kmod_ops;
 /* One property builder is shared by the report and native device publication. */
 uint32_t kumo_mesa_query_properties(const struct kumo_gpu_api *api, struct kumo_mesa_report *out,

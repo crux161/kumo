@@ -1,8 +1,8 @@
-//j653
 //j739
 //j742
 //j744
 //j745
+//j751
 
 //! Compile/link acceptance, with the real Session codec and modeled hardware only.
 //! The native service and Mesa rendering remain later acceptance gates. — KESTREL
@@ -112,7 +112,7 @@ const _: () = assert!(core::mem::offset_of!(Report, l2_slices) == 192);
 const _: () = assert!(core::mem::offset_of!(Report, pgsize_bitmap) == 200);
 const _: () = assert!(core::mem::offset_of!(Report, is_io_coherent) == 208);
 const _: () = assert!(core::mem::offset_of!(Report, timestamp_frequency) == 232);
-const _: () = assert!(core::mem::size_of::<Api>() == 112);
+const _: () = assert!(core::mem::size_of::<Api>() == 120);
 const INFO: DeviceInfo = DeviceInfo {
     gpu_id: 0xa8670005,
     cs_features: 0x7085f,
@@ -930,7 +930,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
     let wire = transport(&sends, &closed, false, false);
     let mut client = Client::new(wire);
     let ok = with_api(&mut client, |api| {
-        if api.version != 12 {
+        if api.version != kumo_gpu::c::VERSION {
             return false;
         }
         let mut guarded = [0xfeedbeefcafebabeu64; 32];
@@ -1116,7 +1116,7 @@ pub extern "C" fn kumo_mesa_bridge_proof() -> u32 {
         };
         (unsafe { kumo_mesa_probe(&old, &mut report) }) == 2
             && sends.get() == 0
-            && api.version == 12
+            && api.version == kumo_gpu::c::VERSION
             && (unsafe { kumo_mesa_probe(api, &mut report) }) == 1
             && sends.get() == QUERIES
     });

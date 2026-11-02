@@ -1,9 +1,75 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j745 -->
 <!-- j746 -->
 <!-- j747 -->
 <!-- j749 -->
 <!-- j750 -->
+<!-- j751 -->
+
+## G7p-c: the native C boundary shares the BO/session owner
+
+The callback ABI is **13**, **120 bytes**. Info stays 104 bytes and the property report stays
+240 bytes. A single appended `native` callback exposes the operations below through
+`pan_kmod_kumo_native(dev, request, reply)`. The factory rejects ABI 12, truncated API tables
+and a missing native callback. Query-only and BO-only APIs leave this callback null.
+
+The device's existing Rust `Buffers` context retains sync state, snapshots, prepared jobs and
+owned wake channels alongside its BOs and logical VM. Each callback briefly lends that sync
+state the same Client; it restores metadata after success or recoverable refusal. There is
+one endpoint and one monotonically increasing request sequence. No second Client or DRM FD
+is created. The adapter publishes/observes Normal-NC shared memory with a system barrier;
+the GPU wrapper remains responsible for cache cleaning before completion.
+
+All native IDs are opaque Rust metadata keys from one never-reused ID space, with kind and
+context lookup before use. C never receives a kernel wake handle or an unchecked GPU fence.
+There are at most 256 native entries (including one group), with the existing 64-sync and
+256-point limits underneath. Capacity and return-ID reservations precede any I/O that could
+accept work or transfer a wake. A snapshot, job or wake ID has an explicit lifetime; dropping
+a job discards only its intent and cannot cancel GPU work.
+
+| Operation | Request fields | Result on success |
+|---|---|---|
+| CREATE_BINARY / CREATE_TIMELINE | value = initial signal (0/1) or u64 timeline value | new sync ID |
+| DROP | id | release sync/snapshot/job metadata or close a wake; group drop refuses |
+| RESET / SIGNAL | id, signal value for SIGNAL | binary reset or host signal |
+| PENDING | id, wait value | value and state report signal availability, separately from completion |
+| SNAPSHOT | id, wait value | new snapshot ID, or UNAVAILABLE with ID 0 |
+| ARM | snapshot id | COMPLETE, or AVAILABLE with an owned wake ID |
+| WAIT | wake id, relative timeout in ns | WOKEN, TIMED_OUT or CLOSED; consumes/closes the wake |
+| GROUP_CREATE | value = current logical VM ID | one group ID for the device lifetime |
+| PREPARE | group id, job, wait/signal arrays and counts | new prepared-job ID |
+| STEP | prepared-job id | SUBMITTED with snapshot ID, or AVAILABLE with wake ID |
+
+Flags and unused fields must be zero. Arrays are live/aligned for their bounded count and are
+copied before the callback returns; no C array pointer is retained. A prepared job records the
+logical VM generation and stream, rechecked against live owned bindings before each step.
+A stale VM or destroyed/unbound stream cannot reach Submit. Input snapshots survive object
+reset/destruction. Output metadata still changes only after acknowledgement, and an accepted
+intent cannot replay. A recoverable refusal preserves it; uncertain transport or failed GPU
+completion latches loss across BO, VM and sync operations.
+
+WAIT accepts 1 ns through 5 s and consumes its wake on timeout, peer close, platform failure or
+unsupported waiting too. A wake byte alone never implies completion: ARM/STEP must obtain an
+authoritative FenceWait Done/status 0. Failure clears result IDs; Unsubmitted (status 11)
+returns the input index in value, and failed GPU completion returns DeviceLost with raw
+gpu_status. The native C wrapper closes the owned session on known loss. Device/scope close
+also closes every remaining Rust-held wake; it does not claim DMA quiescence.
+
+```sh
+python3 scripts/mesa-device-smoke.py --native-sync --run
+```
+
+The extended proof uses real Mesa device/BO/VM lifecycle and C callbacks, a modeled GPU
+producer through the actual codec/Session, and real kernel VMOs, channels, Ports and timers.
+It checks timeout, a wake byte without completion, peer close without completion, rejected
+submit/retry, once-only acceptance, failed dependency, uncertain publication, foreign/stale
+IDs, stale VM generations and exact grant/wake cleanup. Rust verifies one contiguous request
+sequence per session and zero SyncRead requests. The existing device and W^X cases still run.
+
+Group fatal/timed-out reporting and GPU metal acceptance remain G7p gates. Group destruction
+is device/session close in this one-group lane; creating several groups, automatic VA/activity
+tracking, wait-many and future-value wake policy are not added. Gallium's fence wrapper and
+panvk's vk_sync type remain GL1/VK2; sync-file import/export stay unsupported.
+— MILVUS, 2026-11-01
 
 ## G7p-b: captured dependencies before Submit
 

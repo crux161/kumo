@@ -1,5 +1,6 @@
 //j749
 //j750
+//j751
 extern crate std;
 
 use super::*;
@@ -128,7 +129,7 @@ fn accepted_signals_are_pending_until_the_real_fence_is_done() {
     assert_eq!(syncs.signal(point(timeline.sync, 43)), Err(Error::Busy));
     done(&state, 1, 0);
     assert_eq!(syncs.arm(fence), Ok(FenceStatus::Done { gpu_status: 0 }));
-    assert_eq!(syncs.objects.len(), 2);
+    assert_eq!(syncs.state.objects.len(), 2);
     let captured = syncs.snapshot(timeline).unwrap().unwrap();
     assert_eq!(syncs.arm(captured), Ok(FenceStatus::Done { gpu_status: 0 }));
     syncs.signal(point(timeline.sync, 43)).unwrap();
@@ -235,7 +236,7 @@ fn sparse_timeline_values_complete_and_prune_only_through_the_observed_fence() {
     assert_eq!(syncs.snapshot(point(timeline, 11)).unwrap(), Some(second));
     done(&state, 1, 0);
     syncs.arm(ten).unwrap();
-    let Object::Timeline { completed, pending } = &syncs.objects[0].object else {
+    let Object::Timeline { completed, pending } = &syncs.state.objects[0].object else {
         panic!()
     };
     assert_eq!(*completed, 10);
@@ -284,7 +285,7 @@ fn quota_returns_no_memory_before_io_and_completion_reclaims_timeline_space() {
     assert_ne!(replacement, timeline);
     assert_eq!(syncs.reset(timeline), Err(Error::NotFound));
     syncs.destroy(replacement).unwrap();
-    syncs.next_id = u32::MAX;
+    syncs.state.next_id = u32::MAX;
     assert_eq!(syncs.create_binary(false), Err(Error::NoMemory));
 }
 

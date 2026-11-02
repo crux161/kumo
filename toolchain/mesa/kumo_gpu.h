@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j652*/
 /*j653*/
 /*j742*/
 /*j744*/
 /*j745*/
+/*j751*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -19,7 +19,7 @@
  * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
-#define KUMO_GPU_API_VERSION 12u
+#define KUMO_GPU_API_VERSION 13u
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u
@@ -30,6 +30,9 @@
 #define KUMO_GPU_MAP_FAILED 7u
 #define KUMO_GPU_UNMAP_FAILED 8u
 #define KUMO_GPU_UNKNOWN_BUFFER 9u
+#define KUMO_GPU_UNKNOWN_OBJECT 10u
+#define KUMO_GPU_UNSUBMITTED 11u
+#define KUMO_GPU_WAIT_FAILED 12u
 #define KUMO_GPU_SERVER_ERROR 16u /* plus kumo_gpu::Status */
 
 struct kumo_gpu_info {
@@ -91,6 +94,50 @@ struct kumo_gpu_vm_binding {
     uint64_t bytes;
 };
 
+/* Native IDs are scoped metadata keys, never kernel handles. Snapshot/job/wake IDs are
+ * owned until DROP; WAIT consumes its wake ID on every outcome. No ID ever repeats across
+ * contexts. Requests, bounded arrays and output storage must be live, aligned and distinct.
+ * All calls are serial inside the original with_device_api scope. — MILVUS */
+#define KUMO_NATIVE_CREATE_BINARY 1u
+#define KUMO_NATIVE_CREATE_TIMELINE 2u
+#define KUMO_NATIVE_DROP 3u
+#define KUMO_NATIVE_RESET 4u
+#define KUMO_NATIVE_SIGNAL 5u
+#define KUMO_NATIVE_PENDING 6u
+#define KUMO_NATIVE_SNAPSHOT 7u
+#define KUMO_NATIVE_ARM 8u
+#define KUMO_NATIVE_WAIT 9u
+#define KUMO_NATIVE_GROUP_CREATE 10u
+#define KUMO_NATIVE_PREPARE 11u
+#define KUMO_NATIVE_STEP 12u
+#define KUMO_NATIVE_UNAVAILABLE 0u
+#define KUMO_NATIVE_AVAILABLE 1u
+#define KUMO_NATIVE_COMPLETE 2u
+#define KUMO_NATIVE_SUBMITTED 3u
+#define KUMO_NATIVE_WOKEN 4u
+#define KUMO_NATIVE_TIMED_OUT 5u
+#define KUMO_NATIVE_CLOSED 6u
+#define KUMO_NATIVE_MAX_OBJECTS 256u
+#define KUMO_NATIVE_MAX_WAITS 64u
+#define KUMO_NATIVE_MAX_TIMEOUT_NS UINT64_C(5000000000)
+struct kumo_gpu_native_point { uint64_t id, value; };
+struct kumo_gpu_native_job {
+    uint32_t vm, stream_bytes;
+    uint64_t stream_va, signal_point;
+};
+struct kumo_gpu_native_request {
+    uint32_t operation, flags;
+    uint64_t id, value;
+    struct kumo_gpu_native_job job;
+    const struct kumo_gpu_native_point *waits, *signals;
+    uint32_t wait_count, signal_count;
+};
+struct kumo_gpu_native_reply {
+    uint64_t id;
+    uint32_t state, gpu_status;
+    uint64_t value;
+};
+
 struct kumo_gpu_api {
     uint32_t version;
     uint32_t bytes;
@@ -108,6 +155,8 @@ struct kumo_gpu_api {
     uint32_t (*vm_bind)(void *context, const struct kumo_gpu_vm_binding *binding);
     uint32_t (*vm_unbind)(void *context, uint32_t vm, uint64_t va, uint64_t bytes);
     uint32_t (*device_status)(void *context);
+    uint32_t (*native)(void *context, const struct kumo_gpu_native_request *request,
+                       struct kumo_gpu_native_reply *out);
 };
 
 #define KUMO_MESA_INCOMPLETE 1u
@@ -234,7 +283,14 @@ _Static_assert(sizeof(struct kumo_gpu_buffer_info) == 16, "buffer layout");
 _Static_assert(offsetof(struct kumo_gpu_buffer_info, bytes) == 8, "buffer alignment");
 _Static_assert(sizeof(struct kumo_gpu_vm_binding) == 32, "VM binding layout");
 #if UINTPTR_MAX == UINT64_MAX
-_Static_assert(sizeof(struct kumo_gpu_api) == 112, "64-bit callback layout");
+_Static_assert(sizeof(struct kumo_gpu_api) == 120, "64-bit callback layout");
+_Static_assert(offsetof(struct kumo_gpu_api, native) == 112, "native callback offset");
+_Static_assert(sizeof(struct kumo_gpu_native_point) == 16, "native point layout");
+_Static_assert(sizeof(struct kumo_gpu_native_job) == 24, "native job layout");
+_Static_assert(sizeof(struct kumo_gpu_native_request) == 72, "native request layout");
+_Static_assert(offsetof(struct kumo_gpu_native_request, waits) == 48, "native waits offset");
+_Static_assert(offsetof(struct kumo_gpu_native_request, wait_count) == 64, "native counts offset");
+_Static_assert(sizeof(struct kumo_gpu_native_reply) == 24, "native reply layout");
 _Static_assert(offsetof(struct kumo_gpu_api, query) == 16, "callback alignment");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_create) == 24, "create callback");
 _Static_assert(offsetof(struct kumo_gpu_api, buffer_destroy) == 32, "destroy callback");
