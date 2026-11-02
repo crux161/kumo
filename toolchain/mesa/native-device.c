@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j751*/
 /*j752*/
 /*j757*/
 /*j759*/
 /*j760*/
+/*j761*/
 #include "kumo_kmod.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
@@ -87,6 +87,33 @@ uint32_t pan_kmod_kumo_native(struct pan_kmod_dev *base,
      * reset-before-DMA-release obligation; C never fabricates quiescence. — MILVUS */
     if (dev->api.device_status(dev->api.context) != KUMO_GPU_OK) poison(dev);
     return status;
+}
+int pan_kmod_kumo_sync_create(struct pan_kmod_dev *base, bool signaled, uint64_t *id)
+{
+    if (!id) return -1;
+    *id = 0;
+    const struct kumo_gpu_native_request request = {
+        .operation = KUMO_NATIVE_CREATE_BINARY, .value = signaled,
+    };
+    struct kumo_gpu_native_reply out;
+    if (pan_kmod_kumo_native(base, &request, &out) != KUMO_GPU_OK) return -1;
+    if (!out.id) {
+        struct kumo_device *dev = device(base);
+        if (dev) poison(dev);
+        return -1;
+    }
+    *id = out.id;
+    return 0;
+}
+void pan_kmod_kumo_sync_destroy(struct pan_kmod_dev *base, uint64_t id)
+{
+    if (!id) return;
+    const struct kumo_gpu_native_request request = {.operation = KUMO_NATIVE_DROP, .id = id};
+    struct kumo_gpu_native_reply out;
+    if (pan_kmod_kumo_native(base, &request, &out) != KUMO_GPU_OK) {
+        struct kumo_device *dev = device(base);
+        if (dev) poison(dev);
+    }
 }
 uint32_t pan_kmod_kumo_heap_create(struct pan_kmod_dev *base,
                                    const struct kumo_gpu_heap_request *request,

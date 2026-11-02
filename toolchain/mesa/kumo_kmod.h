@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j744*/
 /*j745*/
 /*j751*/
 /*j757*/
 /*j760*/
+/*j761*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -38,6 +38,11 @@ struct pan_kmod_dev *pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api,
 /* CS_FEATURES[7:0] + 1, cached from the factory's attested query. A foreign device returns
  * zero. The native Submit wrapper clobbers the last four registers. — KESTREL */
 uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *dev);
+/* Gallium context binaries own full-width native IDs, independently of its DRM fields.
+ * Failed creation clears the ID; destroying zero is a no-op. A failed void destructor
+ * loses the device rather than claiming the sync was released. — KESTREL */
+int pan_kmod_kumo_sync_create(struct pan_kmod_dev *dev, bool signaled, uint64_t *id);
+void pan_kmod_kumo_sync_destroy(struct pan_kmod_dev *dev, uint64_t id);
 void *pan_kmod_kumo_bo_mmap(struct pan_kmod_bo *bo, int prot, int flags, void *host_addr);
 int pan_kmod_kumo_bo_munmap(struct pan_kmod_bo *bo);
 /* The published device's original session/BO owner also owns all native sync metadata.

@@ -1,8 +1,8 @@
-//j746
 //j751
 //j752
 //j757
 //j759
+//j761
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -227,7 +227,7 @@ impl Backend for Hardware {
         // data BO; it is the G7o-e W^X shape. — TIMBERDOODLE
         let flags = match (self.mode, binding.buffer) {
             // Mode 16 maps data, code and a large BO wherever AUTO_VA put them. — TIMBERDOODLE
-            (16 | 17, _) => binding.flags.0,
+            (16.., _) => binding.flags.0,
             (9.., _) => BindFlags::READ_ONLY,
             (8, 2 | 3) => BindFlags::READ_ONLY,
             (8, _) => BindFlags::NO_EXECUTE,
@@ -714,7 +714,7 @@ fn closed_status_cap_proof() {
 pub extern "C" fn kumo_mesa_device_proof() -> u32 {
     endpoint_proof();
     closed_status_cap_proof();
-    // 17 modes, or 18 when the build links Gallium for GL1-b's screen. — TIMBERDOODLE
+    // The GL build adds the screen and context-sync ownership proofs. — KESTREL
     for mode in 0..unsafe { kumo_mesa_device_modes() } {
         CURRENT.store(mode, core::sync::atomic::Ordering::Relaxed);
         let server = Rc::new(RefCell::new(Server {
@@ -781,6 +781,14 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
         );
         assert!(server.hardware.status_vmo.is_none());
         assert!(server.wakes.is_empty());
+        if mode == 18 {
+            assert_eq!(server.release, SessionRelease::NONE);
+            assert!(created > 1);
+            assert!(!server.calls.iter().any(|c| matches!(
+                c,
+                Command::GroupCreate { .. } | Command::Submit(_) | Command::SyncRead { .. }
+            )));
+        }
         if (9..15).contains(&mode) {
             assert!(!server
                 .calls

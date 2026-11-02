@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j735
 #j738
 #j745
 #j759
 #j760
+#j761
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -113,7 +113,8 @@ def category(symbol):
     if symbol.startswith("drm"):
         return "DRM / libdrm"
     # Native capability backend entry points, supplied by build-closure.py. — KESTREL
-    if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap", "pan_kmod_kumo_cs_reg_count"):
+    if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap", "pan_kmod_kumo_cs_reg_count",
+                  "pan_kmod_kumo_sync_create", "pan_kmod_kumo_sync_destroy"):
         return "other: native capability backend"
     if symbol in BUILD_ID:
         return "other: static build ID"

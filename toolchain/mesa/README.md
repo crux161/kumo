@@ -1,9 +1,30 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j756 -->
 <!-- j757 -->
 <!-- j758 -->
 <!-- j759 -->
 <!-- j760 -->
+<!-- j761 -->
+
+## GL1-c2: Gallium context binary sync ownership
+
+The KUMO context constructor creates a signaled output binary and an empty input binary
+through `pan_kmod_kumo_sync_create`. Their IDs stay in dedicated 64-bit fields; the DRM
+handle fields are not aliases. Both binaries are created before other context resources,
+so either create can fail and release only the initialized IDs. The context destructor
+uses native DROP; a failed void sync destructor loses the device and closes the session.
+No wire or native ABI change is needed.
+
+`mesa-device-smoke.py --gl-screen --run` adds mode 18, driving the real Gallium constructor.
+A test-only observer adds a high word to real native IDs and translates them back at the
+callback boundary, checks each binary's initial payload and that DROP removes its metadata,
+and injects first/second-create refusal. Two subsequent attempts reach the still-refusing
+GROUP_CREATE ioctl and release both binaries. After screen destruction the modeled service
+has no buffer or binding left. Only this QEMU proof wraps `drmIoctl`, and it still delegates
+to the real refusal implementation; the metal screen client does not link the observer.
+
+The group/heap/init-stream and completion-wait paths remain GL1-c's next gate. This slice
+proves sync ownership and failure cleanup, with no successful context or GPU execution claim.
+— KESTREL, 2026-11-02
 
 ## GL1-c1: native command-stream register counts
 

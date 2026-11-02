@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j752
 #j753
 #j757
 #j759
 #j760
+#j761
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -24,6 +24,7 @@ SCREEN_GREEN = b"GL1-b screen green: Gallium's panfrost screen over the native d
 AUTO_VA_GREEN = b"GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fit addresses, a freed range reused, caller addresses refused, a full window refused with nothing sent"
 HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
 CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
+CONTEXT_SYNC_GREEN = b"GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released"
 
 
 def run(command, **kwargs):
@@ -69,6 +70,9 @@ for arg in shlex.split(entry['command'])[1:]:
 generated = out / 'generated/util/format'
 generated.mkdir(parents=True, exist_ok=True)
 subprocess.run(['cp', build / 'src/util/format/u_format_gen.h', generated], check=True)
+compat = out / 'generated/sys'
+compat.mkdir(parents=True, exist_ok=True)
+subprocess.run(['cp', mesa / 'sysroot/include/sys/ioccom.h', compat], check=True)
 subprocess.run(['clang-22', *flags, '-I', str(mesa / 'drm'), '-Wall', '-Wextra', '-Werror',
                 '-Wno-unused-parameter', '-c', '/repo/toolchain/mesa/drm-refusal.c',
                 '-o', out / 'drm-refusal.o'], check=True, cwd=build)
@@ -140,14 +144,19 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     for name in ['kmod', 'util', 'c11']:
         run(["docker", "cp", f"kumo-mesa-drivers-g7k:/output/device-deps/{name}.a", out / f"{name}.a"])
     gl_inputs = []
+    gl_objects = []
     if gl:
         gl_inputs = gl_dependencies(out)
         # Gallium's headers need generated ones from the container's build tree.
-        run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
-             "-Wno-unused-parameter", "-c", TOOL / "gl-screen.c", "-o", out / "gl-screen.o"])
+        for name in ["gl-screen", *(["gl-context"] if cases == "device-smoke" else [])]:
+            obj = out / f"{name}.o"
+            run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
+                 "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
+            gl_objects.append(obj)
     command = ["ld.lld", "-static", "--gc-sections", "-z", "noexecstack", "-T", ROOT / "toolchain/relibc/smoke/link.ld",
                "-o", elf, out / "crt0.o", out / f"{cases}.o", out / "native-device.o", native / "kumo_kmod.o",
-               native / "pan_props.o", native / "pan_model.o", *([out / "gl-screen.o"] if gl else []),
+               native / "pan_props.o", native / "pan_model.o", *gl_objects,
+               *(["--wrap=drmIoctl"] if gl and cases == "device-smoke" else []),
                "--start-group", out / "libdevice.a", *gl_inputs,
                out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a", "--end-group"]
     run(command)
@@ -159,6 +168,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
              native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
+    paths.extend(TOOL / f"{obj.stem}.c" for obj in gl_objects)
     (out / "manifest.json").write_text(json.dumps({"defines": list(defines), "input_sha256": {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}}, indent=2) + "\n")
     return elf
@@ -171,7 +181,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run GL1-b's screen as mode 17 (a 17 MB proof ELF)")
+                        help="also link Gallium and run its screen (mode 17) and context sync ownership (mode 18)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -194,7 +204,9 @@ def main():
         assert proof.count(AUTO_VA_GREEN) == 1 and proof.index(AUTO_VA_GREEN) < proof.index(GREEN)
         if args.gl_screen:
             assert proof.count(SCREEN_GREEN) == 1 and proof.index(SCREEN_GREEN) < proof.index(GREEN)
+            assert proof.count(CONTEXT_SYNC_GREEN) == 1 and proof.index(CONTEXT_SYNC_GREEN) < proof.index(GREEN)
             print(SCREEN_GREEN.decode(), flush=True)
+            print(CONTEXT_SYNC_GREEN.decode(), flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

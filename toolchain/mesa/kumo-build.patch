@@ -1,6 +1,7 @@
 #j735
 #j759
 #j760
+#j761
 --- a/include/drm-uapi/drm.h
 +++ b/include/drm-uapi/drm.h
 @@ -45,7 +45,7 @@
@@ -464,3 +465,84 @@
     struct cs_builder b;
     cs_builder_init(&b, &bconf, init_buffer);
     struct cs_index heap = cs_reg64(&b, 72);
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -11,6 +11,11 @@
+
+ #include "pan_bo.h"
+ #include "pan_context.h"
++
++#ifdef __kumo__
++int pan_kmod_kumo_sync_create(struct pan_kmod_dev *dev, bool signaled, uint64_t *id);
++void pan_kmod_kumo_sync_destroy(struct pan_kmod_dev *dev, uint64_t id);
++#endif
+ #include "pan_minmax_cache.h"
+
+ #include "util/format/u_format.h"
+@@ -660,13 +665,21 @@
+
+    util_dynarray_fini(&panfrost->global_buffers);
+
++#ifdef __kumo__
++   pan_kmod_kumo_sync_destroy(dev->kmod.dev, panfrost->native_in_sync_obj);
++#else
+    drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->in_sync_obj);
++#endif
+    if (panfrost->in_sync_fd != -1) {
+       close(panfrost->in_sync_fd);
+       panfrost->in_sync_fd = -1;
+    }
+
++#ifdef __kumo__
++   pan_kmod_kumo_sync_destroy(dev->kmod.dev, panfrost->native_syncobj);
++#else
+    drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->syncobj);
++#endif
+    ralloc_free(pipe);
+ }
+
+@@ -1108,8 +1121,18 @@
+    /* Create a syncobj in a signaled state. Will be updated to point to the
+     * last queued job out_sync every time we submit a new job.
+     */
++#ifdef __kumo__
++   /* Create the native pair before other context resources: either failure has only
++    * these IDs to release, without calling a half-initialized destructor. — KESTREL */
++   ret = pan_kmod_kumo_sync_create(dev->kmod.dev, true, &ctx->native_syncobj);
++   if (!ret)
++      ret = pan_kmod_kumo_sync_create(dev->kmod.dev, false, &ctx->native_in_sync_obj);
++   if (ret)
++      pan_kmod_kumo_sync_destroy(dev->kmod.dev, ctx->native_syncobj);
++#else
+    ret = drmSyncobjCreate(panfrost_device_fd(dev), DRM_SYNCOBJ_CREATE_SIGNALED,
+                           &ctx->syncobj);
++#endif
+    if (ret) {
+       ralloc_free(ctx);
+       return NULL;
+@@ -1214,8 +1237,10 @@
+
+    /* Sync object/FD used for NATIVE_FENCE_FD. */
+    ctx->in_sync_fd = -1;
++#ifndef __kumo__
+    ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &ctx->in_sync_obj);
+    assert(!ret);
++#endif
+
+    ctx->printf.bo =
+       panfrost_bo_create(dev, PAN_PRINTF_BUFFER_SIZE, 0, "Printf Buffer");
+--- a/src/gallium/drivers/panfrost/pan_context.h
++++ b/src/gallium/drivers/panfrost/pan_context.h
+@@ -131,6 +131,12 @@
+
+    /* Sync obj used to keep track of in-flight jobs. */
+    uint32_t syncobj;
++#ifdef __kumo__
++   /* Native metadata IDs are 64-bit; the DRM handles above/below are never aliases.
++    * The input binary stays unused until a native dependency path is added. — KESTREL */
++   uint64_t native_syncobj;
++   uint64_t native_in_sync_obj;
++#endif
+
+    /* Set of 32 batches. When the set is full, the LRU entry (the batch
+     * with the smallest seqnum) is flushed to free a slot.
