@@ -1,4 +1,5 @@
 //j749
+//j750
 //! Native sync metadata over the actual codec/Session, with real kernel wake objects.
 //! The GPU backend and completion producer are modeled; no Mali execution is claimed.
 #![no_std]
@@ -11,7 +12,7 @@ use kumo_abi::{Handle, Rights};
 use kumo_gpu::{
     client::{Client, FenceStatus, SessionTransport, Transport, TransportError},
     session::{Backend, Session, SubmitError},
-    sync::{Error, Point, Snapshot, SyncObjects},
+    sync::{Error, Point, Snapshot, SubmitProgress, SyncObjects},
     BindFlags, Binding, Command, DeviceInfo, Reply, Request, Response, Status, Submission,
     PAGE_BYTES, REPLY_LEN, REQUEST_LEN, VA_START,
 };
@@ -154,7 +155,9 @@ fn complete(server: &Rc<RefCell<Server>>, point: u64, status: u32) {
     for (value, write) in wakes {
         assert_eq!(value, point);
         if status == 0 {
-            assert_eq!(kumo_rt::channel_write(write, [1u8].as_ptr(), 1), 0);
+            // A timed-out consumer may have closed its read end. Delivery is best-effort;
+            // a live consumer verifies the byte and then rechecks FenceWait. — MILVUS
+            let _ = kumo_rt::channel_write(write, [1u8].as_ptr(), 1);
         }
         close(write);
     }
@@ -180,23 +183,37 @@ fn wait(
     let FenceStatus::Armed(wake) = syncs.arm(snapshot).unwrap() else {
         panic!()
     };
+    park(syncs, wake, server, complete_now.then_some((1, 0)));
+}
+
+fn park(
+    syncs: &mut SyncObjects<'_, Wire>,
+    wake: Handle,
+    server: &Rc<RefCell<Server>>,
+    completion: Option<(u64, u32)>,
+) {
     let port = handle(kumo_rt::port_create());
-    let timer = handle(kumo_rt::timer_create(if complete_now {
+    let timer = handle(kumo_rt::timer_create(if completion.is_some() {
         5_000_000_000
     } else {
         2_000_000
     }));
     assert_eq!(kumo_rt::port_bind(port, wake), 0);
     assert_eq!(kumo_rt::port_bind(port, timer), 0);
-    if complete_now {
-        complete(server, 1, 0);
+    if let Some((point, status)) = completion {
+        complete(server, point, status);
     }
     let source = kumo_rt::port_wait(port);
-    if complete_now {
+    if let Some((_, status)) = completion {
         assert_eq!(source, kumo_rt::handle_koid(wake));
         let mut byte = [0];
-        assert_eq!(kumo_rt::channel_read(wake, byte.as_mut_ptr(), 1), 1);
-        assert_eq!(byte, [1]);
+        let n = kumo_rt::channel_read(wake, byte.as_mut_ptr(), 1);
+        if status == 0 {
+            assert_eq!(n, 1);
+            assert_eq!(byte, [1]);
+        } else {
+            assert_ne!(n, 1);
+        }
     } else {
         assert_eq!(source, kumo_rt::handle_koid(timer));
     }
@@ -205,6 +222,147 @@ fn wait(
     close(timer);
     close(port);
     syncs.close_wait_handle(wake);
+}
+
+fn dependencies() {
+    say(b"G7p-b submit dependencies begin\n");
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = Client::new(Wire {
+        server: server.clone(),
+        reply: None,
+        grant: None,
+    });
+    assert_eq!(client.create_vm().unwrap(), 1);
+    let buffer = client.create_buffer(PAGE_BYTES).unwrap();
+    client
+        .bind(Binding {
+            vm: 1,
+            buffer: buffer.id,
+            va: VA_START,
+            offset: 0,
+            bytes: PAGE_BYTES,
+            flags: BindFlags(BindFlags::READ_ONLY),
+        })
+        .unwrap();
+    assert_eq!(client.create_group(1).unwrap(), 1);
+    {
+        let mut syncs = SyncObjects::new(&mut client).unwrap();
+        let input = point(syncs.create_binary(false).unwrap(), 0);
+        let timeline = syncs.create_timeline(0).unwrap();
+        let output = point(syncs.create_binary(false).unwrap(), 0);
+        let later = point(timeline, 100);
+        let before = server.borrow().calls.len();
+        assert!(matches!(
+            syncs.prepare(job(1), &[input], &[output]),
+            Err(Error::Unsubmitted { wait_index: 0 })
+        ));
+        assert_eq!(server.borrow().calls.len(), before);
+        let first = syncs.submit(job(1), &[input, point(timeline, 42)]).unwrap();
+        let mut prepared = syncs
+            .prepare(job(2), &[input, point(timeline, 42)], &[output, later])
+            .unwrap();
+        syncs.reset(input.sync).unwrap();
+        syncs.signal(input).unwrap();
+        syncs.destroy(input.sync).unwrap();
+        let SubmitProgress::Blocked { dependency, wake } =
+            syncs.submit_prepared(&mut prepared).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(dependency, first);
+        park(&mut syncs, wake, &server, None);
+        assert!(!syncs.wait_pending(output).unwrap());
+        assert!(!syncs.wait_pending(later).unwrap());
+        assert_eq!(
+            server
+                .borrow()
+                .calls
+                .iter()
+                .filter(|c| matches!(c, Command::Submit(_)))
+                .count(),
+            1
+        );
+        say(b"G7p-b submit dependencies: captured input survives reset/destroy; timer abandonment sends no dependent Submit\n");
+
+        let SubmitProgress::Blocked { dependency, wake } =
+            syncs.submit_prepared(&mut prepared).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(dependency, first);
+        park(&mut syncs, wake, &server, Some((1, 0)));
+        assert!(!syncs.wait_pending(output).unwrap());
+        server.borrow_mut().hardware.refuse = true;
+        assert_eq!(
+            syncs.submit_prepared(&mut prepared),
+            Err(Error::Client(kumo_gpu::client::Error::Server(
+                Status::NoMemory
+            )))
+        );
+        assert!(!syncs.wait_pending(output).unwrap());
+        assert!(!syncs.wait_pending(later).unwrap());
+        let SubmitProgress::Submitted(second) = syncs.submit_prepared(&mut prepared).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(syncs.snapshot(output).unwrap(), Some(second));
+        assert_eq!(syncs.snapshot(later).unwrap(), Some(second));
+        let before = server.borrow().calls.len();
+        assert_eq!(
+            syncs.submit_prepared(&mut prepared),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(server.borrow().calls.len(), before);
+        say(b"G7p-b submit dependencies: refused Submit preserves every output; explicit retry accepts once after authoritative dependency completion\n");
+
+        let refused_output = point(syncs.create_binary(false).unwrap(), 0);
+        let mut refused = syncs
+            .prepare(job(3), &[output, later], &[refused_output])
+            .unwrap();
+        let SubmitProgress::Blocked { dependency, wake } =
+            syncs.submit_prepared(&mut refused).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(dependency, second);
+        park(&mut syncs, wake, &server, Some((2, 0xbeef)));
+        assert!(!syncs.wait_pending(refused_output).unwrap());
+        assert_eq!(
+            syncs.submit_prepared(&mut refused),
+            Err(Error::GpuFault(0xbeef))
+        );
+        let before = server.borrow().calls.len();
+        assert!(syncs.submit_prepared(&mut refused).is_err());
+        assert_eq!(server.borrow().calls.len(), before);
+    }
+    assert!(!server
+        .borrow()
+        .calls
+        .iter()
+        .any(|c| matches!(c, Command::SyncRead { .. })));
+    assert_eq!(
+        server
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Command::Submit(_)))
+            .count(),
+        3
+    );
+    assert!(!server.borrow().calls.iter().any(|c| matches!(
+        c,
+        Command::Submit(Submission {
+            signal_point: 3,
+            ..
+        })
+    )));
+    assert!(server.borrow().wakes.is_empty());
+    client.close_buffer_handle(buffer.handle);
+    client.close_session();
+    client.close_session();
+    assert!(server.borrow().closed);
+    assert!(server.borrow().hardware.vmo.is_none());
+    say(b"G7p-b submit dependencies green: captured waits gate Submit, timeout/refusal/failure preserve outputs, acceptance once; zero SyncRead\n");
 }
 
 #[no_mangle]
@@ -288,5 +446,6 @@ extern "C" fn main() -> ! {
     assert!(server.borrow().closed);
     assert!(server.borrow().hardware.vmo.is_none());
     say(b"G7p-a native sync green: binary, timeline, accepted signals, snapshots, wait-pending, kernel wake/timeout, terminal loss; zero SyncRead\n");
+    dependencies();
     kumo_rt::process_exit(0)
 }

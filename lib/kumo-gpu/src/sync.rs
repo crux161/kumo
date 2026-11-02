@@ -1,7 +1,8 @@
 //j749
+//j750
 //! Session-local native sync objects, without DRM handles or sync files. Calls are serial.
 //! Pending means an accepted job owns a signal; only FenceWait Done proves completion.
-//! This first lane publishes signals, not submit dependencies or a blocking OS wait.
+//! Captured dependencies gate publication; the caller owns bounded OS waits.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +12,7 @@ use crate::{Fence, Submission};
 
 pub const MAX_SYNCS: usize = 64;
 pub const MAX_TIMELINE_POINTS: usize = 256;
+pub const MAX_SUBMIT_WAITS: usize = 64;
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -20,6 +22,7 @@ pub enum Error {
     NotFound,
     NoMemory,
     Busy,
+    Unsubmitted { wait_index: u32 },
     Client(ClientError),
     GpuFault(u32),
 }
@@ -57,6 +60,30 @@ enum Payload {
 pub struct Snapshot {
     owner: u64,
     payload: Payload,
+}
+
+/// Captured input payloads and validated output points for one intended submission.
+/// Not cloneable: after acknowledgement this token cannot publish the job a second time.
+/// Dropping it cancels only the intent, never the GPU jobs its dependencies name. — MILVUS
+#[derive(Debug)]
+pub struct PreparedSubmit {
+    owner: u64,
+    submission: Submission,
+    waits: Vec<Snapshot>,
+    signals: Vec<Point>,
+    cursor: usize,
+    accepted: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubmitProgress<H> {
+    /// No Submit was sent. The caller owns this wake and must close it on every path.
+    /// Wake, timeout and peer close all require another step; none advances the cursor.
+    Blocked {
+        dependency: Snapshot,
+        wake: H,
+    },
+    Submitted(Snapshot),
 }
 
 enum Object {
@@ -211,10 +238,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
         Ok(self.snapshot(point)?.is_some())
     }
 
-    /// Publish all output signals only after Submit is acknowledged. Validation and every
-    /// fallible reservation precede transport I/O; a refused Submit leaves payloads intact.
-    /// No submit is retried after transport/protocol uncertainty. — MILVUS
-    pub fn submit(&mut self, submission: Submission, signals: &[Point]) -> Result<Snapshot, Error> {
+    fn reserve_signals(&mut self, submission: Submission, signals: &[Point]) -> Result<(), Error> {
         self.ready()?;
         if !submission.valid_shape()
             || self.group.is_some_and(|group| group != submission.group)
@@ -242,6 +266,89 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
                 _ => return Err(Error::InvalidRequest),
             }
         }
+        Ok(())
+    }
+
+    /// Capture every input fence before returning, so resetting/replacing an input object
+    /// while the caller waits cannot retarget the intended dependency. Unsubmitted values
+    /// refuse locally; this lane has no deferred job queue or future-value wake service.
+    /// Validation and allocation do not publish work or change output payloads. — MILVUS
+    pub fn prepare(
+        &mut self,
+        submission: Submission,
+        waits: &[Point],
+        signals: &[Point],
+    ) -> Result<PreparedSubmit, Error> {
+        self.ready()?;
+        if waits.len() > MAX_SUBMIT_WAITS {
+            return Err(Error::InvalidRequest);
+        }
+        self.reserve_signals(submission, signals)?;
+        let mut captured = Vec::new();
+        captured
+            .try_reserve(waits.len())
+            .map_err(|_| Error::NoMemory)?;
+        for (index, point) in waits.iter().enumerate() {
+            let snapshot = self.snapshot(*point)?.ok_or(Error::Unsubmitted {
+                wait_index: index as u32,
+            })?;
+            if !captured.contains(&snapshot) {
+                captured.push(snapshot);
+            }
+        }
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve(signals.len())
+            .map_err(|_| Error::NoMemory)?;
+        outputs.extend_from_slice(signals);
+        Ok(PreparedSubmit {
+            owner: self.owner,
+            submission,
+            waits: captured,
+            signals: outputs,
+            cursor: 0,
+            accepted: false,
+        })
+    }
+
+    /// Advance only on authoritative Done/status 0 for each captured dependency, then
+    /// publish one Submit and all its signals. A recoverable server refusal can be stepped
+    /// again explicitly; acceptance consumes the intent and uncertainty latches Client loss.
+    /// No OS wait, SyncRead spin or implicit Submit retry occurs here. — MILVUS
+    pub fn submit_prepared(
+        &mut self,
+        prepared: &mut PreparedSubmit,
+    ) -> Result<SubmitProgress<T::Handle>, Error> {
+        self.ready()?;
+        if prepared.owner != self.owner {
+            return Err(Error::NotFound);
+        }
+        if prepared.accepted {
+            return Err(Error::InvalidRequest);
+        }
+        // Other serial calls may have destroyed or advanced an output while the caller
+        // waited. Revalidate before arming any dependency, and again before Submit.
+        // — MILVUS
+        self.reserve_signals(prepared.submission, &prepared.signals)?;
+        while let Some(dependency) = prepared.waits.get(prepared.cursor).copied() {
+            match self.arm(dependency)? {
+                FenceStatus::Done { gpu_status: 0 } => prepared.cursor += 1,
+                FenceStatus::Armed(wake) => {
+                    return Ok(SubmitProgress::Blocked { dependency, wake });
+                }
+                FenceStatus::Done { .. } => unreachable!("arm rejects failed completion"),
+            }
+        }
+        let snapshot = self.submit(prepared.submission, &prepared.signals)?;
+        prepared.accepted = true;
+        Ok(SubmitProgress::Submitted(snapshot))
+    }
+
+    /// Publish all output signals only after Submit is acknowledged. Validation and every
+    /// fallible reservation precede transport I/O; a refused Submit leaves payloads intact.
+    /// No submit is retried after transport/protocol uncertainty. — MILVUS
+    pub fn submit(&mut self, submission: Submission, signals: &[Point]) -> Result<Snapshot, Error> {
+        self.reserve_signals(submission, signals)?;
         let fence = self.client.submit_fence(submission)?;
         self.group = Some(fence.group);
         for point in signals {

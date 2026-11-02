@@ -1,9 +1,46 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j744 -->
 <!-- j745 -->
 <!-- j746 -->
 <!-- j747 -->
 <!-- j749 -->
+<!-- j750 -->
+
+## G7p-b: captured dependencies before Submit
+
+`SyncObjects::prepare(submission, waits, signals)` validates the full output set, reserves
+metadata and captures each input's current payload. Duplicate payloads share one dependency.
+An unsubmitted input refuses locally with its index; preparation sends no request and publishes
+no output. There are at most 64 input points per intent. Resetting, replacing or destroying an
+input object after preparation cannot change the captured fence.
+
+`submit_prepared` steps the intent through those captured dependencies. Each one must answer
+FenceWait Done/status 0 before the next is considered. A pending dependency returns `Blocked`
+with its snapshot and one owned wake-channel read end; no Submit is sent. The caller bounds its
+Port wait with a timer, closes that read end on every path, and steps the same intent again.
+Neither wake, timeout nor peer close advances the dependency cursor. Output objects are
+revalidated after interleaved serial calls, before any wait I/O and before Submit.
+
+Once every input is complete, the existing submit path atomically publishes outputs after
+acceptance. A recoverable server refusal leaves outputs unchanged and permits an explicit
+retry without waiting again for inputs already proven complete. Acceptance consumes the
+non-cloneable intent; further steps refuse locally. Transport/protocol uncertainty or failed
+dependency completion latches loss and prevents dependent work and replay. Dropping an intent
+discards only that local intent, with GPU work and wake ownership unchanged.
+
+```sh
+python3 scripts/mesa-sync-smoke.py --dependencies --run
+```
+
+This executes both native sync proofs in one disposable UEFI image. G7p-b uses the actual
+codec/Session with a modeled GPU, real kernel channels, Port and timer: a timed-out input sends
+no dependent Submit; a later wake still requires completion confirmation; a refused Submit
+preserves both outputs; acceptance happens once; a failed input closes its wake without a byte
+and prevents the dependent job. The request ledger contains zero SyncRead requests.
+
+This is client-side ordering for the existing single-group lane. C callbacks and their shared
+BO/sync session owner, wait-many and future-value wake policy, group fatal/timeout reporting,
+and GPU metal acceptance remain G7p work. The C ABI stays 12 and the wire is unchanged.
+— MILVUS, 2026-11-01
 
 ## G7p-a: native sync payloads on G8c fences
 
@@ -37,7 +74,7 @@ python3 scripts/mesa-sync-smoke.py --run
 The QEMU proof runs the real codec, Session and native client over a modeled GPU producer,
 with real kernel VMO, wake-channel, Port and timer objects. It checks accepted versus completed
 signals, snapshots, rejected-submit rollback, bounded timeout/abandonment and terminal loss.
-It does not execute GPU work. Submit dependencies, blocking/wait-many policy, native C callback
+It does not execute GPU work. Blocking/wait-many policy, native C callback
 exposure, group fatal/timeout reporting and real-driver integration remain G7p/GL1/VK2. The
 C ABI stays 12; no DRM FD, sync-file operation or new wire opcode is introduced.
 — MILVUS, 2026-11-01

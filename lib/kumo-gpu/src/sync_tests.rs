@@ -1,4 +1,5 @@
 //j749
+//j750
 extern crate std;
 
 use super::*;
@@ -385,4 +386,259 @@ fn a_malformed_fence_reply_closes_its_grant_and_latches_loss() {
         Err(Error::Client(ClientError::DeviceLost))
     );
     assert_eq!(state.borrow().calls.len(), 2);
+}
+
+fn armed(state: &Rc<RefCell<Script>>, point: u64, handle: u32) {
+    state
+        .borrow_mut()
+        .replies
+        .push_back((Ok(Response::WaitArmed { point }), Some(handle)));
+}
+
+#[test]
+fn prepared_inputs_survive_reset_replacement_and_destroy_until_one_submit_is_accepted() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let input = point(syncs.create_binary(false).unwrap(), 0);
+    let timeline = point(syncs.create_timeline(0).unwrap(), 42);
+    let output = point(syncs.create_binary(false).unwrap(), 0);
+    submitted(&state, 1);
+    let first = syncs.submit(job(1), &[input, timeline]).unwrap();
+    let mut prepared = syncs
+        .prepare(job(2), &[input, timeline, input], &[output])
+        .unwrap();
+    assert_eq!(prepared.waits, [first]);
+    syncs.signal(input).unwrap();
+    syncs.reset(input.sync).unwrap();
+    syncs.destroy(input.sync).unwrap();
+    armed(&state, 1, 77);
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Ok(SubmitProgress::Blocked {
+            dependency: first,
+            wake: 77,
+        })
+    );
+    syncs.close_wait_handle(77);
+    assert!(!syncs.wait_pending(output).unwrap());
+    assert_eq!(prepared.cursor, 0);
+    done(&state, 1, 0);
+    submitted(&state, 2);
+    let SubmitProgress::Submitted(second) = syncs.submit_prepared(&mut prepared).unwrap() else {
+        panic!()
+    };
+    assert_eq!(syncs.snapshot(output).unwrap(), Some(second));
+    let calls = state.borrow().calls.len();
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::InvalidRequest)
+    );
+    assert_eq!(state.borrow().calls.len(), calls);
+    assert_eq!(state.borrow().closed, [77]);
+    assert_eq!(
+        state.borrow().calls,
+        [
+            Command::Submit(job(1)),
+            Command::FenceWait { group: 1, point: 1 },
+            Command::FenceWait { group: 1, point: 1 },
+            Command::Submit(job(2)),
+        ]
+    );
+}
+
+#[test]
+fn every_distinct_dependency_must_finish_before_outputs_publish() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let first = point(syncs.create_binary(false).unwrap(), 0);
+    let second = point(syncs.create_binary(false).unwrap(), 0);
+    let output = point(syncs.create_timeline(0).unwrap(), 99);
+    submitted(&state, 1);
+    syncs.submit(job(1), &[first]).unwrap();
+    submitted(&state, 2);
+    let second_fence = syncs.submit(job(2), &[second]).unwrap();
+    let mut prepared = syncs.prepare(job(3), &[first, second], &[output]).unwrap();
+    done(&state, 1, 0);
+    armed(&state, 2, 88);
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Ok(SubmitProgress::Blocked {
+            dependency: second_fence,
+            wake: 88,
+        })
+    );
+    syncs.close_wait_handle(88);
+    assert_eq!(prepared.cursor, 1);
+    assert!(!syncs.wait_pending(output).unwrap());
+    done(&state, 2, 0);
+    submitted(&state, 3);
+    assert!(matches!(
+        syncs.submit_prepared(&mut prepared),
+        Ok(SubmitProgress::Submitted(_))
+    ));
+    assert!(syncs.wait_pending(output).unwrap());
+    assert_eq!(
+        state
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Command::FenceWait { point: 1, .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        state.borrow().calls.last(),
+        Some(Command::Submit(Submission {
+            signal_point: 3,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn preparation_refuses_unsubmitted_invalid_foreign_and_excessive_inputs_without_io() {
+    let (mut other_client, _) = client();
+    let mut other = SyncObjects::new(&mut other_client).unwrap();
+    let foreign = point(other.create_binary(true).unwrap(), 0);
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let host = point(syncs.create_binary(true).unwrap(), 0);
+    let future = point(syncs.create_timeline(7).unwrap(), 8);
+    let output = point(syncs.create_binary(false).unwrap(), 0);
+    assert!(matches!(
+        syncs.prepare(job(1), &[host, future], &[output]),
+        Err(Error::Unsubmitted { wait_index: 1 })
+    ));
+    assert!(matches!(
+        syncs.prepare(job(1), &[output], &[output]),
+        Err(Error::Unsubmitted { wait_index: 0 })
+    ));
+    assert!(matches!(
+        syncs.prepare(job(1), &[foreign], &[output]),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        syncs.prepare(job(1), &[point(host.sync, 1)], &[output]),
+        Err(Error::InvalidRequest)
+    ));
+    assert!(matches!(
+        syncs.prepare(job(1), &[host; MAX_SUBMIT_WAITS + 1], &[output]),
+        Err(Error::InvalidRequest)
+    ));
+    assert!(matches!(
+        syncs.prepare(job(1), &[future], &[output, output]),
+        Err(Error::InvalidRequest)
+    ));
+    assert!(!syncs.wait_pending(output).unwrap());
+    assert!(state.borrow().calls.is_empty());
+}
+
+#[test]
+fn changed_outputs_are_revalidated_before_any_dependency_io() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let input = point(syncs.create_binary(false).unwrap(), 0);
+    let output = point(syncs.create_timeline(0).unwrap(), 10);
+    submitted(&state, 1);
+    syncs.submit(job(1), &[input]).unwrap();
+    let mut prepared = syncs.prepare(job(2), &[input], &[output]).unwrap();
+    syncs.signal(output).unwrap();
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::InvalidRequest)
+    );
+    syncs.destroy(output.sync).unwrap();
+    assert_eq!(syncs.submit_prepared(&mut prepared), Err(Error::NotFound));
+    assert_eq!(state.borrow().calls, [Command::Submit(job(1))]);
+}
+
+#[test]
+fn refused_prepared_submit_preserves_outputs_and_retry_does_not_rewait_completed_inputs() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let input = point(syncs.create_binary(false).unwrap(), 0);
+    let output = point(syncs.create_timeline(0).unwrap(), 40);
+    submitted(&state, 1);
+    syncs.submit(job(1), &[input]).unwrap();
+    let mut prepared = syncs.prepare(job(2), &[input], &[output]).unwrap();
+    done(&state, 1, 0);
+    state
+        .borrow_mut()
+        .replies
+        .push_back((Err(Status::NoMemory), None));
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::Client(ClientError::Server(Status::NoMemory)))
+    );
+    assert!(!syncs.wait_pending(output).unwrap());
+    assert!(!prepared.accepted);
+    submitted(&state, 2);
+    assert!(matches!(
+        syncs.submit_prepared(&mut prepared),
+        Ok(SubmitProgress::Submitted(_))
+    ));
+    assert_eq!(
+        state.borrow().calls,
+        [
+            Command::Submit(job(1)),
+            Command::FenceWait { group: 1, point: 1 },
+            Command::Submit(job(2)),
+            Command::Submit(job(2))
+        ]
+    );
+}
+
+#[test]
+fn failed_dependency_prevents_submit_and_all_further_io() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let input = point(syncs.create_binary(false).unwrap(), 0);
+    let output = point(syncs.create_binary(false).unwrap(), 0);
+    submitted(&state, 1);
+    syncs.submit(job(1), &[input]).unwrap();
+    let mut prepared = syncs.prepare(job(2), &[input], &[output]).unwrap();
+    done(&state, 1, 0xbad);
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::GpuFault(0xbad))
+    );
+    assert_eq!(prepared.cursor, 0);
+    assert!(!prepared.accepted);
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::Client(ClientError::DeviceLost))
+    );
+    assert_eq!(state.borrow().calls.len(), 2);
+}
+
+#[test]
+fn uncertain_prepared_submit_cannot_be_replayed() {
+    let (mut client, state) = client();
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    let output = point(syncs.create_binary(false).unwrap(), 0);
+    let mut prepared = syncs.prepare(job(1), &[], &[output]).unwrap();
+    state.borrow_mut().fail_send = true;
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::Client(ClientError::Transport(
+            TransportError::Closed
+        )))
+    );
+    assert_eq!(
+        syncs.submit_prepared(&mut prepared),
+        Err(Error::Client(ClientError::DeviceLost))
+    );
+    assert_eq!(state.borrow().calls.len(), 1);
+}
+
+#[test]
+fn prepared_intent_cannot_cross_store_generations() {
+    let (mut client, state) = client();
+    let mut prepared = {
+        let mut syncs = SyncObjects::new(&mut client).unwrap();
+        syncs.prepare(job(1), &[], &[]).unwrap()
+    };
+    let mut syncs = SyncObjects::new(&mut client).unwrap();
+    assert_eq!(syncs.submit_prepared(&mut prepared), Err(Error::NotFound));
+    assert!(state.borrow().calls.is_empty());
 }
