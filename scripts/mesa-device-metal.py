@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j765
 #j768
 #j769
 #j770
 #j772
+#j773
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -41,6 +41,24 @@ SLOT = b"bin/gpu-client"
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
 PROOFS = {
+    # GL3-a: the first triangle through Mali's tiler, offscreen. The target and layout lines
+    # end in the measured color modifier, so only their fixed prefixes are required. — TIMBERDOODLE
+    "gl3-a": dict(
+        cases="gl-triangle", runtime="device-metal", defines=["-DKUMO_GL_TRIANGLE_MAIN=1"],
+        out="gl3-a-metal", gl=True, begin="GL3-a metal triangle begin",
+        lines=["GL3-a context: current GLES context over the native GPU session",
+               "GL3-a target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
+               "GL3-a compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
+               "GL3-a baseline: public glReadPixels observed an image different from the expected triangle",
+               "GL3-a draw: glClear and one glDrawArrays triangle, native glFinish complete",
+               "GL3-a readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali triangle 0xff6633cc over clear 0xff996633)",
+               "GL3-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
+               "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
+               "GL3-a layout: color modifier after readback 0x",
+               "GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"],
+        green=("GL3-a metal triangle green: Mali rasterized the triangle exactly, all 32768 RGBA8 pixels and 32 guards "
+               "checked, native completion and clean teardown"),
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     "gl2-b": dict(
         cases="gl-clear", runtime="device-metal", defines=["-DKUMO_GL_CLEAR_MAIN=1"],
         out="gl2-b-metal", gl=True, begin="GL2-b metal clear begin",

@@ -1,9 +1,56 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j765 -->
 <!-- j768 -->
 <!-- j769 -->
 <!-- j770 -->
 <!-- j772 -->
+<!-- j773 -->
+
+## GL3-a: the first GLES triangle through the tiler, offscreen
+
+[gl-triangle.c](gl-triangle.c) compiles a GLSL ES 300 vertex and fragment shader at
+runtime, then clears the frontend's owned 256x128 RGBA8 framebuffer to `0xff996633` and
+draws one triangle, (-1,-1), (1,-1), (-1,1), with one vertex buffer and `glDrawArrays`.
+Its varying color is equal at all three vertices, so interpolation is exact and packs to
+`0xff6633cc`. No pixel center lies on the hypotenuse X + 2Y = 256: pixel (x, y), rows
+bottom-up as `glReadPixels` returns them, is inside exactly when x + 2y <= 254, which is
+16,384 pixels. A public readback checks all 32,768 pixels and GL2-b's sixteen guard
+words on each side. A baseline readback first requires an image different from the
+expected one. The color resource's DRM modifier is logged before the draw and after the
+readback: `0x0800000000000351`, AFBC both times. AFBC readback goes through a staging
+blit, so the readback is itself a second tiled draw. That is also what GL2-b's third
+Submit was.
+
+QEMU mode 25 runs the same body over the modeled producer, which executes no GPU and so
+retains the initial image. All 26 modes pass. Mode 25 has three Submits (init, the
+clear and draw batch, the readback blit) and three wakes, one group/heap, no SyncRead,
+matching explicit bind/unbind counts and zero buffers/bindings/heaps/bytes at release.
+
+The standalone client passed on the Orange Pi at 09:39:12 (J773), on Gallium's default
+heap (no tiler OOM):
+
+```text
+GL3-a readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali triangle 0xff6633cc over clear 0xff996633)
+GL3-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc (255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633
+GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The static client is 19,772,408 bytes, SHA256
+`050f98266f019e8a0f9320f3e875e224fc776283c241f80725c6e2f47fe3056d`; the loader read
+the staged 26,558,871-byte initrd, SHA256
+`060b1287e3722f8dfef76493ead34f3d3884d9d42f6c53cf2ca1b5c95af4e308`. Image builds
+replace the sysroot's `libc.a`, so the archive the client linked
+(`23421283...`) is kept as `build/verification/j773/linked-libc.a`. The served tree and
+all 88 manifest files were restored, and pxehost/tio stopped. Evidence:
+`build/verification/j773/metal-boot-to-login.log` (checked boot prefix) and
+`metal-tio-2.log` (full capture). **GL3-b (the copy into `GPU_VIEW`, shown on HDMI)
+is next.** Nothing is presented by this offscreen proof. — TIMBERDOODLE, 2026-11-03
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl3-a --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl3-a --check <tio-log>
+```
 
 ## GL2-b: public GLES clear and pixel readback — GL2 complete
 

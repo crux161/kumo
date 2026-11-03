@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j765
 #j768
 #j769
 #j770
 #j772
+#j773
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -52,6 +52,16 @@ CLEAR_LINES = [b"GL2-b context: current GLES context over the native GPU session
                b"GL2-b clear: public glClear and native glFinish complete, expected RGBA8 0xff996633",
                b"GL2-b readback: 0 of 3072 pixels differ; 0 of 32 readback guards changed (modeled service, initial framebuffer retained)",
                b"GL2-b destroy: context, owned framebuffer drawable and display released"]
+# GL3-a: mode 25's triangle. The target line names the measured color modifier. — TIMBERDOODLE
+TRIANGLE_LINES = [b"GL3-a context: current GLES context over the native GPU session",
+                  b"GL3-a target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
+                  b"GL3-a compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
+                  b"GL3-a baseline: public glReadPixels observed an image different from the expected triangle",
+                  b"GL3-a draw: glClear and one glDrawArrays triangle, native glFinish complete",
+                  b"GL3-a readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (modeled service, initial framebuffer retained)",
+                  b"GL3-a coverage: 16384 pixels inside x+2y<=254; samples ",
+                  b"GL3-a layout: color modifier after readback 0x",
+                  b"GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"]
 
 
 def run(command, **kwargs):
@@ -212,7 +222,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         (out / "kumo").mkdir(exist_ok=True)
         linker_script = compiler.link_script()
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -260,7 +270,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen, context, batch, frontend, GLES2 client, compute and clear proofs (modes 17-24)")
+                        help="also link Gallium and run its screen, context, batch, frontend, GLES2 client, compute, clear and triangle proofs (modes 17-25)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -324,6 +334,13 @@ def main():
             assert at < proof.index(GREEN)
             assert b"GL2-b model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
             print("GL2-b clear green: public glClear/glReadPixels, native completion, initial framebuffer retained, readback guards intact and clean teardown; modeled service runs no GPU", flush=True)
+            at = 0
+            for line in TRIANGLE_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            assert b"GL3-a model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
+            print("GL3-a triangle green: runtime vertex/fragment compilation, a public draw, native completion, initial framebuffer retained, readback guards intact and clean teardown; modeled service runs no GPU", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)
