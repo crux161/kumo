@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j762
 #j765
 #j768
 #j769
 #j770
+#j772
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -41,6 +41,18 @@ SLOT = b"bin/gpu-client"
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
 PROOFS = {
+    "gl2-b": dict(
+        cases="gl-clear", runtime="device-metal", defines=["-DKUMO_GL_CLEAR_MAIN=1"],
+        out="gl2-b-metal", gl=True, begin="GL2-b metal clear begin",
+        lines=["GL2-b context: current GLES context over the native GPU session",
+               "GL2-b target: complete owned 64x48 RGBA8 frontend framebuffer",
+               "GL2-b baseline: public glReadPixels observed pixels different from the requested clear color",
+               "GL2-b clear: public glClear and native glFinish complete, expected RGBA8 0xff996633",
+               "GL2-b readback: 0 of 3072 pixels differ; 0 of 32 readback guards changed (Mali clear color 0xff996633)",
+               "GL2-b samples: first=0xff996633 last=0xff996633",
+               "GL2-b destroy: context, owned framebuffer drawable and display released"],
+        green="GL2-b metal clear green: Mali glClear replaced all 3072 RGBA8 pixels, glReadPixels guards intact, native completion and clean teardown",
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     "gl2-a": dict(
         cases="gl-compute", runtime="device-metal", defines=["-DKUMO_GL_COMPUTE_MAIN=1"],
         out="gl2-a-metal", gl=True, begin="GL2-a metal compute begin",

@@ -1,9 +1,58 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j763 -->
 <!-- j765 -->
 <!-- j768 -->
 <!-- j769 -->
 <!-- j770 -->
+<!-- j772 -->
+
+## GL2-b: public GLES clear and pixel readback — GL2 complete
+
+[gl-clear.c](gl-clear.c) uses the frontend's owned 64x48 RGBA8 framebuffer. Public
+`glReadPixels` first records its initial pixels and requires a different value from
+the requested clear color somewhere in the image. `glClearColor(0.2, 0.4, 0.6, 1.0)`,
+`glClear` and `glFinish` then precede a second public readback. On Mali, every one of
+3,072 pixels must equal packed RGBA8 `0xff996633`; sixteen words before and after the
+CPU readback region must keep `0xa5a5a5a5`. These guards check readback bounds. They
+are not a GPU memory-isolation proof. Context, drawable and display are destroyed.
+
+QEMU mode 24 runs the same GL body, retaining the observed initial framebuffer
+because the modeled producer executes no GPU instructions. The two CPU read buffers
+start with different sentinels, so a no-op readback cannot satisfy the comparison.
+All 25 modes pass. The new mode observes exactly three native submissions/wakes,
+one group/heap, no SyncRead, matching explicit bind/unbind counts, and zero retained
+buffers/bindings/heaps/bytes; the completed wait row is pruned on close.
+
+The standalone client passed on Mali at 20:55:09 (J772):
+
+```text
+GL2-b clear: public glClear and native glFinish complete, expected RGBA8 0xff996633
+GL2-b readback: 0 of 3072 pixels differ; 0 of 32 readback guards changed (Mali clear color 0xff996633)
+GL2-b samples: first=0xff996633 last=0xff996633
+GL2-b destroy: context, owned framebuffer drawable and display released
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The static client is 19,766,552 bytes, SHA256
+`ab8e24882c32b1f5fcccd65957f06764bb27ac71eb34bba0c34d8270c0173364`.
+The loaded 26,553,047-byte initrd matched the staged candidate. The original served
+tree and all 88 manifest files were restored, and pxehost/tio stopped. Evidence:
+`build/proofs/gl2-b-metal/metal-boot-to-login.log` (checked boot prefix) and
+`metal-tio.log` (full original capture). **GL2 is complete; GL3 owns triangle/display
+output.** No image presentation is claimed by this offscreen proof.
+
+An initial texture-FBO test exposed a separate prerequisite: panfrost's texture-size
+preflight asks `os_get_total_physical_memory`, whose `sysconf(_SC_PHYS_PAGES)` call
+returns -1 in the current relibc backend. Mesa therefore reports GL_OUT_OF_MEMORY
+even for 64x48 RGBA8. The clear proof uses the already-owned frontend framebuffer;
+it neither overrides that check nor supplies fictitious physical RAM. Public texture
+allocation remains an explicit follow-up before a texture-dependent workload.
+— KESTREL, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl2-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl2-b --check <tio-log>
+```
 
 ## GL2-a: runtime GLES compute output
 
@@ -40,8 +89,8 @@ The loaded 26,554,119-byte initrd and client matched the staged hashes. The orig
 served tree and all 88 manifest entries were restored, and pxehost/tio stopped. Evidence:
 `build/proofs/gl2-a-metal/metal-boot-to-login.log` (checked boot prefix) and
 `build/proofs/gl2-a-metal/metal-tio.log` (full session, including later interactive commands).
-**GL2-a is closed. GL2-b is next: `glClear` and
-`glReadPixels` checked on Mali.** Displaying an image remains a later gate.
+**GL2-a is closed. GL2-b's clear/readback proof above completes GL2.**
+Displaying an image remains a later gate.
 — KESTREL, 2026-11-02
 
 ```sh

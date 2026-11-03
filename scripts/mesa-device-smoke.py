@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j762
 #j765
 #j768
 #j769
 #j770
+#j772
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -46,6 +46,12 @@ BATCH_LINES = [b"GL1-d poll: a zero-timeout fence_finish found the batch still p
                b"GL1-d readback: 0 of 4096 pixels differ from 0xdeadbeef (the modeled service runs no GPU)",
                b"GL1-d destroy: fence, texture, context and screen are gone; every BO left through a deferred unmap",
                b"GL1-d model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=2 wakes=3"]
+CLEAR_LINES = [b"GL2-b context: current GLES context over the native GPU session",
+               b"GL2-b target: complete owned 64x48 RGBA8 frontend framebuffer",
+               b"GL2-b baseline: public glReadPixels observed pixels different from the requested clear color",
+               b"GL2-b clear: public glClear and native glFinish complete, expected RGBA8 0xff996633",
+               b"GL2-b readback: 0 of 3072 pixels differ; 0 of 32 readback guards changed (modeled service, initial framebuffer retained)",
+               b"GL2-b destroy: context, owned framebuffer drawable and display released"]
 
 
 def run(command, **kwargs):
@@ -206,7 +212,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         (out / "kumo").mkdir(exist_ok=True)
         linker_script = compiler.link_script()
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -254,7 +260,7 @@ def main():
     parser.add_argument("--group-state", action="store_true", help="select G7p-d's group-state acceptance and proof directory")
     parser.add_argument("--heaps", action="store_true", help="select G7q-c's native heap acceptance and proof directory")
     parser.add_argument("--gl-screen", action="store_true",
-                        help="also link Gallium and run its screen, context, batch, frontend, GLES2 client and compute proofs (modes 17-23)")
+                        help="also link Gallium and run its screen, context, batch, frontend, GLES2 client, compute and clear proofs (modes 17-24)")
     args = parser.parse_args()
     out = (ROOT / "build/proofs/gl1-b" if args.gl_screen else ROOT / "build/proofs/g7q-c" if args.heaps
            else ROOT / "build/proofs/g7p-d" if args.group_state
@@ -311,6 +317,13 @@ def main():
             assert at < proof.index(GREEN)
             assert b"GL2-a model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=2" in proof
             print("GL2-a compute green: runtime GLSL compilation, native dispatch/barrier/finish, poison and guards retained, clean teardown; modeled service runs no GPU", flush=True)
+            at = 0
+            for line in CLEAR_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            assert b"GL2-b model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
+            print("GL2-b clear green: public glClear/glReadPixels, native completion, initial framebuffer retained, readback guards intact and clean teardown; modeled service runs no GPU", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)
