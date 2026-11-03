@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-#j759
 #j762
 #j765
 #j768
 #j769
-"""Build live Mesa device and static GLES2 clients, stage them in the Orange Pi GPU slot,
+#j770
+"""Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
-  --proof NAME  select the native device, sync, heap, GL lifecycle or static GLES2 client.
+  --proof NAME  select the native device, sync, heap, GL lifecycle, query or compute client.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
                 (which must not exist) with only bin/gpu-client replaced. Never installs or
                 serves it; that is the operator's pxehost step. Rebuild the default image
@@ -41,6 +41,17 @@ SLOT = b"bin/gpu-client"
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
 PROOFS = {
+    "gl2-a": dict(
+        cases="gl-compute", runtime="device-metal", defines=["-DKUMO_GL_COMPUTE_MAIN=1"],
+        out="gl2-a-metal", gl=True, begin="GL2-a metal compute begin",
+        lines=["GL2-a context: current GLES 3.1-capable context over the native GPU session",
+               "GL2-a compiler: GLSL ES 310 compute source compiled and linked at runtime",
+               "GL2-a buffer: 64 output words and 16 guard words initialized to 0xdeadbeef",
+               "GL2-a dispatch: four groups of sixteen invocations, memory barrier and native glFinish complete",
+               "GL2-a readback: 0 of 64 output words differ; 0 of 16 guards changed (Mali shader results)",
+               "GL2-a destroy: shader, program, SSBO, context, drawable and display released"],
+        green="GL2-a metal compute green: runtime-compiled GLES compute wrote all 64 SSBO words, guards intact, native completion and clean teardown",
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     "gl1-f": dict(
         cases="gl-client", runtime="device-metal", defines=["-DKUMO_GL_CLIENT_MAIN=1"],
         out="gl1-f-metal", gl=True,

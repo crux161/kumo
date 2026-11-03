@@ -1,9 +1,54 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j762 -->
 <!-- j763 -->
 <!-- j765 -->
 <!-- j768 -->
 <!-- j769 -->
+<!-- j770 -->
+
+## GL2-a: runtime GLES compute output
+
+[gl-compute.c](gl-compute.c) compiles and links a GLSL ES 310 compute shader through the
+public GL API on KUMO, dispatches four groups of sixteen invocations, and reads the SSBO
+back after `glMemoryBarrier` and `glFinish`. The shader writes 64 words with
+`0x6b750000u ^ (i * 0x9e3779b9u)`. The CPU initializes all 80 words to `0xdeadbeef`; the
+last sixteen are guards, and the readback must match every output while preserving them.
+Shader, program, buffer and frontend objects are explicitly destroyed.
+
+The first QEMU run exhausted the old 16 KiB process stack in Mesa's GLSL parser. GL links
+now reuse G7n's existing 2 MiB `PT_GNU_STACK` request and header writer. Sora already
+honors and bounds that request; no loader/kernel policy changed. The request is RW and
+non-executable. The generated link script and shared stack helper are included in the
+input manifest, and imported build-module bytecode stays under the build output.
+
+QEMU mode 23 runs the actual compiler and submission path, with exactly two Submits
+(initialization and compute), one group/heap, two wakes, and matching explicit bind/unbind
+counts. Its producer runs no GPU: the readback must retain the CPU poison and guards.
+All 24 modes pass, and teardown releases every buffer/binding/heap/byte; the completed
+wait row is pruned on close.
+
+The standalone `gl-compute` client passed on Mali (J770):
+
+```text
+GL2-a compiler: GLSL ES 310 compute source compiled and linked at runtime
+GL2-a dispatch: four groups of sixteen invocations, memory barrier and native glFinish complete
+GL2-a readback: 0 of 64 output words differ; 0 of 16 guards changed (Mali shader results)
+GL2-a destroy: shader, program, SSBO, context, drawable and display released
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The loaded 26,554,119-byte initrd and client matched the staged hashes. The original
+served tree and all 88 manifest entries were restored, and pxehost/tio stopped. Evidence:
+`build/proofs/gl2-a-metal/metal-boot-to-login.log` (checked boot prefix) and
+`build/proofs/gl2-a-metal/metal-tio.log` (full session, including later interactive commands).
+**GL2-a is closed. GL2-b is next: `glClear` and
+`glReadPixels` checked on Mali.** Displaying an image remains a later gate.
+— KESTREL, 2026-11-02
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl2-a --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl2-a --check <tio-log>
+```
 
 ## GL1-f: the static GLES2 client — GL1 complete
 
