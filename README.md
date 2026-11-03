@@ -8,7 +8,7 @@
 </p>
 
 <h1 align="center">KUMO (雲)</h1>
-<p align="center"><strong>A serene, capability-based microkernel in Rust.</strong></p>
+<p align="center"><strong>"Secure. Performant. Resilient."</strong></p>
 <p align="center">
   <a href="#what-runs-today">Status</a> ·
   <a href="#build-and-run">Build &amp; run</a> ·
