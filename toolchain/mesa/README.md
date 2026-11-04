@@ -5,7 +5,7 @@
 <!-- j778 -->
 <!-- j780 -->
 
-## VK2: panvk over the native session (VK2-a–e staged; metal pending)
+## VK2: panvk over the native session (J779/J780, metal-proven)
 
 CRUX ratified the VK2 cut on 2026-11-04. It has five parts: C ABI 16, a physical device with
 no DRM node, a native `vk_sync` type, the `gpu_queue` seam, and a static-ICD client with WSI
@@ -97,11 +97,33 @@ off.
   `scripts/mesa-device-smoke.py`'s `vk=True` build links the inventory's VK archives,
   drm-refusal, static-build-id and the C++ runtime. It uses `--build-id=sha1` and G7n's
   stack script plus G7m's read-only PT_LOAD/PT_NOTE for the note, which `vkCreateInstance`
-  reads.
+  reads. The probe and proof links retain all 959 implemented API entrypoints through a
+  generated response file: weak dispatch references alone do not extract static archive
+  members. Unimplemented weak entrypoints remain optional.
+
+  KUMO skips WSI initialization and leaves the runtime's WSI device absent. Its GPU maps
+  are Normal-NC and WB_MMAP is disabled, so Mesa uses its no-cache-operations path rather
+  than reading CTR_EL0 to discover a cache granule. The client checks that every
+  host-visible memory type is coherent and uncached; device-only types remain valid.
+  `test-vk-memory-policy.c` covers that distinction and rejects cached, noncoherent,
+  absent or malformed host-memory choices without requiring a GPU.
 
 Run `scripts/mesa-drivers.py` first, so the archives and inventory carry the current
 `kumo-build.patch`. A QEMU mode would also need `create_group_queues` and `submit_streams`
-in `device-smoke.rs`'s model. VK2-b through VK2-e have not run.
+in `device-smoke.rs`'s model.
+
+**Metal (J780, 2026-11-04).** The fourth boot passed: one Mali-G610 MC4 (Vulkan 1.4.354),
+one 128 MiB heap, 159 device extensions with the refused categories absent, one native
+three-queue group, and three completed subqueue-init submissions. Fence and emulated-timeline
+round trips (5 → 7), queue/device idle, second-instance enumeration and teardown passed.
+Five native binaries were released; the tiler heap was destroyed and containment returned
+zero buffers, bindings and waits.
+
+The Mac/metal verification found two runtime port gaps: CTR_EL0 access and WSI initialization.
+It also exposed lazy static-archive extraction omitting a core dispatch implementation;
+the defined-entrypoint response file fixes that. A later proof-only check incorrectly
+required device-only memory to be host-coherent; the host-memory policy regression now
+covers the valid device-only/host-visible distinction.
 
 ```sh
 python3 scripts/mesa-drivers.py
@@ -1371,13 +1393,13 @@ configured for relibc's pthread declarations, without localization or parallel
 algorithms. The Linux-built libc++ binary is never linked.
 
 The checked [driver inventory](DRIVER-INVENTORY.md) records the measured result before
-adding the OS/native closure objects: 39 required GL gaps and 32 required Vulkan gaps
+adding the OS/native closure objects: 39 required GL gaps and 31 required Vulkan gaps
 after the VK2 seams (J780), with the requesting archive/object. G7k's initial counts
 were 53 and 44. Both complete links close every required symbol.
 `build/mesa-drivers/result/` contains all static archives, diagnostic ELFs,
 linker errors/maps/extraction traces, per-object sizes, the exhaustive
 `inventory.json` and `optional-undefined.tsv`, and input/tool/archive hashes.
-There is one optional GL TLS wrapper and 6,292 optional Vulkan dispatch symbols;
+There is one optional GL TLS wrapper and 6,011 optional Vulkan dispatch symbols;
 each is verified against a weak reference in an extracted object. They are
 accounted separately from required failures. Every symbol must be classified or
 the recipe fails. The plan's glapi root has the pinned source's actual name,

@@ -6,8 +6,8 @@ All upstream per-architecture variants are built; v10 is present in both links. 
 
 | Driver | Required gaps | Optional weak symbols | Extracted objects | Probe ELF bytes |
 |---|---:|---:|---:|---:|
-| GL | 39 | 1 | 938 | 18559504 |
-| VK | 32 | 6292 | 634 | 16077160 |
+| GL | 39 | 1 | 938 | 18559488 |
+| VK | 31 | 6011 | 734 | 16565264 |
 
 Optional generated panvk dispatch entries and the GL TLS wrapper are verified against weak references in extracted objects. Every name and owner is in `optional-undefined.tsv`; every required and optional entry is in `inventory.json`. Local undefined symbol-table placeholders are included in this accounting.
 
@@ -28,15 +28,13 @@ Optional generated panvk dispatch entries and the GL TLS wrapper are verified ag
 | `build_id_length` | VK | other: static build ID | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_instance.c.o)` |
 | `copy_build_id_to_sha1` | VK | other: static build ID | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_instance.c.o)` |
 | `drmCloseBufferHandle` | GL/VK | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
-| `drmFreeDevice` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_wsi.c.o)` |
 | `drmFreeDevices` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(vk_instance.c.o)` |
 | `drmFreeVersion` | GL | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
 | `drmGetCap` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
-| `drmGetDevice2` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_wsi.c.o)` |
 | `drmGetDevices2` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(vk_instance.c.o)` |
 | `drmGetVersion` | GL | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
 | `drmIoctl` | GL/VK | Panthor ioctl user | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
-| `drmPrimeFDToHandle` | GL | DRM / libdrm | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
+| `drmPrimeFDToHandle` | GL/VK | DRM / libdrm | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
 | `drmPrimeHandleToFD` | GL/VK | DRM / libdrm | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
 | `drmSyncobjCreate` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
 | `drmSyncobjDestroy` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
@@ -129,16 +127,16 @@ Object text/data/BSS sizes for each driver are in `link-{gl,vk}.object-sizes`; t
 | `build/src/panfrost/lib/libpan-format-v9.a` | 282 | 282 |
 | `build/src/panfrost/lib/libpanfrost_lib.a` | 2408 | 2408 |
 | `build/src/panfrost/model/libpanfrost_model_lib.a` | 272 | 272 |
-| `build/src/panfrost/shared/libpanfrost_shared.a` | 552 | — |
+| `build/src/panfrost/shared/libpanfrost_shared.a` | 552 | 552 |
 | `build/src/panfrost/vulkan/libpanvk_v10.a` | — | 8252 |
 | `build/src/panfrost/vulkan/libpanvk_v12.a` | — | 8252 |
 | `build/src/panfrost/vulkan/libpanvk_v13.a` | — | 8252 |
 | `build/src/panfrost/vulkan/libpanvk_v14.a` | — | 8172 |
 | `build/src/panfrost/vulkan/libpanvk_v6.a` | — | 7146 |
 | `build/src/panfrost/vulkan/libpanvk_v7.a` | — | 7146 |
-| `build/src/panfrost/vulkan/libvulkan_panfrost.a` | — | 30754996 |
+| `build/src/panfrost/vulkan/libvulkan_panfrost.a` | — | 30753708 |
 | `build/src/util/libxmlconfig.a` | 488 | — |
-| `sysroot/lib/libc.a` | 6772622 | 6772622 |
+| `sysroot/lib/libc.a` | 6772560 | 6772560 |
 
 No required pthread creation, dl, expat or driconf symbol remains unresolved in these links. This is link closure evidence only: existing libc exports can still refuse operations at runtime. G7l/G7m must prove their behavior.
 

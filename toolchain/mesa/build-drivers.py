@@ -130,17 +130,23 @@ def category(symbol):
     raise AssertionError(f"unclassified required symbol: {symbol}")
 
 
-def link_archives(archives, driver):
-    # Mesa embeds runtime entrypoints and per-arch implementations in its ICD archive.
-    # Weak dispatch references do not extract their definitions from a static archive;
-    # preserve Meson's link_whole contract for the static ICD. — TIMBERDOODLE
-    result = []
-    for archive in archives:
-        if driver == "vk" and archive.name.endswith("libvulkan_panfrost.a"):
-            result.extend(["--whole-archive", archive, "--no-whole-archive"])
-        else:
-            result.append(archive)
-    return result
+def link_archives(archives, driver, response=None, nm="llvm-nm-22"):
+    if driver != "vk":
+        return list(archives)
+    # Weak dispatch references cannot extract implementations from a static ICD.
+    # The combined archive also embeds duplicate utility objects, so root its defined
+    # API implementations explicitly instead of whole-loading every member. Never turn
+    # an unimplemented weak entrypoint into a required symbol. — TIMBERDOODLE
+    icd, = [p for p in archives if p.name.endswith("libvulkan_panfrost.a")]
+    defined = run([nm, "-P", "--defined-only", icd]).stdout
+    pattern = r"^(?:panvk_(?:v\d+_)?|vk_common_|vk_cmd_enqueue_unless_primary_)[A-Z][A-Za-z0-9_]*$"
+    symbols = sorted({fields[0] for line in defined.splitlines()
+                      if len(fields := line.split()) >= 2 and fields[1] in ("T", "W")
+                      and re.fullmatch(pattern, fields[0])})
+    assert "vk_common_GetPhysicalDeviceProperties2" in symbols, "missing core ICD implementation"
+    response = response or OUT / "vk-static-entrypoints.rsp"
+    response.write_text("".join(f"--undefined={symbol}\n" for symbol in symbols))
+    return [f"@{response}", *archives]
 
 
 def inventory(archives):

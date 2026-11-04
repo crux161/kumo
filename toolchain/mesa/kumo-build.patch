@@ -2551,9 +2551,9 @@
      * need cache flushing ops.
      */
 +#ifdef __kumo__
-+   /* Native GPU BO maps are Normal-NC, with WB_MMAP disabled. Userspace has no
-+    * cache-maintenance authority or CTR_EL0 emulation. Use the existing no-cache-ops
-+    * path, including panvk's nonCoherentAtomSize fallback. — TIMBERDOODLE */
++   /* Native GPU BO maps are Normal-NC, with WB_MMAP disabled. CTR_EL0 is not exposed
++    * or emulated for userspace, and these mappings need no CPU cache flush. Use the
++    * no-cache-ops path, including panvk's nonCoherentAtomSize fallback. — TIMBERDOODLE */
 +   return false;
 +#endif
 +

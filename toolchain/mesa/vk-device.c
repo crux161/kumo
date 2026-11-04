@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <vulkan/vulkan_core.h>
+#include "vk-memory-policy.h"
 
 PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 bool panvk_kumo_offer_device(struct pan_kmod_dev *kmod);
@@ -246,11 +247,7 @@ unsigned kumo_vk_device_cases(const struct kumo_gpu_api *api, void (*say)(const 
           memory.memoryProperties.memoryHeaps[0].size == KUMO_GPU_SESSION_BUDGET_BYTES &&
           budget.heapBudget[0] == KUMO_GPU_SESSION_BUDGET_BYTES, 12);
     CHECK(memory.memoryProperties.memoryTypeCount > 0, 43);
-    for (uint32_t i = 0; i < memory.memoryProperties.memoryTypeCount; ++i) {
-        const VkMemoryPropertyFlags flags = memory.memoryProperties.memoryTypes[i].propertyFlags;
-        CHECK((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
-              !(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 44);
-    }
+    CHECK(kumo_vk_memory_types_valid(&memory.memoryProperties), 44);
     report(say, "VK2-e queues and memory: one family of one queue (graphics, compute, transfer), "
            "no sparse binding; one %llu MiB heap with that budget",
            (unsigned long long)(KUMO_GPU_SESSION_BUDGET_BYTES >> 20));
