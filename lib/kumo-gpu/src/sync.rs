@@ -1,6 +1,7 @@
 //j749
 //j750
 //j751
+//j779
 //! Session-local native sync objects, without DRM handles or sync files. Calls are serial.
 //! Pending means an accepted job owns a signal; only FenceWait Done proves completion.
 //! Captured dependencies gate publication; the caller owns bounded OS waits.
@@ -9,7 +10,32 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::client::{Client, Error as ClientError, FenceStatus, Transport};
-use crate::{Fence, Submission};
+use crate::{Fence, MultiSubmission, Submission};
+
+/// VK2-a: what one intended submission publishes: one stream (Submit), or up to three
+/// subqueue streams under one point (SubmitStreams, VK1 D1). Waits and signals treat both
+/// alike: the point is the one fence the signals carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Work {
+    Single(Submission),
+    Streams(MultiSubmission),
+}
+
+impl Work {
+    pub fn group(self) -> u32 {
+        match self {
+            Self::Single(s) => s.group,
+            Self::Streams(m) => m.group,
+        }
+    }
+
+    pub fn valid_shape(self) -> bool {
+        match self {
+            Self::Single(s) => s.valid_shape(),
+            Self::Streams(m) => m.valid_shape(),
+        }
+    }
+}
 
 pub const MAX_SYNCS: usize = 64;
 pub const MAX_TIMELINE_POINTS: usize = 256;
@@ -69,7 +95,7 @@ pub struct Snapshot {
 #[derive(Debug)]
 pub struct PreparedSubmit {
     owner: u64,
-    submission: Submission,
+    submission: Work,
     waits: Vec<Snapshot>,
     signals: Vec<Point>,
     cursor: usize,
@@ -266,13 +292,13 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
         Ok(self.snapshot(point)?.is_some())
     }
 
-    fn reserve_signals(&mut self, submission: Submission, signals: &[Point]) -> Result<(), Error> {
+    fn reserve_signals(&mut self, submission: Work, signals: &[Point]) -> Result<(), Error> {
         self.ready()?;
         if !submission.valid_shape()
             || self
                 .state
                 .group
-                .is_some_and(|group| group != submission.group)
+                .is_some_and(|group| group != submission.group())
             || signals.len() > MAX_SYNCS
         {
             return Err(Error::InvalidRequest);
@@ -307,6 +333,25 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     pub fn prepare(
         &mut self,
         submission: Submission,
+        waits: &[Point],
+        signals: &[Point],
+    ) -> Result<PreparedSubmit, Error> {
+        self.prepare_work(Work::Single(submission), waits, signals)
+    }
+
+    /// VK2-a: [`Self::prepare`] for several subqueue streams under one point.
+    pub fn prepare_streams(
+        &mut self,
+        submission: MultiSubmission,
+        waits: &[Point],
+        signals: &[Point],
+    ) -> Result<PreparedSubmit, Error> {
+        self.prepare_work(Work::Streams(submission), waits, signals)
+    }
+
+    fn prepare_work(
+        &mut self,
+        submission: Work,
         waits: &[Point],
         signals: &[Point],
     ) -> Result<PreparedSubmit, Error> {
@@ -370,7 +415,7 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
                 FenceStatus::Done { .. } => unreachable!("arm rejects failed completion"),
             }
         }
-        let snapshot = self.submit(prepared.submission, &prepared.signals)?;
+        let snapshot = self.submit_work(prepared.submission, &prepared.signals)?;
         prepared.accepted = true;
         Ok(SubmitProgress::Submitted(snapshot))
     }
@@ -379,8 +424,15 @@ impl<'a, T: Transport> SyncObjects<'a, T> {
     /// fallible reservation precede transport I/O; a refused Submit leaves payloads intact.
     /// No submit is retried after transport/protocol uncertainty. — MILVUS
     pub fn submit(&mut self, submission: Submission, signals: &[Point]) -> Result<Snapshot, Error> {
+        self.submit_work(Work::Single(submission), signals)
+    }
+
+    fn submit_work(&mut self, submission: Work, signals: &[Point]) -> Result<Snapshot, Error> {
         self.reserve_signals(submission, signals)?;
-        let fence = self.client.submit_fence(submission)?;
+        let fence = match submission {
+            Work::Single(s) => self.client.submit_fence(s)?,
+            Work::Streams(m) => self.client.submit_streams_fence(m)?,
+        };
         self.state.group = Some(fence.group);
         for point in signals {
             // Every index was checked above; exclusive client access prevents reentry or

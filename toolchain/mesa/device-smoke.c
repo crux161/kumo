@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j768*/
 /*j769*/
 /*j770*/
 /*j772*/
 /*j773*/
+/*j779*/
 #include "kumo_kmod.h"
 #include <string.h>
 #include <stdio.h>
@@ -110,7 +110,7 @@ static unsigned native_sync_cases(const struct kumo_gpu_api *api, unsigned mode)
     bad = *api; bad.native = NULL;
     CHECK(!pan_kmod_kumo_dev_create(&bad, NULL), 102);
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
-    CHECK(dev && api->version == 15 && api->bytes == 136, 103);
+    CHECK(dev && api->version == 16 && api->bytes == 136, 103);
     struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, UINT64_C(0x20000000), UINT64_C(0x10000000));
     CHECK(vm, 104);
     struct kumo_gpu_native_reply out;
@@ -510,8 +510,8 @@ int main(void)
     puts("GL1-b screen green: Gallium's panfrost screen over the native device, its caps, a render-target texture, and a clean destroy");
 #endif
     puts("GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fit addresses, a freed range reused, caller addresses refused, a full window refused with nothing sent");
-    puts("G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back");
-    puts("G7p-c native C sync green: ABI 15, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
+    puts("G7q-c native heaps green: ABI 16 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back");
+    puts("G7p-c native C sync green: ABI 16, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead");
     puts("G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window");
     puts("G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close");
     return 0;

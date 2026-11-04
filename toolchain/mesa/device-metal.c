@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j758*/
 /*j759*/
 /*j762*/
 /*j765*/
 /*j768*/
+/*j779*/
 /* G7o-f: the native Mesa device, BOs and VM on the Orange Pi, over the live drv-gpu session.
  * Real props, real DMA pages, real page tables. The GPU itself checks the VM path: CS stores
  * through Mesa-made bindings, a live unbind and rebind, and a final store aimed at an
@@ -315,7 +315,7 @@ static uint32_t stall_stream(volatile uint64_t *line, uint64_t gate, uint64_t ta
 static unsigned sync_cases(const struct kumo_gpu_api *api, bool timeout)
 {
     struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
-    CHECK(dev && api->version == 15 && api->bytes == 136, 1);
+    CHECK(dev && api->version == 16 && api->bytes == 136, 1);
     say("G7p-e device: gpu_id=0x%llx, native C ABI %u with a %u-byte table",
         (unsigned long long)dev->props.gpu_id, api->version, api->bytes);
     struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);

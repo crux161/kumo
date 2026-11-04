@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j744*/
 /*j745*/
 /*j751*/
 /*j752*/
 /*j757*/
+/*j779*/
 #ifndef KUMO_MESA_GPU_H
 #define KUMO_MESA_GPU_H
 
@@ -19,7 +19,11 @@
  * reports known loss without wire I/O. Calls are serial and non-reentrant. — KESTREL
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
-#define KUMO_GPU_API_VERSION 15u
+/* ABI 16 (VK2-a, PLAN/015 §8.2): kumo_gpu_native_request gains an appended stream array, so
+ * one PREPARE can carry panvk's subqueue streams under one point, and GROUP_CREATE gains
+ * KUMO_NATIVE_GROUP_QUEUES for the session's three-queue group (VK1). Every ABI 15 field
+ * keeps its offset, and designated initializers that name no stream keep their meaning. */
+#define KUMO_GPU_API_VERSION 16u
 /* The session's shared allocation budget, kumo_gpu::MAX_TOTAL_BUFFER_BYTES: the ceiling the GPU
  * service enforces on every buffer and heap a session holds. GL4-a (PLAN/015 §8.32 D4)
  * preflights textures against it instead of a physical-memory figure. Not an ABI bump: the
@@ -116,6 +120,9 @@ struct kumo_gpu_vm_binding {
 #define KUMO_NATIVE_PREPARE 11u
 #define KUMO_NATIVE_STEP 12u
 #define KUMO_NATIVE_GROUP_STATE 13u
+/* GROUP_CREATE flag: the group's three queues (vertex/tiler, fragment, compute). */
+#define KUMO_NATIVE_GROUP_QUEUES 1u
+#define KUMO_NATIVE_MAX_STREAMS 3u
 /* Mutually exclusive native values, not DRM bit flags. UNKNOWN asserts neither a GPU
  * fault nor a timeout; no group-state result is a fence completion. — MILVUS */
 #define KUMO_GROUP_USABLE 0u
@@ -137,12 +144,22 @@ struct kumo_gpu_native_job {
     uint32_t vm, stream_bytes;
     uint64_t stream_va, signal_point;
 };
+/* One subqueue stream of a PREPARE: queue `queue` runs `stream_bytes` at `stream_va`. */
+struct kumo_gpu_native_stream {
+    uint32_t queue, stream_bytes;
+    uint64_t stream_va;
+};
 struct kumo_gpu_native_request {
     uint32_t operation, flags;
     uint64_t id, value;
     struct kumo_gpu_native_job job;
     const struct kumo_gpu_native_point *waits, *signals;
     uint32_t wait_count, signal_count;
+    /* ABI 16, PREPARE only: zero streams means the single stream in `job`; one to
+     * KUMO_NATIVE_MAX_STREAMS streams replace it, with `job`'s stream fields zero, distinct
+     * queues in ascending order, and `job.signal_point` the one point they share. */
+    const struct kumo_gpu_native_stream *streams;
+    uint32_t stream_count, reserved;
 };
 struct kumo_gpu_native_reply {
     uint64_t id;
@@ -320,7 +337,9 @@ _Static_assert(sizeof(struct kumo_gpu_heap_info) == 24, "heap info layout");
 _Static_assert(offsetof(struct kumo_gpu_heap_info, context_va) == 8, "heap info alignment");
 _Static_assert(sizeof(struct kumo_gpu_native_point) == 16, "native point layout");
 _Static_assert(sizeof(struct kumo_gpu_native_job) == 24, "native job layout");
-_Static_assert(sizeof(struct kumo_gpu_native_request) == 72, "native request layout");
+_Static_assert(sizeof(struct kumo_gpu_native_request) == 88, "native request layout");
+_Static_assert(sizeof(struct kumo_gpu_native_stream) == 16, "native stream layout");
+_Static_assert(offsetof(struct kumo_gpu_native_request, streams) == 72, "native streams offset");
 _Static_assert(offsetof(struct kumo_gpu_native_request, waits) == 48, "native waits offset");
 _Static_assert(offsetof(struct kumo_gpu_native_request, wait_count) == 64, "native counts offset");
 _Static_assert(sizeof(struct kumo_gpu_native_reply) == 24, "native reply layout");

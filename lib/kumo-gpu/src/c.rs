@@ -1,8 +1,8 @@
-//j744
 //j745
 //j751
 //j752
 //j757
+//j779
 
 //! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
 //! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
@@ -12,7 +12,9 @@ use core::{ffi::c_void, mem::size_of};
 use crate::client::{Client, Error, Transport};
 use crate::DeviceThreads;
 
-pub const VERSION: u32 = 15;
+/// ABI 16 (VK2-a, PLAN/015 §8.2): the native request's appended stream array and
+/// GROUP_CREATE's three-queue flag, for panvk's GROUP_SUBMIT. The table is unchanged.
+pub const VERSION: u32 = 16;
 pub const OK: u32 = 0;
 pub const BAD_ARGUMENT: u32 = 1;
 pub const INVALID_REQUEST: u32 = 2;

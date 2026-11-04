@@ -1,5 +1,6 @@
 //j751
 //j752
+//j779
 //! Native C operations. One BO owner retains all sync metadata and wake/status handles.
 //! C receives opaque, never-reused IDs; no kernel handle or caller-supplied fence crosses.
 
@@ -14,7 +15,7 @@ use crate::{
     bo::{Buffers, Mapper, WaitOutcome},
     c,
     client::{Client, FenceStatus, SessionTransport, Transport},
-    sync::{self, PreparedSubmit, Snapshot, SubmitProgress, SyncHandle, SyncObjects},
+    sync::{self, PreparedSubmit, Snapshot, SubmitProgress, SyncHandle, SyncObjects, Work},
     Submission,
 };
 
@@ -31,6 +32,10 @@ pub const GROUP_CREATE: u32 = 10;
 pub const PREPARE: u32 = 11;
 pub const STEP: u32 = 12;
 pub const GROUP_STATE: u32 = 13;
+/// VK2-a (ABI 16): GROUP_CREATE's flag for the session's group of three queues (VK1).
+pub const GROUP_QUEUES: u32 = 1;
+/// VK2-a: at most this many subqueue streams ride one PREPARE.
+pub const MAX_STREAMS: u32 = crate::MAX_GROUP_QUEUES as u32;
 
 pub const UNAVAILABLE: u32 = 0;
 pub const AVAILABLE: u32 = 1;
@@ -63,6 +68,15 @@ pub struct Job {
     pub signal_point: u64,
 }
 
+/// VK2-a (ABI 16): one subqueue stream of a PREPARE, `kumo_gpu_native_stream`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct Stream {
+    pub queue: u32,
+    pub stream_bytes: u32,
+    pub stream_va: u64,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Request {
@@ -75,6 +89,11 @@ pub struct Request {
     pub signals: *const Point,
     pub wait_count: u32,
     pub signal_count: u32,
+    /// VK2-a (ABI 16, appended): a PREPARE's subqueue streams. Zero streams is the single
+    /// stream in `job`; one to three replace it, and `job`'s stream fields are then zero.
+    pub streams: *const Stream,
+    pub stream_count: u32,
+    pub reserved: u32,
 }
 impl Default for Request {
     fn default() -> Self {
@@ -88,6 +107,9 @@ impl Default for Request {
             signals: core::ptr::null(),
             wait_count: 0,
             signal_count: 0,
+            streams: core::ptr::null(),
+            stream_count: 0,
+            reserved: 0,
         }
     }
 }
@@ -107,12 +129,14 @@ enum Object<H> {
     Group {
         vm: u32,
         group: u32,
+        /// VK2-a: 1, or three for a GROUP_QUEUES group.
+        queues: u8,
         watch: crate::GroupWatch<H>,
         report: crate::GroupReport,
     },
     Job {
         vm: u32,
-        submission: Submission,
+        submission: Work,
         prepared: PreparedSubmit,
     },
     Wake(H),
@@ -244,6 +268,7 @@ impl<H> Context<H> {
         request: Request,
         waits: &[Point],
         signals: &[Point],
+        streams: &[Stream],
     ) -> Result<Reply, Fault> {
         match request.operation {
             CREATE_BINARY | CREATE_TIMELINE => {
@@ -358,7 +383,16 @@ impl<H> Context<H> {
                     return Err(sync::Error::InvalidRequest.into());
                 }
                 let id = self.reserve()?;
-                let group = buffers.client.create_group(1)?;
+                let queues = if request.flags == GROUP_QUEUES {
+                    crate::MAX_GROUP_QUEUES
+                } else {
+                    1
+                };
+                let group = if queues == 1 {
+                    buffers.client.create_group(1)?
+                } else {
+                    buffers.client.create_group_queues(1, queues)?
+                };
                 if group != 1 {
                     buffers.client.abandon();
                     return Err(crate::client::Error::Protocol.into());
@@ -389,6 +423,7 @@ impl<H> Context<H> {
                     Object::Group {
                         vm,
                         group,
+                        queues,
                         watch,
                         report,
                     },
@@ -431,26 +466,59 @@ impl<H> Context<H> {
                 })
             }
             PREPARE => {
-                let Object::Group { vm, group, .. } = self.objects[self.index(request.id)?].object
+                let Object::Group {
+                    vm, group, queues, ..
+                } = self.objects[self.index(request.id)?].object
                 else {
                     return Err(Fault::Unknown);
                 };
                 if vm != request.job.vm {
                     return Err(sync::Error::InvalidRequest.into());
                 }
-                let submission = Submission {
-                    group,
-                    stream_va: request.job.stream_va,
-                    stream_bytes: request.job.stream_bytes,
-                    signal_point: request.job.signal_point,
+                let submission = if streams.is_empty() {
+                    Work::Single(Submission {
+                        group,
+                        stream_va: request.job.stream_va,
+                        stream_bytes: request.job.stream_bytes,
+                        signal_point: request.job.signal_point,
+                    })
+                } else {
+                    // VK2-a: panvk's GROUP_SUBMIT, as one SubmitStreams (VK1 D1). Queues must
+                    // exist on this group; the shape rules are MultiSubmission's.
+                    let mut m = crate::MultiSubmission {
+                        group,
+                        signal_point: request.job.signal_point,
+                        count: streams.len() as u8,
+                        ..Default::default()
+                    };
+                    for (slot, stream) in m.streams.iter_mut().zip(streams) {
+                        if stream.queue >= u32::from(queues) {
+                            return Err(sync::Error::InvalidRequest.into());
+                        }
+                        *slot = crate::StreamRef {
+                            queue: stream.queue as u8,
+                            stream_va: stream.stream_va,
+                            stream_bytes: stream.stream_bytes,
+                        };
+                    }
+                    if !m.valid_shape() {
+                        return Err(sync::Error::InvalidRequest.into());
+                    }
+                    Work::Streams(m)
                 };
-                buffers.check_native_submission(vm, submission)?;
+                check_work(buffers, vm, submission)?;
                 let waits = self.points(waits)?;
                 let signals = self.points(signals)?;
                 let id = self.reserve()?;
-                let prepared = SyncObjects::with_state(buffers.client, &mut self.syncs, |s| {
-                    s.prepare(submission, &waits, &signals)
-                })?;
+                let prepared =
+                    SyncObjects::with_state(
+                        buffers.client,
+                        &mut self.syncs,
+                        |s| match submission {
+                            Work::Single(single) => s.prepare(single, &waits, &signals),
+                            Work::Streams(m) => s.prepare_streams(m, &waits, &signals),
+                        },
+                    )?;
                 Ok(self.insert(
                     id,
                     Object::Job {
@@ -466,7 +534,7 @@ impl<H> Context<H> {
                 let Object::Job { vm, submission, .. } = self.objects[index].object else {
                     return Err(Fault::Unknown);
                 };
-                buffers.check_native_submission(vm, submission)?;
+                check_work(buffers, vm, submission)?;
                 let id = self.reserve()?;
                 // Retain the intent on recoverable refusal. All capacity/ID reservations
                 // precede transport I/O, including the returned snapshot or wake. — MILVUS
@@ -509,15 +577,48 @@ fn retain_report(
     }
 }
 
+/// Every stream a native job carries must lie inside one binding of its VM, at STEP as at
+/// PREPARE (bindings may change in between).
+fn check_work<T: SessionTransport, M: Mapper<T::Handle>>(
+    buffers: &Buffers<'_, T, M>,
+    vm: u32,
+    work: Work,
+) -> Result<(), crate::bo::Error> {
+    match work {
+        Work::Single(single) => buffers.check_native_submission(vm, single),
+        Work::Streams(m) => m
+            .streams()
+            .iter()
+            .try_for_each(|stream| buffers.check_native_submission(vm, m.single(*stream))),
+    }
+}
+
 fn valid(request: &Request) -> bool {
-    if request.flags != 0 {
+    if request.reserved != 0 {
+        return false;
+    }
+    // VK2-a: only GROUP_CREATE has a flag (GROUP_QUEUES), and only PREPARE carries streams.
+    let flag_ok =
+        request.flags == 0 || (request.operation == GROUP_CREATE && request.flags == GROUP_QUEUES);
+    if !flag_ok {
         return false;
     }
     if request.operation == PREPARE {
+        let streams_ok = if request.stream_count == 0 {
+            request.streams.is_null()
+        } else {
+            request.stream_count <= MAX_STREAMS
+                && request.job.stream_va == 0
+                && request.job.stream_bytes == 0
+        };
         return request.id != 0
             && request.value == 0
+            && streams_ok
             && request.wait_count as usize <= sync::MAX_SUBMIT_WAITS
             && request.signal_count as usize <= sync::MAX_SYNCS;
+    }
+    if request.stream_count != 0 || !request.streams.is_null() {
+        return false;
     }
     if request.job != Job::default()
         || request.wait_count != 0
@@ -551,6 +652,19 @@ unsafe fn points<'a>(pointer: *const Point, count: u32) -> Result<&'a [Point], F
     Ok(unsafe { core::slice::from_raw_parts(pointer, count as usize) })
 }
 
+/// VK2-a: a PREPARE's stream array, read under the same rules as the point arrays.
+unsafe fn stream_array<'a>(pointer: *const Stream, count: u32) -> Result<&'a [Stream], Fault> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if pointer.is_null() || (pointer as usize) % core::mem::align_of::<Stream>() != 0 {
+        return Err(Fault::Argument);
+    }
+    // SAFETY: the borrowed C API requires a readable live array of `count` entries; it is
+    // copied into a MultiSubmission before this callback returns.
+    Ok(unsafe { core::slice::from_raw_parts(pointer, count as usize) })
+}
+
 pub(crate) unsafe extern "C" fn callback<T: SessionTransport, M: Mapper<T::Handle>>(
     context: *mut c_void,
     request: *const Request,
@@ -573,13 +687,16 @@ pub(crate) unsafe extern "C" fn callback<T: SessionTransport, M: Mapper<T::Handl
     let Ok((waits, signals)) = arrays else {
         return c::BAD_ARGUMENT;
     };
+    let Ok(streams) = (unsafe { stream_array(request.streams, request.stream_count) }) else {
+        return c::BAD_ARGUMENT;
+    };
     let buffers = unsafe { &mut *context.cast::<Buffers<'_, T, M>>() };
     if !buffers.device_ready() && request.operation != GROUP_STATE {
         return c::DEVICE_LOST;
     }
     let mut native = buffers.native.take().unwrap_or_default();
     buffers.barrier_native();
-    let result = native.execute(buffers, request, waits, signals);
+    let result = native.execute(buffers, request, waits, signals, streams);
     buffers.barrier_native();
     buffers.native = Some(native);
     match result {
@@ -612,7 +729,11 @@ pub(crate) unsafe extern "C" fn callback<T: SessionTransport, M: Mapper<T::Handl
 
 const _: () = assert!(size_of::<Point>() == 16);
 const _: () = assert!(size_of::<Job>() == 24);
-const _: () = assert!(size_of::<Request>() == 72);
+// VK2-a (ABI 16): the stream array is appended, so every ABI 15 field keeps its offset.
+const _: () = assert!(size_of::<Request>() == 88);
+const _: () = assert!(size_of::<Stream>() == 16);
+const _: () = assert!(core::mem::offset_of!(Request, streams) == 72);
+const _: () = assert!(core::mem::offset_of!(Request, stream_count) == 80);
 const _: () = assert!(size_of::<Reply>() == 24);
 const _: () = assert!(core::mem::offset_of!(Request, waits) == 48);
 const _: () = assert!(core::mem::offset_of!(Request, wait_count) == 64);

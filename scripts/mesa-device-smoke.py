@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j773
 #j774
 #j775
 #j776
 #j777
+#j779
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -19,11 +19,11 @@ TOOL = ROOT / "toolchain/mesa"
 OUT = ROOT / "build/proofs/g7o-d"
 GREEN = b"G7o-d native device green: complete props, Mesa device/BO/VM lifecycle, immediate binds, generations, loss and contained close"
 WX_GREEN = b"G7o-e W^X driver shapes green: Gallium and panvk executable pools bind read-only, RW maps only, WB_MMAP masked, one 4 GiB window"
-NATIVE_GREEN = b"G7p-c native C sync green: ABI 15, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
+NATIVE_GREEN = b"G7p-c native C sync green: ABI 16, shared BO/sync owner, captured submits, bounded wakes, refusal/loss containment; zero SyncRead"
 GROUP_GREEN = b"G7p-d group state green: READ-only status, fatal/timeout/unknown after channel close, cached C reports, no replay"
 SCREEN_GREEN = b"GL1-b screen green: Gallium's panfrost screen over the native device, its caps, a render-target texture, and a clean destroy"
 AUTO_VA_GREEN = b"GL1-b auto-VA green: AUTO_VA and TRACK_ACTIVITY VMs, lowest-fit addresses, a freed range reused, caller addresses refused, a full window refused with nothing sent"
-HEAP_GREEN = b"G7q-c native heaps green: ABI 15 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
+HEAP_GREEN = b"G7q-c native heaps green: ABI 16 heap callbacks, Panthor's refusals with no I/O, server-VM heaps, VM teardown destroys them, exact bytes back"
 CSIF_GREEN = b"GL1-c1 native CSIF green: attested register counts, 256-register edge, cached query, foreign device refusal"
 CONTEXT_SYNC_GREEN = b"GL1-c2 native context sync green: full-width binary IDs, signaled and empty payloads, first/second-create refusal, repeated group refusal, every sync released"
 CONTEXT_INIT_GREEN = b"GL1-c destroy: the screen and device are gone; the session-owned group was not reused"
