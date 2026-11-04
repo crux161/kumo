@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j776
 #j777
 #j778
 #j780
 #j782
+#j784
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -127,6 +127,35 @@ PROOFS = {
                "VK2-e second instance: no physical device; no Panthor ioctl, DRM device listing or syncobj at any point"],
         green=("VK2-e metal device green: one instance, the Mali-G610, a device on the three-queue group, "
                "an idle queue and clean teardown"),
+        driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
+                "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK4-a (PLAN/015 §8.43): GL3-a's triangle through panvk, a render pass into a linear image
+    # read back from the CPU. Vulkan's origin is top-left, so the samples match GL3-a's. The
+    # target line ends in the measured row pitch and size, so only its prefix is required; the
+    # submit line pins the native split measured on metal. — TIMBERDOODLE
+    "vk4-a": dict(
+        cases="vk-triangle", runtime="device-metal", defines=["-DKUMO_VK_TRIANGLE_MAIN=1"],
+        out="vk4-a-metal", vk=True, begin="VK4-a metal triangle begin",
+        lines=["VK4-a device: Mali-G610",
+               "through the static ICD, one three-queue native group and 3 init submissions",
+               "VK4-a target: 256x128 R8G8B8A8_UNORM linear image, row pitch ",
+               "poisoned to 0xdeadbeef with a 4096-byte guard past it",
+               "VK4-a pipeline: the pinned 243-word vertex and 94-word fragment SPIR-V compiled by panvk on KUMO "
+               "into a graphics pipeline (no pipeline cache), with no native submission",
+               "VK4-a record: render pass clear to 0xff996633, one vkCmdDraw of 3 vertices (shade 0xff6633cc), "
+               "color-to-host barrier",
+               # Measured on metal (J784): panvk's first draw adds its one-time REQ_RESOURCE streams on
+               # the vertex/tiler and fragment subqueues ahead of the command buffer.
+               "VK4-a submit: one fenced vkQueueSubmit as 2 native submissions of 5 streams: subqueues [0 and 1] "
+               "then [0, 1 and 2]; the fence completed",
+               "VK4-a readback: 0 of 32768 pixels differ; 0 of 1024 guard words changed (Mali triangle 0xff6633cc "
+               "over clear 0xff996633)",
+               "VK4-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
+               "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
+               "VK4-a teardown: every object, the device and the instance destroyed; "],
+        green=("VK4-a metal triangle green: Mali rasterized the Vulkan triangle exactly into the linear image, "
+               "all 32768 pixels and the guard checked, and clean teardown"),
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),

@@ -1,9 +1,56 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j777 -->
 <!-- j778 -->
 <!-- j780 -->
 <!-- j781 -->
 <!-- j782 -->
+<!-- j784 -->
+
+## VK4-a: the first Vulkan triangle, offscreen (J784, metal-proven)
+
+[vk-compute.c](vk-compute.c)'s static-ICD bring-up and native observation, now drawing
+GL3-a's triangle through panvk ([vk-triangle.c](vk-triangle.c), `--proof vk4-a`). This is
+the first use of panvk's vertex/tiler and fragment subqueues and of the tiler heap for work.
+
+- **Shaders.** [vk-triangle.vert](vk-triangle.vert) passes position and color from one vertex
+  buffer, and [vk-triangle.frag](vk-triangle.frag) writes the color. Their SPIR-V headers
+  (243 and 94 words) were generated in the offline Mesa container (`kumo-mesa-drivers-g7k`:
+  glslang 16.6.0, SPIRV-Tools v2026.4) and are pinned by source and word hashes.
+  `vk-spirv.py` is now a shader table: generation is opt-in per `--shader` (with `--out`,
+  since the container's repository mount is read-only), and `--verify` checks all three
+  headers. Recompiling VK3-a's compute shader the same way reproduces K2's 308 words
+  exactly; the pinned header itself is unchanged.
+- **Target.** A 256x128 R8G8B8A8_UNORM `VK_IMAGE_TILING_LINEAR` color attachment (panvk's
+  linear tiling features equal its optimal ones). It is bound at the start of a host-visible,
+  coherent allocation, with a 4 KiB CPU-poisoned guard past the image.
+- **Draw.** One VkRenderPass (clear to 0xff996633, store, final GENERAL), the vertices
+  (-1,-1), (1,-1), (-1,1) shaded 0xff6633cc, one `vkCmdDraw(3)`, a color-to-host barrier and
+  a fenced submit. Vulkan's origin is top-left, so pixel (x, y) is inside exactly when
+  x + 2y ≤ 254. GL3-a's samples therefore hold unchanged.
+- **Submission split, exact.** The first draw adds panvk's one-time REQ_RESOURCE streams on
+  the vertex/tiler and fragment subqueues ahead of the command buffer: `[0, 1]`, then
+  `[0, 1, 2]`. VK3-b's compute dispatch had added `[2]` the same way.
+
+**Metal (J784, 2026-11-04), first boot:**
+
+```text
+VK4-a target: 256x128 R8G8B8A8_UNORM linear image, row pitch 1024, offset 0, 131072 bytes (memory type 1), poisoned to 0xdeadbeef with a 4096-byte guard past it
+VK4-a pipeline: the pinned 243-word vertex and 94-word fragment SPIR-V compiled by panvk on KUMO into a graphics pipeline (no pipeline cache), with no native submission
+VK4-a submit: one fenced vkQueueSubmit as 2 native submissions of 5 streams: subqueues [0 and 1] then [0, 1 and 2]; the fence completed
+VK4-a readback: 0 of 32768 pixels differ; 0 of 1024 guard words changed (Mali triangle 0xff6633cc over clear 0xff996633)
+VK4-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc (255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633
+VK4-a teardown: every object, the device and the instance destroyed; 15 of 15 native buffers and the heap released, only the session's group left; no Panthor ioctl, DRM listing or syncobj
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The client hash was `7c6b1abb…`; the initrd served was 24,564,415 bytes. Evidence:
+`build/proofs/vk4-a-metal/metal-boot-to-login.log`. VK4-b (the image copied into view 1
+and held on HDMI) waits on the cut's D2 (PLAN/015 §8.43). — TIMBERDOODLE 2026-11-04
+
+```sh
+python3 toolchain/mesa/vk-spirv.py --verify
+python3 scripts/mesa-device-metal.py --proof vk4-a --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk4-a --check <tio-log>
+```
 
 ## VK3-b: runtime Vulkan compute on Mali (J782, metal-proven)
 
@@ -52,7 +99,7 @@ drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
 drv-gpu showed `client group 1 leases CSG0 queues 0-2` and the 5 x 2 MiB heap at
 `0x30000000`, with no AS1 fault or failed point. The client hash was `d0590be6…`; the
 initrd served was 24,564,223 bytes. Evidence: `build/proofs/vk3-b-metal/metal-boot-to-login.log`.
-**VK3 is closed.** VK4 (first Vulkan triangle) is next.
+**VK3 is closed.** VK4-a (above) drew the first Vulkan triangle.
 — TIMBERDOODLE 2026-11-04
 
 ```sh
