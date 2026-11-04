@@ -1,0 +1,22 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// VK3 (PLAN/015 §8.2): the first Vulkan output. Each invocation below `count` writes
+// words[i] = i * 3 + k into the storage buffer, with k and count as push constants.
+// vk-spirv.py turns this into vk-compute.spv.h; panvk compiles the SPIR-V at runtime.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer Output {
+    uint words[];
+} result;
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint count;
+} push;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < push.count)
+        result.words[i] = i * 3u + push.k;
+}

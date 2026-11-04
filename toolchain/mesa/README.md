@@ -1,9 +1,27 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j775 -->
 <!-- j776 -->
 <!-- j777 -->
 <!-- j778 -->
 <!-- j780 -->
+<!-- j781 -->
+
+## VK3-a: compute shader artifacts (J781)
+
+[vk-compute.comp](vk-compute.comp) uses workgroups of 64 invocations. Invocation `i` below
+push-constant `count` writes `words[i] = i * 3 + k` to the storage buffer at set 0, binding 0.
+[vk-compute.spv.h](vk-compute.spv.h) contains the pinned 308-word SPIR-V module, originally
+generated with glslang 15.1.0 for Vulkan 1.1 and validated by SPIRV-Tools v2025.1.
+
+Check the committed source and words without external tools:
+
+```sh
+python3 toolchain/mesa/vk-spirv.py --verify
+```
+
+The verifier checks the recorded source and SPIR-V hashes. Regeneration needs the compiler
+and validator named by `vk-spirv.py --help`. RE8 preserves the source/header pair byte for
+byte from K2. VK3-b will create and dispatch the compute pipeline on Mali and check its
+output; this artifact check provides no runtime compute result.
 
 ## VK2: panvk over the native session (J779/J780, metal-proven)
 
