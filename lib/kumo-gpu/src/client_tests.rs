@@ -1,8 +1,8 @@
-//j644
 //j681
 //j707
 //j711
 //j752
+//j778
 extern crate std;
 use super::*;
 use crate::{
@@ -619,4 +619,47 @@ fn group_watch_correlates_identity_and_owns_exactly_one_read_grant() {
     client.close_buffer_handle(watch.handle);
     assert_eq!(client.watch_group(1).err(), Some(Error::DeviceLost));
     assert_eq!(client.transport.sent.len(), 1);
+}
+
+/// VK1 (found by VK2-a's native tests): the client accepts exactly the replies the new
+/// commands may have, so a three-queue group and a multi-stream submit work on a real wire.
+#[test]
+fn three_queue_group_and_multi_stream_submit_replies_are_accepted_exactly() {
+    let streams = crate::MultiSubmission {
+        group: 1,
+        signal_point: 4,
+        count: 2,
+        streams: [
+            crate::StreamRef {
+                queue: 0,
+                stream_va: VA_START,
+                stream_bytes: 32,
+            },
+            crate::StreamRef {
+                queue: 2,
+                stream_va: VA_START + 64,
+                stream_bytes: 32,
+            },
+            crate::StreamRef::default(),
+        ],
+    };
+    let mut transport = Script::default();
+    transport.reply(1, Ok(Response::GroupCreated { group: 1 }), None);
+    transport.reply(2, Ok(Response::Submitted { point: 4 }), None);
+    let mut client = Client::new(transport);
+    assert_eq!(client.create_group_queues(1, 3), Ok(1));
+    assert_eq!(
+        client
+            .submit_streams_fence(streams)
+            .map(|fence| fence.point),
+        Ok(4)
+    );
+    // A reply naming another point is a protocol fault, as for a single Submit.
+    let mut transport = Script::default();
+    transport.reply(1, Ok(Response::Submitted { point: 5 }), None);
+    let mut client = Client::new(transport);
+    assert_eq!(
+        client.call(Command::SubmitStreams(streams)),
+        Err(Error::Protocol)
+    );
 }

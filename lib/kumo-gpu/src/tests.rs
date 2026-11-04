@@ -1,8 +1,8 @@
-//j742
 //j752
 //j754
 //j758
 //j776
+//j778
 
 extern crate std;
 
@@ -1312,4 +1312,110 @@ fn the_c_header_names_the_session_budget() {
         "#define KUMO_GPU_SESSION_BUDGET_BYTES (128ull * 1024ull * 1024ull)"
     );
     assert_eq!(MAX_TOTAL_BUFFER_BYTES, 128 * 1024 * 1024);
+}
+
+/// VK1 (PLAN/015 §8.2, cut ratified 2026-11-03): the new shapes have one encoding each, and the
+/// single-queue encodings are byte-identical to before.
+#[test]
+fn vk1_wire_shapes_have_one_encoding_and_leave_single_queue_bytes_alone() {
+    let group = Request {
+        id: 7,
+        command: Command::GroupCreate { vm: 1 },
+    }
+    .encode();
+    assert_eq!(&group[8..12], &4u32.to_le_bytes());
+    assert_eq!(&group[16..24], &1u64.to_le_bytes());
+    assert!(group[24..].iter().all(|b| *b == 0));
+    for command in [
+        Command::GroupCreateQueues { vm: 1, queues: 3 },
+        Command::SubmitStreams(MultiSubmission {
+            group: 1,
+            signal_point: 9,
+            count: 3,
+            streams: [
+                StreamRef {
+                    queue: 0,
+                    stream_va: VA_START,
+                    stream_bytes: 48,
+                },
+                StreamRef {
+                    queue: 1,
+                    stream_va: VA_START + 64,
+                    stream_bytes: MAX_STREAM_BYTES,
+                },
+                StreamRef {
+                    queue: 2,
+                    stream_va: VA_END - 64,
+                    stream_bytes: 64,
+                },
+            ],
+        }),
+    ] {
+        let request = Request { id: 7, command };
+        assert_eq!(Request::decode(&request.encode()), Some(request));
+    }
+}
+
+#[test]
+fn vk1_malformed_multi_queue_requests_are_refused() {
+    let raw = |op: u32, args: [u64; 6]| {
+        let mut bytes = [0u8; REQUEST_LEN];
+        bytes[..4].copy_from_slice(b"KGQ1");
+        bytes[4..8].copy_from_slice(&7u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&op.to_le_bytes());
+        for (chunk, arg) in bytes[16..].chunks_exact_mut(8).zip(args) {
+            chunk.copy_from_slice(&arg.to_le_bytes());
+        }
+        Request::decode(&bytes)
+    };
+    for queues in [0, 1, 2, 4, 256] {
+        assert_eq!(raw(21, [1, queues, 0, 0, 0, 0]), None, "queues {queues}");
+    }
+    assert_eq!(raw(21, [0, 3, 0, 0, 0, 0]), None);
+    let entry = |queue: u64, va: u64, bytes: u64| va | (bytes << 32) | (queue << 56);
+    let ok = entry(0, VA_START, 48);
+    assert!(raw(22, [1 | (1 << 32), 1, ok, 0, 0, 0]).is_some());
+    let bad: [(&str, [u64; 6]); 12] = [
+        ("no streams", [1, 1, 0, 0, 0, 0]),
+        ("four streams", [1 | (4 << 32), 1, ok, 0, 0, 0]),
+        ("no group", [1 << 32, 1, ok, 0, 0, 0]),
+        ("point zero", [1 | (1 << 32), 0, ok, 0, 0, 0]),
+        (
+            "queue three",
+            [1 | (1 << 32), 1, entry(3, VA_START, 48), 0, 0, 0],
+        ),
+        (
+            "descending",
+            [
+                1 | (2 << 32),
+                1,
+                entry(1, VA_START, 48),
+                entry(0, VA_START, 48),
+                0,
+                0,
+            ],
+        ),
+        ("duplicate", [1 | (2 << 32), 1, ok, ok, 0, 0]),
+        ("unused nonzero", [1 | (1 << 32), 1, ok, ok, 0, 0]),
+        (
+            "misaligned",
+            [1 | (1 << 32), 1, entry(0, VA_START + 8, 48), 0, 0, 0],
+        ),
+        ("empty", [1 | (1 << 32), 1, entry(0, VA_START, 0), 0, 0, 0]),
+        (
+            "too long",
+            [
+                1 | (1 << 32),
+                1,
+                entry(0, VA_START, u64::from(MAX_STREAM_BYTES) + 8),
+                0,
+                0,
+                0,
+            ],
+        ),
+        ("reserved word", [1 | (1 << 32), 1, ok, 0, 0, 5]),
+    ];
+    for (name, args) in bad {
+        assert_eq!(raw(22, args), None, "{name}");
+    }
 }

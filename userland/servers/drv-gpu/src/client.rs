@@ -1,8 +1,8 @@
-//j743
 //j752
 //j754
 //j755
 //j775
+//j778
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -23,11 +23,11 @@ use kumo_abi::Rights;
 
 use super::*;
 use drv_gpu::contain::Containment;
-use drv_gpu::{client_job_wrapper, flush_range, protocol, JobSlot, JOB_WRAPPER_WORDS};
+use drv_gpu::{client_job_wrapper, flush_range, protocol};
 use protocol::{
     session::{Backend, Session, SubmitError, MAX_WAITS},
-    Binding, Reply as GpuReply, Request, Response, Status as GpuStatus, Submission, SyncState,
-    REQUEST_LEN,
+    Binding, MultiSubmission, Reply as GpuReply, Request, Response, Status as GpuStatus,
+    Submission, SyncState, REQUEST_LEN,
 };
 
 /// One live client allocation: the session's object ID and the driver's own DMA mapping.
@@ -130,12 +130,17 @@ impl HeapMemory {
     }
 }
 
+/// One point waiting to be published: one wrapper per carried queue (VK1 D1). A Submit carries
+/// queue 0 alone.
 struct Pending {
     point: u64,
-    seqno: u64,
-    insert: u64,
-    slot: JobSlot,
-    words: [u64; JOB_WRAPPER_WORDS],
+    jobs: [Option<QueueJob>; GROUP_QUEUES],
+}
+
+impl Pending {
+    fn jobs(&self) -> impl Iterator<Item = &QueueJob> {
+        self.jobs.iter().flatten()
+    }
 }
 
 struct Hardware<'a> {
@@ -158,6 +163,10 @@ struct Hardware<'a> {
     windows: [McuWindow; 3],
     csg: CsgControl,
     cs: CsControl,
+    /// VK1-b: CSG0's queues; `queue_cs[0]` is `cs`.
+    queue_cs: [CsControl; GROUP_QUEUES],
+    /// Each queue's published-job count, for its sync object's expected seqno.
+    counters: QueueCounters,
     buffers: Vec<BufferRecord>,
     reply_grant: Option<Handle>,
     pending: Option<Pending>,
@@ -618,33 +627,49 @@ impl Backend for Hardware<'_> {
         if self.pending.is_some() {
             return Err(SubmitError::Unpublished(GpuStatus::Busy));
         }
-        let seqno = BRINGUP_JOBS
-            .checked_add(job.signal_point)
-            .ok_or(SubmitError::Unpublished(GpuStatus::BadRequest))?;
-        dsb();
-        let words = client_job_wrapper(
-            CsFeatures::decode(self.cs.features),
-            JobCall {
-                latest_flush: latest_flush_id(self.device),
-                stream_va: job.stream_va,
-                stream_len: job.stream_bytes,
-                sync_va: AS1_SYNC_VA,
-            },
-        )
-        .map_err(|_| SubmitError::Unpublished(GpuStatus::BadRequest))?;
-        let iface = QueueIface::at(MCU_IO_PAGES_VA);
-        let mut io = SharedGlb::new(self.device, self.input, self.output, self.windows);
-        let insert = queue_insert(&mut io, iface);
-        let extract = queue_extract(&mut io, iface);
-        let slot = job_slot(insert, extract, RING_SIZE)
-            .ok_or(SubmitError::Unpublished(GpuStatus::Busy))?;
+        let queued = self.prepare_job(0, job.stream_va, job.stream_bytes)?;
+        self.counters.commit(0);
         // Prepare only. Publish after the acceptance reply, with the interrupt already armed.
         self.pending = Some(Pending {
             point: job.signal_point,
-            seqno,
-            insert,
-            slot,
-            words,
+            jobs: [Some(queued), None, None],
+        });
+        Ok(())
+    }
+
+    fn create_group_queues(&mut self, queues: u8) -> Result<(), GpuStatus> {
+        if usize::from(queues) != GROUP_QUEUES {
+            return Err(GpuStatus::BadRequest);
+        }
+        log(
+            log_level::NOTICE,
+            format_args!(
+                "drv-gpu: client group 1 leases CSG0 queues 0-{}, hardware seqno base={}\n",
+                GROUP_QUEUES - 1,
+                BRINGUP_JOBS
+            ),
+        );
+        Ok(())
+    }
+
+    /// VK1 D1: one wrapper per carried stream, each on its own queue, under one point. All or
+    /// nothing: a refused stream commits no queue's counter and leaves nothing pending.
+    fn submit_streams(&mut self, job: MultiSubmission) -> Result<(), SubmitError> {
+        if self.pending.is_some() {
+            return Err(SubmitError::Unpublished(GpuStatus::Busy));
+        }
+        let mut jobs = [None; GROUP_QUEUES];
+        for stream in job.streams() {
+            let queue = u32::from(stream.queue);
+            jobs[usize::from(stream.queue)] =
+                Some(self.prepare_job(queue, stream.stream_va, stream.stream_bytes)?);
+        }
+        for queued in jobs.iter().flatten() {
+            self.counters.commit(queued.queue);
+        }
+        self.pending = Some(Pending {
+            point: job.signal_point,
+            jobs,
         });
         Ok(())
     }
@@ -846,21 +871,75 @@ impl Hardware<'_> {
         Ok(drv_gpu::heap_chunk_link(va, chunk_bytes))
     }
 
+    /// One queue's wrapper and ring slot, with the seqno its sync object will reach. Prepares
+    /// only: nothing is written to a ring and no counter moves.
+    fn prepare_job(
+        &mut self,
+        queue: u32,
+        stream_va: u64,
+        stream_len: u32,
+    ) -> Result<QueueJob, SubmitError> {
+        let seqno = self
+            .counters
+            .next(queue)
+            .ok_or(SubmitError::Unpublished(GpuStatus::BadRequest))?;
+        dsb();
+        let words = client_job_wrapper(
+            CsFeatures::decode(self.queue_cs[queue as usize].features),
+            JobCall {
+                latest_flush: latest_flush_id(self.device),
+                stream_va,
+                stream_len,
+                sync_va: queue_sync_va(queue),
+            },
+        )
+        .map_err(|_| SubmitError::Unpublished(GpuStatus::BadRequest))?;
+        let iface = queue_iface_of(queue);
+        let mut io = SharedGlb::new(self.device, self.input, self.output, self.windows);
+        let insert = queue_insert(&mut io, iface);
+        let extract = queue_extract(&mut io, iface);
+        let slot = job_slot(insert, extract, RING_SIZE)
+            .ok_or(SubmitError::Unpublished(GpuStatus::Busy))?;
+        Ok(QueueJob {
+            queue,
+            insert,
+            slot,
+            words,
+            seqno,
+        })
+    }
+
     fn finish_pending(&mut self, session: &mut Session) -> Result<Option<u64>, GpuStatus> {
         let Some(job) = self.pending.take() else {
             return Ok(None);
         };
         let csg_bit = job_irq_csg(GROUP_SLOT);
-        let iface = QueueIface::at(MCU_IO_PAGES_VA);
-        let sync = self.work.va + (AS1_SYNC_VA - AS1_WORK_VA);
-        let (input, output, windows, csg, cs, work) = (
+        let (input, output, windows, csg, cs, work, queue_cs) = (
             self.input,
             self.output,
             self.windows,
             self.csg,
             self.cs,
             self.work,
+            self.queue_cs,
         );
+        // VK1-b: the carried queues' jobs, and each queue's sync object in the work mapping.
+        let Some(&first) = job.jobs().next() else {
+            return Ok(None);
+        };
+        let mut carried = [first; GROUP_QUEUES];
+        let mut count = 0;
+        for queued in job.jobs() {
+            carried[count] = *queued;
+            count += 1;
+        }
+        let carried = &carried[..count];
+        let sync_of = |queue: u32| work.va + (queue_sync_va(queue) - AS1_WORK_VA);
+        // SAFETY: aligned words of the driver's retained Normal-NC queue sync page.
+        let read_seqno = |queue: u32| unsafe { (sync_of(queue) as *const u64).read_volatile() };
+        let read_status = |queue: u32| unsafe {
+            ((sync_of(queue) + SYNC_STATUS_OFFSET) as *const u32).read_volatile()
+        };
         {
             let mut io = SharedGlb::new(self.device, input, output, windows);
             ack_group_events(&mut io, csg.input_va, csg.output_va);
@@ -869,32 +948,43 @@ impl Hardware<'_> {
         let started = self.device.now_ns();
         let deadline = started.saturating_add(WORK_TIMEOUT_NS);
         let (mut waits, mut fired) = (0, 0);
-        let (last, seqno, status) = loop {
+        let (last, done, seqno, status) = loop {
             let publish = waits == 0;
             let remaining = deadline.saturating_sub(self.device.now_ns()).max(1_000);
             let irq = await_job_irq(self.device, csg_bit, remaining, |device| {
                 if !publish {
                     return;
                 }
-                write_job_words(
-                    job.insert,
-                    job.slot,
-                    &job.words,
-                    RING_SIZE,
-                    |offset, word| {
-                        // SAFETY: write_job_words bounds each word to the mapped ring page.
-                        unsafe { ((work.va + offset as u64) as *mut u64).write_volatile(word) };
-                    },
-                );
-                dsb();
-                {
-                    let mut io = SharedGlb::new(&mut *device, input, output, windows);
-                    publish_insert(&mut io, iface, job.slot.end);
+                // Every carried queue's wrapper into its own ring, then its insert; then each
+                // queue's doorbell-request bit, and the group's doorbell once (VK1-b).
+                for queued in carried {
+                    let ring = work.va + (ring_va(queued.queue) - AS1_WORK_VA);
+                    write_job_words(
+                        queued.insert,
+                        queued.slot,
+                        &queued.words,
+                        RING_SIZE,
+                        |offset, word| {
+                            // SAFETY: write_job_words bounds each word to the mapped ring page.
+                            unsafe { ((ring + offset as u64) as *mut u64).write_volatile(word) };
+                        },
+                    );
                 }
                 dsb();
-                {
+                for queued in carried {
                     let mut io = SharedGlb::new(&mut *device, input, output, windows);
-                    wake_stream(&mut io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+                    publish_insert(&mut io, queue_iface_of(queued.queue), queued.slot.end);
+                }
+                dsb();
+                for queued in carried {
+                    let mut io = SharedGlb::new(&mut *device, input, output, windows);
+                    wake_stream(
+                        &mut io,
+                        csg.input_va,
+                        csg.output_va,
+                        GROUP_SLOT,
+                        queued.queue,
+                    );
                 }
                 device.write32(csf_doorbell(GROUP_SLOT + 1), 1);
             })
@@ -910,35 +1000,47 @@ impl Hardware<'_> {
             //j755
             // G7q-b: a stream whose tiler ran out of heap waits for an answer. Serve it, then
             // keep waiting under the same deadline. — TIMBERDOODLE
-            let oom = {
+            // VK1-b: any queue may tile (panvk's vertex/tiler queue is queue 0, but the
+            // event is per stream), so each carried queue's OOM is served on its own CS.
+            let oom = carried.iter().find_map(|queued| {
+                let control = queue_cs[queued.queue as usize];
                 let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
-                drv_gpu::tiler_oom(&mut io, cs.input_va, cs.output_va)
-            };
-            if let Some(oom) = oom {
+                drv_gpu::tiler_oom(&mut io, control.input_va, control.output_va)
+                    .map(|oom| (queued.queue, control, oom))
+            });
+            if let Some((queue, control, oom)) = oom {
                 let chunk = self.grow_heap(oom, session)?;
                 {
                     let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
-                    drv_gpu::answer_tiler_oom(&mut io, cs.input_va, cs.output_va, chunk);
+                    drv_gpu::answer_tiler_oom(&mut io, control.input_va, control.output_va, chunk);
                 }
                 dsb();
                 {
                     let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
-                    wake_stream(&mut io, csg.input_va, csg.output_va, GROUP_SLOT, 0);
+                    wake_stream(&mut io, csg.input_va, csg.output_va, GROUP_SLOT, queue);
                 }
                 continue;
             }
-            // SAFETY: aligned words of the driver's retained Normal-NC queue sync page.
-            let seqno = unsafe { (sync as *const u64).read_volatile() };
-            let status = unsafe { ((sync + SYNC_STATUS_OFFSET) as *const u32).read_volatile() };
-            if seqno >= job.seqno
-                || irq.completion == Completion::TimedOut
-                || self.device.now_ns() >= deadline
-            {
-                break (irq.completion, seqno, status);
+            let done = queues_complete(carried, read_seqno);
+            let status = carried
+                .iter()
+                .fold(0, |status, queued| status | read_status(queued.queue));
+            if done || irq.completion == Completion::TimedOut || self.device.now_ns() >= deadline {
+                break (irq.completion, done, read_seqno(first.queue), status);
             }
         };
-        let outcome = classify_job_wait(seqno >= job.seqno, last, fired);
-        if outcome != JobWait::Interrupt || seqno != job.seqno || status != 0 {
+        let outcome = classify_job_wait(done, last, fired);
+        // Every carried queue must land exactly on its seqno; the report names the first
+        // queue that did not (queue 0's CS when all did and only the status failed).
+        let failing = carried
+            .iter()
+            .find(|queued| read_seqno(queued.queue) != queued.seqno)
+            .map_or(cs, |queued| queue_cs[queued.queue as usize]);
+        let exact = carried
+            .iter()
+            .all(|queued| read_seqno(queued.queue) == queued.seqno);
+        if outcome != JobWait::Interrupt || !exact || status != 0 {
+            let cs = failing;
             let cs_status = {
                 let mut io = SharedGlb::new(&mut *self.device, input, output, windows);
                 read_cs_status(&mut io, cs.output_va)
@@ -1006,6 +1108,7 @@ pub(super) fn serve(
     windows: [McuWindow; 3],
     csg: CsgControl,
     cs: CsControl,
+    queue_cs: [CsControl; GROUP_QUEUES],
     shader_present: u64,
     mmu_features: u32,
     tiler_features: u32,
@@ -1036,6 +1139,8 @@ pub(super) fn serve(
         windows,
         csg,
         cs,
+        queue_cs,
+        counters: QueueCounters::new(BRINGUP_JOBS),
         buffers: Vec::new(),
         reply_grant: None,
         pending: None,

@@ -686,8 +686,73 @@ static unsigned heap_cases(const struct kumo_gpu_api *api, bool bridge)
     return 0;
 }
 
+/* VK1-c (PLAN/015 §8.2): one SubmitStreams of three subqueue streams under one point on the
+ * three-queue group. Queue 0 stores A; queue 1 waits until A has landed, then stores B; queue 2
+ * stores C on its own. The order across queues is kept in memory, as panvk keeps it. */
+extern uint32_t kumo_metal_queues(void *context, const uint64_t *streams_va, const uint32_t *streams_bytes,
+                                  uint32_t count);
+#define VK1_A 0x7f1b000au
+#define VK1_B 0x7f1b000bu
+#define VK1_C 0x7f1b000cu
+#define VK1_SENTINEL 0x5a5a5a5au
+static unsigned queue_cases(const struct kumo_gpu_api *api)
+{
+    struct pan_kmod_dev *dev = pan_kmod_kumo_dev_create(api, NULL);
+    CHECK(dev, 1);
+    struct pan_kmod_va_range range = pan_kmod_dev_query_user_va_range(dev);
+    struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, 0, range.start, range.size);
+    CHECK(vm && vm->handle == 1, 2);
+    struct pan_kmod_bo *stream = pan_kmod_bo_alloc(dev, vm, 4096, 0);
+    struct pan_kmod_bo *data = pan_kmod_bo_alloc(dev, vm, 4096, 0);
+    CHECK(stream && data, 3);
+    volatile uint64_t *stream_cpu = pan_kmod_bo_mmap(stream, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    volatile uint32_t *data_cpu = pan_kmod_bo_mmap(data, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+    CHECK(stream_cpu != MAP_FAILED && data_cpu != MAP_FAILED, 4);
+    const uint64_t data_va = range.start, stream_va = range.start + 2 * MIB;
+    struct pan_kmod_vm_op ops[2] = {
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {data_va, data->size}, .map = {data, 0}},
+        {.type = PAN_KMOD_VM_OP_TYPE_MAP, .va = {stream_va, stream->size}, .map = {stream, 0}},
+    };
+    CHECK(pan_kmod_vm_bind(vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, ops, 2) == 0, 5);
+    /* {value, status} pairs at +16 (A), +32 (B) and +48 (C); the statuses start as sentinels. */
+    for (unsigned word = 4; word < 14; ++word)
+        data_cpu[word] = (word & 1) ? VK1_SENTINEL : 0;
+    const uint32_t a_bytes = store_stream(stream_cpu, data_va + 16, VK1_A);
+    volatile uint64_t *line = stream_cpu + 8;
+    line[0] = CS_MOVE48(0, data_va + 16);
+    line[1] = CS_MOVE32(2, VK1_A - 1);
+    line[2] = CS_SYNC_WAIT32_GREATER(0, 2);
+    line[3] = CS_MOVE48(0, data_va + 32);
+    line[4] = CS_MOVE32(2, VK1_B);
+    line[5] = CS_SYNC_SET32(0, 2);
+    line[6] = CS_WAIT_SLOT0;
+    const uint32_t c_bytes = store_stream(stream_cpu + 16, data_va + 48, VK1_C);
+    __asm__ volatile("dsb sy" ::: "memory");
+    const uint64_t streams_va[3] = {stream_va, stream_va + 64, stream_va + 128};
+    const uint32_t streams_bytes[3] = {a_bytes, 56, c_bytes};
+    say("VK1-c group: three subqueue streams on CSG0's queues 0-2, one point, queue 1 gated on queue 0 in memory");
+    const uint32_t result = kumo_metal_queues(api->context, streams_va, streams_bytes, 3);
+    if (result) {
+        say("VK1-c diag: submit result %u; A=0x%08x/0x%08x B=0x%08x/0x%08x C=0x%08x/0x%08x", result, data_cpu[4],
+            data_cpu[5], data_cpu[8], data_cpu[9], data_cpu[12], data_cpu[13]);
+        return 10 + result;
+    }
+    CHECK(data_cpu[4] == VK1_A && data_cpu[5] == 0, 20);
+    CHECK(data_cpu[8] == VK1_B && data_cpu[9] == 0, 21);
+    CHECK(data_cpu[12] == VK1_C && data_cpu[13] == 0, 22);
+    say("VK1-c order: queue 1 waited for queue 0's {0x%08x, status 0}, then stored {0x%08x, status 0}", VK1_A, VK1_B);
+    say("VK1-c independent: queue 2 stored {0x%08x, status 0}; the point completed with GPU status 0", VK1_C);
+    pan_kmod_bo_put(data);
+    pan_kmod_bo_put(stream);
+    pan_kmod_vm_destroy(vm);
+    pan_kmod_dev_destroy(dev);
+    return 0;
+}
+
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
+    if (KUMO_METAL_PROOF == 10)
+        return queue_cases(api);
     if (KUMO_METAL_PROOF == 3 || KUMO_METAL_PROOF == 4)
         return heap_cases(api, KUMO_METAL_PROOF == 4);
     if (KUMO_METAL_PROOF == 5)
@@ -743,6 +808,10 @@ unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 #define BEGIN_LINE "GL1-d metal batch begin: live drv-gpu session, Gallium's clear, flush, fence and readback over the native bridge"
 #define FAILED_LINE "GL1-d metal batch FAILED at case %u"
 #define GREEN_LINE "GL1-d metal batch green: Mali cleared the render target through Gallium, the native fence completed, the CPU read the clear color back, and everything was destroyed"
+#elif KUMO_METAL_PROOF == 10
+#define BEGIN_LINE "VK1-c metal queues begin: live drv-gpu session, one group of three CS queues"
+#define FAILED_LINE "VK1-c metal queues FAILED at case %u"
+#define GREEN_LINE "VK1-c metal queues green: one point carried three subqueue streams, queue 1 ran after queue 0's store, queue 2 ran on its own, all statuses 0"
 #elif KUMO_METAL_PROOF == 9
 #define BEGIN_LINE "GL1-e metal frontend begin: live drv-gpu session, Mesa GLES2 context and KUMO drawable"
 #define FAILED_LINE "GL1-e metal frontend FAILED at case %u"

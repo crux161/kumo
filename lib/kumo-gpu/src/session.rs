@@ -1,8 +1,8 @@
-//j742
 //j743
 //j752
 //j754
 //j755
+//j778
 
 //! Bounded per-channel object table. Commit metadata only after backend success. The backend
 //! must retire on any partial map or uncertain publication; it must never free live DMA.
@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 
 use crate::{
     valid_buffer_bytes, Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
-    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, HeapPlacement, HeapSpec, Request,
-    RequestIds, Response, Status, Submission, SyncState, Timeline, MAX_HEAPS,
-    MAX_TOTAL_BUFFER_BYTES,
+    DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, HeapPlacement, HeapSpec,
+    MultiSubmission, Request, RequestIds, Response, Status, Submission, SyncState, Timeline,
+    MAX_GROUP_QUEUES, MAX_HEAPS, MAX_TOTAL_BUFFER_BYTES,
 };
 
 pub const MAX_BINDINGS: usize = 256;
@@ -113,6 +113,17 @@ pub trait Backend {
         Err(Status::NotSupported)
     }
     fn submit(&mut self, submission: Submission) -> Result<(), SubmitError>;
+    /// VK1: create the session's one group with `queues` ([`MAX_GROUP_QUEUES`]) queues, each
+    /// with its own driver-owned ring. A backend that has not programmed multi-queue groups
+    /// refuses, and nothing is created.
+    fn create_group_queues(&mut self, _queues: u8) -> Result<(), Status> {
+        Err(Status::NotSupported)
+    }
+    /// VK1: publish every stream of `submission` on its queue under the one point, or none
+    /// (`Unpublished`). The point completes when every stream has.
+    fn submit_streams(&mut self, _submission: MultiSubmission) -> Result<(), SubmitError> {
+        Err(SubmitError::Unpublished(Status::NotSupported))
+    }
     /// G7q-a: allocate one heap's context page and initial chunks, link the chunks head-first,
     /// map everything no-execute in the heap window and flush. A recoverable status maps
     /// nothing and keeps nothing; a partial map is `DeviceLost`, and the backend keeps what it
@@ -164,6 +175,8 @@ pub struct Session {
     ids: RequestIds,
     vm: bool,
     group: bool,
+    /// VK1: the live group's queue count, 1 or [`MAX_GROUP_QUEUES`]; 0 with no group.
+    queues: u8,
     retired: bool,
     /// Set by [`Session::close`]. Separate from `retired`, which a backend DeviceLost may set
     /// first: only an explicit close reports released counts, and only once. — TIMBERDOODLE
@@ -236,6 +249,7 @@ impl Session {
         // clearing the flags keeps the closed session from reading as still-created.
         self.vm = false;
         self.group = false;
+        self.queues = 0;
         release
     }
 
@@ -525,6 +539,22 @@ impl Session {
                 }
                 backend.create_group()?;
                 self.group = true;
+                self.queues = 1;
+                Ok(Response::GroupCreated { group: 1 })
+            }
+            Command::GroupCreateQueues { vm, queues } => {
+                if !self.vm || self.group {
+                    return Err(Status::BadState);
+                }
+                if vm != 1 {
+                    return Err(Status::NotFound);
+                }
+                if queues != MAX_GROUP_QUEUES {
+                    return Err(Status::BadRequest);
+                }
+                backend.create_group_queues(queues)?;
+                self.group = true;
+                self.queues = queues;
                 Ok(Response::GroupCreated { group: 1 })
             }
             Command::GroupWatch { group } => {
@@ -556,6 +586,38 @@ impl Session {
                 }
                 self.timeline.reserve(job.signal_point)?;
                 match backend.submit(job) {
+                    Ok(()) => Ok(Response::Submitted {
+                        point: job.signal_point,
+                    }),
+                    Err(SubmitError::Unpublished(status)) => {
+                        self.timeline.abort_unpublished(job.signal_point)?;
+                        Err(status)
+                    }
+                    Err(SubmitError::DeviceLost) => Err(Status::DeviceLost),
+                }
+            }
+            Command::SubmitStreams(job) => {
+                if !self.group {
+                    return Err(Status::BadState);
+                }
+                if job.group != 1 {
+                    return Err(Status::NotFound);
+                }
+                // Every stream names a queue this group has and lies wholly inside one
+                // binding of the group's VM, exactly as a single Submit's stream must.
+                if !job.valid_shape()
+                    || job.streams().iter().any(|stream| {
+                        stream.queue >= self.queues
+                            || !self
+                                .bindings
+                                .iter()
+                                .any(|b| job.single(*stream).validate_for(1, *b).is_ok())
+                    })
+                {
+                    return Err(Status::BadRequest);
+                }
+                self.timeline.reserve(job.signal_point)?;
+                match backend.submit_streams(job) {
                     Ok(()) => Ok(Response::Submitted {
                         point: job.signal_point,
                     }),
@@ -805,6 +867,13 @@ mod tests {
         }
         fn submit(&mut self, s: Submission) -> Result<(), SubmitError> {
             self.calls.push(Command::Submit(s));
+            self.submit_error.take().map_or(Ok(()), Err)
+        }
+        fn create_group_queues(&mut self, queues: u8) -> Result<(), Status> {
+            self.record(Command::GroupCreateQueues { vm: 1, queues })
+        }
+        fn submit_streams(&mut self, m: MultiSubmission) -> Result<(), SubmitError> {
+            self.calls.push(Command::SubmitStreams(m));
             self.submit_error.take().map_or(Ok(()), Err)
         }
         fn retire(&mut self) {
@@ -2297,5 +2366,115 @@ mod tests {
         assert_eq!(s.total_buffer_bytes, 0);
         s.close();
         assert_eq!(s.charge_heap(1, chunk), Err(Status::DeviceLost));
+    }
+
+    fn streams(point: u64, queues: &[(u8, u64)]) -> Command {
+        let mut m = MultiSubmission {
+            group: 1,
+            signal_point: point,
+            count: queues.len() as u8,
+            ..MultiSubmission::default()
+        };
+        for (slot, &(queue, offset)) in m.streams.iter_mut().zip(queues) {
+            *slot = crate::StreamRef {
+                queue,
+                stream_va: VA_START + offset,
+                stream_bytes: 48,
+            };
+        }
+        Command::SubmitStreams(m)
+    }
+
+    fn three_queue_session() -> (Session, Fake) {
+        let (mut s, mut b) = (Session::default(), Fake::default());
+        send(&mut s, &mut b, Command::VmCreate).unwrap();
+        send(&mut s, &mut b, Command::BufferCreate { bytes: PAGE_BYTES }).unwrap();
+        send(&mut s, &mut b, Command::VmBind(binding())).unwrap();
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::GroupCreateQueues { vm: 1, queues: 3 }
+            ),
+            Ok(Response::GroupCreated { group: 1 })
+        );
+        (s, b)
+    }
+
+    #[test]
+    fn vk1_three_subqueue_streams_share_one_point() {
+        let (mut s, mut b) = three_queue_session();
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(0, 0), (1, 64), (2, 128)])),
+            Ok(Response::Submitted { point: 1 })
+        );
+        assert!(matches!(b.calls.last(), Some(Command::SubmitStreams(m)) if m.count == 3));
+        // One point is in flight at a time, as for single Submits: the next waits for it.
+        assert_eq!(send(&mut s, &mut b, job(2)), Err(Status::Busy));
+        s.complete(1, 0).unwrap();
+        assert_eq!(s.fence_state(1), Ok(SyncState::Complete { gpu_status: 0 }));
+        // A single Submit still runs on queue 0 of a three-queue group, on the same timeline.
+        assert_eq!(
+            send(&mut s, &mut b, job(2)),
+            Ok(Response::Submitted { point: 2 })
+        );
+        s.complete(2, 0).unwrap();
+        assert_eq!(
+            send(&mut s, &mut b, streams(3, &[(2, 0)])),
+            Ok(Response::Submitted { point: 3 })
+        );
+    }
+
+    #[test]
+    fn vk1_streams_must_name_a_live_queue_and_lie_in_a_binding() {
+        let (mut s, mut b) = ready();
+        // A one-queue group has only queue 0.
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(1, 0)])),
+            Err(Status::BadRequest)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(0, 0)])),
+            Ok(Response::Submitted { point: 1 })
+        );
+        let (mut s, mut b) = three_queue_session();
+        let calls = b.calls.len();
+        // The binding is one page from VA_START; a stream past it is refused with no I/O.
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(0, 0), (1, PAGE_BYTES)])),
+            Err(Status::BadRequest)
+        );
+        assert_eq!(b.calls.len(), calls);
+        assert_eq!(
+            send(
+                &mut s,
+                &mut b,
+                Command::GroupCreateQueues { vm: 1, queues: 3 }
+            ),
+            Err(Status::BadState)
+        );
+        let mut fresh = (Session::default(), Fake::default());
+        assert_eq!(
+            send(
+                &mut fresh.0,
+                &mut fresh.1,
+                Command::GroupCreateQueues { vm: 1, queues: 3 }
+            ),
+            Err(Status::BadState)
+        );
+    }
+
+    #[test]
+    fn vk1_an_unpublished_multi_submit_returns_its_point() {
+        let (mut s, mut b) = three_queue_session();
+        b.submit_error = Some(SubmitError::Unpublished(Status::Busy));
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(0, 0), (1, 64)])),
+            Err(Status::Busy)
+        );
+        assert_eq!(
+            send(&mut s, &mut b, streams(1, &[(0, 0), (1, 64)])),
+            Ok(Response::Submitted { point: 1 })
+        );
     }
 }

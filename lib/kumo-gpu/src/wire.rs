@@ -1,8 +1,8 @@
-//j681
 //j707
 //j742
 //j752
 //j754
+//j778
 
 //! Exact, versioned little-endian channel frames. All unused fields must be zero. No repr(C),
 //! pointers, native padding or process-local handles cross the wire. One request/reply at a
@@ -12,7 +12,7 @@
 use crate::{
     valid_buffer_bytes, BindFlags, Binding, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu,
     DeviceTexture, DeviceThreads, DeviceTiler, DeviceTopology, GroupReport, HeapPlacement,
-    HeapSpec, Status, Submission, SyncState, Unbind,
+    HeapSpec, MultiSubmission, Status, StreamRef, Submission, SyncState, Unbind, MAX_GROUP_QUEUES,
 };
 
 pub const REQUEST_LEN: usize = 64;
@@ -52,11 +52,20 @@ pub enum Command {
     GroupCreate {
         vm: u32,
     },
+    /// VK1: one normal-priority group of exactly [`MAX_GROUP_QUEUES`] queues, each with its
+    /// own driver-owned 4 KiB ring (D2). One queue is always [`Command::GroupCreate`], so each
+    /// group shape has one encoding. The reply is `GroupCreated`.
+    GroupCreateQueues {
+        vm: u32,
+        queues: u8,
+    },
     /// Obtain a READ-only CPU status VMO, which outlives terminal channel close. — MILVUS
     GroupWatch {
         group: u32,
     },
     Submit(Submission),
+    /// VK1 D1: several subqueue streams under one timeline point. The reply is `Submitted`.
+    SubmitStreams(MultiSubmission),
     /// Query is nonblocking; Pending never implies completion or permission to reuse backing.
     SyncRead {
         group: u32,
@@ -115,6 +124,27 @@ impl Request {
             Command::VmUnbind(u) => (15, [u64::from(u.vm), u.va, u.bytes, 0, 0, 0]),
             Command::GroupCreate { vm } => (4, [u64::from(vm), 0, 0, 0, 0, 0]),
             Command::GroupWatch { group } => (18, [u64::from(group), 0, 0, 0, 0, 0]),
+            Command::GroupCreateQueues { vm, queues } => {
+                (21, [u64::from(vm), u64::from(queues), 0, 0, 0, 0])
+            }
+            Command::SubmitStreams(m) => {
+                // Each entry: VA (the window is below 4 GiB), bytes (at most 64 KiB) from bit
+                // 32 and the queue from bit 56. Unused entries are zero.
+                let entry = |s: StreamRef| {
+                    s.stream_va | (u64::from(s.stream_bytes) << 32) | (u64::from(s.queue) << 56)
+                };
+                (
+                    22,
+                    [
+                        u64::from(m.group) | (u64::from(m.count) << 32),
+                        m.signal_point,
+                        entry(m.streams[0]),
+                        entry(m.streams[1]),
+                        entry(m.streams[2]),
+                        0,
+                    ],
+                )
+            }
             Command::Submit(s) => (
                 5,
                 [
@@ -200,6 +230,27 @@ impl Request {
                 Command::VmUnbind(u)
             }
             4 if a[0] != 0 => Command::GroupCreate { vm: a[0] as u32 },
+            21 if a[0] != 0 && a[1] == u64::from(MAX_GROUP_QUEUES) => Command::GroupCreateQueues {
+                vm: a[0] as u32,
+                queues: MAX_GROUP_QUEUES,
+            },
+            22 => {
+                let entry = |word: u64| StreamRef {
+                    queue: (word >> 56) as u8,
+                    stream_va: word & 0xffff_ffff,
+                    stream_bytes: ((word >> 32) & 0x1_ffff) as u32,
+                };
+                let m = MultiSubmission {
+                    group: a[0] as u32,
+                    signal_point: a[1],
+                    count: (a[0] >> 32) as u8,
+                    streams: [entry(a[2]), entry(a[3]), entry(a[4])],
+                };
+                if !m.valid_shape() {
+                    return None;
+                }
+                Command::SubmitStreams(m)
+            }
             5 => {
                 let s = Submission {
                     group: a[0] as u32,

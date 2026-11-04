@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j773
 #j774
 #j775
 #j776
 #j777
+#j778
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -276,6 +276,17 @@ PROOFS = {
         green=("GL1-a metal streams green: Submit ran streams from cached and uncached writable no-execute "
                "bindings, a rewritten line ran its new words, and a straddling stream was refused"),
         after=None, driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
+    # VK1-c (PLAN/015 §8.2): every bring-up programs three queues (CRUX 2026-11-04); this session
+    # leases all three and runs one point of three subqueue streams, ordered in memory.
+    "vk1-c": dict(
+        define=10, out="vk1-c", begin="VK1-c metal queues begin",
+        lines=["VK1-c group: three subqueue streams on CSG0's queues 0-2, one point, queue 1 gated on queue 0 in memory",
+               "VK1-c order: queue 1 waited for queue 0's {0x7f1b000a, status 0}, then stored {0x7f1b000b, status 0}",
+               "VK1-c independent: queue 2 stored {0x7f1b000c, status 0}; the point completed with GPU status 0"],
+        green=("VK1-c metal queues green: one point carried three subqueue streams, queue 1 ran after queue 0's "
+               "store, queue 2 ran on its own, all statuses 0"),
+        after=None, driver=["drv-gpu: client group 1 leases CSG0 queues 0-2"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"]),
     # GL1-b (J759): Gallium's screen over the native device; the client links Gallium. — TIMBERDOODLE
     "gl1-b": dict(
         define=6, out="gl1-b-metal", gl=True, begin="GL1-b metal screen begin",

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j733
 //j734
 //j742
 //j754
 //j756
+//j778
 
 extern crate alloc;
 
@@ -34,6 +34,9 @@ use drv_gpu::{
     JOB_IRQ_GLOBAL_IF, KUMO_PAINT_BINARY_VA, KUMO_PAINT_DATA_VA, KUMO_PAINT_V10,
     KUMO_PAINT_WORKGROUPS, PAGE_SIZE, PAINT_BYTES, PAINT_HEIGHT, PAINT_STREAM_MAX, PAINT_SURFACE,
     PAINT_WIDTH, SPIN_STREAM_WORDS, SURFACE_CHUNK_BYTES, SYNC_STATUS_OFFSET,
+};
+use drv_gpu::{
+    cs_control_mcu, queues_complete, QueueCounters, QueueJob, GROUP_QUEUES, QUEUE_SYNC_STRIDE,
 };
 use drv_gpu::{csg_pending_events, disable_as, range_unmapped, stop_group};
 use kumo_abi::initrd::{
@@ -72,7 +75,11 @@ const GLB_TIMER_HZ: u32 = 24_000_000;
 /// image loads at the region's start. Metal (J584): an address outside the region truncated to
 /// 0x0100_1000 and faulted writing the read-only firmware image. — TIMBERDOODLE
 const MCU_IO_PAGES_VA: u64 = 0x0410_0000;
-const MCU_SUSPEND_VA: u64 = 0x0410_2000;
+/// VK1-b (CRUX 2026-11-04: every bring-up programs three queues): queue `q`'s two interface
+/// pages sit at `MCU_IO_PAGES_VA + q * 2` pages, so queue 0's are where they always were.
+/// The suspend buffer follows all three, still clear of group B's pages.
+const MCU_IO_LEN: u64 = GROUP_QUEUES as u64 * 2 * PAGE_SIZE;
+const MCU_SUSPEND_VA: u64 = MCU_IO_PAGES_VA + MCU_IO_LEN;
 const _: () = assert!(shared_region_contains(MCU_IO_PAGES_VA));
 const _: () = assert!(shared_region_contains(MCU_SUSPEND_VA));
 /// The group's own address space (AS1), one page each: the ring; the target words (the first
@@ -84,7 +91,25 @@ const RING_SIZE: u64 = 0x1000;
 const AS1_TARGET_VA: u64 = AS1_WORK_VA + PAGE_SIZE;
 const AS1_STREAMS_VA: u64 = AS1_WORK_VA + 2 * PAGE_SIZE;
 const AS1_SYNC_VA: u64 = AS1_WORK_VA + 3 * PAGE_SIZE;
-const WORK_LEN: u64 = 4 * PAGE_SIZE;
+/// VK1-b: queues 1 and 2 get a ring page each after the sync page; queue `q`'s sync object is
+/// `q` lines into the sync page ([`QUEUE_SYNC_STRIDE`]).
+const WORK_LEN: u64 = (3 + GROUP_QUEUES as u64) * PAGE_SIZE;
+const fn ring_va(queue: u32) -> u64 {
+    if queue == 0 {
+        AS1_WORK_VA
+    } else {
+        AS1_WORK_VA + (3 + queue as u64) * PAGE_SIZE
+    }
+}
+const fn queue_iface_of(queue: u32) -> QueueIface {
+    QueueIface::at(MCU_IO_PAGES_VA + queue as u64 * 2 * PAGE_SIZE)
+}
+const fn queue_sync_va(queue: u32) -> u64 {
+    AS1_SYNC_VA + queue as u64 * QUEUE_SYNC_STRIDE
+}
+const _: () = assert!(ring_va(GROUP_QUEUES as u32 - 1) + RING_SIZE <= AS1_WORK_VA + WORK_LEN);
+const _: () =
+    assert!(queue_sync_va(GROUP_QUEUES as u32 - 1) + QUEUE_SYNC_STRIDE <= AS1_SYNC_VA + PAGE_SIZE);
 /// Two wrapped jobs: the second proves the ring advances past a wrapper and the sync object
 /// counts rather than being set.
 const WRAPPED_JOBS: u64 = 2;
@@ -1115,11 +1140,21 @@ fn run_mali(
                 &mut shared_memory,
                 csg_mcu + u64::from(CSG_STREAM_CONTROL_OFFSET),
             );
+            // VK1-b: CSG0's three queues; queue 0's block is `cs`, at the same address.
+            let queue_cs: [CsControl; GROUP_QUEUES] = core::array::from_fn(|q| {
+                read_cs_control(
+                    &mut shared_memory,
+                    cs_control_mcu(csg_mcu, csg.stream_stride, q as u32),
+                )
+            });
             let inside = |va: u64| va >= shared.va && va < shared.va + shared.len;
             if !inside(csg.input_va)
                 || !inside(csg.output_va)
                 || !inside(cs.input_va)
                 || !inside(cs.output_va)
+                || queue_cs
+                    .iter()
+                    .any(|control| !inside(control.input_va) || !inside(control.output_va))
             {
                 log(
                     log_level::ERR,
@@ -1163,7 +1198,7 @@ fn run_mali(
                 readonly: false,
                 executable: false,
             };
-            let Some(io_pages) = map_contiguous(2 * PAGE_SIZE) else {
+            let Some(io_pages) = map_contiguous(MCU_IO_LEN) else {
                 log(
                     log_level::ERR,
                     format_args!("drv-gpu: queue interface pages allocation failed\n"),
@@ -1172,14 +1207,14 @@ fn run_mali(
                 return Err(1);
             };
             dma.push(io_pages);
-            zero_mapping(&io_pages, 2 * PAGE_SIZE);
+            zero_mapping(&io_pages, MCU_IO_LEN);
             if let Err(error) = map_range(
                 &mut table_memory,
                 &mut arena,
                 transtab,
                 MCU_IO_PAGES_VA,
                 io_pages.phys,
-                2 * PAGE_SIZE,
+                MCU_IO_LEN,
                 noexec_uncached,
             ) {
                 log(
@@ -1443,7 +1478,7 @@ fn run_mali(
                 McuWindow {
                     mcu: MCU_IO_PAGES_VA,
                     cpu: io_pages.va,
-                    len: 2 * PAGE_SIZE,
+                    len: MCU_IO_LEN,
                 },
                 suspend_window,
             ];
@@ -1470,7 +1505,7 @@ fn run_mali(
                 address_space: GROUP_AS,
                 suspend_va,
                 protm_suspend_va: 0,
-                queue_mask: 1,
+                queue_mask: (1 << GROUP_QUEUES) - 1,
             };
             log(
                 log_level::NOTICE,
@@ -1490,6 +1525,21 @@ fn run_mali(
             let start = {
                 let mut glb_io = SharedGlb::new(&mut *device, input, output, windows);
                 program_queue(&mut glb_io, cs.input_va, queue);
+                // VK1-b: the subqueues share queue 0's doorbell and priority, each with its
+                // own ring and interface pages.
+                for (q, control) in queue_cs.iter().enumerate().skip(1) {
+                    let iface = queue_iface_of(q as u32);
+                    program_queue(
+                        &mut glb_io,
+                        control.input_va,
+                        QueueConfig {
+                            ring_va: ring_va(q as u32),
+                            ring_input_va: iface.input_va,
+                            ring_output_va: iface.output_va,
+                            ..queue
+                        },
+                    );
+                }
                 program_group(&mut glb_io, csg.input_va, csg.output_va, group);
                 start_group(
                     &mut glb_io,
@@ -2070,6 +2120,7 @@ fn run_mali(
                 windows,
                 csg,
                 cs,
+                queue_cs,
                 shader_present,
                 mmu.features,
                 tiler_features,

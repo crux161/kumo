@@ -1,9 +1,42 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j773 -->
 <!-- j774 -->
 <!-- j775 -->
 <!-- j776 -->
 <!-- j777 -->
+<!-- j778 -->
+
+## VK1: three-queue groups (J778, metal-proven)
+
+VK1 (PLAN/015 §8.2) gives panvk its three CSF subqueues per group: vertex/tiler, fragment
+and compute. CRUX ratified the cut on 2026-11-03: D1 is several subqueue streams under one
+point on the group's one timeline, and D2 is a driver-owned 4 KiB ring per queue. On
+2026-11-04 CRUX decided that every bring-up programs three queues.
+
+- **VK1-a (kumo-gpu).** `GroupCreateQueues` (opcode 21, exactly three queues) and
+  `SubmitStreams` (opcode 22: up to three `(queue, stream)` entries, one point). Single-queue
+  encodings are byte-identical.
+- **VK1-b (drv-gpu).** CSG0 programs CS0-CS2. Each queue gets a 4 KiB ring, two MCU
+  interface pages and a sync line, and they share the group's doorbell; `queue_mask` is
+  0b111. Queue 0 is unchanged. Each queue's expected seqno has its own counter
+  (`QueueCounters`), and a point completes when every carried queue's sync object has
+  reached it.
+- **VK1-c (`--proof vk1-c`, device-metal proof 10).** One point carries three streams.
+  Queue 0 stores A. Queue 1 `SYNC_WAIT32`s until A lands, then stores B. Queue 2 stores C on
+  its own. The check requires all three values with status 0 and drv-gpu's
+  `leases CSG0 queues 0-2` line.
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk1-c --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk1-c --check <tio-log>
+```
+
+**Metal (J778, 2026-11-04), first boot.** The firmware accepted the three-queue CSG0 start
+(suspend buffer moved to `0x4106000`), and the four bring-up jobs completed unchanged.
+`client group 1 leases CSG0 queues 0-2`, then A, B and C landed in order with status 0, and
+containment was clean. A GL3-c boot on the same bring-up stayed green (single-queue sessions,
+18 tiler-OOM refusals on queue 0). VK2-a's later fix to `Client::matches_response` (the
+client refused `GroupCreateQueues`/`SubmitStreams` replies) landed here, with its test, because
+VK1-c needs it.
 
 ## GL4: G8's metal gate through public GL (J777, metal-proven)
 

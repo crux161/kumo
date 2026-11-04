@@ -1,8 +1,8 @@
-//j742
 //j744
 //j745
 //j752
 //j754
+//j778
 
 //! G7a's reusable native client boundary. No allocation, OS handles, MMIO or scheduling
 //! policy lives here. One mutable client performs one request/reply at a time. A transport
@@ -12,8 +12,8 @@
 
 use crate::{
     Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu, DeviceTexture,
-    DeviceThreads, DeviceTiler, DeviceTopology, Fence, Reply, Request, Response, Status,
-    Submission, SyncState, Unbind, REPLY_LEN, REQUEST_LEN,
+    DeviceThreads, DeviceTiler, DeviceTopology, Fence, MultiSubmission, Reply, Request, Response,
+    Status, Submission, SyncState, Unbind, REPLY_LEN, REQUEST_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,6 +188,15 @@ impl<T: Transport> Client<T> {
         };
         Ok(group)
     }
+    /// VK1: the session's one group with `queues` ([`crate::MAX_GROUP_QUEUES`]) queues.
+    pub fn create_group_queues(&mut self, vm: u32, queues: u8) -> Result<u32, Error> {
+        let (Response::GroupCreated { group }, _) =
+            self.call(Command::GroupCreateQueues { vm, queues })?
+        else {
+            unreachable!()
+        };
+        Ok(group)
+    }
     pub fn watch_group(&mut self, group: u32) -> Result<crate::GroupWatch<T::Handle>, Error> {
         let (Response::GroupWatch { report, .. }, Some(handle)) =
             self.call(Command::GroupWatch { group })?
@@ -232,6 +241,18 @@ impl<T: Transport> Client<T> {
     /// — TIMBERDOODLE
     pub fn submit_fence(&mut self, submission: Submission) -> Result<Fence, Error> {
         let (Response::Submitted { point }, _) = self.call(Command::Submit(submission))? else {
+            unreachable!()
+        };
+        Ok(Fence {
+            group: submission.group,
+            point,
+        })
+    }
+    /// VK1 D1: several subqueue streams under one point, kept as a fence. Acceptance is not
+    /// completion; the point completes when every carried stream has.
+    pub fn submit_streams_fence(&mut self, submission: MultiSubmission) -> Result<Fence, Error> {
+        let (Response::Submitted { point }, _) = self.call(Command::SubmitStreams(submission))?
+        else {
             unreachable!()
         };
         Ok(Fence {
@@ -369,7 +390,8 @@ fn matches_response(command: Command, response: Response) -> bool {
         | (Command::GetMemoryProperties, Response::Memory(_))
         | (Command::VmCreate, Response::VmCreated { .. })
         | (Command::VmBind(_), Response::VmBound)
-        | (Command::GroupCreate { .. }, Response::GroupCreated { .. }) => true,
+        | (Command::GroupCreate { .. }, Response::GroupCreated { .. })
+        | (Command::GroupCreateQueues { .. }, Response::GroupCreated { .. }) => true,
         (Command::VmUnbind(range), Response::VmUnbound(received)) => range == received,
         (
             Command::GroupWatch { group },
@@ -391,6 +413,8 @@ fn matches_response(command: Command, response: Response) -> bool {
             heap == received
         }
         (Command::Submit(job), Response::Submitted { point }) => job.signal_point == point,
+        // VK1: one point for every carried stream.
+        (Command::SubmitStreams(job), Response::Submitted { point }) => job.signal_point == point,
         (
             Command::SyncRead { point, .. },
             Response::Sync {

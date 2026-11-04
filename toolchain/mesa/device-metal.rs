@@ -1,8 +1,8 @@
-//j747
 //j753
 //j754
 //j774
 //j777
+//j778
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -203,6 +203,67 @@ pub extern "C" fn kumo_metal_run(
     // normally answers Complete; Pending is bounded rather than spun forever.
     for _ in 0..1000 {
         match client.sync_read(group, point) {
+            Ok(SyncState::Complete { gpu_status: 0 }) => {
+                unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+                return 0;
+            }
+            Ok(SyncState::Complete { .. }) => return 4,
+            Ok(SyncState::Pending) => continue,
+            Err(_) => return 5,
+        }
+    }
+    6
+}
+
+/// VK1-c: the session's one group of three queues, created at first use.
+static QUEUE_GROUP: AtomicU32 = AtomicU32::new(0);
+
+/// VK1-c (PLAN/015 §8.2): one SubmitStreams carrying `count` (at most three) subqueue streams,
+/// stream `i` on queue `i`, under one point of the three-queue group. Returns 0 when the point
+/// completes with GPU status 0. The streams order themselves in memory, as panvk's do.
+#[no_mangle]
+pub extern "C" fn kumo_metal_queues(
+    context: *mut c_void,
+    streams_va: *const u64,
+    streams_bytes: *const u32,
+    count: u32,
+) -> u32 {
+    if context.is_null() || streams_va.is_null() || streams_bytes.is_null() {
+        return 1;
+    }
+    if count == 0 || count > u32::from(kumo_gpu::MAX_GROUP_QUEUES) {
+        return 1;
+    }
+    // SAFETY: as in kumo_metal_run.
+    let client: &mut Client<native::Channel> =
+        unsafe { &mut *context.cast::<Store<'_>>() }.native_client();
+    if QUEUE_GROUP.load(Ordering::Relaxed) == 0 {
+        match client.create_group_queues(1, kumo_gpu::MAX_GROUP_QUEUES) {
+            Ok(group) => QUEUE_GROUP.store(group, Ordering::Relaxed),
+            Err(_) => return 2,
+        }
+    }
+    let group = QUEUE_GROUP.load(Ordering::Relaxed);
+    let mut submission = kumo_gpu::MultiSubmission {
+        group,
+        signal_point: NEXT_POINT.fetch_add(1, Ordering::Relaxed),
+        count: count as u8,
+        ..Default::default()
+    };
+    for queue in 0..count as usize {
+        // SAFETY: the caller's `count`-entry arrays.
+        submission.streams[queue] = kumo_gpu::StreamRef {
+            queue: queue as u8,
+            stream_va: unsafe { *streams_va.add(queue) },
+            stream_bytes: unsafe { *streams_bytes.add(queue) },
+        };
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+    let Ok(fence) = client.submit_streams_fence(submission) else {
+        return 3;
+    };
+    for _ in 0..1000 {
+        match client.sync_read(group, fence.point) {
             Ok(SyncState::Complete { gpu_status: 0 }) => {
                 unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
                 return 0;

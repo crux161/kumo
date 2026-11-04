@@ -1,9 +1,9 @@
 #![no_std]
-//j751
 //j752
 //j754
 //j755
 //j758
+//j778
 
 //! G6a's GPU channel contract (PLAN/013), shared by clients and drv-gpu. Recovery class:
 //! soft-state. One channel owns one VM, one group/queue and its completion timeline; IDs are
@@ -361,6 +361,66 @@ impl Submission {
             return Err(Status::BadRequest);
         }
         Ok(())
+    }
+}
+
+/// VK1 (PLAN/015 §8.2; cut ratified by CRUX 2026-11-03): panvk's three subqueues per group
+/// (vertex/tiler, fragment, compute). A group is created with one queue (GroupCreate) or
+/// exactly this many (GroupCreateQueues).
+pub const MAX_GROUP_QUEUES: u8 = 3;
+
+/// One subqueue stream of a [`MultiSubmission`]: queue `queue` runs `stream_bytes` of CS words
+/// at `stream_va`, under the same shape rules as a single [`Submission`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamRef {
+    pub queue: u8,
+    pub stream_va: u64,
+    pub stream_bytes: u32,
+}
+
+/// VK1 D1: up to [`MAX_GROUP_QUEUES`] subqueue streams under one `signal_point` on the group's
+/// one timeline (G7p's fences are unchanged). The point completes when every carried stream
+/// has. Streams name distinct queues in ascending order, and unused entries are zero, so each
+/// submission has exactly one encoding. Cross-subqueue order is the streams' own business,
+/// kept in memory with CS sync instructions, as panvk keeps it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MultiSubmission {
+    pub group: u32,
+    pub signal_point: u64,
+    pub count: u8,
+    pub streams: [StreamRef; MAX_GROUP_QUEUES as usize],
+}
+
+impl MultiSubmission {
+    /// The carried streams, `count` of them.
+    pub fn streams(&self) -> &[StreamRef] {
+        &self.streams[..usize::from(self.count.min(MAX_GROUP_QUEUES))]
+    }
+
+    /// Stream `stream` as a single submission, for the shared shape and binding checks.
+    pub fn single(self, stream: StreamRef) -> Submission {
+        Submission {
+            group: self.group,
+            stream_va: stream.stream_va,
+            stream_bytes: stream.stream_bytes,
+            signal_point: self.signal_point,
+        }
+    }
+
+    pub fn valid_shape(self) -> bool {
+        let count = usize::from(self.count);
+        self.group != 0
+            && self.signal_point != 0
+            && (1..=usize::from(MAX_GROUP_QUEUES)).contains(&count)
+            && self.streams[count..]
+                .iter()
+                .all(|unused| *unused == StreamRef::default())
+            && self.streams[..count]
+                .iter()
+                .all(|stream| stream.queue < MAX_GROUP_QUEUES && self.single(*stream).valid_shape())
+            && self.streams[..count]
+                .windows(2)
+                .all(|pair| pair[0].queue < pair[1].queue)
     }
 }
 

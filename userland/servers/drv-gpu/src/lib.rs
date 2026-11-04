@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j743
 //j752
 //j754
 //j755
 //j756
+//j778
 
 //! G1b–G5c: power, identity, reset, the first MMU state and the CSF firmware image for the
 //! RK3588 Mali-G610. Recovery class: soft-state; all state is rediscovered on launch and
@@ -2688,6 +2688,67 @@ pub struct JobSlot {
 /// The next wrapper starts on a whole line at or after `insert`, so the prefetcher never fetches
 /// a line the host is still writing; a queue left mid-line (J586's 40-byte first stream) skips
 /// ahead over NOPs. None when the job would overwrite words the firmware has not consumed.
+/// VK1-b (PLAN/015 §8.2; CRUX 2026-11-04: every bring-up programs three queues). CSG0 runs
+/// panvk's three subqueues (vertex/tiler, fragment, compute); queue 0 is today's queue.
+pub const GROUP_QUEUES: usize = 3;
+/// Queue `q`'s sync object sits `q` lines into the queue sync page.
+pub const QUEUE_SYNC_STRIDE: u64 = 64;
+
+/// MCU address of queue `queue`'s CS control block (§9.6): the stream blocks follow the CSG's
+/// at [`CSG_STREAM_CONTROL_OFFSET`], `stream_stride` apart. Queue 0 is today's address.
+pub const fn cs_control_mcu(csg_control_mcu: u64, stream_stride: u32, queue: u32) -> u64 {
+    csg_control_mcu + CSG_STREAM_CONTROL_OFFSET as u64 + queue as u64 * stream_stride as u64
+}
+
+/// One queue's part of a published point: its wrapper, where the wrapper lands in that queue's
+/// ring, and the seqno that queue's sync object must reach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueJob {
+    pub queue: u32,
+    pub insert: u64,
+    pub slot: JobSlot,
+    pub words: [u64; JOB_WRAPPER_WORDS],
+    pub seqno: u64,
+}
+
+/// Each queue's sync object counts the wrappers it completed (each ends in SYNC_ADD64 +1), so a
+/// queue's expected seqno is its base plus the jobs published on it. Queue 0's base is the
+/// bring-up jobs. For a session that only Submits, queue 0's next seqno is exactly the old
+/// `base + point`, because every point then runs one job on queue 0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueueCounters {
+    base: [u64; GROUP_QUEUES],
+    published: [u64; GROUP_QUEUES],
+}
+
+impl QueueCounters {
+    pub const fn new(queue0_base: u64) -> Self {
+        Self {
+            base: [queue0_base, 0, 0],
+            published: [0; GROUP_QUEUES],
+        }
+    }
+
+    /// The seqno queue `queue`'s next job will reach, without committing it.
+    pub fn next(&self, queue: u32) -> Option<u64> {
+        let q = usize::try_from(queue).ok().filter(|q| *q < GROUP_QUEUES)?;
+        self.base[q].checked_add(self.published[q])?.checked_add(1)
+    }
+
+    /// Record one job published on `queue`; call once its wrapper is prepared.
+    pub fn commit(&mut self, queue: u32) {
+        if let Some(count) = self.published.get_mut(queue as usize) {
+            *count += 1;
+        }
+    }
+}
+
+/// Whether every carried queue's sync object has reached its job's seqno: a point completes
+/// when all of its streams have (VK1 D1).
+pub fn queues_complete(jobs: &[QueueJob], mut seqno_of: impl FnMut(u32) -> u64) -> bool {
+    jobs.iter().all(|job| seqno_of(job.queue) >= job.seqno)
+}
+
 pub fn job_slot(insert: u64, extract: u64, ring_size: u64) -> Option<JobSlot> {
     let start = insert.checked_add(CS_LINE_BYTES - 1)? & !(CS_LINE_BYTES - 1);
     let end = start + JOB_WRAPPER_BYTES;
@@ -5249,6 +5310,70 @@ mod g4b_tests {
                 (0x603c, 0),
             ]
         );
+    }
+
+    #[test]
+    fn vk1_three_queue_addresses_extend_queue_zero() {
+        // Queue 0 is today's CS control block; the others follow at the CSG's stream stride.
+        assert_eq!(
+            cs_control_mcu(0x1000, 0x20, 0),
+            0x1000 + u64::from(CSG_STREAM_CONTROL_OFFSET)
+        );
+        assert_eq!(cs_control_mcu(0x1000, 0x20, 2), 0x1040 + 0x40);
+        let mut io = FakeFirmware::new();
+        for queue in 0..GROUP_QUEUES as u64 {
+            program_queue(
+                &mut io,
+                0x6000 + queue * 0x100,
+                QueueConfig {
+                    ring_va: 0x1000_0000 + queue * 0x1000,
+                    ring_size: 0x1000,
+                    ring_input_va: 0x0410_0000 + queue * 0x2000,
+                    ring_output_va: 0x0410_1000 + queue * 0x2000,
+                    doorbell: 1,
+                    priority: 0,
+                },
+            );
+        }
+        // Every queue shares the group's doorbell, as Panthor's queues do.
+        for queue in 0..GROUP_QUEUES as u64 {
+            assert_eq!(io.get(0x6004 + queue * 0x100), 1 << 8);
+        }
+    }
+
+    #[test]
+    fn vk1_queue_counters_keep_queue_zero_and_count_each_queue() {
+        let mut counters = QueueCounters::new(3);
+        // A Submit-only session: base + point, as before VK1.
+        for point in 1..=4u64 {
+            assert_eq!(counters.next(0), Some(3 + point));
+            counters.commit(0);
+        }
+        // Subqueues count from zero, independently of queue 0 and of each other.
+        assert_eq!(counters.next(1), Some(1));
+        assert_eq!(counters.next(2), Some(1));
+        counters.commit(2);
+        assert_eq!(counters.next(2), Some(2));
+        assert_eq!(counters.next(1), Some(1));
+        assert_eq!(counters.next(3), None);
+    }
+
+    #[test]
+    fn vk1_a_point_completes_only_when_every_carried_queue_has() {
+        let job = |queue, seqno| QueueJob {
+            queue,
+            insert: 0,
+            slot: JobSlot {
+                start: 0,
+                end: JOB_WRAPPER_BYTES,
+            },
+            words: [0; JOB_WRAPPER_WORDS],
+            seqno,
+        };
+        let jobs = [job(0, 5), job(2, 1)];
+        assert!(!queues_complete(&jobs, |q| if q == 0 { 5 } else { 0 }));
+        assert!(!queues_complete(&jobs, |q| if q == 0 { 4 } else { 1 }));
+        assert!(queues_complete(&jobs, |q| if q == 0 { 5 } else { 1 }));
     }
 
     #[test]
