@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j775
 #j776
 #j777
 #j779
 #j780
+#j782
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -386,7 +386,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     paths.extend(TOOL / f"{obj.stem}.c" for obj in gl_objects)
     if vk:
         paths.extend([TOOL / "drm-refusal.c", TOOL / "static-build-id.c", TOOL / "kumo-build.patch",
-                      TOOL / "vk-memory-policy.h",
+                      TOOL / "vk-memory-policy.h", TOOL / "vk-compute.spv.h",
                       TOOL / "build-drivers.py", out / "vk-static-entrypoints.rsp",
                       TOOL / "build-compiler.py", linker_script, *vk_inputs,
                       ROOT / "build/mesa-drivers/result/inventory.json"])

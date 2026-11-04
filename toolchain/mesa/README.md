@@ -1,9 +1,64 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j776 -->
 <!-- j777 -->
 <!-- j778 -->
 <!-- j780 -->
 <!-- j781 -->
+<!-- j782 -->
+
+## VK3-b: runtime Vulkan compute on Mali (J782, metal-proven)
+
+[vk-compute.c](vk-compute.c) (`--proof vk3-b`) is VK3's gate: VK3-a's pinned SPIR-V,
+compiled by panvk at runtime and dispatched on Mali through the static ICD. It reuses VK2-e's
+bring-up and observation: every native request and buffer is counted in place, and
+`drmIoctl`, `drmGetDevices2` and `drmSyncobjCreate` are wrapped, so reaching any of them fails
+the proof.
+
+- **Pipeline.** The 308-word module becomes a compute pipeline with no pipeline cache.
+  panvk's SPIR-V → NIR → Valhall compiler runs on KUMO, and pipeline creation makes no
+  native submission.
+- **Buffer.** 1088 storage words in host-visible, coherent and uncached memory, poisoned
+  to `0xdeadbeef` from the CPU before each pass.
+- **Two passes.** Each pass is its own primary command buffer: bind, push `k` and
+  `count = 1000`, dispatch 16 workgroups of 64, then a compute-to-host barrier. Pass 1 uses
+  `k = 0x6b750000` and pass 2 uses `k = 0x6b760000`. After each fenced submit, words 0-999
+  must be `i * 3 + k`. The 24 invocations at or above `count` and the 64 guards past the
+  dispatch must keep the poison.
+- **Submission split, exact.** panvk's first dispatch on a subqueue adds its one-time
+  REQ_RESOURCE stream (compute resources) ahead of the command buffer. Every primary
+  command buffer ends with `finish_cs` on all three subqueues, so it always carries three
+  streams. Subqueue 2 therefore repeats in the first submit, and VK2-d's split makes it
+  two native submissions: `[2]`, then `[0, 1, 2]`. Panthor would also run the request first
+  on that queue. The second submit is one native submission of three streams. This is
+  panvk's first use of VK1's multi-stream points.
+- **Teardown.** Every Vulkan object, the device and the instance are destroyed. The native
+  buffers and the heap are released, and only the session's group remains.
+
+**Metal (J782, 2026-11-04).** Boot 1 stopped at the submission-count check. The client
+expected one compute stream, but the first dispatch also carries the REQ_RESOURCE stream.
+The fence had completed and containment was clean. Boot 2 reran the same image: the
+swap to the fixed client landed mid-TFTP, and pxehost served the already-open file. On boot 3
+the client printed the measured split and readback before checking them, and was green:
+
+```text
+VK3-b pipeline: the pinned 308-word SPIR-V module compiled by panvk on KUMO into a compute pipeline (local size 64, no pipeline cache), with no native submission
+VK3-b submit 1: one fenced vkQueueSubmit as 2 native submissions of 4 streams: subqueues [2] then [0, 1 and 2]; the fence completed
+VK3-b readback 1: 0 of 1000 words differ from i*3+k; 0 of 24 invocations at or above count and 0 of 64 guards changed (Mali: first=0x6b750000 last=0x6b750bb5)
+VK3-b submit 2: one fenced vkQueueSubmit as 1 native submission of 3 streams: subqueues [0, 1 and 2]; the fence completed
+VK3-b readback 2: 0 of 1000 words differ from i*3+k; 0 of 24 invocations at or above count and 0 of 64 guards changed (Mali: first=0x6b760000 last=0x6b760bb5)
+VK3-b teardown: every object, the device and the instance destroyed; 19 of 19 native buffers and the heap released, only the session's group left; no Panthor ioctl, DRM listing or syncobj
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+drv-gpu showed `client group 1 leases CSG0 queues 0-2` and the 5 x 2 MiB heap at
+`0x30000000`, with no AS1 fault or failed point. The client hash was `d0590be6…`; the
+initrd served was 24,564,223 bytes. Evidence: `build/proofs/vk3-b-metal/metal-boot-to-login.log`.
+**VK3 is closed.** VK4 (first Vulkan triangle) is next.
+— TIMBERDOODLE 2026-11-04
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk3-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk3-b --check <tio-log>
+```
 
 ## VK3-a: compute shader artifacts (J781)
 
@@ -20,8 +75,8 @@ python3 toolchain/mesa/vk-spirv.py --verify
 
 The verifier checks the recorded source and SPIR-V hashes. Regeneration needs the compiler
 and validator named by `vk-spirv.py --help`. RE8 preserves the source/header pair byte for
-byte from K2. VK3-b will create and dispatch the compute pipeline on Mali and check its
-output; this artifact check provides no runtime compute result.
+byte from K2. This artifact check provides no runtime compute result; VK3-b (above) runs the
+module on Mali.
 
 ## VK2: panvk over the native session (J779/J780, metal-proven)
 

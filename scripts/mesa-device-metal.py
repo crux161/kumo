@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j775
 #j776
 #j777
 #j778
 #j780
+#j782
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -127,6 +127,36 @@ PROOFS = {
                "VK2-e second instance: no physical device; no Panthor ioctl, DRM device listing or syncobj at any point"],
         green=("VK2-e metal device green: one instance, the Mali-G610, a device on the three-queue group, "
                "an idle queue and clean teardown"),
+        driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
+                "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK3-b (PLAN/015 §8.2): VK3-a's pinned SPIR-V compiled by panvk at runtime and dispatched
+    # on Mali. The client counts every native request and buffer and wraps the same three libdrm
+    # entries as VK2-e. The submit line names the measured native split of the one fenced
+    # vkQueueSubmit; the teardown line ends in the measured buffer count, so only its prefix is
+    # required. — TIMBERDOODLE
+    "vk3-b": dict(
+        cases="vk-compute", runtime="device-metal", defines=["-DKUMO_VK_COMPUTE_MAIN=1"],
+        out="vk3-b-metal", vk=True, begin="VK3-b metal compute begin",
+        lines=["VK3-b device: Mali-G610",
+               "through the static ICD, one three-queue native group and 3 init submissions",
+               "VK3-b pipeline: the pinned 308-word SPIR-V module compiled by panvk on KUMO into a compute "
+               "pipeline (local size 64, no pipeline cache), with no native submission",
+               "VK3-b buffer: 1088 storage words (",
+               "uncached) poisoned to 0xdeadbeef from the CPU",
+               "VK3-b record: two command buffers, each bind, push k (0x6b750000, then 0x6b760000) and count=1000, "
+               "dispatch 16 workgroups of 64, compute-to-host barrier",
+               "VK3-b submit 1: one fenced vkQueueSubmit as 2 native submissions of 4 streams: subqueues [2] then "
+               "[0, 1 and 2]; the fence completed",
+               "VK3-b readback 1: 0 of 1000 words differ from i*3+k; 0 of 24 invocations at or above count and 0 of "
+               "64 guards changed (Mali: first=0x6b750000 last=0x6b750bb5)",
+               "VK3-b submit 2: one fenced vkQueueSubmit as 1 native submission of 3 streams: subqueues [0, 1 and 2]; "
+               "the fence completed",
+               "VK3-b readback 2: 0 of 1000 words differ from i*3+k; 0 of 24 invocations at or above count and 0 of "
+               "64 guards changed (Mali: first=0x6b760000 last=0x6b760bb5)",
+               "VK3-b teardown: every object, the device and the instance destroyed; "],
+        green=("VK3-b metal compute green: a runtime-compiled Vulkan compute pipeline wrote all 1000 storage "
+               "words on Mali twice, the bound and guards intact, and clean teardown"),
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
