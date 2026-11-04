@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j769
 #j770
 #j772
 #j773
 #j774
+#j775
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -62,6 +62,18 @@ TRIANGLE_LINES = [b"GL3-a context: current GLES context over the native GPU sess
                   b"GL3-a coverage: 16384 pixels inside x+2y<=254; samples ",
                   b"GL3-a layout: color modifier after readback 0x",
                   b"GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"]
+# GL3-c (PLAN/015 §8.32): mode 26's heap draw. The modeled service runs no GPU, so no
+# TILER_OOM fires here; the mode proves the proof-only overrides reach the native heap
+# request. The target line names the measured color modifier.
+HEAP_DRAW_LINES = [b"GL3-c heap config: pan_csf_chunk_size=262144 pan_csf_initial_chunks=1 pan_csf_max_chunks=2 set before screen creation (proof-only overrides)",
+                   b"GL3-c context: current GLES context over the native GPU session",
+                   b"GL3-c target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
+                   b"GL3-c compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
+                   b"GL3-c baseline: public glReadPixels observed an image different from the expected one",
+                   b"GL3-c draw: glClear and one glDrawElementsInstanced of 16 layers x 32768 triangles (1x2-pixel cells), native glFinish complete",
+                   b"GL3-c readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (modeled service, initial framebuffer retained)",
+                   b"GL3-c samples: ",
+                   b"GL3-c destroy: shaders, program, index buffer, context, drawable and display released"]
 
 
 def run(command, **kwargs):
@@ -225,7 +237,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         (out / "kumo").mkdir(exist_ok=True)
         linker_script = compiler.link_script()
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle", "gl-heap"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -345,6 +357,15 @@ def main():
             assert at < proof.index(GREEN)
             assert b"GL3-a model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
             print("GL3-a triangle green: runtime vertex/fragment compilation, a public draw, native completion, initial framebuffer retained, readback guards intact and clean teardown; modeled service runs no GPU", flush=True)
+            at = 0
+            for line in HEAP_DRAW_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            assert b"GL3-c model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
+            assert b"GL3-c model heap: chunk_bytes=262144 initial_chunks=1 max_chunks=2 target_in_flight=65535" in proof
+            print("GL3-c heap shape green: proof-only driconf overrides reached Gallium's native heap request (262144 x 1, max 2), "
+                  "an instanced draw, initial framebuffer retained and clean teardown; modeled service runs no GPU", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)
         print(HEAP_GREEN.decode(), flush=True)
         print(GROUP_GREEN.decode(), flush=True)

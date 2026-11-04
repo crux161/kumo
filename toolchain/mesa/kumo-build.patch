@@ -1,8 +1,8 @@
-#j759
 #j760
 #j761
 #j762
 #j765
+#j775
 --- a/include/drm-uapi/drm.h
 +++ b/include/drm-uapi/drm.h
 @@ -45,7 +45,7 @@
@@ -1272,3 +1272,17 @@
 
     caps->context_priority_mask = from_kmod_group_allow_priority_flags(
        dev->kmod.dev->props.allowed_group_priorities_mask);
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -430,6 +430,11 @@
+
+       /* We need to flush the texture caches so future preloads see the new
+        * content. */
++#ifdef __kumo__
++      /* RE2 (KUMO): flush ID 0 always flushes. r58 is otherwise whatever the
++       * interrupted stream left there, which can mark this invalidate done. */
++      cs_move32_to(&b, flush_id, 0);
++#endif
+       cs_flush_caches(&b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE,
+                       MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, flush_id,
+                       cs_defer(0, 0));

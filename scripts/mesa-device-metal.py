@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j769
 #j770
 #j772
 #j773
 #j774
+#j775
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -58,7 +58,36 @@ GL3A = ["GL3-a context: current GLES context over the native GPU session",
         "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
         "GL3-a layout: color modifier after readback 0x",
         "GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"]
+# GL3-c (PLAN/015 §8.32, D3; G7q-d): sixteen layers of 32768 tiny triangles on a one-chunk,
+# max-two heap. The samples are exact: R = x, G = 2y, and blue (the last layer's) and alpha
+# (the sum over layers) both 15 x 16 = 240.
+GL3C = ["GL3-c heap config: pan_csf_chunk_size=262144 pan_csf_initial_chunks=1 pan_csf_max_chunks=2 set before screen creation (proof-only overrides)",
+        "GL3-c context: current GLES context over the native GPU session",
+        "GL3-c target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
+        "GL3-c compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
+        "GL3-c baseline: public glReadPixels observed an image different from the expected one",
+        "GL3-c draw: glClear and one glDrawElementsInstanced of 16 layers x 32768 triangles (1x2-pixel cells), native glFinish complete",
+        "GL3-c readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali: last layer's RGB, alpha summed over all 16 layers)",
+        "GL3-c samples: (0,0)=0xf0f00000 (255,0)=0xf0f000ff (0,127)=0xf0f0fe00 (255,127)=0xf0f0feff",
+        "GL3-c destroy: shaders, program, index buffer, context, drawable and display released"]
 PROOFS = {
+    # GL3-c: the client proves its image; drv-gpu's own lines prove the heap. The fresh
+    # session's first heap lands at the window's start (G7q-a), one chunk, max two; the first
+    # TILER_OOM grows it to two chunks exactly once, and every later one is refused at the
+    # maximum (`driver_any`: at least once), which is when Gallium's exception handler
+    # renders incrementally. Too small a draw fails the refusal line: raise
+    # -DKUMO_GL_HEAP_LAYERS and update GL3C's draw, readback and sample lines (each layer's
+    # step is 255 / layers).
+    "gl3-c": dict(
+        cases="gl-heap", runtime="device-metal", defines=["-DKUMO_GL_HEAP_MAIN=1"],
+        out="gl3-c-metal", gl=True, begin="GL3-c metal heap begin",
+        lines=GL3C,
+        green=("GL3-c metal heap green: the instanced draw's image is exact on a one-chunk, max-two tiler heap, "
+               "guards intact and clean teardown"),
+        driver=["drv-gpu: client heap 1 context 0x30000000 chunks 1x262144 head 0x30001000 (max 2, in flight 65535)",
+                "drv-gpu: client heap 1 grew to 2 chunks: 0x"],
+        driver_any=["drv-gpu: client heap 1 not grown at 2 chunks"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point", "drv-gpu: tiler OOM names no heap"], after=None),
     # GL3-b (PLAN/015 §8.32): the GL3-a triangle copied into view 1 and held on HDMI. The stage
     # adds the `view` lane marker (D1). This image runs no J0c diagnostic, so drv-fb's present
     # gate stays unarmed and the presents are Copied: CRUX accepted that gate on 2026-11-03,
@@ -326,12 +355,17 @@ def check(log, proof):
     for expected in proof["driver"]:
         hits = [line for line in failure if expected in line]
         assert len(hits) == 1, f"{expected!r} appears {len(hits)} times in the failure window"
+    for expected in proof.get("driver_any", []):
+        hits = [line for line in failure if expected in line]
+        assert hits, f"{expected!r} never appears in the proof window"
+        print(f"{expected!r}: {len(hits)} times")
     for unwanted in proof["absent"]:
         assert not any(unwanted in line for line in failure), f"{unwanted!r} in the failure window"
     for bad in ("TOWER", "FAILED", "ABEND"):
         assert not any(bad in line for line in live), f"{bad} in the boot"
     for line in window:
         if line.split("] ", 1)[-1].startswith(("drv-gpu: AS1 fault", "drv-gpu: client point", "drv-gpu: containment",
+                                               "drv-gpu: client heap",
                                                "drv-gpu: CS status", "drv-gpu: MMU rawstat", "drv-gpu: reset",
                                                "gpu-client: client exited", "G7p-e diag", "G7o-f diag")):
             print(line)

@@ -1,8 +1,8 @@
-//j742
 //j743
 //j752
 //j754
 //j755
+//j775
 
 //! One brokered G6b session leases the prepared AS1/CSG0 after the boot proof. G8d-b makes
 //! the lane re-grantable: each `g` on the long-lived handoff is one new session, and only a
@@ -771,8 +771,11 @@ impl Hardware<'_> {
         if !drv_gpu::heap_may_grow(oom, chunks, heap.max_chunks, heap.target_in_flight)
             || session.charge_heap(id, chunk_bytes).is_err()
         {
+            // NOTICE, like a growth: GL3-c's metal proof (PLAN/015 §8.32) must see each
+            // refusal on a level-5 console. It fires only when a heap cannot grow, so every
+            // other image's log is unchanged.
             log(
-                log_level::INFO,
+                log_level::NOTICE,
                 format_args!(
                     "drv-gpu: client heap {} not grown at {} chunks (in flight {})\n",
                     id,

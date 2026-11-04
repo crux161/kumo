@@ -1,9 +1,64 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j769 -->
 <!-- j770 -->
 <!-- j772 -->
 <!-- j773 -->
 <!-- j774 -->
+<!-- j775 -->
+
+## GL3-c: G7q-d under Gallium's real tiler (J775, metal-proven)
+
+GL3-c (PLAN/015 §8.32, D3) closes G7q, the last gate of the tiler-heap work.
+[gl-heap.c](gl-heap.c) sets three proof-only driconf overrides with `setenv` before the
+screen exists: `pan_csf_chunk_size=262144`, `pan_csf_initial_chunks=1` and
+`pan_csf_max_chunks=2`. It unsets them once the screen holds the shape. Mesa's defaults are
+unchanged. Metal found one Mesa defect, fixed in `kumo-build.patch` (below).
+
+- **The draw.** One `glDrawElementsInstanced` draws 16 layers of a 256x64 grid of 1x2-pixel
+  cells, 32,768 triangles per layer. There are no vertex attributes: `gl_VertexID` places
+  each vertex. Each cell splits on a diagonal that no pixel center lies on, so every layer
+  covers every pixel exactly once. A model of the exact index list confirmed this for all
+  32,768 centers.
+- **The exact image.** RGB replaces and alpha adds: `glBlendFuncSeparate(ONE, ZERO, ONE,
+  ONE)` over a zero-alpha clear. Each pixel must read R = x and G = 2y. Blue must be the last
+  layer's 15 x 16 = 240, so a misordered incremental pass shows. Alpha must be the sum over
+  layers, 16 x 15 = 240, so a lost or repeated pass shows. Every pixel and 32 guards are
+  checked through public `glReadPixels`.
+- **QEMU mode 26.** It runs the same body over the modeled service, which tiles nothing.
+  The mode asserts that Gallium's one HeapCreate carried `262144 x 1, max 2,
+  target_in_flight 65535`: the overrides reached the native heap request. Its three Submits
+  (as in GL3-a) were measured on the first run.
+- **Metal.** The client can see only its image, so its green line claims only that. The
+  heap evidence comes from drv-gpu's own lines, checked by `--check`. The first heap must
+  be created at `0x30000000` with `chunks 1x262144` and `(max 2, in flight 65535)`. It must
+  grow to two chunks exactly once (G7q-b). It must then log `not grown at 2 chunks` at
+  least once: that is the refusal, after which Gallium's tiler-OOM handler renders
+  incrementally. The refusal line is now NOTICE, like a growth, so a level-5 console shows
+  it; it fires only when a heap cannot grow. If the draw proves too small on Mali, the
+  refusal check fails. Then raise `-DKUMO_GL_HEAP_LAYERS` and update the checker's lines
+  (each layer's step is 255 / layers).
+
+**The Mesa fix (J775).** The first metal run grew the heap once and refused it 18 times as
+designed, but every pixel was wrong: zeros, or the last batch alone (alpha 15). Gallium's
+tiler-OOM handler (`csf_oom_handler_init`) invalidates the texture caches between incremental
+passes with `FLUSH_CACHE2`, whose `latest_flush_id` operand was r58, which the handler never
+writes. Whatever the interrupted stream left there could mark the invalidate as already done,
+so the next pass's preload read stale AFBC headers. With `PAN_MESA_DEBUG=noafbc`
+(u-interleaved) the same draw was exact. A scissored-clear test showed ordinary preload
+was sound, and a control with `sync` alone still failed. Under `__kumo__` the handler now sets
+r58 to 0 first: flush ID 0 always flushes, as KUMO's job wrapper and Gallium's other
+`FLUSH_CACHE2` already use it. With that hunk the AFBC draw is exact on Mali. The patch still
+applies to the pinned tarball with `--fuzz=0`, and all 24 patched files match the build tree.
+
+**Metal (J775, 2026-11-04).** `client heap 1 context 0x30000000 chunks 1x262144 head
+0x30001000 (max 2, in flight 65535)`, one growth to 2 chunks, 18 refusals, then `0 of 32768
+pixels differ; 0 of 32 readback guards changed` with samples `0xf0f00000`, `0xf0f000ff`,
+`0xf0f0fe00`, `0xf0f0feff`, and containment clean. 16 layers was enough: no resizing needed.
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl3-c --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl3-c --check <tio-log>
+```
 
 ## GL3-b: the triangle copied into view 1 and held on HDMI (J774, metal-proven)
 
