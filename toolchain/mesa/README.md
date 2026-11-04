@@ -1,9 +1,35 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j770 -->
 <!-- j772 -->
 <!-- j773 -->
 <!-- j774 -->
 <!-- j775 -->
+<!-- j776 -->
+
+## GL4-a: texture allocation against the session budget (J776, metal-proven)
+
+D4 (PLAN/015 §8.32, as ratified) is GL4's prerequisite. J772's first texture-backed
+framebuffer failed with `GL_OUT_OF_MEMORY` before any resource existed.
+`st_TestProxyTexImage` asks panfrost's `can_create_resource`, which asked
+`os_get_total_physical_memory`, and relibc's `_SC_PHYS_PAGES` returns -1. Under
+`__kumo__`, `kumo-build.patch` now compares against `KUMO_GPU_SESSION_BUDGET_BYTES`
+(128 MiB, the budget the GPU service already enforces; new in `kumo_gpu.h`, held equal to
+`kumo_gpu::MAX_TOTAL_BUFFER_BYTES` by a kumo-gpu host test) and claims no RAM figure. The
+patch still applies with `--fuzz=0` to the pinned tarball (SHA-256 `794b3d17...`).
+
+[gl-texture.c](gl-texture.c) proves both sides:
+- an 8192x8192 RGBA8 texture (256 MiB) is still refused with `GL_OUT_OF_MEMORY`;
+- a 256x160 RGBA8 texture, GL4's 160 KiB, is created, attached to an FBO, cleared and
+  read back exactly through public GL, with 32 guards.
+
+The refusal alone isn't new: the old preflight refused every texture. The 160 KiB texture
+is. QEMU mode 27 runs the same body; its three Submits (GL2-b's shape) were measured on the
+first run. The metal proof is `--proof gl4-a`.
+
+**Metal (J776, 2026-11-04), first boot.** The 256 MiB request was refused with
+`GL_OUT_OF_MEMORY`; the 160 KiB texture was created, attached, cleared and read back exactly
+(`0 of 40960 pixels differ; 0 of 32 readback guards changed`), Gallium's default heap was
+`5x2097152 (max 64)`, and containment was clean. The appended `pan_resource.c` hunk's blank
+context lines are empty lines, not a lone space (`git diff --check`).
 
 ## GL3-c: G7q-d under Gallium's real tiler (J775, metal-proven)
 

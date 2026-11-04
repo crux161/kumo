@@ -355,12 +355,13 @@ extern unsigned kumo_gl_clear_cases(const struct kumo_gpu_api *api, void (*say)(
 extern unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled,
                                        uint32_t *keep);
 extern unsigned kumo_gl_heap_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled);
+extern unsigned kumo_gl_texture_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled);
 static void say_line(const char *line) { puts(line); fflush(stdout); }
 #endif
 unsigned kumo_mesa_device_modes(void)
 {
 #ifdef KUMO_GL_SCREEN
-    return 27;
+    return 28;
 #else
     return 17;
 #endif
@@ -369,6 +370,7 @@ unsigned kumo_mesa_device_modes(void)
 unsigned kumo_mesa_device_cases(const struct kumo_gpu_api *api, unsigned mode)
 {
 #ifdef KUMO_GL_SCREEN
+    if (mode == 27) return kumo_gl_texture_cases(api, say_line, true);
     if (mode == 26) return kumo_gl_heap_cases(api, say_line, true);
     if (mode == 25) return kumo_gl_triangle_cases(api, say_line, true, NULL);
     if (mode == 24) return kumo_gl_clear_cases(api, say_line, true);

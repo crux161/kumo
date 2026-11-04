@@ -20,6 +20,11 @@
  * Kernel handles stay in Rust; C BOs and mapped pointers must die inside the callback scope.
  * CPU maps are RW Normal-NC data, including GPU-executable BOs. — KESTREL */
 #define KUMO_GPU_API_VERSION 15u
+/* The session's shared allocation budget, kumo_gpu::MAX_TOTAL_BUFFER_BYTES: the ceiling the GPU
+ * service enforces on every buffer and heap a session holds. GL4-a (PLAN/015 §8.32 D4)
+ * preflights textures against it instead of a physical-memory figure. Not an ABI bump: the
+ * service already enforced it. */
+#define KUMO_GPU_SESSION_BUDGET_BYTES (128ull * 1024ull * 1024ull)
 #define KUMO_GPU_OK 0u
 #define KUMO_GPU_BAD_ARGUMENT 1u
 #define KUMO_GPU_INVALID_REQUEST 2u

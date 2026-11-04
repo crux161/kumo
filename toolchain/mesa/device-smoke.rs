@@ -1,8 +1,8 @@
-//j769
 //j770
 //j772
 //j773
 //j775
+//j776
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -459,7 +459,7 @@ impl Transport for Wire {
             id: request.id,
             result,
         });
-        let complete = (matches!(server.hardware.mode, 19 | 21 | 22 | 23 | 24 | 25 | 26)
+        let complete = (matches!(server.hardware.mode, 19 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
             || server.hardware.mode == 20 && !server.hold)
             && matches!(result, Ok(Response::WaitArmed { .. }));
         drop(server);
@@ -944,7 +944,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 .all(|va| va % PAGE_BYTES == 0
                     && (kumo_gpu::VA_START..kumo_gpu::VA_END).contains(va)));
         }
-        if matches!(mode, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26) {
+        if matches!(mode, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27) {
             // GL1-d: Gallium frees every BO with a deferred unmap that now crosses, so each
             // binding it made is explicitly unbound before its buffer goes. — TIMBERDOODLE
             let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
@@ -976,18 +976,20 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             assert_eq!(server.last_point, 1);
             assert_eq!(server.wake_reads.len(), 1);
         }
-        if matches!(mode, 23..=26) {
+        if matches!(mode, 23..=27) {
             // Real GL dispatch; the producer signals completion without executing a GPU
             // or altering the framebuffer/SSBO contents. — KESTREL
             // GL3-a's triangle shares the shape; its Submit count is measured. — TIMBERDOODLE
             // GL3-c's instanced draw is predicted to share GL3-a's three Submits (init, the
-            // clear and draw batch, the AFBC readback blit); the first QEMU run confirms it.
+            // clear and draw batch, the AFBC readback blit), and GL4-a's texture clear GL2-b's
+            // three; the first QEMU run confirms both.
             let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
             let label = match mode {
                 23 => b"GL2-a\0",
                 24 => b"GL2-b\0",
                 25 => b"GL3-a\0",
-                _ => b"GL3-c\0",
+                26 => b"GL3-c\0",
+                _ => b"GL4-a\0",
             };
             unsafe {
                 printf(b"%s model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu submits=%u\n\0".as_ptr(),

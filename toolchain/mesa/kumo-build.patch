@@ -1,8 +1,8 @@
-#j760
 #j761
 #j762
 #j765
 #j775
+#j776
 --- a/include/drm-uapi/drm.h
 +++ b/include/drm-uapi/drm.h
 @@ -45,7 +45,7 @@
@@ -1286,3 +1286,36 @@
        cs_flush_caches(&b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE,
                        MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, flush_id,
                        cs_defer(0, 0));
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -35,6 +35,9 @@
+ #include "pan_tiling.h"
+ #include "pan_trace.h"
+ #include "pan_util.h"
++#ifdef __kumo__
++#include "kumo_gpu.h"
++#endif
+
+ static void
+ panfrost_clear_depth_stencil(struct pipe_context *pipe,
+@@ -1052,6 +1055,12 @@
+                                     template->format, 0))
+       return false;
+
++#ifdef __kumo__
++   /* GL4-a (PLAN/015 §8.32 D4): KUMO claims no physical-memory figure. The native
++    * session budget is the ceiling the GPU service enforces, so a resource larger than
++    * it can never be created; smaller ones are left to BufferCreate's accounting. */
++   return tmp.plane.layout.data_size_B <= KUMO_GPU_SESSION_BUDGET_BYTES;
++#else
+    uint64_t system_memory;
+    if (!os_get_total_physical_memory(&system_memory))
+       return false;
+@@ -1060,6 +1069,7 @@
+    uint64_t memory = os_get_gpu_heap_size(heap_memory_percent, NULL);
+
+    return tmp.plane.layout.data_size_B <= memory;
++#endif
+ }
+
+ static struct pipe_resource *

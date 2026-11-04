@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j770
 #j772
 #j773
 #j774
 #j775
+#j776
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -71,6 +71,22 @@ GL3C = ["GL3-c heap config: pan_csf_chunk_size=262144 pan_csf_initial_chunks=1 p
         "GL3-c samples: (0,0)=0xf0f00000 (255,0)=0xf0f000ff (0,127)=0xf0f0fe00 (255,127)=0xf0f0feff",
         "GL3-c destroy: shaders, program, index buffer, context, drawable and display released"]
 PROOFS = {
+    # GL4-a (PLAN/015 §8.32 D4): public texture allocation against the session budget. The
+    # 256 MiB refusal alone is not new (the old physical-memory preflight refused every
+    # texture); the 160 KiB texture's creation, clear and exact readback are.
+    "gl4-a": dict(
+        cases="gl-texture", runtime="device-metal", defines=["-DKUMO_GL_TEXTURE_MAIN=1"],
+        out="gl4-a-metal", gl=True, begin="GL4-a metal texture begin",
+        lines=["GL4-a context: current GLES context over the native GPU session",
+               "GL4-a preflight: an 8192x8192 RGBA8 texture (256 MiB) refused with GL_OUT_OF_MEMORY against the 128 MiB session budget",
+               "GL4-a texture: a 256x160 RGBA8 texture (160 KiB) created and attached; framebuffer complete",
+               "GL4-a baseline: public glReadPixels observed texture pixels different from the requested clear color",
+               "GL4-a clear: public glClear into the texture and native glFinish complete, expected RGBA8 0xff996633",
+               "GL4-a readback: 0 of 40960 pixels differ; 0 of 32 readback guards changed (Mali clear color 0xff996633)",
+               "GL4-a destroy: texture, framebuffer, context, drawable and display released"],
+        green=("GL4-a metal texture green: a 256 MiB texture refused by the budget preflight, a 160 KiB texture "
+               "cleared on Mali and read back exactly, guards intact and clean teardown"),
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     # GL3-c: the client proves its image; drv-gpu's own lines prove the heap. The fresh
     # session's first heap lands at the window's start (G7q-a), one chunk, max two; the first
     # TILER_OOM grows it to two chunks exactly once, and every later one is refused at the

@@ -1,8 +1,8 @@
-//j707
 //j742
 //j752
 //j754
 //j758
+//j776
 
 extern crate std;
 
@@ -1296,4 +1296,20 @@ fn the_heap_window_sits_outside_every_client_binding() {
         signal_point: 1,
     };
     assert!(!s.valid_shape());
+}
+
+/// GL4-a (PLAN/015 §8.32 D4): the Mesa seam preflights textures against the C header's copy
+/// of the session budget, so the two must agree.
+#[test]
+fn the_c_header_names_the_session_budget() {
+    let header = include_str!("../../../toolchain/mesa/kumo_gpu.h");
+    let line = header
+        .lines()
+        .find(|line| line.starts_with("#define KUMO_GPU_SESSION_BUDGET_BYTES "))
+        .expect("kumo_gpu.h defines the session budget");
+    assert_eq!(
+        line,
+        "#define KUMO_GPU_SESSION_BUDGET_BYTES (128ull * 1024ull * 1024ull)"
+    );
+    assert_eq!(MAX_TOTAL_BUFFER_BYTES, 128 * 1024 * 1024);
 }
