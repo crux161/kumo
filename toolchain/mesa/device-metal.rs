@@ -2,6 +2,7 @@
 //j753
 //j754
 //j774
+//j777
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -534,6 +535,422 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
     }
     log(b"GL3-b release: view 1 channel and surface closed\n");
     result
+}
+
+/// The client is single-threaded; this holds GL4's J0c lease between C calls.
+struct Single<T>(core::cell::UnsafeCell<T>);
+// SAFETY: one thread calls these entry points, serially.
+unsafe impl<T> Sync for Single<T> {}
+static LEASE: Single<Option<kumo_graphics::native::Lease>> =
+    Single(core::cell::UnsafeCell::new(None));
+/// GL4: the boot session's native producer (0 on a regranted session), the one VMO every
+/// J0c image is leased from, the view's present sequence and the frame tally.
+static PRODUCER: AtomicU64 = AtomicU64::new(0);
+static J0C_VMO: AtomicU64 = AtomicU64::new(0);
+static VIEW_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static RETIRED: AtomicU32 = AtomicU32::new(0);
+static COPIED: AtomicU32 = AtomicU32::new(0);
+/// G8's readiness bound (`CHURN_READY_*` in the Rust gpu-client): a quiet window while
+/// drv-fb measures the vblank cadence, then one probe per second for up to 180 s.
+const READY_QUIET_NS: u64 = 20_000_000_000;
+const READY_PROBES: u32 = 180;
+/// drv-fb holds each J0c image 5 s; this bounds one presentation.
+const J0C_BOUND_NS: u64 = 120_000_000_000;
+
+/// GL4 (PLAN/015 §8.32): decode the churn lane (`etc/gpu-lane` = `churn`). The boot session
+/// carries drv-fb's native producer for J0c; a regranted one carries handle 0 and skips it.
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_take() -> u32 {
+    let raw = kumo_metal_lane.swap(0, Ordering::Relaxed);
+    if raw == 0 {
+        log(b"GL4 lane: no lane bootstrap was transferred\n");
+        return 1;
+    }
+    let read = || {
+        let mut bytes = [0u8; 2];
+        let (len, handle) = native::call(
+            Syscall::ChannelRead,
+            [raw, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0],
+        );
+        lane::LaneRead {
+            len,
+            tag: bytes[0],
+            handle,
+        }
+    };
+    let decoded = lane::decode_lane(read, close);
+    close(raw);
+    match decoded {
+        Ok(lane::Lane::View {
+            channel,
+            surface,
+            producer,
+        }) => {
+            VIEW_CHANNEL.store(channel, Ordering::Relaxed);
+            VIEW_SURFACE.store(surface, Ordering::Relaxed);
+            PRODUCER.store(producer, Ordering::Relaxed);
+            if producer != 0 {
+                log(b"GL4 lane: view 1 over V, S, N with the boot session's native producer\n");
+            } else {
+                log(
+                    b"GL4 lane: view 1 over V, S, N; a regranted session with no native producer\n",
+                );
+            }
+            0
+        }
+        Ok(lane::Lane::Native { producer }) => {
+            if producer != 0 {
+                close(producer);
+            }
+            log(b"GL4 lane: Sora named the native lane; this image has no etc/gpu-lane churn marker\n");
+            2
+        }
+        Err(cause) => {
+            log_parts(&[b"GL4 lane: ", cause.as_bytes(), b"\n"]);
+            3
+        }
+    }
+}
+
+/// 1 when this session must run J0c (it carries the native producer), else 0.
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_native() -> u32 {
+    u32::from(PRODUCER.load(Ordering::Relaxed) != 0)
+}
+
+/// GL-fed J0c (CRUX, 2026-11-03): one GL frame, read back and copied upright into the one
+/// J0c VMO, presented through drv-fb's unchanged native lease protocol. The VMO is rewritten
+/// only after the previous sequence's retirement, as the lease requires. drv-fb checks the
+/// lease, the checksum and the display mapping, not who wrote the pixels; the pixels here
+/// are GL-rendered and CPU-copied, not written by hand-built GPU jobs.
+#[no_mangle]
+pub extern "C" fn kumo_metal_j0c(
+    pixels: *const u32,
+    width: u32,
+    height: u32,
+    sequence: u32,
+) -> u32 {
+    use alloc::{format, vec::Vec};
+    use kumo_graphics::native::{Image, RetireWait, WaitReply};
+    let producer = PRODUCER.load(Ordering::Relaxed);
+    let view = lane::VIEW_SURFACE;
+    if producer == 0 || pixels.is_null() || width != view.width || height < view.height {
+        return 1;
+    }
+    let image_bytes = Image {
+        sequence: 1,
+        surface: view,
+        offset: 0,
+        vmo_bytes: 4096,
+        gpu_point: 1,
+        checksum: 0,
+    }
+    .bytes();
+    if J0C_VMO.load(Ordering::Relaxed) == 0 {
+        // RE4 (metal): drv-fb maps the leased image READ|UNCACHED before checking it, and the
+        // kernel refuses Normal-NC on anonymous VMOs, so a VmoCreate image is "no image
+        // reachable". A contiguous DMA VMO is NC- and display-mappable, like the Rust
+        // client's drv-gpu buffer; the pixels are still GL-rendered and CPU-copied.
+        let Some(vmo) =
+            valid(native::call(Syscall::VmoCreateContiguous, [image_bytes, 0, 0, 0, 0, 0]).0)
+        else {
+            return 2;
+        };
+        J0C_VMO.store(vmo, Ordering::Relaxed);
+    }
+    let vmo = J0C_VMO.load(Ordering::Relaxed);
+    // SAFETY: the C caller's readback of width x height packed RGBA8 words, rows bottom-up;
+    // the view takes its bottom 256 x 128.
+    let rows = unsafe { core::slice::from_raw_parts(pixels, (view.width * view.height) as usize) };
+    let mut words: Vec<u32> = Vec::new();
+    if words.try_reserve_exact(rows.len()).is_err() {
+        return 3;
+    }
+    let copied = lane::copy_readback(rows, view, |offset, bytes| {
+        words.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+        native::call(
+            Syscall::VmoWrite,
+            [vmo, offset, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0],
+        )
+        .0 == 0
+    });
+    if copied.is_err() {
+        return 4;
+    }
+    let mut image = Image {
+        sequence,
+        surface: view,
+        offset: 0,
+        vmo_bytes: image_bytes,
+        gpu_point: u64::from(sequence),
+        checksum: 0,
+    };
+    image.checksum = image.checksum(|n| words[n as usize]);
+    let koid = native::call(Syscall::HandleKoid, [vmo, 0, 0, 0, 0, 0]).0;
+    // SAFETY: single-threaded, and no other borrow of the lease is live.
+    let lease = unsafe { &mut *LEASE.0.get() }.get_or_insert_with(Default::default);
+    if !lease.begin(image, koid) {
+        log(b"GL4 J0c: the lease refused the image\n");
+        return 5;
+    }
+    let rights = (kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER).0 as u64;
+    let Some(grant) = valid(native::call(Syscall::HandleDuplicate, [vmo, rights, 0, 0, 0, 0]).0)
+    else {
+        return 6;
+    };
+    // Register the frame-retired wait before publishing the image (G8c-b2).
+    let wait = RetireWait {
+        point: u64::from(sequence),
+    }
+    .encode();
+    let request = image.encode();
+    let write = |bytes: &[u8], handle: u64| {
+        native::call(
+            Syscall::ChannelWrite,
+            [
+                producer,
+                bytes.as_ptr() as u64,
+                bytes.len() as u64,
+                handle,
+                0,
+                0,
+            ],
+        )
+        .0 == 0
+    };
+    if !write(&wait, 0) || !write(&request, grant) {
+        close(grant);
+        return 7;
+    }
+    log(format!(
+        "GL4 J0c sequence{}: GL frame leased READ-only on the native lane, checksum 0x{:08x}\n",
+        sequence, image.checksum
+    )
+    .as_bytes());
+    let Some(port) = valid(native::call(Syscall::PortCreate, [0; 6]).0) else {
+        return 8;
+    };
+    let Some(timer) = valid(native::call(Syscall::TimerCreate, [J0C_BOUND_NS, 0, 0, 0, 0, 0]).0)
+    else {
+        close(port);
+        return 8;
+    };
+    let koid_of = |raw| native::call(Syscall::HandleKoid, [raw, 0, 0, 0, 0, 0]).0;
+    let (producer_koid, timer_koid) = (koid_of(producer), koid_of(timer));
+    let mut wake = 0u64;
+    let mut exchange = lane::NativeExchange::default();
+    let mut step = if native::call(Syscall::PortBind, [port, producer, 0, 0, 0, 0]).0 != 0
+        || native::call(Syscall::PortBind, [port, timer, 0, 0, 0, 0]).0 != 0
+    {
+        lane::NativeStep::Failed
+    } else {
+        lane::NativeStep::Continue
+    };
+    while step == lane::NativeStep::Continue {
+        let source = native::call(Syscall::PortWait, [port, 0, 0, 0, 0, 0]).0;
+        let event = if source == producer_koid {
+            let mut bytes = [0u8; kumo_graphics::native::REQUEST_LEN + 1];
+            let (n, extra) = native::call(
+                Syscall::ChannelRead,
+                [
+                    producer,
+                    bytes.as_mut_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            let extra = valid(extra);
+            let body = bytes.get(..n as usize).unwrap_or(&[]);
+            if let Some(reply) = WaitReply::decode(body) {
+                if let Some(handle) = extra {
+                    if wake != 0
+                        || native::call(Syscall::PortBind, [port, handle, 0, 0, 0, 0]).0 != 0
+                    {
+                        close(handle);
+                        lane::NativeEvent::Unexpected
+                    } else {
+                        wake = handle;
+                        lane::NativeEvent::WaitReply {
+                            armed: reply.armed,
+                            wake: true,
+                        }
+                    }
+                } else {
+                    lane::NativeEvent::WaitReply {
+                        armed: reply.armed,
+                        wake: false,
+                    }
+                }
+            } else if let Some(reply) = kumo_graphics::native::Reply::decode(body) {
+                if let Some(handle) = extra {
+                    close(handle);
+                }
+                lane::NativeEvent::ImageReply {
+                    reply,
+                    handle: extra.is_some(),
+                }
+            } else {
+                if let Some(handle) = extra {
+                    close(handle);
+                }
+                lane::NativeEvent::Unexpected
+            }
+        } else if wake != 0 && source == koid_of(wake) {
+            let mut byte = [0u8; 1];
+            let n = native::call(
+                Syscall::ChannelRead,
+                [wake, byte.as_mut_ptr() as u64, 1, 0, 0, 0],
+            )
+            .0;
+            lane::NativeEvent::WakeByte(if n == 1 { byte[0] } else { 0 })
+        } else {
+            if source == timer_koid {
+                log(b"GL4 J0c: no retirement within the bound\n");
+            }
+            lane::NativeEvent::Unexpected
+        };
+        step = exchange.on(event);
+    }
+    native::call(Syscall::PortUnbind, [port, producer, 0, 0, 0, 0]);
+    native::call(Syscall::PortUnbind, [port, timer, 0, 0, 0, 0]);
+    if wake != 0 {
+        native::call(Syscall::PortUnbind, [port, wake, 0, 0, 0, 0]);
+        close(wake);
+    }
+    close(timer);
+    close(port);
+    if step != lane::NativeStep::Done {
+        return 9;
+    }
+    match exchange.finish() {
+        Ok(reply) if lease.retire(reply) => {}
+        Ok(_) => return 10,
+        Err(true) => {
+            log(b"GL4 J0c: drv-fb cancelled the diagnostic; no reuse, no fabricated completion\n");
+            return 11;
+        }
+        Err(false) => return 12,
+    }
+    log(format!(
+        "GL4 J0c sequence{} retired after drv-fb's consumed load; the VMO may be rewritten\n",
+        sequence
+    )
+    .as_bytes());
+    if lease.complete() {
+        log(b"GL4 J0c complete: 3 GL-rendered frames through one VMO, each rewritten only after its retirement\n");
+    }
+    0
+}
+
+/// G8's readiness on view 1: wait out drv-fb's vblank measurement, then probe once per
+/// second until the first `Retired` (bounded).
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_ready() -> u32 {
+    use alloc::format;
+    let channel = VIEW_CHANNEL.load(Ordering::Relaxed);
+    if channel == 0 {
+        return 1;
+    }
+    sleep(READY_QUIET_NS);
+    let mut sequence = VIEW_SEQUENCE.load(Ordering::Relaxed);
+    let result = lane::present_until_retired(
+        &mut ViewLink { channel },
+        lane::VIEW_SURFACE,
+        &mut sequence,
+        READY_PROBES,
+    );
+    VIEW_SEQUENCE.store(sequence, Ordering::Relaxed);
+    match result {
+        Ok(probes) => {
+            log(format!("GL4 readiness: the first Retired after {} probes\n", probes).as_bytes());
+            0
+        }
+        Err(error) => {
+            log(format!("GL4 readiness failed: {:?}\n", error).as_bytes());
+            2
+        }
+    }
+}
+
+/// One churn frame: the readback's bottom 256 x 128 copied upright into view 1, then one
+/// fresh FULL present. Retired and Copied are tallied separately; anything else fails.
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_frame(pixels: *const u32, width: u32, height: u32) -> u32 {
+    use alloc::format;
+    let (channel, surface) = (
+        VIEW_CHANNEL.load(Ordering::Relaxed),
+        VIEW_SURFACE.load(Ordering::Relaxed),
+    );
+    let view = lane::VIEW_SURFACE;
+    if channel == 0
+        || surface == 0
+        || pixels.is_null()
+        || width != view.width
+        || height < view.height
+    {
+        return 1;
+    }
+    // SAFETY: as in kumo_metal_j0c.
+    let rows = unsafe { core::slice::from_raw_parts(pixels, (view.width * view.height) as usize) };
+    let copied = lane::copy_readback(rows, view, |offset, bytes| {
+        native::call(
+            Syscall::VmoWrite,
+            [
+                surface,
+                offset,
+                bytes.as_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+            ],
+        )
+        .0 == 0
+    });
+    if copied.is_err() {
+        return 2;
+    }
+    let sequence = VIEW_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    match lane::present_frame(&mut ViewLink { channel }, view, sequence, sequence) {
+        Ok(kumo_graphics::Status::Retired) => {
+            RETIRED.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Ok(_) => {
+            COPIED.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => {
+            log(format!("GL4 frame present failed: {:?}\n", error).as_bytes());
+            3
+        }
+    }
+}
+
+/// The session's presentation record, then the view and producer handles are closed.
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_summary(frames: u32) {
+    use alloc::format;
+    log(format!(
+        "GL4 presents: {} frames on view 1, retired={} copied={}\n",
+        frames,
+        RETIRED.load(Ordering::Relaxed),
+        COPIED.load(Ordering::Relaxed)
+    )
+    .as_bytes());
+    for slot in [&VIEW_CHANNEL, &VIEW_SURFACE, &PRODUCER, &J0C_VMO] {
+        let raw = slot.swap(0, Ordering::Relaxed);
+        if raw != 0 {
+            close(raw);
+        }
+    }
 }
 
 #[no_mangle]

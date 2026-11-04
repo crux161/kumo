@@ -1,8 +1,8 @@
-//j770
 //j772
 //j773
 //j775
 //j776
+//j777
 //! Real C runtime/Mesa object lifecycle over the Session codec and real kernel VMO grants.
 #![no_std]
 extern crate alloc;
@@ -20,7 +20,7 @@ use kumo_gpu::{
     session::{Backend, Session, SessionRelease, SubmitError},
     BindFlags, Binding, Command, DeviceCore, DeviceInfo, DeviceMemory, DeviceMmu, DeviceTexture,
     DeviceThreads, DeviceTiler, DeviceTopology, Reply, Request, Response, Status, Submission,
-    PAGE_BYTES, REPLY_LEN, REQUEST_LEN,
+    SyncState, PAGE_BYTES, REPLY_LEN, REQUEST_LEN,
 };
 mod native;
 struct LibcAllocator;
@@ -377,6 +377,23 @@ impl Transport for Wire {
         assert_eq!(server.closed, 0);
         assert_eq!(request.id, server.last_request + 1);
         server.last_request = request.id;
+        // RE4: mode 28 churns textures with no CPU wait between its upload, draw and readback
+        // batches. drv-gpu runs one point at a time, so the next Submit waits on the previous
+        // point, and this producer completes only an ARMed point; Mali finishes it alone.
+        // Model that in-order completion: the previous point completes before the next Submit
+        // is dispatched, when no armed wait is pending. — TIMBERDOODLE
+        if server.hardware.mode == 28
+            && matches!(request.command, Command::Submit(_))
+            && server.last_point != 0
+            && server.wakes.is_empty()
+            && !matches!(
+                server.session.fence_state(server.last_point),
+                Ok(SyncState::Complete { .. })
+            )
+        {
+            let point = server.last_point;
+            server.session.complete(point, 0).unwrap();
+        }
         server.calls.push(request.command);
         let Server {
             session, hardware, ..
@@ -459,8 +476,10 @@ impl Transport for Wire {
             id: request.id,
             result,
         });
-        let complete = (matches!(server.hardware.mode, 19 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
-            || server.hardware.mode == 20 && !server.hold)
+        let complete = (matches!(
+            server.hardware.mode,
+            19 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28
+        ) || server.hardware.mode == 20 && !server.hold)
             && matches!(result, Ok(Response::WaitArmed { .. }));
         drop(server);
         if complete {
@@ -944,7 +963,7 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
                 .all(|va| va % PAGE_BYTES == 0
                     && (kumo_gpu::VA_START..kumo_gpu::VA_END).contains(va)));
         }
-        if matches!(mode, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27) {
+        if matches!(mode, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28) {
             // GL1-d: Gallium frees every BO with a deferred unmap that now crosses, so each
             // binding it made is explicitly unbound before its buffer goes. — TIMBERDOODLE
             let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
@@ -1010,6 +1029,39 @@ pub extern "C" fn kumo_mesa_device_proof() -> u32 {
             assert_eq!(count(|c| matches!(c, Command::SyncRead { .. })), 0);
             assert_eq!(server.last_point, submits as u64);
             assert_eq!(server.wake_reads.len(), submits);
+        }
+        if mode == 28 {
+            // GL4: 100 frames of texture churn through the modeled service: every buffer,
+            // binding, heap and byte is back. Measured on the first completing run (RE4):
+            // 301 Submits (init, then each frame's upload blit, draw and readback blit) and 25
+            // BufferCreates, because Gallium's BO cache recycles each frame's freed 160 KiB
+            // texture rather than crossing it anew. On metal the census holds the churn flat.
+            // — TIMBERDOODLE
+            let count = |f: fn(&Command) -> bool| server.calls.iter().filter(|c| f(c)).count();
+            let created = count(|c| matches!(c, Command::BufferCreate { .. }));
+            let submits = count(|c| matches!(c, Command::Submit(_)));
+            unsafe {
+                printf(
+                    b"GL4 model release: buffers=%u bindings=%u waits=%u heaps=%u bytes=%llu submits=%u creates=%u\n\0"
+                        .as_ptr(),
+                    server.release.buffers,
+                    server.release.bindings,
+                    server.release.waits,
+                    server.release.heaps,
+                    server.release.bytes,
+                    submits as u32,
+                    created as u32,
+                );
+            }
+            assert_eq!(server.release.buffers, 0);
+            assert_eq!(server.release.bindings, 0);
+            assert_eq!(server.release.heaps, 0);
+            assert_eq!(server.release.bytes, 0);
+            assert_eq!(count(|c| matches!(c, Command::GroupCreate { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapCreate(_))), 1);
+            assert_eq!(count(|c| matches!(c, Command::HeapDestroy { .. })), 1);
+            assert_eq!(count(|c| matches!(c, Command::SyncRead { .. })), 0);
+            assert_eq!((created, submits), (25, 301));
         }
         if mode == 26 {
             // GL3-c: the proof-only driconf overrides, set before screen creation, are the

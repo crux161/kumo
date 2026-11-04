@@ -1,9 +1,70 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j772 -->
 <!-- j773 -->
 <!-- j774 -->
 <!-- j775 -->
 <!-- j776 -->
+<!-- j777 -->
+
+## GL4: G8's metal gate through public GL (J777, metal-proven)
+
+GL4 (PLAN/015 §8.2) is the first track to meet G8's bar with a real Mesa driver.
+[gl-churn.c](gl-churn.c) runs on the churn lane (`etc/gpu-lane` = `churn`), so Sora's
+RestartBudget(3) regrants after each exit and one boot holds up to four sessions.
+
+- **Each session's frames:** 100 of them. Each frame creates a 256x160 RGBA8 texture (160 KiB,
+  GL4-a's size), uploads a pattern unique to that frame (R = x, G = y, B = frame), draws with
+  it (one viewport-covering triangle sampling it by `texelFetch`), reads the 256x160
+  framebuffer back between guards and checks every pixel, then deletes the texture. That is
+  16,000 KiB of texture storage per session. The bottom 256x128 goes into view 1 and is
+  presented once, with `Retired` and `Copied` counted separately.
+- **GL-fed J0c (CRUX, 2026-11-03):** only the boot session carries drv-fb's native producer.
+  It renders three GL frames (tags 0xe1..0xe3), copies each upright into one 128 KiB contiguous
+  DMA VMO (`VmoCreateContiguous`: drv-fb maps the image Normal-NC, which the kernel refuses for an
+  anonymous VMO) and
+  presents it through the unchanged native lease protocol: RetireWait, then the image with a
+  READ grant, with reuse only after both the retired reply and the wake byte
+  (`kumo_graphics::lane::NativeExchange`, host-tested). drv-fb checks lease admission, the
+  checksum and the display mapping, not who wrote the pixels. Its present gate arms once J0c
+  completes, as on G8's churn lane. Regranted sessions carry handle 0 and skip J0c.
+- **Readiness:** G8's rule (`present_until_retired`): a 20 s quiet window while drv-fb
+  measures the vblank cadence, then one probe per second until the first `Retired`, bounded
+  at 180.
+- **QEMU mode 28:** the same body with no presenter. The modeled producer completes a point
+  only when a wait is armed, but drv-gpu runs one point at a time, so a frame's back-to-back
+  upload, draw and readback batches deadlocked it. The model now completes the previous
+  point before dispatching the next Submit (in-order, as Mali does). With no GPU, readback
+  returns whatever a recycled staging BO holds (measured: the frame's own upload, flipped), so
+  QEMU checks guards only and Mali checks every pixel. Measured and pinned: 301 Submits (init,
+  then upload, draw and readback per frame) and 25 BufferCreates, since Gallium's BO cache
+  recycles each freed texture; every buffer, binding, heap and byte back.
+- **Metal (`--proof gl4`):** `--check` judges every session of the boot:
+  - at least two sessions;
+  - session 1 runs J0c and no later session does;
+  - drv-fb logs J0c complete and its gate armed;
+  - every session has readiness, 100 exact frames and `retired=100 copied=0`;
+  - post-teardown census DMA VMOs never grow across sessions (within 4). The census fires at
+    most every 10 s, so only samples after a session's green line are compared; a drop at the
+    end (Sora releases the view once the budget is spent) is not a leak.
+
+  The census is the kernel's `census:` line at the DEBUG console. The stage appends `dmesg -n
+  debug` to `etc/autoexec`, which Sora runs before the first GPU session, so nobody has to log
+  in past the boot demos. drv-gpu's DEBUG `client point N complete on JOB` lines are not
+  failures.
+
+**Metal (J777, 2026-11-04).** Four sessions in one boot, each 100 exact frames (0 of 4,096,000
+pixels) with `retired=100 copied=0`. J0c was GL-fed in session 1 (`display: J0c complete: 3
+original-VMO presentations retired`, `present gate armed`), and post-teardown census DMA VMOs
+were 29, 29, 29, then 12 (the boot baseline) after the budget was spent. Two defects were found
+and fixed on the way. (1) A `VmoCreate` J0c image is unreachable by drv-fb (no NC mapping of
+anonymous VMOs). (2) The kernel's `VmoWrite` into a DMA VMO did not clean to PoC, so with the
+DEBUG console's timing drv-fb read stale lines (`J0a shared image checksum mismatch` on sequence
+3). `VmoWrite` now cleans DMA writes, as `zero_reclaimed_run` already did.
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl4 --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl4 --check <tio-log>
+```
 
 ## GL4-a: texture allocation against the session budget (J776, metal-proven)
 

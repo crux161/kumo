@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j772
 #j773
 #j774
 #j775
 #j776
+#j777
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -40,6 +40,8 @@ SLOT = b"bin/gpu-client"
 LANE = b"etc/gpu-lane"
 # kumo_abi::initrd::INITRD_MAX_ENTRIES: the loader's fixed table bound.
 MAX_ENTRIES = 48
+# kumo_abi::initrd::AUTOEXEC_PATH. Sora runs it before it launches the GPU client (RE4).
+AUTOEXEC = b"etc/autoexec"
 # Per proof: the build define, its output, and the live lines that must each appear exactly
 # once, in this order. Driver lines interleave with the client's, so `driver` lines must each
 # appear once between `after` and the green line, in any order, and `absent` never in that
@@ -71,6 +73,36 @@ GL3C = ["GL3-c heap config: pan_csf_chunk_size=262144 pan_csf_initial_chunks=1 p
         "GL3-c samples: (0,0)=0xf0f00000 (255,0)=0xf0f000ff (0,127)=0xf0f0fe00 (255,127)=0xf0f0feff",
         "GL3-c destroy: shaders, program, index buffer, context, drawable and display released"]
 PROOFS = {
+    # GL4 (PLAN/015 §8.2): G8's metal gate through public GL, on the churn lane. Sora's
+    # RestartBudget(3) regrants after each exit, so one boot holds up to four sessions; the
+    # boot session runs the GL-fed J0c (CRUX, 2026-11-03) that arms drv-fb's present gate.
+    # check_sessions() owns this proof's acceptance.
+    "gl4": dict(
+        cases="gl-churn", runtime="device-metal", defines=["-DKUMO_GL_CHURN_MAIN=1"],
+        out="gl4-metal", gl=True, marker=b"churn\n", sessions=True, begin="GL4 metal churn begin",
+        # RE4: the census needs the DEBUG console. CRUX could not type `dmesg -n debug` in
+        # time past the boot demos, so the stage appends it to autoexec, which Sora runs
+        # before the first GPU session. — TIMBERDOODLE
+        autoexec=b"dmesg -n debug\n",
+        boot=["sora: gpu-lane marker selects the churn lane"],
+        first=["GL4 lane: view 1 over V, S, N with the boot session's native producer",
+               "GL4 J0c sequence1 retired after drv-fb's consumed load",
+               "GL4 J0c sequence2 retired after drv-fb's consumed load",
+               "GL4 J0c sequence3 retired after drv-fb's consumed load",
+               "GL4 J0c complete: 3 GL-rendered frames through one VMO, each rewritten only after its retirement",
+               "GL4 J0c: three exact GL frames presented through the native lease, each retired before the next"],
+        later=["GL4 lane: view 1 over V, S, N; a regranted session with no native producer"],
+        each=["GL4 context: current GLES context and an owned 256x160 RGBA8 framebuffer over the native GPU session",
+              "GL4 readiness: the first Retired after ",
+              "GL4 frames: 100 frames each created, uploaded, drew with and deleted one 160 KiB texture (16000 KiB in all); "
+              "0 of 4096000 pixels differ (Mali: every texel copied exactly)",
+              "GL4 destroy: program, context, drawable and display released",
+              "GL4 presents: 100 frames on view 1, retired=100 copied=0"],
+        display=["display: J0c complete: 3 original-VMO presentations retired",
+                 "display: present gate armed, answering Retired on frame starts"],
+        green=("GL4 metal churn green: 100 exact GL frames of texture churn presented on view 1 and clean teardown; "
+               "the presents line carries the Retired/Copied record"),
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     # GL4-a (PLAN/015 §8.32 D4): public texture allocation against the session budget. The
     # 256 MiB refusal alone is not new (the old physical-memory preflight refused every
     # texture); the 160 KiB texture's creation, clear and exact readback are.
@@ -292,7 +324,7 @@ def entries(image):
         yield name, data[offset:offset + size]
 
 
-def stage(destination, elf, marker=None):
+def stage(destination, elf, marker=None, autoexec=None):
     assert not destination.exists(), f"refusing to replace existing image copy: {destination}"
     # The console level is a kernel build constant (J748), so the copy is taken from an image
     # built for it, and the kernel identity check below covers that build. — TIMBERDOODLE
@@ -302,6 +334,8 @@ def stage(destination, elf, marker=None):
     info = f"KUMO_CONSOLE_LOGLEVEL=5\ngpu-client sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}\n"
     if marker is not None:
         info += f"{LANE.decode()} {marker.decode().strip()}\n"
+    if autoexec is not None:
+        info += f"{AUTOEXEC.decode()} += {autoexec.decode().strip()!r}\n"
     (destination / "STAGE-INFO.txt").write_text(info)
     path = destination / "EFI/KUMO/initrd.img"
     original = path.read_bytes()
@@ -312,6 +346,8 @@ def stage(destination, elf, marker=None):
     for index, (name, data) in enumerate(entries(path)):
         if name == SLOT:
             data, replaced = elf.read_bytes(), replaced + 1
+        if autoexec is not None and name == AUTOEXEC:
+            data = data + autoexec
         items.append((original[16 + index * 80:16 + index * 80 + 64], data))
     assert replaced == 1, "the image has no single GPU client slot"
     if marker is not None:
@@ -327,17 +363,20 @@ def stage(destination, elf, marker=None):
     # Prove the staged image differs from the built one in the slot (and the marker it adds),
     # and nowhere else.
     built, staged = dict(entries(IMAGE / "EFI/KUMO/initrd.img")), dict(entries(path))
-    changed = [SLOT] + ([LANE] if marker is not None else [])
+    changed = [SLOT] + ([LANE] if marker is not None else []) + ([AUTOEXEC] if autoexec is not None else [])
     assert staged.keys() == built.keys() | set(changed)
     assert sorted(n for n in staged if built.get(n) != staged[n]) == sorted(changed)
     assert marker is None or staged[LANE] == marker
+    # Sora reads at most 256 bytes of autoexec (main.rs `manifest`); the appended line must fit.
+    assert autoexec is None or (staged[AUTOEXEC] == built[AUTOEXEC] + autoexec and len(staged[AUTOEXEC]) <= 256)
     kernel = "EFI/KUMO/kernel/kumo-kernel.elf"
     assert (IMAGE / kernel).read_bytes() == (destination / kernel).read_bytes()
     if marker is None:
         print(f"staged {destination}: only {SLOT.decode()} differs ({len(staged[SLOT])} bytes); kernel identical")
     else:
-        print(f"staged {destination}: only {SLOT.decode()} ({len(staged[SLOT])} bytes) and {LANE.decode()} "
-              f"({marker.decode().strip()!r}) differ; kernel identical")
+        extra = f" and {AUTOEXEC.decode()} (+{autoexec.decode().strip()!r})" if autoexec is not None else ""
+        print(f"staged {destination}: only {SLOT.decode()} ({len(staged[SLOT])} bytes), {LANE.decode()} "
+              f"({marker.decode().strip()!r}){extra} differ; kernel identical")
     print(f"initrd sha256 {hashlib.sha256(out).hexdigest()} ({len(out)} bytes)")
 
 
@@ -393,6 +432,68 @@ def check(log, proof):
     print(f"{name} metal check green ({proof['out']}): every proof line once, in order; no TOWER, FAILED or ABEND")
 
 
+def check_sessions(log, proof):
+    """GL4: every session of one boot, in order. Session 1 runs J0c; later ones are regrants.
+    Each needs readiness, 100 exact frames and 100 Retired / 0 Copied. drv-fb must have
+    completed J0c and armed its gate. The census (kernel `census:` lines, enabled by the
+    stage's autoexec `dmesg -n debug`, RE4) must hold DMA VMOs flat across sessions."""
+    text = log.read_bytes().decode(errors="replace").replace("\r", "")
+    live = [line for line in text.splitlines() if not re.match(r"^\[[0-9:.]+\] \[ *[0-9]+\.[0-9]+\]", line)]
+    boot = max((i for i, line in enumerate(live) if "Station IP address" in line), default=0)
+    live = live[boot:]
+    begins = [i for i, line in enumerate(live) if proof["begin"] in line]
+    assert len(begins) >= 2, f"{len(begins)} GL4 sessions; G8's bar needs at least two in one boot"
+    for expected in proof["boot"]:
+        assert sum(expected in line for line in live[:begins[0]]) == 1, f"{expected!r} not once before session 1"
+    for expected in proof["display"]:
+        assert sum(expected in line for line in live) == 1, f"{expected!r} not once in the boot"
+    for bad in ("TOWER", "FAILED", "ABEND"):
+        assert not any(bad in line for line in live), f"{bad} in the boot"
+    dma = {}
+    for number, start in enumerate(begins, 1):
+        end = begins[number] if number < len(begins) else len(live)
+        window = live[start:end]
+        required = proof["each"] + (proof["first"] if number == 1 else proof["later"]) + [proof["green"]]
+        for expected in required:
+            hits = sum(expected in line for line in window)
+            assert hits == 1, f"session {number}: {expected!r} appears {hits} times"
+        if number > 1:
+            assert not any("GL4 J0c" in line for line in window), f"session {number} ran J0c"
+        # The census needs `dmesg -n debug`, which also shows drv-gpu's per-point success line
+        # (`client point N complete on JOB ... status=0x0`); only its failure form may match the
+        # `absent` prefix (RE4: K2's checker refused a green session 4 on that). — TIMBERDOODLE
+        failures = [line for line in window if not re.search(r"drv-gpu: client point \d+ complete on JOB: ", line)]
+        for unwanted in proof["absent"]:
+            assert not any(unwanted in line for line in failures), f"session {number}: {unwanted!r}"
+        # Compare like phases (RE4): the census fires at most every 10 s, when Sora wakes, so a
+        # sample may land mid-frames (the client's buffers live) or after teardown. Only the
+        # post-teardown footprint, sampled after a session's green line, measures a leak
+        # across sessions; mid-session samples are printed but not compared. — TIMBERDOODLE
+        green = next(i for i, line in enumerate(window) if proof["green"] in line)
+        census = [(i, int(m.group(1))) for i, line in enumerate(window)
+                  for m in [re.search(r"census: .* vmos=\d+/(\d+)dma", line)] if m]
+        after = [count for i, count in census if i > green]
+        during = [count for i, count in census if i < green]
+        if after:
+            dma[number] = after[-1]
+        print(f"GL4 session {number}: 100/0 Retired/Copied, census DMA VMOs after teardown "
+              f"{dma.get(number, 'not sampled')}, during {during or 'not sampled'}")
+    for line in live:
+        if "display: present gate" in line or "sora: gpu-lane" in line or "restart budget" in line:
+            print(line)
+    assert len(dma) >= 2, "no post-teardown census in at least two sessions: was autoexec's `dmesg -n debug` staged?"
+    # A leak shows as growth across sessions. The last session's sample may land after Sora
+    # exhausts the restart budget and releases the view, falling back to the boot baseline
+    # (metal: 29, 29, 29, then 12); a drop is not a leak (RE4). — TIMBERDOODLE
+    first = dma[min(dma)]
+    spread = max(dma.values()) - first
+    assert spread <= 4, f"census DMA VMOs grew across sessions: {dma}"
+    print(f"GL4 metal check green ({proof['out']}): {len(begins)} sessions of 100 Retired / 0 Copied, "
+          f"J0c GL-fed in session 1, post-teardown census DMA VMOs never grew over sessions {sorted(dma)} "
+          f"({dma}, growth {spread}); "
+          f"no TOWER, FAILED or ABEND")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--proof", choices=sorted(PROOFS), default="g7o-f")
@@ -401,7 +502,7 @@ def main():
     args = parser.parse_args()
     proof = PROOFS[args.proof]
     if args.check:
-        check(args.check, proof)
+        (check_sessions if proof.get("sessions") else check)(args.check, proof)
         return
     spec = importlib.util.spec_from_file_location("device_smoke", ROOT / "scripts/mesa-device-smoke.py")
     module = importlib.util.module_from_spec(spec)
@@ -412,7 +513,7 @@ def main():
                        runtime=proof.get("runtime"))
     print(f"{args.proof} metal client compile/link green: {elf} sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}")
     if args.stage:
-        stage(args.stage, elf, proof.get("marker"))
+        stage(args.stage, elf, proof.get("marker"), proof.get("autoexec"))
 
 
 if __name__ == "__main__":

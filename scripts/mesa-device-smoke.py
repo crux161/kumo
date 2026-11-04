@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j772
 #j773
 #j774
 #j775
 #j776
+#j777
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -82,6 +82,14 @@ TEXTURE_LINES = [b"GL4-a context: current GLES context over the native GPU sessi
                  b"GL4-a clear: public glClear into the texture and native glFinish complete, expected RGBA8 0xff996633",
                  b"GL4-a readback: 0 of 40960 pixels differ; 0 of 32 readback guards changed (modeled service, initial texture retained)",
                  b"GL4-a destroy: texture, framebuffer, context, drawable and display released"]
+# GL4: mode 28's 100 frames of texture churn with no presenter; counts are printed, invariants asserted.
+CHURN_LINES = [b"GL4 context: current GLES context and an owned 256x160 RGBA8 framebuffer over the native GPU session",
+               b"GL4 compiler: GLSL ES 300 sources compiled and linked at runtime; texelFetch copies texel to pixel",
+               b"GL4 baseline: public glReadPixels observed an image different from frame 1's",
+               b"GL4 frames: 100 frames each created, uploaded, drew with and deleted one 160 KiB texture (16000 KiB in all); "
+               b"readback guards intact on every frame (modeled service runs no GPU; pixels not compared)",
+               b"GL4 destroy: program, context, drawable and display released",
+               b"GL4 model release: buffers=0 bindings=0 waits="]
 
 
 def run(command, **kwargs):
@@ -245,7 +253,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         (out / "kumo").mkdir(exist_ok=True)
         linker_script = compiler.link_script()
         # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle", "gl-heap", "gl-texture"] if cases == "device-smoke" else [])]:
+        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle", "gl-heap", "gl-texture", "gl-churn"] if cases == "device-smoke" else [])]:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
@@ -380,6 +388,13 @@ def main():
             assert b"GL4-a model release: buffers=0 bindings=0 waits=1 heaps=0 bytes=0 submits=3" in proof
             print("GL4-a texture green: the budget preflight refused a 256 MiB texture and admitted a 160 KiB one, "
                   "cleared and read back through an FBO, initial texture retained and clean teardown; modeled service runs no GPU", flush=True)
+            at = 0
+            for line in CHURN_LINES:
+                assert proof.count(line) == 1 and proof.index(line) >= at, line
+                at = proof.index(line)
+            assert at < proof.index(GREEN)
+            print("GL4 churn green: 100 frames each creating, uploading, drawing with and deleting a 160 KiB texture through public GL, "
+                  "every buffer, binding, heap and byte released; modeled service runs no GPU", flush=True)
             print("GL3-c heap shape green: proof-only driconf overrides reached Gallium's native heap request (262144 x 1, max 2), "
                   "an instanced draw, initial framebuffer retained and clean teardown; modeled service runs no GPU", flush=True)
         print(AUTO_VA_GREEN.decode(), flush=True)

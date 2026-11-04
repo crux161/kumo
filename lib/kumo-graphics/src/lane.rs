@@ -1,4 +1,5 @@
 //j774
+//j777
 //! GL3-b (PLAN/015 §8.32): the cooperative GPU client's half of Sora's lane bootstrap
 //! (DESIGN/024), and the CPU copy of a public RGBA8 readback into view `GPU_VIEW`'s surface,
 //! presented until the hold ends. Everything here is pure: the caller supplies the kernel
@@ -238,6 +239,44 @@ pub enum HoldError {
     Sequence { present: u32, got: u32 },
     /// drv-fb refused the present.
     Refused { present: u32, status: Status },
+    /// GL4's readiness: no `Retired` within the probe bound.
+    NotRetired { probes: u32 },
+}
+
+/// One present of `surface` with `sequence` and FULL damage, then its reply. Returns the
+/// honest success, `Retired` or `Copied`; anything else is an error naming `present`.
+pub fn present_frame<L: PresentLink>(
+    link: &mut L,
+    surface: Surface,
+    sequence: u32,
+    present: u32,
+) -> Result<Status, HoldError> {
+    let request = Present {
+        sequence,
+        surface,
+        damage: DamageSet::FULL,
+    }
+    .encode();
+    link.send(&request)
+        .map_err(|cause| HoldError::Link { present, cause })?;
+    let mut bytes = [0u8; REPLY_LEN + 1];
+    let len = link
+        .receive(&mut bytes)
+        .map_err(|cause| HoldError::Link { present, cause })?;
+    let reply = bytes
+        .get(..len)
+        .and_then(Reply::decode)
+        .ok_or(HoldError::Malformed { present })?;
+    if reply.sequence != sequence {
+        return Err(HoldError::Sequence {
+            present,
+            got: reply.sequence,
+        });
+    }
+    match reply.status {
+        status @ (Status::Retired | Status::Copied) => Ok(status),
+        status => Err(HoldError::Refused { present, status }),
+    }
 }
 
 /// Present `surface` `count` times, each with a fresh sequence (`first`, `first + 1`, ...)
@@ -255,38 +294,121 @@ pub fn present_hold<L: PresentLink>(
     let mut tally = Tally::default();
     for index in 0..count {
         let present = index + 1;
-        let sequence = first.wrapping_add(index);
-        let request = Present {
-            sequence,
-            surface,
-            damage: DamageSet::FULL,
-        }
-        .encode();
-        link.send(&request)
-            .map_err(|cause| HoldError::Link { present, cause })?;
-        let mut bytes = [0u8; REPLY_LEN + 1];
-        let len = link
-            .receive(&mut bytes)
-            .map_err(|cause| HoldError::Link { present, cause })?;
-        let reply = bytes
-            .get(..len)
-            .and_then(Reply::decode)
-            .ok_or(HoldError::Malformed { present })?;
-        if reply.sequence != sequence {
-            return Err(HoldError::Sequence {
-                present,
-                got: reply.sequence,
-            });
-        }
-        match reply.status {
+        match present_frame(link, surface, first.wrapping_add(index), present)? {
             Status::Retired => tally.retired += 1,
-            Status::Copied => tally.copied += 1,
-            status => return Err(HoldError::Refused { present, status }),
+            _ => tally.copied += 1,
         }
         tally.presents = present;
         link.pause();
     }
     Ok(tally)
+}
+
+/// G8's readiness rule, which GL4 shares: drv-fb's present gate arms only after its start-up
+/// diagnostic, so early replies may honestly be `Copied`. Present with fresh sequences from
+/// `*sequence + 1`, pausing after each `Copied`, until the first `Retired`, at most
+/// `max_probes` times. Returns the probes used; `*sequence` is left at the last one sent.
+pub fn present_until_retired<L: PresentLink>(
+    link: &mut L,
+    surface: Surface,
+    sequence: &mut u32,
+    max_probes: u32,
+) -> Result<u32, HoldError> {
+    for probe in 1..=max_probes {
+        *sequence = sequence.wrapping_add(1);
+        if present_frame(link, surface, *sequence, probe)? == Status::Retired {
+            return Ok(probe);
+        }
+        link.pause();
+    }
+    Err(HoldError::NotRetired { probes: max_probes })
+}
+
+/// One observation during a J0c native presentation, as the client's port reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeEvent {
+    /// drv-fb's answer to the frame-retired wait; `wake` is whether a wake-channel read end
+    /// rode with it.
+    WaitReply { armed: bool, wake: bool },
+    /// The image's reply; `handle` is whether a handle (never expected) rode with it.
+    ImageReply {
+        reply: crate::native::Reply,
+        handle: bool,
+    },
+    /// One byte read from the wake channel.
+    WakeByte(u8),
+    /// A wake from a source the exchange never bound, or an undecodable message.
+    Unexpected,
+}
+
+/// What the exchange needs next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeStep {
+    Continue,
+    Done,
+    Failed,
+}
+
+/// The client half of one J0c presentation after its RetireWait and image were sent: the
+/// Rust gpu-client's `present_image` rules, host-tested. Reuse needs both the retired reply
+/// and, when the wait was armed, the wake byte (the pair gate).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeExchange {
+    armed: bool,
+    wake: bool,
+    woken: bool,
+    reply: Option<crate::native::Reply>,
+}
+
+impl NativeExchange {
+    pub fn on(&mut self, event: NativeEvent) -> NativeStep {
+        match event {
+            NativeEvent::WaitReply { armed, wake } => {
+                if (wake && self.wake) || armed != wake {
+                    return NativeStep::Failed;
+                }
+                self.wake |= wake;
+                self.armed = armed;
+                NativeStep::Continue
+            }
+            NativeEvent::ImageReply { reply, handle } => {
+                if handle {
+                    return NativeStep::Failed;
+                }
+                self.reply = Some(reply);
+                if !self.armed || self.woken {
+                    NativeStep::Done
+                } else {
+                    NativeStep::Continue
+                }
+            }
+            NativeEvent::WakeByte(byte) => {
+                if !self.wake {
+                    return NativeStep::Failed;
+                }
+                self.woken = byte == 1;
+                if self.woken && self.reply.is_some() {
+                    NativeStep::Done
+                } else {
+                    NativeStep::Continue
+                }
+            }
+            NativeEvent::Unexpected => NativeStep::Failed,
+        }
+    }
+
+    /// The reply that may retire the lease: `Err(true)` for a cancellation (stop without
+    /// reuse), `Err(false)` for any other failure.
+    pub fn finish(self) -> Result<crate::native::Reply, bool> {
+        if self.armed && !self.woken {
+            return Err(false);
+        }
+        let reply = self.reply.ok_or(false)?;
+        if reply.is_cancelled() {
+            return Err(true);
+        }
+        Ok(reply)
+    }
 }
 
 #[cfg(test)]
@@ -665,5 +787,125 @@ mod tests {
                 cause: "present request write failed"
             })
         );
+    }
+
+    #[test]
+    fn readiness_probes_until_the_first_retired() {
+        let mut link = Script::statuses(8, &[Status::Copied, Status::Copied, Status::Retired]);
+        let mut sequence = 7;
+        assert_eq!(
+            present_until_retired(&mut link, VIEW_SURFACE, &mut sequence, 5),
+            Ok(3)
+        );
+        assert_eq!(sequence, 10);
+        assert_eq!(link.pauses, 2);
+        let mut never = Script::statuses(1, &[Status::Copied, Status::Copied]);
+        let mut sequence = 0;
+        assert_eq!(
+            present_until_retired(&mut never, VIEW_SURFACE, &mut sequence, 2),
+            Err(HoldError::NotRetired { probes: 2 })
+        );
+        let mut refused = Script::statuses(1, &[Status::BadRequest]);
+        let mut sequence = 0;
+        assert_eq!(
+            present_until_retired(&mut refused, VIEW_SURFACE, &mut sequence, 3),
+            Err(HoldError::Refused {
+                present: 1,
+                status: Status::BadRequest
+            })
+        );
+    }
+
+    fn retired(sequence: u32, gpu_point: u64) -> NativeEvent {
+        NativeEvent::ImageReply {
+            reply: crate::native::Reply {
+                sequence,
+                gpu_point,
+                retired: true,
+            },
+            handle: false,
+        }
+    }
+
+    #[test]
+    fn a_native_exchange_needs_the_reply_and_an_armed_wake() {
+        // Armed: the reply alone is not enough, and the wake byte completes it, in either order.
+        let mut x = NativeExchange::default();
+        assert_eq!(
+            x.on(NativeEvent::WaitReply {
+                armed: true,
+                wake: true
+            }),
+            NativeStep::Continue
+        );
+        assert_eq!(x.on(retired(1, 1)), NativeStep::Continue);
+        assert_eq!(x.on(NativeEvent::WakeByte(1)), NativeStep::Done);
+        assert_eq!(x.finish().map(|r| r.sequence), Ok(1));
+        let mut y = NativeExchange::default();
+        y.on(NativeEvent::WaitReply {
+            armed: true,
+            wake: true,
+        });
+        assert_eq!(y.on(NativeEvent::WakeByte(1)), NativeStep::Continue);
+        assert_eq!(y.on(retired(2, 2)), NativeStep::Done);
+        assert!(y.finish().is_ok());
+        // Already retired when read: unarmed, the reply completes it.
+        let mut z = NativeExchange::default();
+        z.on(NativeEvent::WaitReply {
+            armed: false,
+            wake: false,
+        });
+        assert_eq!(z.on(retired(3, 3)), NativeStep::Done);
+        assert!(z.finish().is_ok());
+    }
+
+    #[test]
+    fn a_native_exchange_refuses_what_the_protocol_never_sends() {
+        let mut mismatch = NativeExchange::default();
+        assert_eq!(
+            mismatch.on(NativeEvent::WaitReply {
+                armed: true,
+                wake: false
+            }),
+            NativeStep::Failed
+        );
+        let mut stray = NativeExchange::default();
+        assert_eq!(stray.on(NativeEvent::WakeByte(1)), NativeStep::Failed);
+        let mut handle = NativeExchange::default();
+        let reply = crate::native::Reply {
+            sequence: 1,
+            gpu_point: 1,
+            retired: true,
+        };
+        assert_eq!(
+            handle.on(NativeEvent::ImageReply {
+                reply,
+                handle: true
+            }),
+            NativeStep::Failed
+        );
+        assert_eq!(
+            NativeExchange::default().on(NativeEvent::Unexpected),
+            NativeStep::Failed
+        );
+        // A wrong wake byte never authorizes reuse; a cancellation is its own outcome.
+        let mut bad_wake = NativeExchange::default();
+        bad_wake.on(NativeEvent::WaitReply {
+            armed: true,
+            wake: true,
+        });
+        bad_wake.on(NativeEvent::WakeByte(7));
+        bad_wake.on(retired(1, 1));
+        assert_eq!(bad_wake.finish(), Err(false));
+        let mut cancelled = NativeExchange::default();
+        cancelled.on(NativeEvent::WaitReply {
+            armed: false,
+            wake: false,
+        });
+        cancelled.on(NativeEvent::ImageReply {
+            reply: crate::native::Reply::cancelled(),
+            handle: false,
+        });
+        assert_eq!(cancelled.finish(), Err(true));
     }
 }

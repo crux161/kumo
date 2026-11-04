@@ -1,8 +1,8 @@
-//j719
 //j725
 //j731
 //j732
 //j743
+//j777
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -3480,12 +3480,22 @@ impl SyscallEngine {
                                 crate::mm::VmoBacking::PhysicalRam { phys_base }
                                 | crate::mm::VmoBacking::Mmio { phys_base }
                                 | crate::mm::VmoBacking::Dma { phys_base } => {
+                                    let dst = phys_ptr_mut(phys_base + offset);
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
                                             src_slice.as_ptr(),
-                                            phys_ptr_mut(phys_base + offset),
+                                            dst,
                                             len,
                                         );
+                                    }
+                                    // RE4 (J777): DMA RAM exists for non-coherent readers (an
+                                    // NC mapping, a device). This copy went through the
+                                    // cacheable physmap, so clean it to PoC as
+                                    // `zero_reclaimed_run` does, or a display reads stale
+                                    // lines (metal: drv-fb's J0c checksum refused a GL frame).
+                                    // — TIMBERDOODLE
+                                    if matches!(backing, crate::mm::VmoBacking::Dma { .. }) {
+                                        kumo_hal::active::clean_dcache_to_poc(dst as usize, len);
                                     }
                                     Errno::Ok.status()
                                 }
