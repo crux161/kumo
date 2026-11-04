@@ -4,6 +4,7 @@
 //j460
 //j467
 //j622
+//j783
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
@@ -106,6 +107,87 @@ pub fn framebuffer_from_gop(
         stride: pixels_per_scan_line,
         format: framebuffer_format_from_efi(pixel_format),
     }
+}
+
+/// One GOP mode as `QueryMode` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GopMode {
+    pub number: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u32,
+}
+
+impl GopMode {
+    /// A linear 32-bit RGB/BGR buffer, the only kind KUMO's framebuffer path takes.
+    pub fn is_linear(&self) -> bool {
+        framebuffer_format_from_efi(self.pixel_format) != FramebufferFormat::Unknown
+            && self.width != 0
+            && self.height != 0
+    }
+
+    fn area(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+}
+
+/// The firmware's VGA fallback. The RK3588 firmware leaves HDMI here when it did not get
+/// the sink's EDID, with the HDMI transmitter still holding the earlier timing (KUMO's D0d
+/// reported the disagreement on several boots).
+pub const GOP_VGA_FALLBACK: (u32, u32) = (640, 480);
+/// The largest mode a fallback is replaced with. With no EDID to go by, 1080p is the CEA-861
+/// mode HDMI sinks most widely accept; anything larger risks an out-of-range sink.
+pub const GOP_FALLBACK_MAX: (u32, u32) = (1920, 1080);
+
+/// What Nijigumo does with the firmware's GOP mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GopChoice {
+    /// The firmware's mode is linear and above the VGA fallback: its choice (normally the
+    /// sink's EDID-preferred mode) stands.
+    KeepFirmware,
+    /// The firmware's mode is the fallback or not linear, and nothing better is offered.
+    KeepNoBetter,
+    /// Switch to this mode: the largest linear one within [`GOP_FALLBACK_MAX`], and larger
+    /// than the current one when that is linear.
+    Switch(GopMode),
+}
+
+/// Choose the boot mode. The firmware's choice is kept unless it is the VGA fallback (or not
+/// linear); then the largest linear mode within [`GOP_FALLBACK_MAX`] replaces it, the lowest
+/// mode number winning a tie. A mode the firmware reports as current is never re-set.
+pub fn choose_gop_mode(current: GopMode, offered: &[GopMode]) -> GopChoice {
+    let fallback = GopMode {
+        number: current.number,
+        width: GOP_VGA_FALLBACK.0,
+        height: GOP_VGA_FALLBACK.1,
+        pixel_format: current.pixel_format,
+    };
+    if current.is_linear() && current.area() > fallback.area() {
+        return GopChoice::KeepFirmware;
+    }
+    let floor = if current.is_linear() {
+        current.area()
+    } else {
+        0
+    };
+    let mut best: Option<GopMode> = None;
+    for mode in offered {
+        if mode.number == current.number
+            || !mode.is_linear()
+            || mode.width > GOP_FALLBACK_MAX.0
+            || mode.height > GOP_FALLBACK_MAX.1
+            || mode.area() <= floor
+        {
+            continue;
+        }
+        match best {
+            Some(b)
+                if b.area() > mode.area()
+                    || (b.area() == mode.area() && b.number < mode.number) => {}
+            _ => best = Some(*mode),
+        }
+    }
+    best.map_or(GopChoice::KeepNoBetter, GopChoice::Switch)
 }
 
 /// One unambiguous EFI Reserved/RuntimeServicesData descriptor must contain the whole GOP page span,
@@ -718,5 +800,113 @@ mod framebuffer_tests {
         ] {
             assert!(reserved_framebuffer_span(bad, &map, 40).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod gop_mode_tests {
+    use super::*;
+
+    const BGR: u32 = efi_pixel_format::BGR_RESERVED_8;
+    const BLT: u32 = efi_pixel_format::BLT_ONLY;
+
+    fn mode(number: u32, width: u32, height: u32, pixel_format: u32) -> GopMode {
+        GopMode {
+            number,
+            width,
+            height,
+            pixel_format,
+        }
+    }
+
+    fn list() -> [GopMode; 7] {
+        [
+            mode(0, 640, 480, BGR),
+            mode(1, 800, 600, BGR),
+            mode(2, 1280, 720, BGR),
+            mode(3, 1600, 900, BGR),
+            mode(4, 1920, 1080, BGR),
+            mode(5, 2560, 1440, BGR),
+            mode(6, 3840, 2160, BGR),
+        ]
+    }
+
+    #[test]
+    fn firmware_mode_above_vga_is_kept() {
+        // opi5's usual 1600x900, QEMU OVMF's 800x600 and a laptop panel's native mode.
+        for current in [
+            mode(3, 1600, 900, BGR),
+            mode(1, 800, 600, BGR),
+            mode(6, 3840, 2160, BGR),
+        ] {
+            assert_eq!(choose_gop_mode(current, &list()), GopChoice::KeepFirmware);
+        }
+    }
+
+    #[test]
+    fn vga_fallback_becomes_the_largest_mode_within_1080p() {
+        assert_eq!(
+            choose_gop_mode(mode(0, 640, 480, BGR), &list()),
+            GopChoice::Switch(mode(4, 1920, 1080, BGR))
+        );
+        // Without 1080p offered, the largest below it.
+        let small = &list()[..4];
+        assert_eq!(
+            choose_gop_mode(mode(0, 640, 480, BGR), small),
+            GopChoice::Switch(mode(3, 1600, 900, BGR))
+        );
+    }
+
+    #[test]
+    fn vga_fallback_with_nothing_better_is_kept() {
+        let only = [mode(0, 640, 480, BGR)];
+        assert_eq!(choose_gop_mode(only[0], &only), GopChoice::KeepNoBetter);
+        // Only modes above the cap, or not linear: nothing within reach.
+        let out = [
+            mode(0, 640, 480, BGR),
+            mode(1, 2560, 1440, BGR),
+            mode(2, 1920, 1080, BLT),
+        ];
+        assert_eq!(choose_gop_mode(out[0], &out), GopChoice::KeepNoBetter);
+        // Smaller modes never replace the fallback.
+        let tiny = [mode(0, 640, 480, BGR), mode(1, 320, 240, BGR)];
+        assert_eq!(choose_gop_mode(tiny[0], &tiny), GopChoice::KeepNoBetter);
+    }
+
+    #[test]
+    fn non_linear_current_takes_any_linear_mode_within_the_cap() {
+        let modes = [
+            mode(0, 1024, 768, BLT),
+            mode(1, 640, 480, BGR),
+            mode(2, 800, 600, BGR),
+        ];
+        assert_eq!(
+            choose_gop_mode(modes[0], &modes),
+            GopChoice::Switch(mode(2, 800, 600, BGR))
+        );
+        // Even a VGA mode beats no linear buffer at all.
+        let vga = [mode(0, 1024, 768, BLT), mode(1, 640, 480, BGR)];
+        assert_eq!(
+            choose_gop_mode(vga[0], &vga),
+            GopChoice::Switch(mode(1, 640, 480, BGR))
+        );
+    }
+
+    #[test]
+    fn ties_take_the_lowest_mode_number_and_current_is_never_reset() {
+        let modes = [
+            mode(0, 640, 480, BGR),
+            mode(1, 1920, 1080, BGR),
+            mode(2, 1920, 1080, efi_pixel_format::RGB_RESERVED_8),
+        ];
+        assert_eq!(
+            choose_gop_mode(modes[0], &modes),
+            GopChoice::Switch(modes[1])
+        );
+        let reversed = [modes[0], modes[2], modes[1]];
+        assert_eq!(
+            choose_gop_mode(modes[0], &reversed),
+            GopChoice::Switch(modes[1])
+        );
     }
 }

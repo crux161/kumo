@@ -5,6 +5,7 @@
 //j460
 //j467
 //j622
+//j783
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -36,10 +37,10 @@ use kumo_abi::{BootInfo, Framebuffer, FramebufferFormat, MemRegion, Range, RawSl
 use niji_loader::elf::{parse_elf64, EM_AARCH64};
 use niji_loader::{summarize_platform, validate_boot_info};
 use niji_uefi::{
-    build_boot_info, efi_memory_type, efi_memory_type_is_firmware_owned, efi_pixel_format,
-    fdt_total_size, framebuffer_from_gop, is_fdt_magic, is_plausible_firmware_pointer,
-    mem_region_kind_from_efi, parse_pl011_console, reserved_framebuffer_span, BootConfig,
-    UefiHandoffSeed,
+    build_boot_info, choose_gop_mode, efi_memory_type, efi_memory_type_is_firmware_owned,
+    efi_pixel_format, fdt_total_size, framebuffer_from_gop, is_fdt_magic,
+    is_plausible_firmware_pointer, mem_region_kind_from_efi, parse_pl011_console,
+    reserved_framebuffer_span, BootConfig, GopChoice, GopMode, UefiHandoffSeed, GOP_FALLBACK_MAX,
 };
 
 pub type EfiHandle = *mut c_void;
@@ -418,11 +419,21 @@ struct EfiFileProtocol {
 
 #[repr(C)]
 struct EfiGraphicsOutputProtocol {
-    query_mode: *const c_void,
-    set_mode: *const c_void,
+    query_mode: extern "efiapi" fn(
+        *mut Self,
+        u32,
+        *mut usize,
+        *mut *mut EfiGraphicsOutputModeInformation,
+    ) -> EfiStatus,
+    set_mode: extern "efiapi" fn(*mut Self, u32) -> EfiStatus,
     blt: *const c_void,
     mode: *mut EfiGraphicsOutputProtocolMode,
 }
+
+/// The most GOP modes Nijigumo lists and chooses among; firmware lists are far shorter.
+const MAX_GOP_MODES: usize = 64;
+/// Modes per `GOP mode list` line, which keeps each line inside [`Utf16Line::CAP`].
+const GOP_MODES_PER_LINE: usize = 6;
 
 #[repr(C)]
 struct EfiGraphicsOutputProtocolMode {
@@ -2065,6 +2076,167 @@ unsafe fn snapshot_memory(
     ))
 }
 
+fn gop_format_name(pixel_format: u32) -> &'static str {
+    match pixel_format {
+        efi_pixel_format::RGB_RESERVED_8 => "RGB",
+        efi_pixel_format::BGR_RESERVED_8 => "BGR",
+        efi_pixel_format::BIT_MASK => "MASK",
+        efi_pixel_format::BLT_ONLY => "BLT",
+        _ => "?",
+    }
+}
+
+/// ` #N WxH FMT` for each mode of one `GOP mode list` line.
+struct GopModeRow<'a>(&'a [GopMode]);
+
+impl fmt::Display for GopModeRow<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for m in self.0 {
+            write!(
+                f,
+                " #{} {}x{} {}",
+                m.number,
+                m.width,
+                m.height,
+                gop_format_name(m.pixel_format)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The current GOP mode, as the mode structure describes it.
+unsafe fn current_gop_mode(gop: *mut EfiGraphicsOutputProtocol) -> GopMode {
+    let mode = unsafe { (*gop).mode };
+    let info = unsafe { (*mode).info };
+    let number = unsafe { (*mode).mode };
+    if info.is_null() {
+        return GopMode {
+            number,
+            width: 0,
+            height: 0,
+            pixel_format: efi_pixel_format::BLT_ONLY,
+        };
+    }
+    unsafe {
+        GopMode {
+            number,
+            width: (*info).horizontal_resolution,
+            height: (*info).vertical_resolution,
+            pixel_format: (*info).pixel_format,
+        }
+    }
+}
+
+/// List every mode the GOP offers and keep the firmware's choice unless it left the VGA
+/// fallback (or no linear buffer); then set the largest linear mode within
+/// [`GOP_FALLBACK_MAX`] (`choose_gop_mode`). A refused SetMode keeps the firmware's mode.
+///
+/// QueryMode's buffers are boot-services pool, which KUMO reclaims at ExitBootServices, so
+/// they are not freed: FreePool on a buffer a non-conforming firmware did not pool-allocate
+/// would be worse than leaving ~40 bytes per mode until the handoff.
+unsafe fn select_gop_mode(
+    con_out: *mut EfiSimpleTextOutputProtocol,
+    gop: *mut EfiGraphicsOutputProtocol,
+) {
+    let mode = unsafe { (*gop).mode };
+    let max_mode = unsafe { (*mode).max_mode };
+    let current = unsafe { current_gop_mode(gop) };
+    let empty = GopMode {
+        number: 0,
+        width: 0,
+        height: 0,
+        pixel_format: efi_pixel_format::BLT_ONLY,
+    };
+    let mut modes = [empty; MAX_GOP_MODES];
+    let mut count = 0;
+    for number in 0..max_mode.min(MAX_GOP_MODES as u32) {
+        let mut size = 0usize;
+        let mut info: *mut EfiGraphicsOutputModeInformation = ptr::null_mut();
+        let status = unsafe { ((*gop).query_mode)(gop, number, &mut size, &mut info) };
+        if status != EFI_SUCCESS
+            || info.is_null()
+            || size < size_of::<EfiGraphicsOutputModeInformation>()
+        {
+            continue;
+        }
+        modes[count] = unsafe {
+            GopMode {
+                number,
+                width: (*info).horizontal_resolution,
+                height: (*info).vertical_resolution,
+                pixel_format: (*info).pixel_format,
+            }
+        };
+        count += 1;
+    }
+    let modes = &modes[..count];
+
+    kprint!(
+        con_out,
+        "GOP modes    : {} of {} queried, current #{} {}x{} {}\r\n",
+        count,
+        max_mode,
+        current.number,
+        current.width,
+        current.height,
+        gop_format_name(current.pixel_format)
+    );
+    for row in modes.chunks(GOP_MODES_PER_LINE) {
+        kprint!(con_out, "GOP mode list:{}\r\n", GopModeRow(row));
+    }
+
+    match choose_gop_mode(current, modes) {
+        GopChoice::KeepFirmware => kprint!(
+            con_out,
+            "GOP choice   : firmware mode #{} {}x{} kept\r\n",
+            current.number,
+            current.width,
+            current.height
+        ),
+        GopChoice::KeepNoBetter => kprint!(
+            con_out,
+            "GOP choice   : firmware left #{} {}x{} {}; no larger linear mode within {}x{}, kept\r\n",
+            current.number,
+            current.width,
+            current.height,
+            gop_format_name(current.pixel_format),
+            GOP_FALLBACK_MAX.0,
+            GOP_FALLBACK_MAX.1
+        ),
+        GopChoice::Switch(next) => {
+            let status = unsafe { ((*gop).set_mode)(gop, next.number) };
+            let now = unsafe { current_gop_mode(gop) };
+            if status == EFI_SUCCESS && now.number == next.number {
+                kprint!(
+                    con_out,
+                    "GOP choice   : firmware left #{} {}x{} {}; set #{} {}x{} {}\r\n",
+                    current.number,
+                    current.width,
+                    current.height,
+                    gop_format_name(current.pixel_format),
+                    now.number,
+                    now.width,
+                    now.height,
+                    gop_format_name(now.pixel_format)
+                );
+            } else {
+                kprint!(
+                    con_out,
+                    "GOP choice   : SetMode #{} {}x{} refused ({:#x}); now #{} {}x{}\r\n",
+                    next.number,
+                    next.width,
+                    next.height,
+                    status,
+                    now.number,
+                    now.width,
+                    now.height
+                );
+            }
+        }
+    }
+}
+
 /// Locate the active GOP and read its framebuffer. Only a usable *linear* buffer
 /// (nonzero base/size, RGB/BGR) is accepted; a BltOnly GOP is reported absent.
 unsafe fn discover_framebuffer(
@@ -2088,12 +2260,18 @@ unsafe fn discover_framebuffer(
         return None;
     }
 
+    if unsafe { (*gop).mode }.is_null() {
+        kprint!(con_out, "framebuffer  : absent (GOP mode null)\r\n");
+        return None;
+    }
+    unsafe { select_gop_mode(con_out, gop) };
+
+    // SetMode rewrites the mode's fields (and may move them), so read them afresh.
     let mode = unsafe { (*gop).mode };
     if mode.is_null() {
         kprint!(con_out, "framebuffer  : absent (GOP mode null)\r\n");
         return None;
     }
-
     let base = unsafe { (*mode).frame_buffer_base };
     let len = unsafe { (*mode).frame_buffer_size } as u64;
     let info = unsafe { (*mode).info };
