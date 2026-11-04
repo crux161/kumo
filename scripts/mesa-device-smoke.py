@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j768
 #j769
 #j770
 #j772
 #j773
+#j774
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -176,15 +176,18 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     for name in ["native-device", cases]:
         run([cc, *flags, *(defines if name == cases else ()), "-Wno-unused-parameter", "-c",
              TOOL / f"{name}.c", "-o", out / f"{name}.o"])
+    # kumo-graphics carries GL3-b's lane decode, readback copy and present hold for the metal
+    # runtime (PLAN/015 §8.32); the QEMU runtime does not use it.
     run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none",
-         "-p", "kumo-rt", "-p", "kumo-gpu", "-p", "kumo-abi"])
+         "-p", "kumo-rt", "-p", "kumo-gpu", "-p", "kumo-abi", "-p", "kumo-graphics"])
     if cases == "device-smoke":
         run(["cargo", "build", "--offline", "--locked", "--release", "--target", "aarch64-unknown-none", "-p", "drv-gpu", "--lib"])
     deps = ROOT / "target/aarch64-unknown-none/release"
     elf = out / cases
     run(["rustc", "--edition=2021", "--crate-type=staticlib", "--target=aarch64-unknown-none",
          "-C", "panic=abort", "-C", "opt-level=2", "--extern", f"kumo_gpu={deps / 'libkumo_gpu.rlib'}",
-         "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}", *(["--extern", f"drv_gpu={deps / 'libdrv_gpu.rlib'}"] if cases == "device-smoke" else []), "-L", f"dependency={deps / 'deps'}",
+         "--extern", f"kumo_abi={deps / 'libkumo_abi.rlib'}",
+         "--extern", f"kumo_graphics={deps / 'libkumo_graphics.rlib'}", *(["--extern", f"drv_gpu={deps / 'libdrv_gpu.rlib'}"] if cases == "device-smoke" else []), "-L", f"dependency={deps / 'deps'}",
          TOOL / f"{runtime}.rs", "-o", out / "libdevice.a"])
     run([cc, "--target=aarch64-unknown-none", "-c", crt0, "-o", out / "crt0.o"])
     # Mesa's exported archives are thin. Materialize their real cached members, rather
@@ -252,6 +255,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
+             ROOT / "lib/kumo-graphics/src/lib.rs", ROOT / "lib/kumo-graphics/src/lane.rs",
              native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
     paths.extend(TOOL / f"{obj.stem}.c" for obj in gl_objects)
     if gl:

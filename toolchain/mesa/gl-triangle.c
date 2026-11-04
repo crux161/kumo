@@ -12,9 +12,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct pipe_screen *panfrost_create_screen_kumo(struct pan_kmod_dev *kmod);
-unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled);
+unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled,
+                                uint32_t *keep);
 
 #define WIDTH 256u
 #define HEIGHT 128u
@@ -80,7 +82,10 @@ static GLuint compile(void (*say)(const char *), GLenum stage, const GLchar *sou
     return shader;
 }
 
-unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled)
+/* `keep`, when not NULL, receives the verified readback (PIXELS words, rows bottom-up)
+ * for GL3-b's copy into a view; GL3-a and QEMU mode 25 pass NULL and are unchanged. */
+unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), bool modeled,
+                                uint32_t *keep)
 {
     struct pan_kmod_dev *kmod = pan_kmod_kumo_dev_create(api, NULL);
     if (!kmod)
@@ -217,6 +222,8 @@ unsigned kumo_gl_triangle_cases(const struct kumo_gpu_api *api, void (*say)(cons
     report(say, "GL3-a layout: color modifier after readback 0x%016llx (%s)",
            (unsigned long long)after, layout(after));
     REQUIRE(inside == PIXELS / 2 && !differ && !damaged, 20);
+    if (keep)
+        memcpy(keep, pixels, PIXELS * sizeof *pixels);
 done:
     if (context && kumo_gl_is_current(context)) {
         glUseProgram(0);
@@ -249,7 +256,7 @@ extern unsigned kumo_metal_proof(void);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
-    return kumo_gl_triangle_cases(api, kumo_metal_log, false);
+    return kumo_gl_triangle_cases(api, kumo_metal_log, false, NULL);
 }
 
 int main(void)
@@ -261,6 +268,55 @@ int main(void)
         return 1;
     }
     kumo_metal_log("GL3-a metal triangle green: Mali rasterized the triangle exactly, all 32768 RGBA8 pixels and 32 guards checked, native completion and clean teardown");
+    return 0;
+}
+#endif
+
+#ifdef KUMO_GL_PRESENT_MAIN
+/* GL3-b (PLAN/015 §8.32): the GL3-a triangle, read back through public glReadPixels,
+ * converted to XRGB8888 on the CPU, written into view 1 (GPU_VIEW) and presented on HDMI.
+ * The view arrives over Sora's lane because the stage adds the `etc/gpu-lane` marker
+ * `view` (D1), so the lane is decoded before Mesa starts. The GL objects are released
+ * before the hold; the view's lease returns when this process exits. This image runs no
+ * J0c diagnostic, so drv-fb's present gate stays unarmed and the presents are honestly
+ * Copied: CRUX accepted that gate on 2026-11-03, leaving Retired to GL4. */
+extern void kumo_metal_log(const char *line);
+extern unsigned kumo_metal_proof(void);
+extern unsigned kumo_metal_view_take(void);
+extern unsigned kumo_metal_view_present(const uint32_t *pixels, uint32_t width, uint32_t height);
+static uint32_t *present_image;
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
+{
+    return kumo_gl_triangle_cases(api, kumo_metal_log, false, present_image);
+}
+
+int main(void)
+{
+    kumo_metal_log("GL3-b metal present begin: the GL3-a triangle, read back, copied into view 1 and presented on HDMI");
+    unsigned failed = kumo_metal_view_take();
+    if (failed) {
+        report(kumo_metal_log, "GL3-b metal present FAILED at lane step %u", failed);
+        return 1;
+    }
+    present_image = malloc(PIXELS * sizeof *present_image);
+    if (!present_image) {
+        kumo_metal_log("GL3-b metal present FAILED: no readback copy buffer");
+        return 1;
+    }
+    failed = kumo_metal_proof();
+    if (failed) {
+        report(kumo_metal_log, "GL3-b metal present FAILED at case %u", failed);
+        free(present_image);
+        return 1;
+    }
+    failed = kumo_metal_view_present(present_image, WIDTH, HEIGHT);
+    free(present_image);
+    if (failed) {
+        report(kumo_metal_log, "GL3-b metal present FAILED at present step %u", failed);
+        return 1;
+    }
+    kumo_metal_log("GL3-b metal present green: the exact Mali triangle was copied into view 1 and every present was accepted; Copied is the gate on an image without J0c");
     return 0;
 }
 #endif

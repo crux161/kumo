@@ -1,9 +1,58 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j768 -->
 <!-- j769 -->
 <!-- j770 -->
 <!-- j772 -->
 <!-- j773 -->
+<!-- j774 -->
+
+## GL3-b: the triangle copied into view 1 and held on HDMI (J774, metal-proven)
+
+GL3-b (PLAN/015 §8.32, D1/D2 as ratified) shows GL3-a's exact image on the glass. Built with
+`KUMO_GL_PRESENT_MAIN`, [gl-triangle.c](gl-triangle.c) runs the GL3-a body unchanged. It then
+copies the verified public `glReadPixels` result into view 1 (`GPU_VIEW`) and presents it:
+
+- **Lane (D1).** The stage adds the initrd marker `etc/gpu-lane` = `view` beside
+  `bin/gpu-client`. Sora reads it at boot and logs `sora: gpu-lane marker selects the view
+  lane`. It keeps `GPU_VIEW` from drv-gpu and sends `V` (view channel), `S` (surface), then
+  `N` over the lane pair. This replaces G8's hand-flipped `GPU_CHURN_VIEW`: a `churn` marker
+  selects the G8 lane, and an image with no marker behaves exactly as before. A `view` lane is
+  one launch. When the client exits, Sora marks the view grantable again and does not regrant.
+- **Decode first.** `kumo_metal_view_take` ([device-metal.rs](device-metal.rs)) decodes the
+  lane before Mesa starts, through `kumo_graphics::lane::decode_lane`. A native-only lane, meaning
+  the marker is missing, fails before any GPU work. The native producer is closed unused.
+- **Copy (D2).** `kumo_graphics::lane::copy_readback` converts each RGBA8 word to XRGB8888
+  (`0xff6633cc` becomes `0x00cc3366`; the clear `0xff996633` becomes `0x00336699`). It flips
+  the bottom-up readback rows upright and writes the 256x128 surface in 512 VmoWrite chunks of
+  256 bytes.
+- **Hold.** `kumo_graphics::lane::present_hold` sends 15 fresh FULL-damage presents, paced one
+  second apart, with one outstanding at a time and a 10 s reply bound. It counts `Retired` and
+  `Copied` separately. Any other status, a sequence mismatch or a link failure ends the hold,
+  named. The client then closes the view channel and surface and exits, so the view's lease
+  returns.
+- **Gate (CRUX, 2026-11-03).** drv-fb arms its `Retired` gate only after the J0c diagnostic
+  completes (J713). A GL proof image replaces the Rust gpu-client that runs J0c, so every
+  present is honestly `Copied`, and `--check` prints drv-fb's `display: present gate ...`
+  line. The metal gate is therefore: every present accepted, nothing refused, and CRUX sees
+  the triangle on HDMI and then the restored console. `Retired` presentation stays GL4's gate.
+
+QEMU mode 25 is unchanged: the body gained only a NULL `keep` argument. Host tests cover the
+marker parse (`cargo test -p sora --lib gpu_lane`) and the lane decode, copy and hold
+(`cargo test -p kumo-graphics lane`). The runtime now links `kumo-graphics`, which
+`mesa-device-smoke.py` builds and records in the proof manifest.
+
+**Metal (J774, 2026-11-04).** Two PXE boots on the Orange Pi each ran the body exactly
+(0 of 32,768 pixels, 0 of 32 guards), wrote the copy in 512 chunks and had all 15 presents
+accepted: `retired=0 copied=15`, with drv-fb's `present gate skipped: diagnostic did not
+complete`. CRUX photographed the second run on HDMI: pink (`0x00cc3366`) lower-left, blue
+(`0x00336699`) upper-right, so the copy is upright. F2c's `VIEW 1` title strip is drawn
+inside the view's own rectangle and hides its top `TITLE_HEIGHT` (16) rows. That is drv-fb's
+existing chrome, not the copy. The checker passes both captures.
+
+```sh
+python3 scripts/mesa-device-smoke.py --gl-screen --run
+python3 scripts/mesa-device-metal.py --proof gl3-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof gl3-b --check <tio-log>
+```
 
 ## GL3-a: the first GLES triangle through the tiler, offscreen
 

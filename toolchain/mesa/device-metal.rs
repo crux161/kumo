@@ -1,6 +1,7 @@
 //j747
 //j753
 //j754
+//j774
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -22,6 +23,7 @@ use kumo_gpu::{
     client::Client,
     Submission, SyncState,
 };
+use kumo_graphics::lane;
 mod native;
 
 type Main = unsafe extern "C" fn(isize, *mut *mut c_char, *mut *mut c_char) -> i32;
@@ -266,6 +268,272 @@ pub extern "C" fn kumo_metal_heap_destroy(context: *mut c_void, heap: u32, bytes
         }
         Err(_) => 2,
     }
+}
+
+fn close(raw: u64) {
+    native::call(Syscall::HandleClose, [raw, 0, 0, 0, 0, 0]);
+}
+
+/// One NOTICE line from parts, truncated at the log's 256-byte limit.
+fn log_parts(parts: &[&[u8]]) {
+    let mut line = [0u8; 256];
+    let mut len = 0;
+    for part in parts {
+        let take = part.len().min(line.len() - len);
+        line[len..len + take].copy_from_slice(&part[..take]);
+        len += take;
+    }
+    log(&line[..len]);
+}
+
+fn valid(raw: u64) -> Option<u64> {
+    lane::valid_handle(raw).then_some(raw)
+}
+
+/// GL3-b (PLAN/015 §8.32): view `GPU_VIEW`'s presentation channel and surface, taken from the
+/// lane before the GL proof runs. Zero until `kumo_metal_view_take` succeeds; the present
+/// takes and closes them.
+static VIEW_CHANNEL: AtomicU64 = AtomicU64::new(0);
+static VIEW_SURFACE: AtomicU64 = AtomicU64::new(0);
+/// The hold: fifteen presents paced one second apart keep the triangle on HDMI for about
+/// fifteen seconds, at a rate that cannot crowd drv-fb's serve loop.
+const VIEW_PRESENTS: u32 = 15;
+const VIEW_PACE_NS: u64 = 1_000_000_000;
+/// A serving drv-fb answers at once; the bound only stops a wedged presenter hanging the
+/// client.
+const VIEW_REPLY_BOUND_NS: u64 = 10_000_000_000;
+
+/// Decode Sora's lane (D1's `view` marker sends `V`, `S`, then `N`) before Mesa starts. The
+/// native producer is closed unused: this image runs no J0c diagnostic, so drv-fb's present
+/// gate stays unarmed and replies are honestly `Copied` (CRUX, 2026-11-03). A native-only
+/// lane means the image lacks its `etc/gpu-lane` marker and fails here, before any GPU work.
+#[no_mangle]
+pub extern "C" fn kumo_metal_view_take() -> u32 {
+    let raw = kumo_metal_lane.swap(0, Ordering::Relaxed);
+    if raw == 0 {
+        log(b"GL3-b lane: no lane bootstrap was transferred\n");
+        return 1;
+    }
+    let read = || {
+        let mut bytes = [0u8; 2];
+        let (len, handle) = native::call(
+            Syscall::ChannelRead,
+            [raw, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0],
+        );
+        lane::LaneRead {
+            len,
+            tag: bytes[0],
+            handle,
+        }
+    };
+    let decoded = lane::decode_lane(read, close);
+    close(raw);
+    match decoded {
+        Ok(lane::Lane::View {
+            channel,
+            surface,
+            producer,
+        }) => {
+            if producer != 0 {
+                close(producer);
+            }
+            VIEW_CHANNEL.store(channel, Ordering::Relaxed);
+            VIEW_SURFACE.store(surface, Ordering::Relaxed);
+            log(b"GL3-b lane: view 1 channel and surface received over V, S, N; the native producer is not used\n");
+            0
+        }
+        Ok(lane::Lane::Native { producer }) => {
+            if producer != 0 {
+                close(producer);
+            }
+            log(b"GL3-b lane: Sora named the native lane; this image has no etc/gpu-lane view marker\n");
+            2
+        }
+        Err(cause) => {
+            log_parts(&[b"GL3-b lane: ", cause.as_bytes(), b"\n"]);
+            3
+        }
+    }
+}
+
+/// One sleep on a private port and one-shot timer, as kumo-rt's `sleep_ns` does.
+fn sleep(ns: u64) {
+    let Some(port) = valid(native::call(Syscall::PortCreate, [0; 6]).0) else {
+        return;
+    };
+    if let Some(timer) = valid(native::call(Syscall::TimerCreate, [ns, 0, 0, 0, 0, 0]).0) {
+        if native::call(Syscall::PortBind, [port, timer, 0, 0, 0, 0]).0 == 0 {
+            native::call(Syscall::PortWait, [port, 0, 0, 0, 0, 0]);
+        }
+        close(timer);
+    }
+    close(port);
+}
+
+/// View `GPU_VIEW`'s presentation channel, as the hold drives it. A reply wait binds only
+/// the channel and a one-shot timer, so no other source can be mistaken for the reply
+/// (the Rust gpu-client's reply-port shape).
+struct ViewLink {
+    channel: u64,
+}
+impl lane::PresentLink for ViewLink {
+    fn send(&mut self, request: &[u8; kumo_graphics::REQUEST_LEN]) -> Result<(), &'static str> {
+        let status = native::call(
+            Syscall::ChannelWrite,
+            [
+                self.channel,
+                request.as_ptr() as u64,
+                request.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+        .0;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err("present request write failed")
+        }
+    }
+    fn receive(
+        &mut self,
+        reply: &mut [u8; kumo_graphics::REPLY_LEN + 1],
+    ) -> Result<usize, &'static str> {
+        let port =
+            valid(native::call(Syscall::PortCreate, [0; 6]).0).ok_or("reply port unavailable")?;
+        let Some(timer) =
+            valid(native::call(Syscall::TimerCreate, [VIEW_REPLY_BOUND_NS, 0, 0, 0, 0, 0]).0)
+        else {
+            close(port);
+            return Err("reply timer unavailable");
+        };
+        let koid = |raw| native::call(Syscall::HandleKoid, [raw, 0, 0, 0, 0, 0]).0;
+        let (channel_koid, timer_koid) = (koid(self.channel), koid(timer));
+        let result = if channel_koid == u64::MAX
+            || timer_koid == u64::MAX
+            || native::call(Syscall::PortBind, [port, self.channel, 0, 0, 0, 0]).0 != 0
+            || native::call(Syscall::PortBind, [port, timer, 0, 0, 0, 0]).0 != 0
+        {
+            Err("reply port bind failed")
+        } else {
+            loop {
+                let source = native::call(Syscall::PortWait, [port, 0, 0, 0, 0, 0]).0;
+                if source == channel_koid {
+                    let (len, extra) = native::call(
+                        Syscall::ChannelRead,
+                        [
+                            self.channel,
+                            reply.as_mut_ptr() as u64,
+                            reply.len() as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
+                    if extra != 0 {
+                        if valid(extra).is_some() {
+                            close(extra);
+                        }
+                        break Err("present reply carried a handle");
+                    }
+                    if len == 0 {
+                        break Err("present channel closed");
+                    }
+                    if (len as i64) < 0 {
+                        break Err("present channel read failed");
+                    }
+                    break Ok(len as usize);
+                }
+                if source == timer_koid {
+                    break Err("present reply timed out");
+                }
+            }
+        };
+        native::call(Syscall::PortUnbind, [port, self.channel, 0, 0, 0, 0]);
+        native::call(Syscall::PortUnbind, [port, timer, 0, 0, 0, 0]);
+        close(timer);
+        close(port);
+        result
+    }
+    fn pause(&mut self) {
+        sleep(VIEW_PACE_NS);
+    }
+}
+
+/// Copy GL3-a's verified readback into view `GPU_VIEW`'s surface as upright XRGB8888 (D2:
+/// public glReadPixels, a CPU swizzle and VmoWrite), then hold it on HDMI with fresh FULL
+/// presents. The view's channel and surface are closed either way, so drv-fb reports the view
+/// released and Sora takes its lease back when the client exits.
+#[no_mangle]
+pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height: u32) -> u32 {
+    use alloc::format;
+    let channel = VIEW_CHANNEL.swap(0, Ordering::Relaxed);
+    let surface = VIEW_SURFACE.swap(0, Ordering::Relaxed);
+    let result = (|| {
+        if channel == 0 || surface == 0 {
+            log(b"GL3-b copy: no view was taken from the lane\n");
+            return 1;
+        }
+        let view = lane::VIEW_SURFACE;
+        if pixels.is_null() || width != view.width || height != view.height {
+            log(b"GL3-b copy: the readback is not the 256x128 view's size\n");
+            return 2;
+        }
+        // SAFETY: the C caller's readback array of width * height packed RGBA8 words, alive
+        // and unaliased for this call.
+        let pixels =
+            unsafe { core::slice::from_raw_parts(pixels, width as usize * height as usize) };
+        let written = lane::copy_readback(pixels, view, |offset, bytes| {
+            native::call(
+                Syscall::VmoWrite,
+                [
+                    surface,
+                    offset,
+                    bytes.as_ptr() as u64,
+                    bytes.len() as u64,
+                    0,
+                    0,
+                ],
+            )
+            .0 == 0
+        });
+        match written {
+            Ok(chunks) => log(format!(
+                "GL3-b copy: {} RGBA8 pixels written to view 1's surface as upright XRGB8888 in {} VmoWrite chunks\n",
+                pixels.len(),
+                chunks
+            )
+            .as_bytes()),
+            Err(error) => {
+                log(format!("GL3-b copy: surface write refused: {:?}\n", error).as_bytes());
+                return 3;
+            }
+        }
+        let mut link = ViewLink { channel };
+        match lane::present_hold(&mut link, view, 1, VIEW_PRESENTS) {
+            Ok(tally) => {
+                log(format!(
+                    "GL3-b present: {} of {} presents accepted with FULL damage; retired={} copied={}\n",
+                    tally.presents, VIEW_PRESENTS, tally.retired, tally.copied
+                )
+                .as_bytes());
+                0
+            }
+            Err(error) => {
+                log(format!("GL3-b present: hold ended: {:?}\n", error).as_bytes());
+                4
+            }
+        }
+    })();
+    if channel != 0 {
+        close(channel);
+    }
+    if surface != 0 {
+        close(surface);
+    }
+    log(b"GL3-b release: view 1 channel and surface closed\n");
+    result
 }
 
 #[no_mangle]

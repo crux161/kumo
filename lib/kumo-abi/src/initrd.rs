@@ -1,9 +1,8 @@
-//j578
-//j595
 //j648
 //j669
 //j675
 //j709
+//j774
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -98,6 +97,10 @@ pub const HOSTNAME_PATH: &str = "etc/hostname";
 pub const PASSWD_PATH: &str = "etc/passwd";
 pub const GROUP_PATH: &str = "etc/group";
 pub const SHADOW_PATH: &str = "etc/shadow";
+/// The GPU client's presentation lane marker (PLAN/015 §8.32 D1). Its first line is `view` or
+/// `churn`; default images carry no marker, and Sora then keeps today's lane unchanged. Only
+/// a proof stage adds it, beside the `bin/gpu-client` it replaces.
+pub const GPU_LANE_PATH: &str = "etc/gpu-lane";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitrdError {

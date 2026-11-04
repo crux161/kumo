@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-#j768
 #j769
 #j770
 #j772
 #j773
+#j774
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
   --proof NAME  select the native device, sync, heap, GL lifecycle, query or compute client.
   --stage DIR   rebuild the Orange Pi image with KUMO_CONSOLE_LOGLEVEL=5, then copy it to DIR
-                (which must not exist) with only bin/gpu-client replaced. Never installs or
-                serves it; that is the operator's pxehost step. Rebuild the default image
-                after the metal run.
+                (which must not exist) with only bin/gpu-client replaced. A proof that needs a
+                presentation lane (GL3-b) also adds the etc/gpu-lane marker, and nothing else
+                differs. Never installs or serves it; that is the operator's pxehost step.
+                Rebuild the default image after the metal run.
   --check LOG   check a tio log of the board's boot for the proof's live lines.
 
 Since J748 the default console shows WARNING and worse. The proof lines are NOTICE, so a
@@ -34,28 +35,54 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "toolchain/mesa"
 IMAGE = ROOT / "build/images/orange-pi-5-plus"
 SLOT = b"bin/gpu-client"
+# PLAN/015 §8.32 D1: Sora reads this marker to pick the GPU client's lane. Default images
+# carry none; only a proof stage adds it, beside the slot. kumo_abi::initrd::GPU_LANE_PATH.
+LANE = b"etc/gpu-lane"
+# kumo_abi::initrd::INITRD_MAX_ENTRIES: the loader's fixed table bound.
+MAX_ENTRIES = 48
 # Per proof: the build define, its output, and the live lines that must each appear exactly
 # once, in this order. Driver lines interleave with the client's, so `driver` lines must each
 # appear once between `after` and the green line, in any order, and `absent` never in that
 # window. — TIMBERDOODLE
 SYNC = ["G7p-e device: gpu_id=", "G7p-e group: native group on VM", "G7p-e A: point 1 submitted natively",
         "G7p-e B: point 2 captured A's unobserved fence", "G7p-e ARM: points 1 and 2 complete"]
+# GL3-a's body lines; GL3-b runs the same body before its copy. The target and layout lines
+# end in the measured color modifier, so only their fixed prefixes are required. — TIMBERDOODLE
+GL3A = ["GL3-a context: current GLES context over the native GPU session",
+        "GL3-a target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
+        "GL3-a compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
+        "GL3-a baseline: public glReadPixels observed an image different from the expected triangle",
+        "GL3-a draw: glClear and one glDrawArrays triangle, native glFinish complete",
+        "GL3-a readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali triangle 0xff6633cc over clear 0xff996633)",
+        "GL3-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
+        "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
+        "GL3-a layout: color modifier after readback 0x",
+        "GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"]
 PROOFS = {
-    # GL3-a: the first triangle through Mali's tiler, offscreen. The target and layout lines
-    # end in the measured color modifier, so only their fixed prefixes are required. — TIMBERDOODLE
+    # GL3-b (PLAN/015 §8.32): the GL3-a triangle copied into view 1 and held on HDMI. The stage
+    # adds the `view` lane marker (D1). This image runs no J0c diagnostic, so drv-fb's present
+    # gate stays unarmed and the presents are Copied: CRUX accepted that gate on 2026-11-03,
+    # leaving Retired to GL4. The present line ends in the measured Retired/Copied split, so
+    # only its prefix is required. `boot` lines precede the begin line; `tail` lines follow
+    # the green line (Sora's record of the client's exit).
+    "gl3-b": dict(
+        cases="gl-triangle", runtime="device-metal", defines=["-DKUMO_GL_PRESENT_MAIN=1"],
+        out="gl3-b-metal", gl=True, marker=b"view\n", begin="GL3-b metal present begin",
+        boot=["sora: gpu-lane marker selects the view lane"],
+        lines=["GL3-b lane: view 1 channel and surface received over V, S, N; the native producer is not used",
+               *GL3A,
+               "GL3-b copy: 32768 RGBA8 pixels written to view 1's surface as upright XRGB8888 in 512 VmoWrite chunks",
+               "GL3-b present: 15 of 15 presents accepted with FULL damage; retired=",
+               "GL3-b release: view 1 channel and surface closed"],
+        green=("GL3-b metal present green: the exact Mali triangle was copied into view 1 and every present was "
+               "accepted; Copied is the gate on an image without J0c"),
+        tail=["gpu-client: client exited; view lane returns view 1 to Sora, no regrant"],
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # GL3-a: the first triangle through Mali's tiler, offscreen. — TIMBERDOODLE
     "gl3-a": dict(
         cases="gl-triangle", runtime="device-metal", defines=["-DKUMO_GL_TRIANGLE_MAIN=1"],
         out="gl3-a-metal", gl=True, begin="GL3-a metal triangle begin",
-        lines=["GL3-a context: current GLES context over the native GPU session",
-               "GL3-a target: complete owned 256x128 RGBA8 frontend framebuffer, color modifier 0x",
-               "GL3-a compiler: GLSL ES 300 vertex and fragment sources compiled and linked at runtime",
-               "GL3-a baseline: public glReadPixels observed an image different from the expected triangle",
-               "GL3-a draw: glClear and one glDrawArrays triangle, native glFinish complete",
-               "GL3-a readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali triangle 0xff6633cc over clear 0xff996633)",
-               "GL3-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
-               "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
-               "GL3-a layout: color modifier after readback 0x",
-               "GL3-a destroy: shaders, program, vertex buffer, context, drawable and display released"],
+        lines=GL3A,
         green=("GL3-a metal triangle green: Mali rasterized the triangle exactly, all 32768 RGBA8 pixels and 32 guards "
                "checked, native completion and clean teardown"),
         driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
@@ -220,34 +247,52 @@ def entries(image):
         yield name, data[offset:offset + size]
 
 
-def stage(destination, elf):
+def stage(destination, elf, marker=None):
     assert not destination.exists(), f"refusing to replace existing image copy: {destination}"
     # The console level is a kernel build constant (J748), so the copy is taken from an image
     # built for it, and the kernel identity check below covers that build. — TIMBERDOODLE
     subprocess.run(["cargo", "xtask", "image", "--arch", "aarch64", "--hardware", "orange-pi-5-plus"],
                    cwd=ROOT, check=True, env={**os.environ, "KUMO_CONSOLE_LOGLEVEL": "5"})
     shutil.copytree(IMAGE, destination)
-    (destination / "STAGE-INFO.txt").write_text(
-        f"KUMO_CONSOLE_LOGLEVEL=5\ngpu-client sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}\n")
+    info = f"KUMO_CONSOLE_LOGLEVEL=5\ngpu-client sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}\n"
+    if marker is not None:
+        info += f"{LANE.decode()} {marker.decode().strip()}\n"
+    (destination / "STAGE-INFO.txt").write_text(info)
     path = destination / "EFI/KUMO/initrd.img"
     original = path.read_bytes()
     count = struct.unpack_from("<I", original, 12)[0]
-    out = bytearray(original[:16 + 80 * count])
+    # Existing entries keep their original name bytes; only offsets and sizes are rewritten.
+    items = []
     replaced = 0
     for index, (name, data) in enumerate(entries(path)):
         if name == SLOT:
             data, replaced = elf.read_bytes(), replaced + 1
+        items.append((original[16 + index * 80:16 + index * 80 + 64], data))
+    assert replaced == 1, "the image has no single GPU client slot"
+    if marker is not None:
+        assert all(name.split(b"\0", 1)[0] != LANE for name, _ in items), "the built image already has a lane marker"
+        items.append((LANE.ljust(64, b"\0"), marker))
+    assert len(items) <= MAX_ENTRIES, f"{len(items)} initrd entries exceed the loader's {MAX_ENTRIES}"
+    out = bytearray(original[:12] + struct.pack("<I", len(items)) + bytes(80 * len(items)))
+    for index, (name, data) in enumerate(items):
+        out[16 + index * 80:16 + index * 80 + 64] = name
         struct.pack_into("<QQ", out, 16 + index * 80 + 64, len(out), len(data))
         out.extend(data)
-    assert replaced == 1, "the image has no single GPU client slot"
     path.write_bytes(out)
-    # Prove the staged image differs from the built one in that one slot, and nowhere else.
+    # Prove the staged image differs from the built one in the slot (and the marker it adds),
+    # and nowhere else.
     built, staged = dict(entries(IMAGE / "EFI/KUMO/initrd.img")), dict(entries(path))
-    assert built.keys() == staged.keys()
-    assert [n for n in built if built[n] != staged[n]] == [SLOT]
+    changed = [SLOT] + ([LANE] if marker is not None else [])
+    assert staged.keys() == built.keys() | set(changed)
+    assert sorted(n for n in staged if built.get(n) != staged[n]) == sorted(changed)
+    assert marker is None or staged[LANE] == marker
     kernel = "EFI/KUMO/kernel/kumo-kernel.elf"
     assert (IMAGE / kernel).read_bytes() == (destination / kernel).read_bytes()
-    print(f"staged {destination}: only {SLOT.decode()} differs ({len(staged[SLOT])} bytes); kernel identical")
+    if marker is None:
+        print(f"staged {destination}: only {SLOT.decode()} differs ({len(staged[SLOT])} bytes); kernel identical")
+    else:
+        print(f"staged {destination}: only {SLOT.decode()} ({len(staged[SLOT])} bytes) and {LANE.decode()} "
+              f"({marker.decode().strip()!r}) differ; kernel identical")
     print(f"initrd sha256 {hashlib.sha256(out).hexdigest()} ({len(out)} bytes)")
 
 
@@ -261,6 +306,9 @@ def check(log, proof):
     begin = proof["begin"]
     start = next((i for i, line in enumerate(live) if begin in line), None)
     assert start is not None, f"{begin!r} never appeared live; was the image built with KUMO_CONSOLE_LOGLEVEL=5?"
+    for expected in proof.get("boot", []):
+        hits = [line for line in live[:start] if expected in line]
+        assert len(hits) == 1, f"{expected!r} appears {len(hits)} times before {begin!r}"
     window = live[start:]
     position = 0
     for expected in [begin, *proof["lines"], proof["green"]]:
@@ -270,6 +318,9 @@ def check(log, proof):
         position = hits[0]
     # Without a failure window, `absent` covers the whole proof: GL1-a must fault nowhere.
     last = next(i for i, line in enumerate(window) if proof["green"] in line)
+    for expected in proof.get("tail", []):
+        hits = [line for line in window[last + 1:] if expected in line]
+        assert len(hits) == 1, f"{expected!r} appears {len(hits)} times after the green line"
     first = next(i for i, line in enumerate(window) if proof["after"] in line) if proof["after"] else 0
     failure = window[first:last]
     for expected in proof["driver"]:
@@ -283,6 +334,10 @@ def check(log, proof):
         if line.split("] ", 1)[-1].startswith(("drv-gpu: AS1 fault", "drv-gpu: client point", "drv-gpu: containment",
                                                "drv-gpu: CS status", "drv-gpu: MMU rawstat", "drv-gpu: reset",
                                                "gpu-client: client exited", "G7p-e diag", "G7o-f diag")):
+            print(line)
+    # Name the present gate's state, so a Copied-only run carries drv-fb's own reason.
+    for line in live:
+        if "display: present gate" in line or "sora: gpu-lane" in line:
             print(line)
     name = begin.split(" metal")[0]
     print(f"{name} metal check green ({proof['out']}): every proof line once, in order; no TOWER, FAILED or ABEND")
@@ -307,7 +362,7 @@ def main():
                        runtime=proof.get("runtime"))
     print(f"{args.proof} metal client compile/link green: {elf} sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}")
     if args.stage:
-        stage(args.stage, elf)
+        stage(args.stage, elf, proof.get("marker"))
 
 
 if __name__ == "__main__":

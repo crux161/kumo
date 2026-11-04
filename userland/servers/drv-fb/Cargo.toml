@@ -1,6 +1,7 @@
 #j567
 #j598
 #j671
+#j774
 
 [package]
 name = "drv-fb"
@@ -14,6 +15,10 @@ test = true
 doctest = false
 
 [dependencies]
+# Named on every target: `rk3588_mode::register_index` uses kumo-abi's checked display
+# register selectors in the host-tested lib too. Gating it to aarch64 hid that on Apple
+# Silicon hosts and broke `cargo test` for drv-fb (and Sora) on x86_64 hosts.
+kumo-abi = { path = "../../../lib/kumo-abi" }
 kumo-graphics = { path = "../../../lib/kumo-graphics" }
 kumo-fdt = { path = "../../../lib/kumo-fdt" }
 # F2c: the pure-Rust rasterizer behind the glyph atlas (PLAN/015 §3.2). Vendored under
@@ -32,4 +37,3 @@ doctest = false
 # rendering lib without dragging in the runtime — the svc-health pattern.
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 kumo-rt = { path = "../../kumo-rt" }
-kumo-abi = { path = "../../../lib/kumo-abi" }

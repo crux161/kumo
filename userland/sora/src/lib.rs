@@ -1,12 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j564
-//j568
 //j687
 //j701
 //j766
 //j720
+//j774
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -655,6 +654,55 @@ pub fn hostname(file: &[u8]) -> Text<64> {
         .filter(|_| plain)
         .and_then(Text::new)
         .unwrap_or_else(|| Text::new("kumo").unwrap_or(Text::empty()))
+}
+
+/// Which presentation lane the image's cooperative GPU client runs, named by the initrd's
+/// `etc/gpu-lane` marker (PLAN/015 §8.32 D1). The marker replaces the compile-time churn
+/// flag that G8's acceptance images flipped by hand, so a proof stage needs no Sora rebuild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuLane {
+    /// No marker: drv-gpu takes view `GPU_VIEW` at boot for its paint, and the client's lane
+    /// carries only `N` and the native producer. Default images stay exactly as before.
+    Default,
+    /// `view`: Sora keeps view `GPU_VIEW` from drv-gpu and sends `V`, `S`, then `N` over the
+    /// lane pair. One launch only: when the client exits, the view returns to Sora and no
+    /// session is regranted.
+    View,
+    /// `churn`: G8's churn lane. The same records as `view`, then supervised session regrants
+    /// after each exit under the restart budget (DESIGN/024).
+    Churn,
+}
+
+impl GpuLane {
+    /// Whether Sora keeps view `GPU_VIEW` for the client rather than handing it to drv-gpu.
+    pub fn keeps_view(self) -> bool {
+        !matches!(self, Self::Default)
+    }
+
+    /// Lane names as they appear in Sora's log lines.
+    pub fn name(self) -> &'static [u8] {
+        match self {
+            Self::Default => b"native",
+            Self::View => b"view",
+            Self::Churn => b"churn",
+        }
+    }
+}
+
+/// The lane `etc/gpu-lane` names: its first line, trimmed, must be exactly `view` or
+/// `churn`. Anything else is `None`, so the caller logs the refusal and keeps the default
+/// lane rather than guessing which one was meant.
+pub fn gpu_lane(file: &[u8]) -> Option<GpuLane> {
+    let first = file
+        .split(|&b| b == b'\n')
+        .next()
+        .unwrap_or(&[])
+        .trim_ascii();
+    match first {
+        b"view" => Some(GpuLane::View),
+        b"churn" => Some(GpuLane::Churn),
+        _ => None,
+    }
 }
 
 /// The boot-local writable FAT scratch volume is visible at `/tmp`, separate from the
@@ -1480,6 +1528,44 @@ impl GpuClock {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_lane_tests {
+    use super::*;
+
+    #[test]
+    fn marker_names_view_or_churn_on_its_first_line() {
+        assert_eq!(gpu_lane(b"view\n"), Some(GpuLane::View));
+        assert_eq!(gpu_lane(b"churn"), Some(GpuLane::Churn));
+        assert_eq!(gpu_lane(b"  view \r\nchurn\n"), Some(GpuLane::View));
+    }
+
+    #[test]
+    fn anything_else_is_refused_not_guessed() {
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"View\n",
+            b"views\n",
+            b"churn view\n",
+            b"\nview\n",
+            b"native\n",
+            b"default\n",
+            b"vi\xffew",
+        ] {
+            assert_eq!(gpu_lane(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_marked_lanes_keep_the_view() {
+        assert!(!GpuLane::Default.keeps_view());
+        assert!(GpuLane::View.keeps_view());
+        assert!(GpuLane::Churn.keeps_view());
+        assert_eq!(GpuLane::Churn.name(), b"churn");
+        assert_eq!(GpuLane::View.name(), b"view");
     }
 }
 

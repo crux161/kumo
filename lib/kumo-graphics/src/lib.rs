@@ -1,9 +1,9 @@
 #![no_std]
-//j675
 //j684
 //j687
 //j696
 //j705
+//j774
 
 //! First software presentation contract (DESIGN/019). One channel grants one surface backed
 //! by one ordinary VMO. The presenter chooses placement; clients never name framebuffer
@@ -16,6 +16,7 @@
 //! still permits reuse under the original contract, but it is not a vblank or tear-free claim.
 //! Clients accept both and must never read `Copied` as `Retired`. — TIMBERDOODLE
 
+pub mod lane;
 pub mod native;
 
 pub const SURFACE_BYTES: usize = 256 * 1024;

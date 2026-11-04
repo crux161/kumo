@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j721
 //j723
 //j741
 //j748
 //j766
+//j774
 
 extern crate alloc;
 
@@ -14,9 +14,9 @@ use drv_blk::BlockAccess;
 use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
-    GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GROUP_PATH, HOSTNAME_PATH,
-    IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH,
-    SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
+    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH,
+    RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -184,6 +184,8 @@ static GPU_NATIVE_CHANNEL: AtomicU32 = AtomicU32::new(0);
 /// first (j713); a regranted churn lane has no native producer, so its `N` carries handle
 /// zero and the client resumes the churn timeline without native frames (DESIGN/024). The
 /// client reads this pair as its second transferred argument. — TIMBERDOODLE
+/// A `view` image (`etc/gpu-lane`, PLAN/015 §8.32 D1) sends the boot churn records, `V`,
+/// `S`, then `N`, and is never regranted.
 static GPU_LANE_BOOTSTRAP: AtomicU32 = AtomicU32::new(0);
 
 /// Boot launch: take the one session wire channel and native producer drv-gpu's launcher
@@ -200,8 +202,8 @@ fn launch_gpu_client(initrd: Handle) -> Option<Handle> {
         initrd,
         u64::from(channel),
         u64::from(native),
-        if GPU_CHURN_VIEW {
-            LaneGrant::SoraChurn
+        if gpu_lane().keeps_view() {
+            LaneGrant::SoraView
         } else {
             LaneGrant::Normal
         },
@@ -213,8 +215,9 @@ fn launch_gpu_client(initrd: Handle) -> Option<Handle> {
 enum LaneGrant {
     /// A normal image: `N` plus the native producer (handle zero when there is none).
     Normal,
-    /// The boot launch on a churn image: swap view `GPU_VIEW`'s grant out of the statics.
-    SoraChurn,
+    /// The boot launch on a `view` or `churn` image: swap view `GPU_VIEW`'s grant out of the
+    /// statics.
+    SoraView,
     /// A regrant on a churn image: the grant drv-fb issued for this session, or zeros when
     /// no view released in time (the client then fails honestly).
     Regranted(Handle, Handle),
@@ -265,7 +268,7 @@ fn launch_gpu_client_session(
     // client can still use the view afterwards. — TIMBERDOODLE
     let (view_grant, homing) = match lane_grant {
         LaneGrant::Normal => (None, GrantReturn::ToSora),
-        LaneGrant::SoraChurn => {
+        LaneGrant::SoraView => {
             let view_channel =
                 Handle(GRAPHICS_CHANNEL[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
             let view_vmo = Handle(GRAPHICS_VMO[drv_gpu::GPU_VIEW].swap(0, Ordering::Relaxed));
@@ -297,7 +300,7 @@ fn launch_gpu_client_session(
                     // Honest absence: the client refuses a V lane without a usable grant.
                     let _ = channel_write_with_handle(sender, b"V".as_ptr(), 1, Handle(0));
                     let _ = channel_write_with_handle(sender, b"S".as_ptr(), 1, Handle(0));
-                    log(b"gpu-client: churn lane has no view grant\n");
+                    log_lane(b" lane has no view grant\n");
                 } else if channel_write_with_handle(sender, b"V".as_ptr(), 1, view_channel) != 0 {
                     // A refused send leaves the handles in Sora's table.
                     match homing {
@@ -306,18 +309,18 @@ fn launch_gpu_client_session(
                                 .store(view_channel.0, Ordering::Relaxed);
                             GRAPHICS_VMO[drv_gpu::GPU_VIEW].store(view_vmo.0, Ordering::Relaxed);
                             GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
-                            log(b"gpu-client: churn lane view channel refused; view restored\n");
+                            log_lane(b" lane view channel refused; view restored\n");
                         }
                         GrantReturn::Released => {
                             return_gpu_view_grant(view_channel, view_vmo, GrantReturn::Released);
-                            log(b"gpu-client: churn lane view channel refused; grant closed\n");
+                            log_lane(b" lane view channel refused; grant closed\n");
                         }
                     }
                 } else if channel_write_with_handle(sender, b"S".as_ptr(), 1, view_vmo) != 0 {
                     // The channel already moved; without its surface the view cannot be
                     // painted, so the client closes it and drv-fb reports the release.
                     let _ = handle_close(view_vmo);
-                    log(b"gpu-client: churn lane view surface refused\n");
+                    log_lane(b" lane view surface refused\n");
                 }
                 // j713: the boot churn lane also runs the J0c native diagnostic first, so
                 // the native producer travels after the view pair. A regranted lane has no
@@ -356,6 +359,14 @@ fn launch_gpu_client_session(
         log(b"gpu-client: launch failed; session retired\n");
         None
     }
+}
+
+/// One `gpu-client: <lane> lane ...` line, naming the lane this image runs, so a `view`
+/// lane's failure never reads as a churn one; a churn image's lines are unchanged.
+fn log_lane(rest: &[u8]) {
+    log(b"gpu-client: ");
+    log(gpu_lane().name());
+    log(rest);
 }
 
 /// Return a churn view grant no client consumed: a boot grant goes back to the statics (a
@@ -417,7 +428,7 @@ fn regrant_gpu_session(initrd: Handle) -> Option<Handle> {
         log(b"gpu-client: session regrant refused; grant closed\n");
         return None;
     }
-    let lane_grant = if GPU_CHURN_VIEW {
+    let lane_grant = if gpu_lane().keeps_view() {
         // j715: observe the release with a bounded poll of the control lane. The first metal
         // regrant queried 34 ms after drv-fb recorded `view 1 recovered` and still saw no
         // release bit, while a later attempt observed it only after ~1.8 s, so the shell's
@@ -3763,11 +3774,55 @@ const RUN_GPU_CONTAINMENT_SMOKE: bool = false;
 const GPU_CONTAIN_WAIT_NS: u64 = 5_000_000_000;
 
 //j711
-/// G8 acceptance lane selector. Off by default: a loop image sets this true so the one
-/// cooperative GPU client receives view `GPU_VIEW`'s channel and surface over the lane
-/// bootstrap pair and runs the 100-frame churn loop on the production view path. Normal
-/// images keep drv-gpu's G5b boot paint and the J0c diagnostic unchanged. — TIMBERDOODLE
-const GPU_CHURN_VIEW: bool = false;
+/// The GPU client's lane, read once from the initrd's `etc/gpu-lane` marker before any
+/// view is handed out (PLAN/015 §8.32 D1). It replaces G8's hand-flipped compile-time churn
+/// selector. With no marker the lane is `Default`: drv-gpu keeps its G5b boot paint and
+/// the J0c diagnostic runs unchanged. `view` and `churn` hand view `GPU_VIEW`'s channel
+/// and surface to the one cooperative client over the lane bootstrap pair; only `churn`
+/// regrants a session after the client exits.
+static GPU_LANE: AtomicU8 = AtomicU8::new(GPU_LANE_DEFAULT);
+const GPU_LANE_DEFAULT: u8 = 0;
+const GPU_LANE_VIEW: u8 = 1;
+const GPU_LANE_CHURN: u8 = 2;
+
+fn gpu_lane() -> sora::GpuLane {
+    match GPU_LANE.load(Ordering::Relaxed) {
+        GPU_LANE_VIEW => sora::GpuLane::View,
+        GPU_LANE_CHURN => sora::GpuLane::Churn,
+        _ => sora::GpuLane::Default,
+    }
+}
+
+/// Read `etc/gpu-lane` once at boot. An absent marker is the default image and logs
+/// nothing; an unreadable or unrecognized one is refused aloud and keeps the default lane,
+/// so a proof image whose marker went wrong fails named instead of running the wrong lane.
+fn read_gpu_lane(initrd: Handle) {
+    let Some((base, len)) = initrd_find(initrd, GPU_LANE_PATH.as_bytes()) else {
+        return;
+    };
+    let mut file = [0u8; 16];
+    let n = (len as usize).min(file.len());
+    let lane = if vmo_read(initrd, base, file.as_mut_ptr(), n) == 0 {
+        sora::gpu_lane(&file[..n])
+    } else {
+        None
+    };
+    let Some(lane) = lane else {
+        notice(&[b"sora: gpu-lane marker refused; default lane kept\n"]);
+        return;
+    };
+    let raw = match lane {
+        sora::GpuLane::Default => GPU_LANE_DEFAULT,
+        sora::GpuLane::View => GPU_LANE_VIEW,
+        sora::GpuLane::Churn => GPU_LANE_CHURN,
+    };
+    GPU_LANE.store(raw, Ordering::Relaxed);
+    notice(&[
+        b"sora: gpu-lane marker selects the ",
+        lane.name(),
+        b" lane\n",
+    ]);
+}
 
 //j721
 /// The clock-watch lane is independent of the churn lane so the same sampler can run as an
@@ -3904,6 +3959,8 @@ extern "C" fn sora_main(
         debug_write(magic.as_ptr(), 8);
         debug_write(b"\n".as_ptr(), 1);
     }
+    // The GPU lane is fixed before drv-fb's views or the GPU client exist (PLAN/015 §8.32 D1).
+    read_gpu_lane(initrd);
 
     // P7-f: walk all initrd entries to find a file by name (userspace find_file).
     // Initrd layout: header(16) + entries(N*80) + data.
@@ -4475,7 +4532,7 @@ extern "C" fn sora_main(
                                     // client can receive it over the lane bootstrap after
                                     // launch, instead of drv-gpu taking it now.
                                     if view == drv_gpu::GPU_VIEW
-                                        && !GPU_CHURN_VIEW
+                                        && !gpu_lane().keeps_view()
                                         && hand_view_to_gpu(view, *channel, *vmo)
                                     {
                                         continue;
@@ -5627,9 +5684,21 @@ extern "C" fn sora_main(
                     let _ = port_unbind(port, process);
                     let _ = handle_close(process);
                 }
-                if !GPU_CHURN_VIEW {
-                    diag(b"gpu-client: client exited; restart gated off on this image\n");
-                    continue;
+                match gpu_lane() {
+                    sora::GpuLane::Default => {
+                        diag(b"gpu-client: client exited; restart gated off on this image\n");
+                        continue;
+                    }
+                    // A `view` lane is one launch (PLAN/015 §8.32 D1): the client's exit
+                    // returns the view's lease. Marking the view grantable lets the release
+                    // query observe it, so a shell client can be granted it again; no session
+                    // is regranted.
+                    sora::GpuLane::View => {
+                        GRAPHICS_GRANTABLE[drv_gpu::GPU_VIEW].store(true, Ordering::Relaxed);
+                        log(b"gpu-client: client exited; view lane returns view 1 to Sora, no regrant\n");
+                        continue;
+                    }
+                    sora::GpuLane::Churn => {}
                 }
                 // The view's lease died with the client; make it eligible for the release
                 // query so the regrant can ask drv-fb for it again (churn lane only).
