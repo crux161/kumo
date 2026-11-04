@@ -55,6 +55,7 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
     shutil.copyfile(firmware / "edk2-arm-vars.fd", work / "vars.fd")
     serial = work / "serial.log"
     print(f"{tag} UEFI proof artifacts: {work}", flush=True)
+    passed = False
     with (work / "qemu.log").open("wb") as log:
         process = subprocess.Popen([
             "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a72",
@@ -86,6 +87,7 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
                 assert b"cause=FAULT" in fault and b"FAR=0x0000000011000000" in fault
                 assert b"synchronous external abort on read" in fault
             print(green.decode(), flush=True)
+            passed = True
             return transcript
         finally:
             process.terminate()
@@ -94,6 +96,13 @@ def boot(image, timeout, *, elf=OUT / "cxx-smoke", label="G7l C++ runtime", gree
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+            # A green run's evidence is serial.log and qemu.log. The ESP and NVRAM are
+            # 64 MiB+ copies re-staged from the image every boot, and every proof lands
+            # here, so they go once QEMU has let go; a failure keeps them to inspect.
+            # — TIMBERDOODLE
+            if passed:
+                shutil.rmtree(work / "esp")
+                (work / "vars.fd").unlink()
 
 
 def main():

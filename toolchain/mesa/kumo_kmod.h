@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j757*/
 /*j760*/
 /*j761*/
 /*j762*/
 /*j765*/
+/*j780*/
 #pragma once
 #include "kumo_gpu.h"
 #include "kmod/pan_kmod.h"
@@ -41,6 +41,11 @@ struct pan_kmod_dev *pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api,
 /* CS_FEATURES[7:0] + 1, cached from the factory's attested query. A foreign device returns
  * zero. The native Submit wrapper clobbers the last four registers. — KESTREL */
 uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *dev);
+/* VK2-d: Panthor's CSIF block for a native device, so panthor_kmod_get_csif_props never reads
+ * one as Panthor's: CS_FEATURES' registers and scoreboards, one group slot, three queues and
+ * four registers kept by the Submit wrapper. A foreign device returns NULL. */
+struct drm_panthor_csif_info;
+const struct drm_panthor_csif_info *pan_kmod_kumo_csif_props(const struct pan_kmod_dev *dev);
 /* Gallium context binaries own full-width native IDs, independently of its DRM fields.
  * Failed creation clears the ID; destroying zero is a no-op. A failed void destructor
  * loses the device rather than claiming the sync was released. — KESTREL */

@@ -1,9 +1,113 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j774 -->
 <!-- j775 -->
 <!-- j776 -->
 <!-- j777 -->
 <!-- j778 -->
+<!-- j780 -->
+
+## VK2: panvk over the native session (VK2-a–e staged; metal pending)
+
+CRUX ratified the VK2 cut on 2026-11-04. It has five parts: C ABI 16, a physical device with
+no DRM node, a native `vk_sync` type, the `gpu_queue` seam, and a static-ICD client with WSI
+off.
+
+- **VK2-a (C ABI 16).** GROUP_CREATE with `KUMO_NATIVE_GROUP_QUEUES` creates the
+  three-queue group. PREPARE can carry up to three `kumo_gpu_native_stream`s under one
+  point. Both are host-tested.
+- **VK2-b (`kumo-build.patch`, panvk).**
+  - The client makes its session's kmod device with `pan_kmod_kumo_dev_create` and hands it
+    to `panvk_kumo_offer_device`. The next instance's enumeration takes that device as its
+    only physical device. Later instances enumerate none, and no DRM node or libdrm device
+    list is consulted.
+  - `panvk_physical_device_init_kumo` runs the rest of panvk's initialization unchanged. It
+    has no DRM IDs to report.
+  - The one heap and its `EXT_memory_budget` budget are `KUMO_GPU_SESSION_BUDGET_BYTES`, as
+    in GL4-a's D4. KUMO claims no RAM figure.
+  - The FD, dma-buf and DRM extensions are off, and the external-memory queries report no
+    handle types.
+  - `kumo_gpu.h` and `kumo_kmod.h` are staged into `src/panfrost/vulkan` beside the
+    Gallium copies.
+- **VK2-c (`panvk_kumo_sync.c`, new through the patch).**
+  - The device's binary `vk_sync` type is one G7p native binary. It supports CPU wait, reset,
+    signal and move, GPU wait (several waits on one payload included), and WAIT_PENDING.
+  - Timelines are the runtime's `vk_sync_timeline` over that binary, the configuration panvk
+    already uses before v10. The timeline mode is therefore EMULATED and submission is
+    DEFERRED, so no submit thread is ever needed. Native timelines would have made it
+    THREADED_ON_DEMAND.
+  - A wait snapshots the payload and arms it, and only ARM's COMPLETE counts as completion.
+    Every native call is serial in the one session owner, so nothing else can submit
+    during a wait. A wait on an absent payload therefore returns VK_TIMEOUT at once instead
+    of sleeping.
+  - A full native table is VK_ERROR_OUT_OF_HOST_MEMORY. Any other refusal loses the session
+    and the device.
+  - `vkCreateDevice` still refuses until VK2-d, because panvk's queues still create Panthor
+    groups, heaps and syncobjs through DRM ioctls.
+
+- **VK2-d1 (kmod).**
+  - `panthor_kmod_get_csif_props` and `panthor_kmod_get_flush_id` answer for a native
+    device instead of reading it as Panthor's private layout. panvk calls them in its device,
+    command-buffer, draw, exception-handler, utrace and queue code.
+  - The CSIF block comes from the attested `CS_FEATURES`: [7:0] is registers − 1 and [15:8]
+    is the scoreboard count (96 and 8 on Mali-G610). It also records one group slot, three
+    queues, and four registers kept by the Submit wrapper. The flush ID is 0, and no native
+    submission carries one.
+
+- **VK2-d2 (panvk's queue, `csf/panvk_vX_gpu_queue.c`).**
+  - The one VkQueue is the session's native three-queue group (GROUP_CREATE with
+    `KUMO_NATIVE_GROUP_QUEUES`), at medium priority on every core. A second device on the
+    same session is refused without loss.
+  - The tiler heap is a native HEAP_CREATE with panvk's own shape. The group has no native
+    destroy; the heap is released once the queue's last point completes.
+  - drv-gpu runs one point at a time on the group's timeline, and refuses a second Submit
+    as Busy. So every submission first waits for the previous point (its STEP snapshot),
+    then PREPAREs on the next point and STEPs. A blocked STEP's wake is waited for and
+    STEP runs again.
+  - panvk's Panthor queue submits become native submissions of at most one stream per
+    subqueue. A new submission starts only where a subqueue repeats, which is where
+    Panthor would serialize. A command buffer's streams therefore travel together, and
+    nothing waits on a later submission. Waits go with the first submission and signals
+    with the last.
+  - A submission with no streams waits on the CPU, drains, and signals the binaries
+    directly. Group state is native GROUP_STATE, and anything but usable loses the queue.
+  - The device borrows the physical device's kmod device; there is no FD to duplicate. It
+    has no syncobj payload copies and no utrace timeline, since there are no timestamps.
+  - It exposes one queue, no sparse binding and no `ARM_scheduling_controls`.
+  - `vkCreateDevice` now proceeds.
+
+- **VK2-e ([vk-device.c](vk-device.c), `--proof vk2-e`).** The static-ICD client. It has no
+  loader and no WSI; every entry point comes from `vk_icdGetInstanceProcAddr`. It offers the
+  session's kmod device to panvk, then checks:
+  - exactly one physical device, the Mali-G610 (vendor 0x13b5, integrated), with one queue
+    family of one queue (graphics, compute, transfer), no sparse binding, and one 128 MiB
+    heap whose budget is the same;
+  - no FD, dma-buf, DRM, core-control or swapchain extension, and
+    `VK_KHR_timeline_semaphore` present;
+  - `vkCreateDevice` making one three-queue group and one heap, and running exactly three
+    single-stream native submissions (the subqueue init streams, on queues 0, 1 and 2);
+  - a fence round trip, and an emulated-timeline round trip: host signal to 5, then an
+    empty submission waiting for 5 and signaling 7. Neither makes a native submission;
+  - an idle queue and an idle device;
+  - teardown that releases the heap and drops every native object but the session's
+    group, after which a second instance enumerates no device.
+
+  The client observes the native API in place. The link wraps `drmIoctl`, `drmGetDevices2`
+  and `drmSyncobjCreate`, so reaching any of them fails the proof. drv-gpu's lines must show
+  `leases CSG0 queues 0-2` and the first heap at `0x30000000` with `chunks 5x2097152`.
+
+  `scripts/mesa-device-smoke.py`'s `vk=True` build links the inventory's VK archives,
+  drm-refusal, static-build-id and the C++ runtime. It uses `--build-id=sha1` and G7n's
+  stack script plus G7m's read-only PT_LOAD/PT_NOTE for the note, which `vkCreateInstance`
+  reads.
+
+Run `scripts/mesa-drivers.py` first, so the archives and inventory carry the current
+`kumo-build.patch`. A QEMU mode would also need `create_group_queues` and `submit_streams`
+in `device-smoke.rs`'s model. VK2-b through VK2-e have not run.
+
+```sh
+python3 scripts/mesa-drivers.py
+python3 scripts/mesa-device-metal.py --proof vk2-e --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk2-e --check <tio-log>
+```
 
 ## VK1: three-queue groups (J778, metal-proven)
 
@@ -1266,8 +1370,10 @@ that it selects LLD directly; every target translation unit uses
 configured for relibc's pthread declarations, without localization or parallel
 algorithms. The Linux-built libc++ binary is never linked.
 
-The checked [driver inventory](DRIVER-INVENTORY.md) records the measured result:
-53 required GL gaps, 44 required Vulkan gaps, and the requesting archive/object.
+The checked [driver inventory](DRIVER-INVENTORY.md) records the measured result before
+adding the OS/native closure objects: 39 required GL gaps and 32 required Vulkan gaps
+after the VK2 seams (J780), with the requesting archive/object. G7k's initial counts
+were 53 and 44. Both complete links close every required symbol.
 `build/mesa-drivers/result/` contains all static archives, diagnostic ELFs,
 linker errors/maps/extraction traces, per-object sizes, the exhaustive
 `inventory.json` and `optional-undefined.tsv`, and input/tool/archive hashes.

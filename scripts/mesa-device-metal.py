@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j774
 #j775
 #j776
 #j777
 #j778
+#j780
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -103,6 +103,33 @@ PROOFS = {
         green=("GL4 metal churn green: 100 exact GL frames of texture churn presented on view 1 and clean teardown; "
                "the presents line carries the Retired/Copied record"),
         driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK2-e (PLAN/015 §8.2): panvk through its static ICD entry, with no loader and no WSI. The
+    # client counts every native request and wraps drmIoctl, drmGetDevices2 and
+    # drmSyncobjCreate: one three-queue group, one heap (panvk's 5 x 2 MiB, max 64) and
+    # exactly three single-stream submissions (the subqueue init streams), with no DRM call
+    # at all. Empty submissions are met on the CPU. drv-gpu's own lines prove the group and
+    # heap; the heap line's head address is not predicted.
+    "vk2-e": dict(
+        cases="vk-device", runtime="device-metal", defines=["-DKUMO_VK_DEVICE_MAIN=1"],
+        out="vk2-e-metal", vk=True, begin="VK2-e metal device begin",
+        lines=["VK2-e instance: created through vk_icdGetInstanceProcAddr, no loader, no WSI",
+               "VK2-e physical device: exactly one, Mali-G610",
+               "VK2-e queues and memory: one family of one queue (graphics, compute, transfer), no sparse binding; "
+               "one 128 MiB heap with that budget",
+               " device extensions, none for FDs, dma-bufs, DRM, core control or swapchains; "
+               "VK_KHR_timeline_semaphore present",
+               "VK2-e device: one three-queue native group, one tiler heap, and the three subqueue init streams as "
+               "3 native submissions of one stream each",
+               "VK2-e fence: signaled at creation, reset, then signaled again by an empty submission",
+               "VK2-e timeline: host signal to 5, then an empty submission waiting for 5 and signaling 7",
+               "VK2-e idle: queue and device idle, with no native submission beyond the init streams",
+               "VK2-e teardown: device and instance destroyed, the heap released, ",
+               "VK2-e second instance: no physical device; no Panthor ioctl, DRM device listing or syncobj at any point"],
+        green=("VK2-e metal device green: one instance, the Mali-G610, a device on the three-queue group, "
+               "an idle queue and clean teardown"),
+        driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
+                "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     # GL4-a (PLAN/015 §8.32 D4): public texture allocation against the session budget. The
     # 256 MiB refusal alone is not new (the old physical-memory preflight refused every
     # texture); the 160 KiB texture's creation, clear and exact readback are.
@@ -521,7 +548,7 @@ def main():
     defines = proof["defines"] if "defines" in proof else [f"-DKUMO_METAL_PROOF={proof['define']}"]
     elf = module.build(proof.get("cases", "device-metal"), ROOT / "build/proofs" / proof["out"],
                        TOOL / "device-metal-crt0.S", defines=defines, gl=proof.get("gl", False),
-                       runtime=proof.get("runtime"))
+                       runtime=proof.get("runtime"), vk=proof.get("vk", False))
     print(f"{args.proof} metal client compile/link green: {elf} sha256 {hashlib.sha256(elf.read_bytes()).hexdigest()}")
     if args.stage:
         stage(args.stage, elf, proof.get("marker"), proof.get("autoexec"))

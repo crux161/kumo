@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: MIT */
-/*j759*/
 /*j760*/
 /*j761*/
 /*j762*/
 /*j765*/
+/*j780*/
 #include "kumo_kmod.h"
+#include "drm-uapi/panthor_drm.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wgnu-pointer-arith"
@@ -28,6 +29,8 @@ struct kumo_device {
     struct kumo_gpu_api api;
     struct pan_kmod_va_range range;
     uint32_t cs_reg_count;
+    /* VK2-d: Panthor's CSIF block, as panvk reads it, from the attested CS_FEATURES. */
+    struct drm_panthor_csif_info csif;
     struct kumo_mesa_bo *bos;
     struct pan_kmod_vm *vm;
     bool lost;
@@ -45,6 +48,11 @@ uint32_t pan_kmod_kumo_cs_reg_count(const struct pan_kmod_dev *base)
 {
     const struct kumo_device *dev = device(base);
     return dev ? dev->cs_reg_count : 0;
+}
+const struct drm_panthor_csif_info *pan_kmod_kumo_csif_props(const struct pan_kmod_dev *base)
+{
+    const struct kumo_device *dev = device(base);
+    return dev ? &dev->csif : NULL;
 }
 static void poison(struct kumo_device *dev)
 {
@@ -293,6 +301,14 @@ pan_kmod_kumo_dev_create(const struct kumo_gpu_api *api, const struct pan_kmod_a
                       &driver, &kumo_kmod_ops, allocator);
     dev->base.props = props;
     dev->cs_reg_count = (report.info.cs_features & 0xff) + 1;
+    /* CS_FEATURES[15:8] is the scoreboard count. The session's one group has three queues,
+     * and the Submit wrapper keeps the last four registers, as Panthor's kernel does. */
+    dev->csif = (struct drm_panthor_csif_info){
+        .csg_slot_count = 1, .cs_slot_count = KUMO_NATIVE_MAX_STREAMS,
+        .cs_reg_count = dev->cs_reg_count,
+        .scoreboard_slot_count = (report.info.cs_features >> 8) & 0xff,
+        .unpreserved_cs_reg_count = 4,
+    };
     dev->api = *api;
     dev->range = (struct pan_kmod_va_range){report.info.va_start, report.info.va_end - report.info.va_start};
     if (api->device_open(api->context) != KUMO_GPU_OK) {

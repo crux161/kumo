@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j759
 #j760
 #j761
 #j762
 #j765
+#j780
 """Container half of scripts/mesa-drivers.py; never downloads or runs a target ELF."""
 # Build-boundary and inventory decisions — SAKER, 2026-10-31.
 import argparse
@@ -56,8 +56,10 @@ def stage():
     mesa = WORK / "mesa-26.2.5"
     run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "kumo-build.patch"], "patch.log")
     run(["patch", "--batch", "--fuzz=0", "-p1", "-d", mesa, "-i", TOOL / "native-device-header.patch"], "native-header.log")
-    for name in ("kumo_gpu.h", "kumo_kmod.h"):
-        shutil.copyfile(TOOL / name, mesa / "src/gallium/drivers/panfrost" / name)
+    # VK2-b/c: panvk reads the session budget (GL4-a) and drives native syncs, as Gallium does.
+    for directory in ("src/gallium/drivers/panfrost", "src/panfrost/vulkan"):
+        for name in ("kumo_gpu.h", "kumo_kmod.h"):
+            shutil.copyfile(TOOL / name, mesa / directory / name)
     shutil.copytree(ROOT / "target/kumo-sysroot", WORK / "sysroot")
     include = WORK / "sysroot/include"
     # Private header repairs; the installed sysroot remains unchanged. All actual
@@ -116,6 +118,7 @@ def category(symbol):
         return "DRM / libdrm"
     # Native capability backend entry points, supplied by build-closure.py. — KESTREL
     if symbol in ("pan_kmod_kumo_bo_mmap", "pan_kmod_kumo_bo_munmap", "pan_kmod_kumo_cs_reg_count",
+                  "pan_kmod_kumo_csif_props",
                   "pan_kmod_kumo_sync_create", "pan_kmod_kumo_sync_destroy", "pan_kmod_kumo_dev_lost",
                   "pan_kmod_kumo_native", "pan_kmod_kumo_heap_create", "pan_kmod_kumo_heap_destroy",
                   "pan_kmod_kumo_vm_sync_lock", "pan_kmod_kumo_vm_sync_unlock",
@@ -125,6 +128,19 @@ def category(symbol):
     if symbol in BUILD_ID:
         return "other: static build ID"
     raise AssertionError(f"unclassified required symbol: {symbol}")
+
+
+def link_archives(archives, driver):
+    # Mesa embeds runtime entrypoints and per-arch implementations in its ICD archive.
+    # Weak dispatch references do not extract their definitions from a static archive;
+    # preserve Meson's link_whole contract for the static ICD. — TIMBERDOODLE
+    result = []
+    for archive in archives:
+        if driver == "vk" and archive.name.endswith("libvulkan_panfrost.a"):
+            result.extend(["--whole-archive", archive, "--no-whole-archive"])
+        else:
+            result.append(archive)
+    return result
 
 
 def inventory(archives):
@@ -138,7 +154,7 @@ def inventory(archives):
              "-c", WORK / f"link-{driver}.c", "-o", obj])
         command = ["ld.lld-22", "-static", "--gc-sections", "-e", "main", "--no-demangle", "--error-limit=0",
                    f"--why-extract={OUT}/link-{driver}.extract", f"-Map={OUT}/link-{driver}.map",
-                   "-o", OUT / f"link-{driver}.elf", obj, "--start-group", *selected,
+                   "-o", OUT / f"link-{driver}.elf", obj, "--start-group", *link_archives(selected, driver),
                    WORK / "sysroot/lib/libc.a", "--end-group"]
         link = run(command, f"link-{driver}.errors", check=False)
         required = set(re.findall(r"^ld.lld-22: error: undefined symbol: (.+)$", link.stderr, re.M))
@@ -158,7 +174,11 @@ def inventory(archives):
             for row in csv.DictReader(f, delimiter="\t"):
                 extracted.add(row["extracted"])
         arch_archive = "libpanfrost-v10.a(" if driver == "gl" else "libpanvk_v10.a("
-        assert any(arch_archive in owner for owner in extracted), "v10 was not linked"
+        if driver == "vk":
+            defined = run(["llvm-nm-22", "-P", "--defined-only", OUT / f"link-{driver}.elf"]).stdout
+            assert re.search(r"^panvk_v10_get_physical_device_properties [Tt] ", defined, re.M), "v10 was not linked"
+        else:
+            assert any(arch_archive in owner for owner in extracted), "v10 was not linked"
         header = run(["llvm-readelf-22", "-h", "-l", OUT / f"link-{driver}.elf"],
                      f"link-{driver}.elf-headers").stdout
         assert "AArch64" in header and "EXEC" in header and "INTERP" not in header

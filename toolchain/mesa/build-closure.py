@@ -3,6 +3,7 @@
 #j745
 #j762
 #j765
+#j780
 """Close both measured Mesa links and build the real KUMO utility acceptance."""
 import hashlib
 import importlib.util
@@ -55,11 +56,12 @@ def main():
         assert hashlib.sha256(header.read_bytes()).hexdigest() == "55fa7f89e5728a209fb615a26ee4099733bba29cee0695c754878f0c5dc6c4c4"
         run(["patch", "--batch", "--fuzz=0", "-p1", "-d", MESA / "mesa-26.2.5", "-i", TOOL / "native-device-header.patch"])
     assert hashlib.sha256(header.read_bytes()).hexdigest() == "584111ae3e5ef8a1659f34b44ce41bd681dffbc80d950bd7ec4d413cdd9fe945"
-    for name in ("kumo_gpu.h", "kumo_kmod.h"):
-        source = TOOL / name
-        dest = MESA / "mesa-26.2.5/src/gallium/drivers/panfrost" / name
-        if not dest.exists() or source.read_bytes() != dest.read_bytes():
-            shutil.copyfile(source, dest)
+    for directory in ("src/gallium/drivers/panfrost", "src/panfrost/vulkan"):
+        for name in ("kumo_gpu.h", "kumo_kmod.h"):
+            source = TOOL / name
+            dest = MESA / "mesa-26.2.5" / directory / name
+            if not dest.exists() or source.read_bytes() != dest.read_bytes():
+                shutil.copyfile(source, dest)
 
     # Install the current SDK without rewriting unchanged headers, so Ninja's
     # dependency graph rebuilds exactly the affected target objects. — SAKER
@@ -99,7 +101,8 @@ def main():
         archives = [MESA / name for name in measured[driver]["archive_bytes"] if name != "sysroot/lib/libc.a"]
         elf = OUT / f"link-{driver}.elf"
         run([*link, "-e", "main", f"-Map={elf}.map", f"--why-extract={elf}.extract", "-o", elf,
-             MESA / f"link-{driver}.o", *objects[:2], *objects[3:], "--start-group", runtime, *archives, libc, "--end-group"])
+             MESA / f"link-{driver}.o", *objects[:2], *objects[3:], "--start-group", runtime,
+             *drivers.link_archives(archives, driver), libc, "--end-group"])
         undefined = run(["llvm-nm-22", "-P", "--undefined-only", elf])
         (OUT / f"link-{driver}.undefined").write_text(undefined)
         optional = {symbol for symbol, entry in measured[driver]["undefined"].items() if not entry["required"]}

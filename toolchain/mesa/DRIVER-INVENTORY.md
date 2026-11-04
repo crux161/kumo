@@ -6,8 +6,8 @@ All upstream per-architecture variants are built; v10 is present in both links. 
 
 | Driver | Required gaps | Optional weak symbols | Extracted objects | Probe ELF bytes |
 |---|---:|---:|---:|---:|
-| GL | 53 | 1 | 939 | 18529504 |
-| VK | 44 | 6292 | 635 | 16049688 |
+| GL | 39 | 1 | 938 | 18559504 |
+| VK | 32 | 6292 | 634 | 16077160 |
 
 Optional generated panvk dispatch entries and the GL TLS wrapper are verified against weak references in extracted objects. Every name and owner is in `optional-undefined.tsv`; every required and optional entry is in `inventory.json`. Local undefined symbol-table placeholders are included in this accounting.
 
@@ -24,60 +24,49 @@ Optional generated panvk dispatch entries and the GL TLS wrapper are verified ag
 | `_Znwm` | GL | C++ runtime | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/lower_precision.cpp.o)` |
 | `__cxa_guard_acquire` | GL | C++ runtime | `build/src/mesa/glapi/es2api/libGLESv2.a(texcompress_astc_luts.cpp.o)` |
 | `__cxa_guard_release` | GL | C++ runtime | `build/src/mesa/glapi/es2api/libGLESv2.a(texcompress_astc_luts.cpp.o)` |
-| `acosf` | GL | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `asinf` | GL | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `atan2f` | GL | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `atanf` | GL | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
 | `build_id_find_nhdr_for_addr` | VK | other: static build ID | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_instance.c.o)` |
 | `build_id_length` | VK | other: static build ID | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_instance.c.o)` |
 | `copy_build_id_to_sha1` | VK | other: static build ID | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_instance.c.o)` |
-| `cos` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/meson-generated_.._nir_constant_expressions.c.o)` |
-| `cosf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
 | `drmCloseBufferHandle` | GL/VK | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
 | `drmFreeDevice` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_wsi.c.o)` |
 | `drmFreeDevices` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(vk_instance.c.o)` |
-| `drmFreeVersion` | GL/VK | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
+| `drmFreeVersion` | GL | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
 | `drmGetCap` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
 | `drmGetDevice2` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(panvk_wsi.c.o)` |
 | `drmGetDevices2` | VK | DRM / libdrm | `build/src/panfrost/vulkan/libvulkan_panfrost.a(vk_instance.c.o)` |
-| `drmGetVersion` | GL/VK | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
+| `drmGetVersion` | GL | DRM / libdrm | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/pan_kmod.c.o)` |
 | `drmIoctl` | GL/VK | Panthor ioctl user | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
 | `drmPrimeFDToHandle` | GL | DRM / libdrm | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
 | `drmPrimeHandleToFD` | GL/VK | DRM / libdrm | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/renderonly_renderonly.c.o)` |
-| `drmSyncobjCreate` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_context.c.o)` |
-| `drmSyncobjDestroy` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_context.c.o)` |
-| `drmSyncobjExportSyncFile` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_context.c.o)` |
-| `drmSyncobjFDToHandle` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_fence.c.o)` |
+| `drmSyncobjCreate` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `drmSyncobjDestroy` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `drmSyncobjExportSyncFile` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `drmSyncobjFDToHandle` | VK | syncobj / sync_file | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
 | `drmSyncobjHandleToFD` | VK | syncobj / sync_file | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
-| `drmSyncobjImportSyncFile` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `drmSyncobjImportSyncFile` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v4.a(libpanfrost-v4.a.p/pan_jm.c.o)` |
 | `drmSyncobjQuery2` | VK | syncobj / sync_file | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
 | `drmSyncobjReset` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
 | `drmSyncobjSignal` | VK | syncobj / sync_file | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
 | `drmSyncobjTimelineSignal` | VK | syncobj / sync_file | `build/src/panfrost/vulkan/libvulkan_panfrost.a(u_sync_provider.c.o)` |
-| `drmSyncobjTimelineWait` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
-| `drmSyncobjTransfer` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
-| `drmSyncobjWait` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
-| `exp2f` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `expf` | GL | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `frexp` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/meson-generated_.._nir_constant_expressions.c.o)` |
-| `frexpf` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/nir_lower_flrp.c.o)` |
-| `ldexp` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `ldexpf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `llrint` | GL | relibc gap | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/util_u_surface.c.o)` |
-| `llround` | GL | relibc gap | `build/src/mesa/libmesa.a(libmesa.a.p/main_get.c.o)` |
-| `llroundf` | GL/VK | relibc gap | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_cmdstream.c.o)` |
-| `log` | GL/VK | relibc gap | `build/src/compiler/spirv/libvtn.a(libvtn.a.p/vtn_opencl.c.o)` |
-| `log10` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/nir_print.c.o)` |
-| `log2f` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `logf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `lrint` | GL | relibc gap | `build/src/gallium/auxiliary/libgallium.a(libgallium.a.p/util_u_surface.c.o)` |
-| `lrintf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `lroundf` | GL | relibc gap | `build/src/mesa/libmesa.a(libmesa.a.p/main_drawpix.c.o)` |
-| `open_memstream` | GL/VK | relibc gap | `build/src/mesa/glapi/es2api/libGLESv2.a(memstream.c.o)` |
-| `pow` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/meson-generated_.._nir_constant_expressions.c.o)` |
-| `powf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
-| `sin` | GL/VK | relibc gap | `build/src/compiler/nir/libnir.a(libnir.a.p/meson-generated_.._nir_constant_expressions.c.o)` |
-| `sinf` | GL/VK | relibc gap | `build/src/compiler/glsl/libglsl.a(libglsl.a.p/ir_constant_expression.cpp.o)` |
+| `drmSyncobjTimelineWait` | GL/VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `drmSyncobjTransfer` | VK | syncobj / sync_file | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `drmSyncobjWait` | GL/VK | syncobj / sync_file | `build/src/gallium/drivers/panfrost/libpanfrost-v4.a(libpanfrost-v4.a.p/pan_jm.c.o)` |
+| `pan_kmod_kumo_bo_attach_sync_point` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_bo_mmap` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_bo.c.o)` |
+| `pan_kmod_kumo_bo_munmap` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_bo.c.o)` |
+| `pan_kmod_kumo_cs_reg_count` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_csif_props` | VK | other: native capability backend | `build/src/panfrost/lib/kmod/libpankmod_lib.a(libpankmod_lib.a.p/panthor_kmod.c.o)` |
+| `pan_kmod_kumo_dev_lost` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_heap_create` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_heap_destroy` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_native` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_snapshot_wait` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_fence.c.o)` |
+| `pan_kmod_kumo_sync_create` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_context.c.o)` |
+| `pan_kmod_kumo_sync_destroy` | GL/VK | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_sync_snapshot` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost.a(libpanfrost.a.p/pan_fence.c.o)` |
+| `pan_kmod_kumo_vm_sync_lock` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_vm_sync_unlock` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
+| `pan_kmod_kumo_vm_wait` | GL | other: native capability backend | `build/src/gallium/drivers/panfrost/libpanfrost-v10.a(libpanfrost-v10.a.p/pan_csf.c.o)` |
 
 ## Archive sizes
 
@@ -101,7 +90,7 @@ Object text/data/BSS sizes for each driver are in `link-{gl,vk}.object-sizes`; t
 | `build/src/gallium/drivers/panfrost/libpanfrost-v6.a` | 2194 | — |
 | `build/src/gallium/drivers/panfrost/libpanfrost-v7.a` | 2194 | — |
 | `build/src/gallium/drivers/panfrost/libpanfrost-v9.a` | 2194 | — |
-| `build/src/gallium/drivers/panfrost/libpanfrost.a` | 5130 | — |
+| `build/src/gallium/drivers/panfrost/libpanfrost.a` | 5192 | — |
 | `build/src/mesa/glapi/es2api/libGLESv2.a` | 6198492 | — |
 | `build/src/mesa/libmesa.a` | 197428 | — |
 | `build/src/panfrost/compiler/bifrost/libpanfrost_bifrost.a` | 8020 | 8020 |
@@ -147,9 +136,9 @@ Object text/data/BSS sizes for each driver are in `link-{gl,vk}.object-sizes`; t
 | `build/src/panfrost/vulkan/libpanvk_v14.a` | — | 8172 |
 | `build/src/panfrost/vulkan/libpanvk_v6.a` | — | 7146 |
 | `build/src/panfrost/vulkan/libpanvk_v7.a` | — | 7146 |
-| `build/src/panfrost/vulkan/libvulkan_panfrost.a` | — | 30757842 |
+| `build/src/panfrost/vulkan/libvulkan_panfrost.a` | — | 30754996 |
 | `build/src/util/libxmlconfig.a` | 488 | — |
-| `sysroot/lib/libc.a` | 6687464 | 6687464 |
+| `sysroot/lib/libc.a` | 6772622 | 6772622 |
 
 No required pthread creation, dl, expat or driconf symbol remains unresolved in these links. This is link closure evidence only: existing libc exports can still refuse operations at runtime. G7l/G7m must prove their behavior.
 

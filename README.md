@@ -129,6 +129,11 @@ cargo test -p kumo-abi
 ./scripts/preflight.sh
 ```
 
+To reclaim local disk space, preview rebuildable caches with
+`python3 scripts/cleanup.py --worktrees`. Add `--apply` to remove them, or `--cargo`
+for broader compilation-cache cleanup. Source, reference materials, worktrees,
+sysroots and build evidence are preserved. See [local cleanup](docs/cleanup.md).
+
 ## Inside KUMO
 
 | Component | Responsibility | Source |

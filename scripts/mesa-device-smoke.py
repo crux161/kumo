@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j774
 #j775
 #j776
 #j777
 #j779
+#j780
 """Prove the native Mesa device/VM backend with the real C runtime and real VMOs."""
 import argparse
 import hashlib
@@ -168,13 +168,82 @@ subprocess.run(['clang-22', *flags, '-I', str(mesa / 'drm'), '-Wall', '-Wextra',
     return [deps / "kumo_gl.o", deps / "gl-frontend.o", deps / "drm-refusal.o", *archives, ROOT / "build/mesa-drivers/result/cxx/libkumo-cxx.a"]
 
 
-def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=(), gl=False, runtime=None):
+# VK2-e: panvk's archives as G7k's inventory measured them, less the same device dependencies.
+VK_SKIP = GL_SKIP
+
+
+def vk_dependencies(out):
+    """Materialize every VK archive and compile drm-refusal and static-build-id inside the
+    offline container, with ralloc.c's flags as GL's drm-refusal uses, then copy them out.
+    panvk's instance reads the linker's build ID through static-build-id (G7m). Run
+    scripts/mesa-drivers.py first, so the archives carry the current kumo-build.patch."""
+    inventory = json.loads((ROOT / "build/mesa-drivers/result/inventory.json").read_text())
+    names = [n for n in inventory["vk"]["archive_bytes"] if n not in VK_SKIP]
+    script = """import json, shlex, subprocess, sys
+from pathlib import Path
+mesa = Path('/work/kumo-mesa'); build = mesa / 'build'
+out = Path('/output/vk-deps'); out.mkdir(exist_ok=True)
+for index, name in enumerate(json.loads(sys.argv[1])):
+    archive = mesa / name
+    target = out / f'{index:02d}-{archive.name}'
+    target.unlink(missing_ok=True)
+    if archive.read_bytes()[:7] == b'!<arch>':
+        subprocess.run(['cp', archive, target], check=True)
+        continue
+    members = subprocess.check_output(['llvm-ar-22', 't', archive], text=True).splitlines()
+    subprocess.run(['llvm-ar-22', 'rcs', target, *[archive.parent / m for m in members]], check=True)
+commands = json.loads((build / 'compile_commands.json').read_text())
+entry = next(c for c in commands if c['file'].endswith('/ralloc.c'))
+flags, skip = [], False
+for arg in shlex.split(entry['command'])[1:]:
+    if skip:
+        skip = False
+    elif arg in ('-o', '-MF', '-MQ', '-MT'):
+        skip = True
+    elif arg not in ('-c', '-MD', '-MMD', entry['file']):
+        flags.append(arg)
+for source in ('drm-refusal', 'static-build-id'):
+    subprocess.run(['clang-22', *flags, '-I', str(mesa / 'drm'), '-I', str(mesa / 'mesa-26.2.5/src'),
+                    '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-c',
+                    f'/repo/toolchain/mesa/{source}.c', '-o', out / f'{source}.o'], check=True, cwd=build)
+"""
+    run(["docker", "exec", "kumo-mesa-drivers-g7k", "python3", "-c", script, json.dumps(names)])
+    deps = out / "vk-deps"
+    if deps.exists():
+        shutil.rmtree(deps)
+    run(["docker", "cp", "kumo-mesa-drivers-g7k:/output/vk-deps", deps])
+    archives = sorted(deps.glob("[0-9][0-9]-*.a"))
+    assert len(archives) == len(names), "every VK archive must be materialized"
+    return [deps / "drm-refusal.o", deps / "static-build-id.o", *archives,
+            ROOT / "build/mesa-drivers/result/cxx/libkumo-cxx.a"]
+
+
+def vk_link_script(script):
+    """G7n's stack request plus G7m's build-ID note, kept in the read-only PT_LOAD and a
+    PT_NOTE, as build-closure.py does: panvk's vkCreateInstance needs the linker's note."""
+    text = script.read_text()
+    assert text.count("    tls    PT_TLS  FLAGS(4);") == 1
+    text = text.replace("    tls    PT_TLS  FLAGS(4);", "    tls    PT_TLS  FLAGS(4);\n    note PT_NOTE FLAGS(4);")
+    assert text.count("    .data : ALIGN(0x1000)") == 1
+    text = text.replace("    .data : ALIGN(0x1000)",
+                        "    .note.gnu.build-id : ALIGN(4) { KEEP(*(.note.gnu.build-id)) } :rodata :note\n\n"
+                        "    .data : ALIGN(0x1000)")
+    path = script.with_name("link-vk.ld")
+    path.write_text(text)
+    return path
+
+
+def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt0.S", defines=(), gl=False, runtime=None,
+          vk=False):
     """Build a static ELF from `cases`.c and a Rust runtime (default: `cases`.rs).
     The GLES2 client reuses the metal session bootstrap with its own main. — KESTREL
     `defines` go to the cases file only, never the shared bridge: G7p-e selects its proof
     with one. — TIMBERDOODLE
     `gl` also links Gallium's panfrost driver, the frontend and lifecycle cases, the inventory's
-    GL archives (G7k), drm-refusal (G7m) and the C++ runtime (G7l). — KESTREL"""
+    GL archives (G7k), drm-refusal (G7m) and the C++ runtime (G7l). — KESTREL
+    `vk` links panvk instead (VK2-e): the inventory's VK archives, drm-refusal, static-build-id,
+    the C++ runtime and a build-ID note, with drmIoctl, drmGetDevices2 and drmSyncobjCreate
+    wrapped so the client can prove none is reached."""
     # The standalone GLES client shares the established GPU-slot bootstrap without
     # copying its Rust session owner; existing proof targets keep their own runtime. — KESTREL
     runtime = runtime or cases
@@ -185,6 +254,11 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     native = ROOT / "build/mesa-native/probe"
     mesa = native / "source/mesa-26.2.5"
     sysroot = ROOT / "target/kumo-sysroot"
+    # Mesa's DRM declarations select sys/ioccom.h on this Mac. Match the container's
+    # adapter for every native-device build, including non-GL proofs. — TIMBERDOODLE
+    ioctl_compat = native / "compat/sys/ioccom.h"
+    ioctl_compat.parent.mkdir(parents=True, exist_ok=True)
+    ioctl_compat.write_text("/* KUMO ioctl declarations; no host headers. */\n#include <sys/ioctl.h>\n")
     cc = shutil.which("clang")
     nm = shutil.which("llvm-nm")
     assert cc and nm
@@ -198,6 +272,7 @@ def build(cases="device-smoke", out=OUT, crt0=ROOT / "toolchain/relibc/smoke/crt
     mode = subprocess.check_output(["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}", "kumo-mesa-drivers-g7k"], text=True).strip()
     assert mode == "none", "native device build container must remain offline"
     gl_inputs = gl_dependencies(out) if gl else []
+    vk_inputs = vk_dependencies(out) if vk else []
     if gl:
         flags.extend(["-isystem", mesa / "src/gallium/include",
                       "-isystem", out / "gl-deps/generated"])
@@ -237,7 +312,7 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     gl_objects = []
     linker_script = ROOT / "toolchain/relibc/smoke/link.ld"
     compiler = None
-    if gl:
+    if gl or vk:
         # Public GLSL compilation needs G7n's existing 2 MiB ELF stack request.
         # Reuse its script/header writer; Sora already bounds and grants it. — KESTREL
         spec = importlib.util.spec_from_file_location("mesa_compiler", TOOL / "build-compiler.py")
@@ -252,17 +327,31 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
         compiler.ROOT, compiler.OUT = ROOT, out
         (out / "kumo").mkdir(exist_ok=True)
         linker_script = compiler.link_script()
-        # Gallium's headers need generated ones from the container's build tree.
-        for name in ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle", "gl-heap", "gl-texture", "gl-churn"] if cases == "device-smoke" else [])]:
+        if vk:
+            linker_script = vk_link_script(linker_script)
+        # Gallium's headers need generated ones from the container's build tree. A VK client
+        # links none of the GL cases.
+        gl_cases = ["gl-screen", "gl-context-init", "gl-batch", *(["gl-client", "gl-context", "gl-compute", "gl-clear", "gl-triangle", "gl-heap", "gl-texture", "gl-churn"] if cases == "device-smoke" else [])]
+        for name in gl_cases if gl else []:
             obj = out / f"{name}.o"
             run([cc, *flags, "-isystem", mesa / "src/gallium/include", "-isystem", out / "gl-deps/generated",
                  "-Wno-unused-parameter", "-c", TOOL / f"{name}.c", "-o", obj])
             gl_objects.append(obj)
-    command = ["ld.lld", "-static", "--gc-sections", "-z", "noexecstack", "-T", linker_script,
+    # Honor Mesa's ICD link_whole contract: weak dispatch references alone do not
+    # retain core runtime implementations such as Properties2. — TIMBERDOODLE
+    vk_link_inputs = []
+    for path in vk_inputs:
+        if path.name.endswith("libvulkan_panfrost.a"):
+            vk_link_inputs.extend(["--whole-archive", path, "--no-whole-archive"])
+        else:
+            vk_link_inputs.append(path)
+    command = ["ld.lld", "-static", "--gc-sections", *(["--build-id=sha1"] if vk else []),
+               "-z", "noexecstack", "-T", linker_script,
                "-o", elf, out / "crt0.o", out / f"{cases}.o", out / "native-device.o", native / "kumo_kmod.o",
                native / "pan_props.o", native / "pan_model.o", *gl_objects,
                *(["--wrap=drmIoctl"] if gl and cases == "device-smoke" else []),
-               "--start-group", out / "libdevice.a", *gl_inputs,
+               *(["--wrap=drmIoctl", "--wrap=drmGetDevices2", "--wrap=drmSyncobjCreate"] if vk else []),
+               "--start-group", out / "libdevice.a", *gl_inputs, *vk_link_inputs,
                out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a", "--end-group"]
     run(command)
     if compiler:
@@ -272,20 +361,27 @@ for name, relative in [('kmod','panfrost/lib/kmod/libpankmod_lib.a'),('util','ut
     # initializer is already measured by G7k; the TLS variable itself is defined
     # in Mesa's C glapi. Allow only measured weak symbols, never a strong gap. — KESTREL
     optional = set()
-    if gl:
+    for driver in ["gl"] * gl + ["vk"] * vk:
         inventory = json.loads((ROOT / "build/mesa-drivers/result/inventory.json").read_text())
-        optional = {name for name, item in inventory["gl"]["undefined"].items() if not item["required"]}
+        optional |= {name for name, item in inventory[driver]["undefined"].items() if not item["required"]}
     for line in undefined.splitlines():
         fields = line.split()
-        assert len(fields) == 2 and fields[0] == "w" and fields[1] in optional, line
+        # LLD localizes hidden weak panvk dispatch placeholders as U, as in the
+        # G7m closure check. Only inventoried optional names are allowed. — TIMBERDOODLE
+        assert (len(fields) == 2 and fields[1] in optional
+                and (fields[0] == "w" or (vk and fields[0] == "U"))), line
     run(["rustfmt", "--edition", "2021", "--check", TOOL / f"{runtime}.rs", TOOL / "native.rs"])
     paths = [elf, Path(__file__), TOOL / f"{cases}.c", TOOL / f"{runtime}.rs", Path(crt0), TOOL / "native-device.c", TOOL / "native.rs", TOOL / "kumo_gpu.h", TOOL / "kumo_kmod.h",
              TOOL / "kumo_kmod.c", ROOT / "lib/kumo-gpu/src/bo.rs", ROOT / "lib/kumo-gpu/src/c.rs",
              ROOT / "lib/kumo-gpu/src/client.rs", ROOT / "lib/kumo-gpu/src/c_sync.rs", ROOT / "lib/kumo-gpu/src/sync.rs",
              ROOT / "lib/kumo-gpu/src/group.rs", ROOT / "userland/servers/drv-gpu/src/lib.rs",
              ROOT / "lib/kumo-graphics/src/lib.rs", ROOT / "lib/kumo-graphics/src/lane.rs",
-             native / "manifest.json", out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
+             native / "manifest.json", ioctl_compat, out / "kmod.a", out / "util.a", out / "c11.a", sysroot / "lib/libc.a"]
     paths.extend(TOOL / f"{obj.stem}.c" for obj in gl_objects)
+    if vk:
+        paths.extend([TOOL / "drm-refusal.c", TOOL / "static-build-id.c", TOOL / "kumo-build.patch",
+                      TOOL / "build-compiler.py", linker_script, *vk_inputs,
+                      ROOT / "build/mesa-drivers/result/inventory.json"])
     if gl:
         paths.extend([TOOL / "kumo_gl.c", TOOL / "kumo_gl.h", TOOL / "gl-frontend.c",
                       TOOL / "build-compiler.py", linker_script,
