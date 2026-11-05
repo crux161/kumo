@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j434
 //j460
 //j467
 //j622
 //j783
+//j800
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -25,6 +25,9 @@
 //! bootloader dependency-light and auditable; only the protocol members Nijigumo
 //! calls are typed, the rest of each service table is opaque pointers so the field
 //! offsets stay correct.
+
+#[cfg(feature = "nvme-oracle")]
+mod nvme_oracle;
 
 use core::ffi::c_void;
 use core::fmt;
@@ -701,6 +704,11 @@ unsafe fn boot_and_jump(
     // explicit PL011 route. The latter is how a Pi 5 image can follow firmware's current RP1
     // PCIe window without pretending that a movable BAR address is a stable BSP fact.
     unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
+
+    #[cfg(feature = "nvme-oracle")]
+    if niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() }) {
+        unsafe { nvme_oracle::run(boot_services, con_out) };
+    }
 
     // Pre-exit summary + validation, using a provisional memory snapshot.
     if let Some((regions_ptr, regions_len, _key, raw_map)) =

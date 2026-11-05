@@ -1,3 +1,4 @@
+#j800
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -15,3 +16,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "niji-uefi"
 path = "src/main.rs"
+
+[features]
+nvme-oracle = []

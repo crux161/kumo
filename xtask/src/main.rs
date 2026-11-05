@@ -1,8 +1,8 @@
-//j648
 //j649
 //j675
 //j709
 //j798
+//j800
 
 use std::env;
 use std::fmt;
@@ -404,6 +404,15 @@ struct StagedAsset {
     dtb_model: Option<String>,
 }
 
+fn nvme_oracle_enabled(value: Option<&str>, board: &str) -> Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") if board == "orange-pi-5-plus" => Ok(true),
+        Some("1") => Err("NVMe firmware oracle requires the Orange Pi 5 Plus target".into()),
+        _ => Err("KUMO_NVME_ORACLE must be 0 or 1".into()),
+    }
+}
+
 fn stage_uefi_bootloader(
     root: &Path,
     out_dir: &Path,
@@ -414,18 +423,28 @@ fn stage_uefi_bootloader(
         ImageArch::X86_64 => ("x86_64-unknown-uefi", "niji-uefi.efi"),
     };
 
-    run_cargo(
-        root,
-        &[
-            "build",
-            "-p",
-            "niji-uefi",
-            "--bin",
-            "niji-uefi",
-            "--target",
-            target,
-        ],
+    let oracle_env = match env::var("KUMO_NVME_ORACLE") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("KUMO_NVME_ORACLE must be UTF-8 0 or 1".into()),
+    };
+    let oracle = nvme_oracle_enabled(
+        oracle_env.as_deref(),
+        plan.hardware.board().map(|b| b.id()).unwrap_or(""),
     )?;
+    let mut args = vec![
+        "build",
+        "-p",
+        "niji-uefi",
+        "--bin",
+        "niji-uefi",
+        "--target",
+        target,
+    ];
+    if oracle {
+        args.extend(["--features", "nvme-oracle"]);
+    }
+    run_cargo(root, &args)?;
 
     let source_path = root
         .join("target")
@@ -2789,6 +2808,27 @@ Expected serial transcript is in:\n\
 
 #[cfg(test)]
 mod boot_manifest_tests {
+    #[test]
+    fn firmware_nvme_oracle_is_explicit_and_orange_only() {
+        use super::nvme_oracle_enabled;
+        for board in [
+            "",
+            "qemu-virt-aarch64",
+            "thinkpad-x13s-gen1",
+            "generic-uefi-x86_64",
+            "orange-pi-5-plus",
+        ] {
+            assert_eq!(nvme_oracle_enabled(None, board), Ok(false));
+            assert_eq!(nvme_oracle_enabled(Some("0"), board), Ok(false));
+            assert_eq!(
+                nvme_oracle_enabled(Some("1"), board).is_ok(),
+                board == "orange-pi-5-plus"
+            );
+        }
+        assert_eq!(nvme_oracle_enabled(Some("1"), "orange-pi-5-plus"), Ok(true));
+        assert!(nvme_oracle_enabled(Some("true"), "orange-pi-5-plus").is_err());
+    }
+
     use super::{
         esp_uefi_path, parse_pl011_console_arg, render_boot_manifest, BOOT_MANIFEST_ESP_PATH,
     };

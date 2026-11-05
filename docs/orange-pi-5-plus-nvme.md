@@ -3,6 +3,7 @@
 <!-- j797 -->
 <!-- j798 -->
 <!-- j799 -->
+<!-- j800 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
@@ -185,4 +186,35 @@ References: NVM Express Base2.1 common SQE/CQE, phase and Identify; matching NVM
 Command Set1.1 Identify Namespace fields, downloaded from nvmexpress.org and
 validated as a PDF (SHA256 95782c03141ba277d76edfe187e32fc6911a086721c5a86f088827366bc562db).
 All command DMA here is the D5 cooperative non-claim; Road C remains open.
+— TIMBERDOODLE
+
+## NV4b independent firmware reference
+
+Build an Orange Pi proof image with `KUMO_NVME_ORACLE=1 cargo xtask image --arch aarch64 --hardware orange-pi-5-plus`. The imager
+selects the optional `niji-uefi/nvme-oracle` Cargo feature; default and `=0` builds
+leave it disabled. An enabled request for another hardware target is rejected.
+The loader also checks the stamped Orange Pi board identity before querying.
+
+Before its final memory-map snapshot/ExitBootServices, Nijigumo locates UEFI NVMe
+PassThru, checks a physical-controller mode and supported alignment, allocates one
+page and submits synchronous Identify Controller and Identify Namespace through
+firmware's own queues/DMA mapping. GetNextNamespace supplies the namespace ID.
+This transport, command packet and response decoder do not depend on drv-nvme.
+The firmware-returned identity and geometry can be compared to KUMO's later logs
+from that same boot; matching synthetic host fixtures are not a hardware oracle.
+
+The request uses a 30-second timeout in UEFI's 100ns units, NULL event, exact4KiB
+transfer, no metadata and the admin queue. Firmware status, returned length and
+completion status are checked. An unproven submitted command halts before EBS
+with its page retained. Successful proof keeps the4KiB LoaderData page reserved
+across handoff; current kernel allocation uses only Usable regions. No media
+command, firmware setting or direct controller/root/shared/SMMU write is added.
+Missing/unsupported protocol before submission reports unavailability and allows
+ordinary boot; it cannot count as reference acceptance. D5 remains a non-claim.
+
+Bindings follow [UEFI's media protocols](https://uefi.org/specs/UEFI/2.10/13_Protocols_Media_Access.html)
+and the [TianoCore protocol header](https://raw.githubusercontent.com/tianocore/edk2/master/MdePkg/Include/Protocol/NvmExpressPassthru.h).
+Host tests check64bit layouts, default/board scope, synchronous packet construction,
+short/failed completions and reference decoding. Hardware comparison evidence
+belongs in the milestone journal; enabling a feature alone does not prove it.
 — TIMBERDOODLE

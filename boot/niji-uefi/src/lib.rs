@@ -5,10 +5,13 @@
 //j467
 //j622
 //j783
+//j800
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
 };
+
+pub mod nvme;
 
 pub const BOOTLOADER_NAME: &str = "Nijigumo";
 
