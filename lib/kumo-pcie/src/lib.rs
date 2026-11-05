@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 //j792
+//j793
 
 //! RK3588 DesignWare PCIe: board discovery and the read-only firmware-state probe (PLAN/019 NV0).
 //!
@@ -19,6 +20,8 @@
 use core::fmt;
 
 use kumo_fdt::{be32, status_enabled, string_list_contains, string_value, Fdt, Node};
+
+pub mod endpoint;
 
 /// APB client window of PCIe3_4L (TRM Table 11-1), which selects the M.2 controller.
 pub const PCIE30X4_APB: u64 = 0xfe15_0000;
@@ -78,6 +81,8 @@ const PHY1_STATUS1: u64 = 0xa04;
 const PHY_CLAMP_RELEASED: u32 = 1 << 8;
 const PHY_SRAM_INIT_DONE: u32 = 1 << 0;
 const PHY_MPLLA_STATE: u32 = 1 << 3;
+const PHY_MPLLB_STATE: u32 = 1 << 6;
+const PHY_POWER_ENABLED: u32 = (1 << 1) | (1 << 2);
 
 /// APB client registers (TRM §11.4.2).
 const CLIENT_GENERAL_CON: u64 = 0x000;
@@ -157,6 +162,16 @@ pub struct Topology {
     pub power_domain: u32,
     pub perst: Option<GpioLine>,
     pub supply: Option<GpioLine>,
+    pub bus_range: [u8; 2],
+    /// Parent/child address windows, in I/O, MEM32, MEM64 order.
+    pub windows: [Option<PciWindow>; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciWindow {
+    pub cpu: u64,
+    pub pci: u64,
+    pub bytes: u64,
 }
 
 impl Topology {
@@ -202,6 +217,9 @@ pub fn discover_rk3588_pcie30x4(dtb: &[u8]) -> Option<Topology> {
             && status_enabled(*node)
             && named_reg(*node, b"apb").is_some_and(|(base, _)| base == PCIE30X4_APB)
     })?;
+    if cells(node, b"#address-cells")? != 3 || cells(node, b"#size-cells")? != 2 {
+        return None;
+    }
     let (dbi, dbi_len) = named_reg(node, b"dbi")?;
     let (apb, apb_len) = named_reg(node, b"apb")?;
     let (config, config_len) = named_reg(node, b"config")?;
@@ -220,6 +238,47 @@ pub fn discover_rk3588_pcie30x4(dtb: &[u8]) -> Option<Topology> {
         return None;
     }
     let power_domain = be32(domain, 4)?;
+    let buses = node.property(b"bus-range")?;
+    if buses.len() != 8 {
+        return None;
+    }
+    let bus_range = [
+        u8::try_from(be32(buses, 0)?).ok()?,
+        u8::try_from(be32(buses, 4)?).ok()?,
+    ];
+    if bus_range[0] >= bus_range[1] {
+        return None;
+    }
+    let ranges = node.property(b"ranges")?;
+    if ranges.len() % 28 != 0 {
+        return None;
+    }
+    let mut windows = [None; 3];
+    for at in (0..ranges.len()).step_by(28) {
+        let flags = be32(ranges, at)?;
+        let space = ((flags >> 24) & 3) as usize;
+        if space == 0 || flags & 0x00ff_ffff != 0 || windows[space - 1].is_some() {
+            return None;
+        }
+        let pair = |offset| {
+            Some(
+                (u64::from(be32(ranges, at + offset)?) << 32)
+                    | u64::from(be32(ranges, at + offset + 4)?),
+            )
+        };
+        let window = PciWindow {
+            pci: pair(4)?,
+            cpu: pair(12)?,
+            bytes: pair(20)?,
+        };
+        if window.bytes == 0
+            || window.cpu.checked_add(window.bytes).is_none()
+            || window.pci.checked_add(window.bytes).is_none()
+        {
+            return None;
+        }
+        windows[space - 1] = Some(window);
+    }
     let spis = Spis {
         sys: named_spi(&fdt, root, node, b"sys")?,
         pmc: named_spi(&fdt, root, node, b"pmc")?,
@@ -251,6 +310,8 @@ pub fn discover_rk3588_pcie30x4(dtb: &[u8]) -> Option<Topology> {
         power_domain,
         perst,
         supply,
+        bus_range,
+        windows,
     };
     topology.valid_for_probe().then_some(topology)
 }
@@ -441,17 +502,27 @@ impl Phy {
         )
     }
 
-    /// Both PHYs report initialized SRAM and running MPLLA. An all-ones read is not
+    pub const fn mpllb_on(&self) -> (bool, bool) {
+        (
+            self.phy0_status1 & PHY_MPLLB_STATE != 0,
+            self.phy1_status1 & PHY_MPLLB_STATE != 0,
+        )
+    }
+
+    /// Both PHYs report initialized SRAM, powered PCS/PMA and an active MPLL. An all-ones read is not
     /// evidence of a working PHY. — TIMBERDOODLE
     pub const fn running(&self) -> bool {
         let (sram0, sram1) = self.sram_ready();
         let (pll0, pll1) = self.pll_on();
+        let (pllb0, pllb1) = self.mpllb_on();
         self.phy0_status1 != u32::MAX
             && self.phy1_status1 != u32::MAX
+            && self.phy0_status1 & PHY_POWER_ENABLED == PHY_POWER_ENABLED
+            && self.phy1_status1 & PHY_POWER_ENABLED == PHY_POWER_ENABLED
             && sram0
             && sram1
-            && pll0
-            && pll1
+            && (pll0 || pllb0)
+            && (pll1 || pllb1)
     }
 
     fn mode_name(&self) -> &'static str {
@@ -849,6 +920,16 @@ fn ladder<I: RegisterRead>(report: &mut Report, io: &mut I) -> Result<(), Stop> 
     require(clock.pipe_clocked(), Stop::PipeClockGated)?;
     require(clock.core_released(), Stop::CoreInReset)?;
     require(phy.running(), Stop::PhyNotRunning)?;
+    // The fitted-drive observation uses MPLLB while the Gen1/no-drive state used MPLLA.
+    // Admit B-only operation only with a live L0 link; preserve the established A path.
+    // Both SRAM and power checks still apply to both PHYs. — TIMBERDOODLE
+    require(
+        phy.pll_on() == (true, true)
+            || report
+                .client
+                .is_some_and(|c| c.link_up() && c.ltssm_state() == 0x11),
+        Stop::PhyNotRunning,
+    )?;
     require(phy.clamp_released(), Stop::PhyClamped)?;
     let window = report.topology.dbi_window().ok_or(Stop::DbiAboveMap)?;
     let version = io.read32(window + DBI_VERSION_NUMBER);
@@ -1013,10 +1094,11 @@ impl fmt::Display for Report {
             Some(phy) => {
                 let (sram0, sram1) = phy.sram_ready();
                 let (pll0, pll1) = phy.pll_on();
+                let (pllb0, pllb1) = phy.mpllb_on();
                 writeln!(
                     f,
                     "PCIE30X4 PHY      Check     cmn={:#x} mode={} clamp={} phy0={:#x} \
-                     phy1={:#x} sram={}/{} mplla={}/{}   OK",
+                     phy1={:#x} sram={}/{} mplla={}/{} mpllb={}/{}   OK",
                     phy.cmn_con0,
                     phy.mode_name(),
                     if phy.clamp_released() { "off" } else { "on" },
@@ -1026,6 +1108,8 @@ impl fmt::Display for Report {
                     bit(sram1),
                     bit(pll0),
                     bit(pll1),
+                    bit(pllb0),
+                    bit(pllb1),
                 )?
             }
             None => writeln!(f, "PCIE30X4 PHY      Check     not read   --")?,
@@ -1273,6 +1357,15 @@ mod tests {
         assert_eq!((t.dbi, t.dbi_len), (PCIE30X4_DBI, PCIE30X4_DBI_LEN));
         assert_eq!((t.apb, t.apb_len), (0xfe15_0000, 0x1_0000));
         assert_eq!((t.config, t.config_len), (0xf000_0000, 0x10_0000));
+        assert_eq!(t.bus_range, [0, 15]);
+        assert_eq!(
+            t.windows[2],
+            Some(PciWindow {
+                cpu: 0x9_0000_0000,
+                pci: 0x9_0000_0000,
+                bytes: 0x4000_0000
+            })
+        );
         assert_eq!((t.lanes, t.max_link_speed), (4, 3));
         assert_eq!(
             t.spis,
@@ -1345,6 +1438,9 @@ mod tests {
             (b"max-link-speed", 0, 0),
             (b"interrupts", 8, 1),  // edge instead of level-high
             (b"interrupts", 12, 1), // nonzero PPI partition cell on an SPI
+            (b"#address-cells", 0, 2),
+            (b"bus-range", 4, 0x100),
+            (b"ranges", 0, 0), // no PCI address space
         ] {
             assert!(
                 discover_rk3588_pcie30x4(&patched(property, offset, &value.to_be_bytes()))
@@ -1660,6 +1756,26 @@ mod tests {
             .filter(|a| (PCIE30X4_DBI_ALIAS..PCIE30X4_DBI_ALIAS + PCIE30X4_DBI_LEN).contains(a))
             .collect();
         assert_eq!(dbi_reads, [&(PCIE30X4_DBI_ALIAS + DBI_VERSION_NUMBER)]);
+    }
+
+    #[test]
+    fn the_fitted_drive_mpllb_state_needs_sram_power_and_a_live_l0_link() {
+        let mut fake = Fake::healthy();
+        for status in [0x47, 0x4f] {
+            fake.set(PCIE3PHY_GRF + PHY0_STATUS1, status);
+            fake.set(PCIE3PHY_GRF + PHY1_STATUS1, status);
+            assert_eq!(probe(topology(), &mut fake).stop, None);
+        }
+        for status in [0x46, 0x45, 0x43, 0x7, u32::MAX] {
+            fake.set(PCIE3PHY_GRF + PHY0_STATUS1, status);
+            fake.set(PCIE3PHY_GRF + PHY1_STATUS1, 0x47);
+            assert_eq!(probe(topology(), &mut fake).stop, Some(Stop::PhyNotRunning));
+        }
+        fake.set(PCIE3PHY_GRF + PHY0_STATUS1, 0x47);
+        fake.set(PCIE30X4_APB + CLIENT_LTSSM_STATUS, 0);
+        fake.reads.clear();
+        assert_eq!(probe(topology(), &mut fake).stop, Some(Stop::PhyNotRunning));
+        assert!(!fake.read_any_in(PCIE30X4_DBI_ALIAS, PCIE30X4_DBI_LEN));
     }
 
     #[test]

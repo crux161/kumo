@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j635
 //j640
 //j660
 //j688
 //j792
+//j793
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -578,6 +578,17 @@ fn targeted_mmio_blocks_above_top(
         plan.push_base_above_top(base, top);
     }
     plan
+}
+
+/// NV1's isolated EL1 config alias: one Device-nGnRnE page, read-only, no EL0 access and
+/// execute-never in both exception levels. The actual page must also pass the PCIe route
+/// and DTB/SoC aperture checks before this descriptor is used. — TIMBERDOODLE
+#[cfg(any(target_os = "none", test))]
+fn readonly_probe_page_descriptor(physical: u64) -> Option<u64> {
+    if physical & 4095 != 0 || physical >= (1 << 48) {
+        return None;
+    }
+    Some(physical | 3 | (1 << 10) | (1 << 7) | (1 << 2) | (1 << 53) | (1 << 54))
 }
 
 fn pl011_reg(offset: usize) -> *mut u32 {
@@ -1935,6 +1946,57 @@ pub mod mmu {
         };
         // IPS uses the same encoding as PARange; clamp to 48-bit (5) for a 4 KiB map.
         (mmfr0 & 0xf).min(5)
+    }
+
+    /// An early-boot-only, one-page mapping in a distinct upper-half slot. It never replaces
+    /// a block/leaf or changes the physmap. Only page-table RAM is written. — TIMBERDOODLE
+    pub(super) unsafe fn with_readonly_probe_page<R>(
+        physical: u64,
+        alloc: &mut dyn FnMut() -> Option<u64>,
+        read: impl FnOnce(u64) -> R,
+    ) -> Result<R, ()> {
+        const VA: u64 = 0xffff_a000_0000_0000;
+        let descriptor = super::readonly_probe_page_descriptor(physical).ok_or(())?;
+        let root: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr1_el1", out(reg) root, options(nostack, nomem));
+        }
+        let mut table = root & ADDR_MASK;
+        let mut count = 0;
+        for shift in [39, 30, 21] {
+            let index = ((VA >> shift) & 511) as usize;
+            let current = read_desc(table, index);
+            if current & DESC_VALID != 0 && current & DESC_TABLE == 0 {
+                return Err(());
+            }
+            table = ensure_table(table, index, alloc, &mut count)?;
+        }
+        let index = ((VA >> 12) & 511) as usize;
+        if read_desc(table, index) != 0 {
+            return Err(());
+        }
+        write_desc(table, index, descriptor);
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+        let result = read(VA);
+        write_desc(table, index, 0);
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+        Ok(result)
     }
 
     /// Build the permanent Stage-A split map and switch to it. TTBR0 identity-maps
@@ -3468,6 +3530,49 @@ pub fn pcie30x4_status_from_dtb(dtb: u64) -> Option<kumo_pcie::Report> {
 #[cfg(not(target_os = "none"))]
 pub fn pcie30x4_status_from_dtb(_dtb: u64) -> Option<kumo_pcie::Report> {
     None
+}
+
+/// PLAN/019 NV1a: read the firmware-enumerated function through one temporary EL1-RO
+/// Device page. The route/error/link checks precede the first config access. The alias is
+/// removed before returning. No device register is written. — TIMBERDOODLE
+///
+/// # Safety
+/// Early boot only, with the kernel identity map active and no concurrent mapper. `alloc`
+/// must return unique, page-aligned, zeroed RAM frames admitted by the boot allocator.
+/// `report` must be the current boot's fresh `pcie30x4_status_from_dtb` observation.
+#[cfg(target_os = "none")]
+pub unsafe fn pcie30x4_endpoint_status(
+    report: &kumo_pcie::Report,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<kumo_pcie::endpoint::Endpoint, kumo_pcie::endpoint::Error> {
+    let page = kumo_pcie::endpoint::select_config_page(report)?;
+    struct ConfigPageRead(u64);
+    impl kumo_pcie::endpoint::ConfigRead for ConfigPageRead {
+        fn read32(&mut self, offset: u16) -> u32 {
+            if offset & 3 != 0 || offset > 4092 {
+                return u32::MAX;
+            }
+            unsafe { mmio_read32(self.0 + u64::from(offset)) }
+        }
+    }
+    unsafe {
+        mmu::with_readonly_probe_page(page.physical, alloc, |va| {
+            kumo_pcie::endpoint::probe(report, &mut ConfigPageRead(va))
+        })
+    }
+    .map_err(|_| kumo_pcie::endpoint::Error::Mapping)?
+}
+
+/// Host stub; follows the target safety contract but never allocates or reads.
+///
+/// # Safety
+/// Same early-boot and frame ownership requirements as the target implementation.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn pcie30x4_endpoint_status(
+    _report: &kumo_pcie::Report,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<kumo_pcie::endpoint::Endpoint, kumo_pcie::endpoint::Error> {
+    Err(kumo_pcie::endpoint::Error::Mapping)
 }
 
 /// Physical reads for `kumo-pcie`'s probe, through the kernel physmap.
@@ -6129,6 +6234,17 @@ pub fn spin_once() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nv1_probe_page_is_readonly_device_nx_and_inaccessible_to_el0() {
+        let descriptor = super::readonly_probe_page_descriptor(0x9_0010_0000).unwrap();
+        assert_eq!(descriptor & 0x0000_ffff_ffff_f000, 0x9_0010_0000);
+        assert_eq!((descriptor >> 6) & 3, 2); // EL1 RO, EL0 no access
+        assert_eq!((descriptor >> 2) & 7, 1); // existing MAIR Device-nGnRnE
+        assert_eq!(descriptor & 3, 3);
+        assert_eq!((descriptor >> 53) & 3, 3); // PXN and UXN
+        assert!(super::readonly_probe_page_descriptor(0x9_0010_0004).is_none());
+        assert!(super::readonly_probe_page_descriptor(1 << 48).is_none());
+    }
     use super::*;
 
     /// A fixed-size `core::fmt::Write` sink for checking report text without `std`.

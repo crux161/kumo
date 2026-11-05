@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j536
 //j559
 //j570
 //j616
 //j792
+//j793
 
 extern crate alloc;
 
@@ -636,12 +636,26 @@ pub fn stage_a(boot: &BootInfo) -> ! {
 
     // PLAN/019 NV0: the M.2 controller (RK3588 PCIe3_4L) as firmware left it. The HAL reads the
     // PMU and CRU, then the PHY GRF, client and DBI only as each guard rung holds, and names the
-    // first unmet one. Nothing is written; the endpoint and NVMe registers wait for NV1/NV2.
+    // first unmet one. NV1 then reads only the firmware-enumerated endpoint's config page;
+    // its temporary CPU alias is read-only and removed before return. NVMe stays NV2.
     // — TIMBERDOODLE
     #[cfg(feature = "arch_aarch64")]
     {
         match kumo_hal::active::pcie30x4_status_from_dtb(boot.platform.dtb) {
-            Some(report) => klog!("{}", report),
+            Some(report) => {
+                klog!("{}", report);
+                let mut alloc = || unsafe { mm::alloc_zeroed_frame(boot) };
+                match unsafe { kumo_hal::active::pcie30x4_endpoint_status(&report, &mut alloc) } {
+                    Ok(endpoint) => {
+                        klog!("{}", endpoint);
+                        klog!("NV1 CPU MAP      Check     one 4 KiB EL1-RO Device/NX alias removed; no userspace grant   OK\n");
+                    }
+                    Err(error) => klog!(
+                        "NV1 ENDPOINT     Check     stopped: {}; no writes   --\n",
+                        error
+                    ),
+                }
+            }
             None => klog!("PCIE30X4          Check     no enabled RK3588 PCIe3_4L  --\n"),
         }
     }
