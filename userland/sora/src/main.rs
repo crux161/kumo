@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j723
 //j741
 //j748
 //j766
 //j774
+//j795
 
 extern crate alloc;
 
@@ -6929,7 +6929,10 @@ fn copy_from_initrd(initrd: Handle, base: u64, len: u64, dst: Handle, offset: u6
     true
 }
 
-/// One request to `identityd` and its reply, pumped through the resident child.
+/// One serialized identity exchange. ProcessWait is not reply readiness: an unrelated
+/// resident can return control while argon2 is still running. Bind before sending and
+/// wait for this channel, so a successful check cannot authorize the next attempt.
+/// — TIMBERDOODLE
 fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Option<usize> {
     let client = Handle(IDENTITYD.load(Ordering::Relaxed));
     if client.0 == 0 {
@@ -6937,13 +6940,30 @@ fn identity_request_reply(request: IdentityRequest<'_>, reply: &mut [u8]) -> Opt
     }
     let mut frame = [0u8; IDENTITY_REQUEST_MAX];
     let len = request.encode_into(&mut frame)?;
-    let written = channel_write(client, frame.as_ptr(), len) == 0;
-    frame.fill(0);
-    if !written || !child_parked(process_wait()) {
+    let Some(port) = reply_port() else {
+        frame.fill(0);
+        return None;
+    };
+    if port_bind(port, client) != 0 {
+        frame.fill(0);
         return None;
     }
-    let n = channel_read(client, reply.as_mut_ptr(), reply.len());
-    (n != 0 && n != u64::MAX).then_some(n as usize)
+    let written = channel_write(client, frame.as_ptr(), len) == 0;
+    frame.fill(0);
+    let result = if written && port_wait(port) == handle_koid(client) {
+        let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+        (n > 0 && n <= reply.len()).then_some(n)
+    } else {
+        None
+    };
+    let _ = port_unbind(port, client);
+    if written && result.is_none() {
+        // A request may still finish after a transport failure. Never reuse its
+        // uncorrelated reply for a later login; fail closed until service restart.
+        IDENTITYD.store(0, Ordering::Relaxed);
+        close_owned(client);
+    }
+    result
 }
 
 /// `id [USER]`: who an account is, as `identityd` knows it; with no name, the session's user.
