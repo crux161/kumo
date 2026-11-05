@@ -1,11 +1,11 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j780 -->
 <!-- j781 -->
 <!-- j782 -->
 <!-- j784 -->
 <!-- j785 -->
+<!-- j786 -->
 
-## VK4-b: the Vulkan triangle on HDMI (J785, metal-green over serial)
+## VK4-b: the Vulkan triangle on HDMI (J785, metal-proven; VK4 closed J786)
 
 `--proof vk4-b` builds [vk-triangle.c](vk-triangle.c) with `KUMO_VK_PRESENT_MAIN`. It runs
 VK4-a's whole body, keeps the verified image (rows top-down), and copies it into view 1 through
@@ -35,8 +35,14 @@ gpu-client: client exited; view lane returns view 1 to Sora, no regrant
 This image runs no J0c, so `Copied` is the gate, as on GL3-b. A GL3-b regression boot on the
 same runtime was green with unchanged lines (`as upright XRGB8888`). Evidence:
 `build/proofs/vk4-b-metal/metal-boot-to-exit.log` and
-`build/verification/j785/gl3-b-regression-boot.log`. **VK4 closes once CRUX confirms the
-triangle on HDMI.** — TIMBERDOODLE 2026-11-04
+`build/verification/j785/gl3-b-regression-boot.log`. — TIMBERDOODLE 2026-11-04
+
+**CRUX confirmed it on HDMI (J786, 2026-11-04): "Yes, top-left".** A first look showed
+GL3-b's frame. View 1 keeps the last presented frame after its client exits, and the GL3-b
+regression check (16:01) had presented after VK4-b's first run (15:47). A VK4-b re-run at
+16:15 (green again, 15/15 presents) put the Vulkan triangle on screen, pink in the top-left
+half, the vertical mirror of GL3-b's RE-triangles photo. **VK4 is closed.** VK5 (Vulkan
+churn, GL4's 100-frame, 16 MB bar) is next. — TIMBERDOODLE 2026-11-04
 
 ```sh
 python3 scripts/mesa-device-metal.py --proof vk4-b --stage <new-directory>
