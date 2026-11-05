@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j570
 //j616
 //j792
 //j793
 //j794
+//j797
 
 extern crate alloc;
 
@@ -656,6 +656,15 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                             Ok(snapshot) => {
                                 klog!("{}", snapshot);
                                 klog!("NV2 CPU MAP      Check     BAR0 EL1-RO Device/NX alias removed; no queues/DMA   OK\n");
+                                if let Some(status) = kumo_hal::active::device_power_status(
+                                    boot.platform.dtb,
+                                    snapshot.physical,
+                                ) {
+                                    klog!("NV3 GUARD        Check     base={:#x} powered={} mintable={} inherit status-only; config/root raw-RO, one BAR page eligible; no writes/DMA   {}\n",
+                                        snapshot.physical, status.powered as u8,
+                                        status.aperture_ready as u8,
+                                        if status.aperture_ready { "OK" } else { "--" });
+                                }
                             }
                             Err(error) => klog!(
                                 "NV2 CONTROLLER   Check     stopped: {}; no writes   --\n",

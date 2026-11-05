@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j660
 //j688
 //j792
 //j793
 //j794
+//j797
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -19,6 +19,7 @@ pub mod display_register;
 pub mod display_reset;
 pub mod display_unit;
 pub mod mali;
+pub mod pcie_unit;
 pub mod power_unit;
 pub mod rockchip_v2;
 pub mod smmuv2;
@@ -3687,7 +3688,8 @@ impl power_unit::PowerIo for PhysPowerIo {
 #[cfg(target_os = "none")]
 pub fn device_power_unit(dtb: u64, aperture_base: u64) -> Option<DevicePowerUnitInfo> {
     let bytes = unsafe { dtb_bytes(dtb)? };
-    power_unit::live_unit(bytes, aperture_base).map(|unit| unit.info())
+    pcie_unit::info(bytes, aperture_base)
+        .or_else(|| power_unit::live_unit(bytes, aperture_base).map(|unit| unit.info()))
 }
 
 #[cfg(not(target_os = "none"))]
@@ -3722,6 +3724,9 @@ pub fn device_power_up(
 #[cfg(target_os = "none")]
 pub fn device_power_status(dtb: u64, aperture_base: u64) -> Option<DevicePowerReadout> {
     let bytes = unsafe { dtb_bytes(dtb)? };
+    if aperture_base == pcie_unit::BAR0 {
+        return pcie_unit::status(bytes, aperture_base, &mut PhysRegisterRead);
+    }
     let unit = power_unit::live_unit(bytes, aperture_base)?;
     Some(power_unit::readout(unit, &mut PhysPowerIo))
 }
@@ -3740,6 +3745,7 @@ pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
         .iter()
         .any(|unit| unit.overlaps(phys_base, len))
         && !display_unit::overlaps_display(phys_base, len)
+        && !pcie_unit::overlaps(phys_base, len)
     {
         return false;
     }
@@ -3747,6 +3753,7 @@ pub fn device_aperture_blocked(dtb: u64, phys_base: u64, len: u64) -> bool {
         Some(bytes) => {
             power_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
                 || display_unit::aperture_blocked(bytes, phys_base, len, &mut PhysPowerIo)
+                || pcie_unit::blocked(bytes, phys_base, len, &mut PhysRegisterRead)
         }
         None => false,
     }
@@ -3759,7 +3766,7 @@ pub fn device_aperture_blocked(_dtb: u64, _phys_base: u64, _len: u64) -> bool {
 
 /// Raw write reservation is independent of DT discovery and power state (DESIGN/022).
 pub fn device_mmio_read_only(base: u64, len: u64) -> bool {
-    display_register::read_only(base, len)
+    display_register::read_only(base, len) || pcie_unit::read_only(base, len)
 }
 pub fn device_register_window(base: u64) -> Option<u64> {
     display_register::window(base)

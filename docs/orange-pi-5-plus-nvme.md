@@ -1,5 +1,6 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
 <!-- j796 -->
+<!-- j797 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
@@ -65,3 +66,40 @@ Close the debt only with evidence that:
 
 Source of the sequencing decision: CRUX's 2026-11-05 NV* continuation instruction.
 The local debt ledger is DEFERRED/011; J796 records ratification and rollback.
+
+## NV3a inherit-only admission
+
+The HAL's status-only unit is named by the observed BAR0 prefix at `0xf0000000`,
+length 4096. It has no power-up or shared-control write sequence. Every status/mint
+observation repeats NV0's guarded root reads, the stable firmware CFG0/identity-MEM
+route checks, and the guarded SMMU disabled-bypass observation. Endpoint config
+and CAP/VS still need their own probe before treating the page as NVMe.
+
+For the enabled Orange Pi root, only these ranges are admitted by the mint guard:
+
+| Range | Raw access |
+| --- | --- |
+| BAR0 first page, `0xf0000000` + 4 KiB | READ/WRITE if the Resource permits it |
+| Client, `0xfe150000` + 4 KiB | READ only |
+| DBI header, alias `0xf5000000` + 4 KiB | READ only |
+| Unrolled iATU, `0xf5300000` + 8 KiB | READ only |
+| Current function page selected from firmware CFG0 | READ only |
+
+Unknown, oversized or alternate root/outbound windows are refused. Raw writes to
+root/config windows remain reserved independently of power/DT discovery, matching
+the existing display reservation model. This slice does not grant interrupts or
+doorbell access, allocate queues, write a device register or start DMA.
+
+The existing 64-byte `DevicePowerStatus` record keeps version 1. `POWERED` and
+`APERTURE_MINTABLE` describe the observed path; `REPAIR_DONE` and
+`CLOCK_AT_BOOT_RATE` stay clear because this unit neither observes BISR completion
+nor selects/verifies a boot frequency. Its diagnostic layout is:
+
+- `pmu[0..6]`: root power status, SMMU IDR0, CR0, CR0ACK, GBPA, MMU Q-channel status.
+  An unread/invalid policy has IDR0 zero and the remaining policy words all-ones;
+  it never means bypass and never sets `APERTURE_MINTABLE`.
+- `cru[0..8]`: GATE32/33/34/39, SOFTRST32/33/34, PHPTOP GATE0. The complete guarded
+  NV0 report also checks PHPTOP reset; the fixed record is selected diagnostics.
+
+Admission and disabled bypass remain a cooperative non-claim, not enforcement.
+— TIMBERDOODLE 2026-11-05

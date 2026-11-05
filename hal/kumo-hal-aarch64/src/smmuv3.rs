@@ -2,6 +2,7 @@
 //j483
 //j619
 //j794
+//j797
 
 //! ARM SMMUv3 scaffolding and RK3588 MMU600 integration-status discovery.
 //!
@@ -275,6 +276,15 @@ pub struct Mmu600PcieSnapshot {
 }
 
 impl Mmu600PcieSnapshot {
+    /// Policy snapshot only: not a DMA test or proof of confinement.
+    pub const fn disabled_bypass(&self) -> bool {
+        self.cr0 != u32::MAX
+            && self.gbpa != u32::MAX
+            && self.cr0 == self.cr0ack
+            && self.cr0 & 1 == 0
+            && self.gbpa & ((1 << 31) | (1 << 20)) == 0
+    }
+
     pub fn mode(&self) -> &'static str {
         if self.cr0 == u32::MAX
             || self.cr0ack == u32::MAX

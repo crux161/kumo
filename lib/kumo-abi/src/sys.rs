@@ -1,8 +1,8 @@
-//j630
 //j632
 //j660
 //j743
 //j790
+//j797
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,8 +203,9 @@ pub mod device_ctx_fault {
 }
 
 /// What [`Syscall::DevicePowerStatus`] copies out (DESIGN/020 §6). The flags let a driver act
-/// without knowing its SoC's register layout; the raw words keep the evidence, in the order the
-/// kernel's boot report reads them.
+/// without knowing its SoC's register layout. Raw-word layout is unit-specific: the GPU
+/// preserves its boot report order; the NVMe inherit unit is documented in
+/// `docs/orange-pi-5-plus-nvme.md`. The record size/version and flags are unchanged.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DevicePowerStatus {
@@ -212,9 +213,9 @@ pub struct DevicePowerStatus {
     pub version: u32,
     /// `DevicePowerStatus::*` flag bits.
     pub flags: u32,
-    /// The power-controller words the kernel read.
+    /// Unit-specific power/admission diagnostic words (not all necessarily PMU registers).
     pub pmu: [u32; 6],
-    /// The clock-and-reset-controller words the kernel read.
+    /// Unit-specific clock/reset diagnostic words.
     pub cru: [u32; 8],
 }
 

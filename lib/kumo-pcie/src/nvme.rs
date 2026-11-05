@@ -1,4 +1,5 @@
 //j794
+//j797
 //! NV2: the firmware-assigned BAR0 prefix, read-only. No queues, DMA or register writes.
 //! This first route supports DWC's unmatched-address MEM path only. A translated MEM
 //! route is deliberately refused until separately proven. — TIMBERDOODLE
@@ -53,8 +54,7 @@ pub fn select_register_page(report: &Report, endpoint: &Endpoint) -> Result<u64,
     {
         return Err(Error::Endpoint);
     }
-    let dbi = report.dbi.as_ref().ok_or(Error::Preconditions)?;
-    if dbi.command & 2 == 0 || endpoint.command & 2 == 0 {
+    if endpoint.command & 2 == 0 {
         return Err(Error::MemoryDisabled);
     }
     let address = match decode_bar(&endpoint.bars, 0).map_err(|_| Error::Bar)? {
@@ -65,6 +65,22 @@ pub fn select_register_page(report: &Report, endpoint: &Endpoint) -> Result<u64,
         } if address != 0 && address & 4095 == 0 => address,
         _ => return Err(Error::Bar),
     };
+    validate_memory_route(report, address)?;
+    Ok(address)
+}
+
+/// Root-side admission for one identity MEM page, without dereferencing it or
+/// claiming an endpoint identity. A caller must still probe config and CAP/VS
+/// before treating an admitted page as an NVMe controller. — TIMBERDOODLE
+pub fn validate_memory_route(report: &Report, address: u64) -> Result<(), Error> {
+    select_config_page(report).map_err(|_| Error::Preconditions)?;
+    let dbi = report.dbi.as_ref().ok_or(Error::Preconditions)?;
+    if dbi.command & 2 == 0 {
+        return Err(Error::MemoryDisabled);
+    }
+    if address == 0 || address & 4095 != 0 {
+        return Err(Error::Bar);
+    }
     let end = address.checked_add(4095).ok_or(Error::Bar)?;
     let (base, limit) = dbi.memory_window();
     if address < base || end > limit || !permitted_page(&report.topology, address) {
@@ -87,7 +103,7 @@ pub fn select_register_page(report: &Report, endpoint: &Endpoint) -> Result<u64,
             return Err(Error::Route);
         }
     }
-    Ok(address)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
