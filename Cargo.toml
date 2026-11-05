@@ -1,9 +1,8 @@
-#j596
-#j598
 #j648
 #j669
 #j675
 #j709
+#j792
 [workspace]
 members = [
     "boot/niji-loader",
@@ -26,6 +25,7 @@ members = [
     "lib/kumo-ipc",
     "lib/kumo-mali",
     "lib/kumo-pdc",
+    "lib/kumo-pcie",
     "lib/kumo-usb-storage",
     "lib/kumo-virtio",
     "lib/kumo-vfs",
@@ -88,6 +88,7 @@ kumo-hal-aarch64 = { path = "hal/kumo-hal-aarch64" }
 kumo-hal-x86_64 = { path = "hal/kumo-hal-x86_64" }
 kumo-ipc = { path = "lib/kumo-ipc" }
 kumo-pdc = { path = "lib/kumo-pdc" }
+kumo-pcie = { path = "lib/kumo-pcie" }
 
 [profile.release]
 codegen-units = 1

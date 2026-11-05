@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j493
 //j536
 //j559
 //j570
 //j616
+//j792
 
 extern crate alloc;
 
@@ -631,6 +631,18 @@ pub fn stage_a(boot: &BootInfo) -> ! {
         match kumo_hal::active::mali_g610_status_from_dtb(boot.platform.dtb) {
             Some(report) => klog!("{}", report),
             None => klog!("MALI G610         Check     no enabled RK3588 Mali  --\n"),
+        }
+    }
+
+    // PLAN/019 NV0: the M.2 controller (RK3588 PCIe3_4L) as firmware left it. The HAL reads the
+    // PMU and CRU, then the PHY GRF, client and DBI only as each guard rung holds, and names the
+    // first unmet one. Nothing is written; the endpoint and NVMe registers wait for NV1/NV2.
+    // — TIMBERDOODLE
+    #[cfg(feature = "arch_aarch64")]
+    {
+        match kumo_hal::active::pcie30x4_status_from_dtb(boot.platform.dtb) {
+            Some(report) => klog!("{}", report),
+            None => klog!("PCIE30X4          Check     no enabled RK3588 PCIe3_4L  --\n"),
         }
     }
 

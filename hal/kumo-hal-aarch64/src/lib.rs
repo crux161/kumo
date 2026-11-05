@@ -1,12 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j632
-//j634
 //j635
 //j640
 //j660
 //j688
+//j792
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3450,6 +3449,36 @@ pub fn mali_g610_status_from_dtb(dtb: u64) -> Option<MaliG610StatusReport> {
 #[cfg(not(target_os = "none"))]
 pub fn mali_g610_status_from_dtb(_dtb: u64) -> Option<MaliG610StatusReport> {
     None
+}
+
+/// PLAN/019 NV0: discover the Orange Pi's M.2 controller (RK3588 PCIe3_4L) and read what firmware
+/// left behind, through `kumo-pcie`'s guard ladder (RESEARCH/018 §9). PMU and CRU words are always
+/// read. The PHY GRF, the APB client and the DBI are read only once the rungs before them hold,
+/// because a DBI read while the PHY PLL is off can stall the AXI bus. The DBI is read through the
+/// TRM's 32-bit alias at `0xF500_0000`: the physmap ends at the top of RAM, below the DTB's
+/// `0xA_4000_0000` window. Nothing is written, and nothing reads the config, MEM or I/O windows.
+/// `None` off RK3588. — TIMBERDOODLE
+#[cfg(target_os = "none")]
+pub fn pcie30x4_status_from_dtb(dtb: u64) -> Option<kumo_pcie::Report> {
+    let bytes = unsafe { dtb_bytes(dtb)? };
+    let topology = kumo_pcie::discover_rk3588_pcie30x4(bytes)?;
+    Some(kumo_pcie::probe(topology, &mut PhysRegisterRead))
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn pcie30x4_status_from_dtb(_dtb: u64) -> Option<kumo_pcie::Report> {
+    None
+}
+
+/// Physical reads for `kumo-pcie`'s probe, through the kernel physmap.
+#[cfg(target_os = "none")]
+struct PhysRegisterRead;
+
+#[cfg(target_os = "none")]
+impl kumo_pcie::RegisterRead for PhysRegisterRead {
+    fn read32(&mut self, phys: u64) -> u32 {
+        unsafe { mmio_read32(mmio_phys(phys)) }
+    }
 }
 
 /// Physical PMU/CRU access for the power sequence: the kernel physmap and the generic timer.

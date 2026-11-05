@@ -1,0 +1,13 @@
+#j792
+[package]
+name = "kumo-pcie"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-fdt = { workspace = true }
+
+[lib]
+doctest = false
