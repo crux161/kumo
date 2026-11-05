@@ -2,20 +2,22 @@
 <!-- j796 -->
 <!-- j797 -->
 <!-- j798 -->
+<!-- j799 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV2 are complete: firmware's PCIe3_4L link and enumeration have been observed,
-the Samsung NVMe function is present at 01:00.0, and its controller registers were
-read without device writes. NV2 reports NVMe 1.3, firmware's admin queues enabled,
-and `MMU600_PCIE` disabled with nonsecure bypass selected. This is a register
-snapshot; it does not prove DMA, capacity, readable blocks or containment.
+NV0–NV3 are complete. Firmware's PCIe3_4L link and enumeration lead to a
+Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
+configuration and graceful restart with two distinct owners, each reaching
+RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
+observation is disabled nonsecure bypass; containment remains unimplemented.
 
-The live implementation is `lib/kumo-pcie`, its AArch64 HAL observers and the early
-kernel boot report. The detailed local milestone plan is PLAN/019; proof records
-are J792–J794. NV3 starts controller ownership and admin queue setup.
+`lib/kumo-pcie`, its HAL observers and the early boot report discover the inherited
+route. `drv-nvme` owns controller operations behind Sora's narrowed Resource and
+DMA custody protocol. NV4 adds polled Identify; block reads and filesystems follow.
+The detailed local plan is PLAN/019; each journal records its own acceptance.
 
 ## D5: cooperative DMA for NV3–NV9
 
@@ -148,3 +150,39 @@ never receives RAM cache maintenance, even when the caller relies on its default
 Device policy and omits the DEVICE flag. This avoids a physical-alias fault when
 mapping firmware's CFG0 window above 4 GiB. RAM and cacheable DMA keep their
 existing maintenance; Normal-NC DMA remains skipped. — TIMBERDOODLE
+
+## NV4a polled Identify
+
+The admitted BAR prefix is now 8192 bytes: controller registers plus the first
+doorbell page. Both pages must independently pass the inherited identity-MEM
+route proof before SMMU observation. Broader ranges and MSI-X table/PBA pages
+remain reserved. Root/config/shared controls stay read-only. The legacy path
+requires a four-byte doorbell stride and NVMe 1.1+ for the active namespace list.
+
+One 12KiB contiguous VMO contains SQ, CQ and one 4KiB data page. Parent custody
+covers the whole allocation before any controller write. The Memory frame's
+size field must equal 12288; the old 8192-byte extent is refused. The queue allows
+one outstanding Identify command: Controller (CNS1), active namespace list (CNS2)
+and first active Namespace (CNS0). PRP1 names the page-aligned data page; PRP2 and
+all other unused command words are zero. There is no media read/write command.
+
+Volatile Normal-NC SQ/data stores precede a full barrier and SQ tail doorbell.
+The poller observes the CQ phase before an acquire barrier and other completion/
+data loads, validates CID/SQID/SQHD/status, then copies data before releasing the
+CQ head. Phase flips at wrap. Errors poison the queue instance and retain the
+active controller's buffers. A separate 30-second command deadline is proof-run
+policy; CAP.TO remains the ready-transition timeout. Successful Identify is
+followed by the existing proved disable/quiescence and process termination.
+
+Controller fields include VID/SSVID, model/serial/firmware, version, MDTS, NN and
+VWC. Namespace decoding checks active IDs, selected legacy LBA format, NSZE/NCAP/
+NUSE ordering and capacity multiplication; metadata/protection are reported and
+make plain-block support false. Only the first active namespace is selected.
+An independent EDK2/host identity comparison remains a separate NV4 acceptance
+step; this code does not manufacture that reference from its own result.
+
+References: NVM Express Base2.1 common SQE/CQE, phase and Identify; matching NVM
+Command Set1.1 Identify Namespace fields, downloaded from nvmexpress.org and
+validated as a PDF (SHA256 95782c03141ba277d76edfe187e32fc6911a086721c5a86f088827366bc562db).
+All command DMA here is the D5 cooperative non-claim; Road C remains open.
+— TIMBERDOODLE

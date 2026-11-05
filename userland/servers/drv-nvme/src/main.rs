@@ -1,13 +1,15 @@
 #![no_std]
 #![no_main]
 //j798
-//! One NV3 admin-queue ownership proof per process. Sora retains a DMA VMO alias
-//! before any controller write; failures park with memory quarantined. No commands,
-//! doorbells, media I/O, root/config or SMMU writes. — TIMBERDOODLE
+//j799
+//! One polled Identify ownership proof per process. Sora retains a DMA VMO alias
+//! before any controller write; failures park with memory quarantined. No media I/O,
+//! root/config or SMMU writes. D5 cooperative raw DMA. — TIMBERDOODLE
 
 extern crate alloc;
 use drv_nvme::{
-    exercise, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, PAGE, PROOF_LEN,
+    exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES, PAGE,
+    PROOF_LEN,
 };
 use kumo_abi::{DevicePowerStatus, Handle, Rights, VmarFlags};
 use kumo_rt::{
@@ -56,7 +58,10 @@ impl RegisterIo for Registers {
         unsafe { core::ptr::read_volatile((MMIO + u64::from(o)) as *const u32) }
     }
     fn write32(&mut self, o: u16, v: u32) {
-        assert!(matches!(o, 0x0c | 0x14 | 0x24 | 0x28 | 0x2c | 0x30 | 0x34));
+        assert!(matches!(
+            o,
+            0x0c | 0x14 | 0x24 | 0x28 | 0x2c | 0x30 | 0x34 | 0x1000 | 0x1004
+        ));
         unsafe { core::ptr::write_volatile((MMIO + u64::from(o)) as *mut u32, v) }
     }
     fn barrier(&mut self) {
@@ -71,6 +76,70 @@ impl RegisterIo for Registers {
     fn sleep_ns(&mut self, n: u64) -> bool {
         kumo_rt::sleep_ns(n)
     }
+}
+
+impl drv_nvme::admin::AdminIo for Registers {
+    fn dma_read32(&mut self, off: u64) -> u32 {
+        assert!(off & 3 == 0 && off < DMA_BYTES);
+        unsafe { core::ptr::read_volatile((DMA + off) as *const u32) }
+    }
+    fn dma_write32(&mut self, off: u64, value: u32) {
+        assert!(off & 3 == 0 && off < DMA_BYTES);
+        unsafe { core::ptr::write_volatile((DMA + off) as *mut u32, value) }
+    }
+    fn dma_acquire(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dmb oshld", options(nostack, preserves_flags));
+        }
+    }
+}
+fn identify(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error> {
+    use drv_nvme::admin::{first_namespace, AdminQueue, Controller, Identify, Namespace};
+    let mut queue = AdminQueue::new();
+    let mut data = [0u8; 4096];
+    let c = queue.identify(io, s, memory, Identify::Controller, &mut data)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV4 IDENTIFY session={} cns=1 nsid=0 cid={} status={:#x} elapsed={}us OK\n",
+            s.session,
+            c.cid,
+            c.status,
+            c.elapsed_ns / 1000
+        ),
+    );
+    let controller = Controller::decode(&data)?;
+    if controller.vid != s.id as u16 || (s.vs >= 0x10200 && controller.version != s.vs) {
+        return Err(Error::Identity);
+    }
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!("{controller}\n"),
+    );
+    let c = queue.identify(io, s, memory, Identify::ActiveNamespaces, &mut data)?;
+    let nsid = first_namespace(&data)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+        "NV4 IDENTIFY session={} cns=2 nsid=0 cid={} status={:#x} first-nsid={} elapsed={}us OK\n",
+        s.session,c.cid,c.status,nsid,c.elapsed_ns/1000),
+    );
+    let c = queue.identify(io, s, memory, Identify::Namespace(nsid), &mut data)?;
+    let ns = Namespace::decode(nsid, &data)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV4 IDENTIFY session={} cns=0 nsid={} cid={} status={:#x} elapsed={}us OK\n",
+            s.session,
+            nsid,
+            c.cid,
+            c.status,
+            c.elapsed_ns / 1000
+        ),
+    );
+    log(kumo_abi::sys::log_level::NOTICE, &alloc::format!("{ns}\n"));
+    Ok(())
 }
 
 #[no_mangle]
@@ -106,14 +175,14 @@ extern "C" fn main(
     {
         fail(control, s.session, Error::Power);
     }
-    let mmio = syscall_handle(resource_mint_mmio(resource, s.bar, PAGE))
+    let mmio = syscall_handle(resource_mint_mmio(resource, s.bar, MMIO_BYTES))
         .unwrap_or_else(|| fail(control, s.session, Error::Mapping));
     if vmar_map(
         Handle(0),
         mmio,
         0,
         MMIO,
-        PAGE,
+        MMIO_BYTES,
         (VmarFlags::READ | VmarFlags::WRITE).0,
     ) != 0
     {
@@ -166,7 +235,7 @@ extern "C" fn main(
         fail(control, s.session, Error::Ack);
     }
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
-    let p = exercise(&mut io, s, memory);
+    let p = exercise_with(&mut io, s, memory, |io| identify(io, s, memory));
     log(
         if p.complete() {
             kumo_abi::sys::log_level::NOTICE
@@ -187,7 +256,7 @@ extern "C" fn main(
     }
     // RDY=0 and EN=0 were read back before this release; Sora still owns its alias.
     let _ = vmar_unmap(DMA, DMA_BYTES);
-    let _ = vmar_unmap(MMIO, PAGE);
+    let _ = vmar_unmap(MMIO, MMIO_BYTES);
     for h in [dma, mmio, resource, port, quarantine, control] {
         let _ = handle_close(h);
     }

@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j616
 //j792
 //j793
 //j794
 //j797
+//j799
 
 extern crate alloc;
 
@@ -660,7 +660,7 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                                     boot.platform.dtb,
                                     snapshot.physical,
                                 ) {
-                                    klog!("NV3 GUARD        Check     base={:#x} powered={} mintable={} inherit status-only; config/root raw-RO, one BAR page eligible; no writes/DMA   {}\n",
+                                    klog!("NV3 GUARD        Check     base={:#x} powered={} mintable={} inherit status-only; config/root raw-RO, bounded BAR prefix eligible; guard only   {}\n",
                                         snapshot.physical, status.powered as u8,
                                         status.aperture_ready as u8,
                                         if status.aperture_ready { "OK" } else { "--" });

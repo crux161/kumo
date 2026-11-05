@@ -1,14 +1,17 @@
 #![no_std]
 #![deny(unsafe_code)]
 //j798
-//! NV3b: legacy NVM admin queue ownership, without commands or doorbells.
+//j799
+//! Legacy NVM admin lifecycle and polled Identify (NV3/NV4a).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
 //! — TIMBERDOODLE
 
 use core::fmt;
 
 pub const PAGE: u64 = 4096;
-pub const DMA_BYTES: u64 = 2 * PAGE;
+pub const DMA_BYTES: u64 = 3 * PAGE;
+pub const MMIO_BYTES: u64 = 2 * PAGE;
+pub mod admin;
 pub const DEPTH: u16 = 32;
 pub const BOOT_LEN: usize = 56;
 pub const MEMORY_LEN: usize = 32;
@@ -34,6 +37,9 @@ pub enum Error {
     Sleep = 11,
     State = 12,
     Programming = 13,
+    Completion = 14,
+    Command = 15,
+    Data = 16,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -51,6 +57,9 @@ impl fmt::Display for Error {
             Self::Sleep => "poll timer failed",
             Self::State => "shutdown or unsupported controller state",
             Self::Programming => "controller register readback disagrees",
+            Self::Completion => "completion identity/queue disagrees",
+            Self::Command => "admin command failed",
+            Self::Data => "invalid or unsupported Identify data",
         })
     }
 }
@@ -93,8 +102,10 @@ impl Startup {
         }
         // Only the observed legacy 1.x NVM/4K case: newer ready modes need a separate proof.
         if self.vs >> 16 != 1
+            || self.vs < 0x10100
             || self.cap == 0
             || self.cap == u64::MAX
+            || (self.cap >> 32) & 15 != 0
             || self.cap & 0xffff < u64::from(DEPTH - 1)
             || (self.cap >> 37) & 1 == 0
             || (self.cap >> 48) & 15 != 0
@@ -266,7 +277,7 @@ impl Proof {
 }
 impl fmt::Display for Proof {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f,"NV3 ADMIN session={} status={} flags={:#x} depth={} sq={:#x} cq={:#x} disable={}us enable={}us stop={}us ready-csts={:#x} final-csts={:#x} {}",
+        write!(f,"NVME ADMIN session={} status={} flags={:#x} depth={} sq={:#x} cq={:#x} disable={}us enable={}us stop={}us ready-csts={:#x} final-csts={:#x} {}",
         self.session,self.status,self.flags,DEPTH,self.sq,self.cq,self.disable_ns/1000,self.enable_ns/1000,self.stop_ns/1000,self.ready_csts,self.final_csts,if self.complete(){"OK"}else{"REFUSED; retain DMA"})
     }
 }
@@ -328,9 +339,20 @@ fn read64(io: &mut impl RegisterIo, offset: u16) -> u64 {
 }
 
 /// Caller has zeroed uncached pages and acknowledged parent custody before entry.
-/// No command/doorbell exists in this function. Any failure after custody keeps both
-/// pages retained; never guess that a timed-out controller stopped. — TIMBERDOODLE
+/// No command/doorbell exists in this function. Any failure after custody keeps the
+/// whole allocation retained; never guess that a timed-out controller stopped. — TIMBERDOODLE
 pub fn exercise(io: &mut impl RegisterIo, s: Startup, m: Memory) -> Proof {
+    exercise_with(io, s, m, |_| Ok(()))
+}
+
+/// Run one ready-state operation before the same proved stop. Operation failure
+/// retains the active controller's buffers just like a transition failure. — TIMBERDOODLE
+pub fn exercise_with<R: RegisterIo>(
+    io: &mut R,
+    s: Startup,
+    m: Memory,
+    operation: impl FnOnce(&mut R) -> Result<(), Error>,
+) -> Proof {
     let mut p = Proof {
         session: s.session,
         sq: m.physical,
@@ -388,6 +410,7 @@ pub fn exercise(io: &mut impl RegisterIo, s: Startup, m: Memory) -> Proof {
         if io.read32(CC) != CC_CONFIG | 1 {
             return Err(Error::Programming);
         }
+        operation(io)?;
         let begin = start(io)?;
         io.write32(CC, CC_CONFIG);
         io.barrier();
@@ -411,6 +434,27 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+    #[test]
+    fn ready_operation_runs_before_stop_and_failure_retains_active_queues() {
+        let mut io = Fake::new();
+        let p = exercise_with(&mut io, startup(), memory(), |io| {
+            assert_eq!(io.cc & 1, 1);
+            assert_eq!(io.state & 3, 1);
+            Err(Error::Data)
+        });
+        assert_eq!(p.status, Error::Data as u32);
+        assert_eq!(p.flags, 3);
+        assert!(!p.releases(memory()));
+        assert_eq!(io.cc & 1, 1);
+        let mut io = Fake::new();
+        let p = exercise_with(&mut io, startup(), memory(), |io| {
+            assert_eq!(io.state & 3, 1);
+            Ok(())
+        });
+        assert!(p.releases(memory()));
+        assert_eq!(io.cc & 1, 0);
+    }
+
     fn startup() -> Startup {
         Startup {
             session: 1,
@@ -662,10 +706,18 @@ mod tests {
         assert!(!Proof { final_csts: 1, ..p }.complete());
         assert!(!Proof { status: 9, ..p }.complete());
         assert!(Memory {
+            physical: 0xffff_d000,
+            ..memory()
+        }
+        .valid());
+        assert!(!Memory {
             physical: 0xffff_e000,
             ..memory()
         }
         .valid());
+        let mut old = memory().encode();
+        put64(&mut old, 24, 8192);
+        assert!(Memory::decode(&old).is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //j797
+//j799
 //! NV3a: inherit-only PCIe/NVMe status and mint admission. No power/reset/ATU/SMMU
 //! writes exist here. Only the already-proven unmatched BAR0 prefix is writable;
 //! root/client/config windows are raw-read-only. D5 is cooperative, not isolation.
@@ -9,7 +10,7 @@ use crate::smmuv3::{self, Mmu600PcieControlStatus, Mmu600PciePowerStatus, Mmu600
 use kumo_pcie::{endpoint::select_config_page, nvme::validate_memory_route, RegisterRead, Report};
 
 pub const BAR0: u64 = 0xf000_0000;
-pub const PREFIX_LEN: u64 = 4096;
+pub const PREFIX_LEN: u64 = 8192;
 const ROOT_WINDOWS: [(u64, u64); 5] = [
     (0xf000_0000, 0x100_0000),
     (0x9_0000_0000, 0x4000_0000),
@@ -45,7 +46,7 @@ pub fn overlaps(base: u64, len: u64) -> bool {
 }
 
 /// Reserve raw root/config writes even off-board, like the display reservation.
-/// Only a VMO contained in the first BAR page may carry WRITE in this slice.
+/// Only a VMO contained in the control/doorbell prefix may carry WRITE.
 pub fn read_only(base: u64, len: u64) -> bool {
     overlaps(base, len) && !contains(BAR0, PREFIX_LEN, base, len)
 }
@@ -76,6 +77,7 @@ fn observe_policy(
     io: &mut impl RegisterRead,
 ) -> Option<(smmuv3::Mmu600PcieSnapshot, u32)> {
     validate_memory_route(report, BAR0).ok()?;
+    validate_memory_route(report, BAR0 + 4096).ok()?;
     let topology = smmuv3::discover_rk3588_mmu600_pcie(dtb)?;
     let power = Mmu600PciePowerStatus {
         pwr_gate_sts0: io.read32(smmuv3::RK3588_PMU_PWR_GATE_STS0),
@@ -225,7 +227,7 @@ mod tests {
     }
     #[test]
     fn status_only_unit_is_exact_and_off_board_is_inert() {
-        assert_eq!(info(DTB, BAR0).unwrap().aperture_len, 4096);
+        assert_eq!(info(DTB, BAR0).unwrap().aperture_len, 8192);
         assert!(info(DTB, BAR0 + 4096).is_none());
         let mut io = Fake::default();
         assert!(status(X13S, BAR0, &mut io).is_none());
@@ -241,9 +243,11 @@ mod tests {
     #[test]
     fn reservations_never_allow_raw_root_or_config_writes() {
         assert!(!read_only(BAR0, 4096));
+        assert!(!read_only(BAR0, 8192));
+        assert!(!read_only(BAR0 + 4096, 4096));
         for (b, n) in [
-            (BAR0, 8192),
-            (BAR0 + 4096, 4096),
+            (BAR0, 12288),
+            (BAR0 + 8192, 4096),
             (0x9_0010_0000, 4096),
             (kumo_pcie::PCIE30X4_APB, 4096),
             (kumo_pcie::PCIE30X4_DBI_ALIAS, 4096),
@@ -262,6 +266,8 @@ mod tests {
         let r = report();
         for (b, n) in [
             (BAR0, 4096),
+            (BAR0, 8192),
+            (BAR0 + 4096, 4096),
             (0x9_0010_0000, 4096),
             (kumo_pcie::PCIE30X4_APB, 4096),
             (kumo_pcie::PCIE30X4_DBI_ALIAS, 4096),
@@ -270,8 +276,8 @@ mod tests {
             assert!(admitted(&r, b, n));
         }
         for (b, n) in [
-            (BAR0, 8192),
-            (BAR0 + 4096, 4096),
+            (BAR0, 12288),
+            (BAR0 + 8192, 4096),
             (0x9_0020_0000, 4096),
             (kumo_pcie::PCIE30X4_DBI_ALIAS, 8192),
             (kumo_pcie::PCIE30X4_APB + 4096, 4096),
@@ -279,6 +285,21 @@ mod tests {
             assert!(!admitted(&r, b, n));
         }
     }
+    #[test]
+    fn doorbell_page_route_must_also_be_proven_before_smmu_reads() {
+        let mut r = report();
+        r.dbi.as_mut().unwrap().outbound[1] = AtuRegion {
+            lower_base: (BAR0 + 4096) as u32,
+            limit: (BAR0 + 8191) as u32,
+            ctrl2: 1 << 31,
+            ..AtuRegion::default()
+        };
+        assert!(validate_memory_route(&r, BAR0).is_ok());
+        let mut io = Fake::default();
+        assert!(!readout(DTB, &r, &mut io).aperture_ready);
+        assert!(!io.aperture_read());
+    }
+
     #[test]
     fn root_refusals_precede_every_smmu_access() {
         let mut cases = Vec::new();
