@@ -1,8 +1,8 @@
-//j629
 //j630
 //j632
 //j660
 //j743
+//j790
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,10 @@ pub enum Syscall {
     ProcessExit = 21,
     ResourceMintMmio = 22,
     InterruptCreate = 23,
+    /// Wait for a delivery on an interrupt object: `(interrupt)`. Returns the pending count in
+    /// x0 (0 on failure) and, since J790, the consumed delivery's top-half stamp in x1: the
+    /// `ClockGet` time at which the kernel's IRQ handler took the line, before any `SoraState`
+    /// deferral or scheduling, or 0 when unknown.
     InterruptWait = 24,
     InterruptComplete = 25,
     ClockGet = 26,

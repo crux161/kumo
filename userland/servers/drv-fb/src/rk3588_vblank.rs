@@ -2,7 +2,7 @@
 //j614
 //j632
 //j639
-
+//j790
 //! D1b: VP2's frame-start interrupt, delivered to drv-fb, and a measurement of its rate.
 //!
 //! Recovery class: soft-state. The VOP raises one interrupt line, GIC SPI 156 (INTID 188), the
@@ -142,6 +142,11 @@ pub fn disable(hw: &mut impl Hardware) {
 }
 
 /// Frame-start timestamps reduced to a rate and its spread.
+///
+/// The timestamps are the kernel IRQ handler's top-half stamps (`InterruptWait`'s x1), not
+/// drv-fb's wake: on metal the 20 Hz scheduler tick and busy-borrow deferrals delay a wake by
+/// up to ~80 ms, and J788's 87/119 window measured that latency, not VP2. A stamp of 0 (no
+/// kernel stamp) falls back to the wake time. — TIMBERDOODLE
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Meter {
     pub count: u32,
@@ -151,6 +156,21 @@ pub struct Meter {
     pub max_interval_ns: u64,
     /// Deliveries whose status had no frame-start bit.
     pub spurious: u32,
+    /// Frame starts whose sample came from the kernel's top-half stamp.
+    pub stamped: u32,
+    /// Longest gap between a frame start's stamp and drv-fb's wake: delivery latency, reported
+    /// beside the cadence and never part of it.
+    pub max_wake_ns: u64,
+}
+
+/// The time a delivery's sample uses: the kernel's top-half stamp, else the wake time. `wake`
+/// runs only without a stamp, so a stamped delivery makes no clock SVC before its completion.
+pub fn sample_time(stamp_ns: u64, wake: impl FnOnce() -> u64) -> u64 {
+    if stamp_ns != 0 {
+        stamp_ns
+    } else {
+        wake()
+    }
 }
 
 impl Meter {
@@ -176,6 +196,15 @@ impl Meter {
 
     pub fn done(&self) -> bool {
         self.count >= FRAMES
+    }
+
+    /// Note drv-fb's wake for a delivery the kernel stamped at `stamp_ns`.
+    pub fn record_wake(&mut self, stamp_ns: u64, wake_ns: u64) {
+        if stamp_ns == 0 {
+            return;
+        }
+        self.stamped += 1;
+        self.max_wake_ns = self.max_wake_ns.max(wake_ns.saturating_sub(stamp_ns));
     }
 
     /// Mean userspace delivery throughput, in millihertz. A masked level interrupt can
@@ -508,6 +537,64 @@ mod tests {
         // 30 Hz, the rate J600's wrong PLL model implied, does not match.
         assert!(!matches(30_000, 60_000));
         assert!(!matches(60_400, 60_000));
+    }
+
+    #[test]
+    fn kernel_stamps_measure_the_cadence_that_late_wakes_hide() {
+        // J788's flake shape: VP2 at 60 Hz, drv-fb's wakes late by up to a 50 ms tick. Wake
+        // times fail the 75% rule; the top-half stamps of the same deliveries pass, while the
+        // wake latency stays visible beside them. Coalesced frames still cost a stamped
+        // interval, so heavy interference cannot pass. — TIMBERDOODLE
+        let period = 16_666_667u64;
+        let mut by_wake = Meter::default();
+        let mut by_stamp = Meter::default();
+        let mut wake_intervals = [0u64; FRAMES as usize - 1];
+        let mut stamp_intervals = [0u64; FRAMES as usize - 1];
+        let mut frame = 0u64;
+        let mut delivered = 0usize;
+        while delivered < FRAMES as usize {
+            let edge = 1_000_000_000 + frame * period;
+            // Every sixth delivery waits for the scheduler: 30-48 ms late, so the frame
+            // starts it overlaps coalesce into it.
+            let late = if delivered % 6 == 5 {
+                30_000_000 + (delivered as u64 % 4) * 6_000_000
+            } else {
+                40_000
+            };
+            let wake = edge + late;
+            let stamp = sample_time(edge, || unreachable!("a stamp needs no clock"));
+            assert_eq!(stamp, edge);
+            if delivered != 0 {
+                wake_intervals[delivered - 1] = wake - by_wake.last_ns;
+                stamp_intervals[delivered - 1] = stamp - by_stamp.last_ns;
+            }
+            by_wake.record(FS, wake);
+            by_stamp.record(FS, stamp);
+            by_stamp.record_wake(stamp, wake);
+            delivered += 1;
+            frame += 1 + late / period;
+        }
+        let wake = cadence(&mut wake_intervals).unwrap();
+        let stamped = cadence(&mut stamp_intervals).unwrap();
+        assert!(
+            matches(wake.millihertz, 60_000) && !wake.credible(),
+            "{wake:?}"
+        );
+        assert!(
+            matches(stamped.millihertz, 60_000) && stamped.credible(),
+            "{stamped:?}"
+        );
+        assert_eq!(by_stamp.stamped, FRAMES);
+        assert_eq!(by_stamp.max_wake_ns, 48_000_000);
+        assert_eq!(by_wake.stamped, 0);
+        assert_eq!(
+            sample_time(0, || 7),
+            7,
+            "no kernel stamp: the wake time is the sample"
+        );
+        let mut unstamped = Meter::default();
+        unstamped.record_wake(0, 9);
+        assert_eq!((unstamped.stamped, unstamped.max_wake_ns), (0, 0));
     }
 
     #[test]

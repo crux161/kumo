@@ -1,8 +1,8 @@
-//j719
 //j731
 //j732
 //j743
 //j748
+//j790
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -326,19 +326,24 @@ const DEFERRED_INTERRUPT_SLOTS: usize = 16;
 /// a zero slot is empty.
 struct DeferredInterrupts {
     slots: [AtomicU32; DEFERRED_INTERRUPT_SLOTS],
+    /// The top-half time each slot's key fired, so a late delivery still reports when the
+    /// device raised it (`InterruptWait`'s stamp). Written only from IRQ context, before the
+    /// slot's key is published, on the one core that also drains. — TIMBERDOODLE
+    stamps: [AtomicU64; DEFERRED_INTERRUPT_SLOTS],
 }
 
 impl DeferredInterrupts {
     const fn new() -> Self {
         Self {
             slots: [const { AtomicU32::new(0) }; DEFERRED_INTERRUPT_SLOTS],
+            stamps: [const { AtomicU64::new(0) }; DEFERRED_INTERRUPT_SLOTS],
         }
     }
 
-    /// Remember `key` until the borrow is free. A key already waiting is not stored twice: a
-    /// masked line has at most one delivery outstanding. Returns false only when every slot
-    /// holds some other key.
-    fn defer(&self, key: u32) -> bool {
+    /// Remember `key`, fired at `stamp_ns`, until the borrow is free. A key already waiting is
+    /// not stored twice and keeps its first stamp: a masked line has at most one delivery
+    /// outstanding. Returns false only when every slot holds some other key.
+    fn defer(&self, key: u32, stamp_ns: u64) -> bool {
         if self
             .slots
             .iter()
@@ -346,19 +351,24 @@ impl DeferredInterrupts {
         {
             return true;
         }
-        self.slots.iter().any(|slot| {
+        self.slots.iter().zip(&self.stamps).any(|(slot, stamp)| {
+            if slot.load(Ordering::Relaxed) != 0 {
+                return false;
+            }
+            stamp.store(stamp_ns, Ordering::Relaxed);
             slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         })
     }
 
-    /// Hand every waiting key to `deliver` and forget it. Returns how many were delivered.
-    fn drain(&self, mut deliver: impl FnMut(u32)) -> usize {
+    /// Hand every waiting key and its stamp to `deliver` and forget it. Returns how many were
+    /// delivered.
+    fn drain(&self, mut deliver: impl FnMut(u32, u64)) -> usize {
         let mut delivered = 0;
-        for slot in &self.slots {
+        for (slot, stamp) in self.slots.iter().zip(&self.stamps) {
             let key = slot.swap(0, Ordering::Relaxed);
             if key != 0 {
-                deliver(key);
+                deliver(key, stamp.load(Ordering::Relaxed));
                 delivered += 1;
             }
         }
@@ -404,8 +414,9 @@ extern "C" fn signal_irq(irq: u32) {
         if let Some(fault) = display_fault {
             sora.engine.signal_display_fault(fault);
         }
-        let late = DEFERRED_INTERRUPTS.drain(|key| sora.engine.signal_interrupt(key));
-        sora.engine.signal_interrupt(irq);
+        let late = DEFERRED_INTERRUPTS
+            .drain(|key, stamp_ns| sora.engine.signal_interrupt_at(key, stamp_ns));
+        sora.engine.signal_interrupt_at(irq, now_ns);
         //j725
         // Record how late the sweep would be before it runs, then the running maxima/counts,
         // and print one record every 1024 sweeps. — TIMBERDOODLE
@@ -439,7 +450,7 @@ extern "C" fn signal_irq(irq: u32) {
         // A full deferral set would lose this line rather than storm the machine; with
         // `DEFERRED_INTERRUPT_SLOTS` far above any board's device-line count it cannot fill.
         if irq >= 32 {
-            let _ = DEFERRED_INTERRUPTS.defer(irq);
+            let _ = DEFERRED_INTERRUPTS.defer(irq, now_ns);
         }
         return;
     };
@@ -946,7 +957,8 @@ enum ChildPortWaitOutcome {
 }
 
 enum ChildInterruptWaitOutcome {
-    Fired(u64),
+    /// The pending count and the consumed delivery's top-half stamp.
+    Fired(u64, u64),
     ShouldWait(KoId),
     Done,
 }
@@ -1162,7 +1174,8 @@ fn wait_child_port_without_borrow(process_koid: KoId, port: Handle) -> u64 {
     }
 }
 
-fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) -> u64 {
+/// Returns `(count, stamp_ns)`: `InterruptWait`'s x0 and x1. — TIMBERDOODLE
+fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) -> (u64, u64) {
     loop {
         let outcome = with_sora_mut(|sora| {
             let Some(child_ptr) = sora
@@ -1182,7 +1195,10 @@ fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) ->
                 .engine
                 .dispatch(child, KernelCall::InterruptWait { interrupt })
             {
-                KernelCallResult::Handle(count) => ChildInterruptWaitOutcome::Fired(count.0 as u64),
+                KernelCallResult::Handle(count) => ChildInterruptWaitOutcome::Fired(
+                    count.0 as u64,
+                    sora.engine.interrupt_consumed_stamp(wait_koid),
+                ),
                 KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
                     ChildInterruptWaitOutcome::ShouldWait(wait_koid)
                 }
@@ -1191,11 +1207,11 @@ fn wait_child_interrupt_without_borrow(process_koid: KoId, interrupt: Handle) ->
         });
 
         match outcome {
-            ChildInterruptWaitOutcome::Fired(count) => return count,
+            ChildInterruptWaitOutcome::Fired(count, stamp_ns) => return (count, stamp_ns),
             ChildInterruptWaitOutcome::ShouldWait(wait_koid) => {
                 crate::user_thread::park_current_child_on_interrupt(wait_koid);
             }
-            ChildInterruptWaitOutcome::Done => return 0,
+            ChildInterruptWaitOutcome::Done => return (0, 0),
         }
     }
 }
@@ -2278,7 +2294,7 @@ extern "C" fn svc_hook(regs: *mut u64) {
             let sora_koid = with_sora(|sora| sora.process.koid());
             if cp_koid != sora_koid {
                 let interrupt = Handle(r[0] as u32);
-                r[0] = wait_child_interrupt_without_borrow(cp_koid, interrupt);
+                (r[0], r[1]) = wait_child_interrupt_without_borrow(cp_koid, interrupt);
                 crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
@@ -2458,6 +2474,10 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 {
                     KernelCallResult::Handle(count) => {
                         r[0] = count.0 as u64;
+                        r[1] =
+                            sora.process.handles().get(interrupt).map_or(0, |entry| {
+                                sora.engine.interrupt_consumed_stamp(entry.koid)
+                            });
                         break;
                     }
                     KernelCallResult::Status(status)
@@ -3966,7 +3986,7 @@ mod tests {
 
     fn drained(set: &DeferredInterrupts) -> alloc::vec::Vec<u32> {
         let mut keys = alloc::vec::Vec::new();
-        let count = set.drain(|key| keys.push(key));
+        let count = set.drain(|key, _| keys.push(key));
         assert_eq!(count, keys.len());
         keys
     }
@@ -3974,7 +3994,7 @@ mod tests {
     #[test]
     fn a_busy_line_is_remembered_and_delivered_once() {
         let set = DeferredInterrupts::new();
-        assert!(set.defer(XHCI_A));
+        assert!(set.defer(XHCI_A, 7));
         assert_eq!(drained(&set), [XHCI_A]);
         assert!(drained(&set).is_empty(), "drain forgets what it delivered");
     }
@@ -3982,9 +4002,9 @@ mod tests {
     #[test]
     fn a_line_that_fires_again_while_waiting_is_stored_once() {
         let set = DeferredInterrupts::new();
-        assert!(set.defer(XHCI_A));
-        assert!(set.defer(XHCI_B));
-        assert!(set.defer(XHCI_A));
+        assert!(set.defer(XHCI_A, 7));
+        assert!(set.defer(XHCI_B, 7));
+        assert!(set.defer(XHCI_A, 7));
         assert_eq!(drained(&set), [XHCI_A, XHCI_B]);
     }
 
@@ -3992,7 +4012,7 @@ mod tests {
     fn a_tlmm_gpio_key_defers_like_any_device_line() {
         let set = DeferredInterrupts::new();
         let key = kumo_abi::sys::tlmm_gpio_irq(104, 1);
-        assert!(set.defer(key));
+        assert!(set.defer(key, 7));
         assert_eq!(drained(&set), [key]);
     }
 
@@ -4000,11 +4020,29 @@ mod tests {
     fn a_full_set_refuses_a_new_line_but_keeps_the_waiting_ones() {
         let set = DeferredInterrupts::new();
         for key in 0..DEFERRED_INTERRUPT_SLOTS as u32 {
-            assert!(set.defer(32 + key));
+            assert!(set.defer(32 + key, 7));
         }
-        assert!(!set.defer(0x200));
-        assert!(set.defer(32), "a key already waiting is still accepted");
+        assert!(!set.defer(0x200, 7));
+        assert!(set.defer(32, 7), "a key already waiting is still accepted");
         assert_eq!(drained(&set).len(), DEFERRED_INTERRUPT_SLOTS);
+    }
+
+    #[test]
+    fn a_deferred_line_keeps_the_time_it_first_fired() {
+        // D1b measures VP2's cadence from these stamps: a delivery deferred behind a busy
+        // borrow must report its top-half time, and a refire while waiting must not move it.
+        // — TIMBERDOODLE
+        let set = DeferredInterrupts::new();
+        assert!(set.defer(XHCI_A, 1_000));
+        assert!(set.defer(XHCI_B, 2_000));
+        assert!(set.defer(XHCI_A, 3_000));
+        let mut out = alloc::vec::Vec::new();
+        assert_eq!(set.drain(|key, stamp| out.push((key, stamp))), 2);
+        assert_eq!(out, [(XHCI_A, 1_000), (XHCI_B, 2_000)]);
+        assert!(set.defer(XHCI_A, 4_000));
+        out.clear();
+        set.drain(|key, stamp| out.push((key, stamp)));
+        assert_eq!(out, [(XHCI_A, 4_000)], "a reused slot takes the new stamp");
     }
     #[test]
     fn iommu_kind_high_bits_are_rejected_before_handle_or_hardware_lookup() {

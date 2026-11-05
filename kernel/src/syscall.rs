@@ -1,8 +1,8 @@
-//j725
 //j731
 //j732
 //j743
 //j777
+//j790
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -294,6 +294,13 @@ struct IrqBinding {
     count: u64,
     requires_complete: bool,
     outstanding: bool,
+    /// Monotonic time the IRQ handler took the oldest delivery `count` still holds, or 0 when
+    /// none is pending (or the signal carried no time). Stamped in the top half, before any
+    /// `SoraState` deferral or scheduling, so it is the device's edge, not the driver's wake.
+    stamp_ns: u64,
+    /// The stamp the last successful `InterruptWait` consumed; `InterruptWait` returns it in
+    /// the secondary register. — TIMBERDOODLE
+    consumed_stamp_ns: u64,
 }
 
 impl IrqBinding {
@@ -1577,6 +1584,14 @@ impl SyscallEngine {
     /// ports (`ChannelWrite` → `signal_ports(READABLE)`); this closes the
     /// symmetric gap for interrupts (J145 §1).
     pub fn signal_interrupt(&mut self, irq: u32) {
+        self.signal_interrupt_at(irq, 0);
+    }
+
+    /// [`Self::signal_interrupt`] with the IRQ handler's top-half time. A deferred delivery
+    /// (busy `SoraState`) keeps the time it fired, not the time it was finally signalled.
+    /// The first undelivered signal sets the stamp; later ones before the next
+    /// `InterruptWait` only add to `count`. — TIMBERDOODLE
+    pub fn signal_interrupt_at(&mut self, irq: u32, stamp_ns: u64) {
         // Indexed walk, not `for binding in &mut self.interrupts`: `signal_ports`
         // re-borrows `self` (port_bindings + ipc), so no borrow of `self.interrupts`
         // may be live across it (GUIDANCE/006 §2.1). signal_ports touches neither
@@ -1591,6 +1606,9 @@ impl SyscallEngine {
                     i += 1;
                     continue;
                 }
+                if self.interrupts[i].count == 0 {
+                    self.interrupts[i].stamp_ns = stamp_ns;
+                }
                 self.interrupts[i].count = self.interrupts[i].count.saturating_add(1);
                 self.interrupts[i].outstanding = true;
                 let koid = self.interrupts[i].koid;
@@ -1600,6 +1618,15 @@ impl SyscallEngine {
             }
             i += 1;
         }
+    }
+
+    /// The top-half stamp the last successful `InterruptWait` on interrupt object `koid`
+    /// consumed, or 0. Read in the same `SoraState` borrow as the wait. — TIMBERDOODLE
+    pub fn interrupt_consumed_stamp(&self, koid: KoId) -> u64 {
+        self.interrupts
+            .iter()
+            .find(|binding| binding.koid == koid && binding.state.get() == IrqState::Bound)
+            .map_or(0, |binding| binding.consumed_stamp_ns)
     }
 
     //j725
@@ -4180,6 +4207,8 @@ impl SyscallEngine {
                     count: 0,
                     requires_complete: decode_tlmm_gpio_irq(irq).is_some(),
                     outstanding: false,
+                    stamp_ns: 0,
+                    consumed_stamp_ns: 0,
                 });
                 KernelCallResult::Handle(handle)
             }
@@ -4200,6 +4229,8 @@ impl SyscallEngine {
                         if binding.count > 0 {
                             let n = binding.count;
                             binding.count = 0;
+                            binding.consumed_stamp_ns = binding.stamp_ns;
+                            binding.stamp_ns = 0;
                             return KernelCallResult::Handle(Handle(n as u32));
                         }
                         return KernelCallResult::Status(Errno::ShouldWait.status());
@@ -9127,6 +9158,45 @@ mod tests {
         }
 
         #[test]
+        fn interrupt_wait_reports_the_oldest_pending_top_half_stamp() {
+            // D1b's cadence is the device's edge, not the driver's wake: the stamp of the
+            // first undelivered signal survives later signals, InterruptWait consumes it, and
+            // an unstamped signal reports 0. — TIMBERDOODLE
+            let (mut engine, mut process, _resource, irq) = setup();
+            let koid = process.handles().get(irq).unwrap().koid;
+            assert_eq!(engine.interrupt_consumed_stamp(koid), 0);
+            engine.signal_interrupt_at(33, 16_666_667);
+            engine.signal_interrupt_at(33, 33_333_334);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+                KernelCallResult::Handle(Handle(2))
+            );
+            assert_eq!(engine.interrupt_consumed_stamp(koid), 16_666_667);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+                KernelCallResult::Status(Errno::ShouldWait.status())
+            );
+            assert_eq!(
+                engine.interrupt_consumed_stamp(koid),
+                16_666_667,
+                "a refused wait leaves the last consumed stamp"
+            );
+            engine.signal_interrupt_at(33, 50_000_001);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+                KernelCallResult::Handle(Handle(1))
+            );
+            assert_eq!(engine.interrupt_consumed_stamp(koid), 50_000_001);
+            engine.signal_interrupt(33);
+            assert_eq!(
+                engine.dispatch(&mut process, KernelCall::InterruptWait { interrupt: irq }),
+                KernelCallResult::Handle(Handle(1))
+            );
+            assert_eq!(engine.interrupt_consumed_stamp(koid), 0);
+            assert_eq!(engine.interrupt_consumed_stamp(KoId(u64::MAX)), 0);
+        }
+
+        #[test]
         fn ordinary_close_preserves_a_duplicate_then_reclaims_before_rebind() {
             let (mut engine, mut process, resource, irq) = setup();
             let koid = process.handles().get(irq).unwrap().koid;
@@ -9343,6 +9413,8 @@ mod tests {
                 count: 0,
                 requires_complete: false,
                 outstanding: false,
+                stamp_ns: 0,
+                consumed_stamp_ns: 0,
             });
             assert_eq!(
                 engine.dispatch(

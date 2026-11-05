@@ -1,8 +1,8 @@
-//j614
 //j629
 //j632
 //j660
 //j743
+//j790
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -967,6 +967,33 @@ pub fn interrupt_wait(interrupt: Handle) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn interrupt_wait(_interrupt: Handle) -> u64 {
     0
+}
+
+/// [`interrupt_wait`] plus the consumed delivery's stamp: `(count, stamp_ns)`. The stamp is the
+/// monotonic time ([`clock_get`]'s clock) at which the kernel's IRQ handler took the line, before
+/// any deferral or scheduling, or 0 when unknown. A driver measuring a device's cadence uses it
+/// instead of its own wake time, which carries the scheduler's latency. — TIMBERDOODLE
+#[cfg(target_arch = "aarch64")]
+pub fn interrupt_wait_stamped(interrupt: Handle) -> (u64, u64) {
+    let count: u64;
+    let stamp: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::InterruptWait as u64,
+            in("x0") interrupt.0 as u64,
+            lateout("x0") count,
+            lateout("x1") stamp,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (count, stamp)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn interrupt_wait_stamped(_interrupt: Handle) -> (u64, u64) {
+    (0, 0)
 }
 
 #[cfg(target_arch = "aarch64")]

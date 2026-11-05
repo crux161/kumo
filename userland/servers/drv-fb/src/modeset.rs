@@ -1,8 +1,8 @@
-//j638
 //j639
 //j683
 //j685
 //j686
+//j790
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -938,9 +938,13 @@ fn on_vblank(mut pending: Pending) -> Option<Pending> {
         return d1c_vblank(pending);
     }
     let mut device = Device(pending.vop.0);
-    let _ = interrupt_wait(pending.irq);
+    // The sample is the kernel's top-half stamp of this frame start; drv-fb's own wake time
+    // carries the scheduler's latency (J788: 87/119 stable on wake times). With a stamp, no
+    // SVC runs between clearing the status and completing the line, so the next frame start
+    // cannot be re-latched behind a preemption there. — TIMBERDOODLE
+    let (_, stamp) = kumo_rt::interrupt_wait_stamped(pending.irq);
     let status = vblank::acknowledge(&mut device);
-    let now = kumo_rt::clock_get();
+    let now = vblank::sample_time(stamp, kumo_rt::clock_get);
     let previous = pending.meter.last_ns;
     let count = pending.meter.count;
     pending.meter.record(status, now);
@@ -955,9 +959,15 @@ fn on_vblank(mut pending: Pending) -> Option<Pending> {
     }
     if pending.meter.done() {
         disarm(pending.port, pending.timer);
+        if status & vblank::FS != 0 {
+            pending.meter.record_wake(stamp, kumo_rt::clock_get());
+        }
         return d1b_finish(pending, &mut device, false);
     }
     let _ = interrupt_complete(pending.irq);
+    if status & vblank::FS != 0 {
+        pending.meter.record_wake(stamp, kumo_rt::clock_get());
+    }
     Some(pending)
 }
 
@@ -977,7 +987,7 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
     });
     if vblank::retry_delivery_window(meter, cadence, mode_mhz, pending.cadence_attempt, timed_out) {
         let rate = cadence.expect("retry requires a cadence");
-        log(format_args!("display: D1b delivery window {}/{} inconclusive: {}/{} stable at {}.{} Hz; fresh120-frame retry, thresholds unchanged\n",pending.cadence_attempt,vblank::MAX_CADENCE_ATTEMPTS,rate.stable,rate.total,rate.millihertz/1000,rate.millihertz%1000));
+        log(format_args!("display: D1b delivery window {}/{} inconclusive: {}/{} stable at {}.{} Hz ({}/{} kernel-stamped, wake lateness max {} us); fresh120-frame retry, thresholds unchanged\n",pending.cadence_attempt,vblank::MAX_CADENCE_ATTEMPTS,rate.stable,rate.total,rate.millihertz/1000,rate.millihertz%1000,meter.stamped,meter.count,meter.max_wake_ns/1000));
         return next(pending, Phase::D1bReady, vblank::SETTLE_MS);
     }
     let passed = !timed_out
@@ -987,7 +997,7 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
             .is_some_and(|rate| rate.credible() && vblank::matches(rate.millihertz, mode_mhz));
     match cadence {
         Some(rate) if !timed_out && meter.spurious == 0 && meter.done() && rate.credible() && vblank::matches(rate.millihertz, mode_mhz) => log(format_args!(
-            "display: D1b vblank: {} IRQs, median {}.{:03} Hz (mode {}.{:03}; {}/{} stable), delivery {}.{:03} Hz, interval min/max {}/{} us, spurious {}; interrupt disarmed; D1b complete\n",
+            "display: D1b vblank: {} IRQs, median {}.{:03} Hz (mode {}.{:03}; {}/{} stable; {}/{} kernel-stamped), delivery {}.{:03} Hz, interval min/max {}/{} us, wake lateness max {} us, spurious {}; interrupt disarmed; D1b complete\n",
             meter.count,
             rate.millihertz / 1_000,
             rate.millihertz % 1_000,
@@ -995,14 +1005,17 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
             mode_mhz % 1_000,
             rate.stable,
             rate.total,
+            meter.stamped,
+            meter.count,
             delivered / 1_000,
             delivered % 1_000,
             meter.min_interval_ns / 1_000,
             meter.max_interval_ns / 1_000,
+            meter.max_wake_ns / 1_000,
             meter.spurious
         )),
         Some(rate) => error(format_args!(
-            "display: D1b DISAGREEMENT: {} IRQs{}, median {}.{:03} Hz against mode {}.{:03}, {}/{} stable, delivery {}.{:03} Hz (interval min/max {}/{} us, spurious {}); disarmed\n",
+            "display: D1b DISAGREEMENT: {} IRQs{}, median {}.{:03} Hz against mode {}.{:03}, {}/{} stable ({}/{} kernel-stamped), delivery {}.{:03} Hz (interval min/max {}/{} us, wake lateness max {} us, spurious {}); disarmed\n",
             meter.count,
             if timed_out { " before the watchdog" } else { "" },
             rate.millihertz / 1_000,
@@ -1011,10 +1024,13 @@ fn d1b_finish(mut pending: Pending, device: &mut Device, timed_out: bool) -> Opt
             mode_mhz % 1_000,
             rate.stable,
             rate.total,
+            meter.stamped,
+            meter.count,
             delivered / 1_000,
             delivered % 1_000,
             meter.min_interval_ns / 1_000,
             meter.max_interval_ns / 1_000,
+            meter.max_wake_ns / 1_000,
             meter.spurious
         )),
         None => error(format_args!(
