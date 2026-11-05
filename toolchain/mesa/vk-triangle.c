@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*j784*/
+/*j785*/
 /* VK4-a (PLAN/015 §8.43): the first Vulkan triangle, offscreen. The static-ICD client of
  * VK2-e brings up panvk on the session's kmod device, then draws GL3-a's triangle:
  * - VK4's pinned vertex and fragment SPIR-V become a graphics pipeline, compiled by panvk on
@@ -27,7 +28,7 @@
 
 PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 bool panvk_kumo_offer_device(struct pan_kmod_dev *kmod);
-unsigned kumo_vk_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+unsigned kumo_vk_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), uint32_t *keep);
 
 #define CHECK(test, code) do { if (!(test)) { failed = (code); goto done; } } while (0)
 
@@ -222,7 +223,9 @@ static uint32_t host_type(const VkPhysicalDeviceMemoryProperties *memory, uint32
     return memory->memoryTypeCount;
 }
 
-unsigned kumo_vk_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *))
+/* `keep`, when not NULL, receives the verified image (PIXELS packed RGBA8 words, rows top-down
+ * from Vulkan's top-left origin) for VK4-b's copy into a view; VK4-a passes NULL. */
+unsigned kumo_vk_triangle_cases(const struct kumo_gpu_api *api, void (*say)(const char *), uint32_t *keep)
 {
     unsigned failed = 0;
     VkInstance instance = VK_NULL_HANDLE;
@@ -648,6 +651,10 @@ unsigned kumo_vk_triangle_cases(const struct kumo_gpu_api *api, void (*say)(cons
 #undef PIXEL
     CHECK(seen.submitted == seen.prepares && submissions >= 1 && seen.stream_queue[0] && seen.stream_queue[1], 41);
     CHECK(!wrong && !guards && inside == PIXELS / 2, 42);
+    if (keep)
+        for (uint32_t y = 0; y < HEIGHT; ++y)
+            for (uint32_t x = 0; x < WIDTH; ++x)
+                keep[y * WIDTH + x] = *(const volatile uint32_t *)(bytes + rows.offset + y * rows.rowPitch + 4u * x);
 
 done:
     if (device && destroy_device && get_device_proc) {
@@ -702,7 +709,7 @@ extern unsigned kumo_metal_proof(void);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
-    return kumo_vk_triangle_cases(api, kumo_metal_log);
+    return kumo_vk_triangle_cases(api, kumo_metal_log, NULL);
 }
 
 int main(void)
@@ -715,6 +722,57 @@ int main(void)
     }
     kumo_metal_log("VK4-a metal triangle green: Mali rasterized the Vulkan triangle exactly into the linear image, "
                    "all 32768 pixels and the guard checked, and clean teardown");
+    return 0;
+}
+#endif
+
+#ifdef KUMO_VK_PRESENT_MAIN
+/* VK4-b (PLAN/015 §8.43): VK4-a's triangle, read from the mapped linear image, copied into
+ * view 1 in Vulkan's own orientation (D2: rows top-down, the right angle at the top-left) and
+ * held on HDMI through GL3-b's lane and present hold. The stage adds the `view` lane marker.
+ * — TIMBERDOODLE */
+#include <stdlib.h>
+extern void kumo_metal_log(const char *line);
+extern unsigned kumo_metal_proof(void);
+extern unsigned kumo_metal_view_proof(uint32_t proof);
+extern unsigned kumo_metal_view_take(void);
+extern unsigned kumo_metal_view_present(const uint32_t *pixels, uint32_t width, uint32_t height);
+static uint32_t *present_image;
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
+{
+    return kumo_vk_triangle_cases(api, kumo_metal_log, present_image);
+}
+
+int main(void)
+{
+    kumo_metal_log("VK4-b metal present begin: the VK4-a triangle, copied into view 1 in Vulkan's orientation "
+                   "and presented on HDMI");
+    unsigned failed = kumo_metal_view_proof(1);
+    if (!failed)
+        failed = kumo_metal_view_take();
+    if (failed) {
+        report(kumo_metal_log, "VK4-b metal present FAILED at lane step %u", failed);
+        return 1;
+    }
+    present_image = calloc(PIXELS, sizeof *present_image);
+    if (!present_image) {
+        kumo_metal_log("VK4-b metal present FAILED: no image copy buffer");
+        return 1;
+    }
+    failed = kumo_metal_proof();
+    if (failed) {
+        report(kumo_metal_log, "VK4-b metal present FAILED at case %u", failed);
+        return 1;
+    }
+    failed = kumo_metal_view_present(present_image, WIDTH, HEIGHT);
+    free(present_image);
+    if (failed) {
+        report(kumo_metal_log, "VK4-b metal present FAILED at present step %u", failed);
+        return 1;
+    }
+    kumo_metal_log("VK4-b metal present green: the exact Mali Vulkan triangle was copied into view 1 with its "
+                   "right angle top-left and every present was accepted; Copied is the gate without J0c");
     return 0;
 }
 #endif

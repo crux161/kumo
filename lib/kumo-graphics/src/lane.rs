@@ -1,5 +1,6 @@
 //j774
 //j777
+//j785
 //! GL3-b (PLAN/015 §8.32): the cooperative GPU client's half of Sora's lane bootstrap
 //! (DESIGN/024), and the CPU copy of a public RGBA8 readback into view `GPU_VIEW`'s surface,
 //! presented until the hold ends. Everything here is pure: the caller supplies the kernel
@@ -172,6 +173,14 @@ pub enum CopyError {
     Write { offset: u64 },
 }
 
+/// The row order of an RGBA8 readback: `glReadPixels` returns rows bottom-up (GL3-b), while a
+/// Vulkan image's rows run top-down from its top-left origin (VK4-b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowOrder {
+    BottomUp,
+    TopDown,
+}
+
 /// Copy a readback of `surface.width` x `surface.height` RGBA8 pixels, rows bottom-up as
 /// `glReadPixels` returns them, into the top-down XRGB8888 surface, in [`COPY_CHUNK`]-byte
 /// writes at increasing offsets. Surface row `y` is readback row `height - 1 - y`, so the
@@ -180,6 +189,18 @@ pub enum CopyError {
 pub fn copy_readback(
     pixels: &[u32],
     surface: Surface,
+    write: impl FnMut(u64, &[u8]) -> bool,
+) -> Result<u32, CopyError> {
+    copy_rows(pixels, surface, RowOrder::BottomUp, write)
+}
+
+/// [`copy_readback`] for either row order. Bottom-up rows are flipped upright. Top-down rows
+/// are copied as they are, so a Vulkan image appears in Vulkan's own orientation (PLAN/015
+/// §8.43 D2: the right angle of VK4's triangle at the top-left).
+pub fn copy_rows(
+    pixels: &[u32],
+    surface: Surface,
+    order: RowOrder,
     mut write: impl FnMut(u64, &[u8]) -> bool,
 ) -> Result<u32, CopyError> {
     let Some(bytes) = surface.byte_len() else {
@@ -196,7 +217,11 @@ pub fn copy_readback(
         for (index, out) in chunk[..len].chunks_exact_mut(4).enumerate() {
             let pixel = offset / 4 + index;
             let (x, y) = (pixel % width, pixel / width);
-            let source = pixels[(height - 1 - y) * width + x];
+            let row = match order {
+                RowOrder::BottomUp => height - 1 - y,
+                RowOrder::TopDown => y,
+            };
+            let source = pixels[row * width + x];
             out.copy_from_slice(&rgba8_to_xrgb8888(source).to_le_bytes());
         }
         if !write(offset as u64, &chunk[..len]) {
@@ -608,6 +633,68 @@ mod tests {
             .filter(|&(x, y)| at(x, y) == 0x00cc_3366)
             .count();
         assert_eq!(shaded, 16384);
+    }
+
+    #[test]
+    fn top_down_rows_are_copied_as_they_are() {
+        let surface = Surface {
+            width: 2,
+            height: 2,
+            stride: 2,
+            format: XRGB8888,
+        };
+        // A Vulkan image: row 0 is the top.
+        let pixels = [0x0000_00a1, 0x0000_00a2, 0x0000_00b1, 0x0000_00b2];
+        let mut words = Vec::new();
+        let count = copy_rows(&pixels, surface, RowOrder::TopDown, |_, bytes| {
+            words.extend(
+                bytes
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+            );
+            true
+        });
+        assert_eq!(count, Ok(1));
+        assert_eq!(words, [0x00a1_0000, 0x00a2_0000, 0x00b1_0000, 0x00b2_0000]);
+        // The bottom-up wrapper still flips.
+        let mut flipped = Vec::new();
+        copy_readback(&pixels, surface, |_, bytes| {
+            flipped.extend_from_slice(bytes);
+            true
+        })
+        .unwrap();
+        assert_eq!(&flipped[..4], &0x00b1_0000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn the_vk4_triangle_fills_view_one_top_left() {
+        const SHADED: u32 = 0xff66_33cc;
+        const CLEARED: u32 = 0xff99_6633;
+        let (width, height) = (VIEW_WIDTH as usize, VIEW_HEIGHT as usize);
+        // VK4-a's image: Vulkan's origin is top-left, so row y is inside when x + 2y <= 254.
+        let mut pixels = std::vec![0u32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[y * width + x] = if x + 2 * y <= 254 { SHADED } else { CLEARED };
+            }
+        }
+        let mut surface = std::vec![0u8; width * height * 4];
+        let count = copy_rows(&pixels, VIEW_SURFACE, RowOrder::TopDown, |offset, bytes| {
+            surface[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            true
+        });
+        assert_eq!(count, Ok(512));
+        let at = |x: usize, y: usize| {
+            let i = (y * width + x) * 4;
+            u32::from_le_bytes(surface[i..i + 4].try_into().unwrap())
+        };
+        // The right angle sits top-left on the glass: the whole top row up to x=254 is shaded.
+        assert_eq!(at(0, 0), 0x00cc_3366);
+        assert_eq!(at(254, 0), 0x00cc_3366);
+        assert_eq!(at(255, 0), 0x0033_6699);
+        assert_eq!(at(0, 127), 0x00cc_3366);
+        assert_eq!(at(1, 127), 0x0033_6699);
+        assert_eq!(at(255, 127), 0x0033_6699);
     }
 
     #[test]

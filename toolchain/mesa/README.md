@@ -1,9 +1,47 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j778 -->
 <!-- j780 -->
 <!-- j781 -->
 <!-- j782 -->
 <!-- j784 -->
+<!-- j785 -->
+
+## VK4-b: the Vulkan triangle on HDMI (J785, metal-green over serial)
+
+`--proof vk4-b` builds [vk-triangle.c](vk-triangle.c) with `KUMO_VK_PRESENT_MAIN`. It runs
+VK4-a's whole body, keeps the verified image (rows top-down), and copies it into view 1 through
+GL3-b's lane: the stage adds the `etc/gpu-lane` `view` marker, Sora sends `V`/`S`/`N`, and
+the client holds 15 FULL presents a second apart. CRUX chose D2(a) on 2026-11-04, so the image
+appears as Vulkan defines it, with the triangle's right angle at the top-left.
+
+- `kumo-graphics` `lane::copy_rows` takes a `RowOrder`. `BottomUp` flips rows upright, as
+  `copy_readback` always did for `glReadPixels`; `TopDown` copies a Vulkan image's rows as
+  they are. Host tests cover both orders and the VK4 triangle's placement on the glass.
+- [device-metal.rs](device-metal.rs): `kumo_metal_view_proof(1)` selects VK4-b before
+  `kumo_metal_view_take`. It names the lane, copy, present and release lines `VK4-b` and
+  copies top-down. Without it, GL3-b's lines and behavior are byte-identical.
+
+**Metal (J785, 2026-11-04), first boot:**
+
+```text
+sora: gpu-lane marker selects the view lane
+VK4-b lane: view 1 channel and surface received over V, S, N; the native producer is not used
+VK4-a readback: 0 of 32768 pixels differ; 0 of 1024 guard words changed (Mali triangle 0xff6633cc over clear 0xff996633)
+VK4-b copy: 32768 RGBA8 pixels written to view 1's surface as top-down XRGB8888 in Vulkan's orientation in 512 VmoWrite chunks
+VK4-b present: 15 of 15 presents accepted with FULL damage; retired=0 copied=15
+VK4-b release: view 1 channel and surface closed
+gpu-client: client exited; view lane returns view 1 to Sora, no regrant
+```
+
+This image runs no J0c, so `Copied` is the gate, as on GL3-b. A GL3-b regression boot on the
+same runtime was green with unchanged lines (`as upright XRGB8888`). Evidence:
+`build/proofs/vk4-b-metal/metal-boot-to-exit.log` and
+`build/verification/j785/gl3-b-regression-boot.log`. **VK4 closes once CRUX confirms the
+triangle on HDMI.** — TIMBERDOODLE 2026-11-04
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk4-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk4-b --check <tio-log>
+```
 
 ## VK4-a: the first Vulkan triangle, offscreen (J784, metal-proven)
 
@@ -43,8 +81,8 @@ drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
 ```
 
 The client hash was `7c6b1abb…`; the initrd served was 24,564,415 bytes. Evidence:
-`build/proofs/vk4-a-metal/metal-boot-to-login.log`. VK4-b (the image copied into view 1
-and held on HDMI) waits on the cut's D2 (PLAN/015 §8.43). — TIMBERDOODLE 2026-11-04
+`build/proofs/vk4-a-metal/metal-boot-to-login.log`. VK4-b (above) puts the image on HDMI.
+— TIMBERDOODLE 2026-11-04
 
 ```sh
 python3 toolchain/mesa/vk-spirv.py --verify

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j777
 #j778
 #j780
 #j782
 #j784
+#j785
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -72,6 +72,25 @@ GL3C = ["GL3-c heap config: pan_csf_chunk_size=262144 pan_csf_initial_chunks=1 p
         "GL3-c readback: 0 of 32768 pixels differ; 0 of 32 readback guards changed (Mali: last layer's RGB, alpha summed over all 16 layers)",
         "GL3-c samples: (0,0)=0xf0f00000 (255,0)=0xf0f000ff (0,127)=0xf0f0fe00 (255,127)=0xf0f0feff",
         "GL3-c destroy: shaders, program, index buffer, context, drawable and display released"]
+# VK4-a's body lines; VK4-b runs the same body before its copy. The target line ends in the
+# measured row pitch and size, so only its prefix is required. — TIMBERDOODLE
+VK4A = ["VK4-a device: Mali-G610",
+        "through the static ICD, one three-queue native group and 3 init submissions",
+        "VK4-a target: 256x128 R8G8B8A8_UNORM linear image, row pitch ",
+        "poisoned to 0xdeadbeef with a 4096-byte guard past it",
+        "VK4-a pipeline: the pinned 243-word vertex and 94-word fragment SPIR-V compiled by panvk on KUMO "
+        "into a graphics pipeline (no pipeline cache), with no native submission",
+        "VK4-a record: render pass clear to 0xff996633, one vkCmdDraw of 3 vertices (shade 0xff6633cc), "
+        "color-to-host barrier",
+        # Measured on metal (J784): panvk's first draw adds its one-time REQ_RESOURCE streams on
+        # the vertex/tiler and fragment subqueues ahead of the command buffer.
+        "VK4-a submit: one fenced vkQueueSubmit as 2 native submissions of 5 streams: subqueues [0 and 1] "
+        "then [0, 1 and 2]; the fence completed",
+        "VK4-a readback: 0 of 32768 pixels differ; 0 of 1024 guard words changed (Mali triangle 0xff6633cc "
+        "over clear 0xff996633)",
+        "VK4-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
+        "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
+        "VK4-a teardown: every object, the device and the instance destroyed; "]
 PROOFS = {
     # GL4 (PLAN/015 §8.2): G8's metal gate through public GL, on the churn lane. Sora's
     # RestartBudget(3) regrants after each exit, so one boot holds up to four sessions; the
@@ -130,30 +149,32 @@ PROOFS = {
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK4-b (PLAN/015 §8.43): VK4-a's image copied into view 1 in Vulkan's orientation (D2: the
+    # right angle top-left) and held on HDMI through GL3-b's lane. The stage adds the `view`
+    # marker; as on GL3-b, this image runs no J0c, so the presents are Copied. — TIMBERDOODLE
+    "vk4-b": dict(
+        cases="vk-triangle", runtime="device-metal", defines=["-DKUMO_VK_PRESENT_MAIN=1"],
+        out="vk4-b-metal", vk=True, marker=b"view\n", begin="VK4-b metal present begin",
+        boot=["sora: gpu-lane marker selects the view lane"],
+        lines=["VK4-b lane: view 1 channel and surface received over V, S, N; the native producer is not used",
+               *VK4A,
+               "VK4-b copy: 32768 RGBA8 pixels written to view 1's surface as top-down XRGB8888 in Vulkan's "
+               "orientation in 512 VmoWrite chunks",
+               "VK4-b present: 15 of 15 presents accepted with FULL damage; retired=",
+               "VK4-b release: view 1 channel and surface closed"],
+        green=("VK4-b metal present green: the exact Mali Vulkan triangle was copied into view 1 with its right "
+               "angle top-left and every present was accepted; Copied is the gate without J0c"),
+        tail=["gpu-client: client exited; view lane returns view 1 to Sora, no regrant"],
+        driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
+                "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     # VK4-a (PLAN/015 §8.43): GL3-a's triangle through panvk, a render pass into a linear image
-    # read back from the CPU. Vulkan's origin is top-left, so the samples match GL3-a's. The
-    # target line ends in the measured row pitch and size, so only its prefix is required; the
-    # submit line pins the native split measured on metal. — TIMBERDOODLE
+    # read back from the CPU. Vulkan's origin is top-left, so the samples match GL3-a's.
+    # — TIMBERDOODLE
     "vk4-a": dict(
         cases="vk-triangle", runtime="device-metal", defines=["-DKUMO_VK_TRIANGLE_MAIN=1"],
         out="vk4-a-metal", vk=True, begin="VK4-a metal triangle begin",
-        lines=["VK4-a device: Mali-G610",
-               "through the static ICD, one three-queue native group and 3 init submissions",
-               "VK4-a target: 256x128 R8G8B8A8_UNORM linear image, row pitch ",
-               "poisoned to 0xdeadbeef with a 4096-byte guard past it",
-               "VK4-a pipeline: the pinned 243-word vertex and 94-word fragment SPIR-V compiled by panvk on KUMO "
-               "into a graphics pipeline (no pipeline cache), with no native submission",
-               "VK4-a record: render pass clear to 0xff996633, one vkCmdDraw of 3 vertices (shade 0xff6633cc), "
-               "color-to-host barrier",
-               # Measured on metal (J784): panvk's first draw adds its one-time REQ_RESOURCE streams on
-               # the vertex/tiler and fragment subqueues ahead of the command buffer.
-               "VK4-a submit: one fenced vkQueueSubmit as 2 native submissions of 5 streams: subqueues [0 and 1] "
-               "then [0, 1 and 2]; the fence completed",
-               "VK4-a readback: 0 of 32768 pixels differ; 0 of 1024 guard words changed (Mali triangle 0xff6633cc "
-               "over clear 0xff996633)",
-               "VK4-a coverage: 16384 pixels inside x+2y<=254; samples (0,0)=0xff6633cc (254,0)=0xff6633cc "
-               "(255,0)=0xff996633 (0,127)=0xff6633cc (255,127)=0xff996633",
-               "VK4-a teardown: every object, the device and the instance destroyed; "],
+        lines=VK4A,
         green=("VK4-a metal triangle green: Mali rasterized the Vulkan triangle exactly into the linear image, "
                "all 32768 pixels and the guard checked, and clean teardown"),
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",

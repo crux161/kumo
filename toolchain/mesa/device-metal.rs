@@ -1,8 +1,8 @@
-//j753
 //j754
 //j774
 //j777
 //j778
+//j785
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -357,6 +357,29 @@ fn valid(raw: u64) -> Option<u64> {
 /// takes and closes them.
 static VIEW_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static VIEW_SURFACE: AtomicU64 = AtomicU64::new(0);
+/// Which proof drives the view: 0 is GL3-b (a bottom-up `glReadPixels` readback, flipped
+/// upright), 1 is VK4-b (a top-down Vulkan image, kept in Vulkan's orientation, PLAN/015
+/// §8.43 D2). It names the view's log lines; GL3-b's are unchanged.
+static VIEW_PROOF: AtomicU32 = AtomicU32::new(0);
+
+fn view_name() -> &'static [u8] {
+    if VIEW_PROOF.load(Ordering::Relaxed) == 1 {
+        b"VK4-b"
+    } else {
+        b"GL3-b"
+    }
+}
+
+/// Select the proof that drives the view before `kumo_metal_view_take` (VK4-b passes 1).
+/// Returns nonzero for an unknown proof, which leaves GL3-b's selection in place.
+#[no_mangle]
+pub extern "C" fn kumo_metal_view_proof(proof: u32) -> u32 {
+    if proof > 1 {
+        return 1;
+    }
+    VIEW_PROOF.store(proof, Ordering::Relaxed);
+    0
+}
 /// The hold: fifteen presents paced one second apart keep the triangle on HDMI for about
 /// fifteen seconds, at a rate that cannot crowd drv-fb's serve loop.
 const VIEW_PRESENTS: u32 = 15;
@@ -373,7 +396,7 @@ const VIEW_REPLY_BOUND_NS: u64 = 10_000_000_000;
 pub extern "C" fn kumo_metal_view_take() -> u32 {
     let raw = kumo_metal_lane.swap(0, Ordering::Relaxed);
     if raw == 0 {
-        log(b"GL3-b lane: no lane bootstrap was transferred\n");
+        log_parts(&[view_name(), b" lane: no lane bootstrap was transferred\n"]);
         return 1;
     }
     let read = || {
@@ -401,18 +424,24 @@ pub extern "C" fn kumo_metal_view_take() -> u32 {
             }
             VIEW_CHANNEL.store(channel, Ordering::Relaxed);
             VIEW_SURFACE.store(surface, Ordering::Relaxed);
-            log(b"GL3-b lane: view 1 channel and surface received over V, S, N; the native producer is not used\n");
+            log_parts(&[
+                view_name(),
+                b" lane: view 1 channel and surface received over V, S, N; the native producer is not used\n",
+            ]);
             0
         }
         Ok(lane::Lane::Native { producer }) => {
             if producer != 0 {
                 close(producer);
             }
-            log(b"GL3-b lane: Sora named the native lane; this image has no etc/gpu-lane view marker\n");
+            log_parts(&[
+                view_name(),
+                b" lane: Sora named the native lane; this image has no etc/gpu-lane view marker\n",
+            ]);
             2
         }
         Err(cause) => {
-            log_parts(&[b"GL3-b lane: ", cause.as_bytes(), b"\n"]);
+            log_parts(&[view_name(), b" lane: ", cause.as_bytes(), b"\n"]);
             3
         }
     }
@@ -525,7 +554,8 @@ impl lane::PresentLink for ViewLink {
 
 /// Copy GL3-a's verified readback into view `GPU_VIEW`'s surface as upright XRGB8888 (D2:
 /// public glReadPixels, a CPU swizzle and VmoWrite), then hold it on HDMI with fresh FULL
-/// presents. The view's channel and surface are closed either way, so drv-fb reports the view
+/// presents. With `kumo_metal_view_proof(1)` the pixels are VK4-a's top-down Vulkan image,
+/// copied as they are (PLAN/015 §8.43 D2). The view's channel and surface are closed either way, so drv-fb reports the view
 /// released and Sora takes its lease back when the client exits.
 #[no_mangle]
 pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height: u32) -> u32 {
@@ -534,19 +564,31 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
     let surface = VIEW_SURFACE.swap(0, Ordering::Relaxed);
     let result = (|| {
         if channel == 0 || surface == 0 {
-            log(b"GL3-b copy: no view was taken from the lane\n");
+            log_parts(&[view_name(), b" copy: no view was taken from the lane\n"]);
             return 1;
         }
         let view = lane::VIEW_SURFACE;
         if pixels.is_null() || width != view.width || height != view.height {
-            log(b"GL3-b copy: the readback is not the 256x128 view's size\n");
+            log_parts(&[
+                view_name(),
+                b" copy: the readback is not the 256x128 view's size\n",
+            ]);
             return 2;
         }
         // SAFETY: the C caller's readback array of width * height packed RGBA8 words, alive
         // and unaliased for this call.
         let pixels =
             unsafe { core::slice::from_raw_parts(pixels, width as usize * height as usize) };
-        let written = lane::copy_readback(pixels, view, |offset, bytes| {
+        let name = core::str::from_utf8(view_name()).unwrap_or("view");
+        let (order, shape) = if VIEW_PROOF.load(Ordering::Relaxed) == 1 {
+            (
+                lane::RowOrder::TopDown,
+                "top-down XRGB8888 in Vulkan's orientation",
+            )
+        } else {
+            (lane::RowOrder::BottomUp, "upright XRGB8888")
+        };
+        let written = lane::copy_rows(pixels, view, order, |offset, bytes| {
             native::call(
                 Syscall::VmoWrite,
                 [
@@ -562,13 +604,15 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
         });
         match written {
             Ok(chunks) => log(format!(
-                "GL3-b copy: {} RGBA8 pixels written to view 1's surface as upright XRGB8888 in {} VmoWrite chunks\n",
+                "{} copy: {} RGBA8 pixels written to view 1's surface as {} in {} VmoWrite chunks\n",
+                name,
                 pixels.len(),
+                shape,
                 chunks
             )
             .as_bytes()),
             Err(error) => {
-                log(format!("GL3-b copy: surface write refused: {:?}\n", error).as_bytes());
+                log(format!("{} copy: surface write refused: {:?}\n", name, error).as_bytes());
                 return 3;
             }
         }
@@ -576,14 +620,14 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
         match lane::present_hold(&mut link, view, 1, VIEW_PRESENTS) {
             Ok(tally) => {
                 log(format!(
-                    "GL3-b present: {} of {} presents accepted with FULL damage; retired={} copied={}\n",
-                    tally.presents, VIEW_PRESENTS, tally.retired, tally.copied
+                    "{} present: {} of {} presents accepted with FULL damage; retired={} copied={}\n",
+                    name, tally.presents, VIEW_PRESENTS, tally.retired, tally.copied
                 )
                 .as_bytes());
                 0
             }
             Err(error) => {
-                log(format!("GL3-b present: hold ended: {:?}\n", error).as_bytes());
+                log(format!("{} present: hold ended: {:?}\n", name, error).as_bytes());
                 4
             }
         }
@@ -594,7 +638,10 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
     if surface != 0 {
         close(surface);
     }
-    log(b"GL3-b release: view 1 channel and surface closed\n");
+    log_parts(&[
+        view_name(),
+        b" release: view 1 channel and surface closed\n",
+    ]);
     result
 }
 
