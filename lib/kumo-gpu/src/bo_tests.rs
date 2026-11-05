@@ -1,8 +1,8 @@
-//j745
 //j751
 //j752
 //j757
 //j779
+//j789
 use super::*;
 use crate::{
     c, client::TransportError, Command, Reply, Request, Response, Status, REPLY_LEN, REQUEST_LEN,
@@ -1430,4 +1430,111 @@ fn native_multi_stream_step_rechecks_a_later_queue_binding_without_io() {
         );
         assert_eq!(state.borrow().calls.len(), before);
     });
+}
+
+/// VK6-a (PLAN/015 §8.49 D1a): a device close inside the scope, which is how the C bridge
+/// reports loss, keeps every live CPU alias with its handle; unmap and destroy then release
+/// locally without messaging the closed session. — TIMBERDOODLE
+#[test]
+fn lost_session_keeps_live_aliases_until_unmap_or_destroy() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    buffers.open_device().unwrap();
+    let mapped = buffers.create(PAGE_BYTES, 0).unwrap();
+    let unmapped = buffers.create(PAGE_BYTES, 0).unwrap();
+    let second = buffers.create(PAGE_BYTES, 0).unwrap();
+    let alias = buffers.map(mapped.id).unwrap();
+    buffers.map(second.id).unwrap();
+    buffers.close_device();
+    assert_eq!(state.borrow().sessions_closed, 1);
+    assert_eq!(state.borrow().unmaps, 0);
+    assert_eq!(state.borrow().closed, [102]);
+    assert_eq!(buffers.live_count(), 2);
+    assert!(!buffers.device_ready());
+    // No new aliases on a lost session; the kept one is untouched.
+    let calls = state.borrow().calls.len();
+    for id in [unmapped.id, mapped.id] {
+        assert_eq!(buffers.map(id), Err(Error::Client(ClientError::DeviceLost)));
+    }
+    assert_eq!(state.borrow().maps, 2);
+    let _ = alias;
+    // Mesa's free path: munmap, then destroy. Neither sends a request.
+    buffers.unmap(mapped.id).unwrap();
+    assert_eq!(state.borrow().unmaps, 1);
+    buffers.destroy(mapped.id).unwrap();
+    assert_eq!(state.borrow().closed, [102, 101]);
+    // A destroy of a still-mapped orphan unmaps it first.
+    buffers.destroy(second.id).unwrap();
+    assert_eq!(state.borrow().unmaps, 2);
+    assert_eq!(state.borrow().closed, [102, 101, 103]);
+    assert_eq!(buffers.destroy(unmapped.id), Err(Error::NotFound));
+    assert_eq!(state.borrow().calls.len(), calls);
+    assert!(!state
+        .borrow()
+        .calls
+        .iter()
+        .any(|c| matches!(c, Command::BufferDestroy { .. })));
+    assert_eq!(buffers.live_count(), 0);
+    buffers.close_device();
+    assert_eq!(state.borrow().sessions_closed, 1);
+}
+
+/// VK6-a: the scope's end releases aliases a device close kept, so nothing outlives the API.
+#[test]
+fn scope_end_releases_aliases_kept_after_loss() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| unsafe {
+        assert_eq!(api.device_open.unwrap()(api.context), c::OK);
+        let mut info = Info::default();
+        assert_eq!(
+            api.buffer_create.unwrap()(api.context, PAGE_BYTES, 0, &mut info),
+            c::OK
+        );
+        let mut pointer = core::ptr::null_mut();
+        assert_eq!(
+            api.buffer_map.unwrap()(api.context, info.id, &mut pointer),
+            c::OK
+        );
+        // The bridge's loss: poison closes the device; the alias survives it.
+        assert_eq!(api.device_close.unwrap()(api.context), c::OK);
+        assert_eq!(state.borrow().unmaps, 0);
+        assert!(state.borrow().closed.is_empty());
+        assert_ne!(api.device_status.unwrap()(api.context), c::OK);
+        // The app never frees it; the scope's end must.
+    });
+    assert_eq!(state.borrow().sessions_closed, 1);
+    assert_eq!(state.borrow().unmaps, 1);
+    assert_eq!(state.borrow().closed, [101]);
+    assert_eq!(buffers.live_count(), 0);
+}
+
+/// VK6-a: after loss the C bridge's free path (unmap, then destroy) succeeds, so Mesa's BO
+/// teardown no longer re-poisons a lost device with NotFound.
+#[test]
+fn c_free_path_after_loss_succeeds_locally() {
+    let (state, mut client, mut mapper) = fixture();
+    let mut buffers = Buffers::new(&mut client, &mut mapper);
+    c::with_device_api(&mut buffers, |api| unsafe {
+        assert_eq!(api.device_open.unwrap()(api.context), c::OK);
+        let mut info = Info::default();
+        assert_eq!(
+            api.buffer_create.unwrap()(api.context, PAGE_BYTES, 0, &mut info),
+            c::OK
+        );
+        let mut pointer = core::ptr::null_mut();
+        assert_eq!(
+            api.buffer_map.unwrap()(api.context, info.id, &mut pointer),
+            c::OK
+        );
+        assert_eq!(api.device_close.unwrap()(api.context), c::OK);
+        let calls = state.borrow().calls.len();
+        assert_eq!(api.buffer_unmap.unwrap()(api.context, info.id), c::OK);
+        assert_eq!(api.buffer_destroy.unwrap()(api.context, info.id), c::OK);
+        assert_eq!(state.borrow().calls.len(), calls);
+        assert_eq!(state.borrow().unmaps, 1);
+        assert_eq!(state.borrow().closed, [101]);
+    });
+    assert_eq!(state.borrow().unmaps, 1);
+    assert_eq!(buffers.live_count(), 0);
 }

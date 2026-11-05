@@ -1,9 +1,44 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j784 -->
 <!-- j785 -->
 <!-- j786 -->
 <!-- j787 -->
 <!-- j788 -->
+<!-- j789 -->
+
+## VK6-a: host mappings stay valid after device loss (J789, host- and QEMU-proven)
+
+PLAN/015 §8.49 (RATIFIED, D1a). Vulkan's Lost Device rule: "The host address space
+corresponding to device memory mapped using vkMapMemory is still valid, and host memory
+accesses to these mapped regions are still valid, but the contents are undefined." KUMO's
+loss path used to break that. `pan_kmod_kumo_dev_lost` → `poison` → `device_close` reached
+kumo-gpu's `release_local`, which unmapped every CPU alias. A conformant app reading a
+mapping after `VK_ERROR_DEVICE_LOST` would take an EL0 fault, as G7p-e's first fatal boot
+did. panvk's own `gpu_queue_check_status` also reads its subqueue contexts through CPU maps.
+
+- `Buffers::close_device`, the bridge's device close and so its loss path, releases every
+  local claim as before and closes the session, so drv-gpu resets and contains the DMA. The
+  one exception: each live CPU alias stays mapped, with its grant handle, until its BO's
+  unmap or destroy.
+- `Buffers::destroy` on a lost client releases only the local claim. The closed session is
+  not messaged; a destroy that *discovers* the loss still reports it. Mesa's free path
+  (munmap, then `buffer_destroy`) therefore succeeds after a loss and no longer re-poisons
+  with NotFound.
+- `Buffers::finish`, the end of `with_device_api`, and `Drop` still release everything:
+  nothing outlives the API scope. New maps after a loss stay refused (`DeviceLost`, and the
+  C side's `ready()` check).
+- A kept mapping holds only its own VMO's frames until it goes, as every client mapping does
+  (J732's census traced leaked frames to exactly such mappings). The GPU is already reset and
+  the session closed.
+
+Host tests (kumo-gpu, 140 in all, 3 new):
+- live aliases survive a device close; unmap and destroy then release locally with no request;
+- the scope's end releases the aliases a close kept;
+- the C free path succeeds after a loss.
+
+QEMU on the change: the device, native-sync, group-state and heaps modes, and the GL screen
+modes (GL1-b through GL4), all green. G7p-c's loss containment and G7p-d's
+fatal/timeout/unknown-after-close are included. VK6-a has no metal gate of its own; VK6-b and
+VK6-c exercise it on Mali. — TIMBERDOODLE 2026-11-04
 
 ## VK5-b: G8's bar through panvk; VK5 closed (J788, metal-proven)
 
@@ -41,8 +76,7 @@ first-use resource requests, so its churn frame 1 was a single submission; sessi
 matched VK5-a's split exactly. Regression boots on the same code were green: VK5-a (every
 pinned line unchanged) and GL4 (4 x 100/0, census 29/29/29/29). Evidence:
 `build/proofs/vk5-b-metal/metal-boot.log`, `build/verification/j788/`. **VK5 is closed: panvk
-meets G8's bar.** VK6 (recovery: `VK_ERROR_DEVICE_LOST`, then a new VkDevice on a regranted
-session) is next. — TIMBERDOODLE 2026-11-04
+meets G8's bar.** VK6 (recovery) follows; VK6-a is above. — TIMBERDOODLE 2026-11-04
 
 ```sh
 python3 scripts/mesa-device-metal.py --proof vk5-b --stage <new-directory>

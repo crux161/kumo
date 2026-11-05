@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
-/*j760*/
 /*j761*/
 /*j762*/
 /*j765*/
 /*j780*/
+/*j789*/
 #include "kumo_kmod.h"
 #include "drm-uapi/panthor_drm.h"
 /* Pinned upstream perf helpers use GNU void-pointer arithmetic. — KESTREL */
@@ -387,7 +387,8 @@ static off_t no_mmap_offset(struct pan_kmod_bo *bo) { (void)bo; return -1; }
 /* GL1-d: Panthor's rule over the BO's points: a reader waits for the last write, a writer for
  * every access. A BO with no point was never in a submission that attached one; a native
  * caller outside Gallium's batches (G7p's proofs) owns its own completion. On a lost device
- * nothing completes, because the BO's CPU aliases are already gone. — TIMBERDOODLE */
+ * nothing completes: the session is closed (its CPU aliases stay valid until each BO is
+ * unmapped or destroyed, PLAN/015 §8.49 D1a). — TIMBERDOODLE */
 static bool wait_bo(struct pan_kmod_bo *base, int64_t timeout, bool read_only)
 {
     const struct kumo_mesa_bo *bo = (const struct kumo_mesa_bo *)base;

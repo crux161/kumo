@@ -1,8 +1,8 @@
-//j745
 //j747
 //j751
 //j752
 //j757
+//j789
 //! Native BO ownership for a borrowed session. Kernel handles stay in Rust; CPU mappings
 //! are full-buffer, read/write Normal-NC data mappings, including executable GPU BOs.
 
@@ -211,9 +211,15 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
             .iter()
             .position(|record| record.buffer.id == id)
             .ok_or(Error::NotFound)?;
+        let lost = self.client.is_lost();
         let record = &mut self.records[index];
         if !record.destroyed {
-            self.client.destroy_buffer(&record.buffer)?;
+            // VK6-a: once the session is lost the driver's reset contains its buffers, and the
+            // endpoint is closed or closing, so a destroy releases only the local claim. A
+            // destroy that discovers the loss still reports it. — TIMBERDOODLE
+            if !lost {
+                self.client.destroy_buffer(&record.buffer)?;
+            }
             record.destroyed = true;
             self.bindings.retain(|binding| binding.buffer != id);
         }
@@ -223,14 +229,25 @@ impl<'a, T: Transport, M: Mapper<T::Handle>> Buffers<'a, T, M> {
         Ok(())
     }
 
-    fn release_local(&mut self) {
+    /// Release every local claim. With `keep_aliases` (a device close inside the API scope,
+    /// which is how the C bridge reports loss), each live CPU alias stays mapped, with its
+    /// grant handle, until its BO's unmap or destroy or the scope's end. Vulkan's lost-device
+    /// rule keeps host access to mapped memory valid (contents undefined), and panvk reads its
+    /// own subqueue contexts through these maps after a loss (PLAN/015 §8.49 D1a). The GPU is
+    /// already reset and the session closed; a kept mapping only holds its VMO's frames until
+    /// it goes, as every client mapping does. — TIMBERDOODLE
+    fn release_local(&mut self, keep_aliases: bool) {
         if let Some(mut native) = self.native.take() {
             if let Some(report) = native.capture_group(self.mapper) {
                 self.group_report = Some(report);
             }
             native.clear(self.client);
         }
-        for record in self.records.drain(..) {
+        for record in core::mem::take(&mut self.records) {
+            if keep_aliases && record.address.is_some() {
+                self.records.push(record);
+                continue;
+            }
             if let Some(address) = record.address {
                 let _ = self.mapper.unmap(address, record.buffer.bytes);
             }
@@ -276,7 +293,7 @@ impl<T: Transport, M: Mapper<T::Handle>> Drop for Buffers<'_, T, M> {
         }
         // No destroy replay on abandonment. A driver-held VMO keeps GPU backing alive;
         // a failed CPU unmap keeps the kernel mapping's own pin. — KESTREL
-        self.release_local();
+        self.release_local(false);
     }
 }
 
@@ -300,7 +317,13 @@ impl<T: SessionTransport, M: Mapper<T::Handle>> Buffers<'_, T, M> {
     pub fn close_device(&mut self) {
         // Release only local claims, then close the endpoint so the driver contains DMA.
         // Endpoint close is idempotent, even after protocol/device loss. — KESTREL
-        self.release_local();
+        // Live CPU aliases outlive the close until their unmap or destroy (VK6-a). — TIMBERDOODLE
+        self.release_local(true);
+        self.client.close_session();
+    }
+    /// The API scope's end: nothing can unmap or destroy after it, so every alias goes too.
+    pub fn finish(&mut self) {
+        self.release_local(false);
         self.client.close_session();
     }
     pub fn device_ready(&self) -> bool {

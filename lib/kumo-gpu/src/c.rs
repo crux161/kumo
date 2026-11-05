@@ -1,8 +1,8 @@
-//j745
 //j751
 //j752
 //j757
 //j779
+//j789
 
 //! Borrowed C query/BO/device boundary for the pinned Mesa backend. Kernel handles and BO ownership
 //! stay in Rust; C receives session-local IDs and scoped CPU pointers. — KESTREL
@@ -209,7 +209,8 @@ pub fn with_device_api<T: crate::client::SessionTransport, M: crate::bo::Mapper<
     api.heap_create = Some(heap_create::<T, M>);
     api.heap_destroy = Some(heap_destroy::<T, M>);
     let result = f(&api);
-    buffers.close_device();
+    // The scope's end releases every claim, aliases a device close kept included (VK6-a).
+    buffers.finish();
     result
 }
 //j757
