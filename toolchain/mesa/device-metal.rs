@@ -1,8 +1,8 @@
-//j754
 //j774
 //j777
 //j778
 //j785
+//j788
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -357,20 +357,61 @@ fn valid(raw: u64) -> Option<u64> {
 /// takes and closes them.
 static VIEW_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static VIEW_SURFACE: AtomicU64 = AtomicU64::new(0);
-/// Which proof drives the view: 0 is GL3-b (a bottom-up `glReadPixels` readback, flipped
-/// upright), 1 is VK4-b (a top-down Vulkan image, kept in Vulkan's orientation, PLAN/015
-/// §8.43 D2). It names the view's log lines; GL3-b's are unchanged.
+/// Which client drives the view: 0 is a GL client (GL3-b, GL4: bottom-up `glReadPixels`
+/// readbacks, flipped upright), 1 is a Vulkan client (VK4-b, VK5: top-down images kept in
+/// Vulkan's orientation, PLAN/015 §8.43 D2 and §8.46 D3). It names the view and churn log
+/// lines and picks the row order; the GL clients' lines are unchanged.
 static VIEW_PROOF: AtomicU32 = AtomicU32::new(0);
 
+fn vulkan_client() -> bool {
+    VIEW_PROOF.load(Ordering::Relaxed) == 1
+}
+
+/// The churn proof's name in its lines: GL4, or VK5 for the Vulkan client.
+fn churn_name() -> &'static [u8] {
+    if vulkan_client() {
+        b"VK5"
+    } else {
+        b"GL4"
+    }
+}
+
+fn churn_str() -> &'static str {
+    if vulkan_client() {
+        "VK5"
+    } else {
+        "GL4"
+    }
+}
+
+/// The API that rendered the frames J0c leases.
+fn churn_api() -> &'static str {
+    if vulkan_client() {
+        "Vulkan"
+    } else {
+        "GL"
+    }
+}
+
+/// GL readbacks arrive bottom-up and are flipped upright; Vulkan images are copied top-down.
+fn client_rows() -> lane::RowOrder {
+    if vulkan_client() {
+        lane::RowOrder::TopDown
+    } else {
+        lane::RowOrder::BottomUp
+    }
+}
+
 fn view_name() -> &'static [u8] {
-    if VIEW_PROOF.load(Ordering::Relaxed) == 1 {
+    if vulkan_client() {
         b"VK4-b"
     } else {
         b"GL3-b"
     }
 }
 
-/// Select the proof that drives the view before `kumo_metal_view_take` (VK4-b passes 1).
+/// Select the client that drives the view before `kumo_metal_view_take` or
+/// `kumo_metal_churn_take` (VK4-b and VK5 pass 1).
 /// Returns nonzero for an unknown proof, which leaves GL3-b's selection in place.
 #[no_mangle]
 pub extern "C" fn kumo_metal_view_proof(proof: u32) -> u32 {
@@ -580,7 +621,7 @@ pub extern "C" fn kumo_metal_view_present(pixels: *const u32, width: u32, height
         let pixels =
             unsafe { core::slice::from_raw_parts(pixels, width as usize * height as usize) };
         let name = core::str::from_utf8(view_name()).unwrap_or("view");
-        let (order, shape) = if VIEW_PROOF.load(Ordering::Relaxed) == 1 {
+        let (order, shape) = if vulkan_client() {
             (
                 lane::RowOrder::TopDown,
                 "top-down XRGB8888 in Vulkan's orientation",
@@ -671,7 +712,7 @@ const J0C_BOUND_NS: u64 = 120_000_000_000;
 pub extern "C" fn kumo_metal_churn_take() -> u32 {
     let raw = kumo_metal_lane.swap(0, Ordering::Relaxed);
     if raw == 0 {
-        log(b"GL4 lane: no lane bootstrap was transferred\n");
+        log_parts(&[churn_name(), b" lane: no lane bootstrap was transferred\n"]);
         return 1;
     }
     let read = || {
@@ -698,11 +739,15 @@ pub extern "C" fn kumo_metal_churn_take() -> u32 {
             VIEW_SURFACE.store(surface, Ordering::Relaxed);
             PRODUCER.store(producer, Ordering::Relaxed);
             if producer != 0 {
-                log(b"GL4 lane: view 1 over V, S, N with the boot session's native producer\n");
+                log_parts(&[
+                    churn_name(),
+                    b" lane: view 1 over V, S, N with the boot session's native producer\n",
+                ]);
             } else {
-                log(
-                    b"GL4 lane: view 1 over V, S, N; a regranted session with no native producer\n",
-                );
+                log_parts(&[
+                    churn_name(),
+                    b" lane: view 1 over V, S, N; a regranted session with no native producer\n",
+                ]);
             }
             0
         }
@@ -710,11 +755,14 @@ pub extern "C" fn kumo_metal_churn_take() -> u32 {
             if producer != 0 {
                 close(producer);
             }
-            log(b"GL4 lane: Sora named the native lane; this image has no etc/gpu-lane churn marker\n");
+            log_parts(&[
+                churn_name(),
+                b" lane: Sora named the native lane; this image has no etc/gpu-lane churn marker\n",
+            ]);
             2
         }
         Err(cause) => {
-            log_parts(&[b"GL4 lane: ", cause.as_bytes(), b"\n"]);
+            log_parts(&[churn_name(), b" lane: ", cause.as_bytes(), b"\n"]);
             3
         }
     }
@@ -727,7 +775,8 @@ pub extern "C" fn kumo_metal_churn_native() -> u32 {
 }
 
 /// GL-fed J0c (CRUX, 2026-11-03): one GL frame, read back and copied upright into the one
-/// J0c VMO, presented through drv-fb's unchanged native lease protocol. The VMO is rewritten
+/// J0c VMO, presented through drv-fb's unchanged native lease protocol. A Vulkan client's
+/// frame (VK5, PLAN/015 §8.46 D2a) is copied top-down instead. The VMO is rewritten
 /// only after the previous sequence's retirement, as the lease requires. drv-fb checks the
 /// lease, the checksum and the display mapping, not who wrote the pixels; the pixels here
 /// are GL-rendered and CPU-copied, not written by hand-built GPU jobs.
@@ -767,14 +816,14 @@ pub extern "C" fn kumo_metal_j0c(
         J0C_VMO.store(vmo, Ordering::Relaxed);
     }
     let vmo = J0C_VMO.load(Ordering::Relaxed);
-    // SAFETY: the C caller's readback of width x height packed RGBA8 words, rows bottom-up;
-    // the view takes its bottom 256 x 128.
+    // SAFETY: the C caller's readback of width x height packed RGBA8 words, rows bottom-up for
+    // GL (the view takes its bottom 256 x 128) or top-down for Vulkan (its top 256 x 128).
     let rows = unsafe { core::slice::from_raw_parts(pixels, (view.width * view.height) as usize) };
     let mut words: Vec<u32> = Vec::new();
     if words.try_reserve_exact(rows.len()).is_err() {
         return 3;
     }
-    let copied = lane::copy_readback(rows, view, |offset, bytes| {
+    let copied = lane::copy_rows(rows, view, client_rows(), |offset, bytes| {
         words.extend(
             bytes
                 .chunks_exact(4)
@@ -802,7 +851,7 @@ pub extern "C" fn kumo_metal_j0c(
     // SAFETY: single-threaded, and no other borrow of the lease is live.
     let lease = unsafe { &mut *LEASE.0.get() }.get_or_insert_with(Default::default);
     if !lease.begin(image, koid) {
-        log(b"GL4 J0c: the lease refused the image\n");
+        log_parts(&[churn_name(), b" J0c: the lease refused the image\n"]);
         return 5;
     }
     let rights = (kumo_abi::Rights::READ | kumo_abi::Rights::TRANSFER).0 as u64;
@@ -835,8 +884,11 @@ pub extern "C" fn kumo_metal_j0c(
         return 7;
     }
     log(format!(
-        "GL4 J0c sequence{}: GL frame leased READ-only on the native lane, checksum 0x{:08x}\n",
-        sequence, image.checksum
+        "{} J0c sequence{}: {} frame leased READ-only on the native lane, checksum 0x{:08x}\n",
+        churn_str(),
+        sequence,
+        churn_api(),
+        image.checksum
     )
     .as_bytes());
     let Some(port) = valid(native::call(Syscall::PortCreate, [0; 6]).0) else {
@@ -919,7 +971,7 @@ pub extern "C" fn kumo_metal_j0c(
             lane::NativeEvent::WakeByte(if n == 1 { byte[0] } else { 0 })
         } else {
             if source == timer_koid {
-                log(b"GL4 J0c: no retirement within the bound\n");
+                log_parts(&[churn_name(), b" J0c: no retirement within the bound\n"]);
             }
             lane::NativeEvent::Unexpected
         };
@@ -940,18 +992,27 @@ pub extern "C" fn kumo_metal_j0c(
         Ok(reply) if lease.retire(reply) => {}
         Ok(_) => return 10,
         Err(true) => {
-            log(b"GL4 J0c: drv-fb cancelled the diagnostic; no reuse, no fabricated completion\n");
+            log_parts(&[
+                churn_name(),
+                b" J0c: drv-fb cancelled the diagnostic; no reuse, no fabricated completion\n",
+            ]);
             return 11;
         }
         Err(false) => return 12,
     }
     log(format!(
-        "GL4 J0c sequence{} retired after drv-fb's consumed load; the VMO may be rewritten\n",
+        "{} J0c sequence{} retired after drv-fb's consumed load; the VMO may be rewritten\n",
+        churn_str(),
         sequence
     )
     .as_bytes());
     if lease.complete() {
-        log(b"GL4 J0c complete: 3 GL-rendered frames through one VMO, each rewritten only after its retirement\n");
+        log(format!(
+            "{} J0c complete: 3 {}-rendered frames through one VMO, each rewritten only after its retirement\n",
+            churn_str(),
+            churn_api()
+        )
+        .as_bytes());
     }
     0
 }
@@ -976,11 +1037,16 @@ pub extern "C" fn kumo_metal_churn_ready() -> u32 {
     VIEW_SEQUENCE.store(sequence, Ordering::Relaxed);
     match result {
         Ok(probes) => {
-            log(format!("GL4 readiness: the first Retired after {} probes\n", probes).as_bytes());
+            log(format!(
+                "{} readiness: the first Retired after {} probes\n",
+                churn_str(),
+                probes
+            )
+            .as_bytes());
             0
         }
         Err(error) => {
-            log(format!("GL4 readiness failed: {:?}\n", error).as_bytes());
+            log(format!("{} readiness failed: {:?}\n", churn_str(), error).as_bytes());
             2
         }
     }
@@ -1006,7 +1072,7 @@ pub extern "C" fn kumo_metal_churn_frame(pixels: *const u32, width: u32, height:
     }
     // SAFETY: as in kumo_metal_j0c.
     let rows = unsafe { core::slice::from_raw_parts(pixels, (view.width * view.height) as usize) };
-    let copied = lane::copy_readback(rows, view, |offset, bytes| {
+    let copied = lane::copy_rows(rows, view, client_rows(), |offset, bytes| {
         native::call(
             Syscall::VmoWrite,
             [
@@ -1036,7 +1102,7 @@ pub extern "C" fn kumo_metal_churn_frame(pixels: *const u32, width: u32, height:
             0
         }
         Err(error) => {
-            log(format!("GL4 frame present failed: {:?}\n", error).as_bytes());
+            log(format!("{} frame present failed: {:?}\n", churn_str(), error).as_bytes());
             3
         }
     }
@@ -1047,7 +1113,8 @@ pub extern "C" fn kumo_metal_churn_frame(pixels: *const u32, width: u32, height:
 pub extern "C" fn kumo_metal_churn_summary(frames: u32) {
     use alloc::format;
     log(format!(
-        "GL4 presents: {} frames on view 1, retired={} copied={}\n",
+        "{} presents: {} frames on view 1, retired={} copied={}\n",
+        churn_str(),
         frames,
         RETIRED.load(Ordering::Relaxed),
         COPIED.load(Ordering::Relaxed)

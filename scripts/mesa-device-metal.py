@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j780
 #j782
 #j784
 #j785
 #j787
+#j788
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -149,6 +149,40 @@ PROOFS = {
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK5-b (PLAN/015 §8.46, D2a/D3a): G8's bar through panvk, on GL4's churn lane. Session 1
+    # (the boot session, with drv-fb's native producer) runs the Vulkan-fed J0c that arms the
+    # present gate; Sora's RestartBudget(3) regrants the later sessions. J0c's frames spend
+    # panvk's first-use resource requests in session 1, so its churn frame 1 may split
+    # differently; `each` requires only the session-independent parts. check_sessions owns
+    # this proof's acceptance. — TIMBERDOODLE
+    "vk5-b": dict(
+        cases="vk-churn", runtime="device-metal", defines=["-DKUMO_VK_CHURN_PRESENT_MAIN=1"],
+        out="vk5-b-metal", vk=True, marker=b"churn\n", sessions=True, begin="VK5 metal churn begin",
+        autoexec=b"dmesg -n debug\n",
+        boot=["sora: gpu-lane marker selects the churn lane"],
+        first=["VK5 lane: view 1 over V, S, N with the boot session's native producer",
+               "VK5 J0c sequence1 retired after drv-fb's consumed load",
+               "VK5 J0c sequence2 retired after drv-fb's consumed load",
+               "VK5 J0c sequence3 retired after drv-fb's consumed load",
+               "VK5 J0c complete: 3 Vulkan-rendered frames through one VMO, each rewritten only after its retirement",
+               "VK5 J0c: three exact Vulkan frames presented through the native lease, each retired before the next"],
+        later=["VK5 lane: view 1 over V, S, N; a regranted session with no native producer"],
+        each=["VK5-a device: Mali-G610",
+              "VK5 readiness: the first Retired after ",
+              "VK5-a texture: each frame's 256x160 optimal R8G8B8A8 image took 266240 bytes of its own memory; "
+              "panvk's AFBC predicate says yes, so the copy ran vk_meta's graphics path",
+              "; frames 2-100 each as 1 ([0, 1 and 2]); ",
+              "; frames 2-100 each created 1 and freed 1; ",
+              "VK5-a frames: 100 frames each created, uploaded, drew with and destroyed one 160 KiB texture "
+              "(16000 KiB in all); 0 of 4096000 pixels differ; 0 guard words changed (Mali: every texel copied "
+              "exactly)",
+              "VK5-a teardown: every object, the device and the instance destroyed; ",
+              "VK5 presents: 100 frames on view 1, retired=100 copied=0"],
+        display=["display: J0c complete: 3 original-VMO presentations retired",
+                 "display: present gate armed, answering Retired on frame starts"],
+        green=("VK5 metal churn green: 100 exact Vulkan frames of texture churn presented on view 1 and clean "
+               "teardown; the presents line carries the Retired/Copied record"),
+        driver=[], absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
     # VK5-a (PLAN/015 §8.46, D1a): 100 frames of Vulkan texture churn, offscreen; the texture,
     # submits and storage lines pin what metal measured. — TIMBERDOODLE
     "vk5-a": dict(
@@ -578,7 +612,7 @@ def check(log, proof):
 
 
 def check_sessions(log, proof):
-    """GL4: every session of one boot, in order. Session 1 runs J0c; later ones are regrants.
+    """GL4 or VK5: every session of one boot, in order. Session 1 runs J0c; later ones are regrants.
     Each needs readiness, 100 exact frames and 100 Retired / 0 Copied. drv-fb must have
     completed J0c and armed its gate. The census (kernel `census:` lines, enabled by the
     stage's autoexec `dmesg -n debug`, RE4) must hold DMA VMOs flat across sessions."""
@@ -586,8 +620,9 @@ def check_sessions(log, proof):
     live = [line for line in text.splitlines() if not re.match(r"^\[[0-9:.]+\] \[ *[0-9]+\.[0-9]+\]", line)]
     boot = max((i for i, line in enumerate(live) if "Station IP address" in line), default=0)
     live = live[boot:]
+    name = proof["begin"].split(" metal")[0]
     begins = [i for i, line in enumerate(live) if proof["begin"] in line]
-    assert len(begins) >= 2, f"{len(begins)} GL4 sessions; G8's bar needs at least two in one boot"
+    assert len(begins) >= 2, f"{len(begins)} {name} sessions; G8's bar needs at least two in one boot"
     for expected in proof["boot"]:
         assert sum(expected in line for line in live[:begins[0]]) == 1, f"{expected!r} not once before session 1"
     for expected in proof["display"]:
@@ -603,7 +638,7 @@ def check_sessions(log, proof):
             hits = sum(expected in line for line in window)
             assert hits == 1, f"session {number}: {expected!r} appears {hits} times"
         if number > 1:
-            assert not any("GL4 J0c" in line for line in window), f"session {number} ran J0c"
+            assert not any(f"{name} J0c" in line for line in window), f"session {number} ran J0c"
         # The census needs `dmesg -n debug`, which also shows drv-gpu's per-point success line
         # (`client point N complete on JOB ... status=0x0`); only its failure form may match the
         # `absent` prefix (RE4: K2's checker refused a green session 4 on that). — TIMBERDOODLE
@@ -621,7 +656,7 @@ def check_sessions(log, proof):
         during = [count for i, count in census if i < green]
         if after:
             dma[number] = after[-1]
-        print(f"GL4 session {number}: 100/0 Retired/Copied, census DMA VMOs after teardown "
+        print(f"{name} session {number}: 100/0 Retired/Copied, census DMA VMOs after teardown "
               f"{dma.get(number, 'not sampled')}, during {during or 'not sampled'}")
     for line in live:
         if "display: present gate" in line or "sora: gpu-lane" in line or "restart budget" in line:
@@ -633,8 +668,9 @@ def check_sessions(log, proof):
     first = dma[min(dma)]
     spread = max(dma.values()) - first
     assert spread <= 4, f"census DMA VMOs grew across sessions: {dma}"
-    print(f"GL4 metal check green ({proof['out']}): {len(begins)} sessions of 100 Retired / 0 Copied, "
-          f"J0c GL-fed in session 1, post-teardown census DMA VMOs never grew over sessions {sorted(dma)} "
+    api = "Vulkan" if name.startswith("VK") else "GL"
+    print(f"{name} metal check green ({proof['out']}): {len(begins)} sessions of 100 Retired / 0 Copied, "
+          f"J0c {api}-fed in session 1, post-teardown census DMA VMOs never grew over sessions {sorted(dma)} "
           f"({dma}, growth {spread}); "
           f"no TOWER, FAILED or ABEND")
 

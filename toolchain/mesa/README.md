@@ -1,9 +1,53 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j782 -->
 <!-- j784 -->
 <!-- j785 -->
 <!-- j786 -->
 <!-- j787 -->
+<!-- j788 -->
+
+## VK5-b: G8's bar through panvk; VK5 closed (J788, metal-proven)
+
+PLAN/015 §8.46 (D2a, D3a). `--proof vk5-b` builds [vk-churn.c](vk-churn.c) with
+`KUMO_VK_CHURN_PRESENT_MAIN` and runs it on GL4's churn lane. The stage adds the `churn`
+marker and autoexec `dmesg -n debug`, and Sora's `RestartBudget(3)` regrants it, so one boot
+holds four sessions.
+
+- The client takes GL4's presenter interface. On the boot session, which holds drv-fb's native
+  producer, three J0c frames (tags 0xe1-0xe3) go through drv-fb's unchanged native lease
+  first: a Vulkan-fed J0c that arms the present gate. Every session then waits for readiness
+  and presents each verified frame's top 256x128 on view 1, rows top-down. VK5-a passes no
+  presenter and is unchanged.
+- [device-metal.rs](device-metal.rs): the churn helpers follow `kumo_metal_view_proof(1)`.
+  Their lines say VK5 and "Vulkan-rendered", and the J0c and frame copies use
+  `lane::copy_rows(TopDown)`. GL4's lines and flip are unchanged.
+- `check_sessions` takes the proof's name from its begin line. Its verdicts on all six of
+  J777's GL4 logs are the same as the previous checker's.
+
+**Metal (J788, 2026-11-04).** Attempt 1 stopped in J0c: drv-fb's own D1b frame-start check
+measured `delivery 49.623 Hz (interval … max 77323 us)` and disarmed, so its diagnostic
+ended "no image reachable". VK5's J0c refused to fabricate a completion (case 211). This is
+pre-existing: drv-fb skipped the present gate on 2 of J777's 6 GL4 boots the same way.
+Attempt 2 was green:
+
+```text
+VK5 J0c complete: 3 Vulkan-rendered frames through one VMO, each rewritten only after its retirement
+display: present gate armed, answering Retired on frame starts
+VK5 presents: 100 frames on view 1, retired=100 copied=0      (sessions 1, 2, 3 and 4)
+VK5 metal check green (vk5-b-metal): 4 sessions of 100 Retired / 0 Copied, J0c Vulkan-fed in session 1, post-teardown census DMA VMOs never grew over sessions [1, 2, 3, 4] ({1: 29, 2: 12, 3: 12, 4: 12}, growth 0); no TOWER, FAILED or ABEND
+```
+
+Every session was exact: 0 of 4,096,000 pixels differ. Session 1's J0c frames used panvk's
+first-use resource requests, so its churn frame 1 was a single submission; sessions 2-4
+matched VK5-a's split exactly. Regression boots on the same code were green: VK5-a (every
+pinned line unchanged) and GL4 (4 x 100/0, census 29/29/29/29). Evidence:
+`build/proofs/vk5-b-metal/metal-boot.log`, `build/verification/j788/`. **VK5 is closed: panvk
+meets G8's bar.** VK6 (recovery: `VK_ERROR_DEVICE_LOST`, then a new VkDevice on a regranted
+session) is next. — TIMBERDOODLE 2026-11-04
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk5-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk5-b --check <tio-log>
+```
 
 ## VK5-a: Vulkan texture churn, offscreen (J787, metal-proven)
 
@@ -41,8 +85,8 @@ buffer. The AFBC allocation is 266,240 bytes (160 KiB of texels, plus headers an
 alignment), so about 26 MB of memory churned behind the 16,000 KiB of texel data GL4's bar
 counts; panvk has no BO cache. Frame 1's four other buffers are allocated lazily on first use
 and live until teardown. The checker pins the texture, submit and storage lines. Evidence:
-`build/proofs/vk5-a-metal/metal-boot.log`. VK5-b (the churn lane, Vulkan-fed J0c, Retired,
-sessions and census) is next. — TIMBERDOODLE 2026-11-04
+`build/proofs/vk5-a-metal/metal-boot.log`. VK5-b (above) presents it on the churn lane.
+— TIMBERDOODLE 2026-11-04
 
 ```sh
 python3 scripts/mesa-device-metal.py --proof vk5-a --stage <new-directory>

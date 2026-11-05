@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*j787*/
+/*j788*/
 /* VK5-a (PLAN/015 §8.46): Vulkan texture churn, offscreen, one session. The static-ICD client
  * of VK2-e brings up panvk on the session's kmod device, then runs GL4's frame through Vulkan
  * 100 times (D1a, ratified 2026-11-04):
@@ -14,6 +15,10 @@
  *   destroys the image, its view and its memory: 16,000 KiB churned in all;
  * - every native submission and buffer is counted per frame, so the first frame's split and
  *   the steady one are measured, and every buffer created is freed by teardown.
+ * VK5-b (§8.46 D2a/D3a) passes a presenter: on the boot session (which holds drv-fb's native
+ * producer) three J0c frames tagged 0xe1..0xe3 go through the native lease first, then every
+ * session waits for readiness and presents each verified frame's top 256x128 on view 1. VK5-a
+ * passes none and is unchanged.
  * The native API is observed in place, and three libdrm entries are wrapped at link time, so
  * any Panthor ioctl, DRM device listing or syncobj creation fails the proof. */
 #include "kumo_kmod.h"
@@ -32,7 +37,15 @@ bool panvk_kumo_offer_device(struct pan_kmod_dev *kmod);
 struct panvk_physical_device;
 bool panvk_image_can_use_afbc(struct panvk_physical_device *phys_dev, VkFormat fmt, VkImageUsageFlags usage,
                               VkImageType type, VkImageTiling tiling, VkImageCreateFlags flags);
-unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const char *));
+/* Callbacks into the metal runtime's churn lane, as GL4's (gl-churn.c); NULL for VK5-a. */
+struct kumo_vk_churn_presenter {
+    bool native;
+    unsigned (*j0c)(const uint32_t *pixels, uint32_t width, uint32_t height, uint32_t sequence);
+    unsigned (*ready)(void);
+    unsigned (*frame)(const uint32_t *pixels, uint32_t width, uint32_t height);
+};
+unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const char *),
+                             const struct kumo_vk_churn_presenter *presenter);
 
 #define CHECK(test, code) do { if (!(test)) { failed = (code); goto done; } } while (0)
 
@@ -40,6 +53,9 @@ unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const c
 #define HEIGHT 160u
 #define PIXELS (WIDTH * HEIGHT)
 #define FRAMES 100u
+#define J0C_FRAMES 3u
+/* J0c's patterns are tagged 0xe1..0xe3, apart from the churn frames' 1..100 (GL4's). */
+#define J0C_TAG 0xe0u
 #define POISON UINT32_C(0xdeadbeef)
 #define GUARD UINT32_C(0xa5a5a5a5)
 #define GUARD_BYTES 4096u
@@ -238,7 +254,11 @@ static void describe_split(char *out, size_t bytes)
     }
 }
 
-unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const char *))
+/* A verified frame, packed top-down for the presenter. */
+static uint32_t packed[PIXELS];
+
+unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const char *),
+                             const struct kumo_vk_churn_presenter *presenter)
 {
     unsigned failed = 0;
     VkInstance instance = VK_NULL_HANDLE;
@@ -681,13 +701,25 @@ unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const c
     unsigned first_created = 0, first_freed = 0, steady_created = 0, steady_freed = 0;
     unsigned uneven = 0, wrong = 0, guards = 0;
     VkDeviceSize texture_bytes = 0;
-    const unsigned churn_prepares = seen.prepares, churn_buffers = seen.buffers;
-    for (unsigned f = 1; f <= FRAMES; ++f) {
+    const unsigned j0c = presenter && presenter->native ? J0C_FRAMES : 0;
+    unsigned churn_prepares = seen.prepares, churn_buffers = seen.buffers, code = 0;
+    for (unsigned step = 0; step < j0c + FRAMES; ++step) {
+        /* J0c's frames come first; the churn's statistics count its 100 frames only. */
+        const bool churn = step >= j0c;
+        const unsigned f = churn ? step - j0c + 1 : 0, tag = churn ? f : J0C_TAG + step + 1;
+        if (churn && step == j0c) {
+            if (presenter) {
+                code = presenter->ready();
+                CHECK(!code, 300 + code);
+            }
+            churn_prepares = seen.prepares;
+            churn_buffers = seen.buffers;
+        }
         const unsigned created = seen.buffers, freed = seen.buffers_released;
         seen.frame_prepares = 0;
         for (unsigned y = 0; y < HEIGHT; ++y)
             for (unsigned x = 0; x < WIDTH; ++x)
-                texels[y * WIDTH + x] = pattern(f, x, y);
+                texels[y * WIDTH + x] = pattern(tag, x, y);
         CHECK(vkCreateImage(device, &texture_info, NULL, &texture) == VK_SUCCESS, 36);
         VkMemoryRequirements texture_needs;
         vkGetImageMemoryRequirements(device, texture, &texture_needs);
@@ -771,13 +803,17 @@ unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const c
         unsigned frame_wrong = 0, frame_guards = 0;
         const volatile uint8_t *const bytes = target_map;
         for (uint32_t y = 0; y < HEIGHT; ++y)
-            for (uint32_t x = 0; x < WIDTH; ++x)
-                frame_wrong += *(const volatile uint32_t *)(bytes + rows.offset + y * rows.rowPitch + 4u * x) !=
-                               pattern(f, x, y);
+            for (uint32_t x = 0; x < WIDTH; ++x) {
+                const uint32_t pixel = *(const volatile uint32_t *)(bytes + rows.offset + y * rows.rowPitch + 4u * x);
+                frame_wrong += pixel != pattern(tag, x, y);
+                packed[y * WIDTH + x] = pixel;
+            }
         for (VkDeviceSize i = target_needs.size / 4; i < target_bytes / 4; ++i)
             frame_guards += target_words[i] != GUARD;
-        wrong += frame_wrong;
-        guards += frame_guards;
+        if (churn) {
+            wrong += frame_wrong;
+            guards += frame_guards;
+        }
 
         vkDestroyImageView(device, texture_view, NULL);
         texture_view = VK_NULL_HANDLE;
@@ -786,6 +822,25 @@ unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const c
         vkFreeMemory(device, texture_memory, NULL);
         texture_memory = VK_NULL_HANDLE;
 
+        if (frame_wrong || frame_guards) {
+            report(say, "VK5-a frame %u (tag 0x%02x) failed: %u of %u pixels differ, %u guard words changed "
+                   "(first 0x%08x)", f, tag, frame_wrong, PIXELS, frame_guards,
+                   *(const volatile uint32_t *)(bytes + rows.offset));
+            CHECK(false, 45);
+        }
+        if (!churn) {
+            /* An exact J0c frame through drv-fb's native lease, retired before the next. */
+            code = presenter->j0c(packed, WIDTH, HEIGHT, step + 1);
+            CHECK(!code, 200 + code);
+            if (step + 1 == j0c)
+                say("VK5 J0c: three exact Vulkan frames presented through the native lease, each retired before "
+                    "the next");
+            continue;
+        }
+        if (presenter) {
+            code = presenter->frame(packed, WIDTH, HEIGHT);
+            CHECK(!code, 500 + code);
+        }
         char split[96];
         describe_split(split, sizeof split);
         const unsigned frame_created = seen.buffers - created, frame_freed = seen.buffers_released - freed;
@@ -808,12 +863,6 @@ unsigned kumo_vk_churn_cases(const struct kumo_gpu_api *api, void (*say)(const c
             ++uneven;
         } else {
             ++steady_frames;
-        }
-        if (frame_wrong || frame_guards) {
-            report(say, "VK5-a frame %u failed: %u of %u pixels differ, %u guard words changed (first 0x%08x)", f,
-                   frame_wrong, PIXELS, frame_guards,
-                   *(const volatile uint32_t *)(bytes + rows.offset));
-            CHECK(false, 45);
         }
     }
     CHECK(seen.submitted == seen.prepares && seen.blocked == 0, 46);
@@ -891,7 +940,7 @@ extern unsigned kumo_metal_proof(void);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
 unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
 {
-    return kumo_vk_churn_cases(api, kumo_metal_log);
+    return kumo_vk_churn_cases(api, kumo_metal_log, NULL);
 }
 
 int main(void)
@@ -904,6 +953,54 @@ int main(void)
     }
     kumo_metal_log("VK5-a metal churn green: 100 exact Vulkan frames, each creating, uploading, drawing with and "
                    "destroying a 160 KiB texture, and clean teardown");
+    return 0;
+}
+#endif
+
+#ifdef KUMO_VK_CHURN_PRESENT_MAIN
+/* VK5-b (PLAN/015 §8.46): G8's bar through panvk on the churn lane. The stage adds the `churn`
+ * marker and autoexec `dmesg -n debug`; Sora regrants the client under its restart budget, so
+ * one boot holds several sessions. Only the boot session carries drv-fb's native producer
+ * and runs the Vulkan-fed J0c (D2a) that arms drv-fb's present gate. — TIMBERDOODLE */
+extern void kumo_metal_log(const char *line);
+extern unsigned kumo_metal_proof(void);
+extern unsigned kumo_metal_view_proof(uint32_t proof);
+extern unsigned kumo_metal_churn_take(void);
+extern unsigned kumo_metal_churn_native(void);
+extern unsigned kumo_metal_j0c(const uint32_t *pixels, uint32_t width, uint32_t height, uint32_t sequence);
+extern unsigned kumo_metal_churn_ready(void);
+extern unsigned kumo_metal_churn_frame(const uint32_t *pixels, uint32_t width, uint32_t height);
+extern void kumo_metal_churn_summary(uint32_t frames);
+static struct kumo_vk_churn_presenter presenter = {
+    .j0c = kumo_metal_j0c,
+    .ready = kumo_metal_churn_ready,
+    .frame = kumo_metal_churn_frame,
+};
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api);
+unsigned kumo_metal_cases(const struct kumo_gpu_api *api)
+{
+    return kumo_vk_churn_cases(api, kumo_metal_log, &presenter);
+}
+
+int main(void)
+{
+    kumo_metal_log("VK5 metal churn begin: 100 Vulkan frames of 160 KiB texture churn on view 1");
+    unsigned failed = kumo_metal_view_proof(1);
+    if (!failed)
+        failed = kumo_metal_churn_take();
+    if (failed) {
+        report(kumo_metal_log, "VK5 metal churn FAILED at lane step %u", failed);
+        return 1;
+    }
+    presenter.native = kumo_metal_churn_native() != 0;
+    failed = kumo_metal_proof();
+    kumo_metal_churn_summary(FRAMES);
+    if (failed) {
+        report(kumo_metal_log, "VK5 metal churn FAILED at case %u", failed);
+        return 1;
+    }
+    kumo_metal_log("VK5 metal churn green: 100 exact Vulkan frames of texture churn presented on view 1 and clean "
+                   "teardown; the presents line carries the Retired/Copied record");
     return 0;
 }
 #endif
