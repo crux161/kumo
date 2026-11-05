@@ -1,4 +1,5 @@
 //j793
+//j794
 //! NV1a: read one firmware-enumerated NVMe function. No config-space writes or BAR sizing.
 //! Layouts are cross-checked against the local PCIe TRM and Linux's pci_regs.h; no Linux code
 //! is copied. Unknown routing, unsafe error response and malformed capabilities stay inert.
@@ -72,7 +73,7 @@ fn contains(base: u64, bytes: u64, page: u64) -> bool {
             .is_some_and(|(end, limit)| end <= limit)
 }
 
-fn permitted_page(t: &Topology, page: u64) -> bool {
+pub(super) fn permitted_page(t: &Topology, page: u64) -> bool {
     // Both SoC routing and DTB ownership must agree. Never turn firmware's iATU data into
     // a Device alias of RAM or of some other SoC block. — TIMBERDOODLE
     let soc = contains(0xf000_0000, 0x100_0000, page) || contains(0x9_0000_0000, 0x4000_0000, page);

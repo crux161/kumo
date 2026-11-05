@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 //j792
 //j793
+//j794
 
 //! RK3588 DesignWare PCIe: board discovery and the read-only firmware-state probe (PLAN/019 NV0).
 //!
@@ -22,6 +23,7 @@ use core::fmt;
 use kumo_fdt::{be32, status_enabled, string_list_contains, string_value, Fdt, Node};
 
 pub mod endpoint;
+pub mod nvme;
 
 /// APB client window of PCIe3_4L (TRM Table 11-1), which selects the M.2 controller.
 pub const PCIE30X4_APB: u64 = 0xfe15_0000;
@@ -91,6 +93,8 @@ const CLIENT_INTR_MASK_LEGACY: u64 = 0x01c;
 const CLIENT_INTR_MASK_MISC: u64 = 0x024;
 const CLIENT_POWER_CON: u64 = 0x02c;
 const CLIENT_HOT_RESET_CTRL: u64 = 0x180;
+const CLIENT_AXI_SLV_ATU_BYPASS: u64 = 0x204;
+const CLIENT_AXI_SLV_MISC_INFO: u64 = 0x218;
 const CLIENT_LTSSM_STATUS: u64 = 0x300;
 const CLIENT_VER: u64 = 0x800;
 
@@ -545,6 +549,8 @@ pub struct Client {
     pub intr_mask_misc: u32,
     pub power_con: u32,
     pub hot_reset_ctrl: u32,
+    pub axi_slv_atu_bypass: u32,
+    pub axi_slv_misc_info: u32,
     pub ltssm_status: u32,
     pub version: u32,
 }
@@ -912,6 +918,8 @@ fn ladder<I: RegisterRead>(report: &mut Report, io: &mut I) -> Result<(), Stop> 
         intr_mask_misc: io.read32(apb + CLIENT_INTR_MASK_MISC),
         power_con: io.read32(apb + CLIENT_POWER_CON),
         hot_reset_ctrl: io.read32(apb + CLIENT_HOT_RESET_CTRL),
+        axi_slv_atu_bypass: io.read32(apb + CLIENT_AXI_SLV_ATU_BYPASS),
+        axi_slv_misc_info: io.read32(apb + CLIENT_AXI_SLV_MISC_INFO),
         ltssm_status: io.read32(apb + CLIENT_LTSSM_STATUS),
         version: io.read32(apb + CLIENT_VER),
     });
@@ -1141,6 +1149,10 @@ impl fmt::Display for Report {
                 client.hot_reset_ctrl,
             )?,
             None => writeln!(f, "PCIE30X4 CLIENT   Check     not read   --")?,
+        }
+        if let Some(client) = self.client {
+            writeln!(f, "PCIE30X4 AXI      Check     atu-bypass={:#x} read-misc-info={:#x}; observed only   OK",
+                client.axi_slv_atu_bypass, client.axi_slv_misc_info)?;
         }
 
         match self.dbi {

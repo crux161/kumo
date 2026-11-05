@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j640
 //j660
 //j688
 //j792
 //j793
+//j794
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -3573,6 +3573,81 @@ pub unsafe fn pcie30x4_endpoint_status(
     _alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<kumo_pcie::endpoint::Endpoint, kumo_pcie::endpoint::Error> {
     Err(kumo_pcie::endpoint::Error::Mapping)
+}
+
+/// NV2: snapshot the fixed NVMe register prefix through a temporary RO/NX Device page.
+/// No register writes; the alias is removed on every normal success/refusal return.
+///
+/// # Safety
+/// Same early-boot/allocator contract as `pcie30x4_endpoint_status`. `endpoint` must
+/// be its successful result from the same fresh report, with no intervening device writes.
+#[cfg(target_os = "none")]
+pub unsafe fn pcie30x4_nvme_status(
+    report: &kumo_pcie::Report,
+    endpoint: &kumo_pcie::endpoint::Endpoint,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<kumo_pcie::nvme::Snapshot, kumo_pcie::nvme::Error> {
+    let physical = kumo_pcie::nvme::select_register_page(report, endpoint)?;
+    unsafe {
+        mmu::with_readonly_probe_page(physical, alloc, |va| {
+            kumo_pcie::nvme::probe(report, endpoint, &mut |offset| {
+                mmio_read32(va + u64::from(offset))
+            })
+        })
+    }
+    .map_err(|_| kumo_pcie::nvme::Error::Mapping)?
+}
+
+/// Host stub; never allocates or reads.
+///
+/// # Safety
+/// Same requirements as the target implementation.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn pcie30x4_nvme_status(
+    _report: &kumo_pcie::Report,
+    _endpoint: &kumo_pcie::endpoint::Endpoint,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<kumo_pcie::nvme::Snapshot, kumo_pcie::nvme::Error> {
+    Err(kumo_pcie::nvme::Error::Mapping)
+}
+
+/// NV2: fresh MMU integration observations, then a temporary RO/NX Device alias
+/// for IDR0/CR0/CR0ACK/GBPA only. This is not a DMA test or a DeviceCtx.
+///
+/// # Safety
+/// Same early-boot/allocator contract as `pcie30x4_endpoint_status`; `report` must
+/// be fresh and from this DTB, with no intervening power/clock/reset writes.
+#[cfg(target_os = "none")]
+pub unsafe fn pcie30x4_mmu_status(
+    dtb: u64,
+    report: &kumo_pcie::Report,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<smmuv3::Mmu600PcieSnapshot, smmuv3::Mmu600SnapshotError> {
+    let status = mmu600_pcie_status_from_dtb(dtb).ok_or(smmuv3::Mmu600SnapshotError::Guard)?;
+    if !smmuv3::mmu600_pcie_snapshot_ready(&status, report) {
+        return Err(smmuv3::Mmu600SnapshotError::Guard);
+    }
+    unsafe {
+        mmu::with_readonly_probe_page(status.topology.base, alloc, |va| {
+            smmuv3::mmu600_pcie_snapshot(&status, report, &mut |offset| {
+                mmio_read32(va + u64::from(offset))
+            })
+        })
+    }
+    .map_err(|_| smmuv3::Mmu600SnapshotError::Mapping)?
+}
+
+/// Host stub; never allocates or reads.
+///
+/// # Safety
+/// Same requirements as the target implementation.
+#[cfg(not(target_os = "none"))]
+pub unsafe fn pcie30x4_mmu_status(
+    _dtb: u64,
+    _report: &kumo_pcie::Report,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Result<smmuv3::Mmu600PcieSnapshot, smmuv3::Mmu600SnapshotError> {
+    Err(smmuv3::Mmu600SnapshotError::Mapping)
 }
 
 /// Physical reads for `kumo-pcie`'s probe, through the kernel physmap.

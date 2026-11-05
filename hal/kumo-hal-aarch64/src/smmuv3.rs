@@ -1,13 +1,14 @@
 //j482
 //j483
 //j619
+//j794
 
 //! ARM SMMUv3 scaffolding and RK3588 MMU600 integration-status discovery.
 //!
 //! RK3588 integration facts come from the vendored RK3588 TRM Part 1, chapters 1, 2, 7, and 8.
-//! This slice reads only documented PMU status and CRU clock-gate/software-reset controls. It does
-//! not dereference either MMU600 aperture, enable an SMMU, configure queues, bind streams, or imply
-//! that a `DeviceCtx` exists.
+//! The integration report reads only PMU/CRU. NV2 additionally observes the enabled PCIe
+//! aperture behind explicit power/clock/reset/Q-channel guards. Neither observer writes,
+//! configures queues, binds streams, or implies that a `DeviceCtx` exists.
 
 use core::fmt;
 
@@ -216,6 +217,110 @@ impl fmt::Display for Mmu600PcieStatusReport {
 /// USB3OTG_0 controller probed by j481.
 pub fn discover_rk3588_mmu600_pcie(dtb: &[u8]) -> Option<Mmu600PcieTopology> {
     discover_rk3588_smmuv3(dtb, RK3588_MMU600_PCIE_BASE, RK3588_MMU600_PCIE_LENGTH)
+}
+
+/// NV2 admission checks for the first PCIe SMMU APB page. These observations are
+/// documented controls/status, not proof of a physically toggling clock. The TCU
+/// must already be active; this observer never wakes a gated block. — TIMBERDOODLE
+pub fn mmu600_pcie_snapshot_ready(
+    status: &Mmu600PcieStatusReport,
+    pcie: &kumo_pcie::Report,
+) -> bool {
+    let c = status.control;
+    let p = status.power;
+    let clock = pcie.clock;
+    status.topology == (Mmu600PcieTopology {
+        base: RK3588_MMU600_PCIE_BASE, length: RK3588_MMU600_PCIE_LENGTH,
+    })
+        && pcie.stop.is_none()
+        && pcie.topology.apb == kumo_pcie::PCIE30X4_APB
+        && p.observed_power_up()
+        && pcie.power.php_up()
+        && !(pcie.power.biu_requested() || pcie.power.biu_acknowledged() || pcie.power.biu_idle())
+        && p.pcie_mmu_qchannel_request() == 0
+        && p.pcie_mmu_qchannel_accept() == 0
+        && p.pcie_mmu_qchannel_deny() == 0
+        && p.pcie_mmu_qchannel_active() & 2 != 0
+        && c.pcie_clock_gate_open() && c.biu_clock_gate_open()
+        && c.pcie_software_reset_clear() && c.biu_software_reset_clear()
+        // aclk_pcie_root -> aclk_pcie_bridge -> aclk_mmu_pcie; PHP BIU and
+        // its PCLK path must also be open/released (TRM Part 1 ch.2).
+        && clock.gate32 & ((1<<0) | (1<<5) | (1<<6) | (1<<8) | (1<<9)) == 0
+        && clock.softrst32 & ((1<<5) | (1<<8) | (1<<9)) == 0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mmu600SnapshotError {
+    Guard,
+    Mapping,
+    Identity,
+}
+
+impl fmt::Display for Mmu600SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Guard => "PCIe MMU topology/power/clock/reset/Q-channel precondition unmet",
+            Self::Mapping => "read-only PCIe MMU page mapping refused",
+            Self::Identity => "PCIe MMU IDR0 absent or not an AArch64 translation implementation",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mmu600PcieSnapshot {
+    pub idr0: u32,
+    pub cr0: u32,
+    pub cr0ack: u32,
+    pub gbpa: u32,
+}
+
+impl Mmu600PcieSnapshot {
+    pub fn mode(&self) -> &'static str {
+        if self.cr0 == u32::MAX
+            || self.cr0ack == u32::MAX
+            || self.gbpa == u32::MAX
+            || self.cr0 != self.cr0ack
+            || self.gbpa & (1 << 31) != 0
+        {
+            "transition/unknown"
+        } else if self.cr0 & 1 != 0 {
+            "enabled; stream policy uninspected"
+        } else if self.gbpa & (1 << 20) != 0 {
+            "disabled-abort"
+        } else {
+            "disabled-bypass (NS); DMA untested"
+        }
+    }
+}
+
+/// Observe only IDR0, CR0, CR0ACK and GBPA. No callback at all on a closed guard;
+/// invalid IDR0 stops before policy. No claim about secure-stream overrides or DMA.
+pub fn mmu600_pcie_snapshot(
+    status: &Mmu600PcieStatusReport,
+    pcie: &kumo_pcie::Report,
+    read: &mut impl FnMut(u16) -> u32,
+) -> Result<Mmu600PcieSnapshot, Mmu600SnapshotError> {
+    if !mmu600_pcie_snapshot_ready(status, pcie) {
+        return Err(Mmu600SnapshotError::Guard);
+    }
+    let idr0 = read(0);
+    if idr0 == u32::MAX || idr0 & 3 == 0 || (idr0 >> 2) & 3 < 2 {
+        return Err(Mmu600SnapshotError::Identity);
+    }
+    Ok(Mmu600PcieSnapshot {
+        idr0,
+        cr0: read(0x20),
+        cr0ack: read(0x24),
+        gbpa: read(0x44),
+    })
+}
+
+impl fmt::Display for Mmu600PcieSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "NV2 SMMU         Check     base={:#x} idr0={:#x} cr0={:#x} ack={:#x} gbpa={:#x} smmuen={} abort={} update={} {}; no writes/DeviceCtx   OK",
+            RK3588_MMU600_PCIE_BASE, self.idr0, self.cr0, self.cr0ack, self.gbpa,
+            self.cr0 & 1, (self.gbpa >> 20) & 1, self.gbpa >> 31, self.mode())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,6 +587,150 @@ mod tests {
     const IOMMU_KIND_VIRTIO: u32 = 1;
     const OPI5_DTB: &[u8] = include_bytes!("../../../rk3588-orangepi-5-plus.dtb");
     const X13S_DTB: &[u8] = include_bytes!("../../../sc8280xp-lenovo-thinkpad-x13s.dtb");
+
+    fn snapshot_inputs() -> (Mmu600PcieStatusReport, kumo_pcie::Report) {
+        (
+            Mmu600PcieStatusReport {
+                topology: discover_rk3588_mmu600_pcie(OPI5_DTB).unwrap(),
+                power: Mmu600PciePowerStatus {
+                    pwr_gate_sts0: 0xfff9,
+                    submem_pwr_gate_sts: 0x7f800,
+                    qchannel_pwr_sts: 0x28000,
+                },
+                control: Mmu600PcieControlStatus {
+                    gate_con34: 0,
+                    softrst_con34: 0,
+                },
+            },
+            kumo_pcie::Report {
+                topology: kumo_pcie::discover_rk3588_pcie30x4(OPI5_DTB).unwrap(),
+                power: kumo_pcie::Power::default(),
+                clock: kumo_pcie::Clock::default(),
+                phy: None,
+                client: None,
+                dbi: None,
+                stop: None,
+            },
+        )
+    }
+
+    #[test]
+    fn mmu_snapshot_closed_guards_make_no_aperture_reads() {
+        let (status, pcie) = snapshot_inputs();
+        let mut cases = std::vec::Vec::new();
+        let mut s = status;
+        s.topology.base = 0xfcb0_0000;
+        cases.push((s, pcie));
+        let mut s = status;
+        s.power.pwr_gate_sts0 |= 1 << 21;
+        cases.push((s, pcie));
+        let mut s = status;
+        s.power.submem_pwr_gate_sts |= 1 << 7;
+        cases.push((s, pcie));
+        for bit in [23, 24, 2, 3, 9, 10] {
+            let mut s = status;
+            s.power.qchannel_pwr_sts |= 1 << bit;
+            cases.push((s, pcie));
+        }
+        let mut s = status;
+        s.power.qchannel_pwr_sts &= !(2 << 16);
+        cases.push((s, pcie));
+        for bit in [7, 9] {
+            let mut s = status;
+            s.control.gate_con34 |= 1 << bit;
+            cases.push((s, pcie));
+            let mut s = status;
+            s.control.softrst_con34 |= 1 << bit;
+            cases.push((s, pcie));
+        }
+        for bit in [0, 5, 6, 8, 9] {
+            let mut p = pcie;
+            p.clock.gate32 |= 1 << bit;
+            cases.push((status, p));
+        }
+        for bit in [5, 8, 9] {
+            let mut p = pcie;
+            p.clock.softrst32 |= 1 << bit;
+            cases.push((status, p));
+        }
+        let mut p = pcie;
+        p.power.biu_idle_sftcon1 = 1 << 5;
+        cases.push((status, p));
+        let mut p = pcie;
+        p.power.biu_idle_ack_sts0 = 1 << 21;
+        cases.push((status, p));
+        let mut p = pcie;
+        p.power.biu_idle_sts0 = 1 << 21;
+        cases.push((status, p));
+        let mut p = pcie;
+        p.stop = Some(kumo_pcie::Stop::PhyNotRunning);
+        cases.push((status, p));
+        for (s, p) in cases {
+            assert_eq!(
+                mmu600_pcie_snapshot(&s, &p, &mut |_| panic!("closed guard read aperture")),
+                Err(Mmu600SnapshotError::Guard)
+            );
+        }
+    }
+
+    #[test]
+    fn mmu_snapshot_checks_identity_then_observes_policy_without_dma_claim() {
+        let (status, pcie) = snapshot_inputs();
+        for idr0 in [0, u32::MAX, 3, 4] {
+            let mut reads = std::vec::Vec::new();
+            assert_eq!(
+                mmu600_pcie_snapshot(&status, &pcie, &mut |offset| {
+                    reads.push(offset);
+                    idr0
+                }),
+                Err(Mmu600SnapshotError::Identity)
+            );
+            assert_eq!(reads, [0]);
+        }
+        let mut reads = std::vec::Vec::new();
+        let snapshot = mmu600_pcie_snapshot(&status, &pcie, &mut |offset| {
+            reads.push(offset);
+            if offset == 0 {
+                0xb
+            } else {
+                0
+            }
+        })
+        .unwrap();
+        assert_eq!(reads, [0, 0x20, 0x24, 0x44]);
+        assert_eq!(snapshot.mode(), "disabled-bypass (NS); DMA untested");
+        assert_eq!(
+            Mmu600PcieSnapshot {
+                gbpa: 1 << 20,
+                ..snapshot
+            }
+            .mode(),
+            "disabled-abort"
+        );
+        assert_eq!(
+            Mmu600PcieSnapshot {
+                cr0: 1,
+                cr0ack: 1,
+                ..snapshot
+            }
+            .mode(),
+            "enabled; stream policy uninspected"
+        );
+        for s in [
+            Mmu600PcieSnapshot { cr0: 1, ..snapshot },
+            Mmu600PcieSnapshot {
+                gbpa: 1 << 31,
+                ..snapshot
+            },
+            Mmu600PcieSnapshot {
+                cr0: u32::MAX,
+                cr0ack: u32::MAX,
+                ..snapshot
+            },
+        ] {
+            assert_eq!(s.mode(), "transition/unknown");
+        }
+    }
 
     #[test]
     fn discovers_only_the_enabled_rk3588_pcie_mmu600() {

@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j634
 //j635
 //j660
 //j792
 //j793
+//j794
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -47,17 +47,17 @@ pub mod active {
         iommu_map_device_page, iommu_unmap_device_range, irq_unmask, mali_g610_status_from_dtb,
         map_user_device_block, map_user_page, mask_spi_interrupt, mask_tlmm_gpio_interrupt,
         mmu600_pcie_status_from_dtb, monotonic_nanos, pcie30x4_endpoint_status,
-        pcie30x4_status_from_dtb, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
-        render_qr_diag, render_qr_diag_once, run_el0_image, run_el0_smoke, set_fault_hook,
-        set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
-        set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
-        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
-        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_spi_interrupt,
-        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
-        wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError, DevicePowerReadout,
-        DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep,
-        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
-        UserMapping, UserState, ARCH,
+        pcie30x4_mmu_status, pcie30x4_nvme_status, pcie30x4_status_from_dtb, read_phys,
+        read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once,
+        run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
+        set_preempt_hook, set_svc_hook, set_tower_context_hook, set_user_aspace_root,
+        set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once, switch_context,
+        sync_icache_to_pou, syscall_count, system_off, system_reset, timer_irq_count,
+        unmap_user_span, unmask_spi_interrupt, user_device_page_desc, user_entry_context,
+        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError,
+        DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report,
+        GicTimerGateReport, PowerStep, ThreadContext, TowerContext, TowerThreadRole, UserImage,
+        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
         display_controller_activate, display_controller_detach, display_controller_new,

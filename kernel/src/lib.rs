@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j559
 //j570
 //j616
 //j792
 //j793
+//j794
 
 extern crate alloc;
 
@@ -637,7 +637,8 @@ pub fn stage_a(boot: &BootInfo) -> ! {
     // PLAN/019 NV0: the M.2 controller (RK3588 PCIe3_4L) as firmware left it. The HAL reads the
     // PMU and CRU, then the PHY GRF, client and DBI only as each guard rung holds, and names the
     // first unmet one. NV1 then reads only the firmware-enumerated endpoint's config page;
-    // its temporary CPU alias is read-only and removed before return. NVMe stays NV2.
+    // NV2 then observes the controller prefix and PCIe MMU policy. Temporary aliases
+    // are EL1 read-only and removed before return; there are no device writes or DMA.
     // — TIMBERDOODLE
     #[cfg(feature = "arch_aarch64")]
     {
@@ -649,6 +650,34 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                     Ok(endpoint) => {
                         klog!("{}", endpoint);
                         klog!("NV1 CPU MAP      Check     one 4 KiB EL1-RO Device/NX alias removed; no userspace grant   OK\n");
+                        match unsafe {
+                            kumo_hal::active::pcie30x4_nvme_status(&report, &endpoint, &mut alloc)
+                        } {
+                            Ok(snapshot) => {
+                                klog!("{}", snapshot);
+                                klog!("NV2 CPU MAP      Check     BAR0 EL1-RO Device/NX alias removed; no queues/DMA   OK\n");
+                            }
+                            Err(error) => klog!(
+                                "NV2 CONTROLLER   Check     stopped: {}; no writes   --\n",
+                                error
+                            ),
+                        }
+                        match unsafe {
+                            kumo_hal::active::pcie30x4_mmu_status(
+                                boot.platform.dtb,
+                                &report,
+                                &mut alloc,
+                            )
+                        } {
+                            Ok(snapshot) => {
+                                klog!("{}", snapshot);
+                                klog!("NV2 CPU MAP      Check     MMU EL1-RO Device/NX alias removed; no userspace grant   OK\n");
+                            }
+                            Err(error) => klog!(
+                                "NV2 SMMU         Check     stopped: {}; no writes   --\n",
+                                error
+                            ),
+                        }
                     }
                     Err(error) => klog!(
                         "NV1 ENDPOINT     Check     stopped: {}; no writes   --\n",
