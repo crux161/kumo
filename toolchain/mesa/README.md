@@ -1,9 +1,53 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j781 -->
 <!-- j782 -->
 <!-- j784 -->
 <!-- j785 -->
 <!-- j786 -->
+<!-- j787 -->
+
+## VK5-a: Vulkan texture churn, offscreen (J787, metal-proven)
+
+PLAN/015 §8.46 (RATIFIED, D1a). [vk-churn.c](vk-churn.c) (`--proof vk5-a`) runs GL4's frame
+through panvk 100 times in one session:
+
+- **Shaders.** [vk-churn.vert](vk-churn.vert) draws a viewport-covering triangle from
+  `gl_VertexIndex`, and [vk-churn.frag](vk-churn.frag) copies texel (x, y) to pixel (x, y)
+  with `texelFetch`. Their SPIR-V (285 and 170 words) was built in the offline container like
+  VK4's and is pinned in `vk-spirv.py`'s table.
+- **Persistent objects.** A 256x160 linear render target (cleared to 0 each frame, 4 KiB
+  poisoned guard), a 160 KiB host-visible staging buffer, one combined image sampler, the
+  pipeline, a resettable command buffer and a fence.
+- **Each frame.** The CPU writes GL4's pattern (R = x, G = y, B = frame) into the staging
+  buffer. The frame creates a 256x160 optimal R8G8B8A8 SAMPLED|TRANSFER_DST image with its
+  own memory, then records the copy buffer → image with its layout transitions, the draw that
+  samples it and a color-to-host barrier. One fenced submit; then the CPU checks every pixel
+  and the guard, and destroys the image, its view and its memory.
+- panvk's own `panvk_image_can_use_afbc` names the texture's layout: AFBC. Writes to AFBC go
+  through vk_meta's **graphics** copy, whose pipelines panvk builds at runtime.
+
+**Metal (J787, 2026-11-04), first boot:**
+
+```text
+VK5-a texture: each frame's 256x160 optimal R8G8B8A8 image took 266240 bytes of its own memory; panvk's AFBC predicate says yes, so the copy ran vk_meta's graphics path
+VK5-a submits: frame 1 as 2 native submissions ([0 and 1] then [0, 1 and 2]); frames 2-100 each as 1 ([0, 1 and 2]); 101 in all
+VK5-a storage: frame 1 created 5 and freed 1 native buffers; frames 2-100 each created 1 and freed 1; 104 created during the churn
+VK5-a frames: 100 frames each created, uploaded, drew with and destroyed one 160 KiB texture (16000 KiB in all); 0 of 4096000 pixels differ; 0 guard words changed (Mali: every texel copied exactly)
+VK5-a teardown: every object, the device and the instance destroyed; 116 of 116 native buffers and the heap released, only the session's group left; no Panthor ioctl, DRM listing or syncobj
+drv-gpu: containment reset=ok buffers=0 bindings=0 waits=0 retained=no
+```
+
+The 100 frames took about 3 s. Each frame allocated and freed exactly its texture's native
+buffer. The AFBC allocation is 266,240 bytes (160 KiB of texels, plus headers and
+alignment), so about 26 MB of memory churned behind the 16,000 KiB of texel data GL4's bar
+counts; panvk has no BO cache. Frame 1's four other buffers are allocated lazily on first use
+and live until teardown. The checker pins the texture, submit and storage lines. Evidence:
+`build/proofs/vk5-a-metal/metal-boot.log`. VK5-b (the churn lane, Vulkan-fed J0c, Retired,
+sessions and census) is next. — TIMBERDOODLE 2026-11-04
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk5-a --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk5-a --check <tio-log>
+```
 
 ## VK4-b: the Vulkan triangle on HDMI (J785, metal-proven; VK4 closed J786)
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j778
 #j780
 #j782
 #j784
 #j785
+#j787
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -146,6 +146,33 @@ PROOFS = {
                "VK2-e second instance: no physical device; no Panthor ioctl, DRM device listing or syncobj at any point"],
         green=("VK2-e metal device green: one instance, the Mali-G610, a device on the three-queue group, "
                "an idle queue and clean teardown"),
+        driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
+                "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
+        absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK5-a (PLAN/015 §8.46, D1a): 100 frames of Vulkan texture churn, offscreen; the texture,
+    # submits and storage lines pin what metal measured. — TIMBERDOODLE
+    "vk5-a": dict(
+        cases="vk-churn", runtime="device-metal", defines=["-DKUMO_VK_CHURN_MAIN=1"],
+        out="vk5-a-metal", vk=True, begin="VK5-a metal churn begin",
+        lines=["VK5-a device: Mali-G610",
+               "through the static ICD, one three-queue native group and 3 init submissions",
+               "VK5-a setup: the pinned 285-word vertex and 170-word texelFetch fragment SPIR-V compiled by panvk "
+               "into a graphics pipeline; a 256x160 linear target (row pitch ",
+               # Measured on metal (J787): the AFBC image takes 266240 bytes (texels, headers, alignment),
+               # its copy runs vk_meta's graphics path, the first frame adds the subqueue 0/1 resource
+               # requests, and each later frame allocates and frees exactly its texture's memory.
+               "VK5-a texture: each frame's 256x160 optimal R8G8B8A8 image took 266240 bytes of its own memory; "
+               "panvk's AFBC predicate says yes, so the copy ran vk_meta's graphics path",
+               "VK5-a submits: frame 1 as 2 native submissions ([0 and 1] then [0, 1 and 2]); frames 2-100 each as 1 "
+               "([0, 1 and 2]); 101 in all",
+               "VK5-a storage: frame 1 created 5 and freed 1 native buffers; frames 2-100 each created 1 and freed 1; "
+               "104 created during the churn",
+               "VK5-a frames: 100 frames each created, uploaded, drew with and destroyed one 160 KiB texture "
+               "(16000 KiB in all); 0 of 4096000 pixels differ; 0 guard words changed (Mali: every texel copied "
+               "exactly)",
+               "VK5-a teardown: every object, the device and the instance destroyed; "],
+        green=("VK5-a metal churn green: 100 exact Vulkan frames, each creating, uploading, drawing with and "
+               "destroying a 160 KiB texture, and clean teardown"),
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
