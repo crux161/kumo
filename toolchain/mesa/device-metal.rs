@@ -1,8 +1,8 @@
-//j774
 //j777
 //j778
 //j785
 //j788
+//j791
 //! G7o-f: the native Mesa device, BOs and VM over the live drv-gpu session that Sora grants
 //! the GPU client, on real hardware. The C cases (device-metal.c) drive the real bridge and
 //! Mesa lifecycle; this side owns the session, logs through the kernel and runs the native
@@ -359,28 +359,25 @@ static VIEW_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static VIEW_SURFACE: AtomicU64 = AtomicU64::new(0);
 /// Which client drives the view: 0 is a GL client (GL3-b, GL4: bottom-up `glReadPixels`
 /// readbacks, flipped upright), 1 is a Vulkan client (VK4-b, VK5: top-down images kept in
-/// Vulkan's orientation, PLAN/015 §8.43 D2 and §8.46 D3). It names the view and churn log
+/// Vulkan's orientation, PLAN/015 §8.43 D2 and §8.46 D3), 2 is VK6's recovery client (a
+/// Vulkan client that only decodes the churn lane, §8.49). It names the view and churn log
 /// lines and picks the row order; the GL clients' lines are unchanged.
 static VIEW_PROOF: AtomicU32 = AtomicU32::new(0);
 
 fn vulkan_client() -> bool {
-    VIEW_PROOF.load(Ordering::Relaxed) == 1
+    VIEW_PROOF.load(Ordering::Relaxed) != 0
 }
 
 /// The churn proof's name in its lines: GL4, or VK5 for the Vulkan client.
 fn churn_name() -> &'static [u8] {
-    if vulkan_client() {
-        b"VK5"
-    } else {
-        b"GL4"
-    }
+    churn_str().as_bytes()
 }
 
 fn churn_str() -> &'static str {
-    if vulkan_client() {
-        "VK5"
-    } else {
-        "GL4"
+    match VIEW_PROOF.load(Ordering::Relaxed) {
+        0 => "GL4",
+        1 => "VK5",
+        _ => "VK6",
     }
 }
 
@@ -411,11 +408,11 @@ fn view_name() -> &'static [u8] {
 }
 
 /// Select the client that drives the view before `kumo_metal_view_take` or
-/// `kumo_metal_churn_take` (VK4-b and VK5 pass 1).
+/// `kumo_metal_churn_take` (VK4-b and VK5 pass 1, VK6 passes 2).
 /// Returns nonzero for an unknown proof, which leaves GL3-b's selection in place.
 #[no_mangle]
 pub extern "C" fn kumo_metal_view_proof(proof: u32) -> u32 {
-    if proof > 1 {
+    if proof > 2 {
         return 1;
     }
     VIEW_PROOF.store(proof, Ordering::Relaxed);
@@ -1120,6 +1117,13 @@ pub extern "C" fn kumo_metal_churn_summary(frames: u32) {
         COPIED.load(Ordering::Relaxed)
     )
     .as_bytes());
+    kumo_metal_churn_release();
+}
+
+/// VK6: return the churn lane's view and producer handles without a presentation record,
+/// for a client that decodes the lane only to learn its session's role.
+#[no_mangle]
+pub extern "C" fn kumo_metal_churn_release() {
     for slot in [&VIEW_CHANNEL, &VIEW_SURFACE, &PRODUCER, &J0C_VMO] {
         let raw = slot.swap(0, Ordering::Relaxed);
         if raw != 0 {

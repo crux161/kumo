@@ -1,9 +1,78 @@
 # Native Mesa boundary — G7b/G7c/G7d/G7e/G7f/G7g/G7h/G7i/G7j
-<!-- j785 -->
 <!-- j786 -->
 <!-- j787 -->
 <!-- j788 -->
 <!-- j789 -->
+<!-- j791 -->
+
+## VK6-b: a Vulkan device lost to an MMU fault, then recovered (J791, metal-proven)
+
+PLAN/015 §8.49 (D1a, D2a, D3a). [vk-churn.c](vk-churn.c)'s sibling [vk-lost.c](vk-lost.c)
+(`--proof vk6-b`, `KUMO_VK_LOST_MAIN=1`) runs on the churn lane, so Sora regrants a fresh,
+reset session after each exit. The boot session, which holds drv-fb's native producer,
+loses its device; every regranted session recovers.
+
+- **The fault.** [vk-lost.comp](vk-lost.comp) (227 words, pinned like VK3-VK5's) stores
+  through a buffer device address taken from a push constant. The device enables
+  `bufferDeviceAddress`. The client wraps `vm_bind`/`vm_unbind` to track every live binding,
+  picks the **lowest** page of the session window (0x2000_0000-0x3000_0000) that no binding
+  covers, and proves it still unbound at the submit.
+  - panvk fills the window from the top: 11 bindings in 0x2f40_0000-0x3000_0000 at
+    dispatch.
+  - Recording the command buffer allocates more there, so a top-down choice was bound by the
+    submit (the third boot: 0x2ffd6000).
+- **The loss.** drv-gpu logs the AS1 fault at exactly that VA and contains the session. The
+  client requires `VK_ERROR_DEVICE_LOST` from the submit or the fence wait, and from
+  `vkDeviceWaitIdle`, plus a lost native status.
+- **Host access (D1a, VK6-a on metal).** A mapped 1024-word witness must stay readable and
+  writable after the loss.
+- **Teardown.** Every destroy and free returns. BOs without a live alias were released by the
+  device close itself (VK6-a), so Mesa's later destroys of those find nothing; the
+  runtime's own check (no Rust record left after the scope) is the leak gate.
+- **Recovery (D2a).** Each regranted session makes a new instance and VkDevice, runs VK3-b's
+  compute exactly, and tears down with every buffer and the heap released.
+- The runtime: `kumo_metal_view_proof(2)` names the churn lines `VK6`, and
+  `kumo_metal_churn_release` returns the lane's view and producer without a presentation
+  record (`kumo_metal_churn_summary` now ends by calling it). `check_recovery` judges the
+  two roles. It requires drv-gpu's AS1 fault at the VA the client printed, inside session 1
+  only; every recovery session must be free of faults and failed points.
+
+**Metal (J791, 2026-11-05), fifth boot:**
+
+```text
+VK6 bindings: 11 live, 0x2f400000-0x30000000, 11702272 bytes bound in all; fault page 0x0000000020000000 inside the session window
+VK6 fatal: one dispatch stores 0xdeadfa17 through a buffer device address at VA 0x0000000020000000 (unbound among 15 live VM bindings)
+drv-gpu: AS1 fault at VA=0x0000000020000000: TRANSLATION_FAULT Write (raw=0x210003c2)
+drv-gpu: containment reset=ok buffers=14 bindings=15 waits=0 heaps=1 retained=no
+VK6 loss: vkQueueSubmit VK_SUCCESS, vkWaitForFences VK_ERROR_DEVICE_LOST, vkDeviceWaitIdle VK_ERROR_DEVICE_LOST; native status lost, 1 native refusals
+VK6 host access: the mapped witness stayed readable and writable after the loss (1024 of 1024 words intact, 1024 of 1024 rewritten words read back)
+VK6 teardown after loss: every destroy and free returned; of 14 native buffers, 13 released by destroy and the rest by the device close; heap destroys acknowledged 0; no Panthor ioctl, DRM listing or syncobj
+VK6 recovery compute: VK3-b's dispatch on the new device, 0 of 1000 words differ from i*3+k, 0 of 88 words past count changed   (sessions 2, 3 and 4)
+VK6 metal check green (vk6-b-metal): session 1 lost its device to the injected fault with host access intact; 3 regranted session(s) recovered with a new VkDevice; no TOWER, FAILED or ABEND
+```
+
+Four earlier boots each found a client-side defect, never a driver one:
+1. and 2. The fixed top page (0x2ffff000) was bound.
+3. The highest free gap was bound by the recording.
+4. The losing role's buffer accounting ignored VK6-a's device-close release.
+
+Boot 4 already showed the true gate: after a real fault and containment, all three
+regranted sessions recovered.
+
+A VK5-b regression boot on the changed runtime was green: four sessions of 100 Retired / 0
+Copied, J0c armed with `120/120 kernel-stamped`. It also exposed a census-phase defect in
+`check_sessions`: one sample landed 2 ms before drv-gpu's release of a session, and was
+compared with samples taken after other sessions' releases. Samples are now kept per phase
+(closing, or after `session N bring-up released`), and only like phases are compared. Its
+verdicts on J777's six GL4 logs are unchanged, and the J788 GL4/VK5 logs and this
+regression are green. Evidence: `build/proofs/vk6-b-metal/metal-boot.log`,
+`build/verification/j791/`. VK6-c (the same recovery after a stall) is next.
+— TIMBERDOODLE 2026-11-05
+
+```sh
+python3 scripts/mesa-device-metal.py --proof vk6-b --stage <new-directory>
+python3 scripts/mesa-device-metal.py --proof vk6-b --check <tio-log>
+```
 
 ## VK6-a: host mappings stay valid after device loss (J789, host- and QEMU-proven)
 
@@ -60,9 +129,11 @@ holds four sessions.
 
 **Metal (J788, 2026-11-04).** Attempt 1 stopped in J0c: drv-fb's own D1b frame-start check
 measured `delivery 49.623 Hz (interval … max 77323 us)` and disarmed, so its diagnostic
-ended "no image reachable". VK5's J0c refused to fabricate a completion (case 211). This is
-pre-existing: drv-fb skipped the present gate on 2 of J777's 6 GL4 boots the same way.
-Attempt 2 was green:
+ended "no image reachable". VK5's J0c refused to fabricate a completion (case 211).
+Correction (J791): J777's two skipped-gate GL4 boots were not D1b failures; they carry no
+D1b DISAGREEMENT and failed on J777's own, since-fixed bugs. The D1b flake was
+userspace-stamped intervals absorbing scheduler-tick latency, which J790 fixed with kernel
+top-half IRQ stamps (VK5-b's J791 regression: `120/120 kernel-stamped`). Attempt 2 was green:
 
 ```text
 VK5 J0c complete: 3 Vulkan-rendered frames through one VMO, each rewritten only after its retirement

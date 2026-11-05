@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-#j782
 #j784
 #j785
 #j787
 #j788
+#j791
 """Build live Mesa device and static GLES clients, stage them in the Orange Pi GPU slot,
 and check a serial log of the hardware run.
 
@@ -149,6 +149,38 @@ PROOFS = {
         driver=["drv-gpu: client group 1 leases CSG0 queues 0-2",
                 "drv-gpu: client heap 1 context 0x30000000 chunks 5x2097152 head 0x"],
         absent=["drv-gpu: AS1 fault", "drv-gpu: client point"], after=None),
+    # VK6-b (PLAN/015 §8.49, D1a/D2a/D3a): the boot session loses its device to an MMU fault
+    # (a buffer-device-address store to the lowest unbound page of its VA window: panvk fills
+    # the window from the top, recording included), sees DEVICE_LOST, keeps
+    # host access to its mapped witness and tears down; every regranted session makes a new
+    # VkDevice and runs VK3-b's compute exactly. check_recovery owns this proof. — TIMBERDOODLE
+    "vk6-b": dict(
+        cases="vk-lost", runtime="device-metal", defines=["-DKUMO_VK_LOST_MAIN=1"],
+        out="vk6-b-metal", vk=True, marker=b"churn\n", recovery=True,
+        begin="VK6-b metal recovery begin",
+        boot=["sora: gpu-lane marker selects the churn lane"],
+        lose=["VK6 lane: view 1 over V, S, N with the boot session's native producer",
+              "VK6 losing device: Mali-G610",
+              "VK6 bindings: ",
+              "VK6 fatal: one dispatch stores 0xdeadfa17 through a buffer device address at VA 0x",
+              "VK6 loss: vkQueueSubmit ",
+              "vkDeviceWaitIdle VK_ERROR_DEVICE_LOST; native status lost",
+              "VK6 host access: the mapped witness stayed readable and writable after the loss (",
+              " of 1024 rewritten words read back)",
+              "VK6 teardown after loss: every destroy and free returned; "],
+        lose_green=("VK6-b metal loss green: the fault surfaced as VK_ERROR_DEVICE_LOST, host access stayed valid "
+                    "and every destroy returned"),
+        # check_recovery also requires drv-gpu's AS1 fault at exactly the VA the client chose.
+        lose_driver=["drv-gpu: containment reset=ok"], fault_va=True,
+        recover=["VK6 lane: view 1 over V, S, N; a regranted session with no native producer",
+                 "VK6 recovering device: Mali-G610",
+                 "VK6 recovery compute: VK3-b's dispatch on the new device, 0 of 1000 words differ from i*3+k, 0 of 88 "
+                 "words past count changed",
+                 "VK6 recovery teardown: every object, the device and the instance destroyed; "],
+        recover_green=("VK6-b metal recovery green: a new VkDevice on a regranted session computed exactly and tore "
+                       "down clean"),
+        recover_absent=["drv-gpu: AS1 fault", "failed:"],
+        green=None, driver=[], absent=[], after=None),
     # VK5-b (PLAN/015 §8.46, D2a/D3a): G8's bar through panvk, on GL4's churn lane. Session 1
     # (the boot session, with drv-fb's native producer) runs the Vulkan-fed J0c that arms the
     # present gate; Sora's RestartBudget(3) regrants the later sessions. J0c's frames spend
@@ -613,6 +645,7 @@ def check(log, proof):
 
 def check_sessions(log, proof):
     """GL4 or VK5: every session of one boot, in order. Session 1 runs J0c; later ones are regrants.
+    Census samples count as post-teardown only after drv-gpu logs the session's release (J791).
     Each needs readiness, 100 exact frames and 100 Retired / 0 Copied. drv-fb must have
     completed J0c and armed its gate. The census (kernel `census:` lines, enabled by the
     stage's autoexec `dmesg -n debug`, RE4) must hold DMA VMOs flat across sessions."""
@@ -629,7 +662,7 @@ def check_sessions(log, proof):
         assert sum(expected in line for line in live) == 1, f"{expected!r} not once in the boot"
     for bad in ("TOWER", "FAILED", "ABEND"):
         assert not any(bad in line for line in live), f"{bad} in the boot"
-    dma = {}
+    dma_released, dma_closing = {}, {}
     for number, start in enumerate(begins, 1):
         end = begins[number] if number < len(begins) else len(live)
         window = live[start:end]
@@ -650,17 +683,28 @@ def check_sessions(log, proof):
         # post-teardown footprint, sampled after a session's green line, measures a leak
         # across sessions; mid-session samples are printed but not compared. — TIMBERDOODLE
         green = next(i for i, line in enumerate(window) if proof["green"] in line)
+        # J791: a sample between the client's green line and drv-gpu's `session N bring-up
+        # released` line measures a closing session (metal: 29 at +2 ms, release at +4 ms); one
+        # after the release measures the released footprint (12). The phases differ, so they are
+        # kept apart and only like phases are compared (RE4's rule). — TIMBERDOODLE
+        release = next((i for i, line in enumerate(window)
+                        if i > green and re.search(r"drv-gpu: session \d+ bring-up released", line)), None)
         census = [(i, int(m.group(1))) for i, line in enumerate(window)
                   for m in [re.search(r"census: .* vmos=\d+/(\d+)dma", line)] if m]
-        after = [count for i, count in census if i > green]
+        released = [count for i, count in census if release is not None and i > release]
+        closing = [count for i, count in census if i > green and (release is None or i < release)]
         during = [count for i, count in census if i < green]
-        if after:
-            dma[number] = after[-1]
-        print(f"{name} session {number}: 100/0 Retired/Copied, census DMA VMOs after teardown "
-              f"{dma.get(number, 'not sampled')}, during {during or 'not sampled'}")
+        if released:
+            dma_released[number] = released[-1]
+        if closing:
+            dma_closing[number] = closing[-1]
+        print(f"{name} session {number}: 100/0 Retired/Copied, census DMA VMOs closing "
+              f"{dma_closing.get(number, 'not sampled')}, released {dma_released.get(number, 'not sampled')}, "
+              f"during {during or 'not sampled'}")
     for line in live:
         if "display: present gate" in line or "sora: gpu-lane" in line or "restart budget" in line:
             print(line)
+    phase, dma = ("released", dma_released) if len(dma_released) >= 2 else ("closing", dma_closing)
     assert len(dma) >= 2, "no post-teardown census in at least two sessions: was autoexec's `dmesg -n debug` staged?"
     # A leak shows as growth across sessions. The last session's sample may land after Sora
     # exhausts the restart budget and releases the view, falling back to the boot baseline
@@ -670,9 +714,54 @@ def check_sessions(log, proof):
     assert spread <= 4, f"census DMA VMOs grew across sessions: {dma}"
     api = "Vulkan" if name.startswith("VK") else "GL"
     print(f"{name} metal check green ({proof['out']}): {len(begins)} sessions of 100 Retired / 0 Copied, "
-          f"J0c {api}-fed in session 1, post-teardown census DMA VMOs never grew over sessions {sorted(dma)} "
+          f"J0c {api}-fed in session 1, {phase} census DMA VMOs never grew over sessions {sorted(dma)} "
           f"({dma}, growth {spread}); "
           f"no TOWER, FAILED or ABEND")
+
+
+def check_recovery(log, proof):
+    """VK6: one boot on the churn lane. Session 1 (the boot session) loses its device and must
+    show the loss, host access and teardown lines, with drv-gpu's fault and containment in its
+    window. Every later session is a regrant that must recover cleanly. No TOWER, FAILED or
+    ABEND anywhere. — TIMBERDOODLE"""
+    text = log.read_bytes().decode(errors="replace").replace("\r", "")
+    live = [line for line in text.splitlines() if not re.match(r"^\[[0-9:.]+\] \[ *[0-9]+\.[0-9]+\]", line)]
+    boot = max((i for i, line in enumerate(live) if "Station IP address" in line), default=0)
+    live = live[boot:]
+    begins = [i for i, line in enumerate(live) if proof["begin"] in line]
+    assert len(begins) >= 2, f"{len(begins)} sessions; VK6 needs the losing session and at least one recovery"
+    for expected in proof["boot"]:
+        assert sum(expected in line for line in live[:begins[0]]) == 1, f"{expected!r} not once before session 1"
+    for bad in ("TOWER", "FAILED", "ABEND"):
+        assert not any(bad in line for line in live), f"{bad} in the boot"
+    for number, start in enumerate(begins, 1):
+        end = begins[number] if number < len(begins) else len(live)
+        window = live[start:end]
+        losing = number == 1
+        required = (proof["lose"] + [proof["lose_green"]] + proof["lose_driver"]) if losing else \
+            (proof["recover"] + [proof["recover_green"]])
+        position = 0
+        for expected in required:
+            hits = [i for i, line in enumerate(window) if expected in line]
+            assert len(hits) == 1, f"session {number}: {expected!r} appears {len(hits)} times"
+            if expected not in proof.get("lose_driver", []):
+                assert hits[0] >= position, f"session {number}: {expected!r} is out of order"
+                position = hits[0]
+        if losing and proof.get("fault_va"):
+            chosen = [m.group(1) for line in window for m in [re.search(r"at VA 0x([0-9a-f]{16}) \(unbound", line)] if m]
+            assert len(chosen) == 1, f"session 1: {len(chosen)} fault VA lines"
+            fault = f"drv-gpu: AS1 fault at VA=0x{chosen[0]}"
+            hits = sum(fault in line for line in window)
+            assert hits == 1, f"session 1: {fault!r} appears {hits} times"
+        if not losing:
+            for unwanted in proof["recover_absent"]:
+                assert not any(unwanted in line for line in window), f"session {number}: {unwanted!r}"
+        for line in window:
+            if any(key in line for key in ("VK6 loss:", "VK6 host access:", "VK6 teardown after loss:",
+                                           "drv-gpu: AS1 fault", "drv-gpu: containment", "VK6 recovery compute:")):
+                print(f"session {number}: {line}")
+    print(f"VK6 metal check green ({proof['out']}): session 1 lost its device to the injected fault with host access "
+          f"intact; {len(begins) - 1} regranted session(s) recovered with a new VkDevice; no TOWER, FAILED or ABEND")
 
 
 def main():
@@ -683,7 +772,8 @@ def main():
     args = parser.parse_args()
     proof = PROOFS[args.proof]
     if args.check:
-        (check_sessions if proof.get("sessions") else check)(args.check, proof)
+        (check_recovery if proof.get("recovery") else check_sessions if proof.get("sessions") else check)(
+            args.check, proof)
         return
     spec = importlib.util.spec_from_file_location("device_smoke", ROOT / "scripts/mesa-device-smoke.py")
     module = importlib.util.module_from_spec(spec)
