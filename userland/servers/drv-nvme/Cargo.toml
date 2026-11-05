@@ -1,0 +1,21 @@
+#j798
+[package]
+name = "drv-nvme"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-pcie.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../../kumo-rt" }
+
+[[bin]]
+name = "drv-nvme"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

@@ -1,6 +1,7 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
 <!-- j796 -->
 <!-- j797 -->
+<!-- j798 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
@@ -103,3 +104,47 @@ nor selects/verifies a boot frequency. Its diagnostic layout is:
 
 Admission and disabled bypass remain a cooperative non-claim, not enforcement.
 — TIMBERDOODLE 2026-11-05
+
+## NV3b userspace admin queue proof
+
+`drv-nvme` has a pure, host-tested register sequencer and a userspace runtime.
+Sora discovers the enabled root from its read-only live DTB capability, observes
+root/config/CAP state through read-only mappings, and gives the child only the
+first BAR page as a Resource with no IRQ grant. The driver repeats power/mint
+admission and verifies CAP/VS. This first path supports the observed legacy
+NVMe 1.x NVM/4 KiB case, with 32-entry admin queues.
+
+One 8 KiB contiguous DMA VMO supplies separate 4 KiB SQ/CQ pages below 4 GiB.
+The kernel zeroes and cleans its previous WB alias; the child maps Normal-NC and
+uses volatile CPU accesses. Before any controller write, it transfers a read-only
+custody alias to Sora and waits for acknowledgment. No shared-control, root/config
+write, SMMU mapping, command or doorbell is granted or issued by this proof.
+
+The sequencer settles any inherited EN/RDY transition, clears EN only from a
+ready enabled state, waits for RDY=0, masks interrupts for polling with MSI-X
+disabled, programs AQA/ASQ/ACQ, verifies readback, enables with the legacy NVM
+entry/page sizes and waits for RDY=1/CFS=0. It then disables and reads back both
+RDY=0 and EN=0 before reporting quiescence. Polling has a CAP.TO-derived deadline,
+an extra 500 ms margin and bounded backoff; a timeout never authorizes release.
+
+Sora checks that the report names the retained session and physical allocation,
+then waits for actual process termination before closing its custody alias. It
+repeats with a distinct process to prove graceful restart. On an unproven result,
+Sora retains custody and the child parks with its allocation; no replacement
+owner is launched. This is cooperative lifetime discipline, not DMA confinement.
+The controller ends disabled after successful NV3 proof; block service follows.
+— TIMBERDOODLE 2026-11-05
+
+The Sora observer uses dedicated temporary read-only mapping slots at `0x40000000`
+(DTB, at most 16 MiB plus its page offset) and `0x42000000`–`0x4208ffff`
+(register windows). Each is unmapped before the next boot service stage. Sora's
+boot-loader mappings are absent from automatic placement bookkeeping; automatic
+placement can overwrite program data. Fixing that general bookkeeping remains
+tracked locally in DEFERRED/012; this observer follows Sora's existing explicit
+DTB mapping convention. — TIMBERDOODLE
+
+Live VmarMap cache maintenance now also follows the VMO backing: an MMIO VMO
+never receives RAM cache maintenance, even when the caller relies on its default
+Device policy and omits the DEVICE flag. This avoids a physical-alias fault when
+mapping firmware's CFG0 window above 4 GiB. RAM and cacheable DMA keep their
+existing maintenance; Normal-NC DMA remains skipped. — TIMBERDOODLE

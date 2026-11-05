@@ -1,8 +1,8 @@
-//j648
 //j669
 //j675
 //j709
 //j774
+//j798
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -27,6 +27,7 @@ pub const DRV_GPU_PATH: &str = "bin/drv-gpu";
 pub const MALI_FIRMWARE_PATH: &str = "lib/firmware/mali_csffw.bin";
 pub const DRV_I2C_HID_PATH: &str = "bin/drv-i2c-hid";
 pub const DRV_XHCI_PATH: &str = "bin/drv-xhci";
+pub const DRV_NVME_PATH: &str = "bin/drv-nvme";
 pub const DRV_BLK_PATH: &str = "bin/drv-blk";
 /// The resident filesystem server. It is handed a read-only backing VMO and the
 /// byte offset of a FAT image inside it, then answers `kumo-vfs` Open/Read frames

@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j741
 //j748
 //j766
 //j774
 //j795
+//j798
 
 extern crate alloc;
 
@@ -29,9 +29,9 @@ use kumo_rt::{
     channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
     handle_duplicate, handle_koid, interrupt_create, port_bind, port_create, port_unbind,
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
-    syscall_handle, thread_create, thread_start, timer_create, vmar_map, vmo_create, vmo_read,
-    vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS, STARTUP_TAG_STDIN,
-    STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
+    resource_mint_mmio, syscall_handle, thread_create, thread_start, timer_create, vmar_map,
+    vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS,
+    STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -3281,6 +3281,288 @@ fn copy_live_dtb(
     ))
 }
 
+struct NvmeReadMap {
+    physical: u64,
+    address: u64,
+    len: u64,
+    vmo: Handle,
+    owned: bool,
+}
+
+impl NvmeReadMap {
+    fn map(vmo: Handle, physical: u64, address: u64, len: u64, owned: bool) -> Option<Self> {
+        // Sora's boot-loaded image is not recorded in the automatic allocator.
+        // Use its dedicated temporary slots, as the other live-DTB observers do;
+        // automatic placement can overwrite and then unmap the image. — TIMBERDOODLE
+        let status = vmar_map(Handle(0), vmo, 0, address, len, VmarFlags::READ.0);
+        if status != 0 {
+            if owned {
+                let _ = handle_close(vmo);
+            }
+            return None;
+        }
+        Some(Self {
+            physical,
+            address,
+            len,
+            vmo,
+            owned,
+        })
+    }
+    fn mmio(root: Handle, physical: u64, address: u64, len: u64) -> Option<Self> {
+        let resource = read_only_grant(resource_create_child(root, physical, len, 0, 0));
+        if resource.0 == 0 {
+            return None;
+        }
+        let raw = resource_mint_mmio(resource, physical, len);
+        let _ = handle_close(resource);
+        Self::map(syscall_handle(raw)?, physical, address, len, true)
+    }
+    fn read(&self, offset: u16) -> u32 {
+        if offset & 3 != 0 || u64::from(offset) + 4 > self.len {
+            return u32::MAX;
+        }
+        unsafe { core::ptr::read_volatile((self.address + u64::from(offset)) as *const u32) }
+    }
+}
+impl Drop for NvmeReadMap {
+    fn drop(&mut self) {
+        let removed = kumo_rt::vmar_unmap(self.address, self.len) == 0;
+        let closed = !self.owned || handle_close(self.vmo) == 0;
+        if !removed || !closed {
+            notice(&[b"nvme: observer mapping cleanup failed\n"]);
+        }
+    }
+}
+struct NvmeRootRead(alloc::vec::Vec<NvmeReadMap>);
+impl kumo_pcie::RegisterRead for NvmeRootRead {
+    fn read32(&mut self, physical: u64) -> u32 {
+        self.0
+            .iter()
+            .find_map(|p| {
+                let offset = physical.checked_sub(p.physical)?;
+                (offset + 4 <= p.len).then(|| p.read(offset as u16))
+            })
+            .unwrap_or(u32::MAX)
+    }
+}
+struct NvmeConfigRead<'a>(&'a NvmeReadMap);
+impl kumo_pcie::endpoint::ConfigRead for NvmeConfigRead<'_> {
+    fn read32(&mut self, offset: u16) -> u32 {
+        self.0.read(offset)
+    }
+}
+
+/// Broker discovery is read-only; the child gets only one BAR Resource, no shared
+/// control, root/config or IRQ capability. Every controller mint goes through the
+/// live HAL guard. The live DTB selects the board, including headless boots.
+/// — TIMBERDOODLE
+fn nvme_startup(root: Handle, dtb_vmo: Handle, bootinfo: Handle) -> Option<drv_nvme::Startup> {
+    if dtb_vmo.0 == 0 || bootinfo.0 == 0 {
+        return None;
+    }
+    let mut field = [0u8; 8];
+    let offset = core::mem::offset_of!(BootInfo, platform.dtb) as u64;
+    if vmo_read(bootinfo, offset, field.as_mut_ptr(), field.len()) != 0 {
+        return None;
+    }
+    let dtb_phys = u64::from_le_bytes(field);
+    if dtb_phys == 0 {
+        return None;
+    }
+    let offset = dtb_phys & 4095;
+    if offset > 4088 {
+        return None;
+    }
+    let header_map = NvmeReadMap::map(dtb_vmo, 0, 0x4000_0000, 4096, false)?;
+    let header =
+        unsafe { core::ptr::read_unaligned((header_map.address + offset) as *const [u8; 8]) };
+    drop(header_map);
+    if u32::from_be_bytes(header[..4].try_into().ok()?) != 0xd00d_feed {
+        return None;
+    }
+    let total = u32::from_be_bytes(header[4..].try_into().ok()?) as u64;
+    if !(40..=16 * 1024 * 1024).contains(&total) {
+        return None;
+    }
+    let bytes = NvmeReadMap::map(
+        dtb_vmo,
+        0,
+        0x4000_0000,
+        (offset + total + 4095) & !4095,
+        false,
+    )?;
+    let dtb = unsafe {
+        core::slice::from_raw_parts((bytes.address + offset) as *const u8, total as usize)
+    };
+    let topology = kumo_pcie::discover_rk3588_pcie30x4(dtb)?;
+    drop(bytes);
+    let mut root_io = NvmeRootRead(alloc::vec::Vec::new());
+    for (slot, (base, len)) in kumo_pcie::STATUS_WINDOWS.into_iter().enumerate() {
+        root_io.0.push(NvmeReadMap::mmio(
+            root,
+            base,
+            0x4200_0000 + slot as u64 * 0x1_0000,
+            len,
+        )?);
+    }
+    let report = kumo_pcie::probe(topology, &mut root_io);
+    let page = kumo_pcie::endpoint::select_config_page(&report).ok()?;
+    let config = NvmeReadMap::mmio(root, page.physical, 0x4207_0000, 4096)?;
+    let endpoint = kumo_pcie::endpoint::probe(&report, &mut NvmeConfigRead(&config)).ok()?;
+    let physical = kumo_pcie::nvme::select_register_page(&report, &endpoint).ok()?;
+    let bar = NvmeReadMap::mmio(root, physical, 0x4208_0000, 4096)?;
+    let snapshot = kumo_pcie::nvme::probe(&report, &endpoint, &mut |off| bar.read(off)).ok()?;
+    let startup = drv_nvme::Startup {
+        session: 1,
+        bar: physical,
+        cap: snapshot.cap,
+        vs: snapshot.vs,
+        id: endpoint.id,
+        class_revision: endpoint.class_revision,
+        root_command: report.dbi.as_ref()?.command as u16,
+        endpoint_command: endpoint.command,
+        msix_control: endpoint.msix.map_or(0, |m| m.control),
+    };
+    startup.validate().ok()?;
+    Some(startup)
+}
+
+fn nvme_wait_source(port: Handle, wanted: u64) -> bool {
+    for _ in 0..8 {
+        let got = port_wait(port);
+        if got == wanted {
+            return true;
+        }
+        if got == 0 {
+            return false;
+        }
+    }
+    false
+}
+fn nvme_receive(port: Handle, channel: Handle, frame: &mut [u8]) -> Option<(usize, u64)> {
+    if !nvme_wait_source(port, handle_koid(channel)) {
+        return None;
+    }
+    let (n, h) = channel_read_with_handle(channel, frame.as_mut_ptr(), frame.len());
+    (n > 0 && n <= frame.len()).then_some((n, h))
+}
+
+/// Parent custody precedes ACK and hence every controller write. After ACK an
+/// unproven owner keeps its process/channel/VMO handles in Sora; do not recycle
+/// them merely because the child failed or timed out. — TIMBERDOODLE
+fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup) -> Option<u64> {
+    let resource = syscall_handle(resource_create_child(
+        root,
+        startup.bar,
+        drv_nvme::PAGE,
+        0,
+        0,
+    ))?;
+    let recipe = SvcRecipe {
+        initrd,
+        path: kumo_abi::DRV_NVME_PATH,
+    };
+    let Some(owner) = spawn_from_recipe(&recipe) else {
+        let _ = handle_close(resource);
+        return None;
+    };
+    let Some(port) = syscall_handle(port_create()) else {
+        let _ = process_kill(owner.process);
+        for h in [resource, owner.client, owner.process] {
+            let _ = handle_close(h);
+        }
+        return None;
+    };
+    let boot = startup.encode();
+    if port_bind(port, owner.client) != 0
+        || channel_write_with_handle(owner.client, boot.as_ptr(), boot.len(), resource) != 0
+    {
+        let _ = process_kill(owner.process);
+        for h in [resource, owner.client, owner.process, port] {
+            let _ = handle_close(h);
+        }
+        return None;
+    }
+    // Resource moved: never close its former handle number after receiving a new
+    // handle, because that slot may already have been reused. — TIMBERDOODLE
+    let mut frame = [0u8; drv_nvme::PROOF_LEN];
+    let first = nvme_receive(port, owner.client, &mut frame);
+    let memory = first.and_then(|(n, h)| {
+        drv_nvme::Memory::decode(&frame[..n])
+            .filter(|m| m.session == startup.session && h != 0)
+            .map(|m| (m, Handle(h as u32)))
+    });
+    let Some((memory, custody)) = memory else {
+        let _ = process_kill(owner.process); // No ACK: this child cannot have touched CC.
+        if let Some((_, h)) = first {
+            if h != 0 {
+                let _ = handle_close(Handle(h as u32));
+            }
+        }
+        for h in [owner.client, owner.process, port] {
+            let _ = handle_close(h);
+        }
+        notice(&[b"nvme: startup/custody negotiation refused; no ACK sent\n"]);
+        return None;
+    };
+    let ack = [drv_nvme::ACK];
+    if channel_write(owner.client, ack.as_ptr(), ack.len()) != 0 {
+        notice(&[b"nvme: custody ACK failed; DMA and owner handles retained\n"]);
+        return None;
+    }
+    let Some((n, h)) = nvme_receive(port, owner.client, &mut frame) else {
+        notice(&[b"nvme: owner stopped answering; DMA and owner handles retained\n"]);
+        return None;
+    };
+    let proof = drv_nvme::Proof::decode(&frame[..n]);
+    if h != 0 || !proof.is_some_and(|p| p.releases(memory) && p.session == startup.session) {
+        notice(&[b"nvme: quiescence unproven; DMA and owner handles retained\n"]);
+        return None;
+    }
+    let process = handle_koid(owner.process);
+    let _ = port_unbind(port, owner.client);
+    if port_bind(port, owner.process) != 0 || !nvme_wait_source(port, process) {
+        notice(&[b"nvme: termination unproven; custody retained\n"]);
+        return None;
+    }
+    let _ = port_unbind(port, owner.process);
+    let mut closed = true;
+    for handle in [custody, owner.client, owner.process, port] {
+        closed &= handle_close(handle) == 0;
+    }
+    if !closed {
+        notice(&[b"nvme: owner cleanup refused\n"]);
+        return None;
+    }
+    notice(&[alloc::format!(
+        "NV3 OWNER session={} process={} quiescent; DMA custody released after termination\n",
+        startup.session,
+        process
+    )
+    .as_bytes()]);
+    Some(process)
+}
+
+fn launch_nvme_admin_proof(initrd: Handle, root: Handle, dtb: Handle, bootinfo: Handle) {
+    let Some(mut startup) = nvme_startup(root, dtb, bootinfo) else {
+        return;
+    };
+    let mut previous = None;
+    for session in 1..=2 {
+        startup.session = session;
+        let Some(process) = run_nvme_admin_owner(initrd, root, startup) else {
+            return;
+        };
+        if previous == Some(process) {
+            notice(&[b"NV3 restart reused process identity; refused\n"]);
+            return;
+        }
+        previous = Some(process);
+    }
+    notice(&[b"NV3 RESTART two distinct userspace owners configured and quiesced; no commands/doorbells/media I/O\n"]);
+}
+
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
 /// absent hardware before touching registers, including on QEMU. No initrd, PMU or CRU grant
 /// reaches the child. The one-shot identity probe exits after reporting. — KESTREL
@@ -4384,6 +4666,12 @@ extern "C" fn sora_main(
     }
 
     launch_gpu_identity(initrd, res);
+    launch_nvme_admin_proof(
+        initrd,
+        res,
+        Handle(dtb_vmo as u32),
+        Handle(bootinfo_vmo as u32),
+    );
 
     // J159: spawn drv-fb when a framebuffer is present.
     // Map the BootInfo VMO (populated by the kernel), read framebuffer geometry,

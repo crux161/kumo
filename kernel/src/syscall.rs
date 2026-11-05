@@ -1,8 +1,8 @@
-//j731
 //j732
 //j743
 //j777
 //j790
+//j798
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -3029,6 +3029,7 @@ impl SyscallEngine {
             return Err(Errno::InvalidArgs);
         }
         let pages = mapping.len / crate::mm::PAGE_SIZE;
+        let cacheable_ram = mapping_needs_cache_maintenance(vmo_entry.vmo.backing(), mapping.flags);
         let phys_base = match vmo_entry.vmo.backing() {
             crate::mm::VmoBacking::PhysicalRam { phys_base }
             | crate::mm::VmoBacking::Mmio { phys_base }
@@ -3071,7 +3072,7 @@ impl SyscallEngine {
             // self-clean (UCI=0 traps `dc cvac` at EL0), so the kernel does it here, the same
             // way `build_user_space` flushes the first image. Device/MMIO/uncached pages are
             // not cacheable RAM and are skipped. `pa` is identity-mapped (cacheable) here.
-            if !device && !uncached {
+            if cacheable_ram {
                 if executable {
                     kumo_hal::active::sync_icache_to_pou(
                         pa as usize,
@@ -5628,6 +5629,15 @@ pub const fn errno_from_ipc(error: IpcError) -> Errno {
     }
 }
 
+/// Resource MMIO defaults to Device even without an explicit DEVICE request bit.
+/// Cache maintenance must follow the backing too: touching a physical MMIO address
+/// through an absent kernel alias can fault before EL0 uses its valid map. — TIMBERDOODLE
+fn mapping_needs_cache_maintenance(backing: crate::mm::VmoBacking, flags: PageFlags) -> bool {
+    !matches!(backing, crate::mm::VmoBacking::Mmio { .. })
+        && !flags.contains(PageFlags::DEVICE)
+        && !flags.contains(PageFlags::UNCACHED)
+}
+
 /// Apply the backend reservation to stale/privileged physical aliases too, not only MMIO
 /// mints. No physical dereference or page-table update precedes this check. — KESTREL
 fn physical_vmo_write_allowed(vmo: &Vmo, offset: u64, len: u64) -> bool {
@@ -5654,6 +5664,43 @@ pub const fn errno_from_object(error: ObjectError) -> Errno {
 mod tests {
     use super::*;
     use kumo_abi::{ObjectKind, Rights};
+
+    #[test]
+    fn live_mmio_mapping_never_cache_maintains_the_physical_aperture() {
+        use crate::mm::VmoBacking;
+        for physical in [0xfe15_0000, 0x9_0010_0000] {
+            for policy in [PageFlags::READ, PageFlags::READ | PageFlags::WRITE] {
+                for extra in [PageFlags::empty(), PageFlags::DEVICE, PageFlags::UNCACHED] {
+                    assert!(!mapping_needs_cache_maintenance(
+                        VmoBacking::Mmio {
+                            phys_base: physical
+                        },
+                        policy | extra
+                    ));
+                }
+            }
+        }
+        for backing in [
+            VmoBacking::Anonymous,
+            VmoBacking::PhysicalRam {
+                phys_base: 0x6000_0000,
+            },
+            VmoBacking::Dma {
+                phys_base: 0x6000_0000,
+            },
+            VmoBacking::DmaPaged,
+        ] {
+            assert!(mapping_needs_cache_maintenance(backing, PageFlags::READ));
+            assert!(mapping_needs_cache_maintenance(
+                backing,
+                PageFlags::READ | PageFlags::EXECUTE
+            ));
+            assert!(!mapping_needs_cache_maintenance(
+                backing,
+                PageFlags::READ | PageFlags::UNCACHED
+            ));
+        }
+    }
 
     //j731
     #[test]

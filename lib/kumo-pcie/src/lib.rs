@@ -3,6 +3,7 @@
 //j792
 //j793
 //j794
+//j798
 
 //! RK3588 DesignWare PCIe: board discovery and the read-only firmware-state probe (PLAN/019 NV0).
 //!
@@ -127,6 +128,18 @@ const ATU_REGION_ENABLE: u32 = 1 << 31;
 
 const GIC_SPI: u32 = 0;
 const DBI_PROBE_LENGTH: u64 = DBI_ATU + 0x200 * ATU_REGIONS as u64;
+
+/// Minimum read-only CPU windows for the firmware observer. Controller windows
+/// still require the kernel's live admission guard before mapping. — TIMBERDOODLE
+pub const STATUS_WINDOWS: [(u64, u64); 7] = [
+    (PMU_PWR_GATE_STS0 & !4095, 4096),
+    (CRU_GATE_CON32 & !4095, 4096),
+    (PHPTOPCRU_GATE_CON00 & !4095, 4096),
+    (PCIE3PHY_GRF, 4096),
+    (PCIE30X4_APB, 4096),
+    (PCIE30X4_DBI_ALIAS, 4096),
+    (PCIE30X4_DBI_ALIAS + DBI_ATU, 0x2000),
+];
 
 /// Register reads for the probe. The target reads physical MMIO; tests supply a fake.
 pub trait RegisterRead {

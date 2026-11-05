@@ -1,9 +1,8 @@
-//j578
-//j595
 //j648
 //j649
 //j675
 //j709
+//j798
 
 use std::env;
 use std::fmt;
@@ -20,7 +19,7 @@ use std::time::{Duration, Instant};
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
     ARGS_PATH, AUTOEXEC_PATH, BMP_VIEW_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH,
-    DRV_I2C_HID_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH,
+    DRV_I2C_HID_PATH, DRV_NVME_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH,
     GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
     INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
     KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, PERSONA_LINUX_HELLO_PATH,
@@ -845,6 +844,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let mali_firmware = build_mali_firmware(&workspace_root()?)?;
             let drv_i2c_hid = build_drv_i2c_hid_image(&workspace_root()?)?;
             let drv_xhci = build_drv_xhci_image(&workspace_root()?)?;
+            let drv_nvme = build_drv_nvme_image(&workspace_root()?)?;
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fatfs = build_fatfs_image(&workspace_root()?)?;
             let identityd = build_identityd_image(&workspace_root()?)?;
@@ -880,6 +880,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (MALI_FIRMWARE_PATH, mali_firmware.as_slice()),
                 (DRV_I2C_HID_PATH, drv_i2c_hid.as_slice()),
                 (DRV_XHCI_PATH, drv_xhci.as_slice()),
+                (DRV_NVME_PATH, drv_nvme.as_slice()),
                 (DRV_BLK_PATH, drv_blk.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
                 (IDENTITYD_PATH, identityd.as_slice()),
@@ -1429,6 +1430,26 @@ fn build_drv_gpu_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as drv-gpu ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+fn build_drv_nvme_image(root: &Path) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            "drv-nvme",
+            "--bin",
+            "drv-nvme",
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let path = root.join("target/aarch64-unknown-none/release/drv-nvme");
+    let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    validate_aarch64_kernel_elf(&bytes).map_err(|e| format!("validate {}: {e}", path.display()))?;
     Ok(bytes)
 }
 
