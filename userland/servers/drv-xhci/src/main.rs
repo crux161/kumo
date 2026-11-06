@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
 
-//j666
 //j690
 //j703
 //j704
 //j767
+//j809
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use drv_blk::{
     decode_connect, BlockAccess, MediaReady, CONTROL_CONNECT_LEN, REQUEST_LEN as BLOCK_REQUEST_LEN,
@@ -224,6 +224,10 @@ const SETTLE_SPIN_ROUNDS: u32 = 4096;
 /// The device Resource handle and GIC IRQ this controller was granted, stashed from the bootstrap
 /// so the keyboard path can bind the interrupt (single-threaded driver — plain atomics suffice).
 static RESOURCE_HANDLE: AtomicU32 = AtomicU32::new(0);
+/// NET0 keeps every observed ax88 slot and its DMA until reset, including failures.
+/// Existing controller halt writes alone are not a reclamation proof. — TIMBERDOODLE
+static AX88_SEEN: AtomicBool = AtomicBool::new(false);
+static CONTROLLER_BASE: AtomicU64 = AtomicU64::new(0);
 /// Downstream device pages handed out so far (J541).
 static DOWNSTREAM_PAGES_USED: AtomicU32 = AtomicU32::new(0);
 /// The storage probe runs once per driver: it maps one fixed read window and fills one static
@@ -285,6 +289,7 @@ extern "C" fn main(
     // Stash for the keyboard path's interrupt binding.
     RESOURCE_HANDLE.store(resource_raw as u32, Ordering::Relaxed);
     DEVICE_IRQ.store(config.irq, Ordering::Relaxed);
+    CONTROLLER_BASE.store(config.mmio_base, Ordering::Relaxed);
 
     // Optional tagged bootstrap messages: the keyboard-channel writer for decoded keystrokes
     // (U5), the pointer writer, and the storage control channel (J545). Read until Sora closes
@@ -455,6 +460,20 @@ extern "C" fn main(
         quiesce_controller(layout);
     }
 
+    if AX88_SEEN.load(Ordering::Relaxed) {
+        ax88_record(format_args!(
+            "NET0 ax88 owner/DMA retained after halt request; no buffer-release claim\n"
+        ));
+        let raw = port_create();
+        if raw != 0 && raw != u64::MAX {
+            loop {
+                let _ = port_wait(Handle(raw as u32));
+            }
+        }
+        loop {
+            cooperative_yield();
+        }
+    }
     log(b"drv-xhci: first light done\n");
     process_exit(0);
 }
@@ -844,6 +863,96 @@ fn enumerate(
     );
 }
 
+/// Descriptor observation only: return before SetConfiguration, vendor commands or
+/// any ax88 endpoint setup. Retain existing slot/EP0 DMA for this owner's lifetime.
+/// Independent firmware comparison is a separate NET0 gate. — TIMBERDOODLE
+fn inventory_ax88(
+    root: u8,
+    route: u32,
+    slot: u8,
+    speed: u8,
+    device: &[u8],
+    config: &[u8],
+    exact: bool,
+) -> bool {
+    use core::fmt::Write;
+    use drv_xhci::ax88;
+    if ax88::family(device).is_none() {
+        return false;
+    }
+    ax88_record(format_args!("NET0 ax88 controller={:#x} root={} route={:#x} slot={} speed={} vid={:04x} pid={:04x} exact={}\n",
+        CONTROLLER_BASE.load(Ordering::Relaxed),root,route,slot,speed,
+        u16::from_le_bytes([device[8],device[9]]),u16::from_le_bytes([device[10],device[11]]),exact));
+    for (kind, bytes) in [("DEVICE", device), ("CONFIG", config)] {
+        for (i, chunk) in bytes.chunks(16).enumerate() {
+            let mut encoded = Ax88Record {
+                bytes: [0; 256],
+                len: 0,
+            };
+            let _ = write!(
+                encoded,
+                "NET0 ax88 ctrl={:#x} slot={} {} offset={} ",
+                CONTROLLER_BASE.load(Ordering::Relaxed),
+                slot,
+                kind,
+                i * 16
+            );
+            for byte in chunk {
+                let _ = write!(encoded, "{:02x}", byte);
+            }
+            let _ = writeln!(encoded);
+            let _ = kumo_rt::log_write(
+                kumo_abi::sys::log_level::NOTICE,
+                &encoded.bytes[..encoded.len],
+            );
+        }
+    }
+    if !exact {
+        ax88_record(format_args!(
+            "NET0 ax88 refused: incomplete descriptor transfer; remains unconfigured\n"
+        ));
+        return true;
+    }
+    match ax88::inspect(device, config, speed == 4) {
+        Ok(Some(i)) => {
+            ax88_record(format_args!("NET0 ax88 {:?} usb={:#x} revision={:#x} ep0={} configuration={} interface={} alt={}\n",i.family,i.usb_revision,i.device_revision,i.ep0_encoding,i.configuration,i.interface,i.alternate));
+            for ep in i.endpoints {
+                ax88_record(format_args!("NET0 ax88 EP address={:#x} attributes={:#x} mps={:#x} interval={} companion={:?}\n",ep.address,ep.attributes,ep.max_packet_size,ep.interval,ep.companion));
+            }
+            ax88_record(format_args!("NET0 ax88 inventory complete; remains unconfigured; no vendor command or Ethernet TX\n"));
+        }
+        result => ax88_record(format_args!(
+            "NET0 ax88 refused {:?}; remains unconfigured\n",
+            result
+        )),
+    }
+    true
+}
+struct Ax88Record {
+    bytes: [u8; 256],
+    len: usize,
+}
+impl core::fmt::Write for Ax88Record {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if text.len() > self.bytes.len() - self.len {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len();
+        Ok(())
+    }
+}
+fn ax88_record(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    let mut line = Ax88Record {
+        bytes: [0; 256],
+        len: 0,
+    };
+    if line.write_fmt(args).is_ok() {
+        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.bytes[..line.len]);
+    }
+}
+
 /// What a root-port device may become on this controller.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RootRole {
@@ -1094,7 +1203,7 @@ fn enumerate_root_device(
         DEVICE_DESCRIPTOR_LEN as u8,
         0x00,
     ];
-    match control_in(
+    let device_result = control_in(
         io,
         layout,
         &mut *image,
@@ -1105,7 +1214,8 @@ fn enumerate_root_device(
         dev_setup,
         data_phys,
         DEVICE_DESCRIPTOR_LEN as u16,
-    ) {
+    );
+    match device_result {
         Some((cc, remaining)) => {
             dsb();
             log(b"drv-xhci: desc cc=");
@@ -1135,6 +1245,36 @@ fn enumerate_root_device(
     }
     // bDeviceClass, captured from the device descriptor before data_buf is reused.
     let device_class = data_buf.byte(4);
+    let mut device = [0u8; 18];
+    data_buf.read_into(0, &mut device);
+    let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
+    let device_exact = if ax88_candidate {
+        data_buf.zero();
+        dsb();
+        if control_in_exact(
+            io,
+            layout,
+            image,
+            evt,
+            &mut ep0_ring,
+            ep0_seg,
+            slot_id,
+            dev_setup,
+            data_phys,
+            18,
+        )
+        .is_some()
+        {
+            data_buf.read_into(0, &mut device);
+            true
+        } else {
+            return ax88_record(format_args!(
+                "NET0 ax88 exact device read failed; unconfigured\n"
+            ));
+        }
+    } else {
+        false
+    };
 
     // --- Slice D: read the configuration descriptor and find the boot-HID interface ---
     // First read the 9-byte header to learn wTotalLength.
@@ -1181,20 +1321,34 @@ fn enumerate_root_device(
         read_len as u8,
         (read_len >> 8) as u8,
     ];
-    if control_in(
-        io,
-        layout,
-        &mut *image,
-        evt,
-        &mut ep0_ring,
-        &mut *ep0_seg,
-        slot_id,
-        cfg_setup,
-        data_phys,
-        read_len,
-    )
-    .is_none()
-    {
+    let config_result = if ax88_candidate {
+        control_in_exact(
+            io,
+            layout,
+            image,
+            evt,
+            &mut ep0_ring,
+            ep0_seg,
+            slot_id,
+            cfg_setup,
+            data_phys,
+            read_len,
+        )
+    } else {
+        control_in(
+            io,
+            layout,
+            image,
+            evt,
+            &mut ep0_ring,
+            ep0_seg,
+            slot_id,
+            cfg_setup,
+            data_phys,
+            read_len,
+        )
+    };
+    if config_result.is_none() {
         log(b"drv-xhci: cfg timeout\n");
         return;
     }
@@ -1203,6 +1357,18 @@ fn enumerate_root_device(
     // holding a slice of device memory is exactly what `DmaBuf` exists to prevent.
     let mut config = [0u8; DATA_BUF_LEN];
     data_buf.read_into(0, &mut config[..read_len as usize]);
+
+    if inventory_ax88(
+        port_number,
+        0,
+        slot_id,
+        speed_raw,
+        &device,
+        &config[..read_len as usize],
+        device_exact && config_result == Some((1, 0)) && total_length == read_len,
+    ) {
+        return;
+    }
 
     // bConfigurationValue is byte 5 of the configuration descriptor.
     let config_value = config[5];
@@ -3343,6 +3509,8 @@ fn log_cc(prefix: &[u8], cc: u8) {
 
 /// What a device's descriptors say it is, copied out of device memory for the class matchers.
 struct DeviceConfig {
+    device: [u8; 18],
+    exact: bool,
     device_class: u8,
     config_value: u8,
     len: usize,
@@ -3472,7 +3640,7 @@ fn read_device_config(
         DEVICE_DESCRIPTOR_LEN as u8,
         0x00,
     ];
-    match control_in(
+    let device_result = control_in(
         io,
         layout,
         image,
@@ -3483,7 +3651,8 @@ fn read_device_config(
         dev_full,
         data_phys,
         DEVICE_DESCRIPTOR_LEN as u16,
-    ) {
+    );
+    match device_result {
         Some((1, _)) => {
             dsb();
             log(b"drv-xhci: dev desc vid=");
@@ -3504,6 +3673,20 @@ fn read_device_config(
 
     // bDeviceClass, captured before data_buf is reused.
     let device_class = data_buf.byte(4);
+    let mut device = [0u8; 18];
+    data_buf.read_into(0, &mut device);
+    let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
+    let device_exact = if ax88_candidate {
+        data_buf.zero();
+        dsb();
+        control_in_exact(
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, dev_full, data_phys, 18,
+        )?;
+        data_buf.read_into(0, &mut device);
+        true
+    } else {
+        false
+    };
 
     // Configuration descriptor: header for wTotalLength, then the whole thing.
     data_buf.zero();
@@ -3522,7 +3705,8 @@ fn read_device_config(
         9,
     )?;
     dsb();
-    let total = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]).min(DATA_BUF_LEN as u16);
+    let advertised = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]);
+    let total = advertised.min(DATA_BUF_LEN as u16);
     data_buf.zero();
     dsb();
     let cfg = [
@@ -3535,22 +3719,21 @@ fn read_device_config(
         total as u8,
         (total >> 8) as u8,
     ];
-    control_in(
-        io,
-        layout,
-        image,
-        evt,
-        ep0_ring,
-        &mut *ep0_seg,
-        slot_id,
-        cfg,
-        data_phys,
-        total,
-    )?;
+    let config_result = if ax88_candidate {
+        control_in_exact(
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_phys, total,
+        )
+    } else {
+        control_in(
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_phys, total,
+        )
+    }?;
     dsb();
     let mut config = [0u8; DATA_BUF_LEN];
     data_buf.read_into(0, &mut config[..total as usize]);
     Some(DeviceConfig {
+        device,
+        exact: device_exact && config_result == (1, 0) && total == advertised,
         device_class,
         config_value: config[5],
         len: total as usize,
@@ -4105,6 +4288,18 @@ fn enumerate_hub_downstream(
         data_buf,
     )?;
 
+    if inventory_ax88(
+        hub_root_port,
+        down_port as u32,
+        dev_slot,
+        down_speed,
+        &config.device,
+        config.bytes(),
+        config.exact,
+    ) {
+        return None;
+    }
+
     // --- What is it? Storage is probed now; a keyboard waits for the other ports ---
     if config.device_class == kumo_hid::USB_CLASS_HUB {
         return skipped(b"drv-xhci: hub dev is a hub; nested hubs left alone\n");
@@ -4517,6 +4712,65 @@ fn spin_delay(iterations: u32) {
 /// separate TDs, then ring the slot doorbell and poll for the Transfer Event. Returns
 /// `(completion_code, remaining)`. The device DMAs the payload into `data_phys`.
 #[allow(clippy::too_many_arguments)]
+/// NET0 ax88 standard descriptor read only. IOC on both stages proves actual
+/// length. Unknown/stalled/short outcomes park the slot's existing storage and
+/// return without reusing its DMA window. No OUT data/vendor request. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+fn control_in_exact(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    ep0_ring: &mut TransferRing,
+    ep0_seg: &mut DmaTrbs,
+    slot_id: u8,
+    setup_packet: [u8; 8],
+    data_phys: u64,
+    length: u16,
+) -> Option<(u8, u32)> {
+    if length == 0
+        || length as usize > DATA_BUF_LEN
+        || setup_packet[0] != 0x80
+        || setup_packet[1] != 6
+        || u16::from_le_bytes([setup_packet[6], setup_packet[7]]) != length
+    {
+        return None;
+    }
+    AX88_SEEN.store(true, Ordering::Relaxed);
+    let setup = Trb::setup_stage(setup_packet, SetupTransferType::In, 0).ok()?;
+    // Single data stage, no Chain; IOC bit5 and ISP bit2 expose short data, too.
+    let data = Trb::from_words([
+        data_phys as u32,
+        (data_phys >> 32) as u32,
+        length as u32,
+        (3 << 10) | (1 << 16) | (1 << 5) | (1 << 2),
+    ]);
+    let status = Trb::status_stage(0, false, true).ok()?;
+    ep0_ring.enqueue(ep0_seg, setup).ok()?;
+    let data_token = ep0_ring.enqueue(ep0_seg, data).ok()?;
+    let status_token = ep0_ring.enqueue(ep0_seg, status).ok()?;
+    dsb();
+    ring_slot_doorbell(io, layout, slot_id, 1);
+    let mut completion = drv_xhci::ax88::ReadCompletion::default();
+    for _ in 0..EP0_STALE_EVENT_LIMIT {
+        let (cc, remaining, token) = poll_transfer_event(io, layout, image, evt, slot_id)?;
+        if completion
+            .observe(
+                token == data_token.iova,
+                token == status_token.iova,
+                cc,
+                remaining,
+            )
+            .ok()?
+        {
+            ep0_ring.reclaim_through(status_token.iova).ok()?;
+            dsb();
+            return Some((1, 0));
+        }
+    }
+    None
+}
+
 fn control_in(
     io: &mut Mmio,
     layout: RegisterLayout,

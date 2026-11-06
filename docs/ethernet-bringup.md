@@ -1,11 +1,13 @@
-# Ethernet bring-up: AX88179 first, one userspace network stack
+# Ethernet bring-up: ax88 first, one userspace network stack
 <!-- j808 -->
+<!-- j809 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: planned; no Ethernet hardware acceptance yet.
+Status: NET0a KUMO descriptor inventory accepted; independent NET0b comparison pending.
 
 ## First controller
 
+Use **ax88** for the AX88179/AX88178A family, as selected by CRUX.
 Start with the available ASIX AX88179 USB adapter. KUMO already has xHCI enumeration,
 control IN and bulk-transfer mechanisms. Moving this adapter between hosts will let
 us exercise a common chip driver and network interface on different platforms.
@@ -120,3 +122,29 @@ files intact, restore default images and stop task PXE/capture processes before 
 IPv6, complete POSIX sockets, TLS, zero-copy, multiqueue and throughput tuning follow as
 separate slices. Link LEDs, ping and PXE success are individual observations, not a
 complete socket/PAL acceptance. — TIMBERDOODLE 2026-11-06
+
+
+## NET0a descriptor inventory
+
+The drv-xhci ax88 module recognizes the two explicit ASIX IDs and checks the complete
+configuration/interface/endpoint/SS-companion structure. It logs raw descriptors and
+root/route/slot/speed observations before any class configuration. A private standard
+GET_DESCRIPTOR IN path requires successful data AND status TRB completions with zero
+residual; short/error/unknown completions do not prove a descriptor read. The adapter
+stays unconfigured, with no vendor command, bulk endpoint setup or Ethernet TX.
+
+An owner that observed ax88 retains its process and DMA until reset, including failed
+reads. Nonresident controllers request halt and park; that request is not a buffer-release
+proof. A shared resident HID owner keeps its normal service and the observed slot.
+Independent host/firmware descriptor comparison is the separate NET0b gate. These are
+implementation boundaries; the journal records the actual physical result.
+— TIMBERDOODLE 2026-11-06
+
+
+NET0a metal observation (2026-11-06): ax88 matched 0b95:1790, bcdDevice0100,
+bcdUSB0210, USB2 high speed on controller0xfc400000/root1/hub route4/slot5.
+Exact device18B/config39B reads passed. Status EP81 has MPS8/interval11; bulk IN82
+and OUT03 each MPS512, no SuperSpeed companion on this connection. Login and both
+NVMe test-file reads passed, then NVMe was unmounted. No USB storage was offered;
+USB-storage coexistence and independent firmware comparison remain future proofs.
+— TIMBERDOODLE 2026-11-06
