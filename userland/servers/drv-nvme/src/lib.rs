@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_code)]
-//j801
 //j802
 //j803
 //j805
 //j806
+//j807
 //! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
 //! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
@@ -27,7 +27,7 @@ pub const BOOT_LEN: usize = 64;
 pub const MEMORY_LEN: usize = 32;
 pub const PROOF_LEN: usize = 80;
 pub const ACK: u8 = b'A';
-/// Private supervisor control: stop the resident read-only owner and return proof.
+/// Private supervisor control: stop the resident owner and return disable proof.
 pub const CONTROL_STOP: u8 = b'Q';
 /// Private supervisor control: prepare normal shutdown and retain DMA until reset.
 pub const CONTROL_SHUTDOWN: u8 = b'S';
@@ -37,6 +37,8 @@ pub const MODE_PROOF: u8 = 0;
 pub const MODE_SERVE: u8 = 1;
 /// One-off reserved-sector Write/Flush proof; normal service stays read-only.
 pub const MODE_WRITE_PROOF: u8 = 2;
+/// Writable service only on the explicitly authorized test SSD/layout.
+pub const MODE_SERVE_WRITABLE: u8 = 3;
 pub const CC: u16 = 0x14;
 pub const CSTS: u16 = 0x1c;
 const CC_CONFIG: u32 = (6 << 16) | (4 << 20);
@@ -119,7 +121,7 @@ pub struct Startup {
     pub irq: u32,
     pub pin: u8,
     pub legacy_mask: u32,
-    /// MODE_PROOF or MODE_SERVE (byte 51).
+    /// Explicit proof/service mode (byte 51); unknown values refuse.
     pub mode: u8,
 }
 impl Startup {
@@ -135,7 +137,7 @@ impl Startup {
             || self.pin != 1
             || !(32..1020).contains(&self.irq)
             || self.legacy_mask & 1 != 0
-            || self.mode > MODE_WRITE_PROOF
+            || self.mode > MODE_SERVE_WRITABLE
         {
             return Err(Error::Bootstrap);
         }
@@ -697,7 +699,7 @@ mod tests {
                 6 => s.pin = 2,
                 7 => s.irq = 31,
                 8 => s.legacy_mask = 0xffff,
-                9 => s.mode = 3,
+                9 => s.mode = 4,
                 _ => s.cap &= !0xffff,
             };
             cases.push((s, memory()));
@@ -742,7 +744,7 @@ mod tests {
         let s = startup();
         assert_eq!(Startup::decode(&s.encode()), Some(s));
         assert_eq!(Memory::decode(&memory().encode()), Some(memory()));
-        for (at, value) in [(8, 1), (8, 2), (51, 3), (60, 1), (50, 0)] {
+        for (at, value) in [(8, 1), (8, 2), (51, 4), (60, 1), (50, 0)] {
             let mut b = s.encode();
             b[at] = value;
             assert!(Startup::decode(&b).is_none(), "byte {at}");
@@ -758,6 +760,11 @@ mod tests {
             ..s
         };
         assert_eq!(Startup::decode(&write.encode()), Some(write));
+        let writable = Startup {
+            mode: MODE_SERVE_WRITABLE,
+            ..s
+        };
+        assert_eq!(Startup::decode(&writable.encode()), Some(writable));
         let mut io = Fake::new();
         let p = exercise(&mut io, s, memory());
         assert!(p.releases(memory()));

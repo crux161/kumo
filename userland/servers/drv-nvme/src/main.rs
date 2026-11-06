@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j801
 //j802
 //j803
 //j805
 //j806
+//j807
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -12,7 +12,8 @@
 //! write; failures park with memory quarantined. Reads LBA 0, LBA 1 and the last LBA
 //! single, batched and with vector 0 masked; NSZE is refused before any doorbell. No
 //! root/client/config or SMMU writes. NV8 adds an explicit one-sector Write/Flush
-//! proof mode outside the FAT volume. D5 cooperative raw DMA.
+//! proof mode outside the FAT volume. NV9 serves the approved FAT test volume
+//! read/write, enforcing each client access mode. D5 cooperative raw DMA.
 //! — TIMBERDOODLE
 
 extern crate alloc;
@@ -22,7 +23,7 @@ use drv_blk::{
 };
 use drv_nvme::{
     exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES,
-    MODE_SERVE, MODE_WRITE_PROOF, PAGE, PROOF_LEN,
+    MODE_SERVE, MODE_SERVE_WRITABLE, MODE_WRITE_PROOF, PAGE, PROOF_LEN,
 };
 use kumo_abi::{DevicePowerStatus, Handle, Rights, VmarFlags};
 use kumo_fatfs::{FatVolume, PartitionReader, SECTOR_SIZE};
@@ -603,11 +604,14 @@ struct Client {
     koid: u64,
     served: u32,
     refused: u32,
+    read_only: bool,
+    writes: u32,
+    flushes: u32,
 }
 const MAX_CLIENTS: usize = 4;
 
 /// NV7: bring the pair up as NV6 does, choose the FAT32 volume, offer it to Sora on the
-/// bootstrap channel and serve block clients read-only. Returns Ok when Sora closes the
+/// bootstrap channel and serve clients under volume/per-client access policy. Returns Ok when Sora closes the
 /// control channel (or no volume exists), after masking vector 0 and deleting the pair,
 /// so the caller's proved disable follows. — TIMBERDOODLE
 fn serve(
@@ -703,11 +707,23 @@ fn serve(
         pair.close(&mut admin, io, s, memory)?;
         return Ok(());
     };
+    // Writes are admitted only for CRUX's exact disposable SSD and J804 volume.
+    // Every request is separately bounded to this partition and its client access.
+    // Other drives/layouts continue read-only. — TIMBERDOODLE
+    let writable = s.mode == MODE_SERVE_WRITABLE
+        && drv_nvme::write::TestExtent::new(
+            &controller,
+            &ns,
+            found.entries,
+            part.first_lba,
+            part.block_count(),
+        )
+        .is_ok();
     let ready = MediaReady {
         block_count: part.block_count(),
         serial: bpb.volume_serial,
         label,
-        read_only: true,
+        read_only: !writable,
     };
     let label_text = label
         .map(|l| alloc::string::String::from_utf8_lossy(l.trim_ascii_end()).into_owned())
@@ -715,14 +731,15 @@ fn serve(
     log(
         kumo_abi::sys::log_level::NOTICE,
         &alloc::format!(
-            "NV7 VOLUME session={} index={} first-lba={} blocks={} fat32 serial={:04X}-{:04X} label={} read-only; offered\n",
+            "NV7 VOLUME session={} index={} first-lba={} blocks={} fat32 serial={:04X}-{:04X} label={} {}; offered\n",
             s.session,
             part.index,
             part.first_lba,
             part.block_count(),
             bpb.volume_serial >> 16,
             bpb.volume_serial & 0xffff,
-            label_text
+            label_text,
+            if writable {"read-write"} else {"read-only"}
         ),
     );
     let offer = ready.encode();
@@ -776,18 +793,24 @@ fn serve(
                     clients[slot] = Client {
                         handle: client.0,
                         koid,
+                        read_only: !writable || access == BlockAccess::ReadOnly,
                         ..Client::default()
                     };
                     log(
                         kumo_abi::sys::log_level::INFO,
                         &alloc::format!(
-                            "NV7 CLIENT session={} slot={} connected asked={} served read-only\n",
+                            "NV7 CLIENT session={} slot={} connected asked={} served {}\n",
                             s.session,
                             slot,
                             if access == BlockAccess::ReadOnly {
                                 "ro"
                             } else {
                                 "rw"
+                            },
+                            if clients[slot].read_only {
+                                "read-only"
+                            } else {
+                                "read-write"
                             }
                         ),
                     );
@@ -813,11 +836,13 @@ fn serve(
             log(
                 kumo_abi::sys::log_level::INFO,
                 &alloc::format!(
-                    "NV7 CLIENT session={} slot={} closed served={} refused={}\n",
+                    "NV7 CLIENT session={} slot={} closed served={} refused={} writes={} flushes={}\n",
                     s.session,
                     i,
                     clients[i].served,
-                    clients[i].refused
+                    clients[i].refused,
+                    clients[i].writes,
+                    clients[i].flushes
                 ),
             );
             clients[i] = Client::default();
@@ -830,7 +855,7 @@ fn serve(
             &frame[..n as usize],
             part.first_lba,
             part.block_count(),
-            true,
+            clients[i].read_only,
         ) {
             Ok(VolumeRequest::Read(lba)) => {
                 match pair.read_irq(
@@ -855,9 +880,39 @@ fn serve(
                     }
                 }
             }
-            // Nothing is ever buffered for a read-only volume.
-            Ok(VolumeRequest::Flush) => STATUS_OK,
-            Ok(VolumeRequest::Write(..)) => STATUS_READ_ONLY,
+            Ok(VolumeRequest::Flush) if !writable => STATUS_OK,
+            Ok(VolumeRequest::Flush) => {
+                if let Err(e) = pair.flush_irq(io, &mut line, s, memory, &mut stats) {
+                    let failed = [STATUS_IO_ERROR];
+                    let _ = channel_write(client, failed.as_ptr(), 1);
+                    return Err(e);
+                }
+                clients[i].flushes += 1;
+                log(
+                    kumo_abi::sys::log_level::INFO,
+                    &alloc::format!("NV9 FLUSH session={} slot={} completed\n", s.session, i),
+                );
+                STATUS_OK
+            }
+            Ok(VolumeRequest::Write(lba, data)) => {
+                if let Err(e) = pair.write_irq(io, &mut line, s, memory, lba, data, &mut stats) {
+                    let failed = [STATUS_IO_ERROR];
+                    let _ = channel_write(client, failed.as_ptr(), 1);
+                    return Err(e);
+                }
+                clients[i].writes += 1;
+                log(
+                    kumo_abi::sys::log_level::INFO,
+                    &alloc::format!(
+                        "NV9 WRITE session={} slot={} lba={} bytes={} completed\n",
+                        s.session,
+                        i,
+                        lba,
+                        data.len()
+                    ),
+                );
+                STATUS_OK
+            }
             Err(status) => {
                 clients[i].refused += 1;
                 status
@@ -883,7 +938,7 @@ fn serve(
         let _ = port_unbind(port, Handle(c.handle));
         let _ = handle_close(Handle(c.handle));
     }
-    if shutdown {
+    if shutdown || writable {
         let elapsed = pair.flush_irq(io, &mut line, s, memory, &mut stats)?;
         log(
             kumo_abi::sys::log_level::NOTICE,
@@ -1012,7 +1067,7 @@ extern "C" fn main(
     }
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
     let p = exercise_with(&mut io, s, memory, |io| {
-        if s.mode == MODE_SERVE {
+        if matches!(s.mode, MODE_SERVE | MODE_SERVE_WRITABLE) {
             serve(io, s, memory, resource, control, port, quarantine)
         } else if s.mode == MODE_WRITE_PROOF {
             write_proof(io, s, memory, resource)

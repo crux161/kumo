@@ -1,15 +1,16 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j802 -->
 <!-- j803 -->
 <!-- j804 -->
 <!-- j805 -->
 <!-- j806 -->
+<!-- j807 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV7 are complete, including physical FAT32 reads and USB/NVMe coexistence. Firmware's PCIe3_4L link and enumeration lead to a
+NV0–NV9 are complete: physical FAT32 reads, USB coexistence, normal NVMe shutdown
+and Kilo saves surviving reboot on the authorized test SSD. Firmware's PCIe3_4L link and enumeration lead to a
 Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
 configuration and graceful restart with two distinct owners, each reaching
 RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
@@ -18,8 +19,12 @@ observation is disabled nonsecure bypass; containment remains unimplemented.
 `lib/kumo-pcie`, its HAL observers and the early boot report discover the inherited
 route. `drv-nvme` owns controller operations behind Sora's narrowed Resource and
 DMA custody protocol. NV4 added polled Identify, NV5 polled reads and NV6
-INTx completions; the block service and filesystems follow.
+INTx completions; NV7–NV9 add the block service and writable FAT32 test volume.
 The detailed local plan is PLAN/019; each journal records its own acceptance.
+NV9 acceptance on 2026-11-06 saved the 48-byte `NV9J807.TXT`, completed normal
+Flush/SHN1/SHST2 shutdown, and read the exact text after reboot. Actual RO/RW
+alias checks passed. Road C was reviewed and remains OPEN; these storage proofs
+do not establish DESIGN/009 DMA confinement. — TIMBERDOODLE 2026-11-06
 
 ## D5: cooperative DMA for NV3–NV9
 
@@ -383,7 +388,7 @@ writable by this proof. `KUMO_NVME_WRITE_PROOF=1 cargo xtask image --arch aarch6
 an independent UEFI read reference. After normal startup, the `nvme-write-proof`
 shell command performs the test (NVMe must be unmounted). Keeping the one-off proof
 out of bootstrap preserves existing block-service readiness deadlines. Other boards and combining preparation with
-the write proof refuse. Default Sora still starts only the read-only service.
+the write proof refuse. Sora starts the volume service; NV9 admits writes only on the approved test SSD/layout.
 
 Firmware captures the target and both adjacent sectors through Block I/O. The
 host saves all1536B, verifies aggregate/per-block hashes, and acknowledges receipt
@@ -434,3 +439,31 @@ without reopening storage or submitting I/O; ownership stays retained.
 Emergency kernel SysRq bypasses this userspace handshake. FAT remains an interop
 test volume, and writable service/editor-save persistence is the NV9 gate.
 D5 cooperative DMA/RoadC remain explicit. — TIMBERDOODLE
+
+
+## NV9 writable FAT32 test volume
+
+Startup mode3 requests writable service. The driver admits it only on the exact
+explicitly disposable Samsung SSD and single J804 FAT32 partition accepted by the
+existing test-media guard. Other identities/layouts stay read-only. Sora keeps
+manual mounting and advertises the actual volume access policy.
+
+Each connected client separately retains RO/RW access. Legacy and explicit RO
+clients cannot upgrade themselves by sending Write frames, even on a writable
+volume. The shared drv-blk validator bounds every one-sector request to the
+partition before DMA or doorbell writes. RW requests use the proved INTx Write
+path; Flush reaches the namespace. Failure quarantines the owner and blocks normal
+power/replacement. A writable owner Flushes before every controlled exit; normal
+power then preserves SHST2 and DMA custody through reset as in NV8b.
+
+The existing FAT server and Kilo save path use these block channels. Mount with
+`mount /dev/disk3s1 /media/nvme`, edit an 8.3 file such as `kilo /media/nvme/NV9.TXT`,
+save with Ctrl-S and exit Ctrl-Q. Normal reboot and `cat /media/nvme/NV9.TXT`
+provide the persistence gate. This is an interoperability test volume, never the
+OS root; RedoxFS/Houtu remains its own plan.
+
+The existing default-off proof image also exposes `nvme-alias-proof` after startup:
+RO writes must refuse before I/O, RW writes use the identical current VBR bytes,
+Flush, and both readbacks must equal the original. No new filesystem formatter.
+D5 cooperative DMA/RoadC remains open through the explicit NV9 review.
+— TIMBERDOODLE

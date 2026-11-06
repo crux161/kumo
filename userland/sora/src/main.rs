@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j801
 //j802
 //j803
 //j805
 //j806
+//j807
 
 extern crate alloc;
 
@@ -3534,17 +3534,22 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
     // NV7: a serve owner answers with its volume and stays resident. Its bootstrap channel
     // becomes NVMe's storage control; custody, process and DMA handles stay with Sora for as
     // long as it serves (a later exit without proof leaves them retained). — TIMBERDOODLE
-    if startup.mode == drv_nvme::MODE_SERVE && h == 0 {
+    if matches!(
+        startup.mode,
+        drv_nvme::MODE_SERVE | drv_nvme::MODE_SERVE_WRITABLE
+    ) && h == 0
+    {
         if let Some(ready) = drv_blk::MediaReady::decode(&frame[..n]) {
             let _ = port_unbind(port, owner.client);
             let _ = handle_close(port);
             STORAGE_CONTROLS[sora::NVME_STORAGE].store(owner.client.0, Ordering::Relaxed);
             let process = handle_koid(owner.process);
             notice(&[alloc::format!(
-                "NV7 OWNER session={} process={} resident; serving {} read-only; DMA custody held while it serves\n",
+                "NV7 OWNER session={} process={} resident; serving {} {}; DMA custody held while it serves\n",
                 startup.session,
                 process,
-                core::str::from_utf8(&sora::disk_path(sora::NVME_STORAGE)).unwrap_or("?")
+                core::str::from_utf8(&sora::disk_path(sora::NVME_STORAGE)).unwrap_or("?"),
+                if ready.read_only {"read-only"} else {"read-write"}
             )
             .as_bytes()]);
             let _ = media_ready(initrd, sora::NVME_STORAGE, owner.client, ready);
@@ -3628,7 +3633,7 @@ fn launch_nvme_service(initrd: Handle, root: Handle, dtb: Handle, bootinfo: Hand
         return;
     };
     startup.session = 1;
-    startup.mode = drv_nvme::MODE_SERVE;
+    startup.mode = drv_nvme::MODE_SERVE_WRITABLE;
     let _ = run_nvme_admin_owner(initrd, root, startup);
 }
 
@@ -3788,7 +3793,7 @@ fn nvme_write_proof_command(initrd: Handle) -> bool {
     if run_nvme_admin_owner(initrd, owner.root_resource, startup).is_none() {
         return false;
     }
-    let ok = nvme_readonly_proof();
+    let ok = nvme_alias_proof(false);
     notice(&[if ok {
         b"NV8 proof command complete; read-only service restored\n"
     } else {
@@ -6693,6 +6698,16 @@ fn eval_command(
             }
         } else {
             log(b"power: NVMe shutdown failed; power command refused\n");
+            fail_status(1);
+        }
+        return true;
+    }
+    #[cfg(feature = "nvme-write-proof")]
+    if cmd.name == "nvme-alias-proof" {
+        let writable = DEVICES.get()[sora::NVME_STORAGE].is_some_and(|d| !d.ready.read_only);
+        if !cmd.args.is_empty() {
+            usage(b"usage: nvme-alias-proof\n");
+        } else if !nvme_alias_proof(writable) {
             fail_status(1);
         }
         return true;
@@ -10302,10 +10317,10 @@ fn launch_lua_repl(initrd: Handle) {
 }
 
 #[cfg(feature = "nvme-write-proof")]
-fn nvme_readonly_proof() -> bool {
+fn nvme_alias_proof(writable: bool) -> bool {
     // Send an actual write frame through both explicit access requests. Payload
     // equals the current VBR, so even a regression cannot corrupt its bytes.
-    // The driver separately proves no controller doorbell was issued. — TIMBERDOODLE
+    // RO refusals prove unchanged doorbells; admitted RW also proves Flush. — TIMBERDOODLE
     for access in [BlockAccess::ReadOnly, BlockAccess::ReadWrite] {
         let (client, server) = channel_create_pair();
         let port = port_create();
@@ -10344,21 +10359,34 @@ fn nvme_readonly_proof() -> bool {
             && nvme_receive(port, client, &mut before) == Some((513, 0))
             && before[0] == drv_blk::STATUS_OK;
         write[drv_blk::REQUEST_LEN..].copy_from_slice(&before[1..]);
-        let ok = ok
+        let expected = if writable && access == BlockAccess::ReadWrite {
+            drv_blk::STATUS_OK
+        } else {
+            drv_blk::STATUS_READ_ONLY
+        };
+        let mut ok = ok
             && channel_write(client, write.as_ptr(), write.len()) == 0
             && nvme_receive(port, client, &mut status) == Some((1, 0))
-            && status[0] == drv_blk::STATUS_READ_ONLY
+            && status[0] == expected
             && channel_write(client, read.as_ptr(), read.len()) == 0
             && nvme_receive(port, client, &mut after) == Some((513, 0))
             && after == before;
+        if ok && expected == drv_blk::STATUS_OK {
+            let flush = drv_blk::Request::flush().encode();
+            let mut result = [0; 1];
+            ok = channel_write(client, flush.as_ptr(), flush.len()) == 0
+                && nvme_receive(port, client, &mut result) == Some((1, 0))
+                && result[0] == drv_blk::STATUS_OK;
+        }
         notice(&[alloc::format!(
-            "NV8 RO alias asked={} refused={} VBR unchanged={} {}\n",
+            "NV9 ALIAS asked={} expected={} got={} VBR unchanged={} {}\n",
             if access == BlockAccess::ReadOnly {
                 "ro"
             } else {
                 "rw"
             },
-            status[0] == drv_blk::STATUS_READ_ONLY,
+            expected,
+            status[0],
             after == before,
             if ok { "OK" } else { "FAILED" }
         )
