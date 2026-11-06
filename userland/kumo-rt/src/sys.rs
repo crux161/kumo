@@ -1,8 +1,8 @@
-//j629
 //j632
 //j660
 //j743
 //j790
+//j815
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -462,6 +462,9 @@ pub const STARTUP_TAG_FS: u8 = b'f';
 /// separate from stdin/stdout data channels so control RPC replies cannot be
 /// mistaken for stream bytes.
 pub const STARTUP_TAG_TTY: u8 = b't';
+/// J815: a session channel to netstack (DESIGN/026). Only a launcher that grants network access
+/// sends one; a program without it cannot address the network at all.
+pub const STARTUP_TAG_NET: u8 = b'n';
 
 /// Explicit capabilities supplied to a newly started program. Each present field came
 /// from one transferred handle on the bootstrap channel; absent fields grant no authority.
@@ -474,6 +477,7 @@ pub struct Startup {
     pub cap0: Option<Handle>,
     pub fs: Option<Handle>,
     pub tty: Option<Handle>,
+    pub net: Option<Handle>,
 }
 
 impl Startup {
@@ -488,6 +492,7 @@ impl Startup {
             STARTUP_TAG_CAP0 => &mut self.cap0,
             STARTUP_TAG_FS => &mut self.fs,
             STARTUP_TAG_TTY => &mut self.tty,
+            STARTUP_TAG_NET => &mut self.net,
             _ => return Some(handle),
         };
         slot.replace(handle)

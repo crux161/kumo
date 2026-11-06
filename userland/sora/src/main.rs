@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j802
 //j803
 //j805
 //j806
 //j807
+//j815
 
 extern crate alloc;
 
@@ -15,8 +15,8 @@ use kumo_abi::{
     BootInfo, Errno, Framebuffer, Handle, ProcessRunFlags, Rights, VmarFlags, AUTOEXEC_PATH,
     BMP_VIEW_PATH, CAT_PATH, DRV_GPU_PATH, DRV_XHCI_PATH, FAT32_IMG_PATH, FATFS_PATH,
     GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, GPU_LANE_PATH, GROUP_PATH,
-    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, PASSWD_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
+    HOSTNAME_PATH, IDENTITYD_PATH, KILO_PATH, LS_PATH, NETSTACK_PATH, PASSWD_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SHADOW_PATH, SVC_HEALTH_PATH, TTYD_PATH, WC_PATH,
 };
 use kumo_fatfs::{FatVolume, SectorReader};
 use kumo_i2c_hid::{HidDeviceKind, I2cHidBusTopology};
@@ -31,7 +31,7 @@ use kumo_rt::{
     port_wait, process_create, process_kill, process_run, process_wait, resource_create_child,
     resource_mint_mmio, syscall_handle, thread_create, thread_start, timer_create, vmar_map,
     vmo_create, vmo_read, vmo_write, STARTUP_TAG_ARGV, STARTUP_TAG_CAP0, STARTUP_TAG_FS,
-    STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
+    STARTUP_TAG_NET, STARTUP_TAG_STDIN, STARTUP_TAG_STDOUT, STARTUP_TAG_TTY,
 };
 use kumoza::{parse, DirectoryError, WorkingDirectory};
 use persona_linux::{arm64 as linux_arm64, elf as linux_elf};
@@ -6826,6 +6826,7 @@ fn eval_command(
             true,
             false,
             StdinMode::Finite(b"a line from sora\n"),
+            false,
         );
         return true;
     } else if cmd.name == "threads" {
@@ -6930,6 +6931,14 @@ fn eval_command(
                 }
             }
         }
+    } else if cmd.name == "net" {
+        // net <program> [args...]: `run`, plus one netstack session channel. Network access is
+        // granted by this launcher word and nothing else (DESIGN/026 §4). — TIMBERDOODLE
+        if cmd.args.is_empty() {
+            usage(b"usage: net <program> [args...]\n");
+        } else {
+            run_program_granted(initrd, &cmd.args, true);
+        }
     } else if cmd.name == "run" {
         // run <program> [args...]: spawn bin/<program> and run it to completion, handing it
         // stdout + its arguments through the bootstrap startup message (x0) — no initrd, so a
@@ -6981,6 +6990,7 @@ fn run_with_startup(
         false,
         false,
         StdinMode::None,
+        false,
     );
 }
 
@@ -7227,11 +7237,73 @@ fn run_on_volume(
         false,
         false,
         StdinMode::None,
+        false,
     );
 }
 
 /// The identity service's client end (PLAN/012), or 0 when it did not start.
 static IDENTITYD: AtomicU32 = AtomicU32::new(0);
+
+/// J815: Sora's end of netstack's control channel, or 0 until the first `net` launch starts it.
+static NETSTACK_CONTROL: AtomicU32 = AtomicU32::new(0);
+
+/// Start netstack (DESIGN/026) and return Sora's end of its control channel. It owns no device:
+/// its only authority is the session channels Sora sends it, one per granted launch.
+fn spawn_netstack(initrd: Handle) -> Option<Handle> {
+    let (control_raw, server_raw) = channel_create_pair();
+    if control_raw == u64::MAX || server_raw == u64::MAX {
+        log(b"netstack: control channel unavailable\n");
+        return None;
+    }
+    let control = Handle(control_raw as u32);
+    let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
+    if !run_elf(
+        initrd,
+        NETSTACK_PATH.as_bytes(),
+        0,
+        server_raw,
+        flags,
+        b"netstack",
+    ) {
+        let _ = handle_close(control);
+        let _ = handle_close(Handle(server_raw as u32));
+        return None;
+    }
+    if !child_parked(process_wait()) {
+        let _ = handle_close(control);
+        log(b"netstack: did not start\n");
+        return None;
+    }
+    Some(control)
+}
+
+/// Mint one netstack session for a launch: a fresh channel whose server end goes to netstack
+/// tagged `S`, and whose client end the caller hands to the child. netstack starts on first use,
+/// so an image that never runs `net` never starts it. — TIMBERDOODLE
+fn netstack_session(initrd: Handle) -> Option<Handle> {
+    let mut control = Handle(NETSTACK_CONTROL.load(Ordering::Relaxed));
+    if control.0 == 0 {
+        control = spawn_netstack(initrd)?;
+        NETSTACK_CONTROL.store(control.0, Ordering::Relaxed);
+    }
+    let (client_raw, server_raw) = channel_create_pair();
+    if client_raw == u64::MAX || server_raw == u64::MAX {
+        log(b"netstack: session channel unavailable\n");
+        return None;
+    }
+    let server = Handle(server_raw as u32);
+    if channel_write_with_handle(control, b"S".as_ptr(), 1, server) != Errno::Ok.status() {
+        // A refused send leaves `server` in Sora's table, and netstack is gone: forget it so the
+        // next `net` launch starts a fresh instance rather than reuse a dead control channel.
+        let _ = handle_close(server);
+        let _ = handle_close(Handle(client_raw as u32));
+        let _ = handle_close(control);
+        NETSTACK_CONTROL.store(0, Ordering::Relaxed);
+        log(b"netstack: control channel refused; session not granted\n");
+        return None;
+    }
+    Some(Handle(client_raw as u32))
+}
 
 /// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a
 /// failure (a child's non-zero exit included, until the kernel reports exit codes), 2 a usage
@@ -8133,6 +8205,7 @@ fn run_with_startup_input(
     grant_tty: bool,
     bind_stdout: bool,
     stdin: StdinMode<'_>,
+    grant_net: bool,
 ) -> Option<InteractiveChild> {
     let (stdout_read_raw, stdout_write_raw) = channel_create_pair();
     if stdout_read_raw == u64::MAX || stdout_write_raw == u64::MAX {
@@ -8230,11 +8303,18 @@ fn run_with_startup_input(
     } else {
         None
     };
+    // J815: a network session exists only because this launcher granted it (DESIGN/026 §4).
+    let net_child = if grant_net {
+        netstack_session(initrd)
+    } else {
+        None
+    };
     let argv_bad = argv.is_some() && (argv_child_raw == 0 || argv_child_raw == u64::MAX);
     let initrd_bad = grant_initrd && (initrd_child_raw == 0 || initrd_child_raw == u64::MAX);
     let fs_bad = fs != FsGrant::None && fs_child.is_none();
     let tty_bad = grant_tty && tty_child.is_none();
-    if argv_bad || initrd_bad || fs_bad || tty_bad {
+    let net_bad = grant_net && net_child.is_none();
+    if argv_bad || initrd_bad || fs_bad || tty_bad || net_bad {
         for handle in [stdout_read, stdout_write, bootstrap_send, bootstrap_child] {
             let _ = handle_close(handle);
         }
@@ -8253,6 +8333,9 @@ fn run_with_startup_input(
         if let Some(tty) = tty_child {
             let _ = handle_close(tty);
         }
+        if let Some(net) = net_child {
+            let _ = handle_close(net);
+        }
         if let Some(writer) = stdin_writer {
             let _ = handle_close(writer);
         }
@@ -8261,9 +8344,9 @@ fn run_with_startup_input(
         return None;
     }
 
-    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty]. Order is
-    // immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
-    let mut tags: [(u8, Handle); 6] = [(0, Handle(0)); 6];
+    // Assemble the tagged set: [stdin], stdout, [argv], [cap0=initrd], [fs], [tty], [net]. Order
+    // is immaterial — the child installs by tag — but kept deterministic for serial diagnosis.
+    let mut tags: [(u8, Handle); 7] = [(0, Handle(0)); 7];
     let mut expected = 0usize;
     if let Some(stdin_read) = stdin_read {
         tags[expected] = (STARTUP_TAG_STDIN, stdin_read);
@@ -8285,6 +8368,10 @@ fn run_with_startup_input(
     }
     if let Some(tty) = tty_child {
         tags[expected] = (STARTUP_TAG_TTY, tty);
+        expected += 1;
+    }
+    if let Some(net) = net_child {
+        tags[expected] = (STARTUP_TAG_NET, net);
         expected += 1;
     }
 
@@ -8473,6 +8560,7 @@ fn start_lua_session(initrd: Handle) -> bool {
         false,
         false,
         StdinMode::Interactive,
+        false,
     ) else {
         debug_write(b"lua: session unavailable\n".as_ptr(), 25);
         return false;
@@ -8687,6 +8775,7 @@ fn start_kilo_session(initrd: Handle, cmd: &kumoza::Command) -> bool {
         true,
         true,
         StdinMode::Interactive,
+        false,
     ) else {
         debug_write(b"kilo: session unavailable\n".as_ptr(), 26);
         return false;
@@ -8798,6 +8887,11 @@ fn write_argv(argv: &[&[u8]]) -> Option<Handle> {
 /// `ls` builtins are the capability-granting launchers). The `bin/` prefix is built into a fixed
 /// buffer (no heap). Returns whether the spawn was attempted (false also logs the reason).
 fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
+    run_program_granted(initrd, argv, false)
+}
+
+/// [`run_program`], with a netstack session when `grant_net` (the `net` launcher).
+fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) -> bool {
     let name = match argv.first() {
         Some(n) => n.as_bytes(),
         None => return false,
@@ -8846,9 +8940,21 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
             false,
             false,
             StdinMode::Finite(&input[..input_len]),
+            false,
         );
     } else {
-        run_with_startup(initrd, full, full, Some(&slots[..count]), false);
+        run_with_startup_input(
+            initrd,
+            full,
+            full,
+            Some(&slots[..count]),
+            false,
+            FsGrant::None,
+            false,
+            false,
+            StdinMode::None,
+            grant_net,
+        );
     }
     true
 }
@@ -10313,6 +10419,7 @@ fn launch_lua_repl(initrd: Handle) {
         StdinMode::Finite(
             b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n",
         ),
+        false,
     );
 }
 

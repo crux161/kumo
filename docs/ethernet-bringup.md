@@ -3,9 +3,10 @@
 <!-- j809 -->
 <!-- j810 -->
 <!-- j812 -->
+<!-- j815 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 contracts and stack pin accepted (J812); NET2a next.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b-1 in QEMU (J815).
 
 ## First controller
 
@@ -207,3 +208,16 @@ probe built it without an allocator for both bare-metal targets and the host. sm
 loopback device needs an allocator, so the first implementation slice provides a bounded
 loopback device instead. Dependencies are vendored only when that slice lands.
 — TIMBERDOODLE 2026-11-06
+
+
+
+## NET2b-1 first network service
+
+`net <program> [args]` launches a program exactly like `run`, plus one session with the
+network service; `run` grants none, and a program cannot ask for one. The service starts on
+the first `net` launch, owns only a loopback interface (127.0.0.1/8), and serves UDP over the
+session protocol. In QEMU a probe moved exact datagrams of 0, 28, 1472 and 14 bytes between
+two of its sockets; oversize datagrams, unknown sockets, remote addresses, TCP (not yet
+served) and the per-client socket limit are refused with specific errors, and a malformed
+request ends the session. Ending a session frees its sockets. Two separately launched
+clients exchanging datagrams at the same time is the next step. — TIMBERDOODLE 2026-11-06

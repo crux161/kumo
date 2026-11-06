@@ -1,8 +1,8 @@
-#j709
 #j792
 #j798
 #j801
 #j813
+#j815
 [workspace]
 members = [
     "boot/niji-loader",
@@ -44,6 +44,7 @@ members = [
     "userland/gpu-client",
     "userland/gpu-contain",
     "userland/ls",
+    "userland/netprobe",
     "userland/lua-repl",
     "userland/threads",
     "userland/kumo-dispatch",
@@ -60,6 +61,7 @@ members = [
     "userland/servers/drv-serial",
     "userland/servers/fatfs",
     "userland/servers/identityd",
+    "userland/servers/netstack",
     "userland/servers/svc-health",
     "userland/servers/ttyd",
     "userland/sora",

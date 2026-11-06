@@ -1,0 +1,29 @@
+#j815
+
+[package]
+name = "netstack"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+kumo-netstack = { path = "../../../lib/kumo-netstack" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-ipc.workspace = true
+kumo-rt = { path = "../../kumo-rt" }
+
+[lib]
+test = true
+doctest = false
+
+# The resident binary, built for the image target only, so `cargo test -p netstack` drives the
+# server core on the host without the runtime (the identityd split).
+[[bin]]
+name = "netstack"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

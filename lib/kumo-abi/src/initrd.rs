@@ -1,8 +1,8 @@
-//j669
 //j675
 //j709
 //j774
 //j798
+//j815
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -38,6 +38,11 @@ pub const FAT32_IMG_PATH: &str = "bin/fat32.img";
 /// read-only bundle, it answers `verify` and `lookup` and is the only process that checks a
 /// password.
 pub const IDENTITYD_PATH: &str = "bin/identityd";
+/// The network service (PLAN/020, DESIGN/026): started by Sora on the first `net` launch; owns
+/// the loopback interface and serves socket sessions Sora grants.
+pub const NETSTACK_PATH: &str = "bin/netstack";
+/// The NET2b socket-contract probe, launched as `net netprobe <mode>`.
+pub const NETPROBE_PATH: &str = "bin/netprobe";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.

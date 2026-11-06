@@ -1,8 +1,8 @@
-//j798
 //j800
 //j804
 //j805
 //j810
+//j815
 
 use std::env;
 use std::fmt;
@@ -924,6 +924,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let drv_blk = build_drv_blk_image(&workspace_root()?)?;
             let fatfs = build_fatfs_image(&workspace_root()?)?;
             let identityd = build_identityd_image(&workspace_root()?)?;
+            let netstack = build_native_bin(&workspace_root()?, "netstack")?;
+            let netprobe = build_native_bin(&workspace_root()?, "netprobe")?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
@@ -960,6 +962,8 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (DRV_BLK_PATH, drv_blk.as_slice()),
                 (FATFS_PATH, fatfs.as_slice()),
                 (IDENTITYD_PATH, identityd.as_slice()),
+                (kumo_abi::initrd::NETSTACK_PATH, netstack.as_slice()),
+                (kumo_abi::initrd::NETPROBE_PATH, netprobe.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),
@@ -1631,6 +1635,29 @@ fn build_fatfs_image(root: &Path) -> Result<Vec<u8>, String> {
         fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
     validate_aarch64_kernel_elf(&bytes)
         .map_err(|err| format!("validate {} as fatfs ELF: {err}", source_path.display()))?;
+    Ok(bytes)
+}
+
+/// Build one aarch64 native bin whose package and bin share `name` (J815: netstack, netprobe).
+fn build_native_bin(root: &Path, name: &str) -> Result<Vec<u8>, String> {
+    run_cargo(
+        root,
+        &[
+            "build",
+            "-p",
+            name,
+            "--bin",
+            name,
+            "--target",
+            "aarch64-unknown-none",
+            "--release",
+        ],
+    )?;
+    let source_path = root.join("target/aarch64-unknown-none/release").join(name);
+    let bytes =
+        fs::read(&source_path).map_err(|err| format!("read {}: {err}", source_path.display()))?;
+    validate_aarch64_kernel_elf(&bytes)
+        .map_err(|err| format!("validate {} as {name} ELF: {err}", source_path.display()))?;
     Ok(bytes)
 }
 

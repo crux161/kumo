@@ -1,0 +1,23 @@
+#j815
+
+[package]
+name = "netprobe"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The socket-contract probe for PLAN/020 NET2b. The protocol logic it drives is the host-tested
+# kumo-netstack codec and netstack server core; this bin is only the client side over a real
+# granted channel, built for aarch64-unknown-none by `cargo xtask image`.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+kumo-abi.workspace = true
+kumo-netstack = { path = "../../lib/kumo-netstack" }
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "netprobe"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
