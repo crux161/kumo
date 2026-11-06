@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j812 -->
 <!-- j815 -->
 <!-- j816 -->
 <!-- j817 -->
 <!-- j820 -->
+<!-- j821 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); PLAN/021 AX7 first proof closed. AXH regression harness is next.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); PLAN/021 AX7 first proof closed. AXH regression harness landed J821; AX0 cost baseline and metal census are next.
 
 ## First controller
 
@@ -266,4 +266,48 @@ proof commands, absent from ordinary images. No client receives kill or supervis
 The repeatable tracked harness is the next, separate AXH slice. Sora's general child-output
 blocking remains PLAN/021 AX9 / DEFERRED/015; this slice dispatches netstack death/timer events
 in both existing wait contexts. No netstack-on-metal proof precedes AX0's resident census.
+— TIMBERDOODLE 2026-11-06
+
+## Repeatable NET2 regression (AXH, J821)
+
+Run `python3 scripts/netstack-smoke.py`. It builds the loglevel-6 QEMU proof image, boots
+five private ESP copies under OVMF, and restores the ordinary QEMU image even on failure.
+Each autoexec is at most 256 bytes. No board, login credentials or Ethernet traffic is used.
+Use `--output <new-directory>` to choose the evidence directory, `--firmware <directory>`
+for another QEMU EDK2 installation, or `--self-test` to check transcript rejection rules.
+
+The cases check explicit authority refusal; UDP size/quota/malformed/deadline errors; TCP
+refusal/buffering/EOF; separate TCP and UDP peers; pending TCP WAIT across server death and
+fresh generation/state; restart-intensity give-up; and replacement while idle at login.
+Only the no-grant case permits one contained exit-2 TOWER. All unexpected faults, probe
+failures and missing/duplicate expectations fail. The five known blocking-autoexec POST
+failures (DEFERRED/015) are reported separately; unknown or partial failure sets fail, and
+the idle case requires green POST. A green result also requires default-image restoration.
+The manifest records HEAD, tool/firmware identity, source/private/default image and ELF
+hashes, per-case runtimes and POST results; serial and build logs remain beside it.
+
+### NET0 manual metal regression witnesses
+
+Record commit, image SHA-256, serial capture and witness time. Keep ax88 attached for both
+cold boots (the board has two USB-A ports; no three-device or hot-plug claim):
+
+1. Keyboard + ax88: match VID/PID `0b95:1790`, revision `0100`, current route/speed and
+   endpoint inventory. Compare raw descriptors to the accepted capture: device18 SHA-256
+   `8f3a364dd0edc2cfc2e00e0e2a0ee8f2c81d177876c822e1cac280ca2085e99d`, config39 SHA-256
+   `32a0f0cb1f97ae5ada11ed06c9064ea159bb75ec57479b6ff461d46f4d6b7de1` (J809/J811).
+   Log in and physically type `echo ax88-keyboard`; require the exact echoed text.
+2. Mount the currently enumerated NVMe FAT partition at `/media/nvme` (J811 used
+   `/dev/disk3s1`), read `HELLO.TXT` and `NV9J807.TXT`, and compare their accepted contents.
+   Unmount it. Do not infer a pass from an initrd file with the same name.
+3. Power off before swapping keyboard for the FAT USB stick; cold-boot stick + ax88.
+   Match descriptors again. Require storage offering with no HID lanes, `/media/KUMO`,
+   and `cat /media/KUMO/J549.TXT` yielding `KUMO j549 USB persistence proof`.
+   Repeat the two NVMe reads; unmount both volumes cleanly before shutdown.
+4. Require no unexpected TOWER/ABEND, no lost keyboard/storage service, and successful
+   shutdown/flush. A missed USB2 root-port enumeration is a failed boot witness, not a
+   coexistence pass. Capture and repeat it explicitly (J811 recorded this timing miss).
+
+This checklist records the manual set every later AX kernel/NET metal slice cites. It does
+not itself rerun the witnesses or prove packets, PHY behavior, SuperSpeed or another host.
+Netstack-on-metal testing still waits for AX0's resident census and capacity gate.
 — TIMBERDOODLE 2026-11-06
