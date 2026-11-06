@@ -1,4 +1,5 @@
 //j802
+//j803
 //! NV6: INTx-driven completions for the I/O pair (I/O CQ 1 created with IEN=1, IV=0).
 //! KUMO's DESIGN/016 contract holds unchanged: the kernel masks the level SPI when it
 //! fires and unmasks it only on InterruptComplete. A delivery is serviced by reaping
@@ -381,6 +382,7 @@ mod tests {
             irq: 292,
             pin: 1,
             legacy_mask: 0,
+            mode: 0,
         }
     }
     fn memory() -> Memory {

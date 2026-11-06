@@ -4,19 +4,27 @@
 //j799
 //j801
 //j802
-//! One ownership proof per process: polled Identify, then a read-only I/O pair whose
-//! completions arrive by INTx (NV6). Sora retains a DMA VMO alias before any controller
+//j803
+//! One owner per process: polled Identify, then a read-only I/O pair whose completions
+//! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
+//! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
+//! closes the control channel. Sora retains a DMA VMO alias before any controller
 //! write; failures park with memory quarantined. Reads LBA 0, LBA 1 and the last LBA
 //! single, batched and with vector 0 masked; NSZE is refused before any doorbell. No
 //! write/flush, root/client/config or SMMU writes. D5 cooperative raw DMA.
 //! — TIMBERDOODLE
 
 extern crate alloc;
+use drv_blk::{
+    decode_connect, volume_request, BlockAccess, MediaReady, VolumeRequest, CONTROL_CONNECT_LEN,
+    REQUEST_LEN, STATUS_IO_ERROR, STATUS_OK, STATUS_READ_ONLY,
+};
 use drv_nvme::{
-    exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES, PAGE,
-    PROOF_LEN,
+    exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES,
+    MODE_SERVE, PAGE, PROOF_LEN,
 };
 use kumo_abi::{DevicePowerStatus, Handle, Rights, VmarFlags};
+use kumo_fatfs::{FatVolume, PartitionReader, SECTOR_SIZE};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
     handle_duplicate, handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind,
@@ -375,6 +383,317 @@ fn media(io: &mut Registers, s: Startup, memory: Memory, resource: Handle) -> Re
     Ok(())
 }
 
+/// Namespace blocks for discovery and the FAT label, read through the INTx path in
+/// batches of up to four.
+struct NvmeBlocks<'a> {
+    io: &'a mut Registers,
+    line: &'a mut Irq,
+    pair: &'a mut drv_nvme::io::IoPair,
+    s: Startup,
+    memory: Memory,
+    stats: &'a mut drv_nvme::intx::Stats,
+}
+impl drv_nvme::volume::Blocks for NvmeBlocks<'_> {
+    fn read(&mut self, lba: u64, out: &mut [u8]) -> Result<(), Error> {
+        use drv_nvme::intx::BATCH;
+        if out.len() % SECTOR_SIZE != 0 {
+            return Err(Error::Range);
+        }
+        for (i, chunk) in out.chunks_mut(BATCH * SECTOR_SIZE).enumerate() {
+            let base = lba.checked_add((i * BATCH) as u64).ok_or(Error::Range)?;
+            let mut lbas = [0u64; BATCH];
+            let n = chunk.len() / SECTOR_SIZE;
+            for (j, slot) in lbas.iter_mut().take(n).enumerate() {
+                *slot = base + j as u64;
+            }
+            self.pair.read_irq(
+                self.io,
+                self.line,
+                self.s,
+                self.memory,
+                &lbas[..n],
+                chunk,
+                self.stats,
+            )?;
+        }
+        Ok(())
+    }
+}
+impl kumo_fatfs::BlockReader for NvmeBlocks<'_> {
+    fn read_block(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+        drv_nvme::volume::Blocks::read(self, lba, buf).is_ok()
+    }
+}
+
+/// A GPT GUID in its canonical text form (first three fields little-endian on disk).
+fn guid_text(g: kumo_gpt::Guid) -> alloc::string::String {
+    let b = g.0;
+    alloc::format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct Client {
+    handle: u32,
+    koid: u64,
+    served: u32,
+    refused: u32,
+}
+const MAX_CLIENTS: usize = 4;
+
+/// NV7: bring the pair up as NV6 does, choose the FAT32 volume, offer it to Sora on the
+/// bootstrap channel and serve block clients read-only. Returns Ok when Sora closes the
+/// control channel (or no volume exists), after masking vector 0 and deleting the pair,
+/// so the caller's proved disable follows. — TIMBERDOODLE
+fn serve(
+    io: &mut Registers,
+    s: Startup,
+    memory: Memory,
+    resource: Handle,
+    control: Handle,
+    port: Handle,
+) -> Result<(), Error> {
+    use drv_nvme::intx::{mask, unmask, Stats};
+    use drv_nvme::io::IoPair;
+    use drv_nvme::volume::{discover, Verdict, MAX_ENTRY_BYTES};
+    let mut admin = drv_nvme::admin::Queue::new();
+    let ns = identify(io, s, memory, &mut admin)?;
+    if ns.lba_bytes as usize != SECTOR_SIZE {
+        return Err(Error::Data);
+    }
+    let mut line = Irq::bind(resource, s.irq)?;
+    let mut stats = Stats::default();
+    let mut pair = IoPair::open(&mut admin, io, s, memory, ns, true)?;
+    unmask(io)?;
+    let mut entries = alloc::vec![0u8; MAX_ENTRY_BYTES];
+    let (found, label) = {
+        let mut blocks = NvmeBlocks {
+            io: &mut *io,
+            line: &mut line,
+            pair: &mut pair,
+            s,
+            memory,
+            stats: &mut stats,
+        };
+        let found = discover(&mut blocks, ns.size, &mut entries)?;
+        let label = match found.chosen {
+            Some((part, _)) => {
+                let mut reader =
+                    PartitionReader::new(&mut blocks, part.first_lba, part.block_count());
+                let fat = FatVolume::mount(&mut reader).map_err(|_| Error::Data)?;
+                fat.volume_label(&mut reader)
+            }
+            None => None,
+        };
+        (found, label)
+    };
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV7 GPT session={} protective-mbr=ok header=ok entries-crc=ok partitions={} reads={}\n",
+            s.session, found.entries, stats.entries
+        ),
+    );
+    for entry in found.reported.iter().flatten() {
+        let p = entry.partition;
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV7 PART session={} index={} type={} first-lba={} blocks={} verdict={} oem={}\n",
+                s.session,
+                p.index,
+                guid_text(p.type_guid),
+                p.first_lba,
+                p.block_count(),
+                match entry.verdict {
+                    Verdict::Skipped => "not-fat-type",
+                    Verdict::NotFat32 => "not-fat32",
+                    Verdict::Chosen => "chosen",
+                    Verdict::Unprobed => "unprobed",
+                },
+                match entry.oem {
+                    Some(oem) => oem
+                        .iter()
+                        .map(|&b| if (0x21..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        })
+                        .collect::<alloc::string::String>(),
+                    None => alloc::string::String::from("-"),
+                }
+            ),
+        );
+    }
+    let Some((part, bpb)) = found.chosen else {
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV7 VOLUME session={} none: no FAT32 Basic Data or ESP partition; nothing offered\n",
+                s.session
+            ),
+        );
+        mask(io)?;
+        pair.close(&mut admin, io, s, memory)?;
+        return Ok(());
+    };
+    let ready = MediaReady {
+        block_count: part.block_count(),
+        serial: bpb.volume_serial,
+        label,
+        read_only: true,
+    };
+    let label_text = label
+        .map(|l| alloc::string::String::from_utf8_lossy(l.trim_ascii_end()).into_owned())
+        .unwrap_or_else(|| alloc::string::String::from("(none)"));
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV7 VOLUME session={} index={} first-lba={} blocks={} fat32 serial={:04X}-{:04X} label={} read-only; offered\n",
+            s.session,
+            part.index,
+            part.first_lba,
+            part.block_count(),
+            bpb.volume_serial >> 16,
+            bpb.volume_serial & 0xffff,
+            label_text
+        ),
+    );
+    let offer = ready.encode();
+    if channel_write(control, offer.as_ptr(), offer.len()) != 0 {
+        return Err(Error::Bootstrap);
+    }
+    let control_koid = handle_koid(control);
+    let mut clients = [Client::default(); MAX_CLIENTS];
+    loop {
+        let source = port_wait(port);
+        if source == control_koid {
+            let mut tag = [0u8; CONTROL_CONNECT_LEN + 1];
+            let (len, raw) = channel_read_with_handle(control, tag.as_mut_ptr(), tag.len());
+            if len == 0 {
+                log(
+                    kumo_abi::sys::log_level::NOTICE,
+                    &alloc::format!(
+                        "NV7 SERVICE session={} control closed; stopping after {} reads\n",
+                        s.session,
+                        stats.entries
+                    ),
+                );
+                break;
+            }
+            if len > tag.len() {
+                return Err(Error::Bootstrap);
+            }
+            let Some(client) = syscall_handle(raw) else {
+                continue;
+            };
+            let access = decode_connect(&tag[..len]);
+            let slot = clients.iter().position(|c| c.handle == 0);
+            let koid = handle_koid(client);
+            match (access, slot) {
+                (Some(access), Some(slot)) if port_bind(port, client) == 0 => {
+                    clients[slot] = Client {
+                        handle: client.0,
+                        koid,
+                        ..Client::default()
+                    };
+                    log(
+                        kumo_abi::sys::log_level::INFO,
+                        &alloc::format!(
+                            "NV7 CLIENT session={} slot={} connected asked={} served read-only\n",
+                            s.session,
+                            slot,
+                            if access == BlockAccess::ReadOnly {
+                                "ro"
+                            } else {
+                                "rw"
+                            }
+                        ),
+                    );
+                }
+                _ => {
+                    let _ = handle_close(client);
+                }
+            }
+            continue;
+        }
+        let Some(i) = clients
+            .iter()
+            .position(|c| c.handle != 0 && c.koid == source)
+        else {
+            continue;
+        };
+        let client = Handle(clients[i].handle);
+        let mut frame = [0u8; REQUEST_LEN + SECTOR_SIZE + 1];
+        let n = channel_read(client, frame.as_mut_ptr(), frame.len());
+        if n == 0 || n > frame.len() as u64 {
+            let _ = port_unbind(port, client);
+            let _ = handle_close(client);
+            log(
+                kumo_abi::sys::log_level::INFO,
+                &alloc::format!(
+                    "NV7 CLIENT session={} slot={} closed served={} refused={}\n",
+                    s.session,
+                    i,
+                    clients[i].served,
+                    clients[i].refused
+                ),
+            );
+            clients[i] = Client::default();
+            continue;
+        }
+        let mut reply = [0u8; 1 + SECTOR_SIZE];
+        let mut reply_len = 1;
+        reply[0] = match volume_request(
+            &frame[..n as usize],
+            part.first_lba,
+            part.block_count(),
+            true,
+        ) {
+            Ok(VolumeRequest::Read(lba)) => {
+                match pair.read_irq(
+                    io,
+                    &mut line,
+                    s,
+                    memory,
+                    &[lba],
+                    &mut reply[1..],
+                    &mut stats,
+                ) {
+                    Ok(_) => {
+                        reply_len = reply.len();
+                        clients[i].served += 1;
+                        STATUS_OK
+                    }
+                    Err(e) => {
+                        // The queue is poisoned: answer, then stop with everything retained.
+                        let failed = [STATUS_IO_ERROR];
+                        let _ = channel_write(client, failed.as_ptr(), failed.len());
+                        return Err(e);
+                    }
+                }
+            }
+            // Nothing is ever buffered for a read-only volume.
+            Ok(VolumeRequest::Flush) => STATUS_OK,
+            Ok(VolumeRequest::Write(..)) => STATUS_READ_ONLY,
+            Err(status) => {
+                clients[i].refused += 1;
+                status
+            }
+        };
+        let _ = channel_write(client, reply.as_ptr(), reply_len);
+    }
+    for c in clients.iter().filter(|c| c.handle != 0) {
+        let _ = port_unbind(port, Handle(c.handle));
+        let _ = handle_close(Handle(c.handle));
+    }
+    mask(io)?;
+    pair.close(&mut admin, io, s, memory)?;
+    Ok(())
+}
+
 #[no_mangle]
 extern "C" fn main(
     bootstrap: u64,
@@ -468,7 +787,13 @@ extern "C" fn main(
         fail(control, s.session, Error::Ack);
     }
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
-    let p = exercise_with(&mut io, s, memory, |io| media(io, s, memory, resource));
+    let p = exercise_with(&mut io, s, memory, |io| {
+        if s.mode == MODE_SERVE {
+            serve(io, s, memory, resource, control, port)
+        } else {
+            media(io, s, memory, resource)
+        }
+    });
     log(
         if p.complete() {
             kumo_abi::sys::log_level::NOTICE

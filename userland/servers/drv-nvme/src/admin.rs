@@ -1,4 +1,7 @@
 //j799
+//j801
+//j802
+//j803
 //! One outstanding polled command per queue: NV4a Identify on the admin queue, and
 //! the queue engine NV5 reuses for its I/O pair. One PRP page, legacy 4-byte doorbell
 //! stride. D5 cooperative raw DMA, no containment. — TIMBERDOODLE
@@ -503,6 +506,7 @@ mod tests {
             irq: 292,
             pin: 1,
             legacy_mask: 0,
+            mode: 0,
         }
     }
     fn memory() -> Memory {

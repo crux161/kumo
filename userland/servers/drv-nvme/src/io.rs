@@ -1,5 +1,6 @@
 //j801
 //j802
+//j803
 //! NV5: one polled I/O queue pair and bounded, read-only media access.
 //! Set Features (Number of Queues) asks for one SQ/CQ; Create I/O CQ precedes
 //! Create I/O SQ, and teardown deletes the SQ before its CQ. Reads are one PRP
@@ -208,6 +209,7 @@ mod tests {
             irq: 292,
             pin: 1,
             legacy_mask: 0,
+            mode: 0,
         }
     }
     fn memory() -> Memory {

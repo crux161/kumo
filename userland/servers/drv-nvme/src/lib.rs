@@ -4,8 +4,9 @@
 //j799
 //j801
 //j802
-//! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5) and its
-//! INTx-driven completions (NV6).
+//j803
+//! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
+//! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
 //! — TIMBERDOODLE
 
@@ -18,11 +19,16 @@ pub const MMIO_BYTES: u64 = 2 * PAGE;
 pub mod admin;
 pub mod intx;
 pub mod io;
+pub mod volume;
 pub const DEPTH: u16 = 32;
 pub const BOOT_LEN: usize = 64;
 pub const MEMORY_LEN: usize = 32;
 pub const PROOF_LEN: usize = 80;
 pub const ACK: u8 = b'A';
+/// Startup mode: prove the lifecycle and exit (NV3–NV6).
+pub const MODE_PROOF: u8 = 0;
+/// Startup mode: stay resident and serve the namespace's FAT32 volume read-only (NV7).
+pub const MODE_SERVE: u8 = 1;
 pub const CC: u16 = 0x14;
 pub const CSTS: u16 = 0x1c;
 const CC_CONFIG: u32 = (6 << 16) | (4 << 20);
@@ -105,6 +111,8 @@ pub struct Startup {
     pub irq: u32,
     pub pin: u8,
     pub legacy_mask: u32,
+    /// MODE_PROOF or MODE_SERVE (byte 51).
+    pub mode: u8,
 }
 impl Startup {
     pub fn validate(&self) -> Result<(), Error> {
@@ -119,6 +127,7 @@ impl Startup {
             || self.pin != 1
             || !(32..1020).contains(&self.irq)
             || self.legacy_mask & 1 != 0
+            || self.mode > MODE_SERVE
         {
             return Err(Error::Bootstrap);
         }
@@ -142,7 +151,7 @@ impl Startup {
     pub fn encode(&self) -> [u8; BOOT_LEN] {
         let mut b = [0; BOOT_LEN];
         b[..8].copy_from_slice(b"NVM3BOOT");
-        put32(&mut b, 8, 2);
+        put32(&mut b, 8, 3);
         put32(&mut b, 12, self.session);
         put64(&mut b, 16, self.bar);
         put64(&mut b, 24, self.cap);
@@ -157,6 +166,7 @@ impl Startup {
             b[i..i + 2].copy_from_slice(&v.to_le_bytes());
         }
         b[50] = self.pin;
+        b[51] = self.mode;
         put32(&mut b, 52, self.irq);
         put32(&mut b, 56, self.legacy_mask);
         b
@@ -164,8 +174,7 @@ impl Startup {
     pub fn decode(b: &[u8]) -> Option<Self> {
         if b.len() != BOOT_LEN
             || &b[..8] != b"NVM3BOOT"
-            || u32at(b, 8) != 2
-            || b[51] != 0
+            || u32at(b, 8) != 3
             || b[60..].iter().any(|&v| v != 0)
         {
             return None;
@@ -181,6 +190,7 @@ impl Startup {
             endpoint_command: u16::from_le_bytes(b[46..48].try_into().ok()?),
             msix_control: u16::from_le_bytes(b[48..50].try_into().ok()?),
             pin: b[50],
+            mode: b[51],
             irq: u32at(b, 52),
             legacy_mask: u32at(b, 56),
         };
@@ -498,6 +508,7 @@ mod tests {
             irq: 292,
             pin: 1,
             legacy_mask: 0,
+            mode: 0,
         }
     }
     fn memory() -> Memory {
@@ -666,7 +677,7 @@ mod tests {
     #[test]
     fn bad_capability_custody_or_allocation_never_writes() {
         let mut cases = Vec::new();
-        for field in 0..10 {
+        for field in 0..11 {
             let mut s = startup();
             match field {
                 0 => s.cap = 0,
@@ -678,6 +689,7 @@ mod tests {
                 6 => s.pin = 2,
                 7 => s.irq = 31,
                 8 => s.legacy_mask = 0xffff,
+                9 => s.mode = 2,
                 _ => s.cap &= !0xffff,
             };
             cases.push((s, memory()));
@@ -722,12 +734,17 @@ mod tests {
         let s = startup();
         assert_eq!(Startup::decode(&s.encode()), Some(s));
         assert_eq!(Memory::decode(&memory().encode()), Some(memory()));
-        for (at, value) in [(8, 1), (51, 1), (60, 1), (50, 0)] {
+        for (at, value) in [(8, 1), (8, 2), (51, 2), (60, 1), (50, 0)] {
             let mut b = s.encode();
             b[at] = value;
             assert!(Startup::decode(&b).is_none(), "byte {at}");
         }
         assert!(Startup::decode(&s.encode()[..63]).is_none());
+        let serve = Startup {
+            mode: MODE_SERVE,
+            ..s
+        };
+        assert_eq!(Startup::decode(&serve.encode()), Some(serve));
         let mut io = Fake::new();
         let p = exercise(&mut io, s, memory());
         assert!(p.releases(memory()));

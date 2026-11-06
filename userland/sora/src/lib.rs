@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j687
 //j701
 //j766
 //j720
 //j774
+//j803
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -371,12 +371,52 @@ pub fn mount_point(path: &[u8]) -> Option<MediaName> {
     }
 }
 
-/// Storage controllers whose driver can offer a volume: usb0, usb1 and host2 (J545).
-pub const STORAGE_DEVICES: usize = 3;
+/// Storage slots whose driver can offer a volume (J545, transport-independent since J803).
+/// Slots 0–2 stay the xHCI controllers usb0, usb1 and host2, so every existing USB name keeps
+/// its meaning; slot 3 is the NVMe namespace. A new transport gets a new slot, never a borrowed
+/// one: SD (PLAN/018) appends rather than reusing an xHCI index.
+pub const STORAGE_DEVICES: usize = 4;
+/// The NVMe namespace's slot: `/dev/disk3s1`.
+pub const NVME_STORAGE: usize = 3;
 
-/// The shell's name for the volume the storage driver on controller `index` offers (J766):
-/// `/dev/disk<index>s1`. Each driver serves the one FAT32 volume it found on its stick, so the
-/// slice is always 1. KUMO has no `/dev` tree; the name exists for `mount` and `umount`.
+/// What carries a storage slot's volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageTransport {
+    /// xHCI controller `n` (USB Bulk-Only/SCSI), removable.
+    Usb(u8),
+    /// The PCIe NVMe namespace, internal and fixed.
+    Nvme,
+}
+
+impl StorageTransport {
+    pub const fn of(index: usize) -> StorageTransport {
+        assert!(index < STORAGE_DEVICES);
+        if index == NVME_STORAGE {
+            StorageTransport::Nvme
+        } else {
+            StorageTransport::Usb(index as u8)
+        }
+    }
+
+    /// The word Sora's diagnostics use for it.
+    pub const fn name(self) -> &'static [u8] {
+        match self {
+            StorageTransport::Usb(_) => b"usb",
+            StorageTransport::Nvme => b"nvme",
+        }
+    }
+
+    /// Whether an offered volume mounts by itself when `/media` is free. Removable USB sticks
+    /// do (J545/J766). The internal NVMe disk waits for an explicit `mount`, so it never takes
+    /// `/media` ahead of the stick a user plugged in.
+    pub const fn auto_mounts(self) -> bool {
+        matches!(self, StorageTransport::Usb(_))
+    }
+}
+
+/// The shell's name for the volume the driver in storage slot `index` offers (J766):
+/// `/dev/disk<index>s1`. Each driver serves the one FAT32 volume it found, so the slice is
+/// always 1. KUMO has no `/dev` tree; the name exists for `mount` and `umount`.
 pub fn disk_path(index: usize) -> [u8; 12] {
     assert!(index < STORAGE_DEVICES);
     let mut path = *b"/dev/disk0s1";
@@ -1258,14 +1298,29 @@ mod tests {
     }
 
     #[test]
-    fn disks_are_named_by_their_controller() {
+    fn disks_are_named_by_their_storage_slot() {
         assert_eq!(&disk_path(0), b"/dev/disk0s1");
         assert_eq!(&disk_path(2), b"/dev/disk2s1");
+        assert_eq!(&disk_path(NVME_STORAGE), b"/dev/disk3s1");
         for index in 0..STORAGE_DEVICES {
             assert_eq!(parse_disk(&disk_path(index)), Some(index));
         }
+        // USB slots keep their controller numbers; NVMe is its own slot and never auto-mounts.
+        for (index, transport) in [
+            StorageTransport::Usb(0),
+            StorageTransport::Usb(1),
+            StorageTransport::Usb(2),
+            StorageTransport::Nvme,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(StorageTransport::of(index), transport);
+            assert_eq!(transport.auto_mounts(), index != NVME_STORAGE);
+        }
+        assert_eq!(StorageTransport::Nvme.name(), b"nvme");
         for refused in [
-            b"/dev/disk3s1".as_slice(),
+            b"/dev/disk4s1".as_slice(),
             b"/dev/disk0s2",
             b"/dev/disk0",
             b"disk0s1",

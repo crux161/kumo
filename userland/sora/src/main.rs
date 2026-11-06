@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j795
 //j798
 //j799
 //j801
 //j802
+//j803
 
 extern crate alloc;
 
@@ -2461,10 +2461,10 @@ const XHCI_MOUSE_BOOTSTRAP_TAG: u8 = b'm';
 /// J545: ...and the storage control channel. A driver that finds a USB stick offers its volume
 /// on it, and Sora answers with one block channel per `fatfs` instance it starts for the volume.
 const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
-/// Sora's ends of the drivers' storage control channels, one per controller (usb0, usb1,
-/// host2); 0 = none.
-static XHCI_STORAGE_CONTROLS: [AtomicU32; 3] =
-    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Sora's ends of the drivers' storage control channels, one per storage slot
+/// (`sora::StorageTransport`: usb0, usb1, host2, then NVMe since J803); 0 = none.
+static STORAGE_CONTROLS: [AtomicU32; sora::STORAGE_DEVICES] =
+    [const { AtomicU32::new(0) }; sora::STORAGE_DEVICES];
 
 /// The removable volume Sora knows, mounted at `/media/<name>` (DESIGN/012 §2.1, J545).
 #[derive(Clone, Copy)]
@@ -2592,7 +2592,7 @@ fn launch_xhci_first_light(
             log(b"drv-xhci: storage control unavailable\n");
             return u64::MAX;
         }
-        XHCI_STORAGE_CONTROLS[index].store(sora_end as u32, Ordering::Relaxed);
+        STORAGE_CONTROLS[index].store(sora_end as u32, Ordering::Relaxed);
         driver_end
     };
 
@@ -3429,6 +3429,7 @@ fn nvme_startup(root: Handle, dtb_vmo: Handle, bootinfo: Handle) -> Option<drv_n
         irq: report.topology.spis.legacy.checked_add(32)?,
         pin: endpoint.interrupt_pin(),
         legacy_mask: report.client.as_ref()?.intr_mask_legacy,
+        mode: drv_nvme::MODE_PROOF,
     };
     startup.validate().ok()?;
     Some(startup)
@@ -3522,6 +3523,27 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
         notice(&[b"nvme: owner stopped answering; DMA and owner handles retained\n"]);
         return None;
     };
+    // NV7: a serve owner answers with its volume and stays resident. Its bootstrap channel
+    // becomes NVMe's storage control; custody, process and DMA handles stay with Sora for as
+    // long as it serves (a later exit without proof leaves them retained). — TIMBERDOODLE
+    if startup.mode == drv_nvme::MODE_SERVE && h == 0 {
+        if let Some(ready) = drv_blk::MediaReady::decode(&frame[..n]) {
+            let _ = port_unbind(port, owner.client);
+            let _ = handle_close(port);
+            STORAGE_CONTROLS[sora::NVME_STORAGE].store(owner.client.0, Ordering::Relaxed);
+            let process = handle_koid(owner.process);
+            notice(&[alloc::format!(
+                "NV7 OWNER session={} process={} resident; serving {} read-only; DMA custody held while it serves\n",
+                startup.session,
+                process,
+                core::str::from_utf8(&sora::disk_path(sora::NVME_STORAGE)).unwrap_or("?")
+            )
+            .as_bytes()]);
+            let _ = media_ready(initrd, sora::NVME_STORAGE, owner.client, ready);
+            // `custody` and `owner.process` are deliberately never closed while it serves.
+            return Some(process);
+        }
+    }
     let proof = drv_nvme::Proof::decode(&frame[..n]);
     if h != 0 || !proof.is_some_and(|p| p.releases(memory) && p.session == startup.session) {
         notice(&[b"nvme: quiescence unproven; DMA and owner handles retained\n"]);
@@ -3551,25 +3573,16 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
     Some(process)
 }
 
-fn launch_nvme_admin_proof(initrd: Handle, root: Handle, dtb: Handle, bootinfo: Handle) {
+fn launch_nvme_service(initrd: Handle, root: Handle, dtb: Handle, bootinfo: Handle) {
     let Some(mut startup) = nvme_startup(root, dtb, bootinfo) else {
         return;
     };
-    let mut previous = None;
-    for session in 1..=2 {
-        startup.session = session;
-        let Some(process) = run_nvme_admin_owner(initrd, root, startup) else {
-            return;
-        };
-        if previous == Some(process) {
-            notice(&[b"NV6 restart reused process identity; refused\n"]);
-            return;
-        }
-        previous = Some(process);
-    }
-    notice(&[
-        b"NV6 RESTART two distinct owners quiesced and released INTx; interrupt evidence is in their logs\n",
-    ]);
+    // NV6's full stress proof is already accepted. Normal startup launches only
+    // the storage service, so unrelated boot clients are not held behind that
+    // demonstration. The proof mode remains available in drv-nvme. — TIMBERDOODLE
+    startup.session = 1;
+    startup.mode = drv_nvme::MODE_SERVE;
+    let _ = run_nvme_admin_owner(initrd, root, startup);
 }
 
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
@@ -4675,7 +4688,7 @@ extern "C" fn sora_main(
     }
 
     launch_gpu_identity(initrd, res);
-    launch_nvme_admin_proof(
+    launch_nvme_service(
         initrd,
         res,
         Handle(dtb_vmo as u32),
@@ -5655,8 +5668,9 @@ extern "C" fn sora_main(
         log(b"sora: ports bound\n");
         // J545: each controller's storage control channel. `PortBind` replays a pending offer,
         // so a stick probed before this point still wakes the loop below.
-        let mut storage_koids: [Option<Handle>; 3] = [None; 3];
-        for (koid, control) in storage_koids.iter_mut().zip(&XHCI_STORAGE_CONTROLS) {
+        let mut storage_koids: [Option<Handle>; sora::STORAGE_DEVICES] =
+            [None; sora::STORAGE_DEVICES];
+        for (koid, control) in storage_koids.iter_mut().zip(&STORAGE_CONTROLS) {
             let control = Handle(control.load(Ordering::Relaxed));
             let raw_koid = handle_koid(control);
             if control.0 != 0 && raw_koid != u64::MAX && port_bind(port, control) == 0 {
@@ -6760,16 +6774,16 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
     Some(client)
 }
 
-/// J545: a storage control channel woke the serve loop: its driver offered a stick's volume, or
-/// the driver is gone and its volume with it.
+/// J545: a storage control channel woke the serve loop: its driver offered a volume, or the
+/// driver is gone and its volume with it.
 /// Returns whether a volume was mounted: a closed or empty control channel is a driver leaving.
 fn media_offered(
     initrd: Handle,
     port: Handle,
     index: usize,
-    koids: &mut [Option<Handle>; 3],
+    koids: &mut [Option<Handle>; sora::STORAGE_DEVICES],
 ) -> bool {
-    let control = Handle(XHCI_STORAGE_CONTROLS[index].load(Ordering::Relaxed));
+    let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
     let mut frame = [0u8; drv_blk::MEDIA_READY_LEN];
     let n = channel_read(control, frame.as_mut_ptr(), frame.len());
     if n == 0 || n == u64::MAX {
@@ -6786,9 +6800,35 @@ fn media_offered(
         log(b"media: bad offer\n");
         return false;
     };
+    media_ready(initrd, index, control, ready)
+}
+
+/// Register the volume storage slot `index` offers and, for a transport that mounts by itself,
+/// mount it when `/media` is free (J545/J766). Returns whether it was mounted. — TIMBERDOODLE
+fn media_ready(initrd: Handle, index: usize, control: Handle, ready: drv_blk::MediaReady) -> bool {
+    let transport = sora::StorageTransport::of(index);
     let name = sora::MediaName::new(ready.label, ready.serial);
     let device = Device { ready, control };
     set_device(index, Some(device));
+    if !transport.auto_mounts() {
+        notice(&[
+            b"media: ",
+            &sora::disk_path(index),
+            b" ",
+            transport.name(),
+            b" fat32 ",
+            name.as_bytes(),
+            if ready.read_only {
+                b" (read-only)" as &[u8]
+            } else {
+                b""
+            },
+            b" ready; `mount ",
+            &sora::disk_path(index),
+            b"` to use\n",
+        ]);
+        return false;
+    }
     // J766: a volume mounts by itself only when `/media` is free or already holds it; a second
     // stick waits for `mount`.
     if media().is_some_and(|media| media.device != index) {
@@ -6803,7 +6843,9 @@ fn media_offered(
     }
     diag(b"media: /media/");
     diag(name.as_bytes());
-    diag(b" usb fat32 blocks=");
+    diag(b" ");
+    diag(transport.name());
+    diag(b" fat32 blocks=");
     diag_hex(ready.block_count);
     diag(b" serial=");
     diag(sora::MediaName::new(None, ready.serial).as_bytes());

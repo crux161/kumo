@@ -1,9 +1,9 @@
 #![no_std]
-//j166
 //j413
 //j414
 //j545
 //j550
+//j803
 
 //! `drv-blk` — a minimal ramdisk block device over a VMO.
 //!
@@ -214,6 +214,47 @@ pub fn read_payload(resp: &[u8]) -> Result<&[u8], ResponseError> {
         None => Err(ResponseError::Empty),
         Some(&STATUS_OK) => Ok(&resp[1..]),
         Some(&status) => Err(ResponseError::Status(status)),
+    }
+}
+
+/// One bounded operation on a served volume, with a device-relative LBA (J549, KESTREL;
+/// shared by every block driver since J803).
+#[derive(Debug, PartialEq, Eq)]
+pub enum VolumeRequest<'a> {
+    Read(u64),
+    Write(u64, &'a [u8]),
+    Flush,
+}
+
+/// Validate the complete frame before any device transaction or write touches the media. A
+/// client's LBA 0 is the volume's `first_lba`; nothing outside its `block_count` blocks can be
+/// named. Services implement one 512-byte block per request. — KESTREL (moved from drv-xhci)
+pub fn volume_request(
+    frame: &[u8],
+    first_lba: u64,
+    block_count: u64,
+    read_only: bool,
+) -> Result<VolumeRequest<'_>, u8> {
+    let request = Request::decode(frame).ok_or(STATUS_BAD_LEN)?;
+    match request.cmd {
+        CMD_FLUSH if frame.len() == REQUEST_LEN => return Ok(VolumeRequest::Flush),
+        CMD_READ if frame.len() == REQUEST_LEN => {}
+        CMD_WRITE if frame.len() == REQUEST_LEN + BLOCK_SIZE as usize => {}
+        _ => return Err(STATUS_BAD_LEN),
+    }
+    if request.count != 1 {
+        return Err(STATUS_BAD_LEN);
+    }
+    if request.lba >= block_count {
+        return Err(STATUS_BAD_LBA);
+    }
+    let lba = first_lba.checked_add(request.lba).ok_or(STATUS_BAD_LBA)?;
+    if request.cmd == CMD_READ {
+        Ok(VolumeRequest::Read(lba))
+    } else if read_only {
+        Err(STATUS_READ_ONLY)
+    } else {
+        Ok(VolumeRequest::Write(lba, &frame[REQUEST_LEN..]))
     }
 }
 
@@ -555,5 +596,84 @@ mod tests {
         let req = Request::flush();
         assert_eq!(req.cmd, CMD_FLUSH);
         assert_eq!(Request::decode(&req.encode()), Some(req));
+    }
+    #[test]
+    fn a_reader_channel_cannot_upgrade_itself_by_sending_a_write() {
+        let mut frame = [0xA5; REQUEST_LEN + BLOCK_SIZE as usize];
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(0, 1).encode());
+        for wire in [
+            &[CONTROL_CONNECT][..],
+            &encode_connect(BlockAccess::ReadOnly),
+        ] {
+            let access = decode_connect(wire).unwrap();
+            assert_eq!(
+                volume_request(&frame, 2048, 4, access == BlockAccess::ReadOnly),
+                Err(STATUS_READ_ONLY)
+            );
+            assert_eq!(
+                volume_request(
+                    &Request::read(0, 1).encode(),
+                    2048,
+                    4,
+                    access == BlockAccess::ReadOnly
+                ),
+                Ok(VolumeRequest::Read(2048))
+            );
+        }
+        let access = decode_connect(&encode_connect(BlockAccess::ReadWrite)).unwrap();
+        assert_eq!(
+            volume_request(&frame, 2048, 4, access == BlockAccess::ReadOnly),
+            Ok(VolumeRequest::Write(2048, &frame[REQUEST_LEN..]))
+        );
+        // A volume's read-only policy still overrides an explicit writer. — KESTREL
+        assert_eq!(volume_request(&frame, 2048, 4, true), Err(STATUS_READ_ONLY));
+    }
+
+    #[test]
+    fn volume_writes_are_exactly_one_sector_inside_the_partition() {
+        let mut frame = [0xAB; REQUEST_LEN + BLOCK_SIZE as usize];
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(3, 1).encode());
+        assert_eq!(
+            volume_request(&frame, 2048, 4, false),
+            Ok(VolumeRequest::Write(2051, &frame[REQUEST_LEN..]))
+        );
+        assert_eq!(volume_request(&frame, 2048, 4, true), Err(STATUS_READ_ONLY));
+        assert_eq!(volume_request(&frame, 2048, 3, false), Err(STATUS_BAD_LBA));
+        assert_eq!(
+            volume_request(&frame, u64::MAX, 4, false),
+            Err(STATUS_BAD_LBA)
+        );
+        assert_eq!(
+            volume_request(&frame[..frame.len() - 1], 2048, 4, false),
+            Err(STATUS_BAD_LEN)
+        );
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(0, 2).encode());
+        assert_eq!(volume_request(&frame, 2048, 4, false), Err(STATUS_BAD_LEN));
+        frame[..REQUEST_LEN].copy_from_slice(&Request::write(0, 0).encode());
+        assert_eq!(volume_request(&frame, 2048, 4, false), Err(STATUS_BAD_LEN));
+    }
+
+    #[test]
+    fn volume_reads_and_flushes_keep_the_existing_wire_contract() {
+        assert_eq!(
+            volume_request(&Request::read(0, 1).encode(), 2048, 4, false),
+            Ok(VolumeRequest::Read(2048))
+        );
+        assert_eq!(
+            volume_request(&Request::flush().encode(), 2048, 4, true),
+            Ok(VolumeRequest::Flush)
+        );
+        let mut extra = [0; REQUEST_LEN + 1];
+        extra[..REQUEST_LEN].copy_from_slice(&Request::read(0, 1).encode());
+        assert_eq!(volume_request(&extra, 2048, 4, false), Err(STATUS_BAD_LEN));
+        // The last block of the volume is addressable; the next one is not.
+        assert_eq!(
+            volume_request(&Request::read(3, 1).encode(), 2048, 4, true),
+            Ok(VolumeRequest::Read(2051))
+        );
+        assert_eq!(
+            volume_request(&Request::read(4, 1).encode(), 2048, 4, true),
+            Err(STATUS_BAD_LBA)
+        );
     }
 }

@@ -1,5 +1,6 @@
 #j798
 #j801
+#j803
 [package]
 name = "drv-nvme"
 authors.workspace = true
@@ -9,6 +10,9 @@ version.workspace = true
 
 [dependencies]
 kumo-pcie.workspace = true
+drv-blk = { path = "../drv-blk" }
+kumo-fatfs = { path = "../../../lib/kumo-fatfs" }
+kumo-gpt = { path = "../../../lib/kumo-gpt" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 kumo-abi.workspace = true

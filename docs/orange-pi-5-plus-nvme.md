@@ -1,9 +1,9 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j798 -->
 <!-- j799 -->
 <!-- j800 -->
 <!-- j801 -->
 <!-- j802 -->
+<!-- j803 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
@@ -307,4 +307,36 @@ Last, it masks vector 0 and reads LBA 0 again. That completion must post with no
 delivery and stay undelivered for 100 ms; unmasking must then raise INTA and the entry
 must be reaped. Each block's SHA-256 is compared with the firmware Block I/O reference
 from the same boot. D5 remains cooperative raw DMA; Road C stays open.
+— TIMBERDOODLE
+
+## NV7 read-only volume service
+
+The NVMe driver can stay resident with its interrupt-driven I/O pair and serve a
+FAT32 partition over the existing drv-blk channel codec. Shared volume request
+validation now lives in drv-blk; USB and NVMe use the same exact-frame, one-sector,
+partition-relative and read-only checks. An attempted write is refused before I/O.
+No Write/Flush/Format command is implemented by the NVMe service.
+
+Discovery checks the protective MBR, primary GPT header and entry-array CRC using
+kumo-gpt, within the identified namespace. Basic Data partitions are checked before
+ESP partitions, each in table order. Only a valid FAT32 BPB fitting its own partition
+is offered. An absent FAT32 volume is reported and the driver deletes its I/O pair,
+proves controller quiescence and releases custody; it does not relabel another FS.
+The first observed SSD layout has one Basic Data partition beginning at LBA2048,
+with 976771072 blocks and an NTFS boot-sector signature. It is preserved.
+
+Sora has transport-independent storage slots: existing USB slots0–2 keep their
+names; NVMe uses slot3 (`/dev/disk3s1`). USB volumes retain their automatic mount
+policy. The internal NVMe FAT volume waits for an explicit mount; its block clients
+remain read-only, including a client requesting write access. The service's DMA
+VMO stays in Sora custody while resident; an unproven exit never licenses reuse.
+Normal startup launches the service directly. The already accepted NV6 stress
+sequence remains available in proof mode and no longer delays normal boot clients.
+Startup wire version3 carries the explicit proof/service mode; versions1/2 refuse.
+
+When a FAT32 partition exists, the commands are `mount /dev/disk3s1 /media/nvme`,
+`ls /media/nvme`, `cat /media/nvme/HELLO.TXT`, then `umount /media/nvme`. If no FAT32
+partition exists, these filesystem acceptance checks remain pending suitable test
+media. Host discovery/codec tests and a valid GPT/no-FAT metal result cannot be
+reported as successful physical FAT mount/read. D5 and Road C remain unchanged.
 — TIMBERDOODLE
