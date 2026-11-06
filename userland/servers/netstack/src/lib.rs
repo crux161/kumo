@@ -1,11 +1,14 @@
 #![no_std]
 //j815
 //j817
+//j820
 
 //! netstack's server core (PLAN/020 NET2b/NET2c, DESIGN/026): sessions over the KNS1/KNR1
 //! socket contract, UDP and TCP sockets on smoltcp, one loopback interface. No syscalls live
 //! here, so the whole request path runs under `cargo test -p netstack`; `main.rs` is the Port
 //! loop around it.
+//!
+//! Recovery class: stateless (discardable socket soft state); process death destroys sessions and connections.
 //!
 //! Every socket and buffer is allocated once in [`Server::new`]; nothing grows afterwards. Each
 //! of the [`SOCKETS_TOTAL`] slots owns one UDP and one TCP smoltcp socket and uses whichever kind
@@ -138,6 +141,7 @@ pub struct Server {
     slots: Vec<Slot>,
     sessions: Vec<Option<SessionSlot>>,
     next_generation: u32,
+    generation_end: u32,
     next_ephemeral: u16,
     stats: Stats,
 }
@@ -230,6 +234,7 @@ impl Server {
             slots,
             sessions: (0..SESSIONS).map(|_| None).collect(),
             next_generation: 1,
+            generation_end: u32::MAX,
             next_ephemeral: EPHEMERAL_FIRST,
             stats: Stats::default(),
         }
@@ -256,12 +261,32 @@ impl Server {
         self.slots.iter().filter(|slot| !slot.is_free()).count()
     }
 
+    /// Sora assigns a nonzero instance epoch. Each epoch owns one disjoint
+    /// 65535-session range; exhaustion refuses rather than reusing a token.
+    /// Old channel capabilities are never attached to a replacement. — TIMBERDOODLE
+    pub fn for_instance(now_ns: u64, epoch: u16) -> Option<Self> {
+        if epoch == 0 {
+            return None;
+        }
+        let mut server = Self::new(now_ns);
+        server.next_generation = (u32::from(epoch) << 16) | 1;
+        server.generation_end = (u32::from(epoch) << 16) | 0xffff;
+        Some(server)
+    }
+
     /// Admit a new session; `None` when all [`SESSIONS`] are in use (the caller closes the
     /// channel unanswered). Generations are never reused by this instance.
     pub fn open_session(&mut self) -> Option<usize> {
         let index = self.sessions.iter().position(Option::is_none)?;
         let generation = self.next_generation;
-        self.next_generation = self.next_generation.checked_add(1).unwrap_or(1);
+        if generation == 0 {
+            return None;
+        }
+        self.next_generation = if generation == self.generation_end {
+            0
+        } else {
+            generation + 1
+        };
         self.sessions[index] = Some(SessionSlot {
             state: Session::new(generation),
             next_socket: 1,

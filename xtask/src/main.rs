@@ -1,8 +1,8 @@
-//j800
 //j804
 //j805
 //j810
 //j815
+//j820
 
 use std::env;
 use std::fmt;
@@ -1016,6 +1016,15 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
     }))
 }
 
+fn net_restart_proof_enabled(value: Option<&str>, board: &str) -> Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") if board == "qemu-virt-aarch64" => Ok(true),
+        Some("1") => Err("netstack restart proof requires the QEMU target".into()),
+        _ => Err("KUMO_NET_RESTART_PROOF must be 0 or 1".into()),
+    }
+}
+
 fn build_sora_image(root: &Path, board: &str) -> Result<Vec<u8>, String> {
     let mut args = vec![
         "build",
@@ -1029,6 +1038,14 @@ fn build_sora_image(root: &Path, board: &str) -> Result<Vec<u8>, String> {
     ];
     if nvme_write_proof_enabled(board)? {
         args.extend(["--features", "nvme-write-proof"]);
+    }
+    let proof = match env::var("KUMO_NET_RESTART_PROOF") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("KUMO_NET_RESTART_PROOF must be UTF-8 0 or 1".into()),
+    };
+    if net_restart_proof_enabled(proof.as_deref(), board)? {
+        args.extend(["--features", "netstack-restart-proof"]);
     }
     run_cargo(root, &args)?;
 
@@ -3223,5 +3240,18 @@ mod initrd_tests {
         assert!(build_initrd(&files)
             .unwrap_err()
             .contains("INITRD_MAX_ENTRIES"));
+    }
+}
+
+#[cfg(test)]
+mod net_restart_proof_tests {
+    #[test]
+    fn restart_injection_is_default_off_and_qemu_only() {
+        use super::net_restart_proof_enabled as enabled;
+        assert_eq!(enabled(None, "qemu-virt-aarch64"), Ok(false));
+        assert_eq!(enabled(Some("0"), "orange-pi-5-plus"), Ok(false));
+        assert_eq!(enabled(Some("1"), "qemu-virt-aarch64"), Ok(true));
+        assert!(enabled(Some("1"), "orange-pi-5-plus").is_err());
+        assert!(enabled(Some("yes"), "qemu-virt-aarch64").is_err());
     }
 }

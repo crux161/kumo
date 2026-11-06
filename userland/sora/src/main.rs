@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j805
 //j806
 //j807
 //j815
 //j816
+//j820
 
 extern crate alloc;
 
@@ -50,14 +50,6 @@ static BOOTINFO_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
 
 /// Read-only DTB VMO handle supplied in x9. `_start` must preserve it before using x9 as scratch.
 static DTB_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
-
-/// A reusable scratch VMO for packing a program's argv before launch. Created once and
-/// rewritten per spawn; `ARGV_VMO` is Sora's full-rights write handle. Each launch mints a
-/// fresh one-shot read+transfer alias from it for the bootstrap startup message (least
-/// privilege — the child reads its args, can't mutate the shared buffer). Runs are
-/// synchronous, so one buffer is safe to reuse. The static avoids threading the handle
-/// through the shell dispatcher.
-static ARGV_VMO: AtomicU64 = AtomicU64::new(0);
 
 /// Supervisor-owned writable copy of `bin/fat32.img`. A `fatfs` instance receives
 /// only a narrowed duplicate, so its restart drops open-table soft state while the
@@ -5629,16 +5621,6 @@ extern "C" fn sora_main(
         log(b"initrd read-only dup fail\n");
     }
 
-    // Create the reusable argv scratch VMO (see the static). Each launch packs the program's
-    // argv into it and mints a fresh one-shot read+transfer alias for the bootstrap startup
-    // message; failure here just means programs run with no argv (degrade, don't abort the boot).
-    let argv_vmo = vmo_create(256);
-    if argv_vmo != u64::MAX {
-        ARGV_VMO.store(argv_vmo, Ordering::Relaxed);
-    } else {
-        log(b"argv vmo create fail\n");
-    }
-
     // Live Sora-side HandleClose proof: close a temporary read-only duplicate, then
     // HandleKoid must reject that process-local number. The original initrd handle is
     // untouched and remains the source for program loading.
@@ -5882,6 +5864,7 @@ extern "C" fn sora_main(
             (k != u64::MAX && port_bind(port, b.channel) == 0).then_some(Handle(k as u32))
         });
         SERVE_PORT.store(u64::from(port.0), Ordering::Relaxed);
+        netstack_attach_serve(port);
         log(b"sora: ports bound\n");
         // J545: each controller's storage control channel. `PortBind` replays a pending offer,
         // so a stick probed before this point still wakes the loop below.
@@ -5994,7 +5977,11 @@ extern "C" fn sora_main(
                     LOG_MIRROR.store(false, Ordering::Relaxed);
                 }
             }
-            let source = Handle(port_wait(port) as u32);
+            let raw_source = port_wait(port);
+            if netstack_event(raw_source) {
+                continue;
+            }
+            let source = Handle(raw_source as u32);
             //j723
             // Capture the wake instant before any dispatch, so the clock sampler can tell a
             // late wake from slow logging. — TIMBERDOODLE
@@ -6586,6 +6573,15 @@ fn eval_command(
     cwd: &mut WorkingDirectory,
 ) -> bool {
     LAST_STATUS.store(0, Ordering::Relaxed);
+    #[cfg(feature = "netstack-restart-proof")]
+    if cmd.name == "netstack-crash-proof" {
+        if cmd.args.first().is_some_and(|a| a == "idle") {
+            netstack_idle_crash_proof(initrd);
+        } else {
+            netstack_crash_proof(initrd, cmd.args.first().is_some_and(|a| a == "burst"));
+        }
+        return true;
+    }
     if cmd.name == "gfx-demo" {
         graphics_demo(cmd);
         return true;
@@ -7329,65 +7325,343 @@ fn wait_background() {
     log(b"wait: background job finished\n");
 }
 
-/// J815: Sora's end of netstack's control channel, or 0 until the first `net` launch starts it.
-static NETSTACK_CONTROL: AtomicU32 = AtomicU32::new(0);
+/// Netstack is a soft-state actor: Sora retains its process watch and grants fresh sessions,
+/// never old sockets, after replacement. Three restart attempts in any ten seconds, including
+/// failed spawns; exhaustion is sticky until reboot. — TIMBERDOODLE
+#[derive(Clone, Copy)]
+struct NetInstance {
+    process: Handle,
+    control: Handle,
+    koid: u64,
+}
 
-/// Start netstack (DESIGN/026) and return Sora's end of its control channel. It owns no device:
-/// its only authority is the session channels Sora sends it, one per granted launch.
-fn spawn_netstack(initrd: Handle) -> Option<Handle> {
+#[derive(Clone, Copy)]
+struct NetSupervisor {
+    instance: Option<NetInstance>,
+    timer: Option<(Handle, u64)>,
+    initrd: Handle,
+    epoch: u16,
+    intensity: sora::RestartIntensity<3>,
+    backoff: sora::RestartBackoff,
+    gave_up: bool,
+}
+
+static NET_SUPERVISOR: Shared<NetSupervisor> = Shared(core::cell::UnsafeCell::new(NetSupervisor {
+    instance: None,
+    timer: None,
+    initrd: Handle(0),
+    epoch: 0,
+    intensity: sora::RestartIntensity::new(10_000_000_000),
+    backoff: sora::RestartBackoff::new(50_000_000, 200_000_000),
+    gave_up: false,
+}));
+
+// Sora still has the pre-AX9 synchronous reply context as well as its serve loop. Both dispatch
+// the same death/timer transition; the first consumes it and stale koids are ignored. This does
+// not make arbitrary child output nonblocking (DEFERRED/015). — TIMBERDOODLE
+fn netstack_ports() -> [Handle; 2] {
+    [
+        Handle(REPLY_PORT.load(Ordering::Relaxed)),
+        Handle(SERVE_PORT.load(Ordering::Relaxed) as u32),
+    ]
+}
+
+fn netstack_watch(object: Handle, bind: bool) -> bool {
+    let ports = netstack_ports();
+    let mut ok = ports[0].0 != 0;
+    for (i, port) in ports.iter().copied().enumerate() {
+        if port.0 != 0 && (i == 0 || port != ports[0]) {
+            let status = if bind {
+                port_bind(port, object)
+            } else {
+                port_unbind(port, object)
+            };
+            ok &= status == 0;
+        }
+    }
+    ok
+}
+
+fn netstack_attach_serve(port: Handle) {
+    #[cfg(feature = "netstack-restart-proof")]
+    if let Some((timer, _)) = NET_PROOF_TIMER.get() {
+        let _ = port_bind(port, timer);
+    }
+    let state = NET_SUPERVISOR.get();
+    for object in [state.instance.map(|s| s.process), state.timer.map(|t| t.0)]
+        .into_iter()
+        .flatten()
+    {
+        if port_bind(port, object) != 0 {
+            log(b"netstack: serve watch unavailable; reply watch retained\n");
+        }
+    }
+}
+
+fn netstack_give_up() {
+    let mut state = NET_SUPERVISOR.get();
+    state.gave_up = true;
+    NET_SUPERVISOR.set(state);
+    log(b"netstack: giving up (restart intensity or resources exhausted)\n");
+}
+
+fn spawn_netstack(initrd: Handle, epoch: u16) -> Option<NetInstance> {
     let (control_raw, server_raw) = channel_create_pair();
     if control_raw == u64::MAX || server_raw == u64::MAX {
-        log(b"netstack: control channel unavailable\n");
         return None;
     }
     let control = Handle(control_raw as u32);
+    // ProcessRun's historical ABI auto-copies integers that name live handles. Bootstrap
+    // the epoch over the control channel instead of risking an accidental grant. — TIMBERDOODLE
+    let epoch_bytes = epoch.to_le_bytes();
+    let bootstrap = [b'I', epoch_bytes[0], epoch_bytes[1]];
+    if channel_write(control, bootstrap.as_ptr(), bootstrap.len()) != 0 {
+        let _ = handle_close(control);
+        let _ = handle_close(Handle(server_raw as u32));
+        return None;
+    }
+    let mut kept = None;
     let flags = (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG2).bits();
-    if !run_elf(
+    if !run_elf_threads(
         initrd,
         NETSTACK_PATH.as_bytes(),
         0,
         server_raw,
         flags,
         b"netstack",
+        0,
+        Some(&mut kept),
     ) {
+        if let Some(process) = kept {
+            let _ = process_kill(process);
+            let _ = handle_close(process);
+        }
         let _ = handle_close(control);
         let _ = handle_close(Handle(server_raw as u32));
         return None;
     }
-    if !child_parked(process_wait()) {
+    let Some(process) = kept else {
         let _ = handle_close(control);
-        log(b"netstack: did not start\n");
+        return None;
+    };
+    let parked = child_parked(process_wait());
+    let koid = handle_koid(process);
+    if !parked || koid == u64::MAX || !netstack_watch(process, true) {
+        let _ = process_kill(process);
+        netstack_watch(process, false);
+        let _ = handle_close(process);
+        let _ = handle_close(control);
         return None;
     }
-    Some(control)
+    Some(NetInstance {
+        process,
+        control,
+        koid,
+    })
 }
 
-/// Mint one netstack session for a launch: a fresh channel whose server end goes to netstack
-/// tagged `S`, and whose client end the caller hands to the child. netstack starts on first use,
-/// so an image that never runs `net` never starts it. — TIMBERDOODLE
-fn netstack_session(initrd: Handle) -> Option<Handle> {
-    let mut control = Handle(NETSTACK_CONTROL.load(Ordering::Relaxed));
-    if control.0 == 0 {
-        control = spawn_netstack(initrd)?;
-        NETSTACK_CONTROL.store(control.0, Ordering::Relaxed);
+fn netstack_start() -> bool {
+    let mut state = NET_SUPERVISOR.get();
+    let Some(epoch) = state.epoch.checked_add(1) else {
+        netstack_give_up();
+        return false;
+    };
+    // Reserve the epoch even if loading fails: a partly started instance may have observed it.
+    state.epoch = epoch;
+    NET_SUPERVISOR.set(state);
+    let Some(instance) = spawn_netstack(state.initrd, epoch) else {
+        return false;
+    };
+    state = NET_SUPERVISOR.get();
+    state.instance = Some(instance);
+    NET_SUPERVISOR.set(state);
+    log(b"netstack: supervised instance ");
+    log_dec(u64::from(epoch));
+    log(b" ready\n");
+    true
+}
+
+fn netstack_schedule_restart() {
+    let mut state = NET_SUPERVISOR.get();
+    if state.gave_up || !state.intensity.try_consume(kumo_rt::clock_get()) {
+        NET_SUPERVISOR.set(state);
+        netstack_give_up();
+        return;
     }
+    let delay = state.backoff.next_delay_ns();
+    NET_SUPERVISOR.set(state);
+    let Some(timer) = syscall_handle(timer_create(delay)) else {
+        netstack_give_up();
+        return;
+    };
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || !netstack_watch(timer, true) {
+        netstack_watch(timer, false);
+        let _ = handle_close(timer);
+        netstack_give_up();
+        return;
+    }
+    state = NET_SUPERVISOR.get();
+    state.timer = Some((timer, koid));
+    NET_SUPERVISOR.set(state);
+    log(b"netstack: restart delayed\n");
+}
+
+/// Called from every existing Sora wait context; no reference is held across a syscall.
+fn netstack_event(source: u64) -> bool {
+    #[cfg(feature = "netstack-restart-proof")]
+    if let Some((timer, _)) = NET_PROOF_TIMER.get().filter(|t| t.1 == source) {
+        NET_PROOF_TIMER.set(None);
+        netstack_watch(timer, false);
+        let _ = handle_close(timer);
+        if let Some(instance) = NET_SUPERVISOR.get().instance {
+            if process_kill(instance.process) == 0 {
+                log(b"netstack-proof: idle kill sent\n");
+            }
+        }
+        return true;
+    }
+    let mut state = NET_SUPERVISOR.get();
+    if let Some(dead) = state.instance.filter(|s| s.koid == source) {
+        state.instance = None;
+        NET_SUPERVISOR.set(state);
+        netstack_watch(dead.process, false);
+        let _ = handle_close(dead.process);
+        let _ = handle_close(dead.control);
+        log(b"netstack: terminated; old sessions invalidated\n");
+        netstack_schedule_restart();
+        return true;
+    }
+    if let Some((timer, _)) = state.timer.filter(|t| t.1 == source) {
+        state.timer = None;
+        NET_SUPERVISOR.set(state);
+        netstack_watch(timer, false);
+        let _ = handle_close(timer);
+        if !netstack_start() {
+            log(b"netstack: replacement spawn failed\n");
+            netstack_schedule_restart();
+        }
+        return true;
+    }
+    false
+}
+
+fn netstack_ready(initrd: Handle) -> Option<NetInstance> {
+    let port = reply_port()?;
+    let mut state = NET_SUPERVISOR.get();
+    if state.initrd.0 == 0 {
+        state.initrd = initrd;
+        NET_SUPERVISOR.set(state);
+        if !netstack_start() {
+            netstack_schedule_restart();
+        }
+    }
+    loop {
+        state = NET_SUPERVISOR.get();
+        if state.gave_up {
+            log(b"netstack: unavailable after give-up; session not granted\n");
+            return None;
+        }
+        if let Some(instance) = state.instance {
+            return Some(instance);
+        }
+        if state.timer.is_none() {
+            return None;
+        }
+        let source = port_wait(port);
+        if source == u64::MAX {
+            return None;
+        }
+        netstack_event(source);
+    }
+}
+
+/// Mint a new capability only on explicit launch. Failure never resets restart intensity;
+/// Sora's TERMINATED watch, rather than a failed send, drives replacement. — TIMBERDOODLE
+fn netstack_session(initrd: Handle) -> Option<Handle> {
+    let control = netstack_ready(initrd)?.control;
     let (client_raw, server_raw) = channel_create_pair();
     if client_raw == u64::MAX || server_raw == u64::MAX {
-        log(b"netstack: session channel unavailable\n");
         return None;
     }
     let server = Handle(server_raw as u32);
     if channel_write_with_handle(control, b"S".as_ptr(), 1, server) != Errno::Ok.status() {
-        // A refused send leaves `server` in Sora's table, and netstack is gone: forget it so the
-        // next `net` launch starts a fresh instance rather than reuse a dead control channel.
         let _ = handle_close(server);
         let _ = handle_close(Handle(client_raw as u32));
-        let _ = handle_close(control);
-        NETSTACK_CONTROL.store(0, Ordering::Relaxed);
         log(b"netstack: control channel refused; session not granted\n");
         return None;
     }
     Some(Handle(client_raw as u32))
+}
+
+#[cfg(feature = "netstack-restart-proof")]
+static NET_PROOF_TIMER: Shared<Option<(Handle, u64)>> = Shared(core::cell::UnsafeCell::new(None));
+
+#[cfg(feature = "netstack-restart-proof")]
+fn netstack_idle_crash_proof(initrd: Handle) {
+    if NET_PROOF_TIMER.get().is_some() || netstack_ready(initrd).is_none() {
+        return;
+    }
+    let Some(timer) = syscall_handle(timer_create(5_000_000_000)) else {
+        return;
+    };
+    let koid = handle_koid(timer);
+    if koid == u64::MAX || !netstack_watch(timer, true) {
+        netstack_watch(timer, false);
+        let _ = handle_close(timer);
+        return;
+    }
+    NET_PROOF_TIMER.set(Some((timer, koid)));
+    log(b"netstack-proof: idle kill armed\n");
+}
+
+/// Private fault injection: Sora kills only the process it supervises. No application gains
+/// kill authority, and this command is absent from default images. — TIMBERDOODLE
+#[cfg(feature = "netstack-restart-proof")]
+fn netstack_crash_proof(initrd: Handle, burst: bool) {
+    let count = if burst { 4 } else { 1 };
+    for _ in 0..count {
+        let Some(instance) = netstack_ready(initrd) else {
+            break;
+        };
+        if process_kill(instance.process) != 0 {
+            log(b"netstack-proof: FAIL kill\n");
+            return;
+        }
+        let Some(port) = reply_port() else {
+            return;
+        };
+        let Some(deadline) = syscall_handle(timer_create(1_000_000_000)) else {
+            return;
+        };
+        let deadline_koid = handle_koid(deadline);
+        if port_bind(port, deadline) != 0 {
+            let _ = handle_close(deadline);
+            return;
+        }
+        while NET_SUPERVISOR
+            .get()
+            .instance
+            .is_some_and(|s| s.koid == instance.koid)
+        {
+            let source = port_wait(port);
+            if source == deadline_koid || source == u64::MAX {
+                break;
+            }
+            netstack_event(source);
+        }
+        let _ = port_unbind(port, deadline);
+        let _ = handle_close(deadline);
+        if NET_SUPERVISOR
+            .get()
+            .instance
+            .is_some_and(|s| s.koid == instance.koid)
+        {
+            log(b"netstack-proof: FAIL termination watch\n");
+            return;
+        }
+    }
+    log(b"netstack-proof: kill observed\n");
 }
 
 /// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a
@@ -8915,15 +9189,18 @@ fn log_dec(mut v: u64) {
 /// Maximum argv entries Sora forwards (program name + 15 args), bounding the heap-free slot array.
 const MAX_ARGV: usize = 16;
 
-/// Pack `slots` (each element one argv entry, `slots[0]` = program name) into the shared scratch
-/// VMO and mint a one-shot read+transfer handle suitable for a bootstrap startup message; returns
-/// `0` if the VMO is unavailable or argv overflows the 256-byte buffer. The child `vmo_read`s the
+/// Pack `slots` into a per-launch snapshot, then retain only read+transfer authority. A
+/// background child's first read may follow another launch; a shared writable scratch VMO
+/// would silently replace its arguments (observed in the restart proof). — TIMBERDOODLE
+/// Returns `0` if the VMO is unavailable or argv overflows the 256-byte buffer. The child `vmo_read`s the
 /// handle and walks it with `kumo_abi::unpack_argv`.
 fn argv_transfer_handle(slots: &[&[u8]]) -> u64 {
     let Some(vmo) = write_argv(slots) else {
         return 0;
     };
-    handle_duplicate(vmo, Rights::READ | Rights::TRANSFER)
+    let grant = handle_duplicate(vmo, Rights::READ | Rights::TRANSFER);
+    let _ = handle_close(vmo);
+    grant
 }
 
 /// Fill `slots` from a parsed command (`argv[0]` = the command name) and return the entry count.
@@ -8951,19 +9228,14 @@ fn string_argv_slots<'a>(
 }
 
 fn write_argv(argv: &[&[u8]]) -> Option<Handle> {
-    let vmo = ARGV_VMO.load(Ordering::Relaxed);
-    if vmo == 0 || vmo == u64::MAX {
-        return None;
-    }
     let mut buf = [0u8; 256];
     let written = kumo_abi::pack_argv(argv, &mut buf)?;
-    // VmoWrite is capped at 256/call; `written <= 256`, so one write suffices. The VMO is
-    // reused across runs — a partial write leaves stale tail bytes, but `unpack_argv`
-    // bounds its walk by the fresh `argc`, so they are never read.
-    if vmo_write(Handle(vmo as u32), 0, buf.as_ptr(), written) != 0 {
+    let vmo = syscall_handle(vmo_create(256))?;
+    if vmo_write(vmo, 0, buf.as_ptr(), written) != 0 {
+        let _ = handle_close(vmo);
         return None;
     }
-    Some(Handle(vmo as u32))
+    Some(vmo)
 }
 
 /// Run an initrd program: spawn `bin/<argv[0]>` to completion via the same finite bootstrap
@@ -10105,11 +10377,19 @@ fn read_channel_ready(channel: Handle, reply: &mut [u8]) -> Option<usize> {
     if port_bind(port, channel) != 0 {
         return None;
     }
-    let result = if port_wait(port) == handle_koid(channel) {
-        let n = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
-        (n <= reply.len()).then_some(n)
-    } else {
-        None
+    let result = loop {
+        let source = port_wait(port);
+        if netstack_event(source) {
+            continue;
+        }
+        if source == handle_koid(channel) {
+            let n = channel_read(channel, reply.as_mut_ptr(), reply.len()) as usize;
+            break (n <= reply.len()).then_some(n);
+        }
+        if source == u64::MAX {
+            break None;
+        }
+        // A packet already queued on the other wait context can outlive its retired watch.
     };
     let _ = port_unbind(port, channel);
     result
@@ -10127,11 +10407,20 @@ fn ttyd_request_reply(client: Handle, request: TtyRequest, reply: &mut [u8]) -> 
     // hide the initial empty read and leave every later key's echo one request behind.
     // PortWait retries unrelated wakes, and binding before sending also covers a fast
     // reply. Read only after this exchange's channel has a packet. — TIMBERDOODLE
-    let result = if channel_write(client, req.as_ptr(), req_len) == 0
-        && port_wait(port) == handle_koid(client)
-    {
-        let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
-        (n > 0 && n <= reply.len()).then_some(n)
+    let result = if channel_write(client, req.as_ptr(), req_len) == 0 {
+        loop {
+            let source = port_wait(port);
+            if netstack_event(source) {
+                continue;
+            }
+            if source == handle_koid(client) {
+                let n = channel_read(client, reply.as_mut_ptr(), reply.len()) as usize;
+                break (n > 0 && n <= reply.len()).then_some(n);
+            }
+            if source == u64::MAX {
+                break None;
+            }
+        }
     } else {
         None
     };

@@ -1,5 +1,6 @@
 //j815
 //j817
+//j820
 
 extern crate std;
 
@@ -765,4 +766,26 @@ fn an_aborted_slot_is_not_reused_before_its_rst_leaves() {
     assert_eq!(statuses, [Status::Ok; 4]);
     run(&mut server, 20);
     assert_eq!(b.recv_tcp(&mut server, c, 64).status, Status::ConnReset);
+}
+
+#[test]
+fn replacement_instances_have_disjoint_generations_and_never_wrap() {
+    assert!(Server::for_instance(0, 0).is_none());
+    let mut first = Server::for_instance(0, 1).unwrap();
+    let mut second = Server::for_instance(0, 2).unwrap();
+    let a = first.open_session().unwrap();
+    let b = second.open_session().unwrap();
+    assert_eq!(
+        first.sessions[a].as_ref().unwrap().state.generation(),
+        0x10001
+    );
+    assert_eq!(
+        second.sessions[b].as_ref().unwrap().state.generation(),
+        0x20001
+    );
+    first.close_session(a);
+    first.next_generation = first.generation_end;
+    let last = first.open_session().unwrap();
+    first.close_session(last);
+    assert!(first.open_session().is_none());
 }

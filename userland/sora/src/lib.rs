@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j701
 //j766
 //j720
 //j774
 //j803
+//j820
 
 use drv_i2c_hid::{OptionalProbeCandidates, ProbeConfig, ProbePlan};
 use kumo_abi::{Errno, Handle, Status};
@@ -167,6 +167,45 @@ impl RestartBudget {
     /// Whether the budget is spent: every future `try_consume` will refuse.
     pub const fn exhausted(&self) -> bool {
         self.used >= self.max_attempts
+    }
+}
+
+/// Sliding restart-attempt window, including failed replacement spawns. The
+/// caller gives up visibly when this refuses; a new launch cannot reset it.
+/// Clock rollback fails closed. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartIntensity<const N: usize> {
+    attempts: [u64; N],
+    count: usize,
+    period_ns: u64,
+    last_now: u64,
+}
+impl<const N: usize> RestartIntensity<N> {
+    pub const fn new(period_ns: u64) -> Self {
+        Self {
+            attempts: [0; N],
+            count: 0,
+            period_ns,
+            last_now: 0,
+        }
+    }
+    pub fn try_consume(&mut self, now: u64) -> bool {
+        if N == 0 || self.period_ns == 0 || now < self.last_now {
+            return false;
+        }
+        self.last_now = now;
+        let expired = self.attempts[..self.count]
+            .iter()
+            .take_while(|&&stamp| now.saturating_sub(stamp) >= self.period_ns)
+            .count();
+        self.attempts.copy_within(expired..self.count, 0);
+        self.count -= expired;
+        if self.count == N {
+            return false;
+        }
+        self.attempts[self.count] = now;
+        self.count += 1;
+        true
     }
 }
 
@@ -1646,5 +1685,36 @@ mod gpu_clock_tests {
         let spll = decode_gpu_clock(4 << 5, 0);
         assert_eq!(spll.parent_name(), "spll");
         assert_eq!(spll.rate_mhz(1188), None);
+    }
+}
+
+#[cfg(test)]
+mod intensity_tests {
+    use super::RestartIntensity;
+    #[test]
+    fn burst_refused_and_sliding_boundary_does_not_double_the_limit() {
+        let mut p = RestartIntensity::<3>::new(100);
+        assert!(p.try_consume(98));
+        assert!(p.try_consume(99));
+        assert!(p.try_consume(100));
+        assert!(!p.try_consume(101));
+        assert!(!p.try_consume(197));
+        assert!(p.try_consume(198));
+        assert!(!p.try_consume(198));
+        assert!(p.try_consume(199));
+        assert!(p.try_consume(200));
+        assert!(!p.try_consume(201));
+    }
+    #[test]
+    fn stable_service_can_recover_later_but_bad_clock_or_empty_policy_refuses() {
+        let mut p = RestartIntensity::<1>::new(20);
+        assert!(p.try_consume(5));
+        assert!(!p.try_consume(4));
+        assert!(!p.try_consume(24));
+        assert!(p.try_consume(25));
+        assert!(p.try_consume(u64::MAX));
+        assert!(!p.try_consume(0));
+        assert!(!RestartIntensity::<0>::new(20).try_consume(1));
+        assert!(!RestartIntensity::<1>::new(0).try_consume(1));
     }
 }

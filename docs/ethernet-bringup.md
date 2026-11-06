@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j810 -->
 <!-- j812 -->
 <!-- j815 -->
 <!-- j816 -->
 <!-- j817 -->
+<!-- j820 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c TCP in QEMU (J817), restart proof pending.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); PLAN/021 AX7 first proof closed. AXH regression harness is next.
 
 ## First controller
 
@@ -239,5 +239,31 @@ bytes, some of them only partly accepted at a time, and received every byte back
 with the same checksum printed by both programs. The client then closed its sending side; the
 server saw end-of-stream, closed, and the client saw end-of-stream too. Connection refusal,
 operations that would block, wait deadlines, a full send buffer, and a peer that resets are
-all reported with specific errors. Still to prove: restarting the service fails old
-connections cleanly and new ones succeed. — TIMBERDOODLE 2026-11-06
+all reported with specific errors. J820 adds the supervised restart proof below. — TIMBERDOODLE 2026-11-06
+
+## Supervised netstack restart (NET2c-2 / AX7, J820)
+
+Sora retains netstack's process and control capabilities. A process-death event invalidates
+all old session channels and socket state. A timer starts a new instance after 50/100/200 ms,
+with at most three restart attempts in any ten seconds; failed replacement spawns count too.
+Exhaustion gives up visibly until reboot. A new launch cannot reset that limit.
+
+Each instance receives a nonzero epoch in a three-byte control bootstrap (`I`, little-endian
+u16); it owns a disjoint 65535-session generation range. Neither epoch nor session generation
+wraps. Epochs cross the control channel because the historical ProcessRun ABI may interpret
+an integer matching a live handle as a capability. Only new explicit `net` launches get new
+session channels. Old sockets never reattach, and application sends are never replayed.
+
+QEMU proved a live TCP connection's pending WAIT ends with PeerClosed, a fresh launch sees a
+new generation and empty socket state, its old TCP bind is reusable, and UDP/TCP still exchange
+exact bytes. A fourth crash inside the intensity window gives up; later launches are refused.
+The proof also exercises the idle supervisor at login. Launch arguments now use a separate
+read-only VMO snapshot per child: a background launch may read after another launch starts.
+
+Fault injection is default-off, QEMU-only: build the image with KUMO_NET_RESTART_PROOF=1 and
+KUMO_CONSOLE_LOGLEVEL=6; `netstack-crash-proof`, `... burst`, and `... idle` are private Sora
+proof commands, absent from ordinary images. No client receives kill or supervision authority.
+The repeatable tracked harness is the next, separate AXH slice. Sora's general child-output
+blocking remains PLAN/021 AX9 / DEFERRED/015; this slice dispatches netstack death/timer events
+in both existing wait contexts. No netstack-on-metal proof precedes AX0's resident census.
+— TIMBERDOODLE 2026-11-06

@@ -3,6 +3,7 @@
 //j815
 //j816
 //j817
+//j820
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -14,12 +15,13 @@
 //! and the sender checks the echo is exact (NET2b-2).
 //! `bg net netprobe tcpserve <port>` + `net netprobe tcpclient <port>`: a 12000-byte stream,
 //! echoed back exact across partial writes, then half-close and EOF (NET2c).
+//! `net netprobe restartwait` / `restartfresh <epoch>`: old TCP session death and fresh state.
 //! `net netprobe tcperrors`: refusal, would-block, deadline, a full send buffer and EOF. Run without `net`, it reports that it holds no network grant —
 //! the grant is a launcher decision, not something a program can ask for.
 
 extern crate alloc;
 
-use kumo_abi::{unpack_argv, Handle};
+use kumo_abi::{unpack_argv, Errno, Handle};
 use kumo_netstack::budget::{SOCKETS_PER_SESSION, UDP_PAYLOAD_MAX};
 use kumo_netstack::socket::{
     decode_reply, encode_request, Addr, Op, RequestHeader, Status, ADDR_LEN, HEADER_LEN,
@@ -763,6 +765,87 @@ fn tcp_errors(client: &mut Client) {
     client.expect(b"recv after peer close (EOF)", end, Status::Ok);
 }
 
+/// Keep a live TCP connection and an unanswered WAIT across a server death. Closure is a
+/// transport fact, not a synthetic success from the codec. No application request is replayed.
+/// — TIMBERDOODLE
+fn restart_wait(client: &mut Client) {
+    let listener = tcp_socket(client);
+    client.bind(listener, 8997);
+    let status = client.call(Op::Listen, listener, 1, &[]).status;
+    client.expect(b"restart listen", status, Status::Ok);
+    let near = tcp_socket(client);
+    let status = connect(client, near, 8997);
+    client.expect(b"restart connect", status, Status::InProgress);
+    let status = wait(client, near, WAIT_CONNECTED, 2000);
+    client.expect(b"restart connected", status, Status::Ok);
+    let status = wait(client, listener, WAIT_CONNECTED, 2000);
+    client.expect(b"restart acceptable", status, Status::Ok);
+    let far = client.call(Op::Accept, listener, 0, &[]);
+    client.expect(b"restart accept", far.status, Status::Ok);
+    let id = client.next_id;
+    client.next_id += 1;
+    let mut request = [0u8; HEADER_LEN];
+    let header = RequestHeader {
+        op: Op::Wait,
+        request_id: id,
+        socket: far.socket,
+        generation: client.generation,
+        flags: 0,
+        arg: WAIT_READABLE as u64 | (60_000u64 << 32),
+    };
+    let len = encode_request(&header, &[], &mut request).unwrap_or(0);
+    if len == 0 || channel_write(client.channel, request.as_ptr(), len) != 0 {
+        client.fail(&[b"restart WAIT did not send"]);
+        return;
+    }
+    client
+        .out
+        .line(&[b"netprobe: restartwait armed (live TCP, pending WAIT)"]);
+    let read = channel_read(client.channel, client.rx.as_mut_ptr(), client.rx.len());
+    let write = channel_write(client.channel, request.as_ptr(), len);
+    if read == 0 && write == Errno::PeerClosed.status() {
+        client
+            .out
+            .line(&[b"netprobe: old session -> PeerClosed; no replay ok"]);
+    } else {
+        client.fail(&[b"old session was not PeerClosed"]);
+    }
+}
+
+/// A new launch must have a new instance generation, empty socket state and reusable binds.
+fn restart_fresh(client: &mut Client, epoch: u16) {
+    if client.generation >> 16 != u32::from(epoch) || epoch < 2 {
+        client.fail(&[b"replacement reused the old instance generation"]);
+    }
+    let status = client.call(Op::Close, 1, 0, &[]).status;
+    client.expect(b"old socket id on fresh session", status, Status::BadSocket);
+    let listener = tcp_socket(client);
+    client.bind(listener, 8997);
+    let status = client.call(Op::Listen, listener, 1, &[]).status;
+    client.expect(b"old TCP bind reused", status, Status::Ok);
+    udp(client);
+    let id = client.next_id;
+    client.next_id += 1;
+    let header = RequestHeader {
+        op: Op::Close,
+        request_id: id,
+        socket: listener,
+        generation: ((u32::from(epoch) - 1) << 16) | 1,
+        flags: 0,
+        arg: 0,
+    };
+    let mut request = [0u8; HEADER_LEN];
+    let len = encode_request(&header, &[], &mut request).unwrap_or(0);
+    let status = client.exchange(&request[..len], id).map(|r| r.status);
+    if status == Some(Status::StaleSession) {
+        client
+            .out
+            .line(&[b"netprobe: old generation -> StaleSession ok"]);
+    } else {
+        client.fail(&[b"old generation was accepted"]);
+    }
+}
+
 fn errors(client: &mut Client) {
     let s = client.udp_socket();
     let port = client.bind(s, 0);
@@ -887,9 +970,11 @@ extern "C" fn main(
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
+        b"restartwait" => restart_wait(&mut client),
+        b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port>",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch>",
             ]);
             process_exit(2);
         }

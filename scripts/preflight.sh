@@ -1,9 +1,9 @@
 #!/bin/sh
-#j792
 #j798
 #j801
 #j813
 #j815
+#j820
 # preflight.sh — mechanical guardrail tripwires (GUIDANCE/006 §5).
 #
 # The machine, not a teammate, catches drift. Run before you say "done":
@@ -40,7 +40,7 @@ else
 fi
 
 # 2. VEIL sterility — no esoteric name as a Rust identifier (PLAN §20 rule).
-VEIL='Ziwei|Pleroma|Tulpa|Hierophant|Sigil|Aether|Leyline|Homunculus|Vanguard|Houtu|Gouchen|Taiyi|Nanji|Strata|Athanor|Ouroboros|Siming|Signet|Investiture'
+VEIL='Ziwei|Pleroma|Tulpa|Hierophant|Sigil|Aether|Leyline|Homunculus|Vanguard|Houtu|Gouchen|Taiyi|Nanji|Strata|Athanor|Ouroboros|Siming|Signet|Investiture|AlIxir|Alixir|alixir'
 veil_hits="$(grep -rnE "\\b(struct|enum|fn|mod|trait|type|const|static)[[:space:]]+($VEIL)\\b" \
     --include='*.rs' kernel hal lib userland boot 2>/dev/null || true)"
 if [ -n "$veil_hits" ]; then

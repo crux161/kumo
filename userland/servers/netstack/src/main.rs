@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 //j815
+//j820
 
 //! The resident netstack: one Port, one loopback interface, sessions over granted channels
 //! (DESIGN/026). Sora transfers a control channel in `x1`; each control message is the tag `S`
 //! carrying the server end of one new session channel. Everything protocol-shaped lives in the
 //! host-tested library; this file is the syscall loop around it.
+//!
+//! Recovery class: stateless (discardable socket soft state); fresh Sora-granted channels reconnect.
 //!
 //! A resident child's `ChannelRead` parks on an empty channel and returns 0 only once the peer
 //! has closed. So every wake reads exactly one message from the channel that woke (the kernel
@@ -143,13 +146,27 @@ extern "C" fn main(
     _arg7: u64,
 ) -> ! {
     let control = valid(control_raw).unwrap_or_else(|| fail(b"netstack: no control channel\n"));
+    // The supervisor queues the instance epoch before admission. Read it before binding,
+    // so its READABLE packet cannot survive as a stale wake in the ordinary receive loop.
+    let mut bootstrap = [0u8; 3];
+    let (n, raw) = channel_read_with_handle(control, bootstrap.as_mut_ptr(), bootstrap.len());
+    if valid(raw).is_some() || n != 3 || bootstrap[0] != b'I' {
+        if let Some(handle) = valid(raw) {
+            let _ = handle_close(handle);
+        }
+        fail(b"netstack: invalid instance bootstrap\n");
+    }
+    let epoch = u16::from_le_bytes([bootstrap[1], bootstrap[2]]);
     let port = valid(port_create()).unwrap_or_else(|| fail(b"netstack: no port\n"));
     let control_koid = handle_koid(control);
     if control_koid == u64::MAX || port_bind(port, control) != 0 {
         fail(b"netstack: control bind failed\n");
     }
     // Heap, not stack: a native child's default stack is 16 KiB.
-    let mut server = alloc::boxed::Box::new(Server::new(clock_get()));
+    let mut server = alloc::boxed::Box::new(
+        Server::for_instance(clock_get(), epoch)
+            .unwrap_or_else(|| fail(b"netstack: invalid instance epoch\n")),
+    );
     let mut channels = Channels {
         port,
         sessions: [None; SESSIONS],
@@ -159,7 +176,7 @@ extern "C" fn main(
     let mut message = alloc::vec![0u8; MAX_INLINE_BYTES];
     log(
         log_level::NOTICE,
-        b"netstack: online, loopback 127.0.0.1/8, UDP; sessions granted by Sora\n",
+        b"netstack: online, loopback 127.0.0.1/8, UDP/TCP; sessions granted by Sora\n",
     );
 
     loop {
