@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j622
 //j783
 //j800
 //j801
 //j804
+//j805
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -713,8 +713,19 @@ unsafe fn boot_and_jump(
     unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
 
     #[cfg(feature = "nvme-oracle")]
-    if niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() }) {
-        unsafe { nvme_oracle::run(boot_services, con_out, system_table) };
+    {
+        let reference = niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() })
+            && unsafe { nvme_oracle::run(boot_services, con_out, system_table) };
+        #[cfg(feature = "nvme-write-reference")]
+        if !reference {
+            print_line(
+                con_out,
+                format_args!("NV8 reference/receipt unavailable; refusing proof boot\r\n"),
+            );
+            spin_forever();
+        }
+        #[cfg(not(feature = "nvme-write-reference"))]
+        let _ = reference;
     }
 
     // Pre-exit summary + validation, using a provisional memory snapshot.

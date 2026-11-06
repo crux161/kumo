@@ -1,15 +1,15 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j800 -->
 <!-- j801 -->
 <!-- j802 -->
 <!-- j803 -->
 <!-- j804 -->
+<!-- j805 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV6 are complete; NV7a adds read-only FAT volume discovery and service. Firmware's PCIe3_4L link and enumeration lead to a
+NV0–NV7 are complete, including physical FAT32 reads and USB/NVMe coexistence. Firmware's PCIe3_4L link and enumeration lead to a
 Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
 configuration and graceful restart with two distinct owners, each reaching
 RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
@@ -372,3 +372,41 @@ The host example `cargo run -p niji-uefi --features nvme-prepare --example nvme-
 -- <new-image-path>` emits a sparse partition image for independent read-only fsck.
 Default images contain no formatter; restore a normal image after the proof.
 D5 remains a cooperative DMA non-claim; Road C remains open. — TIMBERDOODLE
+
+
+## NV8a reserved-sector Write/Flush proof
+
+The explicitly disposable SSD reserves LBA1048576..1048591 (16 sectors,8KiB) for
+raw storage tests, outside the FAT32 partition. Only LBA1048584 (512 bytes) is
+writable by this proof. `KUMO_NVME_WRITE_PROOF=1 cargo xtask image --arch aarch64
+--hardware orange-pi-5-plus` selects explicit Cargo features for both Sora and
+an independent UEFI read reference. After normal startup, the `nvme-write-proof`
+shell command performs the test (NVMe must be unmounted). Keeping the one-off proof
+out of bootstrap preserves existing block-service readiness deadlines. Other boards and combining preparation with
+the write proof refuse. Default Sora still starts only the read-only service.
+
+Firmware captures the target and both adjacent sectors through Block I/O. The
+host saves all1536B, verifies aggregate/per-block hashes, and acknowledges receipt
+before KUMO can boot. Missing reference or receipt halts before ExitBootServices.
+The driver separately identifies the exact disposable SSD, CRC-validates GPT and
+requires the exact single J804 FAT32 partition before accepting the test extent.
+It reads and hashes the target/guards, writes one deterministic512B pattern,
+Flushes that namespace (VWC=1 on the observed SSD), and verifies the target,
+adjacent sectors, MBR and both GPT headers. Write/Flush use INTx completions, exact
+CID/queue identity, timeout/storm bounds and the same permanent failure quarantine.
+IRQ waits drain only recorded retired timer packets: PortUnbind removes a watch
+while already queued signals can remain. The active timeout stays bound during
+that bounded drain; unexpected sources still fail and quarantine the owner.
+An already matching target skips writes/flushes; the next boot's firmware reference
+is the independent persistence check. The pattern remains in this reserved extent.
+
+Sora first requests a proved stop of its existing read-only owner and waits for
+actual termination before releasing custody. It then runs the proof owner. After
+a proved controller disable and actual child termination, Sora starts a
+read-only service owner with fresh DMA custody. A proof client requests both RO
+and RW connections, attempts an actual wire Write with the existing VBR bytes,
+requires READ_ONLY, and reads the unchanged VBR. The driver reports unchanged
+controller doorbells for each refusal. This does not enable filesystem writes.
+Normal CC.SHN/SHST shutdown on reboot is the next NV8 gate; writable FAT service
+and editor-save persistence follow under NV9. D5 non-claim/RoadC remain open.
+— TIMBERDOODLE

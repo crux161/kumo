@@ -1,8 +1,8 @@
-//j675
 //j709
 //j798
 //j800
 //j804
+//j805
 
 use std::env;
 use std::fmt;
@@ -413,6 +413,19 @@ fn nvme_oracle_enabled(value: Option<&str>, board: &str) -> Result<bool, String>
     }
 }
 
+fn nvme_write_proof_enabled(board: &str) -> Result<bool, String> {
+    let value = env::var("KUMO_NVME_WRITE_PROOF")
+        .map(Some)
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok(None),
+            _ => Err("KUMO_NVME_WRITE_PROOF must be UTF-8 0 or 1".to_string()),
+        })?;
+    nvme_oracle_enabled(value.as_deref(), board).map_err(|e| {
+        e.replace("oracle", "write proof")
+            .replace("KUMO_NVME_ORACLE", "KUMO_NVME_WRITE_PROOF")
+    })
+}
+
 fn stage_uefi_bootloader(
     root: &Path,
     out_dir: &Path,
@@ -455,8 +468,14 @@ fn stage_uefi_bootloader(
         "--target",
         target,
     ];
+    let write = nvme_write_proof_enabled(plan.hardware.board().map(|b| b.id()).unwrap_or(""))?;
+    if prepare && write {
+        return Err("NVMe preparation and write proof must be separate images".into());
+    }
     if prepare {
         args.extend(["--features", "nvme-prepare"]);
+    } else if write {
+        args.extend(["--features", "nvme-write-reference"]);
     } else if oracle {
         args.extend(["--features", "nvme-oracle"]);
     }
@@ -870,7 +889,10 @@ fn build_fat32_image() -> Vec<u8> {
 fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleAsset>, String> {
     let initrd = match plan.arch {
         ImageArch::Aarch64 => {
-            let sora = build_sora_image(&workspace_root()?)?;
+            let sora = build_sora_image(
+                &workspace_root()?,
+                plan.hardware.board().map(|b| b.id()).unwrap_or(""),
+            )?;
             let svc_health = build_svc_health_image(&workspace_root()?)?;
             let ttyd = build_ttyd_image(&workspace_root()?)?;
             let drv_serial = build_drv_serial_image(&workspace_root()?)?;
@@ -971,20 +993,21 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
     }))
 }
 
-fn build_sora_image(root: &Path) -> Result<Vec<u8>, String> {
-    run_cargo(
-        root,
-        &[
-            "build",
-            "-p",
-            "sora",
-            "--bin",
-            "sora",
-            "--target",
-            "aarch64-unknown-none",
-            "--release",
-        ],
-    )?;
+fn build_sora_image(root: &Path, board: &str) -> Result<Vec<u8>, String> {
+    let mut args = vec![
+        "build",
+        "-p",
+        "sora",
+        "--bin",
+        "sora",
+        "--target",
+        "aarch64-unknown-none",
+        "--release",
+    ];
+    if nvme_write_proof_enabled(board)? {
+        args.extend(["--features", "nvme-write-proof"]);
+    }
+    run_cargo(root, &args)?;
 
     let source_path = root
         .join("target/aarch64-unknown-none/release")

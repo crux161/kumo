@@ -1,5 +1,6 @@
 //j802
 //j803
+//j805
 //! NV6: INTx-driven completions for the I/O pair (I/O CQ 1 created with IEN=1, IV=0).
 //! KUMO's DESIGN/016 contract holds unchanged: the kernel masks the level SPI when it
 //! fires and unmasks it only on InterruptComplete. A delivery is serviced by reaping
@@ -12,7 +13,7 @@
 //! client or config write: the client INTA mask was inherited open. — TIMBERDOODLE
 
 use crate::admin::{AdminIo, Entry, Queue, COMMAND_TIMEOUT_NS, DATA};
-use crate::io::{read_command, IoPair};
+use crate::io::{flush_command, read_command, write_command, IoPair};
 use crate::{start, Error, Memory, Startup, CSTS, PAGE};
 
 pub const INTMS: u16 = 0x0c;
@@ -37,6 +38,57 @@ pub enum Wake {
 /// The bound interrupt as the driver sees it. `wait` returns Interrupt only for a
 /// delivery the kernel recorded (its count consumed); the line is then masked until
 /// `complete`.
+/// PortUnbind removes a watch, not packets already queued for it. An IRQ may win
+/// just before its timeout fires during cleanup; drain only known retired timer
+/// identities while retaining the current timer and command deadline. — TIMBERDOODLE
+pub struct WaitSources {
+    interrupt: u64,
+    retired: [u64; 16],
+    next: usize,
+}
+impl WaitSources {
+    pub fn new(interrupt: u64) -> Self {
+        Self {
+            interrupt,
+            retired: [0; 16],
+            next: 0,
+        }
+    }
+    pub fn retire(&mut self, timer: u64) {
+        self.retired[self.next] = timer;
+        self.next = (self.next + 1) % self.retired.len();
+    }
+    pub fn wait(
+        &mut self,
+        timer: u64,
+        mut next: impl FnMut() -> u64,
+    ) -> Result<(Wake, u32), Error> {
+        if timer == 0 || self.interrupt == 0 || timer == self.interrupt {
+            return Err(Error::Interrupt);
+        }
+        let mut skipped = 0;
+        loop {
+            let source = next();
+            if source == self.interrupt {
+                return Ok((Wake::Interrupt, skipped));
+            }
+            if source == timer {
+                return Ok((Wake::Timeout, skipped));
+            }
+            if source != 0 {
+                if let Some(i) = self.retired.iter().position(|&old| old == source) {
+                    self.retired[i] = 0;
+                    skipped += 1;
+                    if skipped <= 16 {
+                        continue;
+                    }
+                }
+            }
+            return Err(Error::Interrupt);
+        }
+    }
+}
+
 pub trait Line {
     fn wait(&mut self, ns: u64) -> Result<Wake, Error>;
     fn complete(&mut self) -> Result<(), Error>;
@@ -267,6 +319,91 @@ impl IoPair {
         result
     }
 
+    /// NV8 Write: validate before touching DMA/SQ, retain the payload through the
+    /// matching INTx completion. Extent authority is the caller's policy. — TIMBERDOODLE
+    pub fn write_irq(
+        &mut self,
+        io: &mut impl AdminIo,
+        line: &mut impl Line,
+        s: Startup,
+        memory: Memory,
+        lba: u64,
+        data: &[u8],
+        stats: &mut Stats,
+    ) -> Result<u64, Error> {
+        s.validate()?;
+        if !memory.valid() || memory.session != s.session {
+            return Err(Error::Memory);
+        }
+        if self.queue.poisoned() || self.queue.outstanding() != 0 {
+            return Err(Error::State);
+        }
+        let size = self.ns.lba_bytes as usize;
+        if !self.ns.plain_blocks()
+            || data.is_empty()
+            || data.len() > PAGE as usize
+            || data.len() % size != 0
+        {
+            return Err(Error::Range);
+        }
+        let w = write_command(
+            &self.ns,
+            lba,
+            (data.len() / size) as u16,
+            memory.physical.wrapping_add(DATA),
+        )?;
+        for (i, b) in data.chunks_exact(4).enumerate() {
+            io.dma_write32(
+                DATA + i as u64 * 4,
+                u32::from_le_bytes(b.try_into().unwrap()),
+            );
+        }
+        self.command_irq(io, line, s, memory, w, stats)
+    }
+    pub fn flush_irq(
+        &mut self,
+        io: &mut impl AdminIo,
+        line: &mut impl Line,
+        s: Startup,
+        memory: Memory,
+        stats: &mut Stats,
+    ) -> Result<u64, Error> {
+        self.command_irq(io, line, s, memory, flush_command(&self.ns)?, stats)
+    }
+    fn command_irq(
+        &mut self,
+        io: &mut impl AdminIo,
+        line: &mut impl Line,
+        s: Startup,
+        memory: Memory,
+        words: [u32; 16],
+        stats: &mut Stats,
+    ) -> Result<u64, Error> {
+        if self.queue.poisoned() || self.queue.outstanding() != 0 {
+            return Err(Error::State);
+        }
+        let begin = start(io)?;
+        let queue = &mut self.queue;
+        let result = (|| {
+            let cid = queue.stage(io, s, memory, words)?;
+            queue.ring(io)?;
+            service(queue, io, line, begin, 1, stats, |_, entry| {
+                if entry.cid != cid {
+                    return Err(Error::Completion);
+                }
+                if entry.failed() {
+                    return Err(Error::Command);
+                }
+                Ok(())
+            })?;
+            Ok(start(io)?.saturating_sub(begin))
+        })();
+        if result.is_err() {
+            queue.poison();
+        }
+        result
+    }
+
     /// Late/stray window on this pair's queue.
     pub fn quiet(
         &mut self,
@@ -420,7 +557,10 @@ mod tests {
         phase: u32,
         masked: bool,
         /// Commands rung but not yet posted (cid, lba, slice).
-        queued: Vec<(u32, u64, u64)>,
+        queued: Vec<(u32, u64, u64, u32)>,
+        volatile: std::collections::BTreeMap<u64, [u8; 512]>,
+        stable: std::collections::BTreeMap<u64, [u8; 512]>,
+        command_error: bool,
         /// Post at most one completion per `wait` (no coalescing).
         serial: bool,
         /// Keep INTA asserted for this many deliveries after a head release.
@@ -446,6 +586,9 @@ mod tests {
                 phase: 1,
                 masked: true,
                 queued: Vec::new(),
+                volatile: Default::default(),
+                stable: Default::default(),
+                command_error: false,
                 serial: false,
                 linger: 0,
                 lingering: 0,
@@ -463,15 +606,32 @@ mod tests {
             if self.queued.is_empty() {
                 return false;
             }
-            let (cid, lba, slice) = self.queued.remove(0);
-            for i in 0..512 {
-                let word = &mut self.dma[(slice as usize + i) / 4];
-                *word |= u32::from(block(lba, i)) << ((i % 4) * 8);
+            let (cid, lba, slice, opcode) = self.queued.remove(0);
+            match opcode {
+                0 => self.stable = self.volatile.clone(),
+                1 => {
+                    let mut b = [0; 512];
+                    for (i, x) in b.iter_mut().enumerate() {
+                        *x = (self.dma[(slice as usize + i) / 4] >> ((i % 4) * 8)) as u8;
+                    }
+                    self.volatile.insert(lba, b);
+                }
+                2 => {
+                    for i in 0..512 {
+                        let value = self
+                            .volatile
+                            .get(&lba)
+                            .map_or_else(|| block(lba, i), |b| b[i]);
+                        let word = &mut self.dma[(slice as usize + i) / 4];
+                        *word |= u32::from(value) << ((i % 4) * 8);
+                    }
+                }
+                _ => panic!("unplanned opcode"),
             }
             let base = IO_CQ as usize / 4 + self.cq_tail as usize * 4;
             self.dma[base] = 0;
             self.dma[base + 2] = (1 << 16) | u32::from(self.tail);
-            self.dma[base + 3] = cid | (self.phase << 16);
+            self.dma[base + 3] = cid | (self.phase << 16) | (u32::from(self.command_error) << 17);
             self.cq_tail = (self.cq_tail + 1) % crate::DEPTH;
             if self.cq_tail == 0 {
                 self.phase ^= 1;
@@ -522,12 +682,26 @@ mod tests {
                     while t != v as u16 {
                         let base = IO_SQ as usize / 4 + t as usize * 16;
                         let w: Vec<u32> = d.dma[base..base + 16].to_vec();
-                        assert_eq!(w[0] & 0xffff, 2);
+                        let opcode = w[0] & 0xffff;
+                        assert!(opcode <= 2);
+                        assert_eq!(w[1], 1);
                         let lba = u64::from(w[10]) | (u64::from(w[11]) << 32);
-                        let slice = u64::from(w[6]) - memory().physical;
-                        assert!((DATA..IO_SQ).contains(&slice));
-                        assert!(d.dma[slice as usize / 4..][..128].iter().all(|&x| x == 0));
-                        d.queued.push((w[0] >> 16, lba, slice));
+                        let slice = if opcode == 0 {
+                            assert!(w[2..].iter().all(|&x| x == 0));
+                            0
+                        } else {
+                            assert_eq!(w[12], 0);
+                            assert!(w[2..6].iter().all(|&x| x == 0));
+                            assert_eq!(w[7], 0);
+                            assert!(w[8..10].iter().chain(w[13..].iter()).all(|&x| x == 0));
+                            let slice = u64::from(w[6]) - memory().physical;
+                            assert!((DATA..IO_SQ).contains(&slice));
+                            if opcode == 2 {
+                                assert!(d.dma[slice as usize / 4..][..128].iter().all(|&x| x == 0));
+                            }
+                            slice
+                        };
+                        d.queued.push((w[0] >> 16, lba, slice, opcode));
                         t = (t + 1) % crate::DEPTH;
                     }
                     d.tail = v as u16;
@@ -621,6 +795,143 @@ mod tests {
                 .iter()
                 .enumerate()
                 .all(|(i, &b)| b == block(lba, i)));
+        }
+    }
+
+    #[test]
+    fn irq_cleanup_race_drains_retired_timer_without_consuming_active_deadline() {
+        let mut sources = WaitSources::new(10);
+        sources.retire(20); // IRQ won, but timer20 queued before its watch was removed.
+        let mut events = std::collections::VecDeque::from([20, 10, 99]);
+        assert_eq!(
+            sources.wait(21, || events.pop_front().unwrap()),
+            Ok((Wake::Interrupt, 1))
+        );
+        assert_eq!(events.pop_front(), Some(99));
+        sources.retire(21);
+        let mut events = std::collections::VecDeque::from([21, 22]);
+        assert_eq!(
+            sources.wait(22, || events.pop_front().unwrap()),
+            Ok((Wake::Timeout, 1))
+        );
+        assert!(events.is_empty());
+        sources.retire(22);
+        assert_eq!(sources.wait(23, || 777), Err(Error::Interrupt));
+        assert_eq!(sources.wait(23, || 0), Err(Error::Interrupt));
+        let mut events = std::collections::VecDeque::from([22, 22]);
+        assert_eq!(
+            sources.wait(23, || events.pop_front().unwrap()),
+            Err(Error::Interrupt)
+        );
+    }
+
+    #[test]
+    fn write_flush_and_readback_obey_dma_direction_and_durability_order() {
+        let (d, mut io, mut line) = rig();
+        let mut p = pair();
+        unmask(&mut io).unwrap();
+        let mut stats = Stats::default();
+        let payload = crate::write::pattern();
+        p.write_irq(
+            &mut io,
+            &mut line,
+            startup(),
+            memory(),
+            crate::write::TEST_LBA,
+            &payload,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(d.borrow().volatile[&crate::write::TEST_LBA], payload);
+        assert!(d.borrow().stable.is_empty());
+        p.flush_irq(&mut io, &mut line, startup(), memory(), &mut stats)
+            .unwrap();
+        assert_eq!(d.borrow().stable[&crate::write::TEST_LBA], payload);
+        let mut out = [0; 512];
+        p.read_irq(
+            &mut io,
+            &mut line,
+            startup(),
+            memory(),
+            &[crate::write::TEST_LBA],
+            &mut out,
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(out, payload);
+        assert_eq!((stats.entries, stats.deliveries), (3, 3));
+        assert_eq!(d.borrow().completes, 3);
+        let bytes = d.borrow().dma.clone();
+        let bells = d.borrow().doorbells.clone();
+        for (lba, len) in [
+            (namespace().size, 512),
+            (u64::MAX, 512),
+            (0, 0),
+            (0, 511),
+            (0, 513),
+            (0, 4097),
+        ] {
+            let input = std::vec![1;len];
+            assert_eq!(
+                p.write_irq(
+                    &mut io,
+                    &mut line,
+                    startup(),
+                    memory(),
+                    lba,
+                    &input,
+                    &mut stats
+                ),
+                Err(Error::Range)
+            );
+            assert_eq!(d.borrow().dma, bytes);
+            assert_eq!(d.borrow().doorbells, bells);
+            assert!(!p.queue.poisoned());
+        }
+    }
+    #[test]
+    fn failed_write_or_flush_poisons_and_no_later_dma_is_reused() {
+        for flush in [false, true] {
+            let (d, mut io, mut line) = rig();
+            let mut p = pair();
+            unmask(&mut io).unwrap();
+            let mut stats = Stats::default();
+            d.borrow_mut().command_error = true;
+            let result = if flush {
+                p.flush_irq(&mut io, &mut line, startup(), memory(), &mut stats)
+            } else {
+                p.write_irq(
+                    &mut io,
+                    &mut line,
+                    startup(),
+                    memory(),
+                    crate::write::TEST_LBA,
+                    &crate::write::pattern(),
+                    &mut stats,
+                )
+            };
+            assert_eq!(result, Err(Error::Command));
+            assert!(p.queue.poisoned());
+            let bytes = d.borrow().dma.clone();
+            let bells = d.borrow().doorbells.clone();
+            assert_eq!(
+                p.write_irq(
+                    &mut io,
+                    &mut line,
+                    startup(),
+                    memory(),
+                    crate::write::TEST_LBA,
+                    &crate::write::pattern(),
+                    &mut stats
+                ),
+                Err(Error::State)
+            );
+            assert_eq!(
+                p.flush_irq(&mut io, &mut line, startup(), memory(), &mut stats),
+                Err(Error::State)
+            );
+            assert_eq!(d.borrow().dma, bytes);
+            assert_eq!(d.borrow().doorbells, bells);
         }
     }
 

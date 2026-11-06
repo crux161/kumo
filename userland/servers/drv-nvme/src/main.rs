@@ -1,17 +1,18 @@
 #![no_std]
 #![no_main]
-//j798
 //j799
 //j801
 //j802
 //j803
+//j805
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
 //! closes the control channel. Sora retains a DMA VMO alias before any controller
 //! write; failures park with memory quarantined. Reads LBA 0, LBA 1 and the last LBA
 //! single, batched and with vector 0 masked; NSZE is refused before any doorbell. No
-//! write/flush, root/client/config or SMMU writes. D5 cooperative raw DMA.
+//! root/client/config or SMMU writes. NV8 adds an explicit one-sector Write/Flush
+//! proof mode outside the FAT volume. D5 cooperative raw DMA.
 //! — TIMBERDOODLE
 
 extern crate alloc;
@@ -21,7 +22,7 @@ use drv_blk::{
 };
 use drv_nvme::{
     exercise_with, Error, Memory, Proof, RegisterIo, Startup, ACK, DMA_BYTES, MMIO_BYTES,
-    MODE_SERVE, PAGE, PROOF_LEN,
+    MODE_SERVE, MODE_WRITE_PROOF, PAGE, PROOF_LEN,
 };
 use kumo_abi::{DevicePowerStatus, Handle, Rights, VmarFlags};
 use kumo_fatfs::{FatVolume, PartitionReader, SECTOR_SIZE};
@@ -126,7 +127,7 @@ fn identify(
     s: Startup,
     memory: Memory,
     queue: &mut drv_nvme::admin::Queue,
-) -> Result<drv_nvme::admin::Namespace, Error> {
+) -> Result<(drv_nvme::admin::Controller, drv_nvme::admin::Namespace), Error> {
     use drv_nvme::admin::{first_namespace, Controller, Identify, Namespace};
     let mut data = [0u8; 4096];
     let c = queue.identify(io, s, memory, Identify::Controller, &mut data)?;
@@ -170,7 +171,7 @@ fn identify(
         ),
     );
     log(kumo_abi::sys::log_level::NOTICE, &alloc::format!("{ns}\n"));
-    Ok(ns)
+    Ok((controller, ns))
 }
 
 /// The NVMe INTx line: one interrupt object and a private port. Each wait binds a
@@ -179,6 +180,7 @@ struct Irq {
     port: Handle,
     interrupt: Handle,
     koid: u64,
+    waits: drv_nvme::intx::WaitSources,
 }
 impl Irq {
     fn bind(resource: Handle, irq: u32) -> Result<Self, Error> {
@@ -191,6 +193,7 @@ impl Irq {
             port,
             interrupt,
             koid: handle_koid(interrupt),
+            waits: drv_nvme::intx::WaitSources::new(handle_koid(interrupt)),
         };
         if port_bind(port, interrupt) != 0 {
             return Err(Error::Interrupt);
@@ -218,19 +221,52 @@ impl drv_nvme::intx::Line for Irq {
             return Err(Error::Sleep);
         }
         let timer_koid = handle_koid(timer);
-        let source = port_wait(self.port);
+        let mut last = 0;
+        let port = self.port;
+        let result = self.waits.wait(timer_koid, || {
+            last = port_wait(port);
+            last
+        });
         let _ = port_unbind(self.port, timer);
         let _ = handle_close(timer);
-        if source == self.koid {
-            // The port named the interrupt, so its count is non-zero: this does not park.
-            syscall_handle(interrupt_wait(self.interrupt)).ok_or(Error::Interrupt)?;
-            Ok(drv_nvme::intx::Wake::Interrupt)
-        } else if source == timer_koid {
-            Ok(drv_nvme::intx::Wake::Timeout)
-        } else {
-            Err(Error::Interrupt)
+        self.waits.retire(timer_koid);
+        let (wake, skipped) = match result {
+            Ok(value) => value,
+            Err(e) => {
+                log(
+                    kumo_abi::sys::log_level::ERR,
+                    &alloc::format!(
+                        "NV8 IRQ unexpected source={} irq={} timer={}\n",
+                        last,
+                        self.koid,
+                        timer_koid
+                    ),
+                );
+                return Err(e);
+            }
+        };
+        if skipped > 0 {
+            log(
+                kumo_abi::sys::log_level::NOTICE,
+                &alloc::format!(
+                    "NV8 IRQ drained {} retired timer packet(s); active deadline retained\n",
+                    skipped
+                ),
+            );
         }
+        if wake == drv_nvme::intx::Wake::Interrupt {
+            let count = interrupt_wait(self.interrupt);
+            if syscall_handle(count).is_none() {
+                log(
+                    kumo_abi::sys::log_level::ERR,
+                    &alloc::format!("NV8 IRQ consume failed status={:#x}\n", count),
+                );
+                return Err(Error::Interrupt);
+            }
+        }
+        Ok(wake)
     }
+
     fn complete(&mut self) -> Result<(), Error> {
         if interrupt_complete(self.interrupt) == 0 {
             Ok(())
@@ -261,11 +297,138 @@ fn log_block(s: Startup, nsid: u32, lba: u64, mode: &str, block: &[u8], elapsed_
 /// the pair with IEN=1, unmask vector 0, then read LBA 0 alone, LBA 1 and the last
 /// LBA under one doorbell, refuse NSZE before any doorbell, watch for late deliveries,
 /// re-read LBA 0 with vector 0 masked, mask, delete the pair. — TIMBERDOODLE
+fn write_proof(
+    io: &mut Registers,
+    s: Startup,
+    memory: Memory,
+    resource: Handle,
+) -> Result<(), Error> {
+    use drv_nvme::{
+        admin::Queue,
+        intx::{mask, quiet, unmask, Stats, QUIET_NS},
+        io::IoPair,
+        volume::discover,
+        write::{pattern, TestExtent, TEST_LBA},
+    };
+    let mut admin = Queue::new();
+    let (controller, ns) = identify(io, s, memory, &mut admin)?;
+    let mut line = Irq::bind(resource, s.irq)?;
+    let mut stats = Stats::default();
+    quiet(&mut admin, io, &mut line, QUIET_NS, &mut stats)?;
+    let mut pair = IoPair::open(&mut admin, io, s, memory, ns, true)?;
+    unmask(io)?;
+    let found = {
+        let mut b = NvmeBlocks {
+            io,
+            line: &mut line,
+            pair: &mut pair,
+            s,
+            memory,
+            stats: &mut stats,
+        };
+        let mut entries = alloc::vec![0;drv_nvme::volume::MAX_ENTRY_BYTES];
+        discover(&mut b, ns.size, &mut entries)?
+    };
+    let (part, _) = found.chosen.ok_or(Error::Data)?;
+    let gate = TestExtent::new(
+        &controller,
+        &ns,
+        found.entries,
+        part.first_lba,
+        part.block_count(),
+    )?;
+    let mut before = [0; 1536];
+    let lbas = [TEST_LBA - 1, TEST_LBA, TEST_LBA + 1];
+    pair.read_irq(io, &mut line, s, memory, &lbas, &mut before, &mut stats)?;
+    for (i, lba) in lbas.into_iter().enumerate() {
+        log_block(
+            s,
+            ns.id,
+            lba,
+            "nv8-before",
+            &before[i * 512..(i + 1) * 512],
+            0,
+        );
+    }
+    let mut metadata = [0; 1536];
+    pair.read_irq(
+        io,
+        &mut line,
+        s,
+        memory,
+        &[0, 1, ns.size - 1],
+        &mut metadata,
+        &mut stats,
+    )?;
+    let payload = pattern();
+    if before[512..1024] == payload {
+        log(kumo_abi::sys::log_level::NOTICE,&alloc::format!("NV8 WRITE session={} lba={} persistent pattern already present; zero writes/flushes\n",s.session,TEST_LBA));
+    } else {
+        gate.authorize(TEST_LBA, payload.len())?;
+        let t = pair.write_irq(io, &mut line, s, memory, TEST_LBA, &payload, &mut stats)?;
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV8 WRITE session={} nsid={} lba={} bytes=512 elapsed={}us completed by INTx\n",
+                s.session,
+                ns.id,
+                TEST_LBA,
+                t / 1000
+            ),
+        );
+        let t = pair.flush_irq(io, &mut line, s, memory, &mut stats)?;
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV8 FLUSH session={} nsid={} vwc={} elapsed={}us completed by INTx\n",
+                s.session,
+                ns.id,
+                controller.vwc,
+                t / 1000
+            ),
+        );
+    }
+    let mut after = [0; 1536];
+    pair.read_irq(io, &mut line, s, memory, &lbas, &mut after, &mut stats)?;
+    if after[..512] != before[..512]
+        || after[1024..] != before[1024..]
+        || after[512..1024] != payload
+    {
+        return Err(Error::Data);
+    }
+    for (i, lba) in lbas.into_iter().enumerate() {
+        log_block(
+            s,
+            ns.id,
+            lba,
+            "nv8-after",
+            &after[i * 512..(i + 1) * 512],
+            0,
+        );
+    }
+    pair.read_irq(
+        io,
+        &mut line,
+        s,
+        memory,
+        &[0, 1, ns.size - 1],
+        &mut after,
+        &mut stats,
+    )?;
+    if after != metadata {
+        return Err(Error::Data);
+    }
+    log(kumo_abi::sys::log_level::NOTICE,&alloc::format!("NV8 GUARDS session={} both adjacent sectors and MBR/primary/backup GPT headers unchanged; target pattern exact; entries={} deliveries={}\n",s.session,stats.entries,stats.deliveries));
+    mask(io)?;
+    pair.close(&mut admin, io, s, memory)?;
+    Ok(())
+}
+
 fn media(io: &mut Registers, s: Startup, memory: Memory, resource: Handle) -> Result<(), Error> {
     use drv_nvme::intx::{mask, quiet, unmask, Stats, QUIET_NS};
     use drv_nvme::io::{IoPair, IO_CQ, IO_SQ};
     let mut admin = drv_nvme::admin::Queue::new();
-    let ns = identify(io, s, memory, &mut admin)?;
+    let (_, ns) = identify(io, s, memory, &mut admin)?;
     let size = ns.lba_bytes as usize;
     let mut line = Irq::bind(resource, s.irq)?;
     let mut stats = Stats::default();
@@ -459,7 +622,7 @@ fn serve(
     use drv_nvme::io::IoPair;
     use drv_nvme::volume::{discover, Verdict, MAX_ENTRY_BYTES};
     let mut admin = drv_nvme::admin::Queue::new();
-    let ns = identify(io, s, memory, &mut admin)?;
+    let (_, ns) = identify(io, s, memory, &mut admin)?;
     if ns.lba_bytes as usize != SECTOR_SIZE {
         return Err(Error::Data);
     }
@@ -586,6 +749,16 @@ fn serve(
             if len > tag.len() {
                 return Err(Error::Bootstrap);
             }
+            if len == 1 && tag[0] == drv_nvme::CONTROL_STOP && raw == 0 {
+                log(
+                    kumo_abi::sys::log_level::NOTICE,
+                    &alloc::format!(
+                        "NV8 STOP session={} supervisor requested quiescent teardown\n",
+                        s.session
+                    ),
+                );
+                break;
+            }
             let Some(client) = syscall_handle(raw) else {
                 continue;
             };
@@ -644,6 +817,7 @@ fn serve(
             clients[i] = Client::default();
             continue;
         }
+        let rung = io.doorbells;
         let mut reply = [0u8; 1 + SECTOR_SIZE];
         let mut reply_len = 1;
         reply[0] = match volume_request(
@@ -683,6 +857,20 @@ fn serve(
                 status
             }
         };
+        if reply[0] == STATUS_READ_ONLY {
+            if io.doorbells != rung {
+                return Err(Error::State);
+            }
+            log(
+                kumo_abi::sys::log_level::NOTICE,
+                &alloc::format!(
+                    "NV8 RO session={} slot={} write refused before I/O; doorbells={} unchanged\n",
+                    s.session,
+                    i,
+                    rung
+                ),
+            );
+        }
         let _ = channel_write(client, reply.as_ptr(), reply_len);
     }
     for c in clients.iter().filter(|c| c.handle != 0) {
@@ -790,6 +978,8 @@ extern "C" fn main(
     let p = exercise_with(&mut io, s, memory, |io| {
         if s.mode == MODE_SERVE {
             serve(io, s, memory, resource, control, port)
+        } else if s.mode == MODE_WRITE_PROOF {
+            write_proof(io, s, memory, resource)
         } else {
             media(io, s, memory, resource)
         }

@@ -1,12 +1,13 @@
 //j801
 //j802
 //j803
+//j805
 //! NV5: one polled I/O queue pair and bounded, read-only media access.
 //! Set Features (Number of Queues) asks for one SQ/CQ; Create I/O CQ precedes
 //! Create I/O SQ, and teardown deletes the SQ before its CQ. Reads are one PRP
 //! page at most, which is inside MDTS for every value (MPSMIN is 4 KiB). Any LBA
 //! range that does not fit the namespace is refused before the SQ slot, the data
-//! page or a doorbell is touched. No Write, Flush, Format or interrupt vector.
+//! page or a doorbell is touched. NV8 adds Write/Flush encoding; no Format command.
 //! D5 cooperative raw DMA; Road C stays open. — TIMBERDOODLE
 
 use crate::admin::{AdminIo, Completion, Namespace, Queue, DATA};
@@ -105,6 +106,31 @@ pub fn read_command(
     w[10] = lba as u32;
     w[11] = (lba >> 32) as u32;
     w[12] = u32::from(blocks - 1);
+    Ok(w)
+}
+
+/// NVM Write: same PRP/range bounds as Read, FUA/LR/PRINFO clear. The caller
+/// separately authorizes the writable extent before invoking this. — TIMBERDOODLE
+pub fn write_command(
+    ns: &Namespace,
+    lba: u64,
+    blocks: u16,
+    physical: u64,
+) -> Result<[u32; 16], Error> {
+    if matches!(ns.id, 0 | u32::MAX) {
+        return Err(Error::Range);
+    }
+    let mut words = read_command(ns, lba, blocks, physical)?;
+    words[0] = 0x01;
+    Ok(words)
+}
+/// Flush one namespace, no data pointer or command-specific fields.
+pub fn flush_command(ns: &Namespace) -> Result<[u32; 16], Error> {
+    if matches!(ns.id, 0 | u32::MAX) || !ns.plain_blocks() {
+        return Err(Error::Range);
+    }
+    let mut w = [0; 16];
+    w[1] = ns.id;
     Ok(w)
 }
 

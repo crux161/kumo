@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j798
 //j799
 //j801
 //j802
 //j803
+//j805
 
 extern crate alloc;
 
@@ -2465,6 +2465,8 @@ const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
 /// (`sora::StorageTransport`: usb0, usb1, host2, then NVMe since J803); 0 = none.
 static STORAGE_CONTROLS: [AtomicU32; sora::STORAGE_DEVICES] =
     [const { AtomicU32::new(0) }; sora::STORAGE_DEVICES];
+static NVME_CONTROL_KOID: AtomicU64 = AtomicU64::new(0);
+static NVME_WATCH_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// The removable volume Sora knows, mounted at `/media/<name>` (DESIGN/012 §2.1, J545).
 #[derive(Clone, Copy)]
@@ -3540,7 +3542,21 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
             )
             .as_bytes()]);
             let _ = media_ready(initrd, sora::NVME_STORAGE, owner.client, ready);
-            // `custody` and `owner.process` are deliberately never closed while it serves.
+            NVME_CONTROL_KOID.store(handle_koid(owner.client), Ordering::Relaxed);
+            let watch = NVME_WATCH_PORT.load(Ordering::Relaxed);
+            if watch != 0 {
+                let _ = port_bind(Handle(watch), owner.client);
+            }
+            #[cfg(feature = "nvme-write-proof")]
+            set_nvme_owner(Some(NvmeOwner {
+                process: owner.process,
+                control: owner.client,
+                custody,
+                root_resource: root,
+                startup,
+                memory,
+                stopping: false,
+            }));
             return Some(process);
         }
     }
@@ -3573,16 +3589,140 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
     Some(process)
 }
 
+#[cfg(feature = "nvme-write-proof")]
+#[derive(Clone, Copy)]
+struct NvmeOwner {
+    process: Handle,
+    control: Handle,
+    custody: Handle,
+    root_resource: Handle,
+    startup: drv_nvme::Startup,
+    memory: drv_nvme::Memory,
+    stopping: bool,
+}
+#[cfg(feature = "nvme-write-proof")]
+struct NvmeOwnerCell(core::cell::UnsafeCell<Option<NvmeOwner>>);
+// Single-threaded Sora; copy ownership records out before any kernel re-entry.
+// Keeping these handles named enables proved teardown instead of losing their
+// numbers while retaining DMA custody. — TIMBERDOODLE
+#[cfg(feature = "nvme-write-proof")]
+unsafe impl Sync for NvmeOwnerCell {}
+#[cfg(feature = "nvme-write-proof")]
+static NVME_OWNER: NvmeOwnerCell = NvmeOwnerCell(core::cell::UnsafeCell::new(None));
+#[cfg(feature = "nvme-write-proof")]
+fn nvme_owner() -> Option<NvmeOwner> {
+    unsafe { *NVME_OWNER.0.get() }
+}
+#[cfg(feature = "nvme-write-proof")]
+fn set_nvme_owner(owner: Option<NvmeOwner>) {
+    unsafe { *NVME_OWNER.0.get() = owner };
+}
+
 fn launch_nvme_service(initrd: Handle, root: Handle, dtb: Handle, bootinfo: Handle) {
     let Some(mut startup) = nvme_startup(root, dtb, bootinfo) else {
         return;
     };
-    // NV6's full stress proof is already accepted. Normal startup launches only
-    // the storage service, so unrelated boot clients are not held behind that
-    // demonstration. The proof mode remains available in drv-nvme. — TIMBERDOODLE
     startup.session = 1;
     startup.mode = drv_nvme::MODE_SERVE;
     let _ = run_nvme_admin_owner(initrd, root, startup);
+}
+
+#[cfg(feature = "nvme-write-proof")]
+fn nvme_stop_owner() -> bool {
+    let Some(mut owner) = nvme_owner() else {
+        return false;
+    };
+    if owner.stopping {
+        notice(&[b"NV8 owner already stopping/unproven; reset required\n"]);
+        return false;
+    }
+    owner.stopping = true;
+    set_nvme_owner(Some(owner));
+    set_device(sora::NVME_STORAGE, None);
+    NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
+    let watch = NVME_WATCH_PORT.load(Ordering::Relaxed);
+    if watch != 0 {
+        let _ = port_unbind(Handle(watch), owner.control);
+    }
+    let Some(port) = syscall_handle(port_create()) else {
+        return false;
+    };
+    let stop = [drv_nvme::CONTROL_STOP];
+    let mut frame = [0; drv_nvme::PROOF_LEN];
+    if port_bind(port, owner.control) != 0
+        || channel_write(owner.control, stop.as_ptr(), stop.len()) != 0
+    {
+        return false;
+    }
+    let proof = nvme_receive(port, owner.control, &mut frame).and_then(|(n, h)| {
+        if h != 0 {
+            return None;
+        }
+        drv_nvme::Proof::decode(&frame[..n])
+    });
+    if !proof.is_some_and(|p| p.releases(owner.memory) && p.session == owner.startup.session) {
+        notice(&[b"NV8 stop unproven; owner/DMA retained; no replacement\n"]);
+        return false;
+    }
+    let _ = port_unbind(port, owner.control);
+    if port_bind(port, owner.process) != 0 || !nvme_wait_source(port, handle_koid(owner.process)) {
+        return false;
+    }
+    let process = handle_koid(owner.process);
+    let _ = port_unbind(port, owner.process);
+    let mut closed = true;
+    for h in [owner.control, owner.custody, owner.process, port] {
+        closed &= handle_close(h) == 0;
+    }
+    if !closed {
+        return false;
+    }
+    STORAGE_CONTROLS[sora::NVME_STORAGE].store(0, Ordering::Relaxed);
+    set_nvme_owner(None);
+    notice(&[alloc::format!(
+        "NV8 STOP owner={} quiescent; DMA custody released after termination\n",
+        process
+    )
+    .as_bytes()]);
+    true
+}
+
+#[cfg(feature = "nvme-write-proof")]
+fn nvme_write_proof_command(initrd: Handle) -> bool {
+    if media().is_some_and(|m| m.device == sora::NVME_STORAGE) {
+        notice(&[b"nvme-write-proof: unmount NVMe first\n"]);
+        return false;
+    }
+    let Some(owner) = nvme_owner() else {
+        return false;
+    };
+    let Some(session) = owner.startup.session.checked_add(1) else {
+        return false;
+    };
+    if !nvme_stop_owner() {
+        return false;
+    }
+    let mut startup = owner.startup;
+    startup.session = session;
+    startup.mode = drv_nvme::MODE_WRITE_PROOF;
+    if run_nvme_admin_owner(initrd, owner.root_resource, startup).is_none() {
+        return false;
+    }
+    let Some(session) = startup.session.checked_add(1) else {
+        return false;
+    };
+    startup.session = session;
+    startup.mode = drv_nvme::MODE_SERVE;
+    if run_nvme_admin_owner(initrd, owner.root_resource, startup).is_none() {
+        return false;
+    }
+    let ok = nvme_readonly_proof();
+    notice(&[if ok {
+        b"NV8 proof command complete; read-only service restored\n"
+    } else {
+        b"NV8 proof command FAILED\n"
+    }]);
+    ok
 }
 
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects
@@ -5750,6 +5890,7 @@ extern "C" fn sora_main(
         log(b"sora: entering serve loop\n");
         //j720
         clock_watch_timer = arm_clock_watch(port);
+        NVME_WATCH_PORT.store(port.0, Ordering::Relaxed);
         SERVING.store(true, Ordering::Relaxed);
         // First light of the interactive shell: render the prompt once so the settled framebuffer
         // console invites input instead of sitting silent after boot. Gated on a live ttyd session —
@@ -5789,7 +5930,20 @@ extern "C" fn sora_main(
                 }
                 continue;
             }
-            if let Some(index) = storage_koids.iter().position(|koid| *koid == Some(source)) {
+            // An explicit NVMe owner replacement changes control identity. Old queued
+            // packets must never be read from the new endpoint. USB watches stay fixed.
+            // — TIMBERDOODLE
+            let current = NVME_CONTROL_KOID.load(Ordering::Relaxed);
+            let storage_index = if current != 0 && current == u64::from(source.0) {
+                Some(sora::NVME_STORAGE)
+            } else {
+                storage_koids
+                    .iter()
+                    .enumerate()
+                    .find(|(i, koid)| *i != sora::NVME_STORAGE && **koid == Some(source))
+                    .map(|(i, _)| i)
+            };
+            if let Some(index) = storage_index {
                 if media_offered(initrd, port, index, &mut storage_koids) {
                     settle_first_prompt(&mut first_prompt, port, &cwd, b"media");
                 }
@@ -6448,6 +6602,15 @@ fn eval_command(
         }
         return true;
     }
+    #[cfg(feature = "nvme-write-proof")]
+    if cmd.name == "nvme-write-proof" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: nvme-write-proof\n");
+        } else if !nvme_write_proof_command(initrd) {
+            fail_status(1);
+        }
+        return true;
+    }
     if cmd.name == "mount" {
         mount_command(cmd, cwd);
         return true;
@@ -6774,6 +6937,16 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
     Some(client)
 }
 
+fn nvme_unavailable() {
+    NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
+    set_device(sora::NVME_STORAGE, None);
+    #[cfg(feature = "nvme-write-proof")]
+    if let Some(mut owner) = nvme_owner() {
+        owner.stopping = true;
+        set_nvme_owner(Some(owner));
+    }
+}
+
 /// J545: a storage control channel woke the serve loop: its driver offered a volume, or the
 /// driver is gone and its volume with it.
 /// Returns whether a volume was mounted: a closed or empty control channel is a driver leaving.
@@ -6786,10 +6959,13 @@ fn media_offered(
     let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
     let mut frame = [0u8; drv_blk::MEDIA_READY_LEN];
     let n = channel_read(control, frame.as_mut_ptr(), frame.len());
-    if n == 0 || n == u64::MAX {
+    if n == 0 || n > frame.len() as u64 {
         let _ = port_unbind(port, control);
         koids[index] = None;
         set_device(index, None);
+        if index == sora::NVME_STORAGE {
+            nvme_unavailable();
+        }
         if media().is_some_and(|media| media.control == control) {
             set_media(None);
             log(b"media: driver gone; volume removed\n");
@@ -6797,6 +6973,10 @@ fn media_offered(
         return false;
     }
     let Some(ready) = drv_blk::MediaReady::decode(&frame[..n as usize]) else {
+        if index == sora::NVME_STORAGE {
+            let _ = port_unbind(port, control);
+            nvme_unavailable();
+        }
         log(b"media: bad offer\n");
         return false;
     };
@@ -10030,4 +10210,76 @@ fn launch_lua_repl(initrd: Handle) {
             b"local answer = math.floor(41.75) + 1; print('lua-print', answer); return answer\n",
         ),
     );
+}
+
+#[cfg(feature = "nvme-write-proof")]
+fn nvme_readonly_proof() -> bool {
+    // Send an actual write frame through both explicit access requests. Payload
+    // equals the current VBR, so even a regression cannot corrupt its bytes.
+    // The driver separately proves no controller doorbell was issued. — TIMBERDOODLE
+    for access in [BlockAccess::ReadOnly, BlockAccess::ReadWrite] {
+        let (client, server) = channel_create_pair();
+        let port = port_create();
+        if [client, server, port].contains(&u64::MAX) {
+            for raw in [client, server, port]
+                .into_iter()
+                .filter(|&h| h != u64::MAX)
+            {
+                let _ = handle_close(Handle(raw as u32));
+            }
+            notice(&[b"NV8 RO proof setup failed\n"]);
+            return false;
+        }
+        let client = Handle(client as u32);
+        let server = Handle(server as u32);
+        let port = Handle(port as u32);
+        let control = Handle(STORAGE_CONTROLS[sora::NVME_STORAGE].load(Ordering::Relaxed));
+        let tag = drv_blk::encode_connect(access);
+        if port_bind(port, client) != 0
+            || channel_write_with_handle(control, tag.as_ptr(), tag.len(), server) != 0
+        {
+            let _ = port_unbind(port, client);
+            for h in [client, server, port] {
+                let _ = handle_close(h);
+            }
+            notice(&[b"NV8 RO proof connect failed\n"]);
+            return false;
+        }
+        let mut before = [0; 513];
+        let mut after = [0; 513];
+        let read = drv_blk::Request::read(0, 1).encode();
+        let mut write = [0; drv_blk::REQUEST_LEN + 512];
+        write[..drv_blk::REQUEST_LEN].copy_from_slice(&drv_blk::Request::write(0, 1).encode());
+        let mut status = [0; 1];
+        let ok = channel_write(client, read.as_ptr(), read.len()) == 0
+            && nvme_receive(port, client, &mut before) == Some((513, 0))
+            && before[0] == drv_blk::STATUS_OK;
+        write[drv_blk::REQUEST_LEN..].copy_from_slice(&before[1..]);
+        let ok = ok
+            && channel_write(client, write.as_ptr(), write.len()) == 0
+            && nvme_receive(port, client, &mut status) == Some((1, 0))
+            && status[0] == drv_blk::STATUS_READ_ONLY
+            && channel_write(client, read.as_ptr(), read.len()) == 0
+            && nvme_receive(port, client, &mut after) == Some((513, 0))
+            && after == before;
+        notice(&[alloc::format!(
+            "NV8 RO alias asked={} refused={} VBR unchanged={} {}\n",
+            if access == BlockAccess::ReadOnly {
+                "ro"
+            } else {
+                "rw"
+            },
+            status[0] == drv_blk::STATUS_READ_ONLY,
+            after == before,
+            if ok { "OK" } else { "FAILED" }
+        )
+        .as_bytes()]);
+        let _ = port_unbind(port, client);
+        let _ = handle_close(client);
+        let _ = handle_close(port);
+        if !ok {
+            return false;
+        }
+    }
+    true
 }

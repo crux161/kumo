@@ -1,6 +1,7 @@
 #j800
 #j801
 #j804
+#j805
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -23,6 +24,7 @@ path = "src/main.rs"
 [features]
 nvme-oracle = ["dep:kumo-sha256"]
 nvme-prepare = ["nvme-oracle"]
+nvme-write-reference = ["nvme-oracle"]
 
 [dev-dependencies]
 kumo-fatfs = { path = "../../lib/kumo-fatfs" }

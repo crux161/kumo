@@ -1,6 +1,7 @@
 //j800
 //j801
 //j804
+//j805
 //! Default-off pre-EBS Identify reference through firmware's NVMe queues, then
 //! (NV5) LBA 0, LBA 1 and the last LBA through firmware's whole-namespace Block I/O.
 //! No drv-nvme dependency or direct controller write. Media preparation is a
@@ -159,7 +160,7 @@ pub(super) unsafe fn run(
     bs: *mut EfiBootServices,
     con: *mut EfiSimpleTextOutputProtocol,
     _st: *mut crate::EfiSystemTable,
-) {
+) -> bool {
     let id = guid(
         0x52c78312,
         0x8edc,
@@ -173,7 +174,7 @@ pub(super) unsafe fn run(
             con,
             format_args!("NV4 UEFI unavailable: PassThru {status:#x}\r\n"),
         );
-        return;
+        return false;
     }
     let protocol = raw.cast::<Protocol>();
     let mode = unsafe { (*protocol).mode };
@@ -182,7 +183,7 @@ pub(super) unsafe fn run(
             con,
             format_args!("NV4 UEFI unavailable: unsupported mode/alignment\r\n"),
         );
-        return;
+        return false;
     }
     print_line(
         con,
@@ -201,7 +202,7 @@ pub(super) unsafe fn run(
             con,
             format_args!("NV4 UEFI unavailable: page allocation {status:#x}\r\n"),
         );
-        return;
+        return false;
     }
     // Keep this LoaderData page reserved across EBS, even after success. On any
     // unproven command halt before EBS; never recycle a timed-out DMA buffer. — TIMBERDOODLE
@@ -286,6 +287,10 @@ pub(super) unsafe fn run(
         prepare_media(bs, con, _st, &controller, &ns, buffer)
     };
     unsafe { media_reference(bs, con, &ns, buffer) };
+    #[cfg(feature = "nvme-write-reference")]
+    return unsafe { write_reference(bs, con, _st, &controller, &ns, buffer) };
+    #[cfg(not(feature = "nvme-write-reference"))]
+    true
 }
 
 #[cfg(feature = "nvme-prepare")]
@@ -473,4 +478,94 @@ unsafe fn prepare_media(
             halt(con, nvme::Error::Data);
         }
     }
+}
+
+#[cfg(feature = "nvme-write-reference")]
+unsafe fn write_reference(
+    bs: *mut EfiBootServices,
+    con: *mut EfiSimpleTextOutputProtocol,
+    st: *mut crate::EfiSystemTable,
+    c: &Controller,
+    n: &Namespace,
+    buffer: *mut u8,
+) -> bool {
+    // This is an independent firmware read, not drv-nvme's LBA encoder. The
+    // proof image cannot enter KUMO without verified host backup receipt. — TIMBERDOODLE
+    if c.vid != 0x144d
+        || c.ssvid != 0x144d
+        || c.model() != "Samsung SSD 970 EVO Plus 500GB"
+        || c.serial() != "S58SNM0R302625Z"
+        || c.firmware() != "2B2QEXM7"
+        || c.namespaces != 1
+        || n.id != 1
+        || n.size != 976773168
+        || n.capacity != 976773168
+        || n.lba != 512
+        || n.metadata != 0
+        || n.protection != 0
+    {
+        return false;
+    }
+    let bio = match unsafe { whole_namespace_block_io(bs, n.id) } {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if unsafe { (*bio).media }.is_null() || !nvme::media_matches(unsafe { &*(*bio).media }, n) {
+        return false;
+    }
+    let mut sha = kumo_sha256::Sha256::new();
+    let mut page = [0; PAGE];
+    for lba in [1048583u64, 1048584, 1048585] {
+        if let Err(e) = unsafe { nvme::read_block(bio, lba, buffer) } {
+            halt(con, e);
+        }
+        unsafe { snapshot(buffer, &mut page) };
+        let b = &page[..512];
+        sha.update(&lba.to_le_bytes());
+        sha.update(b);
+        print_line(
+            con,
+            format_args!("NV8 UEFI SHA lba={lba} {}\r\n", Hex(digest(b))),
+        );
+        for (off, chunk) in b.chunks_exact(16).enumerate() {
+            print_line(con, format_args!("NV8 BAK {lba} {} ", off * 16));
+            for byte in chunk {
+                print_line(con, format_args!("{byte:02x}"));
+            }
+            print_line(con, format_args!("\r\n"));
+        }
+    }
+    print_line(con, format_args!("NV8 BAKSHA {}\r\n", Hex(sha.finish())));
+    print_line(
+        con,
+        format_args!("NV8 waiting for host metadata receipt\r\n"),
+    );
+    let input = unsafe { (*st).con_in };
+    if input.is_null() {
+        return false;
+    }
+    let token = b"K805-625Z\r";
+    let mut at = 0;
+    for _ in 0..12_000 {
+        let mut key = crate::EfiInputKey {
+            scan_code: 0,
+            unicode_char: 0,
+        };
+        if unsafe { ((*input).read_key_stroke)(input, &mut key) } == 0 {
+            if key.unicode_char == u16::from(token[at]) {
+                at += 1;
+            } else {
+                at = 0;
+            }
+            if at == token.len() {
+                print_line(
+                    con,
+                    format_args!("NV8 host receipt verified; proof boot allowed\r\n"),
+                );
+                return true;
+            }
+        }
+        unsafe { ((*bs).stall)(10_000) };
+    }
+    false
 }

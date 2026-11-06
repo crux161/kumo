@@ -1,8 +1,8 @@
-#j567
 #j572
 #j597
 #j649
 #j798
+#j805
 
 [package]
 name = "sora"
@@ -48,3 +48,6 @@ path = "src/main.rs"
 test = false
 bench = false
 doctest = false
+
+[features]
+nvme-write-proof = []

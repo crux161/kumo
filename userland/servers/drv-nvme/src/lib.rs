@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_code)]
-//j798
 //j799
 //j801
 //j802
 //j803
+//j805
 //! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
 //! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
@@ -20,15 +20,20 @@ pub mod admin;
 pub mod intx;
 pub mod io;
 pub mod volume;
+pub mod write;
 pub const DEPTH: u16 = 32;
 pub const BOOT_LEN: usize = 64;
 pub const MEMORY_LEN: usize = 32;
 pub const PROOF_LEN: usize = 80;
 pub const ACK: u8 = b'A';
+/// Private supervisor control: stop the resident read-only owner and return proof.
+pub const CONTROL_STOP: u8 = b'Q';
 /// Startup mode: prove the lifecycle and exit (NV3–NV6).
 pub const MODE_PROOF: u8 = 0;
 /// Startup mode: stay resident and serve the namespace's FAT32 volume read-only (NV7).
 pub const MODE_SERVE: u8 = 1;
+/// One-off reserved-sector Write/Flush proof; normal service stays read-only.
+pub const MODE_WRITE_PROOF: u8 = 2;
 pub const CC: u16 = 0x14;
 pub const CSTS: u16 = 0x1c;
 const CC_CONFIG: u32 = (6 << 16) | (4 << 20);
@@ -127,7 +132,7 @@ impl Startup {
             || self.pin != 1
             || !(32..1020).contains(&self.irq)
             || self.legacy_mask & 1 != 0
-            || self.mode > MODE_SERVE
+            || self.mode > MODE_WRITE_PROOF
         {
             return Err(Error::Bootstrap);
         }
@@ -689,7 +694,7 @@ mod tests {
                 6 => s.pin = 2,
                 7 => s.irq = 31,
                 8 => s.legacy_mask = 0xffff,
-                9 => s.mode = 2,
+                9 => s.mode = 3,
                 _ => s.cap &= !0xffff,
             };
             cases.push((s, memory()));
@@ -734,7 +739,7 @@ mod tests {
         let s = startup();
         assert_eq!(Startup::decode(&s.encode()), Some(s));
         assert_eq!(Memory::decode(&memory().encode()), Some(memory()));
-        for (at, value) in [(8, 1), (8, 2), (51, 2), (60, 1), (50, 0)] {
+        for (at, value) in [(8, 1), (8, 2), (51, 3), (60, 1), (50, 0)] {
             let mut b = s.encode();
             b[at] = value;
             assert!(Startup::decode(&b).is_none(), "byte {at}");
@@ -745,6 +750,11 @@ mod tests {
             ..s
         };
         assert_eq!(Startup::decode(&serve.encode()), Some(serve));
+        let write = Startup {
+            mode: MODE_WRITE_PROOF,
+            ..s
+        };
+        assert_eq!(Startup::decode(&write.encode()), Some(write));
         let mut io = Fake::new();
         let p = exercise(&mut io, s, memory());
         assert!(p.releases(memory()));
