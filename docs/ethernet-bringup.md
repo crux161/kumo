@@ -2,9 +2,10 @@
 <!-- j808 -->
 <!-- j809 -->
 <!-- j810 -->
+<!-- j812 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0a/b descriptor proofs accepted; remaining NET0 coexistence witnesses pending.
+Status: NET0 closed (J809-J811); NET1 contracts and stack pin accepted (J812); NET2a next.
 
 ## First controller
 
@@ -172,3 +173,37 @@ the separate contained GPU MMU70000 fault; the identical image's second boot com
 J0c graphics with no TOWER. DEFERRED014 stays open. USB storage was not offered and a
 physical keyboard witness remains pending, so those coexistence checks are unclaimed.
 No ax88 link/MAC/packet/socket functionality is accepted yet. — TIMBERDOODLE 2026-11-06
+
+
+NET0c coexistence (J811): two USB-A ports cannot hold a keyboard, a USB stick and the
+adapter together, so each witness used its own cold boot with the ax88 attached. The
+keyboard worked at the shell; NVMe test files read on every boot. The stick exposed a
+drv-xhci gap: a probed volume was offered only from the HID service loop, so without a
+keyboard it was never served. drv-xhci now runs that loop with zero HID devices when it
+keeps a volume; the stick then mounted at /media/KUMO and a file read back. The ax88
+descriptors matched the NET0a capture on every boot. NET0 is closed. — TIMBERDOODLE
+
+
+## NET1 contracts and protocol engine
+
+The network server and its frame provider talk over one versioned frame channel: a fixed
+32-byte header, one Ethernet frame per message, an interface generation that changes on
+every provider reset, per-direction sequence numbers, and explicit RX/TX credits. A
+completed USB transmit is reported as handed to the bus, never as delivered. Clients use a
+separate session channel granted per program: fixed 32-byte request/reply headers with
+request ids, session-local socket ids, a cap of eight unanswered requests, and a WAIT
+operation for readiness, so no call blocks the server loop.
+
+KUMO channel messages hold up to 4096 bytes and 64 handles, but a channel's queue is not
+bounded by the kernel. Every queue limit is therefore enforced by these protocols, and a
+peer that exceeds one is disconnected. Sessions, sockets (16 per client, 32 total), buffers
+and per-turn work are fixed at start; a restarted server fails old sockets and replays
+nothing.
+
+The protocol engine is pinned to smoltcp `=0.14.0` (0BSD, Rust 1.91 minimum; KUMO's stable
+toolchain is newer) with default features off and only Ethernet/IP media, IPv4, UDP, TCP and
+ICMP sockets enabled. Its eight-crate dependency closure and checksums are recorded, and a
+probe built it without an allocator for both bare-metal targets and the host. smoltcp's own
+loopback device needs an allocator, so the first implementation slice provides a bounded
+loopback device instead. Dependencies are vendored only when that slice lands.
+— TIMBERDOODLE 2026-11-06
