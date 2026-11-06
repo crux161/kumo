@@ -1,8 +1,8 @@
-#j792
 #j798
 #j801
 #j813
 #j815
+#j822
 [workspace]
 members = [
     "boot/niji-loader",
@@ -33,6 +33,7 @@ members = [
     "lib/kumo-vfs",
     "lib/kumo-xhci",
     "tools/stage-a-smoke",
+    "userland/actorprobe",
     "userland/args",
     "userland/cat",
     "userland/bmp-view",

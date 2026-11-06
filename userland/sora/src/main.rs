@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j806
 //j807
 //j815
 //j816
 //j820
+//j822
 
 extern crate alloc;
 
@@ -5947,6 +5947,7 @@ extern "C" fn sora_main(
             }
         }
 
+        actor_arm(port, initrd, root);
         log(b"sora: entering serve loop\n");
         //j720
         clock_watch_timer = arm_clock_watch(port);
@@ -5978,7 +5979,7 @@ extern "C" fn sora_main(
                 }
             }
             let raw_source = port_wait(port);
-            if netstack_event(raw_source) {
+            if actor_event(raw_source) || netstack_event(raw_source) {
                 continue;
             }
             let source = Handle(raw_source as u32);
@@ -6573,6 +6574,16 @@ fn eval_command(
     cwd: &mut WorkingDirectory,
 ) -> bool {
     LAST_STATUS.store(0, Ordering::Relaxed);
+    if cmd.name == "actorbench" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: actorbench\n");
+        } else if SERVE_PORT.load(Ordering::Relaxed) == 0 {
+            ACTOR_PENDING.store(true, Ordering::Relaxed);
+        } else {
+            actor_benchmark(initrd, root);
+        }
+        return true;
+    }
     #[cfg(feature = "netstack-restart-proof")]
     if cmd.name == "netstack-crash-proof" {
         if cmd.args.first().is_some_and(|a| a == "idle") {
@@ -7662,6 +7673,325 @@ fn netstack_crash_proof(initrd: Handle, burst: bool) {
         }
     }
     log(b"netstack-proof: kill observed\n");
+}
+
+// AX0 is opt-in. An autoexec request runs only after the ordinary login services settle.
+static ACTOR_PENDING: AtomicBool = AtomicBool::new(false);
+static ACTOR_INITRD: AtomicU32 = AtomicU32::new(0);
+static ACTOR_ROOT: AtomicU32 = AtomicU32::new(0);
+static ACTOR_TIMER: Shared<Option<(Handle, u64)>> = Shared(core::cell::UnsafeCell::new(None));
+
+fn actor_arm(port: Handle, initrd: Handle, root: Handle) {
+    if !ACTOR_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    ACTOR_INITRD.store(initrd.0, Ordering::Relaxed);
+    ACTOR_ROOT.store(root.0, Ordering::Relaxed);
+    if let Some(timer) = syscall_handle(timer_create(5_000_000_000)) {
+        if port_bind(port, timer) == 0 {
+            ACTOR_TIMER.set(Some((timer, handle_koid(timer))));
+        } else {
+            let _ = handle_close(timer);
+        }
+    }
+}
+fn actor_event(source: u64) -> bool {
+    if let Some((timer, _)) = ACTOR_TIMER.get().filter(|t| t.1 == source) {
+        ACTOR_TIMER.set(None);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        actor_benchmark(
+            Handle(ACTOR_INITRD.load(Ordering::Relaxed)),
+            Handle(ACTOR_ROOT.load(Ordering::Relaxed)),
+        );
+        return true;
+    }
+    false
+}
+
+/// Bounded diagnostic read on the already shared reply Port. A dead or silent child cannot
+/// strand the root supervisor. No reference survives a syscall. — TIMBERDOODLE
+fn actor_read(channel: Handle, buf: &mut [u8]) -> Option<usize> {
+    let port = reply_port()?;
+    let timer = syscall_handle(timer_create(15_000_000_000))?;
+    let tk = handle_koid(timer);
+    let ck = handle_koid(channel);
+    let bound = port_bind(port, timer) == 0 && port_bind(port, channel) == 0;
+    let result = if bound {
+        loop {
+            let source = port_wait(port);
+            if netstack_event(source) {
+                continue;
+            }
+            if source == tk || source == u64::MAX {
+                break None;
+            }
+            if source == ck {
+                let n = channel_read(channel, buf.as_mut_ptr(), buf.len()) as usize;
+                break (n <= buf.len()).then_some(n);
+            }
+        }
+    } else {
+        None
+    };
+    let _ = port_unbind(port, channel);
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    result
+}
+fn actor_snapshot(root: Handle, op: u8) -> Option<kumo_abi::actor::Snapshot> {
+    let mut query = [0; 5];
+    query[..4].copy_from_slice(&kumo_abi::actor::QUERY);
+    query[4] = op;
+    if channel_write(root, query.as_ptr(), 5) != 0 {
+        return None;
+    }
+    let mut b = [0; kumo_abi::actor::SNAPSHOT_LEN];
+    let n = actor_read(root, &mut b)?;
+    kumo_abi::actor::Snapshot::decode(&b[..n])
+}
+fn actor_print(label: &str, s: kumo_abi::actor::Snapshot) {
+    log(alloc::format!("AX0 census {} capacity={} live={} stored={} blocked={} ready={} running={} free={} frames={} heap={}\n",label,s.capacity,s.live,s.stored,s.blocked,s.ready,s.running,s.capacity.saturating_sub(s.live),s.frames_issued,s.heap_used).as_bytes());
+    log(alloc::format!("AX0 processes {} {:?}\n", label, s.processes).as_bytes());
+}
+#[derive(Clone, Copy)]
+struct ActorChild {
+    process: Handle,
+    control: Handle,
+}
+fn actor_stop(child: ActorChild) {
+    let _ = process_kill(child.process);
+    let _ = handle_close(child.process);
+    let _ = handle_close(child.control);
+}
+fn actor_spawn(initrd: Handle, peer: Handle) -> Option<(ActorChild, u64)> {
+    let (control, server) = channel_create_pair();
+    if control == u64::MAX || server == u64::MAX {
+        return None;
+    }
+    let control = Handle(control as u32);
+    let mut process = None;
+    let start = kumo_rt::clock_get();
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let loaded = run_elf_threads(
+        initrd,
+        b"bin/actorprobe",
+        server,
+        u64::from(peer.0),
+        flags,
+        b"actorprobe",
+        0,
+        Some(&mut process),
+    );
+    let child = process.map(|process| ActorChild { process, control });
+    if !loaded {
+        if let Some(child) = child {
+            actor_stop(child);
+        } else {
+            let _ = handle_close(control);
+        }
+        let _ = handle_close(Handle(server as u32));
+        return None;
+    }
+    let Some(child) = child else {
+        let _ = handle_close(control);
+        return None;
+    };
+    let mut b = [0; 32];
+    let ready = actor_read(control, &mut b) == Some(32) && &b[..4] == b"AXP1" && b[4] == b'R';
+    let elapsed = kumo_rt::clock_get().saturating_sub(start);
+    if ready {
+        Some((child, elapsed))
+    } else {
+        actor_stop(child);
+        None
+    }
+}
+fn actor_result(child: ActorChild) -> Option<u64> {
+    let mut b = [0; 32];
+    if actor_read(child.control, &mut b) != Some(32)
+        || &b[..4] != b"AXP1"
+        || b[4] != b'D'
+        || u32::from_le_bytes(b[8..12].try_into().ok()?) != kumo_abi::actor::ROUNDS
+        || b[24..32] != [0; 8]
+    {
+        return None;
+    }
+    Some(u64::from_le_bytes(b[16..24].try_into().ok()?))
+}
+fn actor_trial(initrd: Handle, root: Handle, index: u32) -> bool {
+    let Some(base) = actor_snapshot(root, 1) else {
+        return false;
+    };
+    let (a, b) = channel_create_pair();
+    if a == u64::MAX || b == u64::MAX {
+        return false;
+    }
+    let Some((echo, spawn_a)) = actor_spawn(initrd, Handle(a as u32)) else {
+        let _ = handle_close(Handle(a as u32));
+        let _ = handle_close(Handle(b as u32));
+        return false;
+    };
+    let one = actor_snapshot(root, 0);
+    let client = actor_spawn(initrd, Handle(b as u32));
+    let Some((client, spawn_b)) = client else {
+        actor_stop(echo);
+        let _ = handle_close(Handle(b as u32));
+        return false;
+    };
+    let two = actor_snapshot(root, 0);
+    let ok = one.is_some_and(|s| s.live == base.live + 1)
+        && two.is_some_and(|s| s.live == base.live + 2);
+    let ping_base = actor_snapshot(root, 1);
+    let sent = channel_write(client.control, b"G".as_ptr(), 1) == 0;
+    let result = if sent { actor_result(client) } else { None };
+    let peer = if result.is_some() {
+        actor_result(echo)
+    } else {
+        None
+    };
+    let costs = actor_snapshot(root, 2);
+    // Each probe sends at most Ready + Done. Drain a possibly unanswered Done, then require
+    // EOF; a silent child is killed through our retained handle before it is closed.
+    // — TIMBERDOODLE
+    for child in [client, echo] {
+        let _ = channel_write(child.control, b"Q".as_ptr(), 1);
+    }
+    for child in [client, echo] {
+        let mut closed = false;
+        let mut tail = [0; 32];
+        for _ in 0..2 {
+            match actor_read(child.control, &mut tail) {
+                Some(0) => {
+                    closed = true;
+                    break;
+                }
+                Some(32) => {}
+                _ => break,
+            }
+        }
+        if !closed {
+            let _ = process_kill(child.process);
+        }
+        let _ = handle_close(child.process);
+        let _ = handle_close(child.control);
+    }
+    let clean = actor_snapshot(root, 0);
+    if let (Some(one), Some(two), Some(ns), Some(_), Some(costs), Some(clean), Some(ping_base)) =
+        (one, two, result, peer, costs, clean, ping_base)
+    {
+        let good = ok && clean.live == base.live && ns > 0 && costs.roots > 0;
+        log(alloc::format!(
+            "AX0 trial={} rounds={} bytes={} rtt-total-ns={} spawn-a-ns={} spawn-b-ns={} {}\n",
+            index,
+            kumo_abi::actor::ROUNDS,
+            kumo_abi::actor::PAYLOAD,
+            ns,
+            spawn_a,
+            spawn_b,
+            if good { "PASS" } else { "FAIL" }
+        )
+        .as_bytes());
+        log(alloc::format!(
+            "AX0 memory trial={} frames-a={} frames-b={} heap-a={} heap-b={} clean={}\n",
+            index,
+            one.frames_issued.saturating_sub(base.frames_issued),
+            two.frames_issued.saturating_sub(one.frames_issued),
+            one.heap_used as i128 - base.heap_used as i128,
+            two.heap_used as i128 - one.heap_used as i128,
+            clean.live
+        )
+        .as_bytes());
+        log(alloc::format!("AX0 switch trial={} syscalls={} switches={} root-count={} root-total-ns={} root-min-ns={} root-max-ns={} simd-errors=0\n",
+            index,
+            (costs.syscalls as u32).wrapping_sub(ping_base.syscalls as u32),
+            costs.switches.saturating_sub(ping_base.switches),
+            costs.roots, costs.root_ns, costs.root_min_ns, costs.root_max_ns,
+        ).as_bytes());
+        good
+    } else {
+        false
+    }
+}
+fn actor_benchmark(initrd: Handle, root: Handle) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 || NET_SUPERVISOR.get().initrd.0 != 0 {
+        log(b"AX0 FAIL needs a fresh boot and no background job\n");
+        return;
+    }
+    log(b"AX0 begins: diagnostic costs; no policy change\n");
+    let Some(base) = actor_snapshot(root, 0) else {
+        log(b"AX0 FAIL snapshot\n");
+        return;
+    };
+    actor_print("default-login", base);
+    let mut ok = true;
+    for n in 1..=5 {
+        if !actor_trial(initrd, root, n) {
+            ok = false;
+            break;
+        }
+    }
+    if let Some(s) = actor_snapshot(root, 8) {
+        log(alloc::format!(
+            "AX0 kernel-clock-pair samples={} total-ns={}\n",
+            s.roots,
+            s.root_ns
+        )
+        .as_bytes());
+    }
+    let mut timer_total = 0;
+    for _ in 0..1024 {
+        let a = kumo_rt::clock_get();
+        timer_total += kumo_rt::clock_get().saturating_sub(a);
+    }
+    log(alloc::format!("AX0 clock-pair samples=1024 total-ns={}\n", timer_total).as_bytes());
+    for (index, n) in [1, 2, 4, 8, 12].into_iter().enumerate() {
+        if let Some(s) = actor_snapshot(root, 3 + index as u8) {
+            log(alloc::format!(
+                "AX0 scheduler runnable={} decisions={} total-ns={}\n",
+                n,
+                s.roots,
+                s.root_ns
+            )
+            .as_bytes());
+            if s.root_ns == u64::MAX {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if ok {
+        let args = [
+            alloc::string::String::from("netprobe"),
+            alloc::string::String::from("hold"),
+        ];
+        run_program_background(initrd, &args, true);
+        if let Some(s) = actor_snapshot(root, 0) {
+            actor_print("netstack-client", s);
+            ok &= s.live == base.live + 2;
+            log(alloc::format!(
+                "AX0 capacity-gate free={} requires=2 {}\n",
+                s.capacity.saturating_sub(s.live),
+                if s.capacity.saturating_sub(s.live) >= 2 {
+                    "PASS"
+                } else {
+                    "AX4-REQUIRED"
+                }
+            )
+            .as_bytes());
+        } else {
+            ok = false;
+        }
+        if BG_STDOUT.load(Ordering::Relaxed) != 0 {
+            wait_background();
+        }
+    }
+    let _ = actor_snapshot(root, 2);
+    log(if ok { b"AX0 PASS\n" } else { b"AX0 FAIL\n" });
 }
 
 /// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a

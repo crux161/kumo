@@ -1,4 +1,6 @@
+//j493
 //j565
+//j822
 
 //! A tiny Stage-A serial command shell — KUMO's first interactive surface.
 //!
@@ -8,8 +10,6 @@
 //! lines. This is deliberately minimal — a handful of built-ins over data the kernel
 //! already has — and runs in-kernel over the serial console for now. It is the
 //! ancestor of Kumoza, which takes over once userspace + a `ttyd` server exist.
-
-//j493
 
 use core::fmt::Write;
 
@@ -125,7 +125,10 @@ pub fn run_command(line: &str, env: &ShellEnv, tasks: &[TaskInfo], out: &mut dyn
             let _ = out.write_str("\x1b[2J\x1b[H");
         }
         "ipcstat" => {
-            if parts.next() == Some("reset") {
+            let part = parts.next();
+            if part == Some("actors") {
+                crate::actorstat::report(out);
+            } else if part == Some("reset") {
                 crate::ipcstat::reset();
                 let _ = out.write_str("ipcstat: session cleared\r\n");
             } else {

@@ -4,6 +4,7 @@
 //j816
 //j817
 //j820
+//j822
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -955,6 +956,14 @@ extern "C" fn main(
     ]);
     match mode {
         b"udp" => udp(&mut client),
+        b"hold" => {
+            let s = client.udp_socket();
+            client.bind(s, 0);
+            let got = client
+                .call(Op::Wait, s, WAIT_READABLE as u64 | (2000u64 << 32), &[])
+                .status;
+            client.expect(b"census hold 2s", got, Status::TimedOut);
+        }
         b"errors" => errors(&mut client),
         b"recv" | b"send"
             if port.is_some_and(|p| p != 0)

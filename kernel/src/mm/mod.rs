@@ -7,6 +7,7 @@ use kumo_hal::PageFlags;
 //j616
 //j620
 //j743
+//j822
 
 pub mod heap;
 
@@ -17,6 +18,14 @@ const GIB: u64 = 1 << 30;
 /// Start of the next never-yet-allocated physical frame. A persistent watermark so a
 /// frame handed out for the kernel page tables (`enable_paging`) is never reissued when a
 /// per-process address space is built (`alloc_zeroed_frame`). 0 = nothing allocated yet.
+static ISSUED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Frames actually issued, not address-watermark distance or free/reclaimable frames.
+/// — TIMBERDOODLE
+pub fn frames_issued() -> u64 {
+    ISSUED_FRAMES.load(Ordering::Relaxed)
+}
+
 static FRAME_WATERMARK: AtomicU64 = AtomicU64::new(0);
 
 /// Hand out the next usable physical frame, zeroed, advancing [`FRAME_WATERMARK`] so the
@@ -64,6 +73,7 @@ pub unsafe fn alloc_zeroed_frame_excluding(boot: &BootInfo, excluded: &[Range]) 
             continue;
         }
         FRAME_WATERMARK.store(frame.saturating_add(PAGE_SIZE), Ordering::Relaxed);
+        ISSUED_FRAMES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: usable RAM, mapped now; zero it for a clean table / BSS-clear page.
         unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
         return Some(frame);
@@ -141,6 +151,7 @@ pub unsafe fn alloc_contiguous_frames_excluding(
         if have == count {
             let start = base.expect("run base set once have > 0");
             FRAME_WATERMARK.store(start.saturating_add(bytes), Ordering::Relaxed);
+            ISSUED_FRAMES.fetch_add(count, Ordering::Relaxed);
             // SAFETY: usable RAM, mapped Normal-WB now; zero then push to PoC (see doc).
             unsafe { core::ptr::write_bytes(start as *mut u8, 0, bytes as usize) };
             kumo_hal::active::clean_dcache_to_poc(start as usize, bytes as usize);
@@ -180,6 +191,7 @@ pub unsafe fn alloc_dma_pages_excluding(
             continue;
         }
         FRAME_WATERMARK.store(frame.saturating_add(PAGE_SIZE), Ordering::Relaxed);
+        ISSUED_FRAMES.fetch_add(1, Ordering::Relaxed);
         unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
         kumo_hal::active::clean_dcache_to_poc(frame as usize, PAGE_SIZE as usize);
         pages[filled] = Some(frame);

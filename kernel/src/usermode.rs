@@ -1,4 +1,3 @@
-//j731
 //j732
 //j743
 //j748
@@ -28,6 +27,7 @@ static SWEEP_COUNT: AtomicU32 = AtomicU32::new(0);
 static SWEEP_MAX_LATE_NS: AtomicU64 = AtomicU64::new(0);
 
 //j731
+//j822
 // Engine census is opt-in through `dmesg -n debug`; lower the level to stop it. Once enabled,
 // print list lengths and dispatch window maxima at most every 10 s as Sora enters `PortWait`.
 // Ordinary login and shell input must not start periodic diagnostics. — TIMBERDOODLE
@@ -3427,6 +3427,23 @@ pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
     });
 
     if len == 0 {
+        return 0;
+    }
+    if len == 5 && buf[..4] == kumo_abi::actor::QUERY && buf[4] <= 8 {
+        let reply = crate::actorstat::snapshot(buf[4]).encode();
+        // Snapshot outside SoraState; release the channel borrow before signalling/waking.
+        let peer = with_sora_mut(|sora| {
+            let end = sora.kernel_end;
+            let channel = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel)?;
+            let peer = channel.peer_object(end).koid();
+            let message = KernelMessage::from_borrowed(Message::new(1, &reply, &[]).ok()?).ok()?;
+            channel.write(end, message).ok()?;
+            Some(peer)
+        });
+        if let Some(peer) = peer {
+            signal_and_wake(peer);
+        }
+        // A diagnostic exchange is not a completed shell line (no extra prompt).
         return 0;
     }
     let line = core::str::from_utf8(&buf[..len]).unwrap_or("");

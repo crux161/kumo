@@ -8,7 +8,6 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j494
 //j534
 //j556
 //j724
@@ -41,6 +40,7 @@ static USER_RESUME_MAX_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "none")]
 static USER_RESUME_OVER_1S: AtomicU32 = AtomicU32::new(0);
 //j729
+//j822
 #[cfg(target_os = "none")]
 static SORA_AWAY_AT: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "none")]
@@ -70,6 +70,7 @@ const CHILD_PRIORITY: Priority = Priority(63);
 /// children never got a yield to run. 12 covers the persistent drivers + a per-controller
 /// enumeration fan-out + the svc-health/M10 transients with headroom.
 const MAX_RESIDENT_CHILDREN: usize = 12;
+const _: () = assert!(MAX_RESIDENT_CHILDREN == kumo_abi::actor::RESIDENT_LIMIT);
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
 /// Same priority as the blocking child — more urgent than Sora's boot admit (64), less
 /// urgent than every later wake of hers (`USER_WAKE_PRIORITY`, J730).
@@ -298,6 +299,33 @@ pub fn switch_count() -> u64 {
     unsafe { (&*p).switches }
 }
 
+/// Capacity applies to resident child threads; Sora and the idle floor are excluded.
+/// Copy everything before a caller can print, allocate or re-enter. — TIMBERDOODLE
+pub fn resident_snapshot() -> kumo_abi::actor::Snapshot {
+    let mut result = kumo_abi::actor::Snapshot {
+        capacity: MAX_RESIDENT_CHILDREN as u32,
+        ..Default::default()
+    };
+    if !is_started() {
+        return result;
+    }
+    let s = unsafe { &*sched_ptr() };
+    result.stored = s.children.len() as u32;
+    for child in &s.children {
+        if child.done {
+            continue;
+        }
+        result.processes[result.live as usize] = child.process.0;
+        result.live += 1;
+        match child.thread.state() {
+            ThreadState::Blocked => result.blocked += 1,
+            ThreadState::Running => result.running += 1,
+            _ => result.ready += 1,
+        }
+    }
+    result
+}
+
 /// The kernel identity-map TTBR0 captured at launch. A syscall handler running on the
 /// user thread (TTBR0 = the process tree) switches to this before building page tables by
 /// physical address, then restores the process tree. Valid once `init` has run.
@@ -318,7 +346,16 @@ fn sched_ptr() -> *mut UserSched {
 fn set_active_aspace_root(root: u64) {
     // Switching the user address-space root is arch-specific and inherently unsafe; the
     // HAL validates the root (arm64: TTBR0_EL1; x86: cr3). One uniform call across backends.
+    let measuring = crate::actorstat::enabled();
+    let begin = if measuring {
+        kumo_hal::active::monotonic_nanos()
+    } else {
+        0
+    };
     unsafe { kumo_hal::active::set_user_aspace_root(root) };
+    if measuring {
+        crate::actorstat::record_root(kumo_hal::active::monotonic_nanos().saturating_sub(begin));
+    }
 }
 
 /// Create the architecture-specific first-entry context for a user thread.

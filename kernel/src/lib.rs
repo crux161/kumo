@@ -1,14 +1,15 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j792
 //j793
 //j794
 //j797
 //j799
+//j822
 
 extern crate alloc;
 
+pub mod actorstat;
 pub mod bootstrap;
 pub mod cap;
 pub mod conin;
