@@ -1,0 +1,122 @@
+# Ethernet bring-up: AX88179 first, one userspace network stack
+<!-- j808 -->
+
+Date: 2026-11-06. Author: TIMBERDOODLE.
+Status: planned; no Ethernet hardware acceptance yet.
+
+## First controller
+
+Start with the available ASIX AX88179 USB adapter. KUMO already has xHCI enumeration,
+control IN and bulk-transfer mechanisms. Moving this adapter between hosts will let
+us exercise a common chip driver and network interface on different platforms.
+Each host's USB route still needs its own proof.
+
+The onboard RTL8125BG remains the next backend. Its chip driver can also be portable,
+but Orange Pi bring-up needs additional PCIe controller/config/BAR, PHY, DMA-ring and
+interrupt evidence. The M.2 NVMe route does not prove either onboard Ethernet route.
+The first goal is correct packets and usable sockets; 2.5GbE throughput comes later.
+
+Use one userspace `netstack` with loopback first, as PLAN §9 and DESIGN/008 specify.
+Evaluate and pin [smoltcp](https://github.com/smoltcp-rs/smoltcp) for its protocol engine;
+check the exact release/features with KUMO's pinned toolchains before adoption.
+Its [frame device interface](https://docs.rs/smoltcp/0.14.0/smoltcp/phy/trait.Device.html)
+provides the adapter boundary. No dependency is added by this planning slice.
+— TIMBERDOODLE
+
+## Boundaries
+
+Applications hold explicitly granted socket-service channels. The network server holds
+an Ethernet-frame channel; it gets no xHCI MMIO, IRQ or physical DMA addresses. Initially,
+the AX protocol module runs inside the existing `drv-xhci` owner with pure codec logic
+in a separate library. One process controls the controller. A USB broker or separate
+chip process can follow once interface capabilities exist.
+
+Copied frames fit the existing IPC model. Begin with MTU 1500, one interface, software
+checksums, bounded RX/TX queues and per-client socket quotas. NET1 fixes versioned
+messages, exact size/handle limits, readiness, backpressure and restart errors before
+implementation. Socket state is soft state: server restart fails old sockets; fresh
+connections are explicit. Never silently replay application data.
+
+The USB adapter is not a direct physical-memory DMA owner; xHCI is. Its transfer buffers
+still require bounds, correct cache/order rules and retained custody until quiescence.
+Timeout or process death alone does not allow reuse. Existing raw-DMA operation does
+not establish DESIGN/009 confinement. NVMe's D5 approval does not cover a new PCIe NIC;
+Road C remains open as described in [the NVMe debt record](orange-pi-5-plus-nvme.md).
+
+Keep loopback/socket work independent of physical link bring-up. The existing minimal
+Rust PAL I-b gate uses fs/io/collections/time. External Ethernet extends `std::net`;
+it does not change that gate or replace target/sysroot, TLS/thread/runtime work.
+
+## Prerequisites found in the current USB code
+
+The shared controller currently dispatches HID, hubs and storage. Its SuperSpeed side
+path leaves other classes alone; there is no Ethernet service yet. Storage's synchronous
+bulk poller cannot become a permanent network RX loop. Keyboard, storage and control
+service must remain responsive while RX waits for a packet.
+
+Before Ethernet RX, add bounded EP0 data OUT, endpoint-aware completion routing and a
+resident NIC lane. Current completion dispatch/stashing matches USB slot only and may
+drop the oldest stashed event under pressure. RX, TX and interrupt-status transfers on
+one device need slot/DCI/TRB/generation ownership and explicit overflow handling. Prove
+quiescent cancellation and buffer custody before automatic owner replacement.
+
+The supplied AX note also needs two corrections from its bundled driver reference:
+RX metadata is reached through a trailing aggregate header; TX has an 8-byte prefix.
+Pure framing tests must cover padded bounds, dummy entries, alignment/status and exact
+USB max-packet boundaries. Use observed descriptors and silicon revision, not product
+strings, to select a protocol. The [upstream Linux driver](https://github.com/torvalds/linux/blob/master/drivers/net/usb/ax88179_178a.c)
+is a cross-check; no C implementation is imported here.
+
+## Acceptance ladder
+
+Each row is a future gate, split further whenever necessary. Local PLAN/020 contains
+the exact dependencies, mutation boundaries and negative proofs; RESEARCH/019 indexes
+all supplied `resources/net` files and records the conflicting note. J808 plans work;
+it does not claim any of these gates passed.
+
+| Gate | Required result |
+|---|---|
+| **NET0** | Exact adapter/port/interface/endpoints/revision inventory, raw descriptors matched to an independent host; unknown devices stay unbound |
+| **NET1** | Capability, frame/socket wire, resource limits, readiness/restart design and exact stack dependency choice |
+| **NET2a–c** | Pinned no_std protocol engine, then native UDP and TCP loopback through real IPC, including no-grant/error/restart tests |
+| **NET3** | Pure AX descriptors, vendor requests and aggregate RX/TX framing pass bounds/short/error fixtures |
+| **NET4a–c** | Correct control IN/OUT, endpoint completion ownership, resident scheduling and DMA custody preserve HID/storage |
+| **NET5a–b** | Read-only identity/MAC/status first; then minimal volatile initialization and measured link up/down |
+| **NET6** | Passive RX matches independently captured peer frames, with malformed aggregates and queue pressure bounded |
+| **NET7** | TX matches peer packet capture, including max-packet boundaries; frame-channel isolation/backpressure pass |
+| **NET8** | Static IPv4 ARP and bidirectional ICMP on an isolated test subnet |
+| **NET9** | Native UDP exact datagrams in both directions with size/error/timeout behavior |
+| **NET10** | Native TCP exact stream hashes, partial I/O, backpressure, orderly close/reset and induced-loss handling |
+| **NET11** | Separate DHCP grant/renew/expiry/error proof, isolated from the existing PXE DHCP path |
+| **NET12** | Bounded DNS resolution and invalid-reply/compression/timeout tests against a controlled server |
+| **NET13a–b** | Maintained relibc overlay gains socket FDs, UDP/TCP and the readiness/error subset required by the actual PAL |
+| **NET14** | Pinned build-std programs use UdpSocket and TcpListener/TcpStream over loopback; server failure wakes clients |
+| **NET15** | Same std programs over AX Ethernet; safe reconnect/restart, HID/USB/NVMe coexistence and a second-host portability review |
+
+NET0 is the next smallest slice: strict descriptor selection and bounded inventory,
+without AX vendor writes or Ethernet transmission. Normal USB address/descriptor setup
+is still host-controller activity. Loopback work can advance without the adapter.
+NET13/14 can use loopback before external DHCP/DNS; numeric-IP tests stay independent
+of name resolution. A second-host proof remains pending until actually exercised.
+
+## Additional chips and final evidence
+
+For RTL8125BG, begin a separate guarded inventory for each onboard NIC and physical jack.
+Establish revision-specific initialization, actual firmware requirements, minimum grants
+and a DMA trust decision before rings are enabled. Prove polling RX/TX and quiescent
+restart, then wired INTx if available. Chip MSI/MSI-X capability does not provide a KUMO
+ITS implementation. If wired delivery is unavailable, track that as a separate gate.
+Reuse the accepted frame/socket service and its tests; do not fork the network stack.
+
+The supplied RTL8153/8153B PDFs and Linux `r8153_ecm.c` support a later USB backend.
+Select vendor, ECM or NCM by actual descriptors/revision; those are different protocols.
+Empty ECM/NCM marker files provide hints, not implementation evidence. ASIX variants
+also require their own match; no blanket CDC compatibility is assumed.
+
+Every hardware gate records peer captures/hashes, topology, packet/drop/error counts,
+bounded idle/timeout behavior and continued keyboard/storage service. Host fixtures and
+QEMU loopback prove logic; physical packet capture proves the wire. Keep original boot
+files intact, restore default images and stop task PXE/capture processes before signing.
+IPv6, complete POSIX sockets, TLS, zero-copy, multiqueue and throughput tuning follow as
+separate slices. Link LEDs, ping and PXE success are individual observations, not a
+complete socket/PAL acceptance. — TIMBERDOODLE 2026-11-06
