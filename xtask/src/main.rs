@@ -1,8 +1,8 @@
-//j649
 //j675
 //j709
 //j798
 //j800
+//j804
 
 use std::env;
 use std::fmt;
@@ -432,6 +432,20 @@ fn stage_uefi_bootloader(
         oracle_env.as_deref(),
         plan.hardware.board().map(|b| b.id()).unwrap_or(""),
     )?;
+    let prepare_env = env::var("KUMO_NVME_PREPARE")
+        .map(Some)
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok(None),
+            _ => Err("KUMO_NVME_PREPARE must be UTF-8 0 or 1".to_string()),
+        })?;
+    let prepare = nvme_oracle_enabled(
+        prepare_env.as_deref(),
+        plan.hardware.board().map(|b| b.id()).unwrap_or(""),
+    )
+    .map_err(|e| {
+        e.replace("oracle", "preparation")
+            .replace("KUMO_NVME_ORACLE", "KUMO_NVME_PREPARE")
+    })?;
     let mut args = vec![
         "build",
         "-p",
@@ -441,7 +455,9 @@ fn stage_uefi_bootloader(
         "--target",
         target,
     ];
-    if oracle {
+    if prepare {
+        args.extend(["--features", "nvme-prepare"]);
+    } else if oracle {
         args.extend(["--features", "nvme-oracle"]);
     }
     run_cargo(root, &args)?;

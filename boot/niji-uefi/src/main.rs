@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j467
 //j622
 //j783
 //j800
 //j801
+//j804
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -714,7 +714,7 @@ unsafe fn boot_and_jump(
 
     #[cfg(feature = "nvme-oracle")]
     if niji_uefi::nvme::eligible(unsafe { (*boot_ptr).board_id() }) {
-        unsafe { nvme_oracle::run(boot_services, con_out) };
+        unsafe { nvme_oracle::run(boot_services, con_out, system_table) };
     }
 
     // Pre-exit summary + validation, using a provisional memory snapshot.

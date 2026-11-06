@@ -1,16 +1,15 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j799 -->
 <!-- j800 -->
 <!-- j801 -->
 <!-- j802 -->
 <!-- j803 -->
+<!-- j804 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV5 are complete; NV6 moves the read-only I/O pair to INTx-driven
-completions. Firmware's PCIe3_4L link and enumeration lead to a
+NV0–NV6 are complete; NV7a adds read-only FAT volume discovery and service. Firmware's PCIe3_4L link and enumeration lead to a
 Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
 configuration and graceful restart with two distinct owners, each reaching
 RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
@@ -323,7 +322,7 @@ ESP partitions, each in table order. Only a valid FAT32 BPB fitting its own part
 is offered. An absent FAT32 volume is reported and the driver deletes its I/O pair,
 proves controller quiescence and releases custody; it does not relabel another FS.
 The first observed SSD layout has one Basic Data partition beginning at LBA2048,
-with 976771072 blocks and an NTFS boot-sector signature. It is preserved.
+with 976771072 blocks and an NTFS boot-sector signature. CRUX subsequently designated the entire SSD disposable test media.
 
 Sora has transport-independent storage slots: existing USB slots0–2 keep their
 names; NVMe uses slot3 (`/dev/disk3s1`). USB volumes retain their automatic mount
@@ -340,3 +339,36 @@ partition exists, these filesystem acceptance checks remain pending suitable tes
 media. Host discovery/codec tests and a valid GPT/no-FAT metal result cannot be
 reported as successful physical FAT mount/read. D5 and Road C remain unchanged.
 — TIMBERDOODLE
+
+
+## One-off NV7 media preparation
+
+CRUX explicitly authorized replacing the whole Samsung 970 EVO Plus 500GB test
+SSD. `KUMO_NVME_PREPARE=1 cargo xtask image --arch aarch64 --hardware orange-pi-5-plus`
+builds a preparation loader; this option is rejected for other boards, and is
+absent from default builds. It implies the independent firmware oracle feature.
+This is a one-purpose quick formatter through UEFI Block I/O, not the NV8 driver
+write implementation. It requires VID/SSVID, model, serial S58SNM0R302625Z,
+firmware, NSID1, plain 512-byte sectors and exact 976773168-sector geometry.
+It also requires the three original metadata hashes accepted in J801–J803.
+An unknown layout refuses without writes. An already matching layout also does
+zero writes, even if files or free-space accounting have subsequently changed.
+
+The layout is a GPT Basic Data partition at LBA2048..526335 (256MiB), two FAT32
+copies, label KUMONVME, and HELLO.TXT. Remaining space is unallocated. Original
+MBR/GPT metadata and two NTFS prefix sectors are sent to the serial host, which
+checks and saves all69 sectors and acknowledges receipt before any writes.
+This is an audit backup, not a complete restorable NTFS backup. The old filesystem
+is discarded under the explicit media disposition; source rollback cannot restore
+it. This does not securely erase old data outside the written metadata/seed.
+
+Eight fixed phases write only8293 sectors, flush, then read back every sector.
+The primary FAT VBR is published last. Any failed I/O/flush/verification halts
+before ExitBootServices and retains the loader buffer. If interrupted before any
+GPT marker changes, the original-metadata gate permits repeating the same format.
+Once checked GPT/VBR markers differ, an incomplete layout refuses on the next boot;
+this tool offers no automatic recovery/reformat of unknown media.
+The host example `cargo run -p niji-uefi --features nvme-prepare --example nvme-layout
+-- <new-image-path>` emits a sparse partition image for independent read-only fsck.
+Default images contain no formatter; restore a normal image after the proof.
+D5 remains a cooperative DMA non-claim; Road C remains open. — TIMBERDOODLE

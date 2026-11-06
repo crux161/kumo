@@ -1,17 +1,19 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j460
 //j467
 //j622
 //j783
 //j800
+//j804
 
 use kumo_abi::{
     BootInfo, Framebuffer, FramebufferFormat, MemRegionKind, Range, RawSlice, ABI_VERSION,
 };
 
 pub mod nvme;
+#[cfg(feature = "nvme-prepare")]
+pub mod nvme_prepare;
 
 pub const BOOTLOADER_NAME: &str = "Nijigumo";
 

@@ -1,8 +1,10 @@
 //j800
 //j801
+//j804
 //! Default-off pre-EBS Identify reference through firmware's NVMe queues, then
 //! (NV5) LBA 0, LBA 1 and the last LBA through firmware's whole-namespace Block I/O.
-//! No drv-nvme dependency, media write or direct controller write. — TIMBERDOODLE
+//! No drv-nvme dependency or direct controller write. Media preparation is a
+//! separate explicit, default-off feature for one disposable SSD. — TIMBERDOODLE
 use crate::{
     efi_memory_type, guid, print_line, EfiBootServices, EfiHandle, EfiSimpleTextOutputProtocol,
 };
@@ -153,7 +155,11 @@ unsafe fn media_reference(
     );
 }
 
-pub(super) unsafe fn run(bs: *mut EfiBootServices, con: *mut EfiSimpleTextOutputProtocol) {
+pub(super) unsafe fn run(
+    bs: *mut EfiBootServices,
+    con: *mut EfiSimpleTextOutputProtocol,
+    _st: *mut crate::EfiSystemTable,
+) {
     let id = guid(
         0x52c78312,
         0x8edc,
@@ -275,5 +281,196 @@ pub(super) unsafe fn run(bs: *mut EfiBootServices, con: *mut EfiSimpleTextOutput
         con,
         format_args!("NV4 UEFI reference complete; LoaderData page retained\r\n"),
     );
+    #[cfg(feature = "nvme-prepare")]
+    unsafe {
+        prepare_media(bs, con, _st, &controller, &ns, buffer)
+    };
     unsafe { media_reference(bs, con, &ns, buffer) };
+}
+
+#[cfg(feature = "nvme-prepare")]
+unsafe fn prepare_media(
+    bs: *mut EfiBootServices,
+    con: *mut EfiSimpleTextOutputProtocol,
+    st: *mut crate::EfiSystemTable,
+    controller: &Controller,
+    ns: &Namespace,
+    buffer: *mut u8,
+) {
+    use niji_uefi::nvme_prepare::{self as prep, Disk, Inspection};
+    struct FirmwareDisk {
+        bio: *mut BlockIo,
+        buffer: *mut u8,
+        media_id: u32,
+    }
+    impl FirmwareDisk {
+        fn check(&self) -> Result<(), prep::Error> {
+            let m = unsafe { &*(*self.bio).media };
+            if m.media_id != self.media_id
+                || m.present != 1
+                || m.read_only != 0
+                || m.logical_partition != 0
+                || m.block_size != 512
+                || m.last_block != prep::BLOCKS - 1
+            {
+                return Err(prep::Error::Io);
+            }
+            Ok(())
+        }
+    }
+    impl Disk for FirmwareDisk {
+        fn read(&mut self, lba: u64, b: &mut [u8; 512]) -> Result<(), prep::Error> {
+            self.check()?;
+            unsafe { nvme::read_block(self.bio, lba, self.buffer) }.map_err(|_| prep::Error::Io)?;
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = unsafe { ptr::read_volatile(self.buffer.add(i)) };
+            }
+            Ok(())
+        }
+        fn write(&mut self, lba: u64, b: &[u8; 512]) -> Result<(), prep::Error> {
+            self.check()?;
+            if lba >= prep::BLOCKS {
+                return Err(prep::Error::Io);
+            }
+            for (i, x) in b.iter().enumerate() {
+                unsafe { ptr::write_volatile(self.buffer.add(i), *x) };
+            }
+            let call = unsafe { (*self.bio).write_blocks }.ok_or(prep::Error::Io)?;
+            let status = unsafe { call(self.bio, self.media_id, lba, 512, self.buffer.cast()) };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(prep::Error::Io)
+            }
+        }
+        fn flush(&mut self) -> Result<(), prep::Error> {
+            self.check()?;
+            let call = unsafe { (*self.bio).flush_blocks }.ok_or(prep::Error::Io)?;
+            if unsafe { call(self.bio) } == 0 {
+                Ok(())
+            } else {
+                Err(prep::Error::Io)
+            }
+        }
+    }
+    let bio = match unsafe { whole_namespace_block_io(bs, ns.id) } {
+        Ok(bio) if !unsafe { (*bio).media }.is_null() => bio,
+        _ => {
+            print_line(
+                con,
+                format_args!("NV7 PREP refused: no unique whole namespace\r\n"),
+            );
+            return;
+        }
+    };
+    let m = unsafe { &*(*bio).media };
+    if !nvme::media_matches(m, ns)
+        || m.read_only != 0
+        || unsafe { (*bio).write_blocks }.is_none()
+        || unsafe { (*bio).flush_blocks }.is_none()
+    {
+        print_line(con, format_args!("NV7 PREP refused: media contract\r\n"));
+        return;
+    }
+    let mut disk = FirmwareDisk {
+        bio,
+        buffer,
+        media_id: m.media_id,
+    };
+    let original = match prep::inspect(&mut disk, controller, ns) {
+        Ok(Inspection::Prepared) => {
+            print_line(
+                con,
+                format_args!("NV7 PREP already prepared; zero writes\r\n"),
+            );
+            return;
+        }
+        Ok(Inspection::Original(token)) => token,
+        Err(prep::Error::Io) => halt(con, nvme::Error::Data),
+        Err(e) => {
+            print_line(
+                con,
+                format_args!("NV7 PREP refused: {e:?}; zero writes\r\n"),
+            );
+            return;
+        }
+    };
+    // Save original GPT/MBR and two NTFS prefix sectors to the serial host BEFORE
+    // writing. This is metadata audit only, not a backup of the old filesystem.
+    // The input token acknowledges verified host receipt, under CRUX's existing
+    // disposable-media authority; it is not another erase approval. — TIMBERDOODLE
+    let mut sha = kumo_sha256::Sha256::new();
+    let mut b = [0; 512];
+    for (first, last) in prep::AUDIT_RANGES {
+        for lba in first..=last {
+            if disk.read(lba, &mut b).is_err() {
+                halt(con, nvme::Error::Data);
+            }
+            sha.update(&lba.to_le_bytes());
+            sha.update(&b);
+            for (offset, chunk) in b.chunks_exact(16).enumerate() {
+                print_line(con, format_args!("NV7 BAK {lba} {} ", offset * 16));
+                for byte in chunk {
+                    print_line(con, format_args!("{byte:02x}"));
+                }
+                print_line(con, format_args!("\r\n"));
+            }
+        }
+    }
+    print_line(con, format_args!("NV7 BAKSHA {}\r\n", Hex(sha.finish())));
+    print_line(
+        con,
+        format_args!("NV7 PREP waiting for host metadata receipt\r\n"),
+    );
+    let input = unsafe { (*st).con_in };
+    if input.is_null() {
+        return;
+    }
+    let mut matched = 0;
+    let token = b"K804-625Z\r";
+    let mut received = false;
+    for _ in 0..12_000 {
+        let mut key = crate::EfiInputKey {
+            scan_code: 0,
+            unicode_char: 0,
+        };
+        if unsafe { ((*input).read_key_stroke)(input, &mut key) } == 0 {
+            if key.unicode_char == u16::from(token[matched]) {
+                matched += 1;
+            } else {
+                matched = 0;
+            }
+            if matched == token.len() {
+                received = true;
+                break;
+            }
+        }
+        unsafe { ((*bs).stall)(10_000) };
+    }
+    if !received {
+        print_line(
+            con,
+            format_args!("NV7 PREP receipt timeout; zero writes\r\n"),
+        );
+        return;
+    }
+    print_line(
+        con,
+        format_args!("NV7 PREP begin authorized disposable SSD; 256MiB FAT32\r\n"),
+    );
+    match prep::apply(&mut disk, original, |phase| {
+        print_line(
+            con,
+            format_args!("NV7 PREP phase {phase}/8 flushed and verified\r\n"),
+        )
+    }) {
+        Ok(count) => print_line(
+            con,
+            format_args!("NV7 PREP complete: {count} sectors written/flushed/readback\r\n"),
+        ),
+        Err(e) => {
+            print_line(con, format_args!("NV7 PREP failed {e:?}\r\n"));
+            halt(con, nvme::Error::Data);
+        }
+    }
 }

@@ -1,5 +1,6 @@
 #j800
 #j801
+#j804
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -21,3 +22,12 @@ path = "src/main.rs"
 
 [features]
 nvme-oracle = ["dep:kumo-sha256"]
+nvme-prepare = ["nvme-oracle"]
+
+[dev-dependencies]
+kumo-fatfs = { path = "../../lib/kumo-fatfs" }
+kumo-gpt = { path = "../../lib/kumo-gpt" }
+
+[[example]]
+name = "nvme-layout"
+required-features = ["nvme-prepare"]

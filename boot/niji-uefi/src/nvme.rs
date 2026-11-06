@@ -1,10 +1,11 @@
 //j800
 //j801
+//j804
 //! UEFI NVMe PassThru bindings and reference decoding, independent of drv-nvme.
 //! UEFI 2.10 §13.15 and TianoCore MdePkg/Include/Protocol/NvmExpressPassthru.h.
 //! Identify only through PassThru; firmware owns queue transport and DMA mapping.
 //! NV5 media reads go through the namespace's Block I/O (UEFI 2.10 §13.9), so the
-//! LBA-to-command encoding is EDK2's, not KUMO's. No write entry is callable. — TIMBERDOODLE
+//! LBA-to-command encoding is EDK2's, not KUMO's. Write calls exist only in the explicit nvme-prepare feature. — TIMBERDOODLE
 
 use core::{ffi::c_void, fmt, ptr};
 pub const PAGE: usize = 4096;
@@ -251,16 +252,16 @@ pub struct BlockIoMedia {
     pub io_align: u32,
     pub last_block: u64,
 }
-/// `EFI_BLOCK_IO_PROTOCOL`. WriteBlocks and FlushBlocks stay opaque pointers, so
-/// this binding cannot issue a media write. — TIMBERDOODLE
+/// `EFI_BLOCK_IO_PROTOCOL`; nullable function pointers preserve the UEFI ABI.
 #[repr(C)]
 pub struct BlockIo {
     pub revision: u64,
     pub media: *const BlockIoMedia,
     pub reset: *const c_void,
     pub read_blocks: unsafe extern "efiapi" fn(*mut BlockIo, u32, u64, usize, *mut c_void) -> usize,
-    pub write_blocks: *const c_void,
-    pub flush_blocks: *const c_void,
+    pub write_blocks:
+        Option<unsafe extern "efiapi" fn(*mut BlockIo, u32, u64, usize, *mut c_void) -> usize>,
+    pub flush_blocks: Option<unsafe extern "efiapi" fn(*mut BlockIo) -> usize>,
 }
 /// Bound for walking a firmware device path.
 pub const PATH_MAX: usize = 1024;
@@ -569,8 +570,8 @@ mod tests {
             media: &media,
             reset: ptr::null(),
             read_blocks,
-            write_blocks: ptr::null(),
-            flush_blocks: ptr::null(),
+            write_blocks: None,
+            flush_blocks: None,
         };
         let mut page = Page([0; PAGE]);
         assert_eq!(
