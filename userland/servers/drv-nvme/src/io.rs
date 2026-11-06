@@ -1,4 +1,5 @@
 //j801
+//j802
 //! NV5: one polled I/O queue pair and bounded, read-only media access.
 //! Set Features (Number of Queues) asks for one SQ/CQ; Create I/O CQ precedes
 //! Create I/O SQ, and teardown deletes the SQ before its CQ. Reads are one PRP
@@ -14,6 +15,17 @@ pub const IO_QID: u16 = 1;
 pub const IO_SQ: u64 = 3 * PAGE;
 pub const IO_CQ: u64 = 4 * PAGE;
 
+/// One PRP1-only transfer: dword aligned, below 4 GiB, not crossing a page.
+fn prp(physical: u64, bytes: u64) -> Result<u64, Error> {
+    if physical == 0
+        || physical & 3 != 0
+        || physical.checked_add(bytes).is_none_or(|end| end > 1 << 32)
+        || (physical & (PAGE - 1)) + bytes > PAGE
+    {
+        return Err(Error::Memory);
+    }
+    Ok(physical)
+}
 fn page(physical: u64) -> Result<u64, Error> {
     if physical == 0 || physical & (PAGE - 1) != 0 || physical >= 1 << 32 {
         return Err(Error::Memory);
@@ -33,14 +45,15 @@ fn admin(opcode: u32, prp1: u64, cdw10: u32, cdw11: u32) -> [u32; 16] {
 pub fn set_queue_count() -> [u32; 16] {
     admin(0x09, 0, 0x07, 0)
 }
-/// Create I/O CQ: physically contiguous, interrupts disabled (IEN=0, IV=0).
-pub fn create_cq(physical: u64) -> Result<[u32; 16], Error> {
+/// Create I/O CQ: physically contiguous, vector 0 (IV=0). NV6 sets IEN for pin
+/// interrupts; NV5's polled pair leaves it clear.
+pub fn create_cq(physical: u64, interrupts: bool) -> Result<[u32; 16], Error> {
     let cq = page(physical.checked_add(IO_CQ).ok_or(Error::Memory)?)?;
     Ok(admin(
         0x05,
         cq,
         (u32::from(DEPTH - 1) << 16) | u32::from(IO_QID),
-        1,
+        1 | (u32::from(interrupts) << 1),
     ))
 }
 /// Create I/O SQ bound to CQ 1: physically contiguous, QPRIO 0, NVM set 0.
@@ -60,9 +73,10 @@ pub fn delete_cq() -> [u32; 16] {
     admin(0x04, 0, u32::from(IO_QID), 0)
 }
 
-/// NVM Read, one PRP page. Refuses (Error::Range) a namespace with metadata or
+/// NVM Read, PRP1 only. Refuses (Error::Range) a namespace with metadata or
 /// protection, zero blocks, more than one page, or any LBA range that does not
-/// end at or below NSZE, including overflow. — TIMBERDOODLE
+/// end at or below NSZE, including overflow. PRP1 may sit inside the data page
+/// (NV6 batches) but must be dword aligned and not cross a page. — TIMBERDOODLE
 pub fn read_command(
     ns: &Namespace,
     lba: u64,
@@ -81,7 +95,7 @@ pub fn read_command(
     {
         return Err(Error::Range);
     }
-    let data = page(physical)?;
+    let data = prp(physical, u64::from(blocks) * u64::from(ns.lba_bytes))?;
     let mut w = [0; 16];
     w[0] = 0x02;
     w[1] = ns.id;
@@ -101,8 +115,8 @@ pub struct Allocated {
 }
 
 pub struct IoPair {
-    queue: Queue,
-    ns: Namespace,
+    pub(crate) queue: Queue,
+    pub(crate) ns: Namespace,
     pub allocated: Allocated,
 }
 impl IoPair {
@@ -113,11 +127,12 @@ impl IoPair {
         s: Startup,
         memory: Memory,
         ns: Namespace,
+        interrupts: bool,
     ) -> Result<Self, Error> {
         if !ns.plain_blocks() {
             return Err(Error::Data);
         }
-        let cq = create_cq(memory.physical)?;
+        let cq = create_cq(memory.physical, interrupts)?;
         let sq = create_sq(memory.physical)?;
         let c = admin.submit(io, s, memory, set_queue_count(), &mut [])?;
         let allocated = Allocated {
@@ -152,8 +167,9 @@ impl IoPair {
         }
         self.queue.submit(io, s, memory, words, output)
     }
-    /// Delete SQ 1, then CQ 1. A poisoned I/O queue may still own a command, so
-    /// it is never deleted; the caller keeps every buffer instead.
+    /// Delete SQ 1, then CQ 1. A poisoned I/O queue, or one with a command still
+    /// outstanding, may still own DMA, so it is never deleted; the caller keeps every
+    /// buffer instead.
     pub fn close(
         self,
         admin: &mut Queue,
@@ -161,7 +177,7 @@ impl IoPair {
         s: Startup,
         memory: Memory,
     ) -> Result<(), Error> {
-        if self.queue.poisoned() {
+        if self.queue.poisoned() || self.queue.outstanding() != 0 {
             return Err(Error::State);
         }
         admin.submit(io, s, memory, delete_sq(), &mut [])?;
@@ -189,6 +205,9 @@ mod tests {
             root_command: 7,
             endpoint_command: 6,
             msix_control: 32,
+            irq: 292,
+            pin: 1,
+            legacy_mask: 0,
         }
     }
     fn memory() -> Memory {
@@ -415,7 +434,7 @@ mod tests {
         let mut io = Fake::new();
         let mut admin = Queue::new();
         let ns = namespace();
-        let mut pair = IoPair::open(&mut admin, &mut io, startup(), memory(), ns).unwrap();
+        let mut pair = IoPair::open(&mut admin, &mut io, startup(), memory(), ns, false).unwrap();
         assert_eq!(
             pair.allocated,
             Allocated {
@@ -477,7 +496,19 @@ mod tests {
         want[12] = 7;
         assert_eq!(w, want);
         assert_eq!(read_command(&ns, 0, 1, 0x1_0000_0000), Err(Error::Memory));
-        assert_eq!(read_command(&ns, 0, 1, 0x1234_5200), Err(Error::Memory));
+        assert_eq!(
+            read_command(&ns, 0, 1, 0xffff_fe00).map(|w| w[6]),
+            Ok(0xffff_fe00)
+        );
+        assert_eq!(read_command(&ns, 0, 2, 0xffff_fe00), Err(Error::Memory));
+        assert_eq!(read_command(&ns, 0, 1, 0x1234_5202), Err(Error::Memory));
+        assert_eq!(read_command(&ns, 0, 1, 0x1234_5e04), Err(Error::Memory));
+        assert_eq!(
+            read_command(&ns, 0, 1, 0x1234_5200).map(|w| w[6]),
+            Ok(0x1234_5200)
+        );
+        assert_eq!(create_cq(0x6000_0000, true).map(|w| w[11]), Ok(3));
+        assert_eq!(create_cq(0x6000_0000, false).map(|w| w[11]), Ok(1));
         ns.lba_bytes = 4096;
         assert!(read_command(&ns, 0, 1, 0x1000).is_ok());
         assert_eq!(read_command(&ns, 0, 2, 0x1000), Err(Error::Range));
@@ -496,7 +527,7 @@ mod tests {
         ns.metadata = 8;
         let mut admin = Queue::new();
         assert_eq!(
-            IoPair::open(&mut admin, &mut io, startup(), memory(), ns).err(),
+            IoPair::open(&mut admin, &mut io, startup(), memory(), ns, false).err(),
             Some(Error::Data)
         );
         assert!(io.doorbells.is_empty() && io.dma_writes == 0);
@@ -508,7 +539,8 @@ mod tests {
             let mut io = Fake::new();
             io.fail_opcode = Some(op);
             let mut admin = Queue::new();
-            let e = IoPair::open(&mut admin, &mut io, startup(), memory(), namespace()).err();
+            let e =
+                IoPair::open(&mut admin, &mut io, startup(), memory(), namespace(), false).err();
             assert_eq!(e, Some(Error::Command));
             assert!(admin.poisoned());
             assert!(io.doorbells.iter().all(|&(o, _)| o < 0x1008));
@@ -525,7 +557,8 @@ mod tests {
     fn io_completion_naming_the_wrong_queue_poisons_and_blocks_deletion() {
         let mut io = Fake::new();
         let mut admin = Queue::new();
-        let mut pair = IoPair::open(&mut admin, &mut io, startup(), memory(), namespace()).unwrap();
+        let mut pair =
+            IoPair::open(&mut admin, &mut io, startup(), memory(), namespace(), false).unwrap();
         io.wrong_sqid = true;
         let mut out = [0u8; 512];
         assert_eq!(
@@ -550,7 +583,8 @@ mod tests {
     fn io_phase_wraps_twice_with_cq1_head_doorbells() {
         let mut io = Fake::new();
         let mut admin = Queue::new();
-        let mut pair = IoPair::open(&mut admin, &mut io, startup(), memory(), namespace()).unwrap();
+        let mut pair =
+            IoPair::open(&mut admin, &mut io, startup(), memory(), namespace(), false).unwrap();
         let mut out = [0u8; 512];
         for n in 0..u64::from(DEPTH) * 2 + 3 {
             pair.read(&mut io, startup(), memory(), n, 1, &mut out)

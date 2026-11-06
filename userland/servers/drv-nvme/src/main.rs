@@ -3,10 +3,12 @@
 //j798
 //j799
 //j801
-//! One polled Identify + read-only I/O pair ownership proof per process. Sora retains
-//! a DMA VMO alias before any controller write; failures park with memory quarantined.
-//! NV5 reads LBA 0, LBA 1 and the last LBA, and proves NSZE is refused before any
-//! doorbell. No write/flush, root/config or SMMU writes. D5 cooperative raw DMA.
+//j802
+//! One ownership proof per process: polled Identify, then a read-only I/O pair whose
+//! completions arrive by INTx (NV6). Sora retains a DMA VMO alias before any controller
+//! write; failures park with memory quarantined. Reads LBA 0, LBA 1 and the last LBA
+//! single, batched and with vector 0 masked; NSZE is refused before any doorbell. No
+//! write/flush, root/client/config or SMMU writes. D5 cooperative raw DMA.
 //! — TIMBERDOODLE
 
 extern crate alloc;
@@ -17,8 +19,9 @@ use drv_nvme::{
 use kumo_abi::{DevicePowerStatus, Handle, Rights, VmarFlags};
 use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, handle_close,
-    handle_duplicate, handle_koid, port_bind, port_create, port_wait, resource_mint_mmio,
-    syscall_handle, vmar_map, vmar_unmap, vmo_create_contiguous,
+    handle_duplicate, handle_koid, interrupt_complete, interrupt_create, interrupt_wait, port_bind,
+    port_create, port_unbind, port_wait, resource_mint_mmio, syscall_handle, timer_create,
+    vmar_map, vmar_unmap, vmo_create_contiguous,
 };
 
 kumo_rt::entry!(main);
@@ -65,7 +68,17 @@ impl RegisterIo for Registers {
     fn write32(&mut self, o: u16, v: u32) {
         assert!(matches!(
             o,
-            0x0c | 0x14 | 0x24 | 0x28 | 0x2c | 0x30 | 0x34 | 0x1000 | 0x1004 | 0x1008 | 0x100c
+            0x0c | 0x10
+                | 0x14
+                | 0x24
+                | 0x28
+                | 0x2c
+                | 0x30
+                | 0x34
+                | 0x1000
+                | 0x1004
+                | 0x1008
+                | 0x100c
         ));
         self.doorbells += u32::from(o >= 0x1000);
         unsafe { core::ptr::write_volatile((MMIO + u64::from(o)) as *mut u32, v) }
@@ -152,47 +165,115 @@ fn identify(
     Ok(ns)
 }
 
-fn read_block(
-    io: &mut Registers,
-    s: Startup,
-    memory: Memory,
-    pair: &mut drv_nvme::io::IoPair,
-    ns: &drv_nvme::admin::Namespace,
-    lba: u64,
-) -> Result<(), Error> {
-    let mut block = [0u8; PAGE as usize];
-    let out = &mut block[..ns.lba_bytes as usize];
-    let c = pair.read(io, s, memory, lba, 1, out)?;
+/// The NVMe INTx line: one interrupt object and a private port. Each wait binds a
+/// fresh one-shot timer to the same port and tells the wake sources apart by koid.
+struct Irq {
+    port: Handle,
+    interrupt: Handle,
+    koid: u64,
+}
+impl Irq {
+    fn bind(resource: Handle, irq: u32) -> Result<Self, Error> {
+        let interrupt = syscall_handle(interrupt_create(resource, irq)).ok_or(Error::Interrupt)?;
+        let Some(port) = syscall_handle(port_create()) else {
+            let _ = handle_close(interrupt);
+            return Err(Error::Interrupt);
+        };
+        let line = Self {
+            port,
+            interrupt,
+            koid: handle_koid(interrupt),
+        };
+        if port_bind(port, interrupt) != 0 {
+            return Err(Error::Interrupt);
+        }
+        // Release any kernel mask an early fire applied before the port existed
+        // (the drv-xhci arming lesson). Vector 0 is still masked by INTMS here.
+        if interrupt_complete(interrupt) != 0 {
+            return Err(Error::Interrupt);
+        }
+        Ok(line)
+    }
+}
+impl Drop for Irq {
+    fn drop(&mut self) {
+        let _ = port_unbind(self.port, self.interrupt);
+        let _ = handle_close(self.interrupt);
+        let _ = handle_close(self.port);
+    }
+}
+impl drv_nvme::intx::Line for Irq {
+    fn wait(&mut self, ns: u64) -> Result<drv_nvme::intx::Wake, Error> {
+        let timer = syscall_handle(timer_create(ns.max(1))).ok_or(Error::Sleep)?;
+        if port_bind(self.port, timer) != 0 {
+            let _ = handle_close(timer);
+            return Err(Error::Sleep);
+        }
+        let timer_koid = handle_koid(timer);
+        let source = port_wait(self.port);
+        let _ = port_unbind(self.port, timer);
+        let _ = handle_close(timer);
+        if source == self.koid {
+            // The port named the interrupt, so its count is non-zero: this does not park.
+            syscall_handle(interrupt_wait(self.interrupt)).ok_or(Error::Interrupt)?;
+            Ok(drv_nvme::intx::Wake::Interrupt)
+        } else if source == timer_koid {
+            Ok(drv_nvme::intx::Wake::Timeout)
+        } else {
+            Err(Error::Interrupt)
+        }
+    }
+    fn complete(&mut self) -> Result<(), Error> {
+        if interrupt_complete(self.interrupt) == 0 {
+            Ok(())
+        } else {
+            Err(Error::Interrupt)
+        }
+    }
+}
+
+fn log_block(s: Startup, nsid: u32, lba: u64, mode: &str, block: &[u8], elapsed_ns: u64) {
     log(
         kumo_abi::sys::log_level::NOTICE,
         &alloc::format!(
-            "NV5 READ session={} nsid={} lba={} blocks=1 bytes={} cid={} status={:#x} elapsed={}us nonzero={} sha256={}\n",
+            "NV6 READ session={} nsid={} lba={} mode={} bytes={} elapsed={}us nonzero={} sha256={}\n",
             s.session,
-            ns.id,
+            nsid,
             lba,
-            out.len(),
-            c.cid,
-            c.status,
-            c.elapsed_ns / 1000,
-            out.iter().filter(|&&b| b != 0).count(),
-            kumo_sha256::Hex(kumo_sha256::digest(out))
+            mode,
+            block.len(),
+            elapsed_ns / 1000,
+            block.iter().filter(|&&b| b != 0).count(),
+            kumo_sha256::Hex(kumo_sha256::digest(block))
         ),
     );
-    Ok(())
 }
 
-/// NV5: Identify, then one polled I/O pair; read LBA 0 and 1, prove NSZE is
-/// refused with no doorbell, read the last LBA (the queue survived the refusal),
-/// then delete SQ 1 and CQ 1 before the caller's proved disable. — TIMBERDOODLE
-fn media(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error> {
+/// NV6: Identify (polled, vector masked), bind INTx and watch a quiet window, open
+/// the pair with IEN=1, unmask vector 0, then read LBA 0 alone, LBA 1 and the last
+/// LBA under one doorbell, refuse NSZE before any doorbell, watch for late deliveries,
+/// re-read LBA 0 with vector 0 masked, mask, delete the pair. — TIMBERDOODLE
+fn media(io: &mut Registers, s: Startup, memory: Memory, resource: Handle) -> Result<(), Error> {
+    use drv_nvme::intx::{mask, quiet, unmask, Stats, QUIET_NS};
     use drv_nvme::io::{IoPair, IO_CQ, IO_SQ};
     let mut admin = drv_nvme::admin::Queue::new();
     let ns = identify(io, s, memory, &mut admin)?;
-    let mut pair = IoPair::open(&mut admin, io, s, memory, ns)?;
+    let size = ns.lba_bytes as usize;
+    let mut line = Irq::bind(resource, s.irq)?;
+    let mut stats = Stats::default();
+    let stray = quiet(&mut admin, io, &mut line, QUIET_NS, &mut stats)?;
     log(
         kumo_abi::sys::log_level::NOTICE,
         &alloc::format!(
-            "NV5 QUEUES session={} created qid=1 depth={} sq={:#x} cq={:#x} polled ien=0 allocated-sq={} allocated-cq={}\n",
+            "NV6 IRQ session={} intid={} pin=INTA client-mask={:#x} bound; vector 0 masked; pre-arm deliveries={}\n",
+            s.session, s.irq, s.legacy_mask, stray
+        ),
+    );
+    let mut pair = IoPair::open(&mut admin, io, s, memory, ns, true)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV6 QUEUES session={} created qid=1 depth={} sq={:#x} cq={:#x} ien=1 iv=0 allocated-sq={} allocated-cq={}\n",
             s.session,
             drv_nvme::DEPTH,
             memory.physical + IO_SQ,
@@ -201,27 +282,93 @@ fn media(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error> {
             pair.allocated.completion
         ),
     );
-    read_block(io, s, memory, &mut pair, &ns, 0)?;
-    read_block(io, s, memory, &mut pair, &ns, 1)?;
-    let before = io.doorbells;
-    let mut block = [0u8; PAGE as usize];
-    match pair.read(io, s, memory, ns.size, 1, &mut block[..ns.lba_bytes as usize]) {
-        Err(Error::Range) if io.doorbells == before => log(
+    unmask(io)?;
+    let mut data = [0u8; PAGE as usize];
+    let before = stats;
+    let t = pair.read_irq(
+        io,
+        &mut line,
+        s,
+        memory,
+        &[0],
+        &mut data[..size],
+        &mut stats,
+    )?;
+    log_block(s, ns.id, 0, "single", &data[..size], t);
+    let single = stats.deliveries - before.deliveries;
+    let before = stats;
+    let lbas = [1, ns.size - 1];
+    let t = pair.read_irq(
+        io,
+        &mut line,
+        s,
+        memory,
+        &lbas,
+        &mut data[..2 * size],
+        &mut stats,
+    )?;
+    for (i, &lba) in lbas.iter().enumerate() {
+        log_block(s, ns.id, lba, "batch", &data[i * size..(i + 1) * size], t);
+    }
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV6 BATCH session={} reads=2 doorbell=1 deliveries={} entries={} max-per-delivery={} single-deliveries={}\n",
+            s.session,
+            stats.deliveries - before.deliveries,
+            stats.entries - before.entries,
+            stats.max_batch,
+            single
+        ),
+    );
+    let rung = io.doorbells;
+    match pair.read_irq(io, &mut line, s, memory, &[ns.size], &mut data[..size], &mut stats) {
+        Err(Error::Range) if io.doorbells == rung => log(
             kumo_abi::sys::log_level::NOTICE,
             &alloc::format!(
-                "NV5 RANGE session={} nsid={} lba={} (NSZE) blocks=1 refused before SQ write/doorbell; doorbells={} unchanged\n",
-                s.session, ns.id, ns.size, before
+                "NV6 RANGE session={} nsid={} lba={} (NSZE) refused before SQ write/doorbell; doorbells={} unchanged\n",
+                s.session, ns.id, ns.size, rung
             ),
         ),
         _ => return Err(Error::Range),
     }
-    read_block(io, s, memory, &mut pair, &ns, ns.size - 1)?;
-    pair.close(&mut admin, io, s, memory)?;
+    let late = pair.quiet(io, &mut line, QUIET_NS, &mut stats)?;
+    let m = pair.read_masked(io, &mut line, s, memory, 0, &mut data[..size], &mut stats)?;
+    log_block(
+        s,
+        ns.id,
+        0,
+        "masked",
+        &data[..size],
+        m.posted_ns + m.unmask_ns,
+    );
     log(
         kumo_abi::sys::log_level::NOTICE,
         &alloc::format!(
-            "NV5 QUEUES session={} deleted sq=1 then cq=1; doorbells={}\n",
+            "NV6 MASKED session={} lba=0 posted-without-delivery={}us masked-deliveries={} unmask-to-reap={}us\n",
             s.session,
+            m.posted_ns / 1000,
+            m.deliveries,
+            m.unmask_ns / 1000
+        ),
+    );
+    let late = late + pair.quiet(io, &mut line, QUIET_NS, &mut stats)?;
+    mask(io)?;
+    pair.close(&mut admin, io, s, memory)?;
+    drop(line);
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV6 IRQ session={} deliveries={} entries={} empty={} late={} pre-arm={} masked={} max-per-delivery={} storm-limit={}; vector masked, sq=1/cq=1 deleted, line released; doorbells={}\n",
+            s.session,
+            stats.deliveries,
+            stats.entries,
+            stats.empty,
+            late,
+            stray,
+            m.deliveries,
+            stats.max_batch,
+            drv_nvme::intx::STORM_LIMIT,
             io.doorbells
         ),
     );
@@ -321,7 +468,7 @@ extern "C" fn main(
         fail(control, s.session, Error::Ack);
     }
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
-    let p = exercise_with(&mut io, s, memory, |io| media(io, s, memory));
+    let p = exercise_with(&mut io, s, memory, |io| media(io, s, memory, resource));
     log(
         if p.complete() {
             kumo_abi::sys::log_level::NOTICE

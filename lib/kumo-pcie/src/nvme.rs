@@ -1,5 +1,6 @@
 //j794
 //j797
+//j802
 //! NV2: the firmware-assigned BAR0 prefix, read-only. No queues, DMA or register writes.
 //! This first route supports DWC's unmatched-address MEM path only. A translated MEM
 //! route is deliberately refused until separately proven. — TIMBERDOODLE
@@ -240,6 +241,7 @@ mod tests {
             status: 0x10,
             bars: [0xf000_0004, 0, 0, 0, 0, 0],
             subsystem: 0xa801_144d,
+            interrupt: 0x100,
             cap_count: 0,
             pcie: None,
             msix: None,

@@ -1,16 +1,16 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j797 -->
 <!-- j798 -->
 <!-- j799 -->
 <!-- j800 -->
 <!-- j801 -->
+<!-- j802 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV4 are complete; NV5 adds one polled I/O queue pair and read-only
-block access. Firmware's PCIe3_4L link and enumeration lead to a
+NV0–NV5 are complete; NV6 moves the read-only I/O pair to INTx-driven
+completions. Firmware's PCIe3_4L link and enumeration lead to a
 Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
 configuration and graceful restart with two distinct owners, each reaching
 RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
@@ -18,8 +18,8 @@ observation is disabled nonsecure bypass; containment remains unimplemented.
 
 `lib/kumo-pcie`, its HAL observers and the early boot report discover the inherited
 route. `drv-nvme` owns controller operations behind Sora's narrowed Resource and
-DMA custody protocol. NV4 added polled Identify and NV5 polled reads; interrupts,
-the block service and filesystems follow.
+DMA custody protocol. NV4 added polled Identify, NV5 polled reads and NV6
+INTx completions; the block service and filesystems follow.
 The detailed local plan is PLAN/019; each journal records its own acceptance.
 
 ## D5: cooperative DMA for NV3–NV9
@@ -266,4 +266,45 @@ FIPS known answers and digests that the host's `shasum` produced for every
 padding boundary. It is an evidence digest only. Acceptance compares each
 block's digest from both KUMO owners against the firmware reference from the
 same boot. D5 remains cooperative raw DMA; Road C stays open.
+— TIMBERDOODLE
+
+## NV6 INTx completions
+
+No root-port, client or config write is needed. Firmware leaves the APB client's
+`INTR_MASK_LEGACY` at 0 (INTA–INTD open), the endpoint's Command.InterruptDisable
+clear and its Interrupt Pin at 1 (INTA). The boot report now prints the pin and the
+disable bit. Sora passes the DTB's legacy SPI as a GIC INTID (260 + 32 = 292), the
+pin and the inherited client mask in Startup frame version 2 (64 bytes). drv-nvme
+refuses to start unless INTA is open, the pin is INTA, InterruptDisable is clear and
+the INTID is an SPI. The narrowed Resource carries exactly that one IRQ. MSI-X stays
+disabled; KUMO has no ITS/LPI path.
+
+The kernel contract is DESIGN/016, unchanged. The level SPI is masked at the GIC
+when it fires and unmasked only by InterruptComplete; a dead owner's binding is
+retired (masked) at teardown, so a restarted owner can bind it again. The driver
+binds the interrupt and a private port, completes once to release any pre-bind mask,
+and waits with a one-shot timer on the same port. Wake sources are told apart by
+koid.
+
+Vector 0 is gated at the controller by INTMS/INTMC. It stays masked through Identify,
+queue creation and deletion, so admin completions never assert INTA. I/O CQ 1 is
+created with IEN=1 and IV=0. A delivery is serviced by reaping every posted entry,
+consuming its data, and writing the CQ head doorbell, which lets the controller
+deassert INTA. CSTS is then read to push that posted write to the device, and only
+after that is the interrupt completed. A delivery that reaps nothing (stray, late or
+masked) is completed and counted. More than eight such deliveries in one operation is
+a storm and fails it, leaving the kernel mask in place. A completion that posts but is
+never delivered within the command deadline is reported as an interrupt failure. Any
+failure poisons the I/O queue, and a poisoned queue, or one with a command still
+outstanding, is never deleted.
+
+The proof binds INTx with vector 0 masked and watches a 100 ms window for stray
+deliveries. It then opens the pair, unmasks vector 0, and reads LBA 0 alone. LBA 1
+and the last LBA go out under a single doorbell into two 512-byte slices of the data
+page; PRP1 may now point inside the page, dword-aligned and not crossing it. NSZE is
+refused with the doorbell count unchanged, and another window counts late deliveries.
+Last, it masks vector 0 and reads LBA 0 again. That completion must post with no
+delivery and stay undelivered for 100 ms; unmasking must then raise INTA and the entry
+must be reaped. Each block's SHA-256 is compared with the firmware Block I/O reference
+from the same boot. D5 remains cooperative raw DMA; Road C stays open.
 — TIMBERDOODLE

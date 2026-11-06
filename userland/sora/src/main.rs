@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j774
 //j795
 //j798
 //j799
 //j801
+//j802
 
 extern crate alloc;
 
@@ -3423,6 +3423,12 @@ fn nvme_startup(root: Handle, dtb_vmo: Handle, bootinfo: Handle) -> Option<drv_n
         root_command: report.dbi.as_ref()?.command as u16,
         endpoint_command: endpoint.command,
         msix_control: endpoint.msix.map_or(0, |m| m.control),
+        // NV6: the DTB's legacy SPI as a GIC INTID, the function's Interrupt Pin and
+        // the client's inherited INTx mask. Validation refuses a closed INTA; Sora
+        // never writes the client mask. — TIMBERDOODLE
+        irq: report.topology.spis.legacy.checked_add(32)?,
+        pin: endpoint.interrupt_pin(),
+        legacy_mask: report.client.as_ref()?.intr_mask_legacy,
     };
     startup.validate().ok()?;
     Some(startup)
@@ -3452,12 +3458,13 @@ fn nvme_receive(port: Handle, channel: Handle, frame: &mut [u8]) -> Option<(usiz
 /// unproven owner keeps its process/channel/VMO handles in Sora; do not recycle
 /// them merely because the child failed or timed out. — TIMBERDOODLE
 fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup) -> Option<u64> {
+    // The narrowed Resource now carries exactly one IRQ: INTx (INTID 292 on this board).
     let resource = syscall_handle(resource_create_child(
         root,
         startup.bar,
         drv_nvme::MMIO_BYTES,
-        0,
-        0,
+        startup.irq,
+        1,
     ))?;
     let recipe = SvcRecipe {
         initrd,
@@ -3536,7 +3543,7 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
         return None;
     }
     notice(&[alloc::format!(
-        "NV5 OWNER session={} process={} quiescent; DMA custody released after termination\n",
+        "NV6 OWNER session={} process={} quiescent; DMA custody released after termination\n",
         startup.session,
         process
     )
@@ -3555,13 +3562,13 @@ fn launch_nvme_admin_proof(initrd: Handle, root: Handle, dtb: Handle, bootinfo: 
             return;
         };
         if previous == Some(process) {
-            notice(&[b"NV5 restart reused process identity; refused\n"]);
+            notice(&[b"NV6 restart reused process identity; refused\n"]);
             return;
         }
         previous = Some(process);
     }
     notice(&[
-        b"NV5 RESTART two distinct owners quiesced; read-only I/O pair evidence is in their logs\n",
+        b"NV6 RESTART two distinct owners quiesced and released INTx; interrupt evidence is in their logs\n",
     ]);
 }
 

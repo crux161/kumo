@@ -1,5 +1,6 @@
 //j793
 //j794
+//j802
 //! NV1a: read one firmware-enumerated NVMe function. No config-space writes or BAR sizing.
 //! Layouts are cross-checked against the local PCIe TRM and Linux's pci_regs.h; no Linux code
 //! is copied. Unknown routing, unsafe error response and malformed capabilities stay inert.
@@ -259,6 +260,8 @@ pub struct Endpoint {
     pub status: u16,
     pub bars: [u32; 6],
     pub subsystem: u32,
+    /// Header dword 0x3c: Interrupt Line [7:0], Interrupt Pin [15:8] (1 = INTA).
+    pub interrupt: u32,
     pub cap_count: u8,
     pub pcie: Option<Pcie>,
     pub msix: Option<Msix>,
@@ -302,6 +305,7 @@ pub fn probe(report: &Report, io: &mut impl ConfigRead) -> Result<Endpoint, Erro
         status: (command_status >> 16) as u16,
         bars: core::array::from_fn(|i| io.read32(0x10 + i as u16 * 4)),
         subsystem: io.read32(0x2c),
+        interrupt: io.read32(0x3c),
         cap_count: 0,
         pcie: None,
         msix: None,
@@ -423,14 +427,22 @@ impl fmt::Display for Bar {
     }
 }
 
+impl Endpoint {
+    /// Interrupt Pin: 0 none, 1–4 INTA–INTD; anything else is malformed.
+    pub fn interrupt_pin(&self) -> u8 {
+        (self.interrupt >> 8) as u8
+    }
+}
+
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "NV1 CONFIG       Check     {:02x}:00.0 via={:#x} page=4096 region={} shifted={} read-only   OK",
             self.page.bus, self.page.physical, self.page.region, self.page.shifted as u8)?;
-        writeln!(f, "NV1 ENDPOINT     Check     id={:04x}:{:04x} class={:06x} rev={:#x} header={:#x} cmd={:#x} mse={} bme={} status={:#x} subsys={:04x}:{:04x}   OK",
+        writeln!(f, "NV1 ENDPOINT     Check     id={:04x}:{:04x} class={:06x} rev={:#x} header={:#x} cmd={:#x} mse={} bme={} intx-disable={} status={:#x} subsys={:04x}:{:04x} pin={} line={:#x}   OK",
             self.id as u16, self.id >> 16, self.class_revision >> 8, self.class_revision as u8,
-            self.header, self.command, ((self.command >> 1) & 1), ((self.command >> 2) & 1), self.status,
-            self.subsystem as u16, self.subsystem >> 16)?;
+            self.header, self.command, ((self.command >> 1) & 1), ((self.command >> 2) & 1),
+            (self.command >> 10) & 1, self.status, self.subsystem as u16, self.subsystem >> 16,
+            self.interrupt_pin(), self.interrupt as u8)?;
         writeln!(f, "NV1 BARS         Check     raw={:08x}/{:08x}/{:08x}/{:08x}/{:08x}/{:08x} bar0={} sizes not probed   OK",
             self.bars[0], self.bars[1], self.bars[2], self.bars[3], self.bars[4], self.bars[5], decode_bar(&self.bars, 0).map_err(|_|fmt::Error)?)?;
         if let Some(cap) = self.pcie {
@@ -516,6 +528,7 @@ mod tests {
                 (0x14, 9),
                 (0x2c, 0xa501_144d),
                 (0x34, 0x40),
+                (0x3c, 0x0100),
                 (0x40, 0x0003_5001),
                 (0x44, 0),
                 (0x50, 0x0002_7010),
@@ -629,10 +642,12 @@ mod tests {
         let text = format!("{e}");
         assert!(text.contains("mem64@0x920000000"));
         assert!(text.contains("vectors=16"));
+        assert_eq!(e.interrupt_pin(), 1);
+        assert!(text.contains("intx-disable=0") && text.contains("pin=1"));
         assert!(text.lines().all(|l| l.len() < 240), "{text}");
         assert_eq!(
             f.reads,
-            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 44, 52, 64, 68, 80, 92, 96, 112, 116, 120]
+            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 44, 60, 52, 64, 68, 80, 92, 96, 112, 116, 120]
         );
     }
     #[test]

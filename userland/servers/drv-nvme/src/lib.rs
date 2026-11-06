@@ -3,7 +3,9 @@
 //j798
 //j799
 //j801
-//! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a) and one polled I/O pair (NV5).
+//j802
+//! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5) and its
+//! INTx-driven completions (NV6).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
 //! — TIMBERDOODLE
 
@@ -14,9 +16,10 @@ pub const PAGE: u64 = 4096;
 pub const DMA_BYTES: u64 = 5 * PAGE;
 pub const MMIO_BYTES: u64 = 2 * PAGE;
 pub mod admin;
+pub mod intx;
 pub mod io;
 pub const DEPTH: u16 = 32;
-pub const BOOT_LEN: usize = 56;
+pub const BOOT_LEN: usize = 64;
 pub const MEMORY_LEN: usize = 32;
 pub const PROOF_LEN: usize = 80;
 pub const ACK: u8 = b'A';
@@ -44,6 +47,8 @@ pub enum Error {
     Command = 15,
     Data = 16,
     Range = 17,
+    Interrupt = 18,
+    Storm = 19,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,6 +70,8 @@ impl fmt::Display for Error {
             Self::Command => "admin command failed",
             Self::Data => "invalid or unsupported Identify data",
             Self::Range => "LBA range outside the namespace or one page",
+            Self::Interrupt => "INTx bind/wait/complete failed or a completion had no delivery",
+            Self::Storm => "INTx deliveries without progress beyond the storm bound",
         })
     }
 }
@@ -92,6 +99,12 @@ pub struct Startup {
     pub root_command: u16,
     pub endpoint_command: u16,
     pub msix_control: u16,
+    /// INTx (NV6): the root's legacy INTID, the endpoint's Interrupt Pin, and the APB
+    /// client's inherited INTR_MASK_LEGACY. KUMO never writes the client mask; INTA
+    /// must already be open (bit 0 clear) or the owner refuses. — TIMBERDOODLE
+    pub irq: u32,
+    pub pin: u8,
+    pub legacy_mask: u32,
 }
 impl Startup {
     pub fn validate(&self) -> Result<(), Error> {
@@ -102,6 +115,10 @@ impl Startup {
             || self.root_command & 6 != 6
             || self.endpoint_command & 6 != 6
             || self.msix_control & (1 << 15) != 0
+            || self.endpoint_command & (1 << 10) != 0
+            || self.pin != 1
+            || !(32..1020).contains(&self.irq)
+            || self.legacy_mask & 1 != 0
         {
             return Err(Error::Bootstrap);
         }
@@ -125,7 +142,7 @@ impl Startup {
     pub fn encode(&self) -> [u8; BOOT_LEN] {
         let mut b = [0; BOOT_LEN];
         b[..8].copy_from_slice(b"NVM3BOOT");
-        put32(&mut b, 8, 1);
+        put32(&mut b, 8, 2);
         put32(&mut b, 12, self.session);
         put64(&mut b, 16, self.bar);
         put64(&mut b, 24, self.cap);
@@ -139,13 +156,17 @@ impl Startup {
         ] {
             b[i..i + 2].copy_from_slice(&v.to_le_bytes());
         }
+        b[50] = self.pin;
+        put32(&mut b, 52, self.irq);
+        put32(&mut b, 56, self.legacy_mask);
         b
     }
     pub fn decode(b: &[u8]) -> Option<Self> {
         if b.len() != BOOT_LEN
             || &b[..8] != b"NVM3BOOT"
-            || u32at(b, 8) != 1
-            || b[50..].iter().any(|&v| v != 0)
+            || u32at(b, 8) != 2
+            || b[51] != 0
+            || b[60..].iter().any(|&v| v != 0)
         {
             return None;
         }
@@ -159,6 +180,9 @@ impl Startup {
             root_command: u16::from_le_bytes(b[44..46].try_into().ok()?),
             endpoint_command: u16::from_le_bytes(b[46..48].try_into().ok()?),
             msix_control: u16::from_le_bytes(b[48..50].try_into().ok()?),
+            pin: b[50],
+            irq: u32at(b, 52),
+            legacy_mask: u32at(b, 56),
         };
         s.validate().ok()?;
         Some(s)
@@ -471,6 +495,9 @@ mod tests {
             root_command: 7,
             endpoint_command: 6,
             msix_control: 32,
+            irq: 292,
+            pin: 1,
+            legacy_mask: 0,
         }
     }
     fn memory() -> Memory {
@@ -639,7 +666,7 @@ mod tests {
     #[test]
     fn bad_capability_custody_or_allocation_never_writes() {
         let mut cases = Vec::new();
-        for field in 0..6 {
+        for field in 0..10 {
             let mut s = startup();
             match field {
                 0 => s.cap = 0,
@@ -647,6 +674,10 @@ mod tests {
                 2 => s.msix_control |= 1 << 15,
                 3 => s.endpoint_command = 2,
                 4 => s.cap |= 1 << 48,
+                5 => s.endpoint_command |= 1 << 10,
+                6 => s.pin = 2,
+                7 => s.irq = 31,
+                8 => s.legacy_mask = 0xffff,
                 _ => s.cap &= !0xffff,
             };
             cases.push((s, memory()));
@@ -691,10 +722,12 @@ mod tests {
         let s = startup();
         assert_eq!(Startup::decode(&s.encode()), Some(s));
         assert_eq!(Memory::decode(&memory().encode()), Some(memory()));
-        let mut b = s.encode();
-        b[50] = 1;
-        assert!(Startup::decode(&b).is_none());
-        assert!(Startup::decode(&b[..55]).is_none());
+        for (at, value) in [(8, 1), (51, 1), (60, 1), (50, 0)] {
+            let mut b = s.encode();
+            b[at] = value;
+            assert!(Startup::decode(&b).is_none(), "byte {at}");
+        }
+        assert!(Startup::decode(&s.encode()[..63]).is_none());
         let mut io = Fake::new();
         let p = exercise(&mut io, s, memory());
         assert!(p.releases(memory()));

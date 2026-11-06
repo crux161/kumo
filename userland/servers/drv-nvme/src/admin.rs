@@ -64,10 +64,12 @@ pub struct Completion {
 }
 
 //j801
-/// One outstanding polled command on one SQ/CQ pair inside the DMA allocation.
-/// The admin pair is qid 0 at pages 0/1; NV5's I/O pair is qid 1 at pages 3/4.
-/// Both share the single data page, which is safe only because at most one
-/// command is outstanding across all queues. — TIMBERDOODLE
+//j802
+/// Commands on one SQ/CQ pair inside the DMA allocation. The admin pair is qid 0 at
+/// pages 0/1; the I/O pair is qid 1 at pages 3/4. Polled `submit` keeps one command
+/// in flight across all queues and zeroes the whole shared data page; NV6's interrupt
+/// path stages several reads into disjoint slices of it and reaps them with `take`.
+/// Any failed step poisons the instance permanently. — TIMBERDOODLE
 pub struct Queue {
     qid: u16,
     sq: u64,
@@ -76,6 +78,7 @@ pub struct Queue {
     head: u16,
     phase: u32,
     cid: u16,
+    outstanding: u16,
     poisoned: bool,
 }
 pub type AdminQueue = Queue;
@@ -84,6 +87,21 @@ impl Default for Queue {
         Self::new()
     }
 }
+
+/// One reaped completion queue entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Entry {
+    pub cid: u16,
+    pub status: u16,
+    pub sqhd: u16,
+    pub result: u32,
+}
+impl Entry {
+    pub fn failed(&self) -> bool {
+        (self.status >> 1) & 0x7ff != 0
+    }
+}
+
 impl Queue {
     /// Requires a newly enabled controller with zeroed CQ phase bits.
     pub const fn new() -> Self {
@@ -99,11 +117,131 @@ impl Queue {
             head: 0,
             phase: 1,
             cid: 1,
+            outstanding: 0,
             poisoned: false,
         }
     }
     pub fn poisoned(&self) -> bool {
         self.poisoned
+    }
+    pub fn outstanding(&self) -> u16 {
+        self.outstanding
+    }
+    /// Stop the instance after a failure outside its own steps (a lost delivery).
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn guarded<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.poisoned {
+            return Err(Error::State);
+        }
+        // Any unproven step permanently stops this queue instance. — TIMBERDOODLE
+        self.poisoned = true;
+        let result = step(self);
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+
+    /// Write one SQE (CID field zero; the queue assigns it) without ringing the
+    /// doorbell. One slot always stays empty, as the full-queue rule requires.
+    pub fn stage(
+        &mut self,
+        io: &mut impl AdminIo,
+        s: Startup,
+        memory: Memory,
+        mut words: [u32; 16],
+    ) -> Result<u16, Error> {
+        self.guarded(|q| {
+            s.validate()?;
+            if !memory.valid() || memory.session != s.session {
+                return Err(Error::Memory);
+            }
+            if words[0] >> 16 != 0 || q.outstanding >= DEPTH - 1 {
+                return Err(Error::Command);
+            }
+            let cid = q.cid;
+            words[0] |= u32::from(cid) << 16;
+            let slot = q.sq + u64::from(q.tail) * 64;
+            for (i, word) in words.into_iter().enumerate() {
+                io.dma_write32(slot + i as u64 * 4, word);
+            }
+            q.tail = (q.tail + 1) % DEPTH;
+            q.cid = q.cid.wrapping_add(1);
+            q.outstanding += 1;
+            Ok(cid)
+        })
+    }
+
+    /// Publish every staged SQE with one tail doorbell write.
+    pub fn ring(&mut self, io: &mut impl AdminIo) -> Result<(), Error> {
+        self.guarded(|q| {
+            if io.read32(CSTS) & 3 != 1 {
+                return Err(Error::Fatal);
+            }
+            io.barrier();
+            io.write32(sq_tail(q.qid), u32::from(q.tail));
+            io.barrier();
+            Ok(())
+        })
+    }
+
+    /// True when the CQE at the head carries the current phase. Consumes nothing.
+    pub fn ready(&mut self, io: &mut impl AdminIo) -> Result<bool, Error> {
+        self.guarded(|q| {
+            if io.read32(CSTS) & 3 != 1 {
+                return Err(Error::Fatal);
+            }
+            let last = io.dma_read32(q.cq + u64::from(q.head) * 16 + 12);
+            Ok((last >> 16) & 1 == q.phase)
+        })
+    }
+
+    /// Reap the CQE at the head if its phase is current. The head advances, but the
+    /// CQ head doorbell is written only by `release`, after the caller has used the
+    /// entry. An entry naming another SQ, an impossible SQHD or arriving with nothing
+    /// outstanding poisons the queue.
+    pub fn take(&mut self, io: &mut impl AdminIo) -> Result<Option<Entry>, Error> {
+        self.guarded(|q| {
+            if io.read32(CSTS) & 3 != 1 {
+                return Err(Error::Fatal);
+            }
+            let completion = q.cq + u64::from(q.head) * 16;
+            let last = io.dma_read32(completion + 12);
+            if (last >> 16) & 1 != q.phase {
+                return Ok(None);
+            }
+            io.dma_acquire();
+            let queue = io.dma_read32(completion + 8);
+            if queue >> 16 != u32::from(q.qid) || queue as u16 >= DEPTH || q.outstanding == 0 {
+                return Err(Error::Completion);
+            }
+            let entry = Entry {
+                cid: last as u16,
+                status: (last >> 16) as u16,
+                sqhd: queue as u16,
+                result: io.dma_read32(completion),
+            };
+            q.head = (q.head + 1) % DEPTH;
+            if q.head == 0 {
+                q.phase ^= 1;
+            }
+            q.outstanding -= 1;
+            Ok(Some(entry))
+        })
+    }
+
+    /// Hand every reaped CQ slot back to the controller. For pin interrupts this is
+    /// also what lets the controller deassert INTx. — TIMBERDOODLE
+    pub fn release(&mut self, io: &mut impl AdminIo) -> Result<(), Error> {
+        self.guarded(|q| {
+            io.barrier();
+            io.write32(cq_head(q.qid), u32::from(q.head));
+            io.barrier();
+            Ok(())
+        })
     }
 
     pub fn identify(
@@ -121,9 +259,9 @@ impl Queue {
         self.submit(io, s, memory, words, output)
     }
 
-    /// Submit `words` (CID field zero; the queue assigns it) and wait for its
-    /// completion. `output` receives the first `output.len()` bytes of the data
-    /// page. Validation that touches no queue memory happens before this call.
+    /// Submit `words` (CID field zero) and poll for its completion; `output` gets the
+    /// first `output.len()` bytes of the data page. Requires an idle queue. Validation
+    /// that touches no queue memory happens before this call.
     pub fn submit(
         &mut self,
         io: &mut impl AdminIo,
@@ -135,11 +273,9 @@ impl Queue {
         if self.poisoned {
             return Err(Error::State);
         }
-        // Any unproven command permanently stops this queue instance. — TIMBERDOODLE
-        self.poisoned = true;
         let result = self.submit_inner(io, s, memory, words, output);
-        if result.is_ok() {
-            self.poisoned = false;
+        if result.is_err() {
+            self.poisoned = true;
         }
         result
     }
@@ -149,17 +285,20 @@ impl Queue {
         io: &mut impl AdminIo,
         s: Startup,
         memory: Memory,
-        mut words: [u32; 16],
+        words: [u32; 16],
         output: &mut [u8],
     ) -> Result<Completion, Error> {
         s.validate()?;
         if !memory.valid() || memory.session != s.session {
             return Err(Error::Memory);
         }
-        if output.len() > PAGE as usize || output.len() % 4 != 0 || words[0] >> 16 != 0 {
+        if output.len() > PAGE as usize
+            || output.len() % 4 != 0
+            || words[0] >> 16 != 0
+            || self.outstanding != 0
+        {
             return Err(Error::Command);
         }
-        words[0] |= u32::from(self.cid) << 16;
         let begin = start(io)?;
         let deadline = begin.checked_add(COMMAND_TIMEOUT_NS).ok_or(Error::Clock)?;
         if io.read32(CSTS) & 3 != 1 {
@@ -168,60 +307,32 @@ impl Queue {
         for off in (DATA..DATA + PAGE).step_by(4) {
             io.dma_write32(off, 0);
         }
-        let slot = self.sq + u64::from(self.tail) * 64;
-        for (i, word) in words.into_iter().enumerate() {
-            io.dma_write32(slot + i as u64 * 4, word);
-        }
-        self.tail = (self.tail + 1) % DEPTH;
-        io.barrier();
-        io.write32(sq_tail(self.qid), u32::from(self.tail));
-        io.barrier();
-        let completion = self.cq + u64::from(self.head) * 16;
+        let cid = self.stage(io, s, memory, words)?;
+        self.ring(io)?;
         let mut delay = 1_000_000;
         for _ in 0..4096 {
-            if io.read32(CSTS) & 3 != 1 {
-                return Err(Error::Fatal);
-            }
-            let last = io.dma_read32(completion + 12);
+            let entry = self.take(io)?;
             let now = start(io)?;
             if now < begin {
                 return Err(Error::Clock);
             }
-            if now > deadline {
-                return Err(Error::Timeout);
-            }
-            if (last >> 16) & 1 == self.phase {
-                io.dma_acquire();
-                let queue = io.dma_read32(completion + 8);
-                if last as u16 != self.cid
-                    || queue >> 16 != u32::from(self.qid)
-                    || queue as u16 != self.tail
-                {
+            if let Some(e) = entry {
+                if e.cid != cid || e.sqhd != self.tail {
                     return Err(Error::Completion);
                 }
-                let status = (last >> 16) as u16;
-                if (status >> 1) & 0x7ff != 0 {
+                if e.failed() {
                     return Err(Error::Command);
                 }
-                let result = io.dma_read32(completion);
                 for (i, out) in output.chunks_exact_mut(4).enumerate() {
                     out.copy_from_slice(&io.dma_read32(DATA + i as u64 * 4).to_le_bytes());
                 }
-                self.head = (self.head + 1) % DEPTH;
-                if self.head == 0 {
-                    self.phase ^= 1;
-                }
-                io.barrier();
-                io.write32(cq_head(self.qid), u32::from(self.head));
-                io.barrier();
-                let answer = Completion {
-                    cid: self.cid,
-                    status,
-                    result,
+                self.release(io)?;
+                return Ok(Completion {
+                    cid,
+                    status: e.status,
+                    result: e.result,
                     elapsed_ns: now - begin,
-                };
-                self.cid = self.cid.wrapping_add(1);
-                return Ok(answer);
+                });
             }
             if now >= deadline {
                 return Err(Error::Timeout);
@@ -389,6 +500,9 @@ mod tests {
             root_command: 7,
             endpoint_command: 6,
             msix_control: 32,
+            irq: 292,
+            pin: 1,
+            legacy_mask: 0,
         }
     }
     fn memory() -> Memory {
