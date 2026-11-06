@@ -2,16 +2,19 @@
 #![deny(unsafe_code)]
 //j798
 //j799
-//! Legacy NVM admin lifecycle and polled Identify (NV3/NV4a).
+//j801
+//! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a) and one polled I/O pair (NV5).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
 //! — TIMBERDOODLE
 
 use core::fmt;
 
 pub const PAGE: u64 = 4096;
-pub const DMA_BYTES: u64 = 3 * PAGE;
+/// Admin SQ, admin CQ, data page, I/O SQ, I/O CQ.
+pub const DMA_BYTES: u64 = 5 * PAGE;
 pub const MMIO_BYTES: u64 = 2 * PAGE;
 pub mod admin;
+pub mod io;
 pub const DEPTH: u16 = 32;
 pub const BOOT_LEN: usize = 56;
 pub const MEMORY_LEN: usize = 32;
@@ -40,6 +43,7 @@ pub enum Error {
     Completion = 14,
     Command = 15,
     Data = 16,
+    Range = 17,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -60,6 +64,7 @@ impl fmt::Display for Error {
             Self::Completion => "completion identity/queue disagrees",
             Self::Command => "admin command failed",
             Self::Data => "invalid or unsupported Identify data",
+            Self::Range => "LBA range outside the namespace or one page",
         })
     }
 }
@@ -706,18 +711,20 @@ mod tests {
         assert!(!Proof { final_csts: 1, ..p }.complete());
         assert!(!Proof { status: 9, ..p }.complete());
         assert!(Memory {
-            physical: 0xffff_d000,
+            physical: 0xffff_b000,
             ..memory()
         }
         .valid());
         assert!(!Memory {
-            physical: 0xffff_e000,
+            physical: 0xffff_c000,
             ..memory()
         }
         .valid());
-        let mut old = memory().encode();
-        put64(&mut old, 24, 8192);
-        assert!(Memory::decode(&old).is_none());
+        for extent in [8192, 12288] {
+            let mut old = memory().encode();
+            put64(&mut old, 24, extent);
+            assert!(Memory::decode(&old).is_none());
+        }
     }
 
     #[test]

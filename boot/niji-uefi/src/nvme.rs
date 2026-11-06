@@ -1,7 +1,10 @@
 //j800
+//j801
 //! UEFI NVMe PassThru bindings and reference decoding, independent of drv-nvme.
 //! UEFI 2.10 §13.15 and TianoCore MdePkg/Include/Protocol/NvmExpressPassthru.h.
-//! Identify only; firmware owns queue transport and DMA mapping. — TIMBERDOODLE
+//! Identify only through PassThru; firmware owns queue transport and DMA mapping.
+//! NV5 media reads go through the namespace's Block I/O (UEFI 2.10 §13.9), so the
+//! LBA-to-command encoding is EDK2's, not KUMO's. No write entry is callable. — TIMBERDOODLE
 
 use core::{ffi::c_void, fmt, ptr};
 pub const PAGE: usize = 4096;
@@ -235,6 +238,121 @@ impl fmt::Display for Namespace {
     }
 }
 
+/// `EFI_BLOCK_IO_MEDIA` revision-1 prefix; later revisions only append fields.
+#[repr(C)]
+pub struct BlockIoMedia {
+    pub media_id: u32,
+    pub removable: u8,
+    pub present: u8,
+    pub logical_partition: u8,
+    pub read_only: u8,
+    pub write_caching: u8,
+    pub block_size: u32,
+    pub io_align: u32,
+    pub last_block: u64,
+}
+/// `EFI_BLOCK_IO_PROTOCOL`. WriteBlocks and FlushBlocks stay opaque pointers, so
+/// this binding cannot issue a media write. — TIMBERDOODLE
+#[repr(C)]
+pub struct BlockIo {
+    pub revision: u64,
+    pub media: *const BlockIoMedia,
+    pub reset: *const c_void,
+    pub read_blocks: unsafe extern "efiapi" fn(*mut BlockIo, u32, u64, usize, *mut c_void) -> usize,
+    pub write_blocks: *const c_void,
+    pub flush_blocks: *const c_void,
+}
+/// Bound for walking a firmware device path.
+pub const PATH_MAX: usize = 1024;
+
+/// NSID of a whole-namespace device path: its last node before End-Entire is a
+/// 16-byte NVMe Namespace node (Messaging 03h/17h). A partition child has a Media
+/// node after it and yields None, as does any malformed or unterminated path.
+pub fn whole_namespace(path: &[u8]) -> Option<u32> {
+    let mut at = 0;
+    let mut last: Option<(u8, u8, &[u8])> = None;
+    while at + 4 <= path.len() {
+        let (kind, sub) = (path[at], path[at + 1]);
+        let len = usize::from(u16::from_le_bytes([path[at + 2], path[at + 3]]));
+        if len < 4 || at + len > path.len() {
+            return None;
+        }
+        if (kind, sub) == (0x7f, 0xff) {
+            let (k, s, node) = last?;
+            return ((k, s) == (3, 0x17) && node.len() == 16)
+                .then(|| le32(node, 4))
+                .filter(|&n| n != 0 && n != u32::MAX);
+        }
+        last = Some((kind, sub, &path[at..at + len]));
+        at += len;
+    }
+    None
+}
+
+/// Length of a firmware device path, End-Entire included, bounded by PATH_MAX.
+///
+/// # Safety
+/// `path` must point at a readable device path.
+pub unsafe fn path_len(path: *const u8) -> Option<usize> {
+    if path.is_null() {
+        return None;
+    }
+    let mut at = 0;
+    while at + 4 <= PATH_MAX {
+        let head = unsafe { ptr::read_unaligned(path.add(at).cast::<[u8; 4]>()) };
+        let len = usize::from(u16::from_le_bytes([head[2], head[3]]));
+        if len < 4 || at + len > PATH_MAX {
+            return None;
+        }
+        at += len;
+        if (head[0], head[1]) == (0x7f, 0xff) {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// The Block I/O media must describe the same namespace Identify reported:
+/// present, not a partition, LBA size and last LBA equal, usable alignment.
+pub fn media_matches(m: &BlockIoMedia, ns: &Namespace) -> bool {
+    m.present == 1
+        && m.logical_partition == 0
+        && u64::from(m.block_size) == ns.lba
+        && ns.lba <= PAGE as u64
+        && m.last_block.checked_add(1) == Some(ns.size)
+        && (m.io_align <= 1 || (m.io_align.is_power_of_two() && m.io_align <= PAGE as u32))
+}
+
+/// Read exactly one block with firmware's ReadBlocks.
+///
+/// # Safety
+/// `bio` is a live Block I/O instance whose media passed `media_matches`, and
+/// `buffer` is a page-aligned PAGE-byte allocation retained through completion.
+/// An error is not permission to recycle the buffer. — TIMBERDOODLE
+pub unsafe fn read_block(bio: *mut BlockIo, lba: u64, buffer: *mut u8) -> Result<(), Error> {
+    if bio.is_null() || buffer.is_null() || buffer as usize & (PAGE - 1) != 0 {
+        return Err(Error::Input);
+    }
+    let media = unsafe { &*(*bio).media };
+    if lba > media.last_block || media.block_size == 0 || media.block_size as usize > PAGE {
+        return Err(Error::Input);
+    }
+    let call = unsafe { (*bio).read_blocks };
+    let status = unsafe {
+        call(
+            bio,
+            media.media_id,
+            lba,
+            media.block_size as usize,
+            buffer.cast(),
+        )
+    };
+    if status != 0 {
+        return Err(Error::Firmware(status));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -403,5 +521,122 @@ mod tests {
         b[26] = 0;
         b[..8].fill(255);
         assert!(Namespace::parse(1, &b).is_err());
+    }
+    unsafe extern "efiapi" fn read_blocks(
+        this: *mut BlockIo,
+        media_id: u32,
+        lba: u64,
+        size: usize,
+        buffer: *mut c_void,
+    ) -> usize {
+        let media = unsafe { &*(*this).media };
+        assert_eq!(media_id, media.media_id);
+        assert_eq!(size, 512);
+        assert!(lba <= media.last_block);
+        if lba == 7 {
+            return 7usize | (1usize << 63);
+        }
+        let out = buffer.cast::<u8>();
+        for i in 0..size {
+            unsafe { out.add(i).write((lba as usize * 3 + i) as u8) };
+        }
+        0
+    }
+    #[test]
+    fn block_io_layout_and_read_only_contract() {
+        assert_eq!(offset_of!(BlockIoMedia, removable), 4);
+        assert_eq!(offset_of!(BlockIoMedia, write_caching), 8);
+        assert_eq!(offset_of!(BlockIoMedia, block_size), 12);
+        assert_eq!(offset_of!(BlockIoMedia, io_align), 16);
+        assert_eq!(offset_of!(BlockIoMedia, last_block), 24);
+        assert_eq!(offset_of!(BlockIo, media), 8);
+        assert_eq!(offset_of!(BlockIo, read_blocks), 24);
+        assert_eq!(offset_of!(BlockIo, write_blocks), 32);
+        assert_eq!(size_of::<BlockIo>(), 48);
+        let media = BlockIoMedia {
+            media_id: 9,
+            removable: 0,
+            present: 1,
+            logical_partition: 0,
+            read_only: 0,
+            write_caching: 1,
+            block_size: 512,
+            io_align: 8,
+            last_block: 976773167,
+        };
+        let mut bio = BlockIo {
+            revision: 0x2001f,
+            media: &media,
+            reset: ptr::null(),
+            read_blocks,
+            write_blocks: ptr::null(),
+            flush_blocks: ptr::null(),
+        };
+        let mut page = Page([0; PAGE]);
+        assert_eq!(
+            unsafe { read_block(&mut bio, 1, page.0.as_mut_ptr()) },
+            Ok(())
+        );
+        assert!((0..512).all(|i| page.0[i] == (3 + i) as u8));
+        assert!(page.0[512..].iter().all(|&b| b == 0));
+        assert!(matches!(
+            unsafe { read_block(&mut bio, 7, page.0.as_mut_ptr()) },
+            Err(Error::Firmware(_))
+        ));
+        for (lba, offset) in [(976773168, 0), (0, 1)] {
+            assert_eq!(
+                unsafe { read_block(&mut bio, lba, page.0.as_mut_ptr().wrapping_add(offset)) },
+                Err(Error::Input)
+            );
+        }
+    }
+    #[test]
+    fn whole_namespace_path_and_media_must_match_identify() {
+        let mut pci = std::vec![1u8, 1, 6, 0, 0, 0];
+        let nvme = [3u8, 0x17, 16, 0, 1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let end = [0x7fu8, 0xff, 4, 0];
+        pci.extend_from_slice(&nvme);
+        let mut whole = pci.clone();
+        whole.extend_from_slice(&end);
+        assert_eq!(whole_namespace(&whole), Some(1));
+        assert_eq!(unsafe { path_len(whole.as_ptr()) }, Some(whole.len()));
+        let mut part = pci.clone();
+        part.extend_from_slice(&[4u8, 1, 42, 0]);
+        part.extend_from_slice(&[0; 38]);
+        part.extend_from_slice(&end);
+        assert_eq!(whole_namespace(&part), None);
+        assert_eq!(whole_namespace(&whole[..whole.len() - 4]), None);
+        let mut bad = whole.clone();
+        bad[2] = 2;
+        assert_eq!(whole_namespace(&bad), None);
+        assert_eq!(whole_namespace(&end), None);
+        let mut b = [0; PAGE];
+        b[..8].copy_from_slice(&976773168u64.to_le_bytes());
+        b[8..16].copy_from_slice(&976773168u64.to_le_bytes());
+        b[130] = 9;
+        let ns = Namespace::parse(1, &b).unwrap();
+        let mut m = BlockIoMedia {
+            media_id: 0,
+            removable: 0,
+            present: 1,
+            logical_partition: 0,
+            read_only: 0,
+            write_caching: 0,
+            block_size: 512,
+            io_align: 8,
+            last_block: 976773167,
+        };
+        assert!(media_matches(&m, &ns));
+        m.last_block += 1;
+        assert!(!media_matches(&m, &ns));
+        m.last_block -= 1;
+        m.logical_partition = 1;
+        assert!(!media_matches(&m, &ns));
+        m.logical_partition = 0;
+        m.block_size = 4096;
+        assert!(!media_matches(&m, &ns));
+        m.block_size = 512;
+        m.io_align = 3;
+        assert!(!media_matches(&m, &ns));
     }
 }

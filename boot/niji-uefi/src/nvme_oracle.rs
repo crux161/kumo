@@ -1,14 +1,21 @@
 //j800
-//! Default-off pre-EBS Identify reference through firmware's NVMe queues.
-//! No drv-nvme dependency, media command or direct controller write. — TIMBERDOODLE
-use crate::{efi_memory_type, guid, print_line, EfiBootServices, EfiSimpleTextOutputProtocol};
+//j801
+//! Default-off pre-EBS Identify reference through firmware's NVMe queues, then
+//! (NV5) LBA 0, LBA 1 and the last LBA through firmware's whole-namespace Block I/O.
+//! No drv-nvme dependency, media write or direct controller write. — TIMBERDOODLE
+use crate::{
+    efi_memory_type, guid, print_line, EfiBootServices, EfiHandle, EfiSimpleTextOutputProtocol,
+};
 use core::{ffi::c_void, ptr};
-use niji_uefi::nvme::{self, Controller, Namespace, Protocol, PAGE};
+use kumo_sha256::{digest, Hex};
+use niji_uefi::nvme::{self, BlockIo, Controller, Namespace, Protocol, PAGE};
+
+const BY_PROTOCOL: u32 = 2;
 
 fn halt(con: *mut EfiSimpleTextOutputProtocol, error: nvme::Error) -> ! {
     print_line(
         con,
-        format_args!("NV4 UEFI failed: {error:?}; buffers retained, reset required\r\n"),
+        format_args!("NVMe UEFI oracle failed: {error:?}; buffers retained, reset required\r\n"),
     );
     // Unknown completion never reaches EBS/OS memory reuse. — TIMBERDOODLE
     loop {
@@ -19,6 +26,131 @@ unsafe fn snapshot(buffer: *mut u8, output: &mut [u8; PAGE]) {
     for (i, b) in output.iter_mut().enumerate() {
         *b = unsafe { ptr::read_volatile(buffer.add(i)) };
     }
+}
+
+/// The one Block I/O whose device path ends at NVMe namespace `nsid`; partition
+/// children and any second match make the reference unavailable. — TIMBERDOODLE
+unsafe fn whole_namespace_block_io(
+    bs: *mut EfiBootServices,
+    nsid: u32,
+) -> Result<*mut BlockIo, &'static str> {
+    let block_io = guid(
+        0x964e5b21,
+        0x6459,
+        0x11d2,
+        [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+    );
+    let device_path = guid(
+        0x09576e91,
+        0x6d3f,
+        0x11d2,
+        [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+    );
+    let mut count = 0usize;
+    let mut handles: *mut EfiHandle = ptr::null_mut();
+    let status = unsafe {
+        ((*bs).locate_handle_buffer)(
+            BY_PROTOCOL,
+            &block_io,
+            ptr::null_mut(),
+            &mut count,
+            &mut handles,
+        )
+    };
+    if status != 0 || handles.is_null() {
+        return Err("no Block I/O handles");
+    }
+    let mut found: *mut BlockIo = ptr::null_mut();
+    let mut matches = 0;
+    for i in 0..count {
+        let handle = unsafe { *handles.add(i) };
+        let mut path: *mut c_void = ptr::null_mut();
+        if unsafe { ((*bs).handle_protocol)(handle, &device_path, &mut path) } != 0 {
+            continue;
+        }
+        let Some(len) = (unsafe { nvme::path_len(path.cast()) }) else {
+            continue;
+        };
+        let bytes = unsafe { core::slice::from_raw_parts(path.cast::<u8>(), len) };
+        if nvme::whole_namespace(bytes) != Some(nsid) {
+            continue;
+        }
+        let mut bio: *mut c_void = ptr::null_mut();
+        if unsafe { ((*bs).handle_protocol)(handle, &block_io, &mut bio) } != 0 || bio.is_null() {
+            continue;
+        }
+        matches += 1;
+        found = bio.cast();
+    }
+    let _ = unsafe { ((*bs).free_pool)(handles.cast()) };
+    match matches {
+        1 => Ok(found),
+        0 => Err("no whole-namespace Block I/O"),
+        _ => Err("more than one whole-namespace Block I/O"),
+    }
+}
+
+/// NV5 media reference. Geometry is cross-checked against Identify before the
+/// first read; a failed read halts with the page retained. — TIMBERDOODLE
+unsafe fn media_reference(
+    bs: *mut EfiBootServices,
+    con: *mut EfiSimpleTextOutputProtocol,
+    ns: &Namespace,
+    buffer: *mut u8,
+) {
+    let bio = match unsafe { whole_namespace_block_io(bs, ns.id) } {
+        Ok(bio) => bio,
+        Err(why) => {
+            print_line(con, format_args!("NV5 UEFI unavailable: {why}\r\n"));
+            return;
+        }
+    };
+    let media = unsafe { &*(*bio).media };
+    print_line(
+        con,
+        format_args!(
+            "NV5 UEFI BLOCKIO rev={:#x} media={} block={} last={} align={} ro={}\r\n",
+            unsafe { (*bio).revision },
+            media.media_id,
+            media.block_size,
+            media.last_block,
+            media.io_align,
+            media.read_only
+        ),
+    );
+    if !nvme::media_matches(media, ns) {
+        print_line(
+            con,
+            format_args!("NV5 UEFI unavailable: Block I/O geometry differs from Identify\r\n"),
+        );
+        return;
+    }
+    let mut data = [0; PAGE];
+    for lba in [0, 1, media.last_block] {
+        unsafe { ptr::write_bytes(buffer, 0, PAGE) };
+        if let Err(e) = unsafe { nvme::read_block(bio, lba, buffer) } {
+            halt(con, e);
+        }
+        unsafe { snapshot(buffer, &mut data) };
+        let block = &data[..media.block_size as usize];
+        print_line(
+            con,
+            format_args!(
+                "NV5 UEFI READ lba={lba} bytes={} nonzero={}\r\n",
+                block.len(),
+                block.iter().filter(|&&b| b != 0).count()
+            ),
+        );
+        print_line(
+            con,
+            format_args!("NV5 UEFI SHA lba={lba} {}\r\n", Hex(digest(block))),
+        );
+    }
+    unsafe { ptr::write_bytes(buffer, 0, PAGE) };
+    print_line(
+        con,
+        format_args!("NV5 UEFI media reference complete; LoaderData page retained\r\n"),
+    );
 }
 
 pub(super) unsafe fn run(bs: *mut EfiBootServices, con: *mut EfiSimpleTextOutputProtocol) {
@@ -143,4 +275,5 @@ pub(super) unsafe fn run(bs: *mut EfiBootServices, con: *mut EfiSimpleTextOutput
         con,
         format_args!("NV4 UEFI reference complete; LoaderData page retained\r\n"),
     );
+    unsafe { media_reference(bs, con, &ns, buffer) };
 }

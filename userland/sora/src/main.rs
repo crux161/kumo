@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j766
 //j774
 //j795
 //j798
 //j799
+//j801
 
 extern crate alloc;
 
@@ -3536,7 +3536,7 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
         return None;
     }
     notice(&[alloc::format!(
-        "NV4 OWNER session={} process={} quiescent; DMA custody released after termination\n",
+        "NV5 OWNER session={} process={} quiescent; DMA custody released after termination\n",
         startup.session,
         process
     )
@@ -3555,12 +3555,14 @@ fn launch_nvme_admin_proof(initrd: Handle, root: Handle, dtb: Handle, bootinfo: 
             return;
         };
         if previous == Some(process) {
-            notice(&[b"NV4 restart reused process identity; refused\n"]);
+            notice(&[b"NV5 restart reused process identity; refused\n"]);
             return;
         }
         previous = Some(process);
     }
-    notice(&[b"NV4 RESTART two distinct Identify owners configured and quiesced; no media I/O\n"]);
+    notice(&[
+        b"NV5 RESTART two distinct owners quiesced; read-only I/O pair evidence is in their logs\n",
+    ]);
 }
 
 /// G1b grants only the GPU child Resource. The kernel's live-DTB power-unit lookup rejects

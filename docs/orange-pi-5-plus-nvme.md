@@ -1,15 +1,16 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j796 -->
 <!-- j797 -->
 <!-- j798 -->
 <!-- j799 -->
 <!-- j800 -->
+<!-- j801 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
 ## Current state
 
-NV0–NV3 are complete. Firmware's PCIe3_4L link and enumeration lead to a
+NV0–NV4 are complete; NV5 adds one polled I/O queue pair and read-only
+block access. Firmware's PCIe3_4L link and enumeration lead to a
 Samsung NVMe 1.3 function at 01:00.0. The userspace driver proved admin queue
 configuration and graceful restart with two distinct owners, each reaching
 RDY=1/CFS=0 then RDY=0/EN=0 before buffer release (J798). The guarded SMMU
@@ -17,7 +18,8 @@ observation is disabled nonsecure bypass; containment remains unimplemented.
 
 `lib/kumo-pcie`, its HAL observers and the early boot report discover the inherited
 route. `drv-nvme` owns controller operations behind Sora's narrowed Resource and
-DMA custody protocol. NV4 adds polled Identify; block reads and filesystems follow.
+DMA custody protocol. NV4 added polled Identify and NV5 polled reads; interrupts,
+the block service and filesystems follow.
 The detailed local plan is PLAN/019; each journal records its own acceptance.
 
 ## D5: cooperative DMA for NV3–NV9
@@ -217,4 +219,51 @@ and the [TianoCore protocol header](https://raw.githubusercontent.com/tianocore/
 Host tests check64bit layouts, default/board scope, synchronous packet construction,
 short/failed completions and reference decoding. Hardware comparison evidence
 belongs in the milestone journal; enabling a feature alone does not prove it.
+— TIMBERDOODLE
+
+## NV5 polled I/O pair and read-only media reference
+
+The DMA allocation grows to five contiguous 4KiB pages below 4GiB: admin SQ,
+admin CQ, the shared data page, I/O SQ and I/O CQ. The Memory frame's size field
+must equal 20480, so a 12KiB or 8KiB extent from an older driver is refused.
+Parent custody still covers the whole allocation before any controller write.
+
+After Identify, the admin queue sends Set Features Number of Queues (one SQ, one
+CQ requested; the allocation is logged), Create I/O CQ 1 (physically contiguous,
+IEN=0, no vector), then Create I/O SQ 1 bound to CQ 1. The queue engine is the
+NV4 one, now parameterized by queue ID: legacy doorbells at 0x1008 (SQ1 tail)
+and 0x100c (CQ1 head), completions checked for CID, SQID, SQHD and status, and
+the phase acquire before any completion or data load. Only one command is in
+flight across both queues, which is what lets them share the data page. A
+failed command poisons its queue. A poisoned I/O queue is never deleted, and its
+buffers stay retained like any other unproven state.
+
+Reads are NVM Read with one PRP page. A read needs a namespace with plain
+blocks (no metadata, no protection) and one or more blocks, at most one page,
+with SLBA plus block count no higher than NSZE (checked add). A request that
+fails these checks is refused before the SQ slot, the data page or a doorbell
+is written. The refusal leaves the queue usable and spends no command ID. One
+page is within MDTS for every value, because MPSMIN is 4KiB. The proof reads
+LBA 0, LBA 1 and NSZE-1 and logs each block's SHA-256 and nonzero-byte count.
+It also tries NSZE itself; that must be refused with the doorbell count
+unchanged. Teardown deletes SQ 1 before CQ 1, then runs the existing proved
+disable. No Write, Write Zeroes, Flush, Dataset Management or Format opcode
+exists.
+
+The firmware reference (`KUMO_NVME_ORACLE=1`) adds a media read after its
+Identify reference, using UEFI Block I/O rather than PassThru. That way the
+LBA-to-command encoding is EDK2's, not a second copy of KUMO's. It picks the
+single Block I/O whose device path ends at the NVMe namespace node for the
+firmware's NSID; partition children and ambiguous matches make it unavailable.
+Before any read it requires present, non-partition media whose BlockSize and
+LastBlock+1 equal Identify's LBA size and NSZE. It reads the same three blocks
+into the retained LoaderData page and prints their SHA-256. A failed read halts
+before ExitBootServices, as a failed Identify does. The binding exposes no
+callable WriteBlocks or FlushBlocks.
+
+`lib/kumo-sha256` (FIPS 180-4) computes both sides' digests. Its tests use
+FIPS known answers and digests that the host's `shasum` produced for every
+padding boundary. It is an evidence digest only. Acceptance compares each
+block's digest from both KUMO owners against the firmware reference from the
+same boot. D5 remains cooperative raw DMA; Road C stays open.
 — TIMBERDOODLE

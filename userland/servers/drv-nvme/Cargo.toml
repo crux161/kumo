@@ -1,4 +1,5 @@
 #j798
+#j801
 [package]
 name = "drv-nvme"
 authors.workspace = true
@@ -12,6 +13,7 @@ kumo-pcie.workspace = true
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 kumo-abi.workspace = true
 kumo-rt = { path = "../../kumo-rt" }
+kumo-sha256.workspace = true
 
 [[bin]]
 name = "drv-nvme"

@@ -1,6 +1,7 @@
 //j799
-//! One outstanding polled admin command. NV4a supports Identify only, one PRP page,
-//! legacy 4-byte doorbell stride. D5 cooperative raw DMA, no containment. — TIMBERDOODLE
+//! One outstanding polled command per queue: NV4a Identify on the admin queue, and
+//! the queue engine NV5 reuses for its I/O pair. One PRP page, legacy 4-byte doorbell
+//! stride. D5 cooperative raw DMA, no containment. — TIMBERDOODLE
 
 use crate::{start, u32at, u64at, Error, Memory, RegisterIo, Startup, CSTS, DEPTH, PAGE};
 use core::fmt;
@@ -10,6 +11,14 @@ pub const SQ_TAIL: u16 = 0x1000;
 pub const CQ_HEAD: u16 = 0x1004;
 // CAP.TO bounds RDY, not commands. This is a separate proof-run command timeout.
 pub const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// Legacy doorbells with CAP.DSTRD=0 (Startup::validate refuses any other stride).
+pub const fn sq_tail(qid: u16) -> u16 {
+    SQ_TAIL + 8 * qid
+}
+pub const fn cq_head(qid: u16) -> u16 {
+    CQ_HEAD + 8 * qid
+}
 
 pub trait AdminIo: RegisterIo {
     fn dma_read32(&mut self, offset: u64) -> u32;
@@ -49,31 +58,52 @@ impl Identify {
 pub struct Completion {
     pub cid: u16,
     pub status: u16,
+    /// CQE DW0, command specific (Set Features returns the allocation here).
+    pub result: u32,
     pub elapsed_ns: u64,
 }
 
-pub struct AdminQueue {
+//j801
+/// One outstanding polled command on one SQ/CQ pair inside the DMA allocation.
+/// The admin pair is qid 0 at pages 0/1; NV5's I/O pair is qid 1 at pages 3/4.
+/// Both share the single data page, which is safe only because at most one
+/// command is outstanding across all queues. — TIMBERDOODLE
+pub struct Queue {
+    qid: u16,
+    sq: u64,
+    cq: u64,
     tail: u16,
     head: u16,
     phase: u32,
     cid: u16,
     poisoned: bool,
 }
-impl Default for AdminQueue {
+pub type AdminQueue = Queue;
+impl Default for Queue {
     fn default() -> Self {
         Self::new()
     }
 }
-impl AdminQueue {
+impl Queue {
     /// Requires a newly enabled controller with zeroed CQ phase bits.
     pub const fn new() -> Self {
+        Self::at(0, 0, PAGE)
+    }
+    /// Requires a newly created queue pair whose CQ page is still zeroed.
+    pub const fn at(qid: u16, sq: u64, cq: u64) -> Self {
         Self {
+            qid,
+            sq,
+            cq,
             tail: 0,
             head: 0,
             phase: 1,
             cid: 1,
             poisoned: false,
         }
+    }
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn identify(
@@ -84,31 +114,52 @@ impl AdminQueue {
         kind: Identify,
         output: &mut [u8; PAGE as usize],
     ) -> Result<Completion, Error> {
+        if self.qid != 0 {
+            return Err(Error::State);
+        }
+        let words = kind.command(0, memory.physical.wrapping_add(DATA))?;
+        self.submit(io, s, memory, words, output)
+    }
+
+    /// Submit `words` (CID field zero; the queue assigns it) and wait for its
+    /// completion. `output` receives the first `output.len()` bytes of the data
+    /// page. Validation that touches no queue memory happens before this call.
+    pub fn submit(
+        &mut self,
+        io: &mut impl AdminIo,
+        s: Startup,
+        memory: Memory,
+        words: [u32; 16],
+        output: &mut [u8],
+    ) -> Result<Completion, Error> {
         if self.poisoned {
             return Err(Error::State);
         }
         // Any unproven command permanently stops this queue instance. — TIMBERDOODLE
         self.poisoned = true;
-        let result = self.identify_inner(io, s, memory, kind, output);
+        let result = self.submit_inner(io, s, memory, words, output);
         if result.is_ok() {
             self.poisoned = false;
         }
         result
     }
 
-    fn identify_inner(
+    fn submit_inner(
         &mut self,
         io: &mut impl AdminIo,
         s: Startup,
         memory: Memory,
-        kind: Identify,
-        output: &mut [u8; PAGE as usize],
+        mut words: [u32; 16],
+        output: &mut [u8],
     ) -> Result<Completion, Error> {
         s.validate()?;
         if !memory.valid() || memory.session != s.session {
             return Err(Error::Memory);
         }
-        let words = kind.command(self.cid, memory.physical + DATA)?;
+        if output.len() > PAGE as usize || output.len() % 4 != 0 || words[0] >> 16 != 0 {
+            return Err(Error::Command);
+        }
+        words[0] |= u32::from(self.cid) << 16;
         let begin = start(io)?;
         let deadline = begin.checked_add(COMMAND_TIMEOUT_NS).ok_or(Error::Clock)?;
         if io.read32(CSTS) & 3 != 1 {
@@ -117,15 +168,15 @@ impl AdminQueue {
         for off in (DATA..DATA + PAGE).step_by(4) {
             io.dma_write32(off, 0);
         }
-        let slot = u64::from(self.tail) * 64;
+        let slot = self.sq + u64::from(self.tail) * 64;
         for (i, word) in words.into_iter().enumerate() {
             io.dma_write32(slot + i as u64 * 4, word);
         }
         self.tail = (self.tail + 1) % DEPTH;
         io.barrier();
-        io.write32(SQ_TAIL, u32::from(self.tail));
+        io.write32(sq_tail(self.qid), u32::from(self.tail));
         io.barrier();
-        let completion = PAGE + u64::from(self.head) * 16;
+        let completion = self.cq + u64::from(self.head) * 16;
         let mut delay = 1_000_000;
         for _ in 0..4096 {
             if io.read32(CSTS) & 3 != 1 {
@@ -142,13 +193,17 @@ impl AdminQueue {
             if (last >> 16) & 1 == self.phase {
                 io.dma_acquire();
                 let queue = io.dma_read32(completion + 8);
-                if last as u16 != self.cid || queue >> 16 != 0 || queue as u16 != self.tail {
+                if last as u16 != self.cid
+                    || queue >> 16 != u32::from(self.qid)
+                    || queue as u16 != self.tail
+                {
                     return Err(Error::Completion);
                 }
                 let status = (last >> 16) as u16;
                 if (status >> 1) & 0x7ff != 0 {
                     return Err(Error::Command);
                 }
+                let result = io.dma_read32(completion);
                 for (i, out) in output.chunks_exact_mut(4).enumerate() {
                     out.copy_from_slice(&io.dma_read32(DATA + i as u64 * 4).to_le_bytes());
                 }
@@ -157,11 +212,12 @@ impl AdminQueue {
                     self.phase ^= 1;
                 }
                 io.barrier();
-                io.write32(CQ_HEAD, u32::from(self.head));
+                io.write32(cq_head(self.qid), u32::from(self.head));
                 io.barrier();
                 let answer = Completion {
                     cid: self.cid,
                     status,
+                    result,
                     elapsed_ns: now - begin,
                 };
                 self.cid = self.cid.wrapping_add(1);

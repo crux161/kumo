@@ -2,9 +2,12 @@
 #![no_main]
 //j798
 //j799
-//! One polled Identify ownership proof per process. Sora retains a DMA VMO alias
-//! before any controller write; failures park with memory quarantined. No media I/O,
-//! root/config or SMMU writes. D5 cooperative raw DMA. — TIMBERDOODLE
+//j801
+//! One polled Identify + read-only I/O pair ownership proof per process. Sora retains
+//! a DMA VMO alias before any controller write; failures park with memory quarantined.
+//! NV5 reads LBA 0, LBA 1 and the last LBA, and proves NSZE is refused before any
+//! doorbell. No write/flush, root/config or SMMU writes. D5 cooperative raw DMA.
+//! — TIMBERDOODLE
 
 extern crate alloc;
 use drv_nvme::{
@@ -51,7 +54,9 @@ fn ready_read(port: Handle, control: Handle, b: &mut [u8]) -> Option<(usize, u64
     let (n, h) = channel_read_with_handle(control, b.as_mut_ptr(), b.len());
     (n > 0 && n <= b.len()).then_some((n, h))
 }
-struct Registers;
+struct Registers {
+    doorbells: u32,
+}
 impl RegisterIo for Registers {
     fn read32(&mut self, o: u16) -> u32 {
         assert!(o & 3 == 0 && u64::from(o) < PAGE);
@@ -60,8 +65,9 @@ impl RegisterIo for Registers {
     fn write32(&mut self, o: u16, v: u32) {
         assert!(matches!(
             o,
-            0x0c | 0x14 | 0x24 | 0x28 | 0x2c | 0x30 | 0x34 | 0x1000 | 0x1004
+            0x0c | 0x14 | 0x24 | 0x28 | 0x2c | 0x30 | 0x34 | 0x1000 | 0x1004 | 0x1008 | 0x100c
         ));
+        self.doorbells += u32::from(o >= 0x1000);
         unsafe { core::ptr::write_volatile((MMIO + u64::from(o)) as *mut u32, v) }
     }
     fn barrier(&mut self) {
@@ -94,9 +100,13 @@ impl drv_nvme::admin::AdminIo for Registers {
         }
     }
 }
-fn identify(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error> {
-    use drv_nvme::admin::{first_namespace, AdminQueue, Controller, Identify, Namespace};
-    let mut queue = AdminQueue::new();
+fn identify(
+    io: &mut Registers,
+    s: Startup,
+    memory: Memory,
+    queue: &mut drv_nvme::admin::Queue,
+) -> Result<drv_nvme::admin::Namespace, Error> {
+    use drv_nvme::admin::{first_namespace, Controller, Identify, Namespace};
     let mut data = [0u8; 4096];
     let c = queue.identify(io, s, memory, Identify::Controller, &mut data)?;
     log(
@@ -139,6 +149,82 @@ fn identify(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error>
         ),
     );
     log(kumo_abi::sys::log_level::NOTICE, &alloc::format!("{ns}\n"));
+    Ok(ns)
+}
+
+fn read_block(
+    io: &mut Registers,
+    s: Startup,
+    memory: Memory,
+    pair: &mut drv_nvme::io::IoPair,
+    ns: &drv_nvme::admin::Namespace,
+    lba: u64,
+) -> Result<(), Error> {
+    let mut block = [0u8; PAGE as usize];
+    let out = &mut block[..ns.lba_bytes as usize];
+    let c = pair.read(io, s, memory, lba, 1, out)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV5 READ session={} nsid={} lba={} blocks=1 bytes={} cid={} status={:#x} elapsed={}us nonzero={} sha256={}\n",
+            s.session,
+            ns.id,
+            lba,
+            out.len(),
+            c.cid,
+            c.status,
+            c.elapsed_ns / 1000,
+            out.iter().filter(|&&b| b != 0).count(),
+            kumo_sha256::Hex(kumo_sha256::digest(out))
+        ),
+    );
+    Ok(())
+}
+
+/// NV5: Identify, then one polled I/O pair; read LBA 0 and 1, prove NSZE is
+/// refused with no doorbell, read the last LBA (the queue survived the refusal),
+/// then delete SQ 1 and CQ 1 before the caller's proved disable. — TIMBERDOODLE
+fn media(io: &mut Registers, s: Startup, memory: Memory) -> Result<(), Error> {
+    use drv_nvme::io::{IoPair, IO_CQ, IO_SQ};
+    let mut admin = drv_nvme::admin::Queue::new();
+    let ns = identify(io, s, memory, &mut admin)?;
+    let mut pair = IoPair::open(&mut admin, io, s, memory, ns)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV5 QUEUES session={} created qid=1 depth={} sq={:#x} cq={:#x} polled ien=0 allocated-sq={} allocated-cq={}\n",
+            s.session,
+            drv_nvme::DEPTH,
+            memory.physical + IO_SQ,
+            memory.physical + IO_CQ,
+            pair.allocated.submission,
+            pair.allocated.completion
+        ),
+    );
+    read_block(io, s, memory, &mut pair, &ns, 0)?;
+    read_block(io, s, memory, &mut pair, &ns, 1)?;
+    let before = io.doorbells;
+    let mut block = [0u8; PAGE as usize];
+    match pair.read(io, s, memory, ns.size, 1, &mut block[..ns.lba_bytes as usize]) {
+        Err(Error::Range) if io.doorbells == before => log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV5 RANGE session={} nsid={} lba={} (NSZE) blocks=1 refused before SQ write/doorbell; doorbells={} unchanged\n",
+                s.session, ns.id, ns.size, before
+            ),
+        ),
+        _ => return Err(Error::Range),
+    }
+    read_block(io, s, memory, &mut pair, &ns, ns.size - 1)?;
+    pair.close(&mut admin, io, s, memory)?;
+    log(
+        kumo_abi::sys::log_level::NOTICE,
+        &alloc::format!(
+            "NV5 QUEUES session={} deleted sq=1 then cq=1; doorbells={}\n",
+            s.session,
+            io.doorbells
+        ),
+    );
     Ok(())
 }
 
@@ -188,7 +274,7 @@ extern "C" fn main(
     {
         fail(control, s.session, Error::Mapping);
     }
-    let mut io = Registers;
+    let mut io = Registers { doorbells: 0 };
     let cap = u64::from(io.read32(0)) | (u64::from(io.read32(4)) << 32);
     if cap != s.cap || io.read32(8) != s.vs {
         fail(control, s.session, Error::Identity);
@@ -235,7 +321,7 @@ extern "C" fn main(
         fail(control, s.session, Error::Ack);
     }
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
-    let p = exercise_with(&mut io, s, memory, |io| identify(io, s, memory));
+    let p = exercise_with(&mut io, s, memory, |io| media(io, s, memory));
     log(
         if p.complete() {
             kumo_abi::sys::log_level::NOTICE

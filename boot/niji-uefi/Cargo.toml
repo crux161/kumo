@@ -1,4 +1,5 @@
 #j800
+#j801
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -9,6 +10,7 @@ version.workspace = true
 [dependencies]
 kumo-abi.workspace = true
 niji-loader = { path = "../niji-loader" }
+kumo-sha256 = { workspace = true, optional = true }
 
 [lib]
 path = "src/lib.rs"
@@ -18,4 +20,4 @@ name = "niji-uefi"
 path = "src/main.rs"
 
 [features]
-nvme-oracle = []
+nvme-oracle = ["dep:kumo-sha256"]

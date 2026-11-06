@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j460
 //j467
 //j622
 //j783
 //j800
+//j801
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -253,6 +253,13 @@ type EfiHandleProtocol = extern "efiapi" fn(
 ) -> EfiStatus;
 type EfiExitBootServices = extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> EfiStatus;
 type EfiStall = extern "efiapi" fn(microseconds: usize) -> EfiStatus;
+type EfiLocateHandleBuffer = extern "efiapi" fn(
+    search_type: u32,
+    protocol: *const EfiGuid,
+    search_key: *mut c_void,
+    count: *mut usize,
+    handles: *mut *mut EfiHandle,
+) -> EfiStatus;
 type EfiLocateProtocol = extern "efiapi" fn(
     protocol: *const EfiGuid,
     registration: *mut c_void,
@@ -301,7 +308,7 @@ struct EfiBootServices {
     close_protocol: *const c_void,
     open_protocol_information: *const c_void,
     protocols_per_handle: *const c_void,
-    locate_handle_buffer: *const c_void,
+    locate_handle_buffer: EfiLocateHandleBuffer,
     locate_protocol: EfiLocateProtocol,
 }
 
