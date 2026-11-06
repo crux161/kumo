@@ -1,8 +1,8 @@
-//j709
 //j798
 //j800
 //j804
 //j805
+//j810
 
 use std::env;
 use std::fmt;
@@ -413,6 +413,13 @@ fn nvme_oracle_enabled(value: Option<&str>, board: &str) -> Result<bool, String>
     }
 }
 
+fn ax88_oracle_enabled(value: Option<&str>, board: &str) -> Result<bool, String> {
+    nvme_oracle_enabled(value, board).map_err(|e| {
+        e.replace("NVMe", "ax88")
+            .replace("KUMO_NVME_ORACLE", "KUMO_AX88_ORACLE")
+    })
+}
+
 fn nvme_write_proof_enabled(board: &str) -> Result<bool, String> {
     let value = env::var("KUMO_NVME_WRITE_PROOF")
         .map(Some)
@@ -478,6 +485,18 @@ fn stage_uefi_bootloader(
         args.extend(["--features", "nvme-write-reference"]);
     } else if oracle {
         args.extend(["--features", "nvme-oracle"]);
+    }
+    let ax88_env = env::var("KUMO_AX88_ORACLE")
+        .map(Some)
+        .or_else(|e| match e {
+            env::VarError::NotPresent => Ok(None),
+            _ => Err("KUMO_AX88_ORACLE must be UTF-8 0 or 1".to_string()),
+        })?;
+    if ax88_oracle_enabled(
+        ax88_env.as_deref(),
+        plan.hardware.board().map(|b| b.id()).unwrap_or(""),
+    )? {
+        args.extend(["--features", "ax88-oracle"]);
     }
     run_cargo(root, &args)?;
 
@@ -2847,6 +2866,25 @@ Expected serial transcript is in:\n\
 
 #[cfg(test)]
 mod boot_manifest_tests {
+    #[test]
+    fn ax88_reference_is_default_off_and_orange_only() {
+        for board in [
+            "",
+            "qemu-virt-aarch64",
+            "thinkpad-x13s-gen1",
+            "generic-uefi-x86_64",
+            "orange-pi-5-plus",
+        ] {
+            assert_eq!(super::ax88_oracle_enabled(None, board), Ok(false));
+            assert_eq!(super::ax88_oracle_enabled(Some("0"), board), Ok(false));
+            assert_eq!(
+                super::ax88_oracle_enabled(Some("1"), board).is_ok(),
+                board == "orange-pi-5-plus"
+            );
+        }
+        assert!(super::ax88_oracle_enabled(Some("true"), "orange-pi-5-plus").is_err());
+    }
+
     #[test]
     fn firmware_nvme_oracle_is_explicit_and_orange_only() {
         use super::nvme_oracle_enabled;

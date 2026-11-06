@@ -2,6 +2,7 @@
 #j801
 #j804
 #j805
+#j810
 [package]
 name = "niji-uefi"
 authors.workspace = true
@@ -22,6 +23,7 @@ name = "niji-uefi"
 path = "src/main.rs"
 
 [features]
+ax88-oracle = []
 nvme-oracle = ["dep:kumo-sha256"]
 nvme-prepare = ["nvme-oracle"]
 nvme-write-reference = ["nvme-oracle"]

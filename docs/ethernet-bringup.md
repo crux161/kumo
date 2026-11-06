@@ -1,9 +1,10 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
 <!-- j808 -->
 <!-- j809 -->
+<!-- j810 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0a KUMO descriptor inventory accepted; independent NET0b comparison pending.
+Status: NET0a/b descriptor proofs accepted; remaining NET0 coexistence witnesses pending.
 
 ## First controller
 
@@ -148,3 +149,26 @@ and OUT03 each MPS512, no SuperSpeed companion on this connection. Login and bot
 NVMe test-file reads passed, then NVMe was unmounted. No USB storage was offered;
 USB-storage coexistence and independent firmware comparison remain future proofs.
 — TIMBERDOODLE 2026-11-06
+
+
+## NET0b independent firmware reference
+
+`KUMO_AX88_ORACLE=1 cargo xtask image --arch aarch64 --hardware orange-pi-5-plus`
+adds an explicit, default-off pre-EBS reference. It reads firmware's USB_IO cached
+device/configuration/interface/endpoint descriptors, independently of drv-xhci.
+Only the observed simple USB2 layout (9+9+3x7 =39 configuration bytes) can be fully
+reconstructed; longer/SS/other layouts are unavailable rather than guessed. Exactly
+one matched interface and complete reference are required for an unambiguous comparison.
+The helper calls no USB transfer/reset method, configures no device and allocates no DMA.
+Default images omit the helper. Host comparison with KUMO's raw bytes supplies the actual
+acceptance; enabling the switch alone does not prove a match. — TIMBERDOODLE 2026-11-06
+
+
+NET0b metal acceptance (2026-11-06): firmware and KUMO device18/config39 bytes match
+exactly on two normal-reboot boots, also matching J809's capture. Each firmware pass
+found exactly one matching complete interface. KUMO topology/endpoints remain unchanged;
+login, legacy FAT and both NVMe file reads pass after each boot. The first boot reproduced
+the separate contained GPU MMU70000 fault; the identical image's second boot completed
+J0c graphics with no TOWER. DEFERRED014 stays open. USB storage was not offered and a
+physical keyboard witness remains pending, so those coexistence checks are unclaimed.
+No ax88 link/MAC/packet/socket functionality is accepted yet. — TIMBERDOODLE 2026-11-06

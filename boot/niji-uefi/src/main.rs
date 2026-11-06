@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//j783
 //j800
 //j801
 //j804
 //j805
+//j810
 
 //! Nijigumo's UEFI front-end (`BOOTAA64.EFI`).
 //!
@@ -26,6 +26,8 @@
 //! calls are typed, the rest of each service table is opaque pointers so the field
 //! offsets stay correct.
 
+#[cfg(feature = "ax88-oracle")]
+mod ax88_oracle;
 #[cfg(feature = "nvme-oracle")]
 mod nvme_oracle;
 
@@ -711,6 +713,11 @@ unsafe fn boot_and_jump(
     // explicit PL011 route. The latter is how a Pi 5 image can follow firmware's current RP1
     // PCIe window without pretending that a movable BAR address is a stable BSP fact.
     unsafe { stamp_boot_config(boot_services, root, con_out, boot_ptr) };
+
+    #[cfg(feature = "ax88-oracle")]
+    if unsafe { (*boot_ptr).board_id() } == "orange-pi-5-plus" {
+        unsafe { ax88_oracle::run(boot_services, con_out) };
+    }
 
     #[cfg(feature = "nvme-oracle")]
     {
