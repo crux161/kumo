@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j803
 //j805
 //j806
 //j807
 //j815
+//j816
 
 extern crate alloc;
 
@@ -6931,6 +6931,24 @@ fn eval_command(
                 }
             }
         }
+    } else if cmd.name == "bg" {
+        // bg <run|net> <program> [args...]: start one program without waiting for it; `wait`
+        // later drains its output. One job at a time (J816, NET2b-2). — TIMBERDOODLE
+        match cmd.args.split_first() {
+            Some((launcher, program)) if !program.is_empty() && launcher == "run" => {
+                run_program_background(initrd, program, false)
+            }
+            Some((launcher, program)) if !program.is_empty() && launcher == "net" => {
+                run_program_background(initrd, program, true)
+            }
+            _ => usage(b"usage: bg run|net <program> [args...]\n"),
+        }
+    } else if cmd.name == "wait" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: wait\n");
+        } else {
+            wait_background();
+        }
     } else if cmd.name == "net" {
         // net <program> [args...]: `run`, plus one netstack session channel. Network access is
         // granted by this launcher word and nothing else (DESIGN/026 §4). — TIMBERDOODLE
@@ -7243,6 +7261,73 @@ fn run_on_volume(
 
 /// The identity service's client end (PLAN/012), or 0 when it did not start.
 static IDENTITYD: AtomicU32 = AtomicU32::new(0);
+
+/// J816: the one background job (`bg`): its stdout reader and process handle, or 0 for none.
+static BG_STDOUT: AtomicU32 = AtomicU32::new(0);
+static BG_PROCESS: AtomicU32 = AtomicU32::new(0);
+
+/// Start `argv` as the background job. It reuses the interactive launch, which returns as soon
+/// as the child parks or exits and hands back its ends without draining them; the job reads no
+/// input, so its stdin writer is closed at once. — TIMBERDOODLE
+fn run_program_background(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 {
+        log(b"bg: a background job is still running; `wait` for it first\n");
+        fail_status(1);
+        return;
+    }
+    let Some(name) = argv.first().map(|n| n.as_bytes()) else {
+        return;
+    };
+    if name == b"lua-repl" || name == b"kilo" {
+        usage(b"bg: interactive programs cannot run in the background\n");
+        return;
+    }
+    let mut path = [0u8; 64];
+    let Some(full) = program_path(name, &mut path) else {
+        fail_status(1);
+        return;
+    };
+    let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
+    let count = string_argv_slots(argv, &mut slots);
+    let Some(child) = run_with_startup_input(
+        initrd,
+        full,
+        full,
+        Some(&slots[..count]),
+        false,
+        FsGrant::None,
+        false,
+        false,
+        StdinMode::Interactive,
+        grant_net,
+    ) else {
+        fail_status(1);
+        return;
+    };
+    let _ = handle_close(child.stdin);
+    BG_STDOUT.store(child.stdout.0, Ordering::Relaxed);
+    BG_PROCESS.store(child.process.map_or(0, |p| p.0), Ordering::Relaxed);
+    log(b"bg: started ");
+    log(name);
+    log(b"\n");
+}
+
+/// `wait`: drain the background job's output to the console until it exits.
+fn wait_background() {
+    let stdout = BG_STDOUT.swap(0, Ordering::Relaxed);
+    let process = BG_PROCESS.swap(0, Ordering::Relaxed);
+    if stdout == 0 {
+        log(b"wait: no background job\n");
+        fail_status(1);
+        return;
+    }
+    pump_to_console(Handle(stdout));
+    let _ = handle_close(Handle(stdout));
+    if process != 0 {
+        let _ = handle_close(Handle(process));
+    }
+    log(b"wait: background job finished\n");
+}
 
 /// J815: Sora's end of netstack's control channel, or 0 until the first `net` launch starts it.
 static NETSTACK_CONTROL: AtomicU32 = AtomicU32::new(0);
@@ -8891,20 +8976,27 @@ fn run_program(initrd: Handle, argv: &[alloc::string::String]) -> bool {
 }
 
 /// [`run_program`], with a netstack session when `grant_net` (the `net` launcher).
+/// `bin/<name>` in `path`, or `None` when the name does not fit.
+fn program_path<'a>(name: &[u8], path: &'a mut [u8; 64]) -> Option<&'a [u8]> {
+    const PREFIX: &[u8] = b"bin/";
+    if PREFIX.len() + name.len() > path.len() {
+        debug_write(b"run: name too long\n".as_ptr(), 19);
+        return None;
+    }
+    path[..PREFIX.len()].copy_from_slice(PREFIX);
+    path[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
+    Some(&path[..PREFIX.len() + name.len()])
+}
+
 fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net: bool) -> bool {
     let name = match argv.first() {
         Some(n) => n.as_bytes(),
         None => return false,
     };
-    const PREFIX: &[u8] = b"bin/";
     let mut path = [0u8; 64];
-    if PREFIX.len() + name.len() > path.len() {
-        debug_write(b"run: name too long\n".as_ptr(), 19);
+    let Some(full) = program_path(name, &mut path) else {
         return false;
-    }
-    path[..PREFIX.len()].copy_from_slice(PREFIX);
-    path[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
-    let full = &path[..PREFIX.len() + name.len()];
+    };
     let mut slots: [&[u8]; MAX_ARGV] = [b""; MAX_ARGV];
     let count = string_argv_slots(argv, &mut slots);
     if name == b"lua-repl" {

@@ -1,12 +1,16 @@
 #![no_std]
 #![no_main]
 //j815
+//j816
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
 //! `net netprobe udp`: two UDP sockets in one session exchange exact datagrams on 127.0.0.1.
 //! `net netprobe errors`: deterministic refusals, the 16-socket quota, then a malformed header
-//! that must close the session. Run without `net`, it reports that it holds no network grant —
+//! that must close the session.
+//! `bg net netprobe recv <port> <n>` + `net netprobe send <port> <n>`: two separately launched
+//! processes, each with its own session, exchange `n` datagrams; the receiver echoes each one
+//! and the sender checks the echo is exact (NET2b-2). Run without `net`, it reports that it holds no network grant —
 //! the grant is a launcher decision, not something a program can ask for.
 
 extern crate alloc;
@@ -298,6 +302,139 @@ fn udp(client: &mut Client) {
     client.receive_exact(b, b"and back again", port_a);
 }
 
+fn parse_u16(text: &[u8]) -> Option<u16> {
+    if text.is_empty() || text.len() > 5 {
+        return None;
+    }
+    let mut value = 0u32;
+    for &digit in text {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + (digit - b'0') as u32;
+    }
+    u16::try_from(value).ok()
+}
+
+/// Datagram sizes the `send`/`recv` pair exchanges, in order.
+const PEER_SIZES: [usize; 4] = [13, 0, UDP_PAYLOAD_MAX, 512];
+
+fn peer_payload(index: usize, buf: &mut [u8; UDP_PAYLOAD_MAX]) -> usize {
+    let len = PEER_SIZES[index];
+    if index == 0 {
+        buf[..len].copy_from_slice(b"NET2b-2 hello");
+    } else {
+        pattern(buf, index as u8);
+    }
+    len
+}
+
+/// Receive `count` datagrams on `port` and echo each to its sender.
+fn recv(client: &mut Client, port: u16, count: usize) {
+    let s = client.udp_socket();
+    client.bind(s, port);
+    client
+        .out
+        .line(&[b"netprobe: recv bound 127.0.0.1:", dec(port as u64).bytes()]);
+    for index in 0..count {
+        let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (10_000u64 << 32), &[]);
+        if wait.status != Status::Ok {
+            client.fail(&[b"recv wait -> ", status_name(wait.status)]);
+            return;
+        }
+        let got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+        let payload = client.payload(&got);
+        if got.status != Status::Ok || payload.len() < ADDR_LEN {
+            client.fail(&[b"recvfrom -> ", status_name(got.status)]);
+            return;
+        }
+        let mut echo = [0u8; ADDR_LEN + UDP_PAYLOAD_MAX];
+        echo[..payload.len()].copy_from_slice(payload);
+        let echo = &echo[..payload.len()];
+        let from = u16::from_le_bytes([echo[2], echo[3]]);
+        let data = &echo[ADDR_LEN..];
+        let hash = hex32(fnv(data));
+        client.out.line(&[
+            b"netprobe: recv ",
+            dec(index as u64).bytes(),
+            b": ",
+            dec(data.len() as u64).bytes(),
+            b" B fnv=",
+            &hash,
+            b" from 127.0.0.1:",
+            dec(from as u64).bytes(),
+        ]);
+        // Echo to exactly the address the datagram came from.
+        let status = client.call(Op::SendTo, s, 0, echo).status;
+        client.expect(b"recv echo", status, Status::Ok);
+    }
+}
+
+/// Send `count` datagrams to `port` and require each echo back, exact, from that port. The
+/// first datagram is retransmitted until echoed, because the receiver is a separate process
+/// that may not have bound yet; after that the peer is known live and nothing is retried.
+fn send(client: &mut Client, port: u16, count: usize) {
+    const FIRST_TRIES: u32 = 40;
+    let s = client.udp_socket();
+    let local = client.bind(s, 0);
+    client.out.line(&[
+        b"netprobe: send from 127.0.0.1:",
+        dec(local as u64).bytes(),
+        b" to 127.0.0.1:",
+        dec(port as u64).bytes(),
+    ]);
+    let mut data = [0u8; UDP_PAYLOAD_MAX];
+    for index in 0..count {
+        let len = peer_payload(index, &mut data);
+        let tries = if index == 0 { FIRST_TRIES } else { 1 };
+        let mut attempts = 0;
+        let mut echoed = false;
+        while attempts < tries && !echoed {
+            attempts += 1;
+            let status = client.sendto(s, port, &data[..len]);
+            client.expect(b"send", status, Status::Ok);
+            let timeout: u64 = if index == 0 { 250 } else { 2000 };
+            let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (timeout << 32), &[]);
+            echoed = wait.status == Status::Ok;
+        }
+        if !echoed {
+            client.fail(&[b"no echo for datagram ", dec(index as u64).bytes()]);
+            return;
+        }
+        let got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+        let payload = client.payload(&got);
+        let source = Addr { ip: LOOPBACK, port }.encode();
+        let body = &payload[ADDR_LEN.min(payload.len())..];
+        let hash = hex32(fnv(body));
+        let exact = got.status == Status::Ok
+            && payload.len() >= ADDR_LEN
+            && payload[..ADDR_LEN] == source
+            && body == &data[..len];
+        if exact {
+            client.out.line(&[
+                b"netprobe: send ",
+                dec(index as u64).bytes(),
+                b": ",
+                dec(len as u64).bytes(),
+                b" B fnv=",
+                &hash,
+                b" echoed exact by 127.0.0.1:",
+                dec(port as u64).bytes(),
+                b" after ",
+                dec(attempts as u64).bytes(),
+                b" send(s)",
+            ]);
+        } else {
+            client.fail(&[
+                b"echo ",
+                dec(index as u64).bytes(),
+                b" not exact fnv=",
+                &hash,
+            ]);
+        }
+    }
+}
+
 fn errors(client: &mut Client) {
     let s = client.udp_socket();
     let port = client.bind(s, 0);
@@ -376,12 +513,13 @@ extern "C" fn main(
     let startup = startup(Handle(bootstrap as u32));
     let out = Out(startup.stdout.unwrap_or(Handle(0)));
     let mut argv_buf = [0u8; 256];
-    let mode: &[u8] = match startup.argv {
-        Some(argv) if vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0 => {
-            unpack_argv(&argv_buf).nth(1).unwrap_or(b"")
-        }
-        _ => b"",
-    };
+    let read = startup
+        .argv
+        .is_some_and(|argv| vmo_read(argv, 0, argv_buf.as_mut_ptr(), argv_buf.len()) == 0);
+    let mut args = unpack_argv(if read { &argv_buf[..] } else { &[] }).skip(1);
+    let mode: &[u8] = args.next().unwrap_or(b"");
+    let port = args.next().and_then(parse_u16);
+    let count = args.next().and_then(parse_u16);
     let Some(channel) = startup.net else {
         out.line(&[b"netprobe: no network grant (launch it as `net netprobe ...`)"]);
         process_exit(2);
@@ -407,8 +545,21 @@ extern "C" fn main(
     match mode {
         b"udp" => udp(&mut client),
         b"errors" => errors(&mut client),
+        b"recv" | b"send"
+            if port.is_some_and(|p| p != 0)
+                && count.is_some_and(|n| (1..=PEER_SIZES.len() as u16).contains(&n)) =>
+        {
+            let (port, count) = (port.unwrap_or(0), count.unwrap_or(0) as usize);
+            if mode == b"recv" {
+                recv(&mut client, port, count)
+            } else {
+                send(&mut client, port, count)
+            }
+        }
         _ => {
-            client.out.line(&[b"usage: net netprobe udp|errors"]);
+            client
+                .out
+                .line(&[b"usage: net netprobe udp|errors | recv|send <port> <1-4>"]);
             process_exit(2);
         }
     }

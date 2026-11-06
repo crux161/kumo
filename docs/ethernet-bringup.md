@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j808 -->
 <!-- j809 -->
 <!-- j810 -->
 <!-- j812 -->
 <!-- j815 -->
+<!-- j816 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b-1 in QEMU (J815).
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816).
 
 ## First controller
 
@@ -221,3 +221,11 @@ two of its sockets; oversize datagrams, unknown sockets, remote addresses, TCP (
 served) and the per-client socket limit are refused with specific errors, and a malformed
 request ends the session. Ending a session frees its sockets. Two separately launched
 clients exchanging datagrams at the same time is the next step. — TIMBERDOODLE 2026-11-06
+
+
+NET2b-2 (J816): the shell gained `bg run|net <program> [args]`, which starts one program
+without waiting for it, and `wait`, which collects its output when it finishes. A receiving
+probe started with `bg net` and a sending probe started with `net` ran at the same time as two
+separate programs with two network sessions: datagrams of 13, 0, 1472 and 512 bytes went out
+and came back exact, with matching checksums printed by both sides. Both sessions were freed
+when the programs ended. TCP over loopback is next. — TIMBERDOODLE 2026-11-06
