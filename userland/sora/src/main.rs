@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j799
 //j801
 //j802
 //j803
 //j805
+//j806
 
 extern crate alloc;
 
@@ -2466,6 +2466,7 @@ const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
 static STORAGE_CONTROLS: [AtomicU32; sora::STORAGE_DEVICES] =
     [const { AtomicU32::new(0) }; sora::STORAGE_DEVICES];
 static NVME_CONTROL_KOID: AtomicU64 = AtomicU64::new(0);
+static NVME_UNPROVEN: AtomicBool = AtomicBool::new(false);
 static NVME_WATCH_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// The removable volume Sora knows, mounted at `/media/<name>` (DESIGN/012 §2.1, J545).
@@ -3461,6 +3462,10 @@ fn nvme_receive(port: Handle, channel: Handle, frame: &mut [u8]) -> Option<(usiz
 /// unproven owner keeps its process/channel/VMO handles in Sora; do not recycle
 /// them merely because the child failed or timed out. — TIMBERDOODLE
 fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup) -> Option<u64> {
+    if NVME_UNPROVEN.load(Ordering::Relaxed) {
+        notice(&[b"nvme: unproven owner; replacement refused\n"]);
+        return None;
+    }
     // The narrowed Resource now carries exactly one IRQ: INTx (INTID 292 on this board).
     let resource = syscall_handle(resource_create_child(
         root,
@@ -3516,6 +3521,7 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
         notice(&[b"nvme: startup/custody negotiation refused; no ACK sent\n"]);
         return None;
     };
+    NVME_UNPROVEN.store(true, Ordering::Relaxed);
     let ack = [drv_nvme::ACK];
     if channel_write(owner.client, ack.as_ptr(), ack.len()) != 0 {
         notice(&[b"nvme: custody ACK failed; DMA and owner handles retained\n"]);
@@ -3547,16 +3553,18 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
             if watch != 0 {
                 let _ = port_bind(Handle(watch), owner.client);
             }
-            #[cfg(feature = "nvme-write-proof")]
             set_nvme_owner(Some(NvmeOwner {
                 process: owner.process,
                 control: owner.client,
                 custody,
+                #[cfg(feature = "nvme-write-proof")]
                 root_resource: root,
                 startup,
                 memory,
                 stopping: false,
+                shutdown_ready: false,
             }));
+            NVME_UNPROVEN.store(false, Ordering::Relaxed);
             return Some(process);
         }
     }
@@ -3586,34 +3594,31 @@ fn run_nvme_admin_owner(initrd: Handle, root: Handle, startup: drv_nvme::Startup
         process
     )
     .as_bytes()]);
+    NVME_UNPROVEN.store(false, Ordering::Relaxed);
     Some(process)
 }
 
-#[cfg(feature = "nvme-write-proof")]
 #[derive(Clone, Copy)]
 struct NvmeOwner {
     process: Handle,
     control: Handle,
     custody: Handle,
+    #[cfg(feature = "nvme-write-proof")]
     root_resource: Handle,
     startup: drv_nvme::Startup,
     memory: drv_nvme::Memory,
     stopping: bool,
+    shutdown_ready: bool,
 }
-#[cfg(feature = "nvme-write-proof")]
 struct NvmeOwnerCell(core::cell::UnsafeCell<Option<NvmeOwner>>);
 // Single-threaded Sora; copy ownership records out before any kernel re-entry.
 // Keeping these handles named enables proved teardown instead of losing their
 // numbers while retaining DMA custody. — TIMBERDOODLE
-#[cfg(feature = "nvme-write-proof")]
 unsafe impl Sync for NvmeOwnerCell {}
-#[cfg(feature = "nvme-write-proof")]
 static NVME_OWNER: NvmeOwnerCell = NvmeOwnerCell(core::cell::UnsafeCell::new(None));
-#[cfg(feature = "nvme-write-proof")]
 fn nvme_owner() -> Option<NvmeOwner> {
     unsafe { *NVME_OWNER.0.get() }
 }
-#[cfg(feature = "nvme-write-proof")]
 fn set_nvme_owner(owner: Option<NvmeOwner>) {
     unsafe { *NVME_OWNER.0.get() = owner };
 }
@@ -3637,6 +3642,7 @@ fn nvme_stop_owner() -> bool {
         return false;
     }
     owner.stopping = true;
+    NVME_UNPROVEN.store(true, Ordering::Relaxed);
     set_nvme_owner(Some(owner));
     set_device(sora::NVME_STORAGE, None);
     NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
@@ -3679,9 +3685,75 @@ fn nvme_stop_owner() -> bool {
     }
     STORAGE_CONTROLS[sora::NVME_STORAGE].store(0, Ordering::Relaxed);
     set_nvme_owner(None);
+    NVME_UNPROVEN.store(false, Ordering::Relaxed);
     notice(&[alloc::format!(
         "NV8 STOP owner={} quiescent; DMA custody released after termination\n",
         process
+    )
+    .as_bytes()]);
+    true
+}
+
+/// Shutdown readiness is distinct from controller-disable proof: keep the driver,
+/// process and both DMA owners live until reset. Never reclaim on SHST2 alone.
+/// An unproven outcome blocks normal power; emergency SysRq is separate. — TIMBERDOODLE
+fn nvme_shutdown_owner() -> bool {
+    if NVME_UNPROVEN.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(mut owner) = nvme_owner() else {
+        return true;
+    };
+    if owner.stopping {
+        return owner.shutdown_ready;
+    }
+    if !owner.memory.valid()
+        || owner.memory.session != owner.startup.session
+        || handle_koid(owner.custody) == u64::MAX
+        || handle_koid(owner.process) == u64::MAX
+    {
+        return false;
+    }
+    owner.stopping = true;
+    set_nvme_owner(Some(owner));
+    NVME_UNPROVEN.store(true, Ordering::Relaxed);
+    set_device(sora::NVME_STORAGE, None);
+    if media().is_some_and(|m| m.device == sora::NVME_STORAGE) {
+        set_media(None);
+    }
+    NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
+    let watch = NVME_WATCH_PORT.load(Ordering::Relaxed);
+    if watch != 0 {
+        let _ = port_unbind(Handle(watch), owner.control);
+    }
+    let Some(port) = syscall_handle(port_create()) else {
+        return false;
+    };
+    let request = [drv_nvme::CONTROL_SHUTDOWN];
+    let mut frame = [0; drv_nvme::shutdown::LEN];
+    if port_bind(port, owner.control) != 0
+        || channel_write(owner.control, request.as_ptr(), request.len()) != 0
+    {
+        return false;
+    }
+    let ready = nvme_receive(port, owner.control, &mut frame).and_then(|(n, h)| {
+        if h != 0 {
+            return None;
+        }
+        drv_nvme::shutdown::Ready::decode(&frame[..n])
+    });
+    if !ready.is_some_and(|r| r.valid_for(owner.startup.session)) {
+        notice(&[b"nvme: shutdown unproven; normal power blocked, owner/DMA retained\n"]);
+        return false;
+    }
+    let _ = port_unbind(port, owner.control);
+    let _ = handle_close(port);
+    owner.shutdown_ready = true;
+    set_nvme_owner(Some(owner));
+    NVME_UNPROVEN.store(false, Ordering::Relaxed);
+    notice(&[alloc::format!(
+        "NV8 SHUTDOWN owner={} ready; process and DMA custody retained through reset\n",
+        handle_koid(owner.process)
     )
     .as_bytes()]);
     true
@@ -6611,6 +6683,20 @@ fn eval_command(
         }
         return true;
     }
+    if matches!(
+        cmd.name.as_str(),
+        "reboot" | "reset" | "shutdown" | "poweroff" | "halt"
+    ) {
+        if nvme_shutdown_owner() {
+            if channel_write(root, raw.as_ptr(), raw.len()) != 0 {
+                fail_status(1);
+            }
+        } else {
+            log(b"power: NVMe shutdown failed; power command refused\n");
+            fail_status(1);
+        }
+        return true;
+    }
     if cmd.name == "mount" {
         mount_command(cmd, cwd);
         return true;
@@ -6938,9 +7024,12 @@ fn spawn_fatfs(initrd: Handle) -> Option<Handle> {
 }
 
 fn nvme_unavailable() {
+    NVME_UNPROVEN.store(true, Ordering::Relaxed);
     NVME_CONTROL_KOID.store(0, Ordering::Relaxed);
     set_device(sora::NVME_STORAGE, None);
-    #[cfg(feature = "nvme-write-proof")]
+    if media().is_some_and(|m| m.device == sora::NVME_STORAGE) {
+        set_media(None);
+    }
     if let Some(mut owner) = nvme_owner() {
         owner.stopping = true;
         set_nvme_owner(Some(owner));

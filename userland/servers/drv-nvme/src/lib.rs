@@ -1,10 +1,10 @@
 #![no_std]
 #![deny(unsafe_code)]
-//j799
 //j801
 //j802
 //j803
 //j805
+//j806
 //! Legacy NVM admin lifecycle, polled Identify (NV3/NV4a), one I/O pair (NV5), its
 //! INTx-driven completions (NV6) and the resident read-only volume service (NV7).
 //! Cooperative raw DMA (D5); no SMMUv3 isolation. Pure sequencing over RegisterIo.
@@ -19,6 +19,7 @@ pub const MMIO_BYTES: u64 = 2 * PAGE;
 pub mod admin;
 pub mod intx;
 pub mod io;
+pub mod shutdown;
 pub mod volume;
 pub mod write;
 pub const DEPTH: u16 = 32;
@@ -28,6 +29,8 @@ pub const PROOF_LEN: usize = 80;
 pub const ACK: u8 = b'A';
 /// Private supervisor control: stop the resident read-only owner and return proof.
 pub const CONTROL_STOP: u8 = b'Q';
+/// Private supervisor control: prepare normal shutdown and retain DMA until reset.
+pub const CONTROL_SHUTDOWN: u8 = b'S';
 /// Startup mode: prove the lifecycle and exit (NV3–NV6).
 pub const MODE_PROOF: u8 = 0;
 /// Startup mode: stay resident and serve the namespace's FAT32 volume read-only (NV7).

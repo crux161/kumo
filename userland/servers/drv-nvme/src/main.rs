@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
-//j799
 //j801
 //j802
 //j803
 //j805
+//j806
 //! One owner per process: polled Identify, then a read-only I/O pair whose completions
 //! arrive by INTx (NV6). A proof owner runs the NV6 sequence and exits; a serve owner
 //! (NV7) offers the namespace's FAT32 volume to Sora and serves it read-only until Sora
@@ -617,12 +617,13 @@ fn serve(
     resource: Handle,
     control: Handle,
     port: Handle,
+    quarantine: Handle,
 ) -> Result<(), Error> {
     use drv_nvme::intx::{mask, unmask, Stats};
     use drv_nvme::io::IoPair;
     use drv_nvme::volume::{discover, Verdict, MAX_ENTRY_BYTES};
     let mut admin = drv_nvme::admin::Queue::new();
-    let (_, ns) = identify(io, s, memory, &mut admin)?;
+    let (controller, ns) = identify(io, s, memory, &mut admin)?;
     if ns.lba_bytes as usize != SECTOR_SIZE {
         return Err(Error::Data);
     }
@@ -730,6 +731,7 @@ fn serve(
     }
     let control_koid = handle_koid(control);
     let mut clients = [Client::default(); MAX_CLIENTS];
+    let mut shutdown = false;
     loop {
         let source = port_wait(port);
         if source == control_koid {
@@ -749,7 +751,11 @@ fn serve(
             if len > tag.len() {
                 return Err(Error::Bootstrap);
             }
-            if len == 1 && tag[0] == drv_nvme::CONTROL_STOP && raw == 0 {
+            if len == 1
+                && matches!(tag[0], drv_nvme::CONTROL_STOP | drv_nvme::CONTROL_SHUTDOWN)
+                && raw == 0
+            {
+                shutdown = tag[0] == drv_nvme::CONTROL_SHUTDOWN;
                 log(
                     kumo_abi::sys::log_level::NOTICE,
                     &alloc::format!(
@@ -877,8 +883,38 @@ fn serve(
         let _ = port_unbind(port, Handle(c.handle));
         let _ = handle_close(Handle(c.handle));
     }
+    if shutdown {
+        let elapsed = pair.flush_irq(io, &mut line, s, memory, &mut stats)?;
+        log(
+            kumo_abi::sys::log_level::NOTICE,
+            &alloc::format!(
+                "NV8 SHUTDOWN session={} Flush completed vwc={} elapsed={}us\n",
+                s.session,
+                controller.vwc,
+                elapsed / 1000
+            ),
+        );
+    }
     mask(io)?;
     pair.close(&mut admin, io, s, memory)?;
+    if shutdown {
+        let report = drv_nvme::shutdown::normal(io)?;
+        let ready = drv_nvme::shutdown::Ready {
+            session: s.session,
+            cc: report.cc,
+            csts: report.csts,
+        };
+        log(kumo_abi::sys::log_level::NOTICE,&alloc::format!("NV8 SHUTDOWN session={} cc={:#x} SHN=1 csts={:#x} SHST=2 elapsed={}us; IO queues deleted; DMA retained until reset\n",s.session,report.cc,report.csts,report.elapsed_ns/1000));
+        let frame = ready.encode();
+        if channel_write(control, frame.as_ptr(), frame.len()) != 0 {
+            return Err(Error::Bootstrap);
+        }
+        // Do not return into exercise_with's Controller Reset: preserve SHST2
+        // and every DMA allocation until actual power transition. — TIMBERDOODLE
+        loop {
+            let _ = port_wait(quarantine);
+        }
+    }
     Ok(())
 }
 
@@ -977,7 +1013,7 @@ extern "C" fn main(
     log(kumo_abi::sys::log_level::NOTICE,"drv-nvme: cooperative raw-physical DMA; no SMMUv3 confinement; parent custody acknowledged\n");
     let p = exercise_with(&mut io, s, memory, |io| {
         if s.mode == MODE_SERVE {
-            serve(io, s, memory, resource, control, port)
+            serve(io, s, memory, resource, control, port, quarantine)
         } else if s.mode == MODE_WRITE_PROOF {
             write_proof(io, s, memory, resource)
         } else {

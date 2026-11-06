@@ -1,9 +1,9 @@
 # Orange Pi 5 Plus NVMe: bring-up and DMA debt
-<!-- j801 -->
 <!-- j802 -->
 <!-- j803 -->
 <!-- j804 -->
 <!-- j805 -->
+<!-- j806 -->
 
 Date: 2026-11-05. Author: TIMBERDOODLE.
 
@@ -410,3 +410,27 @@ controller doorbells for each refusal. This does not enable filesystem writes.
 Normal CC.SHN/SHST shutdown on reboot is the next NV8 gate; writable FAT service
 and editor-save persistence follow under NV9. D5 non-claim/RoadC remain open.
 — TIMBERDOODLE
+
+
+## NV8b normal shutdown
+
+Normal Kumoza `reboot`, `reset`, `shutdown`, `poweroff` and `halt` first ask the
+current NVMe owner to stop clients, Flush the namespace, delete I/O SQ then CQ,
+and request normal shutdown (CC.SHN=01). The driver waits up to30seconds for
+CSTS.SHST=10, RDY1/CFS0 and controller shutdown type. Failure retains the driver
+and DMA and blocks forwarding the normal power command. Unknown owner outcomes
+also block normal power and cannot license a replacement owner. Shutdown preparation
+removes an active NVMe mount before the driver parks, including if reset is refused.
+
+Shutdown-ready is a separate32B, session-bound acknowledgment, not the80B
+controller-disable proof. After success the driver parks with EN1/SHN1, both
+parent/child DMA custody and its process retained through the power transition.
+It does not return into controller reset or release buffers: resetting after
+SHST2 can undo the drive's media power-off readiness. Only then does Sora forward
+the existing authorized kernel-console power command. No new kernel policy or
+syscall is introduced. A refused firmware reset can retry the power command
+without reopening storage or submitting I/O; ownership stays retained.
+
+Emergency kernel SysRq bypasses this userspace handshake. FAT remains an interop
+test volume, and writable service/editor-save persistence is the NV9 gate.
+D5 cooperative DMA/RoadC remain explicit. — TIMBERDOODLE
