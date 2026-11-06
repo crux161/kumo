@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j690
 //j703
 //j704
 //j767
 //j809
+//j811
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -861,6 +861,14 @@ fn enumerate(
         enum_phys,
         RootRole::Primary,
     );
+
+    // J811: the HID loops never return, so reaching here means none took the controller. A kept
+    // volume is offered and served only from the resident loop; run it with zero HID lanes rather
+    // than halting the controller under a stick that was probed but never offered. — TIMBERDOODLE
+    if storage_service().is_some() {
+        let mut lanes: [Option<HidLane>; MAX_HID_LANES] = [None, None, None, None];
+        run_hid_lanes(&mut io, layout, image, evt, &mut lanes);
+    }
 }
 
 /// Descriptor observation only: return before SetConfiguration, vendor commands or
@@ -3270,6 +3278,9 @@ fn run_hid_lanes(
             // the same port. Wakes are told apart by their source's koid.
             let interrupt_koid = handle_koid(interrupt);
             let storage_control_koid = irq_port.and_then(offer_storage);
+            if lanes.iter().all(Option::is_none) {
+                log(b"drv-xhci: storage irq-driven; no hid lanes\n");
+            }
             for lane in lanes.iter().flatten() {
                 log(if lane.hid.is_mouse() {
                     b"drv-xhci: mouse irq-driven port=" as &[u8]
@@ -3411,7 +3422,7 @@ fn run_hid_devices(
         device.bring_up(io, layout, image, cmd, evt, &mut lanes, &mut count);
     }
     if count == 0 {
-        return log(b"drv-xhci: no hid lanes; not serving\n");
+        return log(b"drv-xhci: no hid lanes\n");
     }
     run_hid_lanes(io, layout, image, evt, &mut lanes);
 }
