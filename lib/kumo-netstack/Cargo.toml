@@ -1,0 +1,24 @@
+#j813
+[package]
+name = "kumo-netstack"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+# DESIGN/026 §8: the exact NET1 pin. No defaults, so no `std`, `alloc` or `log`; vendored in
+# `vendor/cargo` with crates.io checksums checked at J813. Add features only at their NET gate.
+smoltcp = { version = "=0.14.0", default-features = false, features = [
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+] }
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
