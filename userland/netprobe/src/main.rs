@@ -2,6 +2,7 @@
 #![no_main]
 //j815
 //j816
+//j817
 
 //! `netprobe` — drive netstack's socket contract over a real granted channel (PLAN/020 NET2b).
 //!
@@ -10,7 +11,10 @@
 //! that must close the session.
 //! `bg net netprobe recv <port> <n>` + `net netprobe send <port> <n>`: two separately launched
 //! processes, each with its own session, exchange `n` datagrams; the receiver echoes each one
-//! and the sender checks the echo is exact (NET2b-2). Run without `net`, it reports that it holds no network grant —
+//! and the sender checks the echo is exact (NET2b-2).
+//! `bg net netprobe tcpserve <port>` + `net netprobe tcpclient <port>`: a 12000-byte stream,
+//! echoed back exact across partial writes, then half-close and EOF (NET2c).
+//! `net netprobe tcperrors`: refusal, would-block, deadline, a full send buffer and EOF. Run without `net`, it reports that it holds no network grant —
 //! the grant is a launcher decision, not something a program can ask for.
 
 extern crate alloc;
@@ -19,7 +23,7 @@ use kumo_abi::{unpack_argv, Handle};
 use kumo_netstack::budget::{SOCKETS_PER_SESSION, UDP_PAYLOAD_MAX};
 use kumo_netstack::socket::{
     decode_reply, encode_request, Addr, Op, RequestHeader, Status, ADDR_LEN, HEADER_LEN,
-    WAIT_READABLE,
+    WAIT_CONNECTED, WAIT_READABLE, WAIT_WRITABLE,
 };
 use kumo_rt::{channel_read, channel_write, debug_write, process_exit, startup, vmo_read};
 
@@ -103,6 +107,10 @@ fn status_name(status: Status) -> &'static [u8] {
         Status::NotConnected => b"NotConnected",
         Status::AddrInUse => b"AddrInUse",
         Status::NetUnreachable => b"NetUnreachable",
+        Status::InProgress => b"InProgress",
+        Status::ConnRefused => b"ConnRefused",
+        Status::ConnReset => b"ConnReset",
+        Status::ShutDown => b"ShutDown",
         _ => b"(other)",
     }
 }
@@ -435,6 +443,326 @@ fn send(client: &mut Client, port: u16, count: usize) {
     }
 }
 
+/// The NET2c stream: 12000 bytes generated from their index, so neither side holds it whole.
+const STREAM_TOTAL: usize = 12_000;
+const STREAM_CHUNK: usize = 2048;
+const FNV_START: u32 = 0x811c_9dc5;
+
+fn stream_byte(index: usize) -> u8 {
+    (index as u8)
+        .wrapping_mul(13)
+        .wrapping_add((index >> 8) as u8)
+}
+
+fn fnv_step(hash: u32, bytes: &[u8]) -> u32 {
+    bytes.iter().fold(hash, |hash, &byte| {
+        (hash ^ byte as u32).wrapping_mul(0x0100_0193)
+    })
+}
+
+fn wait(client: &mut Client, socket: u32, interest: u8, ms: u64) -> Status {
+    client
+        .call(Op::Wait, socket, interest as u64 | (ms << 32), &[])
+        .status
+}
+
+fn tcp_socket(client: &mut Client) -> u32 {
+    let reply = client.call(Op::Socket, 0, 2, &[]);
+    client.expect(b"socket tcp", reply.status, Status::Ok);
+    reply.socket
+}
+
+fn connect(client: &mut Client, socket: u32, port: u16) -> Status {
+    client
+        .call(
+            Op::Connect,
+            socket,
+            0,
+            &Addr { ip: LOOPBACK, port }.encode(),
+        )
+        .status
+}
+
+/// Accept one connection on `port`, echo everything until the client half-closes, then close.
+fn tcp_serve(client: &mut Client, port: u16) {
+    let listener = tcp_socket(client);
+    client.bind(listener, port);
+    let got = client.call(Op::Listen, listener, 2, &[]).status;
+    client.expect(b"listen", got, Status::Ok);
+    client.out.line(&[
+        b"netprobe: tcp listening on 127.0.0.1:",
+        dec(port as u64).bytes(),
+    ]);
+    if wait(client, listener, WAIT_CONNECTED, 15_000) != Status::Ok {
+        client.fail(&[b"no connection to accept"]);
+        return;
+    }
+    let accepted = client.call(Op::Accept, listener, 0, &[]);
+    client.expect(b"accept", accepted.status, Status::Ok);
+    let stream = accepted.socket;
+    let peer = client.payload(&accepted);
+    let peer_port = if peer.len() >= ADDR_LEN {
+        u16::from_le_bytes([peer[2], peer[3]])
+    } else {
+        0
+    };
+    client.out.line(&[
+        b"netprobe: tcp accepted 127.0.0.1:",
+        dec(peer_port as u64).bytes(),
+    ]);
+    let (mut total, mut hash) = (0usize, FNV_START);
+    let mut chunk = [0u8; 700];
+    loop {
+        let got = client.call(Op::Recv, stream, chunk.len() as u64, &[]);
+        match got.status {
+            Status::Ok if got.len == 0 => break,
+            Status::Ok => {
+                let n = got.len;
+                chunk[..n].copy_from_slice(client.payload(&got));
+                hash = fnv_step(hash, &chunk[..n]);
+                total += n;
+                let mut off = 0;
+                while off < n {
+                    let sent = client.call(Op::Send, stream, 0, &chunk[off..n]);
+                    match sent.status {
+                        Status::Ok => off += sent.result as usize,
+                        Status::WouldBlock => {
+                            if wait(client, stream, WAIT_WRITABLE, 2000) != Status::Ok {
+                                client.fail(&[b"echo stalled"]);
+                                return;
+                            }
+                        }
+                        other => {
+                            client.fail(&[b"echo send -> ", status_name(other)]);
+                            return;
+                        }
+                    }
+                }
+            }
+            Status::WouldBlock => {
+                if wait(client, stream, WAIT_READABLE, 5000) != Status::Ok {
+                    client.fail(&[b"stream went quiet before EOF"]);
+                    return;
+                }
+            }
+            other => {
+                client.fail(&[b"recv -> ", status_name(other)]);
+                return;
+            }
+        }
+    }
+    client.out.line(&[
+        b"netprobe: tcp echoed ",
+        dec(total as u64).bytes(),
+        b" B fnv=",
+        &hex32(hash),
+        b", EOF after the client's half-close",
+    ]);
+    let closed = client.call(Op::Close, stream, 0, &[]).status;
+    client.expect(b"close stream", closed, Status::Ok);
+    let closed = client.call(Op::Close, listener, 0, &[]).status;
+    client.expect(b"close listener", closed, Status::Ok);
+}
+
+/// Connect (retrying while the server starts), stream STREAM_TOTAL bytes while reading the echo,
+/// half-close, read to EOF, and require the echo byte-for-byte.
+fn tcp_client(client: &mut Client, port: u16) {
+    let pause = client.udp_socket();
+    client.bind(pause, 0);
+    let mut stream = 0;
+    let mut tries = 0;
+    for attempt in 1..=50u64 {
+        tries = attempt;
+        let socket = tcp_socket(client);
+        let status = connect(client, socket, port);
+        if status == Status::InProgress && wait(client, socket, WAIT_CONNECTED, 1000) == Status::Ok
+        {
+            stream = socket;
+            break;
+        }
+        // Refused (the server is not listening yet): drop the socket, pause, try again.
+        let _ = client.call(Op::Close, socket, 0, &[]);
+        let _ = wait(client, pause, WAIT_READABLE, 100);
+    }
+    if stream == 0 {
+        client.fail(&[b"never connected"]);
+        return;
+    }
+    client.out.line(&[
+        b"netprobe: tcp connected to 127.0.0.1:",
+        dec(port as u64).bytes(),
+        b" after ",
+        dec(tries).bytes(),
+        b" attempt(s)",
+    ]);
+    let (mut sent, mut got, mut sends, mut partial) = (0usize, 0usize, 0u64, 0u64);
+    let (mut hash, mut exact, mut shut, mut eof) = (FNV_START, true, false, false);
+    let mut chunk = [0u8; STREAM_CHUNK];
+    for _ in 0..20_000 {
+        let mut progress = false;
+        if sent < STREAM_TOTAL {
+            let n = (STREAM_TOTAL - sent).min(STREAM_CHUNK);
+            for (i, byte) in chunk[..n].iter_mut().enumerate() {
+                *byte = stream_byte(sent + i);
+            }
+            let reply = client.call(Op::Send, stream, 0, &chunk[..n]);
+            match reply.status {
+                Status::Ok => {
+                    sends += 1;
+                    let accepted = reply.result as usize;
+                    if accepted < n {
+                        partial += 1;
+                    }
+                    sent += accepted;
+                    progress |= accepted > 0;
+                }
+                Status::WouldBlock => {}
+                other => {
+                    client.fail(&[b"send -> ", status_name(other)]);
+                    return;
+                }
+            }
+        } else if !shut {
+            let status = client.call(Op::Shutdown, stream, 2, &[]).status;
+            client.expect(b"shutdown write (half-close)", status, Status::Ok);
+            shut = true;
+        }
+        let reply = client.call(Op::Recv, stream, STREAM_CHUNK as u64, &[]);
+        match reply.status {
+            Status::Ok if reply.len == 0 => {
+                eof = true;
+                break;
+            }
+            Status::Ok => {
+                let data = client.payload(&reply);
+                exact &= data
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &byte)| byte == stream_byte(got + i));
+                hash = fnv_step(hash, data);
+                got += data.len();
+                progress = true;
+            }
+            Status::WouldBlock => {}
+            other => {
+                client.fail(&[b"recv -> ", status_name(other)]);
+                return;
+            }
+        }
+        if !progress {
+            let interest = if sent < STREAM_TOTAL {
+                WAIT_READABLE | WAIT_WRITABLE
+            } else {
+                WAIT_READABLE
+            };
+            if wait(client, stream, interest, 2000) != Status::Ok {
+                client.fail(&[b"stream stalled"]);
+                return;
+            }
+        }
+    }
+    let (sent_d, sends_d, partial_d, got_d, hash_x) = (
+        dec(sent as u64),
+        dec(sends),
+        dec(partial),
+        dec(got as u64),
+        hex32(hash),
+    );
+    let line: [&[u8]; 11] = [
+        b"netprobe: tcp sent ",
+        sent_d.bytes(),
+        b" B in ",
+        sends_d.bytes(),
+        b" SENDs (",
+        partial_d.bytes(),
+        b" partial); echo ",
+        got_d.bytes(),
+        b" B fnv=",
+        &hash_x,
+        if exact && eof {
+            b" exact, then EOF"
+        } else {
+            b" NOT exact"
+        },
+    ];
+    client.out.line(&line);
+    if !(exact && eof && got == STREAM_TOTAL && partial > 0) {
+        client.fail(&[b"stream not exact, no EOF, or no partial write"]);
+    }
+    let status = client.call(Op::Close, stream, 0, &[]).status;
+    client.expect(b"close", status, Status::Ok);
+}
+
+/// TCP refusals and edges inside one session.
+fn tcp_errors(client: &mut Client) {
+    let lonely = tcp_socket(client);
+    let status = connect(client, lonely, 8999);
+    client.expect(b"connect to 8999 (no listener)", status, Status::InProgress);
+    let status = wait(client, lonely, WAIT_CONNECTED, 2000);
+    client.expect(b"wait connected", status, Status::ConnRefused);
+
+    let listener = tcp_socket(client);
+    client.bind(listener, 8998);
+    let status = client.call(Op::Listen, listener, 1, &[]).status;
+    client.expect(b"listen backlog 1", status, Status::Ok);
+    let status = client.call(Op::Accept, listener, 0, &[]).status;
+    client.expect(b"accept with none pending", status, Status::WouldBlock);
+    let near = tcp_socket(client);
+    let status = connect(client, near, 8998);
+    client.expect(b"connect to 8998", status, Status::InProgress);
+    let status = wait(client, near, WAIT_CONNECTED, 2000);
+    client.expect(b"wait connected", status, Status::Ok);
+    let status = wait(client, listener, WAIT_CONNECTED, 2000);
+    client.expect(b"wait acceptable", status, Status::Ok);
+    let far = client.call(Op::Accept, listener, 0, &[]);
+    client.expect(b"accept", far.status, Status::Ok);
+    let far = far.socket;
+
+    let status = client.call(Op::Recv, far, 64, &[]).status;
+    client.expect(b"recv with nothing sent", status, Status::WouldBlock);
+    let status = wait(client, far, WAIT_READABLE, 50);
+    client.expect(b"wait readable 50ms", status, Status::TimedOut);
+
+    let block = [0x5Au8; STREAM_CHUNK];
+    let mut filled = Status::Ok;
+    for _ in 0..20 {
+        filled = client.call(Op::Send, near, 0, &block).status;
+        if filled == Status::WouldBlock {
+            break;
+        }
+        let _ = wait(client, far, WAIT_READABLE, 20);
+    }
+    client.expect(b"send into an unread stream", filled, Status::WouldBlock);
+
+    let status = client.call(Op::Close, near, 0, &[]).status;
+    client.expect(b"close the sender", status, Status::Ok);
+    let mut drained = 0usize;
+    let mut end = Status::TimedOut;
+    for _ in 0..200 {
+        let reply = client.call(Op::Recv, far, STREAM_CHUNK as u64, &[]);
+        match reply.status {
+            Status::Ok if reply.len == 0 => {
+                end = Status::Ok;
+                break;
+            }
+            Status::Ok => drained += reply.len,
+            Status::WouldBlock => {
+                let _ = wait(client, far, WAIT_READABLE, 1000);
+            }
+            other => {
+                end = other;
+                break;
+            }
+        }
+    }
+    client.out.line(&[
+        b"netprobe: drained ",
+        dec(drained as u64).bytes(),
+        b" B after the peer closed",
+    ]);
+    client.expect(b"recv after peer close (EOF)", end, Status::Ok);
+}
+
 fn errors(client: &mut Client) {
     let s = client.udp_socket();
     let port = client.bind(s, 0);
@@ -446,8 +774,8 @@ fn errors(client: &mut Client) {
     client.expect(b"wait 50ms", got, Status::TimedOut);
     let got = client.call(Op::Close, 999, 0, &[]).status;
     client.expect(b"close unknown socket", got, Status::BadSocket);
-    let got = client.call(Op::Socket, 0, 2, &[]).status;
-    client.expect(b"socket tcp (NET2c)", got, Status::Unsupported);
+    let got = client.call(Op::Listen, s, 1, &[]).status;
+    client.expect(b"listen on udp", got, Status::Unsupported);
     let elsewhere = Addr {
         ip: [10, 0, 0, 1],
         port: 9,
@@ -556,10 +884,13 @@ extern "C" fn main(
                 send(&mut client, port, count)
             }
         }
+        b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
+        b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
+        b"tcperrors" => tcp_errors(&mut client),
         _ => {
-            client
-                .out
-                .line(&[b"usage: net netprobe udp|errors | recv|send <port> <1-4>"]);
+            client.out.line(&[
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port>",
+            ]);
             process_exit(2);
         }
     }

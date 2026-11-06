@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j809 -->
 <!-- j810 -->
 <!-- j812 -->
 <!-- j815 -->
 <!-- j816 -->
+<!-- j817 -->
 
 Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816).
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c TCP in QEMU (J817), restart proof pending.
 
 ## First controller
 
@@ -229,3 +229,15 @@ probe started with `bg net` and a sending probe started with `net` ran at the sa
 separate programs with two network sessions: datagrams of 13, 0, 1472 and 512 bytes went out
 and came back exact, with matching checksums printed by both sides. Both sessions were freed
 when the programs ended. TCP over loopback is next. — TIMBERDOODLE 2026-11-06
+
+
+## NET2c TCP over loopback
+
+The network service now serves TCP on 127.0.0.1 alongside UDP. A server probe started in the
+background accepted a connection from a separately launched client; the client streamed 12000
+bytes, some of them only partly accepted at a time, and received every byte back in order,
+with the same checksum printed by both programs. The client then closed its sending side; the
+server saw end-of-stream, closed, and the client saw end-of-stream too. Connection refusal,
+operations that would block, wait deadlines, a full send buffer, and a peer that resets are
+all reported with specific errors. Still to prove: restarting the service fails old
+connections cleanly and new ones succeed. — TIMBERDOODLE 2026-11-06

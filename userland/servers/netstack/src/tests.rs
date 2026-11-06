@@ -1,4 +1,5 @@
 //j815
+//j817
 
 extern crate std;
 
@@ -229,9 +230,10 @@ fn errors_fail_deterministically() {
         c.call(&mut server, Op::Close, 99, 0, &[]).status,
         Status::BadSocket
     );
+    // TCP is served since NET2c (J817); this session's TCP socket is simply created.
     assert_eq!(
         c.call(&mut server, Op::Socket, 0, 2, &[]).status,
-        Status::Unsupported
+        Status::Ok
     );
     assert_eq!(
         c.call(&mut server, Op::Send, s, 0, b"x").status,
@@ -418,4 +420,349 @@ fn untrusted_and_violating_requests_close_the_session() {
         After::Close,
         "closed session"
     );
+}
+
+// ---- TCP (NET2c, J817) ----------------------------------------------------------------------
+
+use kumo_netstack::socket::{WAIT_CONNECTED, WAIT_WRITABLE};
+
+/// A test clock: TCP needs time to move (ACK delay, FIN exchange, deadlines). Each test thread
+/// has its own, so parallel tests never share time.
+mod clock {
+    use super::std::cell::Cell;
+    super::std::thread_local!(static NOW: Cell<u64> = const { Cell::new(1_000_000) });
+    pub fn now() -> u64 {
+        NOW.with(Cell::get)
+    }
+    pub fn advance(ns: u64) {
+        NOW.with(|now| now.set(now.get() + ns));
+    }
+}
+
+/// Run the stack for `ms` milliseconds in 1 ms steps; returns any deferred replies.
+fn run(server: &mut Server, ms: u64) -> Vec<Output> {
+    let mut out = Vec::new();
+    for _ in 0..ms {
+        clock::advance(MS);
+        server.poll(clock::now(), &mut out);
+    }
+    out
+}
+
+impl Client {
+    /// `call`, at the test clock's current time.
+    fn at(&mut self, server: &mut Server, op: Op, socket: u32, arg: u64, payload: &[u8]) -> Answer {
+        let mut out = self.send(server, op, socket, arg, payload, clock::now());
+        assert_eq!(out.len(), 1, "{op:?} answers immediately");
+        Self::read(&out.remove(0))
+    }
+
+    fn tcp(&mut self, server: &mut Server) -> u32 {
+        let answer = self.at(server, Op::Socket, 0, 2, &[]);
+        assert_eq!(answer.status, Status::Ok);
+        answer.socket
+    }
+
+    fn tcp_listener(&mut self, server: &mut Server, port: u16, backlog: u64) -> u32 {
+        let l = self.tcp(server);
+        let bind = self.at(
+            server,
+            Op::Bind,
+            l,
+            0,
+            &Addr { ip: LOOPBACK, port }.encode(),
+        );
+        assert_eq!(bind.status, Status::Ok);
+        assert_eq!(
+            self.at(server, Op::Listen, l, backlog, &[]).status,
+            Status::Ok
+        );
+        l
+    }
+
+    fn connect(&mut self, server: &mut Server, socket: u32, port: u16) -> Status {
+        self.at(
+            server,
+            Op::Connect,
+            socket,
+            0,
+            &Addr { ip: LOOPBACK, port }.encode(),
+        )
+        .status
+    }
+
+    fn recv_tcp(&mut self, server: &mut Server, socket: u32, max: u64) -> Answer {
+        self.at(server, Op::Recv, socket, max, &[])
+    }
+}
+
+/// Listener on `port` in `a`, a connected stream from `b`, and the accepted id in `a`.
+fn connected(server: &mut Server, a: &mut Client, b: &mut Client, port: u16) -> (u32, u32, u32) {
+    let l = a.tcp_listener(server, port, 2);
+    let c = b.tcp(server);
+    assert_eq!(b.connect(server, c, port), Status::InProgress);
+    run(server, 20);
+    let ready = b.at(server, Op::Wait, c, WAIT_CONNECTED as u64, &[]);
+    assert_eq!(ready.status, Status::Ok);
+    assert_ne!(ready.result & WAIT_CONNECTED as u64, 0);
+    let accepted = a.at(server, Op::Accept, l, 0, &[]);
+    assert_eq!(accepted.status, Status::Ok);
+    assert_eq!(accepted.socket as u64, accepted.result);
+    // The accepted connection's peer is the connecting socket's local port.
+    let names = b.at(server, Op::GetName, c, 0, &[]);
+    assert_eq!(accepted.payload, names.payload[..ADDR_LEN]);
+    (l, c, accepted.socket)
+}
+
+#[test]
+fn tcp_connect_accept_and_exact_stream_across_partial_writes() {
+    let mut server = Server::new(clock::now());
+    let mut a = Client::open(&mut server);
+    let mut b = Client::open(&mut server);
+    let (_, c, s) = connected(&mut server, &mut a, &mut b, 8000);
+
+    let data = pattern(20_000, 3);
+    let (mut sent, mut received) = (0usize, Vec::new());
+    let (mut partial, mut would_block) = (false, false);
+    for _ in 0..10_000 {
+        if sent < data.len() {
+            let chunk = (data.len() - sent).min(STREAM_PAYLOAD_MAX);
+            let answer = b.at(&mut server, Op::Send, c, 0, &data[sent..sent + chunk]);
+            match answer.status {
+                Status::Ok => {
+                    partial |= (answer.result as usize) < chunk;
+                    sent += answer.result as usize;
+                }
+                Status::WouldBlock => would_block = true,
+                other => panic!("send -> {other:?}"),
+            }
+        }
+        run(&mut server, 2);
+        // A slower reader than writer, so the buffers fill and writes go partial.
+        let got = b_recv(&mut a, &mut server, s, 700);
+        received.extend_from_slice(&got);
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data, "stream read back exact");
+    // Backpressure shows here as partially accepted SENDs; a fully refused SEND (WouldBlock) is
+    // proven against an unread stream in the refusal test.
+    assert!(partial, "partial writes were exercised");
+    let _ = would_block;
+    assert_eq!(server.stats().stream_bytes_received, data.len() as u64);
+}
+
+fn b_recv(client: &mut Client, server: &mut Server, socket: u32, max: u64) -> Vec<u8> {
+    let answer = client.recv_tcp(server, socket, max);
+    match answer.status {
+        Status::Ok => answer.payload,
+        Status::WouldBlock => Vec::new(),
+        other => panic!("recv -> {other:?}"),
+    }
+}
+
+#[test]
+fn tcp_half_close_eof_and_orderly_close() {
+    let mut server = Server::new(clock::now());
+    let mut a = Client::open(&mut server);
+    let mut b = Client::open(&mut server);
+    let (_, c, s) = connected(&mut server, &mut a, &mut b, 8001);
+
+    assert_eq!(
+        b.at(&mut server, Op::Send, c, 0, b"last words").status,
+        Status::Ok
+    );
+    assert_eq!(
+        b.at(&mut server, Op::Shutdown, c, 2, &[]).status,
+        Status::Ok
+    );
+    assert_eq!(
+        b.at(&mut server, Op::Send, c, 0, b"too late").status,
+        Status::ShutDown
+    );
+    run(&mut server, 30);
+    assert_eq!(b_recv(&mut a, &mut server, s, 64), b"last words");
+    let eof = a.recv_tcp(&mut server, s, 64);
+    assert_eq!(
+        (eof.status, eof.payload.len()),
+        (Status::Ok, 0),
+        "peer FIN reads as EOF"
+    );
+
+    // Half-closed: the other direction still carries data.
+    assert_eq!(
+        a.at(&mut server, Op::Send, s, 0, b"still open").status,
+        Status::Ok
+    );
+    run(&mut server, 30);
+    assert_eq!(b_recv(&mut b, &mut server, c, 64), b"still open");
+
+    assert_eq!(a.at(&mut server, Op::Close, s, 0, &[]).status, Status::Ok);
+    run(&mut server, 30);
+    let end = b.recv_tcp(&mut server, c, 64);
+    assert_eq!((end.status, end.payload.len()), (Status::Ok, 0));
+    assert_eq!(b.at(&mut server, Op::Close, c, 0, &[]).status, Status::Ok);
+    run(&mut server, 100);
+    // Only the listener and its two backlog slots remain busy.
+    assert_eq!(server.busy_slots(), 3);
+}
+
+#[test]
+fn tcp_refusal_backlog_would_block_and_deadlines() {
+    let mut server = Server::new(clock::now());
+    let mut a = Client::open(&mut server);
+    let mut b = Client::open(&mut server);
+
+    // No listener: refused.
+    let c = b.tcp(&mut server);
+    assert_eq!(b.connect(&mut server, c, 8100), Status::InProgress);
+    run(&mut server, 20);
+    let refused = b.at(
+        &mut server,
+        Op::Wait,
+        c,
+        WAIT_CONNECTED as u64 | (1000u64 << 32),
+        &[],
+    );
+    assert_eq!(refused.status, Status::ConnRefused);
+
+    // Backlog 1: one connection waits for ACCEPT, the next is refused.
+    let l = a.tcp_listener(&mut server, 8101, 1);
+    assert_eq!(
+        a.at(&mut server, Op::Accept, l, 0, &[]).status,
+        Status::WouldBlock
+    );
+    let (first, second) = (b.tcp(&mut server), b.tcp(&mut server));
+    assert_eq!(b.connect(&mut server, first, 8101), Status::InProgress);
+    run(&mut server, 20);
+    assert_eq!(b.connect(&mut server, second, 8101), Status::InProgress);
+    run(&mut server, 20);
+    let w = |client: &mut Client, server: &mut Server, s| {
+        client
+            .at(
+                server,
+                Op::Wait,
+                s,
+                WAIT_CONNECTED as u64 | (500u64 << 32),
+                &[],
+            )
+            .status
+    };
+    assert_eq!(w(&mut b, &mut server, first), Status::Ok);
+    assert_eq!(w(&mut b, &mut server, second), Status::ConnRefused);
+    let s = a.at(&mut server, Op::Accept, l, 0, &[]).socket;
+
+    // Nothing to read: would-block now, TimedOut at the WAIT deadline.
+    assert_eq!(a.recv_tcp(&mut server, s, 64).status, Status::WouldBlock);
+    let held = a.send(
+        &mut server,
+        Op::Wait,
+        s,
+        WAIT_READABLE as u64 | (50u64 << 32),
+        &[],
+        clock::now(),
+    );
+    assert!(held.is_empty(), "the WAIT is deferred");
+    let early = run(&mut server, 49);
+    assert!(early.is_empty());
+    let late = run(&mut server, 2);
+    assert_eq!(Client::read(&late[0]).status, Status::TimedOut);
+
+    // Writable until the buffers fill, then would-block.
+    assert_ne!(
+        b.at(&mut server, Op::Wait, first, WAIT_WRITABLE as u64, &[])
+            .result
+            & WAIT_WRITABLE as u64,
+        0
+    );
+    let block = [7u8; STREAM_PAYLOAD_MAX];
+    let mut blocked = false;
+    for _ in 0..20 {
+        if b.at(&mut server, Op::Send, first, 0, &block).status == Status::WouldBlock {
+            blocked = true;
+            break;
+        }
+        run(&mut server, 5);
+    }
+    assert!(blocked, "an unread stream pushes back");
+}
+
+#[test]
+fn tcp_peer_session_close_resets_and_every_slot_comes_back() {
+    let mut server = Server::new(clock::now());
+    let mut a = Client::open(&mut server);
+    let mut b = Client::open(&mut server);
+    let (_, c, _) = connected(&mut server, &mut a, &mut b, 8200);
+    assert_eq!(
+        server.close_session(a.session),
+        2,
+        "the listener and the accepted stream"
+    );
+    run(&mut server, 20);
+    assert_eq!(b.recv_tcp(&mut server, c, 64).status, Status::ConnReset);
+    assert_eq!(
+        b.at(&mut server, Op::Send, c, 0, b"x").status,
+        Status::ConnReset
+    );
+    assert_eq!(b.at(&mut server, Op::Close, c, 0, &[]).status, Status::Ok);
+    run(&mut server, 20);
+    assert_eq!(
+        server.busy_slots(),
+        0,
+        "listener, backlog, stream and drains all freed"
+    );
+    assert_eq!(server.live_sockets(), 0);
+}
+
+#[test]
+fn an_aborted_slot_is_not_reused_before_its_rst_leaves() {
+    let mut server = Server::new(clock::now());
+    let mut a = Client::open(&mut server);
+    let mut b = Client::open(&mut server);
+    let (_, c, _) = connected(&mut server, &mut a, &mut b, 8300);
+    // Close a's session and, with NO poll in between, let a new listener arm backlog slots. If
+    // the aborted slots were free at once, `listen()` would reset them and swallow their RST.
+    // (netstack's loop polls after every message; this holds the invariant for any caller.)
+    server.close_session(a.session);
+    let d = server.open_session().unwrap();
+    let now = clock::now();
+    let mut out = Vec::new();
+    let raw = |server: &mut Server, out: &mut Vec<Output>, h: RequestHeader, payload: &[u8]| {
+        let mut bytes = [0u8; 256];
+        let len = encode_request(&h, payload, &mut bytes).unwrap();
+        server.handle(d, &bytes[..len], 0, now, out);
+    };
+    raw(&mut server, &mut out, header(Op::Hello, 0, 0, 0, 1), &[]);
+    let generation = decode_reply(&out[0].bytes, 0).unwrap().generation;
+    let addr = Addr {
+        ip: LOOPBACK,
+        port: 8301,
+    }
+    .encode();
+    raw(
+        &mut server,
+        &mut out,
+        header(Op::Socket, 0, generation, 2, 2),
+        &[],
+    );
+    raw(
+        &mut server,
+        &mut out,
+        header(Op::Bind, 1, generation, 0, 3),
+        &addr,
+    );
+    raw(
+        &mut server,
+        &mut out,
+        header(Op::Listen, 1, generation, 4, 4),
+        &[],
+    );
+    let statuses: Vec<_> = out
+        .iter()
+        .map(|o| decode_reply(&o.bytes, 0).unwrap().status)
+        .collect();
+    assert_eq!(statuses, [Status::Ok; 4]);
+    run(&mut server, 20);
+    assert_eq!(b.recv_tcp(&mut server, c, 64).status, Status::ConnReset);
 }
