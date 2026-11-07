@@ -1,0 +1,22 @@
+#j824
+[package]
+name = "actorcall"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The AX2 call/reply probe (PLAN/021). One binary, five roles selected by argv:
+# ping (caller), pong (echo server), die (peer death mid-call), never (deadline),
+# hold (delayed reply across scheduler ticks). Built for aarch64-unknown-none by
+# `cargo xtask image` and staged at `bin/actorcall`.
+[dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "actorcall"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

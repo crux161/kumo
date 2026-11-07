@@ -1,8 +1,8 @@
-//j632
 //j660
 //j743
 //j790
 //j815
+//j824
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -450,6 +450,48 @@ pub fn channel_read_with_handle(_channel: Handle, _buf: *mut u8, _cap: usize) ->
     (0, 0)
 }
 
+/// The call-aware read for AX2 servers: [`channel_read`] plus the four register words a
+/// `ChannelCall` (syscall 6) delivers.
+///
+/// Returns `(x0, x1, [x2, x3, x4, x5])`: the byte count (the same value
+/// [`channel_read`] returns; `0` means an empty, peer-closed channel in the AX0/AX2
+/// protocols), the attached handle or `0`, and the payload words. For a call of at most
+/// [`kumo_abi::MAX_CALL_BYTES`] bytes the kernel also copies the payload into `buf` when it
+/// is non-empty, so a legacy reader can ignore the words and read bytes; a call-aware
+/// server reads the words and may cross-check them against the copy. Bytes past the
+/// returned count are undefined and must not be decoded.
+///
+/// On x86_64 the AX2 register path is not routed, so this returns `NotSupported` in x0 with
+/// no words; the aarch64 acceptance path is the only caller.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_read_call(handle: Handle, buf: &mut [u8]) -> (i64, usize, [u64; 4]) {
+    let count: u64;
+    let attached: u64;
+    let (w0, w1, w2, w3): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ChannelRead as u64,
+            inlateout("x0") handle.0 as u64 => count,
+            inlateout("x1") buf.as_mut_ptr() as u64 => attached,
+            inlateout("x2") buf.len() as u64 => w0,
+            inlateout("x3") 0u64 => w1,
+            inlateout("x4") 0u64 => w2,
+            inlateout("x5") 0u64 => w3,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (count as i64, attached as usize, [w0, w1, w2, w3])
+}
+
+/// The x86_64 backend does not implement the AX2 register fast path yet; there is no call
+/// frame to return, so the read is refused up front with `NotSupported` in x0.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_read_call(_handle: Handle, _buf: &mut [u8]) -> (i64, usize, [u64; 4]) {
+    (i64::from(kumo_abi::Errno::NotSupported.status()), 0, [0; 4])
+}
+
 pub const STARTUP_TAG_STDIN: u8 = b'i';
 pub const STARTUP_TAG_STDOUT: u8 = b'o';
 pub const STARTUP_TAG_STDERR: u8 = b'e';
@@ -542,6 +584,83 @@ pub fn channel_write(channel: Handle, ptr: *const u8, len: usize) -> Status {
 )))]
 pub fn channel_write(_channel: Handle, _ptr: *const u8, _len: usize) -> Status {
     kumo_abi::Errno::NotSupported.status()
+}
+
+/// Call a server over `handle` with up to [`kumo_abi::MAX_CALL_BYTES`] payload bytes and block
+/// until it replies or `deadline_ns` (absolute monotonic nanoseconds; `0` = no deadline)
+/// passes (AX2).
+///
+/// The payload travels in registers (`x2..=x5`, little-endian, zero-padded): no buffer is
+/// shared and no kernel copy happens. Returns `(status, reply_len, reply_words)`, where
+/// `status` is the syscall result (`0` = `Ok`, a negative `Errno` otherwise), `reply_len` is
+/// how many bytes the server's [`channel_reply`] carried (`0..=32`), and `reply_words` holds
+/// them little-endian in `x2..=x5`. Only the first `reply_len` reply bytes are meaningful;
+/// ignore the rest rather than decoding them.
+///
+/// A payload longer than 32 bytes is refused locally with `InvalidArgs`, without issuing the
+/// syscall, matching an oversized [`channel_write`].
+#[cfg(target_arch = "aarch64")]
+pub fn channel_call(handle: Handle, deadline_ns: u64, payload: &[u8]) -> (i64, usize, [u64; 4]) {
+    let Some(words) = kumo_abi::pack_call_payload(payload) else {
+        return (i64::from(kumo_abi::Errno::InvalidArgs.status()), 0, [0; 4]);
+    };
+    let status: u64;
+    let reply_len: u64;
+    let (w0, w1, w2, w3): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") Syscall::ChannelCall as u64,
+            inlateout("x0") handle.0 as u64 => status,
+            inlateout("x1") deadline_ns => reply_len,
+            inlateout("x2") words[0] => w0,
+            inlateout("x3") words[1] => w1,
+            inlateout("x4") words[2] => w2,
+            inlateout("x5") words[3] => w3,
+            in("x6") payload.len() as u64,
+            in("x7") 0u64,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status as i64, reply_len as usize, [w0, w1, w2, w3])
+}
+
+/// The x86_64 backend does not implement the AX2 register fast path yet, so a call is refused
+/// up front instead of entering a syscall the kernel does not route.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_call(_handle: Handle, _deadline_ns: u64, _payload: &[u8]) -> (i64, usize, [u64; 4]) {
+    (i64::from(kumo_abi::Errno::NotSupported.status()), 0, [0; 4])
+}
+
+/// Answer the most recent [`Syscall::ChannelCall`] delivered to this thread with up to
+/// [`kumo_abi::MAX_CALL_BYTES`] reply bytes packed little-endian in `words`; only the first
+/// `len` bytes are meaningful.
+///
+/// Returns `0` when the parked caller receives the reply, or `BadState` when it is no longer
+/// parked (it timed out or died; the reply is discarded). A reply longer than 32 bytes is
+/// refused locally with `InvalidArgs`, never truncated.
+#[cfg(target_arch = "aarch64")]
+pub fn channel_reply(len: usize, words: [u64; 4]) -> i64 {
+    if len > kumo_abi::MAX_CALL_BYTES {
+        return i64::from(kumo_abi::Errno::InvalidArgs.status());
+    }
+    syscall6(
+        Syscall::ChannelReply,
+        len as u64,
+        words[0],
+        words[1],
+        words[2],
+        words[3],
+        0,
+    ) as i64
+}
+
+/// The x86_64 backend does not implement the AX2 register fast path yet, so a reply is refused
+/// up front with `NotSupported`; no call can be parked for it to answer.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn channel_reply(_len: usize, _words: [u64; 4]) -> i64 {
+    i64::from(kumo_abi::Errno::NotSupported.status())
 }
 
 #[cfg(target_arch = "aarch64")]

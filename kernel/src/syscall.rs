@@ -1,8 +1,8 @@
-//j743
 //j777
 //j790
 //j798
 //j823
+//j824
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -41,6 +41,29 @@ pub enum KernelCall<'a> {
     },
     ChannelRead {
         channel: Handle,
+    },
+    //j824
+    /// AX2 synchronous call: install a <=32-byte request in the peer inbox and let the
+    /// caller block until reply, deadline or peer close. Register policy (x7 == 0, depth 1,
+    /// no handle transfers) lives in the front end; this arm owns capability and state
+    /// validation so the engine can be tested without an address space. — TIMBERDOODLE
+    ChannelCall {
+        channel: Handle,
+        caller_thread: KoId,
+        caller_process: KoId,
+        caller_is_sora: bool,
+        deadline_ns: u64,
+        payload_len: usize,
+        payload: [u64; 4],
+        /// The receiver the front end pre-admitted, when it found one parked.
+        served_by: Option<KoId>,
+    },
+    /// AX2 reply: complete the call this server thread last consumed.
+    ChannelReply {
+        call: usize,
+        server: KoId,
+        payload_len: usize,
+        payload: [u64; 4],
     },
     PortCreate,
     PortWait {
@@ -275,6 +298,99 @@ pub enum KernelCallResult {
     },
     Message(KernelMessage),
     PortPacket(PortPacket),
+    //j824
+    /// The call request is installed and the record is live; the front end may pre-admit
+    /// `ticket.served_by` and park the caller.
+    CallInstalled(CallTicket),
+    /// A reply completed the call exactly once; the caller at `caller_end` must wake.
+    CallReplied(CallWake),
+}
+
+//j824
+/// The scheduling-context handoff recorded for one call. sched-1 treats it as a slot
+/// handoff only (the receiver was admitted, the caller is about to block); sched-2 will
+/// interpret it as a level donation. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CallDonation {
+    pub from: KoId,
+    pub to: KoId,
+    pub priority: u8,
+}
+
+/// A live call record as the engine sees it. `index` is the caller's resume identity and
+/// is never reused while the record exists. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallTicket {
+    pub index: usize,
+    pub pair: usize,
+    pub caller_end: KoId,
+    pub peer_end: KoId,
+    pub ordinal: u32,
+    pub served_by: Option<KoId>,
+}
+
+/// What a receiver's own parked `ChannelRead` gets when it consumes a call request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CallDelivery {
+    pub index: usize,
+    pub len: usize,
+    pub words: [u64; 4],
+}
+
+/// Who a completion must wake. Sora is woken through the deferred user-wake path; a child
+/// through the channel wake path, with an explicit safe reschedule for IRQ completions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallWake {
+    pub caller_thread: KoId,
+    pub caller_process: KoId,
+    pub caller_is_sora: bool,
+    pub caller_end: KoId,
+}
+
+/// Deadline completions, lifted out of the IRQ sweep's engine borrow. The sweep never
+/// switches or blocks; callers and Sora are only made runnable. — TIMBERDOODLE
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CallSweep {
+    pub child_callers: Vec<KoId>,
+    pub sora_wake: bool,
+}
+
+/// A caller-side resume value. `Pending` means park; `Ready` is returned and the record is
+/// dropped, so a caller can never observe the same completion twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CallCompletion {
+    Pending,
+    Ready {
+        status: Errno,
+        len: usize,
+        words: [u64; 4],
+        legacy_reply: bool,
+        caller_end: KoId,
+    },
+}
+
+/// One outstanding AX2 call. The slab entry lives until the caller consumes it; completed
+/// entries remain as ordinal tombstones so a late or duplicate reply cannot misroute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingCall {
+    pair: usize,
+    caller_end: KoId,
+    peer_end: KoId,
+    caller_thread: KoId,
+    caller_process: KoId,
+    caller_is_sora: bool,
+    ordinal: u32,
+    deadline_ns: u64,
+    payload_len: usize,
+    payload_words: [u64; 4],
+    completion: Option<Errno>,
+    reply_len: usize,
+    reply_words: [u64; 4],
+    legacy_reply: bool,
+    consumed: bool,
+    served_by: Option<KoId>,
+    donation: Option<CallDonation>,
+    caller_gone: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1070,6 +1186,12 @@ pub struct SyscallEngine {
     resources: Vec<ResourceBinding>,
     #[cfg(feature = "arch_aarch64")]
     table_pages: crate::device_memory::TablePool<crate::device_memory::KernelPages>,
+    //j824
+    /// AX2 call records. Append-only and never reindexed: a caller resumes with its slot
+    /// index, and a completed record stays as an ordinal tombstone until the caller
+    /// consumes it. — TIMBERDOODLE
+    pending_calls: Vec<Option<PendingCall>>,
+    next_call_ordinal: u32,
 }
 
 impl Default for SyscallEngine {
@@ -1121,6 +1243,9 @@ impl SyscallEngine {
             resources: Vec::new(),
             #[cfg(feature = "arch_aarch64")]
             table_pages: owner.0.table_pages.clone(),
+            pending_calls: Vec::new(),
+            // 0 is "no call" and 1 is the legacy ChannelWrite ordinal; calls start at 2.
+            next_call_ordinal: 2,
         }
     }
 
@@ -1862,6 +1987,11 @@ impl SyscallEngine {
 
     pub fn objects_mut(&mut self) -> &mut ObjectManager {
         &mut self.objects
+    }
+
+    /// Read-only registry access for the AX2 call path (peer lookup, call records).
+    pub(crate) fn ipc(&self) -> &IpcRegistry {
+        &self.ipc
     }
 
     pub fn ipc_mut(&mut self) -> &mut IpcRegistry {
@@ -3308,6 +3438,405 @@ impl SyscallEngine {
         }
     }
 
+    //j824
+    /// The engine half of `ChannelCall`. Mirrors the kernel-internal `IpcRegistry::channel_call`
+    /// validation, then installs a request carrying a fresh ordinal and `FLAG_EXPECTS_REPLY`.
+    /// Depth 1: a thread with an outstanding call (as caller) or an unconsummated served call
+    /// may not call again. Self-calls and kernel-retained peers are `InvalidArgs`. — TIMBERDOODLE
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_channel_call(
+        &mut self,
+        process: &mut Process,
+        channel: Handle,
+        caller_thread: KoId,
+        caller_process: KoId,
+        caller_is_sora: bool,
+        deadline_ns: u64,
+        payload_len: usize,
+        payload: [u64; 4],
+        served_by: Option<KoId>,
+    ) -> Result<CallTicket, Errno> {
+        self.begin_channel_call_with_ordinal(
+            process,
+            channel,
+            caller_thread,
+            caller_process,
+            caller_is_sora,
+            deadline_ns,
+            payload_len,
+            payload,
+            served_by,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_channel_call_with_ordinal(
+        &mut self,
+        process: &mut Process,
+        channel: Handle,
+        caller_thread: KoId,
+        caller_process: KoId,
+        caller_is_sora: bool,
+        deadline_ns: u64,
+        payload_len: usize,
+        payload: [u64; 4],
+        served_by: Option<KoId>,
+        forced_ordinal: Option<u32>,
+    ) -> Result<CallTicket, Errno> {
+        if payload_len > kumo_abi::MAX_CALL_BYTES {
+            return Err(Errno::InvalidArgs);
+        }
+        let channel_entry = process
+            .handles()
+            .require(channel, ObjectKind::Channel, Rights::READ | Rights::WRITE)
+            .map_err(errno_from_object)?;
+        let endpoints = self
+            .ipc
+            .endpoints_for(channel_entry.koid)
+            .map_err(errno_from_ipc)?;
+        // v1 has no kernel-side server and no loopback call.
+        if endpoints.peer_kernel_retained
+            || process
+                .handles()
+                .holds(endpoints.peer_koid, ObjectKind::Channel, Rights::empty())
+        {
+            return Err(Errno::InvalidArgs);
+        }
+        // Depth 1: a caller already blocked in a call, and a server that has consumed a
+        // call but not replied, both refuse to nest.
+        if self.thread_has_outstanding_call(caller_thread)
+            || self.thread_is_serving_call(caller_thread)
+        {
+            return Err(Errno::InvalidArgs);
+        }
+        let ordinal = match forced_ordinal {
+            Some(ordinal) => {
+                if ordinal < 2
+                    || self.call_ordinal_used(endpoints.pair, endpoints.end_koid, ordinal)
+                {
+                    return Err(Errno::InvalidArgs);
+                }
+                ordinal
+            }
+            None => self.allocate_call_ordinal(endpoints.pair, endpoints.end_koid),
+        };
+        // The request itself carries the payload bytes (legacy readers see them), the
+        // kernel ordinal and the expects-reply flag; the words live in the record too.
+        let mut bytes = [0u8; kumo_abi::MAX_CALL_BYTES];
+        kumo_abi::unpack_call_payload(payload, payload_len, &mut bytes[..payload_len])
+            .ok_or(Errno::InvalidArgs)?;
+        let request =
+            KernelMessage::call(ordinal, &bytes[..payload_len], &[]).map_err(errno_from_ipc)?;
+        self.ipc
+            .install_call(endpoints.end_koid, request)
+            .map_err(errno_from_ipc)?;
+        let pending = PendingCall {
+            pair: endpoints.pair,
+            caller_end: endpoints.end_koid,
+            peer_end: endpoints.peer_koid,
+            caller_thread,
+            caller_process,
+            caller_is_sora,
+            ordinal,
+            deadline_ns,
+            payload_len,
+            payload_words: payload,
+            completion: None,
+            reply_len: 0,
+            reply_words: [0; 4],
+            legacy_reply: false,
+            consumed: false,
+            served_by,
+            donation: None,
+            caller_gone: false,
+        };
+        let index = if let Some(index) = self.pending_calls.iter().position(Option::is_none) {
+            self.pending_calls[index] = Some(pending);
+            index
+        } else {
+            self.pending_calls.push(Some(pending));
+            self.pending_calls.len() - 1
+        };
+        Ok(CallTicket {
+            index,
+            pair: endpoints.pair,
+            caller_end: endpoints.end_koid,
+            peer_end: endpoints.peer_koid,
+            ordinal,
+            served_by,
+        })
+    }
+
+    fn allocate_call_ordinal(&mut self, pair: usize, caller_end: KoId) -> u32 {
+        loop {
+            let ordinal = self.next_call_ordinal;
+            self.next_call_ordinal = if ordinal == u32::MAX {
+                2
+            } else {
+                ordinal.saturating_add(1).max(2)
+            };
+            if !self.call_ordinal_used(pair, caller_end, ordinal) {
+                return ordinal;
+            }
+        }
+    }
+
+    fn call_ordinal_used(&self, pair: usize, caller_end: KoId, ordinal: u32) -> bool {
+        self.pending_calls.iter().flatten().any(|call| {
+            call.pair == pair && call.caller_end == caller_end && call.ordinal == ordinal
+        })
+    }
+
+    fn thread_has_outstanding_call(&self, thread: KoId) -> bool {
+        self.pending_calls.iter().flatten().any(|call| {
+            call.caller_thread == thread && call.completion.is_none() && !call.caller_gone
+        })
+    }
+
+    fn thread_is_serving_call(&self, thread: KoId) -> bool {
+        self.pending_calls.iter().flatten().any(|call| {
+            call.served_by == Some(thread)
+                && call.consumed
+                && call.completion.is_none()
+                && !call.caller_gone
+        })
+    }
+
+    /// A receiver's own read consumed `message`; if it is a call request for this pair and
+    /// ordinal, claim it exactly once and report the register payload. The hint marks the
+    /// serving thread so a later `ChannelReply` can route by thread identity. — TIMBERDOODLE
+    pub(crate) fn note_call_read(
+        &mut self,
+        process: &Process,
+        channel: Handle,
+        message: &KernelMessage,
+        reader_thread: KoId,
+    ) -> Option<CallDelivery> {
+        if message.header.flags & kumo_ipc::MessageHeader::FLAG_EXPECTS_REPLY == 0 {
+            return None;
+        }
+        let channel_entry = process.handles().get(channel).ok()?;
+        let endpoints = self.ipc.endpoints_for(channel_entry.koid).ok()?;
+        let index = self.pending_calls.iter().position(|slot| {
+            slot.as_ref().is_some_and(|call| {
+                call.pair == endpoints.pair
+                    && call.ordinal == message.header.ordinal
+                    && call.completion.is_none()
+                    && !call.caller_gone
+                    && !call.consumed
+            })
+        })?;
+        let call = self.pending_calls[index].as_mut()?;
+        call.consumed = true;
+        call.served_by = Some(reader_thread);
+        Some(CallDelivery {
+            index,
+            len: call.payload_len,
+            words: call.payload_words,
+        })
+    }
+
+    /// Resume value for `caller_thread`. A `Ready` outcome drops the record (the ordinal
+    /// tombstone is no longer needed: the caller's call is over). — TIMBERDOODLE
+    pub(crate) fn take_call_completion(
+        &mut self,
+        index: usize,
+        caller_thread: KoId,
+    ) -> CallCompletion {
+        let Some(call) = self.pending_calls.get(index).and_then(Option::as_ref) else {
+            return CallCompletion::Pending;
+        };
+        if call.caller_thread != caller_thread {
+            return CallCompletion::Pending;
+        }
+        let Some(status) = call.completion else {
+            return CallCompletion::Pending;
+        };
+        let ready = CallCompletion::Ready {
+            status,
+            len: call.reply_len,
+            words: call.reply_words,
+            legacy_reply: call.legacy_reply,
+            caller_end: call.caller_end,
+        };
+        self.pending_calls[index] = None;
+        ready
+    }
+
+    /// Complete exactly once. A completed or abandoned record is never rewritten, so a
+    /// late reply, a second close and the deadline sweep cannot race a completion. The
+    /// returned wake names the caller that must be made runnable. — TIMBERDOODLE
+    fn complete_call(
+        &mut self,
+        index: usize,
+        status: Errno,
+        len: usize,
+        words: [u64; 4],
+        legacy_reply: bool,
+    ) -> Option<CallWake> {
+        let call = self.pending_calls.get(index).and_then(Option::as_ref)?;
+        if call.completion.is_some() || call.caller_gone {
+            return None;
+        }
+        let wake = CallWake {
+            caller_thread: call.caller_thread,
+            caller_process: call.caller_process,
+            caller_is_sora: call.caller_is_sora,
+            caller_end: call.caller_end,
+        };
+        let call = self.pending_calls[index].as_mut()?;
+        call.completion = Some(status);
+        call.reply_len = len;
+        call.reply_words = words;
+        call.legacy_reply = legacy_reply;
+        Some(wake)
+    }
+
+    /// `ChannelReply`. BadState (reply discarded) when the slot was never delivered to this
+    /// server, was already completed, or the caller is gone. — TIMBERDOODLE
+    pub(crate) fn channel_reply(
+        &mut self,
+        index: usize,
+        server_thread: KoId,
+        payload_len: usize,
+        payload: [u64; 4],
+    ) -> Result<CallWake, Errno> {
+        if payload_len > kumo_abi::MAX_CALL_BYTES {
+            return Err(Errno::InvalidArgs);
+        }
+        let Some(call) = self.pending_calls.get(index).and_then(Option::as_ref) else {
+            return Err(Errno::BadState);
+        };
+        if call.served_by != Some(server_thread)
+            || !call.consumed
+            || call.caller_gone
+            || call.completion.is_some()
+        {
+            return Err(Errno::BadState);
+        }
+        self.complete_call(index, Errno::Ok, payload_len, payload, false)
+            .ok_or(Errno::BadState)
+    }
+
+    pub(crate) fn note_call_donation(&mut self, index: usize, donation: CallDonation) {
+        if let Some(Some(call)) = self.pending_calls.get_mut(index) {
+            call.donation = Some(donation);
+        }
+    }
+
+    /// Deadline sweep. Runs inside the IRQ engine borrow: it only marks records completed
+    /// and collects the callers to make runnable; it never switches or blocks. — TIMBERDOODLE
+    pub(crate) fn sweep_pending_calls(&mut self, now_ns: u64) -> CallSweep {
+        let mut sweep = CallSweep::default();
+        let mut index = 0;
+        while index < self.pending_calls.len() {
+            let due = self.pending_calls[index].as_ref().is_some_and(|call| {
+                call.completion.is_none()
+                    && !call.caller_gone
+                    && call.deadline_ns != 0
+                    && call.deadline_ns <= now_ns
+            });
+            if due {
+                if let Some(wake) = self.complete_call(index, Errno::TimedOut, 0, [0; 4], false) {
+                    if wake.caller_is_sora {
+                        sweep.sora_wake = true;
+                    } else {
+                        sweep.child_callers.push(wake.caller_end);
+                    }
+                }
+            }
+            index += 1;
+        }
+        sweep
+    }
+
+    /// A channel endpoint closed. Any call whose caller end or peer end is `koid` completes
+    /// PeerClosed exactly once; the returned wakes are the callers to make runnable after
+    /// the caller's engine borrow is dropped. — TIMBERDOODLE
+    pub(crate) fn complete_calls_on_endpoint_closed(&mut self, koid: KoId) -> Vec<CallWake> {
+        let mut wakes = Vec::new();
+        let mut index = 0;
+        while index < self.pending_calls.len() {
+            let affected = self.pending_calls[index].as_ref().is_some_and(|call| {
+                call.completion.is_none()
+                    && !call.caller_gone
+                    && (call.caller_end == koid || call.peer_end == koid)
+            });
+            if affected {
+                if let Some(wake) = self.complete_call(index, Errno::PeerClosed, 0, [0; 4], false) {
+                    wakes.push(wake);
+                }
+            }
+            index += 1;
+        }
+        wakes
+    }
+
+    /// The caller process died. Tombstone every record it owns; the serving thread's slot
+    /// resolution then fails naturally and a late reply is discarded. No slot surgery. — TIMBERDOODLE
+    pub(crate) fn abandon_calls_for_process(&mut self, process: KoId) -> usize {
+        let mut abandoned = 0;
+        for slot in &mut self.pending_calls {
+            let Some(call) = slot.as_mut() else {
+                continue;
+            };
+            if call.caller_process == process && !call.caller_gone {
+                call.caller_gone = true;
+                if call.completion.is_none() {
+                    call.completion = Some(Errno::PeerClosed);
+                }
+                abandoned += 1;
+            }
+        }
+        abandoned
+    }
+
+    /// Legacy-server interop: the ONLY pending call on this pair that the writer's endpoint
+    /// serves. `None` when zero or more than one is outstanding, so a write can never be
+    /// mistaken for one of several replies. — TIMBERDOODLE
+    fn legacy_reply_candidate(&self, sender_end: KoId) -> Option<usize> {
+        let endpoints = self.ipc.endpoints_for(sender_end).ok()?;
+        let mut found = None;
+        for (index, slot) in self.pending_calls.iter().enumerate() {
+            let Some(call) = slot.as_ref() else {
+                continue;
+            };
+            if call.pair == endpoints.pair
+                && call.peer_end == endpoints.end_koid
+                && call.completion.is_none()
+                && !call.caller_gone
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(index);
+            }
+        }
+        found
+    }
+
+    fn complete_legacy_reply(&mut self, index: usize, bytes: &[u8]) -> Option<CallWake> {
+        if bytes.len() > kumo_abi::MAX_CALL_BYTES {
+            return None;
+        }
+        let words = kumo_abi::pack_call_payload(bytes)?;
+        self.complete_call(index, Errno::Ok, bytes.len(), words, true)
+    }
+
+    /// The write that completed a legacy call stays in the caller's inbox; its resume pops
+    /// exactly that message instead of delivering a second, ordinary one. — TIMBERDOODLE
+    pub(crate) fn pop_legacy_reply(&mut self, caller_end: KoId, len: usize, words: [u64; 4]) {
+        if len > kumo_abi::MAX_CALL_BYTES {
+            return;
+        }
+        let mut bytes = [0u8; kumo_abi::MAX_CALL_BYTES];
+        if kumo_abi::unpack_call_payload(words, len, &mut bytes[..len]).is_some() {
+            self.ipc
+                .remove_message_with_bytes(caller_end, &bytes[..len]);
+        }
+    }
+
     fn dispatch_inner(&mut self, process: &mut Process, call: KernelCall<'_>) -> KernelCallResult {
         match call {
             KernelCall::HandleClose { handle } => {
@@ -3321,6 +3850,12 @@ impl SyscallEngine {
                         // — TIMBERDOODLE
                         drop(entry);
                         if kind == ObjectKind::Channel {
+                            //j824
+                            // AX2: a close is a completion source. Complete first so a
+                            // record can never outlive the endpoints it names; the wakes
+                            // are paid after this match, outside the engine borrows that
+                            // `close_by_koid` takes. — TIMBERDOODLE
+                            let call_wakes = self.complete_calls_on_endpoint_closed(koid);
                             if let Ok(peer_koids) = self.ipc.close_by_koid(koid) {
                                 for peer_koid in peer_koids {
                                     self.signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
@@ -3331,6 +3866,18 @@ impl SyscallEngine {
                                     #[cfg(target_os = "none")]
                                     crate::user_thread::wake_child_waiting_on_channel(peer_koid);
                                 }
+                            }
+                            for wake in call_wakes {
+                                #[cfg(target_os = "none")]
+                                if wake.caller_is_sora {
+                                    crate::user_thread::request_user_wake();
+                                } else {
+                                    crate::user_thread::wake_child_waiting_on_channel_for_call(
+                                        wake.caller_end,
+                                    );
+                                }
+                                #[cfg(not(target_os = "none"))]
+                                let _ = wake;
                             }
                         }
                         if kind == ObjectKind::Timer {
@@ -3361,12 +3908,41 @@ impl SyscallEngine {
                     .get(channel)
                     .ok()
                     .and_then(|e| self.ipc.peer_koid_for(e.koid).ok());
+                //j824
+                // Legacy-server interop: a plain write from the serving end completes a
+                // pending call when (and only when) exactly one is outstanding on that
+                // pair. v1 never guesses among several, never truncates, and never steals
+                // a write that transfers handles. The message stays queued; the caller's
+                // resume pops it instead of treating it as a second delivery.
+                let legacy_candidate = process
+                    .handles()
+                    .get(channel)
+                    .ok()
+                    .filter(|_| {
+                        message.handles.is_empty()
+                            && message.bytes.len() <= kumo_abi::MAX_CALL_BYTES
+                    })
+                    .and_then(|entry| self.legacy_reply_candidate(entry.koid));
+                let legacy_bytes = legacy_candidate.map(|_| message.bytes.to_vec());
                 let status = match self.ipc.channel_write(process, channel, message) {
                     Ok(()) => {
+                        let _call_wake = legacy_candidate.and_then(|index| {
+                            legacy_bytes
+                                .as_deref()
+                                .and_then(|bytes| self.complete_legacy_reply(index, bytes))
+                        });
                         if let Some(koid) = signal_koid {
                             self.signal_ports(koid, kumo_abi::Signals::READABLE);
                             #[cfg(target_os = "none")]
-                            crate::user_thread::wake_child_waiting_on_channel(koid);
+                            if _call_wake.is_some() {
+                                crate::user_thread::wake_child_waiting_on_channel_for_call(koid);
+                            } else {
+                                crate::user_thread::wake_child_waiting_on_channel(koid);
+                            }
+                        }
+                        #[cfg(target_os = "none")]
+                        if _call_wake.is_some_and(|wake| wake.caller_is_sora) {
+                            crate::user_thread::request_user_wake();
                         }
                         Errno::Ok.status()
                     }
@@ -3374,6 +3950,46 @@ impl SyscallEngine {
                 };
                 KernelCallResult::Status(status)
             }
+            KernelCall::ChannelCall {
+                channel,
+                caller_thread,
+                caller_process,
+                caller_is_sora,
+                deadline_ns,
+                payload_len,
+                payload,
+                served_by,
+            } => match self.begin_channel_call(
+                process,
+                channel,
+                caller_thread,
+                caller_process,
+                caller_is_sora,
+                deadline_ns,
+                payload_len,
+                payload,
+                served_by,
+            ) {
+                Ok(ticket) => KernelCallResult::CallInstalled(ticket),
+                Err(errno) => KernelCallResult::Status(errno.status()),
+            },
+            KernelCall::ChannelReply {
+                call,
+                server,
+                payload_len,
+                payload,
+            } => match self.channel_reply(call, server, payload_len, payload) {
+                Ok(wake) => {
+                    #[cfg(target_os = "none")]
+                    if wake.caller_is_sora {
+                        crate::user_thread::request_user_wake();
+                    } else {
+                        crate::user_thread::wake_child_waiting_on_channel_for_call(wake.caller_end);
+                    }
+                    KernelCallResult::CallReplied(wake)
+                }
+                Err(errno) => KernelCallResult::Status(errno.status()),
+            },
             KernelCall::ChannelRead { channel } => {
                 // Resolve the endpoint koid before the read borrows `process`, so the
                 // re-arm below can re-signal its bound port (see
@@ -10969,5 +11585,675 @@ mod tests {
             );
             assert!(e.iommu_unit_quarantined(BASE, LEN));
         }
+    }
+
+    //j824
+    // ---- AX2 synchronous calls ------------------------------------------------------
+
+    /// Give the receiver process its own handle to the pair's other end. The caller then
+    /// holds one end only, which is exactly the state after a real handle transfer, so the
+    /// engine's self-call check behaves as it will on a live channel.
+    fn move_channel_end(source: &mut Process, target: &mut Process, handle: Handle) -> Handle {
+        let entry = source.handles().clone_entry(handle).unwrap();
+        source.handles_mut().close(handle).unwrap();
+        target.handles_mut().insert_entry(entry).unwrap()
+    }
+
+    fn call_request(
+        process: &Process,
+        channel: Handle,
+        caller_thread: KoId,
+        caller_is_sora: bool,
+        deadline_ns: u64,
+        bytes: &[u8],
+    ) -> KernelCall<'static> {
+        KernelCall::ChannelCall {
+            channel,
+            caller_thread,
+            caller_process: process.koid(),
+            caller_is_sora,
+            deadline_ns,
+            payload_len: bytes.len(),
+            payload: kumo_abi::pack_call_payload(bytes).unwrap_or([0; 4]),
+            served_by: None,
+        }
+    }
+
+    fn installed(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        channel: Handle,
+        caller_thread: KoId,
+        deadline_ns: u64,
+        bytes: &[u8],
+    ) -> CallTicket {
+        let request = call_request(process, channel, caller_thread, false, deadline_ns, bytes);
+        match engine.dispatch(process, request) {
+            KernelCallResult::CallInstalled(ticket) => ticket,
+            other => panic!("expected an installed call, got {other:?}"),
+        }
+    }
+
+    fn call_status(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        call: KernelCall<'_>,
+    ) -> Status {
+        match engine.dispatch(process, call) {
+            KernelCallResult::Status(status) => status,
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    fn reply_call(
+        engine: &mut SyscallEngine,
+        process: &mut Process,
+        call: usize,
+        server: KoId,
+        bytes: &[u8],
+    ) -> Result<CallWake, Errno> {
+        engine.channel_reply(
+            call,
+            server,
+            bytes.len(),
+            kumo_abi::pack_call_payload(bytes).unwrap(),
+        )
+    }
+
+    #[test]
+    fn channel_call_validation_matches_the_call_contract() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let _server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let thread = KoId(101);
+
+        // No such handle, and a handle that is not a channel.
+        let request = call_request(&caller, Handle(u32::MAX), thread, false, 0, b"x");
+        assert_eq!(
+            call_status(&mut engine, &mut caller, request),
+            Errno::BadHandle.status()
+        );
+        let vmo = match engine.dispatch(&mut caller, KernelCall::VmoCreate { size: 0x1000 }) {
+            KernelCallResult::Handle(handle) => handle,
+            other => panic!("expected a VMO, got {other:?}"),
+        };
+        let request = call_request(&caller, vmo, thread, false, 0, b"x");
+        assert_eq!(
+            call_status(&mut engine, &mut caller, request),
+            Errno::WrongType.status()
+        );
+        // READ|WRITE is required for a call caller.
+        let read_only = caller
+            .handles_mut()
+            .duplicate(caller_end, Rights::READ)
+            .unwrap();
+        let request = call_request(&caller, read_only, thread, false, 0, b"x");
+        assert_eq!(
+            call_status(&mut engine, &mut caller, request),
+            Errno::AccessDenied.status()
+        );
+        // The payload cap is refused, never truncated.
+        let request = call_request(&caller, caller_end, thread, false, 0, &[0u8; 33]);
+        assert_eq!(
+            call_status(&mut engine, &mut caller, request),
+            Errno::InvalidArgs.status()
+        );
+        // Holding both ends is a self-call.
+        let (both_left, _both_right) = create_channel(&mut engine, &mut caller);
+        let request = call_request(&caller, both_left, thread, false, 0, b"self");
+        assert_eq!(
+            call_status(&mut engine, &mut caller, request),
+            Errno::InvalidArgs.status()
+        );
+        // A reply with no served call, and an over-long reply, are refused distinctly.
+        assert_eq!(
+            reply_call(&mut engine, &mut caller, 999, KoId(999), b"late"),
+            Err(Errno::BadState)
+        );
+        assert_eq!(
+            engine.channel_reply(0, KoId(999), 33, [0; 4]),
+            Err(Errno::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn channel_call_request_carries_the_flag_and_replies_on_the_right_record() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let server_thread = KoId(900);
+        let payload =
+            kumo_abi::pack_call_payload(&[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]).unwrap();
+
+        let first = installed(
+            &mut engine,
+            &mut caller,
+            caller_end,
+            KoId(101),
+            0,
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55],
+        );
+        let second = installed(
+            &mut engine,
+            &mut caller,
+            caller_end,
+            KoId(102),
+            0,
+            b"second",
+        );
+        assert_ne!(first.ordinal, second.ordinal);
+        assert_eq!(
+            engine.pending_calls[first.index]
+                .as_ref()
+                .unwrap()
+                .payload_words,
+            payload
+        );
+
+        // The request is an ordinary inbox message that carries FLAG_EXPECTS_REPLY.
+        let message = match engine.dispatch(
+            &mut receiver,
+            KernelCall::ChannelRead {
+                channel: server_end,
+            },
+        ) {
+            KernelCallResult::Message(message) => message,
+            other => panic!("expected the call request, got {other:?}"),
+        };
+        assert_eq!(message.header.ordinal, first.ordinal);
+        assert_eq!(
+            message.header.flags & kumo_ipc::MessageHeader::FLAG_EXPECTS_REPLY,
+            kumo_ipc::MessageHeader::FLAG_EXPECTS_REPLY
+        );
+        assert_eq!(
+            message.bytes(),
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+        );
+
+        // Delivery claims exactly that record and copies its words out.
+        let delivery = engine
+            .note_call_read(&receiver, server_end, &message, server_thread)
+            .expect("the receiver consumes its call");
+        assert_eq!(delivery.index, first.index);
+        assert_eq!(delivery.len, 8);
+        assert_eq!(delivery.words, payload);
+        // Consumed is never delivered twice, and a foreign ordinal never claims a record.
+        assert!(engine
+            .note_call_read(&receiver, server_end, &message, server_thread)
+            .is_none());
+        let mut spurious = message.clone();
+        spurious.header.ordinal = first.ordinal.wrapping_add(999);
+        assert!(engine
+            .note_call_read(&receiver, server_end, &spurious, server_thread)
+            .is_none());
+
+        // Only the serving thread on the right record may reply, and only once.
+        assert_eq!(
+            reply_call(
+                &mut engine,
+                &mut receiver,
+                delivery.index,
+                KoId(901),
+                b"bad"
+            ),
+            Err(Errno::BadState)
+        );
+        assert_eq!(
+            engine.take_call_completion(delivery.index, KoId(999)),
+            CallCompletion::Pending
+        );
+        let wake = reply_call(
+            &mut engine,
+            &mut receiver,
+            delivery.index,
+            server_thread,
+            b"right",
+        )
+        .unwrap();
+        assert_eq!(wake.caller_thread, KoId(101));
+        assert_eq!(wake.caller_end, first.caller_end);
+        assert_eq!(
+            reply_call(
+                &mut engine,
+                &mut receiver,
+                delivery.index,
+                server_thread,
+                b"again"
+            ),
+            Err(Errno::BadState)
+        );
+        assert_eq!(
+            engine.take_call_completion(delivery.index, KoId(101)),
+            CallCompletion::Ready {
+                status: Errno::Ok,
+                len: 5,
+                words: kumo_abi::pack_call_payload(b"right").unwrap(),
+                legacy_reply: false,
+                caller_end: first.caller_end,
+            }
+        );
+        assert!(engine.pending_calls[delivery.index].is_none());
+
+        // The second call is untouched by the first reply.
+        let second_message = match engine.dispatch(
+            &mut receiver,
+            KernelCall::ChannelRead {
+                channel: server_end,
+            },
+        ) {
+            KernelCallResult::Message(message) => message,
+            other => panic!("expected the second request, got {other:?}"),
+        };
+        assert_eq!(second_message.header.ordinal, second.ordinal);
+        let second_delivery = engine
+            .note_call_read(&receiver, server_end, &second_message, server_thread)
+            .unwrap();
+        assert_eq!(second_delivery.index, second.index);
+    }
+
+    #[test]
+    fn deadline_sweep_completes_timed_out_once_without_switching() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let server_thread = KoId(900);
+        let thread = KoId(201);
+        let ticket = installed(&mut engine, &mut caller, caller_end, thread, 100, b"ping");
+
+        // Consume it so a late reply would otherwise have a route.
+        let message = match engine.dispatch(
+            &mut receiver,
+            KernelCall::ChannelRead {
+                channel: server_end,
+            },
+        ) {
+            KernelCallResult::Message(message) => message,
+            other => panic!("expected the request, got {other:?}"),
+        };
+        let delivery = engine
+            .note_call_read(&receiver, server_end, &message, server_thread)
+            .unwrap();
+        assert_eq!(engine.sweep_pending_calls(99), CallSweep::default());
+        let sweep = engine.sweep_pending_calls(100);
+        assert_eq!(sweep.child_callers, alloc::vec![ticket.caller_end]);
+        assert!(!sweep.sora_wake);
+        // A reply after the deadline is discarded, never rewrites the completion.
+        assert_eq!(
+            reply_call(
+                &mut engine,
+                &mut receiver,
+                delivery.index,
+                server_thread,
+                b"late"
+            ),
+            Err(Errno::BadState)
+        );
+        assert_eq!(
+            engine.take_call_completion(ticket.index, thread),
+            CallCompletion::Ready {
+                status: Errno::TimedOut,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket.caller_end,
+            }
+        );
+        assert_eq!(engine.sweep_pending_calls(1_000), CallSweep::default());
+    }
+
+    #[test]
+    fn deadline_sweep_routes_a_sora_caller_to_the_user_wake() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let _server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let request = call_request(&caller, caller_end, KoId(301), true, 50, b"hi");
+        let ticket = match engine.dispatch(&mut caller, request) {
+            KernelCallResult::CallInstalled(ticket) => ticket,
+            other => panic!("expected an installed call, got {other:?}"),
+        };
+        let sweep = engine.sweep_pending_calls(50);
+        assert!(sweep.child_callers.is_empty());
+        assert!(sweep.sora_wake);
+        assert_eq!(
+            engine.take_call_completion(ticket.index, KoId(301)),
+            CallCompletion::Ready {
+                status: Errno::TimedOut,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket.caller_end,
+            }
+        );
+    }
+
+    #[test]
+    fn closing_either_end_completes_pending_calls_with_peer_closed() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let thread = KoId(401);
+        let ticket = installed(&mut engine, &mut caller, caller_end, thread, 0, b"ping");
+
+        // The server's end closes: the surviving caller completes PeerClosed through the
+        // ordinary HandleClose arm (the same path a dying driver takes).
+        assert_eq!(
+            engine.dispatch(
+                &mut receiver,
+                KernelCall::HandleClose { handle: server_end },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.take_call_completion(ticket.index, thread),
+            CallCompletion::Ready {
+                status: Errno::PeerClosed,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket.caller_end,
+            }
+        );
+
+        // The caller closing its own end mid-call completes it the same way.
+        let (caller_end2, server_end2) = create_channel(&mut engine, &mut caller);
+        let _server_end2 = move_channel_end(&mut caller, &mut receiver, server_end2);
+        let thread2 = KoId(402);
+        let ticket2 = installed(&mut engine, &mut caller, caller_end2, thread2, 0, b"ping");
+        assert_eq!(
+            engine.dispatch(
+                &mut caller,
+                KernelCall::HandleClose {
+                    handle: caller_end2,
+                },
+            ),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert_eq!(
+            engine.take_call_completion(ticket2.index, thread2),
+            CallCompletion::Ready {
+                status: Errno::PeerClosed,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket2.caller_end,
+            }
+        );
+    }
+
+    #[test]
+    fn caller_death_tombstones_records_and_discards_a_late_reply() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let server_thread = KoId(900);
+        let thread = KoId(501);
+        let ticket = installed(&mut engine, &mut caller, caller_end, thread, 0, b"ping");
+        let message = match engine.dispatch(
+            &mut receiver,
+            KernelCall::ChannelRead {
+                channel: server_end,
+            },
+        ) {
+            KernelCallResult::Message(message) => message,
+            other => panic!("expected the request, got {other:?}"),
+        };
+        let delivery = engine
+            .note_call_read(&receiver, server_end, &message, server_thread)
+            .unwrap();
+
+        assert_eq!(engine.abandon_calls_for_process(caller.koid()), 1);
+        // The server's slot still resolves, but the caller is gone: BadState, discarded.
+        assert_eq!(
+            reply_call(
+                &mut engine,
+                &mut receiver,
+                delivery.index,
+                server_thread,
+                b"late"
+            ),
+            Err(Errno::BadState)
+        );
+        assert!(
+            engine.pending_calls[ticket.index]
+                .as_ref()
+                .unwrap()
+                .caller_gone
+        );
+        // The record resolves PeerClosed for the caller's own (dead) resume path.
+        assert_eq!(
+            engine.take_call_completion(ticket.index, thread),
+            CallCompletion::Ready {
+                status: Errno::PeerClosed,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket.caller_end,
+            }
+        );
+        // A second teardown pass is a no-op.
+        assert_eq!(engine.abandon_calls_for_process(caller.koid()), 0);
+    }
+
+    #[test]
+    fn ordinal_tombstones_block_reuse_until_the_caller_consumes() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let _server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let caller_koid = caller.koid();
+        let ticket = engine
+            .begin_channel_call_with_ordinal(
+                &mut caller,
+                caller_end,
+                KoId(601),
+                caller_koid,
+                false,
+                500,
+                4,
+                kumo_abi::pack_call_payload(b"ping").unwrap(),
+                None,
+                Some(7),
+            )
+            .unwrap();
+        assert_eq!(ticket.ordinal, 7);
+        // Another thread on the same caller end cannot reuse the live ordinal.
+        assert_eq!(
+            engine.begin_channel_call_with_ordinal(
+                &mut caller,
+                caller_end,
+                KoId(602),
+                caller_koid,
+                false,
+                0,
+                4,
+                [0; 4],
+                None,
+                Some(7),
+            ),
+            Err(Errno::InvalidArgs)
+        );
+        // The deadline completes it, but the tombstone remains until the caller resumes.
+        assert_eq!(
+            engine.sweep_pending_calls(500).child_callers,
+            alloc::vec![ticket.caller_end]
+        );
+        assert_eq!(
+            engine.begin_channel_call_with_ordinal(
+                &mut caller,
+                caller_end,
+                KoId(602),
+                caller_koid,
+                false,
+                0,
+                4,
+                [0; 4],
+                None,
+                Some(7),
+            ),
+            Err(Errno::InvalidArgs)
+        );
+        let _ = engine.take_call_completion(ticket.index, KoId(601));
+        assert_eq!(
+            engine
+                .begin_channel_call_with_ordinal(
+                    &mut caller,
+                    caller_end,
+                    KoId(603),
+                    caller_koid,
+                    false,
+                    0,
+                    4,
+                    [0; 4],
+                    None,
+                    Some(7),
+                )
+                .unwrap()
+                .ordinal,
+            7
+        );
+    }
+
+    #[test]
+    fn legacy_write_completes_exactly_one_pending_call_and_keeps_the_message() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let thread = KoId(701);
+        let ticket = installed(&mut engine, &mut caller, caller_end, thread, 0, b"ping");
+
+        let write = |engine: &mut SyscallEngine, receiver: &mut Process, bytes: &[u8]| {
+            engine.dispatch(
+                receiver,
+                KernelCall::ChannelWrite {
+                    channel: server_end,
+                    message: Message::new(1, bytes, &[]).unwrap(),
+                },
+            )
+        };
+        // Over 32 bytes is never a reply (refused, not truncated).
+        assert_eq!(
+            write(&mut engine, &mut receiver, &[0x5a; 33]),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert!(engine.pending_calls[ticket.index]
+            .as_ref()
+            .unwrap()
+            .completion
+            .is_none());
+        // The single outstanding call is completed by the small write, message retained.
+        assert_eq!(
+            write(&mut engine, &mut receiver, b"pong"),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        let call = engine.pending_calls[ticket.index].as_ref().unwrap();
+        assert_eq!(call.completion, Some(Errno::Ok));
+        assert!(call.legacy_reply);
+        assert_eq!(call.reply_len, 4);
+        assert_eq!(
+            call.reply_words,
+            kumo_abi::pack_call_payload(b"pong").unwrap()
+        );
+        let caller_end_koid = ticket.caller_end;
+        assert_eq!(
+            engine.take_call_completion(ticket.index, thread),
+            CallCompletion::Ready {
+                status: Errno::Ok,
+                len: 4,
+                words: kumo_abi::pack_call_payload(b"pong").unwrap(),
+                legacy_reply: true,
+                caller_end: caller_end_koid,
+            }
+        );
+        // The inbox still holds the request, the long ordinary write, then the reply. The
+        // resume path pops the reply instead of treating it as a second delivery.
+        let _ = engine.dispatch(
+            &mut caller,
+            KernelCall::ChannelRead {
+                channel: caller_end,
+            },
+        );
+        let _ = engine.dispatch(
+            &mut caller,
+            KernelCall::ChannelRead {
+                channel: caller_end,
+            },
+        );
+        engine.pop_legacy_reply(
+            caller_end_koid,
+            4,
+            kumo_abi::pack_call_payload(b"pong").unwrap(),
+        );
+        assert!(matches!(
+            engine.dispatch(&mut caller, KernelCall::ChannelRead { channel: caller_end }),
+            KernelCallResult::Status(status) if status == Errno::ShouldWait.status()
+        ));
+
+        // With two outstanding calls, the write is only an ordinary message.
+        let first = installed(&mut engine, &mut caller, caller_end, KoId(702), 0, b"a");
+        let second = installed(&mut engine, &mut caller, caller_end, KoId(703), 0, b"b");
+        assert_eq!(
+            write(&mut engine, &mut receiver, b"multi"),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert!(engine.pending_calls[first.index]
+            .as_ref()
+            .unwrap()
+            .completion
+            .is_none());
+        assert!(engine.pending_calls[second.index]
+            .as_ref()
+            .unwrap()
+            .completion
+            .is_none());
+    }
+
+    #[test]
+    fn a_call_records_its_donation_once_and_never_changes_the_ready_set() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let _server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let ticket = installed(&mut engine, &mut caller, caller_end, KoId(801), 0, b"ping");
+        engine.note_call_donation(
+            ticket.index,
+            CallDonation {
+                from: KoId(801),
+                to: KoId(900),
+                priority: 63,
+            },
+        );
+        assert_eq!(
+            engine.pending_calls[ticket.index]
+                .as_ref()
+                .unwrap()
+                .donation,
+            Some(CallDonation {
+                from: KoId(801),
+                to: KoId(900),
+                priority: 63,
+            })
+        );
+        // sched-1 records the handoff only; the donation is not applied here.
+        assert!(engine.pending_calls[ticket.index]
+            .as_ref()
+            .unwrap()
+            .completion
+            .is_none());
     }
 }

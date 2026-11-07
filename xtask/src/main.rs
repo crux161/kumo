@@ -1,8 +1,8 @@
-//j810
 //j815
 //j820
 //j822
 //j823
+//j824
 
 use std::env;
 use std::fmt;
@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 
 use imager::{DtbSummary, HardwareTarget, ImageArch, ImagePlan};
 use kumo_abi::initrd::{
-    ARGS_PATH, AUTOEXEC_PATH, BMP_VIEW_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH, DRV_GPU_PATH,
-    DRV_I2C_HID_PATH, DRV_NVME_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH, GFX_CLIENT_PATH,
-    GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH, INITRD_ENTRY_LEN,
-    INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX, INITRD_VERSION,
-    KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH, PERSONA_LINUX_HELLO_PATH,
-    RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH, TTYD_PATH, WC_PATH,
+    ACTORCALL_PATH, ARGS_PATH, AUTOEXEC_PATH, BMP_VIEW_PATH, CAT_PATH, DRV_BLK_PATH, DRV_FB_PATH,
+    DRV_GPU_PATH, DRV_I2C_HID_PATH, DRV_NVME_PATH, DRV_SERIAL_PATH, DRV_XHCI_PATH, FATFS_PATH,
+    GFX_CLIENT_PATH, GPU_CONTAIN_CLIENT_PATH, GPU_CONTAIN_SERVER_PATH, HELLO_PATH,
+    INITRD_ENTRY_LEN, INITRD_HEADER_LEN, INITRD_MAGIC, INITRD_MAX_ENTRIES, INITRD_PATH_MAX,
+    INITRD_VERSION, KILO_PATH, LS_PATH, LUA_REPL_PATH, MALI_FIRMWARE_PATH,
+    PERSONA_LINUX_HELLO_PATH, RELIBC_SMOKE_PATH, SORA_INIT_PATH, SVC_HEALTH_PATH, THREADS_PATH,
+    TTYD_PATH, WC_PATH,
 };
 use kumo_abi::initrd::{GROUP_PATH, HOSTNAME_PATH, IDENTITYD_PATH, PASSWD_PATH, SHADOW_PATH};
 
@@ -928,6 +929,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let netprobe = build_native_bin(&workspace_root()?, "netprobe")?;
             let actorprobe = build_native_bin(&workspace_root()?, "actorprobe")?;
             let asidpair = build_native_bin(&workspace_root()?, "asidpair")?;
+            let actorcall = build_native_bin(&workspace_root()?, "actorcall")?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
@@ -968,6 +970,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (kumo_abi::initrd::NETPROBE_PATH, netprobe.as_slice()),
                 ("bin/actorprobe", actorprobe.as_slice()),
                 ("bin/asidpair", asidpair.as_slice()),
+                (ACTORCALL_PATH, actorcall.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),

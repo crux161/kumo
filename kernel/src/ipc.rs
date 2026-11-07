@@ -1,8 +1,8 @@
-//j409
 //j618
 //j708
 //j719
 //j731
+//j824
 
 use alloc::vec::Vec;
 
@@ -132,6 +132,20 @@ fn map_message_error(error: kumo_ipc::MessageError) -> IpcError {
 pub enum ChannelEnd {
     Left,
     Right,
+}
+
+//j824
+/// Both endpoints of the channel pair that owns a koid, with the pair's stable registry
+/// index. `peer_kernel_retained` marks an opposite end with no owning handle (the kernel's
+/// half of a root channel); AX2 v1 refuses to call such an end. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChannelEndpoints {
+    pub pair: usize,
+    pub end: ChannelEnd,
+    pub end_koid: KoId,
+    pub peer: ChannelEnd,
+    pub peer_koid: KoId,
+    pub peer_kernel_retained: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +375,65 @@ impl IpcRegistry {
             }
         }
         Err(IpcError::NotChannel)
+    }
+
+    //j824
+    /// The endpoints and stable pair index that own `koid`. Used by the AX2 call path to
+    /// reach the peer inbox and to reject calls to the kernel-retained end. — TIMBERDOODLE
+    pub(crate) fn endpoints_for(&self, koid: KoId) -> Result<ChannelEndpoints, IpcError> {
+        for (pair, channel) in self.channels.iter().enumerate() {
+            for end in [ChannelEnd::Left, ChannelEnd::Right] {
+                if channel.object(end).koid() == koid {
+                    let opposite = peer(end);
+                    return Ok(ChannelEndpoints {
+                        pair,
+                        end,
+                        end_koid: koid,
+                        peer: opposite,
+                        peer_koid: channel.object(opposite).koid(),
+                        peer_kernel_retained: channel.endpoint(opposite).references.is_none(),
+                    });
+                }
+            }
+        }
+        Err(IpcError::NotChannel)
+    }
+
+    //j824
+    /// Deliver one synchronous call request from the caller's endpoint into its peer's
+    /// inbox. Rights, depth and kernel-retained-end policy are the engine's job; this owns
+    /// only the registry half, so a request can never be forged through a foreign handle.
+    pub(crate) fn install_call(
+        &mut self,
+        caller_end_koid: KoId,
+        message: KernelMessage,
+    ) -> Result<ChannelEndpoints, IpcError> {
+        let endpoints = self.endpoints_for(caller_end_koid)?;
+        let channel = self.channel_mut_by_koid(caller_end_koid)?;
+        channel.write(endpoints.end, message)?;
+        Ok(endpoints)
+    }
+
+    //j824
+    /// Remove the queued message a legacy `ChannelWrite` left behind after it completed a
+    /// parked call with the same bytes. Searches from the back so an older byte-identical
+    /// message survives. Ordinary ordinal-1, flag-0 writes only. — TIMBERDOODLE
+    pub(crate) fn remove_message_with_bytes(&mut self, end_koid: KoId, bytes: &[u8]) -> bool {
+        let Ok(end) = self.channel_end_for(end_koid) else {
+            return false;
+        };
+        let Ok(channel) = self.channel_mut_by_koid(end_koid) else {
+            return false;
+        };
+        let inbox = &mut channel.endpoint_mut(end).inbox;
+        if let Some(index) = inbox.iter().rposition(|message| {
+            message.header.ordinal == 1 && message.header.flags == 0 && message.bytes() == bytes
+        }) {
+            inbox.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     /// Report the pending [`Signals`] on the channel endpoint identified by `koid`

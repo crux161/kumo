@@ -1,8 +1,8 @@
-//j632
 //j660
 //j743
 //j790
 //j797
+//j824
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +13,21 @@ pub enum Syscall {
     ChannelCreate = 3,
     ChannelWrite = 4,
     ChannelRead = 5,
+    /// Synchronous call into a server over a channel (AX2 fast path).
+    ///
+    /// Registers, per the ratified v1 ABI:
+    /// - `x0` = channel handle; the caller needs `READ` and `WRITE` on it.
+    /// - `x1` = absolute monotonic deadline in nanoseconds; `0` means no deadline.
+    /// - `x2..=x5` = the payload words: little-endian bytes 0 through 31.
+    /// - `x6` = payload length, `0..=32`.
+    /// - `x7` = reserved, must be `0` in v1 (no handle transfer).
+    ///
+    /// Returns `x0` = status (`0` is `Ok`, a negative [`Errno`] otherwise), `x1` = reply
+    /// length, `x2..=x5` = reply words, in the encoding [`Syscall::ChannelReply`] takes.
+    ///
+    /// Call depth is 1: a nested call, a call to the caller's own channel end, and a call to
+    /// the kernel-retained channel end are refused with [`Errno::InvalidArgs`]. v1 introduces
+    /// no new error values.
     ChannelCall = 6,
     PortCreate = 7,
     PortWait = 8,
@@ -107,6 +122,15 @@ pub enum Syscall {
     /// VMO handle or u64::MAX. Physical addresses are returned only at creation, as with
     /// VmoCreateContiguous; no client buffer ID or wire request reveals them. — KESTREL
     VmoCreatePaged = 55,
+    /// Server-side reply to the most recent [`Syscall::ChannelCall`] delivered to this thread.
+    ///
+    /// Args: `x0` = reply length, `0..=32`; `x1..=x4` = reply words, little-endian. A reply
+    /// longer than 32 bytes is refused with [`Errno::InvalidArgs`], never truncated.
+    ///
+    /// Returns `x0` = `Ok` when the parked caller is handed the reply, or
+    /// [`Errno::BadState`] when the caller is no longer parked (it timed out or died); the
+    /// reply is discarded.
+    ChannelReply = 56,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -425,6 +449,14 @@ mod tests {
         assert_eq!(log_level::EMERG, 0);
         assert_eq!(log_level::NOTICE, 5);
         assert_eq!(log_level::DEBUG, 7);
+    }
+
+    #[test]
+    fn channel_call_and_reply_keep_their_abi_slots() {
+        // AX2: the fast path's register ABI is pinned by number. 56 is the next free slot
+        // after the device calls; renumbering either would break every built client at once.
+        assert_eq!(Syscall::ChannelCall as usize, 6);
+        assert_eq!(Syscall::ChannelReply as usize, 56);
     }
 }
 

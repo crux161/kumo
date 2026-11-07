@@ -1,8 +1,8 @@
-#j801
 #j813
 #j815
 #j822
 #j823
+#j824
 [workspace]
 members = [
     "boot/niji-loader",
@@ -33,6 +33,7 @@ members = [
     "lib/kumo-vfs",
     "lib/kumo-xhci",
     "tools/stage-a-smoke",
+    "userland/actorcall",
     "userland/actorprobe",
     "userland/asidpair",
     "userland/args",

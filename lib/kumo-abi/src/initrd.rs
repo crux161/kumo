@@ -1,8 +1,8 @@
-//j675
 //j709
 //j774
 //j798
 //j815
+//j824
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -43,6 +43,9 @@ pub const IDENTITYD_PATH: &str = "bin/identityd";
 pub const NETSTACK_PATH: &str = "bin/netstack";
 /// The NET2b socket-contract probe, launched as `net netprobe <mode>`.
 pub const NETPROBE_PATH: &str = "bin/netprobe";
+/// The AX2 call/reply probe (PLAN/021): one binary, five roles selected by argv. Sora's
+/// `ax2bench` launches it as `ping`/`pong`/`die`/`never`/`hold`.
+pub const ACTORCALL_PATH: &str = "bin/actorcall";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.

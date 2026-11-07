@@ -20,6 +20,7 @@
 //! This module is arch-neutral and fully host-tested. The freestanding arm64 path
 //! drives it from the timer IRQ, while cooperative demos and future syscalls enter
 //! through the same block / wake / yield / finish scheduling points.
+//j824
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -98,6 +99,10 @@ pub struct PriorityClass {
     /// One FIFO per priority level.
     queues: Vec<VecDeque<ThreadId>>,
     len: usize,
+    /// AX2 host-test witness. sched-1's donation is an intentional no-op; this only counts
+    /// that the engine seam was reached, so a test can pin "exactly once". — TIMBERDOODLE
+    #[cfg(test)]
+    donations: u32,
 }
 
 impl PriorityClass {
@@ -111,6 +116,8 @@ impl PriorityClass {
             words: [0; 4],
             queues,
             len: 0,
+            #[cfg(test)]
+            donations: 0,
         }
     }
 
@@ -191,6 +198,15 @@ impl SchedClass for PriorityClass {
 
     fn is_empty(&self) -> bool {
         self.summary == 0
+    }
+
+    fn on_donation(&mut self, _from: ThreadId, _to: ThreadId, _prio: Priority) {
+        // sched-1 hands the slot to the pre-admitted receiver through `block_current`;
+        // the level donation this seam will implement belongs to sched-2 (DESIGN/003 §4).
+        #[cfg(test)]
+        {
+            self.donations = self.donations.saturating_add(1);
+        }
     }
 }
 
@@ -321,6 +337,21 @@ impl Dispatcher {
 
     pub fn current(&self) -> Option<ThreadId> {
         self.current.map(|r| r.id)
+    }
+
+    //j824
+    /// Record an IPC slot handoff for the scheduler class. AX2 calls this exactly once,
+    /// before the caller blocks, when it pre-admitted the receiver. sched-1 forwards it to
+    /// the RT class's no-op seam; sched-2 will perform the actual level donation here.
+    /// — TIMBERDOODLE
+    pub fn on_donation(&mut self, from: ThreadId, to: ThreadId, prio: Priority) {
+        self.rt.on_donation(from, to, prio);
+    }
+
+    /// AX2 host witness: how many donation seams this dispatcher has reached.
+    #[cfg(test)]
+    pub fn donation_count(&self) -> u32 {
+        self.rt.donations
     }
 
     /// Ready threads in the RT class (excludes the running thread and the idle floor).
@@ -764,6 +795,92 @@ mod tests {
             d.finish_current(),
             Decision::Switch {
                 from: Some(KoId(1)),
+                to: KoId(99)
+            }
+        );
+    }
+
+    //j824
+    // ---- AX2 pre-admission and the donation seam -----------------------------------
+
+    #[test]
+    fn pre_admitted_receiver_is_the_next_block_current_switch() {
+        let mut d = Dispatcher::new(4);
+        d.set_idle(KoId(99));
+        // A child caller (64) runs; its parked receiver is pre-admitted at the child call
+        // level (63), exactly as channel_call_without_borrow does before the caller parks.
+        d.set_running(KoId(1), Priority(64), ClassId::Rt);
+        d.admit(KoId(2), Priority(63));
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+        // Sora's call wake level (62) outranks a child (63): the same handoff serves her,
+        // and strict priority still picks her pre-admission first.
+        d.set_running(KoId(3), Priority(64), ClassId::Rt);
+        d.admit(KoId(4), Priority(62));
+        d.admit(KoId(5), Priority(63));
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(3)),
+                to: KoId(4)
+            }
+        );
+        assert_eq!(d.current(), Some(KoId(4)));
+    }
+
+    #[test]
+    fn donation_seam_is_counted_without_reordering_the_ready_set() {
+        let mut d = Dispatcher::new(4);
+        d.set_idle(KoId(99));
+        d.set_running(KoId(1), Priority(64), ClassId::Rt);
+        d.admit(KoId(2), Priority(63));
+        assert_eq!(d.runnable_count(), 1);
+        d.on_donation(KoId(1), KoId(2), Priority(63));
+        assert_eq!(d.donation_count(), 1);
+        // sched-1 hands off the slot only: no level change, no ready-set change, and the
+        // caller keeps running until it blocks on its own.
+        assert_eq!(d.runnable_count(), 1);
+        assert_eq!(d.current(), Some(KoId(1)));
+        // `admit` only queues; the caller keeps the CPU until it blocks itself.
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+    }
+
+    #[test]
+    fn pre_admitted_receivers_keep_fifo_within_one_level() {
+        let mut d = Dispatcher::new(4);
+        d.set_idle(KoId(99));
+        d.set_running(KoId(1), Priority(64), ClassId::Rt);
+        d.admit(KoId(2), Priority(63));
+        d.admit(KoId(3), Priority(63));
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(1)),
+                to: KoId(2)
+            }
+        );
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(2)),
+                to: KoId(3)
+            }
+        );
+        assert_eq!(
+            d.block_current(),
+            Decision::Switch {
+                from: Some(KoId(3)),
                 to: KoId(99)
             }
         );

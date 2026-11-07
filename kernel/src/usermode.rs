@@ -1,8 +1,8 @@
-//j732
 //j743
 //j748
 //j790
 //j823
+//j824
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -99,8 +99,8 @@ use crate::bootstrap::user::{
 use crate::ipc::{ChannelEnd, IpcError, KernelMessage};
 use crate::mm::{alloc_zeroed_frame, Vmar, Vmo};
 use crate::syscall::{
-    commit_process_grants, rollback_process_grants, stage_process_arg, KernelCall,
-    KernelCallResult, SyscallEngine,
+    commit_process_grants, rollback_process_grants, stage_process_arg, CallCompletion,
+    CallDelivery, CallDonation, CallWake, KernelCall, KernelCallResult, SyscallEngine,
 };
 use crate::task::{Job, Process, Thread, DEFAULT_KERNEL_STACK_SIZE};
 
@@ -448,9 +448,14 @@ extern "C" fn signal_irq(irq: u32) {
                 TIMER_TICK_SKIPS.load(Ordering::Relaxed)
             );
         }
-        late
+        //j824
+        // AX2 deadlines are one more completion source beside timers. The sweep only marks
+        // records complete and collects callers: it never switches or blocks in IRQ.
+        // — TIMBERDOODLE
+        let calls = sora.engine.sweep_pending_calls(now_ns);
+        (late, calls)
     });
-    let Some(late) = delivered else {
+    let Some((late, calls)) = delivered else {
         //j725
         // A busy SoraState borrow skips the whole signal path, timer sweep included. Count it,
         // and count the timer PPI separately: those ticks are dropped rather than deferred.
@@ -472,6 +477,16 @@ extern "C" fn signal_irq(irq: u32) {
     }
     if irq >= 32 {
         crate::ipcstat::note_device_irq();
+    }
+    //j824
+    // Deadline completions collected under the engine borrow. Child callers get an explicit
+    // safe reschedule (Channel is not in that class); Sora goes through the deferred user
+    // wake. No switch happens here; the ordinary payers below run it. — TIMBERDOODLE
+    for caller in calls.child_callers {
+        crate::user_thread::wake_child_waiting_on_channel_for_call(caller);
+    }
+    if calls.sora_wake {
+        crate::user_thread::request_user_wake();
     }
     crate::user_thread::reschedule_pending_after_irq_signal_if_safe();
     // Timer ticks only: a busy device stream must not drive peer rotation or inflate the runaway
@@ -951,13 +966,23 @@ fn wait_sora_port_without_borrow(port: Handle) -> u64 {
 }
 
 enum ChildReadOutcome {
-    Message { len: u64, handle: u64 },
+    Message {
+        len: u64,
+        handle: u64,
+        //j824
+        /// A call request this read consumed; the SVC frame splats its words.
+        call: Option<CallDelivery>,
+    },
     ShouldWait(KoId),
     Done,
 }
 
 enum SoraReadOutcome {
-    Message { len: u64, handle: u64 },
+    Message {
+        len: u64,
+        handle: u64,
+        call: Option<CallDelivery>,
+    },
     ShouldWait,
     Done,
 }
@@ -1052,7 +1077,7 @@ fn read_child_channel_without_borrow(
     channel: Handle,
     user_buf: u64,
     cap: usize,
-) -> (u64, u64) {
+) -> (u64, u64, Option<CallDelivery>) {
     loop {
         let outcome = with_sora_mut(|sora| {
             let Some(child_ptr) = sora
@@ -1082,9 +1107,25 @@ fn read_child_channel_without_borrow(
                         core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
                     };
                     let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
-                    ChildReadOutcome::Message {
-                        len: n as u64,
-                        handle,
+                    //j824
+                    // The receiver's own frame carries a call's words; legacy readers still
+                    // got the bytes above. Consumed records are never splatted twice.
+                    // — TIMBERDOODLE
+                    let reader = crate::user_thread::current_thread_koid().unwrap_or(KoId(0));
+                    let call = sora.engine.note_call_read(child, channel, &message, reader);
+                    if let Some(delivery) = call {
+                        crate::user_thread::set_current_call(reader, delivery.index);
+                        ChildReadOutcome::Message {
+                            len: delivery.len as u64,
+                            handle: 0,
+                            call: Some(delivery),
+                        }
+                    } else {
+                        ChildReadOutcome::Message {
+                            len: n as u64,
+                            handle,
+                            call: None,
+                        }
                     }
                 }
                 KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
@@ -1095,11 +1136,11 @@ fn read_child_channel_without_borrow(
         });
 
         match outcome {
-            ChildReadOutcome::Message { len, handle } => return (len, handle),
+            ChildReadOutcome::Message { len, handle, call } => return (len, handle, call),
             ChildReadOutcome::ShouldWait(wait_koid) => {
                 crate::user_thread::park_current_child_on_channel(wait_koid);
             }
-            ChildReadOutcome::Done => return (0, 0),
+            ChildReadOutcome::Done => return (0, 0, None),
         }
     }
 }
@@ -1109,7 +1150,11 @@ fn read_child_channel_without_borrow(
 /// Sora multiplexes several channels on one thread, so an unrelated kernel wake must also be
 /// allowed to release this read. Preserve the original contract: park once, retry once, and
 /// return an empty read if the wake belonged to another channel.
-fn read_sora_channel_without_borrow(channel: Handle, user_buf: u64, cap: usize) -> (u64, u64) {
+fn read_sora_channel_without_borrow(
+    channel: Handle,
+    user_buf: u64,
+    cap: usize,
+) -> (u64, u64, Option<CallDelivery>) {
     let mut parked_once = false;
     loop {
         let outcome = with_sora_mut(|sora| {
@@ -1128,9 +1173,24 @@ fn read_sora_channel_without_borrow(channel: Handle, user_buf: u64, cap: usize) 
                         core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf as *mut u8, n)
                     };
                     let handle = message.handles().first().map(|h| h.0 as u64).unwrap_or(0);
-                    SoraReadOutcome::Message {
-                        len: n as u64,
-                        handle,
+                    //j824
+                    let reader = crate::user_thread::current_thread_koid().unwrap_or(KoId(0));
+                    let call = sora
+                        .engine
+                        .note_call_read(&sora.process, channel, &message, reader);
+                    if let Some(delivery) = call {
+                        crate::user_thread::set_current_call(reader, delivery.index);
+                        SoraReadOutcome::Message {
+                            len: delivery.len as u64,
+                            handle: 0,
+                            call: Some(delivery),
+                        }
+                    } else {
+                        SoraReadOutcome::Message {
+                            len: n as u64,
+                            handle,
+                            call: None,
+                        }
                     }
                 }
                 KernelCallResult::Status(status) if status == Errno::ShouldWait.status() => {
@@ -1141,13 +1201,188 @@ fn read_sora_channel_without_borrow(channel: Handle, user_buf: u64, cap: usize) 
         });
 
         match outcome {
-            SoraReadOutcome::Message { len, handle } => return (len, handle),
+            SoraReadOutcome::Message { len, handle, call } => return (len, handle, call),
             SoraReadOutcome::ShouldWait if !parked_once && crate::user_thread::is_started() => {
                 parked_once = true;
                 crate::user_thread::park_current_user();
             }
-            SoraReadOutcome::ShouldWait | SoraReadOutcome::Done => return (0, 0),
+            SoraReadOutcome::ShouldWait | SoraReadOutcome::Done => return (0, 0, None),
         }
+    }
+}
+
+//j824
+/// The AX2 synchronous call, end to end from a caller's SVC.
+///
+/// All engine work (validation, the request into the peer inbox, port readiness and the
+/// receiver pre-admission) happens in ONE `with_sora_mut`, then that borrow is dropped
+/// before `on_donation` and before the caller parks. `block_current` selects the receiver
+/// that was just admitted: that is the direct switch, with no new context-switch or HAL
+/// code. A lost wake is impossible on the single-core kernel because no other syscall can
+/// run between the completion check and the park.
+fn channel_call_without_borrow(
+    caller_process: KoId,
+    channel: Handle,
+    deadline_ns: u64,
+    payload_len: usize,
+    payload: [u64; 4],
+) -> (u64, u64, [u64; 4]) {
+    if payload_len > kumo_abi::MAX_CALL_BYTES {
+        return (Errno::InvalidArgs.status() as u32 as u64, 0, [0; 4]);
+    }
+    let Some(caller_thread) = crate::user_thread::current_thread_koid() else {
+        return (Errno::Internal.status() as u32 as u64, 0, [0; 4]);
+    };
+    let mut caller_is_sora = false;
+    let installed = with_sora_mut(|sora| {
+        caller_is_sora = caller_process == sora.process.koid();
+        // Identify a parked receiver from the peer endpoint before mutably borrowing the
+        // caller's process table. Sora is not in the wait queue; she qualifies when she
+        // holds the peer end and is parked. A queued call just stays in the inbox.
+        let peer_koid = {
+            let handles = if caller_is_sora {
+                Some(sora.process.handles())
+            } else {
+                sora.engine
+                    .process_by_koid(caller_process)
+                    .map(|process| process.handles())
+            };
+            handles.and_then(|handles| {
+                handles.get(channel).ok().and_then(|entry| {
+                    sora.engine
+                        .ipc()
+                        .endpoints_for(entry.koid)
+                        .ok()
+                        .map(|endpoints| endpoints.peer_koid)
+                })
+            })
+        };
+        let served_by = peer_koid.and_then(|peer| {
+            if sora
+                .process
+                .handles()
+                .holds(peer, ObjectKind::Channel, Rights::empty())
+            {
+                if crate::user_thread::is_parked() {
+                    Some(crate::user_thread::sora_thread_koid())
+                } else {
+                    None
+                }
+            } else {
+                crate::user_thread::channel_call_waiter(peer)
+            }
+        });
+        // Raw pointers keep the existing engine/child aliasing pattern; the caller table and
+        // the engine cannot be borrowed mutably at once through ordinary references.
+        let caller_ptr = if caller_is_sora {
+            &mut sora.process as *mut Process
+        } else {
+            sora.engine
+                .process_by_koid_mut(caller_process)
+                .map(|process| process as *mut Process)
+                .ok_or(Errno::BadHandle)?
+        };
+        let caller = unsafe { &mut *caller_ptr };
+        let ticket = sora.engine.begin_channel_call(
+            caller,
+            channel,
+            caller_thread,
+            caller_process,
+            caller_is_sora,
+            deadline_ns,
+            payload_len,
+            payload,
+            served_by,
+        )?;
+        // A receiver that was not parked still gets ordinary port readability.
+        sora.engine
+            .signal_ports(ticket.peer_end, kumo_abi::Signals::READABLE);
+        Ok::<_, Errno>(ticket)
+    });
+    let ticket = match installed {
+        Ok(ticket) => ticket,
+        Err(errno) => return (errno.status() as u32 as u64, 0, [0; 4]),
+    };
+    // The Sora borrow is dropped. Pre-admit the parked receiver without switching, then
+    // record the slot handoff exactly once (sched-1 keeps it a no-op at the level). The
+    // caller's `block_current` below selects this receiver: that IS the direct switch.
+    // — TIMBERDOODLE
+    if let Some(to) = ticket.served_by {
+        if let Some(priority) = crate::user_thread::pre_admit_call_receiver(to) {
+            crate::user_thread::donate_call_slot(caller_thread, to, priority);
+            with_sora_mut(|sora| {
+                sora.engine.note_call_donation(
+                    ticket.index,
+                    CallDonation {
+                        from: caller_thread,
+                        to,
+                        priority,
+                    },
+                );
+            });
+        }
+    }
+    loop {
+        let completion = with_sora_mut(|sora| {
+            sora.engine
+                .take_call_completion(ticket.index, caller_thread)
+        });
+        match completion {
+            CallCompletion::Pending => {
+                if caller_is_sora {
+                    crate::user_thread::park_current_user();
+                } else {
+                    crate::user_thread::park_current_child_on_channel(ticket.caller_end);
+                }
+            }
+            CallCompletion::Ready {
+                status,
+                len,
+                words,
+                legacy_reply,
+                caller_end,
+            } => {
+                if legacy_reply {
+                    with_sora_mut(|sora| sora.engine.pop_legacy_reply(caller_end, len, words));
+                }
+                return (status.status() as u32 as u64, len as u64, words);
+            }
+        }
+    }
+}
+
+/// A child server's `ChannelReply`. The per-thread current_call slot survives a re-park
+/// without a reply; a missing slot or a caller that died is BadState and the reply is
+/// discarded. — TIMBERDOODLE
+fn channel_reply_without_borrow_child(payload_len: usize, payload: [u64; 4]) -> u64 {
+    if payload_len > kumo_abi::MAX_CALL_BYTES {
+        return Errno::InvalidArgs.status() as u32 as u64;
+    }
+    let Some(server) = crate::user_thread::current_thread_koid() else {
+        return Errno::BadState.status() as u32 as u64;
+    };
+    let Some(call) = crate::user_thread::current_call_of(server) else {
+        return Errno::BadState.status() as u32 as u64;
+    };
+    match with_sora_mut(|sora| {
+        sora.engine
+            .channel_reply(call, server, payload_len, payload)
+    }) {
+        Ok(wake) => {
+            wake_call_caller(wake);
+            Errno::Ok.status() as u32 as u64
+        }
+        Err(errno) => errno.status() as u32 as u64,
+    }
+}
+
+/// Make a completed call's caller runnable. Sora uses the deferred user wake; a child uses
+/// the channel wake with an explicit safe reschedule. Never switches. — TIMBERDOODLE
+fn wake_call_caller(wake: CallWake) {
+    if wake.caller_is_sora {
+        crate::user_thread::request_user_wake();
+    } else {
+        crate::user_thread::wake_child_waiting_on_channel_for_call(wake.caller_end);
     }
 }
 
@@ -1282,7 +1517,15 @@ fn teardown_process_and_signal(koid: KoId) {
     // Surviving channel ends whose peer this exit closes. Their readers are woken after the
     // Sora borrow below ends (GUIDANCE/006 §2.1).
     let mut closed_peers = Vec::new();
+    //j824
+    // AX2 callers this teardown must make runnable, separated from ordinary peer wakes so
+    // they get the explicit safe reschedule. — TIMBERDOODLE
+    let mut call_peers = Vec::new();
+    let mut sora_call_wake = false;
     let reclaim_framebuffer = with_sora_mut(|sora| {
+        // The dying process can no longer be a caller: tombstone its records first, so any
+        // late reply is discarded instead of overwriting a completion.
+        sora.engine.abandon_calls_for_process(koid);
         let reclaim_framebuffer = sora.framebuffer_owner == Some(koid);
         if reclaim_framebuffer {
             sora.framebuffer_owner = None;
@@ -1315,6 +1558,16 @@ fn teardown_process_and_signal(koid: KoId) {
                             sora.engine
                                 .signal_ports(peer_koid, kumo_abi::Signals::PEER_CLOSED);
                             closed_peers.push(peer_koid);
+                        }
+                    }
+                    //j824
+                    // A call whose peer end (or this caller end) just closed completes
+                    // PeerClosed exactly once; collect the callers to wake after the borrow.
+                    for wake in sora.engine.complete_calls_on_endpoint_closed(koid) {
+                        if wake.caller_is_sora {
+                            sora_call_wake = true;
+                        } else {
+                            call_peers.push(wake.caller_end);
                         }
                     }
                 }
@@ -1387,6 +1640,12 @@ fn teardown_process_and_signal(koid: KoId) {
     // — TIMBERDOODLE
     for peer in closed_peers {
         crate::user_thread::wake_child_waiting_on_channel(peer);
+    }
+    for peer in call_peers {
+        crate::user_thread::wake_child_waiting_on_channel_for_call(peer);
+    }
+    if sora_call_wake {
+        crate::user_thread::request_user_wake();
     }
     if reclaim_framebuffer {
         kumo_hal::active::reclaim_framebuffer_console();
@@ -2254,19 +2513,97 @@ extern "C" fn svc_hook(regs: *mut u64) {
         if let Some(cp_koid) = crate::user_thread::current_process_koid() {
             let sora_koid = with_sora(|sora| sora.process.koid());
             if cp_koid != sora_koid {
-                let (n, handle) =
+                let (n, handle, call) =
                     read_child_channel_without_borrow(cp_koid, channel, user_buf, cap);
                 r[0] = n;
                 r[1] = handle;
+                //j824
+                // A call request this read consumed rides the receiver's own frame; the
+                // bytes were still copied above for legacy readers. — TIMBERDOODLE
+                if let Some(call) = call {
+                    r[2..6].copy_from_slice(&call.words);
+                }
                 crate::user_thread::reschedule_if_pending_after_svc();
                 return;
             }
         }
-        let (n, handle) = read_sora_channel_without_borrow(channel, user_buf, cap);
+        let (n, handle, call) = read_sora_channel_without_borrow(channel, user_buf, cap);
         r[0] = n;
         r[1] = handle;
+        if let Some(call) = call {
+            r[2..6].copy_from_slice(&call.words);
+        }
         crate::user_thread::reschedule_if_pending_after_svc();
         return;
+    }
+
+    //j824
+    // ---- AX2 synchronous calls ------------------------------------------------------
+    //
+    // Both directions are top-level so neither runs under an existing `with_sora_mut`
+    // borrow: `channel_call_without_borrow` takes its own, drops it, then parks. The
+    // payload is exactly 32 bytes in x2..x5 with length in x6; x7 is reserved zero.
+    if num == Syscall::ChannelCall as u64 {
+        #[cfg(feature = "arch_x86_64")]
+        {
+            r[0] = Errno::NotSupported.status() as u32 as u64;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        {
+            let channel = Handle(r[0] as u32);
+            let deadline_ns = r[1];
+            let payload_len = r[6];
+            let payload = [r[2], r[3], r[4], r[5]];
+            if r[7] != 0 || payload_len > kumo_abi::MAX_CALL_BYTES as u64 {
+                r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            } else if let Some(cp_koid) = crate::user_thread::current_process_koid() {
+                let (status, len, words) = channel_call_without_borrow(
+                    cp_koid,
+                    channel,
+                    deadline_ns,
+                    payload_len as usize,
+                    payload,
+                );
+                r[0] = status;
+                r[1] = len;
+                r[2..6].copy_from_slice(&words);
+            } else {
+                r[0] = Errno::Internal.status() as u32 as u64;
+            }
+        }
+        crate::user_thread::reschedule_if_pending_after_svc();
+        return;
+    }
+
+    if num == Syscall::ChannelReply as u64 {
+        #[cfg(feature = "arch_x86_64")]
+        {
+            // No call can exist on this backend; never fall through to Sora's chain arm.
+            r[0] = Errno::NotSupported.status() as u32 as u64;
+            crate::user_thread::reschedule_if_pending_after_svc();
+            return;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        {
+            let payload_len = r[0];
+            let payload = [r[1], r[2], r[3], r[4]];
+            if payload_len > kumo_abi::MAX_CALL_BYTES as u64 || r[5] != 0 || r[6] != 0 || r[7] != 0
+            {
+                r[0] = Errno::InvalidArgs.status() as u32 as u64;
+                return;
+            }
+            let Some(cp_koid) = crate::user_thread::current_process_koid() else {
+                r[0] = Errno::Internal.status() as u32 as u64;
+                return;
+            };
+            let sora_koid = with_sora(|sora| sora.process.koid());
+            if cp_koid != sora_koid {
+                r[0] = channel_reply_without_borrow_child(payload_len as usize, payload);
+                crate::user_thread::reschedule_if_pending_after_svc();
+                return;
+            }
+            // Sora's own reply is answered inside her `with_sora_mut` chain below.
+        }
     }
 
     // ---- futex (D1) ------------------------------------------------------------------
@@ -2539,6 +2876,30 @@ extern "C" fn svc_hook(regs: *mut u64) {
             }
             let bytes = unsafe { core::slice::from_raw_parts(user_ptr as *const u8, len) };
             r[0] = write_channel_message(&mut sora.engine, &mut sora.process, r, bytes);
+        } else if num == Syscall::ChannelReply as u64 {
+            //j824
+            // Sora's reply arm lives inside her borrow, beside her other syscalls; her
+            // current_call slot is the routing identity, exactly as a child's is.
+            // — TIMBERDOODLE
+            let payload_len = r[0] as usize;
+            let payload = [r[1], r[2], r[3], r[4]];
+            if payload_len > kumo_abi::MAX_CALL_BYTES || r[5] != 0 || r[6] != 0 || r[7] != 0 {
+                r[0] = Errno::InvalidArgs.status() as u32 as u64;
+            } else if let Some(call) = crate::user_thread::sora_current_call() {
+                let server = crate::user_thread::sora_thread_koid();
+                r[0] = match sora
+                    .engine
+                    .channel_reply(call, server, payload_len, payload)
+                {
+                    Ok(wake) => {
+                        wake_call_caller(wake);
+                        Errno::Ok.status() as u32 as u64
+                    }
+                    Err(errno) => errno.status() as u32 as u64,
+                };
+            } else {
+                r[0] = Errno::BadState.status() as u32 as u64;
+            }
         } else {
             r[0] = u64::MAX;
         }
@@ -3935,6 +4296,8 @@ mod tests {
             Syscall::DebugWrite,
             Syscall::ChannelRead,
             Syscall::ChannelWrite,
+            Syscall::ChannelCall,
+            Syscall::ChannelReply,
             Syscall::FramebufferClaim,
             Syscall::ProcessCreate,
             Syscall::InterruptWait,

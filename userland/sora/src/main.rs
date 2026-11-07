@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j807
 //j815
 //j816
 //j820
 //j822
+//j824
 
 extern crate alloc;
 
@@ -5948,6 +5948,7 @@ extern "C" fn sora_main(
         }
 
         actor_arm(port, initrd, root);
+        ax2_arm(port, initrd, root);
         log(b"sora: entering serve loop\n");
         //j720
         clock_watch_timer = arm_clock_watch(port);
@@ -5979,7 +5980,7 @@ extern "C" fn sora_main(
                 }
             }
             let raw_source = port_wait(port);
-            if actor_event(raw_source) || netstack_event(raw_source) {
+            if actor_event(raw_source) || ax2_event(raw_source) || netstack_event(raw_source) {
                 continue;
             }
             let source = Handle(raw_source as u32);
@@ -6581,6 +6582,16 @@ fn eval_command(
             ACTOR_PENDING.store(true, Ordering::Relaxed);
         } else {
             actor_benchmark(initrd, root);
+        }
+        return true;
+    }
+    if cmd.name == "ax2bench" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: ax2bench\n");
+        } else if SERVE_PORT.load(Ordering::Relaxed) == 0 {
+            AX2_PENDING.store(true, Ordering::Relaxed);
+        } else {
+            ax2_benchmark(initrd, root);
         }
         return true;
     }
@@ -7992,6 +8003,676 @@ fn actor_benchmark(initrd: Handle, root: Handle) {
     }
     let _ = actor_snapshot(root, 2);
     log(if ok { b"AX0 PASS\n" } else { b"AX0 FAIL\n" });
+}
+
+// AX2 is opt-in, like AX0, but has its own pending flag and timer: the AX0 command and its
+// statics are deliberately untouched. One benchmark per boot: `actorbench` and `ax2bench`
+// in the same autoexec would arm two five-second timers and put four probe children on the
+// machine, against the metal two-child rule.
+static AX2_PENDING: AtomicBool = AtomicBool::new(false);
+static AX2_INITRD: AtomicU32 = AtomicU32::new(0);
+static AX2_ROOT: AtomicU32 = AtomicU32::new(0);
+static AX2_TIMER: Shared<Option<(Handle, u64)>> = Shared(core::cell::UnsafeCell::new(None));
+
+/// The AX2 call path's cost per round trip: caller ChannelCall + server ChannelRead +
+/// server ChannelReply, and the two scheduler switches they cause. The trial bracket also
+/// contains Sora's bounded reads and snapshots; AX2_SLACK pays for those fixed observer
+/// costs so the line measures the mechanism, not the supervisor. The harness applies the
+/// same arithmetic; `docs/actor-call.md` records the convention.
+const AX2_ROUNDS: u32 = 1_024;
+const AX2_CALL_SYSCALLS: u64 = 3;
+const AX2_CALL_SWITCHES: u64 = 2;
+const AX2_SLACK: u64 = 64;
+const AX2_REPEAT_ROUNDS: u32 = 100;
+const AX2_NEVER_DEADLINE_MS: u64 = 100;
+const AX2_TRIAL_DEADLINE_MS: u64 = 5_000;
+/// One 20 Hz tick is 50 ms; 75 ms guarantees at least one tick inside each `hold` reply.
+const AX2_HOLD_MS: u64 = 75;
+/// Quiescence gate before the recorded series (metal boot 1's first trial absorbed background
+/// boot work): two samples one settle interval apart must differ by at most this many IPC
+/// syscalls, or the boot is still busy. Retry for at most AX2_SETTLE_TRIES intervals (10 s).
+const AX2_SETTLE_SYSCALLS: u64 = 100;
+const AX2_SETTLE_SAMPLE_NS: u64 = 100_000_000;
+const AX2_SETTLE_TRIES: u32 = 100;
+
+fn ax2_arm(port: Handle, initrd: Handle, root: Handle) {
+    if !AX2_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    AX2_INITRD.store(initrd.0, Ordering::Relaxed);
+    AX2_ROOT.store(root.0, Ordering::Relaxed);
+    if let Some(timer) = syscall_handle(timer_create(5_000_000_000)) {
+        if port_bind(port, timer) == 0 {
+            AX2_TIMER.set(Some((timer, handle_koid(timer))));
+        } else {
+            let _ = handle_close(timer);
+        }
+    }
+}
+fn ax2_event(source: u64) -> bool {
+    if let Some((timer, _)) = AX2_TIMER.get().filter(|t| t.1 == source) {
+        AX2_TIMER.set(None);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        ax2_benchmark(
+            Handle(AX2_INITRD.load(Ordering::Relaxed)),
+            Handle(AX2_ROOT.load(Ordering::Relaxed)),
+        );
+        return true;
+    }
+    false
+}
+
+/// The 32-byte AXP2 control frame actorcall writes before it exits. Layout and transform
+/// are documented in `userland/actorcall/src/main.rs` and `docs/actor-call.md`.
+#[derive(Clone, Copy)]
+struct Ax2Frame {
+    role: u8,
+    rounds: u32,
+    status: i32,
+    errors: u32,
+    simd_errors: u32,
+    total_ns: u64,
+}
+impl Ax2Frame {
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 32 || &bytes[..4] != b"AXP2" {
+            return None;
+        }
+        Some(Self {
+            role: bytes[4],
+            rounds: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+            status: i32::from_le_bytes(bytes[12..16].try_into().ok()?),
+            errors: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
+            simd_errors: u32::from_le_bytes(bytes[20..24].try_into().ok()?),
+            total_ns: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
+        })
+    }
+}
+fn ax2_read(control: Handle) -> Option<Ax2Frame> {
+    let mut bytes = [0u8; 32];
+    if actor_read(control, &mut bytes) != Some(32) {
+        return None;
+    }
+    Ax2Frame::decode(&bytes)
+}
+fn ax2_status_name(status: i32) -> &'static str {
+    match status {
+        0 => "Ok",
+        s if s == Errno::PeerClosed.status() => "PeerClosed",
+        s if s == Errno::TimedOut.status() => "TimedOut",
+        s if s == Errno::BadState.status() => "BadState",
+        s if s == Errno::InvalidArgs.status() => "InvalidArgs",
+        _ => "Status",
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ax2Child {
+    process: Handle,
+    control: Handle,
+}
+fn ax2_stop(child: Ax2Child) {
+    let _ = process_kill(child.process);
+    let _ = handle_close(child.process);
+    let _ = handle_close(child.control);
+}
+
+/// Wait for a child's ready frame (role `R`), proving it was admitted and entered its role.
+fn ax2_ready(child: Ax2Child) -> bool {
+    ax2_read(child.control).is_some_and(|f| f.role == b'R' && f.rounds == 0 && f.status == 0)
+}
+
+/// Release the caller past its go gate. Sora sends this only after the baseline snapshot.
+fn ax2_go(caller: Ax2Child) -> bool {
+    channel_write(caller.control, b"G".as_ptr(), 1) == 0
+}
+
+/// Spawn one actorcall child. The bootstrap channel carries the argv VMO (`a`) and the
+/// child's own control endpoint (`c`); the call endpoint travels in ProcessRun's second
+/// argument, so each child gets exactly two channels and no ambient authority.
+fn ax2_spawn(initrd: Handle, args: &[&[u8]], peer: Handle) -> Option<Ax2Child> {
+    let (control_raw, control_child_raw) = channel_create_pair();
+    if control_raw == u64::MAX || control_child_raw == u64::MAX {
+        let _ = handle_close(Handle(control_raw as u32));
+        let _ = handle_close(Handle(control_child_raw as u32));
+        return None;
+    }
+    let (boot_raw, boot_child_raw) = channel_create_pair();
+    if boot_raw == u64::MAX || boot_child_raw == u64::MAX {
+        let _ = handle_close(Handle(control_raw as u32));
+        let _ = handle_close(Handle(control_child_raw as u32));
+        let _ = handle_close(Handle(boot_raw as u32));
+        let _ = handle_close(Handle(boot_child_raw as u32));
+        return None;
+    }
+    let control = Handle(control_raw as u32);
+    let boot = Handle(boot_raw as u32);
+    let argv_raw = argv_transfer_handle(args);
+    if argv_raw == 0 || argv_raw == u64::MAX {
+        let _ = handle_close(control);
+        let _ = handle_close(boot);
+        let _ = handle_close(Handle(boot_child_raw as u32));
+        let _ = handle_close(Handle(control_child_raw as u32));
+        return None;
+    }
+    let argv = Handle(argv_raw as u32);
+    let argv_queued =
+        channel_write_with_handle(boot, &STARTUP_TAG_ARGV, 1, argv) == Errno::Ok.status();
+    if !argv_queued {
+        let _ = handle_close(argv);
+    }
+    let control_child = Handle(control_child_raw as u32);
+    let control_queued = argv_queued
+        && channel_write_with_handle(boot, &STARTUP_TAG_CAP0, 1, control_child)
+            == Errno::Ok.status();
+    if !control_queued {
+        let _ = handle_close(control_child);
+    }
+    let _ = handle_close(boot);
+    if !control_queued {
+        let _ = handle_close(Handle(boot_child_raw as u32));
+        let _ = handle_close(control);
+        return None;
+    }
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let mut process = None;
+    let loaded = run_elf_threads(
+        initrd,
+        kumo_abi::initrd::ACTORCALL_PATH.as_bytes(),
+        boot_child_raw,
+        u64::from(peer.0),
+        flags,
+        b"actorcall",
+        0,
+        Some(&mut process),
+    );
+    let child = process.map(|process| Ax2Child { process, control });
+    if loaded {
+        if let Some(child) = child {
+            return Some(child);
+        }
+        let _ = handle_close(control);
+        return None;
+    }
+    if let Some(child) = child {
+        ax2_stop(child);
+    } else {
+        let _ = handle_close(control);
+    }
+    let _ = handle_close(Handle(boot_child_raw as u32));
+    None
+}
+
+/// Create the two channel ends and spawn the server first, the caller second. Both ends
+/// are transferred; Sora retains no call-channel authority. On failure the still-owned
+/// end is closed, mirroring `actor_spawn`/`actor_trial`.
+fn ax2_pair(
+    initrd: Handle,
+    server_args: &[&[u8]],
+    client_args: &[&[u8]],
+) -> Option<(Ax2Child, Ax2Child)> {
+    let (a, b) = channel_create_pair();
+    if a == u64::MAX || b == u64::MAX {
+        let _ = handle_close(Handle(a as u32));
+        let _ = handle_close(Handle(b as u32));
+        return None;
+    }
+    let Some(server) = ax2_spawn(initrd, server_args, Handle(a as u32)) else {
+        let _ = handle_close(Handle(a as u32));
+        let _ = handle_close(Handle(b as u32));
+        return None;
+    };
+    let Some(caller) = ax2_spawn(initrd, client_args, Handle(b as u32)) else {
+        ax2_stop(server);
+        let _ = handle_close(Handle(b as u32));
+        return None;
+    };
+    // Both children announce themselves before the baseline snapshot; the caller then
+    // blocks on the go byte, so neither can exit between the snapshot and the calls.
+    if !ax2_ready(server) || !ax2_ready(caller) {
+        ax2_stop(caller);
+        ax2_stop(server);
+        return None;
+    }
+    Some((server, caller))
+}
+
+fn ax2_trial(initrd: Handle, root: Handle, kind: u32, index: u32) -> bool {
+    let Some(before) = actor_snapshot(root, 1) else {
+        return false;
+    };
+    let rounds_text = alloc::format!("{}", AX2_ROUNDS);
+    let bytes_text = alloc::format!("{}", kind);
+    let deadline_text = alloc::format!("{}", AX2_TRIAL_DEADLINE_MS);
+    let ping_args = [
+        &b"actorcall"[..],
+        &b"ping"[..],
+        rounds_text.as_bytes(),
+        bytes_text.as_bytes(),
+        deadline_text.as_bytes(),
+    ];
+    let server_args = [&b"actorcall"[..], &b"pong"[..]];
+    let Some((server, caller)) = ax2_pair(initrd, &server_args, &ping_args) else {
+        return false;
+    };
+    let Some(base) = actor_snapshot(root, 1) else {
+        ax2_stop(caller);
+        ax2_stop(server);
+        return false;
+    };
+    let two_ok = base.live == before.live + 2;
+    if !ax2_go(caller) {
+        ax2_stop(caller);
+        ax2_stop(server);
+        return false;
+    }
+    let ping = ax2_read(caller.control);
+    let pong = ax2_read(server.control);
+    let costs = actor_snapshot(root, 2);
+    ax2_stop(caller);
+    ax2_stop(server);
+    let clean = actor_snapshot(root, 0);
+    let (syscalls, switches, frames) = match costs {
+        Some(costs) => (
+            costs.syscalls.saturating_sub(base.syscalls),
+            costs.switches.saturating_sub(base.switches),
+            costs.frames_issued.saturating_sub(base.frames_issued),
+        ),
+        None => (u64::MAX, u64::MAX, u64::MAX),
+    };
+    let simd_errors = ping
+        .map(|f| f.simd_errors)
+        .unwrap_or(0)
+        .saturating_add(pong.map(|f| f.simd_errors).unwrap_or(0));
+    let rounds = ping.map(|f| f.rounds).unwrap_or(0);
+    let total_ns = ping.map(|f| f.total_ns).unwrap_or(0);
+    let good = two_ok
+        && clean.is_some_and(|s| s.live == before.live)
+        && ping.is_some_and(|f| {
+            f.role == b'p'
+                && f.rounds == AX2_ROUNDS
+                && f.status == 0
+                && f.errors == 0
+                && f.simd_errors == 0
+                && f.total_ns > 0
+        })
+        && pong.is_some_and(|f| {
+            f.role == b'o'
+                && f.rounds == AX2_ROUNDS
+                && f.status == 0
+                && f.errors == 0
+                && f.simd_errors == 0
+        })
+        && frames == 0
+        && simd_errors == 0
+        && syscalls <= AX2_CALL_SYSCALLS * u64::from(AX2_ROUNDS) + AX2_SLACK
+        && switches <= AX2_CALL_SWITCHES * u64::from(AX2_ROUNDS) + AX2_SLACK;
+    log(alloc::format!(
+        "AX2 trial={} kind={} rounds={} rtt-total-ns={} syscalls={} switches={} frames={} simd-errors={} {}\n",
+        index,
+        kind,
+        rounds,
+        total_ns,
+        syscalls,
+        switches,
+        frames,
+        simd_errors,
+        if good { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    good
+}
+
+fn ax2_matrix_die(initrd: Handle, root: Handle) -> bool {
+    const ROUNDS: &str = "1";
+    const BYTES: &str = "8";
+    const DEADLINE: &str = "5000";
+    let Some(before) = actor_snapshot(root, 1) else {
+        log(b"AX2 matrix=die result=Status FAIL\n");
+        return false;
+    };
+    let server_args = [&b"actorcall"[..], &b"die"[..]];
+    let client_args = [
+        &b"actorcall"[..],
+        &b"ping"[..],
+        ROUNDS.as_bytes(),
+        BYTES.as_bytes(),
+        DEADLINE.as_bytes(),
+    ];
+    let Some((server, caller)) = ax2_pair(initrd, &server_args, &client_args) else {
+        log(b"AX2 matrix=die result=Status FAIL\n");
+        return false;
+    };
+    let Some(base) = actor_snapshot(root, 1) else {
+        ax2_stop(caller);
+        ax2_stop(server);
+        log(b"AX2 matrix=die result=Status FAIL\n");
+        return false;
+    };
+    let two_ok = base.live == before.live + 2;
+    let go = ax2_go(caller);
+    let ping = ax2_read(caller.control);
+    let died = ax2_read(server.control);
+    ax2_stop(caller);
+    ax2_stop(server);
+    let clean = actor_snapshot(root, 0);
+    let peer_closed = Errno::PeerClosed.status();
+    let good = two_ok
+        && go
+        && clean.is_some_and(|s| s.live == before.live)
+        && ping.is_some_and(|f| {
+            f.role == b'p'
+                && f.rounds == 1
+                && f.status == peer_closed
+                && f.errors == 0
+                && f.simd_errors == 0
+        })
+        && died.is_some_and(|f| f.role == b'd' && f.rounds == 1 && f.status == 0 && f.errors == 0);
+    let result = ping.map(|f| f.status).unwrap_or(0);
+    log(alloc::format!(
+        "AX2 matrix=die result={} {}\n",
+        ax2_status_name(result),
+        if good { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    good
+}
+
+fn ax2_matrix_never(initrd: Handle, root: Handle) -> bool {
+    const ROUNDS: &str = "1";
+    const BYTES: &str = "8";
+    let deadline_text = alloc::format!("{}", AX2_NEVER_DEADLINE_MS);
+    let Some(before) = actor_snapshot(root, 1) else {
+        log(b"AX2 matrix=never result=Status FAIL\n");
+        return false;
+    };
+    let server_args = [&b"actorcall"[..], &b"never"[..]];
+    let client_args = [
+        &b"actorcall"[..],
+        &b"ping"[..],
+        ROUNDS.as_bytes(),
+        BYTES.as_bytes(),
+        deadline_text.as_bytes(),
+    ];
+    let Some((server, caller)) = ax2_pair(initrd, &server_args, &client_args) else {
+        log(b"AX2 matrix=never result=Status FAIL\n");
+        return false;
+    };
+    let Some(base) = actor_snapshot(root, 1) else {
+        ax2_stop(caller);
+        ax2_stop(server);
+        log(b"AX2 matrix=never result=Status FAIL\n");
+        return false;
+    };
+    let two_ok = base.live == before.live + 2;
+    let go = ax2_go(caller);
+    let ping = ax2_read(caller.control);
+    let silent = ax2_read(server.control);
+    ax2_stop(caller);
+    ax2_stop(server);
+    let clean = actor_snapshot(root, 0);
+    let timed_out = Errno::TimedOut.status();
+    let deadline_ns = AX2_NEVER_DEADLINE_MS * 1_000_000;
+    let good = two_ok
+        && go
+        && clean.is_some_and(|s| s.live == before.live)
+        && ping.is_some_and(|f| {
+            f.role == b'p'
+                && f.rounds == 1
+                && f.status == timed_out
+                && f.errors == 0
+                && f.simd_errors == 0
+                && f.total_ns >= deadline_ns
+        })
+        && silent.is_some_and(|f| {
+            f.role == b'n' && f.rounds == 1 && f.status == Errno::BadState.status() && f.errors == 0
+        });
+    let result = ping.map(|f| f.status).unwrap_or(0);
+    log(alloc::format!(
+        "AX2 matrix=never result={} {}\n",
+        ax2_status_name(result),
+        if good { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    good
+}
+
+fn ax2_matrix_hold(initrd: Handle, root: Handle) -> bool {
+    const ROUNDS: &str = "3";
+    const BYTES: &str = "8";
+    const DEADLINE: &str = "5000";
+    let hold_text = alloc::format!("{}", AX2_HOLD_MS);
+    let Some(before) = actor_snapshot(root, 1) else {
+        log(b"AX2 census hold switches=0 rounds=0\n");
+        log(b"AX2 matrix=hold result=Status FAIL\n");
+        return false;
+    };
+    let server_args = [&b"actorcall"[..], &b"hold"[..], hold_text.as_bytes()];
+    let client_args = [
+        &b"actorcall"[..],
+        &b"ping"[..],
+        ROUNDS.as_bytes(),
+        BYTES.as_bytes(),
+        DEADLINE.as_bytes(),
+    ];
+    let Some((server, caller)) = ax2_pair(initrd, &server_args, &client_args) else {
+        log(b"AX2 census hold switches=0 rounds=0\n");
+        log(b"AX2 matrix=hold result=Status FAIL\n");
+        return false;
+    };
+    let Some(base) = actor_snapshot(root, 1) else {
+        ax2_stop(caller);
+        ax2_stop(server);
+        log(b"AX2 census hold switches=0 rounds=0\n");
+        log(b"AX2 matrix=hold result=Status FAIL\n");
+        return false;
+    };
+    let two_ok = base.live == before.live + 2;
+    let go = ax2_go(caller);
+    let ping = ax2_read(caller.control);
+    let held = ax2_read(server.control);
+    let costs = actor_snapshot(root, 2);
+    ax2_stop(caller);
+    ax2_stop(server);
+    let clean = actor_snapshot(root, 0);
+    let switches = costs
+        .map(|c| c.switches.saturating_sub(base.switches))
+        .unwrap_or(0);
+    let rounds = held.map(|f| f.rounds).unwrap_or(0);
+    log(alloc::format!("AX2 census hold switches={} rounds={}\n", switches, rounds).as_bytes());
+    let hold_ns = AX2_HOLD_MS * 1_000_000;
+    let good = two_ok
+        && go
+        && switches > 0
+        && clean.is_some_and(|s| s.live == before.live)
+        && ping.is_some_and(|f| {
+            f.role == b'p'
+                && f.rounds == 3
+                && f.status == 0
+                && f.errors == 0
+                && f.simd_errors == 0
+                && f.total_ns >= 3 * hold_ns
+        })
+        && held.is_some_and(|f| f.role == b'h' && f.rounds == 3 && f.status == 0 && f.errors == 0);
+    log(alloc::format!(
+        "AX2 matrix=hold result={} {}\n",
+        ax2_status_name(ping.map(|f| f.status).unwrap_or(0)),
+        if good { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    good
+}
+
+fn ax2_matrix_repeat(initrd: Handle, root: Handle) -> bool {
+    let rounds_text = alloc::format!("{}", AX2_REPEAT_ROUNDS);
+    let deadline_text = alloc::format!("{}", AX2_TRIAL_DEADLINE_MS);
+    let before = actor_snapshot(root, 1);
+    let server_args = [&b"actorcall"[..], &b"pong"[..]];
+    let client_args = [
+        &b"actorcall"[..],
+        &b"ping"[..],
+        rounds_text.as_bytes(),
+        &b"8"[..],
+        deadline_text.as_bytes(),
+    ];
+    let mut frames = u64::MAX;
+    let mut live = 0u32;
+    let mut stored = 0u32;
+    let mut free = 0u32;
+    let mut outcome = false;
+    if let Some(before) = before {
+        if let Some((server, caller)) = ax2_pair(initrd, &server_args, &client_args) {
+            let base = actor_snapshot(root, 1);
+            let two_ok = base.is_some_and(|b| b.live == before.live + 2) && ax2_go(caller);
+            let ping = ax2_read(caller.control);
+            let pong = ax2_read(server.control);
+            let costs = actor_snapshot(root, 2);
+            ax2_stop(caller);
+            ax2_stop(server);
+            let clean = actor_snapshot(root, 0);
+            frames = match (base, costs) {
+                (Some(base), Some(costs)) => costs.frames_issued.saturating_sub(base.frames_issued),
+                _ => u64::MAX,
+            };
+            live = clean.map(|s| s.live).unwrap_or(0);
+            stored = clean.map(|s| s.stored).unwrap_or(0);
+            free = clean
+                .map(|s| s.capacity.saturating_sub(s.live))
+                .unwrap_or(0);
+            outcome = two_ok
+                && clean.is_some_and(|s| s.live == before.live)
+                && frames == 0
+                && ping.is_some_and(|f| {
+                    f.role == b'p'
+                        && f.rounds == AX2_REPEAT_ROUNDS
+                        && f.status == 0
+                        && f.errors == 0
+                        && f.simd_errors == 0
+                })
+                && pong.is_some_and(|f| {
+                    f.role == b'o'
+                        && f.rounds == AX2_REPEAT_ROUNDS
+                        && f.status == 0
+                        && f.errors == 0
+                });
+        }
+    }
+    log(alloc::format!(
+        "AX2 census repeat frames={} live={} stored={} free={}\n",
+        frames,
+        live,
+        stored,
+        free
+    )
+    .as_bytes());
+    log(alloc::format!(
+        "AX2 matrix=repeat result={} {}\n",
+        if outcome { "Ok" } else { "Status" },
+        if outcome { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    outcome
+}
+
+/// Wait for boot bring-up work to drain before the recorded series. Two cost snapshots one
+/// settle interval apart must differ by at most `AX2_SETTLE_SYSCALLS`; retry for up to
+/// ten seconds and log every sample. A boot that never settles fails the run instead of
+/// charging background work to trial 1.
+fn ax2_settle(root: Handle) -> bool {
+    let mut sample = 0u32;
+    let mut last = 0u64;
+    while sample < AX2_SETTLE_TRIES {
+        let Some(a) = actor_snapshot(root, 2) else {
+            log(b"AX2 settle snapshot failed\n");
+            return false;
+        };
+        let _ = kumo_rt::sleep_ns(AX2_SETTLE_SAMPLE_NS);
+        let Some(b) = actor_snapshot(root, 2) else {
+            log(b"AX2 settle snapshot failed\n");
+            return false;
+        };
+        sample = sample.saturating_add(1);
+        last = b.syscalls.saturating_sub(a.syscalls);
+        log(alloc::format!(
+            "AX2 settle sample={} syscalls={} delta={}\n",
+            sample,
+            b.syscalls,
+            last
+        )
+        .as_bytes());
+        if last <= AX2_SETTLE_SYSCALLS {
+            log(alloc::format!("AX2 settle ok sample={} delta={}\n", sample, last).as_bytes());
+            return true;
+        }
+    }
+    log(alloc::format!("AX2 settle gave up delta={}\n", last).as_bytes());
+    false
+}
+
+fn ax2_benchmark(initrd: Handle, root: Handle) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 || NET_SUPERVISOR.get().initrd.0 != 0 {
+        log(b"AX2 FAIL needs a fresh boot and no background job\n");
+        return;
+    }
+    log(b"AX2 begins: ChannelCall register fast path (PLAN/021 AX2)\n");
+    if !ax2_settle(root) {
+        log(b"AX2 FAIL settle\n");
+        return;
+    }
+    let Some(base) = actor_snapshot(root, 0) else {
+        log(b"AX2 FAIL snapshot\n");
+        return;
+    };
+    log(alloc::format!(
+        "AX2 census default-login capacity={} live={} stored={} blocked={} ready={} running={} free={} frames={} heap={}\n",
+        base.capacity,
+        base.live,
+        base.stored,
+        base.blocked,
+        base.ready,
+        base.running,
+        base.capacity.saturating_sub(base.live),
+        base.frames_issued,
+        base.heap_used
+    )
+    .as_bytes());
+    let free = base.capacity.saturating_sub(base.live);
+    log(alloc::format!(
+        "AX2 capacity-gate free={} requires=2 {}\n",
+        free,
+        if free >= 2 { "PASS" } else { "AX4-REQUIRED" }
+    )
+    .as_bytes());
+    if free < 2 {
+        log(b"AX2 FAIL capacity (AX4-REQUIRED)\n");
+        return;
+    }
+    let mut ok = true;
+    for kind in [8u32, 32u32] {
+        for index in 1..=5u32 {
+            if !ax2_trial(initrd, root, kind, index) {
+                ok = false;
+            }
+        }
+    }
+    if !ax2_matrix_die(initrd, root) {
+        ok = false;
+    }
+    if !ax2_matrix_never(initrd, root) {
+        ok = false;
+    }
+    if !ax2_matrix_hold(initrd, root) {
+        ok = false;
+    }
+    if !ax2_matrix_repeat(initrd, root) {
+        ok = false;
+    }
+    let _ = actor_snapshot(root, 2);
+    log(if ok { b"AX2 PASS\n" } else { b"AX2 FAIL\n" });
 }
 
 /// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a

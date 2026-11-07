@@ -12,6 +12,7 @@
 //j556
 //j724
 //j730
+//j824
 
 use core::cell::UnsafeCell;
 
@@ -222,6 +223,10 @@ struct ResidentChild {
     exit_code: u64,
     /// True once the child thread has terminated.
     done: bool,
+    /// AX2 reply routing: the call record this child last consumed when serving a call.
+    /// It survives a re-park without a reply and is overwritten only by the next delivered
+    /// call (the abandoned caller then resolves at its deadline). — TIMBERDOODLE
+    current_call: Option<usize>,
 }
 
 /// The scheduler-integrated user-thread harness. Owns the dispatcher, the boot-flow
@@ -263,6 +268,8 @@ pub struct UserSched {
     pub exit_code: u64,
     /// True once the user thread has terminated.
     pub done: bool,
+    /// AX2 reply routing for Sora's own served call.
+    sora_current_call: Option<usize>,
 }
 
 struct UserSchedCell(UnsafeCell<Option<UserSched>>);
@@ -430,6 +437,7 @@ pub fn init(
             preempted_runaways: 0,
             exit_code: 0,
             done: false,
+            sora_current_call: None,
         });
     }
     kumo_hal::active::set_tower_context_hook(tower_context);
@@ -499,6 +507,170 @@ pub fn current_process_koid() -> Option<KoId> {
     }
 }
 
+//j824
+/// The koid of the scheduler thread currently running, when it is Sora or a resident child.
+pub fn current_thread_koid() -> Option<KoId> {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if unsafe { (&*opt).is_none() } {
+        return None;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &*p;
+        let current = s.dispatcher.current()?;
+        if current == s.user_thread.koid() || s.children.iter().any(|c| c.thread.koid() == current)
+        {
+            Some(current)
+        } else {
+            None
+        }
+    }
+}
+
+/// Sora's scheduler thread koid. Only meaningful once the harness is initialised.
+pub fn sora_thread_koid() -> KoId {
+    let p = sched_ptr();
+    unsafe { (&*p).user_thread.koid() }
+}
+
+/// The AX2 call record `thread` last consumed, if any. The slot is deliberately not
+/// cleared by a re-park, so a server may read again before replying. — TIMBERDOODLE
+pub fn current_call_of(thread: KoId) -> Option<usize> {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if unsafe { (&*opt).is_none() } {
+        return None;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &*p;
+        if thread == s.user_thread.koid() {
+            s.sora_current_call
+        } else {
+            s.children
+                .iter()
+                .find(|c| c.thread.koid() == thread)
+                .and_then(|c| c.current_call)
+        }
+    }
+}
+
+/// Sora's own reply slot, read inside her `with_sora_mut` reply arm.
+pub fn sora_current_call() -> Option<usize> {
+    let p = sched_ptr();
+    unsafe { (&*p).sora_current_call }
+}
+
+/// Record the call a receiver just consumed. A new delivered call overwrites the slot;
+/// the previous caller is then abandoned until its deadline (documented v1 semantic).
+pub fn set_current_call(thread: KoId, call: usize) {
+    let opt: *const Option<UserSched> = USER_SCHED.0.get();
+    if unsafe { (&*opt).is_none() } {
+        return;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        if thread == s.user_thread.koid() {
+            s.sora_current_call = Some(call);
+        } else if let Some(child) = s.children.iter_mut().find(|c| c.thread.koid() == thread) {
+            child.current_call = Some(call);
+        }
+    }
+}
+
+/// The resident child parked in `ChannelRead` on `channel_koid`, if one is. Sora never
+/// enters the wait queue; her parked state is checked separately by the caller. — TIMBERDOODLE
+pub fn channel_call_waiter(channel_koid: KoId) -> Option<KoId> {
+    if !is_started() {
+        return None;
+    }
+    let p = sched_ptr();
+    unsafe {
+        (&*p)
+            .wait_queue
+            .waiter_for(WaitTarget::Channel(channel_koid))
+    }
+}
+
+/// Make a parked receiver runnable WITHOUT switching. The caller's next
+/// `block_current` then selects this thread: that is the AX2 direct switch. Returns the
+/// admission priority used, for the donation record; `None` when the receiver is not a
+/// parked Sora/resident child (the call simply stays queued).
+pub fn pre_admit_call_receiver(thread: KoId) -> Option<u8> {
+    if !is_started() {
+        return None;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        if s.done || s.dispatcher.current() == Some(thread) {
+            return None;
+        }
+        if thread == s.user_thread.koid() {
+            if !matches!(s.user_thread.state(), ThreadState::Blocked) {
+                return None;
+            }
+            s.user_thread.ready();
+            s.dispatcher.admit(thread, USER_WAKE_PRIORITY);
+            Some(USER_WAKE_PRIORITY.0)
+        } else {
+            let index = s.children.iter().position(|c| c.thread.koid() == thread)?;
+            if s.children[index].done
+                || !matches!(s.children[index].thread.state(), ThreadState::Blocked)
+            {
+                return None;
+            }
+            s.wait_queue.remove_thread(thread);
+            s.children[index].thread.ready();
+            s.dispatcher.admit(thread, CHILD_PRIORITY);
+            Some(CHILD_PRIORITY.0)
+        }
+    }
+}
+
+/// Record the sched-1 slot handoff. Called exactly once per direct switch, before the
+/// caller blocks; sched-2 will read the same record for the level donation. — TIMBERDOODLE
+pub fn donate_call_slot(from: KoId, to: KoId, priority: u8) {
+    if !is_started() {
+        return;
+    }
+    let p = sched_ptr();
+    unsafe {
+        (&mut *p)
+            .dispatcher
+            .on_donation(from, to, Priority(priority));
+    }
+}
+
+/// Ask the deferred user-wake path to make parked Sora runnable at the next safe boundary.
+/// Completions that cannot switch (IRQ deadline sweep, ChannelReply, a legacy write) use
+/// this; the SVC payer or the IRQ epilogue performs the actual reschedule.
+pub fn request_user_wake() {
+    if !is_started() {
+        return;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        if s.done || !matches!(s.user_thread.state(), ThreadState::Blocked) {
+            return;
+        }
+        s.user_wake_pending = true;
+    }
+}
+
+/// AX2 completion wake: make a parked child caller runnable and mark an explicit safe
+/// reschedule. `WaitTarget::Channel` is not in the safe-reschedule class, so a completion
+/// path that must not switch (IRQ sweep) or that runs under a Sora borrow asks for it here.
+pub fn wake_child_waiting_on_channel_for_call(channel_koid: KoId) {
+    if wake_child_waiting_on(WaitTarget::Channel(channel_koid)) {
+        let p = sched_ptr();
+        unsafe {
+            (&mut *p).safe_reschedule_pending = true;
+        }
+    }
+}
+
 /// Install a fresh resident child into the harness: build its `ResidentChild` record, its
 /// `UserState` from the supplied entry/stack/args, and its first-entry kernel context, then
 /// mark it ready. The caller admits it to the dispatcher at the priority it chooses
@@ -524,6 +696,7 @@ fn install_child(
         process: proc_koid,
         exit_code: 0,
         done: false,
+        current_call: None,
     };
     child.thread.user_state = Some(UserState {
         x: {
@@ -1114,18 +1287,18 @@ fn irq_handoff_allowed(current: KoId, idle: KoId, user: KoId) -> bool {
     current == user
 }
 
-fn wake_child_waiting_on(target: WaitTarget) {
+fn wake_child_waiting_on(target: WaitTarget) -> bool {
     let opt: *const Option<UserSched> = USER_SCHED.0.get();
     let started = unsafe { (&*opt).is_some() };
     if !started {
-        return;
+        return false;
     }
 
     let p = sched_ptr();
     unsafe {
         let s = &mut *p;
         let Some(waiter) = s.wait_queue.waiter_for(target) else {
-            return;
+            return false;
         };
         // The wait queue keys on object koid, so `waiter` is exactly the child parked on
         // this object — wake that one, leaving any sibling resident on its own object asleep.
@@ -1135,10 +1308,10 @@ fn wake_child_waiting_on(target: WaitTarget) {
             .find(|c| c.thread.koid() == waiter)
             .map(|c| &mut c.thread)
         else {
-            return;
+            return false;
         };
         if !matches!(child.state(), ThreadState::Blocked) {
-            return;
+            return false;
         }
         s.wait_queue.remove_thread(waiter);
         child.ready();
@@ -1146,6 +1319,7 @@ fn wake_child_waiting_on(target: WaitTarget) {
         if wait_target_needs_safe_reschedule(target) {
             s.safe_reschedule_pending = true;
         }
+        true
     }
 }
 
