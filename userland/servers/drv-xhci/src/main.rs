@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j703
 //j704
 //j767
 //j809
 //j811
+//j827
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -936,6 +936,126 @@ fn inventory_ax88(
     }
     true
 }
+/// Default-off metal proof, after exact NET0/profile match. Toggle only the documented
+/// IPv4 RX checksum bit in volatile register34, read it back, restore/read original.
+/// No SetConfiguration, endpoint setup, EEPROM/eFuse or Ethernet TX. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+fn ax88_ep0_proof(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    ring: &mut TransferRing,
+    segment: &mut DmaTrbs,
+    slot: u8,
+    speed: u8,
+    device: &[u8],
+    config: &[u8],
+    buffer: DmaBuf,
+) {
+    use kumo_ax88::{
+        control::{MacRegister, Request},
+        profile::{Profile, Speed},
+    };
+    use kumo_xhci::{ControlError, ControlPipe};
+    if !matches!(option_env!("KUMO_AX88_EP0_PROOF"), Some("1")) {
+        return;
+    }
+    let speed = match speed {
+        1 => Speed::Full,
+        3 => Speed::High,
+        4 => Speed::Super,
+        _ => return ax88_record(format_args!("NET4a EP0 REFUSED speed\n")),
+    };
+    if let Err(error) = Profile::from_descriptors(device, config, speed) {
+        return ax88_record(format_args!("NET4a EP0 REFUSED profile={:?}\n", error));
+    }
+    let Ok(mut pipe) = ControlPipe::new(slot) else {
+        return;
+    };
+    let mut cycles = 0;
+    let result = (|| -> Result<(), ControlError> {
+        let read = Request::mac_read(MacRegister::RxChecksum);
+        let length = control_data_exact(
+            io,
+            layout,
+            image,
+            evt,
+            ring,
+            segment,
+            slot,
+            &mut pipe,
+            read.setup(),
+            buffer,
+            read.outbound(),
+        )?;
+        if read.validate_transferred(length).is_err() {
+            return Err(ControlError::Length);
+        }
+        let original = buffer.byte(0);
+        let changed = original ^ 1;
+        ax88_record(format_args!(
+            "NET4a EP0 start slot={} original={:#04x} test={:#04x} cycles=16\n",
+            slot, original, changed
+        ));
+        for cycle in 1..=16 {
+            for value in [changed, original] {
+                let bytes = [value];
+                let write = Request::mac_write(MacRegister::RxChecksum, &bytes)
+                    .map_err(|_| ControlError::Payload)?;
+                let length = control_data_exact(
+                    io,
+                    layout,
+                    image,
+                    evt,
+                    ring,
+                    segment,
+                    slot,
+                    &mut pipe,
+                    write.setup(),
+                    buffer,
+                    write.outbound(),
+                )?;
+                if write.validate_transferred(length).is_err() {
+                    return Err(ControlError::Length);
+                }
+                let length = control_data_exact(
+                    io,
+                    layout,
+                    image,
+                    evt,
+                    ring,
+                    segment,
+                    slot,
+                    &mut pipe,
+                    read.setup(),
+                    buffer,
+                    read.outbound(),
+                )?;
+                if read.validate_transferred(length).is_err() {
+                    return Err(ControlError::Length);
+                }
+                if buffer.byte(0) != value {
+                    return pipe.fail(ControlError::Unexpected);
+                }
+            }
+            cycles = cycle;
+            ax88_record(format_args!(
+                "NET4a EP0 cycle={} changed={:#04x} restored={:#04x} queued={} PASS\n",
+                cycle,
+                changed,
+                original,
+                ring.queued()
+            ));
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ax88_record(format_args!("NET4a EP0 PASS cycles={} requests=65 in=33 out=32 reclaimed=195 queued={} restored=1\n",cycles,ring.queued())),
+        Err(error) => ax88_record(format_args!("NET4a EP0 FAIL cycles={} error={:?} quarantined={} queued={}; retain DMA, no retry\n",cycles,error,pipe.is_quarantined(),ring.queued())),
+    }
+}
+
 struct Ax88Record {
     bytes: [u8; 256],
     len: usize,
@@ -1268,7 +1388,7 @@ fn enumerate_root_device(
             ep0_seg,
             slot_id,
             dev_setup,
-            data_phys,
+            data_buf,
             18,
         )
         .is_some()
@@ -1339,7 +1459,7 @@ fn enumerate_root_device(
             ep0_seg,
             slot_id,
             cfg_setup,
-            data_phys,
+            data_buf,
             read_len,
         )
     } else {
@@ -1375,6 +1495,21 @@ fn enumerate_root_device(
         &config[..read_len as usize],
         device_exact && config_result == Some((1, 0)) && total_length == read_len,
     ) {
+        if device_exact && config_result == Some((1, 0)) && total_length == read_len {
+            ax88_ep0_proof(
+                io,
+                layout,
+                image,
+                evt,
+                &mut ep0_ring,
+                ep0_seg,
+                slot_id,
+                speed_raw,
+                &device,
+                &config[..read_len as usize],
+                data_buf,
+            );
+        }
         return;
     }
 
@@ -3691,7 +3826,7 @@ fn read_device_config(
         data_buf.zero();
         dsb();
         control_in_exact(
-            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, dev_full, data_phys, 18,
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, dev_full, data_buf, 18,
         )?;
         data_buf.read_into(0, &mut device);
         true
@@ -3732,7 +3867,7 @@ fn read_device_config(
     ];
     let config_result = if ax88_candidate {
         control_in_exact(
-            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_phys, total,
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_buf, total,
         )
     } else {
         control_in(
@@ -4308,6 +4443,21 @@ fn enumerate_hub_downstream(
         config.bytes(),
         config.exact,
     ) {
+        if config.exact {
+            ax88_ep0_proof(
+                io,
+                layout,
+                image,
+                evt,
+                &mut ep0_ring,
+                ep0_seg,
+                dev_slot,
+                down_speed,
+                &config.device,
+                config.bytes(),
+                data_buf,
+            );
+        }
         return None;
     }
 
@@ -4719,13 +4869,8 @@ fn spin_delay(iterations: u32) {
     }
 }
 
-/// Issue a standard control-IN transfer over EP0: Setup + (unchained) Data-IN + Status, three
-/// separate TDs, then ring the slot doorbell and poll for the Transfer Event. Returns
-/// `(completion_code, remaining)`. The device DMAs the payload into `data_phys`.
-#[allow(clippy::too_many_arguments)]
-/// NET0 ax88 standard descriptor read only. IOC on both stages proves actual
-/// length. Unknown/stalled/short outcomes park the slot's existing storage and
-/// return without reusing its DMA window. No OUT data/vendor request. — TIMBERDOODLE
+/// NET0 descriptor-only wrapper over the shared exact-data pipe. Failed requests
+/// retain the slot's existing page; callers stop using that adapter. — TIMBERDOODLE
 #[allow(clippy::too_many_arguments)]
 fn control_in_exact(
     io: &mut Mmio,
@@ -4736,50 +4881,110 @@ fn control_in_exact(
     ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     setup_packet: [u8; 8],
-    data_phys: u64,
+    data_buf: DmaBuf,
     length: u16,
 ) -> Option<(u8, u32)> {
-    if length == 0
-        || length as usize > DATA_BUF_LEN
-        || setup_packet[0] != 0x80
+    if setup_packet[0] != 0x80
         || setup_packet[1] != 6
         || u16::from_le_bytes([setup_packet[6], setup_packet[7]]) != length
     {
         return None;
     }
     AX88_SEEN.store(true, Ordering::Relaxed);
-    let setup = Trb::setup_stage(setup_packet, SetupTransferType::In, 0).ok()?;
-    // Single data stage, no Chain; IOC bit5 and ISP bit2 expose short data, too.
-    let data = Trb::from_words([
-        data_phys as u32,
-        (data_phys >> 32) as u32,
-        length as u32,
-        (3 << 10) | (1 << 16) | (1 << 5) | (1 << 2),
-    ]);
-    let status = Trb::status_stage(0, false, true).ok()?;
-    ep0_ring.enqueue(ep0_seg, setup).ok()?;
-    let data_token = ep0_ring.enqueue(ep0_seg, data).ok()?;
-    let status_token = ep0_ring.enqueue(ep0_seg, status).ok()?;
+    let mut pipe = kumo_xhci::ControlPipe::new(slot_id).ok()?;
+    control_data_exact(
+        io,
+        layout,
+        image,
+        evt,
+        ep0_ring,
+        ep0_seg,
+        slot_id,
+        &mut pipe,
+        setup_packet,
+        data_buf,
+        &[],
+    )
+    .ok()?;
+    Some((1, 0))
+}
+
+/// One bounded EP0 transaction; no DMA access after an uncertain completion. The
+/// owner keeps all pages/slot state on failure, with no retry/reset API here.
+/// Resident multiplexing and recovery remain NET4b/NET4c. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+fn control_data_exact(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    ep0_ring: &mut TransferRing,
+    ep0_seg: &mut DmaTrbs,
+    slot_id: u8,
+    pipe: &mut kumo_xhci::ControlPipe,
+    setup_packet: [u8; 8],
+    buffer: DmaBuf,
+    outbound: &[u8],
+) -> Result<usize, kumo_xhci::ControlError> {
+    use kumo_xhci::{ControlData, ControlError, ControlProgress};
+    const BUDGET_NS: u64 = 200_000_000;
+    let request = ControlData::new(setup_packet, buffer.phys(), buffer.len(), outbound)?;
+    pipe.preflight(ep0_ring, ep0_seg, clock_get(), BUDGET_NS)?;
+    // Copy/zero before publishing the first cycle bit. The buffer is private to this
+    // idle pipe and stays untouched until BOTH data and status succeed. — TIMBERDOODLE
+    if request.direction_in() {
+        buffer.zero();
+    } else {
+        buffer.write_from(0, request.outbound());
+    }
+    pipe.submit(&request, ep0_ring, ep0_seg, clock_get(), BUDGET_NS)?;
     dsb();
     ring_slot_doorbell(io, layout, slot_id, 1);
-    let mut completion = drv_xhci::ax88::ReadCompletion::default();
-    for _ in 0..EP0_STALE_EVENT_LIMIT {
-        let (cc, remaining, token) = poll_transfer_event(io, layout, image, evt, slot_id)?;
-        if completion
-            .observe(
-                token == data_token.iova,
-                token == status_token.iova,
-                cc,
+    for spin in 0..EVENT_POLL_LIMIT {
+        dsb();
+        if spin % YIELD_INTERVAL == 0 {
+            pipe.check_deadline(clock_get())?;
+        }
+        // Do not pop another owner's event when there is no room to retain it.
+        // The legacy stash/router is replaced separately in NET4b. — TIMBERDOODLE
+        if event_stash().len() == kumo_xhci::STASH_CAPACITY {
+            return pipe.fail(ControlError::EventOverflow);
+        }
+        let trb = match image.event_ring.pop(evt) {
+            Ok(Some(trb)) => trb,
+            Ok(None) => continue,
+            Err(error) => return pipe.fail(ControlError::Ring(error)),
+        };
+        write_erdp(io, layout, image.event_ring.dequeue_iova());
+        let Some(event) = trb.decode_event() else {
+            return pipe.fail(ControlError::Unexpected);
+        };
+        match pipe.observe(event, clock_get(), ep0_ring)? {
+            ControlProgress::Complete(length) => {
+                dsb();
+                return Ok(length);
+            }
+            ControlProgress::Waiting => {}
+            ControlProgress::Unrelated(Event::Transfer {
+                slot_id,
+                completion_code,
                 remaining,
-            )
-            .ok()?
-        {
-            ep0_ring.reclaim_through(status_token.iova).ok()?;
-            dsb();
-            return Some((1, 0));
+                trb_iova,
+                ..
+            }) => {
+                let _ = event_stash().push(StashedTransfer {
+                    slot_id,
+                    completion_code,
+                    remaining,
+                    trb_iova,
+                });
+                STASH_ENABLED.store(true, Ordering::Relaxed);
+            }
+            ControlProgress::Unrelated(Event::PortStatusChange { .. }) => {}
+            ControlProgress::Unrelated(_) => return pipe.fail(ControlError::Unexpected),
         }
     }
-    None
+    pipe.fail(ControlError::Timeout)
 }
 
 fn control_in(

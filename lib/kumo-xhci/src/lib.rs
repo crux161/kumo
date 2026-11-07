@@ -1,9 +1,9 @@
 #![no_std]
-//j539
 //j540
 //j541
 //j545
 //j703
+//j827
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -12,6 +12,7 @@
 //! `DeviceCtx`; the future controller driver owns the unsafe register and DMA synchronization edge.
 
 mod context;
+mod control;
 mod controller;
 mod dma;
 mod dwc3;
@@ -28,6 +29,7 @@ pub use context::{
     endpoint_context_index, ContextSize, EndpointContext, EndpointType, InputControlContext,
     SlotContext, UsbSpeed,
 };
+pub use control::{ControlData, ControlError, ControlPipe, ControlProgress, CONTROL_DATA_MAX};
 pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
 pub use dma::{DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource};
 pub use dwc3::{HostInit, RegisterUpdate};
