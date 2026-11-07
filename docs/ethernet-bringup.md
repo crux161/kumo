@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j815 -->
 <!-- j816 -->
 <!-- j817 -->
 <!-- j820 -->
 <!-- j821 -->
+<!-- j826 -->
 
-Date: 2026-11-06. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); PLAN/021 AX7 first proof closed. AXH regression harness landed J821; AX0 cost baseline and metal census are next.
+Date: 2026-11-07. Author: TIMBERDOODLE.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET4a is next.
 
 ## First controller
 
@@ -98,9 +98,10 @@ it does not claim any of these gates passed.
 | **NET14** | Pinned build-std programs use UdpSocket and TcpListener/TcpStream over loopback; server failure wakes clients |
 | **NET15** | Same std programs over AX Ethernet; safe reconnect/restart, HID/USB/NVMe coexistence and a second-host portability review |
 
-NET0 is the next smallest slice: strict descriptor selection and bounded inventory,
-without AX vendor writes or Ethernet transmission. Normal USB address/descriptor setup
-is still host-controller activity. Loopback work can advance without the adapter.
+NET4a is the next slice: bounded EP0 data IN/OUT with exact completion lengths,
+before endpoint routing, resident lanes or chip initialization. NET3 supplies the
+pure codec described in [ax88 protocol](ax88-protocol.md). Loopback work can advance
+independently of the adapter.
 NET13/14 can use loopback before external DHCP/DNS; numeric-IP tests stay independent
 of name resolution. A second-host proof remains pending until actually exercised.
 

@@ -1,8 +1,8 @@
-#j815
 #j822
 #j823
 #j824
 #j825
+#j826
 [workspace]
 members = [
     "boot/niji-loader",
@@ -13,6 +13,7 @@ members = [
     "imager",
     "kernel",
     "lib/kumo-abi",
+    "lib/kumo-ax88",
     "lib/kumo-bsp",
     "lib/kumo-fatfs",
     "lib/kumo-fdt",

@@ -1,0 +1,7 @@
+#j826
+[package]
+name = "kumo-ax88"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
