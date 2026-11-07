@@ -1,12 +1,20 @@
 //j545
 //j828
+//j830
 //! One bounded mailbox per endpoint, registered before publishing DMA. Each receipt
 //! names a nonwrapping software generation. Failed registrations stay quarantined;
 //! retirement requires every requested event consumed and no unread event. Raw xHCI
 //! events carry addresses, not generations: reuse is allowed only after that completion
-//! fence; uncertain rings are never reused here. Recovery is NET4c. — TIMBERDOODLE
+//! fence; uncertain rings are never reused here. — TIMBERDOODLE
+//!
+//! NET4c-2 adds the only other way out: a stop fence. Before a Stop Endpoint command
+//! the owner marks the lane (or registers an idle endpoint) as stopping at a ring
+//! restart position. Exactly one stopped-code event is then accepted, naming either an
+//! owned TRB or that position; anything after it faults the lane. `cancel` retires a
+//! stopping lane only after that event and every normal event were consumed. The
+//! command, context readback and repointing proof live in `quiesce`. — TIMBERDOODLE
 
-use crate::Event;
+use crate::{is_stop_completion, Event, RingRestart, COMPLETION_STOPPED_LENGTH_INVALID};
 
 pub const COMPLETION_LANES: usize = 32;
 pub const COMPLETION_TRBS: usize = 3;
@@ -88,6 +96,8 @@ struct Lane {
     events: [Option<RoutedTransfer>; COMPLETION_TRBS],
     order: [u8; COMPLETION_TRBS],
     next: u8,
+    restart: Option<RingRestart>,
+    stop: Option<RoutedTransfer>,
 }
 impl Lane {
     const EMPTY: Self = Self {
@@ -104,6 +114,8 @@ impl Lane {
         events: [None; 3],
         order: [0; 3],
         next: 0,
+        restart: None,
+        stop: None,
     };
 }
 
@@ -114,6 +126,10 @@ pub struct CompletionStats {
     pub consumed: u64,
     pub retired: u64,
     pub faults: u64,
+    /// Stopped-code events accepted by a stop fence.
+    pub stopped: u64,
+    /// Lanes retired through a stop fence instead of a completion fence.
+    pub cancelled: u64,
 }
 
 pub struct CompletionRouter {
@@ -134,6 +150,8 @@ impl CompletionRouter {
                 consumed: 0,
                 retired: 0,
                 faults: 0,
+                stopped: 0,
+                cancelled: 0,
             },
         }
     }
@@ -329,6 +347,30 @@ impl CompletionRouter {
         if self.controller_fault || l.fault.is_some() {
             return Err(RouteError::Quarantined);
         }
+        if l.stop.is_some() {
+            // The stopped event is the endpoint's last word until it is repointed.
+            self.fault(i, RouteError::Duplicate);
+            return Err(RouteError::Duplicate);
+        }
+        if let Some(restart) = l.restart {
+            if is_stop_completion(event.completion_code) {
+                let owned = l.tokens[..l.count]
+                    .iter()
+                    .position(|&token| token == event.key.trb_iova)
+                    .filter(|&n| l.seen & (1 << n) == 0);
+                let accepted = owned.is_some()
+                    || (event.completion_code == COMPLETION_STOPPED_LENGTH_INVALID
+                        && restart.names(event.key.trb_iova));
+                if !accepted {
+                    self.fault(i, RouteError::Unknown);
+                    return Err(RouteError::Unknown);
+                }
+                self.lanes[i].stop = Some(event);
+                self.stats.routed = self.stats.routed.saturating_add(1);
+                self.stats.stopped = self.stats.stopped.saturating_add(1);
+                return Ok(i);
+            }
+        }
         let Some(n) = l.tokens[..l.count]
             .iter()
             .position(|&token| token == event.key.trb_iova)
@@ -375,6 +417,9 @@ impl CompletionRouter {
     pub fn finish(&mut self, ticket: TransferTicket) -> Result<(), RouteError> {
         let i = self.checked(ticket)?;
         let l = &self.lanes[i];
+        if l.restart.is_some() {
+            return Err(RouteError::Busy);
+        }
         if l.taken & l.expected != l.expected || l.seen != l.taken {
             return Err(RouteError::Incomplete);
         }
@@ -390,6 +435,91 @@ impl CompletionRouter {
         self.stats.retired = self.stats.retired.saturating_add(1);
         Ok(())
     }
+    /// Arm the stop fence on a live, unfaulted transfer before issuing Stop Endpoint.
+    pub fn begin_stop(
+        &mut self,
+        ticket: TransferTicket,
+        restart: RingRestart,
+    ) -> Result<(), RouteError> {
+        let i = self.checked(ticket)?;
+        if self.lanes[i].restart.is_some() {
+            return Err(RouteError::Busy);
+        }
+        valid_restart(restart)?;
+        self.lanes[i].restart = Some(restart);
+        Ok(())
+    }
+    /// Register a stop fence for an endpoint with no transfer in flight. Its only
+    /// acceptable event is a Force Stopped Event at `restart`. — TIMBERDOODLE
+    pub fn register_stop(
+        &mut self,
+        slot: u8,
+        dci: u8,
+        restart: RingRestart,
+    ) -> Result<TransferTicket, RouteError> {
+        self.ready(slot, dci)?;
+        valid_restart(restart)?;
+        let index = self
+            .lanes
+            .iter()
+            .position(|l| l.slot == slot && l.dci == dci)
+            .or_else(|| self.lanes.iter().position(|l| l.slot == 0))
+            .ok_or(RouteError::Capacity)?;
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.lanes[index] = Lane {
+            slot,
+            dci,
+            generation,
+            active: true,
+            restart: Some(restart),
+            ..Lane::EMPTY
+        };
+        Ok(TransferTicket {
+            lane: index,
+            generation,
+            slot,
+            dci,
+        })
+    }
+    /// The accepted stopped event, if the controller has produced it yet.
+    pub fn stop_event(&self, ticket: TransferTicket) -> Result<Option<RoutedTransfer>, RouteError> {
+        let i = self.checked(ticket)?;
+        if self.lanes[i].restart.is_none() {
+            return Err(RouteError::Invalid);
+        }
+        Ok(self.lanes[i].stop)
+    }
+    /// Retire a stopped lane. The caller must already have proven the endpoint Stopped
+    /// and repointed past every owned TRB; this checks the event side of that proof.
+    pub fn cancel(&mut self, ticket: TransferTicket) -> Result<(), RouteError> {
+        let i = self.checked(ticket)?;
+        let l = &self.lanes[i];
+        if l.restart.is_none() {
+            return Err(RouteError::Invalid);
+        }
+        if l.stop.is_none() || l.seen != l.taken {
+            return Err(RouteError::Incomplete);
+        }
+        let l = &mut self.lanes[i];
+        l.active = false;
+        l.restart = None;
+        self.stats.cancelled = self.stats.cancelled.saturating_add(1);
+        Ok(())
+    }
+    /// Lanes holding an endpoint identity, active, retired or quarantined.
+    pub fn occupied(&self) -> usize {
+        self.lanes.iter().filter(|l| l.slot != 0).count()
+    }
+}
+fn valid_restart(restart: RingRestart) -> Result<(), RouteError> {
+    let link_ok = restart
+        .link_iova
+        .is_none_or(|iova| iova != 0 && iova & 15 == 0);
+    if restart.dequeue_iova == 0 || restart.dequeue_iova & 15 != 0 || !link_ok {
+        return Err(RouteError::Invalid);
+    }
+    Ok(())
 }
 impl Default for CompletionRouter {
     fn default() -> Self {

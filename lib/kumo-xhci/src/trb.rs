@@ -1,4 +1,5 @@
 //j521
+//j830
 
 use crate::Error;
 
@@ -8,6 +9,21 @@ const CHAIN: u32 = 1 << 4;
 const INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
 const IMMEDIATE_DATA: u32 = 1 << 6;
 const TYPE_SHIFT: u32 = 10;
+
+/// Completion codes interpreted by name (xHCI 1.2, table 6-90).
+pub const COMPLETION_SUCCESS: u8 = 1;
+pub const COMPLETION_SHORT_PACKET: u8 = 13;
+pub const COMPLETION_CONTEXT_STATE_ERROR: u8 = 19;
+/// A Stop Endpoint interrupted a TD; the event names the TRB and its residue.
+pub const COMPLETION_STOPPED: u8 = 26;
+/// Force Stopped Event: the endpoint stopped between TDs or on an idle ring.
+pub const COMPLETION_STOPPED_LENGTH_INVALID: u8 = 27;
+pub const COMPLETION_STOPPED_SHORT_PACKET: u8 = 28;
+
+/// True for the three codes a Stop Endpoint command can force (xHCI 4.6.9).
+pub const fn is_stop_completion(code: u8) -> bool {
+    matches!(code, 26..=28)
+}
 
 /// xHCI TRB type IDs (xHCI 1.2, table 6-91).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +199,37 @@ impl Trb {
             slot_id,
             false,
         )
+    }
+
+    /// Stop Endpoint (xHCI 6.4.3.8). `endpoint_id` is the DCI. — TIMBERDOODLE
+    pub fn stop_endpoint(slot_id: u8, endpoint_id: u8, suspend: bool) -> Result<Self, Error> {
+        if slot_id == 0 || !(1..=31).contains(&endpoint_id) {
+            return Err(Error::InvalidField);
+        }
+        let mut trb = typed(TrbType::StopEndpointCommand);
+        trb.words[3] |=
+            ((endpoint_id as u32) << 16) | ((suspend as u32) << 23) | ((slot_id as u32) << 24);
+        Ok(trb)
+    }
+
+    /// Set TR Dequeue Pointer (xHCI 6.4.3.9) for a stream-less endpoint: Stream ID and
+    /// SCT stay zero, DCS is bit 0 of the pointer word. — TIMBERDOODLE
+    pub fn set_tr_dequeue(
+        slot_id: u8,
+        endpoint_id: u8,
+        dequeue_iova: u64,
+        dequeue_cycle: bool,
+    ) -> Result<Self, Error> {
+        if dequeue_iova & 0xf != 0 {
+            return Err(Error::MisalignedIova);
+        }
+        if slot_id == 0 || !(1..=31).contains(&endpoint_id) || dequeue_iova == 0 {
+            return Err(Error::InvalidField);
+        }
+        let mut trb = typed(TrbType::SetTransferRingDequeueCommand);
+        set_pointer(&mut trb, dequeue_iova | dequeue_cycle as u64);
+        trb.words[3] |= ((endpoint_id as u32) << 16) | ((slot_id as u32) << 24);
+        Ok(trb)
     }
 
     pub fn normal_transfer(config: NormalTransfer) -> Result<Self, Error> {
@@ -465,6 +512,46 @@ mod tests {
         assert_ne!(data.words()[3] & (1 << 16), 0);
         let status = Trb::status_stage(0, false, true).unwrap();
         assert_ne!(status.words()[3] & INTERRUPT_ON_COMPLETION, 0);
+    }
+
+    #[test]
+    fn stop_and_set_dequeue_commands_match_spec_bit_positions() {
+        let stop = Trb::stop_endpoint(3, 5, false).unwrap();
+        assert_eq!(stop.words(), [0, 0, 0, (15 << 10) | (5 << 16) | (3 << 24)]);
+        assert!(stop.trb_type().unwrap().is_command());
+        let suspend = Trb::stop_endpoint(0xff, 31, true).unwrap();
+        assert_eq!(
+            suspend.words()[3],
+            (15 << 10) | (31 << 16) | (1 << 23) | (0xff << 24)
+        );
+        for (slot, dci) in [(0, 1), (1, 0), (1, 32)] {
+            assert_eq!(
+                Trb::stop_endpoint(slot, dci, false),
+                Err(Error::InvalidField)
+            );
+        }
+
+        let set = Trb::set_tr_dequeue(2, 3, 0x1_2345_6780, true).unwrap();
+        assert_eq!(
+            set.words(),
+            [0x2345_6781, 1, 0, (16 << 10) | (3 << 16) | (2 << 24)]
+        );
+        let clear = Trb::set_tr_dequeue(2, 3, 0x4000, false).unwrap();
+        assert_eq!(clear.words()[0], 0x4000);
+        assert!(clear.trb_type().unwrap().is_command());
+        assert_eq!(
+            Trb::set_tr_dequeue(2, 3, 0x4008, true),
+            Err(Error::MisalignedIova)
+        );
+        for (slot, dci, ptr) in [(0, 3, 0x4000), (2, 0, 0x4000), (2, 32, 0x4000), (2, 3, 0)] {
+            assert_eq!(
+                Trb::set_tr_dequeue(slot, dci, ptr, true),
+                Err(Error::InvalidField)
+            );
+        }
+        assert!((0..=255u8)
+            .filter(|&code| is_stop_completion(code))
+            .eq([26, 27, 28]));
     }
 
     #[test]

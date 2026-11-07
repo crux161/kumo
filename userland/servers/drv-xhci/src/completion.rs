@@ -1,4 +1,5 @@
 //j828
+//j830
 //! In-process endpoint actors on the one controller owner. Each lane has a bounded
 //! serial notification queue and a fixed pure completion mailbox. Workers are only
 //! polled with try_run_one; this adapter never parks or calls another actor.
@@ -6,8 +7,8 @@
 
 use kumo_dispatch::SerialQueue;
 use kumo_xhci::{
-    CompletionRouter, CompletionStats, Event, RouteError, RoutedTransfer, TransferTicket,
-    COMPLETION_LANES,
+    CompletionRouter, CompletionStats, Event, RingRestart, RouteError, RoutedTransfer,
+    TransferTicket, COMPLETION_LANES,
 };
 
 pub struct CompletionActors {
@@ -117,6 +118,46 @@ impl CompletionActors {
     pub fn stats(&self) -> CompletionStats {
         self.router.stats()
     }
+    pub fn begin_stop(
+        &mut self,
+        ticket: TransferTicket,
+        restart: RingRestart,
+    ) -> Result<(), RouteError> {
+        self.router.begin_stop(ticket, restart)
+    }
+    pub fn register_stop(
+        &mut self,
+        slot: u8,
+        dci: u8,
+        restart: RingRestart,
+    ) -> Result<TransferTicket, RouteError> {
+        self.router.register_stop(slot, dci, restart)
+    }
+    pub fn stop_event(&self, ticket: TransferTicket) -> Result<Option<RoutedTransfer>, RouteError> {
+        self.router.stop_event(ticket)
+    }
+    /// A stopped event leaves only a wake token in the lane's serial queue; consume it
+    /// so the retired lane starts its next transfer with an empty queue. Unread normal
+    /// events still refuse. — TIMBERDOODLE
+    pub fn cancel(&mut self, ticket: TransferTicket) -> Result<(), RouteError> {
+        if self.router.has_ready(ticket)? {
+            return Err(RouteError::Incomplete);
+        }
+        let queue = &self.queues[ticket.lane()];
+        if !queue.is_empty() {
+            let worker = queue.worker().map_err(|_| RouteError::Busy)?;
+            let result = worker.try_run_one();
+            drop(worker);
+            if result != Some(ticket.lane()) || !queue.is_empty() {
+                self.router.fail(ticket, RouteError::Overflow)?;
+                return Err(RouteError::Overflow);
+            }
+        }
+        self.router.cancel(ticket)
+    }
+    pub fn occupied(&self) -> usize {
+        self.router.occupied()
+    }
 }
 impl Default for CompletionActors {
     fn default() -> Self {
@@ -151,6 +192,58 @@ mod tests {
         assert_eq!(a.take(ep0).unwrap().unwrap().key.trb_iova, 0x1020);
         a.finish(ep0).unwrap();
         assert_eq!(a.take(ep0), Err(RouteError::Stale));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    const RESTART: RingRestart = RingRestart {
+        dequeue_iova: 0x1010,
+        cycle: true,
+        link_iova: None,
+    };
+    fn coded(ptr: u64, completion_code: u8) -> Event {
+        Event::Transfer {
+            slot_id: 5,
+            endpoint_id: 3,
+            trb_iova: ptr,
+            completion_code,
+            remaining: 0,
+        }
+    }
+    #[test]
+    fn cancel_consumes_the_stop_wake_and_leaves_the_lane_reusable() {
+        let mut a = CompletionActors::new();
+        for _ in 0..3 {
+            let t = a.register(5, 3, &[0x1000], 1).unwrap();
+            a.begin_stop(t, RESTART).unwrap();
+            a.route(coded(0x1000, 26)).unwrap();
+            assert_eq!(a.queues[t.lane()].len(), 1);
+            assert_eq!(a.take(t), Ok(None));
+            a.cancel(t).unwrap();
+            assert!(a.queues[t.lane()].is_empty());
+        }
+        let probe = a.register_stop(5, 3, RESTART).unwrap();
+        a.route(coded(0x1010, 27)).unwrap();
+        assert!(a.stop_event(probe).unwrap().is_some());
+        a.cancel(probe).unwrap();
+        assert_eq!(
+            (a.stats().cancelled, a.stats().faults, a.occupied()),
+            (4, 0, 1)
+        );
+    }
+    #[test]
+    fn cancel_refuses_while_a_racing_completion_is_unread() {
+        let mut a = CompletionActors::new();
+        let t = a.register(5, 3, &[0x1000], 1).unwrap();
+        a.route(coded(0x1000, 1)).unwrap();
+        a.begin_stop(t, RESTART).unwrap();
+        a.route(coded(0x1010, 27)).unwrap();
+        assert_eq!(a.cancel(t), Err(RouteError::Incomplete));
+        assert_eq!(a.take(t).unwrap().unwrap().completion_code, 1);
+        a.cancel(t).unwrap();
+        assert!(a.queues[t.lane()].is_empty());
     }
 }
 

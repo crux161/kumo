@@ -1,9 +1,9 @@
 #![no_std]
-//j545
 //j703
 //j827
 //j828
 //j829
+//j830
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -21,6 +21,7 @@ mod fdt;
 mod hub;
 mod noop;
 mod probe;
+mod quiesce;
 mod registers;
 mod ring;
 mod stash;
@@ -57,18 +58,27 @@ pub use probe::{
     QUIRK_DIS_RXDET_INP3, QUIRK_DIS_TX_IPGAP_LINECHECK, QUIRK_DIS_U1_ENTRY, QUIRK_DIS_U2_ENTRY,
     QUIRK_DIS_U2_FREECLK_EXISTS, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
+pub use quiesce::{
+    EndpointQuiesce, EndpointSnapshot, EndpointState, QuiesceError, QuiesceReport, StopVerdict,
+    STOP_RETRIES,
+};
 pub use registers::{
     port_power_value, port_reset_value, port_state_to_neutral, port_warm_reset_value,
     portsc_offset, CapabilityRegisters, PortStatus, RootPortScan,
 };
 pub use ring::{
-    CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
+    CommandRing, EventRing, EventRingSegmentTableEntry, RingRestart, RingSegment, RingToken,
+    TransferRing,
 };
 pub use stash::{
     CompletionKey, CompletionRouter, CompletionStats, RouteError, RoutedTransfer, TransferTicket,
     COMPLETION_LANES, COMPLETION_TRBS,
 };
-pub use trb::{Event, NormalTransfer, SetupTransferType, Trb, TrbType};
+pub use trb::{
+    is_stop_completion, Event, NormalTransfer, SetupTransferType, Trb, TrbType,
+    COMPLETION_CONTEXT_STATE_ERROR, COMPLETION_SHORT_PACKET, COMPLETION_STOPPED,
+    COMPLETION_STOPPED_LENGTH_INVALID, COMPLETION_STOPPED_SHORT_PACKET, COMPLETION_SUCCESS,
+};
 
 /// Validation or ring-state failure detected before hardware is touched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,4 +95,6 @@ pub enum Error {
     RegisterWindowTooSmall,
     ControllerNotHalted,
     ControllerNotReady,
+    /// A ring published or consumed TRBs after the restart position was taken.
+    RingPositionChanged,
 }

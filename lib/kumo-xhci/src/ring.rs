@@ -1,6 +1,7 @@
 //j539
 //j540
 //j828
+//j830
 
 use crate::{Error, QwordSink, Trb, TrbSink, TrbSource};
 
@@ -34,6 +35,24 @@ impl<const N: usize> RingSegment<N> {
 impl<const N: usize> Default for RingSegment<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Where a stopped endpoint must resume: the next producer TRB, whose cycle bit still
+/// differs from `cycle` until software writes it. Set TR Dequeue uses `dequeue_iova` and
+/// `cycle` as DCS. Right after a wrap the controller may report the Link TRB instead,
+/// which names the same position. — TIMBERDOODLE
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingRestart {
+    pub dequeue_iova: u64,
+    pub cycle: bool,
+    pub link_iova: Option<u64>,
+}
+
+impl RingRestart {
+    /// True when a controller-reported stopped dequeue pointer names this position.
+    pub fn names(self, iova: u64) -> bool {
+        iova == self.dequeue_iova || self.link_iova == Some(iova)
     }
 }
 
@@ -228,6 +247,34 @@ impl TransferRing {
 
     pub const fn producer_cycle(&self) -> bool {
         self.0.producer_cycle()
+    }
+
+    /// The position a verified stop must repoint the controller to: past every TRB
+    /// this ring has published.
+    pub const fn restart(&self) -> RingRestart {
+        let ring = &self.0;
+        RingRestart {
+            dequeue_iova: ring.base_iova + ring.enqueue as u64 * TRB_BYTES,
+            cycle: ring.producer_cycle,
+            link_iova: if ring.enqueue == 0 {
+                Some(ring.base_iova + (ring.segment_len as u64 - 1) * TRB_BYTES)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Give up every queued TRB. Only call after the controller confirmed the endpoint
+    /// Stopped and accepted a Set TR Dequeue to exactly `restart`; refuses if the ring
+    /// published anything since. Returns how many TRBs were abandoned. — TIMBERDOODLE
+    pub fn abandon(&mut self, restart: RingRestart) -> Result<usize, Error> {
+        if restart != self.restart() {
+            return Err(Error::RingPositionChanged);
+        }
+        let abandoned = self.0.queued;
+        self.0.dequeue = self.0.enqueue;
+        self.0.queued = 0;
+        Ok(abandoned)
     }
 }
 
@@ -474,6 +521,58 @@ mod tests {
             EventRingSegmentTableEntry::new(0x10_0000, 15),
             Err(Error::RingTooSmall)
         );
+    }
+
+    #[test]
+    fn restart_names_the_next_producer_trb_and_abandon_requires_it_unchanged() {
+        let mut memory = RingSegment::<4>::new();
+        let mut ring = TransferRing::new(memory.entries_mut(), 0x8000).unwrap();
+        let fresh = ring.restart();
+        assert_eq!(
+            fresh,
+            RingRestart {
+                dequeue_iova: 0x8000,
+                cycle: true,
+                link_iova: Some(0x8030),
+            }
+        );
+        let trb = Trb::normal_transfer(NormalTransfer::interrupt_in(0x2_0000, 4)).unwrap();
+        let first = ring.enqueue(memory.entries_mut(), trb).unwrap();
+        let after = ring.restart();
+        assert_eq!(after.dequeue_iova, 0x8010);
+        assert_eq!(after.link_iova, None);
+        assert!(after.names(0x8010) && !after.names(first.iova) && !after.names(0x8030));
+        assert_eq!(ring.abandon(fresh), Err(Error::RingPositionChanged));
+        assert_eq!(ring.queued(), 1);
+        assert_eq!(ring.abandon(after), Ok(1));
+        assert_eq!(ring.queued(), 0);
+        assert_eq!(
+            ring.reclaim_through(first.iova),
+            Err(Error::CompletionNotPending)
+        );
+        // Abandoning around the wrap: three single-TRB TDs fill the lap, the producer
+        // toggles its cycle, and the Link TRB is an alias of the restart position.
+        for _ in 0..2 {
+            ring.enqueue(memory.entries_mut(), trb).unwrap();
+            let restart = ring.restart();
+            assert_eq!(ring.abandon(restart), Ok(1));
+        }
+        let wrapped = ring.restart();
+        assert_eq!(
+            wrapped,
+            RingRestart {
+                dequeue_iova: 0x8000,
+                cycle: false,
+                link_iova: Some(0x8030),
+            }
+        );
+        assert!(wrapped.names(0x8030));
+        // The stale first-lap TRB at the restart position is invalid under the new DCS.
+        assert_ne!(memory.entries()[0].cycle(), wrapped.cycle);
+        assert_eq!(ring.abandon(wrapped), Ok(0));
+        let next = ring.enqueue(memory.entries_mut(), trb).unwrap();
+        assert_eq!(next.iova, 0x8000);
+        assert_eq!(memory.entries()[0].cycle(), wrapped.cycle);
     }
 
     #[test]

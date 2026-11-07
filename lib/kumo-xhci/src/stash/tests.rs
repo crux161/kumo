@@ -1,6 +1,7 @@
 //j828
+//j830
 use super::*;
-use crate::{NormalTransfer, TransferRing, Trb};
+use crate::{NormalTransfer, RingRestart, TransferRing, Trb};
 
 fn raw(slot: u8, dci: u8, ptr: u64) -> Event {
     Event::Transfer {
@@ -44,7 +45,9 @@ fn simultaneous_nic_rx_tx_status_hid_storage_deliver_once_to_exact_receipts() {
             routed: 5,
             consumed: 5,
             retired: 5,
-            faults: 0
+            faults: 0,
+            stopped: 0,
+            cancelled: 0,
         }
     );
 }
@@ -201,4 +204,234 @@ fn invalid_hardware_slot_or_endpoint_cannot_overwrite_an_empty_owner() {
         assert_eq!(r.route(raw(slot, dci, 0x1000)), Err(RouteError::Invalid));
         assert_eq!(r.take(t), Err(RouteError::Quarantined));
     }
+}
+
+fn coded(slot: u8, dci: u8, ptr: u64, completion_code: u8, remaining: u32) -> Event {
+    Event::Transfer {
+        slot_id: slot,
+        endpoint_id: dci,
+        trb_iova: ptr,
+        completion_code,
+        remaining,
+    }
+}
+
+const AFTER: RingRestart = RingRestart {
+    dequeue_iova: 0x1010,
+    cycle: true,
+    link_iova: None,
+};
+const WRAPPED: RingRestart = RingRestart {
+    dequeue_iova: 0x2000,
+    cycle: false,
+    link_iova: Some(0x20f0),
+};
+
+#[test]
+fn in_progress_stop_event_is_the_lanes_last_word_and_cancel_retires_it() {
+    let mut r = CompletionRouter::new();
+    let t = r.register(5, 3, &[0x1000], 1).unwrap();
+    assert_eq!(r.stop_event(t), Err(RouteError::Invalid));
+    assert_eq!(r.cancel(t), Err(RouteError::Invalid));
+    r.begin_stop(t, AFTER).unwrap();
+    assert_eq!(r.begin_stop(t, AFTER), Err(RouteError::Busy));
+    assert_eq!(r.cancel(t), Err(RouteError::Incomplete));
+    r.route(coded(5, 3, 0x1000, 26, 4)).unwrap();
+    let stop = r.stop_event(t).unwrap().unwrap();
+    assert_eq!((stop.completion_code, stop.remaining), (26, 4));
+    assert_eq!(stop.key.generation, t.generation());
+    // A stopped event is not a completion: nothing to take, finish refuses.
+    assert_eq!(r.take(t), Ok(None));
+    assert_eq!(r.finish(t), Err(RouteError::Busy));
+    r.cancel(t).unwrap();
+    assert_eq!(r.take(t), Err(RouteError::Stale));
+    assert_eq!(r.cancel(t), Err(RouteError::Stale));
+    // The tokens are free again for the next transfer on the same endpoint.
+    let next = r.register(5, 3, &[0x1000], 1).unwrap();
+    assert_ne!(next.generation(), t.generation());
+    let stats = r.stats();
+    assert_eq!(
+        (
+            stats.registered,
+            stats.stopped,
+            stats.cancelled,
+            stats.retired,
+            stats.faults
+        ),
+        (2, 1, 1, 0, 0)
+    );
+}
+
+#[test]
+fn force_stopped_event_may_name_only_the_restart_or_its_link_alias() {
+    for (ptr, code, ok) in [
+        (0x2000, 27, true),
+        (0x20f0, 27, true),
+        (0x2010, 27, false),
+        (0x2000, 26, false),
+        (0x2000, 28, false),
+        (0x1000, 27, false),
+    ] {
+        let mut r = CompletionRouter::new();
+        let t = r.register_stop(5, 3, WRAPPED).unwrap();
+        let routed = r.route(coded(5, 3, ptr, code, 0));
+        if ok {
+            routed.unwrap();
+            r.cancel(t).unwrap();
+            assert_eq!(r.stats().cancelled, 1);
+            assert_eq!(r.stats().registered, 0);
+        } else {
+            assert_eq!(routed, Err(RouteError::Unknown));
+            assert_eq!(r.cancel(t), Err(RouteError::Quarantined));
+            assert_eq!(r.ready(5, 3), Err(RouteError::Quarantined));
+        }
+    }
+}
+
+#[test]
+fn a_completion_racing_the_stop_must_be_consumed_before_cancel() {
+    let mut r = CompletionRouter::new();
+    let t = r.register(5, 3, &[0x1000], 1).unwrap();
+    r.route(coded(5, 3, 0x1000, 1, 0)).unwrap();
+    r.begin_stop(t, AFTER).unwrap();
+    // The completed TRB cannot also be the stopped one.
+    let mut twice = CompletionRouter::new();
+    let u = twice.register(5, 3, &[0x1000], 1).unwrap();
+    twice.route(coded(5, 3, 0x1000, 1, 0)).unwrap();
+    twice.begin_stop(u, AFTER).unwrap();
+    assert_eq!(
+        twice.route(coded(5, 3, 0x1000, 26, 0)),
+        Err(RouteError::Unknown)
+    );
+    // The real order: completion, then the Force Stopped Event at the restart.
+    r.route(coded(5, 3, 0x1010, 27, 0)).unwrap();
+    assert_eq!(r.cancel(t), Err(RouteError::Incomplete));
+    let done = r.take(t).unwrap().unwrap();
+    assert_eq!((done.completion_code, done.key.trb_iova), (1, 0x1000));
+    r.cancel(t).unwrap();
+}
+
+#[test]
+fn any_event_after_the_stop_faults_the_lane_and_blocks_cancel() {
+    for late in [
+        coded(5, 3, 0x1010, 27, 0),
+        coded(5, 3, 0x1000, 1, 0),
+        coded(5, 3, 0x1000, 26, 0),
+    ] {
+        let mut r = CompletionRouter::new();
+        let t = r.register(5, 3, &[0x1000], 1).unwrap();
+        r.begin_stop(t, AFTER).unwrap();
+        r.route(coded(5, 3, 0x1000, 26, 4)).unwrap();
+        assert_eq!(r.route(late), Err(RouteError::Duplicate));
+        assert_eq!(r.cancel(t), Err(RouteError::Quarantined));
+        assert_eq!(r.stats().faults, 1);
+    }
+}
+
+#[test]
+fn stopped_codes_without_a_fence_keep_the_net4b_retention_rules() {
+    let mut r = CompletionRouter::new();
+    let t = r.register(5, 3, &[0x1000], 1).unwrap();
+    assert_eq!(
+        r.route(coded(5, 3, 0x1010, 27, 0)),
+        Err(RouteError::Unknown)
+    );
+    assert_eq!(r.cancel(t), Err(RouteError::Quarantined));
+    let mut r = CompletionRouter::new();
+    let t = r.register(5, 3, &[0x1000], 1).unwrap();
+    r.route(coded(5, 3, 0x1000, 26, 4)).unwrap();
+    assert!(r.take(t).unwrap().is_some());
+    assert_eq!(r.finish(t), Err(RouteError::Quarantined));
+    // An idle endpoint with no fence still faults on a stray stopped event.
+    let mut r = CompletionRouter::new();
+    assert_eq!(
+        r.route(coded(6, 3, 0x2000, 27, 0)),
+        Err(RouteError::Unknown)
+    );
+    assert_eq!(r.register_stop(6, 3, WRAPPED), Err(RouteError::Quarantined));
+}
+
+#[test]
+fn stop_fence_refusals_happen_before_any_command_is_issued() {
+    let mut r = CompletionRouter::new();
+    for restart in [
+        RingRestart {
+            dequeue_iova: 0,
+            ..AFTER
+        },
+        RingRestart {
+            dequeue_iova: 0x1018,
+            ..AFTER
+        },
+        RingRestart {
+            link_iova: Some(0x1008),
+            ..AFTER
+        },
+        RingRestart {
+            link_iova: Some(0),
+            ..AFTER
+        },
+    ] {
+        assert_eq!(r.register_stop(5, 3, restart), Err(RouteError::Invalid));
+        let t = r.register(5, 4, &[0x3000], 1).unwrap();
+        assert_eq!(r.begin_stop(t, restart), Err(RouteError::Invalid));
+        r.route(coded(5, 4, 0x3000, 1, 0)).unwrap();
+        r.take(t).unwrap();
+        r.finish(t).unwrap();
+    }
+    let busy = r.register(5, 3, &[0x1000], 1).unwrap();
+    assert_eq!(r.register_stop(5, 3, AFTER), Err(RouteError::Busy));
+    r.fail(busy, RouteError::Incomplete).unwrap();
+    assert_eq!(r.begin_stop(busy, AFTER), Err(RouteError::Quarantined));
+    assert_eq!(r.register_stop(5, 3, AFTER), Err(RouteError::Quarantined));
+    for (slot, dci) in [(0, 3), (5, 0), (5, 32)] {
+        assert_eq!(r.register_stop(slot, dci, AFTER), Err(RouteError::Invalid));
+    }
+}
+
+#[test]
+fn repeated_stop_and_cancel_cycles_keep_a_flat_lane_census() {
+    let mut memory = [Trb::zero(); 16];
+    let mut ring = TransferRing::new(&mut memory, 0x4000).unwrap();
+    let mut r = CompletionRouter::new();
+    let other = r.register(4, 3, &[0x9000], 1).unwrap();
+    let occupied = r.occupied() + 1;
+    let trb = Trb::normal_transfer(NormalTransfer::interrupt_in(0x8000, 4)).unwrap();
+    for cycle in 0..100u64 {
+        let [token] = ring.preview::<1>().unwrap();
+        let t = r.register(5, 3, &[token], 1).unwrap();
+        ring.enqueue(&mut memory, trb).unwrap();
+        let restart = ring.restart();
+        r.begin_stop(t, restart).unwrap();
+        // Alternate the two legal shapes: interrupted TD, or FSE after completion.
+        if cycle % 2 == 0 {
+            r.route(coded(5, 3, token, 26, 4)).unwrap();
+        } else {
+            r.route(coded(5, 3, token, 13, 1)).unwrap();
+            r.route(coded(5, 3, restart.dequeue_iova, 27, 0)).unwrap();
+            r.take(t).unwrap().unwrap();
+        }
+        r.cancel(t).unwrap();
+        assert_eq!(ring.abandon(restart), Ok(1));
+        // Probe the repointed ring: an idle stop must name the same restart.
+        let probe = r.register_stop(5, 3, ring.restart()).unwrap();
+        r.route(coded(5, 3, ring.restart().dequeue_iova, 27, 0))
+            .unwrap();
+        r.cancel(probe).unwrap();
+        assert_eq!((r.occupied(), ring.queued()), (occupied, 0));
+    }
+    let stats = r.stats();
+    assert_eq!(
+        (
+            stats.registered,
+            stats.stopped,
+            stats.cancelled,
+            stats.faults
+        ),
+        (101, 200, 200, 0)
+    );
+    assert_eq!(stats.consumed, 50);
+    r.route(coded(4, 3, 0x9000, 1, 0)).unwrap();
+    assert!(r.take(other).unwrap().is_some());
+    r.finish(other).unwrap();
 }

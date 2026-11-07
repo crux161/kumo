@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j809
 //j811
 //j827
 //j828
 //j829
+//j830
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -35,12 +35,14 @@ use kumo_usb_storage::{
 };
 use kumo_xhci::{
     endpoint_context_index, portsc_offset, prepare_noop_command_image, CapabilityRegisters,
-    ContextSize, ControllerStatus, DmaBuf, DmaQwords, DmaTrbs, EndpointContext, Event,
-    HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts, InputControlContext,
-    NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
-    QwordSink, RegisterIo, RegisterLayout, RootPortScan, RouteError, RoutedTransfer,
-    SetupTransferType, SlotContext, TransferRing, TransferTicket, Trb, TrbSink, UsbSpeed,
-    XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    ContextSize, ControllerStatus, DmaBuf, DmaQwords, DmaTrbs, EndpointContext, EndpointQuiesce,
+    EndpointSnapshot, Event, HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts,
+    InputControlContext, NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer,
+    PortStatus, QuiesceError, QuiesceReport, QwordSink, RegisterIo, RegisterLayout, RootPortScan,
+    RouteError, RoutedTransfer, SetupTransferType, SlotContext, StopVerdict, TransferRing,
+    TransferTicket, Trb, TrbSink, UsbSpeed, XhciProbeConfig, COMPLETION_STOPPED,
+    COMPLETION_STOPPED_LENGTH_INVALID, COMPLETION_STOPPED_SHORT_PACKET, COMPLETION_TRBS,
+    XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
@@ -1172,13 +1174,17 @@ impl core::fmt::Write for Ax88Record {
     }
 }
 fn ax88_record(args: core::fmt::Arguments<'_>) {
+    record(kumo_abi::sys::log_level::NOTICE, args);
+}
+/// One formatted log line, written in one call; lines over 256 bytes are dropped.
+fn record(level: u8, args: core::fmt::Arguments<'_>) {
     use core::fmt::Write;
     let mut line = Ax88Record {
         bytes: [0; 256],
         len: 0,
     };
     if line.write_fmt(args).is_ok() {
-        let _ = kumo_rt::log_write(kumo_abi::sys::log_level::NOTICE, &line.bytes[..line.len]);
+        let _ = kumo_rt::log_write(level, &line.bytes[..line.len]);
     }
 }
 
@@ -4272,6 +4278,7 @@ fn configure_and_read_hub(
             if let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, 4)) {
                 if let Some(ticket) = reserve_transfer(&int_ring, int_seg, slot_id, dci, &[normal])
                 {
+                    let owned = int_ring.restart().dequeue_iova;
                     report_buf.zero();
                     if enqueue_reserved(&mut int_ring, int_seg, ticket, &[normal]).is_none() {
                         return;
@@ -4317,10 +4324,54 @@ fn configure_and_read_hub(
                             }
                             log(b"\n");
                         }
-                        _ => {
-                            quarantine_transfer(ticket, RouteError::Incomplete);
-                            log(b"drv-xhci: hub status idle; lane/DMA retained\n");
-                        }
+                        // NET4c-2: an idle or failed status transfer is stopped, drained,
+                        // proven Stopped and repointed instead of retained. Any unproven
+                        // answer keeps the NET4b retention. — TIMBERDOODLE
+                        _ => match endpoint_context_va(page_va, dci) {
+                            None => {
+                                quarantine_transfer(ticket, RouteError::Incomplete);
+                                log(b"drv-xhci: hub status idle; lane/DMA retained\n");
+                            }
+                            Some(context_va) => match quiesce_endpoint(
+                                io,
+                                layout,
+                                image,
+                                cmd,
+                                evt,
+                                &mut int_ring,
+                                slot_id,
+                                dci,
+                                Some((ticket, &[owned])),
+                                context_va,
+                            ) {
+                                Ok(done) => {
+                                    log_quiesced(slot_id, dci, &done);
+                                    quiesce_proof(
+                                        io,
+                                        layout,
+                                        image,
+                                        cmd,
+                                        evt,
+                                        &mut int_ring,
+                                        int_seg,
+                                        slot_id,
+                                        dci,
+                                        context_va,
+                                        report_buf,
+                                    );
+                                }
+                                Err(fault) => record(
+                                    kumo_abi::sys::log_level::NOTICE,
+                                    format_args!(
+                                        "drv-xhci: hub status controller={:#x} slot={} dci={} quiesce failed {:?}; lane/DMA retained\n",
+                                        CONTROLLER_BASE.load(Ordering::Relaxed),
+                                        slot_id,
+                                        dci,
+                                        fault
+                                    ),
+                                ),
+                            },
+                        },
                     }
                 }
             }
@@ -5430,6 +5481,387 @@ fn poll_transfer_event_limited(
     }
     // Limited drains may simply be idle; only the owning deadline may quarantine.
     completion_actors().take(ticket).ok().flatten()
+}
+
+/// Output Endpoint Context of `dci` in a device page laid out by this driver.
+fn endpoint_context_va(page_va: u64, dci: u8) -> Option<u64> {
+    let offset = ContextSize::Bytes64.device_offset(dci)?;
+    (dci != 0).then_some(page_va + OFF_OUTPUT_CTX as u64 + offset as u64)
+}
+
+/// Read EP State and the TR Dequeue Pointer/DCS the controller wrote back.
+fn read_endpoint_snapshot(context_va: u64) -> EndpointSnapshot {
+    dsb();
+    EndpointSnapshot::from_words([0, 1, 2, 3].map(|word| read_ctx_word(context_va, word)))
+}
+
+/// One cancelled transfer (or idle probe) proven quiescent and retired.
+struct Quiesced {
+    report: QuiesceReport,
+    completed: Option<RoutedTransfer>,
+    abandoned: usize,
+}
+
+// Fields are read only through Debug, in the failure record.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum QuiesceFault {
+    Route(RouteError),
+    Proof(QuiesceError),
+    Ring(kumo_xhci::Error),
+    StopTimeout,
+    SetDequeueTimeout,
+    Command,
+}
+
+/// Wait between a Context State Error and the reissued Stop Endpoint.
+const STOP_RETRY_NS: u64 = 1_000_000;
+
+/// NET4c-2: Stop Endpoint, drain its stopped event through the one event pump, prove
+/// Stopped from the Output Endpoint Context, Set TR Dequeue past every TRB the ring
+/// published, read that back, and only then retire the receipt and abandon the ring.
+/// Any other answer quarantines the lane with its DMA still held. `pending` names a
+/// live transfer and its TRBs; `None` stops an idle endpoint. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+fn quiesce_endpoint(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
+    evt: &DmaTrbs,
+    ring: &mut TransferRing,
+    slot: u8,
+    dci: u8,
+    pending: Option<(TransferTicket, &[u64])>,
+    context_va: u64,
+) -> Result<Quiesced, QuiesceFault> {
+    let restart = ring.restart();
+    let (ticket, owned) = match pending {
+        Some((ticket, owned)) => {
+            if let Err(error) = completion_actors().begin_stop(ticket, restart) {
+                DMA_RETAINED.store(true, Ordering::Relaxed);
+                completion_actors().fail(ticket, RouteError::Incomplete);
+                return Err(QuiesceFault::Route(error));
+            }
+            (ticket, owned)
+        }
+        None => match completion_actors().register_stop(slot, dci, restart) {
+            Ok(ticket) => (ticket, &[][..]),
+            Err(error) => {
+                DMA_RETAINED.store(true, Ordering::Relaxed);
+                return Err(QuiesceFault::Route(error));
+            }
+        },
+    };
+    let result = (|| {
+        let mut proof = EndpointQuiesce::new(restart, owned).map_err(QuiesceFault::Proof)?;
+        let (dequeue_iova, dequeue_cycle) = loop {
+            let stop = Trb::stop_endpoint(slot, dci, false).map_err(|_| QuiesceFault::Command)?;
+            let (code, _, _) = submit_command(io, layout, image, cmd, evt, stop)
+                .ok_or(QuiesceFault::StopTimeout)?;
+            let event = completion_actors()
+                .stop_event(ticket)
+                .map_err(QuiesceFault::Route)?;
+            let context = read_endpoint_snapshot(context_va);
+            match proof
+                .stop_completed(code, event, context)
+                .map_err(QuiesceFault::Proof)?
+            {
+                StopVerdict::Retry => settle(STOP_RETRY_NS),
+                StopVerdict::Repoint {
+                    dequeue_iova,
+                    dequeue_cycle,
+                } => break (dequeue_iova, dequeue_cycle),
+            }
+        };
+        let set = Trb::set_tr_dequeue(slot, dci, dequeue_iova, dequeue_cycle)
+            .map_err(|_| QuiesceFault::Command)?;
+        let (code, _, _) = submit_command(io, layout, image, cmd, evt, set)
+            .ok_or(QuiesceFault::SetDequeueTimeout)?;
+        let report = proof
+            .repointed(code, read_endpoint_snapshot(context_va))
+            .map_err(QuiesceFault::Proof)?;
+        // A transfer that completed before the stop is still delivered to its owner.
+        let mut completed = None;
+        for _ in 0..COMPLETION_TRBS {
+            match completion_actors()
+                .take(ticket)
+                .map_err(QuiesceFault::Route)?
+            {
+                Some(event) => completed = Some(event),
+                None => break,
+            }
+        }
+        completion_actors()
+            .cancel(ticket)
+            .map_err(QuiesceFault::Route)?;
+        let abandoned = ring.abandon(restart).map_err(QuiesceFault::Ring)?;
+        Ok(Quiesced {
+            report,
+            completed,
+            abandoned,
+        })
+    })();
+    if result.is_err() {
+        DMA_RETAINED.store(true, Ordering::Relaxed);
+        completion_actors().fail(ticket, RouteError::Incomplete);
+    }
+    result
+}
+
+fn log_quiesced(slot: u8, dci: u8, done: &Quiesced) {
+    let r = &done.report;
+    record(
+        kumo_abi::sys::log_level::INFO,
+        format_args!(
+            "drv-xhci: hub status idle; controller={:#x} slot={} dci={} stop cc={} trb={:#x} rem={} ctx={:?}@{:#x} set={:#x}/{} retries={} abandoned={} completed={}; lane retired\n",
+            CONTROLLER_BASE.load(Ordering::Relaxed),
+            slot,
+            dci,
+            r.stop.completion_code,
+            r.stop.key.trb_iova,
+            r.stop.remaining,
+            r.stopped.state,
+            r.stopped.dequeue_iova,
+            r.repointed.dequeue_iova,
+            r.repointed.dequeue_cycle as u8,
+            r.retries,
+            done.abandoned,
+            done.completed.is_some() as u8
+        ),
+    );
+}
+
+const QUIESCE_PROOF_CYCLES: u32 = 40;
+/// After a doorbell, give the endpoint time to fetch its TD and start polling.
+const QUIESCE_START_NS: u64 = 2_000_000;
+const QUIESCE_PROBE_NS: u64 = 1_000_000;
+const QUIESCE_CANARY: [u8; 4] = [0xa5; 4];
+
+/// Default-off NET4c-2 proof on a real interrupt-IN endpoint: post a TD, cancel it
+/// through `quiesce_endpoint`, then ring the doorbell with no TD and stop again. The
+/// second stop must be a Force Stopped Event at the restart: the cancelled TD cannot
+/// run again. Repeats across ring wraps and checks a flat census. — TIMBERDOODLE
+#[allow(clippy::too_many_arguments)]
+fn quiesce_proof(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
+    evt: &DmaTrbs,
+    ring: &mut TransferRing,
+    segment: &mut DmaTrbs,
+    slot: u8,
+    dci: u8,
+    context_va: u64,
+    buffer: DmaBuf,
+) {
+    if !matches!(option_env!("KUMO_XHCI_QUIESCE_PROOF"), Some("1")) {
+        return;
+    }
+    let notice = kumo_abi::sys::log_level::NOTICE;
+    let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
+    let before = completion_actors().stats();
+    let lanes = completion_actors().occupied();
+    let custody = DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed);
+    let start = ring.restart();
+    record(
+        notice,
+        format_args!(
+            "NET4c2 quiesce start controller={:#x} slot={} dci={} cycles={} restart={:#x} dcs={} lanes={} custody={}\n",
+            controller,
+            slot,
+            dci,
+            QUIESCE_PROOF_CYCLES,
+            start.dequeue_iova,
+            start.cycle as u8,
+            lanes,
+            custody
+        ),
+    );
+    let (mut wraps, mut interrupted, mut partial, mut unstarted, mut raced, mut cycles) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let result = (|| -> Result<(), (&'static str, Option<QuiesceFault>)> {
+        for cycle in 1..=QUIESCE_PROOF_CYCLES {
+            buffer.write_from(0, &QUIESCE_CANARY);
+            let normal = Trb::normal_transfer(NormalTransfer::interrupt_in(buffer.phys(), 4))
+                .map_err(|_| ("trb", None))?;
+            let owned = ring.restart().dequeue_iova;
+            let ticket =
+                queue_transfer(ring, segment, slot, dci, &[normal]).ok_or(("queue", None))?;
+            wraps += ring.restart().link_iova.is_some() as u32;
+            dsb();
+            ring_slot_doorbell(io, layout, slot, dci);
+            settle(QUIESCE_START_NS);
+            let done = quiesce_endpoint(
+                io,
+                layout,
+                image,
+                cmd,
+                evt,
+                ring,
+                slot,
+                dci,
+                Some((ticket, &[owned])),
+                context_va,
+            )
+            .map_err(|fault| ("cancel", Some(fault)))?;
+            // Four legal shapes (xHCI 4.6.9, table 4-2): Stopped inside the TD with
+            // nothing moved; Stopped with a residue or Stopped - Short Packet with its
+            // EDTLA when a report landed as the stop hit; a Force Stopped Event at the
+            // TD before it started; or a completion that won the race, followed by a
+            // Force Stopped Event at the restart.
+            let stop = done.report.stop;
+            let at_td = done.completed.is_none() && stop.key.trb_iova == owned;
+            let moved = match stop.completion_code {
+                COMPLETION_STOPPED => 4u32.checked_sub(stop.remaining),
+                COMPLETION_STOPPED_SHORT_PACKET => Some(stop.remaining).filter(|&n| n <= 4),
+                _ => Some(0),
+            };
+            match (at_td, stop.completion_code, moved) {
+                (true, COMPLETION_STOPPED, Some(0)) => interrupted += 1,
+                (true, COMPLETION_STOPPED | COMPLETION_STOPPED_SHORT_PACKET, Some(_)) => {
+                    partial += 1
+                }
+                (true, COMPLETION_STOPPED_LENGTH_INVALID, _) => unstarted += 1,
+                (false, COMPLETION_STOPPED_LENGTH_INVALID, _) if done.completed.is_some() => {
+                    raced += 1
+                }
+                _ => {
+                    record(
+                        notice,
+                        format_args!(
+                            "NET4c2 shape controller={:#x} slot={} dci={} cycle={} stop={}@{:#x} rem={} owned={:#x} completed={:?}\n",
+                            controller,
+                            slot,
+                            dci,
+                            cycle,
+                            stop.completion_code,
+                            stop.key.trb_iova,
+                            stop.remaining,
+                            owned,
+                            done.completed.map(|e| (e.completion_code, e.key.trb_iova, e.remaining))
+                        ),
+                    );
+                    return Err(("stop shape", None));
+                }
+            }
+            // Bytes the controller did not report writing must still hold the canary.
+            let moved = moved.unwrap_or(4) as usize;
+            if at_td && buffer.read::<4>(0)[moved..] != QUIESCE_CANARY[moved..] {
+                return Err(("canary after cancel", None));
+            }
+            if done.abandoned != 1 {
+                return Err(("abandoned", None));
+            }
+            // Probe: a doorbell with nothing new published must not revive the TD.
+            buffer.write_from(0, &QUIESCE_CANARY);
+            let restart = ring.restart();
+            dsb();
+            ring_slot_doorbell(io, layout, slot, dci);
+            settle(QUIESCE_PROBE_NS);
+            let probe = quiesce_endpoint(
+                io, layout, image, cmd, evt, ring, slot, dci, None, context_va,
+            )
+            .map_err(|fault| ("probe", Some(fault)))?;
+            let fse = probe.report.stop;
+            if fse.completion_code != COMPLETION_STOPPED_LENGTH_INVALID
+                || !restart.names(fse.key.trb_iova)
+                || probe.completed.is_some()
+                || probe.abandoned != 0
+                || buffer.read::<4>(0) != QUIESCE_CANARY
+            {
+                return Err(("probe shape", None));
+            }
+            let census = (
+                ring.queued(),
+                image.command_ring.queued(),
+                completion_actors().occupied(),
+                DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed),
+            );
+            if census != (0, 0, lanes, custody) {
+                return Err(("census", None));
+            }
+            cycles = cycle;
+            record(
+                notice,
+                format_args!(
+                    "NET4c2 cycle={} controller={:#x} slot={} dci={} stop={}@{:#x} rem={} ctx={:#x} set={:#x}/{} raced={} probe={}@{:#x} queued=0 commands=0 PASS\n",
+                    cycle,
+                    controller,
+                    slot,
+                    dci,
+                    stop.completion_code,
+                    stop.key.trb_iova,
+                    stop.remaining,
+                    done.report.stopped.dequeue_iova,
+                    done.report.repointed.dequeue_iova,
+                    done.report.repointed.dequeue_cycle as u8,
+                    done.completed.is_some() as u8,
+                    fse.completion_code,
+                    fse.key.trb_iova
+                ),
+            );
+        }
+        Ok(())
+    })();
+    let after = completion_actors().stats();
+    match result {
+        Ok(()) => {
+            let counts = (
+                after.registered - before.registered,
+                after.stopped - before.stopped,
+                after.cancelled - before.cancelled,
+                after.retired - before.retired,
+                after.faults - before.faults,
+            );
+            let n = u64::from(QUIESCE_PROOF_CYCLES);
+            let pass = counts == (n, 2 * n, 2 * n, 0, 0) && wraps >= 2;
+            record(
+                notice,
+                format_args!(
+                    "NET4c2 quiesce {} controller={:#x} slot={} dci={} cycles={} wraps={} interrupted={} partial={} unstarted={} raced={} probes={} registered={} stopped={} cancelled={} retired={} faults={} lanes={}/{} custody={}/{}\n",
+                    if pass { "PASS" } else { "FAIL" },
+                    controller,
+                    slot,
+                    dci,
+                    cycles,
+                    wraps,
+                    interrupted,
+                    partial,
+                    unstarted,
+                    raced,
+                    cycles,
+                    counts.0,
+                    counts.1,
+                    counts.2,
+                    counts.3,
+                    counts.4,
+                    lanes,
+                    completion_actors().occupied(),
+                    custody,
+                    DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed)
+                ),
+            );
+        }
+        Err((stage, fault)) => record(
+            notice,
+            format_args!(
+                "NET4c2 quiesce FAIL controller={:#x} slot={} dci={} cycle={} stage={} fault={:?}; {}\n",
+                controller,
+                slot,
+                dci,
+                cycles + 1,
+                stage,
+                fault,
+                if fault.is_some() {
+                    "lane/DMA retained"
+                } else {
+                    "stop verified and lane retired; proof stopped"
+                }
+            ),
+        ),
+    }
 }
 
 /// Write a device-slot doorbell: `db[slot_id] = dci` (stream 0).
