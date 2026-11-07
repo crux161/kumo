@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j609
 //j614
 //j619
 //j625
 //j660
+//j823
 
 mod fpsimd;
 mod gdt;
@@ -1059,6 +1059,20 @@ pub unsafe fn set_user_aspace_root(root: u64) {
 pub fn read_user_aspace_root() -> u64 {
     paging::read_root()
 }
+
+/// x86_64 has no ASID field in CR3; AX1's per-address-space ASIDs are AArch64-only
+/// (PCIDs are out of scope).
+pub fn asid_width() -> u8 {
+    0
+}
+
+/// x86_64 roots own no ASID, so there is nothing to retire.
+pub fn retire_user_aspace(_root: u64) -> bool {
+    true
+}
+
+/// x86_64 invalidation is the CR3 switch performed by the paging backend.
+pub fn invalidate_user_aspace(_root: u64) {}
 
 pub fn halt() -> ! {
     loop {

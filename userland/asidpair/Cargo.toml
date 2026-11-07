@@ -1,0 +1,23 @@
+#j823
+[package]
+name = "asidpair"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The AX1 address-space stress probe (PLAN/021). One binary, many roles: two live instances
+# map different data at the same user VA and check every byte while the scheduler rotates
+# them; one instance unmaps and remaps that VA with new contents; sequential fresh instances
+# reuse the VA after their predecessor exits. Built for aarch64-unknown-none by
+# `cargo xtask image` and staged at `bin/asidpair`.
+[dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+
+[[bin]]
+name = "asidpair"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

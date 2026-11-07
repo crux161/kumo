@@ -1,11 +1,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j635
 //j660
 //j792
 //j793
 //j794
+//j823
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -33,7 +33,7 @@ pub mod active {
         PublishedTable as PublishedDeviceTable, TableMemory as DeviceTableMemory,
     };
     pub use kumo_hal_aarch64::{
-        arch_name, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
+        arch_name, asid_width, build_user_tables, clean_dcache_to_poc, clear_preempt_hook,
         complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
         console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
@@ -43,21 +43,22 @@ pub mod active {
         fb_fill, fb_geometry, fb_paint_band, framebuffer_console_owned_by_kernel, freeze_console,
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_timer_interrupts, install_exception_vectors,
-        interrupted_at_el0, iommu_create_device_context, iommu_destroy_device_context, iommu_init,
-        iommu_map_device_page, iommu_unmap_device_range, irq_unmask, mali_g610_status_from_dtb,
-        map_user_device_block, map_user_page, mask_spi_interrupt, mask_tlmm_gpio_interrupt,
-        mmu600_pcie_status_from_dtb, monotonic_nanos, pcie30x4_endpoint_status,
-        pcie30x4_mmu_status, pcie30x4_nvme_status, pcie30x4_status_from_dtb, read_phys,
-        read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag, render_qr_diag_once,
-        run_el0_image, run_el0_smoke, set_fault_hook, set_framebuffer, set_interrupt_hook,
-        set_preempt_hook, set_svc_hook, set_tower_context_hook, set_user_aspace_root,
-        set_user_kernel_stack, smmu_apps_discover_from_dtb, spin_once, switch_context,
-        sync_icache_to_pou, syscall_count, system_off, system_reset, timer_irq_count,
-        unmap_user_span, unmask_spi_interrupt, user_device_page_desc, user_entry_context,
-        user_nc_page_desc, user_page_desc, wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError,
-        DevicePowerReadout, DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report,
-        GicTimerGateReport, PowerStep, ThreadContext, TowerContext, TowerThreadRole, UserImage,
-        UserImageError, UserLoadSegment, UserMapping, UserState, ARCH,
+        interrupted_at_el0, invalidate_user_aspace, iommu_create_device_context,
+        iommu_destroy_device_context, iommu_init, iommu_map_device_page, iommu_unmap_device_range,
+        irq_unmask, mali_g610_status_from_dtb, map_user_device_block, map_user_page,
+        mask_spi_interrupt, mask_tlmm_gpio_interrupt, mmu600_pcie_status_from_dtb, monotonic_nanos,
+        pcie30x4_endpoint_status, pcie30x4_mmu_status, pcie30x4_nvme_status,
+        pcie30x4_status_from_dtb, read_phys, read_user_aspace_root, reclaim_framebuffer_console,
+        render_qr_diag, render_qr_diag_once, retire_user_aspace, run_el0_image, run_el0_smoke,
+        set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
+        set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
+        smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
+        system_off, system_reset, timer_irq_count, unmap_user_span, unmask_spi_interrupt,
+        user_device_page_desc, user_entry_context, user_nc_page_desc, user_page_desc,
+        wait_for_timer_irqs, AppsSmmuTopology, DevicePowerError, DevicePowerReadout,
+        DevicePowerUnitInfo, DevicePowerUpOutcome, El0Report, GicTimerGateReport, PowerStep,
+        ThreadContext, TowerContext, TowerThreadRole, UserImage, UserImageError, UserLoadSegment,
+        UserMapping, UserState, ARCH,
     };
     pub use kumo_hal_aarch64::{
         display_controller_activate, display_controller_detach, display_controller_new,
@@ -71,7 +72,7 @@ pub mod active {
 #[cfg(feature = "arch_x86_64")]
 pub mod active {
     pub use kumo_hal_x86_64::{
-        apply_boot_io_apic_timer, arch_name, build_user_tables, clean_dcache_to_poc,
+        apply_boot_io_apic_timer, arch_name, asid_width, build_user_tables, clean_dcache_to_poc,
         clear_preempt_hook, complete_tlmm_gpio_interrupt, configure_i2c21_tlmm_pinctrl_from_dtb,
         configure_spi_interrupt, configure_tlmm_gpio_interrupt, console_drain, console_read_byte,
         console_set_dw8250_base, console_set_pl011_base, console_use_physmap,
@@ -83,16 +84,16 @@ pub mod active {
         gic_set_no_dtb_fallback, gic_timer_gate_report, halt, halt_cpu,
         handoff_framebuffer_console, init_local_timer_from_reference, init_timer_interrupts,
         inspect_acpi_rsdp, inspect_boot_io_apic, install_descriptor_tables,
-        install_exception_vectors, interrupted_at_el0, io_apic_timer_irq_count,
-        iommu_create_device_context, iommu_destroy_device_context, iommu_init,
-        iommu_map_device_page, iommu_unmap_device_range, irq_unmask, local_timer_irq_count,
-        map_user_device_block, map_user_page, mask_pic_timer_source, mask_spi_interrupt,
-        mask_tlmm_gpio_interrupt, monotonic_nanos, plan_boot_io_apic_timer,
+        install_exception_vectors, interrupted_at_el0, invalidate_user_aspace,
+        io_apic_timer_irq_count, iommu_create_device_context, iommu_destroy_device_context,
+        iommu_init, iommu_map_device_page, iommu_unmap_device_range, irq_unmask,
+        local_timer_irq_count, map_user_device_block, map_user_page, mask_pic_timer_source,
+        mask_spi_interrupt, mask_tlmm_gpio_interrupt, monotonic_nanos, plan_boot_io_apic_timer,
         prepare_scheduled_fpsimd_smoke, prepare_scheduled_ring3_smoke,
         prepare_scheduled_user_image, probe_io_apic_timer_interrupt, prove_fpsimd_boundary,
         read_phys, read_user_aspace_root, reclaim_framebuffer_console, render_qr_diag,
-        render_qr_diag_once, run_el0_image, run_el0_smoke, run_ring3_smoke, set_fault_hook,
-        set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
+        render_qr_diag_once, retire_user_aspace, run_el0_image, run_el0_smoke, run_ring3_smoke,
+        set_fault_hook, set_framebuffer, set_interrupt_hook, set_preempt_hook, set_svc_hook,
         set_tower_context_hook, set_user_aspace_root, set_user_kernel_stack,
         smmu_apps_discover_from_dtb, spin_once, switch_context, sync_icache_to_pou, syscall_count,
         system_off, system_reset, timer_irq_count, unmap_user_span, unmask_boot_io_apic_timer,

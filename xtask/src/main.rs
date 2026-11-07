@@ -1,8 +1,8 @@
-//j805
 //j810
 //j815
 //j820
 //j822
+//j823
 
 use std::env;
 use std::fmt;
@@ -927,6 +927,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
             let netstack = build_native_bin(&workspace_root()?, "netstack")?;
             let netprobe = build_native_bin(&workspace_root()?, "netprobe")?;
             let actorprobe = build_native_bin(&workspace_root()?, "actorprobe")?;
+            let asidpair = build_native_bin(&workspace_root()?, "asidpair")?;
             let fat32_img = build_fat32_image();
             let persona_linux_hello = build_persona_linux_hello_elf();
             let hello = build_hello_image(&workspace_root()?)?;
@@ -966,6 +967,7 @@ fn stage_initrd(out_dir: &Path, plan: &ImagePlan) -> Result<Option<StagedSimpleA
                 (kumo_abi::initrd::NETSTACK_PATH, netstack.as_slice()),
                 (kumo_abi::initrd::NETPROBE_PATH, netprobe.as_slice()),
                 ("bin/actorprobe", actorprobe.as_slice()),
+                ("bin/asidpair", asidpair.as_slice()),
                 (FAT32_IMG_PATH, fat32_img.as_slice()),
                 (PERSONA_LINUX_HELLO_PATH, persona_linux_hello.as_slice()),
                 (HELLO_PATH, hello.as_slice()),

@@ -2,6 +2,7 @@
 //j743
 //j748
 //j790
+//j823
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -187,7 +188,18 @@ fn discard_previous_runtime() -> Result<(), UsermodeError> {
         return Err(UsermodeError::ChannelSetup);
     }
     let previous = slot.take();
+    // AX1: the stopped runtime's address space owns an ASID. Read its tagged root while the
+    // state still exists, drop the runtime, then return the ASID. Sora is the primary
+    // process, so the regular teardown path deliberately skips the mapping/ASID release.
+    // — TIMBERDOODLE
+    let aspace_root = previous
+        .as_ref()
+        .and_then(|state| state.try_borrow().ok())
+        .and_then(|state| state.process.ttbr0);
     drop(previous);
+    if let Some(root) = aspace_root {
+        kumo_hal::active::retire_user_aspace(root);
+    }
     Ok(())
 }
 
@@ -1340,6 +1352,18 @@ fn teardown_process_and_signal(koid: KoId) {
                     kept,
                     released + kept
                 );
+            }
+            // AX1: with the mapping records gone, retire the address space's ASID. It must
+            // happen before `retire_vmos` can hand the same frames to a new owner, and even
+            // when the process recorded no mappings — every built space owns a root and an
+            // ASID. Sora's own root is retired by `discard_previous_runtime`.
+            // — TIMBERDOODLE
+            if let Some(root) = sora
+                .engine
+                .process_by_koid(koid)
+                .and_then(|proc| proc.ttbr0)
+            {
+                kumo_hal::active::retire_user_aspace(root);
             }
         }
         sora.engine.retire_device_contexts();
@@ -2952,7 +2976,13 @@ fn attempt_sora(
         process.root_vmar(),
         kernel_ttbr0,
     )
-    .map_err(UsermodeError::UserThreadInit)?;
+    .map_err(|error| {
+        // AX1: the address space was built (and its ASID allocated) but never published;
+        // return the ASID instead of leaking it. This is the only fallible step after
+        // `build_user_tables`. — TIMBERDOODLE
+        kumo_hal::active::retire_user_aspace(user_ttbr0);
+        UsermodeError::UserThreadInit(error)
+    })?;
 
     // Koids of Sora's own channel ends — the koids Sora binds to its serve-loop port.
     // Resolved from the handle table before `process` is moved into `SoraState`.

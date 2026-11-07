@@ -1,14 +1,15 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j688
 //j792
 //j793
 //j794
 //j797
+//j823
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+pub mod asid;
 mod cjk_font;
 pub mod display_control;
 pub mod display_dma;
@@ -24,6 +25,7 @@ pub mod power_unit;
 pub mod rockchip_v2;
 pub mod smmuv2;
 pub mod smmuv3;
+pub use asid::{AllocOutcome, Asid, AsidAllocator, AsidError};
 pub use display_iommu::DisplayIoMmu;
 pub use mali::{
     discover_rk3588_mali_g610, MaliG610ClockSource, MaliG610ClockStatus, MaliG610PowerStatus,
@@ -1779,7 +1781,12 @@ pub fn monotonic_nanos() -> u64 {
 
 #[cfg(target_os = "none")]
 pub mod mmu {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    use super::asid::{
+        asid_of_ttbr0, decode_asid_bits, encode_ttbr0, AllocOutcome, Asid, AsidAllocator,
+    };
     // 2 MiB block granule, shared with the crate-root `console_mmio_block_above_top` so the
     // host-testable pre-check computes the same block this module's mapper writes.
     use super::BLOCK_2M;
@@ -1795,6 +1802,12 @@ pub mod mmu {
     const SH_INNER: u64 = 3 << 8;
     const PXN: u64 = 1 << 53;
     const UXN: u64 = 1 << 54;
+    /// Non-global, a **final-level-only** attribute (bit 11). A leaf/block descriptor with
+    /// nG set is tagged with the ASID selected for the walk; without it the entry is global
+    /// and matches under every ASID. Table descriptors above the final level leave bit 11
+    /// zero deliberately: hardware ignores nG there and treats the entry as non-global
+    /// regardless. — TIMBERDOODLE
+    const DESC_NG: u64 = 1 << 11;
 
     // MAIR attribute indices.
     const MAIR_WB: u64 = 0; // Normal write-back
@@ -1810,6 +1823,138 @@ pub mod mmu {
     static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
     static KERNEL_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
     static KERNEL_IMAGE_LEN: AtomicU64 = AtomicU64::new(0);
+
+    /// The ASID width the core reported in `ID_AA64MMFR0_EL1.ASIDBits`; 0 until
+    /// [`enable_kernel`] has run.
+    static ASID_WIDTH_BITS: AtomicU32 = AtomicU32::new(0);
+
+    /// The one-core ASID allocator. AX1 is single-core by design: the boot CPU owns this
+    /// cell and no other CPU exists yet. `None` until `enable_kernel` reports the width.
+    struct AsidCell(UnsafeCell<Option<AsidAllocator>>);
+    unsafe impl Sync for AsidCell {}
+    static ASID_ALLOCATOR: AsidCell = AsidCell(UnsafeCell::new(None));
+
+    fn with_asid_allocator<R>(f: impl FnOnce(&mut AsidAllocator) -> R) -> Option<R> {
+        // SAFETY: single-core kernel state; every caller runs serialized on the boot CPU
+        // (there is no second CPU in AX1) and holds no reference across the call.
+        unsafe { (&mut *ASID_ALLOCATOR.0.get()).as_mut().map(f) }
+    }
+
+    /// Invalidate one ASID on every PE in the inner-shareable domain.
+    ///
+    /// `TLBI ASIDE1IS` is the broadcast form; `TLBI ASIDE1` is the local-only alternative.
+    /// One core makes them equivalent today, but PLAN/014 MP4 owns the cross-CPU rule and
+    /// the broadcast shape is what it will require, so AX1 starts there. The operand holds
+    /// the ASID in bits [63:48]. — TIMBERDOODLE
+    fn invalidate_asid(asid: Asid) {
+        let operand = (asid.raw() as u64) << 48;
+        // SAFETY: a TLBI has no memory operand and cannot fault at EL1.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi aside1is, {operand}",
+                "dsb ish",
+                "isb",
+                operand = in(reg) operand,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Invalidate every stage-1 translation for this CPU's VMID — global and non-global.
+    fn flush_all_local() {
+        // SAFETY: as `invalidate_asid`.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Allocate one ASID. On exhaustion, flush the whole local TLB, start a new
+    /// generation and retry exactly once: `rollover` keeps every live ASID with its
+    /// number, so a second `Exhausted` means all spaces of this width are genuinely live.
+    fn allocate_asid() -> Option<Asid> {
+        with_asid_allocator(|allocator| match allocator.allocate() {
+            AllocOutcome::Allocated { asid, .. } => Some(asid),
+            AllocOutcome::Exhausted => {
+                flush_all_local();
+                allocator.rollover();
+                match allocator.allocate() {
+                    AllocOutcome::Allocated { asid, .. } => Some(asid),
+                    AllocOutcome::Exhausted => None,
+                }
+            }
+        })
+        .flatten()
+    }
+
+    /// Invalidate `asid` and return the number to the allocator.
+    fn release_asid(asid: Asid) -> Option<bool> {
+        invalidate_asid(asid);
+        with_asid_allocator(|allocator| allocator.release(asid).is_ok())
+    }
+
+    /// Encode `root` as an ASID-tagged TTBR0 value. The caller owns `asid`; if the root
+    /// cannot be encoded, the ASID is flushed and released here because no caller can
+    /// retire a root that was never published.
+    pub(crate) fn encode_user_root(root: u64, asid: Asid) -> Option<u64> {
+        match encode_ttbr0(root, asid) {
+            Some(value) => Some(value),
+            None => {
+                let _ = release_asid(asid);
+                None
+            }
+        }
+    }
+
+    /// Allocate an ASID for a new user address space. Exhaustion rolls the generation
+    /// over after a full local flush and retries once.
+    pub(crate) fn allocate_user_asid() -> Option<Asid> {
+        allocate_asid()
+    }
+
+    /// Return the ASID of an address space that was built but never published.
+    pub(crate) fn discard_user_asid(asid: Asid) {
+        let _ = release_asid(asid);
+    }
+
+    /// The reported ASID width in bits; 0 before [`enable_kernel`].
+    pub fn asid_width() -> u8 {
+        ASID_WIDTH_BITS.load(Ordering::Relaxed) as u8
+    }
+
+    /// Invalidate every translation an address space could have cached. A tagged root
+    /// invalidates only its ASID; an untagged (ASID 0) root invalidates the local TLB.
+    pub fn invalidate_user_aspace(root: u64) {
+        let asid = asid_of_ttbr0(root);
+        if asid.is_kernel() {
+            flush_all_local();
+        } else {
+            invalidate_asid(asid);
+        }
+    }
+
+    /// Retire an address space's ASID: invalidate its translations, then return the number
+    /// to the allocator. Returns whether the ASID was live. An untagged/ASID-0 root owns
+    /// nothing and is a no-op success. — TIMBERDOODLE
+    pub fn retire_user_aspace(root: u64) -> bool {
+        let asid = asid_of_ttbr0(root);
+        if asid.is_kernel() {
+            return true;
+        }
+        release_asid(asid).unwrap_or(false)
+    }
+
+    fn init_asids(width_bits: u8) {
+        ASID_WIDTH_BITS.store(width_bits as u32, Ordering::Relaxed);
+        // SAFETY: first writer; single-threaded boot before any user space exists.
+        unsafe { *ASID_ALLOCATOR.0.get() = AsidAllocator::new(width_bits) };
+    }
 
     fn write_desc(table_phys: u64, index: usize, value: u64) {
         unsafe { ((table_phys + (index as u64) * 8) as *mut u64).write_volatile(value) };
@@ -1849,6 +1994,8 @@ pub mod mmu {
         }
         let child = alloc().ok_or(())?;
         *tables += 1;
+        // nG on a table descriptor is ignored by hardware (final level only), so bit 11
+        // stays zero here by design. — TIMBERDOODLE
         write_desc(parent, index, child | DESC_VALID | DESC_TABLE);
         Ok(child)
     }
@@ -1861,6 +2008,8 @@ pub mod mmu {
         alloc: &mut dyn FnMut() -> Option<u64>,
         tables: &mut usize,
     ) -> Result<(), ()> {
+        // `root` may carry the address space's ASID in bits [63:48]; walk the base only.
+        let root = root & ADDR_MASK;
         let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
         let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
         let l3 = ensure_table(l2, ((va >> 21) & 0x1ff) as usize, alloc, tables)?;
@@ -1876,16 +2025,21 @@ pub mod mmu {
         alloc: &mut dyn FnMut() -> Option<u64>,
         tables: &mut usize,
     ) -> Result<(), ()> {
+        // `root` may carry the address space's ASID in bits [63:48]; walk the base only.
+        let root = root & ADDR_MASK;
         let l1 = ensure_table(root, ((va >> 39) & 0x1ff) as usize, alloc, tables)?;
         let l2 = ensure_table(l1, ((va >> 30) & 0x1ff) as usize, alloc, tables)?;
         write_desc(l2, ((va >> 21) & 0x1ff) as usize, pa | desc);
         Ok(())
     }
 
-    /// Clear the 4 KiB user leaves covering `[va, va + len)` and flush the TLB. Every page is
-    /// preflighted before any is cleared, so a hole, block descriptor or missing table leaves
-    /// the mapping untouched. The kernel calls this with its identity map active and `root`
-    /// naming the user tree, mirroring `map_user_page`. — TIMBERDOODLE
+    /// Clear the 4 KiB user leaves covering `[va, va + len)` and invalidate the owning
+    /// address space's stale translations. Every page is preflighted before any is cleared,
+    /// so a hole, block descriptor or missing table leaves the mapping untouched. The kernel
+    /// calls this with its identity map active and `root` naming the user tree, mirroring
+    /// `map_user_page`. `root` may carry the address space's ASID in bits [63:48]: the walk
+    /// masks it off and the flush targets that ASID (an untagged root falls back to
+    /// `tlbi vmalle1`). — TIMBERDOODLE
     ///
     /// # Safety
     /// `root` must be a live L0 table; the kernel identity map must be active; the whole range
@@ -1898,10 +2052,11 @@ pub mod mmu {
         {
             return Err(());
         }
+        let root_pa = root & ADDR_MASK;
         let mut page = 0;
         while page < len {
             let at = va + page;
-            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            let l1 = read_desc(root_pa, ((at >> 39) & 0x1ff) as usize);
             if l1 & DESC_VALID == 0 || l1 & DESC_TABLE == 0 {
                 return Err(());
             }
@@ -1922,21 +2077,13 @@ pub mod mmu {
         let mut page = 0;
         while page < len {
             let at = va + page;
-            let l1 = read_desc(root, ((at >> 39) & 0x1ff) as usize);
+            let l1 = read_desc(root_pa, ((at >> 39) & 0x1ff) as usize);
             let l2 = read_desc(l1 & ADDR_MASK, ((at >> 30) & 0x1ff) as usize);
             let l3 = read_desc(l2 & ADDR_MASK, ((at >> 21) & 0x1ff) as usize);
             write_desc(l3 & ADDR_MASK, ((at >> 12) & 0x1ff) as usize, 0);
             page += PAGE_4K;
         }
-        unsafe {
-            core::arch::asm!(
-                "dsb ish",
-                "tlbi vmalle1",
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags),
-            );
-        }
+        invalidate_user_aspace(root);
         Ok(())
     }
 
@@ -2042,7 +2189,17 @@ pub mod mmu {
                 } else {
                     block_desc(pa, MAIR_DEVICE, true)
                 };
-                map_block(ttbr0, pa, pa, desc, alloc, &mut tables)?;
+                // The same leaf goes into both trees with different globality. TTBR1's
+                // walk must stay global: with TCR_EL1.A1=0, nG entries select
+                // TTBR0_EL1's ASID regardless of which TTBR translated the address
+                // (DDI0487G D5-2790), so a non-global kernel entry would be tagged per
+                // process. Global is what makes the kernel high half ASID-independent.
+                // TTBR0's identity copy is nG, so it is ASID-0-tagged: ASIDE1 never needs
+                // to reach it, and — the load-bearing reason — a global identity leaf
+                // cannot satisfy a user ASID's access to the same low VA. The identity
+                // map and child VMARs share 0..512 MiB; without the split the lookup is
+                // unpredictable. — TIMBERDOODLE
+                map_block(ttbr0, pa, pa, desc | DESC_NG, alloc, &mut tables)?;
                 map_block(
                     ttbr1,
                     PHYSMAP_BASE + pa,
@@ -2071,7 +2228,8 @@ pub mod mmu {
         );
         for &block in targeted.as_slice() {
             let desc = block_desc(block, MAIR_DEVICE, true);
-            map_block(ttbr0, block, block, desc, alloc, &mut tables)?;
+            // Same globality split as the dense loop: identity is nG, physmap is global.
+            map_block(ttbr0, block, block, desc | DESC_NG, alloc, &mut tables)?;
             map_block(
                 ttbr1,
                 PHYSMAP_BASE + block,
@@ -2093,6 +2251,16 @@ pub mod mmu {
         }
 
         let ips = parange();
+        let mmfr0: u64;
+        // SAFETY: reading an ID register cannot fault at EL1.
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nostack, nomem))
+        };
+        // ASIDBits: 0b0000 is the 8-bit implementation and 0b0010 the 16-bit one; reserved
+        // encodings mean 8 bits. TCR_EL1.AS (bit 36) is RES0 on an 8-bit core — writing it
+        // there is UNPREDICTABLE — so it is set only for the 16-bit encoding. — TIMBERDOODLE
+        let asid_width_bits = decode_asid_bits(mmfr0).unwrap_or(8);
+        let tcr_as = if asid_width_bits == 16 { 1 << 36 } else { 0 };
         // Both halves use 4 KiB granules, inner-shareable WBWA walks, and 48-bit VAs.
         let tcr: u64 = T0SZ
             | (1 << 8)
@@ -2104,7 +2272,8 @@ pub mod mmu {
             | (1 << 26)
             | (3 << 28)
             | (2 << 30)
-            | (ips << 32);
+            | (ips << 32)
+            | tcr_as;
 
         unsafe {
             core::arch::asm!(
@@ -2138,6 +2307,10 @@ pub mod mmu {
             );
         }
 
+        // Publish the allocator only after the boot switch: no user space can exist before
+        // this call returns.
+        init_asids(asid_width_bits);
+
         Ok((tables, gb_count * GB))
     }
 
@@ -2152,7 +2325,9 @@ pub mod mmu {
     /// Writable-and-executable is impossible by construction (W wins → non-exec), so no
     /// page is ever both, with `SCTLR.WXN` left untouched.
     pub fn user_page_desc(executable: bool, writable: bool) -> u64 {
-        let base = DESC_VALID | DESC_TABLE | DESC_AF | SH_INNER | (MAIR_WB << 2);
+        // nG: the leaf is tagged with the owning process's ASID, so it is invisible to
+        // every other address space and to the kernel's ASID-0 identity map. — TIMBERDOODLE
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | DESC_NG | SH_INNER | (MAIR_WB << 2);
         if writable {
             base | AP_EL1RW_EL0RW | UXN | PXN
         } else if executable {
@@ -2177,7 +2352,8 @@ pub mod mmu {
         alloc: &mut dyn FnMut() -> Option<u64>,
         tables: &mut usize,
     ) -> Result<(), ()> {
-        map_page(root, va, pa, desc, alloc, tables)
+        // `root` may carry the address space's ASID in bits [63:48]; walk the base only.
+        map_page(root & ADDR_MASK, va, pa, desc, alloc, tables)
     }
 
     // (`map_kernel_device_block` — the EL1-only console-window mapper — is gone with the
@@ -2205,15 +2381,16 @@ pub mod mmu {
         } else {
             AP_EL1RO_EL0RO
         };
-        let desc = pa | DESC_VALID | DESC_AF | (mair << 2) | PXN | UXN | ap;
-        map_block(root, va, pa, desc, alloc, tables)
+        let desc = pa | DESC_VALID | DESC_AF | DESC_NG | (mair << 2) | PXN | UXN | ap;
+        // `root` may carry the address space's ASID in bits [63:48]; walk the base only.
+        map_block(root & ADDR_MASK, va, pa, desc, alloc, tables)
     }
 
     /// Build a 4 KiB **Device-nGnRnE** page descriptor for EL0 (MMIO registers).
     /// Follows [`user_page_desc`]'s shape but uses `MAIR_DEVICE` and omits `SH_INNER`
     /// (device memory has no shareability domain). Use with [`map_user_page`].
     pub fn user_device_page_desc(writable: bool) -> u64 {
-        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_DEVICE << 2);
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | DESC_NG | (MAIR_DEVICE << 2);
         if writable {
             base | AP_EL1RW_EL0RW | UXN | PXN
         } else {
@@ -2228,7 +2405,7 @@ pub mod mmu {
         // Match the kernel framebuffer alias exactly: Normal-NC, non-shareable.
         // Giving two aliases of the same PA different shareability attributes is
         // architecturally unsafe and can fault on metal even though QEMU accepts it.
-        let base = DESC_VALID | DESC_TABLE | DESC_AF | (MAIR_NC << 2);
+        let base = DESC_VALID | DESC_TABLE | DESC_AF | DESC_NG | (MAIR_NC << 2);
         if writable {
             base | AP_EL1RW_EL0RW | UXN | PXN
         } else {
@@ -2244,10 +2421,10 @@ pub mod mmu {
         value
     }
 
-    /// Switch `TTBR0_EL1` to `root` and flush the low-half TLB. TTBR1 (the kernel) is
-    /// untouched, so EL1 keeps executing across the swap. ASID 0 throughout; a full
-    /// `tlbi vmalle1` avoids stale aliasing between the kernel identity map and a process
-    /// tree.
+    /// Boot/self-test switch: `TTBR0_EL1 = root` followed by a full low-half flush. Use it
+    /// only where both roots are ASID 0 (the early EL0 smoke); the outgoing and incoming
+    /// entries would otherwise alias in the TLB. Per-process switches use
+    /// [`switch_ttbr0`], whose distinct ASIDs make the flush unnecessary. — TIMBERDOODLE
     ///
     /// # Safety
     /// `root` must be a valid L0 table for the intended address space.
@@ -2259,6 +2436,24 @@ pub mod mmu {
                 "isb",
                 "tlbi vmalle1",
                 "dsb ish",
+                "isb",
+                root = in(reg) root,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Switch `TTBR0_EL1` to `root` without a TLB flush. Every user root is ASID-tagged and
+    /// the kernel's TTBR1 entries are global, so the incoming root cannot alias the outgoing
+    /// one; an unmap invalidates its own ASID (`invalidate_user_aspace`).
+    ///
+    /// # Safety
+    /// `root` must be a valid L0 table for the intended address space.
+    pub unsafe fn switch_ttbr0(root: u64) {
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "msr ttbr0_el1, {root}",
                 "isb",
                 root = in(reg) root,
                 options(nostack, preserves_flags),
@@ -2280,8 +2475,8 @@ pub mod mmu {
 pub use mmu::enable_kernel as enable_kernel_mmu;
 #[cfg(target_os = "none")]
 pub use mmu::{
-    map_user_device_block, map_user_page, unmap_user_span, user_device_page_desc,
-    user_nc_page_desc, user_page_desc,
+    asid_width, invalidate_user_aspace, map_user_device_block, map_user_page, retire_user_aspace,
+    unmap_user_span, user_device_page_desc, user_nc_page_desc, user_page_desc,
 };
 #[cfg(target_os = "none")]
 pub use mmu::{read_ttbr0, set_ttbr0};
@@ -2349,10 +2544,11 @@ pub unsafe fn map_user_device_block(
 }
 
 /// Arch-neutral name the kernel uses to switch the user address-space root. This backend
-/// programs `TTBR0_EL1`. Inherently unsafe: `root` must be a valid table for the space.
+/// programs `TTBR0_EL1` without a flush: roots are ASID-tagged, so the incoming space cannot
+/// alias the outgoing one. Inherently unsafe: `root` must be a valid table for the space.
 #[cfg(target_os = "none")]
 pub unsafe fn set_user_aspace_root(root: u64) {
-    unsafe { mmu::set_ttbr0(root) }
+    unsafe { mmu::switch_ttbr0(root) }
 }
 
 /// Arch-neutral name the kernel uses to read the current user address-space root
@@ -2557,14 +2753,13 @@ pub mod el0 {
         "  msr  sp_el0, x10",
         "  ldr  x10, [x9, #272]", // ttbr0 (process page tables)
         // Publish every page-table write before the new root becomes visible to the walker.
-        // `set_ttbr0` already begins with this barrier; fresh scheduler entry must obey the same
-        // contract. Without it a real core may observe the L3 table before its leaf descriptor,
-        // even though QEMU reaches EL0. — KESTREL 2026-07-17
+        // `switch_ttbr0` already begins with this barrier; fresh scheduler entry must obey the
+        // same contract. Without it a real core may observe the L3 table before its leaf
+        // descriptor, even though QEMU reaches EL0. No flush: the root carries its space's
+        // ASID, so no stale translation can match it.
+        // — KESTREL 2026-07-17, TIMBERDOODLE 2026-11-06
         "  dsb  ish",
         "  msr  ttbr0_el1, x10",
-        "  isb",
-        "  tlbi vmalle1",
-        "  dsb  ish",
         "  isb",
         "  ldp  x0, x1, [x9, #0]", // EL0 register file (x9 last — it is the base)
         "  ldp  x2, x3, [x9, #16]",
@@ -3031,6 +3226,11 @@ pub mod el0 {
     /// Build the process address space, switch `TTBR0` to it, `eret` to EL0, and on return
     /// (a `ProcessExit` syscall) restore the kernel identity map. TTBR1 — the kernel —
     /// stays mapped throughout, so EL1 keeps executing across both swaps.
+    ///
+    /// This synchronous boot/self-test path deliberately stays on ASID 0 and uses the
+    /// flushing [`super::mmu::set_ttbr0`]: it runs before Sora exists and must not depend on
+    /// the per-address-space allocator. Scheduler entry (`kumo_user_enter`) is the tagged
+    /// path. — TIMBERDOODLE
     fn enter_user_image(
         image: UserImage<'_>,
         alloc: &mut dyn FnMut() -> Option<u64>,
@@ -3062,15 +3262,29 @@ pub mod el0 {
         enter_user_image(image, alloc)
     }
 
-    /// Build a per-process TTBR0 tree and return its L0 root physical address. The caller
-    /// owns the tree and is responsible for switching to it and tearing it down. This is
-    /// the page-table half of `run_el0_image`; P5-sched uses it directly so it can enter
-    /// the user process via the scheduler instead of the synchronous detour.
+    /// Build a per-process TTBR0 tree, allocate its ASID and return an **ASID-tagged**
+    /// TTBR0 value (root in bits [47:0], ASID in bits [63:48]). The caller owns both and
+    /// retires the space with `retire_user_aspace` (or `invalidate_user_aspace` while it
+    /// lives). This is the page-table half of `run_el0_image`; P5-sched uses it directly so
+    /// it can enter the user process via the scheduler instead of the synchronous detour.
     pub fn build_user_tables(
         image: &UserImage<'_>,
         alloc: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<u64, UserImageError> {
-        build_user_space(image, alloc)
+        let asid = super::mmu::allocate_user_asid().ok_or(UserImageError::OutOfFrames)?;
+        let root = match build_user_space(image, alloc) {
+            Ok(root) => root,
+            Err(error) => {
+                // No tree was published, so return the ASID before reporting the failure.
+                super::mmu::discard_user_asid(asid);
+                return Err(error);
+            }
+        };
+        match super::mmu::encode_user_root(root, asid) {
+            Some(tagged) => Ok(tagged),
+            // The encoder flushed and released the ASID: no root can be published.
+            None => Err(UserImageError::OutOfFrames),
+        }
     }
 
     /// Run the embedded smoke payload (DebugWrite + ChannelCreate + ProcessExit) as a real
@@ -3249,6 +3463,22 @@ pub unsafe fn set_user_aspace_root(_root: u64) {}
 pub fn read_user_aspace_root() -> u64 {
     0
 }
+
+/// Host stub: there is no hardware ASID field off target.
+#[cfg(not(target_os = "none"))]
+pub fn asid_width() -> u8 {
+    0
+}
+
+/// Host stub: an untagged host root owns no ASID, so retiring it succeeds as a no-op.
+#[cfg(not(target_os = "none"))]
+pub fn retire_user_aspace(_root: u64) -> bool {
+    true
+}
+
+/// Host stub: there is no TLB to invalidate off target.
+#[cfg(not(target_os = "none"))]
+pub fn invalidate_user_aspace(_root: u64) {}
 
 /// Host stub: the freestanding kernel installs real page tables; on the host there is
 /// nothing to do.

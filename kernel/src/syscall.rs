@@ -1,8 +1,8 @@
-//j732
 //j743
 //j777
 //j790
 //j798
+//j823
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -3093,8 +3093,10 @@ impl SyscallEngine {
 
     /// Clear an exact live user mapping after its record has been validated. The caller has
     /// switched to the kernel identity map; the HAL preflights every page before clearing any,
-    /// so a hole or block leaves the tree untouched. The root switch back flushes the TLB; the
-    /// HAL also flushes after the clear. — TIMBERDOODLE
+    /// so a hole or block leaves the tree untouched. `ttbr0` may carry the address space's ASID
+    /// in bits [63:48]: the HAL masks it for the walk and invalidates that ASID after clearing
+    /// (an untagged root falls back to `tlbi vmalle1`). A root switch no longer flushes now
+    /// that ASIDs separate the spaces. — TIMBERDOODLE
     fn clear_from_live_tree(&self, ttbr0: u64, mapping: Mapping) -> Result<(), Errno> {
         // SAFETY: caller switched TTBR0 to the kernel identity map; `ttbr0` is the user tree
         // root and the range was validated against the process's own mapping record.
@@ -3868,6 +3870,14 @@ impl SyscallEngine {
                     Ok(e) => e.koid,
                     Err(e) => return KernelCallResult::Status(errno_from_object(e).status()),
                 };
+                // AX1: a process owns exactly one address space. Rebuilding it would abandon
+                // the old tree's ASID with no owner left to retire it. — TIMBERDOODLE
+                if self
+                    .process_by_koid(proc_koid)
+                    .is_some_and(|target| target.ttbr0.is_some())
+                {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                }
                 // Extract mappings and boot_info before mutably borrowing self.
                 let boot = self.boot_info;
                 let Some(ref boot_ref) = boot else {
@@ -4029,13 +4039,19 @@ impl SyscallEngine {
                 #[cfg(not(target_os = "none"))]
                 let result = kumo_hal::active::build_user_tables(&image, &mut alloc);
                 match result {
-                    Ok(ttbr0) => {
-                        if let Some(target) = self.process_by_koid_mut(proc_koid) {
+                    Ok(ttbr0) => match self.process_by_koid_mut(proc_koid) {
+                        Some(target) => {
                             target.ttbr0 = Some(ttbr0);
                             target.set_user_stack(stack_base, stack_size);
+                            KernelCallResult::Handle(Handle(ttbr0 as u32))
                         }
-                        KernelCallResult::Handle(Handle(ttbr0 as u32))
-                    }
+                        // AX1: the built address space has no process to own it; return its
+                        // ASID rather than leaking it. — TIMBERDOODLE
+                        None => {
+                            kumo_hal::active::retire_user_aspace(ttbr0);
+                            KernelCallResult::Status(Errno::BadHandle.status())
+                        }
+                    },
                     Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
                 }
             }
@@ -4644,7 +4660,11 @@ impl SyscallEngine {
                     let Some(boot) = self.boot_info.as_ref() else {
                         return KernelCallResult::Status(Errno::BadState.status());
                     };
-                    let Some(root) = (unsafe { crate::mm::alloc_zeroed_frame(boot) }) else {
+                    // AX1: this runs on the caller's user thread, so the identity-mapped
+                    // zeroing inside the allocator must happen under the kernel root. The
+                    // helper saves, switches and restores like every other frame path.
+                    // — TIMBERDOODLE
+                    let Ok(root) = alloc_anonymous_frame(boot) else {
                         return KernelCallResult::Status(Errno::NoMemory.status());
                     };
                     pgd_phys = root;

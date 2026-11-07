@@ -1,11 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//j793
 //j794
 //j797
 //j799
 //j822
+//j823
 
 extern crate alloc;
 
@@ -532,7 +532,15 @@ pub fn stage_a(boot: &BootInfo) -> ! {
                 "ROOTING TABLES     Check     {} MiB mapped  {} tables   OK\n",
                 p.mapped_bytes >> 20,
                 p.tables
-            )
+            );
+            // AX1: the ASID width the core reported, now programmed into TCR_EL1.AS. Zero
+            // would mean the width was never read; 8 or 16 is the evidence a run cites.
+            // — TIMBERDOODLE
+            klog_at!(
+                kmsg::NOTICE,
+                "mmu: asid width={}\n",
+                kumo_hal::active::asid_width()
+            );
         }
         None => {
             // Every permanent device path below (including GICv2 IAR/EOIR) uses TTBR1's
