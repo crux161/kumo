@@ -1,5 +1,6 @@
 # Exact EP0 data transfers
 <!-- j827 -->
+<!-- j828 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -38,8 +39,9 @@ aborts its pipe if retention is full. The live poll has a 200 ms deadline and a 
 iteration ceiling with cooperative yields. A deadline is a refusal to wait longer,
 never a DMA-release proof. There is no unquarantine API in this slice.
 
-The existing slot-only stash and legacy pollers still need NET4b's endpoint/token/
-generation routing. Pending resident NIC lanes, full mailbox behavior, endpoint
+NET4b replaces the slot-only stash and legacy pollers with endpoint/token/generation
+receipts and bounded serial actors; see [completion ownership](xhci-completions.md).
+Pending resident NIC lanes, endpoint
 stop/disable/reset recovery and a flat repeated resource census belong to NET4c.
 This EP0 proof does not accept concurrent RX/TX/status or controller-owner restart.
 
@@ -85,5 +87,5 @@ persistence files read correctly and the volume unmounted. Physical keyboard and
 USB-stick witnesses are recorded separately in the journal; enumeration alone
 is not a physical keyboard test. Ordinary images omit the volatile proof.
 
-Next is NET4b endpoint-aware completion ownership, followed by NET4c's resident
-nonblocking lanes and buffer-custody/recovery proof. — TIMBERDOODLE 2026-11-07
+NET4c is next: resident nonblocking lanes and buffer-custody/recovery proof.
+— TIMBERDOODLE 2026-11-07

@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j817 -->
 <!-- j820 -->
 <!-- j821 -->
 <!-- j826 -->
 <!-- j827 -->
+<!-- j828 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET4b completion ownership is next.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET4c is next, starting with parent DMA custody and verified quiescence.
 
 ## First controller
 
@@ -98,8 +98,9 @@ it does not claim any of these gates passed.
 | **NET14** | Pinned build-std programs use UdpSocket and TcpListener/TcpStream over loopback; server failure wakes clients |
 | **NET15** | Same std programs over AX Ethernet; safe reconnect/restart, HID/USB/NVMe coexistence and a second-host portability review |
 
-NET4b is the next slice: endpoint-aware completion ownership, before resident lanes
-or chip initialization. [Exact EP0 data transfers](xhci-ep0.md) records NET4a's
+NET4c is the next slice: parent DMA custody, verified quiescence and nonblocking
+resident NIC lanes before chip initialization. [Completion ownership](xhci-completions.md)
+records NET4b's endpoint actors and receipts. [Exact EP0 data transfers](xhci-ep0.md) records NET4a's
 transport and reversible metal proof. NET3 supplies the pure codec described in
 [ax88 protocol](ax88-protocol.md). Loopback work can advance
 independently of the adapter.

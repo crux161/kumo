@@ -1,8 +1,8 @@
-#j521
 #j525
 #j537
 #j545
 #j826
+#j828
 
 [package]
 name = "drv-xhci"
@@ -19,6 +19,7 @@ bench = false
 doctest = false
 
 [dependencies]
+kumo-dispatch = { path = "../../kumo-dispatch" }
 kumo-ax88 = { path = "../../../lib/kumo-ax88" }
 kumo-abi.workspace = true
 drv-blk = { path = "../drv-blk" }

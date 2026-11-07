@@ -1,9 +1,9 @@
 #![no_std]
-//j540
 //j541
 //j545
 //j703
 //j827
+//j828
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -59,7 +59,10 @@ pub use registers::{
 pub use ring::{
     CommandRing, EventRing, EventRingSegmentTableEntry, RingSegment, RingToken, TransferRing,
 };
-pub use stash::{StashedTransfer, TransferEventStash, STASH_CAPACITY};
+pub use stash::{
+    CompletionKey, CompletionRouter, CompletionStats, RouteError, RoutedTransfer, TransferTicket,
+    COMPLETION_LANES, COMPLETION_TRBS,
+};
 pub use trb::{Event, NormalTransfer, SetupTransferType, Trb, TrbType};
 
 /// Validation or ring-state failure detected before hardware is touched.

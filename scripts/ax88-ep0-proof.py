@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j827
+#j828
 """Validate NET4a's Orange Pi EP0 trace; fixtures are not physical evidence."""
 import argparse
 import hashlib
@@ -18,7 +19,7 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def parse(text):
+def parse(text, routing=False):
     text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text).replace("\r", "")
     require(not re.search(r"NET4a EP0 (FAIL|REFUSED)", text), "failed/refused EP0 proof")
     starts = re.findall(r"NET4a EP0 start slot=(\d+) original=(0x[0-9a-f]+) test=(0x[0-9a-f]+) cycles=(\d+)", text)
@@ -47,6 +48,11 @@ def parse(text):
     require(tuple(map(int, summaries[0])) == (16, 65, 33, 32, 195, 0, 1), "wrong completion/reclaim totals")
     positions = [m.start() for m in re.finditer("NET4a EP0 cycle=", text)]
     require(text.index("NET4a EP0 start") < positions[0] <= positions[-1] < text.index("NET4a EP0 PASS"), "wrong proof ordering")
+    if routing:
+        records = re.findall(r"NET4b EP0 routing registered=(\d+) routed=(\d+) consumed=(\d+) retired=(\d+) faults=(\d+) (PASS|FAIL)", text)
+        require(len(records) == 1, "missing/duplicate NET4b routing result")
+        require(tuple(map(int, records[0][:5])) == (65, 130, 130, 65, 0) and records[0][5] == "PASS", "wrong NET4b ownership totals")
+        require(positions[-1] < text.index("NET4b EP0 routing") < text.index("NET4a EP0 PASS"), "wrong routing/proof ordering")
     return {"passed": True, "controller": headers[0][0], "root": int(headers[0][1]),
             "route": headers[0][2], "slot": slot, "speed": int(headers[0][4]),
             "cycles": 16, "requests": 65, "in": 33, "out": 32, "reclaimed": 195,
@@ -93,23 +99,36 @@ class Tests(unittest.TestCase):
         for failure in ["NET4a EP0 FAIL error=Timeout", "NET4a EP0 REFUSED profile=Revision"]:
             with self.assertRaises(ValueError): parse(self.trace() + failure)
 
+    def test_routing_requires_real_counter_deltas_once_and_in_order(self):
+        line = "NET4b EP0 routing registered=65 routed=130 consumed=130 retired=65 faults=0 PASS\n"
+        text = self.trace().replace("NET4a EP0 PASS", line + "NET4a EP0 PASS")
+        self.assertTrue(parse(text, routing=True)["passed"])
+        for bad in [self.trace(), text + line, line + self.trace(), text.replace("registered=65", "registered=64"),
+                    text.replace("routed=130", "routed=129"), text.replace("consumed=130", "consumed=129"),
+                    text.replace("retired=65", "retired=64"), text.replace("faults=0", "faults=1"),
+                    text.replace("faults=0 PASS", "faults=0 FAIL")]:
+            with self.assertRaises(ValueError): parse(bad, routing=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path, nargs="?", help="serial capture or board dmesg output")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--routing", action="store_true", help="also require NET4b router counter proof")
     args = parser.parse_args()
     if args.self_test:
         return 0 if unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful() else 1
     if not args.capture:
         parser.error("capture or --self-test is required")
     try:
-        result = parse(args.capture.read_text(errors="replace"))
+        result = parse(args.capture.read_text(errors="replace"), routing=args.routing)
     except ValueError as error:
         print(f"NET4a EP0 proof FAIL: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
     print("NET4a EP0 proof green: 16 reversible cycles, 65 exact requests, ring empty; original register restored")
+    if args.routing:
+        print("NET4b routing proof green: 65 registrations, 130 routed/consumed, 65 retired, zero proof faults")
     return 0
 
 

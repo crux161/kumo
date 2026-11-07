@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j704
 //j767
 //j809
 //j811
 //j827
+//j828
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -37,9 +37,9 @@ use kumo_xhci::{
     ContextSize, ControllerStatus, DmaBuf, DmaQwords, DmaTrbs, EndpointContext, Event,
     HubConnectDebounce, HubConnectVerdict, HubDescriptor, HubPorts, InputControlContext,
     NoOpCommandCompletion, NoOpCommandImage, NoOpCommandIovas, NormalTransfer, PortStatus,
-    QwordSink, RegisterIo, RegisterLayout, RootPortScan, SetupTransferType, SlotContext,
-    StashedTransfer, TransferEventStash, TransferRing, Trb, UsbSpeed, XhciProbeConfig,
-    XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
+    QwordSink, RegisterIo, RegisterLayout, RootPortScan, RouteError, RoutedTransfer,
+    SetupTransferType, SlotContext, TransferRing, TransferTicket, Trb, TrbSink, UsbSpeed,
+    XhciProbeConfig, XHCI_NO_STREAM_ID, XHCI_PROBE_CONFIG_LEN,
 };
 
 /// Diagnostics go to the kernel log (`dmesg`) since J559, shown on the console only when its level
@@ -226,7 +226,7 @@ const SETTLE_SPIN_ROUNDS: u32 = 4096;
 static RESOURCE_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// NET0 keeps every observed ax88 slot and its DMA until reset, including failures.
 /// Existing controller halt writes alone are not a reclamation proof. — TIMBERDOODLE
-static AX88_SEEN: AtomicBool = AtomicBool::new(false);
+static DMA_RETAINED: AtomicBool = AtomicBool::new(false);
 static CONTROLLER_BASE: AtomicU64 = AtomicU64::new(0);
 /// Downstream device pages handed out so far (J541).
 static DOWNSTREAM_PAGES_USED: AtomicU32 = AtomicU32::new(0);
@@ -244,7 +244,6 @@ const STORAGE_BOOTSTRAP_TAG: u8 = b'b';
 const MAX_BLOCK_CLIENTS: usize = 4;
 /// Keep other slots' transfer events for their own poll (J545). Only the resident loop serving
 /// a stick turns this on; during enumeration another slot's event is stale and is dropped.
-static STASH_ENABLED: AtomicBool = AtomicBool::new(false);
 static DEVICE_IRQ: AtomicU32 = AtomicU32::new(0);
 /// The keyboard-channel writer Sora handed us (U5); 0 = none (this controller delivers to the
 /// serial log instead). Decoded key bytes are written here → Sora → the shell.
@@ -460,9 +459,9 @@ extern "C" fn main(
         quiesce_controller(layout);
     }
 
-    if AX88_SEEN.load(Ordering::Relaxed) {
+    if DMA_RETAINED.load(Ordering::Relaxed) {
         ax88_record(format_args!(
-            "NET0 ax88 owner/DMA retained after halt request; no buffer-release claim\n"
+            "USB owner/DMA retained after halt request; no buffer-release claim\n"
         ));
         let raw = port_create();
         if raw != 0 && raw != u64::MAX {
@@ -555,18 +554,21 @@ fn storage_snapshot(window: DmaBuf, len: usize) -> &'static [u8] {
     &snapshot[..len]
 }
 
-/// Transfer events kept for their own slot while another slot is polled (J545).
-struct EventStashCell(core::cell::UnsafeCell<TransferEventStash>);
+/// Each endpoint owns an in-process serial actor and fixed completion mailbox.
+struct CompletionActorsCell(core::cell::UnsafeCell<drv_xhci::completion::CompletionActors>);
+// SAFETY: one driver thread owns the controller; references never cross another access.
+unsafe impl Sync for CompletionActorsCell {}
+static COMPLETIONS: CompletionActorsCell = CompletionActorsCell(core::cell::UnsafeCell::new(
+    drv_xhci::completion::CompletionActors::new(),
+));
+fn completion_actors() -> &'static mut drv_xhci::completion::CompletionActors {
+    // SAFETY: one controller owner, no reentrant user callbacks. — TIMBERDOODLE
+    unsafe { &mut *COMPLETIONS.0.get() }
+}
 
-// SAFETY: drv-xhci is single-threaded, and `event_stash` is the only way in.
-unsafe impl Sync for EventStashCell {}
-
-static EVENT_STASH: EventStashCell =
-    EventStashCell(core::cell::UnsafeCell::new(TransferEventStash::new()));
-
-fn event_stash() -> &'static mut TransferEventStash {
-    // SAFETY: single-threaded, and no caller keeps the reference across another call.
-    unsafe { &mut *EVENT_STASH.0.get() }
+fn quarantine_transfer(ticket: TransferTicket, error: RouteError) {
+    DMA_RETAINED.store(true, Ordering::Relaxed);
+    completion_actors().fail(ticket, error);
 }
 
 /// The stick this driver serves, once its volume has been judged and mounted (J545).
@@ -973,6 +975,7 @@ fn ax88_ep0_proof(
     let Ok(mut pipe) = ControlPipe::new(slot) else {
         return;
     };
+    let before = completion_actors().stats();
     let mut cycles = 0;
     let result = (|| -> Result<(), ControlError> {
         let read = Request::mac_read(MacRegister::RxChecksum);
@@ -1050,6 +1053,29 @@ fn ax88_ep0_proof(
         }
         Ok(())
     })();
+    let after = completion_actors().stats();
+    if result.is_ok() {
+        let counts = (
+            after.registered - before.registered,
+            after.routed - before.routed,
+            after.consumed - before.consumed,
+            after.retired - before.retired,
+            after.faults - before.faults,
+        );
+        ax88_record(format_args!(
+            "NET4b EP0 routing registered={} routed={} consumed={} retired={} faults={} {}\n",
+            counts.0,
+            counts.1,
+            counts.2,
+            counts.3,
+            counts.4,
+            if counts == (65, 130, 130, 65, 0) {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        ));
+    }
     match result {
         Ok(()) => ax88_record(format_args!("NET4a EP0 PASS cycles={} requests=65 in=33 out=32 reclaimed=195 queued={} restored=1\n",cycles,ring.queued())),
         Err(error) => ax88_record(format_args!("NET4a EP0 FAIL cycles={} error={:?} quarantined={} queued={}; retain DMA, no retry\n",cycles,error,pipe.is_quarantined(),ring.queued())),
@@ -1231,7 +1257,6 @@ fn enumerate_root_device(
     // --- GET_DESCRIPTOR(Device) over EP0, two-phase for bMaxPacketSize0 ---
     // Phase 1 requests only the first 8 bytes at this speed's initial EP0 size; byte 7 carries the
     // speed-dependent bMaxPacketSize0 encoding.
-    data_buf.zero();
     dsb();
     let dev8_setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
     match control_in(
@@ -1243,7 +1268,7 @@ fn enumerate_root_device(
         &mut *ep0_seg,
         slot_id,
         dev8_setup,
-        data_phys,
+        data_buf,
         8,
     ) {
         Some((1, _)) => {}
@@ -1319,7 +1344,6 @@ fn enumerate_root_device(
     }
 
     // Phase 3: the full 18-byte device descriptor at the corrected EP0 max packet size.
-    data_buf.zero();
     dsb();
     let dev_setup = [
         0x80,
@@ -1340,7 +1364,7 @@ fn enumerate_root_device(
         &mut *ep0_seg,
         slot_id,
         dev_setup,
-        data_phys,
+        data_buf,
         DEVICE_DESCRIPTOR_LEN as u16,
     );
     match device_result {
@@ -1377,7 +1401,6 @@ fn enumerate_root_device(
     data_buf.read_into(0, &mut device);
     let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
     let device_exact = if ax88_candidate {
-        data_buf.zero();
         dsb();
         if control_in_exact(
             io,
@@ -1406,7 +1429,6 @@ fn enumerate_root_device(
 
     // --- Slice D: read the configuration descriptor and find the boot-HID interface ---
     // First read the 9-byte header to learn wTotalLength.
-    data_buf.zero();
     dsb();
     let cfg_header_setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
     if control_in(
@@ -1418,7 +1440,7 @@ fn enumerate_root_device(
         &mut *ep0_seg,
         slot_id,
         cfg_header_setup,
-        data_phys,
+        data_buf,
         9,
     )
     .is_none()
@@ -1437,7 +1459,6 @@ fn enumerate_root_device(
 
     // Then read the full configuration (interfaces + endpoints), capped to the buffer.
     let read_len = total_length.min(DATA_BUF_LEN as u16);
-    data_buf.zero();
     dsb();
     let cfg_setup = [
         0x80,
@@ -1472,7 +1493,7 @@ fn enumerate_root_device(
             ep0_seg,
             slot_id,
             cfg_setup,
-            data_phys,
+            data_buf,
             read_len,
         )
     };
@@ -2031,6 +2052,15 @@ impl BotDisk<'_> {
         let Ok(command) = ScsiCommand::write_10(lba as u32, 1, SECTOR_SIZE as u32) else {
             return false;
         };
+        if completion_actors()
+            .ready(self.slot_id, self.out_dci)
+            .is_err()
+            || completion_actors()
+                .ready(self.slot_id, self.in_dci)
+                .is_err()
+        {
+            return false;
+        }
         self.read_window.write_from(0, data);
         self.write_or_flush(&command, BOT_TAG_WRITE_VOLUME, b"write10-volume") == Some(SECTOR_SIZE)
     }
@@ -2450,7 +2480,6 @@ fn offer_storage(port: Handle) -> Option<u64> {
         return None;
     }
     // From here on a block read can pop the keyboard's completion: keep it for the keyboard.
-    STASH_ENABLED.store(true, Ordering::Relaxed);
     let ready = service.ready.encode();
     if channel_write(control, ready.as_ptr(), ready.len()) != 0 {
         log(b"drv-xhci: storage offer fail\n");
@@ -2693,6 +2722,8 @@ fn bot_command(
     if command.transfer_length() as usize > data_buf.len() {
         return None;
     }
+    completion_actors().ready(slot_id, out_dci).ok()?;
+    completion_actors().ready(slot_id, in_dci).ok()?;
     let cbw = CommandBlockWrapper::for_scsi(tag, 0, command).ok()?;
     cbw_buf.write_from(0, cbw.as_bytes());
     dsb();
@@ -2724,6 +2755,7 @@ fn bot_command(
                 log(b"drv-xhci: storage data buffer too short\n");
                 return None;
             }
+            completion_actors().ready(slot_id, in_dci).ok()?;
             data_buf.window(0, expected as usize)?.zero();
             dsb();
             bulk_transfer(
@@ -2762,6 +2794,7 @@ fn bot_command(
         }
     };
 
+    completion_actors().ready(slot_id, in_dci).ok()?;
     csw_buf.zero();
     dsb();
     let csw_len = bulk_transfer(
@@ -2836,36 +2869,33 @@ fn bulk_transfer(
         NormalTransfer::bulk_out(buffer_phys, length)
     };
     let trb = Trb::normal_transfer(config).ok()?;
-    if ring.enqueue(segment, trb).is_err() {
-        log_storage_phase(command_name, b"ring-full");
-        return None;
-    }
+    let ticket = queue_transfer(ring, segment, slot_id, dci, &[trb])?;
     dsb();
     let trace = STORAGE_TRACE.load(Ordering::Relaxed);
     if trace {
         log_storage_phase_pair(command_name, phase, b"begin");
     }
     ring_slot_doorbell(io, layout, slot_id, dci);
-    let Some((cc, remaining, trb_iova)) = poll_transfer_event(io, layout, image, evt, slot_id)
-    else {
+    let Some(event) = poll_transfer_event(io, layout, image, evt, ticket) else {
+        quarantine_transfer(ticket, RouteError::Incomplete);
         log_storage_phase_pair(command_name, phase, b"timeout");
         return None;
     };
-    let _ = ring.reclaim_through(trb_iova);
-    dsb();
+    let cc = event.completion_code;
+    let remaining = event.remaining;
     if trace || cc != 1 {
         log_storage_cc_pair(command_name, phase, cc, remaining);
     }
-    if remaining > length {
+    if remaining > length
+        || (direction_in && !matches!(cc, 1 | 13))
+        || (!direction_in && (cc != 1 || remaining != 0))
+    {
+        quarantine_transfer(ticket, RouteError::Unknown);
         return None;
     }
-    if direction_in {
-        if cc != 1 && cc != 13 {
-            return None;
-        }
-    } else if cc != 1 || remaining != 0 {
-        return None;
-    }
+    completion_actors().finish(ticket).ok()?;
+    ring.reclaim_through(event.key.trb_iova).ok()?;
+    dsb();
     Some(length - remaining)
 }
 
@@ -3024,6 +3054,8 @@ struct HidLane {
     slot_id: u8,
     pending: bool,
     token: u64,
+    ticket: Option<TransferTicket>,
+    failed: bool,
     armed_logged: bool,
     decoder: kumo_hid::Decoder,
     mouse_decoder: kumo_hid::MouseDecoder,
@@ -3063,6 +3095,8 @@ impl HidLane {
             slot_id,
             pending: false,
             token: 0,
+            ticket: None,
+            failed: false,
             armed_logged: false,
             decoder: kumo_hid::Decoder::new(),
             mouse_decoder: kumo_hid::MouseDecoder::new(),
@@ -3073,35 +3107,49 @@ impl HidLane {
     /// event is reclaimed is the J425/J632 rule: a wake without a match used to leak a ring slot
     /// until enqueue failed and the driver exited.
     fn arm(&mut self, io: &mut Mmio, layout: RegisterLayout) {
-        self.report.zero();
-        dsb();
+        if self.failed || self.pending {
+            return;
+        }
+        if completion_actors().ready(self.slot_id, self.dci).is_err()
+            || self.hid.max_packet_size as usize > self.report.len()
+        {
+            self.failed = true;
+            return;
+        }
         let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(
             self.report_phys,
             self.hid.max_packet_size as u32,
         )) else {
-            return log(b"drv-xhci: normal trb fail\n");
+            self.failed = true;
+            return;
         };
         let mut seg = unsafe { DmaTrbs::new(self.ring_va as *mut Trb, INT_RING_TRBS) };
-        match self.ring.enqueue(&mut seg, normal) {
-            Err(_) => {
-                // Never exit on a full ring: exiting quiesces the controller and the device
-                // never comes back. Retry on the next interrupt.
-                log(b"drv-xhci: int ring full; draining\n");
-            }
-            Ok(token) => {
-                self.pending = true;
-                self.token = token.iova;
-                dsb();
-                ring_slot_doorbell(io, layout, self.slot_id, self.dci);
-                if !self.armed_logged {
-                    log(b"drv-xhci: hid transfer armed dci=");
-                    log_hex(self.dci as u64);
-                    log(b" trb=");
-                    log_hex(token.iova);
-                    log(b"\n");
-                    self.armed_logged = true;
-                }
-            }
+        let Some(ticket) = reserve_transfer(&self.ring, &seg, self.slot_id, self.dci, &[normal])
+        else {
+            self.failed = true;
+            return;
+        };
+        let Ok([token]) = self.ring.preview::<1>() else {
+            self.failed = true;
+            return;
+        };
+        self.report.zero();
+        if enqueue_reserved(&mut self.ring, &mut seg, ticket, &[normal]).is_none() {
+            self.failed = true;
+            return;
+        }
+        self.pending = true;
+        self.token = token;
+        self.ticket = Some(ticket);
+        dsb();
+        ring_slot_doorbell(io, layout, self.slot_id, self.dci);
+        if !self.armed_logged {
+            log(b"drv-xhci: hid transfer armed dci=");
+            log_hex(self.dci as u64);
+            log(b" trb=");
+            log_hex(token);
+            log(b"\n");
+            self.armed_logged = true;
         }
     }
 }
@@ -3352,6 +3400,45 @@ fn bring_up_hid_device(
     }
 }
 
+fn hid_ready(lanes: &[Option<HidLane>; MAX_HID_LANES]) -> bool {
+    lanes
+        .iter()
+        .flatten()
+        .filter(|l| !l.failed)
+        .filter_map(|l| l.ticket)
+        .any(|ticket| completion_actors().has_ready(ticket).unwrap_or(false))
+}
+fn poll_hid_completion(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+    lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+) -> Option<(usize, RoutedTransfer)> {
+    for _ in 0..IRQ_EVENT_DRAIN_LIMIT {
+        for (i, lane) in lanes
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, l)| l.as_mut().map(|l| (i, l)))
+        {
+            if lane.failed {
+                continue;
+            }
+            let Some(ticket) = lane.ticket else {
+                continue;
+            };
+            match completion_actors().take(ticket) {
+                Ok(Some(event)) => return Some((i, event)),
+                Err(_) => lane.failed = true,
+                Ok(None) => {}
+            }
+        }
+        dsb();
+        let _ = pump_event(io, layout, image, evt);
+    }
+    None
+}
+
 /// Serve every lane in `lanes` from one resident loop. The controller grants one interrupt for
 /// all its slots, so a keyboard and a composite receiver behind the same hub share a wake; each
 /// completion is matched to its lane by TRB address. Bounded only when the controller has no IRQ.
@@ -3362,15 +3449,6 @@ fn run_hid_lanes(
     evt: &DmaTrbs,
     lanes: &mut [Option<HidLane>; MAX_HID_LANES],
 ) {
-    let mut slots = [0u8; MAX_HID_LANES];
-    let mut slot_count = 0usize;
-    for lane in lanes.iter().flatten() {
-        if !slots[..slot_count].contains(&lane.slot_id) {
-            slots[slot_count] = lane.slot_id;
-            slot_count += 1;
-        }
-    }
-
     // U4: IRQ-driven persistent path. A busy-poll at our priority (63) would starve Sora (64), so
     // if this controller was granted its IRQ, enable the controller interrupter and block on the
     // xHCI interrupt between reports — the driver stays resident and services the HID devices
@@ -3444,31 +3522,30 @@ fn run_hid_lanes(
                         lane.arm(io, layout);
                     }
                 }
-                // Block until the controller raises its interrupt (a report completed).
-                match irq_port {
-                    Some(port) => {
-                        // J545: the port also wakes for the stick's control channel and its block
-                        // clients. Serve those in place and keep waiting for the controller.
-                        loop {
+                if !hid_ready(lanes) {
+                    match irq_port {
+                        Some(port) => loop {
                             let source = port_wait(port);
-                            if source == interrupt_koid
-                                || !serve_storage_wake(
-                                    io,
-                                    layout,
-                                    &mut *image,
-                                    evt,
-                                    port,
-                                    source,
-                                    storage_control_koid,
-                                )
-                            {
+                            if source == interrupt_koid {
+                                interrupt_wait(interrupt);
                                 break;
                             }
+                            let served = serve_storage_wake(
+                                io,
+                                layout,
+                                image,
+                                evt,
+                                port,
+                                source,
+                                storage_control_koid,
+                            );
+                            if !served || hid_ready(lanes) {
+                                break;
+                            }
+                        },
+                        None => {
+                            interrupt_wait(interrupt);
                         }
-                        interrupt_wait(interrupt);
-                    }
-                    None => {
-                        interrupt_wait(interrupt);
                     }
                 }
                 clear_interrupt_pending(io, layout);
@@ -3477,31 +3554,54 @@ fn run_hid_lanes(
                 // controller will not raise another interrupt while EHB is set.
                 write_erdp(io, layout, image.event_ring.dequeue_iova());
                 for _ in 0..HID_EVENTS_PER_WAKE {
-                    let Some((_cc, _, trb_iova)) = poll_transfer_event_slots(
-                        io,
-                        layout,
-                        &mut *image,
-                        evt,
-                        &slots[..slot_count],
-                        IRQ_EVENT_DRAIN_LIMIT,
-                    ) else {
+                    let Some((index, event)) = poll_hid_completion(io, layout, image, evt, lanes)
+                    else {
                         break;
                     };
-                    for lane in lanes.iter_mut().flatten() {
-                        if !lane.pending || lane.token != trb_iova {
+                    for (i, lane) in lanes
+                        .iter_mut()
+                        .enumerate()
+                        .filter_map(|(i, l)| l.as_mut().map(|l| (i, l)))
+                    {
+                        if i != index {
                             continue;
                         }
-                        let _ = lane.ring.reclaim_through(trb_iova);
+                        let Some(ticket) = lane.ticket else {
+                            continue;
+                        };
+                        if !matches!(event.completion_code, 1 | 13)
+                            || event.remaining > lane.hid.max_packet_size as u32
+                            || event.key.trb_iova != lane.token
+                        {
+                            quarantine_transfer(ticket, RouteError::Unknown);
+                            lane.failed = true;
+                            continue;
+                        }
+                        if completion_actors().finish(ticket).is_err() {
+                            lane.failed = true;
+                            continue;
+                        }
+                        if lane.ring.reclaim_through(event.key.trb_iova).is_err() {
+                            completion_actors().reject(event.event(), RouteError::Unknown);
+                            lane.failed = true;
+                            continue;
+                        }
                         lane.pending = false;
+                        lane.ticket = None;
+                        let actual = lane.hid.max_packet_size as usize - event.remaining as usize;
+                        if (!lane.hid.is_mouse() && actual != kumo_hid::REPORT_BYTES)
+                            || (lane.hid.is_mouse() && actual < 3)
+                        {
+                            continue;
+                        }
                         dsb();
                         let report: [u8; kumo_hid::REPORT_BYTES] = lane.report.read(0);
                         if lane.hid.is_mouse() {
                             // Boot mouse: forward the 3-byte `[buttons, dx, dy]` wire form Sora's
                             // pointer pipeline already consumes. Idle reports repeat at the
                             // polling interval, so drop them rather than waking Sora for nothing.
-                            if let Some((motion, _edges)) = lane
-                                .mouse_decoder
-                                .decode(&report[..lane.hid.max_packet_size.min(8) as usize], None)
+                            if let Some((motion, _edges)) =
+                                lane.mouse_decoder.decode(&report[..actual.min(8)], None)
                             {
                                 let mouse = MOUSE_CHANNEL.load(Ordering::Relaxed);
                                 if mouse != 0 && !motion.is_idle() {
@@ -3578,8 +3678,8 @@ fn control_no_data(
     let setup = Trb::setup_stage(setup_packet, SetupTransferType::NoData, 0).ok()?;
     // A no-data control transfer's Status stage is IN, with IOC.
     let status = Trb::status_stage(0, true, true).ok()?;
-    ep0_ring.enqueue(&mut *ep0_seg, setup).ok()?;
-    let status_token = ep0_ring.enqueue(&mut *ep0_seg, status).ok()?;
+    let status_iova = ep0_ring.preview::<2>().ok()?[1];
+    let ticket = queue_transfer(ep0_ring, ep0_seg, slot_id, 1, &[setup, status])?;
     dsb();
     ring_slot_doorbell(
         io,
@@ -3587,46 +3687,31 @@ fn control_no_data(
         slot_id,
         endpoint_context_index(0, false).unwrap_or(1),
     );
-    let (cc, remaining, trb_iova) =
-        wait_ep0_status(io, layout, image, evt, slot_id, status_token.iova)?;
+    let (cc, remaining, trb_iova) = wait_ep0_status(io, layout, image, evt, ticket, status_iova)?;
     let _ = ep0_ring.reclaim_through(trb_iova);
     Some((cc, remaining))
 }
 
-/// Transfer events a control transfer may skip before giving up on its own Status stage.
-const EP0_STALE_EVENT_LIMIT: u32 = 8;
-
-/// Wait for the Transfer Event that completes *this* control transfer: the one naming its Status
-/// TRB. Matching on the slot alone let an event left over from an earlier transfer complete the
-/// next one before its data arrived. J538's first boot read a hub descriptor of 16 zero bytes on
-/// both hubs that way. Any other event for the slot is logged and skipped. — TIMBERDOODLE
+/// Consume only the status event owned by this receipt; any owned early error
+/// quarantines EP0 without reusing its ring or buffer. — TIMBERDOODLE
 fn wait_ep0_status(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
-    slot_id: u8,
+    ticket: TransferTicket,
     status_iova: u64,
 ) -> Option<(u8, u32, u64)> {
-    for _ in 0..EP0_STALE_EVENT_LIMIT {
-        let (cc, remaining, trb_iova) = poll_transfer_event(io, layout, image, evt, slot_id)?;
-        if trb_iova == status_iova {
-            return Some((cc, remaining, trb_iova));
-        }
-        log(b"drv-xhci: ep0 skipped event slot=");
-        log_hex(slot_id as u64);
-        log(b" trb=");
-        log_hex(trb_iova);
-        log(b" cc=");
-        log_hex(cc as u64);
-        log(b" rem=");
-        log_hex(remaining as u64);
-        log(b" want=");
-        log_hex(status_iova);
-        log(b"\n");
+    let Some(event) = poll_transfer_event(io, layout, image, evt, ticket) else {
+        quarantine_transfer(ticket, RouteError::Incomplete);
+        return None;
+    };
+    if event.key.trb_iova != status_iova || event.completion_code != 1 || event.remaining != 0 {
+        quarantine_transfer(ticket, RouteError::Unknown);
+        return None;
     }
-    log(b"drv-xhci: ep0 status event never arrived\n");
-    None
+    completion_actors().finish(ticket).ok()?;
+    Some((event.completion_code, event.remaining, event.key.trb_iova))
 }
 
 /// The xHCI Interval field for an interrupt endpoint, from PORTSC speed + bInterval. Full/Low speed
@@ -3688,14 +3773,12 @@ fn read_device_config(
     speed: UsbSpeed,
     data_buf: DmaBuf,
 ) -> Option<DeviceConfig> {
-    let data_phys = base_phys + OFF_DATA as u64;
     let ep0_ring_phys = base_phys + OFF_EP0_RING as u64;
     let input_ctx_phys = base_phys + OFF_INPUT_CTX as u64;
 
     let mps0 = speed.initial_ep0_max_packet_size();
 
     // Phase 1: 8-byte device descriptor at this speed's initial EP0 packet size.
-    data_buf.zero();
     dsb();
     let dev8 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
     match control_in(
@@ -3707,7 +3790,7 @@ fn read_device_config(
         &mut *ep0_seg,
         slot_id,
         dev8,
-        data_phys,
+        data_buf,
         8,
     ) {
         Some((1, _)) => {}
@@ -3774,7 +3857,6 @@ fn read_device_config(
     }
 
     // Phase 3: the full device descriptor.
-    data_buf.zero();
     dsb();
     let dev_full = [
         0x80,
@@ -3795,7 +3877,7 @@ fn read_device_config(
         &mut *ep0_seg,
         slot_id,
         dev_full,
-        data_phys,
+        data_buf,
         DEVICE_DESCRIPTOR_LEN as u16,
     );
     match device_result {
@@ -3823,7 +3905,6 @@ fn read_device_config(
     data_buf.read_into(0, &mut device);
     let ax88_candidate = drv_xhci::ax88::family(&device).is_some();
     let device_exact = if ax88_candidate {
-        data_buf.zero();
         dsb();
         control_in_exact(
             io, layout, image, evt, ep0_ring, ep0_seg, slot_id, dev_full, data_buf, 18,
@@ -3835,7 +3916,6 @@ fn read_device_config(
     };
 
     // Configuration descriptor: header for wTotalLength, then the whole thing.
-    data_buf.zero();
     dsb();
     let cfg_head = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 9, 0x00];
     control_in(
@@ -3847,13 +3927,12 @@ fn read_device_config(
         &mut *ep0_seg,
         slot_id,
         cfg_head,
-        data_phys,
+        data_buf,
         9,
     )?;
     dsb();
     let advertised = u16::from_le_bytes([data_buf.byte(2), data_buf.byte(3)]);
     let total = advertised.min(DATA_BUF_LEN as u16);
-    data_buf.zero();
     dsb();
     let cfg = [
         0x80,
@@ -3871,7 +3950,7 @@ fn read_device_config(
         )
     } else {
         control_in(
-            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_phys, total,
+            io, layout, image, evt, ep0_ring, ep0_seg, slot_id, cfg, data_buf, total,
         )
     }?;
     dsb();
@@ -3993,7 +4072,6 @@ fn configure_and_read_hub(
     // --- GET_DESCRIPTOR(Hub) --- class request; descriptor type 0x2A for SuperSpeed hubs, else
     // 0x29. bNbrPorts is byte 2.
     let hub_desc_type = if speed_raw >= 4 { 0x2a } else { 0x29 };
-    data_buf.zero();
     dsb();
     let hub_setup = [0xa0, 0x06, 0x00, hub_desc_type, 0x00, 0x00, 16, 0x00];
     match control_in(
@@ -4005,7 +4083,7 @@ fn configure_and_read_hub(
         &mut *ep0_seg,
         slot_id,
         hub_setup,
-        data_phys,
+        data_buf,
         16,
     ) {
         Some((1, _)) => {}
@@ -4115,10 +4193,14 @@ fn configure_and_read_hub(
             // SAFETY: inside this hub's mapped page, and only reached through `DmaBuf`.
             let report_buf =
                 unsafe { DmaBuf::new((page_va as usize + OFF_REPORT) as *mut u8, report_phys, 4) };
-            report_buf.zero();
             dsb();
             if let Ok(normal) = Trb::normal_transfer(NormalTransfer::interrupt_in(report_phys, 4)) {
-                if int_ring.enqueue(&mut *int_seg, normal).is_ok() {
+                if let Some(ticket) = reserve_transfer(&int_ring, int_seg, slot_id, dci, &[normal])
+                {
+                    report_buf.zero();
+                    if enqueue_reserved(&mut int_ring, int_seg, ticket, &[normal]).is_none() {
+                        return;
+                    }
                     dsb();
                     ring_slot_doorbell(io, layout, slot_id, dci);
                     // Tight budget: a driver child is not preemptible (the IRQ handoff only
@@ -4134,7 +4216,7 @@ fn configure_and_read_hub(
                             layout,
                             image,
                             evt,
-                            slot_id,
+                            ticket,
                             IRQ_EVENT_DRAIN_LIMIT,
                         ) {
                             got = Some(result);
@@ -4142,8 +4224,14 @@ fn configure_and_read_hub(
                         }
                     }
                     match got {
-                        Some((cc, _, trb_iova)) => {
-                            let _ = int_ring.reclaim_through(trb_iova);
+                        Some(event)
+                            if matches!(event.completion_code, 1 | 13) && event.remaining <= 4 =>
+                        {
+                            if completion_actors().finish(ticket).is_err() {
+                                return;
+                            }
+                            let _ = int_ring.reclaim_through(event.key.trb_iova);
+                            let cc = event.completion_code;
                             dsb();
                             log(b"drv-xhci: hub status cc=");
                             log_hex(cc as u64);
@@ -4154,7 +4242,10 @@ fn configure_and_read_hub(
                             }
                             log(b"\n");
                         }
-                        None => log(b"drv-xhci: hub status idle\n"),
+                        _ => {
+                            quarantine_transfer(ticket, RouteError::Incomplete);
+                            log(b"drv-xhci: hub status idle; lane/DMA retained\n");
+                        }
                     }
                 }
             }
@@ -4170,7 +4261,6 @@ fn configure_and_read_hub(
     let stable = loop {
         let mut port = 1u8;
         while port <= polled_ports {
-            data_buf.zero();
             dsb();
             let get_status = [0xa3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00];
             if let Some((1, _)) = control_in(
@@ -4182,7 +4272,7 @@ fn configure_and_read_hub(
                 &mut *ep0_seg,
                 slot_id,
                 get_status,
-                data_phys,
+                data_buf,
                 4,
             ) {
                 dsb();
@@ -4550,7 +4640,7 @@ fn reset_and_address_downstream(
     hub_slot_id: u8,
     hub_root_port: u8,
     hub_speed_raw: u8,
-    hub_data_phys: u64,
+    _hub_data_phys: u64,
     hub_data_buf: DmaBuf,
     down_port: u8,
     pass: Deadline,
@@ -4591,7 +4681,6 @@ fn reset_and_address_downstream(
         // Keep each settle short: this driver preempts Sora, so a long spin here stalls the
         // whole system (and a sibling controller's live keyboard) while a port comes up.
         spin_delay(200_000);
-        hub_data_buf.zero();
         dsb();
         let get_status = [0xa3, 0x00, 0x00, 0x00, down_port, 0x00, 0x04, 0x00];
         if control_in(
@@ -4603,7 +4692,7 @@ fn reset_and_address_downstream(
             &mut *hub_ep0_seg,
             hub_slot_id,
             get_status,
-            hub_data_phys,
+            hub_data_buf,
             4,
         )
         .is_none()
@@ -4890,7 +4979,7 @@ fn control_in_exact(
     {
         return None;
     }
-    AX88_SEEN.store(true, Ordering::Relaxed);
+    DMA_RETAINED.store(true, Ordering::Relaxed);
     let mut pipe = kumo_xhci::ControlPipe::new(slot_id).ok()?;
     control_data_exact(
         io,
@@ -4930,61 +5019,49 @@ fn control_data_exact(
     const BUDGET_NS: u64 = 200_000_000;
     let request = ControlData::new(setup_packet, buffer.phys(), buffer.len(), outbound)?;
     pipe.preflight(ep0_ring, ep0_seg, clock_get(), BUDGET_NS)?;
-    // Copy/zero before publishing the first cycle bit. The buffer is private to this
-    // idle pipe and stays untouched until BOTH data and status succeed. — TIMBERDOODLE
+    let ticket = reserve_transfer(ep0_ring, ep0_seg, slot_id, 1, &request.trbs())
+        .ok_or(ControlError::EventOverflow)?;
     if request.direction_in() {
         buffer.zero();
     } else {
         buffer.write_from(0, request.outbound());
     }
-    pipe.submit(&request, ep0_ring, ep0_seg, clock_get(), BUDGET_NS)?;
+    if let Err(error) = pipe.submit(&request, ep0_ring, ep0_seg, clock_get(), BUDGET_NS) {
+        quarantine_transfer(ticket, RouteError::Unknown);
+        return Err(error);
+    }
     dsb();
     ring_slot_doorbell(io, layout, slot_id, 1);
-    for spin in 0..EVENT_POLL_LIMIT {
-        dsb();
-        if spin % YIELD_INTERVAL == 0 {
-            pipe.check_deadline(clock_get())?;
-        }
-        // Do not pop another owner's event when there is no room to retain it.
-        // The legacy stash/router is replaced separately in NET4b. — TIMBERDOODLE
-        if event_stash().len() == kumo_xhci::STASH_CAPACITY {
-            return pipe.fail(ControlError::EventOverflow);
-        }
-        let trb = match image.event_ring.pop(evt) {
-            Ok(Some(trb)) => trb,
-            Ok(None) => continue,
-            Err(error) => return pipe.fail(ControlError::Ring(error)),
-        };
-        write_erdp(io, layout, image.event_ring.dequeue_iova());
-        let Some(event) = trb.decode_event() else {
-            return pipe.fail(ControlError::Unexpected);
-        };
-        match pipe.observe(event, clock_get(), ep0_ring)? {
-            ControlProgress::Complete(length) => {
-                dsb();
-                return Ok(length);
+    let result = (|| {
+        for spin in 0..EVENT_POLL_LIMIT {
+            if spin % YIELD_INTERVAL == 0 {
+                pipe.check_deadline(clock_get())?;
             }
-            ControlProgress::Waiting => {}
-            ControlProgress::Unrelated(Event::Transfer {
-                slot_id,
-                completion_code,
-                remaining,
-                trb_iova,
-                ..
-            }) => {
-                let _ = event_stash().push(StashedTransfer {
-                    slot_id,
-                    completion_code,
-                    remaining,
-                    trb_iova,
-                });
-                STASH_ENABLED.store(true, Ordering::Relaxed);
+            match completion_actors().take(ticket) {
+                Ok(Some(event)) => match pipe.observe(event.event(), clock_get(), ep0_ring)? {
+                    ControlProgress::Complete(length) => {
+                        completion_actors()
+                            .finish(ticket)
+                            .map_err(|_| ControlError::EventOverflow)?;
+                        dsb();
+                        return Ok(length);
+                    }
+                    ControlProgress::Waiting => {}
+                    ControlProgress::Unrelated(_) => return pipe.fail(ControlError::Unexpected),
+                },
+                Err(_) => return pipe.fail(ControlError::EventOverflow),
+                Ok(None) => {
+                    dsb();
+                    let _ = pump_event(io, layout, image, evt);
+                }
             }
-            ControlProgress::Unrelated(Event::PortStatusChange { .. }) => {}
-            ControlProgress::Unrelated(_) => return pipe.fail(ControlError::Unexpected),
         }
+        pipe.fail(ControlError::Timeout)
+    })();
+    if result.is_err() {
+        quarantine_transfer(ticket, RouteError::Incomplete);
     }
-    pipe.fail(ControlError::Timeout)
+    result
 }
 
 fn control_in(
@@ -4996,9 +5073,17 @@ fn control_in(
     ep0_seg: &mut DmaTrbs,
     slot_id: u8,
     setup_packet: [u8; 8],
-    data_phys: u64,
+    data_buf: DmaBuf,
     length: u16,
 ) -> Option<(u8, u32)> {
+    completion_actors().ready(slot_id, 1).ok()?;
+    if length == 0
+        || length as usize > data_buf.len()
+        || u16::from_le_bytes([setup_packet[6], setup_packet[7]]) != length
+    {
+        return None;
+    }
+    let data_phys = data_buf.phys();
     let setup = Trb::setup_stage(setup_packet, SetupTransferType::In, 0).ok()?;
     // Chain=0 single Data Stage TRB (see the metal note above about data_stage's errant Chain).
     const TRB_TYPE_DATA_STAGE: u32 = 3;
@@ -5009,9 +5094,10 @@ fn control_in(
         (TRB_TYPE_DATA_STAGE << 10) | (1 << 16),
     ]);
     let status = Trb::status_stage(0, false, true).ok()?;
-    ep0_ring.enqueue(&mut *ep0_seg, setup).ok()?;
-    ep0_ring.enqueue(&mut *ep0_seg, data).ok()?;
-    let status_token = ep0_ring.enqueue(&mut *ep0_seg, status).ok()?;
+    let status_iova = ep0_ring.preview::<3>().ok()?[2];
+    let ticket = reserve_transfer(ep0_ring, ep0_seg, slot_id, 1, &[setup, data, status])?;
+    data_buf.zero();
+    enqueue_reserved(ep0_ring, ep0_seg, ticket, &[setup, data, status])?;
     dsb();
     ring_slot_doorbell(
         io,
@@ -5019,8 +5105,7 @@ fn control_in(
         slot_id,
         endpoint_context_index(0, false).unwrap_or(1),
     );
-    let (cc, remaining, trb_iova) =
-        wait_ep0_status(io, layout, image, evt, slot_id, status_token.iova)?;
+    let (cc, remaining, trb_iova) = wait_ep0_status(io, layout, image, evt, ticket, status_iova)?;
     // Reclaim the setup/data/status TRBs so the EP0 ring doesn't fill across many transfers.
     let _ = ep0_ring.reclaim_through(trb_iova);
     Some((cc, remaining))
@@ -5139,23 +5224,13 @@ fn submit_command(
         if spin % YIELD_INTERVAL == 0 && spin != 0 {
             cooperative_yield();
         }
-        let popped = match image.event_ring.pop(evt) {
-            Ok(popped) => popped,
-            Err(_) => return None,
-        };
-        if let Some(trb) = popped {
-            let event = trb.decode_event();
-            // Every successful pop advances the software dequeue cursor, including port-change
-            // and transfer events unrelated to this command. Mirror every such advance to ERDP;
-            // publishing only the matching completion leaves hardware and software disagreeing
-            // about the ring head whenever boot traffic is interleaved.
-            write_erdp(io, layout, image.event_ring.dequeue_iova());
-            if let Some(Event::CommandCompletion {
+        if let Some(event) = pump_event(io, layout, image, evt) {
+            if let Event::CommandCompletion {
                 command_iova,
                 parameter,
                 completion_code,
                 slot_id,
-            }) = event
+            } = event
             {
                 if command_iova == token.iova {
                     let _ = image.command_ring.reclaim_through(command_iova);
@@ -5168,101 +5243,118 @@ fn submit_command(
     None
 }
 
-/// Poll the event ring for a Transfer Event on `slot_id`, skipping unrelated events. Returns
-/// `(completion_code, remaining)`.
-/// Poll the event ring for a Transfer Event on `slot_id`. Returns `(completion_code, remaining,
-/// trb_iova)` — the `trb_iova` names the completed transfer TRB so the caller can reclaim its
-/// transfer ring (otherwise the ring reports full after ~15 TRBs and enqueue silently fails).
+/// Pop once and route every Transfer Event, including those encountered by a command
+/// waiter. Every pop advances ERDP; no poller discards another endpoint's ownership.
+fn pump_event(
+    io: &mut Mmio,
+    layout: RegisterLayout,
+    image: &mut NoOpCommandImage,
+    evt: &DmaTrbs,
+) -> Option<Event> {
+    let trb = match image.event_ring.pop(evt) {
+        Ok(Some(trb)) => trb,
+        _ => return None,
+    };
+    write_erdp(io, layout, image.event_ring.dequeue_iova());
+    match completion_actors().route_trb(trb) {
+        Ok(event) => event,
+        Err(error) => {
+            DMA_RETAINED.store(true, Ordering::Relaxed);
+            ax88_record(format_args!(
+                "NET4b completion fault slot={} dci={} trb={:#x} error={:?}; retain DMA\n",
+                trb.slot_id(),
+                trb.endpoint_id(),
+                trb.pointer(),
+                error
+            ));
+            trb.decode_event()
+        }
+    }
+}
+
+/// Register all physical TRBs and reserve mailbox credit BEFORE any cycle bit is
+/// published. A failed reservation never mutates the ring. — TIMBERDOODLE
+fn reserve_transfer(
+    ring: &TransferRing,
+    segment: &DmaTrbs,
+    slot: u8,
+    dci: u8,
+    trbs: &[Trb],
+) -> Option<TransferTicket> {
+    if trbs.is_empty()
+        || trbs.len() > 3
+        || ring.queued() != 0
+        || segment.trb_slots() != ring.capacity() + 1
+    {
+        return None;
+    }
+    let predicted = ring.preview::<3>().ok()?;
+    let mut expected = 0;
+    for (i, trb) in trbs.iter().enumerate() {
+        if trb.words()[3] & (1 << 5) != 0 {
+            expected |= 1 << i;
+        }
+    }
+    completion_actors()
+        .register(slot, dci, &predicted[..trbs.len()], expected)
+        .ok()
+}
+fn enqueue_reserved(
+    ring: &mut TransferRing,
+    segment: &mut DmaTrbs,
+    ticket: TransferTicket,
+    trbs: &[Trb],
+) -> Option<()> {
+    for trb in trbs {
+        if ring.enqueue(segment, *trb).is_err() {
+            quarantine_transfer(ticket, RouteError::Unknown);
+            return None;
+        }
+    }
+    Some(())
+}
+fn queue_transfer(
+    ring: &mut TransferRing,
+    segment: &mut DmaTrbs,
+    slot: u8,
+    dci: u8,
+    trbs: &[Trb],
+) -> Option<TransferTicket> {
+    let ticket = reserve_transfer(ring, segment, slot, dci, trbs)?;
+    enqueue_reserved(ring, segment, ticket, trbs)?;
+    Some(ticket)
+}
 fn poll_transfer_event(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
-    slot_id: u8,
-) -> Option<(u8, u32, u64)> {
-    poll_transfer_event_limited(io, layout, image, evt, slot_id, EVENT_POLL_LIMIT)
+    ticket: TransferTicket,
+) -> Option<RoutedTransfer> {
+    poll_transfer_event_limited(io, layout, image, evt, ticket, EVENT_POLL_LIMIT)
 }
-
-/// As [`poll_transfer_event`] but with an explicit spin budget. The IRQ-driven loop must use a
-/// SMALL budget: this driver runs at a higher priority than Sora, so a long spin here (the
-/// enumeration-time 2,000,000) starves the whole system whenever a wake arrives without a matching
-/// event. The interrupt already told us an event is queued, so a short drain is sufficient.
 fn poll_transfer_event_limited(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
-    slot_id: u8,
+    ticket: TransferTicket,
     limit: u32,
-) -> Option<(u8, u32, u64)> {
-    poll_transfer_event_slots(io, layout, image, evt, &[slot_id], limit)
-}
-
-/// [`poll_transfer_event_limited`] over a set of slots: the resident HID loop serves lanes on
-/// more than one device slot, so a completion for any of those slots is its to reclaim. An event
-/// for another slot is stashed for that slot's own poll, exactly as the single-slot path did.
-fn poll_transfer_event_slots(
-    io: &mut Mmio,
-    layout: RegisterLayout,
-    image: &mut NoOpCommandImage,
-    evt: &DmaTrbs,
-    slots: &[u8],
-    limit: u32,
-) -> Option<(u8, u32, u64)> {
-    let stashing = STASH_ENABLED.load(Ordering::Relaxed);
-    if stashing {
-        for slot in slots {
-            if let Some(event) = event_stash().take(*slot) {
-                return Some((event.completion_code, event.remaining, event.trb_iova));
-            }
-        }
-    }
+) -> Option<RoutedTransfer> {
     for spin in 0..limit {
+        match completion_actors().take(ticket) {
+            Ok(Some(event)) => return Some(event),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
         dsb();
-        // Long event polls must not monopolise a non-preemptible driver child.
-        if spin % YIELD_INTERVAL == 0 && spin != 0 {
+        if spin != 0 && spin % YIELD_INTERVAL == 0 {
             cooperative_yield();
         }
-        let popped = match image.event_ring.pop(evt) {
-            Ok(popped) => popped,
-            Err(_) => return None,
-        };
-        if let Some(trb) = popped {
-            let event = trb.decode_event();
-            // A consumed event is no longer owned by the controller regardless of whether it is
-            // the transfer this caller wants. In particular, acknowledge boot-time Port Status
-            // Change events immediately; deferring ERDP until a later keyboard completion can
-            // leave EHB asserted and make the first HID interrupt nondeterministic after reboot.
-            write_erdp(io, layout, image.event_ring.dequeue_iova());
-            if let Some(Event::Transfer {
-                completion_code,
-                remaining,
-                slot_id: event_slot,
-                trb_iova,
-                ..
-            }) = event
-            {
-                if slots.contains(&event_slot) {
-                    return Some((completion_code, remaining, trb_iova));
-                }
-                // J545: another device's completion, popped while a HID slot waited. In the
-                // resident loop that is the keyboard's report during a block read: keep it for
-                // the keyboard's own poll rather than drop it and stall typing. — TIMBERDOODLE
-                if stashing {
-                    let stashed = StashedTransfer {
-                        slot_id: event_slot,
-                        completion_code,
-                        remaining,
-                        trb_iova,
-                    };
-                    if event_stash().push(stashed).is_some() {
-                        log(b"drv-xhci: event stash full; oldest dropped\n");
-                    }
-                }
-            }
-        }
+        let _ = pump_event(io, layout, image, evt);
     }
-    None
+    // Limited drains may simply be idle; only the owning deadline may quarantine.
+    completion_actors().take(ticket).ok().flatten()
 }
 
 /// Write a device-slot doorbell: `db[slot_id] = dci` (stream 0).

@@ -1,5 +1,6 @@
 //j539
 //j540
+//j828
 
 use crate::{Error, QwordSink, Trb, TrbSink, TrbSource};
 
@@ -186,6 +187,20 @@ pub struct TransferRing(ProducerRing);
 impl TransferRing {
     pub fn new<S: TrbSink + ?Sized>(segment: &mut S, base_iova: u64) -> Result<Self, Error> {
         ProducerRing::initialize(segment, base_iova).map(Self)
+    }
+
+    /// Predict physical ownership before making any cycle bit visible to DMA.
+    pub fn preview<const N: usize>(&self) -> Result<[u64; N], Error> {
+        if N == 0 || N > self.capacity() - self.queued() {
+            return Err(Error::RingFull);
+        }
+        let mut result = [0; N];
+        let mut index = self.0.enqueue;
+        for slot in &mut result {
+            *slot = self.0.base_iova + index as u64 * TRB_BYTES;
+            index = advance(index, self.0.segment_len);
+        }
+        Ok(result)
     }
 
     pub fn enqueue<S: TrbSink + ?Sized>(
