@@ -1,14 +1,15 @@
 #![no_std]
 #![no_main]
 
-//j827
 //j828
 //j829
 //j830
 //j831
+//j832
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+mod ax88_identity;
 mod resident_nic;
 
 use drv_blk::{
@@ -1034,6 +1035,12 @@ fn ax88_ep0_proof(
     config: &[u8],
     buffer: DmaBuf,
 ) {
+    if ax88_identity::ENABLED {
+        ax88_identity::run(
+            io, layout, image, evt, ring, segment, slot, speed, device, config, buffer,
+        );
+        return;
+    }
     use kumo_ax88::{
         control::{MacRegister, Request},
         profile::{Profile, Speed},
@@ -4800,6 +4807,10 @@ fn enumerate_hub_downstream(
                 config.bytes(),
                 data_buf,
             );
+            // Identity mode takes precedence over mutating proof flags. — TIMBERDOODLE
+            if ax88_identity::ENABLED {
+                return None;
+            }
             // NET4c-3: proof images keep the adapter for the resident loop.
             return resident_nic::handoff(
                 dev_slot,

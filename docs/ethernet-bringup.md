@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j826 -->
 <!-- j827 -->
 <!-- j828 -->
 <!-- j830 -->
 <!-- j831 -->
+<!-- j832 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a is next: read-only chip identity, MAC and status.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a read-only identity closed J832; NET5b volatile initialization is next.
 
 ## First controller
 
@@ -424,4 +424,20 @@ python3 scripts/ax88-resident-proof.py --self-test
 python3 scripts/ax88-resident-proof.py capture.log
 ```
 
+— TIMBERDOODLE 2026-11-07
+
+
+## NET5a read-only identity (J832)
+
+The default-off `KUMO_AX88_IDENTITY_PROOF=1` path reads only the ten named MAC/PHY
+fields in [the identity proof](ax88-identity.md). `KUMO_AX88_ORACLE=1` also enables
+an independent firmware USB_IO reference before handoff. KUMO requires exact data
+and status completions; firmware reports status but has no actual-length output.
+Neither path writes a PHY page, powers or initializes the chip, reads EEPROM/eFuse,
+sets up Ethernet endpoints or transmits packets. Identity mode takes precedence
+over the older mutating EP0/resident proof flags. Ordinary images omit the probe.
+
+The observed node address is locally administered, not an attestation of a factory
+MAC. Zero PHY IDs are unavailable status, not a cable-down result. NET5b must
+establish the volatile PHY/clock/queue state before physical RX/TX proofs.
 — TIMBERDOODLE 2026-11-07

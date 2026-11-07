@@ -1,18 +1,107 @@
 //j810
+//j832
 //! Independent firmware-cache descriptor reference for the observed USB2 ax88 layout.
-//! No drv-xhci parser, USB request, register access or DMA allocation. — TIMBERDOODLE
+//! No shared drv-xhci parser. NET5a adds an explicit vendor-IN-only firmware reader.
+//! — TIMBERDOODLE
 use core::ffi::c_void;
 
-/// UEFI UsbIo.h: six transfer methods, four cached descriptor getters, then
-/// string/language/reset. Only cached getters are callable here. — TIMBERDOODLE
+/// UEFI2.11 section17.2.5/6. Only control-IN and cached getters are callable here;
+/// bulk/interrupt/reset entries remain opaque. — TIMBERDOODLE
 #[repr(C)]
 pub struct Protocol {
-    transfers: [*const c_void; 6],
+    pub control: Option<
+        extern "efiapi" fn(
+            *mut Self,
+            *mut DeviceRequest,
+            u32,
+            u32,
+            *mut c_void,
+            usize,
+            *mut u32,
+        ) -> usize,
+    >,
+    transfers: [*const c_void; 5],
     pub get_device: extern "efiapi" fn(*mut Self, *mut [u8; 18]) -> usize,
     pub get_config: extern "efiapi" fn(*mut Self, *mut [u8; 9]) -> usize,
     pub get_interface: extern "efiapi" fn(*mut Self, *mut [u8; 9]) -> usize,
     pub get_endpoint: extern "efiapi" fn(*mut Self, u8, *mut [u8; 7]) -> usize,
     unused_tail: [*const c_void; 3],
+}
+
+/// Wire-sized request; firmware consumes native little-endian fields on our targets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceRequest {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+}
+impl DeviceRequest {
+    pub fn bytes(self) -> [u8; 8] {
+        let v = self.value.to_le_bytes();
+        let i = self.index.to_le_bytes();
+        let n = self.length.to_le_bytes();
+        [
+            self.request_type,
+            self.request,
+            v[0],
+            v[1],
+            i[0],
+            i[1],
+            n[0],
+            n[1],
+        ]
+    }
+}
+
+/// Independently transcribed from the supplied ASIX/Linux reference. Do not share
+/// KUMO's request encoder: this is the second transport/value witness. — TIMBERDOODLE
+pub const IDENTITY_READS: [(&str, u8, u16, u16, u16); 10] = [
+    ("node_id", 1, 0x10, 6, 6),
+    ("usb_link", 1, 2, 1, 1),
+    ("silicon_status", 1, 3, 1, 1),
+    ("phy_power_reset", 1, 0x26, 2, 2),
+    ("clock", 1, 0x33, 1, 1),
+    ("phy_page", 2, 3, 31, 2),
+    ("phy_id1", 2, 3, 2, 2),
+    ("phy_id2", 2, 3, 3, 2),
+    ("phy_basic_status", 2, 3, 1, 2),
+    ("phy_physical_status", 2, 3, 17, 2),
+];
+
+/// The protocol has no OUT actual-length parameter; success here attests firmware's
+/// status only, not an independently measured USB byte count. — TIMBERDOODLE
+/// # Safety
+/// `usb` must be a live USB_IO interface and the buffer must outlive this call.
+pub unsafe fn identity_read(
+    usb: *mut Protocol,
+    index: usize,
+    data: &mut [u8; 6],
+) -> Option<(DeviceRequest, usize, u32)> {
+    let &(_, request, value, register, length) = IDENTITY_READS.get(index)?;
+    let mut setup = DeviceRequest {
+        request_type: 0xc0,
+        request,
+        value,
+        index: register,
+        length,
+    };
+    // SAFETY: caller supplies a live USB_IO interface; no pointer escapes.
+    let control = unsafe { (*usb).control }?;
+    let mut result = u32::MAX;
+    let sent = setup;
+    let status = control(
+        usb,
+        &mut setup,
+        0,
+        200,
+        data.as_mut_ptr().cast(),
+        length as usize,
+        &mut result,
+    );
+    Some((sent, status, result))
 }
 
 pub fn matches(device: &[u8; 18]) -> bool {
@@ -62,11 +151,76 @@ mod tests {
     fn protocol_layout_matches_uefi_offsets() {
         use core::mem::{offset_of, size_of};
         let p = size_of::<usize>();
+        assert_eq!(offset_of!(Protocol, control), 0);
+        assert_eq!(size_of::<DeviceRequest>(), 8);
+        assert_eq!(offset_of!(DeviceRequest, value), 2);
+        assert_eq!(offset_of!(DeviceRequest, length), 6);
         assert_eq!(offset_of!(Protocol, get_device), 6 * p);
         assert_eq!(offset_of!(Protocol, get_config), 7 * p);
         assert_eq!(offset_of!(Protocol, get_interface), 8 * p);
         assert_eq!(offset_of!(Protocol, get_endpoint), 9 * p);
         assert_eq!(size_of::<Protocol>(), 13 * p);
+    }
+    #[test]
+    fn firmware_control_abi_uses_in_direction_bounded_timeout_and_input_length() {
+        extern "efiapi" fn control(
+            _: *mut Protocol,
+            request: *mut DeviceRequest,
+            direction: u32,
+            timeout: u32,
+            data: *mut c_void,
+            length: usize,
+            result: *mut u32,
+        ) -> usize {
+            assert_eq!((direction, timeout), (0, 200));
+            let request = unsafe { *request };
+            assert_eq!(request.request_type, 0xc0);
+            assert!(matches!(request.request, 1 | 2));
+            assert_eq!(length, request.length as usize);
+            assert!((1..=6).contains(&length));
+            for i in 0..length {
+                unsafe { data.cast::<u8>().add(i).write(i as u8) }
+            }
+            unsafe { *result = 0 };
+            0
+        }
+        extern "efiapi" fn device(_: *mut Protocol, _: *mut [u8; 18]) -> usize {
+            0
+        }
+        extern "efiapi" fn desc(_: *mut Protocol, _: *mut [u8; 9]) -> usize {
+            0
+        }
+        extern "efiapi" fn endpoint(_: *mut Protocol, _: u8, _: *mut [u8; 7]) -> usize {
+            0
+        }
+        let mut usb = Protocol {
+            control: Some(control),
+            transfers: [core::ptr::null(); 5],
+            get_device: device,
+            get_config: desc,
+            get_interface: desc,
+            get_endpoint: endpoint,
+            unused_tail: [core::ptr::null(); 3],
+        };
+        for i in 0..IDENTITY_READS.len() {
+            let mut data = [0xa5; 6];
+            let (setup, status, result) = unsafe { identity_read(&mut usb, i, &mut data) }.unwrap();
+            assert_eq!((status, result), (0, 0));
+            assert_eq!(setup.bytes()[0], 0xc0);
+            for (at, byte) in data.iter().enumerate() {
+                assert_eq!(
+                    *byte,
+                    if at < setup.length as usize {
+                        at as u8
+                    } else {
+                        0xa5
+                    }
+                );
+            }
+        }
+        assert!(unsafe { identity_read(&mut usb, 10, &mut [0; 6]) }.is_none());
+        usb.control = None;
+        assert!(unsafe { identity_read(&mut usb, 0, &mut [0; 6]) }.is_none());
     }
     fn fixture() -> ([u8; 18], [u8; 9], [u8; 9], [[u8; 7]; 3]) {
         (
