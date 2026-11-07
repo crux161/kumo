@@ -1,9 +1,9 @@
 #![no_std]
-//j703
 //j827
 //j828
 //j829
 //j830
+//j831
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -29,7 +29,7 @@ mod trb;
 
 pub use context::{
     endpoint_context_index, ContextSize, EndpointContext, EndpointType, InputControlContext,
-    SlotContext, UsbSpeed,
+    SlotContext, SlotSnapshot, SlotState, UsbSpeed,
 };
 pub use control::{ControlData, ControlError, ControlPipe, ControlProgress, CONTROL_DATA_MAX};
 pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
@@ -37,7 +37,9 @@ pub use custody::{
     CustodyError, DmaCustodyLedger, DmaMemory, DMA_ACK_LEN, DMA_ALLOCATION_MAX, DMA_CUSTODY_LEN,
     DMA_CUSTODY_MAX, DMA_TOTAL_MAX,
 };
-pub use dma::{DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource};
+pub use dma::{
+    boundary_window, DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource, TRANSFER_BOUNDARY,
+};
 pub use dwc3::{HostInit, RegisterUpdate};
 pub use fdt::{
     discover_primary_xhci, discover_rk3588_usb0_xhci, discover_x13s_usb0_xhci, GicInterrupt,

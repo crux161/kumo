@@ -1,5 +1,6 @@
 //j521
 //j523
+//j831
 
 use crate::Error;
 
@@ -225,6 +226,41 @@ impl EndpointContext {
     }
 }
 
+/// Output Slot Context Slot State (xHCI table 6-7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotState {
+    DisabledOrEnabled,
+    Default,
+    Addressed,
+    Configured,
+    Reserved(u8),
+}
+
+/// The Output Slot Context fields a configure/deconfigure readback checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotSnapshot {
+    pub state: SlotState,
+    pub context_entries: u8,
+    pub device_address: u8,
+}
+
+impl SlotSnapshot {
+    /// Decode dwords 0 through 3 of an Output Slot Context (xHCI 6.2.2).
+    pub const fn from_words(words: [u32; 4]) -> Self {
+        Self {
+            state: match words[3] >> 27 {
+                0 => SlotState::DisabledOrEnabled,
+                1 => SlotState::Default,
+                2 => SlotState::Addressed,
+                3 => SlotState::Configured,
+                other => SlotState::Reserved(other as u8),
+            },
+            context_entries: (words[0] >> 27) as u8,
+            device_address: words[3] as u8,
+        }
+    }
+}
+
 /// First context of an Input Context: selects contexts affected by a command.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -374,5 +410,33 @@ mod tests {
         assert_eq!(endpoint_context_index(1, true), Some(3));
         assert_eq!(endpoint_context_index(15, true), Some(31));
         assert_eq!(endpoint_context_index(16, true), None);
+    }
+
+    #[test]
+    fn output_slot_context_decodes_state_entries_and_address() {
+        let configured = SlotSnapshot::from_words([5 << 27 | 0x30_0003, 0, 0, 3 << 27 | 0x07]);
+        assert_eq!(
+            configured,
+            SlotSnapshot {
+                state: SlotState::Configured,
+                context_entries: 5,
+                device_address: 7,
+            }
+        );
+        let addressed = SlotSnapshot::from_words([1 << 27, 0, 0, 2 << 27 | 0x07]);
+        assert_eq!(addressed.state, SlotState::Addressed);
+        assert_eq!(addressed.context_entries, 1);
+        assert_eq!(
+            SlotSnapshot::from_words([0, 0, 0, 0]).state,
+            SlotState::DisabledOrEnabled
+        );
+        assert_eq!(
+            SlotSnapshot::from_words([0, 0, 0, 1 << 27]).state,
+            SlotState::Default
+        );
+        assert_eq!(
+            SlotSnapshot::from_words([0, 0, 0, 31 << 27]).state,
+            SlotState::Reserved(31)
+        );
     }
 }

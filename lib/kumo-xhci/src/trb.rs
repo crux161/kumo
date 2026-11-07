@@ -1,5 +1,6 @@
 //j521
 //j830
+//j831
 
 use crate::Error;
 
@@ -229,6 +230,19 @@ impl Trb {
         let mut trb = typed(TrbType::SetTransferRingDequeueCommand);
         set_pointer(&mut trb, dequeue_iova | dequeue_cycle as u64);
         trb.words[3] |= ((endpoint_id as u32) << 16) | ((slot_id as u32) << 24);
+        Ok(trb)
+    }
+
+    /// Configure Endpoint with Deconfigure (DC, bit 9) set: every endpoint but EP0 goes
+    /// Disabled and the slot returns to Addressed. The Input Context Pointer is ignored
+    /// (xHCI 4.6.6), so it is zero. Stop endpoints first: a Running endpoint is simply
+    /// unscheduled, with no stopped event. — TIMBERDOODLE
+    pub fn deconfigure_endpoints(slot_id: u8) -> Result<Self, Error> {
+        if slot_id == 0 {
+            return Err(Error::InvalidField);
+        }
+        let mut trb = typed(TrbType::ConfigureEndpointCommand);
+        trb.words[3] |= (1 << 9) | ((slot_id as u32) << 24);
         Ok(trb)
     }
 
@@ -552,6 +566,16 @@ mod tests {
         assert!((0..=255u8)
             .filter(|&code| is_stop_completion(code))
             .eq([26, 27, 28]));
+    }
+
+    #[test]
+    fn deconfigure_sets_dc_and_carries_no_input_context() {
+        let dc = Trb::deconfigure_endpoints(3).unwrap();
+        assert_eq!(dc.words(), [0, 0, 0, (12 << 10) | (1 << 9) | (3 << 24)]);
+        assert!(dc.trb_type().unwrap().is_command());
+        let configure = Trb::configure_endpoint(0x1000, 3).unwrap();
+        assert_eq!(configure.words()[3] & (1 << 9), 0);
+        assert_eq!(Trb::deconfigure_endpoints(0), Err(Error::InvalidField));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 <!-- j828 -->
 <!-- j829 -->
 <!-- j830 -->
+<!-- j831 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -245,3 +246,18 @@ Not claimed: Reset Endpoint, Disable Slot or controller reset, and stream endpoi
 The hub page is not freed, because J829's parent custody has no release API. There
 is no NIC endpoint, resident RX lane, DMA confinement or process-death recovery yet.
 Those remain NET4c-3 and later. — TIMBERDOODLE 2026-11-07
+
+NET4c-3 (J831) uses this stop for the ax88's resident lanes, then disables and
+reclaims. Configure Endpoint with Deconfigure (`Trb::deconfigure_endpoints`) is
+issued only after every pending lane was cancelled here. The Output Slot and Endpoint
+Contexts must then read back Addressed and Disabled (`SlotSnapshot`) before a ring
+is rewritten. `drv_xhci::nic::NicLifecycle` enforces that order. Details and metal
+numbers are in [Ethernet bring-up](ethernet-bringup.md). — TIMBERDOODLE 2026-11-07
+
+
+NET4c-3 checks a stop-racing completion's code, exact token and residual before
+reading DMA, using the same checked-length helper as normal completion. Repoint
+proves the controller stopped; it does not validate payload metadata. The backing
+remains held on either kind of failure. Its repeated census covers owned lanes and
+DMA allocations; no whole-kernel resource or physical wire-pressure claim follows.
+— TIMBERDOODLE 2026-11-07

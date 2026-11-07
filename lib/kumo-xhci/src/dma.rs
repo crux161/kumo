@@ -1,5 +1,6 @@
 //j539
 //j540
+//j831
 
 //! Volatile-only access to memory the controller writes.
 //!
@@ -24,6 +25,29 @@
 //! and promises nothing to a non-coherent bus master reading Normal-NC memory.
 
 use crate::{EventRingSegmentTableEntry, Trb};
+
+/// A transfer buffer must not cross a 64 KiB boundary (xHCI 4.11.7.1, 6.4.1).
+pub const TRANSFER_BOUNDARY: u64 = 0x1_0000;
+
+/// Offset of a `window`-byte region inside a contiguous backing at `base_phys` of
+/// `backing` bytes that crosses no 64 KiB boundary: the start if that already fits,
+/// otherwise the first boundary. A backing of twice the window always yields one for a
+/// window of at most 32 KiB. Pure arithmetic; the caller still maps and owns the memory.
+/// — TIMBERDOODLE
+pub fn boundary_window(base_phys: u64, backing: u64, window: u64) -> Option<u64> {
+    if window == 0 || window > TRANSFER_BOUNDARY || window > backing {
+        return None;
+    }
+    let to_boundary = TRANSFER_BOUNDARY - (base_phys & (TRANSFER_BOUNDARY - 1));
+    let offset = if to_boundary >= window {
+        0
+    } else {
+        to_boundary
+    };
+    let end = offset.checked_add(window)?;
+    base_phys.checked_add(end)?;
+    (end <= backing).then_some(offset)
+}
 
 /// Order earlier stores to DMA memory before later ones, as the controller observes them.
 #[inline(always)]
@@ -422,5 +446,28 @@ mod tests {
         for index in 0..2 {
             assert_eq!(source.read_trb(index), ring.as_slice().read_trb(index));
         }
+    }
+
+    #[test]
+    fn boundary_window_never_crosses_64k_and_fits_its_backing() {
+        use super::{boundary_window, TRANSFER_BOUNDARY};
+        for base in (0x10_0000u64..0x12_0000).step_by(0x1000) {
+            let offset = boundary_window(base, 0x1_0000, 0x8000).unwrap();
+            let start = base + offset;
+            assert!(offset + 0x8000 <= 0x1_0000);
+            assert_eq!(
+                start / TRANSFER_BOUNDARY,
+                (start + 0x8000 - 1) / TRANSFER_BOUNDARY
+            );
+        }
+        assert_eq!(boundary_window(0x1_0000, 0x8000, 0x8000), Some(0));
+        assert_eq!(boundary_window(0x1_9000, 0x8000, 0x8000), None);
+        assert_eq!(boundary_window(0x1_9000, 0x1_0000, 0x8000), Some(0x7000));
+        for (base, backing, window) in
+            [(0, 0x1000, 0), (0, 0x2_0000, 0x1_0001), (0, 0x1000, 0x2000)]
+        {
+            assert_eq!(boundary_window(base, backing, window), None);
+        }
+        assert_eq!(boundary_window(u64::MAX - 0xfff, 0x1_0000, 0x8000), None);
     }
 }

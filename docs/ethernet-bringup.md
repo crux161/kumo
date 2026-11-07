@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j821 -->
 <!-- j826 -->
 <!-- j827 -->
 <!-- j828 -->
 <!-- j830 -->
+<!-- j831 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET4c-3 is next: independent resident NIC buffers and a nonblocking RX lane.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a is next: read-only chip identity, MAC and status.
 
 ## First controller
 
@@ -98,8 +98,9 @@ it does not claim any of these gates passed.
 | **NET14** | Pinned build-std programs use UdpSocket and TcpListener/TcpStream over loopback; server failure wakes clients |
 | **NET15** | Same std programs over AX Ethernet; safe reconnect/restart, HID/USB/NVMe coexistence and a second-host portability review |
 
-NET4c-3 is the next slice: independent resident NIC buffers and a nonblocking RX
-lane before chip initialization, cancelled only through NET4c-2's verified stop.
+NET4c landed as three signed slices (J829 parent custody, J830 verified stop, J831
+resident lanes); see the NET4c-3 section below. Both physical arrangements are proven separately; RX pressure under real frames is
+NET6's gate. NET5a is next: read-only identity.
 [Completion ownership](xhci-completions.md) records NET4b's endpoint actors and
 receipts, NET4c-1's parent custody and NET4c-2's quiescence proof. [Exact EP0 data transfers](xhci-ep0.md) records NET4a's
 transport and reversible metal proof. NET3 supplies the pure codec described in
@@ -315,3 +316,112 @@ This checklist records the manual set every later AX kernel/NET metal slice cite
 not itself rerun the witnesses or prove packets, PHY behavior, SuperSpeed or another host.
 Netstack-on-metal testing still waits for AX0's resident census and capacity gate.
 — TIMBERDOODLE 2026-11-06
+
+
+## NET4c-3 resident ax88 lanes (J831)
+
+`KUMO_AX88_RESIDENT_PROOF=1` is off by default. Without it the adapter stays
+unconfigured, as since NET0. With it, enumeration hands the adapter to the one
+resident loop that already serves HID and storage, instead of dropping it.
+
+- **Buffers.** One parent-custodied 64 KiB backing at VA `0x17000000` holds a 32 KiB RX
+  window chosen by `boundary_window` so it crosses no 64 KiB boundary. The other
+  half holds both 16-TRB rings and the 8-byte status buffer. Nothing is shared with
+  EP0, HID, storage or the device page. TX gets its buffer in NET7.
+- **Configuration.** SET_CONFIGURATION(1), then one Configure Endpoint for the status
+  interrupt-IN (DCI 3) and bulk-IN RX (DCI 5) endpoints, read back Configured/Running
+  at the fresh rings. CLEAR_FEATURE(ENDPOINT_HALT) then resets both device-side
+  toggles. No vendor command; the chip is not initialized (NET5b).
+- **Lanes.** The loop arms one 32 KiB RX transfer and one 8-byte status transfer and
+  never waits on either. Routed completions are consumed when they arrive: status
+  bytes go through `kumo_ax88::status`, RX aggregates through the NET3 parser. With
+  the chip uninitialized, RX stayed pending and no status report arrived on metal.
+- **Lifecycle.** `drv_xhci::nic::NicLifecycle` fixes the order: verified stop of every
+  pending lane (NET4c-2), Configure Endpoint with Deconfigure, a readback of
+  Addressed/Disabled/Disabled, and only then ring reinitialization and a fresh
+  configure. Any refused or failed step is sticky and retains everything. xHCI 4.6.6
+  drops a Running endpoint with no stopped event, so stop must come first.
+
+The proof binds a one-shot 100 ms timer to the loop's existing port. It runs:
+
+1. thirty idle ticks, each with one exact EP0 device-descriptor read;
+2. twenty stop/deconfigure/reclaim/reconfigure cycles, one per tick;
+3. thirty settled idle ticks.
+
+Proof images set the boot keyboard's HID idle to 100 ms, which boot keyboards must
+support. HID liveness is then counted rather than inferred, and the decoder ignores
+repeated reports. Each window records:
+
+- the loop's longest busy stretch after a wake;
+- the slowest EP0 read;
+- the latest tick;
+- the longest gap between HID reports.
+
+These are wall-clock numbers. There is no per-thread CPU clock, so time the
+scheduler gave other processes is included. Every cycle record splits its time into
+stop, deconfigure, configure-with-readback and clear-halt steps.
+
+Metal, keyboard + ax88 behind the fc400000 hub pair, J831's final proof boot:
+
+| Window | Wall ms | Slowest EP0 read | Busy max | HID gap max | Tick late max |
+|---|---|---|---|---|---|
+| idle, during boot | 6392 | 290 ms | 292 ms | 1448 ms | 1353 ms |
+| 20 cycles | 3547 | n/a | 60.0 ms | 157 ms | 50 ms |
+| settled | 3692 | 6.3 ms | 10.3 ms | 140 ms | 67 ms |
+
+| Cycle step, max over 20 | Time |
+|---|---|
+| two verified stops | 5.7 ms; usually about 0.1 ms |
+| Configure Endpoint with Deconfigure | 22.9 ms; 0.7–23 ms |
+| Configure Endpoint + readback | 32.0 ms, every cycle |
+| two CLEAR_FEATURE requests | 0.68 ms |
+
+The census was exact:
+
+- configures 21, cancels 40, stops, disables and reclaims 20 each;
+- router stopped and cancelled 40 each, zero faults;
+- lanes 9/9 and next custody sequence 8/8 (seven held VMOs on this controller);
+- both lanes still pending at the end.
+
+All 60 EP0 reads matched the NET0 descriptor, and 118 HID reports arrived. CRUX confirmed a physical USB keyboard echo after
+the proof completed.
+
+The boot-window stall coincides with the display driver's HDMI PHY re-lock and
+scanout rebuild. The console went silent for 2.6 s there. The same EP0 read takes at
+most 6.3 ms once settled, but without CPU accounting this is not attributed beyond
+that coincidence. A full stop/disable/restart costs the loop about 33–56 ms, nearly
+all controller command latency. The command waiter blocks the owner for that long,
+and HID reports waited up to 157 ms then. Idle RX/status are not polled; HID and timer wakes continue to service the owner.
+No per-thread CPU-use measurement is available.
+
+Not claimed:
+
+- chip initialization, link, RX or TX traffic, or RX pressure under real frames
+  (NET5b to NET7);
+- Reset Endpoint for halted lanes, or controller reset (HID shares the controller);
+- a nonblocking command waiter;
+- real RX pressure, a whole-kernel resource census or DMA confinement.
+
+The same guarded image also passed a separate USB-stick+ax88 cold boot. During
+its initial idle window, serial login read `J549.TXT` exactly (six blocks, zero
+writes) and unmounted `/media/KUMO`; both NIC lanes stayed pending throughout.
+Both NVMe persistence files were read and unmounted on both arrangements. The
+stick run passed 60 EP0 reads and 20 cycles, with 40 cancelled/stopped transfers,
+zero router faults, lanes 10/10 and next custody sequence 9/9 (eight held VMOs).
+Its slowest cycle was 64.8 ms; settled EP0 max 4.1 ms and busy max 8.0 ms. The
+larger 1.17 s boot busy maximum includes scheduling and concurrent display work;
+it is not a bounded latency promise. No link/status/RX completion was observed.
+
+Normal and stop-racing completions share a pure checked length validator. Invalid
+completion codes or residuals above the requested span expose no DMA bytes; a
+failed cancellation step stays failed with backing held. The flat census measures
+owned rings, receipts and DMA allocations, not global OS heap/frame stability.
+
+Validate with:
+
+```sh
+python3 scripts/ax88-resident-proof.py --self-test
+python3 scripts/ax88-resident-proof.py capture.log
+```
+
+— TIMBERDOODLE 2026-11-07

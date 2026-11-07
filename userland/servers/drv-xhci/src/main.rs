@@ -1,13 +1,15 @@
 #![no_std]
 #![no_main]
 
-//j811
 //j827
 //j828
 //j829
 //j830
+//j831
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+mod resident_nic;
 
 use drv_blk::{
     decode_connect, BlockAccess, MediaReady, CONTROL_CONNECT_LEN, REQUEST_LEN as BLOCK_REQUEST_LEN,
@@ -26,7 +28,7 @@ use kumo_rt::{
     channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, clock_get,
     handle_close, handle_duplicate, handle_koid, interrupt_complete, interrupt_create,
     interrupt_wait, port_bind, port_create, port_unbind, port_wait, process_exit,
-    resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
+    resource_mint_mmio, sleep_ns, timer_create, vmar_map, vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -946,7 +948,7 @@ fn enumerate(
     // than halting the controller under a stick that was probed but never offered. — TIMBERDOODLE
     if storage_service().is_some() {
         let mut lanes: [Option<HidLane>; MAX_HID_LANES] = [None, None, None, None];
-        run_hid_lanes(&mut io, layout, image, evt, &mut lanes);
+        run_hid_lanes(&mut io, layout, image, cmd, evt, &mut lanes, &mut None);
     }
 }
 
@@ -1716,7 +1718,7 @@ fn enumerate_root_device(
         }),
         None,
     ];
-    run_hid_devices(&mut devices, io, layout, image, cmd, evt);
+    run_hid_devices(&mut devices, None, io, layout, image, cmd, evt);
 }
 
 /// J525: select a root-attached SCSI/BOT interface, identify its geometry, and discover a GPT ESP
@@ -3495,8 +3497,13 @@ fn poll_hid_completion(
     image: &mut NoOpCommandImage,
     evt: &DmaTrbs,
     lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+    nic: &Option<resident_nic::NicResident>,
 ) -> Option<(usize, RoutedTransfer)> {
     for _ in 0..IRQ_EVENT_DRAIN_LIMIT {
+        // NET4c-3: a routed NIC event ends this drain; the NIC lane consumes it next.
+        if nic.as_ref().is_some_and(|n| n.ready()) {
+            return None;
+        }
         for (i, lane) in lanes
             .iter_mut()
             .enumerate()
@@ -3527,8 +3534,10 @@ fn run_hid_lanes(
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
+    cmd: &mut DmaTrbs,
     evt: &DmaTrbs,
     lanes: &mut [Option<HidLane>; MAX_HID_LANES],
+    nic: &mut Option<resident_nic::NicResident>,
 ) {
     // U4: IRQ-driven persistent path. A busy-poll at our priority (63) would starve Sora (64), so
     // if this controller was granted its IRQ, enable the controller interrupter and block on the
@@ -3572,8 +3581,22 @@ fn run_hid_lanes(
             // the same port. Wakes are told apart by their source's koid.
             let interrupt_koid = handle_koid(interrupt);
             let storage_control_koid = irq_port.and_then(offer_storage);
-            if lanes.iter().all(Option::is_none) {
+            if lanes.iter().all(Option::is_none) && nic.is_none() {
                 log(b"drv-xhci: storage irq-driven; no hid lanes\n");
+            }
+            // NET4c-3: configure the adapter's lanes on this owner; they are armed with the
+            // HID lanes below and never waited on. A proof tick is a one-shot timer bound
+            // to the same port. — TIMBERDOODLE
+            let mut proof_timer: Option<(Handle, u64)> = None;
+            if let Some(resident) = nic.as_mut() {
+                match resident.start(io, layout, image, cmd, evt) {
+                    Ok(()) => log(b"drv-xhci: nic irq-driven; rx+status lanes resident\n"),
+                    Err(stage) => resident.fail_start(stage),
+                }
+                if resident.proof_due() {
+                    proof_timer = irq_port.and_then(arm_proof_timer);
+                    resident.schedule();
+                }
             }
             for lane in lanes.iter().flatten() {
                 log(if lane.hid.is_mouse() {
@@ -3603,12 +3626,21 @@ fn run_hid_lanes(
                         lane.arm(io, layout);
                     }
                 }
-                if !hid_ready(lanes) {
+                if let Some(resident) = nic.as_mut() {
+                    resident.arm_idle(io, layout);
+                }
+                let mut tick = false;
+                let waited = !hid_ready(lanes) && !nic.as_ref().is_some_and(|n| n.ready());
+                if waited {
                     match irq_port {
                         Some(port) => loop {
                             let source = port_wait(port);
                             if source == interrupt_koid {
                                 interrupt_wait(interrupt);
+                                break;
+                            }
+                            if proof_timer.is_some_and(|(_, koid)| koid == source) {
+                                tick = true;
                                 break;
                             }
                             let served = serve_storage_wake(
@@ -3620,7 +3652,10 @@ fn run_hid_lanes(
                                 source,
                                 storage_control_koid,
                             );
-                            if !served || hid_ready(lanes) {
+                            if !served
+                                || hid_ready(lanes)
+                                || nic.as_ref().is_some_and(|n| n.ready())
+                            {
                                 break;
                             }
                         },
@@ -3629,13 +3664,16 @@ fn run_hid_lanes(
                         }
                     }
                 }
+                // NET4c-3 measures this owner's own work per wake, from here to the end.
+                let woke = clock_get();
                 clear_interrupt_pending(io, layout);
                 // ERDP must be re-written on EVERY serviced interrupt, not only when a matching
                 // transfer event is found: the write clears EHB (Event Handler Busy), and the
                 // controller will not raise another interrupt while EHB is set.
                 write_erdp(io, layout, image.event_ring.dequeue_iova());
                 for _ in 0..HID_EVENTS_PER_WAKE {
-                    let Some((index, event)) = poll_hid_completion(io, layout, image, evt, lanes)
+                    let Some((index, event)) =
+                        poll_hid_completion(io, layout, image, evt, lanes, nic)
                     else {
                         break;
                     };
@@ -3669,6 +3707,7 @@ fn run_hid_lanes(
                         }
                         lane.pending = false;
                         lane.ticket = None;
+                        resident_nic::note_hid_report();
                         let actual = lane.hid.max_packet_size as usize - event.remaining as usize;
                         if (!lane.hid.is_mouse() && actual != kumo_hid::REPORT_BYTES)
                             || (lane.hid.is_mouse() && actual < 3)
@@ -3709,6 +3748,19 @@ fn run_hid_lanes(
                         break;
                     }
                 }
+                if let Some(resident) = nic.as_mut() {
+                    resident.service();
+                    if tick {
+                        if let Some((timer, _)) = proof_timer.take() {
+                            let _ = handle_close(timer);
+                        }
+                        if resident.proof_tick(io, layout, image, cmd, evt) {
+                            proof_timer = irq_port.and_then(arm_proof_timer);
+                            resident.schedule();
+                        }
+                    }
+                    resident.note_busy(clock_get().saturating_sub(woke));
+                }
                 interrupt_complete(interrupt);
             }
         }
@@ -3724,8 +3776,10 @@ fn run_hid_lanes(
 }
 
 /// Bring up every device's lanes and hand them to one resident loop that never returns.
+/// NET4c-3: an ax88 handed off in a proof image joins the same loop. — TIMBERDOODLE
 fn run_hid_devices(
     devices: &mut [Option<KeyboardHandoff>; MAX_HID_DEVICES],
+    nic: Option<resident_nic::NicHandoff>,
     io: &mut Mmio,
     layout: RegisterLayout,
     image: &mut NoOpCommandImage,
@@ -3737,10 +3791,41 @@ fn run_hid_devices(
     for device in devices.iter_mut().flatten() {
         device.bring_up(io, layout, image, cmd, evt, &mut lanes, &mut count);
     }
-    if count == 0 {
+    // Proof images make the boot keyboard report every 100 ms (HID 1.11 appendix G
+    // requires Set_Idle of boot keyboards), so HID liveness beside pending NIC lanes is
+    // measured rather than inferred. The decoder only acts on key changes.
+    let mut hid_idle_cc = None;
+    if nic.is_some() {
+        if let Some(keyboard) = devices
+            .iter_mut()
+            .flatten()
+            .find(|d| d.plan.keyboard.is_some())
+        {
+            hid_idle_cc = keyboard.set_idle(io, layout, image, evt, resident_nic::HID_IDLE_4MS);
+        }
+    }
+    // Only proof images ever configure the adapter; the constant folds this away otherwise.
+    let mut resident = nic.filter(|_| resident_nic::ENABLED).and_then(|handoff| {
+        resident_nic::NicResident::bring_up(handoff, io, layout, image, evt, hid_idle_cc)
+    });
+    if count == 0 && resident.is_none() {
         return log(b"drv-xhci: no hid lanes\n");
     }
-    run_hid_lanes(io, layout, image, evt, &mut lanes);
+    run_hid_lanes(io, layout, image, cmd, evt, &mut lanes, &mut resident);
+}
+
+/// Bind a one-shot NET4c-3 proof tick to the resident loop's port: `(timer, koid)`.
+fn arm_proof_timer(port: Handle) -> Option<(Handle, u64)> {
+    let raw = timer_create(resident_nic::TICK_NS);
+    if raw == 0 || raw == u64::MAX {
+        return None;
+    }
+    let timer = Handle(raw as u32);
+    if port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return None;
+    }
+    Some((timer, handle_koid(timer)))
 }
 
 /// Issue a no-data control transfer over EP0 (Setup + IN Status), for SET_CONFIGURATION and
@@ -4456,6 +4541,7 @@ fn configure_and_read_hub(
     // (storage) has had its turn. — TIMBERDOODLE
     let mut devices: [Option<KeyboardHandoff>; MAX_HID_DEVICES] = [None, None];
     let mut device_count = 0usize;
+    let mut nic: Option<resident_nic::NicHandoff> = None;
     for down_port in stable.iter() {
         let found = enumerate_hub_downstream(
             io,
@@ -4473,17 +4559,21 @@ fn configure_and_read_hub(
             down_port,
             Deadline::after(HUB_PASS_BUDGET_NS),
         );
-        if let Some(handoff) = found {
-            if device_count < MAX_HID_DEVICES {
+        match found {
+            Some(Downstream::Keyboard(handoff)) if device_count < MAX_HID_DEVICES => {
                 devices[device_count] = Some(handoff);
                 device_count += 1;
-            } else {
-                log(b"drv-xhci: hub dev third hid device left alone\n");
             }
+            Some(Downstream::Keyboard(_)) => {
+                log(b"drv-xhci: hub dev third hid device left alone\n")
+            }
+            Some(Downstream::Nic(handoff)) if nic.is_none() => nic = Some(handoff),
+            Some(Downstream::Nic(_)) => log(b"drv-xhci: second ax88 left unconfigured\n"),
+            None => {}
         }
     }
-    if device_count > 0 {
-        run_hid_devices(&mut devices, io, layout, image, cmd, evt);
+    if device_count > 0 || nic.is_some() {
+        run_hid_devices(&mut devices, nic, io, layout, image, cmd, evt);
     }
 }
 
@@ -4502,6 +4592,37 @@ struct KeyboardHandoff {
 }
 
 impl KeyboardHandoff {
+    /// HID SET_IDLE to the boot keyboard interface; returns the completion code.
+    fn set_idle(
+        &mut self,
+        io: &mut Mmio,
+        layout: RegisterLayout,
+        image: &mut NoOpCommandImage,
+        evt: &DmaTrbs,
+        duration_4ms: u8,
+    ) -> Option<u8> {
+        let interface = self.plan.keyboard?.interface_number;
+        // SAFETY: the device's page stays mapped for the driver's lifetime.
+        let ep0_seg = &mut unsafe {
+            DmaTrbs::new(
+                (self.page_va as usize + OFF_EP0_RING) as *mut Trb,
+                EP0_RING_TRBS,
+            )
+        };
+        let set_idle = [0x21, 0x0a, 0x00, duration_4ms, interface, 0x00, 0x00, 0x00];
+        control_no_data(
+            io,
+            layout,
+            image,
+            evt,
+            &mut self.ep0_ring,
+            ep0_seg,
+            self.slot_id,
+            set_idle,
+        )
+        .map(|(cc, _)| cc)
+    }
+
     fn bring_up(
         &mut self,
         io: &mut Mmio,
@@ -4538,6 +4659,12 @@ impl KeyboardHandoff {
             count,
         );
     }
+}
+
+/// What a hub-downstream device leaves for the resident loop.
+enum Downstream {
+    Keyboard(KeyboardHandoff),
+    Nic(resident_nic::NicHandoff),
 }
 
 /// The next unused downstream device page in the `DEV2_VA` window, mapped: `(va, phys)` (J541).
@@ -4580,7 +4707,7 @@ fn enumerate_hub_downstream(
     hub_data_buf: DmaBuf,
     down_port: u8,
     pass: Deadline,
-) -> Option<KeyboardHandoff> {
+) -> Option<Downstream> {
     let Some(DownstreamDevice {
         slot_id: dev_slot,
         speed_raw: down_speed,
@@ -4673,6 +4800,19 @@ fn enumerate_hub_downstream(
                 config.bytes(),
                 data_buf,
             );
+            // NET4c-3: proof images keep the adapter for the resident loop.
+            return resident_nic::handoff(
+                dev_slot,
+                dev_va,
+                dev_phys,
+                down_speed,
+                slot_words,
+                config.device,
+                config.bytes(),
+                config.config_value,
+                ep0_ring,
+            )
+            .map(Downstream::Nic);
         }
         return None;
     }
@@ -4727,7 +4867,7 @@ fn enumerate_hub_downstream(
         log_hex(mouse.in_endpoint_address as u64);
         log(b"\n");
     }
-    Some(KeyboardHandoff {
+    Some(Downstream::Keyboard(KeyboardHandoff {
         slot_id: dev_slot,
         page_va: dev_va,
         page_phys: dev_phys,
@@ -4736,7 +4876,7 @@ fn enumerate_hub_downstream(
         config_value: config.config_value,
         plan,
         ep0_ring,
-    })
+    }))
 }
 
 /// A hub-downstream device that answered Address Device on its own slot and page.
