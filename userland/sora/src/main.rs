@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j816
 //j820
 //j822
 //j824
 //j825
+//j829
 
 extern crate alloc;
 
@@ -2464,6 +2464,87 @@ const XHCI_STORAGE_BOOTSTRAP_TAG: u8 = b'b';
 /// (`sora::StorageTransport`: usb0, usb1, host2, then NVMe since J803); 0 = none.
 static STORAGE_CONTROLS: [AtomicU32; sora::STORAGE_DEVICES] =
     [const { AtomicU32::new(0) }; sora::STORAGE_DEVICES];
+// Private USB parent custody uses the existing per-controller control channels.
+// Ledger aliases stay in Sora's handle table until reset, including peer death.
+// — TIMBERDOODLE
+struct UsbDmaCustodyCell(core::cell::UnsafeCell<[kumo_xhci::DmaCustodyLedger; sora::NVME_STORAGE]>);
+// SAFETY: Sora has one receive thread; ledger borrows end before any syscall.
+unsafe impl Sync for UsbDmaCustodyCell {}
+static USB_DMA_CUSTODY: UsbDmaCustodyCell = UsbDmaCustodyCell(core::cell::UnsafeCell::new(
+    [const { kumo_xhci::DmaCustodyLedger::new() }; sora::NVME_STORAGE],
+));
+static USB_CONTROL_KOIDS: [AtomicU64; sora::NVME_STORAGE] =
+    [const { AtomicU64::new(0) }; sora::NVME_STORAGE];
+static USB_CUSTODY_INITRD: AtomicU32 = AtomicU32::new(0);
+fn configure_usb_custody(index: usize, controller: u64) -> bool {
+    if index >= sora::NVME_STORAGE {
+        return false;
+    }
+    // SAFETY: no reference escapes this startup-only operation.
+    unsafe {
+        (&mut *USB_DMA_CUSTODY.0.get())[index]
+            .configure(controller)
+            .is_ok()
+    }
+}
+/// Rejected/unacknowledged imports may close; an alias already accepted by any
+/// USB ledger never does. Keep even an unexpected duplicate handle safe. — TIMBERDOODLE
+fn close_unheld_usb_handle(raw: u64) {
+    if raw == 0 || raw > u32::MAX as u64 {
+        return;
+    }
+    // SAFETY: one Sora receiver; the shared borrow ends before handle_close.
+    let held = unsafe {
+        (&*USB_DMA_CUSTODY.0.get())
+            .iter()
+            .any(|l| l.contains_handle(raw as u32))
+    };
+    if !held {
+        let _ = handle_close(Handle(raw as u32));
+    }
+}
+
+fn accept_usb_custody(index: usize, frame: &[u8], raw: u64, control: Handle) {
+    use kumo_xhci::{CustodyError, DmaMemory};
+    let memory = DmaMemory::decode(frame);
+    let result =
+        if index >= sora::NVME_STORAGE || raw == 0 || raw == u64::MAX || raw > u32::MAX as u64 {
+            Err(CustodyError::Handle)
+        } else {
+            memory.and_then(|memory| {
+                // SAFETY: single receive thread; store the strong handle before ACK.
+                let ledger = unsafe { &mut (&mut *USB_DMA_CUSTODY.0.get())[index] };
+                let ack = ledger.accept(memory, raw as u32)?;
+                Ok((ack, memory, ledger.count()))
+            })
+        };
+    match result {
+        Ok((ack, memory, count)) => {
+            let message = alloc::format!(
+                "XHCI DMA HOLD controller={:#x} seq={} bytes={} held={}\n",
+                memory.controller,
+                memory.sequence,
+                memory.bytes,
+                count
+            );
+            notice(&[message.as_bytes()]);
+            if channel_write(control, ack.as_ptr(), ack.len()) != 0 {
+                notice(&[b"xhci: custody ACK failed; parent VMO alias retained\n"]);
+            }
+        }
+        Err(_) => {
+            // This allocation was not acknowledged/published. Existing aliases stay held.
+            close_unheld_usb_handle(raw);
+            let mut nack = *b"XDN1\0\0\0\0";
+            if frame.len() >= 8 {
+                nack[4..].copy_from_slice(&frame[4..8]);
+            }
+            let _ = channel_write(control, nack.as_ptr(), nack.len());
+            notice(&[b"xhci: DMA custody refused; no publication ACK\n"]);
+        }
+    }
+}
+
 static NVME_CONTROL_KOID: AtomicU64 = AtomicU64::new(0);
 static NVME_UNPROVEN: AtomicBool = AtomicBool::new(false);
 static NVME_WATCH_PORT: AtomicU32 = AtomicU32::new(0);
@@ -2545,6 +2626,7 @@ fn launch_xhci_first_light(
     dtb_vmo: Handle,
     dtb_phys: u64,
 ) -> (Option<Handle>, Option<Handle>) {
+    USB_CUSTODY_INITRD.store(initrd.0, Ordering::Relaxed);
     let (kbd_reader, kbd_writer) = channel_create_pair();
     let have_channel = kbd_reader != u64::MAX && kbd_writer != u64::MAX;
     if !have_channel {
@@ -2606,6 +2688,7 @@ fn launch_xhci_first_light(
             writer_for(have_channel),
             mouse_for(have_mouse),
             storage_for(0),
+            0,
         ),
         None => log(b"drv-xhci: no supported usb0 xhci\n"),
     }
@@ -2622,6 +2705,7 @@ fn launch_xhci_first_light(
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(1),
+        1,
     );
     spawn_xhci(
         initrd,
@@ -2636,6 +2720,7 @@ fn launch_xhci_first_light(
         writer_for(have_channel),
         mouse_for(have_mouse),
         storage_for(2),
+        2,
     );
     // The originals stay with Sora only as duplication sources; close them.
     if have_channel {
@@ -3908,7 +3993,12 @@ fn spawn_xhci(
     keyboard_writer: u64,
     mouse_writer: u64,
     storage_writer: u64,
+    controller_index: usize,
 ) {
+    if !configure_usb_custody(controller_index, config.mmio_base) {
+        log(b"drv-xhci: duplicate or invalid custody owner\n");
+        return;
+    }
     log(b"drv-xhci: topology mmio=");
     log_hex(config.mmio_base);
     log(b" len=");
@@ -5877,11 +5967,15 @@ extern "C" fn sora_main(
         // so a stick probed before this point still wakes the loop below.
         let mut storage_koids: [Option<Handle>; sora::STORAGE_DEVICES] =
             [None; sora::STORAGE_DEVICES];
-        for (koid, control) in storage_koids.iter_mut().zip(&STORAGE_CONTROLS) {
+        for (index, (koid, control)) in storage_koids.iter_mut().zip(&STORAGE_CONTROLS).enumerate()
+        {
             let control = Handle(control.load(Ordering::Relaxed));
             let raw_koid = handle_koid(control);
             if control.0 != 0 && raw_koid != u64::MAX && port_bind(port, control) == 0 {
                 *koid = Some(Handle(raw_koid as u32));
+                if index < sora::NVME_STORAGE {
+                    USB_CONTROL_KOIDS[index].store(raw_koid, Ordering::Relaxed);
+                }
             }
         }
         let cons_koid = Handle(console_koid as u32);
@@ -7174,9 +7268,13 @@ fn media_offered(
     koids: &mut [Option<Handle>; sora::STORAGE_DEVICES],
 ) -> bool {
     let control = Handle(STORAGE_CONTROLS[index].load(Ordering::Relaxed));
-    let mut frame = [0u8; drv_blk::MEDIA_READY_LEN];
-    let n = channel_read(control, frame.as_mut_ptr(), frame.len());
-    if n == 0 || n > frame.len() as u64 {
+    let mut frame = [0u8; kumo_xhci::DMA_CUSTODY_LEN];
+    let (n, raw) = channel_read_with_handle(control, frame.as_mut_ptr(), frame.len());
+    if n == 0 || n > frame.len() {
+        close_unheld_usb_handle(raw);
+        if index < sora::NVME_STORAGE {
+            USB_CONTROL_KOIDS[index].store(0, Ordering::Relaxed);
+        }
         let _ = port_unbind(port, control);
         koids[index] = None;
         set_device(index, None);
@@ -7187,6 +7285,15 @@ fn media_offered(
             set_media(None);
             log(b"media: driver gone; volume removed\n");
         }
+        return false;
+    }
+    if frame.get(..4) == Some(&b"XDM1"[..]) {
+        accept_usb_custody(index, &frame[..n], raw, control);
+        return false;
+    }
+    if raw != 0 || n != drv_blk::MEDIA_READY_LEN {
+        close_unheld_usb_handle(raw);
+        log(b"media: malformed offer; no DMA publication ACK\n");
         return false;
     }
     let Some(ready) = drv_blk::MediaReady::decode(&frame[..n as usize]) else {
@@ -7597,6 +7704,25 @@ fn netstack_schedule_restart() {
 }
 
 /// Called from every existing Sora wait context; no reference is held across a syscall.
+/// Nested client waits must acknowledge USB custody too: a login/stdout wait may
+/// otherwise depend on the very keyboard whose driver is waiting for ACK.
+/// Per-wake one message; no draining ChannelRead on an empty peer. — TIMBERDOODLE
+fn dispatch_service_event(source: u64) -> bool {
+    if source != 0 {
+        if let Some(index) = USB_CONTROL_KOIDS
+            .iter()
+            .position(|k| k.load(Ordering::Relaxed) == source)
+        {
+            let initrd = Handle(USB_CUSTODY_INITRD.load(Ordering::Relaxed));
+            let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+            let mut watches = [None; sora::STORAGE_DEVICES];
+            let _ = media_offered(initrd, port, index, &mut watches);
+            return true;
+        }
+    }
+    netstack_event(source)
+}
+
 fn netstack_event(source: u64) -> bool {
     #[cfg(feature = "netstack-restart-proof")]
     if let Some((timer, _)) = NET_PROOF_TIMER.get().filter(|t| t.1 == source) {
@@ -7661,7 +7787,7 @@ fn netstack_ready(initrd: Handle) -> Option<NetInstance> {
         if source == u64::MAX {
             return None;
         }
-        netstack_event(source);
+        dispatch_service_event(source);
     }
 }
 
@@ -7737,7 +7863,7 @@ fn netstack_crash_proof(initrd: Handle, burst: bool) {
             if source == deadline_koid || source == u64::MAX {
                 break;
             }
-            netstack_event(source);
+            dispatch_service_event(source);
         }
         let _ = port_unbind(port, deadline);
         let _ = handle_close(deadline);
@@ -7799,7 +7925,7 @@ fn actor_read(channel: Handle, buf: &mut [u8]) -> Option<usize> {
     let result = if bound {
         loop {
             let source = port_wait(port);
-            if netstack_event(source) {
+            if dispatch_service_event(source) {
                 continue;
             }
             if source == tk || source == u64::MAX {
@@ -9368,7 +9494,7 @@ fn ax4_collect(children: &[Ax4Child], want: u8, frames: &mut [Ax4Frame]) -> u32 
         if source == tk || source == u64::MAX {
             break;
         }
-        if netstack_event(source) {
+        if dispatch_service_event(source) {
             continue;
         }
         let Some(index) = children
@@ -9461,7 +9587,7 @@ fn ax4_close_all(children: &[Ax4Child], closed: &mut [bool]) -> u32 {
         if source == tk || source == u64::MAX {
             break;
         }
-        if netstack_event(source) {
+        if dispatch_service_event(source) {
             continue;
         }
         let Some(index) = children
@@ -12900,7 +13026,7 @@ fn read_channel_ready(channel: Handle, reply: &mut [u8]) -> Option<usize> {
     }
     let result = loop {
         let source = port_wait(port);
-        if netstack_event(source) {
+        if dispatch_service_event(source) {
             continue;
         }
         if source == handle_koid(channel) {
@@ -12931,7 +13057,7 @@ fn ttyd_request_reply(client: Handle, request: TtyRequest, reply: &mut [u8]) -> 
     let result = if channel_write(client, req.as_ptr(), req_len) == 0 {
         loop {
             let source = port_wait(port);
-            if netstack_event(source) {
+            if dispatch_service_event(source) {
                 continue;
             }
             if source == handle_koid(client) {

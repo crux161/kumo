@@ -1,9 +1,9 @@
 #![no_std]
-//j541
 //j545
 //j703
 //j827
 //j828
+//j829
 
 //! Pure xHCI data structures and ring state machines.
 //!
@@ -14,6 +14,7 @@
 mod context;
 mod control;
 mod controller;
+mod custody;
 mod dma;
 mod dwc3;
 mod fdt;
@@ -31,6 +32,10 @@ pub use context::{
 };
 pub use control::{ControlData, ControlError, ControlPipe, ControlProgress, CONTROL_DATA_MAX};
 pub use controller::{ControllerStatus, NoOpRegisterConfig, RegisterIo, RegisterLayout};
+pub use custody::{
+    CustodyError, DmaCustodyLedger, DmaMemory, DMA_ACK_LEN, DMA_ALLOCATION_MAX, DMA_CUSTODY_LEN,
+    DMA_CUSTODY_MAX, DMA_TOTAL_MAX,
+};
 pub use dma::{DmaBuf, DmaQwords, DmaTrbs, QwordSink, TrbSink, TrbSource};
 pub use dwc3::{HostInit, RegisterUpdate};
 pub use fdt::{

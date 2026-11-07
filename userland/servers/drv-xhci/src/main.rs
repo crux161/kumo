@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j767
 //j809
 //j811
 //j827
 //j828
+//j829
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -14,7 +14,7 @@ use drv_blk::{
     STATUS_IO_ERROR, STATUS_OK,
 };
 use drv_xhci::{storage_request, StorageRequest};
-use kumo_abi::{Handle, VmarFlags};
+use kumo_abi::{Handle, Rights, VmarFlags};
 use kumo_fatfs::{
     BlockReader, Bpb, FatError, FatVolume, PartitionFitError, PartitionReader, SECTOR_SIZE,
 };
@@ -23,9 +23,10 @@ use kumo_gpt::{
     MbrPartitionTable, Partition, EFI_SYSTEM_PARTITION_TYPE_GUID,
 };
 use kumo_rt::{
-    channel_read, channel_read_with_handle, channel_write, clock_get, handle_close, handle_koid,
-    interrupt_complete, interrupt_create, interrupt_wait, port_bind, port_create, port_unbind,
-    port_wait, process_exit, resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
+    channel_read, channel_read_with_handle, channel_write, channel_write_with_handle, clock_get,
+    handle_close, handle_duplicate, handle_koid, interrupt_complete, interrupt_create,
+    interrupt_wait, port_bind, port_create, port_unbind, port_wait, process_exit,
+    resource_mint_mmio, sleep_ns, vmar_map, vmo_create_contiguous,
 };
 use kumo_usb_storage::{
     CommandBlockWrapper, CommandStatus, CommandStatusWrapper, DataDirection, MassStorageInterface,
@@ -585,13 +586,87 @@ fn storage_service() -> &'static mut Option<StorageService> {
     unsafe { &mut *STORAGE_SERVICE.0.get() }
 }
 
+static DMA_CUSTODY_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+static DMA_CUSTODY_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Startup-only handshake. A successful transfer makes the alias a strong parent
+/// reference; only an exact ACK allows this function to return a publishable address.
+/// No caller programs a new allocation before this returns. — TIMBERDOODLE
+fn create_custodied_dma(bytes: u64) -> (u64, u64) {
+    use kumo_xhci::{DmaMemory, DMA_ACK_LEN, DMA_ALLOCATION_MAX, DMA_CUSTODY_MAX};
+    let control = Handle(STORAGE_CONTROL.load(Ordering::Relaxed));
+    if control.0 == 0
+        || bytes == 0
+        || bytes & 4095 != 0
+        || bytes > DMA_ALLOCATION_MAX
+        || DMA_CUSTODY_FAILED.load(Ordering::Relaxed)
+    {
+        return (u64::MAX, 0);
+    }
+    let sequence = DMA_CUSTODY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    if sequence == 0 || sequence as usize > DMA_CUSTODY_MAX {
+        DMA_CUSTODY_FAILED.store(true, Ordering::Relaxed);
+        return (u64::MAX, 0);
+    }
+    let (raw, physical) = vmo_create_contiguous(bytes);
+    if raw == 0 || raw == u64::MAX || physical == 0 {
+        DMA_CUSTODY_FAILED.store(true, Ordering::Relaxed);
+        return (u64::MAX, 0);
+    }
+    let memory = DmaMemory {
+        sequence,
+        bytes,
+        physical,
+        controller: CONTROLLER_BASE.load(Ordering::Relaxed),
+    };
+    let alias = handle_duplicate(Handle(raw as u32), Rights::READ | Rights::TRANSFER);
+    if memory.validate().is_err() || alias == 0 || alias == u64::MAX {
+        if alias != 0 && alias != u64::MAX {
+            let _ = handle_close(Handle(alias as u32));
+        }
+        let _ = handle_close(Handle(raw as u32));
+        DMA_CUSTODY_FAILED.store(true, Ordering::Relaxed);
+        return (u64::MAX, 0);
+    }
+    let frame = memory.encode();
+    if channel_write_with_handle(control, frame.as_ptr(), frame.len(), Handle(alias as u32)) != 0 {
+        let _ = handle_close(Handle(alias as u32));
+        let _ = handle_close(Handle(raw as u32));
+        DMA_CUSTODY_FAILED.store(true, Ordering::Relaxed);
+        return (u64::MAX, 0);
+    }
+    // Alias moved: its old handle number may be reused. Do not close it now.
+    // Waiting before publication harms this startup actor only. — TIMBERDOODLE
+    let mut ack = [0; DMA_ACK_LEN];
+    let (n, h) = channel_read_with_handle(control, ack.as_mut_ptr(), ack.len());
+    let accepted = n == ack.len() && h == 0 && memory.acknowledge(&ack).is_ok();
+    if h != 0 && h != u64::MAX {
+        let _ = handle_close(Handle(h as u32));
+    }
+    if !accepted {
+        let _ = handle_close(Handle(raw as u32));
+        DMA_CUSTODY_FAILED.store(true, Ordering::Relaxed);
+        ax88_record(format_args!(
+            "XHCI DMA custody refused controller={:#x} seq={}; no publication\n",
+            memory.controller, sequence
+        ));
+        return (u64::MAX, 0);
+    }
+    DMA_RETAINED.store(true, Ordering::Relaxed);
+    ax88_record(format_args!(
+        "XHCI DMA ACK controller={:#x} seq={} bytes={} phys={:#x}\n",
+        memory.controller, sequence, bytes, physical
+    ));
+    (raw, physical)
+}
+
 /// Slice B: allocate the no-op DMA image, take the controller through reset → run, ring the
 /// command doorbell, and poll the event ring for the No-Op Command Completion. On success it
 /// continues into Slice C enumeration reusing the running command/event rings.
 fn run_noop_ladder(layout: RegisterLayout, caplength: u8, max_ports: u8) {
     // One physically-contiguous, zeroed DMA page. `phys` is the device-visible base (USB SMMU
     // bypass), so ring/DCBAA/ERST IOVAs are just `phys + offset`.
-    let (dma_raw, phys) = vmo_create_contiguous(DMA_LEN);
+    let (dma_raw, phys) = create_custodied_dma(DMA_LEN);
     if dma_raw == u64::MAX || phys == 0 {
         log(b"drv-xhci: dma vmo fail\n");
         return;
@@ -1894,7 +1969,7 @@ fn configure_and_probe_storage(
         Ok(adapter) => adapter,
         Err(_) => return log(b"drv-xhci: storage block geometry exceeds DMA window\n"),
     };
-    let (read_raw, read_allocation_phys) = vmo_create_contiguous(STORAGE_ALLOCATION_LEN);
+    let (read_raw, read_allocation_phys) = create_custodied_dma(STORAGE_ALLOCATION_LEN);
     if read_raw == u64::MAX || read_allocation_phys == 0 {
         return log(b"drv-xhci: storage read vmo fail\n");
     }
@@ -5119,7 +5194,7 @@ fn read_ctx_word(va: u64, word_index: usize) -> u32 {
 /// Allocate and map one zeroed, uncached, contiguous device page at `va`; returns its physical
 /// address (the IOVA under SMMU bypass).
 fn map_device_page(va: u64) -> Option<u64> {
-    let (raw, phys) = vmo_create_contiguous(ENUM_LEN);
+    let (raw, phys) = create_custodied_dma(ENUM_LEN);
     if raw == u64::MAX || phys == 0 {
         log(b"drv-xhci: enum vmo fail\n");
         return None;
@@ -5371,7 +5446,7 @@ fn setup_scratchpad(dma_va: u64, dma_phys: u64, dcbaa: &mut DmaQwords, count: u3
         return true;
     }
     let bytes = count as u64 * PAGE_SIZE;
-    let (buffers_raw, buffers_phys) = vmo_create_contiguous(bytes);
+    let (buffers_raw, buffers_phys) = create_custodied_dma(bytes);
     if buffers_raw == u64::MAX || buffers_phys == 0 {
         return false;
     }

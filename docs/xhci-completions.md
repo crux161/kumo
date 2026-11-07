@@ -1,5 +1,6 @@
 # xHCI completion ownership
 <!-- j828 -->
+<!-- j829 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -68,7 +69,8 @@ One-shot hub status can remain pending when its startup budget ends. Its endpoin
 and page are deliberately retained; a later completion is reported as quarantined.
 This is separate from a successful EP0 routing proof, whose fault delta must be zero.
 NET4c must establish actual endpoint/controller quiescence and reclaim these retained
-resources. Process-death DMA safety and DESIGN009 confinement remain unproved.
+resources. NET4c-1 adds parent-held allocation aliases as described below. Full
+process-death recovery and DESIGN009 confinement remain unproved.
 Recovery class is stateless; no critical durable truth is in the router. — TIMBERDOODLE
 
 ## Proofs and remaining work
@@ -97,3 +99,62 @@ Hardware keyboard/USB-stick/NVMe coexistence witnesses remain separate records.
 NET4c owns independent resident NIC buffers, nonblocking RX scheduling, deadlines,
 pressure and stop/disable/reset recovery with a flat repeated resource census.
 This slice adds neither Ethernet endpoint setup nor traffic. — TIMBERDOODLE 2026-11-07
+
+
+## NET4c-1: parent DMA custody before publication
+
+All four contiguous-allocation paths in drv-xhci use `create_custodied_dma`:
+
+| Backing | Contents / size | Creator and custodian | CPU mapping / device address |
+|---|---|---|---|
+| Initial controller page | DCBAA, command/event rings and ERST; 4 KiB | driver creates; Sora holds alias | uncached VA `0x12000000`; physical base plus offsets |
+| Device pages | contexts, EP0/rings/control and HID/BOT/hub data; 4 KiB each | same | uncached VA `0x13000000`, `0x16000000`, or `0x14000000 + n*4096`; physical base plus offsets |
+| Scratchpad pages | controller-advertised count, page rounded | same | never CPU mapped; physical entries in scratchpad array |
+| Storage buffer | one 16 KiB window selected within 32 KiB backing | same | uncached VA `0x15000000 + window_offset`; physical base plus window offset |
+
+The existing per-controller storage-control channel also carries private custody
+frames. Before mapping/programming a new allocation, the driver duplicates its VMO
+with READ|TRANSFER, transfers that alias and an exact 32-byte `XDM1` frame (sequence,
+length, physical base, controller base), and waits for an exact eight-byte `XDA1`
+with the same sequence. Sora imports and records the alias before sending ACK. The
+parent log `XHCI DMA HOLD` precedes the driver's `XHCI DMA ACK`. No new public ABI,
+client DMA handle or driver authority is introduced. Physical metadata is a cooperative
+driver report, not a kernel-verified address binding. — TIMBERDOODLE
+
+The pure `kumo-xhci::DmaCustodyLedger` has 32 slots per controller, at most 4 MiB per
+allocation and 16 MiB total. It checks page alignment/nonoverflow, exact controller,
+monotonic sequence, distinct handles and disjoint reported physical spans. Three
+fixed ledgers cover the existing USB controller slots. Sora's single receive thread
+releases each ledger borrow before logging or syscalls. Its nested client waits
+also dispatch the control channels, avoiding a login/keyboard startup dependency.
+Media offers retain their exact 25-byte shape and remain distinct from custody.
+
+Rejected, malformed or missing ACKs never permit publication; the driver stops
+allocating after failure. Sora may close only an unaccepted import. Every accepted
+alias remains held on malformed messages, ACK delivery failure and peer closure;
+there is no release/reset API. Thus a child exit alone cannot drop the final VMO
+reference. The retained budget is bounded for one boot, and automatic controller
+respawn is not enabled. Sora death or machine reset ends this custody; a Sora restart
+is not proven safe while DMA remains active. — TIMBERDOODLE
+
+This handshake protects allocation lifetime. It does not prevent a faulty driver
+from programming another physical address, prove HCHalted, revoke DMA, stop an
+endpoint, drain cancelled events, or permit reuse of uncertain buffers. Full
+NET4c still needs verified quiescence, resident independent NIC buffers/nonblocking
+RX and repeated flat start/stop census. The existing raw USB DMA non-claim and
+Road C remain explicit. Do not expand the NVMe D5 exception to another PCIe device.
+
+Validate a single completed boot capture with:
+
+```sh
+python3 scripts/xhci-dma-proof.py --self-test
+python3 scripts/xhci-dma-proof.py capture.log
+python3 scripts/ax88-ep0-proof.py --routing capture.log
+```
+
+The custody checker requires every observed HOLD/ACK to pair in causal order with
+matching sizes and sequential slots, bounded disjoint spans and no refused custody.
+It requires login after the final ACK, and reports the per-controller retained
+census. This is trace evidence of startup, not a destructive child-death or DMA
+confinement test. Physical keyboard, USB-stick and NVMe witnesses remain separate.
+— TIMBERDOODLE 2026-11-07
