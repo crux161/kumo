@@ -1,8 +1,8 @@
-#j813
 #j815
 #j822
 #j823
 #j824
+#j825
 [workspace]
 members = [
     "boot/niji-loader",
@@ -35,6 +35,7 @@ members = [
     "tools/stage-a-smoke",
     "userland/actorcall",
     "userland/actorprobe",
+    "userland/ax4idle",
     "userland/asidpair",
     "userland/args",
     "userland/cat",

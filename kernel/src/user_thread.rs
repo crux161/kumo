@@ -8,11 +8,11 @@
 //!
 //! ChannelRead blocking (empty inbox → park → wake on write) arrives in P5-sora.
 
-//j534
 //j556
 //j724
 //j730
 //j824
+//j825
 
 use core::cell::UnsafeCell;
 
@@ -70,8 +70,14 @@ const CHILD_PRIORITY: Priority = Priority(63);
 /// third spawn and every later blocking `M10` then failed the slot gate, and the pending async
 /// children never got a yield to run. 12 covers the persistent drivers + a per-controller
 /// enumeration fan-out + the svc-health/M10 transients with headroom.
-const MAX_RESIDENT_CHILDREN: usize = 12;
-const _: () = assert!(MAX_RESIDENT_CHILDREN == kumo_abi::actor::RESIDENT_LIMIT);
+/// The compile-time ceiling on resident children. The live bound is the Job policy mirror
+/// [`UserSched::resident_limit`], which starts at this value and can be set anywhere in
+/// `1..=MAX_RESIDENT_CHILDREN` (it can rise again after a temporary narrowing). `children`
+/// reserves this capacity up front so a boot wave does not reallocate
+/// while a child awaits first entry; AX4's boxed entries make that a heap-churn preference,
+/// not a correctness requirement. Every stored child is one boxed allocation.
+const MAX_RESIDENT_CHILDREN: usize = kumo_abi::actor::RESIDENT_MAX;
+const _: () = assert!(MAX_RESIDENT_CHILDREN == kumo_abi::actor::RESIDENT_MAX);
 /// P10-g: async child preempts Sora via reschedule_current in process_wait.
 /// Same priority as the blocking child — more urgent than Sora's boot admit (64), less
 /// urgent than every later wake of hers (`USER_WAKE_PRIORITY`, J730).
@@ -246,8 +252,13 @@ pub struct UserSched {
     /// True until the first switch into Sora's `kumo_user_enter` trampoline.
     pub user_fresh: bool,
     /// The resident children spawned by Sora's `ProcessRun` demos, each with its own
-    /// per-child state. Bounded by `MAX_RESIDENT_CHILDREN`; looked up by thread koid.
-    children: alloc::vec::Vec<ResidentChild>,
+    /// per-child state. Bounded by the live policy bound (`resident_limit`); looked up by
+    /// thread koid. Each entry is boxed: the J169 entry context bakes a `&UserState` into
+    /// the child's saved x19, so the `ResidentChild`'s address must be stable from install
+    /// until reap even while this Vec grows. A `Vec<Box<_>>` moves pointers, never the
+    /// pointee; `reap_done` is the only dropper, and it removes only after the thread has
+    /// terminated and is no longer current. — TIMBERDOODLE
+    children: alloc::vec::Vec<alloc::boxed::Box<ResidentChild>>,
     /// Threads parked on a typed wait target, keyed by thread and object koid.
     wait_queue: WaitQueue,
     /// A timer/device wake admitted a resident child while some other EL0 thread kept
@@ -270,6 +281,10 @@ pub struct UserSched {
     pub done: bool,
     /// AX2 reply routing for Sora's own served call.
     sora_current_call: Option<usize>,
+    /// AX4 resident bound mirrored from Sora's root Job policy. Admission compares the
+    /// resident children count against this value; it is the authoritative live gate because
+    /// the scheduler owns the resident set. Always in `1..=MAX_RESIDENT_CHILDREN`.
+    resident_limit: u32,
 }
 
 struct UserSchedCell(UnsafeCell<Option<UserSched>>);
@@ -308,8 +323,8 @@ pub fn switch_count() -> u64 {
 
 /// Capacity applies to resident child threads; Sora and the idle floor are excluded.
 /// Copy everything before a caller can print, allocate or re-enter. — TIMBERDOODLE
-pub fn resident_snapshot() -> kumo_abi::actor::Snapshot {
-    let mut result = kumo_abi::actor::Snapshot {
+pub fn resident_snapshot_wide() -> kumo_abi::actor::SnapshotWide {
+    let mut result = kumo_abi::actor::SnapshotWide {
         capacity: MAX_RESIDENT_CHILDREN as u32,
         ..Default::default()
     };
@@ -317,6 +332,7 @@ pub fn resident_snapshot() -> kumo_abi::actor::Snapshot {
         return result;
     }
     let s = unsafe { &*sched_ptr() };
+    result.capacity = s.resident_limit;
     result.stored = s.children.len() as u32;
     for child in &s.children {
         if child.done {
@@ -331,6 +347,116 @@ pub fn resident_snapshot() -> kumo_abi::actor::Snapshot {
         }
     }
     result
+}
+
+/// AX0's legacy 192-byte view: capacity 12 and the first 12 resident koids. `None` when the
+/// true stored or live count does not fit that frozen frame — AXB1 must refuse rather than
+/// emit a frame whose own decoder rejects it. AX4 probes use [`resident_snapshot_wide`].
+pub fn resident_snapshot() -> Option<kumo_abi::actor::Snapshot> {
+    let wide = resident_snapshot_wide();
+    if wide.live as usize > kumo_abi::actor::RESIDENT_LIMIT
+        || wide.stored as usize > kumo_abi::actor::RESIDENT_LIMIT
+    {
+        return None;
+    }
+    let mut result = kumo_abi::actor::Snapshot {
+        enabled: wide.enabled,
+        capacity: kumo_abi::actor::RESIDENT_LIMIT as u32,
+        live: wide.live,
+        stored: wide.stored,
+        blocked: wide.blocked,
+        ready: wide.ready,
+        running: wide.running,
+        frames_issued: wide.frames_issued,
+        heap_used: wide.heap_used,
+        roots: wide.roots,
+        root_ns: wide.root_ns,
+        root_min_ns: wide.root_min_ns,
+        root_max_ns: wide.root_max_ns,
+        syscalls: wide.syscalls,
+        switches: wide.switches,
+        ..Default::default()
+    };
+    result.processes[..wide.live as usize].copy_from_slice(&wide.processes[..wide.live as usize]);
+    Some(result)
+}
+
+/// AX4: the mirrored resident bound, or the compile-time ceiling before the scheduler runs.
+pub fn resident_limit() -> u32 {
+    if is_started() {
+        unsafe { (&*sched_ptr()).resident_limit }
+    } else {
+        MAX_RESIDENT_CHILDREN as u32
+    }
+}
+
+/// AX4: whether one more resident child would be admitted right now. The `ProcessRun` front
+/// end checks this before staging any handle grants, so a capacity refusal never consumes a
+/// transfer; the authoritative gate remains inside `run_prepared_child`/`spawn_child_async`,
+/// which re-run `reap_done` immediately before admission. Single-threaded SVC execution means
+/// the answer cannot change between the preflight and the gate.
+pub fn resident_has_capacity() -> bool {
+    if !is_started() {
+        return true;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        reap_done(s);
+        s.children.len() < s.resident_limit as usize
+    }
+}
+
+///j825
+/// Free kernel-heap bytes a spawn must find before it starts allocating. The kernel stack
+/// alone is 16 KiB; the resident record, handle table, mapping and dispatcher entries need
+/// room on top. The 8 MiB heap is fixed and cannot grow, so a spawn at the ceiling must be
+/// refused with `NoMemory` — the status Sora can answer — and not reach `alloc`'s panic
+/// path, which is a silent halt on the boot/teardown path. — TIMBERDOODLE
+const SPAWN_HEAP_RESERVE: usize = 64 * 1024;
+
+///j825
+/// Whether a spawn's fixed allocations fit in what remains of the kernel heap. Checked
+/// before `Thread::new` (which allocates the kernel stack) on every spawn path. — TIMBERDOODLE
+pub fn spawn_heap_ready() -> bool {
+    crate::mm::heap::headroom() >= SPAWN_HEAP_RESERVE
+}
+
+/// AX4: resident children that have not terminated, measured the way the admission gate
+/// measures them: terminated entries are reaped first. A policy bound at this value can
+/// therefore never produce a snapshot whose stored count exceeds its capacity.
+pub fn resident_live() -> u32 {
+    if !is_started() {
+        return 0;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        reap_done(s);
+        s.children.len() as u32
+    }
+}
+
+/// AX4: install a resident bound, re-checking the engine's decision against the resident set
+/// as it is at this instant. A bound outside `1..=MAX_RESIDENT_CHILDREN` or below the stored
+/// children (terminated entries are reaped first) is refused rather than clamped, so the
+/// scheduler invariant `stored <= capacity` cannot be broken by a direct caller. Returns
+/// false before the scheduler exists, where there is no resident set for a policy to govern.
+pub fn set_resident_limit(limit: u32) -> bool {
+    if !is_started() {
+        return false;
+    }
+    let p = sched_ptr();
+    unsafe {
+        let s = &mut *p;
+        reap_done(s);
+        if limit == 0 || limit as usize > MAX_RESIDENT_CHILDREN || s.children.len() > limit as usize
+        {
+            return false;
+        }
+        s.resident_limit = limit;
+    }
+    true
 }
 
 /// The kernel identity-map TTBR0 captured at launch. A syscall handler running on the
@@ -438,6 +564,7 @@ pub fn init(
             exit_code: 0,
             done: false,
             sora_current_call: None,
+            resident_limit: job.resident_limit(),
         });
     }
     kumo_hal::active::set_tower_context_hook(tower_context);
@@ -689,7 +816,7 @@ fn install_child(
     arg: u64,
     arg2: u64,
 ) -> KoId {
-    let mut child = ResidentChild {
+    let mut child = alloc::boxed::Box::new(ResidentChild {
         thread: new_child,
         fresh: true,
         ttbr0,
@@ -697,7 +824,7 @@ fn install_child(
         exit_code: 0,
         done: false,
         current_call: None,
-    };
+    });
     child.thread.user_state = Some(UserState {
         x: {
             let mut x = [0u64; 31];
@@ -742,6 +869,23 @@ fn reap_done(s: &mut UserSched) {
             i += 1;
         }
     }
+    //j825
+    // AX4: a capacity fill leaves these two vectors at their burst high-water marks even
+    // after every child is reaped. They are kernel-heap state that survives the cycle, so
+    // drop the slack here, where the resident set has just fallen; the sparse threshold
+    // keeps ordinary spawn traffic from reallocating on every reap. — TIMBERDOODLE
+    if s.children.capacity() > s.children.len().saturating_mul(2).saturating_add(16) {
+        s.children.shrink_to_fit();
+    }
+    if s.wait_queue.entries.capacity()
+        > s.wait_queue
+            .entries
+            .len()
+            .saturating_mul(2)
+            .saturating_add(16)
+    {
+        s.wait_queue.entries.shrink_to_fit();
+    }
 }
 
 /// Run a child process as a real scheduler participant. Returns after the child exits
@@ -756,6 +900,13 @@ pub fn run_child(
     arg: u64,
     arg2: u64,
 ) -> Status {
+    //j825
+    // AX4: ask the fixed heap before taking a 16 KiB stack out of it. `KernelStack` also
+    // reports allocation failure, but refusing here keeps the whole spawn — stack, record,
+    // handle table — inside a known reserve. — TIMBERDOODLE
+    if !spawn_heap_ready() {
+        return Errno::NoMemory.status();
+    }
     let temp_process = Process::from_parts(proc_koid, root_vmar);
     let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
         Ok(thread) => thread,
@@ -780,8 +931,12 @@ pub fn run_prepared_child(
     let (koid, next_ctx) = unsafe {
         let s = &mut *p;
         reap_done(s);
-        if s.children.len() >= MAX_RESIDENT_CHILDREN {
-            return Errno::ShouldWait.status();
+        // AX4: the policy bound, not the compile-time ceiling, is the admission gate. A
+        // refusal is final for this state (a policy cap never clears on retry), so it is
+        // `BadState` rather than the old slot-pressure `ShouldWait`. Refusal precedes
+        // install and admission, so no child, wait entry or dispatcher slot is created.
+        if s.children.len() >= s.resident_limit as usize {
+            return Errno::BadState.status();
         }
 
         let koid = install_child(s, new_child, proc_koid, ttbr0, entry, sp, arg, arg2);
@@ -824,18 +979,39 @@ pub fn spawn_child_async(
     arg: u64,
     arg2: u64,
 ) -> Status {
+    let p = sched_ptr();
+    //j825
+    // AX4: reap and gate BEFORE allocating the 16 KiB kernel stack. The old order built the
+    // Thread first, so an over-limit spawn still consumed (and, on a full heap, could not
+    // free) a stack, and the capacity refusal depended on allocation success. The preflight
+    // is authoritative here: single-core SVC execution means nothing can grow the resident
+    // set between this check and the install below, and the second check keeps refusal
+    // ahead of install even if that ever changes. — TIMBERDOODLE
+    unsafe {
+        let s = &mut *p;
+        reap_done(s);
+        // AX4: the policy bound, not the compile-time ceiling, is the admission gate. A
+        // refusal is final for this state (a policy cap never clears on retry), so it is
+        // `BadState` rather than the old slot-pressure `ShouldWait`. Refusal precedes
+        // install and admission, so no child, wait entry or dispatcher slot is created.
+        if s.children.len() >= s.resident_limit as usize {
+            return Errno::BadState.status();
+        }
+    }
+    if !spawn_heap_ready() {
+        return Errno::NoMemory.status();
+    }
+
     let temp_process = Process::from_parts(proc_koid, root_vmar);
     let new_child = match Thread::new(objects, &temp_process, 0, 0, DEFAULT_KERNEL_STACK_SIZE) {
         Ok(thread) => thread,
         Err(_) => return Errno::NoMemory.status(),
     };
 
-    let p = sched_ptr();
     unsafe {
         let s = &mut *p;
-        reap_done(s);
-        if s.children.len() >= MAX_RESIDENT_CHILDREN {
-            return Errno::ShouldWait.status();
+        if s.children.len() >= s.resident_limit as usize {
+            return Errno::BadState.status();
         }
 
         let koid = install_child(s, new_child, proc_koid, ttbr0, entry, sp, arg, arg2);
@@ -1882,5 +2058,249 @@ mod tests {
         assert!(!wait_target_needs_safe_reschedule(WaitTarget::Channel(
             KoId(44)
         )));
+    }
+}
+
+//j825
+/// AX4 capacity and steadiness tests. They share the one process-global UserSched, so every
+/// test here takes the same lock and the whole acceptance sequence runs in one #[test].
+#[cfg(test)]
+mod ax4_capacity_tests {
+    use super::*;
+    use crate::mm::Vmar;
+
+    static AX4_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sched() -> &'static UserSched {
+        unsafe { &*super::sched_ptr() }
+    }
+
+    fn sched_mut() -> &'static mut UserSched {
+        unsafe { &mut *super::sched_ptr() }
+    }
+
+    /// Spawn one never-run resident actor. `proc_koid` identifies the process for
+    /// `kill_process_threads`; entry/sp are never entered on the host.
+    fn spawn_actor(objects: &mut ObjectManager, proc_koid: u64) -> Status {
+        let base = 0x1000_0000 + (proc_koid % 0x1000) * 0x10_0000;
+        let vmar = Vmar::new(base, PAGE_SIZE * 16).unwrap();
+        super::spawn_child_async(
+            objects,
+            KoId(proc_koid),
+            vmar,
+            0,
+            0x1000 + (proc_koid & 0xfff) * 0x10,
+            0x2000_0000,
+            proc_koid,
+            0,
+        )
+    }
+
+    fn state_addr(child: &ResidentChild) -> u64 {
+        child.thread.user_state.as_ref().unwrap() as *const UserState as u64
+    }
+
+    #[test]
+    fn policy_gate_reap_and_repeated_waves_keep_a_flat_census() {
+        let _guard = AX4_LOCK.lock().unwrap();
+        let mut objects = ObjectManager::new();
+        let vmar = Vmar::new(0xffff_0000_0000_0000, PAGE_SIZE * 256).unwrap();
+        init(&mut objects, KoId(7), vmar, 0).unwrap();
+
+        // The root Job's default is the resident ceiling and init mirrors it.
+        assert_eq!(resident_limit(), kumo_abi::actor::RESIDENT_MAX as u32);
+        assert_eq!(super::MAX_RESIDENT_CHILDREN, 288);
+        assert!(set_resident_limit(3));
+
+        // Exactly at the policy limit is admitted.
+        for proc_koid in [100, 101, 102] {
+            assert_eq!(spawn_actor(&mut objects, proc_koid), Errno::Ok.status());
+        }
+        let at_limit = resident_snapshot_wide();
+        assert_eq!(
+            (at_limit.capacity, at_limit.live, at_limit.stored),
+            (3, 3, 3)
+        );
+        assert_eq!(at_limit.blocked + at_limit.ready + at_limit.running, 3);
+        assert_eq!(sched().dispatcher.runnable_count(), 3);
+        let addresses = [
+            state_addr(&sched().children[0]),
+            state_addr(&sched().children[1]),
+            state_addr(&sched().children[2]),
+        ];
+
+        // One over is refused with BadState, and the refusal changes nothing: same census,
+        // same koid list, no dispatcher slot, no wait entry, no panic.
+        assert!(!resident_has_capacity());
+        assert_eq!(spawn_actor(&mut objects, 200), Errno::BadState.status());
+        let refused = resident_snapshot_wide();
+        assert_eq!((refused.capacity, refused.live, refused.stored), (3, 3, 3));
+        assert_eq!(refused.processes[..3], at_limit.processes[..3]);
+        assert_eq!(sched().dispatcher.runnable_count(), 3);
+        assert!(sched().wait_queue.entries.is_empty());
+        assert_eq!(sched().children.len(), 3);
+        assert_eq!(resident_live(), 3);
+
+        // A parked child is removed from the wait queue (and never woken) when its process
+        // is killed: the reaped koid cannot reappear at a later channel wake.
+        let parked = sched().children[0].thread.koid();
+        assert!(sched_mut()
+            .dispatcher
+            .remove_ready_rt(parked, super::CHILD_PRIORITY));
+        sched_mut()
+            .wait_queue
+            .park(parked, WaitTarget::Channel(KoId(777)));
+        let kill_report = kill_process_threads(KoId(100));
+        assert_eq!(kill_report.killed, 1);
+        assert_eq!(kill_report.parked_on, Some(("channel", 777)));
+        assert_eq!(kill_report.parked_channel, Some(KoId(777)));
+        assert!(sched().wait_queue.entries.is_empty());
+        assert_eq!(sched().dispatcher.runnable_count(), 2);
+        // The policy count prunes the terminated child first, so a bound at this value can
+        // never yield a snapshot whose stored count exceeds its capacity (AXR2 validity).
+        assert_eq!(sched().children.len(), 3);
+        assert_eq!(resident_live(), 2);
+        assert_eq!(sched().children.len(), 2);
+        let pruned = resident_snapshot_wide();
+        assert_eq!((pruned.capacity, pruned.live, pruned.stored), (3, 2, 2));
+        // The preflight sees the reaped slot immediately (it reaps before answering).
+        assert!(resident_has_capacity());
+
+        // Reap one, then the same spawn succeeds: admission runs after reap_done, so a
+        // finished child frees its slot on the very next attempt.
+        assert_eq!(spawn_actor(&mut objects, 200), Errno::Ok.status());
+        assert_eq!(sched().children.len(), 3);
+        assert_eq!(resident_live(), 3);
+        assert_eq!(sched().dispatcher.runnable_count(), 3);
+        // J169: removing the first box shifted the remaining BOXES, not their pointees.
+        // The inline UserState addresses baked into x19 at install are unchanged.
+        assert_eq!(state_addr(&sched().children[0]), addresses[1]);
+        assert_eq!(state_addr(&sched().children[1]), addresses[2]);
+        assert_ne!(state_addr(&sched().children[2]), 0);
+
+        // The frozen AX0 view still fits exactly twelve, and refuses cleanly above it.
+        assert!(set_resident_limit(kumo_abi::actor::RESIDENT_MAX as u32));
+        for proc_koid in [101, 102, 200] {
+            assert_eq!(kill_process_threads(KoId(proc_koid)).killed, 1);
+        }
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
+        for i in 0..12u64 {
+            assert_eq!(spawn_actor(&mut objects, 300 + i), Errno::Ok.status());
+        }
+        let twelve = resident_snapshot().expect("12 slots fit AXR1");
+        assert_eq!((twelve.capacity, twelve.live, twelve.stored), (12, 12, 12));
+        assert_eq!(twelve.processes[11], 311);
+        assert_eq!(spawn_actor(&mut objects, 312), Errno::Ok.status());
+        assert_eq!(resident_snapshot(), None, "AXB1 must fail, not truncate");
+        assert_eq!(resident_snapshot_wide().live, 13);
+        for i in 0..13u64 {
+            assert_eq!(kill_process_threads(KoId(300 + i)).killed, 1);
+        }
+        assert_eq!(process_wait(), Errno::Ok.status());
+
+        // The cap itself is the last admissible value; one past it is InvalidArgs at the
+        // policy layer, and the compile-time array is never exceeded. The scheduler mirror
+        // re-checks independently: no direct caller can install 0, >288, or a bound below
+        // the stored set, so the AXR2 invariant `stored <= capacity` always holds.
+        assert_eq!(
+            crate::task::validate_resident_limit(289, 0),
+            Err(Errno::InvalidArgs)
+        );
+        assert_eq!(crate::task::validate_resident_limit(288, 288), Ok(()));
+        assert_eq!(
+            crate::task::validate_resident_limit(288, 289),
+            Err(Errno::BadState)
+        );
+        assert!(!set_resident_limit(0));
+        assert!(!set_resident_limit(289));
+        for i in 0..3u64 {
+            assert_eq!(spawn_actor(&mut objects, 400 + i), Errno::Ok.status());
+        }
+        assert!(!set_resident_limit(2));
+        assert_eq!(resident_limit(), 288);
+        for i in 0..3u64 {
+            assert_eq!(kill_process_threads(KoId(400 + i)).killed, 1);
+        }
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
+
+        // Repeated 256-actor waves: each cycle must return to exactly the pre-wave state.
+        let frame_floor = crate::mm::frames_issued();
+        let proc_base = 10_000u64;
+        for wave in 0..4u64 {
+            for i in 0..256u64 {
+                let proc_koid = proc_base + wave * 256 + i;
+                assert_eq!(spawn_actor(&mut objects, proc_koid), Errno::Ok.status());
+            }
+            let peak = resident_snapshot_wide();
+            assert_eq!(
+                (peak.capacity, peak.live, peak.stored),
+                (288, 256, 256),
+                "wave {wave}"
+            );
+            assert_eq!(peak.blocked + peak.ready + peak.running, 256);
+            assert_eq!(sched().dispatcher.runnable_count(), 256);
+            assert_eq!(resident_snapshot(), None);
+            // Host actor threads are Vec-backed; no frame is issued or retained by the
+            // resident set itself.
+            assert_eq!(crate::mm::frames_issued(), frame_floor);
+
+            for i in 0..256u64 {
+                let proc_koid = proc_base + wave * 256 + i;
+                assert_eq!(kill_process_threads(KoId(proc_koid)).killed, 1);
+            }
+            assert_eq!(process_wait(), Errno::Ok.status());
+            let clean = resident_snapshot_wide();
+            assert_eq!(
+                (
+                    clean.live,
+                    clean.stored,
+                    clean.blocked,
+                    clean.ready,
+                    clean.running
+                ),
+                (0, 0, 0, 0, 0),
+                "wave {wave} did not drain"
+            );
+            assert!(sched().children.is_empty());
+            assert!(sched().wait_queue.entries.is_empty());
+            //j825
+            // A 256-actor wave grows both vectors to a 512 high-water mark. `reap_done`
+            // must release that slack when the set drains; otherwise every wave keeps
+            // ~16 KiB of dead capacity in the fixed kernel heap. — TIMBERDOODLE
+            assert!(
+                sched().children.capacity() <= 64,
+                "wave {wave}: children slack"
+            );
+            assert!(
+                sched().wait_queue.entries.capacity() <= 64,
+                "wave {wave}: wait-queue slack"
+            );
+            assert_eq!(sched().dispatcher.runnable_count(), 0);
+            assert_eq!(resident_live(), 0);
+            assert_eq!(crate::mm::frames_issued(), frame_floor);
+        }
+
+        // 256 runnables rotate without starving a more urgent waiter: Sora's wake preempts
+        // the whole class immediately (the same property actorstat's dispatcher test proves
+        // on a private instance).
+        for i in 0..256u64 {
+            assert_eq!(spawn_actor(&mut objects, 20_000 + i), Errno::Ok.status());
+        }
+        assert_eq!(sched().dispatcher.runnable_count(), 256);
+        match sched_mut().dispatcher.wake_rt(KoId(90_000), Priority(62)) {
+            Decision::Switch { to, .. } => assert_eq!(to, KoId(90_000)),
+            other => panic!("a more urgent Sora wake was starved by 256 actors: {other:?}"),
+        }
+        let mut remaining = 256;
+        for i in 0..256u64 {
+            let report = kill_process_threads(KoId(20_000 + i));
+            remaining -= report.killed;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(process_wait(), Errno::Ok.status());
+        assert!(sched().children.is_empty());
+        assert_eq!(resident_live(), 0);
     }
 }

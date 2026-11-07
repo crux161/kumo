@@ -1,8 +1,8 @@
-//j660
 //j743
 //j790
 //j815
 //j824
+//j825
 
 use kumo_abi::{Handle, Rights, Status, Syscall};
 
@@ -14,12 +14,12 @@ use kumo_abi::{Handle, Rights, Status, Syscall};
 /// just-zeroed buffer is still zero after the kernel filled it (and, in release builds,
 /// to fold the initrd entry walk into "all paths empty").
 #[cfg(target_arch = "aarch64")]
-fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+fn syscall_raw(num: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(
             "svc #0",
-            in("x8") num as u64,
+            in("x8") num,
             in("x0") x0,
             in("x1") x1,
             in("x2") x2,
@@ -40,8 +40,8 @@ fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
 /// AMD64 KUMO syscall ABI: `rax` = number, arguments in the SysV integer registers,
 /// and the primary result returned in `rax`. `int 0x80` enters the ring-3 IDT gate.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
-    let mut ret = num as u64;
+fn syscall_raw(num: u64, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+    let mut ret = num;
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -61,8 +61,14 @@ fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
     target_arch = "aarch64",
     all(target_arch = "x86_64", target_os = "none")
 )))]
-fn syscall(_num: Syscall, _x0: u64, _x1: u64, _x2: u64, _x3: u64) -> u64 {
+fn syscall_raw(_num: u64, _x0: u64, _x1: u64, _x2: u64, _x3: u64) -> u64 {
     0
+}
+
+/// [`syscall_raw`] with a typed [`Syscall`] number.
+#[inline]
+fn syscall(num: Syscall, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+    syscall_raw(num as u64, x0, x1, x2, x3)
 }
 
 /// 6-argument variant: `x8` = number, `x0`-`x5` = args, returns `x0`.
@@ -1003,6 +1009,25 @@ pub fn process_wait() -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 pub fn process_wait() -> u64 {
     u64::MAX
+}
+
+/// Set the root Job's resident-actor bound (PLAN/021 AX4).
+/// `job` must name the caller's Job and carry MANAGE. `limit` is in 1..=288;
+/// malformed limits and capability refusals never change the policy.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+))]
+pub fn job_set_policy(job: Handle, limit: u64) -> i64 {
+    (syscall(Syscall::JobSetPolicy, job.0 as u64, limit, 0, 0) as u32 as i32) as i64
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "none")
+)))]
+pub fn job_set_policy(_job: Handle, _limit: u64) -> i64 {
+    kumo_abi::Errno::NotSupported.status() as i64
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -1,0 +1,16 @@
+#j825
+[package]
+name = "ax4idle"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+[dependencies]
+kumo-abi.workspace = true
+kumo-rt = { path = "../kumo-rt" }
+[[bin]]
+name = "ax4idle"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false

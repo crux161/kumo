@@ -3,11 +3,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kumo_abi::{BootInfo, MemRegion, MemRegionKind, Range};
 use kumo_hal::PageFlags;
 
-//j469
 //j616
 //j620
 //j743
 //j822
+//j825
 
 pub mod heap;
 
@@ -27,6 +27,91 @@ pub fn frames_issued() -> u64 {
 }
 
 static FRAME_WATERMARK: AtomicU64 = AtomicU64::new(0);
+
+/// AX4: frames returned by a dead owner and available for reuse. Distinct from the DMA run
+/// list: only ordinary kernel/user RAM frames enter here, never a DMA run, a device frame,
+/// an identity-mapped kernel frame, or a page still named by any live mapping or handle.
+///
+/// The list is touched from syscall and teardown paths only (never from an IRQ handler), on
+/// the single core PLAN/021 AX1 allows. Push/pop are plain Vec operations; a full list or a
+/// failed reservation drops the frame rather than panicking (the frame is then simply lost
+/// to the boot watermark, as it was before AX4).
+struct FreeFrameList(core::cell::UnsafeCell<alloc::vec::Vec<u64>>);
+// SAFETY: the kernel is single-core and no interrupt path allocates or frees frames; the
+// only concurrent access is reentrancy from an SVC that cannot preempt itself.
+unsafe impl Sync for FreeFrameList {}
+static FREE_FRAMES: FreeFrameList =
+    FreeFrameList(core::cell::UnsafeCell::new(alloc::vec::Vec::new()));
+/// Frames actually handed out from [`FREE_FRAMES`] instead of the bump watermark. Not part
+/// of `frames_issued`; a flat census means this counter absorbs all post-warm-up churn.
+static FRAMES_REUSED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic count of frames successfully queued for reuse (accepted by the list).
+static FRAMES_FREED: AtomicU64 = AtomicU64::new(0);
+
+/// Frames currently queued for reuse. Test and diagnostic surface.
+pub fn free_frame_count() -> usize {
+    // SAFETY: single-core; the caller is observing, not holding the list.
+    unsafe { (&*FREE_FRAMES.0.get()).len() }
+}
+
+/// How many allocations were served from the reuse list rather than the watermark.
+pub fn frames_reused() -> u64 {
+    FRAMES_REUSED.load(Ordering::Relaxed)
+}
+
+/// How many frames have been queued for reuse over the whole boot. Monotonic, unlike the
+/// current list length; a test can use a delta without racing a concurrent pop.
+pub fn frames_freed() -> u64 {
+    FRAMES_FREED.load(Ordering::Relaxed)
+}
+
+/// Queue a dead owner's frame for reuse. `false` means the frame could not be recorded
+/// (misaligned, zero, or the list's reservation failed); the caller must treat a lost frame
+/// as leaked, never as still mapped. The frame is not touched here: at the frees that matter
+/// the caller may still have a user TTBR0 live, and only the identity-map-safe allocation
+/// path may zero or clean it. — TIMBERDOODLE
+pub fn free_frame(frame: u64) -> bool {
+    if frame == 0 || frame % PAGE_SIZE != 0 {
+        return false;
+    }
+    // SAFETY: single-core, syscall/teardown context only (see FreeFrameList).
+    let list = unsafe { &mut *FREE_FRAMES.0.get() };
+    if list.try_reserve(1).is_err() {
+        return false;
+    }
+    list.push(frame);
+    FRAMES_FREED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Why a queued frame may not be reused: it falls in an exclusion the caller just named.
+/// The list scan leaves such a frame queued for a later allocation.
+fn frame_in_excluded(frame: u64, excluded: &[Range]) -> bool {
+    excluded.iter().any(|range| {
+        range
+            .start
+            .checked_add(range.len)
+            .is_none_or(|end| frame >= range.start && frame < end)
+    })
+}
+
+/// Take the newest queued frame the caller can use. The scan pops nothing it rejects, so an
+/// exclusion or a coarse-alias rejection defers the frame rather than losing it.
+fn take_free_frame(usable: impl Fn(u64) -> bool) -> Option<u64> {
+    // SAFETY: single-core, syscall context only (see FreeFrameList).
+    let list = unsafe { &mut *FREE_FRAMES.0.get() };
+    let mut index = list.len();
+    while index > 0 {
+        index -= 1;
+        let frame = list[index];
+        if !usable(frame) {
+            continue;
+        }
+        list.swap_remove(index);
+        return Some(frame);
+    }
+    None
+}
 
 /// Hand out the next usable physical frame, zeroed, advancing [`FRAME_WATERMARK`] so the
 /// same frame is never returned twice across the whole boot (kernel tables *and* user
@@ -55,6 +140,31 @@ pub unsafe fn alloc_zeroed_frame_excluding(boot: &BootInfo, excluded: &[Range]) 
     let watermark = FRAME_WATERMARK.load(Ordering::Relaxed);
     #[cfg(feature = "arch_aarch64")]
     let framebuffer = boot_framebuffer_range(boot);
+    // AX4: a previously issued frame costs no watermark advance and no ISSUED bump. The
+    // frame already passed every filter when it was first issued, but device apertures move:
+    // re-check the coarse-alias and current-device filters so a frame that a new DMA or
+    // framebuffer grant now covers cannot become user RAM. Zero and clean to PoC before it is
+    // mapped anywhere, preserving the j476 visibility guarantee for an uncached alias.
+    if let Some(frame) = take_free_frame(|frame| {
+        if frame_in_excluded(frame, excluded) {
+            return false;
+        }
+        if !crate::syscall::kernel_device_frame_allowed(frame & !(BLOCK_2M - 1), BLOCK_2M) {
+            return false;
+        }
+        #[cfg(feature = "arch_aarch64")]
+        if !normal_identity_block(plan.regions(), framebuffer, frame & !(BLOCK_2M - 1)) {
+            return false;
+        }
+        true
+    }) {
+        // SAFETY: a previously issued frame, mapped by the active identity map; the same
+        // contract as the watermark path below.
+        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
+        kumo_hal::active::clean_dcache_to_poc(frame as usize, PAGE_SIZE as usize);
+        FRAMES_REUSED.fetch_add(1, Ordering::Relaxed);
+        return Some(frame);
+    }
     loop {
         let frame = frames.next_frame()?.start;
         if frame < watermark || !crate::syscall::kernel_device_frame_allowed(frame, PAGE_SIZE) {
@@ -198,6 +308,181 @@ pub unsafe fn alloc_dma_pages_excluding(
         filled += 1;
     }
     filled
+}
+
+/// AX4: free a dead user address space's page-table frames (the walk that used to leak).
+///
+/// The walk only follows valid table descriptors at L0..=L2 (`bits 1:0 == 0b11`); L3 entries
+/// and L1/L2 block leaves are mappings, not tables, and are never freed here. Children are
+/// freed before the table that names them and the L0 root is freed last, so no frame is
+/// reusable while a higher-level descriptor still points at it. The descriptors are read
+/// through the kernel physmap, which stays live under any TTBR0, so this is safe on the
+/// dying process's own SVC path after its ASID has already been invalidated and released.
+#[cfg(feature = "arch_aarch64")]
+mod user_tables {
+    use super::{free_frame, PAGE_SIZE};
+    const PA_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+    #[cfg(target_os = "none")]
+    fn read_phys_u64(phys: u64) -> u64 {
+        let mut bytes = [0u8; 8];
+        kumo_hal::active::read_phys(phys, &mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn walk(table: u64, level: u8, read: &mut dyn FnMut(u64) -> u64, freed: &mut usize) {
+        // L3 entries are leaf pages. L0..=L2 entries with bits 1:0 == 0b11 are tables; a
+        // block (0b01) is a mapping and stays with the VMO that owns it.
+        if level >= 3 {
+            return;
+        }
+        for index in 0..512u64 {
+            let desc = read(table + index * 8);
+            if desc & 0b11 != 0b11 {
+                continue;
+            }
+            let child = desc & PA_MASK;
+            if child == 0 {
+                continue;
+            }
+            walk(child, level + 1, read, freed);
+            if free_frame(child) {
+                *freed += 1;
+            }
+        }
+    }
+
+    /// Host-testable core: `read` returns the descriptor word at a physical address.
+    pub(super) fn free_user_tables_with(root: u64, read: &mut dyn FnMut(u64) -> u64) -> usize {
+        let root = root & PA_MASK;
+        if root == 0 || root % PAGE_SIZE != 0 {
+            return 0;
+        }
+        let mut freed = 0;
+        walk(root, 0, read, &mut freed);
+        if free_frame(root) {
+            freed += 1;
+        }
+        freed
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn free_user_tables(root: u64) -> usize {
+        free_user_tables_with(root, &mut read_phys_u64)
+    }
+
+    /// AX4: free the leaf pages one address space mapped for an anonymous range (its user
+    /// stack).
+    ///
+    /// AddressSpaceCreate installs the stack through the HAL builder, so no VMO owns those
+    /// frames; without this walk they are the only user frames no retire pass can see. Only
+    /// L3 page leaves inside `[start, start + len)` are freed: a missing table, a hole or an
+    /// L1/L2 block leaves that page untouched. The range was reserved against
+    /// `Process::mappings` when it was installed, so it cannot alias a VMO leaf and this
+    /// cannot double-free. Runs before `free_user_tables`, whose walk retires the tables
+    /// this one reads. — TIMBERDOODLE
+    pub(super) fn free_user_pages_with(
+        root: u64,
+        start: u64,
+        len: u64,
+        read: &mut dyn FnMut(u64) -> u64,
+    ) -> usize {
+        let root = root & PA_MASK;
+        let Some(end) = start.checked_add(len) else {
+            return 0;
+        };
+        if root == 0
+            || root % PAGE_SIZE != 0
+            || len == 0
+            || start % PAGE_SIZE != 0
+            || len % PAGE_SIZE != 0
+        {
+            return 0;
+        }
+        let mut freed = 0;
+        let mut va = start;
+        while va < end {
+            if let Some(frame) = leaf_frame(root, va, read) {
+                if free_frame(frame) {
+                    freed += 1;
+                }
+            }
+            va += PAGE_SIZE;
+        }
+        freed
+    }
+
+    /// Translate one 4 KiB page from a 48-bit VA space. Every level must be a table
+    /// descriptor (`bits 1:0 == 0b11`); the L3 entry must be a page leaf. A 2 MiB block at
+    /// L2 is a mapping the VMO/image path owns, not an allocator frame, so it is skipped.
+    fn leaf_frame(root: u64, va: u64, read: &mut dyn FnMut(u64) -> u64) -> Option<u64> {
+        let l1 = read(root + ((va >> 39) & 0x1ff) * 8);
+        if l1 & 0b11 != 0b11 {
+            return None;
+        }
+        let l1 = l1 & PA_MASK;
+        if l1 == 0 {
+            return None;
+        }
+        let l2 = read(l1 + ((va >> 30) & 0x1ff) * 8);
+        if l2 & 0b11 != 0b11 {
+            return None;
+        }
+        let l2 = l2 & PA_MASK;
+        if l2 == 0 {
+            return None;
+        }
+        let l3 = read(l2 + ((va >> 21) & 0x1ff) * 8);
+        if l3 & 0b11 != 0b11 {
+            return None;
+        }
+        let l3 = l3 & PA_MASK;
+        if l3 == 0 {
+            return None;
+        }
+        let leaf = read(l3 + ((va >> 12) & 0x1ff) * 8);
+        if leaf & 0b11 != 0b11 {
+            return None;
+        }
+        let frame = leaf & PA_MASK;
+        (frame != 0).then_some(frame)
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn free_user_pages(root: u64, start: u64, len: u64) -> usize {
+        free_user_pages_with(root, start, len, &mut read_phys_u64)
+    }
+}
+
+/// Retire a user address space: invalidate and release its ASID through the HAL, then free
+/// the anonymous leaf pages the space mapped outside a VMO (`user_stack`, installed by
+/// AddressSpaceCreate) and the L0-L3 table frames for every non-kernel ASID. ASID 0 is the
+/// kernel's identity map and owns no user tables, so nothing is walked. Returns whether the
+/// HAL found a live ASID.
+///
+/// The order is the teardown safety contract: mappings were cleared from the live tree
+/// while it still existed, then the ASID was invalidated (HAL `release_asid` invalidates
+/// before returning the number), and only then may frames be queued for reuse. The stack
+/// leaves go first because the VA walk needs the still-linked tables; the table walk then
+/// unlinks the frames that named them. Anonymous VMO leaf frames are freed later by
+/// `retire_vmos`, after this call — still after the ASID.
+#[cfg(all(feature = "arch_aarch64", target_os = "none"))]
+pub fn retire_user_aspace(root: u64, user_stack: Option<(u64, u64)>) -> bool {
+    let live = kumo_hal::active::retire_user_aspace(root);
+    let asid = ((root >> 48) & 0xffff) as u16;
+    if live && asid != 0 {
+        if let Some((start, len)) = user_stack {
+            user_tables::free_user_pages(root, start, len);
+        }
+        user_tables::free_user_tables(root);
+    }
+    live
+}
+
+/// Non-AArch64 kernel builds have no tagged user tables to walk; keep the HAL contract.
+#[cfg(not(all(feature = "arch_aarch64", target_os = "none")))]
+pub fn retire_user_aspace(root: u64, _user_stack: Option<(u64, u64)>) -> bool {
+    kumo_hal::active::retire_user_aspace(root)
 }
 
 /// What kernel paging brought up.
@@ -785,8 +1070,21 @@ fn overlaps(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
     a_start < b_end && b_start < a_end
 }
 
+//j825
+/// Serializes host tests that touch the process-global reuse list across modules (the mm
+/// recreation tests and the syscall Anonymous-retirement test). — TIMBERDOODLE
+#[cfg(test)]
+pub(crate) static FREE_FRAME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn clear_free_frames_for_test() {
+    // SAFETY: every caller holds FREE_FRAME_TEST_LOCK.
+    unsafe { (&mut *FREE_FRAMES.0.get()).clear() };
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use kumo_abi::{RawSlice, ABI_VERSION};
 
@@ -1061,5 +1359,136 @@ mod tests {
             vmar.map(vmo, PAGE_SIZE, 0x4000_3000, PAGE_SIZE * 2, PageFlags::READ),
             Err(MemoryError::OutOfBounds)
         );
+    }
+
+    #[test]
+    fn the_reuse_list_defers_rejected_frames_and_never_takes_junk() {
+        let _serial = super::FREE_FRAME_TEST_LOCK.lock().unwrap();
+        super::clear_free_frames_for_test();
+        assert!(super::free_frame(0x10_0000));
+        assert!(super::free_frame(0x10_1000));
+        assert!(super::free_frame(0x10_2000));
+        assert_eq!(super::free_frame_count(), 3);
+        assert!(!super::free_frame(0));
+        assert!(!super::free_frame(0x10_0001));
+        // The newest usable frame is taken; a rejected frame stays queued for later.
+        assert_eq!(super::take_free_frame(|f| f != 0x10_2000), Some(0x10_1000));
+        assert_eq!(super::free_frame_count(), 2);
+        assert_eq!(super::take_free_frame(|f| f != 0x10_2000), Some(0x10_0000));
+        assert_eq!(super::take_free_frame(|_| true), Some(0x10_2000));
+        assert_eq!(super::take_free_frame(|_| true), None);
+        assert_eq!(super::free_frame_count(), 0);
+        super::clear_free_frames_for_test();
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn user_table_walk_frees_tables_child_first_and_root_last() {
+        let _serial = super::FREE_FRAME_TEST_LOCK.lock().unwrap();
+        super::clear_free_frames_for_test();
+        // A four-level tree in a fake physical address space:
+        //   root L0 -> L1 -> L2 -> L3, plus an L2 block leaf that must not be freed.
+        let mut mem = alloc::vec![0u64; 0x10000 / 8];
+        let at = |pa: u64| (pa / 8) as usize;
+        let root = 0x1000u64;
+        let l1 = 0x2000u64;
+        let l2 = 0x3000u64;
+        let l3 = 0x4000u64;
+        let block_leaf = 0x0080_0000u64;
+        let page_leaf = 0x0090_0000u64;
+        mem[at(root)] = l1 | 0b11;
+        mem[at(l1)] = l2 | 0b11;
+        mem[at(l2 + 2 * 8)] = l3 | 0b11;
+        mem[at(l2 + 5 * 8)] = block_leaf | 0b01;
+        mem[at(l3)] = page_leaf | 0b11;
+        let mut read = |pa: u64| mem[at(pa)];
+        let freed = super::user_tables::free_user_tables_with(root, &mut read);
+        assert_eq!(freed, 4);
+        // Free order was L3, L2, L1, root; the stack returns them in reverse.
+        let mut popped = alloc::vec::Vec::new();
+        while let Some(frame) = super::take_free_frame(|_| true) {
+            popped.push(frame);
+        }
+        popped.reverse();
+        assert_eq!(popped, alloc::vec![l3, l2, l1, root]);
+        // Neither leaf (block or page) entered the reuse list.
+        assert!(!popped.contains(&block_leaf) && !popped.contains(&page_leaf));
+        assert_eq!(super::free_frame_count(), 0);
+        super::clear_free_frames_for_test();
+    }
+
+    #[cfg(feature = "arch_aarch64")]
+    #[test]
+    fn user_stack_walk_frees_only_the_pages_it_owns() {
+        let _serial = super::FREE_FRAME_TEST_LOCK.lock().unwrap();
+        super::clear_free_frames_for_test();
+        // A four-level tree in a fake physical address space. L2 index 2 names the L3 table
+        // the stack range lands in; index 5 names a block that must be skipped on sight.
+        let mut mem = alloc::vec![0u64; 0x10000 / 8];
+        let at = |pa: u64| (pa / 8) as usize;
+        let root = 0x1000u64;
+        let l1 = 0x2000u64;
+        let l2 = 0x3000u64;
+        let l3 = 0x4000u64;
+        let stack_leaf = 0x0090_0000u64;
+        let neighbour_leaf = 0x0090_2000u64;
+        let block_leaf = 0x0080_0000u64;
+        mem[at(root)] = l1 | 0b11;
+        mem[at(l1)] = l2 | 0b11;
+        mem[at(l2 + 2 * 8)] = l3 | 0b11;
+        mem[at(l2 + 5 * 8)] = block_leaf | 0b01;
+        mem[at(l3)] = stack_leaf | 0b11;
+        mem[at(l3 + 2 * 8)] = neighbour_leaf | 0b11;
+        let mut read = |pa: u64| mem[at(pa)];
+        let stack = 0x0040_0000u64; // L0 0, L1 0, L2 2, L3 0
+
+        // Two pages: page 0 is the stack leaf, page 1 is a hole. Only the leaf is freed,
+        // and the neighbour outside the range stays untouched.
+        assert_eq!(
+            super::user_tables::free_user_pages_with(root, stack, 2 * super::PAGE_SIZE, &mut read),
+            1
+        );
+        assert_eq!(super::take_free_frame(|_| true), Some(stack_leaf));
+        assert_eq!(super::take_free_frame(|_| true), None);
+
+        // A hole alone frees nothing.
+        assert_eq!(
+            super::user_tables::free_user_pages_with(
+                root,
+                stack + super::PAGE_SIZE,
+                super::PAGE_SIZE,
+                &mut read
+            ),
+            0
+        );
+
+        // The L2 block's VA frees nothing: a block is a mapping, not an allocator leaf.
+        let block_va = 0x00a0_0000u64;
+        assert_eq!(
+            super::user_tables::free_user_pages_with(root, block_va, super::PAGE_SIZE, &mut read),
+            0
+        );
+
+        // The neighbour outside the range stays put, and invalid ranges are refused.
+        assert_eq!(
+            super::user_tables::free_user_pages_with(
+                root,
+                stack + 2 * super::PAGE_SIZE,
+                super::PAGE_SIZE,
+                &mut read
+            ),
+            1
+        );
+        assert_eq!(super::take_free_frame(|_| true), Some(neighbour_leaf));
+        assert_eq!(super::take_free_frame(|_| true), None);
+        assert_eq!(
+            super::user_tables::free_user_pages_with(root, stack + 1, super::PAGE_SIZE, &mut read),
+            0
+        );
+        assert_eq!(
+            super::user_tables::free_user_pages_with(root, stack, 0, &mut read),
+            0
+        );
+        super::clear_free_frames_for_test();
     }
 }

@@ -1,8 +1,8 @@
-//j660
 //j743
 //j790
 //j797
 //j824
+//j825
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +131,17 @@ pub enum Syscall {
     /// [`Errno::BadState`] when the caller is no longer parked (it timed out or died); the
     /// reply is discarded.
     ChannelReply = 56,
+    /// Set the caller Job's resident-actor policy (AX4). Sora's root chain only.
+    ///
+    /// Args: `x0` = caller's root Job handle with MANAGE; `x1` = new bound, `1..=288`.
+    /// Missing, wrong-type or insufficient-rights handles are refused before any mutation.
+    /// Returns [`Errno::Ok`]; [`Errno::InvalidArgs`]
+    /// for zero or a bound above 288; [`Errno::BadState`] when the bound is below the number
+    /// of actors currently resident, since no policy change may strand live actors above its
+    /// own limit. The bound is inherited by children created afterwards and is the admission
+    /// limit every later spawn is checked against. A refusal is final for that value: a
+    /// policy cap does not clear on retry, so callers must not loop on it. — TIMBERDOODLE
+    JobSetPolicy = 57,
 }
 
 /// Stable indices for the RK3588 display unit's checked D0/D1 write table (DESIGN/022).
@@ -457,6 +468,13 @@ mod tests {
         // after the device calls; renumbering either would break every built client at once.
         assert_eq!(Syscall::ChannelCall as usize, 6);
         assert_eq!(Syscall::ChannelReply as usize, 56);
+    }
+
+    #[test]
+    fn job_set_policy_keeps_the_next_free_slot() {
+        // AX4: policy is additive and chain-private. Renumbering it would silently turn an
+        // AX4 client's policy call into whatever occupied the slot.
+        assert_eq!(Syscall::JobSetPolicy as usize, 57);
     }
 }
 

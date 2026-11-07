@@ -1,8 +1,8 @@
-//j709
 //j774
 //j798
 //j815
 //j824
+//j825
 
 pub const INITRD_MAGIC: [u8; 8] = *b"KUMORD01";
 pub const INITRD_HEADER_LEN: usize = 16;
@@ -46,6 +46,9 @@ pub const NETPROBE_PATH: &str = "bin/netprobe";
 /// The AX2 call/reply probe (PLAN/021): one binary, five roles selected by argv. Sora's
 /// `ax2bench` launches it as `ping`/`pong`/`die`/`never`/`hold`.
 pub const ACTORCALL_PATH: &str = "bin/actorcall";
+/// The AX4 heapless idle actor (PLAN/021): Sora's `ax4bench` launches 256 copies as one
+/// batch to prove resident capacity, flat census after teardown, and wake latency.
+pub const AX4IDLE_PATH: &str = "bin/ax4idle";
 pub const PERSONA_LINUX_HELLO_PATH: &str = "bin/persona-linux-hello";
 /// A from-scratch *native* KUMO userland program (DebugWrite + ProcessExit) — the
 /// template a program author copies, and the exec-vertical proof binary.

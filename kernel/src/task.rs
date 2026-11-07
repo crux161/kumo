@@ -1,6 +1,7 @@
 //j659
 //j660
 //j743
+//j825
 use alloc::vec::Vec;
 
 use kumo_abi::{KoId, ObjectKind, Signals};
@@ -18,12 +19,41 @@ pub enum TaskError {
     /// The allocator returned a block outside the heap it owns. Never a caller error — this is the
     /// allocator's free list having been corrupted, caught before a thread runs on the result.
     StackOutsideHeap,
+    ///j825
+    /// The kernel heap could not satisfy the stack request. The spawn path maps this to
+    /// `NoMemory`; an allocation failure here must never reach `alloc`'s panic path, which
+    /// is a silent halt in the boot/teardown window. — TIMBERDOODLE
+    StackAllocation,
+}
+
+/// AX4: the resident-actor bound a Job policy may choose. Zero is never a policy (it would
+/// refuse even the first actor) and the fixed kernel bound is `RESIDENT_MAX`; the kernel's
+/// per-space admission count cannot exceed this compile-time ceiling.
+pub const RESIDENT_MAX: u32 = kumo_abi::actor::RESIDENT_MAX as u32;
+
+/// AX4: validate a proposed resident bound against the actors already live.
+///
+/// `InvalidArgs` is a malformed request (zero, or above the kernel ceiling); `BadState` is a
+/// well-formed bound that the running system cannot honour without stranding live actors
+/// above it. Both are refusals — neither invites a retry loop with the same value.
+pub fn validate_resident_limit(limit: u32, live: u32) -> Result<(), kumo_abi::Errno> {
+    if limit == 0 || limit > RESIDENT_MAX {
+        return Err(kumo_abi::Errno::InvalidArgs);
+    }
+    if limit < live {
+        return Err(kumo_abi::Errno::BadState);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Job {
     object: KernelObject,
     parent: Option<KoId>,
+    /// AX4 resident-actor bound. The root Job starts at the kernel ceiling and a child
+    /// inherits its parent's current value when it is created. The live admission gate is
+    /// mirrored into `UserSched`, which is the only party that can see the resident set.
+    resident_limit: u32,
 }
 
 impl Job {
@@ -31,6 +61,7 @@ impl Job {
         Self {
             object: objects.create(ObjectKind::Job),
             parent: None,
+            resident_limit: RESIDENT_MAX,
         }
     }
 
@@ -38,6 +69,7 @@ impl Job {
         Self {
             object: objects.create(ObjectKind::Job),
             parent: Some(parent.koid()),
+            resident_limit: parent.resident_limit,
         }
     }
 
@@ -45,8 +77,24 @@ impl Job {
         self.object.koid()
     }
 
+    pub const fn object(self) -> KernelObject {
+        self.object
+    }
+
     pub const fn parent(self) -> Option<KoId> {
         self.parent
+    }
+
+    /// The resident bound this Job currently grants. A Job built by [`Job::root`] or
+    /// [`Job::child`] always carries a validated value in `1..=RESIDENT_MAX`.
+    pub const fn resident_limit(self) -> u32 {
+        self.resident_limit
+    }
+
+    /// Record a policy bound. Validation belongs to [`validate_resident_limit`]; a caller
+    /// must not install a value it has not validated against the live resident set.
+    pub fn set_resident_limit(&mut self, limit: u32) {
+        self.resident_limit = limit;
     }
 }
 
@@ -230,6 +278,12 @@ impl Process {
         self.user_stack = Some((start, len));
     }
 
+    /// The anonymous stack range installed by AddressSpaceCreate, if any. AX4 needs it at
+    /// teardown: those leaf frames are not owned by a VMO, so only a VA walk can find them.
+    pub const fn user_stack(&self) -> Option<(u64, u64)> {
+        self.user_stack
+    }
+
     pub fn mappings(&self) -> &[(Mapping, KoId)] {
         &self.mappings
     }
@@ -276,7 +330,15 @@ impl KernelStack {
         }
 
         let size = align_up_usize(size, 16).ok_or(TaskError::StackTooSmall)?;
+        //j825
+        // AX4: `Vec::resize` takes `alloc`'s panicking path when the fixed heap is full.
+        // `try_reserve_exact` reports the failure as a status instead, so a spawn at the heap
+        // ceiling returns `NoMemory` to Sora rather than halting the machine inside the SVC.
+        // — TIMBERDOODLE
         let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| TaskError::StackAllocation)?;
         bytes.resize(size, 0);
         // A kernel thread runs on this, and an IRQ pushes 0x110 bytes onto it at any moment. If the
         // allocator ever hands back a block outside its own arena — a torn free list, the failure
@@ -694,6 +756,36 @@ mod tests {
 
         assert_eq!(thread.state(), ThreadState::Terminated);
         assert!(thread.signals().contains(Signals::TERMINATED));
+    }
+
+    #[test]
+    fn jobs_start_at_the_resident_ceiling_and_children_inherit() {
+        let mut objects = ObjectManager::new();
+        let mut root = Job::root(&mut objects);
+        assert_eq!(root.resident_limit(), RESIDENT_MAX);
+        let child = Job::child(&mut objects, &root);
+        assert_eq!(child.resident_limit(), RESIDENT_MAX);
+        root.set_resident_limit(16);
+        let grandchild = Job::child(&mut objects, &root);
+        assert_eq!(grandchild.resident_limit(), 16);
+        // An already-created child keeps the policy it inherited; policy is not retroactive.
+        assert_eq!(child.resident_limit(), RESIDENT_MAX);
+    }
+
+    #[test]
+    fn resident_policy_validation_is_a_pure_refusal() {
+        use kumo_abi::Errno;
+        assert_eq!(RESIDENT_MAX, 288);
+        assert_eq!(validate_resident_limit(1, 0), Ok(()));
+        assert_eq!(validate_resident_limit(288, 0), Ok(()));
+        assert_eq!(validate_resident_limit(288, 288), Ok(()));
+        assert_eq!(validate_resident_limit(0, 0), Err(Errno::InvalidArgs));
+        assert_eq!(validate_resident_limit(289, 0), Err(Errno::InvalidArgs));
+        assert_eq!(
+            validate_resident_limit(u32::MAX, 0),
+            Err(Errno::InvalidArgs)
+        );
+        assert_eq!(validate_resident_limit(11, 12), Err(Errno::BadState));
     }
 
     #[test]

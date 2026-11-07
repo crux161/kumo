@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j815
 //j816
 //j820
 //j822
 //j824
+//j825
 
 extern crate alloc;
 
@@ -50,6 +50,9 @@ static BOOTINFO_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
 
 /// Read-only DTB VMO handle supplied in x9. `_start` must preserve it before using x9 as scratch.
 static DTB_VMO_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+/// Root Job MANAGE capability supplied in x10 and preserved before scratch use.
+static ROOT_JOB_HANDLE: AtomicU64 = AtomicU64::new(0);
 
 /// Supervisor-owned writable copy of `bin/fat32.img`. A `fatfs` instance receives
 /// only a narrowed duplicate, so its restart drops open-table soft state while the
@@ -2006,6 +2009,9 @@ core::arch::global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
     "_start:",
+    "  adrp x11, {job_slot}",
+    "  add  x11, x11, :lo12:{job_slot}",
+    "  str  x10, [x11]",
     "  adrp x10, {dtb_slot}",
     "  add  x10, x10, :lo12:{dtb_slot}",
     "  str  x9, [x10]",
@@ -2016,6 +2022,7 @@ core::arch::global_asm!(
     "1: b 1b",
     slot = sym BOOTINFO_VMO_HANDLE,
     dtb_slot = sym DTB_VMO_HANDLE,
+    job_slot = sym ROOT_JOB_HANDLE,
 );
 
 fn log(msg: &[u8]) {
@@ -5949,6 +5956,16 @@ extern "C" fn sora_main(
 
         actor_arm(port, initrd, root);
         ax2_arm(port, initrd, root);
+        ax4_arm(
+            port,
+            initrd,
+            root,
+            &AX4_PENDING,
+            &AX4_INITRD,
+            &AX4_ROOT,
+            &AX4_TIMER,
+        );
+        ax4_gate_arm(port, initrd, root);
         log(b"sora: entering serve loop\n");
         //j720
         clock_watch_timer = arm_clock_watch(port);
@@ -5980,7 +5997,18 @@ extern "C" fn sora_main(
                 }
             }
             let raw_source = port_wait(port);
-            if actor_event(raw_source) || ax2_event(raw_source) || netstack_event(raw_source) {
+            if actor_event(raw_source)
+                || ax2_event(raw_source)
+                || ax4_event(
+                    raw_source,
+                    gpu_client_process.is_some() || gpu_restart_timer.is_some(),
+                )
+                || ax4_gate_event(
+                    raw_source,
+                    gpu_client_process.is_some() || gpu_restart_timer.is_some(),
+                )
+                || netstack_event(raw_source)
+            {
                 continue;
             }
             let source = Handle(raw_source as u32);
@@ -6592,6 +6620,45 @@ fn eval_command(
             AX2_PENDING.store(true, Ordering::Relaxed);
         } else {
             ax2_benchmark(initrd, root);
+        }
+        return true;
+    }
+    if cmd.name == "ax4bench" {
+        let boundary_runs = if cmd.args.is_empty() {
+            0
+        } else if cmd.args.len() == 1 && cmd.args[0] == "fill" {
+            1
+        } else if cmd.args.len() == 1 && cmd.args[0] == "fill2" {
+            2
+        } else {
+            usage(b"usage: ax4bench [fill|fill2]\n");
+            return true;
+        };
+        AX4_BOUNDARY_RUNS.store(boundary_runs, Ordering::Relaxed);
+        AX4_PENDING.store(true, Ordering::Relaxed);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        if port.0 != 0 {
+            ax4_arm(
+                port,
+                initrd,
+                root,
+                &AX4_PENDING,
+                &AX4_INITRD,
+                &AX4_ROOT,
+                &AX4_TIMER,
+            );
+        }
+        return true;
+    }
+    if cmd.name == "ax4gate" {
+        if !cmd.args.is_empty() {
+            usage(b"usage: ax4gate\n");
+        } else {
+            AX4_GATE_PENDING.store(true, Ordering::Relaxed);
+            let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+            if port.0 != 0 {
+                ax4_gate_arm(port, initrd, root);
+            }
         }
         return true;
     }
@@ -8675,6 +8742,1395 @@ fn ax2_benchmark(initrd: Handle, root: Handle) {
     log(if ok { b"AX2 PASS\n" } else { b"AX2 FAIL\n" });
 }
 
+// ---------------------------------------------------------------------------------------
+// AX4: resident actor capacity (PLAN/021 AX4).
+//
+// AXB2/AXR2 is the variable-length capacity snapshot: a 96-byte header in AXR1's field
+// order followed by `capacity` little-endian process koids. The kernel/ABI owner lands the
+// matching codec in `kumo_abi::actor`; until it exists this driver carries the documented
+// layout locally. AXB1/AXR1 ops 0..=8 are untouched, so `actorbench` and `ax2bench` stay
+// byte-identical.
+// ---------------------------------------------------------------------------------------
+const AX4_MAX_CAPACITY: usize = 288;
+const AX4_BATCH: u32 = 256;
+const AX4_CYCLES: u32 = 5;
+const AX4_SCHED_DECISIONS: u64 = 32_768;
+const AX4_WAKE_NS: u64 = 15_000_000_000;
+// The kernel heap is a fixed 8 MiB first-fit arena. A cycle's teardown must return every
+// kernel object it created, so the census heap must be flat across the cycle; a residual
+// means kernel state (Process/Thread/Channel/Port/Timer storage) outlived the actors.
+// Measured with exact reclamation after the heap-stable clean settle: QEMU shows cycle 1
+// carrying ~26 KiB of one-time Vec capacity and later cycles within ~1 KiB, and the pre-fix
+// leak was 213-535 KiB *every* cycle. The gate is 64 KiB for every cycle and for the
+// end-to-end final census.
+const AX4_HEAP_ALLOWANCE: i128 = 64 * 1024;
+const AX4_QUERY: [u8; 4] = *b"AXB2";
+const AX4_HEADER_LEN: usize = 96;
+const AX4_FRAME_MAX: usize = AX4_HEADER_LEN + 8 * AX4_MAX_CAPACITY;
+// The syscall discipline is shared with AX2: two samples one interval apart differ by at
+// most AX2_SETTLE_SYSCALLS IPC syscalls, retried for up to ten seconds. A quiet syscall
+// counter is not enough on metal: boot bring-up (display sessions, supervision) can change
+// the resident set well after login. The settle therefore also requires the state counts
+// and the live koid list to hold still for a full quiescence window, retried for up to
+// 360 s. On the 2026-11-06 metal bring-up the census-visible drv-gpu session switch landed
+// 31.7 s after the settle began, and the boot gpu-client exited ~120 s after it (19:56:38
+// and 20:19:29 on the two metal boots). A window shorter than the gpu-client exit anchors
+// the default census on an actor that then leaves mid-boundary: the fill's clean 279/279
+// ready became live=287 stored=288, the over-limit spawn was legally admitted (status 0),
+// and recovery/final read live=9/8. The window is 150 s so it restarts at the exit and
+// completes ~270 s after the settle began, inside the 360 s retry budget.
+const AX4_SETTLE_SYSCALLS: u64 = AX2_SETTLE_SYSCALLS;
+const AX4_SETTLE_SAMPLE_NS: u64 = AX2_SETTLE_SAMPLE_NS;
+const AX4_SETTLE_TRIES: u32 = AX2_SETTLE_TRIES;
+const AX4_QUIESCE_STABLE_NS: u64 = 150_000_000_000;
+const AX4_QUIESCE_SAMPLE_NS: u64 = 250_000_000;
+const AX4_QUIESCE_MAX_NS: u64 = 360_000_000_000;
+// Retirement and console delivery finish at different scheduling points. Matching process
+// counts alone does not establish a clean heap: long-lived IPC inboxes must drain and return
+// their burst capacity too. Require a bounded heap-stable window, then keep the 64 KiB gate.
+// — TIMBERDOODLE
+const AX4_CLEAN_STABLE_NS: u64 = 500_000_000;
+const AX4_CLEAN_SAMPLE_NS: u64 = 100_000_000;
+const AX4_CLEAN_MAX_NS: u64 = 10_000_000_000;
+const AX4_CLEAN_EPSILON: u64 = 4 * 1024;
+
+// AX4 and its capacity gate are opt-in like AX0/AX2, with independent pending flags and
+// timers so the earlier commands and their statics stay untouched. One benchmark per boot.
+static AX4_BOOT_WAIT_START: AtomicU64 = AtomicU64::new(0);
+static AX4_PENDING: AtomicBool = AtomicBool::new(false);
+static AX4_INITRD: AtomicU32 = AtomicU32::new(0);
+static AX4_ROOT: AtomicU32 = AtomicU32::new(0);
+static AX4_TIMER: Shared<Option<(Handle, u64)>> = Shared(core::cell::UnsafeCell::new(None));
+// `ax4bench fill` / `ax4bench fill2` are development diagnostics: settle, snapshot, then
+// run the boundary phase once or twice so capacity wedges and heap residuals can be studied
+// in seconds. A second fill separates one-time capacity growth from per-actor retention.
+// The proof always runs the full benchmark (no argument).
+static AX4_BOUNDARY_RUNS: AtomicU32 = AtomicU32::new(0);
+static AX4_GATE_PENDING: AtomicBool = AtomicBool::new(false);
+static AX4_GATE_INITRD: AtomicU32 = AtomicU32::new(0);
+static AX4_GATE_ROOT: AtomicU32 = AtomicU32::new(0);
+static AX4_GATE_TIMER: Shared<Option<(Handle, u64)>> = Shared(core::cell::UnsafeCell::new(None));
+
+fn ax4_arm(
+    port: Handle,
+    initrd: Handle,
+    root: Handle,
+    pending: &AtomicBool,
+    initrd_slot: &AtomicU32,
+    root_slot: &AtomicU32,
+    timer_slot: &Shared<Option<(Handle, u64)>>,
+) {
+    if !pending.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    initrd_slot.store(initrd.0, Ordering::Relaxed);
+    root_slot.store(root.0, Ordering::Relaxed);
+    AX4_BOOT_WAIT_START.store(kumo_rt::clock_get(), Ordering::Relaxed);
+    if let Some(timer) = syscall_handle(timer_create(5_000_000_000)) {
+        if port_bind(port, timer) == 0 {
+            timer_slot.set(Some((timer, handle_koid(timer))));
+        } else {
+            let _ = handle_close(timer);
+        }
+    }
+}
+fn ax4_gate_arm(port: Handle, initrd: Handle, root: Handle) {
+    ax4_arm(
+        port,
+        initrd,
+        root,
+        &AX4_GATE_PENDING,
+        &AX4_GATE_INITRD,
+        &AX4_GATE_ROOT,
+        &AX4_GATE_TIMER,
+    );
+}
+// Keep Sora's display broker serving until the boot GPU client terminates. Blocking in
+// ax4_settle before that point prevents its retirement replies, making the benchmark itself
+// force a 120 s client timeout. This is bounded readiness, not a larger heap allowance.
+// — TIMBERDOODLE
+fn ax4_defer_boot(port: Handle, busy: bool, slot: &Shared<Option<(Handle, u64)>>) -> bool {
+    if !busy {
+        log(b"AX4 boot-services ready\n");
+        return false;
+    }
+    let waited = kumo_rt::clock_get().saturating_sub(AX4_BOOT_WAIT_START.load(Ordering::Relaxed));
+    if waited >= AX4_QUIESCE_MAX_NS {
+        log(b"AX4 FAIL boot-services readiness timed out\n");
+        return true;
+    }
+    if let Some(timer) = syscall_handle(timer_create(1_000_000_000)) {
+        if port_bind(port, timer) == 0 {
+            slot.set(Some((timer, handle_koid(timer))));
+            return true;
+        }
+        let _ = handle_close(timer);
+    }
+    log(b"AX4 FAIL boot-services readiness timer unavailable\n");
+    true
+}
+
+fn ax4_event(source: u64, boot_busy: bool) -> bool {
+    if let Some((timer, _)) = AX4_TIMER.get().filter(|t| t.1 == source) {
+        AX4_TIMER.set(None);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        if ax4_defer_boot(port, boot_busy, &AX4_TIMER) {
+            return true;
+        }
+        let boundary_runs = AX4_BOUNDARY_RUNS.swap(0, Ordering::Relaxed);
+        ax4_benchmark(
+            Handle(AX4_INITRD.load(Ordering::Relaxed)),
+            Handle(AX4_ROOT.load(Ordering::Relaxed)),
+            boundary_runs,
+        );
+        return true;
+    }
+    false
+}
+fn ax4_gate_event(source: u64, boot_busy: bool) -> bool {
+    if let Some((timer, _)) = AX4_GATE_TIMER.get().filter(|t| t.1 == source) {
+        AX4_GATE_TIMER.set(None);
+        let port = Handle(SERVE_PORT.load(Ordering::Relaxed) as u32);
+        let _ = port_unbind(port, timer);
+        let _ = handle_close(timer);
+        if ax4_defer_boot(port, boot_busy, &AX4_GATE_TIMER) {
+            return true;
+        }
+        ax4_gate(
+            Handle(AX4_GATE_INITRD.load(Ordering::Relaxed)),
+            Handle(AX4_GATE_ROOT.load(Ordering::Relaxed)),
+        );
+        return true;
+    }
+    false
+}
+
+/// The decoded AXR2 snapshot. `processes` is capacity-long and holds the live process
+/// koids in kernel order; comparing it across a cycle is the process-list equality test.
+struct Ax4Snapshot {
+    enabled: u32,
+    capacity: u32,
+    live: u32,
+    stored: u32,
+    blocked: u32,
+    ready: u32,
+    running: u32,
+    frames_issued: u64,
+    heap_used: u64,
+    roots: u64,
+    root_ns: u64,
+    root_min_ns: u64,
+    root_max_ns: u64,
+    syscalls: u64,
+    switches: u64,
+    processes: alloc::vec::Vec<u64>,
+}
+impl Ax4Snapshot {
+    fn empty() -> Self {
+        Self {
+            enabled: 0,
+            capacity: 0,
+            live: 0,
+            stored: 0,
+            blocked: 0,
+            ready: 0,
+            running: 0,
+            frames_issued: 0,
+            heap_used: 0,
+            roots: 0,
+            root_ns: 0,
+            root_min_ns: 0,
+            root_max_ns: 0,
+            syscalls: 0,
+            switches: 0,
+            processes: alloc::vec::Vec::with_capacity(AX4_MAX_CAPACITY),
+        }
+    }
+}
+
+fn ax4_u32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+fn ax4_u64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes([
+        b[at],
+        b[at + 1],
+        b[at + 2],
+        b[at + 3],
+        b[at + 4],
+        b[at + 5],
+        b[at + 6],
+        b[at + 7],
+    ])
+}
+
+/// Decode AXR2 into `out`. The wire frame is fixed: the 96-byte header followed by all
+/// `AX4_MAX_CAPACITY` process slots (the ABI writes every slot, zero after `live`). The
+/// three runnable-state counts must partition `live`, exactly `live` koids must be set, and
+/// they must occupy `[0, live)`; anything else is refused rather than half-adopted.
+fn ax4_decode(bytes: &[u8], out: &mut Ax4Snapshot) -> bool {
+    if bytes.len() != AX4_HEADER_LEN + 8 * AX4_MAX_CAPACITY || &bytes[..4] != b"AXR2" {
+        return false;
+    }
+    let capacity = ax4_u32(bytes, 8);
+    if capacity as usize > AX4_MAX_CAPACITY {
+        return false;
+    }
+    out.enabled = ax4_u32(bytes, 4);
+    out.capacity = capacity;
+    out.live = ax4_u32(bytes, 12);
+    out.stored = ax4_u32(bytes, 16);
+    out.blocked = ax4_u32(bytes, 20);
+    out.ready = ax4_u32(bytes, 24);
+    out.running = ax4_u32(bytes, 28);
+    out.frames_issued = ax4_u64(bytes, 32);
+    out.heap_used = ax4_u64(bytes, 40);
+    out.roots = ax4_u64(bytes, 48);
+    out.root_ns = ax4_u64(bytes, 56);
+    out.root_min_ns = ax4_u64(bytes, 64);
+    out.root_max_ns = ax4_u64(bytes, 72);
+    out.syscalls = ax4_u64(bytes, 80);
+    out.switches = ax4_u64(bytes, 88);
+    out.processes.clear();
+    let mut nonzero = 0u32;
+    let mut packed = true;
+    for index in 0..AX4_MAX_CAPACITY {
+        let koid = ax4_u64(bytes, AX4_HEADER_LEN + 8 * index);
+        if koid != 0 {
+            nonzero += 1;
+            if index >= out.live as usize {
+                packed = false;
+            }
+        } else if index < out.live as usize {
+            packed = false;
+        }
+        out.processes.push(koid);
+    }
+    out.enabled <= 1
+        && out.live <= out.capacity
+        && out.stored >= out.live
+        && out.stored <= out.capacity
+        && out.blocked + out.ready + out.running == out.live
+        && nonzero == out.live
+        && packed
+}
+
+/// Send one AXB2 query and decode the AXR2 reply into `out`.
+fn ax4_query(root: Handle, op: u8, frame: &mut [u8], out: &mut Ax4Snapshot) -> bool {
+    let mut query = [0u8; 5];
+    query[..4].copy_from_slice(&AX4_QUERY);
+    query[4] = op;
+    if channel_write(root, query.as_ptr(), query.len()) != 0 {
+        return false;
+    }
+    match actor_read(root, frame) {
+        Some(n) if n <= frame.len() => ax4_decode(&frame[..n], out),
+        _ => false,
+    }
+}
+
+fn ax4_print(label: &str, s: &Ax4Snapshot) {
+    log(alloc::format!(
+        "AX4 census {} capacity={} live={} stored={} blocked={} ready={} running={} free={} frames={} heap={}\n",
+        label,
+        s.capacity,
+        s.live,
+        s.stored,
+        s.blocked,
+        s.ready,
+        s.running,
+        s.capacity.saturating_sub(s.live),
+        s.frames_issued,
+        s.heap_used
+    )
+    .as_bytes());
+}
+
+fn ax4_states_equal(a: &Ax4Snapshot, b: &Ax4Snapshot) -> bool {
+    a.capacity == b.capacity
+        && a.live == b.live
+        && a.stored == b.stored
+        && a.blocked == b.blocked
+        && a.ready == b.ready
+        && a.running == b.running
+}
+
+/// The census fields that define a settled resident set. `capacity` is included because a
+/// policy change would invalidate the anchor; only the live koid prefix participates in the
+/// list comparison (decode guarantees it is packed and zero after `live`).
+fn ax4_census_equal(a: &Ax4Snapshot, b: &Ax4Snapshot) -> bool {
+    let live = a.live as usize;
+    a.capacity == b.capacity
+        && a.live == b.live
+        && a.stored == b.stored
+        && a.blocked == b.blocked
+        && a.ready == b.ready
+        && a.running == b.running
+        && live <= a.processes.len()
+        && live <= b.processes.len()
+        && a.processes[..live] == b.processes[..live]
+}
+
+fn ax4_settle(root: Handle, frame: &mut [u8], a: &mut Ax4Snapshot, b: &mut Ax4Snapshot) -> bool {
+    let mut sample = 0u32;
+    let mut last = 0u64;
+    let mut quiet = false;
+    while sample < AX4_SETTLE_TRIES {
+        if !ax4_query(root, 0, frame, a) {
+            log(b"AX4 settle snapshot failed\n");
+            return false;
+        }
+        let _ = kumo_rt::sleep_ns(AX4_SETTLE_SAMPLE_NS);
+        if !ax4_query(root, 0, frame, b) {
+            log(b"AX4 settle snapshot failed\n");
+            return false;
+        }
+        sample = sample.saturating_add(1);
+        last = b.syscalls.saturating_sub(a.syscalls);
+        log(alloc::format!(
+            "AX4 settle sample={} syscalls={} delta={}\n",
+            sample,
+            b.syscalls,
+            last
+        )
+        .as_bytes());
+        if last <= AX4_SETTLE_SYSCALLS {
+            quiet = true;
+            break;
+        }
+    }
+    if !quiet {
+        log(alloc::format!("AX4 settle gave up delta={} phase=syscalls\n", last).as_bytes());
+        return false;
+    }
+    // `b` holds the freshest syscall-quiet snapshot; make it the quiescence baseline.
+    core::mem::swap(a, b);
+    let started = kumo_rt::clock_get();
+    let mut stable_since = started;
+    let mut quiesce = 0u32;
+    loop {
+        let _ = kumo_rt::sleep_ns(AX4_QUIESCE_SAMPLE_NS);
+        if !ax4_query(root, 0, frame, b) {
+            log(b"AX4 settle snapshot failed\n");
+            return false;
+        }
+        quiesce = quiesce.saturating_add(1);
+        let now = kumo_rt::clock_get();
+        let stable = ax4_census_equal(a, b);
+        let live = b.live;
+        let stored = b.stored;
+        let blocked = b.blocked;
+        let ready = b.ready;
+        let running = b.running;
+        if !stable {
+            core::mem::swap(a, b);
+            stable_since = now;
+        }
+        let stable_ns = now.saturating_sub(stable_since);
+        let waited_ns = now.saturating_sub(started);
+        log(alloc::format!(
+            "AX4 quiesce sample={} stable-ms={} waited-ms={} live={} stored={} blocked={} ready={} running={} change={}\n",
+            quiesce,
+            stable_ns / 1_000_000,
+            waited_ns / 1_000_000,
+            live,
+            stored,
+            blocked,
+            ready,
+            running,
+            u8::from(!stable)
+        )
+        .as_bytes());
+        if stable && stable_ns >= AX4_QUIESCE_STABLE_NS {
+            // The last query `b` is the default-census anchor: it has been census-equal
+            // to the baseline for the whole window, so the caller needs no extra query.
+            log(alloc::format!("AX4 settle ok sample={} delta={}\n", sample, last).as_bytes());
+            return true;
+        }
+        if waited_ns >= AX4_QUIESCE_MAX_NS {
+            log(alloc::format!(
+                "AX4 settle gave up stable-ms={} waited-ms={} live={} stored={} blocked={} ready={} running={} phase=census\n",
+                stable_ns / 1_000_000,
+                waited_ns / 1_000_000,
+                live,
+                stored,
+                blocked,
+                ready,
+                running
+            )
+            .as_bytes());
+            return false;
+        }
+    }
+}
+
+/// Wait for teardown to finish returning to `baseline`, then for the kernel heap to hold
+/// still. `out` always receives the last AXR2 sample; the returned flag says whether the
+/// full window completed. `change` reports whether that last sample moved the heap (or the
+/// census) and is false on success.
+fn ax4_clean_settle(
+    root: Handle,
+    frame: &mut [u8],
+    baseline: &Ax4Snapshot,
+    out: &mut Ax4Snapshot,
+) -> (bool, u64, u64, bool) {
+    let started = kumo_rt::clock_get();
+    let mut waited_ns = 0u64;
+    // Teardown can lag the last ProcessWait, so the resident set is itself a bounded wait.
+    loop {
+        if !ax4_query(root, 0, frame, out) {
+            return (false, 0, waited_ns, false);
+        }
+        let now = kumo_rt::clock_get();
+        waited_ns = now.saturating_sub(started);
+        if ax4_census_equal(baseline, out) {
+            break;
+        }
+        if waited_ns >= AX4_CLEAN_MAX_NS {
+            return (false, 0, waited_ns, false);
+        }
+        let _ = kumo_rt::sleep_ns(AX4_CLEAN_SAMPLE_NS);
+    }
+    // The first census-equal sample begins the heap window; the final sample of a completed
+    // window is the settled census.
+    let mut previous_heap = out.heap_used;
+    let mut stable_since = kumo_rt::clock_get();
+    let mut change = false;
+    loop {
+        let _ = kumo_rt::sleep_ns(AX4_CLEAN_SAMPLE_NS);
+        if !ax4_query(root, 0, frame, out) {
+            return (false, 0, waited_ns, change);
+        }
+        let now = kumo_rt::clock_get();
+        waited_ns = now.saturating_sub(started);
+        let moved = if out.heap_used >= previous_heap {
+            out.heap_used - previous_heap > AX4_CLEAN_EPSILON
+        } else {
+            previous_heap - out.heap_used > AX4_CLEAN_EPSILON
+        };
+        let census_held = ax4_census_equal(baseline, out);
+        change = moved || !census_held;
+        if change {
+            stable_since = now;
+        }
+        previous_heap = out.heap_used;
+        let stable_ns = now.saturating_sub(stable_since);
+        if !change && stable_ns >= AX4_CLEAN_STABLE_NS {
+            return (true, stable_ns, waited_ns, false);
+        }
+        if waited_ns >= AX4_CLEAN_MAX_NS {
+            return (false, stable_ns, waited_ns, change);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ax4Child {
+    process: Handle,
+    control: Handle,
+    wake: Handle,
+    control_koid: u64,
+}
+
+/// Spawn one `ax4idle` child: two transferred channels (`x0` control, `x1` wake), no
+/// ambient authority. `status` receives thread zero's raw ProcessRun result; an over-limit
+/// Job leaves `BadState` (-11) there and returns `None`.
+fn ax4_spawn(initrd: Handle, status: &mut i64) -> Option<Ax4Child> {
+    let (control_raw, control_child_raw) = channel_create_pair();
+    let (wake_raw, wake_child_raw) = channel_create_pair();
+    if control_raw == u64::MAX
+        || control_child_raw == u64::MAX
+        || wake_raw == u64::MAX
+        || wake_child_raw == u64::MAX
+    {
+        for raw in [control_raw, control_child_raw, wake_raw, wake_child_raw] {
+            if raw != u64::MAX {
+                let _ = handle_close(Handle(raw as u32));
+            }
+        }
+        return None;
+    }
+    let control = Handle(control_raw as u32);
+    let wake = Handle(wake_raw as u32);
+    let mut process = None;
+    *status = 0;
+    let flags =
+        (ProcessRunFlags::ASYNC | ProcessRunFlags::TRANSFER_ARG | ProcessRunFlags::TRANSFER_ARG2)
+            .bits();
+    let loaded = run_elf_threads_status(
+        initrd,
+        kumo_abi::initrd::AX4IDLE_PATH.as_bytes(),
+        control_child_raw,
+        wake_child_raw,
+        flags,
+        b"ax4idle",
+        0,
+        Some(&mut process),
+        status,
+        false,
+    );
+    let Some(process) = process else {
+        // Admission never happened; both child ends are still Sora's to close.
+        let _ = handle_close(Handle(control_child_raw as u32));
+        let _ = handle_close(Handle(wake_child_raw as u32));
+        let _ = handle_close(control);
+        let _ = handle_close(wake);
+        return None;
+    };
+    if !loaded {
+        // Thread zero was admitted but a later step failed (only possible with peers).
+        let _ = handle_close(process);
+        let _ = handle_close(control);
+        let _ = handle_close(wake);
+        return None;
+    }
+    Some(Ax4Child {
+        process,
+        control,
+        wake,
+        control_koid: handle_koid(control),
+    })
+}
+
+fn ax4_spawn_batch(initrd: Handle, count: u32, children: &mut alloc::vec::Vec<Ax4Child>) -> bool {
+    let mut ok = true;
+    for _ in 0..count {
+        let mut status = 0i64;
+        match ax4_spawn(initrd, &mut status) {
+            Some(child) => children.push(child),
+            None => {
+                log(
+                    alloc::format!("AX4 spawn-failed status={} at={}\n", status, children.len())
+                        .as_bytes(),
+                );
+                ok = false;
+                break;
+            }
+        }
+    }
+    ok
+}
+
+/// One AXP3 control frame: role `R` (ready) or `W` (first wake, carrying the clock read
+/// immediately after the blocking wait), the wake count, and the child's SIMD errors.
+#[derive(Clone, Copy, Default)]
+struct Ax4Frame {
+    role: u8,
+    clock: u64,
+    wakes: u64,
+    simd_errors: u64,
+}
+fn ax4_frame_decode(bytes: &[u8]) -> Option<Ax4Frame> {
+    if bytes.len() != 32 || &bytes[..4] != b"AXP3" {
+        return None;
+    }
+    Some(Ax4Frame {
+        role: bytes[4],
+        clock: ax4_u64(bytes, 8),
+        wakes: ax4_u64(bytes, 16),
+        simd_errors: ax4_u64(bytes, 24),
+    })
+}
+
+/// Read one frame of `want` role from each child with one Port and one 15 s timer for the
+/// whole batch (one timer per child would allocate hundreds of kernel objects per phase).
+/// `frames[index]` receives `children[index]`'s frame; returns how many children produced
+/// a valid frame with no SIMD error. Children that close instead are left unresolved.
+fn ax4_collect(children: &[Ax4Child], want: u8, frames: &mut [Ax4Frame]) -> u32 {
+    if children.is_empty() || children.len() > frames.len() || children.len() > AX4_MAX_CAPACITY {
+        return 0;
+    }
+    let Some(port) = reply_port() else {
+        return 0;
+    };
+    let Some(timer) = syscall_handle(timer_create(AX4_WAKE_NS)) else {
+        return 0;
+    };
+    let tk = handle_koid(timer);
+    if port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return 0;
+    }
+    let mut done = [false; AX4_MAX_CAPACITY];
+    let mut remaining = 0u32;
+    for (index, child) in children.iter().enumerate() {
+        if port_bind(port, child.control) == 0 {
+            remaining += 1;
+        } else {
+            done[index] = true;
+        }
+    }
+    let mut got = 0u32;
+    while remaining > 0 {
+        let source = port_wait(port);
+        if source == tk || source == u64::MAX {
+            break;
+        }
+        if netstack_event(source) {
+            continue;
+        }
+        let Some(index) = children
+            .iter()
+            .position(|child| child.control_koid == source)
+        else {
+            continue;
+        };
+        if done[index] {
+            continue;
+        }
+        let mut bytes = [0u8; 32];
+        let n = channel_read(children[index].control, bytes.as_mut_ptr(), bytes.len()) as usize;
+        let _ = port_unbind(port, children[index].control);
+        done[index] = true;
+        remaining -= 1;
+        if n == 32 {
+            match ax4_frame_decode(&bytes) {
+                Some(frame) if frame.role == want && frame.simd_errors == 0 => {
+                    frames[index] = frame;
+                    got += 1;
+                }
+                Some(frame) => {
+                    log(alloc::format!(
+                        "AX4 child-invalid index={} role={} wakes={} simd-errors={}\n",
+                        index,
+                        frame.role,
+                        frame.wakes,
+                        frame.simd_errors
+                    )
+                    .as_bytes());
+                }
+                None => {
+                    log(alloc::format!("AX4 child-invalid index={} frame=bad\n", index).as_bytes());
+                }
+            }
+        } else if n != 0 {
+            log(alloc::format!("AX4 child-invalid index={} read={}\n", index, n).as_bytes());
+        }
+    }
+    for (index, child) in children.iter().enumerate() {
+        if !done[index] {
+            let _ = port_unbind(port, child.control);
+        }
+    }
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    got
+}
+
+/// Drive every child to exit with `Q` and wait, with one Port and one timer, for each
+/// control channel to report PEER_CLOSED. `closed[index]` is set only for children that
+/// really closed; the caller kills the rest. A stale frame is drained, then the binding is
+/// replayed so a queued frame cannot hide a later close.
+fn ax4_close_all(children: &[Ax4Child], closed: &mut [bool]) -> u32 {
+    if children.len() > closed.len() || children.len() > AX4_MAX_CAPACITY {
+        return 0;
+    }
+    for child in children {
+        let _ = channel_write(child.control, b"Q".as_ptr(), 1);
+    }
+    // Let the woken children run and exit before the first blocking read.
+    for _ in 0..3 {
+        let _ = process_wait();
+    }
+    let Some(port) = reply_port() else {
+        return 0;
+    };
+    let Some(timer) = syscall_handle(timer_create(AX4_WAKE_NS)) else {
+        return 0;
+    };
+    let tk = handle_koid(timer);
+    if port_bind(port, timer) != 0 {
+        let _ = handle_close(timer);
+        return 0;
+    }
+    let mut done = [false; AX4_MAX_CAPACITY];
+    let mut remaining = 0u32;
+    for (index, child) in children.iter().enumerate() {
+        closed[index] = false;
+        if port_bind(port, child.control) == 0 {
+            remaining += 1;
+        } else {
+            done[index] = true;
+        }
+    }
+    let mut count = 0u32;
+    while remaining > 0 {
+        let source = port_wait(port);
+        if source == tk || source == u64::MAX {
+            break;
+        }
+        if netstack_event(source) {
+            continue;
+        }
+        let Some(index) = children
+            .iter()
+            .position(|child| child.control_koid == source)
+        else {
+            continue;
+        };
+        if done[index] {
+            continue;
+        }
+        let mut bytes = [0u8; 32];
+        let n = channel_read(children[index].control, bytes.as_mut_ptr(), bytes.len()) as usize;
+        if n == 0 {
+            let _ = port_unbind(port, children[index].control);
+            done[index] = true;
+            remaining -= 1;
+            closed[index] = true;
+            count += 1;
+        } else if n == 32 {
+            // A queued frame is not close. Rebind so the channel's current state (more
+            // data, or PEER_CLOSED after the queue drains) is replayed.
+            let _ = port_unbind(port, children[index].control);
+            if port_bind(port, children[index].control) != 0 {
+                done[index] = true;
+                remaining -= 1;
+            }
+        } else {
+            let _ = port_unbind(port, children[index].control);
+            done[index] = true;
+            remaining -= 1;
+        }
+    }
+    for (index, child) in children.iter().enumerate() {
+        if !done[index] {
+            let _ = port_unbind(port, child.control);
+        }
+    }
+    let _ = port_unbind(port, timer);
+    let _ = handle_close(timer);
+    count
+}
+
+/// Release all children, kill any that did not close, and return the census to its
+/// pre-spawn state. The resident login services keep `ProcessWait` at `ShouldWait`, so the
+/// pumps only let killed children run and be reaped; they cannot reach `Ok`.
+fn ax4_teardown(children: &mut alloc::vec::Vec<Ax4Child>) {
+    let mut closed = [false; AX4_MAX_CAPACITY];
+    if children.len() <= closed.len() {
+        let _ = ax4_close_all(children, &mut closed);
+    }
+    for (index, child) in children.iter().enumerate() {
+        if index >= closed.len() || !closed[index] {
+            let _ = process_kill(child.process);
+        }
+        let _ = handle_close(child.process);
+        let _ = handle_close(child.control);
+        let _ = handle_close(child.wake);
+    }
+    children.clear();
+    for _ in 0..4 {
+        let _ = process_wait();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ax4_cycle(
+    initrd: Handle,
+    root: Handle,
+    cycle: u32,
+    frame: &mut [u8],
+    frames: &mut [Ax4Frame],
+    children: &mut alloc::vec::Vec<Ax4Child>,
+    pre: &mut Ax4Snapshot,
+    peak: &mut Ax4Snapshot,
+    clean: &mut Ax4Snapshot,
+    contaminated: &mut bool,
+) -> bool {
+    if !ax4_query(root, 0, frame, pre) {
+        log(alloc::format!("AX4 cycle={} pre-snapshot-failed FAIL\n", cycle).as_bytes());
+        return false;
+    }
+    let spawned = ax4_spawn_batch(initrd, AX4_BATCH, children);
+    let ready = if spawned {
+        ax4_collect(children, b'R', frames)
+    } else {
+        0
+    };
+    let peak_ok = ax4_query(root, 0, frame, peak);
+    ax4_teardown(children);
+    // Wait for both retirement and console delivery; the process census alone does not
+    // account for burst storage retained by a still-live IPC inbox.
+    let (settled, stable_ns, waited_ns, change) = ax4_clean_settle(root, frame, pre, clean);
+    let clean_line = if settled {
+        alloc::format!(
+            "AX4 clean-settle cycle={} stable-ms={} waited-ms={} heap={} change={}\n",
+            cycle,
+            stable_ns / 1_000_000,
+            waited_ns / 1_000_000,
+            clean.heap_used,
+            u8::from(change)
+        )
+    } else {
+        alloc::format!(
+            "AX4 clean-settle gave up cycle={} stable-ms={} waited-ms={} heap={} change={}\n",
+            cycle,
+            stable_ns / 1_000_000,
+            waited_ns / 1_000_000,
+            clean.heap_used,
+            u8::from(change)
+        )
+    };
+    log(clean_line.as_bytes());
+    let clean_ok = settled;
+    let peak_live_ok = peak_ok && peak.live == pre.live.saturating_add(AX4_BATCH);
+    let state_equal = clean_ok && ax4_states_equal(pre, clean);
+    let koids_equal = clean_ok && pre.processes == clean.processes;
+    let frames_delta = if clean_ok {
+        i128::from(clean.frames_issued) - i128::from(pre.frames_issued)
+    } else {
+        i128::MAX
+    };
+    let heap_delta = if clean_ok {
+        i128::from(clean.heap_used) - i128::from(pre.heap_used)
+    } else {
+        0
+    };
+    // AX0's rule: the first cycle is the only one allowed to absorb boot bring-up work,
+    // and only when the settle gate was green (it ran immediately before this).
+    let contamination = cycle == 1 && frames_delta > 0;
+    if contamination {
+        *contaminated = true;
+    }
+    let frames_ok = frames_delta == 0 || contamination;
+    let ok = spawned
+        && ready == AX4_BATCH
+        && peak_ok
+        && peak_live_ok
+        && clean_ok
+        && state_equal
+        && koids_equal
+        && frames_ok
+        && heap_delta <= AX4_HEAP_ALLOWANCE;
+    log(alloc::format!(
+        "AX4 cycle={} children={} peak-live={} peak-stored={} clean-live={} clean-stored={} frames-delta={} heap-delta={} state-equal={} koids-equal={} contaminated={} {}\n",
+        cycle,
+        AX4_BATCH,
+        peak.live,
+        peak.stored,
+        clean.live,
+        clean.stored,
+        frames_delta,
+        heap_delta,
+        u8::from(state_equal),
+        u8::from(koids_equal),
+        u8::from(contamination),
+        if ok { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    if contamination {
+        log(alloc::format!(
+            "AX4 contamination cycle={} frames-delta={} settle=green source=first-cycle-allowance\n",
+            cycle,
+            frames_delta
+        )
+        .as_bytes());
+    }
+    ok
+}
+
+fn ax4_scheduler_series(root: Handle, frame: &mut [u8], s: &mut Ax4Snapshot) -> bool {
+    let mut ok = true;
+    for (index, n) in [16u32, 32, 64, 128, 256].into_iter().enumerate() {
+        // AX0 owns ops 0..=8; AX4 extends the same private-Dispatcher series with one op
+        // per size at 9..=13 (the kernel agent's actorstat work).
+        let op = 9u8 + index as u8;
+        if ax4_query(root, op, frame, s) {
+            log(alloc::format!(
+                "AX4 scheduler runnable={} decisions={} total-ns={}\n",
+                n,
+                s.roots,
+                s.root_ns
+            )
+            .as_bytes());
+            if s.roots != AX4_SCHED_DECISIONS || s.root_ns == 0 || s.root_ns == u64::MAX {
+                ok = false;
+            }
+        } else {
+            log(alloc::format!("AX4 scheduler runnable={} decisions=0 total-ns=0\n", n).as_bytes());
+            log(alloc::format!("AX4 scheduler unavailable op={}\n", op).as_bytes());
+            ok = false;
+        }
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ax4_wake_series(
+    initrd: Handle,
+    root: Handle,
+    frame: &mut [u8],
+    frames: &mut [Ax4Frame],
+    children: &mut alloc::vec::Vec<Ax4Child>,
+    latencies: &mut alloc::vec::Vec<u64>,
+    base: &mut Ax4Snapshot,
+    post: &mut Ax4Snapshot,
+) -> bool {
+    let mut ok = true;
+    for n in [16u32, 32, 64, 128, 256] {
+        children.clear();
+        if !ax4_spawn_batch(initrd, n, children) {
+            ok = false;
+        }
+        let ready = ax4_collect(children, b'R', frames);
+        if ready != n {
+            ok = false;
+        }
+        if children.is_empty() {
+            log(alloc::format!(
+                "AX4 wake n={} mode=single samples=0 min-ns=0 median-ns=0 max-ns=0 FAIL\n",
+                n
+            )
+            .as_bytes());
+            continue;
+        }
+        // Single target: one ClockGet immediately before the wake byte. The child reads
+        // its own clock immediately after the blocking wait returns.
+        let t0 = kumo_rt::clock_get();
+        if channel_write(children[0].wake, b"W".as_ptr(), 1) != 0 {
+            ok = false;
+        }
+        let single = ax4_collect(&children[..1], b'W', frames) == 1;
+        let single_ns = if single {
+            frames[0].clock.saturating_sub(t0)
+        } else {
+            u64::MAX
+        };
+        log(alloc::format!(
+            "AX4 wake n={} mode=single samples=1 min-ns={} median-ns={} max-ns={} {}\n",
+            n,
+            single_ns,
+            single_ns,
+            single_ns,
+            if single { "PASS" } else { "FAIL" }
+        )
+        .as_bytes());
+        if !single {
+            ok = false;
+        }
+        // Broadcast to every child still parked behind its first wake. The single target is
+        // deliberately excluded: its protocol reports only the first wake.
+        let t1 = kumo_rt::clock_get();
+        for child in children.iter().skip(1) {
+            let _ = channel_write(child.wake, b"W".as_ptr(), 1);
+        }
+        let got = if children.len() > 1 {
+            ax4_collect(&children[1..], b'W', frames)
+        } else {
+            0
+        } as usize;
+        latencies.clear();
+        for index in 0..got {
+            latencies.push(frames[index].clock.saturating_sub(t1));
+        }
+        latencies.sort_unstable();
+        let min_ns = latencies.first().copied().unwrap_or(0);
+        let median_ns = latencies.get(latencies.len() / 2).copied().unwrap_or(0);
+        let max_ns = latencies.last().copied().unwrap_or(0);
+        let broadcast = got as u32 == n.saturating_sub(1) && got > 0;
+        ax4_teardown(children);
+        let clean = ax4_query(root, 0, frame, post)
+            && post.live == base.live
+            && post.stored == base.stored
+            && post.processes == base.processes;
+        log(alloc::format!(
+            "AX4 wake n={} mode=broadcast targets={} samples={} min-ns={} median-ns={} max-ns={} {} clean={}\n",
+            n,
+            n.saturating_sub(1),
+            got,
+            min_ns,
+            median_ns,
+            max_ns,
+            if broadcast { "PASS" } else { "FAIL" },
+            u8::from(clean)
+        )
+        .as_bytes());
+        if !broadcast || !clean {
+            ok = false;
+        }
+    }
+    ok
+}
+
+// A ready frame is sent before its actor parks, and proof logging wakes drv-fb. Capture
+// both sides of refusal after those actors park, so the comparison measures admission rather
+// than the benchmark's own console traffic. Failure to idle remains a bounded, visible error.
+// — TIMBERDOODLE
+fn ax4_idle_snapshot(root: Handle, frame: &mut [u8], out: &mut Ax4Snapshot) -> bool {
+    let started = kumo_rt::clock_get();
+    loop {
+        if !ax4_query(root, 0, frame, out) {
+            return false;
+        }
+        if out.live == out.stored && out.ready == 0 && out.running == 0 {
+            return true;
+        }
+        if kumo_rt::clock_get().saturating_sub(started) >= AX4_CLEAN_MAX_NS {
+            log(b"AX4 idle census timed out\n");
+            return false;
+        }
+        let _ = kumo_rt::sleep_ns(AX4_CLEAN_SAMPLE_NS);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ax4_boundary(
+    initrd: Handle,
+    root: Handle,
+    frame: &mut [u8],
+    frames: &mut [Ax4Frame],
+    children: &mut alloc::vec::Vec<Ax4Child>,
+    base: &mut Ax4Snapshot,
+    before: &mut Ax4Snapshot,
+    full: &mut Ax4Snapshot,
+    after: &mut Ax4Snapshot,
+    post: &mut Ax4Snapshot,
+) -> bool {
+    let mut ok = true;
+    if !ax4_query(root, 0, frame, before) {
+        log(b"AX4 boundary FAIL pre-snapshot\n");
+        return false;
+    }
+    let fill = before.capacity.saturating_sub(before.live);
+    let spawned = ax4_spawn_batch(initrd, fill, children);
+    log(alloc::format!(
+        "AX4 boundary spawn-done requested={} spawned={} {}\n",
+        fill,
+        children.len(),
+        if spawned { "Ok" } else { "Err" }
+    )
+    .as_bytes());
+    if !spawned {
+        ok = false;
+    }
+    let ready = ax4_collect(children, b'R', frames);
+    log(alloc::format!("AX4 boundary ready={} expected={}\n", ready, fill).as_bytes());
+    let full_ok =
+        ax4_idle_snapshot(root, frame, full) && full.live == full.capacity && ready == fill;
+    log(alloc::format!(
+        "AX4 boundary census capacity={} live={} stored={}\n",
+        full.capacity,
+        full.live,
+        full.stored
+    )
+    .as_bytes());
+    log(alloc::format!(
+        "AX4 boundary fill capacity={} live={} stored={} spawns={} {}\n",
+        full.capacity,
+        full.live,
+        full.stored,
+        fill,
+        if full_ok { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    if !full_ok {
+        ok = false;
+    }
+    // One over-limit admission. BadState (-11) is the documented refusal; a panic or a
+    // TOWER would take the boot with it, so reaching this line is itself part of the gate.
+    log(b"AX4 boundary over-limit attempt\n");
+    let mut status = 0i64;
+    if let Some(extra) = ax4_spawn(initrd, &mut status) {
+        children.push(extra);
+    }
+    let snap_ok = ax4_idle_snapshot(root, frame, after);
+    let state_equal = snap_ok && ax4_states_equal(full, after);
+    let koids_equal = snap_ok && full.processes == after.processes;
+    let refused = status == i64::from(Errno::BadState.status());
+    let refusal_ok = refused && state_equal && koids_equal;
+    log(alloc::format!(
+        "AX4 refusal status={} capacity={} live={} stored={} state-equal={} koids-equal={} {}\n",
+        status,
+        after.capacity,
+        after.live,
+        after.stored,
+        u8::from(state_equal),
+        u8::from(koids_equal),
+        if refusal_ok { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    if !refusal_ok {
+        ok = false;
+    }
+    ax4_teardown(children);
+    // A later spawn must succeed once the capacity is returned.
+    let mut recover_status = 0i64;
+    let recovered = ax4_spawn(initrd, &mut recover_status);
+    if let Some(child) = recovered {
+        children.push(child);
+    }
+    let ready = if children.len() == 1 {
+        ax4_collect(children, b'R', frames)
+    } else {
+        0
+    };
+    let live = if ax4_query(root, 0, frame, post) {
+        post.live
+    } else {
+        0
+    };
+    let recover_ok = children.len() == 1 && ready == 1 && live == before.live.saturating_add(1);
+    log(alloc::format!(
+        "AX4 boundary recover spawn={} live={} {}\n",
+        if children.len() == 1 { "Ok" } else { "Err" },
+        live,
+        if recover_ok { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    if !recover_ok {
+        ok = false;
+    }
+    ax4_teardown(children);
+    // The benchmark ends where it started, kernel heap included: the fill/recovery children
+    // used the same retirement path as a cycle, so any heap retained here is the same leak
+    // the cycle gate rejects. 64 KiB tolerates one-time bookkeeping only. Use the same
+    // heap-stable settle as a cycle so the final gate includes completed retirement and
+    // console delivery, rather than merely matching process counts.
+    let (settled, stable_ns, waited_ns, change) = ax4_clean_settle(root, frame, base, post);
+    let settle_line = if settled {
+        alloc::format!(
+            "AX4 clean-settle final stable-ms={} waited-ms={} heap={} change={}\n",
+            stable_ns / 1_000_000,
+            waited_ns / 1_000_000,
+            post.heap_used,
+            u8::from(change)
+        )
+    } else {
+        alloc::format!(
+            "AX4 clean-settle gave up final stable-ms={} waited-ms={} heap={} change={}\n",
+            stable_ns / 1_000_000,
+            waited_ns / 1_000_000,
+            post.heap_used,
+            u8::from(change)
+        )
+    };
+    log(settle_line.as_bytes());
+    let heap_flat = i128::from(post.heap_used) - i128::from(base.heap_used) <= AX4_HEAP_ALLOWANCE;
+    let clean_ok = settled
+        && post.live == base.live
+        && post.stored == base.stored
+        && ax4_states_equal(base, post)
+        && post.processes == base.processes
+        && heap_flat;
+    ax4_print("final", post);
+    if !clean_ok {
+        ok = false;
+    }
+    ok
+}
+
+fn ax4_benchmark(initrd: Handle, root: Handle, boundary_runs: u32) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 || NET_SUPERVISOR.get().initrd.0 != 0 {
+        log(b"AX4 FAIL needs a fresh boot and no background job\n");
+        return;
+    }
+    log(b"AX4 begins: resident actor capacity (PLAN/021 AX4)\n");
+    let mut ok = true;
+    // Exercise the Job policy ABI before measuring. 0 and >288 are InvalidArgs, and the
+    // ABI bound itself is accepted (idempotent for the kernel's default root policy).
+    let zero = kumo_rt::job_set_policy(Handle(ROOT_JOB_HANDLE.load(Ordering::Relaxed) as u32), 0);
+    log(alloc::format!(
+        "AX4 policy limit=0 status={} {}\n",
+        zero,
+        if zero == i64::from(Errno::InvalidArgs.status()) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    )
+    .as_bytes());
+    let too_big = kumo_rt::job_set_policy(
+        Handle(ROOT_JOB_HANDLE.load(Ordering::Relaxed) as u32),
+        AX4_MAX_CAPACITY as u64 + 1,
+    );
+    log(alloc::format!(
+        "AX4 policy limit={} status={} {}\n",
+        AX4_MAX_CAPACITY + 1,
+        too_big,
+        if too_big == i64::from(Errno::InvalidArgs.status()) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    )
+    .as_bytes());
+    let bound = kumo_rt::job_set_policy(
+        Handle(ROOT_JOB_HANDLE.load(Ordering::Relaxed) as u32),
+        AX4_MAX_CAPACITY as u64,
+    );
+    log(alloc::format!(
+        "AX4 policy limit={} status={} {}\n",
+        AX4_MAX_CAPACITY,
+        bound,
+        if bound == 0 { "PASS" } else { "FAIL" }
+    )
+    .as_bytes());
+    ok &= zero == i64::from(Errno::InvalidArgs.status())
+        && too_big == i64::from(Errno::InvalidArgs.status())
+        && bound == 0;
+    // Every buffer and Vec is allocated before the first measured window: Sora-heap growth
+    // inside a cycle would issue frames and contaminate the flat-census measurement.
+    let mut frame = [0u8; AX4_FRAME_MAX];
+    let mut frames = alloc::vec![Ax4Frame::default(); AX4_MAX_CAPACITY];
+    let mut children: alloc::vec::Vec<Ax4Child> = alloc::vec::Vec::with_capacity(AX4_MAX_CAPACITY);
+    let mut latencies: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(AX4_MAX_CAPACITY);
+    let mut base = Ax4Snapshot::empty();
+    let mut pre = Ax4Snapshot::empty();
+    let mut peak = Ax4Snapshot::empty();
+    let mut clean = Ax4Snapshot::empty();
+    let mut before = Ax4Snapshot::empty();
+    let mut full = Ax4Snapshot::empty();
+    let mut after = Ax4Snapshot::empty();
+    let mut post = Ax4Snapshot::empty();
+    let mut contaminated = false;
+    if !ax4_settle(root, &mut frame, &mut pre, &mut base) {
+        log(b"AX4 FAIL settle-quiesce\n");
+        return;
+    }
+    // The settle's last quiescence sample is the default-login census, so the heap anchor
+    // is taken only after the resident set has held still for the whole window.
+    ax4_print("default-login", &base);
+    if base.capacity < AX4_BATCH || base.live.saturating_add(AX4_BATCH) > base.capacity {
+        log(alloc::format!(
+            "AX4 FAIL batch does not fit live={} capacity={} batch={}\n",
+            base.live,
+            base.capacity,
+            AX4_BATCH
+        )
+        .as_bytes());
+        return;
+    }
+    if boundary_runs > 0 {
+        for run in 1..=boundary_runs {
+            log(alloc::format!("AX4 boundary-only diagnostic run={}\n", run).as_bytes());
+            if !ax4_boundary(
+                initrd,
+                root,
+                &mut frame,
+                &mut frames,
+                &mut children,
+                &mut base,
+                &mut before,
+                &mut full,
+                &mut after,
+                &mut post,
+            ) {
+                ok = false;
+            }
+        }
+        log(if ok { b"AX4 PASS\n" } else { b"AX4 FAIL\n" });
+        return;
+    }
+    for cycle in 1..=AX4_CYCLES {
+        if !ax4_cycle(
+            initrd,
+            root,
+            cycle,
+            &mut frame,
+            &mut frames,
+            &mut children,
+            &mut pre,
+            &mut peak,
+            &mut clean,
+            &mut contaminated,
+        ) {
+            ok = false;
+        }
+    }
+    if !ax4_scheduler_series(root, &mut frame, &mut clean) {
+        ok = false;
+    }
+    if !ax4_wake_series(
+        initrd,
+        root,
+        &mut frame,
+        &mut frames,
+        &mut children,
+        &mut latencies,
+        &mut base,
+        &mut post,
+    ) {
+        ok = false;
+    }
+    if !ax4_boundary(
+        initrd,
+        root,
+        &mut frame,
+        &mut frames,
+        &mut children,
+        &mut base,
+        &mut before,
+        &mut full,
+        &mut after,
+        &mut post,
+    ) {
+        ok = false;
+    }
+    log(if ok { b"AX4 PASS\n" } else { b"AX4 FAIL\n" });
+}
+
+/// Post-AX4 capacity gate (J819/J822): reproduce the AX0 sequence — default-login census,
+/// then netstack plus one `netprobe hold` client — and require two free resident slots.
+fn ax4_gate(initrd: Handle, root: Handle) {
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 || NET_SUPERVISOR.get().initrd.0 != 0 {
+        log(b"AX4 gate FAIL needs a fresh boot and no background job\n");
+        return;
+    }
+    log(b"AX4 gate begins: post-AX4 capacity gate (J819)\n");
+    let mut frame = [0u8; AX4_FRAME_MAX];
+    let mut a = Ax4Snapshot::empty();
+    let mut b = Ax4Snapshot::empty();
+    if !ax4_settle(root, &mut frame, &mut a, &mut b) {
+        log(b"AX4 gate FAIL settle-quiesce\n");
+        return;
+    }
+    // The settle ends on a quiescence sample; it is the gate's default-login anchor.
+    ax4_print("default-login", &b);
+    let base_live = b.live;
+    let mut ok = true;
+    let args = [
+        alloc::string::String::from("netprobe"),
+        alloc::string::String::from("hold"),
+    ];
+    run_program_background(initrd, &args, true);
+    if ax4_query(root, 0, &mut frame, &mut b) {
+        ax4_print("netstack-client", &b);
+        let free = b.capacity.saturating_sub(b.live);
+        ok &= b.live == base_live.saturating_add(2);
+        log(alloc::format!(
+            "AX4 capacity-gate free={} requires=2 {}\n",
+            free,
+            if free >= 2 { "PASS" } else { "AX4-REQUIRED" }
+        )
+        .as_bytes());
+        ok &= free >= 2;
+    } else {
+        ok = false;
+    }
+    if BG_STDOUT.load(Ordering::Relaxed) != 0 {
+        wait_background();
+    }
+    if ax4_query(root, 0, &mut frame, &mut b) {
+        ax4_print("gate-clean", &b);
+        // The supervised netstack remains available after its hold client exits, just as
+        // in AX0. Verify that service, rather than expecting both actors to disappear.
+        // — TIMBERDOODLE
+        let netstack = NET_SUPERVISOR.get().instance;
+        ok &= b.live == base_live.saturating_add(1)
+            && netstack.is_some_and(|instance| b.processes.contains(&instance.koid));
+    } else {
+        ok = false;
+    }
+    log(if ok {
+        b"AX4 gate PASS\n"
+    } else {
+        b"AX4 gate FAIL\n"
+    });
+}
+
 /// The last command's status, for the prompt's `✖` block (PLAN/012 item 5): 0 success, 1 a
 /// failure (a child's non-zero exit included, until the kernel reports exit codes), 2 a usage
 /// error, 127 a command or program that does not exist.
@@ -10343,7 +11799,7 @@ fn run_program_granted(initrd: Handle, argv: &[alloc::string::String], grant_net
 /// `ProcessRun`'s ASYNC arm resolves that identity from the handle. No kernel change was needed.
 /// Every existing caller passes 0 and is unaffected.
 #[allow(clippy::too_many_arguments)]
-fn run_elf_threads(
+fn run_elf_threads_status(
     initrd: Handle,
     path: &[u8],
     arg: u64,
@@ -10352,6 +11808,8 @@ fn run_elf_threads(
     name: &[u8],
     extra_threads: u32,
     kept: Option<&mut Option<Handle>>,
+    status: &mut i64,
+    log_spawn: bool,
 ) -> bool {
     const PAGE_SIZE: u64 = 4096;
     const MAX_SEGMENTS: usize = 8;
@@ -10535,7 +11993,13 @@ fn run_elf_threads(
         }
         let child_as = Handle(child_as_h as u32);
         loader_handles[1] = Some(child_as);
-        log_process_koid(name, child_as);
+        // The capacity probe reports aggregate census/results. Per-actor diagnostics
+        // otherwise queue thousands of small framebuffer updates and measure console
+        // backlog instead of actor retirement. Ordinary launches retain their diagnostics.
+        // — TIMBERDOODLE
+        if log_spawn {
+            log_process_koid(name, child_as);
+        }
 
         for segment in segments.iter().take(segment_count) {
             let page_delta = segment.virt_addr & (PAGE_SIZE - 1);
@@ -10577,7 +12041,13 @@ fn run_elf_threads(
         }
 
         let sp = |i: u64| STACK_TOP + i * STACK_STRIDE - 0x10;
-        if process_run(child_as, elf.entry, sp(0), arg, arg2, flags) != 0 {
+        // AX4: a refusal is a status, not a panic. The caller may want the raw widened
+        // `BadState` (-11) an over-limit Job returns. — TIMBERDOODLE
+        let run_status = process_run(child_as, elf.entry, sp(0), arg, arg2, flags);
+        // Kernel statuses arrive zero-extended in x0; Errno values are i32, so the low
+        // word must be reinterpreted as signed (`BadState` -> -11, not 4294967285).
+        *status = i64::from(run_status as u32 as i32);
+        if run_status != 0 {
             break 'load false;
         }
         // Peers enter the same code with their index in x0. ASYNC because a second thread that
@@ -10611,6 +12081,14 @@ fn run_elf_threads(
         if let Some(kept) = kept {
             *kept = loader_handles[1].take();
         }
+    } else if let Some(process) = loader_handles[1] {
+        // A refused ProcessRun created an address space but no resident thread. Closing
+        // its handle alone does not retire that record or its mappings. The creator's
+        // MANAGE capability permits the normal teardown even with zero threads; preserve
+        // the original load/admission status while surrendering every partial allocation.
+        // A partially admitted child may already have exited, in which case kill is inert.
+        // — TIMBERDOODLE
+        let _ = process_kill(process);
     }
     let cleanup_ok = sora::close_handles(&loader_handles, handle_close);
     if !cleanup_ok {
@@ -10618,6 +12096,38 @@ fn run_elf_threads(
         log(b": handle cleanup fail\n");
     }
     loaded && cleanup_ok
+}
+
+/// [`run_elf_threads`] with thread zero's raw `ProcessRun` result (PLAN/021 AX4).
+///
+/// A refused admission returns `false` and leaves the widened Errno in `status`
+/// (`BadState` = -11 for an over-limit Job). Failures before `ProcessRun` (a missing
+/// file, a bad header, an allocation failure) leave the caller's initial value intact.
+/// Existing callers keep using [`run_elf_threads`] unchanged.
+#[allow(clippy::too_many_arguments)]
+fn run_elf_threads(
+    initrd: Handle,
+    path: &[u8],
+    arg: u64,
+    arg2: u64,
+    flags: u64,
+    name: &[u8],
+    extra_threads: u32,
+    kept: Option<&mut Option<Handle>>,
+) -> bool {
+    let mut status = 0i64;
+    run_elf_threads_status(
+        initrd,
+        path,
+        arg,
+        arg2,
+        flags,
+        name,
+        extra_threads,
+        kept,
+        &mut status,
+        true,
+    )
 }
 
 fn run_elf(initrd: Handle, path: &[u8], arg: u64, arg2: u64, flags: u64, name: &[u8]) -> bool {

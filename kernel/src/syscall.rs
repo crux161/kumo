@@ -1,8 +1,8 @@
-//j777
 //j790
 //j798
 //j823
 //j824
+//j825
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::mem;
@@ -10,6 +10,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use kumo_abi::ProcessRunFlags;
+
+///j825
+/// Release a `Vec`'s backing allocation once its length has fallen well below its
+/// high-water capacity. `shrink_to_fit` never fails: if the allocator cannot satisfy the
+/// smaller block it keeps the current one, so this is safe on the teardown path. The sparse
+/// threshold keeps ordinary message traffic from reallocating on every removal.
+/// — TIMBERDOODLE
+fn shrink_sparse<T>(values: &mut Vec<T>) {
+    // AX4: the band keeps a doubling push from oscillating while leaving only a few
+    // elements of dead capacity behind a burst. — TIMBERDOODLE
+    if values.capacity() > values.len().saturating_mul(2).saturating_add(8) {
+        values.shrink_to_fit();
+    }
+}
 use kumo_abi::{
     decode_tlmm_gpio_irq, interrupt_authority_key, sys::DeviceCtxInfo, BootInfo, DevicePowerStatus,
     Errno, Handle, KoId, ObjectKind, Rights, Status, Syscall,
@@ -64,6 +78,16 @@ pub enum KernelCall<'a> {
         server: KoId,
         payload_len: usize,
         payload: [u64; 4],
+    },
+    /// AX4: set the root Job's resident bound using its explicit MANAGE capability.
+    /// Sora's chain is the only constructor. Capability checks precede policy mutation;
+    /// validation lives in
+    /// `task::validate_resident_limit`; the live count comes from the scheduler, which owns
+    /// the resident set. On `Ok` the front end records the value on `sora.root_job` so
+    /// children created afterwards inherit it.
+    JobSetPolicy {
+        job: Handle,
+        limit: u64,
     },
     PortCreate,
     PortWait {
@@ -322,7 +346,6 @@ pub(crate) struct CallDonation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallTicket {
     pub index: usize,
-    pub pair: usize,
     pub caller_end: KoId,
     pub peer_end: KoId,
     pub ordinal: u32,
@@ -373,7 +396,6 @@ pub(crate) enum CallCompletion {
 /// entries remain as ordinal tombstones so a late or duplicate reply cannot misroute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PendingCall {
-    pair: usize,
     caller_end: KoId,
     peer_end: KoId,
     caller_thread: KoId,
@@ -1174,7 +1196,12 @@ pub struct SyscallEngine {
     /// `VmoCreateContiguous`. Shared across engine clones so two engines can never hand out
     /// the same frames. — TIMBERDOODLE
     free_dma_runs: Rc<RefCell<Vec<kumo_abi::Range>>>,
-    processes: Vec<Process>,
+    /// AX4: slot-reusing process records. A dead process's slot is cleared at teardown
+    /// once its handles, mappings and VMO references are gone, so repeated actor cycles do
+    /// not grow this Vec or keep a dropped `Process` (and its handle table) alive.
+    processes: Vec<Option<Process>>,
+    /// Number of `Some` slots; the census's process count. Kept in step with install/clear.
+    process_live: usize,
     threads: Vec<Thread>,
     boot_info: Option<kumo_abi::BootInfo>,
     #[cfg(feature = "arch_aarch64")]
@@ -1232,6 +1259,7 @@ impl SyscallEngine {
             vmos: Vec::new(),
             free_dma_runs: Rc::new(RefCell::new(Vec::new())),
             processes: Vec::new(),
+            process_live: 0,
             threads: Vec::new(),
             boot_info: None,
             #[cfg(feature = "arch_aarch64")]
@@ -1698,6 +1726,38 @@ impl SyscallEngine {
             .port_bindings
             .retain(|&(port_koid, object_koid)| port_koid != koid && object_koid != koid);
         self.devices.port_bindings.len() != before
+    }
+
+    ///j825
+    /// AX4: reclaim the IPC records and registry slack a spawn/teardown cycle leaves behind.
+    /// Ports and channel pairs are judged by their handle-lineage observers: once the last
+    /// handle anywhere drops, the record — and the packet/inbox vectors it owns — is freed.
+    /// Without this pass every actor retained roughly 2 KiB of kernel heap for the life of
+    /// the machine, and a capacity fill exhausted the fixed 8 MiB heap. Called after a handle
+    /// close that can drop an owner and once per process teardown. Returns the record count
+    /// removed, for tests. — TIMBERDOODLE
+    pub(crate) fn reclaim_unowned_ipc(&mut self, compact: bool) -> usize {
+        let mut reclaimed = 0;
+        for koid in self.ipc.take_unreferenced_ports() {
+            self.release_port_bindings(koid);
+            reclaimed += 1;
+        }
+        reclaimed += self.ipc.reap_unowned_channels();
+        if compact {
+            // Teardown: this is the point where a fill's high-water capacities are worth
+            // reclaiming exactly, because the AX4 heap gate compares the post-bench census
+            // with the pre-bench one. — TIMBERDOODLE
+            self.ipc.compact();
+            self.timers.shrink_to_fit();
+            self.vmos.shrink_to_fit();
+            self.devices.port_bindings.shrink_to_fit();
+        } else {
+            self.ipc.shrink_sparse();
+            shrink_sparse(&mut self.timers);
+            shrink_sparse(&mut self.vmos);
+            shrink_sparse(&mut self.devices.port_bindings);
+        }
+        reclaimed
     }
 
     /// Signal all interrupt objects bound to `irq`. Called from the IRQ handler.
@@ -2754,10 +2814,12 @@ impl SyscallEngine {
         Ok(())
     }
 
-    /// Reclaim a dead DMA VMO's run or individual pages for later DMA allocation. Every
-    /// reference must be gone: no handle in any process or the caller, no CPU mapping, no
-    /// queued IPC transfer, and no pin or device mapping (`strong_count == 1`). Anonymous,
-    /// physical and MMIO VMOs keep their existing lifecycles. — TIMBERDOODLE
+    /// Reclaim a dead VMO's memory. DMA runs/pages return to the DMA allocator; an
+    /// Anonymous VMO's materialized frames return to the generic reuse list and the record
+    /// itself is dropped. Every reference must be gone: no handle in any process or the
+    /// caller, no CPU mapping, no queued IPC transfer, and no pin or device mapping
+    /// (`strong_count == 1` covers device mappings and other `Rc` holders). Physical and
+    /// MMIO backings keep their existing lifecycles; those frames are not ours. — TIMBERDOODLE
     pub(crate) fn retire_vmos(&mut self, caller: Option<&Process>) -> usize {
         let mut removed = 0;
         let mut index = 0;
@@ -2778,24 +2840,37 @@ impl SyscallEngine {
                     .holds(koid, ObjectKind::Vmo, Rights::empty())
                     || process.mappings().iter().any(|(_, mapped)| *mapped == koid)
             };
-            let paged = self.vmos[index].vmo.backing() == crate::mm::VmoBacking::DmaPaged;
-            let freeable = (run.is_some() || paged)
+            let backing = self.vmos[index].vmo.backing();
+            let paged = backing == crate::mm::VmoBacking::DmaPaged;
+            // AX4: an Anonymous VMO's materialized frames are ordinary user RAM. Once every
+            // handle, mapping record and in-flight IPC reference is gone, the frames can be
+            // queued for reuse and the entry itself dropped (an unmaterialized Anonymous VMO
+            // still frees its record). PhysicalRam and Mmio backings are not ours to reclaim.
+            let anonymous = backing == crate::mm::VmoBacking::Anonymous;
+            let freeable = (run.is_some() || paged || anonymous)
                 && Rc::strong_count(&self.vmos[index]) == 1
-                && !self.processes.iter().any(|process| referenced(process))
+                && !self
+                    .processes
+                    .iter()
+                    .flatten()
+                    .any(|process| referenced(process))
                 && !caller.is_some_and(|process| referenced(process))
                 && !self.ipc.koid_queued(koid);
             if !freeable {
                 index += 1;
                 continue;
             }
-            // Record the run before dropping the entry; if the free list cannot grow, keep
-            // the VMO rather than lose the only record of its frames. — TIMBERDOODLE
-            let needed = if paged {
-                self.vmos[index].frames.borrow().len()
-            } else {
-                1
+            // Reserve the DMA record before dropping the entry; if the free list cannot
+            // grow, keep the VMO rather than lose the only record of its frames. Anonymous
+            // frames go to the generic reuse list per frame (`free_frame`), where a failed
+            // reservation leaks only that frame at the watermark, exactly as before AX4.
+            // — TIMBERDOODLE
+            let needed = match run {
+                Some(_) => 1,
+                None if paged => self.vmos[index].frames.borrow().len(),
+                None => 0,
             };
-            if self.free_dma_runs.borrow_mut().try_reserve(needed).is_err() {
+            if needed != 0 && self.free_dma_runs.borrow_mut().try_reserve(needed).is_err() {
                 index += 1;
                 continue;
             }
@@ -2807,6 +2882,13 @@ impl SyscallEngine {
             }
             if paged {
                 self.return_dma_pages(&entry.frames.borrow());
+            }
+            if anonymous {
+                // Free after the entry is detached and every reference gate has passed.
+                // Frames are only ever identified by physical address here, never read.
+                for frame in entry.frames.borrow().iter().flatten() {
+                    let _ = crate::mm::free_frame(*frame);
+                }
             }
             removed += 1;
         }
@@ -3243,10 +3325,14 @@ impl SyscallEngine {
     /// stays referenced rather than its frames reaching the free list while a leaf still names
     /// them. Returns (released, kept). — TIMBERDOODLE
     pub(crate) fn release_process_mappings(&mut self, koid: KoId) -> (usize, usize) {
-        let Some(index) = self.processes.iter().position(|p| p.koid() == koid) else {
+        let Some(index) = self
+            .processes
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|p| p.koid() == koid))
+        else {
             return (0, 0);
         };
-        let ttbr0 = self.processes[index].ttbr0;
+        let ttbr0 = self.processes[index].as_ref().and_then(|p| p.ttbr0);
         #[cfg(target_os = "none")]
         let saved = ttbr0.map(|_| {
             let saved = kumo_hal::active::read_user_aspace_root();
@@ -3255,13 +3341,20 @@ impl SyscallEngine {
             saved
         });
         let (mut released, mut kept) = (0, 0);
-        let mut at = self.processes[index].mappings().len();
+        let mut at = self.processes[index]
+            .as_ref()
+            .map_or(0, |process| process.mappings().len());
         while at > 0 {
             at -= 1;
-            let mapping = self.processes[index].mappings()[at].0;
+            let Some(process) = self.processes[index].as_ref() else {
+                break;
+            };
+            let mapping = process.mappings()[at].0;
             let cleared = ttbr0.is_none_or(|root| self.clear_from_live_tree(root, mapping).is_ok());
             if cleared {
-                self.processes[index].remove_mapping_exact(mapping.virt, mapping.len);
+                if let Some(process) = self.processes[index].as_mut() {
+                    process.remove_mapping_exact(mapping.virt, mapping.len);
+                }
                 released += 1;
             } else {
                 kept += 1;
@@ -3277,12 +3370,66 @@ impl SyscallEngine {
 
     /// Look up a process by koid. Returns `None` if not found.
     pub fn process_by_koid(&self, koid: KoId) -> Option<&Process> {
-        self.processes.iter().find(|p| p.koid() == koid)
+        self.processes.iter().flatten().find(|p| p.koid() == koid)
     }
 
     /// Look up a process by koid (mutable).
     pub fn process_by_koid_mut(&mut self, koid: KoId) -> Option<&mut Process> {
-        self.processes.iter_mut().find(|p| p.koid() == koid)
+        self.processes
+            .iter_mut()
+            .flatten()
+            .find(|p| p.koid() == koid)
+    }
+
+    /// Install a new process record in the first free slot. A slot is only free after
+    /// [`Self::clear_process_slot`] judged its previous tenant dead and unreferenced.
+    fn install_process(&mut self, process: Process) {
+        if let Some(slot) = self.processes.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(process);
+        } else {
+            self.processes.push(Some(process));
+        }
+        self.process_live += 1;
+    }
+
+    /// Drop a dead process's record and make its slot reusable. The caller must have closed
+    /// its handles and released every mapping record (so this record no longer references a
+    /// VMO), and must have run `retire_vmos` already: J731 kept the record precisely because
+    /// its mapping records were the last references to the child's buffers. Returns whether
+    /// a record was present.
+    pub(crate) fn clear_process_slot(&mut self, koid: KoId) -> bool {
+        let Some(index) = self
+            .processes
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|p| p.koid() == koid))
+        else {
+            return false;
+        };
+        if self.processes[index].take().is_none() {
+            return false;
+        }
+        self.process_live = self.process_live.saturating_sub(1);
+        //j825
+        // AX4: a fill of 284 actors grows this slot vector to its high-water mark, and
+        // clearing records in place left that capacity (and the trailing empty slots) in the
+        // heap for the life of the machine — a large part of the boundary-fill wedge. Drop
+        // trailing empty slots and the excess capacity once the burst is gone. — TIMBERDOODLE
+        while self.processes.last().is_some_and(|slot| slot.is_none()) {
+            self.processes.pop();
+        }
+        //j825
+        // AX4: the boundary fill is followed by the recovery spawn *before* the fill's dead
+        // slots are cleared, so the tail stays occupied and the pop above never reaches the
+        // 284 interior holes — each a 152-byte `Option<Process>` slot that would survive for
+        // the life of the machine. Once the holes dominate the live set, compact them; koids
+        // and handles are looked up by value, so live records may move. — TIMBERDOODLE
+        if self.processes.len() > self.process_live.saturating_mul(2).saturating_add(8) {
+            self.processes.retain(|slot| slot.is_some());
+        }
+        // Teardown only: an exact release is cheap here (a handful of live records) and the
+        // AX4 census compares this heap with the pre-bench one. — TIMBERDOODLE
+        self.processes.shrink_to_fit();
+        true
     }
 
     /// Look up a thread by koid (mutable).
@@ -3345,7 +3492,7 @@ impl SyscallEngine {
             child.object(),
             Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::WAIT | Rights::MANAGE,
         )?;
-        self.processes.push(child);
+        self.install_process(child);
         Ok(handle)
     }
 
@@ -3389,7 +3536,14 @@ impl SyscallEngine {
         stamps[2] = dispatch_stamp();
         self.retire_interrupts();
         stamps[3] = dispatch_stamp();
-        self.retire_vmos(Some(process));
+        // AX4: Sora lives outside `processes`. A child dispatch cannot see her held VMOs,
+        // so that census is incomplete and may not retire backing. Defer until her next
+        // dispatch or process teardown, both of which include the external root process.
+        // Otherwise a netstack syscall retires Sora's not-yet-transferred argv VMO.
+        // — TIMBERDOODLE
+        if self.process_by_koid(process.koid()).is_none() {
+            self.retire_vmos(Some(process));
+        }
         stamps[4] = dispatch_stamp();
         for (part, max) in DISPATCH_PART_MAX_NS.iter().enumerate() {
             max.fetch_max(
@@ -3408,6 +3562,7 @@ impl SyscallEngine {
         let (handles, handle_slots) = self
             .processes
             .iter()
+            .flatten()
             .chain(caller)
             .map(Process::handles)
             .fold((0, 0), |(live, slots), table| {
@@ -3432,7 +3587,7 @@ impl SyscallEngine {
                 .count(),
             device_ctxs: self.devices.device_ctxs.len(),
             device_vmar_mappings: self.devices.device_vmar_mappings.len(),
-            processes: self.processes.len(),
+            processes: self.process_live,
             handles,
             handle_slots,
         }
@@ -3512,14 +3667,12 @@ impl SyscallEngine {
         }
         let ordinal = match forced_ordinal {
             Some(ordinal) => {
-                if ordinal < 2
-                    || self.call_ordinal_used(endpoints.pair, endpoints.end_koid, ordinal)
-                {
+                if ordinal < 2 || self.call_ordinal_used(endpoints.end_koid, ordinal) {
                     return Err(Errno::InvalidArgs);
                 }
                 ordinal
             }
-            None => self.allocate_call_ordinal(endpoints.pair, endpoints.end_koid),
+            None => self.allocate_call_ordinal(endpoints.end_koid),
         };
         // The request itself carries the payload bytes (legacy readers see them), the
         // kernel ordinal and the expects-reply flag; the words live in the record too.
@@ -3532,7 +3685,6 @@ impl SyscallEngine {
             .install_call(endpoints.end_koid, request)
             .map_err(errno_from_ipc)?;
         let pending = PendingCall {
-            pair: endpoints.pair,
             caller_end: endpoints.end_koid,
             peer_end: endpoints.peer_koid,
             caller_thread,
@@ -3560,7 +3712,6 @@ impl SyscallEngine {
         };
         Ok(CallTicket {
             index,
-            pair: endpoints.pair,
             caller_end: endpoints.end_koid,
             peer_end: endpoints.peer_koid,
             ordinal,
@@ -3568,7 +3719,7 @@ impl SyscallEngine {
         })
     }
 
-    fn allocate_call_ordinal(&mut self, pair: usize, caller_end: KoId) -> u32 {
+    fn allocate_call_ordinal(&mut self, caller_end: KoId) -> u32 {
         loop {
             let ordinal = self.next_call_ordinal;
             self.next_call_ordinal = if ordinal == u32::MAX {
@@ -3576,16 +3727,17 @@ impl SyscallEngine {
             } else {
                 ordinal.saturating_add(1).max(2)
             };
-            if !self.call_ordinal_used(pair, caller_end, ordinal) {
+            if !self.call_ordinal_used(caller_end, ordinal) {
                 return ordinal;
             }
         }
     }
 
-    fn call_ordinal_used(&self, pair: usize, caller_end: KoId, ordinal: u32) -> bool {
-        self.pending_calls.iter().flatten().any(|call| {
-            call.pair == pair && call.caller_end == caller_end && call.ordinal == ordinal
-        })
+    fn call_ordinal_used(&self, caller_end: KoId, ordinal: u32) -> bool {
+        self.pending_calls
+            .iter()
+            .flatten()
+            .any(|call| call.caller_end == caller_end && call.ordinal == ordinal)
     }
 
     fn thread_has_outstanding_call(&self, thread: KoId) -> bool {
@@ -3620,7 +3772,8 @@ impl SyscallEngine {
         let endpoints = self.ipc.endpoints_for(channel_entry.koid).ok()?;
         let index = self.pending_calls.iter().position(|slot| {
             slot.as_ref().is_some_and(|call| {
-                call.pair == endpoints.pair
+                call.caller_end == endpoints.peer_koid
+                    && call.peer_end == endpoints.end_koid
                     && call.ordinal == message.header.ordinal
                     && call.completion.is_none()
                     && !call.caller_gone
@@ -3802,7 +3955,7 @@ impl SyscallEngine {
             let Some(call) = slot.as_ref() else {
                 continue;
             };
-            if call.pair == endpoints.pair
+            if call.caller_end == endpoints.peer_koid
                 && call.peer_end == endpoints.end_koid
                 && call.completion.is_none()
                 && !call.caller_gone
@@ -3883,6 +4036,17 @@ impl SyscallEngine {
                         if kind == ObjectKind::Timer {
                             self.release_timer(koid);
                             self.release_port_bindings(koid);
+                        }
+                        if matches!(kind, ObjectKind::Channel | ObjectKind::Port) {
+                            //j825
+                            // AX4: the dropped entry may have been the last owner of this
+                            // channel pair or port (a duplicate may still own it, in which
+                            // case the reclaim pass keeps it). Closing a channel can also
+                            // drop queued messages that carried a port handle, so both
+                            // record kinds are re-judged only after the entry has dropped.
+                            // A port's bindings go with the record, never with one handle.
+                            // — TIMBERDOODLE
+                            self.reclaim_unowned_ipc(false);
                         }
                         Errno::Ok.status()
                     }
@@ -4200,6 +4364,35 @@ impl SyscallEngine {
                 },
                 Err(_) => KernelCallResult::Status(Errno::InvalidArgs.status()),
             },
+            KernelCall::JobSetPolicy { job, limit } => {
+                let entry = match process
+                    .handles()
+                    .require(job, ObjectKind::Job, Rights::MANAGE)
+                {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return KernelCallResult::Status(errno_from_object(error).status())
+                    }
+                };
+                if entry.koid != process.job() {
+                    return KernelCallResult::Status(Errno::AccessDenied.status());
+                }
+                let Ok(limit) = u32::try_from(limit) else {
+                    return KernelCallResult::Status(Errno::InvalidArgs.status());
+                };
+                // AX4: a malformed bound is InvalidArgs; a well-formed bound below the live
+                // resident set is BadState (installing it would strand actors above the
+                // policy). Neither refusal changes any state. Validation precedes the
+                // scheduler mirror, so a refused call cannot leave the two out of step.
+                let live = crate::user_thread::resident_live();
+                match crate::task::validate_resident_limit(limit, live) {
+                    Ok(()) if crate::user_thread::set_resident_limit(limit) => {
+                        KernelCallResult::Status(Errno::Ok.status())
+                    }
+                    Ok(()) => KernelCallResult::Status(Errno::BadState.status()),
+                    Err(error) => KernelCallResult::Status(error.status()),
+                }
+            }
             KernelCall::VmarMap {
                 process_handle,
                 vmo_handle,
@@ -4661,10 +4854,11 @@ impl SyscallEngine {
                             target.set_user_stack(stack_base, stack_size);
                             KernelCallResult::Handle(Handle(ttbr0 as u32))
                         }
-                        // AX1: the built address space has no process to own it; return its
-                        // ASID rather than leaking it. — TIMBERDOODLE
+                        // AX1/AX4: the built address space has no process to own it; return
+                        // its ASID and the stack frames the builder just installed rather
+                        // than leaking them. — TIMBERDOODLE
                         None => {
-                            kumo_hal::active::retire_user_aspace(ttbr0);
+                            crate::mm::retire_user_aspace(ttbr0, Some((stack_base, stack_size)));
                             KernelCallResult::Status(Errno::BadHandle.status())
                         }
                     },
@@ -6479,16 +6673,31 @@ mod tests {
                 koid,
             );
             let child_koid = child.koid();
-            engine.processes.push(child);
-            let index = engine.processes.len() - 1;
+            engine.install_process(child);
+            assert_eq!(engine.process_live, 1);
             // Teardown drains the handles; the mapping record alone still holds the run.
-            drop(engine.processes[index].handles_mut().drain());
+            drop(
+                engine
+                    .process_by_koid_mut(child_koid)
+                    .unwrap()
+                    .handles_mut()
+                    .drain(),
+            );
             assert_eq!(engine.retire_vmos(None), 0);
             assert_eq!(engine.release_process_mappings(child_koid), (1, 0));
-            assert!(engine.processes[index].mappings().is_empty());
+            assert!(engine
+                .process_by_koid(child_koid)
+                .unwrap()
+                .mappings()
+                .is_empty());
             assert_eq!(engine.retire_vmos(None), 1);
             assert!(engine.vmos.iter().all(|entry| entry.koid != koid));
             assert_eq!(engine.release_process_mappings(KoId(u64::MAX)), (0, 0));
+            // AX4: only after the mapping references are gone may the slot be cleared.
+            assert!(engine.clear_process_slot(child_koid));
+            assert_eq!(engine.process_live, 0);
+            assert!(engine.process_by_koid(child_koid).is_none());
+            assert!(!engine.clear_process_slot(child_koid));
         }
 
         #[test]
@@ -6588,19 +6797,32 @@ mod tests {
         }
 
         #[test]
-        fn anonymous_vmos_keep_their_lifecycle() {
+        fn an_unreferenced_anonymous_vmo_retires_and_frees_its_frames() {
+            // AX4: a live handle keeps the materialized page; once the last reference is
+            // gone the entry (and its frame) is reclaimable, exactly like a DMA run. The
+            // frame is only queued (never touched) at this point — the reuse path zeroes and
+            // cleans it under the identity map before another owner sees it.
+            let _serial = crate::mm::FREE_FRAME_TEST_LOCK.lock().unwrap();
+            crate::mm::clear_free_frames_for_test();
             let mut engine = SyscallEngine::new();
             let mut process = test_process(&mut engine);
             let object = engine.objects.create(ObjectKind::Vmo);
             let koid = object.koid();
+            let frame = 0x00a0_0000;
             engine.vmos.push(Rc::new(VmoEntry {
                 koid,
                 vmo: Vmo::new(PAGE_SIZE).unwrap(),
-                frames: RefCell::new(Vec::new()),
+                frames: RefCell::new(alloc::vec![Some(frame), None]),
             }));
             let handle = process.handles_mut().insert(object, Rights::READ).unwrap();
-            close(&mut engine, &mut process, handle);
+            // A handle still names it: the entry and its frame stay. The holder is passed
+            // as the caller because it is not an engine-owned process (as Sora is not).
+            assert_eq!(engine.retire_vmos(Some(&process)), 0);
             assert!(engine.vmos.iter().any(|entry| entry.koid == koid));
+            let freed_before = crate::mm::frames_freed();
+            close(&mut engine, &mut process, handle);
+            assert!(!engine.vmos.iter().any(|entry| entry.koid == koid));
+            assert!(crate::mm::frames_freed() > freed_before);
         }
 
         #[test]
@@ -8220,6 +8442,80 @@ mod tests {
         let job = crate::task::Job::root(engine.objects_mut());
         let vmar = crate::mm::Vmar::new(0xffff_0000_0000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
         Process::new(engine.objects_mut(), &job, vmar)
+    }
+
+    #[test]
+    fn child_dispatch_preserves_vmos_held_by_external_root() {
+        let mut engine = SyscallEngine::new();
+        let mut root = test_process(&mut engine);
+        let argv = match engine.dispatch(&mut root, KernelCall::VmoCreate { size: 256 }) {
+            KernelCallResult::Handle(handle) => handle,
+            result => panic!("expected argv VMO, got {result:?}"),
+        };
+        let argv_koid = root.handles().get(argv).unwrap().koid;
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x1000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let child = engine.process_create(&mut root, &job, vmar).unwrap();
+        let child_koid = root.handles().get(child).unwrap().koid;
+        assert!(matches!(
+            engine.dispatch_by_koid(child_koid, KernelCall::PortCreate),
+            KernelCallResult::Handle(_)
+        ));
+        assert!(
+            engine.vmo_entry_by_koid(argv_koid).is_some(),
+            "a child cannot retire the external root's still-held argv backing"
+        );
+        assert_eq!(
+            engine.dispatch(&mut root, KernelCall::HandleClose { handle: argv }),
+            KernelCallResult::Status(Errno::Ok.status())
+        );
+        assert!(
+            engine.vmo_entry_by_koid(argv_koid).is_none(),
+            "the complete root census still reclaims backing after its final close"
+        );
+    }
+
+    #[test]
+    fn job_policy_requires_own_job_manage_and_rejects_wide_limits() {
+        let mut engine = SyscallEngine::new();
+        let job = crate::task::Job::root(engine.objects_mut());
+        let vmar = crate::mm::Vmar::new(0x1000_0000, crate::mm::PAGE_SIZE * 16).unwrap();
+        let mut process = Process::new(engine.objects_mut(), &job, vmar);
+        let own = process
+            .handles_mut()
+            .insert(job.object(), Rights::MANAGE)
+            .unwrap();
+        let readonly = process
+            .handles_mut()
+            .insert(job.object(), Rights::READ)
+            .unwrap();
+        let other = crate::task::Job::root(engine.objects_mut());
+        let foreign = process
+            .handles_mut()
+            .insert(other.object(), Rights::MANAGE)
+            .unwrap();
+        let object = engine.objects_mut().create(ObjectKind::Vmo);
+        let wrong = process
+            .handles_mut()
+            .insert(object, Rights::MANAGE)
+            .unwrap();
+        for (handle, limit, expected) in [
+            (Handle(0), 288, Errno::BadHandle),
+            (readonly, 288, Errno::AccessDenied),
+            (wrong, 288, Errno::WrongType),
+            (foreign, 288, Errno::AccessDenied),
+            (own, 1u64 << 32 | 288, Errno::InvalidArgs),
+            (own, 0, Errno::InvalidArgs),
+            (own, 289, Errno::InvalidArgs),
+        ] {
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::JobSetPolicy { job: handle, limit }
+                ),
+                KernelCallResult::Status(expected.status())
+            );
+        }
     }
 
     #[test]
@@ -11661,6 +11957,64 @@ mod tests {
     }
 
     #[test]
+    fn pending_call_survives_unrelated_channel_reclamation() {
+        let mut engine = SyscallEngine::new();
+        let mut caller = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        // The older disposable pair precedes the live call's pair in the registry.
+        let (old_left, old_right) = create_channel(&mut engine, &mut caller);
+        let (_root_handle, root_id, root_end) = engine.root_channel_create(&mut caller).unwrap();
+        let (caller_end, server_end) = create_channel(&mut engine, &mut caller);
+        let server_end = move_channel_end(&mut caller, &mut receiver, server_end);
+        let ticket = installed(&mut engine, &mut caller, caller_end, KoId(901), 0, b"ping");
+        for handle in [old_left, old_right] {
+            assert_eq!(
+                engine.dispatch(&mut caller, KernelCall::HandleClose { handle }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+        assert_eq!(engine.ipc.channel_count(), 2);
+        assert_eq!(
+            engine
+                .ipc
+                .channel_pair_mut(root_id)
+                .unwrap()
+                .object(root_end)
+                .koid()
+                .0,
+            root_id as u64
+        );
+        let message = match engine.dispatch(
+            &mut receiver,
+            KernelCall::ChannelRead {
+                channel: server_end,
+            },
+        ) {
+            KernelCallResult::Message(message) => message,
+            other => panic!("expected call request, got {other:?}"),
+        };
+        let delivery = engine
+            .note_call_read(&receiver, server_end, &message, KoId(902))
+            .expect("registry compaction must not orphan the call");
+        assert_eq!(delivery.index, ticket.index);
+        reply_call(
+            &mut engine,
+            &mut receiver,
+            delivery.index,
+            KoId(902),
+            b"pong",
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.take_call_completion(ticket.index, KoId(901)),
+            CallCompletion::Ready {
+                status: Errno::Ok,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn channel_call_validation_matches_the_call_contract() {
         let mut engine = SyscallEngine::new();
         let mut caller = test_process(&mut engine);
@@ -11990,6 +12344,68 @@ mod tests {
         );
     }
 
+    //j825
+    #[test]
+    fn a_killed_callers_endpoint_close_wakes_only_the_surviving_caller() {
+        // AX4: ProcessKill abandons the dead caller's records first; closing its endpoint
+        // then must not put the reaped caller back on any run queue, while the surviving
+        // caller on its own endpoint still completes PeerClosed and is woken exactly once.
+        let mut engine = SyscallEngine::new();
+        let mut caller_a = test_process(&mut engine);
+        let mut caller_b = test_process(&mut engine);
+        let mut receiver = test_process(&mut engine);
+        let (a_caller_end, a_peer_end) = create_channel(&mut engine, &mut caller_a);
+        let a_peer_end = move_channel_end(&mut caller_a, &mut receiver, a_peer_end);
+        let (b_caller_end, b_peer_end) = create_channel(&mut engine, &mut caller_b);
+        let b_peer_end = move_channel_end(&mut caller_b, &mut receiver, b_peer_end);
+        let ticket_a = installed(&mut engine, &mut caller_a, a_caller_end, KoId(601), 0, b"a");
+        let ticket_b = installed(&mut engine, &mut caller_b, b_caller_end, KoId(602), 0, b"b");
+
+        assert_eq!(engine.abandon_calls_for_process(caller_a.koid()), 1);
+        let a_peer_koid = receiver.handles().get(a_peer_end).unwrap().koid;
+        let b_peer_koid = receiver.handles().get(b_peer_end).unwrap().koid;
+        // The receiver closes the dead caller's peer end: the tombstoned record is skipped,
+        // so the wake list is empty and the reaped caller koid never re-enters a run queue.
+        assert!(engine
+            .complete_calls_on_endpoint_closed(a_peer_koid)
+            .is_empty());
+        // Closing the surviving caller's peer end wakes exactly caller B, never caller A.
+        let wakes = engine.complete_calls_on_endpoint_closed(b_peer_koid);
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].caller_process, caller_b.koid());
+        assert_eq!(wakes[0].caller_thread, KoId(602));
+        assert_ne!(wakes[0].caller_process, caller_a.koid());
+        assert_ne!(wakes[0].caller_thread, KoId(601));
+        // A real close of both receiver ends still drains cleanly.
+        for handle in [a_peer_end, b_peer_end] {
+            assert_eq!(
+                engine.dispatch(&mut receiver, KernelCall::HandleClose { handle }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+        // The dead caller's own resume path still sees PeerClosed (tombstone), not a wake.
+        assert_eq!(
+            engine.take_call_completion(ticket_a.index, KoId(601)),
+            CallCompletion::Ready {
+                status: Errno::PeerClosed,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket_a.caller_end,
+            }
+        );
+        assert_eq!(
+            engine.take_call_completion(ticket_b.index, KoId(602)),
+            CallCompletion::Ready {
+                status: Errno::PeerClosed,
+                len: 0,
+                words: [0; 4],
+                legacy_reply: false,
+                caller_end: ticket_b.caller_end,
+            }
+        );
+    }
+
     #[test]
     fn caller_death_tombstones_records_and_discards_a_late_reply() {
         let mut engine = SyscallEngine::new();
@@ -12255,5 +12671,282 @@ mod tests {
             .unwrap()
             .completion
             .is_none());
+    }
+
+    //j825
+    #[test]
+    fn a_refused_spawn_can_roll_staged_grants_back_and_retry() {
+        // AX4: a capacity refusal happens before a child exists, so ProcessRun's staged
+        // handle grants must be discardable without consuming the source transfer rights.
+        let mut engine = SyscallEngine::new();
+        let mut source = test_process(&mut engine);
+        let rights = Rights::READ | Rights::TRANSFER | Rights::DUPLICATE;
+        let object_a = engine.objects.create(ObjectKind::Vmo);
+        let object_b = engine.objects.create(ObjectKind::Vmo);
+        let a = source.handles_mut().insert(object_a, rights).unwrap();
+        let b = source.handles_mut().insert(object_b, rights).unwrap();
+        let mut target = HandleTable::new();
+        let (arg_a, grant_a) =
+            stage_process_arg(source.handles(), &mut target, a.0 as u64, true).unwrap();
+        let (arg_b, grant_b) =
+            stage_process_arg(source.handles(), &mut target, b.0 as u64, true).unwrap();
+        assert!(grant_a.is_some() && grant_b.is_some());
+        assert_ne!(arg_a, 0);
+        assert_ne!(arg_b, 0);
+        assert_eq!(target.live_count(), 2);
+        assert_eq!(source.handles().live_count(), 2);
+
+        assert_eq!(
+            rollback_process_grants(&mut target, &[grant_a, grant_b]),
+            Ok(())
+        );
+        assert_eq!(target.live_count(), 0);
+        assert_eq!(target.slot_count(), 0);
+        // A transfer grant is staged, never applied early: the source still owns both, so
+        // a refused spawn leaves Sora's table exactly as it found it.
+        assert_eq!(source.handles().live_count(), 2);
+        assert!(source.handles().get(a).is_ok());
+        assert!(source.handles().get(b).is_ok());
+
+        // The same source handles can be staged again after the rollback.
+        let mut retry = HandleTable::new();
+        assert!(stage_process_arg(source.handles(), &mut retry, a.0 as u64, true).is_ok());
+        assert_eq!(retry.live_count(), 1);
+        assert_eq!(source.handles().live_count(), 2);
+    }
+
+    ///j825
+    /// AX4 boundary-fill reclamation. A spawn/teardown cycle must leave the IPC registries,
+    /// the timer list and the process-slot vector flat — counts *and* backing capacity.
+    /// These tests mirror what `teardown_process_and_signal` now does after draining a dead
+    /// process's handles. — TIMBERDOODLE
+    mod actor_reclamation {
+        use super::*;
+
+        fn close(engine: &mut SyscallEngine, process: &mut Process, handle: Handle) {
+            assert_eq!(
+                engine.dispatch(process, KernelCall::HandleClose { handle }),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+        }
+
+        fn create_timer(engine: &mut SyscallEngine, process: &mut Process) -> (Handle, KoId) {
+            let KernelCallResult::Handle(handle) = engine.dispatch(
+                process,
+                KernelCall::TimerCreate {
+                    deadline_ns: 10_000_000_000,
+                },
+            ) else {
+                panic!("expected a timer handle");
+            };
+            let koid = process.handles().get(handle).unwrap().koid;
+            (handle, koid)
+        }
+
+        #[test]
+        fn a_channel_pair_is_reclaimed_after_its_last_owner_closes() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let base = engine.census(Some(&process));
+            let (left, right) = create_channel(&mut engine, &mut process);
+            let duplicate = process.handles_mut().duplicate(left, Rights::WAIT).unwrap();
+            assert_eq!(engine.census(Some(&process)).channels, base.channels + 1);
+
+            // A duplicate keeps the left endpoint owned: the pair must survive both closes.
+            close(&mut engine, &mut process, left);
+            close(&mut engine, &mut process, right);
+            assert_eq!(engine.census(Some(&process)).channels, base.channels + 1);
+            close(&mut engine, &mut process, duplicate);
+            assert_eq!(engine.census(Some(&process)).channels, base.channels);
+        }
+
+        #[test]
+        fn a_port_is_reclaimed_with_its_last_handle_and_its_bindings() {
+            let mut engine = SyscallEngine::new();
+            let mut process = test_process(&mut engine);
+            let base = engine.census(Some(&process));
+            let port = create_port(&mut engine, &mut process);
+            let (channel, _peer_left_open) = create_channel(&mut engine, &mut process);
+            assert_eq!(
+                engine.dispatch(
+                    &mut process,
+                    KernelCall::PortBind {
+                        port,
+                        object: channel,
+                    }
+                ),
+                KernelCallResult::Status(Errno::Ok.status())
+            );
+            let duplicate = process.handles_mut().duplicate(port, Rights::WAIT).unwrap();
+            assert_eq!(engine.census(Some(&process)).ports, base.ports + 1);
+
+            // One handle close while a duplicate survives must not drop the record or its
+            // bindings: the port object is still reachable and its waiter is still valid.
+            close(&mut engine, &mut process, port);
+            assert_eq!(engine.census(Some(&process)).ports, base.ports + 1);
+            assert_eq!(
+                engine.census(Some(&process)).port_bindings,
+                base.port_bindings + 1
+            );
+
+            close(&mut engine, &mut process, duplicate);
+            let after = engine.census(Some(&process));
+            assert_eq!(after.ports, base.ports);
+            assert_eq!(after.port_bindings, base.port_bindings);
+            assert!(engine.ipc.capacities().1 <= 64);
+        }
+
+        #[test]
+        fn a_late_actor_and_fill_teardown_compact_interior_slots() {
+            let mut engine = SyscallEngine::new();
+            let resident = test_process(&mut engine);
+            engine.install_process(resident);
+            let base = engine.census(None);
+            let base_slots = engine.processes.len();
+
+            // A capacity fill installs its actors, then the harness spawns one more actor
+            // (the recovery child) before the fill's dead slots are cleared. The tail is
+            // occupied, so trailing pops cannot reach the interior holes.
+            let mut fill_koids = Vec::new();
+            for _ in 0..64 {
+                let fill = test_process(&mut engine);
+                fill_koids.push(fill.koid());
+                engine.install_process(fill);
+            }
+            let late = test_process(&mut engine);
+            let late_koid = late.koid();
+            engine.install_process(late);
+            for koid in fill_koids {
+                assert!(engine.clear_process_slot(koid));
+            }
+            assert!(
+                engine.processes.len() <= engine.process_live * 2 + 8,
+                "interior holes are compacted once they dominate the live set"
+            );
+            assert_eq!(
+                engine.processes.capacity(),
+                engine.processes.len(),
+                "exact slot capacity after the fill teardown"
+            );
+            assert_eq!(engine.census(None).processes, base.processes + 1);
+            assert!(engine.clear_process_slot(late_koid));
+            assert_eq!(engine.census(None).processes, base.processes);
+            assert_eq!(engine.processes.len(), base_slots, "pre-fill slot count");
+            assert_eq!(engine.processes.capacity(), engine.processes.len());
+        }
+
+        #[test]
+        fn repeated_actor_churn_leaves_the_registries_and_slot_vector_flat() {
+            let mut engine = SyscallEngine::new();
+            let mut resident = test_process(&mut engine);
+            engine.install_process(resident);
+            let base = engine.census(None);
+            let (base_channels, base_ports) = engine.ipc.capacities();
+            let base_timers = engine.timers.capacity();
+            let base_bindings = engine.devices.port_bindings.capacity();
+            let base_slots = engine.processes.len();
+            let base_slot_capacity = engine.processes.capacity();
+
+            for cycle in 0..3 {
+                let mut actor_koids = Vec::new();
+                let mut channel_koids = Vec::new();
+                let mut timer_koids = Vec::new();
+                let mut port_koids = Vec::new();
+                for _ in 0..64 {
+                    let mut actor = test_process(&mut engine);
+                    actor_koids.push(actor.koid());
+                    for _ in 0..2 {
+                        let (left, right) = create_channel(&mut engine, &mut actor);
+                        channel_koids.push(actor.handles().get(left).unwrap().koid);
+                        channel_koids.push(actor.handles().get(right).unwrap().koid);
+                    }
+                    let port = create_port(&mut engine, &mut actor);
+                    port_koids.push(actor.handles().get(port).unwrap().koid);
+                    let (timer, timer_koid) = create_timer(&mut engine, &mut actor);
+                    timer_koids.push(timer_koid);
+                    assert_eq!(
+                        engine.dispatch(
+                            &mut actor,
+                            KernelCall::PortBind {
+                                port,
+                                object: timer,
+                            }
+                        ),
+                        KernelCallResult::Status(Errno::Ok.status())
+                    );
+                    engine.install_process(actor);
+                }
+
+                // Mirror `teardown_process_and_signal`: the record drop releases every
+                // handle lineage, each channel endpoint is closed by koid, and timer and
+                // binding entries are released by koid before the reclaim pass runs.
+                for koid in actor_koids {
+                    assert!(engine.clear_process_slot(koid));
+                }
+                for koid in &channel_koids {
+                    let _ = engine.ipc.close_by_koid(*koid);
+                }
+                for koid in timer_koids {
+                    engine.release_timer(koid);
+                }
+                for koid in port_koids {
+                    engine.release_port_bindings(koid);
+                }
+                engine.reclaim_unowned_ipc(true);
+
+                let after = engine.census(None);
+                assert_eq!(after.ports, base.ports, "cycle {cycle}: ports");
+                assert_eq!(after.channels, base.channels, "cycle {cycle}: channels");
+                assert_eq!(after.timers, base.timers, "cycle {cycle}: timers");
+                assert_eq!(
+                    after.port_bindings, base.port_bindings,
+                    "cycle {cycle}: bindings"
+                );
+                assert_eq!(after.processes, base.processes, "cycle {cycle}: slots");
+                assert_eq!(engine.processes.len(), base_slots);
+                assert!(
+                    engine.processes.capacity() <= base_slot_capacity + 64,
+                    "cycle {cycle}: slot-vector capacity"
+                );
+                let (channels, ports) = engine.ipc.capacities();
+                assert!(
+                    channels <= base_channels + 64,
+                    "cycle {cycle}: channel capacity"
+                );
+                assert!(ports <= base_ports + 64, "cycle {cycle}: port capacity");
+                assert!(
+                    engine.timers.capacity() <= base_timers + 64,
+                    "cycle {cycle}: timer capacity"
+                );
+                assert!(
+                    engine.devices.port_bindings.capacity() <= base_bindings + 64,
+                    "cycle {cycle}: binding capacity"
+                );
+                // The teardown reclaim is asked for exact release: every registry holding a
+                // fill's high-water capacity must be down to its live length, not merely
+                // within the sparse threshold. This is the AX4 census's heap contract.
+                let (channels, ports) = engine.ipc.capacities();
+                assert_eq!(
+                    channels, after.channels,
+                    "cycle {cycle}: exact channel capacity"
+                );
+                assert_eq!(ports, after.ports, "cycle {cycle}: exact port capacity");
+                assert_eq!(
+                    engine.timers.capacity(),
+                    after.timers,
+                    "cycle {cycle}: exact timer capacity"
+                );
+                assert_eq!(
+                    engine.devices.port_bindings.capacity(),
+                    after.port_bindings,
+                    "cycle {cycle}: exact binding capacity"
+                );
+                assert_eq!(
+                    engine.processes.capacity(),
+                    engine.processes.len(),
+                    "cycle {cycle}: exact slot capacity"
+                );
+            }
+        }
     }
 }

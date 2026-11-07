@@ -1,8 +1,8 @@
-//j743
 //j748
 //j790
 //j823
 //j824
+//j825
 //! P5-sora: two-party root channel + kernel-held Sora recipe + supervised restart.
 //!
 //! The kernel creates a root channel: one endpoint goes to Sora as a bootstrap handle
@@ -135,23 +135,23 @@ pub(crate) struct SoraState {
     pub process: Process,
     /// The root Job — child processes are created under this.
     pub root_job: Job,
-    /// Index of the root [`ChannelPair`] in the IPC registry.
+    /// Stable ID of the root [`ChannelPair`] in the IPC registry.
     pub root_channel: usize,
     /// The kernel's endpoint for the root channel (Left — Sora gets Right).
     pub kernel_end: ChannelEnd,
-    /// Index of the console [`ChannelPair`] in the IPC registry.
+    /// Stable ID of the console [`ChannelPair`] in the IPC registry.
     pub console_channel: usize,
     /// The kernel's endpoint for the console channel.
     pub console_kernel_end: ChannelEnd,
-    /// Index of the block [`ChannelPair`] (P7-g: kernel-as-client block reads).
+    /// Stable ID of the block [`ChannelPair`] (P7-g: kernel-as-client block reads).
     pub block_channel: usize,
     /// The kernel's endpoint for the block channel.
     pub block_kernel_end: ChannelEnd,
-    /// Index of the network [`ChannelPair`] (P9-c: loopback server).
+    /// Stable ID of the network [`ChannelPair`] (P9-c: loopback server).
     pub net_channel: usize,
     /// The kernel's endpoint for the network channel.
     pub net_kernel_end: ChannelEnd,
-    /// Index of the keyboard [`ChannelPair`] (P8-a restoration).
+    /// Stable ID of the keyboard [`ChannelPair`] (P8-a restoration).
     pub keyboard_channel: usize,
     /// The kernel's endpoint for the keyboard channel.
     pub keyboard_kernel_end: ChannelEnd,
@@ -188,17 +188,17 @@ fn discard_previous_runtime() -> Result<(), UsermodeError> {
         return Err(UsermodeError::ChannelSetup);
     }
     let previous = slot.take();
-    // AX1: the stopped runtime's address space owns an ASID. Read its tagged root while the
-    // state still exists, drop the runtime, then return the ASID. Sora is the primary
-    // process, so the regular teardown path deliberately skips the mapping/ASID release.
-    // — TIMBERDOODLE
-    let aspace_root = previous
+    // AX1/AX4: the stopped runtime's address space owns an ASID and an anonymous stack, both
+    // of which the regular teardown path deliberately skips for the primary process. Read
+    // the tagged root and the recorded stack range while the state still exists, drop the
+    // runtime, then return the ASID and the stack leaves before the tables. — TIMBERDOODLE
+    let aspace = previous
         .as_ref()
         .and_then(|state| state.try_borrow().ok())
-        .and_then(|state| state.process.ttbr0);
+        .map(|state| (state.process.ttbr0, state.process.user_stack()));
     drop(previous);
-    if let Some(root) = aspace_root {
-        kumo_hal::active::retire_user_aspace(root);
+    if let Some((Some(root), user_stack)) = aspace {
+        crate::mm::retire_user_aspace(root, user_stack);
     }
     Ok(())
 }
@@ -881,6 +881,23 @@ fn run_sora_child_without_borrow(
             && arg == arg2
         {
             return Err(Errno::InvalidArgs.status());
+        }
+        // AX4: refuse a full resident set before staging anything. The blocking path commits
+        // its grants before switching into the child (the child must see them), and a commit
+        // consumes the source's transfer handle, so it cannot be undone afterwards. The gate
+        // in `run_prepared_child` still decides admission; this preflight only guarantees a
+        // refusal leaves Sora's handle table untouched.
+        if !crate::user_thread::resident_has_capacity() {
+            return Err(Errno::BadState.status());
+        }
+        //j825
+        // AX4: a spawn that cannot fit its fixed kernel allocations is refused here, before
+        // any grant is staged or consumed, exactly like a capacity refusal. The per-spawn
+        // gate inside `spawn_child_async`/`run_child` remains authoritative; this preflight
+        // only guarantees a memory refusal leaves Sora's handle table untouched and never
+        // reaches `alloc`'s panic path. — TIMBERDOODLE
+        if !crate::user_thread::spawn_heap_ready() {
+            return Err(Errno::NoMemory.status());
         }
 
         let target_ptr = match sora.engine.process_by_koid_mut(proc_koid) {
@@ -1577,6 +1594,13 @@ fn teardown_process_and_signal(koid: KoId) {
                 kumo_abi::ObjectKind::Resource => {
                     sora.engine.release_resource(koid);
                 }
+                //j825
+                // AX4: a timer handle is the timer's whole lifetime. The handle drain used
+                // to leave its binding in the engine, so every actor left a `TimerBinding`
+                // behind and each timer IRQ swept an ever-growing list. — TIMBERDOODLE
+                kumo_abi::ObjectKind::Timer => {
+                    sora.engine.release_timer(koid);
+                }
                 _ => {}
             }
             // Any object this process owned may have been a port or a watched object;
@@ -1588,6 +1612,13 @@ fn teardown_process_and_signal(koid: KoId) {
                 sora.engine.release_port_bindings(koid);
             }
         }
+        //j825
+        // AX4: every drained entry has now dropped its owner. Reclaim the port/channel
+        // records (and the registry slack a burst of actors left) that this process was the
+        // last owner of. This is what keeps a spawn/teardown cycle's kernel heap flat; the
+        // `true` asks for exact capacity release, because the census that follows a fill
+        // compares this heap with the pre-fill one. — TIMBERDOODLE
+        sora.engine.reclaim_unowned_ipc(true);
         // Drained entries have now dropped their capability owners. Retain uncertain
         // contexts and retire final IRQ owners before publishing termination; surviving
         // duplicates/grants keep their interrupt binding and watches. No re-entry. — KESTREL
@@ -1595,6 +1626,12 @@ fn teardown_process_and_signal(koid: KoId) {
         // A dead child's mapping records are references too: release them before the VMO pass
         // so the buffers it mapped can retire (J731). Sora's own teardown keeps hers.
         // — TIMBERDOODLE
+        //j825
+        // AX4: the record is kept only while its mapping records still reference VMOs. Once
+        // every mapping cleared, `retire_vmos` has run and the process object has been
+        // signalled, the slot is clearable and reusable; a kept mapping (a refused live-tree
+        // clear) retains the record exactly as J731 required. — TIMBERDOODLE
+        let mut clear_slot = false;
         if !primary {
             let (released, kept) = sora.engine.release_process_mappings(koid);
             if kept != 0 {
@@ -1606,22 +1643,29 @@ fn teardown_process_and_signal(koid: KoId) {
                     released + kept
                 );
             }
-            // AX1: with the mapping records gone, retire the address space's ASID. It must
-            // happen before `retire_vmos` can hand the same frames to a new owner, and even
-            // when the process recorded no mappings — every built space owns a root and an
-            // ASID. Sora's own root is retired by `discard_previous_runtime`.
-            // — TIMBERDOODLE
-            if let Some(root) = sora
+            clear_slot = kept == 0;
+            // AX1/AX4: with the mapping records gone, retire the address space: release the
+            // ASID and free its L0-L3 table frames plus the anonymous stack leaves
+            // AddressSpaceCreate installed outside any VMO. This happens before
+            // `retire_vmos` can hand the same frames to a new owner, and even when the
+            // process recorded no mappings — every built space owns a root and an ASID.
+            // VMO-backed leaf frames stay referenced by their entries until `retire_vmos`
+            // releases them below; every free follows the ASID release. Sora's own root is
+            // retired by `discard_previous_runtime`. — TIMBERDOODLE
+            if let Some((root, user_stack)) = sora
                 .engine
                 .process_by_koid(koid)
-                .and_then(|proc| proc.ttbr0)
+                .and_then(|proc| proc.ttbr0.map(|root| (root, proc.user_stack())))
             {
-                kumo_hal::active::retire_user_aspace(root);
+                crate::mm::retire_user_aspace(root, user_stack);
             }
         }
         sora.engine.retire_device_contexts();
         sora.engine.retire_interrupts();
-        sora.engine.retire_vmos(None);
+        // AX4: Sora's own process lives outside `engine.processes`, so this pass must be
+        // told about her handle table explicitly. Anonymous VMO frames are now reclaimable;
+        // without her reference a VMO still named by a live Sora handle could be retired.
+        sora.engine.retire_vmos(Some(&sora.process));
         if primary {
             sora.process.signal(kumo_abi::Signals::TERMINATED);
         } else if let Some(proc) = sora.engine.process_by_koid_mut(koid) {
@@ -1631,6 +1675,9 @@ fn teardown_process_and_signal(koid: KoId) {
         }
         sora.engine
             .signal_ports(koid, kumo_abi::Signals::TERMINATED);
+        if clear_slot {
+            sora.engine.clear_process_slot(koid);
+        }
         reclaim_framebuffer
     });
     // J547: a child parked in `ChannelRead` on a surviving end waits on that endpoint, not on
@@ -2867,6 +2914,22 @@ extern "C" fn svc_hook(regs: *mut u64) {
                 KernelCallResult::Handle(handle) => r[0] = handle.0 as u64,
                 _ => r[0] = u64::MAX,
             }
+        } else if num == Syscall::JobSetPolicy as u64 {
+            // Only the root chain supports this initial policy mechanism; the supplied Job
+            // capability must still pass the engine's type, MANAGE and ownership checks.
+            let job = Handle(r[0] as u32);
+            let limit = r[1];
+            r[0] = match sora
+                .engine
+                .dispatch(&mut sora.process, KernelCall::JobSetPolicy { job, limit })
+            {
+                KernelCallResult::Status(status) if status == Errno::Ok.status() => {
+                    sora.root_job.set_resident_limit(limit as u32);
+                    status as u32 as u64
+                }
+                KernelCallResult::Status(status) => status as u32 as u64,
+                _ => u64::MAX,
+            };
         } else if num == Syscall::ChannelWrite as u64 {
             let user_ptr = r[1];
             let len = (r[2] as usize).min(MAX_CHANNEL_BYTES);
@@ -3104,6 +3167,13 @@ fn attempt_sora(
         None => Handle(0),
     };
 
+    // AX4: mint an explicit, non-transferable Job policy capability. Preserve it in x10
+    // at Sora entry; process identity alone must not confer policy authority. — TIMBERDOODLE
+    let root_job_handle = process
+        .handles_mut()
+        .insert(job.object(), Rights::MANAGE)
+        .map_err(|_| UsermodeError::ChannelSetup)?;
+
     // P9-b: root Resource — grants access to all physical MMIO and every IRQ line
     // (scaffold; Gouchen will mint per-device Resources later). Sora receives the
     // handle in x5 and narrows it before handing grants to drivers.
@@ -3306,6 +3376,12 @@ fn attempt_sora(
     // Store sora's ttbr0 on its Process so the VmarMap live-tree gate
     // (process.ttbr0 == Some(root)) triggers when sora self-maps at runtime.
     process.ttbr0 = Some(user_ttbr0);
+    // AX4: the image builder allocates Sora's stack as anonymous frames too, exactly like
+    // AddressSpaceCreate does for a child. Record the range so `discard_previous_runtime`
+    // and the failure path below can hand those leaves back with the address space.
+    if let Some(stack_base) = recipe.stack_top.checked_sub(USER_STACK_SIZE) {
+        process.set_user_stack(stack_base, USER_STACK_SIZE);
+    }
 
     let kernel_ttbr0 = kumo_hal::active::read_user_aspace_root();
     let user_state = UserState {
@@ -3321,6 +3397,7 @@ fn attempt_sora(
             x[7] = kbd_handle.0 as u64; // keyboard channel handle (P8-a)
             x[8] = bootinfo_vmo_handle.0 as u64; // BootInfo VMO handle (J159)
             x[9] = dtb_vmo_handle.0 as u64; // read-only DTB VMO handle
+            x[10] = root_job_handle.0 as u64; // root Job policy capability (AX4)
             x
         },
         elr: recipe.entry,
@@ -3338,10 +3415,10 @@ fn attempt_sora(
         kernel_ttbr0,
     )
     .map_err(|error| {
-        // AX1: the address space was built (and its ASID allocated) but never published;
-        // return the ASID instead of leaking it. This is the only fallible step after
-        // `build_user_tables`. — TIMBERDOODLE
-        kumo_hal::active::retire_user_aspace(user_ttbr0);
+        // AX1/AX4: the address space was built (and its ASID allocated) but never published;
+        // return the ASID and the anonymous stack leaves instead of leaking them. This is
+        // the only fallible step after `build_user_tables`. — TIMBERDOODLE
+        crate::mm::retire_user_aspace(user_ttbr0, process.user_stack());
         UsermodeError::UserThreadInit(error)
     })?;
 
@@ -3820,14 +3897,37 @@ pub fn poll_root_command(env: &mut crate::shell::ShellEnv) -> usize {
     if len == 0 {
         return 0;
     }
-    if len == 5 && buf[..4] == kumo_abi::actor::QUERY && buf[4] <= 8 {
-        let reply = crate::actorstat::snapshot(buf[4]).encode();
+    //j825
+    // Two diagnostic magics share one exchange. AXB1 answers the frozen AXR1 frame while the
+    // true census fits it; when it does not, the reply is a 4-byte little-endian status
+    // (`Errno::BadState`) so a probe fails cleanly instead of decoding a frame its own
+    // decoder rejects. AXB2 answers the capacity-bounded AXR2 frame for ops 0..=13.
+    // — TIMBERDOODLE
+    if len == 5 && (buf[..4] == kumo_abi::actor::QUERY || buf[..4] == kumo_abi::actor::QUERY2) {
+        let wide_query = buf[..4] == kumo_abi::actor::QUERY2;
+        let max_op = if wide_query { 13 } else { 8 };
+        if buf[4] > max_op {
+            return 0;
+        }
+        let mut status = [0u8; 4];
+        let mut legacy_frame = [0u8; kumo_abi::actor::SNAPSHOT_LEN];
+        let mut wide_frame = [0u8; kumo_abi::actor::SNAPSHOT2_LEN];
+        let reply: &[u8] = if wide_query {
+            wide_frame = crate::actorstat::snapshot_wide(buf[4]).encode();
+            &wide_frame
+        } else if let Some(snapshot) = crate::actorstat::snapshot(buf[4]) {
+            legacy_frame = snapshot.encode();
+            &legacy_frame
+        } else {
+            status = kumo_abi::Errno::BadState.status().to_le_bytes();
+            &status
+        };
         // Snapshot outside SoraState; release the channel borrow before signalling/waking.
         let peer = with_sora_mut(|sora| {
             let end = sora.kernel_end;
             let channel = sora.engine.ipc_mut().channel_pair_mut(sora.root_channel)?;
             let peer = channel.peer_object(end).koid();
-            let message = KernelMessage::from_borrowed(Message::new(1, &reply, &[]).ok()?).ok()?;
+            let message = KernelMessage::from_borrowed(Message::new(1, reply, &[]).ok()?).ok()?;
             channel.write(end, message).ok()?;
             Some(peer)
         });

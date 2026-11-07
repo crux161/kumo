@@ -14,6 +14,8 @@
 // — CORVUS 2026-06-24: corrected — this was documented as a non-reclaiming *bump*
 // allocator, but the code is `linked_list_allocator` with a real `deallocate`.
 
+//j825
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
@@ -110,4 +112,14 @@ pub fn used() -> usize {
 #[cfg(not(target_os = "none"))]
 pub fn used() -> usize {
     0
+}
+
+///j825
+/// Bytes not currently allocated in the kernel heap. The region is fixed, so this is the
+/// complete budget any further allocation has to fit in. Before `init` (and on the host,
+/// where `used()` is 0) the whole region counts as available. Callers that are about to
+/// allocate a multi-KiB record ask first, so a full heap becomes an error status rather
+/// than `alloc`'s panic path. — TIMBERDOODLE
+pub fn headroom() -> usize {
+    HEAP_SIZE.saturating_sub(used())
 }

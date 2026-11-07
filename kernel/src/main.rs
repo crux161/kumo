@@ -7,12 +7,37 @@
 //! tests with `std`.
 
 //j447
+//j825
 
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
 #[cfg(not(target_os = "none"))]
 fn main() {}
+
+///j825
+/// Report a panic on the earliest console before halting. Both handlers used to halt in
+/// silence, so any panic — a full fixed heap at the AX4 capacity fill was the first one seen
+/// on metal — looked like a wedged machine: 100% CPU and no serial output. This path must not
+/// allocate: `core::fmt::write` formats into a sink that hands each fragment straight to the
+/// alloc-free UART/framebuffer writer. — TIMBERDOODLE
+#[cfg(target_os = "none")]
+fn panic_report(info: &core::panic::PanicInfo<'_>) -> ! {
+    struct Console;
+
+    impl core::fmt::Write for Console {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            kumo_hal::active::early_console_write(text.as_bytes());
+            Ok(())
+        }
+    }
+
+    let _ = core::fmt::write(
+        &mut Console,
+        format_args!("\nTOWER: KERNEL PANIC: {info}\n"),
+    );
+    kumo_hal::active::halt()
+}
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 mod boot {
@@ -55,8 +80,8 @@ mod boot {
     }
 
     #[panic_handler]
-    fn panic(_info: &PanicInfo<'_>) -> ! {
-        kumo_hal::active::halt()
+    fn panic(info: &PanicInfo<'_>) -> ! {
+        crate::panic_report(info)
     }
 }
 
@@ -220,7 +245,7 @@ mod boot_x86 {
     }
 
     #[panic_handler]
-    fn panic(_info: &PanicInfo<'_>) -> ! {
-        kumo_hal::active::halt()
+    fn panic(info: &PanicInfo<'_>) -> ! {
+        crate::panic_report(info)
     }
 }

@@ -1,8 +1,8 @@
-//j625
 //j632
 //j719
 //j731
 //j732
+//j825
 
 use alloc::{
     rc::{Rc, Weak},
@@ -203,7 +203,11 @@ impl HandleTable {
         self.insert_referenced(object, rights)
     }
 
-    fn insert_referenced(
+    ///j825
+    /// Insert `object` and mint an ownership observer for it. Shared with the IPC registry
+    /// so a port record can be reclaimed when its last owning handle drops, exactly like a
+    /// channel. The caller is responsible for the object kind. — TIMBERDOODLE
+    pub(crate) fn insert_referenced(
         &mut self,
         object: KernelObject,
         rights: Rights,
@@ -251,7 +255,20 @@ impl HandleTable {
 
     pub fn remove(&mut self, handle: Handle) -> Result<OwnedHandleEntry, ObjectError> {
         let index = self.position(handle).ok_or(ObjectError::BadHandle)?;
-        Ok(self.entries.remove(index))
+        let entry = self.entries.remove(index);
+        //j825
+        // AX4: a table that serviced a burst of actors keeps its high-water capacity after
+        // every handle closes, and Sora's table alone can retain tens of KiB. Release it once
+        // the table is mostly empty; the sparse threshold keeps per-close traffic from
+        // reallocating, and `shrink_to_fit` keeps the old block if the allocator declines.
+        // — TIMBERDOODLE
+        // AX4: keep the band tight so a fill's handle-table high-water does not survive
+        // the drain as dead capacity (24 B per entry). A doubling push still fits the band,
+        // so ordinary open/close traffic does not oscillate. — TIMBERDOODLE
+        if self.entries.capacity() > self.entries.len() * 2 + 8 {
+            self.entries.shrink_to_fit();
+        }
+        Ok(entry)
     }
 
     pub(crate) fn holds(&self, koid: KoId, kind: ObjectKind, rights: Rights) -> bool {

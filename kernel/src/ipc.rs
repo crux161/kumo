@@ -1,15 +1,15 @@
-//j618
 //j708
 //j719
 //j731
 //j824
+//j825
 
 use alloc::vec::Vec;
 
 use kumo_abi::{Handle, KoId, ObjectKind, Rights, Signals};
 use kumo_ipc::{Message, MessageHeader, MAX_INLINE_BYTES, MAX_MESSAGE_HANDLES};
 
-use crate::object::{KernelObject, ObjectError, ObjectManager, OwnedHandleEntry};
+use crate::object::{HandleReferences, KernelObject, ObjectError, ObjectManager, OwnedHandleEntry};
 use crate::task::Process;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,7 +181,7 @@ impl IpcRegistry {
     }
 
     /// Create a root channel: one endpoint goes to `process` as a handle, the other
-    /// is retained by the kernel. Returns `(process_handle, channel_index, kernel_end)`.
+    /// is retained by the kernel. Returns `(process_handle, stable_pair_id, kernel_end)`.
     /// The kernel reads/writes `kernel_end` via [`channel_pair_mut`](Self::channel_pair_mut).
     pub fn root_channel_create(
         &mut self,
@@ -195,9 +195,11 @@ impl IpcRegistry {
             Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE | Rights::WAIT,
         )?;
         channel.set_references(None, Some(right_references));
-        let index = self.channels.len();
+        // AX4: retain an endpoint koid rather than a Vec slot, since reclamation moves
+        // slots and must never retarget a kernel-owned channel. — TIMBERDOODLE
+        let id = channel.object(ChannelEnd::Left).koid().0 as usize;
         self.channels.push(channel);
-        Ok((right, index, ChannelEnd::Left))
+        Ok((right, id, ChannelEnd::Left))
     }
 
     pub fn channel_create(
@@ -225,11 +227,16 @@ impl IpcRegistry {
         objects: &mut ObjectManager,
         process: &mut Process,
     ) -> Result<Handle, IpcError> {
-        let port = Port::new(objects);
-        let handle = process.handles_mut().insert(
+        //j825
+        // AX4: mint the same ownership observer channels use. Every duplicate, transfer or
+        // queued grant clones the handle's Rc, so the port record can be reclaimed with its
+        // last owner instead of outliving the process that made it. — TIMBERDOODLE
+        let mut port = Port::new(objects);
+        let (handle, references) = process.handles_mut().insert_referenced(
             port.object(),
             Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
         )?;
+        port.references = Some(references);
         self.ports.push(port);
         Ok(handle)
     }
@@ -452,11 +459,9 @@ impl IpcRegistry {
         Err(IpcError::NotChannel)
     }
 
-    /// Access a [`ChannelPair`] by its index in the registry (returned by
-    /// [`channel_create`](Self::channel_create)). Used by the kernel to read/write
-    /// its own channel endpoint directly, without going through a handle table.
-    pub fn channel_pair_mut(&mut self, index: usize) -> Option<&mut ChannelPair> {
-        self.channels.get_mut(index)
+    /// Access a kernel-retained pair by its stable ID from [`Self::root_channel_create`].
+    pub fn channel_pair_mut(&mut self, id: usize) -> Option<&mut ChannelPair> {
+        self.channel_mut_by_koid(KoId(id as u64)).ok()
     }
 
     fn channel_mut_by_koid(&mut self, koid: KoId) -> Result<&mut ChannelPair, IpcError> {
@@ -471,8 +476,9 @@ impl IpcRegistry {
     }
 
     //j731
-    /// Registry sizes for the J731 census. No path removes a port, so `port_count` is every
-    /// port created since boot. — TIMBERDOODLE
+    /// Registry sizes for the J731 census. Since AX4, a port is removed when its last
+    /// owning handle closes, so this is the live port count, not every port ever created.
+    /// — TIMBERDOODLE
     pub fn port_count(&self) -> usize {
         self.ports.len()
     }
@@ -529,7 +535,98 @@ impl IpcRegistry {
             }
             collect_carried_transfers(channel.endpoint_mut(carried_end), &mut carried);
         }
+        //j825
+        // AX4: once neither endpoint has an owner, the pair is unreachable forever. Drop it
+        // here (the last close call) so a spawn/teardown cycle leaves no channel record.
+        // — TIMBERDOODLE
+        self.reap_unowned_channels();
         Ok(signals)
+    }
+
+    ///j825
+    /// AX4: remove a channel pair whose endpoints are both closed and unowned. The inbox
+    /// vectors (and their retained capacity) are freed with the record; each inbox was
+    /// already drained by the `last_owner` close. Kernel-retained root ends have no
+    /// observer, so a root channel is never reaped. Returns how many pairs were dropped.
+    /// — TIMBERDOODLE
+    pub fn reap_unowned_channels(&mut self) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.channels.len() {
+            let pair = &self.channels[index];
+            let dead = |end: ChannelEnd| {
+                let endpoint = pair.endpoint(end);
+                !endpoint.open && last_owner(endpoint)
+            };
+            if dead(ChannelEnd::Left) && dead(ChannelEnd::Right) {
+                self.channels.remove(index);
+                removed += 1;
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
+
+    ///j825
+    /// AX4: remove every port whose last owning handle is gone, returning the koids so the
+    /// caller can drop their bindings. A port built directly with `Port::new` has no
+    /// observer and is never reclaimed. — TIMBERDOODLE
+    pub fn take_unreferenced_ports(&mut self) -> Vec<KoId> {
+        let mut removed = Vec::new();
+        let mut index = 0;
+        while index < self.ports.len() {
+            let unreferenced = self.ports[index]
+                .references
+                .as_ref()
+                .is_some_and(|references| !references.is_referenced());
+            if unreferenced {
+                removed.push(self.ports.remove(index).object.koid());
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
+
+    ///j825
+    /// Release channel/port vector capacity that a burst of actors left high-watered.
+    /// `shrink_to_fit` may decline the move if the allocator cannot satisfy it, so this is
+    /// safe on a teardown path; the sparse threshold keeps ordinary traffic from churning.
+    /// — TIMBERDOODLE
+    pub fn shrink_sparse(&mut self) {
+        // AX4: the burst tail is what survives a capacity fill. A slack of `2 * len + 8`
+        // keeps an ordinary open/close oscillation from reallocating (a push doubles, so a
+        // doubled capacity is still within the band) while leaving only a few elements of
+        // dead capacity once a 1024-pair high-water mark is behind us. 64 elements was
+        // 7 KiB of channels alone — more than the final AX4 census gate allows.
+        // — TIMBERDOODLE
+        if self.channels.capacity() > self.channels.len() * 2 + 8 {
+            self.channels.shrink_to_fit();
+        }
+        if self.ports.capacity() > self.ports.len() * 2 + 8 {
+            self.ports.shrink_to_fit();
+        }
+    }
+
+    ///j825
+    /// AX4: exact capacity release at process teardown. [`Self::shrink_sparse`] tolerates up
+    /// a geometric band of slack so ordinary close traffic does not reallocate; a
+    /// teardown burst is the one point where every byte of that slack is worth reclaiming, so
+    /// this drops it unconditionally. `shrink_to_fit` keeps the old block if the allocator
+    /// cannot satisfy the move, which keeps this safe on an out-of-memory teardown. A fill of
+    /// 288 actors leaves the channels vector at a 1024-pair high-water mark; the slack alone
+    /// is tens of KiB, more than the AX4 heap gate allows to survive the cycle. — TIMBERDOODLE
+    pub fn compact(&mut self) {
+        self.channels.shrink_to_fit();
+        self.ports.shrink_to_fit();
+    }
+
+    ///j825
+    /// Backing-vector capacities `(channels, ports)`, for the AX4 reclamation tests. — TIMBERDOODLE
+    #[cfg(test)]
+    pub fn capacities(&self) -> (usize, usize) {
+        (self.channels.capacity(), self.ports.capacity())
     }
 }
 
@@ -590,7 +687,17 @@ impl ChannelPair {
 
     pub fn read(&mut self, end: ChannelEnd) -> Result<KernelMessage, IpcError> {
         if !self.endpoint(end).inbox.is_empty() {
-            return Ok(self.endpoint_mut(end).inbox.remove(0));
+            let endpoint = self.endpoint_mut(end);
+            let message = endpoint.inbox.remove(0);
+            // AX4: a long-lived console/channel survives actor teardown. Release its burst
+            // capacity as it drains; reclaiming only dead channel pairs leaves the console's
+            // high-water allocation behind forever. Keep ordinary traffic inside the same
+            // geometric slack band as the registry. — TIMBERDOODLE
+            if endpoint.inbox.capacity() > endpoint.inbox.len().saturating_mul(2).saturating_add(8)
+            {
+                endpoint.inbox.shrink_to_fit();
+            }
+            return Ok(message);
         }
         // Inbox empty. A still-open peer means "wait for a future write" (ShouldWait → park); a
         // closed peer means end-of-stream — no writer is left, so report PeerClosed so a drainer
@@ -692,6 +799,11 @@ pub struct PortPacket {
 pub struct Port {
     object: KernelObject,
     packets: Vec<PortPacket>,
+    //j825
+    /// Counts the handles that still own this port; `None` only for a port a test built
+    /// directly. `take_unreferenced_ports` reclaims the record when this says zero.
+    /// — TIMBERDOODLE
+    references: Option<HandleReferences>,
 }
 
 impl Port {
@@ -699,6 +811,7 @@ impl Port {
         Self {
             object: objects.create(ObjectKind::Port),
             packets: Vec::new(),
+            references: None,
         }
     }
 
@@ -722,7 +835,17 @@ impl Port {
         if self.packets.is_empty() {
             Err(IpcError::ShouldWait)
         } else {
-            Ok(self.packets.remove(0))
+            let packet = self.packets.remove(0);
+            //j825
+            // AX4: a fill/wake burst queues one packet per source and then drains them; once
+            // the last packet is gone, drop the high-water capacity with it instead of keeping
+            // it for the life of the port. The small cap keeps ordinary event traffic
+            // (console/block/net wakeups, one packet at a time) allocation-free.
+            // — TIMBERDOODLE
+            if self.packets.is_empty() && self.packets.capacity() > 16 {
+                self.packets.shrink_to_fit();
+            }
+            Ok(packet)
         }
     }
 
@@ -767,6 +890,32 @@ mod tests {
     use super::*;
 
     //j719
+    #[test]
+    fn live_channel_releases_burst_storage_without_losing_messages() {
+        let mut objects = ObjectManager::new();
+        let mut pair = ChannelPair::new(&mut objects);
+        for ordinal in 0..1024 {
+            pair.write(
+                ChannelEnd::Left,
+                KernelMessage::new(ordinal, b"burst", &[]).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(pair.endpoint(ChannelEnd::Right).inbox.capacity() >= 1024);
+        for ordinal in 0..1024 {
+            let message = pair.read(ChannelEnd::Right).unwrap();
+            assert_eq!(message.header.ordinal, ordinal);
+            assert_eq!(message.bytes(), b"burst");
+        }
+        assert!(pair.endpoint(ChannelEnd::Right).inbox.capacity() <= 8);
+        pair.write(
+            ChannelEnd::Left,
+            KernelMessage::new(1024, b"after", &[]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pair.read(ChannelEnd::Right).unwrap().bytes(), b"after");
+    }
+
     #[test]
     fn closing_one_duplicate_keeps_the_queued_config_for_the_survivor() {
         let mut objects = ObjectManager::new();
@@ -984,7 +1133,7 @@ mod tests {
         )
         .unwrap();
         let message = ipc
-            .channel_pair_mut(0)
+            .channel_mut_by_koid(process.handles().get(left).unwrap().koid)
             .unwrap()
             .read(ChannelEnd::Right)
             .unwrap();
@@ -1144,6 +1293,22 @@ mod tests {
         assert_eq!(packet.source, source);
         assert!(packet.signals.contains(Signals::READABLE));
         assert!(packet.signals.contains(Signals::PEER_CLOSED));
+    }
+
+    #[test]
+    fn draining_a_port_releases_its_packet_capacity() {
+        //j825
+        // AX4: a fill/wake burst leaves one packet per source in the port; the capacity is
+        // kernel heap that would otherwise survive the cycle. The drain path must hand it
+        // back rather than keep the high-water mark for the port's life. — TIMBERDOODLE
+        let mut objects = ObjectManager::new();
+        let mut port = Port::new(&mut objects);
+        for source in 0..64 {
+            port.queue_signal(KoId(source), Signals::READABLE);
+        }
+        assert!(port.packets.capacity() >= 64);
+        while port.wait().is_ok() {}
+        assert_eq!(port.packets.capacity(), 0);
     }
 
     #[test]
