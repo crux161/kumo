@@ -1,8 +1,8 @@
-//j831
 //j833
 //j834
 //j835
 //j838
+//j839
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -83,6 +83,9 @@ const TX_BURST_DELAY_NS: u64 = 11_000_000_000;
 /// frames inside one second, separating a time-based transmit wall from a count-based
 /// one (J836: every boot transmitted exactly 11 frames).
 const TX_EXACT_GAP_NS: u64 = 10_000_000;
+/// J839 experiment: ask for the reference TX re-arm every this many completions; the
+/// link tick performs it and records the chip's FIFO word.
+const TX_REARM_EVERY: u32 = 16;
 /// A submitted transfer whose exact completion never arrives must not wedge the proof.
 /// Full-duplex load starves OUT completions for tens of seconds (12.2 s and 32.5 s
 /// measured at seq 623 on metal), so the bound sits far above that before the schedule
@@ -818,6 +821,11 @@ impl NicResident {
         p.completed += 1;
         p.bytes += (len - kumo_ax88::tx::PREFIX_LEN) as u64;
         p.next += 1;
+        // J839 experiment: the request only sets a flag; the work runs in the link
+        // tick's frame, never in proof_tick's (a prior addition overflowed it).
+        if ax88_link::TX_ENABLED && p.next.is_multiple_of(TX_REARM_EVERY) {
+            kumo_ax88::link::request_rearm();
+        }
         if seq >= probe::TX_EXACT && (seq - probe::TX_EXACT + 1).is_multiple_of(256) {
             ax88_record(format_args!(
                 "NET7 tx progress seq={} completed={} ms={}\n",

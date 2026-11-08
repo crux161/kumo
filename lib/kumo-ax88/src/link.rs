@@ -1,6 +1,7 @@
 //j833
 //j834
 //j836
+//j839
 //! NET5b: minimal volatile initialization and link control for the NET0-profiled
 //! AX88179, as pure sequencing over an exact vendor-request port. Every value comes
 //! from the supplied ax88179_178a.c (reset, link_reset, set_rx_mode, unbind), cut to
@@ -174,6 +175,14 @@ impl LinkConfig {
 /// medium, and receive off before the unbind() park.
 pub const RX_RESET: (&str, Write) = ("rx-reset", Write::word(MacRegister::RxControl, 0, 0xffff));
 pub const RECEIVE_OFF: (&str, Write) = ("park-medium", Write::word(MacRegister::Medium, 0, 0xffff));
+
+/// J839 experiment: request the reference link_reset()'s TX re-arm from outside the
+/// proof tick (which has no room for new frames); the next receive-goal tick runs it.
+static REARM_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn request_rearm() {
+    REARM_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkConfig {
@@ -409,6 +418,10 @@ impl Link {
 
     /// One paced step. Returns whether another tick is wanted.
     pub fn tick<P: Port>(&mut self, port: &mut P, status: StatusView) -> bool {
+        if self.rearm_if_pending(port).is_err() {
+            self.phase = Phase::Failed;
+            return false;
+        }
         let now = port.now_ns();
         let _ = match self.phase {
             Phase::Start => self.start(port, now),
@@ -723,6 +736,28 @@ impl Link {
             return Ok(());
         }
         self.write(port, "medium-link", config.medium)
+    }
+
+    /// Runs a pending TX re-arm on the tick's own frame: RX_CTL 0000 then
+    /// START|AB|IPE and one 0x81/0x8c FIFO read, recorded for the peer capture.
+    fn rearm_if_pending<P: Port>(&mut self, port: &mut P) -> Step {
+        if !self.receiving || !REARM_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let on = Request::mac_write(
+            MacRegister::RxControl,
+            &(RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes(),
+        )
+        .map_err(|_| Stop)?;
+        let off = Request::mac_write(MacRegister::RxControl, &[0x00, 0x00]).map_err(|_| Stop)?;
+        self.transfer(port, &off)?;
+        self.transfer(port, &on)?;
+        let fifo = self.transfer(port, &Request::fifo_status())?;
+        port.record(format_args!(
+            "NET7 tx rearm fifo={:#010x}\n",
+            u32::from_le_bytes([fifo[0], fifo[1], fifo[2], fifo[3]])
+        ));
+        Ok(())
     }
 
     fn park<P: Port>(&mut self, port: &mut P) -> Step {

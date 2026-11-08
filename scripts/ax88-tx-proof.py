@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j835
 #j836
+#j839
 """NET7a: check a KUMO full-duplex TX proof against the peer's own packet capture.
 
 The RX half is NET6's check (same sender, same manifest). Every frame KUMO handed to
@@ -68,6 +69,7 @@ def tx_check(text, captured, node_hint=None):
             progress = re.fullmatch(r"NET7 tx progress seq=(\d+) completed=(\d+) ms=(\d+)", l)
             slow = re.fullmatch(r"NET7 tx slow seq=(\d+) ms=(\d+)", l)
             fifo = re.fullmatch(r"NET7 tx fifo seq=(\d+) pending_ms=(\d+) value=(0x[0-9a-f]{8})", l)
+            rearm = re.fullmatch(r"NET7 tx rearm fifo=(0x[0-9a-f]{8})", l)
             if progress:
                 require(int(progress[1]) < EXACT + BURST and int(progress[2]) == int(progress[1]) + 1, f"tx progress {l!r}")
                 require(int(progress[1]) > last_progress, f"tx progress out of order {l!r}")
@@ -76,6 +78,8 @@ def tx_check(text, captured, node_hint=None):
                 require(int(slow[1]) < EXACT + BURST and int(slow[2]) >= 1000, f"tx slow {l!r}")
             elif fifo:
                 require(int(fifo[1]) < EXACT + BURST and int(fifo[2]) >= 1000, f"tx fifo {l!r}")
+            elif rearm:
+                pass
             else:
                 require(l.startswith(("NET7 tx node=", "NET7 tx summary ")), f"unknown NET7 record {l!r}")
     require(sorted(exact) == list(range(EXACT)), "exact TX phase incomplete")

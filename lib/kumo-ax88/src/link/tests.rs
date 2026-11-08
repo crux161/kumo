@@ -1,6 +1,7 @@
 //j833
 //j834
 //j836
+//j839
 extern crate std;
 use super::*;
 use std::string::{String, ToString};
@@ -268,6 +269,33 @@ fn initialization_is_this_literal_request_trace() {
         .chip
         .has("NET5b write step=phy-release reg=0x26 value=2000 readback=2080"));
     assert!(bench.chip.has("NET5b init PASS reads=22 writes=7"));
+}
+
+#[test]
+fn a_requested_rearm_runs_on_the_next_tick_and_records_the_fifo_word() {
+    let mut bench = Bench::receive(Some(GIGA), Some(TICK / 2));
+    bench.settle(true);
+    assert!(bench.link.receiving());
+    let before = bench.chip.trace.len();
+    request_rearm();
+    bench.tick();
+    let on = (RX_CTL_START | RX_CTL_AB | RX_CTL_IPE).to_le_bytes();
+    let trace: Vec<_> = bench.chip.trace[before..]
+        .iter()
+        .map(|(s, o, _)| (*s, o.clone()))
+        .collect();
+    // The same tick's own phase steps follow the re-arm; only its first three
+    // exchanges are the re-arm's.
+    assert_eq!(
+        &trace[..3],
+        &[
+            (setup(0x40, 1, 0x0b, 2, 2), std::vec![0, 0]),
+            (setup(0x40, 1, 0x0b, 2, 2), on.to_vec()),
+            (setup(0xc0, 0x81, 0x8c, 0, 4), Vec::new()),
+        ][..]
+    );
+    assert!(bench.chip.has("NET7 tx rearm fifo=0x00000000"));
+    assert_eq!(&bench.chip.mac[0x0b][..2], &on);
 }
 
 #[test]
