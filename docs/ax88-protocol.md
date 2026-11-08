@@ -1,5 +1,6 @@
 # ax88 protocol codec
 <!-- j826 -->
+<!-- j833 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -67,8 +68,9 @@ readback and software-offload setting before RX/TX is enabled.
 
 ## RX aggregate
 
-The enabled RX mode must provide the two-byte IP-alignment pseudo header. NET5b must
-establish and read back that mode. The aggregate is:
+The enabled RX mode must provide the two-byte IP-alignment pseudo header. NET5b
+(J833) sets and reads back RX control 0288 with IPE; see [the link proof](ax88-link.md).
+The aggregate is:
 
 ```text
 [wire packet, padding to 8 bytes] ...

@@ -1,4 +1,5 @@
 //j827
+//j833
 //! Bounded exact-length EP0 data transfers. Stateless requests; one pipe owns one
 //! outstanding transfer. A failed pipe has no reset/reuse API: the controller owner
 //! retains its ring and buffer until separately proved quiescent. — TIMBERDOODLE
@@ -183,6 +184,13 @@ impl ControlPipe {
         });
         Ok(())
     }
+    /// Whether the budget has run out, without failing the pipe. The owner judges
+    /// expiry only after draining its completions once more: a starved owner can find
+    /// a finished transfer late (NET5b metal), and the deadline bounds waiting, not
+    /// finished work. — TIMBERDOODLE
+    pub fn expired(&self, now_ns: u64) -> bool {
+        self.pending.is_some_and(|p| now_ns >= p.end_ns)
+    }
     pub fn check_deadline(&mut self, now_ns: u64) -> Result<(), ControlError> {
         if self.quarantined {
             return Err(ControlError::Quarantined);
@@ -192,13 +200,16 @@ impl ControlPipe {
         }
         Ok(())
     }
+    /// An event delivered before the owner fails the pipe counts even past the
+    /// deadline; once `check_deadline` has failed it, everything is quarantined.
     pub fn observe(
         &mut self,
         event: Event,
-        now_ns: u64,
         ring: &mut TransferRing,
     ) -> Result<ControlProgress, ControlError> {
-        self.check_deadline(now_ns)?;
+        if self.quarantined {
+            return Err(ControlError::Quarantined);
+        }
         let Some(mut p) = self.pending else {
             return self.fail(ControlError::NoPending);
         };

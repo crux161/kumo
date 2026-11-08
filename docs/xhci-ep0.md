@@ -1,6 +1,7 @@
 # Exact EP0 data transfers
 <!-- j827 -->
 <!-- j828 -->
+<!-- j833 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -38,6 +39,16 @@ to their owner. The driver reserves stash capacity before popping an event and
 aborts its pipe if retention is full. The live poll has a 200 ms deadline and a hard
 iteration ceiling with cooperative yields. A deadline is a refusal to wait longer,
 never a DMA-release proof. There is no unquarantine API in this slice.
+
+J833 (NET5b metal) corrected when the deadline is judged. The wait loop checked the
+clock before looking for the completion, and `observe` re-checked it. A drv-xhci
+starved for over 200 ms during the boot-time HDMI re-lock therefore failed a PHY read
+that had completed; the late event then arrived as a quarantine fault. The deadline
+bounds waiting, not finished work. `ControlPipe::expired` reports an exhausted budget
+without failing the pipe, and the owner drains the whole event ring first. Only if
+that drain delivers nothing for the receipt does `check_deadline` quarantine. An
+event delivered before that point counts, even past the clock; after it, everything
+stays quarantined as before. — TIMBERDOODLE
 
 NET4b replaces the slot-only stash and legacy pollers with endpoint/token/generation
 receipts and bounded serial actors; see [completion ownership](xhci-completions.md).

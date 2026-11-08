@@ -1,5 +1,6 @@
 # ax88 read-only identity proof
 <!-- j832 -->
+<!-- j833 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -79,7 +80,7 @@ its IDs are zero; no cable-down/speed
 claim is made. The locally administered node MAC is the currently observed RAM
 address, not a factory/EEPROM identity or a promised persistent address.
 
-NET5b follows with a separately documented volatile initialization sequence and
-readbacks. PHY readiness, link up/down, RX/TX, packets, confinement and portability
+NET5b (J833) follows with the separately documented volatile initialization
+sequence and readbacks in [the link proof](ax88-link.md). PHY readiness, link up/down, RX/TX, packets, confinement and portability
 to another host remain later gates. Ordinary images keep the existing inventory
 and leave the adapter unconfigured. — TIMBERDOODLE 2026-11-07

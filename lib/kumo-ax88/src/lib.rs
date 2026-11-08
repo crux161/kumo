@@ -3,6 +3,7 @@
 //j826
 //j831
 //j832
+//j833
 //! Allocation-free ax88 (AX88179/AX88178A) wire codecs. No USB transport or hardware
 //! access. A successful parse validates the entire aggregate before yielding any frame.
 //! Wire facts: supplied resources/net/ax88179_178a.c; see docs/ax88-protocol.md.
@@ -10,6 +11,7 @@
 pub mod control;
 pub mod identity;
 pub mod inventory;
+pub mod link;
 pub mod profile;
 pub mod rx;
 pub mod status;

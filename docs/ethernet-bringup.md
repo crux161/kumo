@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j827 -->
 <!-- j828 -->
 <!-- j830 -->
 <!-- j831 -->
 <!-- j832 -->
+<!-- j833 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a read-only identity closed J832; NET5b volatile initialization is next.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a read-only identity closed J832; NET5b volatile initialization and cable up/down closed J833. NET6 passive RX is next.
 
 ## First controller
 
@@ -440,4 +440,29 @@ over the older mutating EP0/resident proof flags. Ordinary images omit the probe
 The observed node address is locally administered, not an attestation of a factory
 MAC. Zero PHY IDs are unavailable status, not a cable-down result. NET5b must
 establish the volatile PHY/clock/queue state before physical RX/TX proofs.
+— TIMBERDOODLE 2026-11-07
+
+
+## NET5b volatile initialization and link control (J833)
+
+`KUMO_AX88_LINK_PROOF=1` runs `kumo-ax88::link` on the resident owner's EP0. It
+releases PHY reset, waits 500 ms, enables clocks and waits 200 ms, then reads a
+page-zero PHY identity. It turns checksum offload off and leaves MAC receive off,
+and starts unicast+broadcast RX mode with the two-byte IP header alignment. On every
+link up it programs the reference queue and speed/duplex medium. Each write is read
+back. Each link change is cross-checked against the interrupt endpoint and an
+independent autonegotiation resolution. At the end it parks the chip as `unbind()`
+does. It writes nothing to the PHY and nothing to EEPROM/eFuse, transmits nothing,
+and receives no frames. [The link proof](ax88-link.md) records every value and wait,
+and what was left out.
+
+On metal (keyboard + ax88, LAN switch peer), all 16 writes read back exactly. The
+PHY (ID 001cc915) linked 3.0 s after release at 1000/full, the resolved mode. CRUX
+completed two physical unplug/replug cycles; all five transitions were confirmed by
+the status endpoint within 197 ms. The census stayed flat with 0 faults and 0 RX
+completions, and a physical keyboard echo passed. The first boot exposed an EP0
+deadline judged before draining completions; J833 fixes it
+([Exact EP0 data transfers](xhci-ep0.md)). The display's D1d holder-death check
+failed during both corrected proof boots and remains an open observation. The
+switch's own port reading, frames, pause/EEE and a second host are unclaimed.
 — TIMBERDOODLE 2026-11-07

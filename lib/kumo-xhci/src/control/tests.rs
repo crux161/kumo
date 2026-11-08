@@ -1,4 +1,5 @@
 //j827
+//j833
 use super::*;
 
 fn request(direction_in: bool, len: u16, payload: &[u8]) -> Result<ControlData<'_>, ControlError> {
@@ -154,7 +155,7 @@ fn data_then_status_is_the_only_success_and_reclaim_point() {
     let before = memory;
     assert_eq!(ring.queued(), 3);
     assert_eq!(
-        pipe.observe(event(0x4010, 1, 0), 101, &mut ring),
+        pipe.observe(event(0x4010, 1, 0), &mut ring),
         Ok(ControlProgress::Waiting)
     );
     assert_eq!(ring.queued(), 3);
@@ -170,7 +171,7 @@ fn data_then_status_is_the_only_success_and_reclaim_point() {
     );
     assert_eq!(memory, before);
     assert_eq!(
-        pipe.observe(event(0x4020, 1, 0), 103, &mut ring),
+        pipe.observe(event(0x4020, 1, 0), &mut ring),
         Ok(ControlProgress::Complete(1))
     );
     assert_eq!(ring.queued(), 0);
@@ -201,18 +202,18 @@ fn foreign_slot_endpoint_or_nontransfer_keeps_ownership_with_its_caller() {
         },
     ] {
         assert_eq!(
-            pipe.observe(e, 101, &mut ring),
+            pipe.observe(e, &mut ring),
             Ok(ControlProgress::Unrelated(e))
         );
         assert_eq!(ring.queued(), 3);
         assert!(!pipe.is_quarantined());
     }
     assert_eq!(
-        pipe.observe(event(0x4010, 1, 0), 102, &mut ring),
+        pipe.observe(event(0x4010, 1, 0), &mut ring),
         Ok(ControlProgress::Waiting)
     );
     assert_eq!(
-        pipe.observe(event(0x4020, 1, 0), 103, &mut ring),
+        pipe.observe(event(0x4020, 1, 0), &mut ring),
         Ok(ControlProgress::Complete(1))
     );
 }
@@ -226,7 +227,7 @@ fn stall_error_short_bad_residue_unknown_pointer_and_reordered_events_quarantine
             }
             let (mut pipe, mut ring, mut memory) = active();
             assert_eq!(
-                pipe.observe(event(token, cc, 0), 101, &mut ring),
+                pipe.observe(event(token, cc, 0), &mut ring),
                 Err(ControlError::Completion(cc))
             );
             assert!(pipe.is_quarantined());
@@ -247,7 +248,7 @@ fn stall_error_short_bad_residue_unknown_pointer_and_reordered_events_quarantine
         for token in [0x4010, 0x4020] {
             let (mut pipe, mut ring, _) = active();
             assert_eq!(
-                pipe.observe(event(token, 1, residue), 101, &mut ring),
+                pipe.observe(event(token, 1, residue), &mut ring),
                 Err(ControlError::Residual(residue))
             );
             assert_eq!(ring.queued(), 3);
@@ -260,30 +261,30 @@ fn stall_error_short_bad_residue_unknown_pointer_and_reordered_events_quarantine
         (0x4030, ControlError::Unexpected),
     ] {
         let (mut pipe, mut ring, _) = active();
-        assert_eq!(pipe.observe(event(token, 1, 0), 101, &mut ring), Err(error));
+        assert_eq!(pipe.observe(event(token, 1, 0), &mut ring), Err(error));
         assert!(pipe.is_quarantined());
         assert_eq!(ring.queued(), 3);
     }
     let (mut pipe, mut ring, _) = active();
-    pipe.observe(event(0x4010, 1, 0), 101, &mut ring).unwrap();
+    pipe.observe(event(0x4010, 1, 0), &mut ring).unwrap();
     assert_eq!(
-        pipe.observe(event(0x4010, 1, 0), 102, &mut ring),
+        pipe.observe(event(0x4010, 1, 0), &mut ring),
         Err(ControlError::Order)
     );
     assert_eq!(ring.queued(), 3);
 }
 
 #[test]
-fn deadline_before_or_after_data_retains_dma_and_rejects_late_completion() {
+fn owner_judged_deadline_retains_dma_but_a_completion_found_first_counts() {
     for have_data in [false, true] {
         let (mut pipe, mut ring, mut memory) = active();
         if have_data {
-            pipe.observe(event(0x4010, 1, 0), 101, &mut ring).unwrap();
+            pipe.observe(event(0x4010, 1, 0), &mut ring).unwrap();
         }
         assert_eq!(pipe.check_deadline(1099), Ok(()));
         assert_eq!(pipe.check_deadline(1100), Err(ControlError::Timeout));
         assert_eq!(
-            pipe.observe(event(0x4020, 1, 0), 1101, &mut ring),
+            pipe.observe(event(0x4020, 1, 0), &mut ring),
             Err(ControlError::Quarantined)
         );
         assert_eq!(ring.queued(), 3);
@@ -298,12 +299,20 @@ fn deadline_before_or_after_data_retains_dma_and_rejects_late_completion() {
             Err(ControlError::Quarantined)
         );
     }
+    // Found after the deadline but before the owner judged expiry: the transfer
+    // finished, so it counts. The deadline bounds waiting, not finished work.
     let (mut pipe, mut ring, _) = active();
+    assert!(!pipe.expired(1099) && pipe.expired(1100));
     assert_eq!(
-        pipe.observe(event(0x4010, 1, 0), 1100, &mut ring),
-        Err(ControlError::Timeout)
+        pipe.observe(event(0x4010, 1, 0), &mut ring),
+        Ok(ControlProgress::Waiting)
     );
-    assert_eq!(ring.queued(), 3);
+    assert_eq!(
+        pipe.observe(event(0x4020, 1, 0), &mut ring),
+        Ok(ControlProgress::Complete(1))
+    );
+    assert_eq!(ring.queued(), 0);
+    assert!(pipe.is_idle() && !pipe.expired(u64::MAX));
 }
 
 #[test]
@@ -319,11 +328,11 @@ fn repeated_in_out_transfers_wrap_ring_without_leaking_entries_or_payloads() {
         pipe.submit(&req, &mut ring, &mut memory, 0, 10).unwrap();
         let p = pipe.pending.unwrap();
         assert_eq!(
-            pipe.observe(event(p.tokens[1], 1, 0), 1, &mut ring),
+            pipe.observe(event(p.tokens[1], 1, 0), &mut ring),
             Ok(ControlProgress::Waiting)
         );
         assert_eq!(
-            pipe.observe(event(p.tokens[2], 1, 0), 2, &mut ring),
+            pipe.observe(event(p.tokens[2], 1, 0), &mut ring),
             Ok(ControlProgress::Complete(2))
         );
         assert_eq!(ring.queued(), 0);

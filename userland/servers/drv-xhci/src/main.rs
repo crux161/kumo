@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-//j828
 //j829
 //j830
 //j831
 //j832
+//j833
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 mod ax88_identity;
+mod ax88_link;
 mod resident_nic;
 
 use drv_blk::{
@@ -4811,7 +4812,7 @@ fn enumerate_hub_downstream(
             if ax88_identity::ENABLED {
                 return None;
             }
-            // NET4c-3: proof images keep the adapter for the resident loop.
+            // NET4c-3/NET5b: proof images keep the adapter for the resident loop.
             return resident_nic::handoff(
                 dev_slot,
                 dev_va,
@@ -5311,11 +5312,23 @@ fn control_data_exact(
     ring_slot_doorbell(io, layout, slot_id, 1);
     let result = (|| {
         for spin in 0..EVENT_POLL_LIMIT {
-            if spin % YIELD_INTERVAL == 0 {
-                pipe.check_deadline(clock_get())?;
+            // J833: the deadline bounds waiting, not finished work. A starved owner can
+            // find a completed transfer late (NET5b metal, during the HDMI re-lock), so
+            // expiry fails the pipe only after a full event-ring drain still delivers
+            // nothing for this receipt. — TIMBERDOODLE
+            if spin % YIELD_INTERVAL == 0 && pipe.expired(clock_get()) {
+                for _ in 0..=RING_TRBS {
+                    dsb();
+                    if pump_event(io, layout, image, evt).is_none() {
+                        break;
+                    }
+                }
+                if !completion_actors().has_ready(ticket).unwrap_or(false) {
+                    pipe.check_deadline(clock_get())?;
+                }
             }
             match completion_actors().take(ticket) {
-                Ok(Some(event)) => match pipe.observe(event.event(), clock_get(), ep0_ring)? {
+                Ok(Some(event)) => match pipe.observe(event.event(), ep0_ring)? {
                     ControlProgress::Complete(length) => {
                         completion_actors()
                             .finish(ticket)

@@ -1,4 +1,5 @@
 //j831
+//j833
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -9,23 +10,28 @@
 //! beside HID and are never waited on. A cycle ends them through NET4c-2's verified
 //! stop, deconfigures the endpoints, reads Disabled back, and only then rewrites the
 //! rings, before configuring and arming again. `drv_xhci::nic::NicLifecycle` enforces
-//! that order; a refused or failed step retains everything. The chip is not
-//! initialized (NET5b), so RX is expected to stay pending; no frame is transmitted.
-//! Recovery class: stateless; the custody parent holds the DMA. — TIMBERDOODLE
+//! that order; a refused or failed step retains everything. Without NET5b the chip
+//! is not initialized, so RX is expected to stay pending; no frame is transmitted.
+//! KUMO_AX88_LINK_PROOF (NET5b) reuses these lanes and the proof tick to pace
+//! `kumo_ax88::link` on this owner's EP0 instead of the cycling timeline; MAC
+//! receive stays off there too. Recovery class: stateless; the custody parent holds
+//! the DMA. — TIMBERDOODLE
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use drv_xhci::nic::{completed_length, NicLane, NicLifecycle, NicPhase};
 use kumo_abi::{Handle, VmarFlags};
+use kumo_ax88::link::{Link, StatusView};
 use kumo_ax88::profile::{Profile, Speed};
 use kumo_rt::{clock_get, vmar_map};
 use kumo_xhci::{
-    boundary_window, endpoint_context_index, CompletionStats, ContextSize, DmaBuf, DmaTrbs,
-    EndpointContext, EndpointSnapshot, EndpointState, InputControlContext, NoOpCommandImage,
-    NormalTransfer, RegisterLayout, RouteError, RoutedTransfer, SlotSnapshot, SlotState,
-    TransferRing, TransferTicket, Trb,
+    boundary_window, endpoint_context_index, CompletionStats, ContextSize, ControlPipe, DmaBuf,
+    DmaTrbs, EndpointContext, EndpointSnapshot, EndpointState, InputControlContext,
+    NoOpCommandImage, NormalTransfer, RegisterLayout, RouteError, RoutedTransfer, SlotSnapshot,
+    SlotState, TransferRing, TransferTicket, Trb,
 };
 
+use super::ax88_link::{self, Ep0Port};
 use super::{
     ax88_record, completion_actors, control_in, control_no_data, create_custodied_dma, dsb,
     endpoint_context_va, enqueue_reserved, quarantine_transfer, quiesce_endpoint, read_ctx_word,
@@ -34,7 +40,8 @@ use super::{
     OFF_EP0_RING, OFF_INPUT_CTX, OFF_OUTPUT_CTX,
 };
 
-pub(super) const ENABLED: bool = flag(option_env!("KUMO_AX88_RESIDENT_PROOF"));
+pub(super) const ENABLED: bool =
+    flag(option_env!("KUMO_AX88_RESIDENT_PROOF")) || ax88_link::ENABLED;
 
 const fn flag(value: Option<&str>) -> bool {
     match value {
@@ -179,6 +186,8 @@ pub(super) struct NicResident {
     status: Lane,
     life: NicLifecycle,
     link: Option<bool>,
+    /// When the status lane's link bit last changed (NET5b's agreement check).
+    status_changed_ns: u64,
     status_reports: u32,
     rx_completions: u32,
     rx_frames: u32,
@@ -187,6 +196,9 @@ pub(super) struct NicResident {
     /// two CLEAR_FEATURE(ENDPOINT_HALT) requests.
     last_start_ns: (u64, u64),
     proof: Proof,
+    /// NET5b: the exact vendor-request pipe and the pure link sequence it carries.
+    pipe: ControlPipe,
+    link_proof: Link,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -316,6 +328,7 @@ impl NicResident {
             ));
             return None;
         }
+        let pipe = ControlPipe::new(dev.slot_id).ok()?;
         ax88_record(format_args!(
             "NET4c3 nic ready controller={:#x} slot={} config={} rx=dci{}@{:#x}/{} status=dci{}@{:#x} rings={:#x} backing={:#x} custody={}\n",
             controller,
@@ -336,12 +349,15 @@ impl NicResident {
             status,
             life: NicLifecycle::new(),
             link: None,
+            status_changed_ns: 0,
             status_reports: 0,
             rx_completions: 0,
             rx_frames: 0,
             hid_idle_cc,
             last_start_ns: (0, 0),
             proof: Proof::default(),
+            pipe,
+            link_proof: Link::new(),
         })
     }
 
@@ -578,6 +594,7 @@ impl NicResident {
                 if let Ok(status) = kumo_ax88::status::InterruptStatus::parse(&bytes[..actual]) {
                     if self.link != Some(status.link_up()) {
                         self.link = Some(status.link_up());
+                        self.status_changed_ns = clock_get();
                         ax88_record(format_args!(
                             "NET4c3 nic status link={} words={:#010x}/{:#010x}\n",
                             status.link_up() as u8,
@@ -803,6 +820,9 @@ impl NicResident {
         cmd: &mut DmaTrbs,
         evt: &DmaTrbs,
     ) -> bool {
+        if ax88_link::ENABLED {
+            return self.link_tick(io, layout, image, evt);
+        }
         let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
         let now = clock_get();
         let late = now.saturating_sub(self.proof.due_ns);
@@ -975,6 +995,125 @@ impl NicResident {
             p.max_cycle_ns / 1_000,
             self.life.is_pending(NicLane::Rx) as u8,
             self.life.is_pending(NicLane::Status) as u8
+        ));
+    }
+
+    /// NET5b: one paced step of the pure link sequence on this owner's exact EP0 pipe.
+    /// The NET4c-3 cycling timeline does not run in this mode; both lanes stay armed.
+    fn link_tick(
+        &mut self,
+        io: &mut Mmio,
+        layout: RegisterLayout,
+        image: &mut NoOpCommandImage,
+        evt: &DmaTrbs,
+    ) -> bool {
+        let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
+        let now = clock_get();
+        self.proof.tick += 1;
+        if self.proof.tick == 1 {
+            self.proof.custody = DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed);
+            self.proof.lanes = completion_actors().occupied();
+            self.proof.before = Some(completion_actors().stats());
+            self.proof.hid_start = HID_REPORTS.load(Ordering::Relaxed);
+            ax88_record(format_args!(
+                "NET5b resident controller={:#x} slot={} tick_ms={} hid_idle_cc={:?} lanes={} custody={}\n",
+                controller,
+                self.dev.slot_id,
+                TICK_NS / 1_000_000,
+                self.hid_idle_cc,
+                self.proof.lanes,
+                self.proof.custody
+            ));
+            self.open_window(now);
+        } else {
+            let late = now.saturating_sub(self.proof.due_ns);
+            self.proof.window.late_max_ns = self.proof.window.late_max_ns.max(late);
+        }
+        let status = StatusView {
+            reports: self.status_reports,
+            link: self.link,
+            changed_ns: self.status_changed_ns,
+        };
+        let segment = self.ep0();
+        // SAFETY: the adapter's own page holds its EP0 data buffer for the driver's lifetime.
+        let buffer = unsafe {
+            DmaBuf::new(
+                (self.dev.page_va as usize + OFF_DATA) as *mut u8,
+                self.dev.page_phys + OFF_DATA as u64,
+                8,
+            )
+        };
+        let mut port = Ep0Port {
+            io: &mut *io,
+            layout,
+            image: &mut *image,
+            evt,
+            ring: &mut self.dev.ep0_ring,
+            segment,
+            slot: self.dev.slot_id,
+            pipe: &mut self.pipe,
+            buffer,
+        };
+        let more = self.link_proof.tick(&mut port, status);
+        if !more {
+            self.proof.done = true;
+            self.link_finish(controller);
+        }
+        more
+    }
+
+    fn link_finish(&mut self, controller: u64) {
+        let p = self.proof;
+        let w = p.window;
+        let after = completion_actors().stats();
+        let before = p.before.unwrap_or(after);
+        let hid = HID_REPORTS
+            .load(Ordering::Relaxed)
+            .wrapping_sub(p.hid_start);
+        ax88_record(format_args!(
+            "NET5b service controller={:#x} ticks={} ms={} hid_reports={} hid_max_gap_ms={} busy_max_us={} tick_late_max_ms={} status_reports={} rx_completions={}\n",
+            controller,
+            p.tick,
+            clock_get().saturating_sub(w.start_ns) / 1_000_000,
+            hid,
+            HID_MAX_GAP_NS.load(Ordering::Relaxed) / 1_000_000,
+            w.busy_max_ns / 1_000,
+            w.late_max_ns / 1_000_000,
+            self.status_reports,
+            self.rx_completions
+        ));
+        let lanes = completion_actors().occupied();
+        let custody = DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed);
+        let ep0_queued = self.dev.ep0_ring.queued();
+        let faults = after.faults - before.faults;
+        // MAC receive stayed off, so any RX completion is a finding, not traffic.
+        let pass = self.link_proof.outcome() == Some(true)
+            && faults == 0
+            && self.rx_completions == 0
+            && ep0_queued == 0
+            && !self.pipe.is_quarantined()
+            && lanes == p.lanes
+            && custody == p.custody
+            && self.life.is_pending(NicLane::Rx)
+            && self.life.is_pending(NicLane::Status)
+            && (self.hid_idle_cc != Some(1) || hid > 0);
+        ax88_record(format_args!(
+            "NET5b census controller={:#x} slot={} registered={} routed={} consumed={} retired={} faults={} ep0_queued={} lanes={}/{} custody={}/{} rx_pending={} status_pending={} {}\n",
+            controller,
+            self.dev.slot_id,
+            after.registered - before.registered,
+            after.routed - before.routed,
+            after.consumed - before.consumed,
+            after.retired - before.retired,
+            faults,
+            ep0_queued,
+            p.lanes,
+            lanes,
+            p.custody,
+            custody,
+            self.life.is_pending(NicLane::Rx) as u8,
+            self.life.is_pending(NicLane::Status) as u8,
+            if pass { "PASS" } else { "FAIL" }
         ));
     }
 
