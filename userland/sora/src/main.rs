@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-//j820
 //j822
 //j824
 //j825
 //j829
+//j837
 
 extern crate alloc;
 
@@ -2975,9 +2975,32 @@ impl DisplayBroker {
             return None;
         }
         let process = process?;
+        // Sora's shared-thread read releases a park on an unrelated wake and returns
+        // empty, so one read is not a wait: under the resident ax88 load the holder's
+        // ack arrived after a spurious release and the check killed a still-starting
+        // child (J837).  Wait in bounded re-parks: each empty read parks again until
+        // the child's write, its death, or the bounds end the wait.
+        const ACK_WAIT_NS: u64 = 2_000_000_000;
+        const ACK_SPINS: u32 = 4096;
+        let deadline = kumo_rt::clock_get().saturating_add(ACK_WAIT_NS);
         let mut ack = [0u8; 1];
-        let n = channel_read(send, ack.as_mut_ptr(), 1);
-        if n != 1 || ack[0] != b'H' || handle_koid(ctx) != u64::MAX {
+        let mut n = 0;
+        for _ in 0..ACK_SPINS {
+            n = channel_read(send, ack.as_mut_ptr(), 1);
+            if n == 1 || kumo_rt::clock_get() >= deadline {
+                break;
+            }
+        }
+        let consumed = n == 1 && ack[0] == b'H' && {
+            // The transferred context lands in the child at its read; allow the same
+            // bounded retry for the sender-side handle to read dead.  — TIMBERDOODLE
+            let mut spins = 0;
+            while handle_koid(ctx) != u64::MAX && spins < ACK_SPINS {
+                spins += 1;
+            }
+            handle_koid(ctx) == u64::MAX
+        };
+        if !consumed {
             let _ = process_kill(process);
             return None;
         }

@@ -1,8 +1,8 @@
-//j639
 //j683
 //j685
 //j686
 //j790
+//j837
 
 //! R1 live adapter: read-only VOP2/TX diagnostic mappings and checked VOP writes through
 //! Resource WRITE authority (DESIGN/022 D1d-a). The kernel protects all VOP/MMU pages. It
@@ -1613,6 +1613,19 @@ fn fault_probes(pending: &mut Pending, device: &mut Device) -> bool {
 
 /// An actual final context holder dies while the owned front is active. Sora retains
 /// only the recovery recipe; this process loses MAP authority during the handoff. — KESTREL
+/// Restore the GOP console scanout before any failure return: a failed recovery must
+/// never leave VP2 scanning a diagnostic buffer with the present gate closed, which is
+/// the J837 video cut-out. — TIMBERDOODLE
+fn recover_fail(pending: &mut Pending, device: &mut Device) -> bool {
+    let (gop, _) = scanout::target_scanout(&pending.program);
+    scanout::flip(device, gop);
+    let _ = scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS);
+    error(format_args!(
+        "display: D1d recovery failed; GOP console re-latched for the fail-safe\n"
+    ));
+    false
+}
+
 fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
     if pending.vblank.control.0 == 0 {
         return false;
@@ -1629,13 +1642,13 @@ fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
         kumo_abi::Rights::READ,
     ) != 0
     {
-        return false;
+        return recover_fail(pending, device);
     }
     scanout::flip(device, 0x60000000);
     if scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS).is_none()
         || !scanout::on_glass(device, 0x60000000)
     {
-        return false;
+        return recover_fail(pending, device);
     }
     let sent = kumo_rt::channel_write_with_handle(
         pending.vblank.control,
@@ -1644,7 +1657,7 @@ fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
         pending.vblank.context,
     );
     if sent != 0 {
-        return false;
+        return recover_fail(pending, device);
     }
     let denied = kumo_rt::device_register_write(
         pending.vop.0,
@@ -1653,7 +1666,7 @@ fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
         scanout::COMMIT_VP2,
     ) == kumo_abi::Errno::BadState.status();
     if !denied {
-        return false;
+        return recover_fail(pending, device);
     }
     log(format_args!(
         "display: D1d live owned front handed to sole holder; stale checked VOP write denied\n"
@@ -1661,7 +1674,7 @@ fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
     let mut reply = [0u8; 1];
     let (n, ctx) = kumo_rt::channel_read_with_handle(pending.vblank.control, reply.as_mut_ptr(), 1);
     if n != 1 || reply[0] != b'R' || ctx == 0 {
-        return false;
+        return recover_fail(pending, device);
     }
     pending.vblank.context = Handle(ctx as u32);
     let mut info = kumo_abi::sys::DeviceCtxInfo {
@@ -1672,13 +1685,13 @@ fn holder_death_recovery(pending: &mut Pending, device: &mut Device) -> bool {
         || info.fault_record
             != kumo_abi::sys::device_ctx_state::RECORD | kumo_abi::sys::device_ctx_state::LIVE
     {
-        return false;
+        return recover_fail(pending, device);
     }
     scanout::flip(device, gop);
     if scanout::wait_latched(device, kumo_rt::clock_get, scanout::LATCH_TIMEOUT_NS).is_none()
         || !scanout::on_glass(device, gop)
     {
-        return false;
+        return recover_fail(pending, device);
     }
     log(format_args!("display: D1d holder killed during live DMA; approved GOP-only generation {} recovered and console latched\n",info.fault_addr));
     true
