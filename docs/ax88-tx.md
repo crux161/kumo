@@ -77,5 +77,12 @@ at seq 623 (~490 KB handed over) for 12.2, 32.5, 122.4 and 122.2 s with
 `ep_state=Running`, in one case with no peer traffic in flight; the completion always
 arrived later and was counted. A completion absent for 120 s stops the schedule once
 with the endpoint state, and one delayed over 1 s is recorded as `NET7 tx slow`.
-Whether stalled frames reach the wire is unverified; the peer capture is the delivery
-half and it is still outstanding, so this record proof stops at that gate.
+J840 closed the delivery half: with the reference link_reset TX re-arm (RX_CTL
+0000/0288 plus one 0x81/0x8c read) requested on every completion and run by a
+per-wake pump in the driver's arm_idle, the peer's capture held all 2080 frames
+byte-exact (exact 32/32, burst 2048/2048, 4 boundary frames) and the official
+checker is green. The transfer-624 stall is the USB-side buffer filling, separate
+from delivery; the re-arm needed a 32 KiB drv-xhci stack (PT_GNU_STACK via
+build.rs), because 16 KiB overflowed on proof-path additions three times. Kick
+cadence measured: tick-only 2027/2080, per-wake at 8 completions 2060/2080, at 1
+2080/2080.
