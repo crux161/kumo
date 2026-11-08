@@ -242,7 +242,12 @@ impl Device for FrameDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = MTU;
+        // smoltcp's Ethernet `ip_mtu()` subtracts the 14-byte frame header from this
+        // value, so the device advertises the whole frame: the IP MTU stays MTU and the
+        // largest unfragmented UDP payload is exactly 1472. Advertising the IP MTU here
+        // made smoltcp silently drop every IP packet over 1486 bytes, because the
+        // fragmentation feature is off (found by NET9's zero/maximum datagram test).
+        caps.max_transmission_unit = FRAME_MAX;
         caps
     }
 }
@@ -266,11 +271,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_declare_an_ethernet_medium_at_the_ip_mtu() {
+    fn capabilities_declare_an_ethernet_medium_whose_ip_mtu_is_the_mtu() {
         let device = FrameDevice::new();
         let caps = device.capabilities();
         assert_eq!(caps.medium, Medium::Ethernet);
-        assert_eq!(caps.max_transmission_unit, MTU);
+        assert_eq!(caps.max_transmission_unit, FRAME_MAX);
+        assert_eq!(caps.ip_mtu(), MTU, "smoltcp subtracts the frame header");
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//j815
 //j817
 //j820
 //j843
 //j844
+//j846
 
 extern crate std;
 
@@ -1048,6 +1048,78 @@ fn a_wire_datagram_is_received_and_counted_for_credits() {
         .encode()
     );
     assert_eq!(&got.payload[ADDR_LEN..], b"from the wire");
+}
+
+#[test]
+fn wire_datagrams_of_zero_and_maximum_size_cross_both_ways() {
+    let mut server = Server::new(0);
+    server.attach_wire(0, WIRE_MAC, WIRE_IP, 24);
+    let mut c = Client::open(&mut server);
+    let s = c.udp(&mut server);
+    assert_eq!(c.bind(&mut server, s, WIRE_PORT), WIRE_PORT);
+
+    // Inbound: the zero-length and the maximum unfragmented datagram from the peer.
+    server
+        .push_wire_frame(&udp_frame(PEER_PORT, WIRE_PORT, b""))
+        .unwrap();
+    let big = pattern(UDP_PAYLOAD_MAX, 9);
+    server
+        .push_wire_frame(&udp_frame(PEER_PORT, WIRE_PORT, &big))
+        .unwrap();
+    let mut out = Vec::new();
+    server.poll(MS, &mut out);
+    let zero = c.recvfrom(&mut server, s, UDP_PAYLOAD_MAX as u16);
+    assert_eq!((zero.status, zero.result), (Status::Ok, 0));
+    assert_eq!(
+        &zero.payload[..ADDR_LEN],
+        Addr {
+            ip: PEER_IP,
+            port: PEER_PORT
+        }
+        .encode()
+    );
+    assert_eq!(
+        zero.payload.len(),
+        ADDR_LEN,
+        "an empty datagram is an empty body"
+    );
+    let max = c.recvfrom(&mut server, s, UDP_PAYLOAD_MAX as u16);
+    assert_eq!(
+        (max.status, max.result),
+        (Status::Ok, UDP_PAYLOAD_MAX as u64)
+    );
+    assert_eq!(&max.payload[ADDR_LEN..], big.as_slice());
+
+    // Outbound: one datagram at a time. The first send starts the ARP exchange, and the
+    // neighbour's one-packet queue holds only that first datagram; a send queued before
+    // the reply would be dropped by smoltcp pre-resolution (netprobe's peer mode gives
+    // the first send the same 200 ms beat before its burst).
+    let to = Addr {
+        ip: PEER_IP,
+        port: PEER_PORT,
+    };
+    let mut frame = [0u8; FRAME_MAX];
+    assert_eq!(c.sendto_to(&mut server, s, to, b"").status, Status::Ok);
+    server
+        .take_wire_frame(&mut frame)
+        .expect("an ARP request for the peer");
+    server.push_wire_frame(&arp_reply()).unwrap();
+    server.poll(MS, &mut out);
+    let n = server
+        .take_wire_frame(&mut frame)
+        .expect("the zero-length datagram");
+    let ip = Ipv4Packet::new_checked(&frame[14..n]).expect("ipv4");
+    let udp = UdpPacket::new_checked(ip.payload()).expect("udp");
+    assert_eq!(udp.payload().len(), 0);
+    assert_eq!(c.sendto_to(&mut server, s, to, &big).status, Status::Ok);
+    server.poll(MS, &mut out);
+    let n = server
+        .take_wire_frame(&mut frame)
+        .expect("the maximum datagram");
+    let ip = Ipv4Packet::new_checked(&frame[14..n]).expect("ipv4");
+    let udp = UdpPacket::new_checked(ip.payload()).expect("udp");
+    assert_eq!(udp.payload(), big.as_slice());
+    assert_eq!(n, FRAME_MAX, "the maximum datagram is one whole frame");
 }
 
 #[test]

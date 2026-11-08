@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 //j845
+//j846
 //j843
 //j844
 //j816
@@ -502,6 +503,136 @@ fn ping(client: &mut Client, ip: [u8; 4], count: u16, retries: u32) {
         dec(count as u64).bytes(),
         b" exact",
     ]);
+}
+
+/// NET9's payload contract, shared with the Mac peer script and the pcap checker:
+/// index 0 is the zero-length datagram, index 1 is the maximum unfragmented payload
+/// (1472 bytes: the prefix then zeros), every other index is the prefix plus `i % 16`
+/// fill bytes. `side` is `kumo` or `peer`.
+fn net9_payload(buf: &mut [u8; UDP_PAYLOAD_MAX], side: &[u8], i: u16) -> usize {
+    let index = dec(i as u64);
+    let mut prefix = [0u8; 32];
+    let mut at = 0;
+    for part in [side, &b"-net9-"[..], index.bytes(), &b"-"[..]] {
+        prefix[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    match i {
+        0 => 0,
+        1 => {
+            buf[..at].copy_from_slice(&prefix[..at]);
+            UDP_PAYLOAD_MAX
+        }
+        _ => {
+            let fill = (i % 16) as usize;
+            buf[..at].copy_from_slice(&prefix[..at]);
+            for byte in &mut buf[at..at + fill] {
+                *byte = b'x';
+            }
+            at + fill
+        }
+    }
+}
+
+/// NET9: exchange datagrams with a real peer in both directions. Send `count` numbered
+/// datagrams to `<ip>:<port>`, then receive up to `count` from the peer and echo each one
+/// back byte-exact. The Mac peer script verifies the initiations; the echoes prove the
+/// received direction. Counters print to stdout; the peer script and the capture are the
+/// authority on metal, where stdout is not on the serial console.
+fn peer(client: &mut Client, ip: [u8; 4], port: u16, count: u16, retries: u32) {
+    let count = count.clamp(2, 48);
+    let retries = retries.clamp(1, 6000);
+    let s = client.udp_socket();
+    let local = client.bind_any(s, 0);
+    client.out.line(&[
+        b"netprobe: peer ",
+        dec(local as u64).bytes(),
+        b" <-> ",
+        dec(port as u64).bytes(),
+        b" x",
+        dec(count as u64).bytes(),
+    ]);
+    let mut payload = [0u8; UDP_PAYLOAD_MAX];
+
+    // Initiate: every datagram, retrying until the wire exists.
+    let mut sent = 0u16;
+    'outer: for i in 0..count {
+        let len = net9_payload(&mut payload, b"kumo", i);
+        let mut attempts = 0u32;
+        loop {
+            let status = client.sendto_addr(s, Addr { ip, port }, &payload[..len]);
+            if status == Status::Ok {
+                sent += 1;
+                if i == 0 {
+                    // The first datagram starts the ARP exchange and the neighbour's
+                    // one-packet queue holds only it; give the reply a beat before the
+                    // burst, or the next sends are dropped pre-resolution (smoltcp).
+                    let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (200u64 << 32), &[]);
+                }
+                break;
+            }
+            let retry = status == Status::NetUnreachable || status == Status::WouldBlock;
+            if !retry || attempts >= retries {
+                client.fail(&[b"peer send -> ", status_name(status)]);
+                break 'outer;
+            }
+            attempts += 1;
+            let sleep_ms = if status == Status::WouldBlock {
+                200u64
+            } else {
+                500u64
+            };
+            let _ = client.call(Op::Wait, s, WAIT_CONNECTED as u64 | (sleep_ms << 32), &[]);
+        }
+    }
+
+    // Echo: read up to `count` peer datagrams and send each one back byte-exact.
+    let mut echo_buf = [0u8; UDP_PAYLOAD_MAX];
+    let mut received = 0u16;
+    let mut echoed = 0u16;
+    let mut idle_waits = 0u8;
+    while received < count && idle_waits < 10 {
+        let wait = client.call(Op::Wait, s, WAIT_READABLE as u64 | (2000u64 << 32), &[]);
+        if wait.status != Status::Ok {
+            idle_waits += 1;
+            continue;
+        }
+        let got = client.call(Op::RecvFrom, s, UDP_PAYLOAD_MAX as u64, &[]);
+        let (source, body_len) = {
+            let reply = client.payload(&got);
+            if got.status != Status::Ok || reply.len() < ADDR_LEN {
+                idle_waits += 1;
+                continue;
+            }
+            let source = Addr {
+                ip: [reply[4], reply[5], reply[6], reply[7]],
+                port: u16::from_le_bytes([reply[2], reply[3]]),
+            };
+            let body_len = reply.len() - ADDR_LEN;
+            echo_buf[..body_len].copy_from_slice(&reply[ADDR_LEN..]);
+            (source, body_len)
+        };
+        received += 1;
+        if client.sendto_addr(s, source, &echo_buf[..body_len]) == Status::Ok {
+            echoed += 1;
+        } else {
+            client.fail(&[b"peer echo refused"]);
+        }
+        idle_waits = 0;
+    }
+    client.out.line(&[
+        b"netprobe: peer sent ",
+        dec(sent as u64).bytes(),
+        b"/",
+        dec(count as u64).bytes(),
+        b" received ",
+        dec(received as u64).bytes(),
+        b" echoed ",
+        dec(echoed as u64).bytes(),
+    ]);
+    if sent != count || received != count || echoed != count {
+        client.fail(&[b"peer exchange incomplete"]);
+    }
 }
 
 fn udp(client: &mut Client) {
@@ -1178,7 +1309,7 @@ extern "C" fn main(
     let mode: &[u8] = args.next().unwrap_or(b"");
     // `wire <ip> <port> [count]` and `ping <ip> [count]` take an address where the other
     // modes take a port; ping has no port, so its first number is the count.
-    let wire_ip = if mode == b"wire" || mode == b"ping" {
+    let wire_ip = if mode == b"wire" || mode == b"ping" || mode == b"peer" {
         args.next().and_then(parse_ipv4)
     } else {
         None
@@ -1246,6 +1377,13 @@ extern "C" fn main(
             count.unwrap_or(4),
             retries,
         ),
+        b"peer" if wire_ip.is_some_and(|ip| ip != [0; 4]) && port.is_some_and(|p| p != 0) => peer(
+            &mut client,
+            wire_ip.unwrap_or([0; 4]),
+            port.unwrap_or(0),
+            count.unwrap_or(24),
+            retries,
+        ),
         b"tcpserve" if port.is_some_and(|p| p != 0) => tcp_serve(&mut client, port.unwrap_or(0)),
         b"tcpclient" if port.is_some_and(|p| p != 0) => tcp_client(&mut client, port.unwrap_or(0)),
         b"tcperrors" => tcp_errors(&mut client),
@@ -1253,7 +1391,7 @@ extern "C" fn main(
         b"restartfresh" if port.is_some() => restart_fresh(&mut client, port.unwrap_or(0)),
         _ => {
             client.out.line(&[
-                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries]",
+                b"usage: net netprobe udp|errors|tcperrors | recv|send <port> <1-4> | tcpserve|tcpclient <port> | restartwait | restartfresh <epoch> | wire <ip> <port> [count] | ping <ip> [count] [retries] | peer <ip> <port> [count] [retries]",
             ]);
             process_exit(2);
         }
