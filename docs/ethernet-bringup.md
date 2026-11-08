@@ -1,12 +1,12 @@
 # Ethernet bring-up: ax88 first, one userspace network stack
-<!-- j828 -->
 <!-- j830 -->
 <!-- j831 -->
 <!-- j832 -->
 <!-- j833 -->
+<!-- j834 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
-Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a read-only identity closed J832; NET5b volatile initialization and cable up/down closed J833. NET6 passive RX is next.
+Status: NET0 closed (J809-J811); NET1 accepted (J812); NET2a closed (J813-J814); NET2b closed in QEMU (J815-J816); NET2c closed in QEMU (TCP J817, supervised restart J820); NET3 pure codec landed J826; NET4a exact EP0 IN/OUT proved J827; NET4b completion ownership proved J828. NET4c-1 parent DMA custody closed J829; NET4c-2 verified endpoint quiescence closed J830; NET4c-3 resident ax88 lanes closed J831 on separate keyboard+ax88 and USB-stick+ax88 cold boots. PLAN/021 AX7 first proof, AXH, AX0, AX1, AX2 and AX4 are closed. AX4 discharged the resident-capacity prerequisite for netstack-on-metal work. NET5a read-only identity closed J832; NET5b volatile initialization and cable up/down closed J833; NET6 passive RX closed J834. NET7 TX is next.
 
 ## First controller
 
@@ -465,4 +465,25 @@ deadline judged before draining completions; J833 fixes it
 ([Exact EP0 data transfers](xhci-ep0.md)). The display's D1d holder-death check
 failed during both corrected proof boots and remains an open observation. The
 switch's own port reading, frames, pause/EEE and a second host are unclaimed.
+— TIMBERDOODLE 2026-11-07
+
+
+## NET6 passive receive (J834)
+
+`KUMO_AX88_RX_PROOF=1` reuses NET5b's sequence with a receive goal. On each link up
+it does link_reset()'s RX control toggle and enables MAC receive. A peer on the same
+switch sends numbered UDP broadcasts with `scripts/ax88-rx-proof.py send`; every size
+and byte follows from the sequence number. KUMO verifies every test frame in
+software and logs the 64 slow frames individually. The 4096-frame burst goes into a
+bitmap and digest. The peer's END frame closes the window, and the chip is parked
+with receive off. See [passive receive](ax88-rx.md).
+
+On two separate keyboard+ax88 boots, all 64 exact frames arrived valid. On the
+second, every one matches CRUX's tcpdump of the sender byte for byte, apart from
+macOS's checksum-offload placeholders. The chip strips the FCS and sends no dummy
+metadata. An 83 Mb/s burst was bounded, not corrupted: 286 and 304 of 4096
+frames arrived, each verified against the schedule, with up to 25 frames per
+aggregate. The single 32 KiB RX transfer is the throughput limit. There were no parse
+errors or router faults, the census stayed flat, the keyboard kept reporting and
+NVMe reads passed. TX, unicast/ARP and throughput are later gates.
 — TIMBERDOODLE 2026-11-07

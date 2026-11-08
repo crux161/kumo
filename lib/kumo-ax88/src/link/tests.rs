@@ -1,4 +1,5 @@
 //j833
+//j834
 extern crate std;
 use super::*;
 use std::string::{String, ToString};
@@ -190,6 +191,19 @@ impl Bench {
             self.cable(Some(partner));
             self.settle(true);
         }
+    }
+    fn receive(cable: Option<Partner>, delay: Option<u64>) -> Self {
+        let mut bench = Self::new(cable, delay);
+        bench.link = Link::with_goal(Goal::Receive);
+        bench
+    }
+    fn steps(&self) -> Vec<&str> {
+        self.chip
+            .lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("NET5b write step="))
+            .map(|l| l.split(' ').next().unwrap())
+            .collect()
     }
     fn finish(&mut self) -> Option<bool> {
         self.until(|b| b.link.outcome().is_some());
@@ -574,8 +588,104 @@ fn every_record_fits_one_log_line() {
     bench.finish();
     let mut slow = Bench::new(None, None);
     slow.finish();
-    for line in bench.chip.lines.iter().chain(&slow.chip.lines) {
+    let mut receive = Bench::receive(Some(GIGA), Some(TICK / 2));
+    receive.settle(true);
+    receive.link.conclude();
+    receive.finish();
+    for line in bench
+        .chip
+        .lines
+        .iter()
+        .chain(&slow.chip.lines)
+        .chain(&receive.chip.lines)
+    {
         assert!(line.starts_with("NET5b ") && line.ends_with('\n'), "{line}");
         assert!(line.len() <= 200, "{} bytes: {line}", line.len());
+    }
+}
+
+#[test]
+fn the_receive_goal_toggles_rx_control_enables_receive_and_parks_it_off() {
+    let mut bench = Bench::receive(Some(GIGA), Some(TICK / 2));
+    bench.settle(true);
+    assert!(bench.link.receiving());
+    assert!(!bench.chip.has("NET5b cable"));
+    assert!(bench.chip.has("NET5b start policy=sw-checksum,unicast+broadcast,receive-on phy_writes=0 goal=receive window_s=600"));
+    assert_eq!(&bench.chip.mac[0x22][..2], &[0x0b, 0x01]);
+    // Nothing ends the window until the caller concludes it.
+    for _ in 0..50 {
+        assert!(bench.tick());
+    }
+    bench.link.conclude();
+    assert_eq!(bench.finish(), Some(true), "{:#?}", bench.chip.lines);
+    assert_eq!(
+        bench.steps(),
+        [
+            "phy-reset",
+            "phy-release",
+            "clock",
+            "rx-checksum",
+            "tx-checksum",
+            "medium",
+            "rx-control",
+            "rx-reset",
+            "rx-control",
+            "queue",
+            "medium-receive",
+            "park-medium",
+            "park-rx-control",
+            "park-clock",
+            "park-phy",
+        ]
+    );
+    assert!(bench
+        .chip
+        .has("NET5b write step=medium-receive reg=0x22 value=0b01 readback=0b01"));
+    assert!(bench
+        .chip
+        .has("NET5b monitor complete goal=receive concluded=1 ups=1 downs=0 agreed=1"));
+    assert!(bench.chip.has("NET5b result PASS goal=receive"));
+    assert!(bench.chip.has("receive=1 concluded=1 parked=1"));
+    assert_eq!(&bench.chip.mac[0x22][..2], &[0, 0]);
+}
+
+#[test]
+fn an_unconcluded_receive_window_fails_but_still_turns_receive_off() {
+    let mut bench = Bench::receive(Some(FAST), Some(TICK / 2));
+    assert_eq!(bench.finish(), Some(false));
+    assert!(bench
+        .chip
+        .has("NET5b monitor incomplete goal=receive concluded=0 ups=1"));
+    assert!(bench
+        .chip
+        .has("NET5b write step=park-medium reg=0x22 value=0000 readback=0000"));
+    assert!(bench.chip.has("NET5b result FAIL goal=receive"));
+    assert!(bench.chip.has("value=0203 readback=0203"));
+}
+
+#[test]
+fn a_link_flap_during_receive_reapplies_the_toggle_and_receive() {
+    let mut bench = Bench::receive(Some(GIGA), Some(TICK / 2));
+    bench.cycle(1, GIGA);
+    bench.link.conclude();
+    assert_eq!(bench.finish(), Some(true), "{:#?}", bench.chip.lines);
+    let steps = bench.steps();
+    assert_eq!(steps.iter().filter(|s| **s == "rx-reset").count(), 2);
+    assert_eq!(steps.iter().filter(|s| **s == "medium-receive").count(), 2);
+    let c = bench.link.counts();
+    assert_eq!((c.ups, c.downs, c.agreed), (2, 1, 3));
+}
+
+#[test]
+fn receiving_adds_only_the_receive_bit_to_every_medium() {
+    for physr in [0xa400u16, 0x8400, 0x6400, 0x4400, 0x2400, 0x0400] {
+        let c = link_config(physr, 2).unwrap();
+        let (a, b) = (c.medium.bytes(), c.receiving());
+        let (a, b) = (
+            u16::from_le_bytes([a[0], a[1]]),
+            u16::from_le_bytes([b.bytes()[0], b.bytes()[1]]),
+        );
+        assert_eq!(b, a | MEDIUM_RECEIVE_EN);
+        assert_eq!(b & 0x8070, 0, "no jumbo or pause bits");
     }
 }

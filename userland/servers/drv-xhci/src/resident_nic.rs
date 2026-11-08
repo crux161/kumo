@@ -1,5 +1,6 @@
 //j831
 //j833
+//j834
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -14,15 +15,19 @@
 //! is not initialized, so RX is expected to stay pending; no frame is transmitted.
 //! KUMO_AX88_LINK_PROOF (NET5b) reuses these lanes and the proof tick to pace
 //! `kumo_ax88::link` on this owner's EP0 instead of the cycling timeline; MAC
-//! receive stays off there too. Recovery class: stateless; the custody parent holds
+//! receive stays off there too. KUMO_AX88_RX_PROOF (NET6) runs the same sequence with
+//! the receive goal and tallies every RX aggregate with `kumo_ax88::probe`; the peer's
+//! END frame concludes the window. Recovery class: stateless; the custody parent holds
 //! the DMA. — TIMBERDOODLE
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use drv_xhci::nic::{completed_length, NicLane, NicLifecycle, NicPhase};
 use kumo_abi::{Handle, VmarFlags};
-use kumo_ax88::link::{Link, StatusView};
+use kumo_ax88::link::{Goal, Link, StatusView};
+use kumo_ax88::probe::{self, Tally, Verdict};
 use kumo_ax88::profile::{Profile, Speed};
+use kumo_ax88::rx::{Aggregate, Packet};
 use kumo_rt::{clock_get, vmar_map};
 use kumo_xhci::{
     boundary_window, endpoint_context_index, CompletionStats, ContextSize, ControlPipe, DmaBuf,
@@ -41,7 +46,9 @@ use super::{
 };
 
 pub(super) const ENABLED: bool =
-    flag(option_env!("KUMO_AX88_RESIDENT_PROOF")) || ax88_link::ENABLED;
+    flag(option_env!("KUMO_AX88_RESIDENT_PROOF")) || ax88_link::ENABLED || ax88_link::RX_ENABLED;
+/// NET6 concludes its receive window this long after the peer's first END frame.
+const RX_SETTLE_NS: u64 = 2_000_000_000;
 
 const fn flag(value: Option<&str>) -> bool {
     match value {
@@ -188,6 +195,9 @@ pub(super) struct NicResident {
     link: Option<bool>,
     /// When the status lane's link bit last changed (NET5b's agreement check).
     status_changed_ns: u64,
+    /// NET6 receive-window counts and when the peer's END frame first arrived.
+    rx_tally: Tally,
+    rx_end_ns: u64,
     status_reports: u32,
     rx_completions: u32,
     rx_frames: u32,
@@ -350,6 +360,8 @@ impl NicResident {
             life: NicLifecycle::new(),
             link: None,
             status_changed_ns: 0,
+            rx_tally: Tally::new(),
+            rx_end_ns: 0,
             status_reports: 0,
             rx_completions: 0,
             rx_frames: 0,
@@ -357,7 +369,11 @@ impl NicResident {
             last_start_ns: (0, 0),
             proof: Proof::default(),
             pipe,
-            link_proof: Link::new(),
+            link_proof: if ax88_link::RX_ENABLED {
+                Link::with_goal(Goal::Receive)
+            } else {
+                Link::new()
+            },
         })
     }
 
@@ -609,6 +625,9 @@ impl NicResident {
                 // SAFETY: single-threaded; no earlier snapshot slice is in use.
                 let snapshot = unsafe { &mut *RX_SNAPSHOT.0.get() };
                 self.rx.buffer.read_into(0, &mut snapshot[..actual]);
+                if ax88_link::RX_ENABLED {
+                    return self.receive(&snapshot[..actual]);
+                }
                 let frames = kumo_ax88::rx::Aggregate::parse(&snapshot[..actual])
                     .map(|aggregate| aggregate.entries());
                 if let Ok(entries) = frames {
@@ -619,6 +638,58 @@ impl NicResident {
                     actual, frames
                 ));
             }
+        }
+    }
+
+    /// NET6: count one completed aggregate. Exact-phase, END and invalid test frames are
+    /// logged one per line; burst frames only reach the tally. Never blocks.
+    fn receive(&mut self, bytes: &[u8]) {
+        let parsed = Aggregate::parse(bytes);
+        self.rx_tally
+            .aggregate(bytes.len(), parsed.map(|a| a.counts()));
+        let aggregate = match parsed {
+            Ok(aggregate) => aggregate,
+            Err(error) => {
+                return ax88_record(format_args!(
+                    "NET6 aggregate n={} bytes={} parse={:?}\n",
+                    self.rx_tally.aggregates,
+                    bytes.len(),
+                    error
+                ))
+            }
+        };
+        let mut logged = false;
+        for packet in aggregate.packets() {
+            let Packet::Frame { bytes: frame, .. } = packet else {
+                continue;
+            };
+            let Some(test) = self.rx_tally.frame(frame) else {
+                continue;
+            };
+            if test.seq < probe::EXACT || test.seq == probe::END || test.verdict != Verdict::Valid {
+                logged = true;
+                ax88_record(format_args!(
+                    "NET6 frame seq={} len={} fnv={:016x} trailing={} fcs={} verdict={:?} hdr={}\n",
+                    test.seq,
+                    frame.len(),
+                    probe::fnv64(frame),
+                    test.trailing,
+                    test.fcs as u8,
+                    test.verdict,
+                    Hex(&frame[..frame.len().min(42)])
+                ));
+            }
+        }
+        if logged {
+            let c = aggregate.counts();
+            ax88_record(format_args!(
+                "NET6 aggregate n={} bytes={} frames={} dropped={} dummies={}\n",
+                self.rx_tally.aggregates,
+                bytes.len(),
+                c.frames,
+                c.dropped,
+                c.dummy
+            ));
         }
     }
 
@@ -820,7 +891,7 @@ impl NicResident {
         cmd: &mut DmaTrbs,
         evt: &DmaTrbs,
     ) -> bool {
-        if ax88_link::ENABLED {
+        if ax88_link::ENABLED || ax88_link::RX_ENABLED {
             return self.link_tick(io, layout, image, evt);
         }
         let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
@@ -1009,6 +1080,13 @@ impl NicResident {
     ) -> bool {
         let controller = CONTROLLER_BASE.load(Ordering::Relaxed);
         let now = clock_get();
+        if ax88_link::RX_ENABLED && self.rx_tally.end > 0 {
+            if self.rx_end_ns == 0 {
+                self.rx_end_ns = now;
+            } else if now.saturating_sub(self.rx_end_ns) >= RX_SETTLE_NS {
+                self.link_proof.conclude();
+            }
+        }
         self.proof.tick += 1;
         if self.proof.tick == 1 {
             self.proof.custody = DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed);
@@ -1086,10 +1164,26 @@ impl NicResident {
         let custody = DMA_CUSTODY_SEQUENCE.load(Ordering::Relaxed);
         let ep0_queued = self.dev.ep0_ring.queued();
         let faults = after.faults - before.faults;
-        // MAC receive stayed off, so any RX completion is a finding, not traffic.
+        let r = self.rx_tally;
+        // NET5b keeps MAC receive off, so any RX completion is a finding there. NET6
+        // needs every slow frame, some burst, the END frame and no invalid record.
+        let traffic = if ax88_link::RX_ENABLED {
+            r.parse_errors == 0
+                && r.invalid == 0
+                && r.duplicates == 0
+                && r.unexpected_seq == 0
+                && r.exact_received() == probe::EXACT
+                && r.burst_received > 0
+                && r.end > 0
+        } else {
+            self.rx_completions == 0
+        };
+        if ax88_link::RX_ENABLED {
+            self.receive_summary();
+        }
         let pass = self.link_proof.outcome() == Some(true)
             && faults == 0
-            && self.rx_completions == 0
+            && traffic
             && ep0_queued == 0
             && !self.pipe.is_quarantined()
             && lanes == p.lanes
@@ -1098,7 +1192,8 @@ impl NicResident {
             && self.life.is_pending(NicLane::Status)
             && (self.hid_idle_cc != Some(1) || hid > 0);
         ax88_record(format_args!(
-            "NET5b census controller={:#x} slot={} registered={} routed={} consumed={} retired={} faults={} ep0_queued={} lanes={}/{} custody={}/{} rx_pending={} status_pending={} {}\n",
+            "{} census controller={:#x} slot={} registered={} routed={} consumed={} retired={} faults={} ep0_queued={} lanes={}/{} custody={}/{} rx_pending={} status_pending={} {}\n",
+            if ax88_link::RX_ENABLED { "NET6" } else { "NET5b" },
             controller,
             self.dev.slot_id,
             after.registered - before.registered,
@@ -1117,11 +1212,67 @@ impl NicResident {
         ));
     }
 
+    /// NET6's receive-window counts, then the burst bitmap eight words per line.
+    fn receive_summary(&self) {
+        let r = self.rx_tally;
+        ax88_record(format_args!(
+            "NET6 rx aggregates={} parse_errors={} frames={} dropped={} dummies={} max_frames={} max_bytes={} arp={} ipv4={} ipv6={} other={} rx_completions={}\n",
+            r.aggregates,
+            r.parse_errors,
+            r.frames,
+            r.dropped,
+            r.dummies,
+            r.max_frames_per_aggregate,
+            r.max_aggregate_bytes,
+            r.arp,
+            r.ipv4,
+            r.ipv6,
+            r.other,
+            self.rx_completions
+        ));
+        ax88_record(format_args!(
+            "NET6 rx test exact={}/{} burst={}/{} digest={:016x} end={} duplicates={} invalid={} unexpected={} fcs={} no_fcs={}\n",
+            r.exact_received(),
+            probe::EXACT,
+            r.burst_received,
+            probe::BURST,
+            r.burst_digest,
+            r.end,
+            r.duplicates,
+            r.invalid,
+            r.unexpected_seq,
+            r.fcs,
+            r.no_fcs
+        ));
+        for (n, words) in r.burst_bits.chunks(8).enumerate() {
+            let mut line = [0u8; 128];
+            for (i, w) in words.iter().enumerate() {
+                for (j, b) in w.to_be_bytes().iter().enumerate() {
+                    let at = i * 16 + j * 2;
+                    line[at] = b"0123456789abcdef"[usize::from(b >> 4)];
+                    line[at + 1] = b"0123456789abcdef"[usize::from(b & 15)];
+                }
+            }
+            ax88_record(format_args!(
+                "NET6 rx bitmap line={} words={}\n",
+                n,
+                core::str::from_utf8(&line).unwrap_or("?")
+            ));
+        }
+    }
+
     pub(super) fn fail_start(&mut self, stage: &str) {
         self.life.fail();
         ax88_record(format_args!(
             "NET4c3 nic FAIL stage={}; lanes retained\n",
             stage
         ));
+    }
+}
+
+struct Hex<'a>(&'a [u8]);
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
 }

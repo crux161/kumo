@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j833
+#j834
 """Check NET5b's volatile ax88 initialization and measured cable up/down capture.
 
 Every queue/medium value, the autonegotiation resolution and the cycle count are
@@ -100,6 +101,10 @@ def live_lines(text):
     out = []
     for line in text.splitlines():
         line = re.sub(r"^\[\d\d:\d\d:\d\d\.\d+\] ", "", line)
+        # The login prompt ends without a newline, so a record can share its line.
+        if line.startswith("INDRA login: ") and line[13:].strip():
+            out.append("INDRA login:")
+            line = line[13:]
         if not re.match(r"\[\s*\d+\.\d+\] ", line):
             out.append(line)
     return out
@@ -267,6 +272,8 @@ class Tests(unittest.TestCase):
         text += "[12:01:00.000] [   92.096389] NET5b link up n=9 ms=1 since_ms=1 physr=0xbc00\n"
         result = parse(text, (1000, True))
         self.assertEqual(result["cycles"], 2)
+        prompted = fixture().replace("NET5b settled step=clock", "INDRA login: NET5b settled step=clock")
+        self.assertEqual(parse(prompted)["cycles"], 2)
         self.assertEqual([t["kind"] for t in result["transitions"]], ["up", "down", "up", "down", "up"])
 
     def test_every_missing_or_duplicated_record_fails(self):

@@ -1,5 +1,6 @@
 # ax88 volatile initialization and link control (NET5b)
 <!-- j833 -->
+<!-- j834 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -10,7 +11,8 @@ vendor-request `Port`. drv-xhci adapts that port to the resident owner's
 `ControlPipe` on EP0 and paces it with the existing 100 ms proof tick. The PHY and
 clock settle waits are therefore timer ticks, not blocking sleeps. HID and storage
 keep running beside them. Only `KUMO_AX88_LINK_PROOF=1` images run it. Ordinary
-images still leave the adapter unconfigured.
+images still leave the adapter unconfigured. NET6 runs the same sequence with a
+receive goal that turns MAC receive on; see [passive receive](ax88-rx.md).
 
 ## The sequence
 

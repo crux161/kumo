@@ -1,4 +1,5 @@
 //j833
+//j834
 //! Default-off NET5b. The resident owner's exact EP0 pipe carries the pure
 //! `kumo_ax88::link` sequence, paced by the loop's 100 ms proof tick, so the PHY and
 //! clock settle waits never block HID or storage service. No new DMA, grant,
@@ -11,10 +12,16 @@ use kumo_xhci::{
     ControlError, ControlPipe, DmaBuf, DmaTrbs, NoOpCommandImage, RegisterLayout, TransferRing,
 };
 
-pub(super) const ENABLED: bool = match option_env!("KUMO_AX88_LINK_PROOF") {
-    Some(value) => matches!(value.as_bytes(), [b'1']),
-    None => false,
-};
+pub(super) const ENABLED: bool = flag(option_env!("KUMO_AX88_LINK_PROOF"));
+/// NET6: the same sequence with the receive goal; takes precedence over NET5b.
+pub(super) const RX_ENABLED: bool = flag(option_env!("KUMO_AX88_RX_PROOF"));
+
+const fn flag(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(value.as_bytes(), [b'1']),
+        None => false,
+    }
+}
 
 pub(super) struct Ep0Port<'a> {
     pub io: &'a mut Mmio,

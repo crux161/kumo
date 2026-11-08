@@ -1,6 +1,7 @@
 # ax88 protocol codec
 <!-- j826 -->
 <!-- j833 -->
+<!-- j834 -->
 
 Date: 2026-11-07. Author: TIMBERDOODLE.
 
@@ -70,7 +71,10 @@ readback and software-offload setting before RX/TX is enabled.
 
 The enabled RX mode must provide the two-byte IP-alignment pseudo header. NET5b
 (J833) sets and reads back RX control 0288 with IPE; see [the link proof](ax88-link.md).
-The aggregate is:
+NET6 (J834) measured the metal AX88179 UA2 against a real peer. Its aggregates carry
+no dummy entries and no tail padding: a single 60-byte frame arrives as 72 bytes (62
+padded to 64, one metadata word, the trailer). The packet length excludes the FCS;
+no frame ended in its own CRC-32. See [passive receive](ax88-rx.md). The aggregate is:
 
 ```text
 [wire packet, padding to 8 bytes] ...

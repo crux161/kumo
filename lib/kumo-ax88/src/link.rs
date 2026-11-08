@@ -1,12 +1,14 @@
 //j833
+//j834
 //! NET5b: minimal volatile initialization and link control for the NET0-profiled
 //! AX88179, as pure sequencing over an exact vendor-request port. Every value comes
 //! from the supplied ax88179_178a.c (reset, link_reset, set_rx_mode, unbind), cut to
 //! KUMO's initial policy: software checksums, unicast+broadcast reception, no pause,
 //! EEE, LED, wake, multicast or jumbo setup. The request constructors cannot express
-//! EEPROM/eFuse access and this module issues no PHY write. MAC receive stays off
-//! (MEDIUM bit 8 clear) until NET6. Records are raw little-endian register bytes.
-//! — TIMBERDOODLE
+//! EEPROM/eFuse access and this module issues no PHY write. The NET5b cable goal keeps
+//! MAC receive off (MEDIUM bit 8 clear); NET6's receive goal turns it on at each link
+//! up after link_reset()'s RX control toggle, and off again before parking. Records
+//! are raw little-endian register bytes. — TIMBERDOODLE
 use core::fmt;
 
 use crate::control::{Direction, MacRegister, Request};
@@ -155,6 +157,23 @@ pub const fn aggregate_limit(queue: [u8; 5]) -> usize {
     1024 * (queue[3] as usize + 2)
 }
 
+impl LinkConfig {
+    /// NET6: the same medium with MAC receive enabled.
+    pub fn receiving(&self) -> Write {
+        let b = self.medium.bytes();
+        Write::word(
+            MacRegister::Medium,
+            u16::from_le_bytes([b[0], b[1]]) | MEDIUM_RECEIVE_EN,
+            0xffff,
+        )
+    }
+}
+
+/// NET6 receive goal: link_reset()'s RX control stop/start before each link-up's
+/// medium, and receive off before the unbind() park.
+pub const RX_RESET: (&str, Write) = ("rx-reset", Write::word(MacRegister::RxControl, 0, 0xffff));
+pub const RECEIVE_OFF: (&str, Write) = ("park-medium", Write::word(MacRegister::Medium, 0, 0xffff));
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkConfig {
     pub speed_mbps: u16,
@@ -285,7 +304,18 @@ struct Awaiting {
 struct Stop;
 type Step = Result<(), Stop>;
 
+/// What the monitor waits for: NET5b's physical cable cycles, or NET6's caller-ended
+/// receive window with MAC receive on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Goal {
+    CableCycles,
+    Receive,
+}
+
 pub struct Link {
+    goal: Goal,
+    concluded: bool,
+    receiving: bool,
     phase: Phase,
     started_ns: u64,
     released_ns: u64,
@@ -307,7 +337,14 @@ impl Default for Link {
 
 impl Link {
     pub const fn new() -> Self {
+        Self::with_goal(Goal::CableCycles)
+    }
+
+    pub const fn with_goal(goal: Goal) -> Self {
         Self {
+            goal,
+            concluded: false,
+            receiving: false,
             phase: Phase::Start,
             started_ns: 0,
             released_ns: 0,
@@ -336,6 +373,16 @@ impl Link {
         self.counts
     }
 
+    /// Whether a link-up has turned MAC receive on (receive goal only).
+    pub const fn receiving(&self) -> bool {
+        self.receiving
+    }
+
+    /// End the receive window; the next tick parks once the link state is confirmed.
+    pub fn conclude(&mut self) {
+        self.concluded = true;
+    }
+
     /// `Some(pass)` once the sequence has ended; a failure is `Some(false)`.
     pub fn outcome(&self) -> Option<bool> {
         match self.phase {
@@ -347,9 +394,13 @@ impl Link {
 
     fn passed(&self) -> bool {
         let c = self.counts;
+        let goal = match self.goal {
+            Goal::CableCycles => c.cycles >= CABLE_CYCLES,
+            Goal::Receive => self.concluded && self.receiving && c.ups > 0,
+        };
         self.init_ok
             && self.parked_ok
-            && c.cycles >= CABLE_CYCLES
+            && goal
             && c.missed == 0
             && c.disagreed == 0
             && c.agreed == c.ups + c.downs
@@ -379,11 +430,17 @@ impl Link {
 
     fn start<P: Port>(&mut self, port: &mut P, now: u64) -> Step {
         self.started_ns = now;
-        port.record(format_args!(
-            "NET5b start policy=sw-checksum,unicast+broadcast,receive-off phy_writes=0 cycles={} window_s={}\n",
-            CABLE_CYCLES,
-            MONITOR_NS / 1_000_000_000
-        ));
+        match self.goal {
+            Goal::CableCycles => port.record(format_args!(
+                "NET5b start policy=sw-checksum,unicast+broadcast,receive-off phy_writes=0 cycles={} window_s={}\n",
+                CABLE_CYCLES,
+                MONITOR_NS / 1_000_000_000
+            )),
+            Goal::Receive => port.record(format_args!(
+                "NET5b start policy=sw-checksum,unicast+broadcast,receive-on phy_writes=0 goal=receive window_s={}\n",
+                MONITOR_NS / 1_000_000_000
+            )),
+        }
         for register in BASELINE {
             let bytes = self.transfer(port, &Request::mac_read(register))?;
             port.record(format_args!(
@@ -540,7 +597,7 @@ impl Link {
                 let now = port.now_ns();
                 self.confirm(port, now, status);
             }
-            if self.counts.cycles < CABLE_CYCLES {
+            if self.goal == Goal::CableCycles && self.counts.cycles < CABLE_CYCLES {
                 port.record(format_args!(
                     "NET5b cable {} the ax88 Ethernet cable (cycle {}/{})\n",
                     if up { "unplug" } else { "replug" },
@@ -549,8 +606,26 @@ impl Link {
                 ));
             }
         }
-        let complete = self.counts.cycles >= CABLE_CYCLES && self.awaiting.is_none() && up;
-        if complete || now >= deadline {
+        let goal = match self.goal {
+            Goal::CableCycles => self.counts.cycles >= CABLE_CYCLES,
+            Goal::Receive => self.concluded,
+        };
+        let complete = goal && self.awaiting.is_none() && up;
+        if self.goal == Goal::Receive && (complete || now >= deadline) {
+            let c = self.counts;
+            port.record(format_args!(
+                "NET5b monitor {} goal=receive concluded={} ups={} downs={} agreed={} missed={} disagreed={} ms={}\n",
+                if complete { "complete" } else { "incomplete" },
+                self.concluded as u8,
+                c.ups,
+                c.downs,
+                c.agreed,
+                c.missed,
+                c.disagreed,
+                ms(port.now_ns() - self.started_ns)
+            ));
+            self.phase = Phase::Park;
+        } else if complete || now >= deadline {
             let c = self.counts;
             port.record(format_args!(
                 "NET5b monitor {} cycles={}/{} ups={} downs={} agreed={} missed={} disagreed={} ms={}\n",
@@ -626,11 +701,26 @@ impl Link {
         let Some(config) = config else {
             return Ok(());
         };
+        if self.goal == Goal::Receive {
+            let (step, write) = RX_RESET;
+            self.write(port, step, write)?;
+            let (step, write) = POLICY[3];
+            self.write(port, step, write)?;
+        }
         self.write(port, "queue", config.queue)?;
+        if self.goal == Goal::Receive {
+            self.write(port, "medium-receive", config.receiving())?;
+            self.receiving = true;
+            return Ok(());
+        }
         self.write(port, "medium-link", config.medium)
     }
 
     fn park<P: Port>(&mut self, port: &mut P) -> Step {
+        if self.goal == Goal::Receive {
+            let (step, write) = RECEIVE_OFF;
+            self.write(port, step, write)?;
+        }
         for (step, write) in PARK {
             self.write(port, step, write)?;
         }
@@ -658,6 +748,25 @@ impl Link {
         ));
         self.phase = Phase::Done;
         let c = self.counts;
+        if self.goal == Goal::Receive {
+            port.record(format_args!(
+                "NET5b result {} goal=receive reads={} writes={} ups={} downs={} agreed={} missed={} disagreed={} max_transfer_us={} init={} receive={} concluded={} parked={}\n",
+                if self.passed() { "PASS" } else { "FAIL" },
+                c.reads,
+                c.writes,
+                c.ups,
+                c.downs,
+                c.agreed,
+                c.missed,
+                c.disagreed,
+                c.max_transfer_ns / 1_000,
+                self.init_ok as u8,
+                self.receiving as u8,
+                self.concluded as u8,
+                self.parked_ok as u8
+            ));
+            return Ok(());
+        }
         port.record(format_args!(
             "NET5b result {} reads={} writes={} ups={} downs={} cycles={}/{} agreed={} missed={} disagreed={} max_transfer_us={} init={} parked={}\n",
             if self.passed() { "PASS" } else { "FAIL" },
