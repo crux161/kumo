@@ -1,5 +1,6 @@
 //j834
 //j835
+//j836
 //! NET6 passive-RX test frames: a peer's numbered IPv4/UDP broadcasts to `PORT`, whose
 //! size and every payload byte follow from the sequence number alone. Each frame is
 //! verified in software (IPv4 header checksum, UDP checksum, payload) and summarized
@@ -326,8 +327,8 @@ pub const TX_BURST: u32 = 2048;
 /// 512/1024 transfer boundary (504 and 1016 bytes + 8-byte prefix land exactly on it),
 /// and at the 1514-byte maximum.
 const TX_SIZES: [u16; TX_EXACT as usize] = [
-    30, 42, 59, 60, 61, 64, 100, 200, 400, 503, 504, 505, 511, 512, 513, 600, 800, 1000, 1015,
-    1016, 1017, 1023, 1024, 1025, 1200, 1400, 1500, 1510, 1511, 1512, 1513, 1514,
+    1514, 42, 59, 60, 61, 64, 100, 200, 400, 503, 504, 505, 511, 512, 513, 600, 800, 1000, 1015,
+    1016, 1017, 1023, 1024, 1025, 1200, 1400, 1500, 1510, 1511, 1512, 1513, 30,
 ];
 
 pub fn tx_frame_len(seq: u32) -> usize {

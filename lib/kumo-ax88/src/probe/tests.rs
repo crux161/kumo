@@ -1,5 +1,6 @@
 //j834
 //j835
+//j836
 extern crate std;
 use super::*;
 use std::vec::Vec;
@@ -251,7 +252,7 @@ fn tx_frames_cover_padding_and_both_transfer_boundaries() {
         }
     }
     assert_eq!(&boundary[..2], &[504, 1016]);
-    assert!(tx_frame(TX_EXACT - 1, src, &mut buf[..1513]).is_none());
+    assert!(tx_frame(0, src, &mut buf[..1513]).is_none());
     // Pinned in scripts/ax88-tx-proof.py --self-test.
     let n = tx_frame(1, src, &mut buf).unwrap();
     assert_eq!(fnv64(&buf[..n]), 0x94e3_b3b6_42dd_8ed6);

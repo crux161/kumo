@@ -1,5 +1,6 @@
 //j833
 //j834
+//j836
 extern crate std;
 use super::*;
 use std::string::{String, ToString};
@@ -110,6 +111,10 @@ impl Port for Chip {
             (0xc0, 2) => {
                 assert_eq!(value, 3, "PHY address");
                 into[..2].copy_from_slice(&self.phy_read(index).to_le_bytes());
+            }
+            (0xc0, 0x81) => {
+                assert_eq!(value, 0x8c, "fifo status register");
+                into[..len].copy_from_slice(&[0u8; 4][..len]);
             }
             (0x40, 1) if self.stuck != Some(value as u8) => {
                 self.mac[value][..len].copy_from_slice(request.outbound());

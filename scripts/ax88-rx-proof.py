@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #j834
 #j835
+#j836
 """NET6 passive RX: the peer sender and the capture checker.
 
   send   broadcast the numbered test datagrams from this host (no root needed)
@@ -235,6 +236,7 @@ def receive_init(c, controller, slot):
             write("rx-reset", "0b", "0000", 0xffff)
             write("rx-control", "0b", "8802", 0xffff)
             write("queue", "2e", want[2], 0xff_ffff_ffff)
+            c.take(r"NET5b fifo value=(0x[0-9a-f]{8})", "tx fifo status")
             write("medium-receive", "22", (le(want[3]) | 0x0100).to_bytes(2, "little").hex(), 0xffff)
             modes.append(link.label(hcd))
         elif kind == "down":
@@ -414,7 +416,7 @@ def fixture(fcs=True, lost=(70, 71, 4000)):
               "NET5b link up n=1 ms=3900 since_ms=2990 physr=0xad02",
               "NET5b negotiated speed=1000 full=1 hcd=1000/full bmsr=0x796d anar=0x05e1 anlpar=0xc1e1 gbcr=0x0200 gbsr=0x3800 usb=0x42 agrees=1",
               w("rx-reset", "0b", "0000", "0000"), w("rx-control", "0b", "8802", "8802"), w("queue", "2e", "07200316ff", "07200316ff"),
-              w("medium-receive", "22", "0b01", "0b01"), "NET5b status agrees link=1 lag_ms=0 reports=4"]
+              "NET5b fifo value=0x00000000", w("medium-receive", "22", "0b01", "0b01"), "NET5b status agrees link=1 lag_ms=0 reports=4"]
     n = 0
     received = []
     for seq in list(range(EXACT)) + [s for s in range(EXACT, EXACT + BURST) if s not in lost] + [END]:

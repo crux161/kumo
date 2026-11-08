@@ -1,5 +1,6 @@
 //j833
 //j834
+//j836
 //! NET5b: minimal volatile initialization and link control for the NET0-profiled
 //! AX88179, as pure sequencing over an exact vendor-request port. Every value comes
 //! from the supplied ax88179_178a.c (reset, link_reset, set_rx_mode, unbind), cut to
@@ -709,6 +710,14 @@ impl Link {
         }
         self.write(port, "queue", config.queue)?;
         if self.goal == Goal::Receive {
+            // Reference link_reset() polls the device TX FIFO empty (vendor 0x81/0x8c)
+            // before the medium. Record one read: the 2026-11-07 wire capture showed TX
+            // stops after the first padded transfer, so this word is the experiment.
+            let fifo = self.transfer(port, &Request::fifo_status())?;
+            port.record(format_args!(
+                "NET5b fifo value={:#010x}\n",
+                u32::from_le_bytes([fifo[0], fifo[1], fifo[2], fifo[3]])
+            ));
             self.write(port, "medium-receive", config.receiving())?;
             self.receiving = true;
             return Ok(());

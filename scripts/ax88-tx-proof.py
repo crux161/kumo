@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #j835
+#j836
 """NET7a: check a KUMO full-duplex TX proof against the peer's own packet capture.
 
 The RX half is NET6's check (same sender, same manifest). Every frame KUMO handed to
@@ -27,8 +28,8 @@ require, fnv64, pattern = rx.require, rx.fnv64, rx.pattern
 ETHERTYPE = 0x88B5
 MAGIC = b"KUMOTX07"
 EXACT, BURST = 32, 2048
-SIZES = [30, 42, 59, 60, 61, 64, 100, 200, 400, 503, 504, 505, 511, 512, 513, 600, 800, 1000,
-         1015, 1016, 1017, 1023, 1024, 1025, 1200, 1400, 1500, 1510, 1511, 1512, 1513, 1514]
+SIZES = [1514, 42, 59, 60, 61, 64, 100, 200, 400, 503, 504, 505, 511, 512, 513, 600, 800, 1000,
+         1015, 1016, 1017, 1023, 1024, 1025, 1200, 1400, 1500, 1510, 1511, 1512, 1513, 30]
 
 
 def frame_len(seq):
@@ -145,7 +146,7 @@ class Tests(unittest.TestCase):
         text, manifest, captured = fixture()
         result = check(text, manifest, captured)
         self.assertEqual(result["tx"]["delivered"], 2080)
-        self.assertEqual(sorted(result["tx"]["short_frame_padding"]), [0, 1, 2])
+        self.assertEqual(sorted(result["tx"]["short_frame_padding"]), [1, 2, 31])
 
     def test_delivery_and_bytes_are_proved_by_the_capture_only(self):
         text, manifest, captured = fixture()
@@ -159,8 +160,8 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(text, manifest, None)
         # Ethernet padding content is unspecified: reported, never required.
-        padded = [f[:59] + b"\x01" if i == tx_at[0] else f for i, f in enumerate(captured)]
-        self.assertEqual(check(text, manifest, padded)["tx"]["short_frame_padding"][0][-2:], "01")
+        padded = [f[:59] + b"\x01" if i == tx_at[31] else f for i, f in enumerate(captured)]
+        self.assertEqual(check(text, manifest, padded)["tx"]["short_frame_padding"][31][-2:], "01")
 
     def test_record_mutations_fail(self):
         text, manifest, captured = fixture()
