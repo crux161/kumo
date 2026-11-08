@@ -2,6 +2,7 @@
 //j833
 //j834
 //j835
+//j838
 //! NET4c-3: the ax88's resident RX and status lanes on the one controller owner. It is
 //! default-off: without KUMO_AX88_RESIDENT_PROOF the adapter stays unconfigured, as
 //! since NET0.
@@ -78,6 +79,10 @@ const RINGS_LEN: u64 = 0xa00;
 /// the burst starts later, to overlap the peer's RX phases.
 const TX_EXACT_DELAY_NS: u64 = 2_000_000_000;
 const TX_BURST_DELAY_NS: u64 = 11_000_000_000;
+/// J838 experiment: the exact phase's inter-frame gap. The 10 ms pace puts all 32
+/// frames inside one second, separating a time-based transmit wall from a count-based
+/// one (J836: every boot transmitted exactly 11 frames).
+const TX_EXACT_GAP_NS: u64 = 10_000_000;
 /// A submitted transfer whose exact completion never arrives must not wedge the proof.
 /// Full-duplex load starves OUT completions for tens of seconds (12.2 s and 32.5 s
 /// measured at seq 623 on metal), so the bound sits far above that before the schedule
@@ -753,7 +758,7 @@ impl NicResident {
         }
         let due = p.receive_ns
             + if seq < probe::TX_EXACT {
-                TX_EXACT_DELAY_NS + u64::from(seq) * TICK_NS
+                TX_EXACT_DELAY_NS + u64::from(seq) * TX_EXACT_GAP_NS
             } else {
                 TX_BURST_DELAY_NS
             };
